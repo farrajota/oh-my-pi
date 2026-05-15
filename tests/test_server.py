@@ -2219,3 +2219,111 @@ async def test_triage_issue_does_not_recheck_when_issue_row_exists(
     assert github.calls == [], "MUST NOT query timeline on a repeat-triage"
     assert len(stub_run_task) == 1
     close_database()
+
+
+# -------- /webhook/github cancellation hooks --------------------------------
+
+
+def _post_issue_comment_simple(
+    client: TestClient,
+    *,
+    delivery: str,
+    issue_number: int,
+    user: str = "alice",
+    secret: str = "test-webhook-secret",
+):
+    return _post_issue_comment(
+        client,
+        delivery=delivery,
+        user=user,
+        number=issue_number,
+        body="follow-up",
+        secret=secret,
+    )
+
+
+def _post_issues_closed(
+    client: TestClient,
+    *,
+    delivery: str,
+    issue_number: int,
+    secret: str = "test-webhook-secret",
+):
+    payload = {
+        "action": "closed",
+        "issue": {"number": issue_number, "user": {"login": "alice"}},
+        "repository": {"full_name": "octo/widget"},
+    }
+    body = json.dumps(payload).encode()
+    return client.post(
+        "/webhook/github",
+        content=body,
+        headers=_signed_headers(secret, body, event="issues", delivery=delivery),
+    )
+
+
+def _seed_pending_closure(db, *, key: str, number: int) -> None:
+    db.upsert_pending_closure(
+        issue_key=key,
+        repo="octo/widget",
+        number=number,
+        comment_id=42,
+        issue_author="alice",
+        close_at="2999-01-01T00:00:00.000000Z",
+    )
+
+
+def test_webhook_issue_comment_cancels_pending_closure(settings: Settings) -> None:
+    db = get_database(settings.sqlite_path)
+    key = issue_key("octo/widget", 7)
+    _seed_pending_closure(db, key=key, number=7)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        resp = _post_issue_comment_simple(client, delivery="d-cancel-comment", issue_number=7)
+    assert resp.status_code == 202
+    row = db.get_pending_closure(key)
+    assert row is not None
+    assert row.state == "cancelled"
+    assert row.cancel_reason == "user_replied"
+    close_database()
+
+
+def test_webhook_issues_closed_cancels_pending_closure(settings: Settings) -> None:
+    db = get_database(settings.sqlite_path)
+    key = issue_key("octo/widget", 8)
+    _seed_pending_closure(db, key=key, number=8)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        resp = _post_issues_closed(client, delivery="d-cancel-closed", issue_number=8)
+    assert resp.status_code == 202
+    row = db.get_pending_closure(key)
+    assert row is not None
+    assert row.state == "cancelled"
+    assert row.cancel_reason == "externally_closed"
+    close_database()
+
+
+def test_webhook_pr_conversation_does_not_cancel_pending_closure(settings: Settings) -> None:
+    """A comment on a PR (issue payload with `pull_request`) routes to
+    `handle_pr_conversation`, which is unrelated to the question auto-close
+    schedule on the originating issue."""
+    db = get_database(settings.sqlite_path)
+    key = issue_key("octo/widget", 9)
+    _seed_pending_closure(db, key=key, number=9)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        # Use the existing PR-issue-comment helper (number 9 here is the PR).
+        resp = _post_pr_issue_comment(
+            client,
+            delivery="d-pr-noop",
+            user="alice",
+            pr_number=9,
+        )
+    assert resp.status_code == 202
+    row = db.get_pending_closure(key)
+    # Row may have been touched only if the PR maps back to issue 9; safest
+    # assertion: the row stays `pending` because routing went down a path
+    # other than `handle_comment`.
+    assert row is not None
+    assert row.state == "pending"
+    close_database()

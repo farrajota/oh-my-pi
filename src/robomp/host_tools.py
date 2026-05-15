@@ -13,12 +13,14 @@ import subprocess
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 
 from omp_rpc import HostTool, HostToolContext, RpcCommandError, host_tool
 
 from robomp import persona
+from robomp.config import Settings
 from robomp.db import Database, issue_key
 from robomp.git_ops import GitCommandError, HeadDriftError, rev_parse_head
 from robomp.github_backend import GitHubBackend
@@ -47,6 +49,7 @@ class ToolBindings:
     loop: asyncio.AbstractEventLoop
     author_name: str
     author_email: str
+    settings: Settings | None = None
     # Number of the GitHub thread the inbound webhook arrived on. For an
     # issue comment this is the issue; for a PR conversation or review
     # comment it's the PR. `gh_post_comment` defaults its target here so
@@ -331,6 +334,63 @@ def _run_pre_publish_bun_check(
         _raise_command(msg)
 
 
+_AUTOCLOSE_INELIGIBLE_STATES: frozenset[str] = frozenset({"closed", "merged", "abandoned"})
+
+
+def _should_schedule_autoclose(bindings: ToolBindings, target_number: int) -> float | None:
+    """Return the configured close window (hours) when this comment should
+    schedule an auto-close; ``None`` otherwise.
+
+    Conditions: feature enabled in `Settings`, the comment lands on the
+    originating issue (not a different number, not a PR thread), the issue is
+    classified as `question`, and the issue is not already in a terminal
+    state (closed/merged/abandoned).
+    """
+    settings = bindings.settings
+    if settings is None or not settings.question_autoclose_enabled:
+        return None
+    hours = float(settings.question_autoclose_hours)
+    if hours <= 0:
+        return None
+    if target_number != bindings.issue.number:
+        return None
+    if bindings.inbound_is_pr:
+        return None
+    row = bindings.db.get_issue(bindings.issue_key)
+    if row is None or row.classification != "question":
+        return None
+    if row.state in _AUTOCLOSE_INELIGIBLE_STATES:
+        return None
+    return hours
+
+
+def _schedule_autoclose(bindings: ToolBindings, *, comment_id: int, hours: float) -> str | None:
+    """Insert (or refresh) a `pending_closures` row for the bot's answer.
+
+    Failures are logged but never poisoned back to the agent — the human has
+    already seen the comment and the orchestrator's bookkeeping shouldn't
+    surface as a tool error.
+    """
+    close_at_dt = datetime.now(UTC) + timedelta(hours=hours)
+    close_at = close_at_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    try:
+        bindings.db.upsert_pending_closure(
+            issue_key=bindings.issue_key,
+            repo=bindings.issue.repo,
+            number=bindings.issue.number,
+            comment_id=comment_id,
+            issue_author=bindings.issue.author,
+            close_at=close_at,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.exception(
+            "autoclose schedule failed",
+            extra={"issue_key": bindings.issue_key, "comment_id": comment_id, "error": str(exc)},
+        )
+        return None
+    return close_at
+
+
 # ---------- gh_post_comment ----------
 def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
@@ -340,15 +400,31 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
         target_number = bindings.default_comment_number
         if isinstance(args.get("number"), int):
             target_number = int(args["number"])
+        # If this comment answers the originating question issue, append the
+        # 👎-to-keep-open suffix so the auto-close scheduler has a reaction
+        # surface to consult.
+        schedule_close = _should_schedule_autoclose(bindings, target_number)
+        body_to_post = body
+        if schedule_close is not None:
+            body_to_post = f"{body.rstrip()}\n\n{persona.question_autoclose_suffix(schedule_close)}"
         try:
             comment = _run_coro(
                 bindings.loop,
-                bindings.github.post_comment(bindings.repo.full_name, target_number, body),
+                bindings.github.post_comment(bindings.repo.full_name, target_number, body_to_post),
             )
         except GitHubError as exc:
             _audit(bindings, "gh_post_comment", args, error=str(exc))
             _raise_command(f"GitHub rejected comment: {exc.status} {exc.message}")
-        _audit(bindings, "gh_post_comment", args, result={"comment_id": comment.id})
+        audit_result: dict[str, Any] = {"comment_id": comment.id}
+        if schedule_close is not None:
+            scheduled_at = _schedule_autoclose(
+                bindings,
+                comment_id=comment.id,
+                hours=schedule_close,
+            )
+            if scheduled_at is not None:
+                audit_result["scheduled_close_at"] = scheduled_at
+        _audit(bindings, "gh_post_comment", args, result=audit_result)
         return f"comment posted: id={comment.id}"
 
     return host_tool(

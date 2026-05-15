@@ -511,6 +511,7 @@ async def run_task(
         issue=inputs.issue,
         workspace=inputs.workspace,
         loop=loop,
+        settings=inputs.settings,
         author_name=inputs.settings.resolved_author_name,
         author_email=inputs.settings.git_author_email,
         inbound_thread_number=pr_number,

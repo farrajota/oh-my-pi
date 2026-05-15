@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from robomp import github_events
+from robomp.autoclose import AutocloseScheduler
 from robomp.config import Settings, get_settings
 from robomp.dashboard import render_index, static_dir, tail_jsonl
 from robomp.db import (
@@ -238,6 +239,7 @@ def _build_state(settings: Settings) -> dict[str, Any]:
     github, git_transport = _build_orchestrator(settings)
     sandbox = SandboxManager(settings.workspace_root, transport=git_transport)
     pool = WorkerPool(settings=settings, db=db, github=github, sandbox=sandbox, git_transport=git_transport)
+    autoclose = AutocloseScheduler(settings=settings, db=db, github=github)
     return {
         "settings": settings,
         "db": db,
@@ -246,6 +248,7 @@ def _build_state(settings: Settings) -> dict[str, Any]:
         "sandbox": sandbox,
         "pool": pool,
         "issue_browse_cache": _IssueBrowseCache(),
+        "autoclose": autoclose,
     }
 
 
@@ -260,9 +263,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.bag["started_at"] = time.time()
         pool: WorkerPool = app.state.bag["pool"]
         await pool.start()
+        autoclose: AutocloseScheduler = app.state.bag["autoclose"]
+        await autoclose.start()
         try:
             yield
         finally:
+            await autoclose.stop()
             await pool.stop(
                 drain_timeout=cfg.shutdown_drain_timeout_seconds,
                 kill_timeout=cfg.shutdown_kill_timeout_seconds,
@@ -323,6 +329,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             reviewer_bots=cfg.reviewer_bots,
             resolve_issue_from_pr=_resolve,
         )
+
+        # Auto-close cancellation hooks. A pending question-issue closure is
+        # cancelled synchronously the moment any human signal arrives:
+        # follow-up comment in the issue thread, or the issue being closed
+        # externally. The DAO is a no-op when no row exists or it's already
+        # past `pending`, so this is safe to fire on every routed event.
+        if decision.issue_key:
+            cancel_reason: str | None = None
+            if (
+                x_github_event == "issue_comment"
+                and str(payload.get("action") or "") == "created"
+                and decision.task == "handle_comment"
+            ):
+                cancel_reason = "user_replied"
+            elif x_github_event == "issues" and str(payload.get("action") or "") == "closed":
+                cancel_reason = "externally_closed"
+            if cancel_reason is not None:
+                cancelled = db.cancel_pending_closure(decision.issue_key, reason=cancel_reason)
+                if cancelled:
+                    log.info(
+                        "autoclose cancelled",
+                        extra={
+                            "issue_key": decision.issue_key,
+                            "reason": cancel_reason,
+                            "event": x_github_event,
+                        },
+                    )
 
         # Persist directive metadata on the stored payload so the durable
         # queue (and any replay) carries the maintainer signal forward.

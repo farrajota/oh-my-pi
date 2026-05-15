@@ -27,6 +27,7 @@ from robomp.github_client import (
     IssueSummary,
     PullRequestInfo,
     PullRequestReviewInfo,
+    ReactionInfo,
     RepoInfo,
     ReviewCommentInfo,
 )
@@ -281,6 +282,22 @@ class GitHubProxyClient:
             json_body={"repo": repo, "number": number, "assignees": assignees},
         )
 
+    async def list_comment_reactions(self, repo: str, comment_id: int) -> tuple[ReactionInfo, ...]:
+        data = await self._request(
+            "GET",
+            "/gh/v1/comment_reactions",
+            params={"repo": repo, "comment_id": comment_id},
+        )
+        items = data.get("items") if isinstance(data, dict) else None
+        return tuple(_reaction_from(item) for item in items or ())
+
+    async def close_issue(self, repo: str, number: int, *, reason: str = "completed") -> None:
+        await self._request(
+            "POST",
+            "/gh/v1/close_issue",
+            json_body={"repo": repo, "number": number, "reason": reason},
+        )
+
 
 # ---------- ProxyGitTransport ----------
 
@@ -420,6 +437,16 @@ def _comment_from(data: Any) -> CommentInfo:
         author=str(data.get("author") or ""),
         body=str(data.get("body") or ""),
         created_at=str(data.get("created_at") or ""),
+    )
+
+
+def _reaction_from(data: Any) -> ReactionInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed reaction payload")
+    return ReactionInfo(
+        content=str(data.get("content") or ""),
+        user_login=str(data.get("user_login") or ""),
+        user_type=str(data.get("user_type") or ""),
     )
 
 

@@ -16,6 +16,7 @@ from robomp.github_client import (
     IssueSummary,
     PullRequestInfo,
     PullRequestReviewInfo,
+    ReactionInfo,
     RepoInfo,
     ReviewCommentInfo,
 )
@@ -76,6 +77,10 @@ class GitHubBackend(Protocol):
     async def add_issue_labels(self, repo: str, number: int, labels: list[str]) -> tuple[str, ...]: ...
 
     async def add_assignees(self, repo: str, number: int, assignees: list[str]) -> None: ...
+
+    async def list_comment_reactions(self, repo: str, comment_id: int) -> tuple[ReactionInfo, ...]: ...
+
+    async def close_issue(self, repo: str, number: int, *, reason: str = "completed") -> None: ...
 
 
 __all__ = ["GitHubBackend"]

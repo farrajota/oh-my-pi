@@ -24,6 +24,7 @@ from robomp.github_client import (
     IssueSummary,
     PullRequestInfo,
     PullRequestReviewInfo,
+    ReactionInfo,
     RepoInfo,
     ReviewCommentInfo,
 )
@@ -374,6 +375,52 @@ async def test_round_trip_all_endpoints(round_trip_app) -> None:
     assert labels == ("triage",)
 
     assert await client.add_assignees("octo/widget", 1, ["alice"]) is None
+
+
+async def test_list_comment_reactions_round_trip(proxy_settings: Settings) -> None:
+    app = create_proxy_app(proxy_settings)
+    app.state.settings = proxy_settings
+
+    def gh(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/repos/octo/widget/issues/comments/999/reactions":
+            assert req.url.params.get("content") == "-1"
+            return httpx.Response(
+                200,
+                json=[
+                    {"content": "-1", "user": {"login": "alice", "type": "User"}},
+                ],
+            )
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    _attach_gh(app, gh)
+    client = GitHubProxyClient(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.ASGITransport(app=app),
+    )
+    reactions = await client.list_comment_reactions("octo/widget", 999)
+    assert reactions == (ReactionInfo(content="-1", user_login="alice", user_type="User"),)
+
+
+async def test_close_issue_round_trip(proxy_settings: Settings) -> None:
+    captured: dict[str, object] = {}
+    app = create_proxy_app(proxy_settings)
+    app.state.settings = proxy_settings
+
+    def gh(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/repos/octo/widget/issues/7" and req.method == "PATCH":
+            captured["body"] = json.loads(req.content)
+            return httpx.Response(200, json={})
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    _attach_gh(app, gh)
+    client = GitHubProxyClient(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.ASGITransport(app=app),
+    )
+    assert await client.close_issue("octo/widget", 7) is None
+    assert captured["body"] == {"state": "closed", "state_reason": "completed"}
 
 
 # ============================================================================

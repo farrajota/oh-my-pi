@@ -2469,3 +2469,160 @@ def test_gh_open_pr_skips_fix_when_no_script(db: Database, tmp_path: Path, monke
     assert not fix_calls.exists()
     assert check_calls.read_text() == "called"
     assert "opened #7" in result
+
+
+# -------- gh_post_comment + question auto-close ---------------------------
+
+
+def _stub_settings(*, enabled: bool = True, hours: float = 4.0):
+    """Construct a Settings stub with question_autoclose knobs only.
+
+    `model_construct` skips field validation, which lets us avoid wiring up
+    every required env var just to set the autoclose fields a test needs.
+    """
+    from pydantic import SecretStr
+
+    from robomp.config import Settings
+
+    return Settings.model_construct(
+        github_token=None,
+        github_webhook_secret=SecretStr("x"),
+        bot_login="robomp-bot",
+        git_author_email="bot@example.invalid",
+        repo_allowlist_raw="octo/widget",
+        gh_proxy_url="http://proxy.invalid",
+        gh_proxy_hmac_key=SecretStr("k" * 32),
+        question_autoclose_enabled=enabled,
+        question_autoclose_hours=hours,
+        question_autoclose_scan_seconds=60.0,
+    )
+
+
+def _question_handler(captured: dict[str, Any]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            201,
+            json={"id": 4242, "user": {"login": "robomp-bot"}, "body": "x", "created_at": "t"},
+        )
+
+    return handler
+
+
+def test_gh_post_comment_appends_suffix_and_schedules_for_question(db: Database, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+    transport = httpx.MockTransport(_question_handler(captured))
+    bindings, loop, t = _bindings(db, tmp_path, transport)
+    db.set_issue_classification(bindings.issue_key, "question")
+    bindings = ToolBindings(
+        db=bindings.db,
+        github=bindings.github,
+        git_transport=bindings.git_transport,
+        repo=bindings.repo,
+        issue=bindings.issue,
+        workspace=bindings.workspace,
+        loop=bindings.loop,
+        author_name=bindings.author_name,
+        author_email=bindings.author_email,
+        settings=_stub_settings(),
+    )
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool.execute({"body": "Here's the answer"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    body = captured["body"]["body"]
+    assert body.startswith("Here's the answer")
+    # Suffix appended exactly once.
+    assert body.count("react 👎") == 1
+    assert "auto-close in 4 hours" in body
+    row = db.get_pending_closure(bindings.issue_key)
+    assert row is not None
+    assert row.state == "pending"
+    assert row.comment_id == 4242
+    # `_stub_issue()` opens the issue as `alice`.
+    assert row.issue_author == "alice"
+
+
+def test_gh_post_comment_skips_suffix_for_non_question(db: Database, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+    transport = httpx.MockTransport(_question_handler(captured))
+    bindings, loop, t = _bindings(db, tmp_path, transport)
+    db.set_issue_classification(bindings.issue_key, "bug")
+    bindings = ToolBindings(
+        db=bindings.db,
+        github=bindings.github,
+        git_transport=bindings.git_transport,
+        repo=bindings.repo,
+        issue=bindings.issue,
+        workspace=bindings.workspace,
+        loop=bindings.loop,
+        author_name=bindings.author_name,
+        author_email=bindings.author_email,
+        settings=_stub_settings(),
+    )
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool.execute({"body": "Here's the diagnosis"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert captured["body"] == {"body": "Here's the diagnosis"}
+    assert db.get_pending_closure(bindings.issue_key) is None
+
+
+def test_gh_post_comment_skips_suffix_when_target_differs_from_origin(db: Database, tmp_path: Path) -> None:
+    """Posting to a different `number` (e.g. cross-issue reply) must not schedule."""
+    captured: dict[str, Any] = {}
+    transport = httpx.MockTransport(_question_handler(captured))
+    bindings, loop, t = _bindings(db, tmp_path, transport)
+    db.set_issue_classification(bindings.issue_key, "question")
+    bindings = ToolBindings(
+        db=bindings.db,
+        github=bindings.github,
+        git_transport=bindings.git_transport,
+        repo=bindings.repo,
+        issue=bindings.issue,
+        workspace=bindings.workspace,
+        loop=bindings.loop,
+        author_name=bindings.author_name,
+        author_email=bindings.author_email,
+        settings=_stub_settings(),
+    )
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool.execute({"body": "see other issue", "number": 99}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert captured["body"] == {"body": "see other issue"}
+    assert db.get_pending_closure(bindings.issue_key) is None
+
+
+def test_gh_post_comment_skips_suffix_when_feature_disabled(db: Database, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+    transport = httpx.MockTransport(_question_handler(captured))
+    bindings, loop, t = _bindings(db, tmp_path, transport)
+    db.set_issue_classification(bindings.issue_key, "question")
+    bindings = ToolBindings(
+        db=bindings.db,
+        github=bindings.github,
+        git_transport=bindings.git_transport,
+        repo=bindings.repo,
+        issue=bindings.issue,
+        workspace=bindings.workspace,
+        loop=bindings.loop,
+        author_name=bindings.author_name,
+        author_email=bindings.author_email,
+        settings=_stub_settings(enabled=False),
+    )
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool.execute({"body": "Here's the answer"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert captured["body"] == {"body": "Here's the answer"}
+    assert db.get_pending_closure(bindings.issue_key) is None

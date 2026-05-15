@@ -10,7 +10,10 @@ and branches:
 - `bug` / `documentation` → reproduce, fix on a fresh branch, open a PR whose
   body has `## Repro` / `## Cause` / `## Fix` / `## Verification` and
   `Fixes #N`.
-- `question` → one comment.
+- `question` → one comment, suffixed with a 👎-to-keep-open prompt; if the
+  issue author doesn't react 👎 within `ROBOMP_QUESTION_AUTOCLOSE_HOURS`
+  (default 4), the issue auto-closes as `state_reason=completed`. A follow-up
+  comment or external close cancels the schedule synchronously.
 - `enhancement` / `proposal` → one comment, no PR.
 - `invalid` / `duplicate` → one brief comment.
 

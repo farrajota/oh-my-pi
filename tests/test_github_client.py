@@ -170,3 +170,53 @@ def test_list_closing_pull_requests_empty_timeline() -> None:
     transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
     client = GitHubClient("tok", transport=transport)
     assert _run_async(client.list_closing_pull_requests("octo/widget", 7)) == ()
+
+
+def test_list_comment_reactions_filters_to_thumbs_down() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["content"] = request.url.params.get("content", "")
+        captured["per_page"] = request.url.params.get("per_page", "")
+        return httpx.Response(
+            200,
+            json=[
+                {"content": "-1", "user": {"login": "Alice", "type": "User"}},
+                {"content": "-1", "user": {"login": "rando", "type": "User"}},
+            ],
+        )
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    reactions = _run_async(client.list_comment_reactions("octo/widget", 999))
+    assert captured["path"] == "/repos/octo/widget/issues/comments/999/reactions"
+    assert captured["content"] == "-1"
+    assert captured["per_page"] == "100"
+    assert tuple(r.user_login for r in reactions) == ("Alice", "rando")
+    assert all(r.content == "-1" for r in reactions)
+
+
+def test_close_issue_sends_completed_state_reason() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    assert _run_async(client.close_issue("octo/widget", 42)) is None
+    assert captured["method"] == "PATCH"
+    assert captured["path"] == "/repos/octo/widget/issues/42"
+    assert captured["body"] == {"state": "closed", "state_reason": "completed"}
+
+
+def test_close_issue_propagates_error() -> None:
+    transport = httpx.MockTransport(lambda r: httpx.Response(404, json={"message": "Not Found"}))
+    client = GitHubClient("tok", transport=transport)
+    with pytest.raises(GitHubError) as exc:
+        _run_async(client.close_issue("octo/widget", 42))
+    assert exc.value.status == 404

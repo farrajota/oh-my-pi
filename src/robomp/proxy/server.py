@@ -466,6 +466,30 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             return _gh_error_response(exc)
         return JSONResponse({"ok": True})
 
+    @app.get("/gh/v1/comment_reactions")
+    async def list_comment_reactions(request: Request, repo: str, comment_id: int) -> JSONResponse:
+        await _authenticate(request)
+        github: GitHubClient = request.app.state.github
+        try:
+            reactions = await github.list_comment_reactions(repo, comment_id)
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse({"items": [_serialize(r) for r in reactions]})
+
+    @app.post("/gh/v1/close_issue")
+    async def close_issue(request: Request) -> JSONResponse:
+        data = await _json_body(request)
+        repo = _require_str(data.get("repo"), "repo")
+        number = _require_int(data.get("number"), "number")
+        reason_raw = data.get("reason")
+        reason = reason_raw if isinstance(reason_raw, str) and reason_raw else "completed"
+        github: GitHubClient = request.app.state.github
+        try:
+            await github.close_issue(repo, number, reason=reason)
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse({"ok": True})
+
     # ---- git transport ----
     #
     # The underlying `robomp.git_ops` primitives are blocking `subprocess.run`

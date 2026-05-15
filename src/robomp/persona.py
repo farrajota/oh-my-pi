@@ -315,6 +315,19 @@ def bare_mention_reply() -> str:
     return "What would you like me to do?"
 
 
+def question_autoclose_suffix(hours: float) -> str:
+    """Render the 👎-to-keep-open suffix appended to the bot's question answers.
+
+    `hours` is rendered without trailing zeros for whole values (e.g. `4`
+    rather than `4.0`); fractional windows render with one decimal.
+    """
+    if float(hours).is_integer():
+        rendered = str(int(hours))
+    else:
+        rendered = f"{hours:g}"
+    return render(_load("question_autoclose_suffix.md").rstrip(), {"hours": rendered})
+
+
 __all__ = [
     "classify_next_step",
     "directive",
@@ -332,4 +345,5 @@ __all__ = [
     "system_append",
     "unable_to_reproduce_comment",
     "bare_mention_reply",
+    "question_autoclose_suffix",
 ]

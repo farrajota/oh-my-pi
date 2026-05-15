@@ -430,3 +430,133 @@ def test_count_submissions_since_respects_window(db: Database) -> None:
     # Future cutoff means the just-inserted row is *before* the window.
     future = iso_seconds_ago(-60)
     assert db.count_submissions_since("alice", future) == 0
+
+
+# -------- pending_closures ---------------------------------------------
+
+
+_KEY = issue_key("octo/widget", 42)
+
+
+def _seed_pending(db: Database, *, close_at: str = "2026-05-15T00:00:00.000000Z") -> None:
+    db.upsert_pending_closure(
+        issue_key=_KEY,
+        repo="octo/widget",
+        number=42,
+        comment_id=999,
+        issue_author="Alice",
+        close_at=close_at,
+    )
+
+
+def test_upsert_pending_closure_lowercases_author_and_starts_pending(db: Database) -> None:
+    _seed_pending(db)
+    row = db.get_pending_closure(_KEY)
+    assert row is not None
+    assert row.state == "pending"
+    assert row.cancel_reason is None
+    assert row.issue_author == "alice"  # author stored lower-cased for cheap eq
+    assert row.comment_id == 999
+
+
+def test_upsert_pending_closure_overwrites_prior_schedule(db: Database) -> None:
+    _seed_pending(db)
+    db.finalize_closure(_KEY, state="cancelled", reason="user_replied")
+    # A follow-up bot answer should reset the row to pending and update fields.
+    db.upsert_pending_closure(
+        issue_key=_KEY,
+        repo="octo/widget",
+        number=42,
+        comment_id=1234,
+        issue_author="alice",
+        close_at="2030-01-01T00:00:00.000000Z",
+    )
+    row = db.get_pending_closure(_KEY)
+    assert row is not None
+    assert row.state == "pending"
+    assert row.cancel_reason is None
+    assert row.comment_id == 1234
+    assert row.close_at == "2030-01-01T00:00:00.000000Z"
+
+
+def test_claim_due_closures_only_returns_due_pending(db: Database) -> None:
+    _seed_pending(db, close_at="2000-01-01T00:00:00.000000Z")  # past
+    db.upsert_pending_closure(
+        issue_key=issue_key("octo/widget", 7),
+        repo="octo/widget",
+        number=7,
+        comment_id=10,
+        issue_author="bob",
+        close_at="2999-01-01T00:00:00.000000Z",  # future
+    )
+    claimed = db.claim_due_closures(now="2026-05-15T00:00:00.000000Z")
+    assert [r.issue_key for r in claimed] == [_KEY]
+    assert all(r.state == "claimed" for r in claimed)
+    # And re-claiming returns nothing because the first one is no longer pending.
+    again = db.claim_due_closures(now="2026-05-15T00:00:00.000000Z")
+    assert again == []
+
+
+def test_claim_due_closures_atomic_under_contention(db: Database) -> None:
+    """Two concurrent claims see disjoint rows."""
+    for n in range(5):
+        db.upsert_pending_closure(
+            issue_key=issue_key("octo/widget", n),
+            repo="octo/widget",
+            number=n,
+            comment_id=100 + n,
+            issue_author="alice",
+            close_at="2000-01-01T00:00:00.000000Z",
+        )
+    seen: list[str] = []
+    lock = threading.Lock()
+
+    def claim_some() -> None:
+        rows = db.claim_due_closures(now="2026-05-15T00:00:00.000000Z", limit=2)
+        with lock:
+            seen.extend(r.issue_key for r in rows)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for _ in range(4):
+            list(pool.map(lambda _: claim_some(), range(4)))
+    # Each row must appear at most once across all claims.
+    assert sorted(seen) == sorted({issue_key("octo/widget", n) for n in range(5)})
+
+
+def test_cancel_pending_closure_only_fires_when_pending(db: Database) -> None:
+    _seed_pending(db)
+    assert db.cancel_pending_closure(_KEY, reason="user_replied")
+    row = db.get_pending_closure(_KEY)
+    assert row is not None
+    assert row.state == "cancelled"
+    assert row.cancel_reason == "user_replied"
+    # A second cancel against an already-cancelled row is a no-op.
+    assert not db.cancel_pending_closure(_KEY, reason="user_replied")
+
+
+def test_cancel_pending_closure_skips_claimed_rows(db: Database) -> None:
+    """A `claimed` row must be left for the scheduler tick that owns it."""
+    _seed_pending(db, close_at="2000-01-01T00:00:00.000000Z")
+    claimed = db.claim_due_closures(now="2026-05-15T00:00:00.000000Z")
+    assert claimed and claimed[0].state == "claimed"
+    assert not db.cancel_pending_closure(_KEY, reason="user_replied")
+    row = db.get_pending_closure(_KEY)
+    assert row is not None and row.state == "claimed"
+
+
+def test_finalize_closure_rejects_non_terminal_state(db: Database) -> None:
+    _seed_pending(db)
+    import pytest
+
+    with pytest.raises(ValueError):
+        db.finalize_closure(_KEY, state="pending", reason=None)  # type: ignore[arg-type]
+
+
+def test_requeue_claimed_closure_only_flips_claimed(db: Database) -> None:
+    _seed_pending(db, close_at="2000-01-01T00:00:00.000000Z")
+    db.claim_due_closures(now="2026-05-15T00:00:00.000000Z")
+    assert db.requeue_claimed_closure(_KEY)
+    row = db.get_pending_closure(_KEY)
+    assert row is not None and row.state == "pending"
+    # Now in pending state, requeue is a no-op.
+    assert not db.requeue_claimed_closure(_KEY)

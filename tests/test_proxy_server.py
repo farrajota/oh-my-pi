@@ -497,6 +497,78 @@ async def test_add_assignees(proxy_settings: Settings) -> None:
     assert json.loads(captured["req"].content) == {"assignees": ["alice"]}
 
 
+async def test_comment_reactions(proxy_settings: Settings) -> None:
+    captured: dict[str, httpx.Request] = {}
+
+    def gh(req: httpx.Request) -> httpx.Response:
+        captured["req"] = req
+        return httpx.Response(
+            200,
+            json=[
+                {"content": "-1", "user": {"login": "alice", "type": "User"}},
+            ],
+        )
+
+    app = _build_app(proxy_settings, gh)
+    target = "/gh/v1/comment_reactions?repo=octo%2Fwidget&comment_id=999"
+    async with await _async_client(app) as client:
+        resp = await client.get(target, headers=_signed("GET", target))
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "items": [{"content": "-1", "user_login": "alice", "user_type": "User"}],
+    }
+    req = captured["req"]
+    assert req.method == "GET"
+    assert req.url.path == "/repos/octo/widget/issues/comments/999/reactions"
+    assert req.url.params.get("content") == "-1"
+
+
+async def test_close_issue(proxy_settings: Settings) -> None:
+    captured: dict[str, httpx.Request] = {}
+
+    def gh(req: httpx.Request) -> httpx.Response:
+        captured["req"] = req
+        return httpx.Response(200, json={})
+
+    app = _build_app(proxy_settings, gh)
+    body = b'{"repo":"octo/widget","number":7,"reason":"completed"}'
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/close_issue",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/close_issue", body), "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    req = captured["req"]
+    assert req.method == "PATCH"
+    assert req.url.path == "/repos/octo/widget/issues/7"
+    import json
+
+    assert json.loads(req.content) == {"state": "closed", "state_reason": "completed"}
+
+
+async def test_close_issue_defaults_reason_to_completed(proxy_settings: Settings) -> None:
+    captured: dict[str, httpx.Request] = {}
+
+    def gh(req: httpx.Request) -> httpx.Response:
+        captured["req"] = req
+        return httpx.Response(200, json={})
+
+    app = _build_app(proxy_settings, gh)
+    body = b'{"repo":"octo/widget","number":7}'
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/close_issue",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/close_issue", body), "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 200
+    import json
+
+    assert json.loads(captured["req"].content) == {"state": "closed", "state_reason": "completed"}
+
+
 async def test_open_pull_request(proxy_settings: Settings) -> None:
     captured: dict[str, httpx.Request] = {}
 

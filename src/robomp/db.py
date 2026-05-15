@@ -79,6 +79,21 @@ CREATE TABLE IF NOT EXISTS submissions (
   ts            TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS submissions_login_ts ON submissions(login, ts);
+
+CREATE TABLE IF NOT EXISTS pending_closures (
+  issue_key     TEXT PRIMARY KEY,
+  repo          TEXT NOT NULL,
+  number        INTEGER NOT NULL,
+  comment_id    INTEGER NOT NULL,
+  issue_author  TEXT NOT NULL,
+  close_at      TEXT NOT NULL,
+  state         TEXT NOT NULL CHECK (state IN ('pending','claimed','closed','cancelled')),
+  cancel_reason TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pending_closures_state_close_at
+  ON pending_closures(state, close_at);
 """
 
 
@@ -136,6 +151,38 @@ class SubmissionAdmission:
     accepted: bool
     duplicate: bool
     used: int
+
+
+PendingClosureState = Literal["pending", "claimed", "closed", "cancelled"]
+
+
+@dataclass(slots=True, frozen=True)
+class PendingClosureRow:
+    issue_key: str
+    repo: str
+    number: int
+    comment_id: int
+    issue_author: str
+    close_at: str
+    state: PendingClosureState
+    cancel_reason: str | None
+    created_at: str
+    updated_at: str
+
+
+def _pending_closure_from_row(row: sqlite3.Row) -> PendingClosureRow:
+    return PendingClosureRow(
+        issue_key=row["issue_key"],
+        repo=row["repo"],
+        number=int(row["number"]),
+        comment_id=int(row["comment_id"]),
+        issue_author=row["issue_author"],
+        close_at=row["close_at"],
+        state=row["state"],
+        cancel_reason=row["cancel_reason"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
 
 
 def issue_key(repo: str, number: int) -> str:
@@ -806,6 +853,139 @@ class Database:
                 (login.lower(), since),
             ).fetchone()
         return int(row["n"]) if row is not None else 0
+
+    # ---- pending_closures ----
+    def upsert_pending_closure(
+        self,
+        *,
+        issue_key: str,
+        repo: str,
+        number: int,
+        comment_id: int,
+        issue_author: str,
+        close_at: str,
+    ) -> None:
+        """Schedule (or reschedule) a question issue to auto-close.
+
+        A follow-up bot answer on the same issue overwrites the prior schedule:
+        we always watch the latest comment and can roll the close_at forward.
+        Resets state to `pending` and clears any prior cancel_reason so a row
+        previously closed/cancelled becomes a live schedule again.
+        """
+        now = _utcnow()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO pending_closures
+                  (issue_key, repo, number, comment_id, issue_author, close_at,
+                   state, cancel_reason, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+                ON CONFLICT(issue_key) DO UPDATE SET
+                  repo = excluded.repo,
+                  number = excluded.number,
+                  comment_id = excluded.comment_id,
+                  issue_author = excluded.issue_author,
+                  close_at = excluded.close_at,
+                  state = 'pending',
+                  cancel_reason = NULL,
+                  updated_at = excluded.updated_at
+                """,
+                (issue_key, repo, number, comment_id, issue_author.lower(), close_at, now, now),
+            )
+
+    def claim_due_closures(self, *, now: str, limit: int = 50) -> list[PendingClosureRow]:
+        """Atomically flip due `pending` rows to `claimed` and return them.
+
+        Atomic claim prevents two scheduler ticks (or a tick racing a
+        cancellation) from acting on the same row twice. Caller is responsible
+        for finalizing each claimed row via `finalize_closure` or returning
+        it to `pending` via `requeue_claimed_closure` after a transient error.
+        """
+        with self._txn() as conn:
+            rows = conn.execute(
+                """
+                UPDATE pending_closures
+                SET state = 'claimed', updated_at = ?
+                WHERE issue_key IN (
+                  SELECT issue_key FROM pending_closures
+                  WHERE state = 'pending' AND close_at <= ?
+                  ORDER BY close_at
+                  LIMIT ?
+                )
+                RETURNING issue_key, repo, number, comment_id, issue_author,
+                          close_at, state, cancel_reason, created_at, updated_at
+                """,
+                (now, now, int(limit)),
+            ).fetchall()
+        return [_pending_closure_from_row(row) for row in rows]
+
+    def finalize_closure(
+        self,
+        issue_key: str,
+        *,
+        state: PendingClosureState,
+        reason: str | None,
+    ) -> None:
+        """Mark a claimed row terminal (`closed` / `cancelled`)."""
+        if state not in ("closed", "cancelled"):
+            raise ValueError(f"finalize_closure: invalid terminal state {state!r}")
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE pending_closures
+                SET state = ?, cancel_reason = ?, updated_at = ?
+                WHERE issue_key = ?
+                """,
+                (state, reason, _utcnow(), issue_key),
+            )
+
+    def requeue_claimed_closure(self, issue_key: str) -> bool:
+        """Return a `claimed` row to `pending` so the next tick retries it.
+
+        Used by the scheduler when a transient GitHub error prevents the
+        close from completing. Only flips `claimed -> pending`; rows in any
+        other state are left untouched.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE pending_closures
+                SET state = 'pending', updated_at = ?
+                WHERE issue_key = ? AND state = 'claimed'
+                """,
+                (_utcnow(), issue_key),
+            )
+            return cur.rowcount > 0
+
+    def cancel_pending_closure(self, issue_key: str, *, reason: str) -> bool:
+        """Cancel a scheduled close. No-op when state is not `pending`.
+
+        A row already `claimed` is left for the scheduler tick that owns it
+        to finalize — racing a cancel against a claim must not double-write
+        the row's terminal state.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE pending_closures
+                SET state = 'cancelled', cancel_reason = ?, updated_at = ?
+                WHERE issue_key = ? AND state = 'pending'
+                """,
+                (reason, _utcnow(), issue_key),
+            )
+            return cur.rowcount > 0
+
+    def get_pending_closure(self, issue_key: str) -> PendingClosureRow | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT issue_key, repo, number, comment_id, issue_author,
+                       close_at, state, cancel_reason, created_at, updated_at
+                FROM pending_closures WHERE issue_key = ?
+                """,
+                (issue_key,),
+            ).fetchone()
+        return _pending_closure_from_row(row) if row is not None else None
 
 
 _DB_SINGLETON: Database | None = None

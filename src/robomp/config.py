@@ -107,6 +107,16 @@ class Settings(BaseSettings):
     # Comma-separated; `@` prefix optional.
     reviewer_bots_raw: str = Field("", alias="ROBOMP_REVIEWER_BOTS")
 
+    # Question auto-close. When the bot answers an issue classified as
+    # `question`, the comment is suffixed with a 👎-to-keep-open prompt and a
+    # row is scheduled in `pending_closures`. The scheduler closes the issue
+    # after `question_autoclose_hours` unless the issue author downvoted the
+    # comment, a human follow-up arrived, or the issue was closed externally.
+    # Set `question_autoclose_enabled=False` (or hours <= 0) to disable.
+    question_autoclose_enabled: bool = Field(True, alias="ROBOMP_QUESTION_AUTOCLOSE_ENABLED")
+    question_autoclose_hours: float = Field(4.0, alias="ROBOMP_QUESTION_AUTOCLOSE_HOURS")
+    question_autoclose_scan_seconds: float = Field(60.0, alias="ROBOMP_QUESTION_AUTOCLOSE_SCAN_SECONDS")
+
     @field_validator("bot_login", mode="after")
     @classmethod
     def _require_bot_login(cls, value: str) -> str:

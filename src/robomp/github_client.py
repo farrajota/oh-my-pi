@@ -106,6 +106,20 @@ class IssueSummary:
     html_url: str
 
 
+@dataclass(slots=True, frozen=True)
+class ReactionInfo:
+    """A reaction on an issue/comment.
+
+    `content` is GitHub's reaction string: `+1`, `-1`, `laugh`, `hooray`,
+    `confused`, `heart`, `rocket`, `eyes`. The auto-close scheduler only
+    looks at `-1` (👎) reactions from the issue's original author.
+    """
+
+    content: str
+    user_login: str
+    user_type: str
+
+
 def _parse_retry_after(resp: httpx.Response) -> float | None:
     ra = resp.headers.get("retry-after")
     if ra:
@@ -416,6 +430,28 @@ class GitHubClient:
             json={"assignees": assignees},
         )
 
+    async def list_comment_reactions(self, repo: str, comment_id: int) -> tuple[ReactionInfo, ...]:
+        """Reactions on an issue comment, filtered server-side to 👎 (`content=-1`).
+
+        The auto-close scheduler only consults 👎 reactions; filtering server-side
+        keeps payloads small even on noisy threads. Returns reactions in the
+        order GitHub provides (creation order).
+        """
+        data = await self.request(
+            "GET",
+            f"/repos/{repo}/issues/comments/{comment_id}/reactions",
+            params={"content": "-1", "per_page": 100},
+        )
+        return tuple(_reaction_from_payload(item) for item in (data or []))
+
+    async def close_issue(self, repo: str, number: int, *, reason: str = "completed") -> None:
+        """Close an issue with `state_reason` (`completed`/`not_planned`/`reopened`)."""
+        await self.request(
+            "PATCH",
+            f"/repos/{repo}/issues/{number}",
+            json={"state": "closed", "state_reason": reason},
+        )
+
     async def get_authenticated_login(self) -> str:
         data = await self.request("GET", "/user")
         return str(data["login"])
@@ -473,6 +509,15 @@ def _comment_from_payload(data: Mapping[str, Any]) -> CommentInfo:
     )
 
 
+def _reaction_from_payload(data: Mapping[str, Any]) -> ReactionInfo:
+    user = data.get("user") or {}
+    return ReactionInfo(
+        content=str(data.get("content") or ""),
+        user_login=str(user.get("login") or "") if isinstance(user, Mapping) else "",
+        user_type=str(user.get("type") or "") if isinstance(user, Mapping) else "",
+    )
+
+
 def parse_issue_payload(payload: Mapping[str, Any]) -> tuple[RepoInfo, IssueInfo]:
     """Build typed records from a webhook payload (issues.opened, etc.)."""
     repo_payload = payload["repository"]
@@ -491,6 +536,7 @@ __all__ = [
     "IssueSummary",
     "PullRequestInfo",
     "PullRequestReviewInfo",
+    "ReactionInfo",
     "RepoInfo",
     "ReviewCommentInfo",
     "parse_issue_payload",
