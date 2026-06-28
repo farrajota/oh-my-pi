@@ -38,7 +38,11 @@ function createContext(coreStreaming = false) {
 		ui: { requestRender: () => calls.render++ },
 		settings: { get: () => false },
 		hideThinkingBlock: false,
-		statusLine: { invalidate: () => calls.statusInvalidate++ },
+		statusLine: {
+			invalidate: () => calls.statusInvalidate++,
+			markActivityStart: () => {},
+			markActivityEnd: () => {},
+		},
 		updateEditorTopBorder: () => {},
 		clearPinnedError: () => {},
 		beginWorkingMessageRun: () => calls.beginRun++,
