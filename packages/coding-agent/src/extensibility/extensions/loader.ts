@@ -35,6 +35,7 @@ import type {
 	LoadExtensionsResult,
 	MessageRenderer,
 	ProviderConfig,
+	WorkingMessageSuffixRenderer,
 	RegisteredCommand,
 	ToolDefinition,
 } from "./types";
@@ -197,6 +198,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		this.extension.assistantThinkingRenderers.push(renderer);
 	}
 
+	registerWorkingMessageSuffix(name: string, renderer: WorkingMessageSuffixRenderer): void {
+		this.extension.workingMessageSuffixes.set(name, renderer);
+	}
+
 	getFlag(name: string): boolean | string | undefined {
 		if (!this.extension.flags.has(name)) return undefined;
 		return this.runtime.flagValues.get(name);
@@ -276,6 +281,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		tools: new Map(),
 		assistantThinkingRenderers: [],
 		messageRenderers: new Map(),
+		workingMessageSuffixes: new Map(),
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),

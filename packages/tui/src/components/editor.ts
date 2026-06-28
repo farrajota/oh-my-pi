@@ -352,6 +352,57 @@ export interface EditorTheme {
 	hintStyle?: (text: string) => string;
 }
 
+const fallbackStyle = (text: string): string => text;
+
+const FALLBACK_BOX_SYMBOLS = {
+	topLeft: "┌",
+	topRight: "┐",
+	bottomLeft: "└",
+	bottomRight: "┘",
+	horizontal: "─",
+	vertical: "│",
+	teeDown: "┬",
+	teeUp: "┴",
+	teeLeft: "┤",
+	teeRight: "├",
+	cross: "┼",
+};
+
+const FALLBACK_SYMBOLS: SymbolTheme = {
+	cursor: "❯",
+	inputCursor: "▏",
+	boxRound: {
+		topLeft: "╭",
+		topRight: "╮",
+		bottomLeft: "╰",
+		bottomRight: "╯",
+		horizontal: "─",
+		vertical: "│",
+	},
+	boxSharp: FALLBACK_BOX_SYMBOLS,
+	table: FALLBACK_BOX_SYMBOLS,
+	quoteBorder: "▏",
+	hrChar: "─",
+	spinnerFrames: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+};
+
+const FALLBACK_SELECT_LIST_THEME: SelectListTheme = {
+	selectedPrefix: fallbackStyle,
+	selectedText: fallbackStyle,
+	description: fallbackStyle,
+	scrollInfo: fallbackStyle,
+	noMatch: fallbackStyle,
+	symbols: FALLBACK_SYMBOLS,
+	hovered: fallbackStyle,
+};
+
+const FALLBACK_EDITOR_THEME: EditorTheme = {
+	borderColor: fallbackStyle,
+	selectList: FALLBACK_SELECT_LIST_THEME,
+	symbols: FALLBACK_SYMBOLS,
+	hintStyle: fallbackStyle,
+};
+
 export interface EditorTopBorder {
 	/** The status content (already styled) */
 	content: string;
@@ -471,9 +522,10 @@ export class Editor implements Component, Focusable {
 	#topBorderContent?: EditorTopBorder;
 	#borderVisible = true;
 
-	constructor(theme: EditorTheme) {
-		this.#theme = theme;
-		this.borderColor = theme.borderColor;
+	constructor(theme?: EditorTheme) {
+		const resolvedTheme = theme ?? FALLBACK_EDITOR_THEME;
+		this.#theme = resolvedTheme;
+		this.borderColor = resolvedTheme.borderColor;
 	}
 
 	setAutocompleteProvider(provider: AutocompleteProvider): void {

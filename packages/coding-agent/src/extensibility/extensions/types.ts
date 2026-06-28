@@ -920,6 +920,19 @@ export type AssistantThinkingRenderer = (
 	theme: Theme,
 ) => Component | undefined;
 
+export interface WorkingMessageSuffixContext {
+	now: number;
+	startedAt?: number;
+	elapsedMs?: number;
+	runTokenDelta?: number;
+	cwd: string;
+}
+
+export type WorkingMessageSuffixRenderer = (
+	message: string,
+	context: WorkingMessageSuffixContext,
+) => string | undefined;
+
 // ============================================================================
 // Command Registration
 // ============================================================================
@@ -1078,6 +1091,9 @@ export interface ExtensionAPI {
 
 	/** Register a renderer for assistant thinking blocks. Rendered after the original thinking text. */
 	registerAssistantThinkingRenderer(renderer: AssistantThinkingRenderer): void;
+
+	/** Register a suffix renderer for synchronous working messages. */
+	registerWorkingMessageSuffix(name: string, renderer: WorkingMessageSuffixRenderer): void;
 
 	// =========================================================================
 	// Actions
@@ -1370,6 +1386,7 @@ export interface Extension {
 	tools: Map<string, RegisteredTool<any, any>>;
 	assistantThinkingRenderers: AssistantThinkingRenderer[];
 	messageRenderers: Map<string, MessageRenderer>;
+	workingMessageSuffixes: Map<string, WorkingMessageSuffixRenderer>;
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;

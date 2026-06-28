@@ -64,7 +64,7 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
-import type { CompactOptions } from "../extensibility/extensions/types";
+import type { CompactOptions, WorkingMessageSuffixContext } from "../extensibility/extensions/types";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import { type GuidedGoalMessage, runGuidedGoalTurn } from "../goals/guided-setup";
 import type { Goal, GoalModeState } from "../goals/state";
@@ -196,7 +196,7 @@ interface WorkingMessageAccentCacheKey {
 	sessionAccentEnabled: boolean;
 }
 
-function renderWorkingMessage(message: string, accent?: WorkingMessageAccent): string {
+function renderWorkingMessage(message: string, accent?: WorkingMessageAccent, suffix = ""): string {
 	const palette = accent
 		? ({
 				low: "dim",
@@ -206,7 +206,7 @@ function renderWorkingMessage(message: string, accent?: WorkingMessageAccent): s
 			} satisfies ShimmerPalette)
 		: undefined;
 	const hint = interruptHint();
-	if (!message.endsWith(hint)) return shimmerText(message, theme, palette);
+	if (!message.endsWith(hint)) return shimmerText(`${message}${suffix}`, theme, palette);
 	const header = message.slice(0, -hint.length);
 	const hintPalette = accent
 		? ({
@@ -219,6 +219,7 @@ function renderWorkingMessage(message: string, accent?: WorkingMessageAccent): s
 		[
 			{ text: header, palette },
 			{ text: hint, palette: hintPalette },
+			{ text: suffix, palette },
 		],
 		theme,
 	);
@@ -448,6 +449,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	autoCompactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
 	#pendingWorkingMessage: string | undefined;
+	#workingMessageStartedAt: number | undefined;
+	#workingMessageRunTokenDelta = 0;
 	#workingMessageAccentCacheKey?: WorkingMessageAccentCacheKey;
 	#workingMessageAccentCacheValue?: WorkingMessageAccent;
 	#workingMessageAccentCacheHasValue = false;
@@ -1317,6 +1320,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			cancelled: false,
 			started: false,
 		};
+		this.beginWorkingMessageRun();
+		this.setWorkingMessageRunTokenDelta(0);
 		this.#pendingSubmittedInput = submission;
 		if (!submission.customType) {
 			this.#resetGoalContinuationSuppression();
@@ -1354,6 +1359,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmittedInput = undefined;
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
+		this.endWorkingMessageRun();
 		if (submission.customType === "goal-continuation") {
 			this.#goalContinuationTurnInFlight = false;
 		}
@@ -3517,12 +3523,46 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#cacheWorkingMessageAccent(key, main && dim ? { main, dim } : undefined);
 	}
 
+	beginWorkingMessageRun(now = Date.now()): void {
+		this.#workingMessageStartedAt = now;
+		this.#workingMessageRunTokenDelta = 0;
+	}
+
+	getWorkingMessageRunElapsedMs(now = Date.now()): number | undefined {
+		const startedAt = this.#workingMessageStartedAt;
+		return startedAt === undefined ? undefined : now - startedAt;
+	}
+
+	setWorkingMessageRunTokenDelta(tokenDelta: number): void {
+		this.#workingMessageRunTokenDelta = Math.max(0, Math.round(tokenDelta));
+	}
+
+	endWorkingMessageRun(): void {
+		this.#workingMessageStartedAt = undefined;
+		this.#workingMessageRunTokenDelta = 0;
+	}
+
 	ensureLoadingAnimation(): void {
 		if (!this.loadingAnimation) {
 			this.#clearWorkingMessageAccentCache();
 			this.statusContainer.clear();
-			const messageColorFn = ((message: string) =>
-				renderWorkingMessage(message, this.#getWorkingMessageAccent())) as LoaderMessageColorFn & {
+			const messageColorFn = ((message: string) => {
+				const runner = this.session.extensionRunner;
+				let suffix = "";
+				if (runner) {
+					const now = Date.now();
+					const startedAt = this.#workingMessageStartedAt;
+					const context: WorkingMessageSuffixContext = {
+						now,
+						startedAt,
+						elapsedMs: startedAt === undefined ? undefined : now - startedAt,
+						runTokenDelta: this.#workingMessageRunTokenDelta,
+						cwd: this.sessionManager.getCwd(),
+					};
+					suffix = runner.renderWorkingMessageSuffix(message, context);
+				}
+				return renderWorkingMessage(message, this.#getWorkingMessageAccent(), suffix);
+			}) as LoaderMessageColorFn & {
 				animated?: true;
 			};
 			// Shimmer drives the 30fps redraw; when it is disabled the working

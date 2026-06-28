@@ -128,6 +128,7 @@ export class SelectorController {
 	}
 
 	showSettingsSelector(): void {
+		const currentContextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
 		getAvailableThemes().then(availableThemes => {
 			// Fullscreen settings editor on the alternate screen: the overlay
 			// enables mouse tracking (click/hover/wheel) for its lifetime and
@@ -147,6 +148,12 @@ export class SelectorController {
 						(a, b) => a.localeCompare(b),
 					),
 					cwd: getProjectDir(),
+					tui: this.ctx.ui,
+					settings: this.ctx.settings,
+					modelRegistry: this.ctx.session.modelRegistry,
+					scopedModels: this.ctx.session.scopedModels,
+					currentModel: this.ctx.session.model,
+					currentContextTokens,
 					model: this.ctx.session.model,
 					imageBudget: this.ctx.ui.imageBudget,
 					requestRender: () => this.ctx.ui.requestRender(),

@@ -1,3 +1,5 @@
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -50,8 +52,78 @@ const MAX_LIVE_IRC_CARDS = 4;
 const IDLE_RECAP_MIN_SECONDS = 1;
 const IDLE_RECAP_MAX_SECONDS = 3600;
 
+function formatCompactTokens(tokens: number): string {
+	if (tokens < 1000) return String(tokens);
+	const thousands = tokens / 1000;
+	return `${thousands >= 10 ? thousands.toFixed(0) : thousands.toFixed(1)}K`;
+}
+function formatElapsedDuration(ms: number): string {
+	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	const parts: string[] = [];
+	if (hours > 0) parts.push(`${hours}h`);
+	if (minutes > 0) parts.push(`${minutes}m`);
+	if (seconds > 0 || parts.length === 0) parts.push(`${seconds}s`);
+	return parts.join(" ");
+}
+
+function formatCompletionFooter(elapsedMs: number, runTokenDelta?: number): string {
+	const base = `Completed in ${formatElapsedDuration(elapsedMs)}`;
+	if (runTokenDelta === undefined) return base;
+	return `${base} · +${formatCompactTokens(runTokenDelta)} tokens`;
+}
+
+function estimateMessageTokens(message: AgentMessage): number {
+	return Math.max(0, Math.round(estimateTokens(message)));
+}
+
+function toolResultMessageFromEvent(event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>): AgentMessage {
+	return {
+		role: "toolResult",
+		toolCallId: event.toolCallId,
+		toolName: event.toolName,
+		content: event.result.content,
+		details: event.result.details,
+		isError: event.isError,
+		timestamp: Date.now(),
+	} as AgentMessage;
+}
+
+function lastAssistantMessage(messages: AgentMessage[]): AgentMessage | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role === "assistant") return message;
+	}
+	return undefined;
+}
+
+function isSameAssistantTurnEnd(a: AgentMessage | undefined, b: AgentMessage | undefined): boolean {
+	return a !== undefined && b !== undefined && (a === b || (a.timestamp === b.timestamp && a.content === b.content));
+}
+
+function hasVisibleAssistantContent(message: AgentMessage): boolean {
+	return message.content.some(
+		content =>
+			(content.type === "text" && canonicalizeMessage(content.text)) ||
+			(content.type === "thinking" && canonicalizeMessage(content.thinking)),
+	);
+}
+
+function hasToolCallContent(message: AgentMessage): boolean {
+	return message.content.some(content => content.type === "toolCall");
+}
+
 type AgentSessionEventHandlers = {
 	[E in AgentSessionEventKind]: (event: Extract<AgentSessionEvent, { type: E }>) => Promise<void>;
+};
+
+type WorkingMessageLifecycleContext = InteractiveModeContext & {
+	beginWorkingMessageRun(): void;
+	endWorkingMessageRun(): void;
+	getWorkingMessageRunElapsedMs(): number | undefined;
+	setWorkingMessageRunTokenDelta(tokenDelta: number): void;
 };
 
 export class EventController {
@@ -80,6 +152,11 @@ export class EventController {
 	// activity (new turn, compaction, editor draft) supersedes the idle recap.
 	#idleRecapAbort?: AbortController;
 	#ircExpiryTimers = new Map<string, NodeJS.Timeout>();
+	#currentRunTokenDelta = 0;
+	#currentAssistantMessageTokenEstimate = 0;
+	#countedToolResultIds = new Set<string>();
+	#toolExecutionStartedAt = new Map<string, number>();
+	#lastCompletedAssistantMessage: AgentMessage | undefined = undefined;
 	// Insertion-ordered IRC cards not yet retired; values are the transcript
 	// components each card contributed (see #retireIrcCard for the guard).
 	#liveIrcCards = new Map<string, Component[]>();
@@ -101,7 +178,7 @@ export class EventController {
 	#handlers: AgentSessionEventHandlers;
 	#terminalProgressActive = false;
 
-	constructor(private ctx: InteractiveModeContext) {
+	constructor(private ctx: WorkingMessageLifecycleContext) {
 		this.#streamingReveal = new StreamingRevealController({
 			getSmoothStreaming: () => this.ctx.settings.get("display.smoothStreaming"),
 			getHideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
@@ -179,6 +256,24 @@ export class EventController {
 	#resetReadGroup(): void {
 		this.#lastReadGroup?.finalize();
 		this.#lastReadGroup = undefined;
+	}
+
+	#addRunTokens(tokens: number): void {
+		if (tokens <= 0) return;
+		this.#currentRunTokenDelta += tokens;
+		this.#updateWorkingMessageRunTokenDelta();
+	}
+
+	#updateWorkingMessageRunTokenDelta(): void {
+		this.ctx.setWorkingMessageRunTokenDelta(
+			Math.max(0, this.#currentRunTokenDelta + this.#currentAssistantMessageTokenEstimate),
+		);
+	}
+
+	#finishToolExecutionElapsedMs(toolCallId: string, now = Date.now()): number {
+		const startedAt = this.#toolExecutionStartedAt.get(toolCallId);
+		this.#toolExecutionStartedAt.delete(toolCallId);
+		return startedAt === undefined ? 0 : Math.max(0, now - startedAt);
 	}
 
 	#getReadGroup(): ReadToolGroupComponent {
@@ -298,11 +393,16 @@ export class EventController {
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
 		this.#lastIntent = undefined;
+		this.#currentRunTokenDelta = 0;
+		this.#currentAssistantMessageTokenEstimate = 0;
+		this.#countedToolResultIds.clear();
+		this.#toolExecutionStartedAt.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#resetReadGroup();
 		this.#resolveDisplaceableTodo();
 		this.#lastAssistantComponent = undefined;
+		this.#lastCompletedAssistantMessage = undefined;
 		// Restore the previous turn's inline error in the transcript before dropping
 		// the banner, so the error stays in history once the banner is gone.
 		this.#pinnedErrorComponent?.setErrorPinned(false);
@@ -317,6 +417,8 @@ export class EventController {
 		this.#cancelIdleRecap();
 		this.ctx.statusLine.markActivityStart();
 		this.#setTerminalProgress(true);
+		this.ctx.beginWorkingMessageRun();
+		this.ctx.setWorkingMessageRunTokenDelta(0);
 		this.ctx.ensureLoadingAnimation();
 		this.ctx.ui.requestRender();
 	}
@@ -391,6 +493,8 @@ export class EventController {
 			this.ctx.addMessageToChat(event.message);
 			this.ctx.ui.requestRender();
 		} else if (event.message.role === "assistant") {
+			this.#currentAssistantMessageTokenEstimate = 0;
+			this.#updateWorkingMessageRunTokenDelta();
 			this.#lastVisibleBlockCount = 0;
 			this.ctx.streamingComponent = createAssistantMessageComponent(this.ctx);
 			this.ctx.streamingMessage = event.message;
@@ -574,6 +678,8 @@ export class EventController {
 				this.#streamingReveal.resyncVisibility();
 			}
 			this.ctx.streamingMessage = event.message;
+			this.#currentAssistantMessageTokenEstimate = estimateMessageTokens(event.message as AgentMessage);
+			this.#updateWorkingMessageRunTokenDelta();
 			this.#streamingReveal.setTarget(this.ctx.streamingMessage);
 
 			const visibleBlockCount = this.ctx.streamingMessage.content.filter(
@@ -699,14 +805,23 @@ export class EventController {
 	}
 
 	async #handleMessageEnd(event: Extract<AgentSessionEvent, { type: "message_end" }>): Promise<void> {
-		if (event.message.role === "user") return;
-		const unlockedThinkingVisibility =
-			event.message.role === "assistant" && this.ctx.noteDisplayableThinkingContent(event.message);
+		if (event.message.role === "toolResult") {
+			if (!this.#countedToolResultIds.has(event.message.toolCallId)) {
+				this.#addRunTokens(estimateMessageTokens(event.message as AgentMessage));
+				this.#countedToolResultIds.add(event.message.toolCallId);
+			}
+			return;
+		}
+		if (event.message.role !== "assistant") {
+			this.#addRunTokens(estimateMessageTokens(event.message as AgentMessage));
+			return;
+		}
+		const unlockedThinkingVisibility = this.ctx.noteDisplayableThinkingContent(event.message);
 		if (unlockedThinkingVisibility && this.ctx.streamingComponent) {
 			this.ctx.streamingComponent.setHideThinkingBlock(this.ctx.effectiveHideThinkingBlock);
 			this.#streamingReveal.resyncVisibility();
 		}
-		if (event.message.role === "assistant" && settings.get("speech.enabled")) {
+		if (settings.get("speech.enabled")) {
 			if (event.message.stopReason === "aborted") {
 				// Esc / Ctrl+C / interrupt: stop speaking now and drop the trailing partial.
 				vocalizer.clear();
@@ -717,7 +832,7 @@ export class EventController {
 				if (mode === "assistant" || mode === "all") vocalizer.flush();
 			}
 		}
-		if (this.ctx.streamingComponent && event.message.role === "assistant") {
+		if (this.ctx.streamingComponent) {
 			this.ctx.streamingMessage = event.message;
 			this.#streamingReveal.stop();
 			this.#toolArgsReveal.flushAll();
@@ -775,6 +890,18 @@ export class EventController {
 				this.ctx.lastAssistantUsage = usage;
 			}
 			this.#lastAssistantComponent = this.ctx.streamingComponent;
+			this.#lastCompletedAssistantMessage = event.message as AgentMessage;
+			const successfulAssistant =
+				this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error";
+			if (successfulAssistant) {
+				this.#addRunTokens(estimateMessageTokens(event.message as AgentMessage));
+			}
+			this.#currentAssistantMessageTokenEstimate = 0;
+			this.#updateWorkingMessageRunTokenDelta();
+			const elapsedMs = this.ctx.getWorkingMessageRunElapsedMs();
+			if (successfulAssistant && elapsedMs !== undefined && hasVisibleAssistantContent(event.message as AgentMessage) && !hasToolCallContent(event.message as AgentMessage)) {
+				this.#lastAssistantComponent.setCompletionFooter(formatCompletionFooter(elapsedMs, this.#currentRunTokenDelta));
+			}
 			this.#lastAssistantComponent.markTranscriptBlockFinalized();
 			if (settings.get("display.showTokenUsage")) {
 				this.ctx.chatContainer.addChild(createUsageRowBlock(event.message.usage));
@@ -797,6 +924,7 @@ export class EventController {
 	}
 
 	async #handleToolExecutionStart(event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>): Promise<void> {
+		this.#toolExecutionStartedAt.set(event.toolCallId, Date.now());
 		this.#ensureWorkingLoaderWhileStreaming();
 		this.#updateWorkingMessageFromIntent(event.intent);
 		this.#resolveDisplaceablePoll(event.toolName);
@@ -881,11 +1009,19 @@ export class EventController {
 	}
 
 	async #handleToolExecutionEnd(event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>): Promise<void> {
+		const toolResultTokens = estimateMessageTokens(toolResultMessageFromEvent(event));
+		const toolElapsedMs = this.#finishToolExecutionElapsedMs(event.toolCallId);
+		if (!this.#countedToolResultIds.has(event.toolCallId)) {
+			this.#addRunTokens(toolResultTokens);
+			this.#countedToolResultIds.add(event.toolCallId);
+		}
 		if (event.toolName === "read") {
 			if (this.#inlineReadToolImages(event.toolCallId, event.result)) {
 				const component = this.ctx.pendingTools.get(event.toolCallId);
 				if (component) {
 					component.updateResult({ ...event.result, isError: event.isError }, false, event.toolCallId);
+					component.setTokenCount?.(event.toolCallId, toolResultTokens);
+					component.setElapsedMs?.(event.toolCallId, toolElapsedMs);
 					this.ctx.pendingTools.delete(event.toolCallId);
 				}
 				const asyncState = (event.result.details as { async?: { state?: string } } | undefined)?.async?.state;
@@ -910,6 +1046,8 @@ export class EventController {
 				const asyncState = (event.result.details as { async?: { state?: string } } | undefined)?.async?.state;
 				const isBackgroundRunning = asyncState === "running";
 				component.updateResult({ ...event.result, isError: event.isError }, isBackgroundRunning, event.toolCallId);
+				component.setTokenCount?.(event.toolCallId, toolResultTokens);
+				component.setElapsedMs?.(event.toolCallId, toolElapsedMs);
 				if (isBackgroundRunning) {
 					this.#backgroundToolCallIds.add(event.toolCallId);
 				} else {
@@ -925,6 +1063,8 @@ export class EventController {
 				const asyncState = (event.result.details as { async?: { state?: string } } | undefined)?.async?.state;
 				const isBackgroundRunning = asyncState === "running";
 				component.updateResult({ ...event.result, isError: event.isError }, isBackgroundRunning, event.toolCallId);
+				component.setTokenCount?.(event.toolCallId, toolResultTokens);
+				component.setElapsedMs?.(event.toolCallId, toolElapsedMs);
 				if (isBackgroundRunning) {
 					this.#backgroundToolCallIds.add(event.toolCallId);
 				} else {
@@ -979,18 +1119,26 @@ export class EventController {
 			}
 		}
 	}
-	async #handleAgentEnd(_event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		// A superseded agent_end: the agent is already streaming a fresh turn, so
-		// this event belongs to a turn that has already been replaced. The session
-		// dispatches to listeners fire-and-forget across an async extension-emit hop
-		// (#emitSessionEvent), so an interrupted turn's agent_end can land AFTER the
-		// resumed turn's agent_start (e.g. any post-turn agent.continue()). Running
-		// the turn-end teardown now would stop the loader the live turn just created,
-		// leaving "Working…" gone while the agent keeps running. The live turn owns
-		// the loader and finalizes it at its own agent_end (isStreaming === false by
-		// then). Mirrors the collab guest's !isStreaming loader reconciler.
-		if (this.ctx.session.isStreaming) return;
+	async #handleAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
+		// `session.isStreaming` stays true through prompt unwind (#promptInFlightCount),
+		// so use the live core loop flag only to protect a newer active turn. A
+		// mismatched agent_end while the core loop is idle may be a deferred/superseded
+		// end, but it still owns the old working-message run and loader timer.
+		const lastEventAssistant = lastAssistantMessage(event.messages);
+		const mismatchedAgentEnd =
+			lastEventAssistant !== undefined && !isSameAssistantTurnEnd(lastEventAssistant, this.#lastCompletedAssistantMessage);
+		if (mismatchedAgentEnd && this.ctx.session.agent.state.isStreaming) return;
 
+		this.ctx.endWorkingMessageRun();
+		if (mismatchedAgentEnd) {
+			this.#stopWorkingLoader();
+			this.ctx.statusContainer.clear();
+			this.ctx.ui.requestRender();
+			return;
+		}
+
+		// Footer text is stamped on assistant message_end before transcript finalization;
+		// matched agent_end owns full turn cleanup once the matching turn settles.
 		await this.#finishAgentEnd();
 	}
 

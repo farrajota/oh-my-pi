@@ -163,6 +163,8 @@ export type StatusLineSegmentId =
 	| "time"
 	| "session"
 	| "hostname"
+	| "omp_version"
+	| "docker_container"
 	| "cache_read"
 	| "cache_write"
 	| "cache_hit"
@@ -1462,6 +1464,29 @@ export const SETTINGS_SCHEMA = {
 			group: "Input",
 			label: "Emoji Autocomplete",
 			description: "Suggest emojis from `:name:` shortcodes and expand text emoticons like `:D` or `:-)`",
+		},
+	},
+
+	"promptSuggestions.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			group: "Input",
+			label: "Prompt Suggestions",
+			description: "Show context-aware next-prompt ghost suggestions after agent responses",
+		},
+	},
+
+	"promptSuggestions.model": {
+		type: "string",
+		default: "pi/smol",
+		ui: {
+			tab: "interaction",
+			group: "Input",
+			label: "Prompt Suggestions Model",
+			description: "Model or role used to generate next-prompt suggestions (smol/default/slow, pi/<role>, or provider/model)",
+			options: "runtime",
 		},
 	},
 

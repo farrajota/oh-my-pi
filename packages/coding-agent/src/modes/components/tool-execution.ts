@@ -44,6 +44,26 @@ import { isFramedBlockComponent, renderStatusLine, WidthAwareText } from "../../
 import { sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";
 import { renderDiff } from "./diff";
 
+function formatTokenMeta(tokens: number): string {
+	if (tokens < 1000) return `+${tokens} tokens`;
+	const thousands = tokens / 1000;
+	return `+${thousands >= 10 ? thousands.toFixed(0) : thousands.toFixed(1)}K tokens`;
+}
+
+function formatElapsedMeta(ms: number): string {
+	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function formatToolMeta(elapsedMs: number | undefined, tokenCount: number | undefined): string[] | undefined {
+	const meta: string[] = [];
+	if (elapsedMs !== undefined) meta.push(formatElapsedMeta(elapsedMs));
+	if (tokenCount !== undefined) meta.push(formatTokenMeta(tokenCount));
+	return meta.length === 0 ? undefined : meta;
+}
+
 /**
  * Drop trailing removal/hunk-header lines that appear in a streaming diff
  * before the matching `+added` lines have arrived. Without this, a partial
@@ -180,6 +200,8 @@ export interface ToolExecutionHandle {
 	): void;
 	setArgsComplete(toolCallId?: string): void;
 	setExpanded(expanded: boolean): void;
+	setTokenCount?(toolCallId: string, tokens: number): void;
+	setElapsedMs?(toolCallId: string, elapsedMs: number): void;
 }
 
 /** Drive pending-tool redraws at 30fps for live tool headers and displaceable
@@ -243,6 +265,8 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		isError?: boolean;
 		details?: any;
 	};
+	#tokenCount: number | undefined;
+	#elapsedMs: number | undefined;
 	// Edit preview state
 	#editMode?: EditMode;
 	#editDiffPreview?: PerFileDiffPreview[];
@@ -497,6 +521,16 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		this.#updateDisplay();
 		// Convert non-PNG images to PNG for Kitty protocol (async)
 		this.#maybeConvertImagesForKitty();
+	}
+
+	setElapsedMs(_toolCallId: string, elapsedMs: number): void {
+		this.#elapsedMs = Math.max(0, Math.round(elapsedMs));
+		this.#updateDisplay();
+	}
+
+	setTokenCount(_toolCallId: string, tokens: number): void {
+		this.#tokenCount = Math.max(0, Math.round(tokens));
+		this.#updateDisplay();
 	}
 
 	/**
@@ -1173,7 +1207,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	#formatToolExecution(contentWidth: number): string {
 		const lines: string[] = [];
 		const icon = this.#isPartial ? "pending" : this.#result?.isError ? "error" : "done";
-		lines.push(renderStatusLine({ icon, title: this.#toolLabel }, theme));
+		lines.push(renderStatusLine({ icon, title: this.#toolLabel, meta: formatToolMeta(this.#elapsedMs, this.#tokenCount) }, theme));
 
 		const argsObject = this.#args && typeof this.#args === "object" ? (this.#args as Record<string, unknown>) : null;
 		if (!this.#expanded && argsObject && Object.keys(argsObject).length > 0) {

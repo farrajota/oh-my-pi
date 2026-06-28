@@ -1327,7 +1327,17 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 									sixelLineMask?.[index] ? line : uiTheme.fg("toolOutput", replaceTabs(line)),
 								),
 							);
-						} else if (expanded) {
+						} else if (expanded || options.isPartial === true) {
+							// While streaming (isPartial), render the live output append-only
+							// instead of a fixed-height tail window. A tail window re-renders
+							// the same N rows shifted up by one on every new line, so the whole
+							// window's content changes each frame while the viewport top stays
+							// put — forcing the pinned renderer to repaint the entire window in
+							// place (it cannot hardware-scroll a mid-viewport region under tmux).
+							// Flowing the output instead grows the transcript by one line per
+							// update, so the viewport scrolls by one row and the renderer's
+							// native scroll-append fast path repaints a single row. The compact
+							// tail window still applies once the command completes (below).
 							outputLines.push(...rawOutputLines.map(line => uiTheme.fg("toolOutput", replaceTabs(line))));
 						} else {
 							const styledOutput = rawOutputLines

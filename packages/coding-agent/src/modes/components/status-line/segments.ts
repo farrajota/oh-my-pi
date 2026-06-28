@@ -2,7 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
-import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
+import { VERSION, formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
 import { type ThemeColor, theme } from "../../../modes/theme/theme";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../../tools/render-utils";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
@@ -478,6 +478,22 @@ const hostnameSegment: StatusLineSegment = {
 	},
 };
 
+const ompVersionSegment: StatusLineSegment = {
+	id: "omp_version",
+	render() {
+		return { content: theme.fg("muted", `omp ${VERSION}`), visible: true };
+	},
+};
+
+const dockerContainerSegment: StatusLineSegment = {
+	id: "docker_container",
+	render() {
+		const name = process.env.DOCKER_CONTAINER_NAME || process.env.HOSTNAME || os.hostname();
+		if (!name) return { content: "", visible: false };
+		return { content: theme.fg("success", sanitizeStatusText(name)), visible: true };
+	},
+};
+
 const cacheReadSegment: StatusLineSegment = {
 	id: "cache_read",
 	render(ctx) {
@@ -613,6 +629,8 @@ const usageSegment: StatusLineSegment = {
 
 export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	pi: piSegment,
+	omp_version: ompVersionSegment,
+	docker_container: dockerContainerSegment,
 	model: modelSegment,
 	mode: modeSegment,
 	path: pathSegment,

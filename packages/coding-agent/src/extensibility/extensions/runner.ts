@@ -57,6 +57,7 @@ import type {
 	UserBashEventResult,
 	UserPythonEvent,
 	UserPythonEventResult,
+	WorkingMessageSuffixContext,
 } from "./types";
 
 /** Combined result from all before_agent_start handlers */
@@ -211,6 +212,7 @@ export class ExtensionRunner {
 	#shutdownHandler: ShutdownHandler = () => {};
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
+	#failedWorkingMessageSuffixRenderers: Set<string> = new Set();
 	#initialized = false;
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
@@ -451,6 +453,36 @@ export class ExtensionRunner {
 			}
 		}
 		return undefined;
+	}
+
+	renderWorkingMessageSuffix(message: string, context: WorkingMessageSuffixContext): string {
+		let result = "";
+		for (const ext of this.extensions) {
+			for (const [name, renderer] of ext.workingMessageSuffixes) {
+				const key = `${ext.resolvedPath}\0${name}`;
+				if (this.#failedWorkingMessageSuffixRenderers.has(key)) {
+					continue;
+				}
+
+				try {
+					const suffix = renderer(message, context);
+					if (suffix) {
+						result += suffix;
+					}
+				} catch (err) {
+					this.#failedWorkingMessageSuffixRenderers.add(key);
+					const error = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: `working_message_suffix:${name}`,
+						error,
+						stack,
+					});
+				}
+			}
+		}
+		return result;
 	}
 
 	getAssistantThinkingRenderers(): AssistantThinkingRenderer[] {

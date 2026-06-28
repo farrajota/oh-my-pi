@@ -185,6 +185,7 @@ export class AssistantMessageComponent extends Container {
 	#markerSlot: Container;
 	#lastMessage?: AssistantMessage;
 	#toolImagesByCallId = new Map<string, ImageContent[]>();
+	#completionFooter: string | undefined;
 	#convertedKittyImages = new Map<string, ImageContent>();
 	#kittyConversionsInFlight = new Set<string>();
 	#transcriptBlockFinalized: boolean;
@@ -279,6 +280,15 @@ export class AssistantMessageComponent extends Container {
 			this.#markerSlot.addChild(new CacheInvalidationMarkerComponent(info));
 		}
 		this.#blockVersion++;
+	}
+
+	setCompletionFooter(text: string | undefined): void {
+		this.#completionFooter = text;
+		this.#fastPathKey = undefined;
+		this.#fastPathItems = undefined;
+		if (this.#lastMessage) {
+			this.updateContent(this.#lastMessage);
+		}
 	}
 
 	override invalidate(): void {
@@ -798,6 +808,11 @@ export class AssistantMessageComponent extends Container {
 			message.stopReason !== "error"
 		) {
 			this.#appendErrorBlock(message.errorMessage);
+		}
+
+		if (this.#completionFooter) {
+			this.#contentContainer.addChild(new Spacer(1));
+			this.#contentContainer.addChild(new Text(theme.fg("dim", this.#completionFooter), 1, 0));
 		}
 		// Store fast-path state for next call
 		if (shouldCapture) {

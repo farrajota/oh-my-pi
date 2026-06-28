@@ -87,12 +87,26 @@ type ReadEntry = {
 	correctedFrom?: string;
 	contentText?: string;
 	conflictCount?: number;
+	tokenCount?: number;
+	elapsedMs?: number;
 	codeStartLine?: number;
 	codeLineNumbers?: Array<number | null>;
 };
 
 /** Number of code lines to show in collapsed preview mode */
 const COLLAPSED_PREVIEW_LINES = PREVIEW_LIMITS.OUTPUT_COLLAPSED;
+function formatTokenMeta(tokens: number): string {
+	if (tokens < 1000) return `+${tokens} tokens`;
+	const thousands = tokens / 1000;
+	return `+${thousands >= 10 ? thousands.toFixed(0) : thousands.toFixed(1)}K tokens`;
+}
+
+function formatElapsedMeta(ms: number): string {
+	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
 
 type ReadDisplayTarget = {
 	entry: ReadEntry;
@@ -401,6 +415,20 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		this.#updateDisplay();
 	}
 
+	setTokenCount(toolCallId: string, tokens: number): void {
+		const entry = this.#entries.get(toolCallId);
+		if (!entry) return;
+		entry.tokenCount = Math.max(0, Math.round(tokens));
+		this.#updateDisplay();
+	}
+
+	setElapsedMs(toolCallId: string, elapsedMs: number): void {
+		const entry = this.#entries.get(toolCallId);
+		if (!entry) return;
+		entry.elapsedMs = Math.max(0, Math.round(elapsedMs));
+		this.#updateDisplay();
+	}
+
 	getComponent(): Component {
 		return this;
 	}
@@ -534,7 +562,29 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 			conflictCount: this.#conflictCountForTargets(row.targets),
 			line: firstSelectorLineForTargets(row.targets),
 			linkPath: linkPathForTargets(row.targets),
+			elapsedMs: this.#elapsedMsForTargets(row.targets),
+			tokenCount: this.#tokenCountForTargets(row.targets),
 		});
+	}
+
+	#elapsedMsForTargets(targets: ReadDisplayTarget[]): number | undefined {
+		let elapsedMs: number | undefined;
+		for (const target of targets) {
+			if (target.entry.elapsedMs !== undefined) {
+				elapsedMs = Math.max(elapsedMs ?? 0, target.entry.elapsedMs);
+			}
+		}
+		return elapsedMs;
+	}
+
+	#tokenCountForTargets(targets: ReadDisplayTarget[]): number | undefined {
+		let tokenCount: number | undefined;
+		for (const target of targets) {
+			if (target.entry.tokenCount !== undefined) {
+				tokenCount = (tokenCount ?? 0) + target.entry.tokenCount;
+			}
+		}
+		return tokenCount;
 	}
 
 	#statusForTargets(targets: ReadDisplayTarget[]): ReadEntry["status"] {
@@ -581,7 +631,14 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 
 	#formatPathValue(
 		value: string,
-		options: { correctedFrom?: string; conflictCount?: number; line?: number; linkPath?: string } = {},
+		options: {
+			correctedFrom?: string;
+			conflictCount?: number;
+			line?: number;
+			linkPath?: string;
+			elapsedMs?: number;
+			tokenCount?: number;
+		} = {},
 	): string {
 		const split = splitPathAndSel(value);
 		const selectorSuffix = split.sel ? `:${split.sel}` : "";
@@ -599,6 +656,12 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 			pathDisplay += theme.fg("dim", ` (corrected from ${shortenPath(options.correctedFrom)})`);
 		}
 		pathDisplay += this.#formatConflictBadge(options.conflictCount);
+		if (options.elapsedMs !== undefined) {
+			pathDisplay += theme.fg("dim", ` ${theme.sep.dot} ${formatElapsedMeta(options.elapsedMs)}`);
+		}
+		if (options.tokenCount !== undefined) {
+			pathDisplay += theme.fg("dim", ` ${theme.sep.dot} ${formatTokenMeta(options.tokenCount)}`);
+		}
 		return pathDisplay;
 	}
 
@@ -623,6 +686,8 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 					conflictCount: entry.conflictCount,
 					line: firstSelectorLine(split.sel),
 					linkPath: readTargetLinkPath(split.path, entry.linkPath),
+					elapsedMs: entry.elapsedMs,
+					tokenCount: entry.tokenCount,
 				})
 			: "";
 		const title = pathDisplay ? `Read ${pathDisplay}` : "Read";

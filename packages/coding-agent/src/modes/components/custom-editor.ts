@@ -1,6 +1,15 @@
 import { fileURLToPath } from "node:url";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { addKeyAliases, canonicalKeyId, Editor, type KeyId, parseKey, parseKittySequence } from "@oh-my-pi/pi-tui";
+import {
+	addKeyAliases,
+	canonicalKeyId,
+	Editor,
+	type EditorTheme,
+	type KeyId,
+	parseKey,
+	parseKittySequence,
+	type TUI,
+} from "@oh-my-pi/pi-tui";
 import { BracketedPasteHandler } from "@oh-my-pi/pi-tui/bracketed-paste";
 import type { AppKeybinding } from "../../config/keybindings";
 import { isSettingsInitialized, settings } from "../../config/settings";
@@ -287,7 +296,16 @@ export function extractImagePathFromText(text: string): string | undefined {
  * Custom editor that handles configurable app-level shortcuts for coding-agent.
  */
 export class CustomEditor extends Editor {
+	readonly tui: TUI;
 	imageLinks?: readonly (string | undefined)[];
+
+	constructor(theme: EditorTheme);
+	constructor(tui: TUI, theme: EditorTheme, keybindings?: unknown);
+	constructor(tuiOrTheme: TUI | EditorTheme, theme?: EditorTheme, _keybindings?: unknown) {
+		const editorTheme = theme ?? (tuiOrTheme as EditorTheme);
+		super(editorTheme);
+		this.tui = theme ? (tuiOrTheme as TUI) : (undefined as unknown as TUI);
+	}
 
 	/** Draft images pasted into the composer, consumed on submit. Co-located with
 	 *  {@link imageLinks} so every piece of draft-image state lives on the editor. */

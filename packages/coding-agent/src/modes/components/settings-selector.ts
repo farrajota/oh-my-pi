@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Effort } from "@oh-my-pi/pi-ai";
+import type { Effort, Model } from "@oh-my-pi/pi-ai";
 import {
 	type Component,
 	Container,
@@ -23,6 +23,7 @@ import {
 	TabBar,
 	Text,
 	truncateToWidth,
+	type TUI,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import type { ShapeTarget } from "@oh-my-pi/snapcompact";
@@ -31,9 +32,11 @@ import {
 	getType,
 	normalizeProviderMaxInFlightRequests,
 	type SettingPath,
+	type Settings,
 	settings,
 	validateProviderMaxInFlightRequests,
 } from "../../config/settings";
+import type { ModelRegistry } from "../../config/model-registry";
 import type {
 	SettingTab,
 	StatusLinePreset,
@@ -47,6 +50,7 @@ import { getTabBarTheme } from "../shared";
 import { bottomBorder, divider, row, topBorder } from "./overlay-box";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingDef, getSettingsForTab, type SettingDef } from "./settings-defs";
+import { ModelSelectorComponent } from "./model-selector";
 import { SnapcompactShapePreview } from "./snapcompact-shape-preview";
 import { getPreset } from "./status-line/presets";
 
@@ -371,6 +375,18 @@ export interface SettingsRuntimeContext {
 	providers: string[];
 	/** Working directory for plugins tab */
 	cwd: string;
+	/** TUI instance used by nested runtime selectors. */
+	tui: TUI;
+	/** Settings instance used by nested runtime selectors. */
+	settings: Settings;
+	/** Registry backing runtime model selection. */
+	modelRegistry: ModelRegistry;
+	/** Model scope provided by the session. */
+	scopedModels: ReadonlyArray<{ model: Model; thinkingLevel?: string }>;
+	/** Current session model for runtime model selection. */
+	currentModel?: Model;
+	/** Current context token count for runtime model selection. */
+	currentContextTokens?: number;
 	/** Active model (api + id); resolves what the snapcompact `auto` shape maps to. */
 	model?: ShapeTarget;
 	/** Shared TUI image budget (graphics ids + transmit-once) for image previews. */
@@ -885,6 +901,24 @@ export class SettingsSelectorComponent implements Component {
 		done: (value?: string) => void,
 	): Container {
 		let options = def.options;
+
+		if (def.path === "promptSuggestions.model") {
+			return new ModelSelectorComponent(
+				this.context.tui,
+				this.context.currentModel,
+				this.context.settings,
+				this.context.modelRegistry,
+				this.context.scopedModels,
+				(model, _role, _thinkingLevel, selector) => {
+					const value = selector ?? `${model.provider}/${model.id}`;
+					this.#setSettingValue(def.path, value);
+					this.callbacks.onChange(def.path, value);
+					done(value);
+				},
+				() => done(),
+				{ temporaryOnly: true, currentContextTokens: this.context.currentContextTokens },
+			);
+		}
 
 		// Special case: inject runtime options for thinking level
 		if (def.path === "defaultThinkingLevel") {
