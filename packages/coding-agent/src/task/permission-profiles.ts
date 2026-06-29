@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { normalizeToolNames } from "../tools/builtin-names";
 
 export type SubagentPermissionMode = "off" | "suggest" | "enforce";
 
@@ -51,7 +52,8 @@ export const BUILTIN_PERMISSION_PROFILES: Record<string, PermissionProfile> = {
 		denyTools: ["edit", "write", "bash", "eval", "browser", "web_search", "task", "ast_edit"],
 	},
 	"focused-edit": {
-		description: "Read/search/edit/write within the selected path scope. No shell, browser, web search, or child delegation.",
+		description:
+			"Read/search/edit/write within the selected path scope. No shell, browser, web search, or child delegation.",
 		useWhen: "Bounded source/test edits where the parent will run verification.",
 		tools: ["read", "search", "find", "lsp", "edit", "write", "ast_grep", "ast_edit", "irc"],
 		denyTools: ["bash", "eval", "browser", "web_search", "task"],
@@ -114,7 +116,9 @@ export async function loadPermissionProfiles(cwd: string): Promise<{
 
 	return {
 		profiles,
-		summaries: Object.keys(profiles).map(name => summarizeProfile(name, profiles[name] ?? {}, sources.get(name) ?? "project")),
+		summaries: Object.keys(profiles).map(name =>
+			summarizeProfile(name, profiles[name] ?? {}, sources.get(name) ?? "project"),
+		),
 		errors,
 	};
 }
@@ -140,7 +144,10 @@ export function composeEffectivePermissions(input: {
 	};
 
 	if (input.mode === "off") {
-		return { ok: true, value: { ...base, profiles: [], tools: undefined, denyTools: [], allowPaths: [], denyPaths: [] } };
+		return {
+			ok: true,
+			value: { ...base, profiles: [], tools: undefined, denyTools: [], allowPaths: [], denyPaths: [] },
+		};
 	}
 
 	const requestedProfiles = input.request?.profiles ?? [];
@@ -156,16 +163,37 @@ export function composeEffectivePermissions(input: {
 		selectedProfiles.push(profile);
 	}
 
-	const requestedTools = concatStrings(selectedProfiles.map(profile => profile.tools), input.request?.tools);
+	const requestedTools = concatStrings(
+		selectedProfiles.map(profile => profile.tools),
+		input.request?.tools,
+	);
 	let tools = input.toolsEnabled ? uniqueTools(requestedTools) : undefined;
 	const denyTools = input.toolsEnabled
-		? uniqueTools(concatStrings(selectedProfiles.map(profile => profile.denyTools), input.request?.denyTools, input.inherited?.denyTools))
+		? uniqueTools(
+				concatStrings(
+					selectedProfiles.map(profile => profile.denyTools),
+					input.request?.denyTools,
+					input.inherited?.denyTools,
+				),
+			)
 		: [];
 	const allowPaths = input.pathsEnabled
-		? uniqueStrings(concatStrings(selectedProfiles.map(profile => profile.allowPaths), input.request?.allowPaths, input.inherited?.allowPaths))
+		? uniqueStrings(
+				concatStrings(
+					selectedProfiles.map(profile => profile.allowPaths),
+					input.request?.allowPaths,
+					input.inherited?.allowPaths,
+				),
+			)
 		: [];
 	const denyPaths = input.pathsEnabled
-		? uniqueStrings(concatStrings(selectedProfiles.map(profile => profile.denyPaths), input.request?.denyPaths, input.inherited?.denyPaths))
+		? uniqueStrings(
+				concatStrings(
+					selectedProfiles.map(profile => profile.denyPaths),
+					input.request?.denyPaths,
+					input.inherited?.denyPaths,
+				),
+			)
 		: [];
 
 	if (input.toolsEnabled && input.inherited?.tools) {
@@ -193,7 +221,7 @@ export function evaluateSubagentPermission(input: {
 	cwd: string;
 }): { action: "allow" | "deny"; reason: string; matched: string } {
 	const { scope, toolName } = input;
-	if (!scope || scope.mode !== "enforce") return allowDecision();
+	if (scope?.mode !== "enforce") return allowDecision();
 	const normalizedToolName = toolName.toLowerCase();
 	if (RUNTIME_ALLOWED_TOOLS.has(normalizedToolName)) return allowDecision();
 
@@ -259,7 +287,9 @@ Stay within this scope. Do not try to bypass it with bash/eval or indirect write
 }
 
 function isMissingFileError(error: unknown): boolean {
-	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "ENOENT";
+	return (
+		typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "ENOENT"
+	);
 }
 
 function readProfileMap(value: unknown): Record<string, PermissionProfile> | undefined {
@@ -307,10 +337,14 @@ function summarizeProfile(name: string, profile: PermissionProfile, source: Prof
 
 function concatStrings(...values: Array<string[] | undefined>): string[];
 function concatStrings(values: Array<string[] | undefined>, ...extra: Array<string[] | undefined>): string[];
-function concatStrings(first: Array<string[] | undefined> | string[] | undefined, ...extra: Array<string[] | undefined>): string[] {
-	const parts = Array.isArray(first) && first.every(item => Array.isArray(item) || item === undefined)
-		? [...(first as Array<string[] | undefined>), ...extra]
-		: [first as string[] | undefined, ...extra];
+function concatStrings(
+	first: Array<string[] | undefined> | string[] | undefined,
+	...extra: Array<string[] | undefined>
+): string[] {
+	const parts =
+		Array.isArray(first) && first.every(item => Array.isArray(item) || item === undefined)
+			? [...(first as Array<string[] | undefined>), ...extra]
+			: [first as string[] | undefined, ...extra];
 	const result: string[] = [];
 	for (const part of parts) {
 		if (!part) continue;
@@ -324,7 +358,7 @@ function concatStrings(first: Array<string[] | undefined> | string[] | undefined
 function uniqueTools(values: string[]): string[] {
 	const seen = new Set<string>();
 	const result: string[] = [];
-	for (const value of values) {
+	for (const value of normalizeToolNames(values)) {
 		const key = value.toLowerCase();
 		if (seen.has(key)) continue;
 		seen.add(key);
@@ -350,7 +384,11 @@ type PathCandidate = {
 	relative: string;
 };
 
-function collectPathCandidates(input: Record<string, unknown>, cwd: string, includeBashCommand: boolean): PathCandidate[] {
+function collectPathCandidates(
+	input: Record<string, unknown>,
+	cwd: string,
+	includeBashCommand: boolean,
+): PathCandidate[] {
 	const raw = new Set<string>();
 	collectPathStrings(input, raw, 0);
 	if (includeBashCommand && typeof input.command === "string") {
@@ -395,7 +433,10 @@ function looksPathLike(value: string): boolean {
 
 function normalizePathCandidate(value: string, cwd: string): PathCandidate {
 	const expanded = value.startsWith("~/") ? path.join(process.env.HOME ?? "", value.slice(2)) : value;
-	const absolute = (path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(cwd, expanded)).replace(/\\/g, "/");
+	const absolute = (path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(cwd, expanded)).replace(
+		/\\/g,
+		"/",
+	);
 	let relative = path.relative(cwd, absolute).replace(/\\/g, "/");
 	if (relative === "") relative = ".";
 	return { display: value, absolute, relative };

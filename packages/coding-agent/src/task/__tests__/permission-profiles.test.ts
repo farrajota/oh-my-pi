@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
 	BUILTIN_PERMISSION_PROFILES,
 	composeEffectivePermissions,
+	type EffectiveSubagentPermissions,
 	evaluateSubagentPermission,
 	loadPermissionProfiles,
-	type EffectiveSubagentPermissions,
 	type PermissionProfile,
 	type SubagentPermissionMode,
 	type TaskPermissionRequest,
@@ -54,7 +54,12 @@ function enforceScope(input: {
 	return result.value;
 }
 
-function evaluate(scope: EffectiveSubagentPermissions, toolName: string, toolInput: Record<string, unknown>, cwd: string) {
+function evaluate(
+	scope: EffectiveSubagentPermissions,
+	toolName: string,
+	toolInput: Record<string, unknown>,
+	cwd: string,
+) {
 	return evaluateSubagentPermission({ scope, toolName, toolInput, cwd });
 }
 
@@ -130,6 +135,19 @@ describe("permission profile composition and evaluation", () => {
 			reason: "BLOCKED: Subagent permission profile denied tool 'browser'.",
 			matched: "subagent:tool-deny:browser",
 		});
+	});
+
+	test("normalizes profile tool aliases before enforcing tool allowlists", async () => {
+		const cwd = await tempCwd();
+		const scope = enforceScope({
+			request: { profiles: ["read-only"] },
+			mode: "enforce",
+		});
+
+		expect(scope.tools).toEqual(expect.arrayContaining(["grep", "glob"]));
+		expect(scope.tools).not.toEqual(expect.arrayContaining(["search", "find"]));
+		expect(evaluate(scope, "grep", {}, cwd).action).toBe("allow");
+		expect(evaluate(scope, "edit", {}, cwd)).toMatchObject({ action: "deny" });
 	});
 
 	test("focused-edit with inline allowPaths allows scoped reads and denies out-of-scope reads", async () => {

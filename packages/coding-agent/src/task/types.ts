@@ -3,8 +3,9 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import type { AgentSessionEvent } from "../session/agent-session";
-import type { NestedRepoPatch } from "./worktree";
 import type { TaskPermissionRequest } from "./permission-profiles";
+import type { TaskToolProfileName } from "./tool-profiles";
+import type { NestedRepoPatch } from "./worktree";
 
 /** Source of an agent definition */
 export type AgentSource = "bundled" | "user" | "project";
@@ -80,6 +81,7 @@ export const ROLE_LABEL_MAX = 80;
 /** Schema bound on the raw `role` input, before it is label-normalized at every use site. */
 export const ROLE_INPUT_MAX = 256;
 const ROLE_INPUT_SCHEMA = `string <= ${ROLE_INPUT_MAX}` as const;
+const TASK_TOOL_PROFILE_SCHEMA = "'none' | 'inspect' | 'review' | 'edit' | 'plan' | 'web-research' | 'vision'" as const;
 
 const taskPermissionSchema = type({
 	"profiles?": "string[]",
@@ -109,11 +111,7 @@ const taskPermissionSchemaProfilesOnly = type({
 	"+": "delete",
 });
 
-function selectTaskPermissionSchema(options: {
-	enabled: boolean;
-	toolsEnabled: boolean;
-	pathsEnabled: boolean;
-}) {
+function selectTaskPermissionSchema(options: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean }) {
 	if (!options.enabled) return undefined;
 	if (options.toolsEnabled && options.pathsEnabled) return taskPermissionSchema;
 	if (options.toolsEnabled) return taskPermissionSchemaToolsOnly;
@@ -130,6 +128,7 @@ function createTaskItemSchema(options: {
 		"description?": "string",
 		"role?": ROLE_INPUT_SCHEMA,
 		assignment: "string",
+		"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
 		"+": "delete",
 	};
 	if (options.isolationEnabled) shape["isolated?"] = "boolean";
@@ -148,6 +147,7 @@ function createTaskSchema(options: {
 		"description?": "string",
 		"role?": ROLE_INPUT_SCHEMA,
 		assignment: "string",
+		"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
 		"+": "delete",
 	};
 	if (options.isolationEnabled) shape["isolated?"] = "boolean";
@@ -189,6 +189,8 @@ export interface TaskItem {
 	assignment?: string;
 	/** Least-privilege guardrails for this spawn. */
 	permissions?: TaskPermissionRequest;
+	/** Least-privilege tool-profile shorthand for this spawn. */
+	toolProfile?: TaskToolProfileName;
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
 }
@@ -211,7 +213,10 @@ const taskSchemaBatchNoIsolation = createBatchTaskSchema({
 });
 const ALL_TASK_SCHEMAS = [taskSchema, taskSchemaNoIsolation, taskSchemaBatch, taskSchemaBatchNoIsolation] as const;
 
-type DynamicTaskSchema = (typeof ALL_TASK_SCHEMAS)[number] | ReturnType<typeof createTaskSchema> | ReturnType<typeof createBatchTaskSchema>;
+type DynamicTaskSchema =
+	| (typeof ALL_TASK_SCHEMAS)[number]
+	| ReturnType<typeof createTaskSchema>
+	| ReturnType<typeof createBatchTaskSchema>;
 export type TaskSchema = typeof taskSchema;
 /** Active task tool parameter schema for the current isolation / batch flags */
 export type TaskToolSchemaInstance = DynamicTaskSchema;
@@ -228,7 +233,9 @@ export function getTaskSchema(options: {
 		}
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	return options.batchEnabled ? createBatchTaskSchema({ ...options, permissions }) : createTaskSchema({ ...options, permissions });
+	return options.batchEnabled
+		? createBatchTaskSchema({ ...options, permissions })
+		: createTaskSchema({ ...options, permissions });
 }
 
 /**
@@ -254,6 +261,8 @@ export interface TaskParams {
 	context?: string;
 	/** Least-privilege guardrails for the flat-form spawn. */
 	permissions?: TaskPermissionRequest;
+	/** Least-privilege tool-profile shorthand for the flat-form spawn. */
+	toolProfile?: TaskToolProfileName;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
 }

@@ -6,11 +6,11 @@ import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMeta
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
-import type { EffectiveSubagentPermissions } from "../../task/permission-profiles";
 import type { Settings } from "../../config/settings";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { SessionManager } from "../../session/session-manager";
+import type { EffectiveSubagentPermissions } from "../../task/permission-profiles";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { createExtensionModelQuery } from "./model-api";
 import type {
@@ -26,12 +26,12 @@ import type {
 	ContextUsage,
 	Extension,
 	ExtensionActions,
+	ExtensionActorIdentity,
 	ExtensionCommandContext,
 	ExtensionCommandContextActions,
 	ExtensionContext,
 	ExtensionContextActions,
 	ExtensionError,
-	ExtensionActorIdentity,
 	ExtensionEvent,
 	ExtensionFlag,
 	ExtensionRuntime,

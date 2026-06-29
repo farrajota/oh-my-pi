@@ -48,12 +48,6 @@ import type { LocalProtocolOptions } from "../internal-urls";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
-import {
-	composeEffectivePermissions,
-	loadPermissionProfiles,
-	type PermissionProfileSummary,
-	type SubagentPermissionMode,
-} from "./permission-profiles";
 import { runSubprocess } from "./executor";
 import {
 	applyEligibleNestedPatches,
@@ -66,8 +60,15 @@ import {
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
+import {
+	composeEffectivePermissions,
+	loadPermissionProfiles,
+	type PermissionProfileSummary,
+	type SubagentPermissionMode,
+} from "./permission-profiles";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { repairTaskParams } from "./repair-args";
+import { applyTaskToolProfile, resolveTaskToolProfile } from "./tool-profiles";
 import { parseIsolationMode } from "./worktree";
 
 function renderSubagentUserPrompt(assignment: string): string {
@@ -162,8 +163,6 @@ export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"report_finding",
 	"search_tool_bm25",
 ]);
-
-const PLAN_MODE_AGENT_TOOL_ALLOWLIST: ReadonlySet<string> = new Set(["ast_grep", "report_finding"]);
 
 export function isReadOnlyAgent(agent: AgentDefinition): boolean {
 	return !!agent.tools?.length && agent.tools.every(tool => READ_ONLY_TOOL_NAMES.has(tool));
@@ -265,7 +264,11 @@ function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
  * frontmatter, the inherited session schema, or an eval-workflow
  * `agent(..., schema)` call); `tasks`/`context` require `task.batch`.
  */
-function validateShapeParams(batchEnabled: boolean, permissionsEnabled: boolean, params: TaskParams): string | undefined {
+function validateShapeParams(
+	batchEnabled: boolean,
+	permissionsEnabled: boolean,
+	params: TaskParams,
+): string | undefined {
 	if ((params as Record<string, unknown>).schema !== undefined) {
 		return "The task tool does not accept `schema`. Rely on the selected agent definition's `output` schema or the inherited session schema; workflows needing ad-hoc structured output use eval `agent(prompt, schema)`.";
 	}
@@ -344,7 +347,16 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if (Array.isArray(params.tasks) && params.tasks.length > 0) {
 		return params.tasks;
 	}
-	return [{ id: params.id, description: params.description, role: params.role, assignment: params.assignment, permissions: params.permissions }];
+	return [
+		{
+			id: params.id,
+			description: params.description,
+			role: params.role,
+			assignment: params.assignment,
+			toolProfile: params.toolProfile,
+			permissions: params.permissions,
+		},
+	];
 }
 
 /**
@@ -361,6 +373,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem): TaskParams {
 	if (item.role !== undefined) spawn.role = item.role;
 	if (item.assignment !== undefined) spawn.assignment = item.assignment;
 	if (item.permissions !== undefined) spawn.permissions = item.permissions;
+	if (item.toolProfile !== undefined) spawn.toolProfile = item.toolProfile;
 	if (params.context !== undefined) spawn.context = params.context;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
@@ -615,7 +628,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * Create a TaskTool instance with async agent discovery.
 	 */
 	static async create(session: ToolSession): Promise<TaskTool> {
-		const [{ agents }, profileLoad] = await Promise.all([discoverAgentsForCreate(session.cwd), loadPermissionProfiles(session.cwd)]);
+		const [{ agents }, profileLoad] = await Promise.all([
+			discoverAgentsForCreate(session.cwd),
+			loadPermissionProfiles(session.cwd),
+		]);
 		return new TaskTool(session, agents, profileLoad.summaries, profileLoad.errors);
 	}
 
@@ -629,7 +645,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const batchEnabled = this.#isBatchEnabled();
 		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
 		const permissionsEnabled = permissionMode !== "off";
-		const validationError = validateShapeParams(batchEnabled, permissionsEnabled, params) ?? validateSpawnParams(params, batchEnabled);
+		const validationError =
+			validateShapeParams(batchEnabled, permissionsEnabled, params) ?? validateSpawnParams(params, batchEnabled);
 		if (validationError) {
 			return createTaskModeError(validationError);
 		}
@@ -1143,22 +1160,40 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 		}
 
+		const profiledTools = applyTaskToolProfile(agent.tools, params.toolProfile);
+		if (params.toolProfile !== undefined && params.toolProfile !== "none" && profiledTools?.length === 0) {
+			logger.warn("Task tool profile produced an empty tool set", {
+				agent: agent.name,
+				toolProfile: params.toolProfile,
+				agentTools: agent.tools ?? null,
+			});
+		}
+
 		const planModeState = this.session.getPlanModeState?.();
-		const planModeBaseTools = ["read", "grep", "glob", "lsp", "web_search"];
-		const planModeTools = [
-			...planModeBaseTools,
-			...(agent.tools ?? []).filter(
-				tool => PLAN_MODE_AGENT_TOOL_ALLOWLIST.has(tool) && !planModeBaseTools.includes(tool),
-			),
-		];
-		const effectiveAgent: typeof agent = planModeState?.enabled
-			? {
-					...agent,
-					systemPrompt: `${planModeSubagentPrompt}\n\n${agent.systemPrompt}`,
-					tools: planModeTools,
-					spawns: undefined,
-				}
-			: agent;
+		let effectiveAgent: typeof agent = agent;
+		if (planModeState?.enabled) {
+			const baseToolsForPlan = profiledTools ?? agent.tools;
+			const planModeTools = applyTaskToolProfile(baseToolsForPlan, "plan") ?? resolveTaskToolProfile("plan");
+			if (planModeTools.length === 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Plan mode cannot spawn agent "${agent.name}" because its explicit tools do not intersect the plan profile.`,
+						},
+					],
+					details: { projectAgentsDir, results: [], totalDurationMs: 0 },
+				};
+			}
+			effectiveAgent = {
+				...agent,
+				systemPrompt: `${planModeSubagentPrompt}\n\n${agent.systemPrompt}`,
+				tools: planModeTools,
+				spawns: undefined,
+			};
+		} else if (agent.tools !== undefined || params.toolProfile !== undefined) {
+			effectiveAgent = { ...agent, tools: profiledTools };
+		}
 
 		// Apply per-agent model override from settings (highest priority)
 		const agentModelOverrides = this.session.settings.get("task.agentModelOverrides");
@@ -1293,8 +1328,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const allowlistedTools = permissionScope.tools
 					? new Set(permissionScope.tools.map(tool => tool.toLowerCase()))
 					: undefined;
-				const candidateTools = permissionAgent.tools ?? permissionScope.tools ?? this.session.getActiveToolNames?.();
-				if (candidateTools) {
+				const candidateTools =
+					permissionAgent.tools ?? permissionScope.tools ?? this.session.getActiveToolNames?.();
+				if (candidateTools !== undefined) {
 					let nextTools = candidateTools.filter(tool => {
 						const normalized = tool.toLowerCase();
 						if (deniedTools.has(normalized)) return false;
@@ -1307,7 +1343,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					permissionAgent = { ...permissionAgent, tools: nextTools };
 				}
 			}
-
 
 			const availableSkills = [...(this.session.skills ?? [])];
 			// Resolve autoload skills from agent definition against available skills

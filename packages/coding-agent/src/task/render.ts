@@ -640,10 +640,14 @@ function formatOutputInline(data: unknown, theme: Theme, maxWidth = 80): string 
 }
 
 function stringList(value: unknown): string[] {
-	return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.length > 0) : [];
+	return Array.isArray(value)
+		? value.filter((item): item is string => typeof item === "string" && item.length > 0)
+		: [];
 }
 
-function renderPermissionLines(permissions: Partial<TaskItem>["permissions"] | Partial<TaskParams>["permissions"] | undefined): string[] {
+function renderPermissionLines(
+	permissions: Partial<TaskItem>["permissions"] | Partial<TaskParams>["permissions"] | undefined,
+): string[] {
 	if (!permissions) return [];
 	const lines: string[] = [];
 	const profiles = stringList(permissions.profiles);
@@ -667,7 +671,11 @@ function renderPermissionLines(permissions: Partial<TaskItem>["permissions"] | P
 	return lines;
 }
 
-function appendPermissionLines(lines: string[], permissions: Partial<TaskItem>["permissions"] | Partial<TaskParams>["permissions"] | undefined, theme: Theme): void {
+function appendPermissionLines(
+	lines: string[],
+	permissions: Partial<TaskItem>["permissions"] | Partial<TaskParams>["permissions"] | undefined,
+	theme: Theme,
+): void {
 	const permissionLines = renderPermissionLines(permissions);
 	for (const line of permissionLines) lines.push(`  ${theme.fg("dim", line)}`);
 }

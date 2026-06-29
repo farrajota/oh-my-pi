@@ -1,6 +1,6 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as os from "node:os";
 import { VERSION } from "@oh-my-pi/pi-utils";
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { setTheme } from "../../../modes/theme/theme";
 import { renderSegment } from "./segments";
 import type { SegmentContext } from "./types";

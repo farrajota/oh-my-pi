@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
 import { ExtensionRunner } from "../runner";
-import type { Extension, ExtensionError, ExtensionRuntime, WorkingMessageSuffixContext, WorkingMessageSuffixRenderer } from "../types";
+import type {
+	Extension,
+	ExtensionError,
+	ExtensionRuntime,
+	WorkingMessageSuffixContext,
+	WorkingMessageSuffixRenderer,
+} from "../types";
 
 function extension(resolvedPath: string, suffixes: Extension["workingMessageSuffixes"]): Extension {
 	return {
@@ -56,8 +62,11 @@ describe("ExtensionRunner.renderWorkingMessageSuffix", () => {
 			extension(
 				"/extensions/first.ts",
 				new Map([
-					["a", (message) => ` [${message}]`],
-					["b", (_message, suffixContext) => ` [${suffixContext.elapsedMs}ms/+${suffixContext.runTokenDelta} tokens]`],
+					["a", message => ` [${message}]`],
+					[
+						"b",
+						(_message, suffixContext) => ` [${suffixContext.elapsedMs}ms/+${suffixContext.runTokenDelta} tokens]`,
+					],
 				]),
 			),
 			extension("/extensions/second.ts", new Map([["c", () => " [second]"]])),
@@ -85,7 +94,7 @@ describe("ExtensionRunner.renderWorkingMessageSuffix", () => {
 			),
 			extension("/extensions/next.ts", new Map([["next", () => " [next]"]])),
 		]);
-		subject.onError((error) => errors.push(error));
+		subject.onError(error => errors.push(error));
 
 		expect(subject.renderWorkingMessageSuffix("Working", context)).toBe(" [healthy] [next]");
 		expect(subject.renderWorkingMessageSuffix("Working", context)).toBe(" [healthy] [next]");

@@ -22,11 +22,12 @@ import {
 	type Tab,
 	TabBar,
 	Text,
-	truncateToWidth,
 	type TUI,
+	truncateToWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import type { ShapeTarget } from "@oh-my-pi/snapcompact";
+import type { ModelRegistry } from "../../config/model-registry";
 import {
 	getDefault,
 	getType,
@@ -36,7 +37,6 @@ import {
 	settings,
 	validateProviderMaxInFlightRequests,
 } from "../../config/settings";
-import type { ModelRegistry } from "../../config/model-registry";
 import type {
 	SettingTab,
 	StatusLinePreset,
@@ -47,10 +47,10 @@ import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { AUTO_THINKING, type ConfiguredThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
+import { ModelSelectorComponent } from "./model-selector";
 import { bottomBorder, divider, row, topBorder } from "./overlay-box";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingDef, getSettingsForTab, type SettingDef } from "./settings-defs";
-import { ModelSelectorComponent } from "./model-selector";
 import { SnapcompactShapePreview } from "./snapcompact-shape-preview";
 import { getPreset } from "./status-line/presets";
 

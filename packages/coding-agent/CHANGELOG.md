@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add minimal Task subagent tool profiles via toolProfile and compose them with subagent permission profiles.
+
 ### Fixed
 
 - Fixed recoverable context-overflow compaction keeping the failed assistant error turn in visible session history after scheduling the retry. ([#3747](https://github.com/can1357/oh-my-pi/issues/3747))

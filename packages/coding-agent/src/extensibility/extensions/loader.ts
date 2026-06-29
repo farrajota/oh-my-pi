@@ -35,9 +35,9 @@ import type {
 	LoadExtensionsResult,
 	MessageRenderer,
 	ProviderConfig,
-	WorkingMessageSuffixRenderer,
 	RegisteredCommand,
 	ToolDefinition,
+	WorkingMessageSuffixRenderer,
 } from "./types";
 
 installLegacyPiSpecifierShim();

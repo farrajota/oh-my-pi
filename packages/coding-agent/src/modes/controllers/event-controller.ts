@@ -898,8 +898,15 @@ export class EventController {
 			this.#currentAssistantMessageTokenEstimate = 0;
 			this.#updateWorkingMessageRunTokenDelta();
 			const elapsedMs = this.ctx.getWorkingMessageRunElapsedMs();
-			if (successfulAssistant && elapsedMs !== undefined && hasVisibleAssistantContent(event.message) && !hasToolCallContent(event.message)) {
-				this.#lastAssistantComponent.setCompletionFooter(formatCompletionFooter(elapsedMs, this.#currentRunTokenDelta));
+			if (
+				successfulAssistant &&
+				elapsedMs !== undefined &&
+				hasVisibleAssistantContent(event.message) &&
+				!hasToolCallContent(event.message)
+			) {
+				this.#lastAssistantComponent.setCompletionFooter(
+					formatCompletionFooter(elapsedMs, this.#currentRunTokenDelta),
+				);
 			}
 			this.#lastAssistantComponent.markTranscriptBlockFinalized();
 			if (settings.get("display.showTokenUsage")) {
@@ -1125,7 +1132,8 @@ export class EventController {
 		// end, but it still owns the old working-message run and loader timer.
 		const lastEventAssistant = lastAssistantMessage(event.messages);
 		const mismatchedAgentEnd =
-			lastEventAssistant !== undefined && !isSameAssistantTurnEnd(lastEventAssistant, this.#lastCompletedAssistantMessage);
+			lastEventAssistant !== undefined &&
+			!isSameAssistantTurnEnd(lastEventAssistant, this.#lastCompletedAssistantMessage);
 		if (mismatchedAgentEnd && this.ctx.session.agent.state.isStreaming) return;
 
 		this.ctx.endWorkingMessageRun();

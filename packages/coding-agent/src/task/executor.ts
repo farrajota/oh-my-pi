@@ -42,8 +42,8 @@ import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
-import type { ContextFileEntry, ToolSession } from "../tools";
-import { resolveEvalBackends } from "../tools/eval-backends";
+import type { ContextFileEntry } from "../tools";
+import { normalizeToolNames } from "../tools/builtin-names";
 import { isIrcEnabled } from "../tools/irc";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import {
@@ -56,8 +56,8 @@ import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
-import { type EffectiveSubagentPermissions, formatPermissionScopeForPrompt } from "./permission-profiles";
 import { Semaphore } from "./parallel";
+import { type EffectiveSubagentPermissions, formatPermissionScopeForPrompt } from "./permission-profiles";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
 	type AgentDefinition,
@@ -735,54 +735,58 @@ function getUsageTokens(usage: unknown): number {
 /**
  * Create proxy tools that reuse the parent's MCP connections.
  */
-export function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
-	return mcpManager.getTools().map(tool => {
-		const mcpTool = tool as { mcpToolName?: string; mcpServerName?: string };
-		return {
-			name: tool.name,
-			label: tool.label ?? tool.name,
-			description: tool.description ?? "",
-			parameters: tool.parameters,
-			execute: async (_toolCallId, params, _onUpdate, _ctx, signal) => {
-				if (signal?.aborted) {
-					throw new ToolAbortError();
-				}
-				const serverName = mcpTool.mcpServerName ?? "";
-				const mcpToolName = mcpTool.mcpToolName ?? "";
-				try {
-					const result = await withAbortTimeout(
-						(async () => {
-							const connection = await mcpManager.waitForConnection(serverName);
-							return callTool(connection, mcpToolName, params as Record<string, unknown>, { signal });
-						})(),
-						MCP_CALL_TIMEOUT_MS,
-						signal,
-					);
-					return {
-						content: (result.content ?? []).map(item =>
-							item.type === "text"
-								? { type: "text" as const, text: item.text ?? "" }
-								: { type: "text" as const, text: JSON.stringify(item) },
-						),
-						details: { serverName, mcpToolName, isError: result.isError },
-					};
-				} catch (error) {
-					if (error instanceof ToolAbortError) {
-						throw error;
+export function createMCPProxyTools(mcpManager: MCPManager, allowedToolNames?: readonly string[]): CustomTool[] {
+	const allowedNames = allowedToolNames === undefined ? undefined : new Set(normalizeToolNames(allowedToolNames));
+	return mcpManager
+		.getTools()
+		.filter(tool => allowedNames === undefined || allowedNames.has(tool.name))
+		.map(tool => {
+			const mcpTool = tool as { mcpToolName?: string; mcpServerName?: string };
+			return {
+				name: tool.name,
+				label: tool.label ?? tool.name,
+				description: tool.description ?? "",
+				parameters: tool.parameters,
+				execute: async (_toolCallId, params, _onUpdate, _ctx, signal) => {
+					if (signal?.aborted) {
+						throw new ToolAbortError();
 					}
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `MCP error: ${error instanceof Error ? error.message : String(error)}`,
-							},
-						],
-						details: { serverName, mcpToolName, isError: true },
-					};
-				}
-			},
-		};
-	});
+					const serverName = mcpTool.mcpServerName ?? "";
+					const mcpToolName = mcpTool.mcpToolName ?? "";
+					try {
+						const result = await withAbortTimeout(
+							(async () => {
+								const connection = await mcpManager.waitForConnection(serverName);
+								return callTool(connection, mcpToolName, params as Record<string, unknown>, { signal });
+							})(),
+							MCP_CALL_TIMEOUT_MS,
+							signal,
+						);
+						return {
+							content: (result.content ?? []).map(item =>
+								item.type === "text"
+									? { type: "text" as const, text: item.text ?? "" }
+									: { type: "text" as const, text: JSON.stringify(item) },
+							),
+							details: { serverName, mcpToolName, isError: result.isError },
+						};
+					} catch (error) {
+						if (error instanceof ToolAbortError) {
+							throw error;
+						}
+						return {
+							content: [
+								{
+									type: "text" as const,
+									text: `MCP error: ${error instanceof Error ? error.message : String(error)}`,
+								},
+							],
+							details: { serverName, mcpToolName, isError: true },
+						};
+					}
+				},
+			};
+		});
 }
 
 export function createSubagentSettings(
@@ -1916,12 +1920,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	// Add tools if specified
 	let toolNames: string[] | undefined;
-	if (agent.tools && agent.tools.length > 0) {
+	if (agent.tools !== undefined) {
 		toolNames = agent.tools;
-		// Auto-include task tool if spawns defined but task not in tools
-		if (agent.spawns !== undefined && !toolNames.includes("task") && !atMaxDepth) {
-			toolNames = [...toolNames, "task"];
-		}
 	}
 
 	if (atMaxDepth && toolNames?.includes("task")) {
@@ -1929,15 +1929,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	}
 	const ircDenied = options.permissionScope?.denyTools.some(tool => tool.toLowerCase() === "irc") ?? false;
 	// IRC is normally available; when a permission profile denies it, do not auto-add it.
-	if (toolNames && !toolNames.includes("irc") && !ircDenied) {
+	if (toolNames !== undefined && !toolNames.includes("irc") && !ircDenied) {
 		toolNames = [...toolNames, "irc"];
-	}
-	if (toolNames?.includes("exec")) {
-		const backends = resolveEvalBackends({ settings } as ToolSession);
-		const expanded = toolNames.filter(name => name !== "exec");
-		if (backends.python || backends.js || backends.ruby || backends.julia) expanded.push("eval");
-		expanded.push("bash");
-		toolNames = Array.from(new Set(expanded));
 	}
 
 	const modelPatterns = normalizeModelPatterns(modelOverride ?? agent.model);
@@ -2123,7 +2116,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			sessionOpenedAt = performance.now();
 
-			const mcpProxyTools = options.mcpManager ? createMCPProxyTools(options.mcpManager) : [];
+			const mcpProxyTools = options.mcpManager ? createMCPProxyTools(options.mcpManager, toolNames) : [];
 			const enableMCP = !options.mcpManager;
 
 			// Derive subagent-scoped telemetry from the parent's config so the

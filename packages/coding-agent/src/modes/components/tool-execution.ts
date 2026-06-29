@@ -1207,7 +1207,12 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	#formatToolExecution(contentWidth: number): string {
 		const lines: string[] = [];
 		const icon = this.#isPartial ? "pending" : this.#result?.isError ? "error" : "done";
-		lines.push(renderStatusLine({ icon, title: this.#toolLabel, meta: formatToolMeta(this.#elapsedMs, this.#tokenCount) }, theme));
+		lines.push(
+			renderStatusLine(
+				{ icon, title: this.#toolLabel, meta: formatToolMeta(this.#elapsedMs, this.#tokenCount) },
+				theme,
+			),
+		);
 
 		const argsObject = this.#args && typeof this.#args === "object" ? (this.#args as Record<string, unknown>) : null;
 		if (!this.#expanded && argsObject && Object.keys(argsObject).length > 0) {

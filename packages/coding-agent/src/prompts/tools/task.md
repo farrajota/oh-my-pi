@@ -21,11 +21,13 @@
   - `id`: stable agent id, CamelCase, ≤32 chars; generated when omitted
   - `description`: UI label only — subagent never sees it
   - `role`: specialist identity this subagent embodies (e.g. "Auth-flow security reviewer") — sets its system-prompt persona and roster display name; tailor every spawn rather than cloning a generic worker
+  - `toolProfile`: optional least-privilege tool profile. Allowed values: `none`, `inspect`, `review`, `edit`, `plan`, `web-research`, `vision`. Meanings: `none=[]`; `inspect=read/search/find`; `review=read/search/find/ast_grep`; `edit=read/search/find/ast_grep/edit/write`; `plan=read/search/find/lsp/web_search`; `web-research=web_search/read`; `vision=read/inspect_image`.
 {{#if isolationEnabled}}
   - `isolated`: run this spawn in an isolated env; returns patches. Isolated agents are torn down at completion — not addressable afterwards
 {{/if}}
 {{#if permissionsEnabled}}
   - `permissions`: least-privilege guardrails for this spawn. Prefer profiles; add inline path/tool overrides only when needed:
+    When both toolProfile and permissions are supplied, the effective tool set is the intersection; permissions never widen toolProfile.
     - `profiles`: permission profile names. Combine multiple profiles when the task needs each capability.
 {{#if permissionToolsEnabled}}
     - `tools`: optional one-off tool allowlist.
@@ -41,11 +43,13 @@
 - `description`: UI label only — subagent never sees it
 - `role`: specialist identity this subagent embodies (e.g. "Auth-flow security reviewer") — sets its system-prompt persona and roster display name; tailor every spawn rather than cloning a generic worker
 - `assignment`: complete self-contained instructions; one-liners and missing acceptance criteria are PROHIBITED
+- `toolProfile`: optional least-privilege tool profile. Allowed values: `none`, `inspect`, `review`, `edit`, `plan`, `web-research`, `vision`. Meanings: `none=[]`; `inspect=read/search/find`; `review=read/search/find/ast_grep`; `edit=read/search/find/ast_grep/edit/write`; `plan=read/search/find/lsp/web_search`; `web-research=web_search/read`; `vision=read/inspect_image`.
 {{#if isolationEnabled}}
 - `isolated`: run in isolated env; returns patches. Isolated agents are torn down at completion — not addressable afterwards
 {{/if}}
 {{#if permissionsEnabled}}
 - `permissions`: least-privilege guardrails for this spawn. Prefer profiles; add inline path/tool overrides only when needed:
+  When both toolProfile and permissions are supplied, the effective tool set is the intersection; permissions never widen toolProfile.
   - `profiles`: permission profile names. Combine multiple profiles when the task needs each capability.
 {{#if permissionToolsEnabled}}
   - `tools`: optional one-off tool allowlist.

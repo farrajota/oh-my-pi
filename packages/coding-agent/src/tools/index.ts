@@ -28,8 +28,8 @@ import type { UsageStatistics } from "../session/session-entries";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
-import { canSpawnAtDepth } from "../task/types";
 import type { EffectiveSubagentPermissions } from "../task/permission-profiles";
+import { canSpawnAtDepth } from "../task/types";
 import { countToolsForAutoDiscovery, resolveEffectiveToolDiscoveryMode } from "../tool-discovery/mode";
 import type { DiscoverableTool, DiscoverableToolSearchIndex } from "../tool-discovery/tool-index";
 import type { EventBus } from "../utils/event-bus";
@@ -492,10 +492,12 @@ export type ToolName = BuiltinToolName;
 export async function createTools(session: ToolSession, toolNames?: string[]): Promise<Tool[]> {
 	const includeYield = session.requireYieldTool === true;
 	const enableLsp = session.enableLsp ?? true;
-	let requestedTools = toolNames && toolNames.length > 0 ? normalizeToolNames(toolNames) : undefined;
+	const explicitToolList = toolNames !== undefined;
+	let requestedTools = explicitToolList ? normalizeToolNames(toolNames) : undefined;
+	const explicitNoTools = requestedTools !== undefined && requestedTools.length === 0;
 	const goalEnabled = session.settings.get("goal.enabled");
 	const goalModeActive = goalEnabled && session.getGoalModeState?.()?.enabled === true;
-	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
+	if (!explicitNoTools && goalModeActive && requestedTools && !requestedTools.includes("goal")) {
 		requestedTools = [...requestedTools, "goal"];
 	}
 	const backends = resolveEvalBackends(session);
@@ -554,7 +556,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const allowEval = effectivePythonAllowed || allowJs || effectiveRubyAllowed || effectiveJuliaAllowed;
 
 	// Auto-include AST counterparts when their text-based sibling is present
-	if (requestedTools) {
+	if (!explicitNoTools && requestedTools) {
 		if (
 			requestedTools.includes("grep") &&
 			!requestedTools.includes("ast_grep") &&
@@ -657,7 +659,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		}),
 	);
 	const tools = baseResults.filter((r): r is Tool => r !== null);
-	if (!tools.some(tool => tool.name === "resolve")) {
+	if (!explicitNoTools && !tools.some(tool => tool.name === "resolve")) {
 		const resolveTool = await logger.time("createTools:resolve", HIDDEN_TOOLS.resolve, session);
 		if (resolveTool) {
 			tools.push(wrapToolWithMetaNotice(resolveTool));

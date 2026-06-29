@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { Settings, resetSettingsForTest } from "../../config/settings";
+import { resetSettingsForTest, Settings } from "../../config/settings";
 import { EventController } from "./event-controller";
 
 beforeAll(async () => {

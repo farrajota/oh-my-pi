@@ -247,11 +247,16 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		return null;
 	}
 
-	let tools = parseArrayOrCSV(frontmatter.tools);
-	if (tools) tools = normalizeToolNames(tools);
+	let tools: string[] | undefined;
+	if (Array.isArray(frontmatter.tools)) {
+		tools = frontmatter.tools.filter((item): item is string => typeof item === "string");
+	} else {
+		tools = parseArrayOrCSV(frontmatter.tools);
+	}
+	if (tools !== undefined) tools = normalizeToolNames(tools);
 
-	// Subagents with explicit tool lists always need yield
-	if (tools && !tools.includes("yield")) {
+	// Subagents with non-empty explicit tool lists always need yield
+	if (tools !== undefined && tools.length > 0 && !tools.includes("yield")) {
 		tools = [...tools, "yield"];
 	}
 

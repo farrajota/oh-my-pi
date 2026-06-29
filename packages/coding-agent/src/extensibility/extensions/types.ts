@@ -47,6 +47,7 @@ import type { Theme } from "../../modes/theme/theme";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { EffectiveSubagentPermissions } from "../../task/permission-profiles";
 import type {
 	BashToolDetails,
 	BashToolInput,
@@ -96,7 +97,6 @@ import type {
 	TurnStartEvent,
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
-import type { EffectiveSubagentPermissions } from "../../task/permission-profiles";
 import type * as TypeBox from "../typebox";
 
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";

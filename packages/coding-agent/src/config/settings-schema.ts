@@ -1485,7 +1485,8 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			group: "Input",
 			label: "Prompt Suggestions Model",
-			description: "Model or role used to generate next-prompt suggestions (smol/default/slow, pi/<role>, or provider/model)",
+			description:
+				"Model or role used to generate next-prompt suggestions (smol/default/slow, pi/<role>, or provider/model)",
 			options: "runtime",
 		},
 	},
@@ -4052,8 +4053,16 @@ export const SETTINGS_SCHEMA = {
 				"Control per-spawn subagent permission profiles. Off keeps current behavior; Suggest shows profile guidance without blocking; Enforce applies tool/path guardrails before tool calls.",
 			options: [
 				{ value: "off", label: "Off", description: "Do not expose or apply per-spawn permission profiles" },
-				{ value: "suggest", label: "Suggest", description: "Show profile guidance and pass scope to subagents without blocking tool calls" },
-				{ value: "enforce", label: "Enforce", description: "Apply selected profile tool/path guardrails before tool calls" },
+				{
+					value: "suggest",
+					label: "Suggest",
+					description: "Show profile guidance and pass scope to subagents without blocking tool calls",
+				},
+				{
+					value: "enforce",
+					label: "Enforce",
+					description: "Apply selected profile tool/path guardrails before tool calls",
+				},
 			],
 		},
 	},
@@ -4076,7 +4085,8 @@ export const SETTINGS_SCHEMA = {
 			tab: "tasks",
 			group: "Subagent Permissions",
 			label: "Path Allow/Deny Lists",
-			description: "Allow permission profiles and task spawns to restrict which files and directories a subagent should access.",
+			description:
+				"Allow permission profiles and task spawns to restrict which files and directories a subagent should access.",
 		},
 	},
 
