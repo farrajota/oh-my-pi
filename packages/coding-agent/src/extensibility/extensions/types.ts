@@ -96,6 +96,7 @@ import type {
 	TurnStartEvent,
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
+import type { EffectiveSubagentPermissions } from "../../task/permission-profiles";
 import type * as TypeBox from "../typebox";
 
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
@@ -330,6 +331,12 @@ export interface ExtensionModelQuery {
 	family(model: Model): string;
 }
 
+export interface ExtensionActorIdentity {
+	id: string;
+	kind: "main" | "sub" | "advisor";
+	parentId?: string;
+}
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -341,6 +348,10 @@ export interface ExtensionContext {
 	hasUI: boolean;
 	/** Current working directory */
 	cwd: string;
+	/** Stable actor identity for this session. */
+	actor: ExtensionActorIdentity;
+	/** Per-spawn subagent permission scope, when present. */
+	permissionScope?: EffectiveSubagentPermissions;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
 	/** Model registry for API key resolution */
@@ -621,6 +632,10 @@ export interface UserBashEvent {
 	excludeFromContext: boolean;
 	/** Current working directory */
 	cwd: string;
+	/** Stable actor identity for this session. */
+	actor: ExtensionActorIdentity;
+	/** Per-spawn subagent permission scope, when present. */
+	permissionScope?: EffectiveSubagentPermissions;
 }
 
 // ============================================================================
@@ -636,6 +651,10 @@ export interface UserPythonEvent {
 	excludeFromContext: boolean;
 	/** Current working directory */
 	cwd: string;
+	/** Stable actor identity for this session. */
+	actor: ExtensionActorIdentity;
+	/** Per-spawn subagent permission scope, when present. */
+	permissionScope?: EffectiveSubagentPermissions;
 }
 
 // ============================================================================

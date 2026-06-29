@@ -36,7 +36,7 @@ describe("task schema (single-spawn)", () => {
 			schema: '{"properties":{}}',
 		});
 		expect(parsed instanceof type.errors).toBe(false);
-		if (!(parsed instanceof type.errors)) {
+		if (!(parsed instanceof type.errors) && typeof parsed === "object" && parsed !== null) {
 			// Unknown keys are stripped: batch/context exist only on the batch
 			// schema and the per-call schema input was removed outright.
 			expect("tasks" in parsed).toBe(false);

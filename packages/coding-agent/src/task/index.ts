@@ -48,6 +48,12 @@ import type { LocalProtocolOptions } from "../internal-urls";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
+import {
+	composeEffectivePermissions,
+	loadPermissionProfiles,
+	type PermissionProfileSummary,
+	type SubagentPermissionMode,
+} from "./permission-profiles";
 import { runSubprocess } from "./executor";
 import {
 	applyEligibleNestedPatches,
@@ -174,6 +180,24 @@ export function formatResultOutputFallback(result: Pick<SingleResult, "output" |
 	return result.requests > 0 ? `(no output) after ${result.requests} req` : "(no output)";
 }
 
+function formatListForDetails(values: string[] | undefined): string | undefined {
+	return values && values.length > 0 ? values.join(", ") : undefined;
+}
+
+function appendPermissionDetails(lines: string[], permissions: TaskParams["permissions"] | undefined): void {
+	if (!permissions) return;
+	const profiles = formatListForDetails(permissions.profiles);
+	if (profiles) lines.push(`Profiles: ${truncateForPrompt(profiles)}`);
+	const tools = formatListForDetails(permissions.tools);
+	if (tools) lines.push(`Tools: ${truncateForPrompt(tools)}`);
+	const denyTools = formatListForDetails(permissions.denyTools);
+	if (denyTools) lines.push(`Denied tools: ${truncateForPrompt(denyTools)}`);
+	const allowPaths = formatListForDetails(permissions.allowPaths);
+	if (allowPaths) lines.push(`Allowed paths: ${truncateForPrompt(allowPaths)}`);
+	const denyPaths = formatListForDetails(permissions.denyPaths);
+	if (denyPaths) lines.push(`Denied paths: ${truncateForPrompt(denyPaths)}`);
+}
+
 /**
  * Render the tool description from a cached agent list and current settings.
  */
@@ -186,6 +210,12 @@ function renderDescription(
 	asyncEnabled: boolean,
 	ircEnabled: boolean,
 	parentSpawns: string,
+	permissionsEnabled: boolean,
+	permissionMode: SubagentPermissionMode,
+	permissionToolsEnabled: boolean,
+	permissionPathsEnabled: boolean,
+	permissionProfiles: PermissionProfileSummary[],
+	permissionProfileErrors: string[],
 ): string {
 	const spawningDisabled = parentSpawns === "";
 	let filteredAgents = disabledAgents.length > 0 ? agents.filter(a => !disabledAgents.includes(a.name)) : agents;
@@ -213,6 +243,12 @@ function renderDescription(
 		batchEnabled,
 		asyncEnabled,
 		ircEnabled,
+		permissionsEnabled,
+		permissionMode,
+		permissionToolsEnabled,
+		permissionPathsEnabled,
+		permissionProfiles,
+		permissionProfileErrors,
 	});
 }
 
@@ -229,9 +265,14 @@ function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
  * frontmatter, the inherited session schema, or an eval-workflow
  * `agent(..., schema)` call); `tasks`/`context` require `task.batch`.
  */
-function validateShapeParams(batchEnabled: boolean, params: TaskParams): string | undefined {
+function validateShapeParams(batchEnabled: boolean, permissionsEnabled: boolean, params: TaskParams): string | undefined {
 	if ((params as Record<string, unknown>).schema !== undefined) {
 		return "The task tool does not accept `schema`. Rely on the selected agent definition's `output` schema or the inherited session schema; workflows needing ad-hoc structured output use eval `agent(prompt, schema)`.";
+	}
+	if (!permissionsEnabled) {
+		if (params.permissions !== undefined || params.tasks?.some(item => item.permissions !== undefined)) {
+			return "Subagent permissions are disabled. Enable task.permissions.mode in /settings before using `permissions`.";
+		}
 	}
 	if (!batchEnabled) {
 		const disallowed = (["tasks", "context"] as const).filter(field => params[field] !== undefined);
@@ -303,7 +344,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if (Array.isArray(params.tasks) && params.tasks.length > 0) {
 		return params.tasks;
 	}
-	return [{ id: params.id, description: params.description, role: params.role, assignment: params.assignment }];
+	return [{ id: params.id, description: params.description, role: params.role, assignment: params.assignment, permissions: params.permissions }];
 }
 
 /**
@@ -319,6 +360,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem): TaskParams {
 	if (item.description !== undefined) spawn.description = item.description;
 	if (item.role !== undefined) spawn.role = item.role;
 	if (item.assignment !== undefined) spawn.assignment = item.assignment;
+	if (item.permissions !== undefined) spawn.permissions = item.permissions;
 	if (params.context !== undefined) spawn.context = params.context;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
@@ -467,6 +509,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (typeof params.context === "string" && params.context.trim()) {
 			lines.push(`Context:\n${truncateForPrompt(params.context)}`);
 		}
+		appendPermissionDetails(lines, params.permissions);
 		const tasks = Array.isArray(params.tasks) ? params.tasks : [];
 		const firstTask = tasks[0];
 		if (firstTask) {
@@ -479,6 +522,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			if (typeof firstTask.assignment === "string") {
 				lines.push(`Assignment:\n${truncateForPrompt(firstTask.assignment)}`);
 			}
+			appendPermissionDetails(lines, firstTask.permissions);
 			if (tasks.length > 1) {
 				lines.push(`+${tasks.length - 1} more task${tasks.length === 2 ? "" : "s"}`);
 			}
@@ -496,6 +540,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly mergeCallAndResult = true;
 	readonly #discoveredAgents: AgentDefinition[];
 	readonly #blockedAgent: string | undefined;
+	readonly #permissionProfiles: PermissionProfileSummary[];
+	readonly #permissionProfileErrors: string[];
 	/**
 	 * One semaphore per TaskTool instance (i.e. per session): bounds concurrent
 	 * subagents across parallel `task` calls within the session. Sized from
@@ -505,7 +551,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 	get parameters(): TaskToolSchemaInstance {
 		const isolationEnabled = this.session.settings.get("task.isolation.mode") !== "none";
-		return getTaskSchema({ isolationEnabled, batchEnabled: this.#isBatchEnabled() });
+		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
+		return getTaskSchema({
+			isolationEnabled,
+			batchEnabled: this.#isBatchEnabled(),
+			permissions: {
+				enabled: permissionMode !== "off",
+				toolsEnabled: this.session.settings.get("task.permissions.tools.enabled"),
+				pathsEnabled: this.session.settings.get("task.permissions.paths.enabled"),
+			},
+		});
 	}
 
 	renderCall(args: unknown, options: Parameters<typeof renderTaskCall>[1], theme: Theme) {
@@ -517,6 +572,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const disabledAgents = this.session.settings.get("task.disabledAgents") as string[];
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
 		const isolationMode = this.session.settings.get("task.isolation.mode");
+		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
 		return renderDescription(
 			this.#discoveredAgents,
 			maxConcurrency,
@@ -526,14 +582,24 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			this.session.settings.get("async.enabled"),
 			isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			this.session.getSessionSpawns() ?? "*",
+			permissionMode !== "off",
+			permissionMode,
+			this.session.settings.get("task.permissions.tools.enabled"),
+			this.session.settings.get("task.permissions.paths.enabled"),
+			this.#permissionProfiles,
+			this.#permissionProfileErrors,
 		);
 	}
 	private constructor(
 		private readonly session: ToolSession,
 		discoveredAgents: AgentDefinition[],
+		permissionProfiles: PermissionProfileSummary[],
+		permissionProfileErrors: string[],
 	) {
 		this.#blockedAgent = $env.PI_BLOCKED_AGENT;
 		this.#discoveredAgents = discoveredAgents;
+		this.#permissionProfiles = permissionProfiles;
+		this.#permissionProfileErrors = permissionProfileErrors;
 	}
 
 	#isBatchEnabled(): boolean {
@@ -549,8 +615,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * Create a TaskTool instance with async agent discovery.
 	 */
 	static async create(session: ToolSession): Promise<TaskTool> {
-		const { agents } = await discoverAgentsForCreate(session.cwd);
-		return new TaskTool(session, agents);
+		const [{ agents }, profileLoad] = await Promise.all([discoverAgentsForCreate(session.cwd), loadPermissionProfiles(session.cwd)]);
+		return new TaskTool(session, agents, profileLoad.summaries, profileLoad.errors);
 	}
 
 	async execute(
@@ -561,7 +627,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const params = repairTaskParams(rawParams as TaskParams);
 		const batchEnabled = this.#isBatchEnabled();
-		const validationError = validateShapeParams(batchEnabled, params) ?? validateSpawnParams(params, batchEnabled);
+		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
+		const permissionsEnabled = permissionMode !== "off";
+		const validationError = validateShapeParams(batchEnabled, permissionsEnabled, params) ?? validateSpawnParams(params, batchEnabled);
 		if (validationError) {
 			return createTaskModeError(validationError);
 		}
@@ -1110,6 +1178,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// structured output go through eval agent(prompt, schema).
 		const effectiveOutputSchema = effectiveAgent.output ?? this.session.outputSchema;
 
+		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
+		const permissionToolsEnabled = this.session.settings.get("task.permissions.tools.enabled");
+		const permissionPathsEnabled = this.session.settings.get("task.permissions.paths.enabled");
+		const ircEnabled = isIrcEnabled(this.session.settings, taskDepth);
+		let permissionAgent: typeof effectiveAgent = effectiveAgent;
+		const loadedPermissionProfiles = await loadPermissionProfiles(this.session.cwd);
+
 		let isolationContext: IsolationContext | null = null;
 		if (isIsolated) {
 			try {
@@ -1195,6 +1270,45 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				agentId = await outputManager.allocate(params.id?.trim() || generateTaskName());
 			}
 
+			const composedPermissions = composeEffectivePermissions({
+				mode: permissionMode,
+				toolsEnabled: permissionToolsEnabled,
+				pathsEnabled: permissionPathsEnabled,
+				actorId: agentId,
+				actorKind: "sub",
+				parentId: this.session.getAgentId?.() ?? MAIN_AGENT_ID,
+				request: params.permissions,
+				inherited: this.session.getPermissionScope?.(),
+				profiles: loadedPermissionProfiles.profiles,
+			});
+			if (!composedPermissions.ok) {
+				return {
+					content: [{ type: "text", text: composedPermissions.error }],
+					details: { projectAgentsDir, results: [], totalDurationMs: Date.now() - startTime },
+				};
+			}
+			const permissionScope = composedPermissions.value;
+			if (permissionScope.mode === "enforce" && permissionScope.toolsEnabled) {
+				const deniedTools = new Set(permissionScope.denyTools.map(tool => tool.toLowerCase()));
+				const allowlistedTools = permissionScope.tools
+					? new Set(permissionScope.tools.map(tool => tool.toLowerCase()))
+					: undefined;
+				const candidateTools = permissionAgent.tools ?? permissionScope.tools ?? this.session.getActiveToolNames?.();
+				if (candidateTools) {
+					let nextTools = candidateTools.filter(tool => {
+						const normalized = tool.toLowerCase();
+						if (deniedTools.has(normalized)) return false;
+						if (allowlistedTools && !allowlistedTools.has(normalized)) return false;
+						return this.session.getToolByName ? this.session.getToolByName(tool) !== undefined : true;
+					});
+					if (ircEnabled && !deniedTools.has("irc") && !nextTools.some(tool => tool.toLowerCase() === "irc")) {
+						nextTools = [...nextTools, "irc"];
+					}
+					permissionAgent = { ...permissionAgent, tools: nextTools };
+				}
+			}
+
+
 			const availableSkills = [...(this.session.skills ?? [])];
 			// Resolve autoload skills from agent definition against available skills
 			const resolvedAutoloadSkills =
@@ -1246,7 +1360,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			const sharedRunOptions = {
 				cwd: this.session.cwd,
-				agent: effectiveAgent,
+				agent: permissionAgent,
 				task: renderSubagentUserPrompt(assignment),
 				assignment,
 				context: sharedContext,
@@ -1296,6 +1410,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				parentTelemetry: this.session.getTelemetry?.(),
 				parentEvalSessionId,
 				parentAgentId: this.session.getAgentId?.() ?? MAIN_AGENT_ID,
+				permissionScope,
 				// Live source of truth for `serviceTierSubagent: inherit`. When the
 				// session exposes a tier accessor, pass tier-or-null (null = explicit
 				// none, e.g. /fast off); otherwise leave undefined so inherit falls

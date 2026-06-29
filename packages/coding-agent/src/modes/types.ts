@@ -253,6 +253,10 @@ export interface InteractiveModeContext {
 	flushPendingModelSwitch(): Promise<void>;
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
+	beginWorkingMessageRun(): void;
+	endWorkingMessageRun(): void;
+	getWorkingMessageRunElapsedMs(): number | undefined;
+	setWorkingMessageRunTokenDelta(tokenDelta: number): void;
 	ensureLoadingAnimation(): void;
 	startPendingSubmission(input: {
 		text: string;

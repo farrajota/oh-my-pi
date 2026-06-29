@@ -490,6 +490,7 @@ export class ExtensionUiController {
 						compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 						hasUI: true,
 						cwd: this.ctx.sessionManager.getCwd(),
+						actor: { id: "Main", kind: "main" },
 						sessionManager: this.ctx.session.sessionManager,
 						modelRegistry: this.ctx.session.modelRegistry,
 						model: this.ctx.session.model,

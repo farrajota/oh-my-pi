@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { ExtensionRunner } from "../runner";
-import type { Extension, ExtensionError, ExtensionRuntime, WorkingMessageSuffixContext } from "../types";
+import type { Extension, ExtensionError, ExtensionRuntime, WorkingMessageSuffixContext, WorkingMessageSuffixRenderer } from "../types";
 
 function extension(resolvedPath: string, suffixes: Extension["workingMessageSuffixes"]): Extension {
 	return {
@@ -41,7 +41,7 @@ describe("ExtensionRunner.renderWorkingMessageSuffix", () => {
 		const suffix = runner([
 			extension(
 				"/extensions/empty.ts",
-				new Map([
+				new Map<string, WorkingMessageSuffixRenderer>([
 					["undefined", () => undefined],
 					["empty", () => ""],
 				]),

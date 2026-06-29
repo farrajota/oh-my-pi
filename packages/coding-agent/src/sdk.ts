@@ -130,6 +130,7 @@ import {
 	loadProjectContextFiles as loadContextFilesInternal,
 } from "./system-prompt";
 import { AgentOutputManager } from "./task/output-manager";
+import type { EffectiveSubagentPermissions } from "./task/permission-profiles";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -509,6 +510,8 @@ export interface CreateAgentSessionOptions {
 	 * top-level "Main" session, which has no parent.
 	 */
 	parentAgentId?: string;
+	/** Per-spawn subagent permission scope, when present. */
+	permissionScope?: EffectiveSubagentPermissions;
 	/** Inherited eval executor session id for subagents sharing parent eval state. */
 	parentEvalSessionId?: string;
 
@@ -1530,6 +1533,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
+			getPermissionScope: () => options.permissionScope,
+			getActiveToolNames: () => session?.getActiveToolNames() ?? [],
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",
@@ -2042,6 +2047,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			modelRegistry,
 			() => (hasSession ? createSessionMemoryRuntimeContext(session, agentDir, cwd) : undefined),
 			settings,
+			{
+				actor: {
+					id: resolvedAgentId,
+					kind: agentKind,
+					parentId: options.parentAgentId,
+				},
+				permissionScope: options.permissionScope,
+			},
 		);
 
 		credentialDisabledTarget = extensionRunner;

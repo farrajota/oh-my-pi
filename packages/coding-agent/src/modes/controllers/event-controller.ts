@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Loader, TERMINAL } from "@oh-my-pi/pi-tui";
@@ -91,19 +91,23 @@ function toolResultMessageFromEvent(event: Extract<AgentSessionEvent, { type: "t
 	} as AgentMessage;
 }
 
-function lastAssistantMessage(messages: AgentMessage[]): AgentMessage | undefined {
+function isAssistantMessage(message: AgentMessage): message is AssistantMessage {
+	return message.role === "assistant";
+}
+
+function lastAssistantMessage(messages: AgentMessage[]): AssistantMessage | undefined {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
-		if (message.role === "assistant") return message;
+		if (isAssistantMessage(message)) return message;
 	}
 	return undefined;
 }
 
-function isSameAssistantTurnEnd(a: AgentMessage | undefined, b: AgentMessage | undefined): boolean {
+function isSameAssistantTurnEnd(a: AssistantMessage | undefined, b: AssistantMessage | undefined): boolean {
 	return a !== undefined && b !== undefined && (a === b || (a.timestamp === b.timestamp && a.content === b.content));
 }
 
-function hasVisibleAssistantContent(message: AgentMessage): boolean {
+function hasVisibleAssistantContent(message: AssistantMessage): boolean {
 	return message.content.some(
 		content =>
 			(content.type === "text" && canonicalizeMessage(content.text)) ||
@@ -111,7 +115,7 @@ function hasVisibleAssistantContent(message: AgentMessage): boolean {
 	);
 }
 
-function hasToolCallContent(message: AgentMessage): boolean {
+function hasToolCallContent(message: AssistantMessage): boolean {
 	return message.content.some(content => content.type === "toolCall");
 }
 
@@ -119,12 +123,7 @@ type AgentSessionEventHandlers = {
 	[E in AgentSessionEventKind]: (event: Extract<AgentSessionEvent, { type: E }>) => Promise<void>;
 };
 
-type WorkingMessageLifecycleContext = InteractiveModeContext & {
-	beginWorkingMessageRun(): void;
-	endWorkingMessageRun(): void;
-	getWorkingMessageRunElapsedMs(): number | undefined;
-	setWorkingMessageRunTokenDelta(tokenDelta: number): void;
-};
+type WorkingMessageLifecycleContext = InteractiveModeContext;
 
 export class EventController {
 	#lastReadGroup: ReadToolGroupComponent | undefined = undefined;
@@ -156,7 +155,7 @@ export class EventController {
 	#currentAssistantMessageTokenEstimate = 0;
 	#countedToolResultIds = new Set<string>();
 	#toolExecutionStartedAt = new Map<string, number>();
-	#lastCompletedAssistantMessage: AgentMessage | undefined = undefined;
+	#lastCompletedAssistantMessage: AssistantMessage | undefined = undefined;
 	// Insertion-ordered IRC cards not yet retired; values are the transcript
 	// components each card contributed (see #retireIrcCard for the guard).
 	#liveIrcCards = new Map<string, Component[]>();
@@ -890,7 +889,7 @@ export class EventController {
 				this.ctx.lastAssistantUsage = usage;
 			}
 			this.#lastAssistantComponent = this.ctx.streamingComponent;
-			this.#lastCompletedAssistantMessage = event.message as AgentMessage;
+			this.#lastCompletedAssistantMessage = event.message;
 			const successfulAssistant =
 				this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error";
 			if (successfulAssistant) {
@@ -899,7 +898,7 @@ export class EventController {
 			this.#currentAssistantMessageTokenEstimate = 0;
 			this.#updateWorkingMessageRunTokenDelta();
 			const elapsedMs = this.ctx.getWorkingMessageRunElapsedMs();
-			if (successfulAssistant && elapsedMs !== undefined && hasVisibleAssistantContent(event.message as AgentMessage) && !hasToolCallContent(event.message as AgentMessage)) {
+			if (successfulAssistant && elapsedMs !== undefined && hasVisibleAssistantContent(event.message) && !hasToolCallContent(event.message)) {
 				this.#lastAssistantComponent.setCompletionFooter(formatCompletionFooter(elapsedMs, this.#currentRunTokenDelta));
 			}
 			this.#lastAssistantComponent.markTranscriptBlockFinalized();

@@ -639,6 +639,39 @@ function formatOutputInline(data: unknown, theme: Theme, maxWidth = 80): string 
 	return `Output: ${pairs.join(", ")}`;
 }
 
+function stringList(value: unknown): string[] {
+	return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.length > 0) : [];
+}
+
+function renderPermissionLines(permissions: Partial<TaskItem>["permissions"] | Partial<TaskParams>["permissions"] | undefined): string[] {
+	if (!permissions) return [];
+	const lines: string[] = [];
+	const profiles = stringList(permissions.profiles);
+	const tools = stringList(permissions.tools);
+	const denyTools = stringList(permissions.denyTools);
+	const allowPaths = stringList(permissions.allowPaths);
+	const denyPaths = stringList(permissions.denyPaths);
+	if (profiles.length > 0) lines.push(`Profiles: ${profiles.join(" + ")}`);
+	if (tools.length > 0 || denyTools.length > 0) {
+		const parts: string[] = [];
+		if (tools.length > 0) parts.push(tools.join(", "));
+		if (denyTools.length > 0) parts.push(`deny ${denyTools.join(", ")}`);
+		lines.push(`Tools: ${parts.join("; ")}`);
+	}
+	if (allowPaths.length > 0 || denyPaths.length > 0) {
+		const parts: string[] = [];
+		if (allowPaths.length > 0) parts.push(`allow ${allowPaths.join(", ")}`);
+		if (denyPaths.length > 0) parts.push(`deny ${denyPaths.join(", ")}`);
+		lines.push(`Paths: ${parts.join("; ")}`);
+	}
+	return lines;
+}
+
+function appendPermissionLines(lines: string[], permissions: Partial<TaskItem>["permissions"] | Partial<TaskParams>["permissions"] | undefined, theme: Theme): void {
+	const permissionLines = renderPermissionLines(permissions);
+	for (const line of permissionLines) lines.push(`  ${theme.fg("dim", line)}`);
+}
+
 /**
  * Render the call preview lines for the single spawned agent. The
  * args stream in token by token, so every field access is defensive.
@@ -658,6 +691,7 @@ function renderTaskCallLines(args: Partial<TaskParams> | undefined, theme: Theme
 		}
 		lines.push(line);
 	}
+	appendPermissionLines(lines, args.permissions, theme);
 	lines.push(...renderTaskItemLines(args.tasks, theme));
 	return lines;
 }
@@ -693,6 +727,7 @@ function renderTaskItemLines(tasks: TaskItem[] | undefined, theme: Theme): strin
 			line += theme.fg("dim", " [isolated]");
 		}
 		lines.push(line);
+		appendPermissionLines(lines, task?.permissions, theme);
 	}
 	if (cap < tasks.length) {
 		lines.push(`${bullet} ${theme.fg("dim", formatMoreItems(tasks.length - cap, "agent"))}`);

@@ -139,7 +139,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Discovery & MCP",
 		"Developer",
 	],
-	tasks: ["Modes", "Subagents", "Isolation", "Commands & Skills"],
+	tasks: ["Modes", "Subagents", "Isolation", "Subagent Permissions", "Commands & Skills"],
 	providers: ["Services", "Fireworks", "Tiny Model", "Protocol", "Privacy"],
 };
 
@@ -4037,6 +4037,46 @@ export const SETTINGS_SCHEMA = {
 			label: "LSP in Subagents",
 			description:
 				"Allow subagents spawned via the task tool to use the lsp tool. Off by default to keep subagents cheap; enable when LSP-aware delegation is worth the extra tokens.",
+		},
+	},
+
+	"task.permissions.mode": {
+		type: "enum",
+		values: ["off", "suggest", "enforce"] as const,
+		default: "off",
+		ui: {
+			tab: "tasks",
+			group: "Subagent Permissions",
+			label: "Permission Profiles",
+			description:
+				"Control per-spawn subagent permission profiles. Off keeps current behavior; Suggest shows profile guidance without blocking; Enforce applies tool/path guardrails before tool calls.",
+			options: [
+				{ value: "off", label: "Off", description: "Do not expose or apply per-spawn permission profiles" },
+				{ value: "suggest", label: "Suggest", description: "Show profile guidance and pass scope to subagents without blocking tool calls" },
+				{ value: "enforce", label: "Enforce", description: "Apply selected profile tool/path guardrails before tool calls" },
+			],
+		},
+	},
+
+	"task.permissions.tools.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Subagent Permissions",
+			label: "Tool Allow/Deny Lists",
+			description: "Allow permission profiles and task spawns to restrict which tools a subagent can use.",
+		},
+	},
+
+	"task.permissions.paths.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Subagent Permissions",
+			label: "Path Allow/Deny Lists",
+			description: "Allow permission profiles and task spawns to restrict which files and directories a subagent should access.",
 		},
 	},
 

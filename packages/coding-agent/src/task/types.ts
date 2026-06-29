@@ -4,6 +4,7 @@ import { $env } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { NestedRepoPatch } from "./worktree";
+import type { TaskPermissionRequest } from "./permission-profiles";
 
 /** Source of an agent definition */
 export type AgentSource = "bundled" | "user" | "project";
@@ -80,20 +81,100 @@ export const ROLE_LABEL_MAX = 80;
 export const ROLE_INPUT_MAX = 256;
 const ROLE_INPUT_SCHEMA = `string <= ${ROLE_INPUT_MAX}` as const;
 
-export const taskItemSchema = type({
-	"id?": "string",
-	"description?": "string",
-	"role?": ROLE_INPUT_SCHEMA,
-	assignment: "string",
+const taskPermissionSchema = type({
+	"profiles?": "string[]",
+	"tools?": "string[]",
+	"denyTools?": "string[]",
+	"allowPaths?": "string[]",
+	"denyPaths?": "string[]",
 	"+": "delete",
 });
-const taskItemSchemaIsolated = type({
-	"id?": "string",
-	"description?": "string",
-	"role?": ROLE_INPUT_SCHEMA,
-	assignment: "string",
-	"isolated?": "boolean",
+
+const taskPermissionSchemaToolsOnly = type({
+	"profiles?": "string[]",
+	"tools?": "string[]",
+	"denyTools?": "string[]",
 	"+": "delete",
+});
+
+const taskPermissionSchemaPathsOnly = type({
+	"profiles?": "string[]",
+	"allowPaths?": "string[]",
+	"denyPaths?": "string[]",
+	"+": "delete",
+});
+
+const taskPermissionSchemaProfilesOnly = type({
+	"profiles?": "string[]",
+	"+": "delete",
+});
+
+function selectTaskPermissionSchema(options: {
+	enabled: boolean;
+	toolsEnabled: boolean;
+	pathsEnabled: boolean;
+}) {
+	if (!options.enabled) return undefined;
+	if (options.toolsEnabled && options.pathsEnabled) return taskPermissionSchema;
+	if (options.toolsEnabled) return taskPermissionSchemaToolsOnly;
+	if (options.pathsEnabled) return taskPermissionSchemaPathsOnly;
+	return taskPermissionSchemaProfilesOnly;
+}
+
+function createTaskItemSchema(options: {
+	isolationEnabled: boolean;
+	permissions: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
+}) {
+	const shape: Record<string, unknown> = {
+		"id?": "string",
+		"description?": "string",
+		"role?": ROLE_INPUT_SCHEMA,
+		assignment: "string",
+		"+": "delete",
+	};
+	if (options.isolationEnabled) shape["isolated?"] = "boolean";
+	const permissionSchema = selectTaskPermissionSchema(options.permissions);
+	if (permissionSchema) shape["permissions?"] = permissionSchema;
+	return type(shape);
+}
+
+function createTaskSchema(options: {
+	isolationEnabled: boolean;
+	permissions: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
+}) {
+	const shape: Record<string, unknown> = {
+		agent: "string",
+		"id?": "string",
+		"description?": "string",
+		"role?": ROLE_INPUT_SCHEMA,
+		assignment: "string",
+		"+": "delete",
+	};
+	if (options.isolationEnabled) shape["isolated?"] = "boolean";
+	const permissionSchema = selectTaskPermissionSchema(options.permissions);
+	if (permissionSchema) shape["permissions?"] = permissionSchema;
+	return type(shape);
+}
+
+function createBatchTaskSchema(options: {
+	isolationEnabled: boolean;
+	permissions: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
+}) {
+	return type({
+		agent: "string",
+		context: "string",
+		tasks: createTaskItemSchema(options).array(),
+		"+": "delete",
+	});
+}
+
+export const taskItemSchema = createTaskItemSchema({
+	isolationEnabled: false,
+	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
+});
+const taskItemSchemaIsolated = createTaskItemSchema({
+	isolationEnabled: true,
+	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 });
 
 /** Single task item. Fields are optional defensively: args stream in token by token. */
@@ -106,51 +187,48 @@ export interface TaskItem {
 	role?: string;
 	/** The work; required by the schema. */
 	assignment?: string;
+	/** Least-privilege guardrails for this spawn. */
+	permissions?: TaskPermissionRequest;
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
 }
 
-export const taskSchema = type({
-	agent: "string",
-	"id?": "string",
-	"description?": "string",
-	"role?": ROLE_INPUT_SCHEMA,
-	assignment: "string",
-	"isolated?": "boolean",
-	"+": "delete",
+export const taskSchema = createTaskSchema({
+	isolationEnabled: true,
+	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 });
-const taskSchemaNoIsolation = type({
-	agent: "string",
-	"id?": "string",
-	"description?": "string",
-	"role?": ROLE_INPUT_SCHEMA,
-	assignment: "string",
-	"+": "delete",
+const taskSchemaNoIsolation = createTaskSchema({
+	isolationEnabled: false,
+	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 });
-const taskSchemaBatch = type({
-	agent: "string",
-	context: "string",
-	tasks: taskItemSchemaIsolated.array(),
-	"+": "delete",
+const taskSchemaBatch = createBatchTaskSchema({
+	isolationEnabled: true,
+	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 });
-const taskSchemaBatchNoIsolation = type({
-	agent: "string",
-	context: "string",
-	tasks: taskItemSchema.array(),
-	"+": "delete",
+const taskSchemaBatchNoIsolation = createBatchTaskSchema({
+	isolationEnabled: false,
+	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 });
 const ALL_TASK_SCHEMAS = [taskSchema, taskSchemaNoIsolation, taskSchemaBatch, taskSchemaBatchNoIsolation] as const;
 
-type DynamicTaskSchema = (typeof ALL_TASK_SCHEMAS)[number];
+type DynamicTaskSchema = (typeof ALL_TASK_SCHEMAS)[number] | ReturnType<typeof createTaskSchema> | ReturnType<typeof createBatchTaskSchema>;
 export type TaskSchema = typeof taskSchema;
 /** Active task tool parameter schema for the current isolation / batch flags */
 export type TaskToolSchemaInstance = DynamicTaskSchema;
 
-export function getTaskSchema(options: { isolationEnabled: boolean; batchEnabled: boolean }): DynamicTaskSchema {
-	if (options.batchEnabled) {
-		return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
+export function getTaskSchema(options: {
+	isolationEnabled: boolean;
+	batchEnabled: boolean;
+	permissions?: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
+}): DynamicTaskSchema {
+	const permissions = options.permissions ?? { enabled: false, toolsEnabled: false, pathsEnabled: false };
+	if (!permissions.enabled) {
+		if (options.batchEnabled) {
+			return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
+		}
+		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
+	return options.batchEnabled ? createBatchTaskSchema({ ...options, permissions }) : createTaskSchema({ ...options, permissions });
 }
 
 /**
@@ -174,6 +252,8 @@ export interface TaskParams {
 	tasks?: TaskItem[];
 	/** Batch form: shared background prepended to every assignment; required by the batch schema. */
 	context?: string;
+	/** Least-privilege guardrails for the flat-form spawn. */
+	permissions?: TaskPermissionRequest;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
 }

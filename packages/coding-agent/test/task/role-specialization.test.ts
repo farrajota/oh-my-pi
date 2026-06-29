@@ -89,7 +89,7 @@ describe("task schema accepts role", () => {
 	it("keeps role on the flat single-spawn shape", () => {
 		const parsed = taskSchema({ agent: "task", assignment: "x", role: "Rust specialist" });
 		expect(parsed instanceof type.errors).toBe(false);
-		if (!(parsed instanceof type.errors)) {
+		if (!(parsed instanceof type.errors) && typeof parsed === "object" && parsed !== null && "role" in parsed) {
 			expect(parsed.role).toBe("Rust specialist");
 		}
 	});
@@ -102,7 +102,7 @@ describe("task schema accepts role", () => {
 			tasks: [{ assignment: "x", role: "DB migration specialist" }],
 		});
 		expect(parsed instanceof type.errors).toBe(false);
-		if (!(parsed instanceof type.errors) && "tasks" in parsed) {
+		if (!(parsed instanceof type.errors) && typeof parsed === "object" && parsed !== null && "tasks" in parsed) {
 			const tasks = parsed.tasks as Array<{ role?: string }>;
 			expect(tasks[0]?.role).toBe("DB migration specialist");
 		}

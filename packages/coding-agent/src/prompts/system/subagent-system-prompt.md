@@ -14,6 +14,10 @@ CONTEXT
 {{context}}
 {{/if}}
 
+{{#if permissionBlock}}
+{{permissionBlock}}
+{{/if}}
+
 {{#if planReference}}
 PLAN
 ===================================

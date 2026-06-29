@@ -56,6 +56,7 @@ import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
+import { type EffectiveSubagentPermissions, formatPermissionScopeForPrompt } from "./permission-profiles";
 import { Semaphore } from "./parallel";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
@@ -425,6 +426,8 @@ export interface ExecutorOptions {
 	 * passes its own `getAgentId()`).
 	 */
 	parentAgentId?: string;
+	/** Per-spawn guardrail scope composed by the task tool. */
+	permissionScope?: EffectiveSubagentPermissions;
 	/**
 	 * Keep the finished subagent addressable in the registry for IRC/revival.
 	 * Defaults to true. Eval bridge agents are programmatic one-shot helpers and
@@ -1924,9 +1927,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	if (atMaxDepth && toolNames?.includes("task")) {
 		toolNames = toolNames.filter(name => name !== "task");
 	}
-	// IRC is always available; the COOP prompt section advertises it, so a restricted
-	// whitelist must still carry `irc` for the subagent to actually use it.
-	if (toolNames && !toolNames.includes("irc")) {
+	const ircDenied = options.permissionScope?.denyTools.some(tool => tool.toLowerCase() === "irc") ?? false;
+	// IRC is normally available; when a permission profile denies it, do not auto-add it.
+	if (toolNames && !toolNames.includes("irc") && !ircDenied) {
 		toolNames = [...toolNames, "irc"];
 	}
 	if (toolNames?.includes("exec")) {
@@ -2191,6 +2194,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						outputSchema: normalizedOutputSchema,
 						ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
 						ircSelfId: ircEnabled ? id : "",
+						permissionBlock: formatPermissionScopeForPrompt(options.permissionScope),
 					});
 					return defaultPrompt.length === 0
 						? [subagentPrompt]
@@ -2214,6 +2218,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				localProtocolOptions: options.localProtocolOptions,
 				telemetry: subagentTelemetry,
 				parentEvalSessionId: options.parentEvalSessionId,
+				permissionScope: options.permissionScope,
 				onFirstChatDispatch: () => {
 					firstChatDispatchAt ??= performance.now();
 				},

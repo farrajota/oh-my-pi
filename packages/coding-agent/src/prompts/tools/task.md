@@ -24,6 +24,18 @@
 {{#if isolationEnabled}}
   - `isolated`: run this spawn in an isolated env; returns patches. Isolated agents are torn down at completion — not addressable afterwards
 {{/if}}
+{{#if permissionsEnabled}}
+  - `permissions`: least-privilege guardrails for this spawn. Prefer profiles; add inline path/tool overrides only when needed:
+    - `profiles`: permission profile names. Combine multiple profiles when the task needs each capability.
+{{#if permissionToolsEnabled}}
+    - `tools`: optional one-off tool allowlist.
+    - `denyTools`: optional one-off tool denylist.
+{{/if}}
+{{#if permissionPathsEnabled}}
+    - `allowPaths`: files/directories this spawn may access. Prefer explicit files and narrow directories.
+    - `denyPaths`: files/directories this spawn must not access.
+{{/if}}
+{{/if}}
 {{else}}
 - `id`: stable agent id, CamelCase, ≤32 chars; generated when omitted
 - `description`: UI label only — subagent never sees it
@@ -32,8 +44,48 @@
 {{#if isolationEnabled}}
 - `isolated`: run in isolated env; returns patches. Isolated agents are torn down at completion — not addressable afterwards
 {{/if}}
+{{#if permissionsEnabled}}
+- `permissions`: least-privilege guardrails for this spawn. Prefer profiles; add inline path/tool overrides only when needed:
+  - `profiles`: permission profile names. Combine multiple profiles when the task needs each capability.
+{{#if permissionToolsEnabled}}
+  - `tools`: optional one-off tool allowlist.
+  - `denyTools`: optional one-off tool denylist.
+{{/if}}
+{{#if permissionPathsEnabled}}
+  - `allowPaths`: files/directories this spawn may access. Prefer explicit files and narrow directories.
+  - `denyPaths`: files/directories this spawn must not access.
+{{/if}}
+{{/if}}
 {{/if}}
 </parameters>
+
+{{#if permissionsEnabled}}
+<permission-scoping>
+Before every spawn, choose a least-privilege permission envelope:
+1. Choose `role` for expertise.
+2. Choose `permissions.profiles` for capabilities.
+{{#if permissionPathsEnabled}}3. Add `permissions.allowPaths` for the files/directories the agent needs, and `permissions.denyPaths` for known off-limits areas.{{/if}}
+{{#if permissionToolsEnabled}}4. Add `permissions.denyTools` for tools irrelevant or risky for this task; use `permissions.tools` only when no profile fits.{{/if}}
+
+Mode: {{permissionMode}}. Profiles are guardrails, not a security sandbox. Do not ask subagents to bypass them with bash/eval. If the work needs access outside scope, the subagent should report the missing permission.
+
+Multiple profiles may be combined. Tool allows are additive. Path allows are additive. Denied tools/paths are additive. Deny wins over allow. The global baseline permissions extension always applies and cannot be relaxed by a spawn profile.
+</permission-scoping>
+
+<permission-profiles>
+{{#list permissionProfiles join="\n"}}
+# {{name}}
+{{description}}
+Use when: {{useWhen}}
+Tools: {{toolsSummary}}
+Paths: {{pathsSummary}}
+Source: {{source}}
+{{/list}}
+{{#if permissionProfileErrors}}
+Profile config errors: {{permissionProfileErrors}}
+{{/if}}
+</permission-profiles>
+{{/if}}
 
 <rules>
 - **Maximize fan-out.** Issue the widest {{#if batchEnabled}}`tasks[]` batch{{else}}set of parallel `task` calls{{/if}} the work decomposes into. NEVER serialize work that could run concurrently.
@@ -75,6 +127,7 @@ Parallel when tasks touch disjoint files or are independent refactors/tests.
 
 <assignment-fmt>
 # Target       ← exact files and symbols; explicit non-goals
+{{#if permissionsEnabled}}# Permissions  ← selected profiles, allowed paths, denied paths, special tool grants{{/if}}
 # Change       ← step-by-step add/remove/rename; APIs and patterns
 # Acceptance   ← observable result; no project-wide commands
 </assignment-fmt>

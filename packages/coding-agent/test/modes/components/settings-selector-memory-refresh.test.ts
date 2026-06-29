@@ -3,6 +3,8 @@ import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-ag
 import { SettingsSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/settings-selector";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
+type SettingsSelectorContext = ConstructorParameters<typeof SettingsSelectorComponent>[0];
+
 beforeAll(async () => {
 	await initTheme();
 });
@@ -47,6 +49,10 @@ function createSelector(onCancel: () => void = () => {}): SettingsSelectorCompon
 			availableThemes: ["dark"],
 			providers: [],
 			cwd: process.cwd(),
+			tui: {} as SettingsSelectorContext["tui"],
+			settings,
+			modelRegistry: {} as SettingsSelectorContext["modelRegistry"],
+			scopedModels: [],
 		},
 		{
 			onChange: () => {},

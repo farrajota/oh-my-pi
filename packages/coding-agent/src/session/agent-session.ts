@@ -7053,6 +7053,7 @@ export class AgentSession {
 			ui: noOpUIContext,
 			hasUI: false,
 			cwd: this.sessionManager.getCwd(),
+			actor: { id: this.#agentId ?? "Main", kind: this.#agentKind },
 			sessionManager: this.sessionManager,
 			modelRegistry: this.#modelRegistry,
 			model: this.model ?? undefined,
@@ -12497,6 +12498,8 @@ export class AgentSession {
 				command,
 				excludeFromContext,
 				cwd,
+				actor: this.#extensionRunner.getActor(),
+				permissionScope: this.#extensionRunner.getPermissionScope(),
 			});
 			if (hookResult?.result) {
 				this.recordBashResult(command, hookResult.result, options);
@@ -12620,6 +12623,8 @@ export class AgentSession {
 					code,
 					excludeFromContext,
 					cwd,
+					actor: this.#extensionRunner.getActor(),
+					permissionScope: this.#extensionRunner.getPermissionScope(),
 				});
 				this.assertEvalExecutionAllowed();
 				if (hookResult?.result) {

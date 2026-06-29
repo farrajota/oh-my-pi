@@ -6,6 +6,7 @@ import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMeta
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { EffectiveSubagentPermissions } from "../../task/permission-profiles";
 import type { Settings } from "../../config/settings";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
@@ -30,6 +31,7 @@ import type {
 	ExtensionContext,
 	ExtensionContextActions,
 	ExtensionError,
+	ExtensionActorIdentity,
 	ExtensionEvent,
 	ExtensionFlag,
 	ExtensionRuntime,
@@ -231,6 +233,10 @@ export class ExtensionRunner {
 		private readonly modelRegistry: ModelRegistry,
 		getMemory?: () => MemoryRuntimeContext | undefined,
 		private readonly settings?: Settings,
+		private readonly sessionScope?: {
+			actor?: ExtensionActorIdentity;
+			permissionScope?: EffectiveSubagentPermissions;
+		},
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
@@ -335,6 +341,18 @@ export class ExtensionRunner {
 
 	getExtensionPaths(): string[] {
 		return this.extensions.map(e => e.path);
+	}
+
+	getActor(): ExtensionActorIdentity {
+		return this.sessionScope?.actor ?? { id: "Main", kind: "main" };
+	}
+
+	getPermissionScope(): EffectiveSubagentPermissions | undefined {
+		return this.sessionScope?.permissionScope;
+	}
+
+	getCwd(): string {
+		return this.cwd;
 	}
 
 	/** Get all registered tools from all extensions. */
@@ -534,6 +552,8 @@ export class ExtensionRunner {
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
 			modelRegistry: this.modelRegistry,
+			actor: this.getActor(),
+			permissionScope: this.getPermissionScope(),
 			get model() {
 				return getModel();
 			},

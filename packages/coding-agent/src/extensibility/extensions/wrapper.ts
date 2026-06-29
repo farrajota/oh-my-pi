@@ -5,6 +5,7 @@ import type { AgentTool, AgentToolContext, AgentToolUpdateCallback } from "@oh-m
 import type { ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import type { Settings } from "../../config/settings";
 import type { Theme } from "../../modes/theme/theme";
+import { evaluateSubagentPermission } from "../../task/permission-profiles";
 import { type ApprovalMode, formatApprovalPrompt, requiresApproval } from "../../tools/approval";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
@@ -111,6 +112,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
 		context?: AgentToolContext,
 	) {
+		const permissionDecision = evaluateSubagentPermission({
+			scope: this.runner.getPermissionScope(),
+			toolName: this.tool.name,
+			toolInput: params as Record<string, unknown>,
+			cwd: this.runner.getCwd(),
+		});
+		if (permissionDecision.action === "deny") throw new Error(permissionDecision.reason);
+
 		// 1. Check approval policy (before extension handlers).
 		// CLI `--auto-approve` / `--yolo` sets approval mode to yolo.
 		// User `tools.approval.<tool>` policies are still applied in all modes.
