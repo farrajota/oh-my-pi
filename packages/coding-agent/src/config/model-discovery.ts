@@ -122,11 +122,18 @@ type OllamaDiscoveredModelMetadata = {
 type LlamaCppDiscoveredServerMetadata = {
 	contextWindow?: number;
 	input?: ("text" | "image")[];
+	maxTokens?: "contextWindow";
+};
+
+type LlamaCppDiscoveredModelRuntimeMetadata = {
+	contextWindow: number;
+	maxTokens: number;
 };
 
 type LlamaCppModelListEntry = {
 	id: string;
-	contextWindow?: number;
+	runtimeContextWindow?: number;
+	trainingContextWindow?: number;
 };
 
 function toPositiveNumberOrUndefined(value: unknown): number | undefined {
@@ -142,7 +149,59 @@ function toPositiveNumberOrUndefined(value: unknown): number | undefined {
 	return undefined;
 }
 
+function isLlamaCppUnlimitedSentinel(value: unknown): boolean {
+	if (typeof value === "number") {
+		return value === -1;
+	}
+	if (typeof value === "string" && value.trim()) {
+		return Number(value) === -1;
+	}
+	return false;
+}
+
+/**
+ * llama.cpp `/props.default_generation_settings.params.{max_tokens,n_predict}`
+ * are per-request defaults the server applies when a client omits the field —
+ * clients can still raise them per call. Positive values therefore are NOT
+ * hard model caps; only the `-1` unlimited sentinel reliably tells us the
+ * server bounds generation by the runtime context window. Anything else
+ * leaves the discovery default in place.
+ */
+function extractLlamaCppMaxTokens(payload: Record<string, unknown>): "contextWindow" | undefined {
+	const generationSettings = payload.default_generation_settings;
+	const params = isRecord(generationSettings) ? generationSettings.params : undefined;
+	const candidates = [
+		isRecord(params) ? params.max_tokens : undefined,
+		isRecord(params) ? params.n_predict : undefined,
+		isRecord(generationSettings) ? generationSettings.max_tokens : undefined,
+		isRecord(generationSettings) ? generationSettings.n_predict : undefined,
+		payload.max_tokens,
+		payload.n_predict,
+	];
+	return candidates.some(isLlamaCppUnlimitedSentinel) ? "contextWindow" : undefined;
+}
+
+function resolveLlamaCppMaxTokens(contextWindow: number, maxTokens: "contextWindow" | undefined): number {
+	return maxTokens === "contextWindow"
+		? contextWindow
+		: Math.min(contextWindow, maxTokens ?? DISCOVERY_DEFAULT_MAX_TOKENS);
+}
+
+function extractOllamaRuntimeContextWindow(payload: Record<string, unknown>): number | undefined {
+	const parameters = payload.parameters;
+	if (typeof parameters !== "string") {
+		return undefined;
+	}
+	const match = parameters.match(/(?:^|\n)\s*num_ctx\s+(\d+)\s*(?:$|\n)/m);
+	return match ? toPositiveNumberOrUndefined(match[1]) : undefined;
+}
+
 function extractOllamaContextWindow(payload: Record<string, unknown>): number | undefined {
+	const runtimeContextWindow = extractOllamaRuntimeContextWindow(payload);
+	if (runtimeContextWindow !== undefined) {
+		return runtimeContextWindow;
+	}
+
 	const modelInfo = payload.model_info;
 	if (isRecord(modelInfo)) {
 		for (const [key, value] of Object.entries(modelInfo)) {
@@ -155,12 +214,7 @@ function extractOllamaContextWindow(payload: Record<string, unknown>): number | 
 		}
 	}
 
-	const parameters = payload.parameters;
-	if (typeof parameters !== "string") {
-		return undefined;
-	}
-	const match = parameters.match(/(?:^|\n)\s*num_ctx\s+(\d+)\s*(?:$|\n)/m);
-	return match ? toPositiveNumberOrUndefined(match[1]) : undefined;
+	return undefined;
 }
 
 function extractLlamaCppContextWindow(payload: Record<string, unknown>): number | undefined {
@@ -174,12 +228,17 @@ function extractLlamaCppContextWindow(payload: Record<string, unknown>): number 
 	return toPositiveNumberOrUndefined(payload.n_ctx);
 }
 
-function extractLlamaCppModelContextWindow(item: Record<string, unknown>): number | undefined {
+function extractLlamaCppModelContextWindows(
+	item: Record<string, unknown>,
+): Pick<LlamaCppModelListEntry, "runtimeContextWindow" | "trainingContextWindow"> {
 	const meta = item.meta;
 	if (!isRecord(meta)) {
-		return undefined;
+		return {};
 	}
-	return toPositiveNumberOrUndefined(meta.n_ctx) ?? toPositiveNumberOrUndefined(meta.n_ctx_train);
+	return {
+		runtimeContextWindow: toPositiveNumberOrUndefined(meta.n_ctx),
+		trainingContextWindow: toPositiveNumberOrUndefined(meta.n_ctx_train),
+	};
 }
 
 function parseLlamaCppModelList(payload: unknown): LlamaCppModelListEntry[] {
@@ -190,7 +249,7 @@ function parseLlamaCppModelList(payload: unknown): LlamaCppModelListEntry[] {
 		if (!isRecord(item) || typeof item.id !== "string" || !item.id) {
 			return [];
 		}
-		return [{ id: item.id, contextWindow: extractLlamaCppModelContextWindow(item) }];
+		return [{ id: item.id, ...extractLlamaCppModelContextWindows(item) }];
 	});
 }
 
@@ -338,6 +397,7 @@ async function discoverLlamaCppServerMetadata(
 		}
 		return {
 			contextWindow: extractLlamaCppContextWindow(payload),
+			maxTokens: extractLlamaCppMaxTokens(payload),
 			input: extractLlamaCppInputCapabilities(payload),
 		};
 	} catch {
@@ -378,7 +438,11 @@ export async function discoverLlamaCppModels(
 	for (const item of models) {
 		const { id } = item;
 		if (!id) continue;
-		const contextWindow = item.contextWindow ?? serverMetadata?.contextWindow ?? DISCOVERY_DEFAULT_CONTEXT_WINDOW;
+		const contextWindow =
+			item.runtimeContextWindow ??
+			serverMetadata?.contextWindow ??
+			item.trainingContextWindow ??
+			DISCOVERY_DEFAULT_CONTEXT_WINDOW;
 		discovered.push(
 			buildModel({
 				id,
@@ -391,7 +455,7 @@ export async function discoverLlamaCppModels(
 				imageInputDecoder: "stb",
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow,
-				maxTokens: Math.min(contextWindow, DISCOVERY_DEFAULT_MAX_TOKENS),
+				maxTokens: resolveLlamaCppMaxTokens(contextWindow, serverMetadata?.maxTokens),
 				headers,
 				compat: {
 					supportsStore: false,
@@ -404,23 +468,37 @@ export async function discoverLlamaCppModels(
 	return discovered;
 }
 
-export async function discoverLlamaCppModelContextWindow(
+export async function discoverLlamaCppModelRuntimeMetadata(
 	model: Pick<Model<Api>, "provider" | "id" | "baseUrl" | "headers">,
 	ctx: DiscoveryContext,
-): Promise<number | undefined> {
+): Promise<LlamaCppDiscoveredModelRuntimeMetadata | undefined> {
 	const baseUrl = normalizeLlamaCppBaseUrl(model.baseUrl);
 	const modelsUrl = `${baseUrl}/models`;
 	const baseHeaders: Record<string, string> = { ...(model.headers ?? {}) };
 	const attempt = async (headers: Record<string, string>) => {
-		const response = await ctx.fetch(modelsUrl, {
-			headers,
-			signal: AbortSignal.timeout(250),
-		});
+		const [response, serverMetadata] = await Promise.all([
+			ctx.fetch(modelsUrl, {
+				headers,
+				signal: AbortSignal.timeout(250),
+			}),
+			discoverLlamaCppServerMetadata(ctx, baseUrl, headers),
+		]);
 		if (!response.ok) {
 			return undefined;
 		}
 		const entries = parseLlamaCppModelList(await response.json());
-		return entries.find(entry => entry.id === model.id)?.contextWindow;
+		const entry = entries.find(entry => entry.id === model.id);
+		if (!entry) {
+			return undefined;
+		}
+		const contextWindow = entry.runtimeContextWindow ?? serverMetadata?.contextWindow ?? entry.trainingContextWindow;
+		if (contextWindow === undefined) {
+			return undefined;
+		}
+		return {
+			contextWindow,
+			maxTokens: resolveLlamaCppMaxTokens(contextWindow, serverMetadata?.maxTokens),
+		};
 	};
 	try {
 		const apiKey = await ctx.getBearerApiKeyResolver(model.provider);

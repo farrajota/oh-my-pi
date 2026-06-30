@@ -174,6 +174,22 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(model?.maxTokens).toBe(32768);
 	});
 
+	test("prefers Ollama runtime num_ctx over training context metadata", async () => {
+		const fetchMock = mockOllamaDiscovery(["qwen3:27b"], "http://127.0.0.1:11434", {
+			parameters: "temperature 0.6\nnum_ctx 123904\n",
+			model_info: {
+				"qwen3.context_length": 262144,
+			},
+			capabilities: ["completion", "thinking"],
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		const model = registry.find("ollama", "qwen3:27b");
+		expect(model?.contextWindow).toBe(123904);
+		expect(model?.maxTokens).toBe(32_768);
+	});
+
 	test("discovers ollama-cloud through built-in descriptor flow without regressing local implicit ollama", async () => {
 		authStorage.setRuntimeApiKey("ollama-cloud", "cloud-test-key");
 
@@ -632,7 +648,7 @@ describe("ModelRegistry runtime discovery", () => {
 		const apiKey = await registry.getApiKey(llamaModels[0]);
 		expect(apiKey).toBe(kNoAuth);
 	});
-	test("llama.cpp discovery reads context window from props n_ctx", async () => {
+	test("llama.cpp discovery maps unlimited output limits to the context window", async () => {
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
 			if (url === "http://127.0.0.1:8080/models") {
@@ -646,6 +662,7 @@ describe("ModelRegistry runtime discovery", () => {
 					JSON.stringify({
 						default_generation_settings: {
 							n_ctx: 262144,
+							params: { max_tokens: -1, n_predict: -1 },
 						},
 						modalities: {
 							vision: true,
@@ -664,10 +681,42 @@ describe("ModelRegistry runtime discovery", () => {
 		await registry.refresh();
 		const llama = registry.find("llama.cpp", "qwen35-35b-a3b");
 		expect(llama?.contextWindow).toBe(262144);
-		expect(llama?.maxTokens).toBe(32_768);
+		expect(llama?.maxTokens).toBe(262144);
 		expect(llama?.input).toEqual(["text", "image"]);
 	});
-	test("llama.cpp discovery prefers per-model meta n_ctx over props", async () => {
+
+	test("llama.cpp discovery ignores positive props defaults as per-request limits, not hard caps", async () => {
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(JSON.stringify({ data: [{ id: "bounded-output" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(
+					JSON.stringify({
+						default_generation_settings: {
+							n_ctx: 262144,
+							params: { max_tokens: 65536, n_predict: 65536 },
+						},
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const llama = registry.find("llama.cpp", "bounded-output");
+		expect(llama?.contextWindow).toBe(262144);
+		expect(llama?.maxTokens).toBe(32_768);
+	});
+	test("llama.cpp discovery prefers runtime n_ctx over training context metadata", async () => {
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
 			if (url === "http://127.0.0.1:8080/models") {
@@ -696,11 +745,36 @@ describe("ModelRegistry runtime discovery", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 		await registry.refresh();
 		expect(registry.find("llama.cpp", "ctx-88k")?.contextWindow).toBe(88832);
+		expect(registry.find("llama.cpp", "ctx-train")?.contextWindow).toBe(128000);
+		expect(registry.find("llama.cpp", "unloaded")?.contextWindow).toBe(128000);
+	});
+
+	test("llama.cpp discovery falls back to n_ctx_train before the global default", async () => {
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(
+					JSON.stringify({
+						data: [{ id: "ctx-train", meta: { n_ctx_train: 65536 } }, { id: "unloaded" }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(JSON.stringify({ default_generation_settings: {} }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
 		expect(registry.find("llama.cpp", "ctx-train")?.contextWindow).toBe(65536);
 		expect(registry.find("llama.cpp", "unloaded")?.contextWindow).toBe(128000);
 	});
 
-	test("llama.cpp selected model refresh patches newly loaded meta n_ctx", async () => {
+	test("llama.cpp selected model refresh patches newly loaded meta n_ctx and unlimited output limit", async () => {
 		writeModelCache(
 			"llama.cpp",
 			Date.now(),
@@ -730,6 +804,20 @@ describe("ModelRegistry runtime discovery", () => {
 					headers: { "Content-Type": "application/json" },
 				});
 			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(
+					JSON.stringify({
+						default_generation_settings: {
+							n_ctx: 239104,
+							params: { max_tokens: -1, n_predict: -1 },
+						},
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
 			throw new Error(`Unexpected URL: ${url}`);
 		};
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
@@ -738,8 +826,128 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(stale.contextWindow).toBe(128000);
 		const refreshed = await registry.refreshSelectedModelMetadata(stale);
 		expect(refreshed.contextWindow).toBe(239104);
-		expect(refreshed.maxTokens).toBe(32768);
+		expect(refreshed.maxTokens).toBe(239104);
 		expect(registry.find("llama.cpp", "sleeping-model")?.contextWindow).toBe(239104);
+	});
+
+	test("llama.cpp selected model refresh leaves the cached model untouched when /models no longer lists it", async () => {
+		writeModelCache(
+			"llama.cpp",
+			Date.now(),
+			[
+				buildModel({
+					id: "swapped-out-model",
+					name: "swapped-out-model",
+					provider: "llama.cpp",
+					api: "openai-responses",
+					baseUrl: "http://127.0.0.1:8080",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 32768,
+				}),
+			],
+			true,
+			"",
+			cacheDbPath,
+		);
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(JSON.stringify({ data: [{ id: "another-model", meta: { n_ctx: 524288 } }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(
+					JSON.stringify({
+						default_generation_settings: {
+							n_ctx: 524288,
+							params: { max_tokens: -1, n_predict: -1 },
+						},
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		const stale = registry.find("llama.cpp", "swapped-out-model");
+		if (!stale) throw new Error("cached llama.cpp model missing");
+		const refreshed = await registry.refreshSelectedModelMetadata(stale);
+		expect(refreshed.contextWindow).toBe(128000);
+		expect(refreshed.maxTokens).toBe(32768);
+	});
+
+	test("llama.cpp selected model refresh clamps unlimited output to overridden context", async () => {
+		writeRawModelsJson({
+			"llama.cpp": {
+				baseUrl: "http://127.0.0.1:8080",
+				api: "openai-responses",
+				auth: "none",
+				discovery: { type: "llama.cpp" },
+				modelOverrides: {
+					"bounded-context-model": { contextWindow: 128000 },
+				},
+			},
+		});
+		writeModelCache(
+			"llama.cpp",
+			Date.now(),
+			[
+				buildModel({
+					id: "bounded-context-model",
+					name: "bounded-context-model",
+					provider: "llama.cpp",
+					api: "openai-responses",
+					baseUrl: "http://127.0.0.1:8080",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 262144,
+					maxTokens: 32768,
+				}),
+			],
+			true,
+			"",
+			cacheDbPath,
+		);
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(JSON.stringify({ data: [{ id: "bounded-context-model", meta: { n_ctx: 262144 } }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(
+					JSON.stringify({
+						default_generation_settings: {
+							n_ctx: 262144,
+							params: { max_tokens: -1, n_predict: -1 },
+						},
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		const bounded = registry.find("llama.cpp", "bounded-context-model");
+		if (!bounded) throw new Error("cached llama.cpp model missing");
+		expect(bounded.contextWindow).toBe(128000);
+		const refreshed = await registry.refreshSelectedModelMetadata(bounded);
+		expect(refreshed.contextWindow).toBe(128000);
+		expect(refreshed.maxTokens).toBe(128000);
 	});
 
 	test("llama.cpp selected model refresh does not resolve command api keys", async () => {

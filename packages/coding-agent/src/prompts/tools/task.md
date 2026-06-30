@@ -1,19 +1,52 @@
-{{#if asyncEnabled}}{{#if batchEnabled}}Spawns subagents to work in the background — one per `tasks[]` item; a single spawn is a one-item batch.{{else}}Spawns ONE subagent per call to work in the background.{{/if}}
+{{#if asyncEnabled}}{{#if batchEnabled}}Delegate work to background subagents by passing multiple items in a single `tasks[]` batch.{{else}}Delegate work to ONE background subagent per call.{{/if}}
+Execution does not block your turn: you receive agent and job IDs immediately, and the final results deliver themselves when the subagents finish.{{else}}{{#if batchEnabled}}Run subagents synchronously by passing items in a `tasks[]` batch.{{else}}Run ONE subagent synchronously per call.{{/if}}
+Execution blocks your turn: the call only returns once the work is completely finished.{{/if}}
 
-- Spawning is non-blocking: the call returns immediately with the agent id{{#if batchEnabled}}s{{/if}} and job id{{#if batchEnabled}}s{{/if}}; each result is delivered automatically when that agent yields.
-- Parallelism = {{#if batchEnabled}}multiple `tasks[]` items in ONE call. MUST batch into one `tasks[]` (share `context` once). Separate `task` calls ONLY for a different `agent` type or unrelated `context`{{else}}multiple `task` calls in one assistant message{{/if}}.
-- If genuinely blocked on a result, wait with `job poll`; otherwise keep working. `job cancel` terminates a task and **cannot carry a message** — only for stalled/abandoned work.
-{{else}}{{#if batchEnabled}}Runs subagents synchronously — one per `tasks[]` item; a single spawn is a one-item batch.{{else}}Runs ONE subagent synchronously per call.{{/if}}
+# Delegation Strategy
+- **Maximize parallelism:** Break work into the widest possible {{#if batchEnabled}}array of `tasks[]`{{else}}set of parallel `task` calls{{/if}}. NEVER serialize work that can run concurrently. Tasks touching different files or independent refactors should run in parallel; agents resolve their own file collisions live.
+- **Sequence only when necessary:** The only reason to run A before B is if B strictly requires A's output to function (e.g., a core API contract or schema migration). {{#if ircEnabled}}If the missing piece is small, run them in parallel and have B ask A via `irc`!{{/if}}
+- **Role matching:** Assign each subagent a specific `role` (e.g. "Security Reviewer", "DB Migrator"). Do not spawn generic workers.
+- **No overhead:** Each assignment MUST instruct its agent to skip formatters, linters, and project-wide test suites. You will run those once at the end.
+- **Do your own thinking:** NEVER assign reasoning, architecture, or design to `quick_task` or `explore`. They are for mechanical lookups only. Keep hard decisions in your own context or use `task`, `plan`, or `oracle`.
+- **One-pass agents:** Prefer agents that investigate **and** edit in a single pass; only spin a read-only discovery step (e.g. `explore`) when the affected files are genuinely unknown.
 
-- Spawning is blocking: the call returns only after the agent{{#if batchEnabled}}s{{/if}} finish; results arrive inline.
-- Parallelism = {{#if batchEnabled}}multiple `tasks[]` items in ONE call. MUST batch into one `tasks[]` (share `context` once). Separate `task` calls ONLY for a different `agent` type or unrelated `context`{{else}}multiple `task` calls in one assistant message{{/if}}.
+# Inputs
+- `agent`: The base agent type to use (e.g., `task`, `explore`).
+{{#if batchEnabled}}
+- `context`: Shared project state, constraints, and contracts. Applies to the entire batch; do not duplicate this background into individual tasks.
+- `tasks[]`: Array of subagents to spawn.
+  - `assignment`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
+  - `id`: A stable CamelCase identifier (≤32 chars). Generated automatically if omitted.
+  - `description`: A UI label only; the subagent NEVER sees it.
+  - `role`: The specialist this subagent embodies. Tailor per spawn; do not clone a generic worker.
+{{#if isolationEnabled}}
+  - `isolated`: Run in a dedicated worktree and return patches. Isolated agents are destroyed upon completion and cannot be addressed afterward.
+{{/if}}
+{{else}}
+- `assignment`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
+- `id`: A stable CamelCase identifier (≤32 chars). Generated automatically if omitted.
+- `description`: A UI label only; the subagent NEVER sees it.
+- `role`: The specialist this subagent embodies. Tailor per spawn; do not clone a generic worker.
+{{#if isolationEnabled}}
+- `isolated`: Run in a dedicated worktree and return patches. Isolated agents are destroyed upon completion and cannot be addressed afterward.
+{{/if}}
+{{/if}}
+
+# Context and Communication
+Subagents start blank. They have no access to your conversation history.
+{{#if batchEnabled}}
+- Pass large payloads using `local://<path>` URIs, never inline text.
+{{else}}
+- *Note: The single-spawn shape has no `context` field.* Write shared project state ONCE to a `local://` file (e.g., `local://ctx.md`) and reference that URL in your assignments. Pass large payloads using `local://<path>` URIs, never inline text.
 {{/if}}
 {{#if ircEnabled}}
-- Coordinate with agents via `irc` using their ids. Agents reach you and their siblings live the same way.
+- Once spawned, coordinate with live agents via `irc` using their IDs. If task B depends on task A, B SHOULD message A directly.
+{{/if}}
+{{#if asyncEnabled}}
+- If you run out of things to do and are genuinely blocked waiting for a subagent, use `job poll`. Use `job cancel` only for stalled work.
 {{/if}}
 
-<parameters>
-- `agent`: agent type to spawn
+# Format Contracts
 {{#if batchEnabled}}
 - `context`: shared background prepended to every assignment — goal, constraints, shared contract (see context-fmt); REQUIRED, session-specific only
 - `tasks`: tasks to spawn — one subagent per item, all in parallel:
@@ -130,20 +163,19 @@ Parallel when tasks touch disjoint files or are independent refactors/tests.
 </context-fmt>
 {{/if}}
 
-<assignment-fmt>
+The `assignment` field MUST follow this format:
 # Target       ← exact files and symbols; explicit non-goals
 {{#if permissionsEnabled}}# Permissions  ← selected profiles, allowed paths, denied paths, special tool grants{{/if}}
 # Change       ← step-by-step add/remove/rename; APIs and patterns
 # Acceptance   ← observable result; no project-wide commands
-</assignment-fmt>
 
-<agents>
+# Available Agents
 {{#if spawningDisabled}}
-Agent spawning is disabled for this context.
+Agent spawning is currently disabled.
 {{else}}
 {{#list agents join="\n"}}
-# {{name}}{{#if readOnly}} — READ-ONLY (no edit/write/exec tools){{/if}}
+### {{name}}{{#if readOnly}} (READ-ONLY: no edit/write/command tools){{/if}}
 {{description}}
+{{#if readOnly}}Use ONLY for investigation and reporting; do the edits yourself or assign them to a writing agent.{{/if}}
 {{/list}}
 {{/if}}
-</agents>
