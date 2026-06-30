@@ -70,7 +70,8 @@ describe("permission profile loading", () => {
 
 		expect(loaded.errors).toEqual([]);
 		expect(Object.keys(loaded.profiles).sort()).toEqual(Object.keys(BUILTIN_PERMISSION_PROFILES).sort());
-		expect(loaded.profiles["read-only"]?.denyTools).toContain("write");
+		expect(loaded.profiles["read-only"]?.tools).toContain("read");
+		expect(loaded.profiles["read-only"]?.denyTools).toBeUndefined();
 		expect(loaded.summaries.find(summary => summary.name === "focused-edit")?.source).toBe("built-in");
 	});
 
@@ -118,7 +119,8 @@ describe("permission profile loading", () => {
 
 		expect(loaded.errors).toHaveLength(1);
 		expect(loaded.errors[0]).toContain(".omp/permissions.json");
-		expect(loaded.profiles["read-only"]?.denyTools).toContain("write");
+		expect(loaded.profiles["read-only"]?.tools).toContain("read");
+		expect(loaded.profiles["read-only"]?.denyTools).toBeUndefined();
 		expect(loaded.profiles["focused-edit"]?.tools).toContain("edit");
 	});
 });
@@ -129,11 +131,56 @@ describe("permission profile composition and evaluation", () => {
 		const scope = enforceScope({ profiles: ["focused-edit", "no-network"] });
 
 		expect(scope.tools).toEqual(expect.arrayContaining(["read", "edit", "write"]));
-		expect(scope.denyTools).toEqual(expect.arrayContaining(["browser", "web_search", "task"]));
+		expect(scope.denyTools).toEqual(expect.arrayContaining(["browser", "web_search"]));
 		expect(evaluate(scope, "browser", {}, cwd)).toMatchObject({
 			action: "deny",
 			reason: "BLOCKED: Subagent permission profile denied tool 'browser'.",
 			matched: "subagent:tool-deny:browser",
+		});
+	});
+
+	test("modifier-only profiles require an allowlist in enforce mode", () => {
+		const result = composeEffectivePermissions({
+			mode: "enforce",
+			toolsEnabled: true,
+			pathsEnabled: true,
+			actorId: "tester",
+			actorKind: "sub",
+			request: { profiles: ["no-network"] },
+			profiles: BUILTIN_PERMISSION_PROFILES,
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			error: "Subagent tool permissions require a concrete allowlist. Add permissions.tools or at least one role profile with tools; modifier-only profiles only add restrictions.",
+		});
+	});
+
+	test("modifier-only profiles compose with inline tools", async () => {
+		const cwd = await tempCwd();
+		const scope = enforceScope({ request: { profiles: ["no-network"], tools: ["read"] } });
+
+		expect(scope.tools).toEqual(["read"]);
+		expect(scope.denyTools).toEqual(expect.arrayContaining(["browser", "web_search"]));
+		expect(evaluate(scope, "read", {}, cwd).action).toBe("allow");
+		expect(evaluate(scope, "write", {}, cwd)).toMatchObject({
+			action: "deny",
+			matched: "subagent:tool-allowlist",
+		});
+		expect(evaluate(scope, "browser", {}, cwd)).toMatchObject({
+			action: "deny",
+			matched: "subagent:tool-deny:browser",
+		});
+	});
+
+	test("explicit empty tools is a concrete allowlist", async () => {
+		const cwd = await tempCwd();
+		const scope = enforceScope({ request: { tools: [] } });
+
+		expect(scope.tools).toEqual([]);
+		expect(evaluate(scope, "read", {}, cwd)).toMatchObject({
+			action: "deny",
+			matched: "subagent:tool-allowlist",
 		});
 	});
 
@@ -223,7 +270,8 @@ describe("deterministic permission profile smoke fixture", () => {
 		);
 		expect(evaluate(scope, "write", { path: "allowed/new.txt" }, cwd)).toMatchObject({
 			action: "deny",
-			reason: "BLOCKED: Subagent permission profile denied tool 'write'.",
+			reason: "BLOCKED: Subagent permission profile does not allow tool 'write'.",
+			matched: "subagent:tool-allowlist",
 		});
 	});
 });

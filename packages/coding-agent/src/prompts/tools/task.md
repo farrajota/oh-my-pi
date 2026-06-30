@@ -30,8 +30,8 @@
     When both toolProfile and permissions are supplied, the effective tool set is the intersection; permissions never widen toolProfile.
     - `profiles`: permission profile names. Combine multiple profiles when the task needs each capability.
 {{#if permissionToolsEnabled}}
-    - `tools`: optional one-off tool allowlist.
-    - `denyTools`: optional one-off tool denylist.
+    - `tools`: optional one-off explicit tool allowlist.
+    - `denyTools`: optional extra hard deny for modifier profiles or overrides; not the normal way to shape a role.
 {{/if}}
 {{#if permissionPathsEnabled}}
     - `allowPaths`: files/directories this spawn may access. Prefer explicit files and narrow directories.
@@ -52,8 +52,8 @@
   When both toolProfile and permissions are supplied, the effective tool set is the intersection; permissions never widen toolProfile.
   - `profiles`: permission profile names. Combine multiple profiles when the task needs each capability.
 {{#if permissionToolsEnabled}}
-  - `tools`: optional one-off tool allowlist.
-  - `denyTools`: optional one-off tool denylist.
+  - `tools`: optional one-off explicit tool allowlist.
+  - `denyTools`: optional extra hard deny for modifier profiles or overrides; not the normal way to shape a role.
 {{/if}}
 {{#if permissionPathsEnabled}}
   - `allowPaths`: files/directories this spawn may access. Prefer explicit files and narrow directories.
@@ -67,13 +67,14 @@
 <permission-scoping>
 Before every spawn, choose a least-privilege permission envelope:
 1. Choose `role` for expertise.
-2. Choose `permissions.profiles` for capabilities.
-{{#if permissionPathsEnabled}}3. Add `permissions.allowPaths` for the files/directories the agent needs, and `permissions.denyPaths` for known off-limits areas.{{/if}}
-{{#if permissionToolsEnabled}}4. Add `permissions.denyTools` for tools irrelevant or risky for this task; use `permissions.tools` only when no profile fits.{{/if}}
+2. Choose at least one role permission profile that defines `tools`, or set `permissions.tools` explicitly.
+3. Add modifier profiles such as `no-network`, `no-delegation`, or `secrets-blind` only alongside a role profile or explicit `permissions.tools`.
+{{#if permissionPathsEnabled}}4. Add `permissions.allowPaths` for exact files/directories when the target is known, especially for edit/write/bash-capable agents, and `permissions.denyPaths` for known off-limits areas.{{/if}}
+{{#if permissionToolsEnabled}}5. Add `permissions.denyTools` only for extra hard-deny constraints.{{/if}}
 
 Mode: {{permissionMode}}. Profiles are guardrails, not a security sandbox. Do not ask subagents to bypass them with bash/eval. If the work needs access outside scope, the subagent should report the missing permission.
 
-Multiple profiles may be combined. Tool allows are additive. Path allows are additive. Denied tools/paths are additive. Deny wins over allow. The global baseline permissions extension always applies and cannot be relaxed by a spawn profile.
+Tool allowlists are additive, but enforce mode requires a concrete allowlist from a role profile, inline permissions.tools, or an inherited parent allowlist. Modifier-only profiles add restrictions and do not grant tools. Path allows are additive, path denies are additive, and denied tools/paths win over allows. The global baseline permissions extension always applies and cannot be relaxed by a spawn profile.
 </permission-scoping>
 
 <permission-profiles>

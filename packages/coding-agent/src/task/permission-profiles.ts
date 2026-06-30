@@ -49,29 +49,30 @@ export const BUILTIN_PERMISSION_PROFILES: Record<string, PermissionProfile> = {
 		description: "Read/search/code-intelligence only. No edits, shell, browser, web search, or child delegation.",
 		useWhen: "Investigation, review, planning, and file discovery.",
 		tools: ["read", "search", "find", "lsp", "irc"],
-		denyTools: ["edit", "write", "bash", "eval", "browser", "web_search", "task", "ast_edit"],
 	},
 	"focused-edit": {
 		description:
 			"Read/search/edit/write within the selected path scope. No shell, browser, web search, or child delegation.",
 		useWhen: "Bounded source/test edits where the parent will run verification.",
 		tools: ["read", "search", "find", "lsp", "edit", "write", "ast_grep", "ast_edit", "irc"],
-		denyTools: ["bash", "eval", "browser", "web_search", "task"],
 	},
 	"test-runner": {
 		description: "Read/search plus shell execution for targeted verification. No edits or child delegation.",
 		useWhen: "Running a specific test/check command after implementation.",
 		tools: ["read", "search", "find", "bash", "irc"],
-		denyTools: ["edit", "write", "ast_edit", "browser", "web_search", "task"],
 	},
 	"no-network": {
-		description: "Deny browser and web-search tools.",
-		useWhen: "Local-repository work that should not fetch external context.",
+		description:
+			"Modifier-only profile that denies browser and web-search tools; pair with a role profile or inline permissions.tools when tool enforcement is in enforce mode.",
+		useWhen:
+			"Local-repository work that should not fetch external context; use alongside a role profile or inline permissions.tools in enforce mode.",
 		denyTools: ["browser", "web_search"],
 	},
 	"no-delegation": {
-		description: "Deny spawning child subagents.",
-		useWhen: "Small scoped tasks that should not fan out further.",
+		description:
+			"Modifier-only profile that denies spawning child subagents; pair with a role profile or inline permissions.tools when tool enforcement is in enforce mode.",
+		useWhen:
+			"Small scoped tasks that should not fan out further; use alongside a role profile or inline permissions.tools in enforce mode.",
 		denyTools: ["task"],
 	},
 };
@@ -163,11 +164,16 @@ export function composeEffectivePermissions(input: {
 		selectedProfiles.push(profile);
 	}
 
+	const childToolAllowlistDefined =
+		input.toolsEnabled &&
+		(selectedProfiles.some(profile => Object.hasOwn(profile, "tools")) ||
+			(input.request ? Object.hasOwn(input.request, "tools") : false));
+	let toolAllowlistDefined = childToolAllowlistDefined;
 	const requestedTools = concatStrings(
 		selectedProfiles.map(profile => profile.tools),
 		input.request?.tools,
 	);
-	let tools = input.toolsEnabled ? uniqueTools(requestedTools) : undefined;
+	let tools = input.toolsEnabled && childToolAllowlistDefined ? uniqueTools(requestedTools) : undefined;
 	const denyTools = input.toolsEnabled
 		? uniqueTools(
 				concatStrings(
@@ -196,9 +202,24 @@ export function composeEffectivePermissions(input: {
 			)
 		: [];
 
-	if (input.toolsEnabled && input.inherited?.tools) {
+	if (input.toolsEnabled && input.inherited?.tools !== undefined) {
 		const inherited = new Set(input.inherited.tools.map(tool => tool.toLowerCase()));
-		tools = tools ? tools.filter(tool => inherited.has(tool.toLowerCase())) : [...input.inherited.tools];
+		tools = childToolAllowlistDefined
+			? (tools ?? []).filter(tool => inherited.has(tool.toLowerCase()))
+			: [...input.inherited.tools];
+		toolAllowlistDefined = true;
+	}
+
+	if (
+		input.mode === "enforce" &&
+		input.toolsEnabled &&
+		requestNeedsToolAllowlist(input.request) &&
+		!toolAllowlistDefined
+	) {
+		return {
+			ok: false,
+			error: "Subagent tool permissions require a concrete allowlist. Add permissions.tools or at least one role profile with tools; modifier-only profiles only add restrictions.",
+		};
 	}
 
 	return {
@@ -206,7 +227,7 @@ export function composeEffectivePermissions(input: {
 		value: {
 			...base,
 			profiles: uniqueStrings([...(input.inherited?.profiles ?? []), ...requestedProfiles]),
-			tools: tools && tools.length > 0 ? tools : undefined,
+			tools: toolAllowlistDefined ? (tools ?? []) : undefined,
 			denyTools,
 			allowPaths,
 			denyPaths,
@@ -278,7 +299,7 @@ export function formatPermissionScopeForPrompt(scope: EffectiveSubagentPermissio
 
 You are running under task guardrails, not a security sandbox.
 Profiles: ${scope.profiles.length > 0 ? scope.profiles.join(", ") : "none"}
-Tool allowlist: ${scope.tools && scope.tools.length > 0 ? scope.tools.join(", ") : "unrestricted"}
+Tool allowlist: ${scope.tools === undefined ? "unrestricted" : scope.tools.length > 0 ? scope.tools.join(", ") : "none"}
 Denied tools: ${scope.denyTools.length > 0 ? scope.denyTools.join(", ") : "none"}
 Allowed paths: ${scope.allowPaths.length > 0 ? scope.allowPaths.join(", ") : "unrestricted"}
 Denied paths: ${scope.denyPaths.length > 0 ? scope.denyPaths.join(", ") : "none"}
@@ -320,8 +341,18 @@ function normalizeProfile(value: Record<string, unknown>): PermissionProfile | u
 	return Object.keys(profile).length > 0 ? profile : undefined;
 }
 
+function requestNeedsToolAllowlist(request: TaskPermissionRequest | undefined): boolean {
+	if (!request) return false;
+	return (request.profiles?.length ?? 0) > 0 || Object.hasOwn(request, "tools") || Object.hasOwn(request, "denyTools");
+}
+
 function summarizeProfile(name: string, profile: PermissionProfile, source: ProfileSource): PermissionProfileSummary {
-	const allowedTools = profile.tools?.length ? `allow ${profile.tools.join(", ")}` : "allow unrestricted";
+	const allowedTools =
+		profile.tools === undefined
+			? "no tool allowlist (modifier-only)"
+			: profile.tools.length > 0
+				? `allow ${profile.tools.join(", ")}`
+				: "allow none";
 	const deniedTools = profile.denyTools?.length ? `deny ${profile.denyTools.join(", ")}` : "deny none";
 	const allowedPaths = profile.allowPaths?.length ? `allow ${profile.allowPaths.join(", ")}` : "allow unrestricted";
 	const deniedPaths = profile.denyPaths?.length ? `deny ${profile.denyPaths.join(", ")}` : "deny none";
