@@ -29,12 +29,13 @@ import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../sessi
 import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import type { ResolveToolDetails } from "../../tools/resolve";
 import { nextActionableTask } from "../../tools/todo";
+import { SpeechEnhancer } from "../../tts/speech-enhancer";
 import { vocalizer } from "../../tts/vocalizer";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { interruptHint } from "../shared";
 import { createAssistantMessageComponent } from "../utils/interactive-context-helpers";
 import { StreamingRevealController } from "./streaming-reveal";
-import { ToolArgsRevealController } from "./tool-args-reveal";
+import { streamingStringKeysForTool, ToolArgsRevealController } from "./tool-args-reveal";
 
 type AgentSessionEventKind = AgentSessionEvent["type"];
 
@@ -187,6 +188,21 @@ export class EventController {
 	#terminalProgressActive = false;
 
 	constructor(private ctx: WorkingMessageLifecycleContext) {
+		// Enhanced speech (`speech.enhanced`) rewrites blocks through the
+		// tiny/smol role with this session's registry and credentials; the
+		// vocalizer falls back to mechanical cleanup when unset. Tolerates
+		// partial contexts (tests, minimal embeddings) by wiring null.
+		const session = ctx.session;
+		vocalizer.setEnhancer(
+			session?.modelRegistry && session.agent && session.settings
+				? new SpeechEnhancer({
+						settings: session.settings,
+						registry: session.modelRegistry,
+						sessionId: session.sessionId,
+						metadataResolver: provider => session.agent.metadataForProvider(provider),
+					})
+				: null,
+		);
 		this.#streamingReveal = new StreamingRevealController({
 			getSmoothStreaming: () => this.ctx.settings.get("display.smoothStreaming"),
 			getHideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
@@ -381,7 +397,7 @@ export class EventController {
 		}
 
 		this.ctx.statusLine.invalidate();
-		this.ctx.updateEditorTopBorder();
+		this.ctx.ui.requestRender();
 
 		const run = this.#handlers[event.type] as (e: AgentSessionEvent) => Promise<void>;
 		await run(event);
@@ -751,7 +767,7 @@ export class EventController {
 					renderArgs = this.#toolArgsReveal.setTarget(content.id, partialJson, {
 						rawInput,
 						exposeRawPartialJson: exposesRawPartialJson(content.name, rawInput, tool),
-						fullArgs: content.arguments,
+						streamingStringKeys: streamingStringKeysForTool(content.name, rawInput),
 					});
 				} else {
 					this.#toolArgsReveal.finish(content.id);
@@ -919,7 +935,9 @@ export class EventController {
 			}
 			this.#lastAssistantComponent.markTranscriptBlockFinalized();
 			if (settings.get("display.showTokenUsage")) {
-				this.ctx.chatContainer.addChild(createUsageRowBlock(event.message.usage));
+				this.ctx.chatContainer.addChild(
+					createUsageRowBlock(event.message.usage, event.message.duration, event.message.ttft),
+				);
 			}
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
@@ -933,7 +951,7 @@ export class EventController {
 				this.ctx.showPinnedError(event.message.errorMessage);
 			}
 			this.ctx.statusLine.invalidate();
-			this.ctx.updateEditorTopBorder();
+			this.ctx.ui.requestRender();
 		}
 		this.ctx.ui.requestRender();
 	}
@@ -1115,13 +1133,9 @@ export class EventController {
 		}
 		// Update todo display when todo tool completes
 		if (event.toolName === "todo" && !event.isError) {
-			const hadTodoReminder = (this.ctx.todoReminderContainer?.children.length ?? 0) > 0;
-			this.ctx.todoReminderContainer?.clear();
 			const details = event.result.details as { phases?: TodoPhase[] } | undefined;
 			if (details?.phases) {
 				this.ctx.setTodos(details.phases);
-			} else if (hadTodoReminder) {
-				this.ctx.ui.requestRender();
 			}
 		} else if (event.toolName === "todo" && event.isError) {
 			const textContent = event.result.content.find(
@@ -1317,21 +1331,21 @@ export class EventController {
 				if (!event.skipped) {
 					this.ctx.rebuildChatFromMessages();
 					this.ctx.statusLine.invalidate();
-					this.ctx.updateEditorTopBorder();
+					this.ctx.ui.requestRender();
 				}
 				this.ctx.showWarning(event.errorMessage);
 			} else if (!event.skipped) {
 				this.ctx.lastAssistantUsage = undefined;
 				this.ctx.rebuildChatFromMessages();
 				this.ctx.statusLine.invalidate();
-				this.ctx.updateEditorTopBorder();
+				this.ctx.ui.requestRender();
 				this.ctx.showStatus("Auto-shake completed");
 			}
 		} else if (event.result) {
 			this.ctx.lastAssistantUsage = undefined;
 			this.ctx.rebuildChatFromMessages();
 			this.ctx.statusLine.invalidate();
-			this.ctx.updateEditorTopBorder();
+			this.ctx.ui.requestRender();
 		} else if (event.errorMessage) {
 			this.ctx.showWarning(event.errorMessage);
 		} else if (isHandoffAction) {
@@ -1339,7 +1353,7 @@ export class EventController {
 			this.ctx.lastAssistantUsage = undefined;
 			this.ctx.rebuildChatFromMessages();
 			this.ctx.statusLine.invalidate();
-			this.ctx.updateEditorTopBorder();
+			this.ctx.ui.requestRender();
 			await this.ctx.reloadTodos();
 			this.ctx.showStatus("Auto-handoff completed");
 		} else if (event.skipped) {
@@ -1427,9 +1441,7 @@ export class EventController {
 
 	async #handleTodoReminder(event: Extract<AgentSessionEvent, { type: "todo_reminder" }>): Promise<void> {
 		const component = new TodoReminderComponent(event.todos, event.attempt, event.maxAttempts);
-		this.ctx.todoReminderContainer.clear();
-		this.ctx.todoReminderContainer.addChild(component);
-		this.ctx.ui.requestRender();
+		this.ctx.present(component);
 	}
 
 	async #handleTodoAutoClear(_event: Extract<AgentSessionEvent, { type: "todo_auto_clear" }>): Promise<void> {

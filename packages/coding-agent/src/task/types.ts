@@ -1,7 +1,7 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
+import { type BaseType, type } from "arktype";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { TaskPermissionRequest } from "./permission-profiles";
 import type { TaskToolProfileName } from "./tool-profiles";
@@ -137,12 +137,23 @@ function createTaskItemSchema(options: {
 	return type(shape);
 }
 
+const TASK_AGENT_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+function taskAgentSchemaRule(defaultAgent: string): string {
+	const trimmed = defaultAgent.trim();
+	if (TASK_AGENT_NAME_PATTERN.test(trimmed)) {
+		return `string = '${trimmed}'`;
+	}
+	return "string";
+}
+
 function createTaskSchema(options: {
 	isolationEnabled: boolean;
 	permissions: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
+	defaultAgent?: string;
 }) {
 	const shape: Record<string, unknown> = {
-		agent: "string",
+		agent: taskAgentSchemaRule(options.defaultAgent ?? "task"),
 		"id?": "string",
 		"description?": "string",
 		"role?": ROLE_INPUT_SCHEMA,
@@ -153,15 +164,16 @@ function createTaskSchema(options: {
 	if (options.isolationEnabled) shape["isolated?"] = "boolean";
 	const permissionSchema = selectTaskPermissionSchema(options.permissions);
 	if (permissionSchema) shape["permissions?"] = permissionSchema;
-	return type(shape);
+	return type.raw(shape);
 }
 
 function createBatchTaskSchema(options: {
 	isolationEnabled: boolean;
 	permissions: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
+	defaultAgent?: string;
 }) {
-	return type({
-		agent: "string",
+	return type.raw({
+		agent: taskAgentSchemaRule(options.defaultAgent ?? "task"),
 		context: "string",
 		tasks: createTaskItemSchema(options).array(),
 		"+": "delete",
@@ -195,21 +207,36 @@ export interface TaskItem {
 	isolated?: boolean;
 }
 
-export const taskSchema = createTaskSchema({
-	isolationEnabled: true,
-	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
+export const taskSchema = type({
+	agent: "string = 'task'",
+	"id?": "string",
+	"description?": "string",
+	"role?": ROLE_INPUT_SCHEMA,
+	assignment: "string",
+	"isolated?": "boolean",
+	"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
+	"+": "delete",
 });
-const taskSchemaNoIsolation = createTaskSchema({
-	isolationEnabled: false,
-	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
+const taskSchemaNoIsolation = type({
+	agent: "string = 'task'",
+	"id?": "string",
+	"description?": "string",
+	"role?": ROLE_INPUT_SCHEMA,
+	assignment: "string",
+	"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
+	"+": "delete",
 });
-const taskSchemaBatch = createBatchTaskSchema({
-	isolationEnabled: true,
-	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
+const taskSchemaBatch = type({
+	agent: "string = 'task'",
+	context: "string",
+	tasks: taskItemSchemaIsolated.array(),
+	"+": "delete",
 });
-const taskSchemaBatchNoIsolation = createBatchTaskSchema({
-	isolationEnabled: false,
-	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
+const taskSchemaBatchNoIsolation = type({
+	agent: "string = 'task'",
+	context: "string",
+	tasks: taskItemSchema.array(),
+	"+": "delete",
 });
 const ALL_TASK_SCHEMAS = [taskSchema, taskSchemaNoIsolation, taskSchemaBatch, taskSchemaBatchNoIsolation] as const;
 
@@ -219,23 +246,43 @@ type DynamicTaskSchema =
 	| ReturnType<typeof createBatchTaskSchema>;
 export type TaskSchema = typeof taskSchema;
 /** Active task tool parameter schema for the current isolation / batch flags */
-export type TaskToolSchemaInstance = DynamicTaskSchema;
+export type TaskToolSchemaInstance = DynamicTaskSchema | BaseType;
+
+const taskSchemaCache = new Map<string, BaseType>();
 
 export function getTaskSchema(options: {
 	isolationEnabled: boolean;
 	batchEnabled: boolean;
 	permissions?: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
-}): DynamicTaskSchema {
+}): DynamicTaskSchema;
+export function getTaskSchema(options: {
+	isolationEnabled: boolean;
+	batchEnabled: boolean;
+	defaultAgent: string;
+	permissions?: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
+}): TaskToolSchemaInstance;
+export function getTaskSchema(options: {
+	isolationEnabled: boolean;
+	batchEnabled: boolean;
+	defaultAgent?: string;
+	permissions?: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
+}): TaskToolSchemaInstance {
 	const permissions = options.permissions ?? { enabled: false, toolsEnabled: false, pathsEnabled: false };
-	if (!permissions.enabled) {
+	const defaultAgent = options.defaultAgent ?? "task";
+	if (!permissions.enabled && defaultAgent === "task") {
 		if (options.batchEnabled) {
 			return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		}
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	return options.batchEnabled
-		? createBatchTaskSchema({ ...options, permissions })
-		: createTaskSchema({ ...options, permissions });
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}:${permissions.enabled ? "perm" : "noperm"}:${permissions.toolsEnabled ? "tools" : "notools"}:${permissions.pathsEnabled ? "paths" : "nopaths"}`;
+	const cached = taskSchemaCache.get(key);
+	if (cached) return cached;
+	const schema = options.batchEnabled
+		? createBatchTaskSchema({ ...options, permissions, defaultAgent })
+		: createTaskSchema({ ...options, permissions, defaultAgent });
+	taskSchemaCache.set(key, schema);
+	return schema;
 }
 
 /**
@@ -245,7 +292,7 @@ export function getTaskSchema(options: {
  * transcripts using the flat form keep working under either setting.
  */
 export interface TaskParams {
-	/** Agent type; required. */
+	/** Agent type to spawn; omitted values resolve from the session spawn policy. */
 	agent?: string;
 	/** Stable agent id (flat form); default = generated AdjectiveNoun. */
 	id?: string;

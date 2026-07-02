@@ -136,6 +136,7 @@ import { wrapStreamFnWithProviderConcurrency } from "./task/provider-concurrency
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
+	concreteThinkingLevel,
 	parseConfiguredThinkingLevel,
 	parseThinkingLevel,
 	resolveProvisionalAutoLevel,
@@ -405,6 +406,15 @@ export interface CreateAgentSessionOptions {
 	customSystemPrompt?: string;
 	/** Already-loaded text appended through the bundled system prompt templates. */
 	appendSystemPrompt?: string;
+	/**
+	 * Already-loaded title-generation system prompt override (typically
+	 * {@link discoverTitleSystemPromptFile} → {@link resolvePromptInput}). When
+	 * set, every automatic session-title generation path on this session — the
+	 * first-input title and the replan-driven refresh — uses this prompt
+	 * instead of the bundled default. Refresh on cwd change via
+	 * {@link AgentSession.setTitleSystemPrompt}.
+	 */
+	titleSystemPrompt?: string;
 	/** Optional provider-facing session identifier for prompt caches and sticky auth selection.
 	 * Keeps persisted session files isolated while reusing provider-side caches. */
 	providerSessionId?: string;
@@ -1247,7 +1257,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		resolveModelRoleValue(settings.getModelRole("default"), allowedModels, {
 			settings,
 			matchPreferences: modelMatchPreferences,
-			modelRegistry,
 		}),
 	);
 	let model = options.model;
@@ -1262,7 +1271,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			? getRestorableSessionModels(existingSession.models, sessionManager.getLastModelChangeRole())
 			: [];
 	let restoredSessionModelIndex = -1;
-	let restoredSessionThinkingLevel: ThinkingLevel | undefined;
+	let restoredSessionThinkingLevel: ConfiguredThinkingLevel | undefined;
 	if (!hasExplicitModel && !model && sessionModelStrings.length > 0) {
 		logger.time("restoreSessionModel", () => {
 			let failedSessionModel: string | undefined;
@@ -1270,6 +1279,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const sessionModelStr = sessionModelStrings[i];
 				const parsedModel = parseModelString(sessionModelStr, {
 					allowMaxAlias: true,
+					allowAutoAlias: true,
 					isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
 				});
 				if (!parsedModel) {
@@ -1337,7 +1347,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Concrete level the agent/session start with. With `auto` this is the
 	// provisional level shown until the first per-turn classification resolves;
 	// `auto` itself stays a session-only concept handled by AgentSession.
-	let effectiveThinkingLevel: ThinkingLevel | undefined = thinkingLevel === AUTO_THINKING ? undefined : thinkingLevel;
+	let effectiveThinkingLevel: ThinkingLevel | undefined = concreteThinkingLevel(thinkingLevel);
 	if (model) {
 		const resolvedModel = model;
 		effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
@@ -1573,6 +1583,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			activateDiscoveredTools: toolNames => session.activateDiscoveredTools(toolNames),
 			getCheckpointState: () => session.getCheckpointState(),
 			setCheckpointState: state => session.setCheckpointState(state ?? undefined),
+			getLastCompletedRewind: () => session.getLastCompletedRewind(),
 			getToolChoiceQueue: () => session.toolChoiceQueue,
 			buildToolChoice: name => {
 				const m = session.model;
@@ -1922,6 +1933,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const sessionModelStr = sessionModelStrings[i];
 				const parsedModel = parseModelString(sessionModelStr, {
 					allowMaxAlias: true,
+					allowAutoAlias: true,
 					isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
 				});
 				if (!parsedModel) continue;
@@ -1936,7 +1948,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					// `thinking.defaultLevel` must not become sticky.
 					thinkingLevel = pickInitialThinkingLevel(restoredModel);
 					autoThinking = thinkingLevel === AUTO_THINKING;
-					effectiveThinkingLevel = thinkingLevel === AUTO_THINKING ? undefined : thinkingLevel;
+					effectiveThinkingLevel = concreteThinkingLevel(thinkingLevel);
 					effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
 						autoThinking
 							? resolveProvisionalAutoLevel(restoredModel)
@@ -1951,9 +1963,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!model && options.modelPattern) {
 			const availableModels = modelRegistry.getAll();
 			const matchPreferences = getModelMatchPreferences(settings);
-			const { model: resolved } = parseModelPattern(options.modelPattern, availableModels, matchPreferences, {
-				modelRegistry,
-			});
+			const { model: resolved } = parseModelPattern(options.modelPattern, availableModels, matchPreferences);
 			if (resolved) {
 				model = resolved;
 				modelFallbackMessage = undefined;
@@ -1983,7 +1993,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const reResolvedRoleSpec = resolveModelRoleValue(settings.getModelRole("default"), fallbackCandidates, {
 					settings,
 					matchPreferences: modelMatchPreferences,
-					modelRegistry,
 				});
 				if (reResolvedRoleSpec.model) {
 					defaultRoleSpec = reResolvedRoleSpec;
@@ -1995,7 +2004,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					// so the role's explicit selector (e.g. `:max`) now applies.
 					thinkingLevel = pickInitialThinkingLevel(resolvedDefaultModel);
 					autoThinking = thinkingLevel === AUTO_THINKING;
-					effectiveThinkingLevel = thinkingLevel === AUTO_THINKING ? undefined : thinkingLevel;
+					effectiveThinkingLevel = concreteThinkingLevel(thinkingLevel);
 					effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
 						autoThinking
 							? resolveProvisionalAutoLevel(resolvedDefaultModel)
@@ -2192,10 +2201,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// `auto` enforces the per-model policy (inline for Gemini, off otherwise);
 		// like the rest of the prune machinery this is fixed for the session, so a
 		// mid-session model switch keeps the start-time decision.
-		const inlineToolDescriptors = shouldInlineToolDescriptors(
-			settings.get("inlineToolDescriptors"),
-			model ? (modelRegistry.getCanonicalId(model) ?? model.id) : undefined,
-		);
+		const inlineToolDescriptors = shouldInlineToolDescriptors(settings.get("inlineToolDescriptors"), model?.id);
 		const eagerTasks = settings.get("task.eager") !== "default";
 		const eagerTasksAlways = settings.get("task.eager") === "always";
 		const intentField = $flag("PI_INTENT_TRACING", settings.get("tools.intentTracing")) ? INTENT_FIELD : undefined;
@@ -2764,6 +2770,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			providerSessionId: options.providerSessionId,
 			parentEvalSessionId: options.parentEvalSessionId,
 			advisorTools,
+			titleSystemPrompt: options.titleSystemPrompt,
 		});
 		hasSession = true;
 		if (asyncJobManager) {
