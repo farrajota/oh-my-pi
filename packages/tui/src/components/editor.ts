@@ -1171,6 +1171,15 @@ export class Editor implements Component, Focusable {
 
 				// If Tab was pressed, always apply the selection
 				if (kb.matches(data, "tui.input.tab")) {
+					// Check for stale autocomplete state due to buffer edits since last refresh
+					// (destructive keys or paste can outrun the debounced update).
+					const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
+					const currentTextBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+					if (!this.#autocompletePrefixMatchesCursorText(currentTextBeforeCursor)) {
+						// Autocomplete is stale - silently cancel; Tab has no fallback action here.
+						this.#cancelAutocomplete();
+						return;
+					}
 					const selected = this.#autocompleteList.getSelectedItem();
 					if (selected && this.#autocompleteProvider) {
 						const shouldChainSlashCommandAutocomplete = this.#isSlashCommandNameAutocompleteSelection();
@@ -1235,30 +1244,38 @@ export class Editor implements Component, Focusable {
 				}
 				// If Enter was pressed on a file path, apply completion
 				else if (kb.matches(data, "tui.input.submit") || data === "\n") {
-					const selected = this.#autocompleteList.getSelectedItem();
-					if (selected && this.#autocompleteProvider) {
-						const result = this.#autocompleteProvider.applyCompletion(
-							this.#state.lines,
-							this.#state.cursorLine,
-							this.#state.cursorCol,
-							selected,
-							this.#autocompletePrefix,
-						);
-
-						this.#state.lines = result.lines;
-						this.#state.cursorLine = result.cursorLine;
-						this.#setCursorCol(result.cursorCol);
-
+					// Check for stale autocomplete state due to buffer edits since last refresh.
+					const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
+					const currentTextBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+					if (!this.#autocompletePrefixMatchesCursorText(currentTextBeforeCursor)) {
+						// Autocomplete is stale - cancel and fall through to normal submission
 						this.#cancelAutocomplete();
-						this.onAutocompleteUpdate?.();
+					} else {
+						const selected = this.#autocompleteList.getSelectedItem();
+						if (selected && this.#autocompleteProvider) {
+							const result = this.#autocompleteProvider.applyCompletion(
+								this.#state.lines,
+								this.#state.cursorLine,
+								this.#state.cursorCol,
+								selected,
+								this.#autocompletePrefix,
+							);
 
-						if (this.onChange) {
-							this.onChange(this.getText());
+							this.#state.lines = result.lines;
+							this.#state.cursorLine = result.cursorLine;
+							this.#setCursorCol(result.cursorCol);
+
+							this.#cancelAutocomplete();
+							this.onAutocompleteUpdate?.();
+
+							if (this.onChange) {
+								this.onChange(this.getText());
+							}
+
+							result.onApplied?.();
 						}
-
-						result.onApplied?.();
+						return;
 					}
-					return;
 				}
 			}
 			// For other keys (like regular typing), DON'T return here
@@ -1927,7 +1944,6 @@ export class Editor implements Component, Focusable {
 				// then evaluate autocomplete triggers once at the final cursor position.
 				if (filteredText) {
 					this.#insertTextAtCursor(filteredText);
-					this.#retriggerAutocompleteAtCursor();
 				}
 				return;
 			}
@@ -2403,6 +2419,7 @@ export class Editor implements Component, Focusable {
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
+		this.#retriggerAutocompleteAtCursor();
 	}
 
 	#yankFromKillRing(): void {
@@ -2509,6 +2526,7 @@ export class Editor implements Component, Focusable {
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
+		this.#retriggerAutocompleteAtCursor();
 	}
 
 	#deleteToEndOfLine(): void {
@@ -2540,6 +2558,7 @@ export class Editor implements Component, Focusable {
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
+		this.#retriggerAutocompleteAtCursor();
 	}
 
 	#deleteWordBackwards(): void {
@@ -2574,6 +2593,7 @@ export class Editor implements Component, Focusable {
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
+		this.#retriggerAutocompleteAtCursor();
 	}
 
 	#deleteWordForwards(): void {
@@ -2605,6 +2625,7 @@ export class Editor implements Component, Focusable {
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
+		this.#retriggerAutocompleteAtCursor();
 	}
 
 	#handleForwardDelete(): void {
@@ -2896,11 +2917,38 @@ export class Editor implements Component, Focusable {
 		return this.#isInSubmittedSlashCommandContext() || this.#isInMidPromptSkillSlashContext();
 	}
 
+	/**
+	 * Decide whether the popup's `#autocompletePrefix` still safely maps onto the current
+	 * text before the cursor for an accept-time (`applyCompletion`) call. Mirrors the
+	 * re-anchoring branches in `CombinedAutocompleteProvider.applyCompletion`:
+	 *
+	 * - Exact match → always safe.
+	 * - Path branch is safe when the prefix is still a live suffix of the text; the
+	 *   provider's default slice at `cursorCol - prefix.length` then hits the right span.
+	 * - Slash branch re-anchors when both the prefix and the current text carry a
+	 *   leading slash command and the current slash token is clean (no whitespace or
+	 *   inner slash), matching `applyCompletion`'s slash-branch guard.
+	 * - `@`-file branch re-anchors via `#extractAtPrefix`; safe when the current text
+	 *   still ends in a whitespace-anchored `@<token>`.
+	 * - Everything else is stale — accepting it would corrupt the buffer (issue #4295).
+	 */
 	#autocompletePrefixMatchesCursorText(currentTextBeforeCursor: string): boolean {
 		if (currentTextBeforeCursor === this.#autocompletePrefix) return true;
-		if (findTrailingSlashCommandStart(this.#autocompletePrefix) !== 0) return false;
-		const slashStart = findTrailingSlashCommandStart(currentTextBeforeCursor);
-		return slashStart !== null && currentTextBeforeCursor.slice(slashStart) === this.#autocompletePrefix;
+
+		if (findLeadingSlashCommandStart(this.#autocompletePrefix) !== null) {
+			const currentLeadingStart = findLeadingSlashCommandStart(currentTextBeforeCursor);
+			if (currentLeadingStart !== null) {
+				const token = currentTextBeforeCursor.slice(currentLeadingStart);
+				if (!token.includes(" ") && !token.slice(1).includes("/")) return true;
+			}
+			return false;
+		}
+
+		if (this.#autocompletePrefix.startsWith("@")) {
+			return /(?:^|\s)@[^\s]*$/.test(currentTextBeforeCursor);
+		}
+
+		return currentTextBeforeCursor.endsWith(this.#autocompletePrefix);
 	}
 
 	#isSlashCommandNameAutocompleteSelection(): boolean {
