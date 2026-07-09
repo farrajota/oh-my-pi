@@ -56,7 +56,6 @@ import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
-import { Semaphore } from "./parallel";
 import { type EffectiveSubagentPermissions, formatPermissionScopeForPrompt } from "./permission-profiles";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
@@ -1391,6 +1390,12 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					delayMs: event.delayMs,
 					errorMessage: event.errorMessage,
 					startedAtMs: Date.now(),
+					mode: event.mode,
+					round: event.round,
+					deadlineMs: event.deadlineMs,
+					timeoutMs: event.timeoutMs,
+					reason: event.reason,
+					resetAware: event.resetAware,
 				};
 				progress.retryFailure = undefined;
 				scheduleProgress(true);
@@ -1403,6 +1408,11 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					progress.retryFailure = {
 						attempt,
 						errorMessage: event.finalError ?? "Auto-retry failed",
+						mode: event.mode,
+						round: event.round,
+						deadlineMs: event.deadlineMs,
+						timeoutMs: event.timeoutMs,
+						reason: event.reason,
 					};
 				}
 				scheduleProgress(true);

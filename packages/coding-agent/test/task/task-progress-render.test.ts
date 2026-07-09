@@ -122,6 +122,85 @@ describe("task progress rendering", () => {
 		expect(strippedRow).not.toContain(theme.getSpinnerFrames("status")[0]);
 	});
 
+	it("keeps normal retry progress on the retrying badge and countdown", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		vi.spyOn(Date, "now").mockReturnValue(10_000);
+		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
+		const progress = runningProgress({
+			id: "NormalRetry",
+			description: "retry short provider backoff",
+			retryState: {
+				attempt: 2,
+				maxAttempts: 5,
+				delayMs: 60_000,
+				errorMessage: "Too many requests",
+				startedAtMs: 10_000,
+			},
+		});
+
+		const rendered = Bun.stripANSI(
+			taskToolRenderer
+				.renderResult({ content: [{ type: "text", text: "" }], details: detailsFor(progress) }, options, theme)
+				.render(120)
+				.join("\n"),
+		);
+
+		expect(rendered).toContain("retrying");
+		expect(rendered).toContain("retrying 2/5 in");
+		expect(rendered).not.toContain("waiting-limit");
+		expect(rendered).not.toContain("rate-limited");
+	});
+
+	it("renders repeated retry progress as a limit wait distinct from failed rate limits", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
+		const progress = runningProgress({
+			id: "LimitWaiter",
+			description: "wait for subscription reset",
+			retryState: {
+				attempt: 4,
+				maxAttempts: 10,
+				delayMs: 900_000,
+				errorMessage: "Claude session limit reached",
+				startedAtMs: 1_000_000,
+				mode: "repeated",
+				round: 3,
+				deadlineMs: 86_400_000,
+				timeoutMs: 86_400_000,
+				reason: "max-retries",
+				resetAware: true,
+			},
+		});
+
+		const failed = runningProgress({
+			index: 1,
+			id: "LimitFailed",
+			status: "failed",
+			description: "gave up after provider backoff",
+			retryFailure: { attempt: 10, errorMessage: "Auto-retry failed" },
+		});
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [],
+			totalDurationMs: 0,
+			progress: [progress, failed],
+		};
+		const rendered = Bun.stripANSI(
+			taskToolRenderer
+				.renderResult({ content: [{ type: "text", text: "" }], details }, options, theme)
+				.render(120)
+				.join("\n"),
+		);
+
+		expect(rendered).toContain("waiting-limit");
+		expect(rendered).toContain("waiting for session limit reset (round 3) in");
+		expect(rendered).toContain("Claude session limit reached");
+		expect(rendered).toContain("LimitFailed");
+		expect(rendered).toContain("rate-limited");
+		expect(rendered).toContain("auto-retry gave up after 10 attempts");
+	});
+
 	it("renders pending task rows with the agent dot, not the pending glyph", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };

@@ -928,11 +928,11 @@ function renderAgentProgress(
 	}
 
 	// Show retry-blocked badge so the parent immediately sees that a child
-	// is sleeping on a provider 429, not silently progressing. Wins over the
-	// generic running marker because "we're waiting on a quota window" is
-	// the operationally meaningful state.
+	// is sleeping on provider limits, not silently progressing. Repeated long
+	// windows get a distinct badge so they do not look like short backoff retries.
 	if (progress.retryState && progress.status === "running") {
-		statusLine += ` ${formatBadge("retrying", "warning", theme)}`;
+		const retryBadge = progress.retryState.mode === "repeated" ? "waiting-limit" : "retrying";
+		statusLine += ` ${formatBadge(retryBadge, "warning", theme)}`;
 	} else if (progress.retryFailure && (progress.status === "failed" || progress.status === "aborted")) {
 		statusLine += ` ${formatBadge("rate-limited", "error", theme)}`;
 	} else if (progress.status === "failed" || progress.status === "aborted") {
@@ -984,13 +984,20 @@ function renderAgentProgress(
 
 	// Retry detail line: surface why the subagent is paused and roughly how
 	// long until the next attempt. Without this, the parent UI would just
-	// keep spinning while a child sleeps on a 3-hour provider rate-limit.
+	// keep spinning while a child sleeps on a provider limit window.
 	if (progress.retryState && progress.status === "running") {
 		const remainingMs = Math.max(0, progress.retryState.startedAtMs + progress.retryState.delayMs - Date.now());
 		const waitLabel = remainingMs > 0 ? `in ${formatDuration(remainingMs)}` : "now";
 		const summary =
-			`retrying ${progress.retryState.attempt}/${progress.retryState.maxAttempts} ${waitLabel}: ` +
-			previewLine(progress.retryState.errorMessage, 60);
+			progress.retryState.mode === "repeated"
+				? `waiting for session limit reset (round ${progress.retryState.round ?? 1}) ${waitLabel}: ${previewLine(
+						progress.retryState.errorMessage,
+						60,
+					)}`
+				: `retrying ${progress.retryState.attempt}/${progress.retryState.maxAttempts} ${waitLabel}: ${previewLine(
+						progress.retryState.errorMessage,
+						60,
+					)}`;
 		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("warning", summary)}`);
 	} else if (progress.retryFailure && progress.status !== "running") {
 		const summary = `auto-retry gave up after ${progress.retryFailure.attempt} attempt${

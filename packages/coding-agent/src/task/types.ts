@@ -461,6 +461,12 @@ export interface AgentProgress {
 		delayMs: number;
 		errorMessage: string;
 		startedAtMs: number;
+		mode?: "normal" | "repeated" | undefined;
+		round?: number | undefined;
+		deadlineMs?: number | undefined;
+		timeoutMs?: number | undefined;
+		reason?: "max-retries" | "max-delay" | undefined;
+		resetAware?: boolean | undefined;
 	};
 	/**
 	 * Terminal retry failure surfaced once the subagent gave up retrying
@@ -471,6 +477,20 @@ export interface AgentProgress {
 	retryFailure?: {
 		attempt: number;
 		errorMessage: string;
+		mode?: "normal" | "repeated" | undefined;
+		round?: number | undefined;
+		deadlineMs?: number | undefined;
+		timeoutMs?: number | undefined;
+		reason?:
+			| "success"
+			| "cancelled"
+			| "timeout"
+			| "manual-input"
+			| "generation-superseded"
+			| "not-recoverable"
+			| "max-retries"
+			| "max-delay"
+			| undefined;
 	};
 	/**
 	 * Snapshot of the most recent `task` tool call's in-flight `TaskToolDetails`,

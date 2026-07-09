@@ -1431,12 +1431,17 @@ export class EventController {
 			this.#pinnedErrorComponent = undefined;
 			this.ctx.clearPinnedError();
 		}
-		const delaySeconds = Math.round(event.delayMs / 1000);
+		const loaderText =
+			event.mode === "repeated"
+				? `Waiting for session limit reset (round ${event.round ?? 1}) in ${formatElapsedDuration(event.delayMs)}…${
+						this.ctx.focusedAgentId ? "" : " Esc to cancel"
+					}`
+				: `Retrying (${event.attempt}/${event.maxAttempts}) in ${Math.round(event.delayMs / 1000)}s…${this.#maintenanceEscHint()}`;
 		this.ctx.retryLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("warning", spinner),
 			text => theme.fg("muted", text),
-			`Retrying (${event.attempt}/${event.maxAttempts}) in ${delaySeconds}s…${this.#maintenanceEscHint()}`,
+			loaderText,
 			getSymbolTheme().spinnerFrames,
 		);
 		this.ctx.statusContainer.addChild(this.ctx.retryLoader);

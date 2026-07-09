@@ -231,6 +231,17 @@ export interface AutoCompactionEndEvent {
 	skipped?: boolean;
 }
 
+export type AutoRetryMode = "normal" | "repeated";
+export type AutoRetryExhaustionReason = "max-retries" | "max-delay";
+export type AutoRetryRepeatedEndReason =
+	| "success"
+	| "cancelled"
+	| "timeout"
+	| "manual-input"
+	| "generation-superseded"
+	| "not-recoverable"
+	| AutoRetryExhaustionReason;
+
 /** Fired when auto-retry starts */
 export interface AutoRetryStartEvent {
 	type: "auto_retry_start";
@@ -239,6 +250,12 @@ export interface AutoRetryStartEvent {
 	delayMs: number;
 	errorMessage: string;
 	errorId?: number;
+	mode?: AutoRetryMode;
+	round?: number;
+	deadlineMs?: number;
+	timeoutMs?: number;
+	reason?: AutoRetryExhaustionReason;
+	resetAware?: boolean;
 }
 
 export interface RecoveredRetryError {
@@ -255,6 +272,11 @@ export interface AutoRetryEndEvent {
 	attempt: number;
 	finalError?: string;
 	recoveredErrors?: RecoveredRetryError[];
+	mode?: AutoRetryMode;
+	round?: number;
+	deadlineMs?: number;
+	timeoutMs?: number;
+	reason?: AutoRetryRepeatedEndReason;
 }
 
 // ============================================================================

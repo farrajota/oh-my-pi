@@ -20,6 +20,153 @@ const ACCOUNT_RATE_LIMIT_PATTERN =
 	/\baccount(?:'s)?\b[^\n]{0,80}\brate.?limit\b|\brate.?limit\b[^\n]{0,80}\baccount\b/i;
 const INSUFFICIENT_BALANCE_PATTERN = /insufficient.?balance/i;
 
+export type RecoverableLongWindowLimit = {
+	recoverable: boolean;
+	reason?: "session" | "weekly" | "daily" | "quota-reset";
+	resetAfterMs?: number;
+	resetAtMs?: number;
+};
+
+const LONG_WINDOW_NEGATIVE_PATTERN =
+	/usage_not_included|insufficient.?balance|invalid.?grant|invalid.?auth|unauthori[sz]ed|forbidden|revoked|expired.?token|bad.?credential|context.?length|maximum.?prompt.?length|context.?overflow|too many requests|per.?minute|requests?\s*\/\s*min|overloaded|model.?capacity|resource.?exhausted|internal server error|internal error/i;
+const INSUFFICIENT_QUOTA_PATTERN = /insufficient.?quota/i;
+const SERVER_STATUS_PATTERN = /\b(?:500|502|503|504|529)\b/;
+const SESSION_LIMIT_PATTERN =
+	/\b(?:session|5[\s-]*hours?|five[\s-]*hours?)\b[\s\S]{0,80}\b(?:limit|usage|window|reset)\b|\b(?:limit|usage|window|reset)\b[\s\S]{0,80}\b(?:session|5[\s-]*hours?|five[\s-]*hours?)\b/i;
+const WEEKLY_LIMIT_PATTERN =
+	/\b(?:weekly|week)\b[\s\S]{0,80}\b(?:limit|usage|quota|reset|window)\b|\b(?:limit|usage|quota|reset|window)\b[\s\S]{0,80}\b(?:weekly|week)\b/i;
+const DAILY_LIMIT_PATTERN =
+	/\b(?:daily|day)\b[\s\S]{0,80}\b(?:limit|usage|quota|reset|window)\b|\b(?:limit|usage|quota|reset|window)\b[\s\S]{0,80}\b(?:daily|day)\b/i;
+const RESETTABLE_QUOTA_PATTERN =
+	/\b(?:usage_limit_reached|usage.?limit|quota|limit_reached)\b[\s\S]{0,120}\b(?:reset|resets|retry after|try again in|available again|available in)\b|\b(?:reset|resets|retry after|try again in|available again|available in)\b[\s\S]{0,120}\b(?:usage_limit_reached|usage.?limit|quota|limit_reached)\b/i;
+const RELATIVE_RESET_PATTERN =
+	/\b(?:try again in|retry after|reset(?:s)?(?:\s+after|\s+in)|quota will reset after|available again in|available in)\s+((?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(?:d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b(?:\s*(?:,|and)?\s*(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(?:d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b)*)/i;
+const RELATIVE_DURATION_PART_PATTERN =
+	/(\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b/gi;
+const ABSOLUTE_RESET_PATTERN =
+	/\b(?:reset(?:s)?|quota will reset|try again|retry)\s+(?:at|on|after)\s+([^\n;]+?)(?=$|[.)\]]\s|[,;]\s)/i;
+
+const WORD_NUMBER_VALUES: Record<string, number> = {
+	one: 1,
+	two: 2,
+	three: 3,
+	four: 4,
+	five: 5,
+	six: 6,
+	seven: 7,
+	eight: 8,
+	nine: 9,
+	ten: 10,
+	eleven: 11,
+	twelve: 12,
+};
+
+/**
+ * Narrow classifier for long-window usage limits that are safe for repeated
+ * session-level retry. This intentionally excludes entitlement, auth,
+ * per-minute throttles, capacity, and server failures even when they also use
+ * generic rate-limit wording.
+ */
+export function classifyRecoverableLongWindowLimit(input: {
+	status?: number;
+	message?: string;
+	errorId?: number;
+}): RecoverableLongWindowLimit {
+	void input.errorId;
+
+	if (input.status === 401 || input.status === 403 || (input.status !== undefined && input.status >= 500)) {
+		return { recoverable: false };
+	}
+
+	const message = input.message?.trim();
+	if (!message) return { recoverable: false };
+
+	if (LONG_WINDOW_NEGATIVE_PATTERN.test(message) || SERVER_STATUS_PATTERN.test(message)) {
+		return { recoverable: false };
+	}
+
+	const resetAfterMs = parseRelativeResetAfterMs(message);
+	const resetAtMs = parseAbsoluteResetAtMs(message);
+	const hasResetSignal =
+		resetAfterMs !== undefined ||
+		resetAtMs !== undefined ||
+		/\b(?:reset|resets|retry after|try again in|available again|available in)\b/i.test(message);
+	const reason = classifyLongWindowReason(message, hasResetSignal);
+	if (!reason) return { recoverable: false };
+
+	if (INSUFFICIENT_QUOTA_PATTERN.test(message) && !hasResetSignal) {
+		return { recoverable: false };
+	}
+
+	return {
+		recoverable: true,
+		reason,
+		...(resetAfterMs !== undefined ? { resetAfterMs } : {}),
+		...(resetAtMs !== undefined ? { resetAtMs } : {}),
+	};
+}
+
+function classifyLongWindowReason(
+	message: string,
+	hasResetSignal: boolean,
+): RecoverableLongWindowLimit["reason"] | undefined {
+	if (SESSION_LIMIT_PATTERN.test(message)) return "session";
+	if (WEEKLY_LIMIT_PATTERN.test(message)) return "weekly";
+	if (DAILY_LIMIT_PATTERN.test(message)) return "daily";
+	if (hasResetSignal && RESETTABLE_QUOTA_PATTERN.test(message)) return "quota-reset";
+	return undefined;
+}
+
+function parseRelativeResetAfterMs(message: string): number | undefined {
+	const match = RELATIVE_RESET_PATTERN.exec(message);
+	if (!match) return undefined;
+	const durationText = match[1];
+	if (!durationText) return undefined;
+
+	let totalMs = 0;
+	RELATIVE_DURATION_PART_PATTERN.lastIndex = 0;
+	for (const part of durationText.matchAll(RELATIVE_DURATION_PART_PATTERN)) {
+		const valueText = part[1];
+		const unit = part[2];
+		if (!valueText || !unit) continue;
+
+		const value = parseDurationValue(valueText);
+		if (value === undefined) continue;
+
+		const normalizedUnit = unit.toLowerCase();
+		if (normalizedUnit.startsWith("d")) totalMs += value * 24 * 60 * 60 * 1000;
+		else if (normalizedUnit.startsWith("h")) totalMs += value * 60 * 60 * 1000;
+		else totalMs += value * 60 * 1000;
+	}
+
+	return Number.isFinite(totalMs) && totalMs > 0 ? totalMs : undefined;
+}
+
+function parseDurationValue(value: string): number | undefined {
+	const numeric = Number(value);
+	if (Number.isFinite(numeric)) return numeric;
+	return WORD_NUMBER_VALUES[value.toLowerCase()];
+}
+
+function parseAbsoluteResetAtMs(message: string): number | undefined {
+	const match = ABSOLUTE_RESET_PATTERN.exec(message);
+	if (!match) return undefined;
+	const timestampText = match[1];
+	if (!timestampText) return undefined;
+
+	const candidate = timestampText.trim().replace(/[.)\]]+$/, "");
+	if (
+		!/(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:?\d{2})|\b(?:UTC|GMT)\b)/i.test(
+			candidate,
+		)
+	) {
+		return undefined;
+	}
+
+	const timestamp = Date.parse(candidate);
+	return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
 /**
  * Classify a rate-limit error message into a reason category.
  * Priority order: QUOTA (Antigravity "quota will reset") > MODEL_CAPACITY > QUOTA (account) >

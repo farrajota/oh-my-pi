@@ -1369,6 +1369,53 @@ export const SETTINGS_SCHEMA = {
 			description: "Allow retry recovery to switch to configured fallback models",
 		},
 	},
+	"retry.repeated.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Enable repeated retries",
+			description:
+				"Keep retrying after normal retry and fallback recovery is exhausted for recoverable subscription, session, weekly, or daily limit windows.",
+		},
+	},
+	"retry.repeated.timerMs": {
+		type: "number",
+		default: 15 * 60 * 1000,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Repeated retry timer",
+			description: "Poll interval when no exact provider reset time is known. Minimum 1 minute.",
+			options: [
+				{ value: "60000", label: "1 minute" },
+				{ value: "300000", label: "5 minutes" },
+				{ value: "900000", label: "15 minutes" },
+				{ value: "1800000", label: "30 minutes" },
+				{ value: "3600000", label: "1 hour" },
+			],
+		},
+	},
+	"retry.repeated.timeoutMs": {
+		type: "number",
+		default: 24 * 60 * 60 * 1000,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Repeated retry timeout",
+			description:
+				"Maximum elapsed time from the first repeated retry in a chain before OMP stops and requires manual intervention.",
+			options: [
+				{ value: "3600000", label: "1 hour" },
+				{ value: "21600000", label: "6 hours" },
+				{ value: "43200000", label: "12 hours" },
+				{ value: "86400000", label: "24 hours" },
+				{ value: "172800000", label: "48 hours" },
+			],
+		},
+	},
+
 	"retry.fallbackChains": {
 		type: "record",
 		default: {} as Record<string, string[]>,
@@ -5165,6 +5212,9 @@ export interface RetrySettings {
 	baseDelayMs: number;
 	maxDelayMs: number;
 	modelFallback: boolean;
+	"repeated.enabled": boolean;
+	"repeated.timerMs": number;
+	"repeated.timeoutMs": number;
 }
 
 export interface MemoriesSettings {

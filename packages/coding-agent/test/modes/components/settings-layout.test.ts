@@ -108,6 +108,52 @@ describe("settings layout", () => {
 		});
 	});
 
+	it("exposes repeated retry controls in the model retry settings", () => {
+		const repeatedPaths: SettingPath[] = [
+			"retry.repeated.enabled",
+			"retry.repeated.timerMs",
+			"retry.repeated.timeoutMs",
+		];
+		const defs = getSettingsForTab("model").filter(def => repeatedPaths.includes(def.path));
+
+		expect(defs.map(def => def.path)).toEqual(repeatedPaths);
+		expect(Settings.instance.get("retry.repeated.enabled")).toBe(false);
+		expect(Settings.instance.get("retry.repeated.timerMs")).toBe(900000);
+		expect(Settings.instance.get("retry.repeated.timeoutMs")).toBe(86400000);
+
+		expect(defs[0]).toMatchObject({
+			path: "retry.repeated.enabled",
+			type: "boolean",
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Enable repeated retries",
+		});
+		expect(defs[1]).toMatchObject({
+			path: "retry.repeated.timerMs",
+			type: "submenu",
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Repeated retry timer",
+		});
+		expect(defs[2]).toMatchObject({
+			path: "retry.repeated.timeoutMs",
+			type: "submenu",
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Repeated retry timeout",
+		});
+
+		if (defs[1]?.type !== "submenu") throw new Error("retry.repeated.timerMs should render as a submenu");
+		if (defs[2]?.type !== "submenu") throw new Error("retry.repeated.timeoutMs should render as a submenu");
+
+		const timerValues = defs[1].options.map(option => Number(option.value));
+		expect(timerValues).toEqual([60000, 300000, 900000, 1800000, 3600000]);
+		expect(Math.min(...timerValues)).toBe(60000);
+
+		const timeoutValues = defs[2].options.map(option => Number(option.value));
+		expect(timeoutValues).toEqual([3600000, 21600000, 43200000, 86400000, 172800000]);
+	});
+
 	it("exposes retry fallback chains as editable JSON in the model settings", () => {
 		const def = getSettingsForTab("model").find(item => item.path === "retry.fallbackChains");
 

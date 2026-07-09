@@ -55,6 +55,9 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 		pendingTools: new Map<string, unknown>(),
 		hideThinkingBlock: false,
 		setWorkingMessage: vi.fn(),
+		beginWorkingMessageRun: vi.fn(),
+		endWorkingMessageRun: vi.fn(),
+		setWorkingMessageRunTokenDelta: vi.fn(),
 		clearPinnedError: vi.fn(),
 		loadingAnimation: undefined,
 		autoCompactionLoader: undefined,
@@ -81,6 +84,7 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 			},
 		},
 		session: {
+			agent: { state: { isStreaming: false } },
 			get isStreaming() {
 				return streamState.isStreaming;
 			},
@@ -98,8 +102,17 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 	return { ctx, streamState, statusContainer, workingLoaders, setProgress };
 }
 
+function ownStringValues(value: unknown): string[] {
+	if (!value || typeof value !== "object") return [];
+	return Object.values(value).filter((entry): entry is string => typeof entry === "string");
+}
+
+function expectRetryLoaderText(ctx: InteractiveModeContext, expected: string): void {
+	expect(ownStringValues(ctx.retryLoader).some(text => text.includes(expected))).toBe(true);
+}
+
 const AGENT_START = { type: "agent_start" } as unknown as AgentSessionEvent;
-const AGENT_END = { type: "agent_end" } as unknown as AgentSessionEvent;
+const AGENT_END = { type: "agent_end", messages: [] } as unknown as AgentSessionEvent;
 const COMPACTION_START = {
 	type: "auto_compaction_start",
 	reason: "overflow",
@@ -117,6 +130,15 @@ const RETRY_START = {
 	maxAttempts: 3,
 	delayMs: 1000,
 	errorMessage: "overloaded",
+} as unknown as AgentSessionEvent;
+const REPEATED_RETRY_START = {
+	type: "auto_retry_start",
+	mode: "repeated",
+	attempt: 3,
+	maxAttempts: 3,
+	delayMs: 14 * 60 * 1000,
+	errorMessage: "session limit",
+	round: 2,
 } as unknown as AgentSessionEvent;
 const TASK_TOOL_EXECUTION_END = {
 	type: "tool_execution_end",
@@ -194,6 +216,24 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		await controller.handleEvent(AGENT_START);
 		expect(ctx.loadingAnimation).toBeDefined();
 		expect(statusContainer.children).toContain(ctx.loadingAnimation);
+	});
+
+	it("keeps normal auto-retry loader text unchanged", async () => {
+		const { ctx } = createContext();
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(RETRY_START);
+
+		expectRetryLoaderText(ctx, "Retrying (1/3) in 1s… (esc to cancel)");
+	});
+
+	it("uses explicit session-limit wait text for repeated auto-retry", async () => {
+		const { ctx } = createContext();
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(REPEATED_RETRY_START);
+
+		expectRetryLoaderText(ctx, "Waiting for session limit reset (round 2) in 14m… Esc to cancel");
 	});
 
 	it("re-shows the Working… loader after a subagent task completes while the session keeps streaming", async () => {

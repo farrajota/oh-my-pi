@@ -513,6 +513,12 @@ export type AgentSessionEvent =
 			delayMs: number;
 			errorMessage: string;
 			errorId?: number;
+			mode?: "normal" | "repeated";
+			round?: number;
+			deadlineMs?: number;
+			timeoutMs?: number;
+			reason?: "max-retries" | "max-delay";
+			resetAware?: boolean;
 	  }
 	| {
 			type: "auto_retry_end";
@@ -520,6 +526,19 @@ export type AgentSessionEvent =
 			attempt: number;
 			finalError?: string;
 			recoveredErrors?: RecoveredRetryError[];
+			mode?: "normal" | "repeated";
+			round?: number;
+			deadlineMs?: number;
+			timeoutMs?: number;
+			reason?:
+				| "success"
+				| "cancelled"
+				| "timeout"
+				| "manual-input"
+				| "generation-superseded"
+				| "not-recoverable"
+				| "max-retries"
+				| "max-delay";
 	  }
 	| { type: "retry_fallback_applied"; from: string; to: string; role: string }
 	| { type: "retry_fallback_succeeded"; model: string; role: string }
@@ -1378,6 +1397,27 @@ function queuedTextContent(message: AgentMessage): string | undefined {
 	if (typeof content === "string") return content;
 	return content.find((part): part is TextContent => part.type === "text")?.text;
 }
+type RepeatedRetryExhaustionReason = "max-retries" | "max-delay";
+type RepeatedRetryEndReason =
+	| "success"
+	| "cancelled"
+	| "timeout"
+	| "manual-input"
+	| "generation-superseded"
+	| "not-recoverable"
+	| RepeatedRetryExhaustionReason;
+
+interface RepeatedRetryState {
+	active: boolean;
+	startedAtMs: number;
+	round: number;
+	deadlineMs: number;
+	timeoutMs: number;
+	reason: RepeatedRetryExhaustionReason;
+	generation: number;
+	lastErrorMessage?: string;
+	lastErrorId?: number;
+}
 
 function queuedImageContent(message: AgentMessage): ImageContent[] | undefined {
 	if (!("content" in message) || typeof message.content === "string") return undefined;
@@ -1627,6 +1667,7 @@ export class AgentSession {
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
+	#repeatedRetryState: RepeatedRetryState | undefined = undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined = undefined;
 	#pendingRecoveredRetryErrors: PendingRecoveredRetryError[] = [];
 	// Todo completion reminder state
@@ -3786,11 +3827,12 @@ export class AgentSession {
 				if (this.#handoffAbortController) {
 					this.#skipPostTurnMaintenanceAssistantTimestamp = assistantMsg.timestamp;
 				}
+				const repeatedRetryState = this.#repeatedRetryState;
 				if (
 					assistantMsg.stopReason !== "error" &&
 					assistantMsg.stopReason !== "aborted" &&
 					!this.#isEmptyAssistantStop(assistantMsg) &&
-					this.#retryAttempt > 0
+					(this.#retryAttempt > 0 || repeatedRetryState !== undefined)
 				) {
 					if (this.#activeRetryFallback && this.model) {
 						await this.#emitSessionEvent({
@@ -3800,14 +3842,18 @@ export class AgentSession {
 						});
 					}
 					const recoveredErrors = await this.#markPendingRecoveredRetryErrors(assistantMsg);
-					await this.#emitSessionEvent({
-						type: "auto_retry_end",
-						success: true,
-						attempt: this.#retryAttempt,
-						recoveredErrors,
-					});
-					this.#clearPendingRecoveredRetryErrors();
-					this.#retryAttempt = 0;
+					if (repeatedRetryState) {
+						await this.#finishRepeatedRetry("success", { success: true, recoveredErrors });
+					} else {
+						await this.#emitSessionEvent({
+							type: "auto_retry_end",
+							success: true,
+							attempt: this.#retryAttempt,
+							recoveredErrors,
+						});
+						this.#clearPendingRecoveredRetryErrors();
+						this.#retryAttempt = 0;
+					}
 				}
 				if (assistantMsg.provider === "opencode-go") {
 					this.#modelRegistry.authStorage.recordUsageCost(assistantMsg.provider, assistantMsg.usage.cost.total, {
@@ -4058,6 +4104,14 @@ export class AgentSession {
 			// `stopReason === "error"`.
 			if (this.#isClassifierRefusal(msg)) {
 				this.#removeAssistantMessageFromActiveContext(msg);
+			}
+			if (this.#repeatedRetryState) {
+				await this.#finishRepeatedRetry("not-recoverable", {
+					message: msg,
+					finalError: msg.errorMessage,
+				});
+				await emitAgentEndNotification();
+				return;
 			}
 			this.#resolveRetry();
 
@@ -5479,6 +5533,12 @@ export class AgentSession {
 				delayMs: event.delayMs,
 				errorMessage: event.errorMessage,
 				errorId: event.errorId,
+				mode: event.mode,
+				round: event.round,
+				deadlineMs: event.deadlineMs,
+				timeoutMs: event.timeoutMs,
+				reason: event.reason,
+				resetAware: event.resetAware,
 			});
 		} else if (event.type === "auto_retry_end") {
 			await this.#extensionRunner.emit({
@@ -5487,6 +5547,11 @@ export class AgentSession {
 				attempt: event.attempt,
 				finalError: event.finalError,
 				recoveredErrors: event.recoveredErrors,
+				mode: event.mode,
+				round: event.round,
+				deadlineMs: event.deadlineMs,
+				timeoutMs: event.timeoutMs,
+				reason: event.reason,
 			});
 		} else if (event.type === "ttsr_triggered") {
 			await this.#extensionRunner.emit({ type: "ttsr_triggered", rules: event.rules });
@@ -7476,6 +7541,7 @@ export class AgentSession {
 			// A user turn owns the next decision; drop a queued forced choice from
 			// a reminder continuation this prompt just preempted.
 			this.#toolChoiceQueue.removeByLabel("plan-mode-decision");
+			await this.#cancelRepeatedRetryForManualInput();
 		}
 
 		// If streaming, queue via steer() or followUp() based on option
@@ -8002,6 +8068,7 @@ export class AgentSession {
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
 		// a user interrupt suppressed.
 		this.#advisorAutoResumeSuppressed = false;
+		await this.#cancelRepeatedRetryForManualInput();
 		const normalizedImages = await this.#normalizeImagesForModel(images);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (normalizedImages?.length) {
@@ -13616,6 +13683,195 @@ export class AgentSession {
 		return undefined;
 	}
 
+	#getRepeatedRetryTimerMs(): number {
+		return this.#normalizeRepeatedRetrySetting(this.settings.get("retry.repeated.timerMs"), 900_000);
+	}
+
+	#getRepeatedRetryTimeoutMs(): number {
+		return this.#normalizeRepeatedRetrySetting(this.settings.get("retry.repeated.timeoutMs"), 86_400_000);
+	}
+
+	#normalizeRepeatedRetrySetting(value: unknown, defaultMs: number): number {
+		const numeric = typeof value === "number" ? value : Number(value);
+		if (!Number.isFinite(numeric)) return defaultMs;
+		return Math.max(60_000, numeric);
+	}
+
+	#repeatedRetryEnabled(retrySettings: { enabled?: boolean }): boolean {
+		return retrySettings.enabled === true && this.settings.get("retry.repeated.enabled") === true;
+	}
+
+	#clearRepeatedRetryState(): RepeatedRetryState | undefined {
+		const state = this.#repeatedRetryState;
+		this.#repeatedRetryState = undefined;
+		return state;
+	}
+
+	async #finishRepeatedRetry(
+		reason: RepeatedRetryEndReason,
+		options?: {
+			success?: boolean;
+			finalError?: string;
+			message?: AssistantMessage;
+			recoveredErrors?: RecoveredRetryError[];
+		},
+	): Promise<boolean> {
+		const state = this.#clearRepeatedRetryState();
+		if (!state) return false;
+		if (options?.message) {
+			await this.#persistRetryLifecycleErrorMessage(options.message);
+		}
+		const attempt = this.#retryAttempt;
+		this.#retryAttempt = 0;
+		this.#retryAbortController = undefined;
+		await this.#emitSessionEvent({
+			type: "auto_retry_end",
+			success: options?.success === true,
+			attempt,
+			finalError: options?.finalError,
+			recoveredErrors: options?.recoveredErrors,
+			mode: "repeated",
+			round: state.round,
+			deadlineMs: state.deadlineMs,
+			timeoutMs: state.timeoutMs,
+			reason,
+		});
+		this.#retryAttempt = 0;
+		this.#clearPendingRecoveredRetryErrors();
+		this.#resolveRetry();
+		return true;
+	}
+
+	async #cancelRepeatedRetryForManualInput(): Promise<void> {
+		if (!this.#repeatedRetryState) return;
+		const retryAbortController = this.#retryAbortController;
+		await this.#finishRepeatedRetry("manual-input", { finalError: "Repeated retry cancelled by user input" });
+		retryAbortController?.abort();
+	}
+
+	async #maybeScheduleRepeatedRetryAfterExhaustion(input: {
+		message: AssistantMessage;
+		errorId: number;
+		reason: RepeatedRetryExhaustionReason;
+		generation: number;
+		retrySettings: { enabled?: boolean; maxRetries: number };
+		finalError?: string;
+	}): Promise<boolean> {
+		const existingState = this.#repeatedRetryState;
+		if (!this.#repeatedRetryEnabled(input.retrySettings)) {
+			if (existingState) {
+				return await this.#finishRepeatedRetry("not-recoverable", {
+					message: input.message,
+					finalError: input.finalError ?? input.message.errorMessage,
+				});
+			}
+			return false;
+		}
+		if (this.#promptGeneration !== input.generation) {
+			if (existingState) {
+				return await this.#finishRepeatedRetry("generation-superseded", {
+					message: input.message,
+					finalError: input.finalError ?? input.message.errorMessage,
+				});
+			}
+			return false;
+		}
+
+		const limit = AIError.classifyRecoverableLongWindowLimit({
+			status: input.message.errorStatus,
+			message: input.message.errorMessage,
+			errorId: input.errorId,
+		});
+		if (!limit.recoverable) {
+			if (existingState) {
+				return await this.#finishRepeatedRetry("not-recoverable", {
+					message: input.message,
+					finalError: input.finalError ?? input.message.errorMessage,
+				});
+			}
+			return false;
+		}
+
+		const now = Date.now();
+		const timeoutMs = this.#getRepeatedRetryTimeoutMs();
+		const state = existingState ?? {
+			active: true,
+			startedAtMs: now,
+			round: 0,
+			deadlineMs: now + timeoutMs,
+			timeoutMs,
+			reason: input.reason,
+			generation: input.generation,
+		};
+		state.timeoutMs = timeoutMs;
+		state.deadlineMs = state.startedAtMs + timeoutMs;
+		state.reason = input.reason;
+		state.generation = input.generation;
+		state.lastErrorMessage = input.message.errorMessage;
+		state.lastErrorId = input.message.errorId;
+		this.#repeatedRetryState = state;
+
+		const remainingMs = state.deadlineMs - now;
+		if (remainingMs <= 0) {
+			return await this.#finishRepeatedRetry("timeout", {
+				message: input.message,
+				finalError: input.finalError ?? input.message.errorMessage,
+			});
+		}
+
+		const resetDelayMs = limit.resetAtMs !== undefined ? Math.max(0, limit.resetAtMs - now) : limit.resetAfterMs;
+		const resetAware = resetDelayMs !== undefined;
+		const delayMs = Math.max(0, Math.min(resetDelayMs ?? this.#getRepeatedRetryTimerMs(), remainingMs));
+		state.round += 1;
+
+		await this.#emitSessionEvent({
+			type: "auto_retry_start",
+			attempt: this.#retryAttempt,
+			maxAttempts: input.retrySettings.maxRetries,
+			delayMs,
+			errorMessage: input.message.errorMessage ?? "Unknown error",
+			errorId: input.message.errorId,
+			mode: "repeated",
+			round: state.round,
+			deadlineMs: state.deadlineMs,
+			timeoutMs: state.timeoutMs,
+			reason: input.reason,
+			resetAware,
+		});
+
+		this.#removeAssistantMessageFromActiveContext(input.message, "repeated-auto-retry");
+
+		const retryAbortController = new AbortController();
+		this.#retryAbortController?.abort();
+		this.#retryAbortController = retryAbortController;
+		try {
+			await scheduler.wait(delayMs, { signal: retryAbortController.signal });
+		} catch {
+			if (this.#retryAbortController !== retryAbortController) return true;
+			return await this.#finishRepeatedRetry("cancelled", { finalError: "Retry cancelled" });
+		}
+		if (this.#retryAbortController === retryAbortController) {
+			this.#retryAbortController = undefined;
+		}
+		if (!this.#repeatedRetryState) return true;
+		if (Date.now() >= this.#repeatedRetryState.deadlineMs) {
+			return await this.#finishRepeatedRetry("timeout", {
+				message: input.message,
+				finalError: input.finalError ?? input.message.errorMessage,
+			});
+		}
+		if (this.#promptGeneration !== input.generation) {
+			return await this.#finishRepeatedRetry("generation-superseded", {
+				message: input.message,
+				finalError: input.finalError ?? input.message.errorMessage,
+			});
+		}
+
+		this.#retryAttempt = 0;
+		this.#scheduleAgentContinue({ delayMs: 1, generation: input.generation });
+		return true;
+	}
+
 	/**
 	 * Handle retryable errors with exponential backoff.
 	 * @returns true if retry was initiated, false if max retries exceeded or disabled
@@ -13642,7 +13898,34 @@ export class AgentSession {
 			this.#retryResolve = resolve;
 		}
 
+		const errorMessage = message.errorMessage || "Unknown error";
+		const id = this.#classifyRetryMessage(message);
+		if (this.#repeatedRetryState) {
+			const limit = AIError.classifyRecoverableLongWindowLimit({
+				status: message.errorStatus,
+				message: message.errorMessage,
+				errorId: id,
+			});
+			if (!limit.recoverable) {
+				return await this.#finishRepeatedRetry("not-recoverable", {
+					message,
+					finalError: message.errorMessage,
+				});
+			}
+		}
+
 		if (this.#retryAttempt > retrySettings.maxRetries) {
+			if (
+				await this.#maybeScheduleRepeatedRetryAfterExhaustion({
+					message,
+					errorId: id,
+					reason: "max-retries",
+					generation,
+					retrySettings,
+				})
+			) {
+				return true;
+			}
 			await this.#persistRetryLifecycleErrorMessage(message);
 			// Max retries exceeded, emit final failure and reset
 			await this.#emitSessionEvent({
@@ -13657,8 +13940,6 @@ export class AgentSession {
 			return false;
 		}
 
-		const errorMessage = message.errorMessage || "Unknown error";
-		const id = this.#classifyRetryMessage(message);
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = staleOpenAIResponsesReplayError
@@ -13763,6 +14044,19 @@ export class AgentSession {
 		// can act on it.
 		const maxDelayMs = retrySettings.maxDelayMs;
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel) {
+			const maxDelayFinalError = `Provider requested ${delayMs}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`;
+			if (
+				await this.#maybeScheduleRepeatedRetryAfterExhaustion({
+					message,
+					errorId: id,
+					reason: "max-delay",
+					generation,
+					retrySettings,
+					finalError: maxDelayFinalError,
+				})
+			) {
+				return true;
+			}
 			await this.#persistRetryLifecycleErrorMessage(message);
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;
@@ -13770,7 +14064,7 @@ export class AgentSession {
 				type: "auto_retry_end",
 				success: false,
 				attempt,
-				finalError: `Provider requested ${delayMs}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
+				finalError: maxDelayFinalError,
 			});
 			this.#clearPendingRecoveredRetryErrors();
 			this.#resolveRetry();
@@ -13863,7 +14157,11 @@ export class AgentSession {
 	 * Cancel in-progress retry.
 	 */
 	abortRetry(): void {
-		this.#retryAbortController?.abort();
+		const retryAbortController = this.#retryAbortController;
+		if (this.#repeatedRetryState) {
+			void this.#finishRepeatedRetry("cancelled", { finalError: "Retry cancelled" });
+		}
+		retryAbortController?.abort();
 		// Note: _retryAttempt is reset in the catch block of _autoRetry
 		this.#resolveRetry();
 	}
@@ -13922,6 +14220,7 @@ export class AgentSession {
 
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
+		this.#clearRepeatedRetryState();
 
 		// Re-attempt the turn
 		this.#scheduleAgentContinue({ delayMs: 1 });
