@@ -122,6 +122,13 @@ const agentEventTypes = new Set<AgentEvent["type"]>([
 const isAgentEvent = (event: AgentSessionEvent): event is AgentEvent =>
 	agentEventTypes.has(event.type as AgentEvent["type"]);
 
+function isIntentionalRepeatedRetryEnd(event: Extract<AgentSessionEvent, { type: "auto_retry_end" }>): boolean {
+	return (
+		event.mode === "repeated" &&
+		(event.reason === "manual-input" || event.reason === "cancelled" || event.reason === "generation-superseded")
+	);
+}
+
 function normalizeModelPatterns(value: string | string[] | undefined): string[] {
 	if (!value) return [];
 	if (Array.isArray(value)) {
@@ -1403,8 +1410,11 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			}
 			if (event.type === "auto_retry_end") {
 				const attempt = progress.retryState?.attempt ?? event.attempt;
+				const intentionallyEnded = isIntentionalRepeatedRetryEnd(event);
 				progress.retryState = undefined;
-				if (!event.success) {
+				if (intentionallyEnded) {
+					progress.retryFailure = undefined;
+				} else if (!event.success) {
 					progress.retryFailure = {
 						attempt,
 						errorMessage: event.finalError ?? "Auto-retry failed",

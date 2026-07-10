@@ -108,12 +108,14 @@ describe("mock provider", () => {
 
 	test("response.throw produces a terminal error event with the failure on stopReason/errorMessage", async () => {
 		const mock = createMockModel({
-			responses: [{ throw: "boom" }],
+			responses: [{ throw: "boom", errorStatus: 429, errorCode: "model_cooldown" }],
 		});
 
 		const result = await mock.stream(mock.model, emptyContext()).result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("boom");
+		expect(result.errorStatus).toBe(429);
+		expect(result.errorCode).toBe("model_cooldown");
 	});
 
 	test("calling without a configured response rejects on the next call", async () => {

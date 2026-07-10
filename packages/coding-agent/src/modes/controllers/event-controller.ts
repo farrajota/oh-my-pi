@@ -71,6 +71,13 @@ function formatElapsedDuration(ms: number): string {
 	return parts.join(" ");
 }
 
+function isIntentionalRepeatedRetryEnd(event: Extract<AgentSessionEvent, { type: "auto_retry_end" }>): boolean {
+	return (
+		event.mode === "repeated" &&
+		(event.reason === "manual-input" || event.reason === "cancelled" || event.reason === "generation-superseded")
+	);
+}
+
 function formatCompletionFooter(elapsedMs: number, runTokenDelta?: number): string {
 	const base = `Completed in ${formatElapsedDuration(elapsedMs)}`;
 	if (runTokenDelta === undefined) return base;
@@ -1469,7 +1476,9 @@ export class EventController {
 			this.#clearRetrySupersededAssistantComponents();
 		} else {
 			this.#clearRetrySupersededAssistantComponents();
-			this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+			if (!isIntentionalRepeatedRetryEnd(event)) {
+				this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+			}
 		}
 		this.#ensureWorkingLoaderWhileStreaming();
 		this.ctx.ui.requestRender();

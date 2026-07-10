@@ -170,6 +170,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 						body: params,
 						signal: requestSignal,
 						fetch: options?.fetch,
+						maxAttempts: options?.providerMaxAttempts,
 						// Transient 408/429/5xx get Retry-After-aware transport retries;
 						// the first-event watchdog aborts `requestSignal`, so retries
 						// cannot extend the caller's deadline.

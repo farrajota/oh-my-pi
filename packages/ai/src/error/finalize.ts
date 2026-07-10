@@ -20,10 +20,24 @@ export interface FinalizeOptions {
 	capturedErrorResponse?: CapturedHttpErrorResponse;
 }
 
+/** Extract a provider-supplied code without interpreting error text. */
+function providerCode(error: unknown): string | undefined {
+	try {
+		if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+		const code = error.code;
+		if (typeof code === "string") return code;
+		return typeof code === "number" && Number.isFinite(code) ? String(code) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /** The full bundle a provider assigns onto its `AssistantMessage` error fields. */
 export interface FinalizeResult {
 	/** Structured flag id from {@link classify}. */
 	id: number;
+	/** Provider-supplied machine-readable code, when structurally present. */
+	code?: string;
 	/** HTTP status, from the error or the captured response. */
 	status: number | undefined;
 	/** `"aborted"` when the caller cancelled, otherwise `"error"`. */
@@ -62,6 +76,7 @@ export async function finalize(error: unknown, opts: FinalizeOptions = {}): Prom
 
 	return {
 		id,
+		code: providerCode(error),
 		status: currentStatus,
 		stopReason: aborted ? "aborted" : "error",
 		message,

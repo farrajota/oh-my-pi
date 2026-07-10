@@ -201,6 +201,31 @@ describe("task progress rendering", () => {
 		expect(rendered).toContain("auto-retry gave up after 10 attempts");
 	});
 
+	it("does not render a retry failure badge after an intentional repeated retry cancellation clears progress", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
+		// This is the settled projection after a repeated retry ends because the
+		// user resumed input or cancelled the task: no waiting state or failure.
+		const progress = runningProgress({
+			id: "LimitCancelled",
+			status: "aborted",
+			description: "session limit wait cancelled",
+		});
+
+		const rendered = Bun.stripANSI(
+			taskToolRenderer
+				.renderResult({ content: [{ type: "text", text: "" }], details: detailsFor(progress) }, options, theme)
+				.render(120)
+				.join("\n"),
+		);
+
+		expect(rendered).toContain("LimitCancelled");
+		expect(rendered).toContain("aborted");
+		expect(rendered).not.toContain("waiting-limit");
+		expect(rendered).not.toContain("rate-limited");
+		expect(rendered).not.toContain("auto-retry gave up");
+	});
+
 	it("renders pending task rows with the agent dot, not the pending glyph", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };

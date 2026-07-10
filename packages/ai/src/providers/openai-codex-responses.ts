@@ -368,6 +368,39 @@ interface CodexRequestSetup {
 	websocketFirstEventTimeoutMs: number | undefined;
 }
 
+/** Tracks the total number of outbound Codex transport attempts for one stream. */
+interface CodexTransportAttemptState {
+	maxAttempts?: number;
+	attempts: number;
+}
+
+function createCodexTransportAttemptState(providerMaxAttempts: number | undefined): CodexTransportAttemptState {
+	return {
+		maxAttempts:
+			typeof providerMaxAttempts === "number" && Number.isFinite(providerMaxAttempts)
+				? Math.max(1, Math.floor(providerMaxAttempts))
+				: undefined,
+		attempts: 0,
+	};
+}
+
+function canStartCodexTransportAttempt(state: CodexTransportAttemptState): boolean {
+	return state.maxAttempts === undefined || state.attempts < state.maxAttempts;
+}
+
+function startCodexTransportAttempt(state: CodexTransportAttemptState): boolean {
+	if (!canStartCodexTransportAttempt(state)) return false;
+	state.attempts += 1;
+	return true;
+}
+
+class CodexTransportAttemptLimitError extends Error {
+	constructor() {
+		super("Codex provider transport attempt limit reached");
+		this.name = "CodexTransportAttemptLimitError";
+	}
+}
+
 interface CodexOpenItem {
 	item: CodexEventItem;
 	block: CodexOutputBlock | null;
@@ -382,6 +415,7 @@ class CodexStreamRuntime {
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 	websocketState?: CodexWebSocketSessionState;
+	transportAttemptState: CodexTransportAttemptState;
 	/**
 	 * Items open on the wire keyed by `item.id`. `response.output_item.added`
 	 * registers here; `output_item.done` removes. A keyed event whose `item_id`
@@ -416,11 +450,13 @@ class CodexStreamRuntime {
 		requestBodyForState: RequestBody;
 		transport: CodexTransport;
 		websocketState?: CodexWebSocketSessionState;
+		transportAttemptState: CodexTransportAttemptState;
 	}) {
 		this.eventStream = initial.eventStream;
 		this.requestBodyForState = initial.requestBodyForState;
 		this.transport = initial.transport;
 		this.websocketState = initial.websocketState;
+		this.transportAttemptState = initial.transportAttemptState;
 	}
 
 	/**
@@ -999,6 +1035,7 @@ async function openInitialCodexEventStream(
 	options: OpenAICodexResponsesOptions | undefined,
 	requestSetup: CodexRequestSetup,
 	requestContext: CodexRequestContext,
+	transportAttemptState: CodexTransportAttemptState,
 ): Promise<{
 	eventStream: AsyncGenerator<Record<string, unknown>>;
 	requestBodyForState: RequestBody;
@@ -1017,6 +1054,7 @@ async function openInitialCodexEventStream(
 					requestSetup,
 					websocketState,
 					websocketRetries,
+					transportAttemptState,
 					options ? event => options.onSseEvent?.(event, model) : undefined,
 				);
 			} catch (error) {
@@ -1035,6 +1073,7 @@ async function openInitialCodexEventStream(
 						activated: activateFallback,
 						fatal: isFatal,
 					});
+				if (!canStartCodexTransportAttempt(transportAttemptState)) throw error;
 				if (!activateFallback) {
 					websocketRetries += 1;
 					await scheduler.wait(CODEX_WEBSOCKET_RETRY_DELAY_MS * Math.max(1, websocketRetries), {
@@ -1046,7 +1085,15 @@ async function openInitialCodexEventStream(
 			}
 		}
 	}
-	return openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
+	return openCodexSseTransport(
+		model,
+		requestContext,
+		requestSetup,
+		options,
+		websocketState,
+		transportAttemptState,
+		transformedBody,
+	);
 }
 async function openCodexWebSocketTransport(
 	model: Model<"openai-codex-responses">,
@@ -1055,6 +1102,7 @@ async function openCodexWebSocketTransport(
 	requestSetup: CodexRequestSetup,
 	websocketState: CodexWebSocketSessionState,
 	retry: number,
+	transportAttemptState: CodexTransportAttemptState,
 	onSseEvent?: (event: RawSseEvent) => void,
 ): Promise<{
 	eventStream: AsyncGenerator<Record<string, unknown>>;
@@ -1081,6 +1129,7 @@ async function openCodexWebSocketTransport(
 	if (replacementWebsocketRequest !== undefined) {
 		websocketRequest = replacementWebsocketRequest as typeof websocketRequest;
 	}
+	if (!startCodexTransportAttempt(transportAttemptState)) throw new CodexTransportAttemptLimitError();
 	recordCodexTurnRequestDiagnostics(websocketState, websocketRequest, "websocket", canAppendBeforeRequest);
 	const websocketHeaders = createCodexHeaders(
 		requestContext.requestHeaders,
@@ -1148,6 +1197,7 @@ async function openCodexSseTransport(
 	requestSetup: CodexRequestSetup,
 	options: OpenAICodexResponsesOptions | undefined,
 	state: CodexWebSocketSessionState | undefined,
+	transportAttemptState: CodexTransportAttemptState,
 	body = requestContext.transformedBody,
 ): Promise<{
 	eventStream: AsyncGenerator<Record<string, unknown>>;
@@ -1169,6 +1219,7 @@ async function openCodexSseTransport(
 				requestContext.responsesLite,
 				requestSetup.requestSignal,
 				requestSetup.firstEventTimeoutMs,
+				transportAttemptState,
 				event => options?.onSseEvent?.(event, model),
 				options?.fetch,
 			),
@@ -1277,12 +1328,21 @@ async function handleCodexStreamFailure(context: CodexStreamFailureContext, erro
 	output.stopReason = result.stopReason;
 	output.errorStatus = result.status;
 	output.errorId = result.id;
-	output.errorMessage = result.message;
+	output.errorMessage = formatCodexTerminalErrorMessage(error, result.message);
+	output.errorCode = result.code;
 	output.duration = performance.now() - context.startTime;
 	if (context.firstTokenTime) {
 		output.ttft = context.firstTokenTime - context.startTime;
 	}
 	return output;
+}
+
+/** @internal Exported for focused provider error-contract tests. */
+export function formatCodexTerminalErrorMessage(error: unknown, finalizedMessage: string): string {
+	if (!(error instanceof CodexApiError) || error.code !== "model_cooldown") return finalizedMessage;
+	const originalMessage = typeof error.info.message === "string" ? error.info.message.trim() : undefined;
+	if (!originalMessage || finalizedMessage.includes(originalMessage)) return finalizedMessage;
+	return `${finalizedMessage}\n\n${originalMessage}`;
 }
 
 /**
@@ -1700,6 +1760,7 @@ class CodexStreamProcessor {
 		this.#dropTrailingDegenerateToolCall();
 		if (
 			this.runtime.whitespaceLoopRetries >= CODEX_WHITESPACE_LOOP_RETRY_LIMIT ||
+			!canStartCodexTransportAttempt(this.runtime.transportAttemptState) ||
 			!this.runtime.canSafelyReplayWebsocketOverSse ||
 			this.output.content.some(block => block.type !== "thinking") ||
 			this.options?.signal?.aborted
@@ -1767,7 +1828,12 @@ class CodexStreamProcessor {
 			return false;
 		}
 		const websocketState = this.requestContext.websocketState;
-		if (!websocketState || this.runtime.transport !== "websocket" || this.options?.signal?.aborted) {
+		if (
+			!websocketState ||
+			this.runtime.transport !== "websocket" ||
+			this.options?.signal?.aborted ||
+			!canStartCodexTransportAttempt(this.runtime.transportAttemptState)
+		) {
 			return false;
 		}
 
@@ -1826,7 +1892,8 @@ class CodexStreamProcessor {
 			!websocketState ||
 			this.output.content.length > 0 ||
 			this.options?.signal?.aborted ||
-			this.runtime.providerRetryAttempt >= CODEX_MAX_RETRIES
+			this.runtime.providerRetryAttempt >= CODEX_MAX_RETRIES ||
+			!canStartCodexTransportAttempt(this.runtime.transportAttemptState)
 		) {
 			return false;
 		}
@@ -1860,7 +1927,8 @@ class CodexStreamProcessor {
 			isCodexWebSocketRetryableStreamError(error) &&
 			this.runtime.canSafelyReplayWebsocketOverSse &&
 			!this.runtime.sawTerminalEvent &&
-			!this.options?.signal?.aborted;
+			!this.options?.signal?.aborted &&
+			canStartCodexTransportAttempt(this.runtime.transportAttemptState);
 		if (!canReplay) return false;
 
 		const state = websocketState;
@@ -1912,7 +1980,8 @@ class CodexStreamProcessor {
 			!(error instanceof CodexProviderStreamError && error.retryable) ||
 			this.output.content.length > 0 ||
 			this.runtime.providerRetryAttempt >= CODEX_MAX_RETRIES ||
-			this.options?.signal?.aborted
+			this.options?.signal?.aborted ||
+			!canStartCodexTransportAttempt(this.runtime.transportAttemptState)
 		) {
 			return false;
 		}
@@ -1959,6 +2028,7 @@ class CodexStreamProcessor {
 				this.requestSetup,
 				state,
 				this.runtime.websocketStreamRetries,
+				this.runtime.transportAttemptState,
 				this.options ? event => this.options?.onSseEvent?.(event, this.model) : undefined,
 			);
 			this.runtime.eventStream = next.eventStream;
@@ -1971,6 +2041,7 @@ class CodexStreamProcessor {
 			// Activate fallback so subsequent turns use SSE, and replay this turn over SSE
 			// instead of surfacing a raw transport error to the caller.
 			recordCodexWebSocketFailure(state, true);
+			if (!canStartCodexTransportAttempt(this.runtime.transportAttemptState)) throw error;
 			CODEX_DEBUG &&
 				logger.debug("[codex] codex websocket reopen failed, falling back to SSE", {
 					error: error.message,
@@ -1981,7 +2052,14 @@ class CodexStreamProcessor {
 	}
 
 	async #reopenSseStream(state: CodexWebSocketSessionState | undefined): Promise<void> {
-		const next = await openCodexSseTransport(this.model, this.requestContext, this.requestSetup, this.options, state);
+		const next = await openCodexSseTransport(
+			this.model,
+			this.requestContext,
+			this.requestSetup,
+			this.options,
+			state,
+			this.runtime.transportAttemptState,
+		);
 		this.runtime.eventStream = next.eventStream;
 		this.runtime.requestBodyForState = next.requestBodyForState;
 		this.runtime.transport = next.transport;
@@ -2054,12 +2132,20 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 		let processingContext: CodexStreamProcessor | undefined;
 		let requestContext: CodexRequestContext | undefined;
 
+		const transportAttemptState = createCodexTransportAttemptState(options?.providerMaxAttempts);
 		try {
 			requestContext = await buildCodexRequestContext(model, context, options, output);
-			const initialTransport = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
+			const initialTransport = await openInitialCodexEventStream(
+				model,
+				options,
+				requestSetup,
+				requestContext,
+				transportAttemptState,
+			);
 			const runtime = new CodexStreamRuntime({
 				...initialTransport,
 				websocketState: requestContext.websocketState,
+				transportAttemptState,
 			});
 			if (requestContext.websocketState) {
 				requestContext.websocketState.lastTransport = initialTransport.transport;
@@ -3275,6 +3361,7 @@ async function openCodexSseEventStream(
 	responsesLite: boolean,
 	signal: AbortSignal | undefined,
 	firstEventTimeoutMs: number | undefined,
+	transportAttemptState: CodexTransportAttemptState,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
@@ -3287,6 +3374,15 @@ async function openCodexSseEventStream(
 			sentTurnStateHeader: headers.has(X_CODEX_TURN_STATE_HEADER),
 			sentModelsEtagHeader: headers.has(X_MODELS_ETAG_HEADER),
 		});
+	const maxAttempts =
+		transportAttemptState.maxAttempts === undefined
+			? CODEX_MAX_RETRIES + 1
+			: transportAttemptState.maxAttempts - transportAttemptState.attempts;
+	if (maxAttempts < 1) throw new CodexTransportAttemptLimitError();
+	const countingFetch: FetchImpl = async (input, init) => {
+		if (!startCodexTransportAttempt(transportAttemptState)) throw new CodexTransportAttemptLimitError();
+		return (fetchOverride ?? globalThis.fetch)(input, init);
+	};
 	// `wrapCodexSseStream` arms the iterator-level idle watchdog only after this
 	// fetch resolves. A pre-response timer still bounds time-to-first-byte (a
 	// proxy that accepts the POST but never sends headers would otherwise hang
@@ -3301,10 +3397,10 @@ async function openCodexSseEventStream(
 			headers,
 			body: JSON.stringify(body),
 			signal: watchdog.signal,
-			maxAttempts: CODEX_MAX_RETRIES + 1,
+			maxAttempts,
 			defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
 			maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
-			fetch: fetchOverride,
+			fetch: countingFetch,
 			timeout: false,
 		});
 	} finally {

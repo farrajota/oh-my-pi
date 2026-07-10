@@ -22,7 +22,7 @@ const INSUFFICIENT_BALANCE_PATTERN = /insufficient.?balance/i;
 
 export type RecoverableLongWindowLimit = {
 	recoverable: boolean;
-	reason?: "session" | "weekly" | "daily" | "quota-reset";
+	reason?: "session" | "weekly" | "daily" | "quota-reset" | "provider-cooldown";
 	resetAfterMs?: number;
 	resetAtMs?: number;
 };
@@ -40,11 +40,14 @@ const DAILY_LIMIT_PATTERN =
 const RESETTABLE_QUOTA_PATTERN =
 	/\b(?:usage_limit_reached|usage.?limit|quota|limit_reached)\b[\s\S]{0,120}\b(?:reset|resets|retry after|try again in|available again|available in)\b|\b(?:reset|resets|retry after|try again in|available again|available in)\b[\s\S]{0,120}\b(?:usage_limit_reached|usage.?limit|quota|limit_reached)\b/i;
 const RELATIVE_RESET_PATTERN =
-	/\b(?:try again in|retry after|reset(?:s)?(?:\s+after|\s+in)|quota will reset after|available again in|available in)\s+((?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(?:d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b(?:\s*(?:,|and)?\s*(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(?:d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b)*)/i;
+	/\b(?:try again in|retry after|reset(?:s)?(?:\s+after|\s+in)|quota will reset after|available again in|available in)\s+~?\s*((?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(?:d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b(?:\s*(?:,|and)?\s*(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(?:d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b)*)/i;
 const RELATIVE_DURATION_PART_PATTERN =
 	/(\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b/gi;
 const ABSOLUTE_RESET_PATTERN =
 	/\b(?:reset(?:s)?|quota will reset|try again|retry)\s+(?:at|on|after)\s+([^\n;]+?)(?=$|[.)\]]\s|[,;]\s)/i;
+const EXPLICIT_429_STATUS_PATTERN = /\b429\b/;
+const AGGREGATE_PROVIDER_COOLDOWN_PATTERN = /\ball\s+credentials\b[\s\S]{0,120}\bcooling\s+down\b/i;
+const PROVIDER_COOLDOWN_MESSAGE_MARKER = "type=model_cooldown";
 
 const WORD_NUMBER_VALUES: Record<string, number> = {
 	one: 1,
@@ -71,6 +74,7 @@ export function classifyRecoverableLongWindowLimit(input: {
 	status?: number;
 	message?: string;
 	errorId?: number;
+	code?: string;
 }): RecoverableLongWindowLimit {
 	void input.errorId;
 
@@ -83,6 +87,10 @@ export function classifyRecoverableLongWindowLimit(input: {
 
 	if (LONG_WINDOW_NEGATIVE_PATTERN.test(message) || SERVER_STATUS_PATTERN.test(message)) {
 		return { recoverable: false };
+	}
+
+	if (isAggregateProviderCooldown(input.status, input.code, message)) {
+		return { recoverable: true, reason: "provider-cooldown" };
 	}
 
 	const resetAfterMs = parseRelativeResetAfterMs(message);
@@ -115,6 +123,15 @@ function classifyLongWindowReason(
 	if (DAILY_LIMIT_PATTERN.test(message)) return "daily";
 	if (hasResetSignal && RESETTABLE_QUOTA_PATTERN.test(message)) return "quota-reset";
 	return undefined;
+}
+
+function isAggregateProviderCooldown(status: number | undefined, code: string | undefined, message: string): boolean {
+	const has429Status = status === 429 || (status === undefined && EXPLICIT_429_STATUS_PATTERN.test(message));
+	return (
+		has429Status &&
+		AGGREGATE_PROVIDER_COOLDOWN_PATTERN.test(message) &&
+		(code === "model_cooldown" || message.includes(PROVIDER_COOLDOWN_MESSAGE_MARKER))
+	);
 }
 
 function parseRelativeResetAfterMs(message: string): number | undefined {

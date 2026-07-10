@@ -140,6 +140,17 @@ const REPEATED_RETRY_START = {
 	errorMessage: "session limit",
 	round: 2,
 } as unknown as AgentSessionEvent;
+
+function repeatedRetryEnd(reason: string): AgentSessionEvent {
+	return {
+		type: "auto_retry_end",
+		success: false,
+		attempt: 3,
+		mode: "repeated",
+		reason,
+		finalError: "session retry ended",
+	} as unknown as AgentSessionEvent;
+}
 const TASK_TOOL_EXECUTION_END = {
 	type: "tool_execution_end",
 	toolCallId: "call-task-1",
@@ -234,6 +245,33 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		await controller.handleEvent(REPEATED_RETRY_START);
 
 		expectRetryLoaderText(ctx, "Waiting for session limit reset (round 2) in 14m… Esc to cancel");
+	});
+
+	it("quietly clears repeated retry UI for intentional lifecycle endings", async () => {
+		const { ctx, statusContainer } = createContext();
+		const controller = new EventController(ctx);
+
+		for (const reason of ["manual-input", "cancelled", "generation-superseded"]) {
+			await controller.handleEvent(REPEATED_RETRY_START);
+			expect(ctx.retryLoader).toBeDefined();
+			expect(statusContainer.children).toHaveLength(1);
+
+			await controller.handleEvent(repeatedRetryEnd(reason));
+
+			expect(ctx.retryLoader).toBeUndefined();
+			expect(statusContainer.children).toHaveLength(0);
+		}
+		expect(ctx.showError).not.toHaveBeenCalled();
+	});
+
+	it("keeps repeated retry exhaustion visible as an error", async () => {
+		const { ctx } = createContext();
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(REPEATED_RETRY_START);
+		await controller.handleEvent(repeatedRetryEnd("max-retries"));
+
+		expect(ctx.showError).toHaveBeenCalledWith("Retry failed after 3 attempts: session retry ended");
 	});
 
 	it("re-shows the Working… loader after a subagent task completes while the session keeps streaming", async () => {

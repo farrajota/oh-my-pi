@@ -4207,6 +4207,65 @@ describe("openai-codex streaming", () => {
 			.join("");
 		expect(text).toBe("Second");
 	});
+	it("preserves an in-stream model_cooldown code on the terminal message", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const fetchMock = vi.fn(
+			async () =>
+				new Response(
+					`data: ${JSON.stringify({ type: "error", code: "model_cooldown", message: "Codex model cooldown" })}\n\n`,
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				),
+		);
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock as FetchImpl,
+		}).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorCode).toBe("model_cooldown");
+	});
+
+	it("does not fall back from a failed websocket when providerMaxAttempts is one", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		let connectionCount = 0;
+		class FailingWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				connectionCount += 1;
+				queueMicrotask(() => {
+					this.emit("error", new Event("error"));
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", new Event("close"));
+				});
+			}
+		}
+		global.WebSocket = FailingWebSocket as unknown as typeof WebSocket;
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback exceeded the one-attempt budget");
+		});
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		const result = await streamOpenAICodexResponses(
+			createCodexTestModel("https://chatgpt.com/backend-api"),
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				fetch: fetchMock as FetchImpl,
+				sessionId: "ws-single-attempt-session",
+				providerSessionState,
+				providerMaxAttempts: 1,
+			},
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(connectionCount).toBe(1);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
 });
 
 describe("openai-codex SSE statelessness", () => {

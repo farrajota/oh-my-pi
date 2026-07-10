@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -26,14 +26,15 @@ type SessionEvent = {
 	errorMessage?: string;
 };
 
-type MockResponse = Record<string, unknown>;
-
 type Harness = {
 	session: AgentSession;
+	agent: Agent;
 	settings: Settings;
 	events: SessionEvent[];
 	tempDir: string;
 	authStorage: AuthStorage;
+	providerCallCount: () => number;
+	providerMaxAttemptsAtCall: () => readonly (number | undefined)[];
 };
 
 const NOW = new Date("2026-07-09T12:00:00.000Z");
@@ -41,6 +42,8 @@ const TIMER_MS = 60_000;
 const TIMEOUT_MS = 3_600_000;
 const SESSION_LIMIT = "stream_read_error: Claude session limit reached. Your quota will reset later.";
 const USAGE_NOT_INCLUDED = "429 usage_not_included: this model is not included in your plan";
+const CODEX_MODEL_COOLDOWN =
+	"429 All credentials for model gpt-5.6-sol are cooling down via provider codex (type=model_cooldown)";
 
 function repeatedStarts(events: SessionEvent[]): SessionEvent[] {
 	return events.filter(event => event.type === "auto_retry_start" && event.mode === "repeated");
@@ -49,8 +52,8 @@ function repeatedStarts(events: SessionEvent[]): SessionEvent[] {
 function repeatedEnds(events: SessionEvent[]): SessionEvent[] {
 	return events.filter(event => event.type === "auto_retry_end" && event.mode === "repeated");
 }
-function errorResponse(errorMessage: string): MockResponse {
-	return { throw: errorMessage };
+function errorResponse(errorMessage: string, error?: { errorStatus?: number; errorCode?: string }): MockResponse {
+	return { throw: errorMessage, ...error };
 }
 
 function successResponse(text = "ok"): MockResponse {
@@ -69,6 +72,7 @@ let scheduledWaits: ScheduledWait[] = [];
 let originalDateNow: (() => number) | undefined;
 let originalSchedulerWait: typeof scheduler.wait | undefined;
 let holdLongWaits = true;
+let holdDeferredContinues = false;
 
 async function flushAsync(): Promise<void> {
 	await Promise.resolve();
@@ -84,27 +88,64 @@ async function advance(ms: number): Promise<void> {
 	await flushAsync();
 }
 
-async function waitForRepeatedStart(events: SessionEvent[]): Promise<SessionEvent> {
-	for (let attempt = 0; attempt < 10; attempt++) {
+function waitForRepeatedStart(harness: Harness, round = 1): Promise<SessionEvent> {
+	const existingStart = repeatedStarts(harness.events).find(event => event.round === round);
+	if (existingStart) return Promise.resolve(existingStart);
+
+	const realSchedulerWait = originalSchedulerWait;
+	if (!realSchedulerWait) throw new Error("Original scheduler is unavailable");
+	const { promise, resolve, reject } = Promise.withResolvers<SessionEvent>();
+	const timeoutController = new AbortController();
+	let unsubscribe: (() => void) | undefined;
+	const timeout = realSchedulerWait.call(scheduler, 1_000, { signal: timeoutController.signal });
+	void timeout.then(
+		() => {
+			unsubscribe?.();
+			reject(
+				new Error(
+					`Repeated retry did not reach round ${round}: ${JSON.stringify({
+						providerCallCount: harness.providerCallCount(),
+						providerMaxAttemptsAtCall: harness.providerMaxAttemptsAtCall(),
+						autoRetryEvents: harness.events,
+						scheduledWaitDelays: scheduledWaits.map(wait => wait.delayMs),
+						isRetrying: harness.session.isRetrying,
+						agentProviderMaxAttempts: harness.agent.providerMaxAttempts,
+					})}`,
+				),
+			);
+		},
+		() => {},
+	);
+	let settling = false;
+	const settle = async (retryEvent: SessionEvent) => {
+		if (settling) return;
+		settling = true;
 		await flushAsync();
-		const start = repeatedStarts(events)[0];
-		if (start) return start;
-		const wait = scheduledWaits[0];
-		if (!wait) continue;
-		await advance(wait.delayMs);
-	}
-	throw new Error("Repeated retry did not start");
+		timeoutController.abort();
+		unsubscribe?.();
+		resolve(retryEvent);
+	};
+	unsubscribe = harness.session.subscribe(event => {
+		if (event.type !== "auto_retry_start") return;
+		const retryEvent = event as SessionEvent;
+		if (retryEvent.mode !== "repeated" || retryEvent.round !== round) return;
+		void settle(retryEvent);
+	});
+	return promise;
 }
 
 function installFakeScheduler(): void {
 	currentTimeMs = NOW.getTime();
 	scheduledWaits = [];
 	holdLongWaits = true;
+	holdDeferredContinues = false;
 	originalDateNow = Date.now;
 	originalSchedulerWait = scheduler.wait;
 	Date.now = () => currentTimeMs;
 	scheduler.wait = ((delayMs: number, options?: { signal?: AbortSignal }) => {
-		if (!holdLongWaits || delayMs <= 10) return Promise.resolve();
+		if (!holdLongWaits || (delayMs < 60_000 && (!holdDeferredContinues || delayMs !== 1))) {
+			return originalSchedulerWait?.call(scheduler, 0, options) ?? Promise.resolve();
+		}
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		const signal = options?.signal;
 		if (signal?.aborted) {
@@ -160,9 +201,17 @@ async function createHarness(responses: MockResponse[], configure?: (settings: S
 	configure?.(settings);
 
 	const mockModel = createMockModel({ responses });
-	const agent = new Agent({
+	let providerCalls = 0;
+	const providerMaxAttemptsAtCall: Array<number | undefined> = [];
+	let agent: Agent | undefined;
+	const streamFn = (...args: Parameters<typeof mockModel.stream>) => {
+		providerCalls++;
+		providerMaxAttemptsAtCall.push(agent?.providerMaxAttempts);
+		return mockModel.stream(...args);
+	};
+	agent = new Agent({
 		initialState: { model, systemPrompt: ["test"], tools: [], messages: [] },
-		streamFn: mockModel.stream,
+		streamFn,
 	});
 	const session = new AgentSession({
 		agent,
@@ -177,7 +226,16 @@ async function createHarness(responses: MockResponse[], configure?: (settings: S
 		}
 	});
 
-	return { session, settings, events, tempDir, authStorage };
+	return {
+		agent,
+		session,
+		settings,
+		events,
+		tempDir,
+		authStorage,
+		providerCallCount: () => providerCalls,
+		providerMaxAttemptsAtCall: () => providerMaxAttemptsAtCall,
+	};
 }
 
 async function disposeHarness(harness: Harness | undefined): Promise<void> {
@@ -220,7 +278,7 @@ describe("AgentSession repeated retry runtime", () => {
 		harness = await createHarness([errorResponse(SESSION_LIMIT), successResponse()]);
 
 		const prompt = harness.session.prompt("hit a session limit");
-		const start = await waitForRepeatedStart(harness.events);
+		const start = await waitForRepeatedStart(harness);
 		expect(start.deadlineMs).toBeGreaterThanOrEqual(NOW.getTime() + TIMEOUT_MS);
 		expect(start.deadlineMs).toBeLessThan(NOW.getTime() + TIMEOUT_MS + 1_000);
 		expect(start).toMatchObject({ mode: "repeated", round: 1, reason: "max-retries", delayMs: TIMER_MS });
@@ -238,7 +296,7 @@ describe("AgentSession repeated retry runtime", () => {
 		});
 
 		const prompt = harness.session.prompt("hit max delay");
-		const start = await waitForRepeatedStart(harness.events);
+		const start = await waitForRepeatedStart(harness);
 
 		expect(start).toMatchObject({ mode: "repeated", round: 1, reason: "max-delay" });
 		harness.session.abortRetry();
@@ -251,7 +309,7 @@ describe("AgentSession repeated retry runtime", () => {
 		harness = await createHarness([errorResponse(resetMessage), successResponse()]);
 
 		const prompt = harness.session.prompt("respect reset-after");
-		const start = await waitForRepeatedStart(harness.events);
+		const start = await waitForRepeatedStart(harness);
 
 		expect(start).toMatchObject({ mode: "repeated", resetAware: true });
 		expect(start.delayMs).toBeGreaterThanOrEqual(120_000);
@@ -267,7 +325,7 @@ describe("AgentSession repeated retry runtime", () => {
 		harness = await createHarness([errorResponse(resetMessage), successResponse()]);
 
 		const prompt = harness.session.prompt("respect reset-at");
-		const start = await waitForRepeatedStart(harness.events);
+		const start = await waitForRepeatedStart(harness);
 
 		expect(start).toMatchObject({ mode: "repeated", resetAware: true });
 		expect(start.delayMs).toBeGreaterThan(9 * 60_000);
@@ -281,7 +339,7 @@ describe("AgentSession repeated retry runtime", () => {
 		harness = await createHarness([errorResponse(SESSION_LIMIT), successResponse()]);
 
 		const prompt = harness.session.prompt("unknown reset");
-		const start = await waitForRepeatedStart(harness.events);
+		const start = await waitForRepeatedStart(harness);
 
 		expect(start).toMatchObject({
 			mode: "repeated",
@@ -293,13 +351,91 @@ describe("AgentSession repeated retry runtime", () => {
 		expect(typeof (await prompt)).toBe("boolean");
 	});
 
+	test("repeats aggregate Codex provider cooldown probes one per tick and resumes on success", async () => {
+		harness = await createHarness(
+			[
+				errorResponse(CODEX_MODEL_COOLDOWN, { errorStatus: 429, errorCode: "model_cooldown" }),
+				errorResponse(CODEX_MODEL_COOLDOWN, { errorStatus: 429, errorCode: "model_cooldown" }),
+				errorResponse(CODEX_MODEL_COOLDOWN, { errorStatus: 429, errorCode: "model_cooldown" }),
+				successResponse("recovered"),
+			],
+			settings => {
+				settings.set("retry.maxRetries", 1);
+			},
+		);
+		harness.agent.providerMaxAttempts = 4;
+
+		const firstRoundPromise = waitForRepeatedStart(harness);
+		const prompt = harness.session.prompt("wait for Codex provider credentials");
+		const firstRound = await firstRoundPromise;
+		expect(firstRound).toMatchObject({ mode: "repeated", round: 1, reason: "max-retries", delayMs: TIMER_MS });
+		const callsAtRepeatedEntry = harness.providerCallCount();
+		expect(callsAtRepeatedEntry).toBe(2);
+		expect(harness.providerMaxAttemptsAtCall()).toEqual([4, 4]);
+		const normalRetryStarts = () =>
+			harness!.events.filter(event => event.type === "auto_retry_start" && event.mode !== "repeated");
+		expect(normalRetryStarts()).toHaveLength(1);
+
+		await flushAsync();
+		expect(harness.providerCallCount()).toBe(callsAtRepeatedEntry);
+		expect(repeatedStarts(harness.events)).toHaveLength(1);
+
+		const secondRoundPromise = waitForRepeatedStart(harness, 2);
+		await advance(TIMER_MS);
+		const secondRound = await secondRoundPromise;
+		await flushAsync();
+		expect(harness.providerCallCount()).toBe(callsAtRepeatedEntry + 1);
+		expect(secondRound).toMatchObject({ mode: "repeated", round: 2, reason: "max-retries" });
+		expect(normalRetryStarts()).toHaveLength(1);
+		expect(harness.providerMaxAttemptsAtCall()).toEqual([4, 4, 1]);
+		expect(harness.agent.providerMaxAttempts).toBe(4);
+		expect(scheduledWaits).toHaveLength(1);
+		expect(scheduledWaits[0]?.delayMs).toBe(TIMER_MS);
+
+		await flushAsync();
+		expect(harness.providerCallCount()).toBe(callsAtRepeatedEntry + 1);
+
+		await advance(TIMER_MS);
+		expect(await prompt).toBe(true);
+		expect(harness.providerCallCount()).toBe(callsAtRepeatedEntry + 2);
+		expect(repeatedEnds(harness.events)).toHaveLength(1);
+		expect(repeatedEnds(harness.events)[0]).toMatchObject({ success: true, reason: "success", round: 2 });
+		expect(harness.providerMaxAttemptsAtCall()).toEqual([4, 4, 1, 1]);
+		expect(harness.agent.providerMaxAttempts).toBe(4);
+		expect(harness.session.isRetrying).toBe(false);
+		expect(normalRetryStarts()).toHaveLength(1);
+	});
+	test("fails fast for ordinary per-minute 429 errors without repeated retry", async () => {
+		harness = await createHarness(
+			[
+				errorResponse("429 Requests per minute limit reached", {
+					errorStatus: 429,
+					errorCode: "rate_limit_exceeded",
+				}),
+			],
+			settings => {
+				settings.set("retry.maxRetries", 0);
+				settings.set("retry.repeated.enabled", true);
+			},
+		);
+
+		const result = await harness.session.prompt("do not repeat ordinary rate limits");
+
+		expect(typeof result).toBe("boolean");
+		expect(harness.providerCallCount()).toBe(1);
+		expect(repeatedStarts(harness.events)).toEqual([]);
+		expect(repeatedEnds(harness.events)).toEqual([]);
+		expect(harness.agent.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
+		expect(harness.session.isRetrying).toBe(false);
+	});
+
 	test("times out a repeated retry chain at the configured deadline", async () => {
 		harness = await createHarness([errorResponse(SESSION_LIMIT), errorResponse(SESSION_LIMIT)], settings => {
 			settings.set("retry.repeated.timeoutMs", TIMER_MS);
 		});
 
 		void harness.session.prompt("eventually timeout");
-		const start = await waitForRepeatedStart(harness.events);
+		const start = await waitForRepeatedStart(harness);
 		expect(start).toMatchObject({ delayMs: TIMER_MS, timeoutMs: TIMER_MS });
 
 		await advance(TIMER_MS + 1);
@@ -312,7 +448,7 @@ describe("AgentSession repeated retry runtime", () => {
 		harness = await createHarness([errorResponse(SESSION_LIMIT), successResponse()]);
 
 		void harness.session.prompt("cancel repeated retry");
-		await waitForRepeatedStart(harness.events);
+		await waitForRepeatedStart(harness);
 		expect(repeatedStarts(harness.events)).toHaveLength(1);
 
 		harness.session.abortRetry();
@@ -326,7 +462,7 @@ describe("AgentSession repeated retry runtime", () => {
 		harness = await createHarness([errorResponse(SESSION_LIMIT), successResponse("after manual input")]);
 
 		void harness.session.prompt("wait on limit");
-		await waitForRepeatedStart(harness.events);
+		await waitForRepeatedStart(harness);
 		expect(repeatedStarts(harness.events)).toHaveLength(1);
 
 		const second = harness.session.prompt("new user direction", { streamingBehavior: "followUp" });
@@ -335,6 +471,86 @@ describe("AgentSession repeated retry runtime", () => {
 		expect(await second).toBe(true);
 		expect(repeatedEnds(harness.events)).toHaveLength(1);
 		expect(repeatedEnds(harness.events)[0]).toMatchObject({ success: false, reason: "manual-input" });
+	});
+
+	test("manual input supersedes a resolved repeated probe before its deferred continuation", async () => {
+		harness = await createHarness([errorResponse(SESSION_LIMIT), successResponse("manual recovery")]);
+		harness.agent.providerMaxAttempts = 4;
+		holdDeferredContinues = true;
+
+		const retryPrompt = harness.session.prompt("wait for the session limit");
+		await waitForRepeatedStart(harness);
+		await advance(TIMER_MS);
+
+		const deferred = scheduledWaits.find(wait => wait.delayMs === 1);
+		expect(deferred).toBeDefined();
+		if (!deferred) throw new Error("Repeated probe continuation was not scheduled");
+
+		const manualPrompt = harness.session.prompt("new user direction", { streamingBehavior: "followUp" });
+		expect(await manualPrompt).toBe(true);
+		await advance(1);
+
+		expect(await retryPrompt).toBe(true);
+		expect(harness.providerCallCount()).toBe(1);
+		expect(harness.providerMaxAttemptsAtCall()).toEqual([4]);
+		expect(harness.agent.providerMaxAttempts).toBe(4);
+		expect(repeatedEnds(harness.events)).toHaveLength(1);
+		expect(repeatedEnds(harness.events)[0]).toMatchObject({ success: false, reason: "manual-input" });
+	});
+
+	test("terminates a repeated probe when its deferred continuation rejects", async () => {
+		harness = await createHarness([errorResponse(SESSION_LIMIT)]);
+		harness.agent.providerMaxAttempts = 4;
+		let continueCalls = 0;
+		Object.defineProperty(harness.agent, "continue", {
+			value: () => {
+				continueCalls++;
+				return Promise.reject(new Error("deferred continue failed"));
+			},
+		});
+
+		const retryPrompt = harness.session.prompt("retry through the session limit");
+		await waitForRepeatedStart(harness);
+		await advance(TIMER_MS);
+		await flushAsync();
+
+		expect(await retryPrompt).toBe(true);
+		expect(continueCalls).toBe(1);
+		expect(harness.providerCallCount()).toBe(1);
+		expect(harness.providerMaxAttemptsAtCall()).toEqual([4]);
+		expect(harness.agent.providerMaxAttempts).toBe(4);
+		expect(harness.session.isRetrying).toBe(false);
+		expect(repeatedEnds(harness.events)).toHaveLength(1);
+		expect(repeatedEnds(harness.events)[0]).toMatchObject({
+			success: false,
+			reason: "not-recoverable",
+			finalError: "Repeated probe continuation failed: deferred continue failed",
+		});
+	});
+
+	test("terminates a repeated probe when its deferred scheduler wait aborts", async () => {
+		harness = await createHarness([errorResponse(SESSION_LIMIT)]);
+		harness.agent.providerMaxAttempts = 4;
+		holdDeferredContinues = true;
+
+		const retryPrompt = harness.session.prompt("retry through the session limit");
+		await waitForRepeatedStart(harness);
+		await advance(TIMER_MS);
+
+		const deferred = scheduledWaits.find(wait => wait.delayMs === 1);
+		expect(deferred).toBeDefined();
+		if (!deferred) throw new Error("Repeated probe continuation was not scheduled");
+		scheduledWaits.splice(scheduledWaits.indexOf(deferred), 1);
+		deferred.reject(new Error("AbortError"));
+		await flushAsync();
+
+		expect(await retryPrompt).toBe(true);
+		expect(harness.providerCallCount()).toBe(1);
+		expect(harness.providerMaxAttemptsAtCall()).toEqual([4]);
+		expect(harness.agent.providerMaxAttempts).toBe(4);
+		expect(harness.session.isRetrying).toBe(false);
+		expect(repeatedEnds(harness.events)).toHaveLength(1);
+		expect(repeatedEnds(harness.events)[0]).toMatchObject({ success: false, reason: "cancelled" });
 	});
 
 	test("success after an immediate repeated wait emits terminal success and clears repeated state for a later chain", async () => {

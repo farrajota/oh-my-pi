@@ -87,6 +87,10 @@ export interface MockResponse {
 	stopDetails?: StopDetails | null;
 	/** Error text paired with an explicit `"error"` stop reason. */
 	errorMessage?: string;
+	/** HTTP status paired with a terminal assistant error. */
+	errorStatus?: number;
+	/** Structured provider error code paired with a terminal assistant error. */
+	errorCode?: string;
 	/** Usage stats. Missing fields default to 0; missing `cost.total` is recomputed from components. */
 	usage?: Partial<Omit<Usage, "cost">> & { cost?: Partial<Usage["cost"]> };
 	/** Pre-set responseId. */
@@ -352,7 +356,16 @@ async function runMock(
 				: response.throw instanceof Error
 					? response.throw.message
 					: String(response.throw);
-		emitTerminalError(stream, model, startedAt, perfStart, "error", message);
+		emitTerminalError(
+			stream,
+			model,
+			startedAt,
+			perfStart,
+			"error",
+			message,
+			response.errorStatus,
+			response.errorCode,
+		);
 		return;
 	}
 
@@ -398,6 +411,8 @@ async function runMock(
 	partial.stopReason = reason;
 	partial.stopDetails = response.stopDetails;
 	partial.errorMessage = response.errorMessage;
+	partial.errorStatus = response.errorStatus;
+	partial.errorCode = response.errorCode;
 	partial.usage = mergeUsage(response.usage);
 	partial.duration = performance.now() - perfStart;
 
@@ -472,6 +487,8 @@ function emitTerminalError(
 	perfStart: number,
 	reason: "aborted" | "error",
 	message: string,
+	errorStatus?: number,
+	errorCode?: string,
 ): void {
 	const failure: AssistantMessage = {
 		role: "assistant",
@@ -482,6 +499,8 @@ function emitTerminalError(
 		usage: emptyUsage(),
 		stopReason: reason as StopReason,
 		errorMessage: message,
+		...(errorStatus !== undefined ? { errorStatus } : {}),
+		...(errorCode !== undefined ? { errorCode } : {}),
 		timestamp: startedAt,
 		duration: performance.now() - perfStart,
 	};

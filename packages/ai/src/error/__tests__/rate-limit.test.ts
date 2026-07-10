@@ -30,6 +30,14 @@ describe("classifyRecoverableLongWindowLimit", () => {
 				expected: { recoverable: true, reason: "weekly", resetAfterMs: 6 * 60 * 60 * 1000 },
 			},
 			{
+				name: "Codex usage_limit_reached with approximate reset wording",
+				input: {
+					status: 429,
+					message: "usage_limit_reached: Usage limit reached. Try again in ~10 min.",
+				},
+				expected: { recoverable: true, reason: "quota-reset", resetAfterMs: 10 * 60 * 1000 },
+			},
+			{
 				name: "provider quota will reset",
 				input: {
 					status: 429,
@@ -75,6 +83,58 @@ describe("classifyRecoverableLongWindowLimit", () => {
 			expect({ name: testCase.name, result: classifyRecoverableLongWindowLimit(testCase.input) }).toMatchObject({
 				name: testCase.name,
 				result: testCase.expected,
+			});
+		}
+	});
+
+	it("classifies only 429 aggregate provider credential cooldowns", () => {
+		const acceptedCases = [
+			{
+				name: "structured model_cooldown code",
+				input: {
+					status: 429,
+					code: "model_cooldown",
+					message: "All credentials for model gpt-5 are cooling down via provider codex.",
+				},
+			},
+			{
+				name: "embedded model_cooldown marker with message status",
+				input: {
+					message: "429 All credentials for model gpt-5 are cooling down via provider codex (type=model_cooldown)",
+				},
+			},
+		];
+
+		for (const testCase of acceptedCases) {
+			expect(classifyRecoverableLongWindowLimit(testCase.input)).toEqual({
+				recoverable: true,
+				reason: "provider-cooldown",
+			});
+		}
+
+		const rejectedCases = [
+			{
+				name: "model_cooldown code without aggregate credential wording",
+				input: { status: 429, code: "model_cooldown", message: "The model is cooling down." },
+			},
+			{
+				name: "aggregate credential wording without model_cooldown code or marker",
+				input: { status: 429, message: "All credentials for model gpt-5 are cooling down via provider codex." },
+			},
+			{
+				name: "non-429 aggregate model_cooldown",
+				input: {
+					status: 400,
+					code: "model_cooldown",
+					message: "All credentials for model gpt-5 are cooling down via provider codex.",
+				},
+			},
+		];
+
+		for (const testCase of rejectedCases) {
+			expect({ name: testCase.name, result: classifyRecoverableLongWindowLimit(testCase.input) }).toEqual({
+				name: testCase.name,
+				result: { recoverable: false },
 			});
 		}
 	});

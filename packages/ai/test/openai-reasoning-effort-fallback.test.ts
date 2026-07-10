@@ -121,6 +121,25 @@ function summaryReasoningErrorResponse(): Response {
 	);
 }
 
+function providerErrorResponse(code: string | number): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message: "The model is temporarily unavailable.",
+				type: "server_error",
+				code,
+			},
+		}),
+		{ status: 503, headers: { "content-type": "application/json" } },
+	);
+}
+function providerErrorWithoutCodeResponse(): Response {
+	return new Response(JSON.stringify({ error: { message: "The model is temporarily unavailable." } }), {
+		status: 503,
+		headers: { "content-type": "application/json" },
+	});
+}
+
 function parseJsonBody(init: RequestInit | undefined): Record<string, unknown> {
 	return JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>;
 }
@@ -364,5 +383,53 @@ describe("OpenAI reasoning effort fallback retry", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorStatus).toBe(400);
 		expect(attempts).toBe(1);
+		expect(result.errorCode).toBe("invalid_request_error");
+	});
+
+	it("preserves provider codes on generic OpenAI terminal errors", async () => {
+		let completionsCalls = 0;
+		const completions = await streamOpenAICompletions(createCompletionsModel(), testContext, {
+			apiKey: "test-key",
+			fetch: Object.assign(
+				async (): Promise<Response> => {
+					completionsCalls += 1;
+					return providerErrorResponse("model_cooldown");
+				},
+				{
+					preconnect: fetch.preconnect,
+				},
+			),
+			providerMaxAttempts: 1,
+		}).result();
+		let responsesCalls = 0;
+		const responses = await streamOpenAIResponses(createResponsesModel(), testContext, {
+			apiKey: "test-key",
+			fetch: Object.assign(
+				async (): Promise<Response> => {
+					responsesCalls += 1;
+					return providerErrorResponse("model_cooldown");
+				},
+				{
+					preconnect: fetch.preconnect,
+				},
+			),
+			providerMaxAttempts: 1,
+		}).result();
+		const missingCode = await streamOpenAIResponses(createResponsesModel(), testContext, {
+			apiKey: "test-key",
+			fetch: Object.assign(async (): Promise<Response> => providerErrorWithoutCodeResponse(), {
+				preconnect: fetch.preconnect,
+			}),
+			providerMaxAttempts: 1,
+		}).result();
+
+		expect(completions.stopReason).toBe("error");
+		expect(completions.errorCode).toBe("model_cooldown");
+		expect(completionsCalls).toBe(1);
+		expect(responses.stopReason).toBe("error");
+		expect(responses.errorCode).toBe("model_cooldown");
+		expect(responsesCalls).toBe(1);
+		expect(missingCode.stopReason).toBe("error");
+		expect(missingCode.errorCode).toBeUndefined();
 	});
 });

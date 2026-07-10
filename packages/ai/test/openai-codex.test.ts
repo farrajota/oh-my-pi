@@ -5,7 +5,10 @@ import {
 } from "@oh-my-pi/pi-ai/oauth/openai-codex";
 import { type RequestBody, transformRequestBody } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import { CodexApiError, parseCodexError } from "@oh-my-pi/pi-ai/providers/openai-codex/response-handler";
-import { convertOpenAICodexResponsesTools } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import {
+	convertOpenAICodexResponsesTools,
+	formatCodexTerminalErrorMessage,
+} from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type { Tool } from "@oh-my-pi/pi-ai/types";
 import { OPENAI_HEADER_VALUES } from "@oh-my-pi/pi-catalog/wire/codex";
 import { createCodexModel } from "./helpers";
@@ -380,5 +383,31 @@ describe("openai-codex error parsing", () => {
 		expect(error.code).toBe("rate_limit_exceeded");
 		expect(error.headers?.get("retry-after")).toBe("7");
 		expect(error.message).toContain("rate limit exceeded");
+	});
+
+	it("preserves the original aggregate cooldown message alongside its friendly terminal error", async () => {
+		const originalMessage =
+			"429 All credentials for model gpt-5 are cooling down via provider codex (type=model_cooldown)";
+		const error = await CodexApiError.fromResponse(
+			new Response(JSON.stringify({ error: { code: "model_cooldown", message: originalMessage } }), { status: 429 }),
+		);
+		const finalizedMessage = "Rate limit exceeded. Please try again later.";
+
+		expect(formatCodexTerminalErrorMessage(error, finalizedMessage)).toBe(
+			`${finalizedMessage}\n\n${originalMessage}`,
+		);
+		const alreadyPreserved = `${finalizedMessage}\n\n${originalMessage}`;
+		expect(formatCodexTerminalErrorMessage(error, alreadyPreserved)).toBe(alreadyPreserved);
+	});
+
+	it("keeps the finalized friendly error for non-cooldown Codex failures", async () => {
+		const error = await CodexApiError.fromResponse(
+			new Response(JSON.stringify({ error: { code: "rate_limit_exceeded", message: "slow down" } }), {
+				status: 429,
+			}),
+		);
+		const finalizedMessage = "Rate limit exceeded. Please try again later.";
+
+		expect(formatCodexTerminalErrorMessage(error, finalizedMessage)).toBe(finalizedMessage);
 	});
 });

@@ -232,6 +232,12 @@ export interface AgentOptions {
 	maxRetryDelayMs?: number;
 
 	/**
+	 * Total outbound transport attempts for supported OpenAI-family providers,
+	 * including the initial request. `undefined` preserves the provider default.
+	 */
+	providerMaxAttempts?: number;
+
+	/**
 	 * Provides tool execution context, resolved per tool call.
 	 * Use for late-bound UI or session state access.
 	 */
@@ -366,6 +372,7 @@ export class Agent {
 	#serviceTierResolver?: (model: Model) => ServiceTier | undefined;
 	#hideThinkingSummary?: boolean;
 	#maxRetryDelayMs?: number;
+	#providerMaxAttempts?: number;
 	#getToolContext?: (toolCall?: ToolCallContext) => AgentToolContext | undefined;
 	#cursorExecHandlers?: CursorExecHandlers;
 	#cursorOnToolResult?: CursorToolResultHandler;
@@ -444,6 +451,7 @@ export class Agent {
 		this.#serviceTierResolver = opts.serviceTierResolver;
 		this.#hideThinkingSummary = opts.hideThinkingSummary;
 		this.#maxRetryDelayMs = opts.maxRetryDelayMs;
+		this.#providerMaxAttempts = opts.providerMaxAttempts;
 		this.getApiKey = opts.getApiKey;
 		this.#onPayload = opts.onPayload;
 		this.#onResponse = opts.onResponse;
@@ -680,6 +688,21 @@ export class Agent {
 	 */
 	set maxRetryDelayMs(value: number | undefined) {
 		this.#maxRetryDelayMs = value;
+	}
+
+	/**
+	 * Get the current OpenAI-family transport attempt cap.
+	 */
+	get providerMaxAttempts(): number | undefined {
+		return this.#providerMaxAttempts;
+	}
+
+	/**
+	 * Set the OpenAI-family transport attempt cap. `undefined` restores the
+	 * provider default.
+	 */
+	set providerMaxAttempts(value: number | undefined) {
+		this.#providerMaxAttempts = value;
 	}
 
 	get state(): AgentState {
@@ -1137,6 +1160,7 @@ export class Agent {
 			providerSessionState: this.#providerSessionState,
 			thinkingBudgets: this.#thinkingBudgets,
 			maxRetryDelayMs: this.#maxRetryDelayMs,
+			providerMaxAttempts: this.#providerMaxAttempts,
 			kimiApiFormat: this.#kimiApiFormat,
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,

@@ -42,6 +42,12 @@ export interface OpenAIStreamRequestInit {
 	body: unknown;
 	signal: AbortSignal;
 	fetch?: FetchImpl;
+	/**
+	 * Total outbound transport attempts including the initial request. Finite
+	 * values are normalized to an integer of at least 1; otherwise the default
+	 * retry budget is used.
+	 */
+	maxAttempts?: number;
 	/** Raw wire-frame observer (`onSseEvent` debug pipeline). */
 	onSseEvent?: SseEventObserver;
 }
@@ -68,7 +74,10 @@ export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): P
 		body: JSON.stringify(init.body),
 		signal: init.signal,
 		fetch: init.fetch,
-		maxAttempts: DEFAULT_MAX_ATTEMPTS,
+		maxAttempts:
+			typeof init.maxAttempts === "number" && Number.isFinite(init.maxAttempts)
+				? Math.max(1, Math.floor(init.maxAttempts))
+				: DEFAULT_MAX_ATTEMPTS,
 		// Bun's native fetch enforces a hard ~300s pre-response timeout (issue #2422).
 		// Cold large-context streams legitimately exceed it; the caller's
 		// `firstEventTimeoutMs`/`AbortSignal` already govern stuck requests.
