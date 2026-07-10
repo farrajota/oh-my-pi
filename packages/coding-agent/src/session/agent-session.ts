@@ -526,7 +526,7 @@ export type AgentSessionEvent =
 			attempt: number;
 			finalError?: string;
 			recoveredErrors?: RecoveredRetryError[];
-			mode?: "normal" | "repeated";
+			mode?: "normal";
 			round?: number;
 			deadlineMs?: number;
 			timeoutMs?: number;
@@ -539,6 +539,21 @@ export type AgentSessionEvent =
 				| "not-recoverable"
 				| "max-retries"
 				| "max-delay";
+	  }
+	| {
+			type: "auto_retry_end";
+			success: boolean;
+			attempt: number;
+			finalError?: string;
+			recoveredErrors?: RecoveredRetryError[];
+			mode: "repeated";
+			round: number;
+			startedAtMs: number;
+			terminalAtMs: number;
+			durationMs: number;
+			deadlineMs: number;
+			timeoutMs: number;
+			reason: RepeatedRetryEndReason;
 	  }
 	| { type: "retry_fallback_applied"; from: string; to: string; role: string }
 	| { type: "retry_fallback_succeeded"; model: string; role: string }
@@ -5454,7 +5469,18 @@ export class AgentSession {
 			return;
 		}
 
-		if (!this.#extensionRunner.hasHandlers(event.type)) return;
+		const hasGenericHandlers = this.#extensionRunner.hasHandlers(event.type);
+		const specializedRetryEventType =
+			event.type === "auto_retry_end" && event.mode === "repeated"
+				? event.reason === "success"
+					? "auto_retry_recovered"
+					: event.reason === "timeout"
+						? "auto_retry_timeout"
+						: undefined
+				: undefined;
+		const hasSpecializedRetryHandlers =
+			specializedRetryEventType !== undefined && this.#extensionRunner.hasHandlers(specializedRetryEventType);
+		if (!hasGenericHandlers && !hasSpecializedRetryHandlers) return;
 		if (event.type === "agent_end") {
 			// `agent_end` extension notification is emitted from the settled
 			// agent_end maintenance path so `session_stop` control hooks are not
@@ -5553,18 +5579,44 @@ export class AgentSession {
 				resetAware: event.resetAware,
 			});
 		} else if (event.type === "auto_retry_end") {
-			await this.#extensionRunner.emit({
-				type: "auto_retry_end",
-				success: event.success,
-				attempt: event.attempt,
-				finalError: event.finalError,
-				recoveredErrors: event.recoveredErrors,
-				mode: event.mode,
-				round: event.round,
-				deadlineMs: event.deadlineMs,
-				timeoutMs: event.timeoutMs,
-				reason: event.reason,
-			});
+			if (hasGenericHandlers) {
+				await this.#extensionRunner.emit({
+					type: "auto_retry_end",
+					success: event.success,
+					attempt: event.attempt,
+					finalError: event.finalError,
+					recoveredErrors: event.recoveredErrors,
+					mode: event.mode,
+					round: event.round,
+					deadlineMs: event.deadlineMs,
+					timeoutMs: event.timeoutMs,
+					reason: event.reason,
+				});
+			}
+			if (hasSpecializedRetryHandlers && event.mode === "repeated" && event.reason === "success") {
+				await this.#extensionRunner.emit({
+					type: "auto_retry_recovered",
+					round: event.round,
+					startedAtMs: event.startedAtMs,
+					recoveredAtMs: event.terminalAtMs,
+					durationMs: event.durationMs,
+					deadlineMs: event.deadlineMs,
+					timeoutMs: event.timeoutMs,
+					recoveredErrors: event.recoveredErrors,
+				});
+			} else if (hasSpecializedRetryHandlers && event.mode === "repeated" && event.reason === "timeout") {
+				await this.#extensionRunner.emit({
+					type: "auto_retry_timeout",
+					round: event.round,
+					startedAtMs: event.startedAtMs,
+					timedOutAtMs: event.terminalAtMs,
+					durationMs: event.durationMs,
+					deadlineMs: event.deadlineMs,
+					timeoutMs: event.timeoutMs,
+					finalError: event.finalError,
+					recoveredErrors: event.recoveredErrors,
+				});
+			}
 		} else if (event.type === "ttsr_triggered") {
 			await this.#extensionRunner.emit({ type: "ttsr_triggered", rules: event.rules });
 		} else if (event.type === "todo_reminder") {
@@ -13766,6 +13818,7 @@ export class AgentSession {
 	): Promise<boolean> {
 		const state = this.#clearRepeatedRetryState();
 		if (!state) return false;
+		const terminalAtMs = Date.now();
 		if (options?.message) {
 			await this.#persistRetryLifecycleErrorMessage(options.message);
 		}
@@ -13780,6 +13833,9 @@ export class AgentSession {
 			recoveredErrors: options?.recoveredErrors,
 			mode: "repeated",
 			round: state.round,
+			startedAtMs: state.startedAtMs,
+			terminalAtMs,
+			durationMs: Math.max(0, terminalAtMs - state.startedAtMs),
 			deadlineMs: state.deadlineMs,
 			timeoutMs: state.timeoutMs,
 			reason,

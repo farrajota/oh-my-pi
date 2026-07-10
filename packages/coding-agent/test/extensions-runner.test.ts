@@ -1833,4 +1833,63 @@ describe("ExtensionRunner", () => {
 			expect(events[0]?.provider).toBe("provider-1");
 		});
 	});
+
+	describe("auto_retry lifecycle events", () => {
+		it("delivers recovered and timeout payloads to an extension subscribing to both hooks", async () => {
+			const eventsPath = path.join(tempDir.path(), "auto-retry-lifecycle-events.jsonl");
+			const extCode = `
+				import * as fs from "node:fs";
+
+				export default function(pi) {
+					pi.on("auto_retry_recovered", async (event) => {
+						fs.appendFileSync(${JSON.stringify(eventsPath)}, JSON.stringify(event) + "\\n");
+					});
+					pi.on("auto_retry_timeout", async (event) => {
+						fs.appendFileSync(${JSON.stringify(eventsPath)}, JSON.stringify(event) + "\\n");
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "auto-retry-lifecycle.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const recoveredEvent = {
+				type: "auto_retry_recovered" as const,
+				round: 2,
+				startedAtMs: 1_000,
+				recoveredAtMs: 1_250,
+				durationMs: 250,
+				deadlineMs: 5_000,
+				timeoutMs: 4_000,
+				recoveredErrors: [],
+			};
+			const timeoutEvent = {
+				type: "auto_retry_timeout" as const,
+				round: 4,
+				startedAtMs: 1_000,
+				timedOutAtMs: 5_000,
+				durationMs: 4_000,
+				deadlineMs: 5_000,
+				timeoutMs: 4_000,
+				finalError: "provider remained overloaded",
+				recoveredErrors: [],
+			};
+
+			await runner.emit(recoveredEvent);
+			await runner.emit(timeoutEvent);
+
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toEqual([recoveredEvent, timeoutEvent]);
+		});
+	});
 });

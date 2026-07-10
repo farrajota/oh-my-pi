@@ -279,6 +279,31 @@ export interface AutoRetryEndEvent {
 	reason?: AutoRetryRepeatedEndReason;
 }
 
+/** Fired when a repeated auto-retry recovers. */
+export interface AutoRetryRecoveredEvent {
+	type: "auto_retry_recovered";
+	round: number;
+	startedAtMs: number;
+	recoveredAtMs: number;
+	durationMs: number;
+	deadlineMs: number;
+	timeoutMs: number;
+	recoveredErrors?: RecoveredRetryError[];
+}
+
+/** Fired when a repeated auto-retry reaches its timeout. */
+export interface AutoRetryTimeoutEvent {
+	type: "auto_retry_timeout";
+	round: number;
+	startedAtMs: number;
+	timedOutAtMs: number;
+	durationMs: number;
+	deadlineMs: number;
+	timeoutMs: number;
+	finalError?: string;
+	recoveredErrors?: RecoveredRetryError[];
+}
+
 // ============================================================================
 // TTSR / Todo Reminders
 // ============================================================================

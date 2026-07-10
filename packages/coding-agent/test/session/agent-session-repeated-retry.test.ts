@@ -26,11 +26,52 @@ type SessionEvent = {
 	errorMessage?: string;
 };
 
+type SpecializedRetryEvent = {
+	type: "auto_retry_recovered" | "auto_retry_timeout";
+	round: number;
+	startedAtMs: number;
+	recoveredAtMs?: number;
+	timedOutAtMs?: number;
+	durationMs: number;
+	deadlineMs: number;
+	timeoutMs: number;
+	finalError?: string;
+	recoveredErrors?: unknown[];
+};
+
+class SpecializedRetryHookRunner {
+	readonly events: SpecializedRetryEvent[] = [];
+	readonly deliveryOrder: string[] = [];
+
+	constructor(private readonly subscribeToGenericAutoRetryEnd = false) {}
+
+	hasHandlers(eventType: string): boolean {
+		return (
+			eventType === "auto_retry_recovered" ||
+			eventType === "auto_retry_timeout" ||
+			(this.subscribeToGenericAutoRetryEnd && eventType === "auto_retry_end")
+		);
+	}
+
+	async emitBeforeAgentStart(_event: unknown): Promise<undefined> {
+		return undefined;
+	}
+
+	async emit(event: { type: string }): Promise<void> {
+		if (!this.hasHandlers(event.type)) return;
+		this.deliveryOrder.push(event.type);
+		if (event.type === "auto_retry_recovered" || event.type === "auto_retry_timeout") {
+			this.events.push(event as SpecializedRetryEvent);
+		}
+	}
+}
+
 type Harness = {
 	session: AgentSession;
 	agent: Agent;
 	settings: Settings;
 	events: SessionEvent[];
+	extensionRunner: SpecializedRetryHookRunner;
 	tempDir: string;
 	authStorage: AuthStorage;
 	providerCallCount: () => number;
@@ -180,7 +221,11 @@ function restoreFakeScheduler(): void {
 	scheduledWaits = [];
 }
 
-async function createHarness(responses: MockResponse[], configure?: (settings: Settings) => void): Promise<Harness> {
+async function createHarness(
+	responses: MockResponse[],
+	configure?: (settings: Settings) => void,
+	subscribeToGenericAutoRetryEnd = false,
+): Promise<Harness> {
 	const tempDir = path.join(os.tmpdir(), `pi-repeated-retry-${Snowflake.next()}`);
 	fs.mkdirSync(tempDir, { recursive: true });
 
@@ -199,6 +244,7 @@ async function createHarness(responses: MockResponse[], configure?: (settings: S
 	settings.set("retry.repeated.timerMs", TIMER_MS);
 	settings.set("retry.repeated.timeoutMs", TIMEOUT_MS);
 	configure?.(settings);
+	const extensionRunner = new SpecializedRetryHookRunner(subscribeToGenericAutoRetryEnd);
 
 	const mockModel = createMockModel({ responses });
 	let providerCalls = 0;
@@ -218,6 +264,7 @@ async function createHarness(responses: MockResponse[], configure?: (settings: S
 		sessionManager: SessionManager.inMemory(),
 		settings,
 		modelRegistry,
+		extensionRunner: extensionRunner as never,
 	});
 	const events: SessionEvent[] = [];
 	session.subscribe(event => {
@@ -231,6 +278,7 @@ async function createHarness(responses: MockResponse[], configure?: (settings: S
 		session,
 		settings,
 		events,
+		extensionRunner,
 		tempDir,
 		authStorage,
 		providerCallCount: () => providerCalls,
@@ -375,6 +423,7 @@ describe("AgentSession repeated retry runtime", () => {
 		const normalRetryStarts = () =>
 			harness!.events.filter(event => event.type === "auto_retry_start" && event.mode !== "repeated");
 		expect(normalRetryStarts()).toHaveLength(1);
+		expect(harness.extensionRunner.events).toEqual([]);
 
 		await flushAsync();
 		expect(harness.providerCallCount()).toBe(callsAtRepeatedEntry);
@@ -394,6 +443,7 @@ describe("AgentSession repeated retry runtime", () => {
 
 		await flushAsync();
 		expect(harness.providerCallCount()).toBe(callsAtRepeatedEntry + 1);
+		expect(harness.extensionRunner.events).toEqual([]);
 
 		await advance(TIMER_MS);
 		expect(await prompt).toBe(true);
@@ -404,6 +454,29 @@ describe("AgentSession repeated retry runtime", () => {
 		expect(harness.agent.providerMaxAttempts).toBe(4);
 		expect(harness.session.isRetrying).toBe(false);
 		expect(normalRetryStarts()).toHaveLength(1);
+		const recoveredEvents = harness.extensionRunner.events.filter(event => event.type === "auto_retry_recovered");
+		const timeoutEvents = harness.extensionRunner.events.filter(event => event.type === "auto_retry_timeout");
+		expect(harness.extensionRunner.events).toHaveLength(1);
+		expect(recoveredEvents).toHaveLength(1);
+		expect(timeoutEvents).toEqual([]);
+		expect(recoveredEvents[0]).toMatchObject({
+			type: "auto_retry_recovered",
+			round: 2,
+			startedAtMs: NOW.getTime(),
+			recoveredAtMs: NOW.getTime() + 2 * TIMER_MS,
+			durationMs: 2 * TIMER_MS,
+			deadlineMs: NOW.getTime() + TIMEOUT_MS,
+			timeoutMs: TIMEOUT_MS,
+		});
+	});
+
+	test("delivers the generic repeated end before recovered when both hooks are subscribed", async () => {
+		holdLongWaits = false;
+		harness = await createHarness([errorResponse(SESSION_LIMIT), successResponse("recovered")], undefined, true);
+
+		expect(await harness.session.prompt("recover after a session limit")).toBe(true);
+		expect(harness.extensionRunner.deliveryOrder).toEqual(["auto_retry_end", "auto_retry_recovered"]);
+		expect(harness.extensionRunner.events).toHaveLength(1);
 	});
 	test("fails fast for ordinary per-minute 429 errors without repeated retry", async () => {
 		harness = await createHarness(
@@ -437,11 +510,27 @@ describe("AgentSession repeated retry runtime", () => {
 		void harness.session.prompt("eventually timeout");
 		const start = await waitForRepeatedStart(harness);
 		expect(start).toMatchObject({ delayMs: TIMER_MS, timeoutMs: TIMER_MS });
+		expect(harness.extensionRunner.events).toEqual([]);
 
 		await advance(TIMER_MS + 1);
 		await flushAsync();
 		expect(repeatedEnds(harness.events)).toHaveLength(1);
 		expect(repeatedEnds(harness.events)[0]).toMatchObject({ success: false, reason: "timeout" });
+		const recoveredEvents = harness.extensionRunner.events.filter(event => event.type === "auto_retry_recovered");
+		const timeoutEvents = harness.extensionRunner.events.filter(event => event.type === "auto_retry_timeout");
+		expect(harness.extensionRunner.events).toHaveLength(1);
+		expect(recoveredEvents).toEqual([]);
+		expect(timeoutEvents).toHaveLength(1);
+		expect(timeoutEvents[0]).toMatchObject({
+			type: "auto_retry_timeout",
+			round: 1,
+			startedAtMs: NOW.getTime(),
+			timedOutAtMs: NOW.getTime() + TIMER_MS + 1,
+			durationMs: TIMER_MS + 1,
+			deadlineMs: NOW.getTime() + TIMER_MS,
+			timeoutMs: TIMER_MS,
+			finalError: SESSION_LIMIT,
+		});
 	});
 
 	test("abortRetry cancels an active repeated wait once", async () => {
@@ -456,6 +545,7 @@ describe("AgentSession repeated retry runtime", () => {
 
 		expect(repeatedEnds(harness.events)).toHaveLength(1);
 		expect(repeatedEnds(harness.events)[0]).toMatchObject({ success: false, reason: "cancelled" });
+		expect(harness.extensionRunner.events).toEqual([]);
 	});
 
 	test("user-authored input cancels an active repeated wait", async () => {
@@ -471,6 +561,7 @@ describe("AgentSession repeated retry runtime", () => {
 		expect(await second).toBe(true);
 		expect(repeatedEnds(harness.events)).toHaveLength(1);
 		expect(repeatedEnds(harness.events)[0]).toMatchObject({ success: false, reason: "manual-input" });
+		expect(harness.extensionRunner.events).toEqual([]);
 	});
 
 	test("manual input supersedes a resolved repeated probe before its deferred continuation", async () => {
@@ -496,6 +587,7 @@ describe("AgentSession repeated retry runtime", () => {
 		expect(harness.agent.providerMaxAttempts).toBe(4);
 		expect(repeatedEnds(harness.events)).toHaveLength(1);
 		expect(repeatedEnds(harness.events)[0]).toMatchObject({ success: false, reason: "manual-input" });
+		expect(harness.extensionRunner.events).toEqual([]);
 	});
 
 	test("terminates a repeated probe when its deferred continuation rejects", async () => {
@@ -526,6 +618,7 @@ describe("AgentSession repeated retry runtime", () => {
 			reason: "not-recoverable",
 			finalError: "Repeated probe continuation failed: deferred continue failed",
 		});
+		expect(harness.extensionRunner.events).toEqual([]);
 	});
 
 	test("terminates a repeated probe when its deferred scheduler wait aborts", async () => {
@@ -551,6 +644,7 @@ describe("AgentSession repeated retry runtime", () => {
 		expect(harness.session.isRetrying).toBe(false);
 		expect(repeatedEnds(harness.events)).toHaveLength(1);
 		expect(repeatedEnds(harness.events)[0]).toMatchObject({ success: false, reason: "cancelled" });
+		expect(harness.extensionRunner.events).toEqual([]);
 	});
 
 	test("success after an immediate repeated wait emits terminal success and clears repeated state for a later chain", async () => {
@@ -581,5 +675,6 @@ describe("AgentSession repeated retry runtime", () => {
 		expect(typeof result).toBe("boolean");
 		expect(repeatedStarts(harness.events)).toEqual([]);
 		expect(repeatedEnds(harness.events)).toEqual([]);
+		expect(harness.extensionRunner.events).toEqual([]);
 	});
 });
