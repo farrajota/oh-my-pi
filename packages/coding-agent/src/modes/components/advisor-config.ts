@@ -9,8 +9,8 @@
  * advisor's model / tools / instructions on the right, filling the free space.
  *
  * Each screen is backed by a proven primitive — {@link SelectList} (list / detail
- * / tools / thinking), {@link Input} (name), {@link ModelSelectorComponent} (the
- * same rich `/model` picker, in direct-select mode), and {@link HookEditorComponent}
+ * / tools / thinking), {@link Input} (name), {@link ModelBrowser} (the
+ * shared model picker, in direct-select mode), and {@link HookEditorComponent}
  * (multiline instructions; Ctrl+G opens `$EDITOR`). The overlay edits an in-memory
  * {@link WatchdogConfigDoc} and only touches disk + the live advisors via the host
  * `save` callback.

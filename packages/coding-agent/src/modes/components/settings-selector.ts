@@ -47,7 +47,7 @@ import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { AUTO_THINKING, type ConfiguredThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
-import { ModelSelectorComponent } from "./model-selector";
+import { buildBrowserItems, ModelBrowser, sortModelItems } from "./model-browser";
 import { bottomBorder, divider, row, topBorder } from "./overlay-box";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingDef, getSettingsForTab, type SettingDef } from "./settings-defs";
@@ -903,21 +903,36 @@ export class SettingsSelectorComponent implements Component {
 		let options = def.options;
 
 		if (def.path === "promptSuggestions.model") {
-			return new ModelSelectorComponent(
-				this.context.tui,
-				this.context.currentModel,
-				this.context.settings,
-				this.context.modelRegistry,
-				this.context.scopedModels,
-				(model, _role, _thinkingLevel, selector) => {
-					const value = selector ?? `${model.provider}/${model.id}`;
-					this.#setSettingValue(def.path, value);
-					this.callbacks.onChange(def.path, value);
-					done(value);
-				},
-				() => done(),
-				{ temporaryOnly: true, currentContextTokens: this.context.currentContextTokens },
-			);
+			const storage = this.context.settings.getStorage();
+			const mruOrder = storage?.getModelUsageOrder() ?? [];
+			let models: ReadonlyArray<Model>;
+			if (this.context.scopedModels.length > 0) {
+				models = this.context.scopedModels.map(scoped => scoped.model);
+			} else {
+				try {
+					models = this.context.modelRegistry.getAvailable();
+				} catch {
+					models = [];
+				}
+			}
+			const items = buildBrowserItems(models);
+			sortModelItems(items, { mruOrder });
+			const picker = new ModelBrowser(this.context.settings, {
+				currentContextTokens: this.context.currentContextTokens,
+				disableOverContext: true,
+			});
+			picker.setMruOrder(mruOrder);
+			picker.setPerfStats(storage?.getModelPerf() ?? new Map());
+			picker.setItems(items);
+			picker.selectSelector(currentValue);
+			picker.onActivate = item => {
+				const value = item.selector;
+				this.#setSettingValue(def.path, value);
+				this.callbacks.onChange(def.path, value);
+				done(value);
+			};
+			picker.onCancel = () => done();
+			return picker;
 		}
 
 		// Special case: inject runtime options for thinking level
