@@ -202,6 +202,8 @@ export interface ToolExecutionHandle extends Component {
 	setExpanded(expanded: boolean): void;
 	setTokenCount?(toolCallId: string, tokens: number): void;
 	setElapsedMs?(toolCallId: string, elapsedMs: number): void;
+	/** Freeze the block as final history: stop spinners and let it commit to scrollback. */
+	seal(): void;
 }
 
 /** Redraw live tool blocks at the spinner's glyph-advance rate. Rendering more

@@ -277,6 +277,7 @@ import toolCallLoopRedirectTemplate from "../prompts/system/tool-call-loop-redir
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
 import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import unexpectedStopRetryTemplate from "../prompts/system/unexpected-stop-retry.md" with { type: "text" };
+import vibeModeActivePrompt from "../prompts/system/vibe-mode-active.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
 import {
 	deobfuscateAssistantContent,
@@ -286,6 +287,7 @@ import {
 	type SecretObfuscator,
 } from "../secrets/obfuscator";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
+import { usesCodexTaskPrompt } from "../task/prompt-policy";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -297,7 +299,7 @@ import {
 	shouldDisableReasoning,
 	toReasoningEffort,
 } from "../thinking";
-import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/text";
+import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
 import { countToolsForAutoDiscovery, resolveEffectiveToolDiscoveryMode } from "../tool-discovery/mode";
 import {
@@ -329,6 +331,7 @@ import { describeAttachedImagesForTextModel } from "../utils/image-vision-fallba
 import { formatLocalCalendarDate } from "../utils/local-date";
 import { generateSessionTitle } from "../utils/title-generator";
 import { buildNamedToolChoice, isToolChoiceActive } from "../utils/tool-choice";
+import type { VibeModeState } from "../vibe/state";
 import type { AuthStorage } from "./auth-storage";
 import type { ClientBridge, ClientBridgePermissionOption, ClientBridgePermissionOutcome } from "./client-bridge";
 import {
@@ -745,6 +748,8 @@ export interface AgentSessionConfig {
 	modelRegistry: ModelRegistry;
 	/** Tool registry for LSP and settings */
 	toolRegistry?: Map<string, AgentTool>;
+	/** Creates the tools registered only while `/vibe` mode is active. */
+	createVibeTools?: () => AgentTool[];
 	/** Tool names whose current registry entry is still the built-in implementation. */
 	builtInToolNames?: Iterable<string>;
 	/** Update tool-session predicates that render guidance from the live active tool set. */
@@ -1089,6 +1094,7 @@ export interface FreshSessionResult {
 
 /** Standard thinking levels */
 
+/** `retry.fallbackChains` config: chain key (role name or model selector) → ordered fallback selectors. */
 type RetryFallbackChains = Record<string, string[]>;
 
 type RetryFallbackRevertPolicy = "never" | "cooldown-expiry";
@@ -1101,6 +1107,7 @@ interface RetryFallbackSelector {
 }
 
 interface ActiveRetryFallbackState {
+	/** Chain key that produced this fallback: a model-role name or a model-selector key. */
 	role: string;
 	originalSelector: string;
 	originalThinkingLevel: ConfiguredThinkingLevel | undefined;
@@ -1126,6 +1133,24 @@ function parseRetryFallbackSelector(
 		id: parsed.id,
 		thinkingLevel: concreteThinkingLevel(parsed.thinkingLevel),
 	};
+}
+
+/**
+ * `retry.fallbackChains` keys are either model-role names (`smol`, `default`)
+ * or model selectors (`provider/model-id[:thinking]`). Role names never
+ * contain a slash, so its presence marks a model-keyed chain whose primary is
+ * the key itself — the chain follows the model across role reassignments.
+ */
+function isRetryFallbackModelKey(key: string): boolean {
+	return key.includes("/");
+}
+
+/**
+ * A `provider/*` fallback-chain key: matches any active model of that provider,
+ * so one entry covers every current and future model behind the provider.
+ */
+function isRetryFallbackWildcardKey(key: string): boolean {
+	return key.endsWith("/*");
 }
 
 function formatRetryFallbackSelector(model: Model, thinkingLevel: ThinkingLevel | undefined): string {
@@ -1665,6 +1690,7 @@ export class AgentSession {
 	#advisorPrimaryTurnsCompleted = 0;
 	#advisorInterruptImmuneTurnStart: number | undefined;
 	#planModeState: PlanModeState | undefined;
+	#vibeModeState: VibeModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
 	#advisorEnabled = false;
@@ -1802,6 +1828,8 @@ export class AgentSession {
 
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
+	#createVibeTools: (() => AgentTool[]) | undefined;
+	#installedVibeToolNames = new Set<string>();
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
@@ -2165,6 +2193,7 @@ export class AgentSession {
 		this.#pruneToolDescriptions = config.pruneToolDescriptions === true;
 		this.#validateRetryFallbackChains();
 		this.#toolRegistry = config.toolRegistry ?? new Map();
+		this.#createVibeTools = config.createVibeTools;
 		this.#builtInToolNames = new Set(config.builtInToolNames ?? []);
 		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
@@ -2559,7 +2588,7 @@ export class AgentSession {
 			if (this.#advisorSharedInstructions) systemPrompt.push(this.#advisorSharedInstructions);
 			if (config.instructions?.trim()) systemPrompt.push(config.instructions.trim());
 
-			const names = config.tools?.length ? new Set(config.tools) : ADVISOR_DEFAULT_TOOL_NAMES;
+			const names = config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(config.tools);
 			const tools = (this.#advisorTools ?? []).filter(t => names.has(t.name));
 
 			const primaryProviderSessionId = this.sessionId;
@@ -3870,6 +3899,16 @@ export class AgentSession {
 			if (event.message.role === "assistant") {
 				this.#lastAssistantMessage = event.message;
 				const assistantMsg = event.message as AssistantMessage;
+				// Fold this turn's timing into per-model perf aggregates (drives the
+				// /models TPS/TTFT display). Errored turns measure nothing; aborted
+				// turns with reported usage are still valid throughput samples.
+				if (assistantMsg.stopReason !== "error" && assistantMsg.duration !== undefined) {
+					this.settings.getStorage()?.recordModelPerf(`${assistantMsg.provider}/${assistantMsg.model}`, {
+						outputTokens: assistantMsg.usage.output,
+						durationMs: assistantMsg.duration,
+						ttftMs: assistantMsg.ttft,
+					});
+				}
 				if (
 					assistantMsg.disabledFeatures?.includes("priority") &&
 					this.#serviceTierByFamily.anthropic === "priority"
@@ -6240,6 +6279,49 @@ export class AgentSession {
 		return Array.from(this.#toolRegistry.keys());
 	}
 
+	#wrapRuntimeTool(tool: AgentTool): AgentTool {
+		const wrapped = wrapToolWithMetaNotice(tool);
+		return this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped;
+	}
+
+	/**
+	 * Registers the ephemeral vibe tools and activates them alongside `baseToolNames`.
+	 *
+	 * @throws When this session cannot create vibe tools or the factory returns duplicate names.
+	 */
+	async activateVibeTools(baseToolNames: string[]): Promise<void> {
+		const createVibeTools = this.#createVibeTools;
+		if (!createVibeTools) {
+			throw new Error("Vibe tools are unavailable in this session.");
+		}
+
+		const tools = createVibeTools();
+		const vibeToolNames = tools.map(tool => tool.name);
+		if (new Set(vibeToolNames).size !== vibeToolNames.length) {
+			throw new Error("Vibe tool names must be unique.");
+		}
+
+		for (const tool of tools) {
+			if (this.#toolRegistry.has(tool.name)) continue;
+			this.#toolRegistry.set(tool.name, this.#wrapRuntimeTool(tool));
+			this.#builtInToolNames.add(tool.name);
+			this.#installedVibeToolNames.add(tool.name);
+		}
+
+		await this.#applyActiveToolsByName([...new Set([...baseToolNames, ...vibeToolNames])]);
+	}
+
+	/** Removes tools installed by {@link activateVibeTools} and activates `nextToolNames`. */
+	async deactivateVibeTools(nextToolNames: string[]): Promise<void> {
+		for (const name of this.#installedVibeToolNames) {
+			this.#toolRegistry.delete(name);
+			this.#builtInToolNames.delete(name);
+			this.#selectedDiscoveredToolNames.delete(name);
+		}
+		this.#installedVibeToolNames.clear();
+		await this.#applyActiveToolsByName(nextToolNames);
+	}
+
 	#getEditModeSession() {
 		return {
 			settings: this.settings,
@@ -6251,19 +6333,17 @@ export class AgentSession {
 		return resolveEditMode(this.#getEditModeSession());
 	}
 
-	/**
-	 * Model key (`provider/id`) currently surfaced in the system prompt, or
-	 * undefined when the model is unset or `includeModelInPrompt` is disabled.
-	 */
+	/** Cache key for model-dependent prompt content: displayed id or hidden-policy cohort. */
 	#currentPromptModelKey(): string | undefined {
-		if (!this.settings.get("includeModelInPrompt")) return undefined;
-		return this.model ? formatModelString(this.model) : undefined;
+		const model = this.model ? formatModelString(this.model) : undefined;
+		if (!model || this.settings.get("includeModelInPrompt")) return model;
+		return usesCodexTaskPrompt(model) ? "task-policy:gpt-5.6" : "task-policy:default";
 	}
 
 	async #syncAfterModelChange(previousEditMode: EditMode): Promise<void> {
 		const currentEditMode = this.#resolveActiveEditMode();
 		const editModeChanged = previousEditMode !== currentEditMode && this.getActiveToolNames().includes("edit");
-		// The system prompt may surface the active model; a switch makes the cached prompt stale.
+		// The system prompt selects model-specific policy even when it does not display the model id.
 		const modelChanged = this.#currentPromptModelKey() !== this.#promptModelKey;
 		if (editModeChanged || modelChanged) {
 			await this.refreshBaseSystemPrompt();
@@ -6969,12 +7049,13 @@ export class AgentSession {
 	 * `agent.replaceMessages` or a provider.
 	 */
 	buildTranscriptSessionContext(
-		options?: Pick<BuildSessionContextOptions, "collapseCompactedHistory">,
+		options?: Pick<BuildSessionContextOptions, "collapseCompactedHistory" | "keepDanglingToolCalls">,
 	): SessionContext {
 		return deobfuscateSessionContext(
 			this.sessionManager.buildSessionContext({
 				transcript: true,
 				collapseCompactedHistory: options?.collapseCompactedHistory,
+				keepDanglingToolCalls: options?.keepDanglingToolCalls,
 			}),
 			this.#obfuscator,
 		);
@@ -7200,6 +7281,14 @@ export class AgentSession {
 		this.#goalModeState = state;
 	}
 
+	getVibeModeState(): VibeModeState | undefined {
+		return this.#vibeModeState;
+	}
+
+	setVibeModeState(state: VibeModeState | undefined): void {
+		this.#vibeModeState = state;
+	}
+
 	get goalRuntime(): GoalRuntime {
 		return this.#goalRuntime;
 	}
@@ -7319,6 +7408,21 @@ export class AgentSession {
 
 	async sendGoalModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" }): Promise<void> {
 		const message = this.#buildGoalModeMessage();
+		if (!message) return;
+		await this.sendCustomMessage(
+			{
+				customType: message.customType,
+				content: message.content,
+				display: message.display,
+				details: message.details,
+				attribution: message.attribution,
+			},
+			options ? { deliverAs: options.deliverAs } : undefined,
+		);
+	}
+
+	async sendVibeModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" }): Promise<void> {
+		const message = this.#buildVibeModeMessage();
 		if (!message) return;
 		await this.sendCustomMessage(
 			{
@@ -7454,6 +7558,18 @@ export class AgentSession {
 			role: "custom",
 			customType: "goal-mode-context",
 			content: prompt.render(goalModeContextPrompt, { goalContext: content, todoContext }),
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+	}
+
+	#buildVibeModeMessage(): CustomMessage | null {
+		if (!this.#vibeModeState?.enabled) return null;
+		return {
+			role: "custom",
+			customType: "vibe-mode-context",
+			content: prompt.render(vibeModeActivePrompt),
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
@@ -7897,6 +8013,10 @@ export class AgentSession {
 			const goalModeMessage = this.#buildGoalModeMessage();
 			if (goalModeMessage) {
 				messages.push(goalModeMessage);
+			}
+			const vibeModeMessage = this.#buildVibeModeMessage();
+			if (vibeModeMessage) {
+				messages.push(vibeModeMessage);
 			}
 			if (options?.prependMessages) {
 				messages.push(...options.prependMessages);
@@ -8765,12 +8885,7 @@ export class AgentSession {
 
 	#syncTodoPhasesFromBranch(): void {
 		const phases = getLatestTodoPhasesFromEntries(this.sessionManager.getBranch());
-		// Strip completed/abandoned tasks — they were done in a previous run,
-		// so they have no bearing on progress tracking for the new turn.
-		for (const phase of phases) {
-			phase.tasks = phase.tasks.filter(t => t.status !== "completed" && t.status !== "abandoned");
-		}
-		this.setTodoPhases(phases.filter(p => p.tasks.length > 0));
+		this.setTodoPhases(phases);
 	}
 
 	#cloneTodoPhases(phases: TodoPhase[]): TodoPhase[] {
@@ -11006,21 +11121,21 @@ export class AgentSession {
 
 		this.#emptyStopRetryCount++;
 		if (this.#emptyStopRetryCount > EMPTY_STOP_MAX_RETRIES) {
-			logger.warn("Assistant returned empty stop after retry cap", {
-				attempts: this.#emptyStopRetryCount - 1,
+			const attempts = this.#emptyStopRetryCount - 1;
+			const finalError = "Assistant returned empty stop after retry cap";
+			logger.warn(finalError, {
+				attempts,
 				model: assistantMessage.model,
 				provider: assistantMessage.provider,
 			});
-			if (this.#retryAttempt > 0) {
-				await this.#emitSessionEvent({
-					type: "auto_retry_end",
-					success: false,
-					attempt: this.#retryAttempt,
-					finalError: "Assistant returned empty stop after retry cap",
-				});
-				this.#clearPendingRecoveredRetryErrors();
-				this.#retryAttempt = 0;
-			}
+			await this.#emitSessionEvent({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this.#retryAttempt > 0 ? this.#retryAttempt : attempts,
+				finalError,
+			});
+			this.#clearPendingRecoveredRetryErrors();
+			this.#retryAttempt = 0;
 			this.#resolveRetry();
 			// Tool-use orphans corrupt Anthropic message history (tool_result without
 			// matching tool_use). Always remove them even when the retry cap is hit.
@@ -13521,36 +13636,68 @@ export class AgentSession {
 		const configuredChains = this.settings.get("retry.fallbackChains");
 		if (configuredChains === undefined) return;
 		if (!configuredChains || typeof configuredChains !== "object" || Array.isArray(configuredChains)) {
-			const msg = "retry.fallbackChains must be a mapping of role names to selector arrays.";
+			const msg = "retry.fallbackChains must be a mapping of role names or model selectors to selector arrays.";
 			logger.warn(msg);
 			this.configWarnings.push(msg);
 			return;
 		}
 
-		for (const [role, chain] of Object.entries(configuredChains)) {
+		for (const key in configuredChains) {
+			const chain = (configuredChains as RetryFallbackChains)[key];
+			const keyKind = isRetryFallbackModelKey(key) ? "model" : "role";
+			if (keyKind === "model") {
+				if (isRetryFallbackWildcardKey(key)) {
+					const provider = key.slice(0, -2);
+					if (!this.#modelRegistry.getAll().some(model => model.provider === provider)) {
+						const msg = `retry.fallbackChains wildcard key references unknown provider: ${key}`;
+						logger.warn(msg);
+						this.configWarnings.push(msg);
+					}
+				} else {
+					const parsedKey = parseRetryFallbackSelector(key, this.#modelRegistry);
+					if (!parsedKey) {
+						const msg = `Invalid model selector key in retry.fallbackChains: ${key}`;
+						logger.warn(msg);
+						this.configWarnings.push(msg);
+					} else if (!this.#modelRegistry.find(parsedKey.provider, parsedKey.id)) {
+						const msg = `retry.fallbackChains key references unknown model: ${key}`;
+						logger.warn(msg);
+						this.configWarnings.push(msg);
+					}
+				}
+			}
 			if (!Array.isArray(chain)) {
-				const msg = `Fallback chain for role '${role}' must be an array of selector strings.`;
+				const msg = `Fallback chain for ${keyKind} '${key}' must be an array of selector strings.`;
 				logger.warn(msg);
 				this.configWarnings.push(msg);
 				continue;
 			}
 			for (const selectorStr of chain) {
 				if (typeof selectorStr !== "string") {
-					const msg = `Fallback chain for role '${role}' contains a non-string selector.`;
+					const msg = `Fallback chain for ${keyKind} '${key}' contains a non-string selector.`;
 					logger.warn(msg);
 					this.configWarnings.push(msg);
 					continue;
 				}
+				if (isRetryFallbackWildcardKey(selectorStr)) {
+					const provider = selectorStr.slice(0, -2);
+					if (!this.#modelRegistry.getAll().some(model => model.provider === provider)) {
+						const msg = `Fallback chain for ${keyKind} '${key}' references unknown provider: ${selectorStr}`;
+						logger.warn(msg);
+						this.configWarnings.push(msg);
+					}
+					continue;
+				}
 				const parsed = parseRetryFallbackSelector(selectorStr, this.#modelRegistry);
 				if (!parsed) {
-					const msg = `Invalid fallback selector format in role '${role}': ${selectorStr}`;
+					const msg = `Invalid fallback selector format in ${keyKind} '${key}': ${selectorStr}`;
 					logger.warn(msg);
 					this.configWarnings.push(msg);
 					continue;
 				}
 				const exists = this.#modelRegistry.find(parsed.provider, parsed.id);
 				if (!exists) {
-					const msg = `Fallback chain for role '${role}' references unknown model: ${selectorStr}`;
+					const msg = `Fallback chain for ${keyKind} '${key}' references unknown model: ${selectorStr}`;
 					logger.warn(msg);
 					this.configWarnings.push(msg);
 				}
@@ -13563,6 +13710,8 @@ export class AgentSession {
 	}
 
 	#getRetryFallbackPrimarySelector(role: string): RetryFallbackSelector | undefined {
+		if (isRetryFallbackWildcardKey(role)) return undefined;
+		if (isRetryFallbackModelKey(role)) return parseRetryFallbackSelector(role, this.#modelRegistry);
 		const configuredSelector = this.settings.getModelRole(role);
 		return configuredSelector ? parseRetryFallbackSelector(configuredSelector, this.#modelRegistry) : undefined;
 	}
@@ -13584,6 +13733,13 @@ export class AgentSession {
 		this.#modelRegistry.suppressSelector(currentSelector, Date.now() + cooldownMs);
 	}
 
+	/**
+	 * Map the failing model selector to the chain key that owns it, by
+	 * specificity: an exact model-selector key, then a `provider/*` wildcard,
+	 * then a model role whose current assignment matches, then `default`.
+	 * Model-oriented keys win over roles so a chain follows the model across
+	 * role reassignments.
+	 */
 	#resolveRetryFallbackRole(currentSelector: string): string | undefined {
 		const parsedCurrent = parseRetryFallbackSelector(currentSelector, this.#modelRegistry);
 		if (!parsedCurrent) return undefined;
@@ -13597,18 +13753,33 @@ export class AgentSession {
 				? formatRetryFallbackBaseSelector(parseRetryFallbackSelector(currentPlainSelector) ?? parsedCurrent)
 				: undefined;
 
-		for (const role of Object.keys(chains)) {
-			const primarySelector = this.#getRetryFallbackPrimarySelector(role);
-			if (primarySelector?.raw === currentSelector) return role;
+		const exactModelKeys: string[] = [];
+		const roleKeys: string[] = [];
+		for (const key in chains) {
+			if (!isRetryFallbackModelKey(key)) roleKeys.push(key);
+			else if (!isRetryFallbackWildcardKey(key)) exactModelKeys.push(key);
 		}
-		for (const role of Object.keys(chains)) {
-			const primarySelector = this.#getRetryFallbackPrimarySelector(role);
-			if (!primarySelector) continue;
-			if (currentPlainSelector && primarySelector.raw === currentPlainSelector) return role;
-			const primaryBaseSelector = formatRetryFallbackBaseSelector(primarySelector);
-			if (primaryBaseSelector === currentBaseSelector) return role;
-			if (currentPlainBaseSelector && primaryBaseSelector === currentPlainBaseSelector) return role;
+		const matchesCurrent = (primary: RetryFallbackSelector | undefined): boolean => {
+			if (!primary) return false;
+			if (primary.raw === currentSelector || (currentPlainSelector && primary.raw === currentPlainSelector)) {
+				return true;
+			}
+			const base = formatRetryFallbackBaseSelector(primary);
+			return base === currentBaseSelector || (!!currentPlainBaseSelector && base === currentPlainBaseSelector);
+		};
+
+		// 1. Exact model-selector keys — most specific.
+		for (const key of exactModelKeys) {
+			if (matchesCurrent(this.#getRetryFallbackPrimarySelector(key))) return key;
 		}
+		// 2. Provider wildcard (`provider/*`) — any active model of this provider.
+		const wildcardKey = `${parsedCurrent.provider}/*`;
+		if (Array.isArray(chains[wildcardKey])) return wildcardKey;
+		// 3. Role keys — matched by the role's currently-assigned model.
+		for (const key of roleKeys) {
+			if (matchesCurrent(this.#getRetryFallbackPrimarySelector(key))) return key;
+		}
+		// 4. The default chain, when default has no explicit role primary.
 		const defaultChain = chains.default;
 		if (
 			Array.isArray(defaultChain) &&
@@ -13620,13 +13791,45 @@ export class AgentSession {
 		return undefined;
 	}
 
-	#getRetryFallbackEffectiveChain(role: string): RetryFallbackSelector[] {
-		const primarySelector = this.#getRetryFallbackPrimarySelector(role);
-		if (!primarySelector) return [];
-		const chain = [primarySelector];
-		const seen = new Set<string>([primarySelector.raw]);
+	/**
+	 * Parse one configured chain entry. A `provider/*` entry keeps the failing
+	 * model's id and swaps the provider (google-antigravity/x → google/x);
+	 * ids the target provider lacks are skipped by the candidate loop's
+	 * registry lookup.
+	 */
+	#parseRetryFallbackChainEntry(
+		entry: string,
+		current: RetryFallbackSelector | undefined,
+	): RetryFallbackSelector | undefined {
+		if (isRetryFallbackWildcardKey(entry)) {
+			if (!current) return undefined;
+			const provider = entry.slice(0, -2);
+			return { raw: `${provider}/${current.id}`, provider, id: current.id, thinkingLevel: undefined };
+		}
+		return parseRetryFallbackSelector(entry, this.#modelRegistry);
+	}
+
+	#getRetryFallbackEffectiveChain(role: string, currentSelector?: string): RetryFallbackSelector[] {
+		const parsedCurrent = currentSelector
+			? parseRetryFallbackSelector(currentSelector, this.#modelRegistry)
+			: undefined;
+		const seen = new Set<string>();
+		const chain: RetryFallbackSelector[] = [];
+		if (isRetryFallbackWildcardKey(role)) {
+			// A wildcard key has no fixed primary: the active model is the
+			// primary, followed by the configured provider-level fallbacks.
+			if (parsedCurrent) {
+				chain.push(parsedCurrent);
+				seen.add(parsedCurrent.raw);
+			}
+		} else {
+			const primarySelector = this.#getRetryFallbackPrimarySelector(role);
+			if (!primarySelector) return [];
+			chain.push(primarySelector);
+			seen.add(primarySelector.raw);
+		}
 		for (const selector of this.#getRetryFallbackChains()[role] ?? []) {
-			const parsed = parseRetryFallbackSelector(selector, this.#modelRegistry);
+			const parsed = this.#parseRetryFallbackChainEntry(selector, parsedCurrent);
 			if (!parsed || seen.has(parsed.raw)) continue;
 			seen.add(parsed.raw);
 			chain.push(parsed);
@@ -13635,7 +13838,7 @@ export class AgentSession {
 	}
 
 	#findRetryFallbackCandidates(role: string, currentSelector: string): RetryFallbackSelector[] {
-		let chain = this.#getRetryFallbackEffectiveChain(role);
+		let chain = this.#getRetryFallbackEffectiveChain(role, currentSelector);
 		const parsedCurrent = parseRetryFallbackSelector(currentSelector, this.#modelRegistry);
 		if (chain.length === 0 && role === "default" && parsedCurrent) {
 			const chains = this.#getRetryFallbackChains();
@@ -13648,7 +13851,7 @@ export class AgentSession {
 				const seen = new Set<string>([parsedCurrent.raw]);
 				chain = [parsedCurrent];
 				for (const selector of defaultChain) {
-					const parsed = parseRetryFallbackSelector(selector, this.#modelRegistry);
+					const parsed = this.#parseRetryFallbackChainEntry(selector, parsedCurrent);
 					if (!parsed || seen.has(parsed.raw)) continue;
 					seen.add(parsed.raw);
 					chain.push(parsed);
@@ -14195,31 +14398,13 @@ export class AgentSession {
 			this.#retryResolve = resolve;
 		}
 
-		if (this.#retryAttempt > retrySettings.maxRetries) {
-			if (
-				await this.#maybeScheduleRepeatedRetryAfterExhaustion({
-					message,
-					errorId: id,
-					reason: "max-retries",
-					generation,
-					retrySettings,
-				})
-			) {
-				return true;
-			}
-			await this.#persistRetryLifecycleErrorMessage(message);
-			// Max retries exceeded, emit final failure and reset
-			await this.#emitSessionEvent({
-				type: "auto_retry_end",
-				success: false,
-				attempt: this.#retryAttempt - 1,
-				finalError: message.errorMessage,
-			});
-			this.#clearPendingRecoveredRetryErrors();
-			this.#retryAttempt = 0;
-			this.#resolveRetry(); // Resolve so waitForRetry() completes
-			return false;
-		}
+		// All attempts on the current model are spent. Don't fail yet: the
+		// fallback chain below gets one last consult. Credential rotation can
+		// consume the entire budget without the fallback branch ever running
+		// (every rotation sets switchedCredential and skips it), so without
+		// this last resort a provider-wide usage cap never fails over to the
+		// configured chain.
+		const retryBudgetExhausted = this.#retryAttempt > retrySettings.maxRetries;
 
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
@@ -14236,7 +14421,12 @@ export class AgentSession {
 			this.#resetCurrentResponsesProviderSession("stale replay error");
 		}
 
-		if (this.model && !staleOpenAIResponsesReplayError && AIError.is(id, AIError.Flag.UsageLimit)) {
+		if (
+			!retryBudgetExhausted &&
+			this.model &&
+			!staleOpenAIResponsesReplayError &&
+			AIError.is(id, AIError.Flag.UsageLimit)
+		) {
 			const retryAfterMs = parsedRetryAfterMs ?? calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
 			const outcome = await this.#modelRegistry.authStorage.markUsageLimitReached(
 				this.model.provider,
@@ -14282,7 +14472,9 @@ export class AgentSession {
 		const allowModelFallback = options?.allowModelFallback !== false;
 		const currentSelector = this.model ? formatRetryFallbackSelector(this.model, this.thinkingLevel) : undefined;
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
-			if (allowModelFallback && retrySettings.modelFallback) {
+			// A refusal chain stops at the retry budget: the exhausted-attempt
+			// last resort is for provider failures, not classifier decisions.
+			if (allowModelFallback && retrySettings.modelFallback && !(retryBudgetExhausted && classifierRefusal)) {
 				if (!classifierRefusal) {
 					this.#noteRetryFallbackCooldown(currentSelector, parsedRetryAfterMs, errorMessage);
 				}
@@ -14300,6 +14492,37 @@ export class AgentSession {
 			} else if (usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
 				delayMs = parsedRetryAfterMs;
 			}
+		}
+		if (retryBudgetExhausted) {
+			if (!switchedModel) {
+				if (
+					await this.#maybeScheduleRepeatedRetryAfterExhaustion({
+						message,
+						errorId: id,
+						reason: "max-retries",
+						generation,
+						retrySettings,
+					})
+				) {
+					return true;
+				}
+				await this.#persistRetryLifecycleErrorMessage(message);
+				// Max retries exceeded and no fallback model to switch to: emit
+				// final failure and reset.
+				await this.#emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this.#retryAttempt - 1,
+					finalError: message.errorMessage,
+				});
+				this.#clearPendingRecoveredRetryErrors();
+				this.#retryAttempt = 0;
+				this.#resolveRetry(); // Resolve so waitForRetry() completes
+				return false;
+			}
+			// The fallback model gets a fresh retry budget — leaving the spent
+			// counter in place would exhaust it again on its first error.
+			this.#retryAttempt = 1;
 		}
 		if (classifierRefusal && !switchedModel) {
 			this.#retryAttempt = 0;
@@ -15050,10 +15273,13 @@ export class AgentSession {
 				// Side-channel turns must not share OpenAI/Codex append-only
 				// conversation state with the main agent turn: IRC and /btw can run
 				// while the main turn is mid-tool-call. Keep the prompt-cache key
-				// stable, but give provider routing a unique request lineage.
+				// stable, but give provider routing a unique request lineage. The
+				// shared provider state map is still required so Codex can allocate
+				// websocket state under that side-channel session id.
 				sessionId: `${cacheSessionId}:side:${Snowflake.next()}`,
 				promptCacheKey: cacheSessionId,
-				preferWebsockets: false,
+				preferWebsockets: this.#preferWebsockets,
+				providerSessionState: this.#providerSessionState,
 				reasoning: toReasoningEffort(this.thinkingLevel),
 				disableReasoning: shouldDisableReasoning(this.thinkingLevel),
 				hideThinkingSummary: this.agent.hideThinkingSummary,

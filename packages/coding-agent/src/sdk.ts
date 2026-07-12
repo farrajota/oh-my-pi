@@ -162,6 +162,7 @@ import {
 	BUILTIN_TOOLS,
 	computeEssentialBuiltinNames,
 	createTools,
+	createVibeTools,
 	type DeferredDiagnosticsEntry,
 	discoverStartupLspServers,
 	EditTool,
@@ -192,6 +193,7 @@ import {
 import { normalizeToolName, normalizeToolNames } from "./tools/builtin-names";
 import { ToolContextStore } from "./tools/context";
 import { getImageGenTools } from "./tools/image-gen";
+import { isIrcEnabled } from "./tools/irc";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { queueResolveHandler } from "./tools/resolve";
 import { ttsTool } from "./tools/tts";
@@ -2457,11 +2459,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				eagerTasks,
 				eagerTasksAlways,
 				taskBatch: settings.get("task.batch"),
+				taskMaxConcurrency: settings.get("task.maxConcurrency"),
+				taskIrcEnabled: isIrcEnabled(settings, options.taskDepth ?? 0),
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
 				includeWorkspaceTree,
 				memoryRootEnabled: memoryBackend.id === "local",
-				model: settings.get("includeModelInPrompt") ? getActiveModelString() : undefined,
+				model: getActiveModelString(),
+				includeModelInPrompt: settings.get("includeModelInPrompt"),
 				personality: agentKind === "sub" ? "none" : settings.get("personality"),
 				renderMermaid: settings.get("tui.renderMermaid"),
 				activeRepoContext,
@@ -2892,6 +2897,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillsSettings: settings.getGroup("skills"),
 			modelRegistry,
 			toolRegistry,
+			createVibeTools:
+				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix
+					? () => createVibeTools(toolSession)
+					: undefined,
 			builtInToolNames: builtInRegistryToolNames,
 			transformContext,
 			transformProviderContext,
