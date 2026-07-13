@@ -179,4 +179,28 @@ describe("task renderer: streaming call preview", () => {
 		expect(out).not.toContain("Review the auth module.");
 		expect(out).not.toContain("ReviewAuth");
 	});
+
+	it("renders each batch item's permission profile", () => {
+		const args: TaskParams = {
+			context: "ctx",
+			tasks: [
+				{
+					name: "Scoped",
+					task: "inspect auth",
+					permissions: {
+						profiles: ["read-only"],
+						tools: [],
+						denyTools: [],
+						allowPaths: [],
+						denyPaths: [],
+					},
+				},
+			],
+		};
+
+		const out = render(args);
+
+		expect(out).toContain("Scoped");
+		expect(out).toContain("Profiles: read-only");
+	});
 });

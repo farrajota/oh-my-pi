@@ -804,7 +804,7 @@ function renderTaskItemLines(tasks: TaskItem[] | undefined, theme: Theme): strin
 			line += theme.fg("dim", " [isolated]");
 		}
 		lines.push(line);
-		appendPermissionLines(lines, task?.permissions, theme);
+		appendPermissionLines(lines, item?.permissions, theme);
 	}
 	if (cap < tasks.length) {
 		lines.push(`${bullet} ${theme.fg("dim", formatMoreItems(tasks.length - cap, "agent"))}`);
