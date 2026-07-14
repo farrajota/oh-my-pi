@@ -45,7 +45,7 @@ import {
 	SKILL_PROMPT_MESSAGE_TYPE,
 	type SkillPromptDetails,
 } from "../../session/messages";
-import type { SessionContext } from "../../session/session-context";
+import type { SessionContext, StrippedToolCallsMarker } from "../../session/session-context";
 import { replaceTabs } from "../../tools/render-utils";
 import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillCommand } from "../skill-command";
 import { createAssistantMessageComponent } from "./interactive-context-helpers";
@@ -57,6 +57,7 @@ import {
 	buildIrcMessageCard,
 	normalizeToolArgs,
 	resolveAssistantErrorPresentation,
+	splitAssistantMessageToolTimeline,
 } from "./transcript-render-helpers";
 
 type TextBlock = { type: "text"; text: string };
@@ -251,7 +252,10 @@ export class UiHelpers {
 				break;
 			}
 			case "assistant": {
-				const assistantComponent = createAssistantMessageComponent(this.ctx, message);
+				const assistantComponent = createAssistantMessageComponent(
+					this.ctx,
+					splitAssistantMessageToolTimeline(message).beforeTools,
+				);
 				this.ctx.chatContainer.addChild(assistantComponent);
 				break;
 			}
@@ -357,6 +361,7 @@ export class UiHelpers {
 			if (message.role !== "toolResult") flushPendingUsage();
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
+				const timeline = splitAssistantMessageToolTimeline(message);
 				this.ctx.addMessageToChat(message);
 				const lastChild = this.ctx.chatContainer.children[this.ctx.chatContainer.children.length - 1];
 				const assistantComponent = lastChild instanceof AssistantMessageComponent ? lastChild : undefined;
@@ -383,6 +388,11 @@ export class UiHelpers {
 				const errorPresentation = resolveAssistantErrorPresentation(message, this.ctx.viewSession.retryAttempt);
 				const hasErrorStop = errorPresentation.kind === "full";
 				const errorMessage = hasErrorStop ? errorPresentation.text : null;
+				const appendAssistantSegment = (segment: AssistantMessage | undefined) => {
+					if (!segment || !assistantHasVisibleContent(segment)) return;
+					const component = createAssistantMessageComponent(this.ctx, segment);
+					this.ctx.chatContainer.addChild(component);
+				};
 
 				// Render tool call components
 				for (const content of message.content) {
@@ -390,6 +400,7 @@ export class UiHelpers {
 						continue;
 					}
 					resolveWaitingPoll(content.name);
+					const afterToolSegment = timeline.afterToolCalls.get(content.id);
 
 					if (
 						content.name === "read" &&
@@ -410,6 +421,19 @@ export class UiHelpers {
 								false,
 								content.id,
 							);
+						} else if (afterToolSegment) {
+							if (!readGroup) {
+								readGroup = new ReadToolGroupComponent({
+									showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+								});
+								readGroup.setExpanded(this.ctx.toolOutputExpanded);
+								this.ctx.chatContainer.addChild(readGroup);
+							}
+							readGroup.updateArgs(content.arguments, content.id);
+							this.ctx.pendingTools.set(content.id, readGroup);
+							if (assistantComponent) {
+								readToolCallAssistantComponents.set(content.id, assistantComponent);
+							}
 						} else {
 							const normalizedArgs = normalizeToolArgs(content.arguments);
 							readToolCallArgs.set(content.id, normalizedArgs);
@@ -417,6 +441,7 @@ export class UiHelpers {
 								readToolCallAssistantComponents.set(content.id, assistantComponent);
 							}
 						}
+						appendAssistantSegment(afterToolSegment);
 						continue;
 					}
 
@@ -464,6 +489,27 @@ export class UiHelpers {
 					} else {
 						this.ctx.pendingTools.set(content.id, component);
 					}
+					appendAssistantSegment(afterToolSegment);
+				}
+				// Dangling toolCalls (no result on the resolved path — failed or
+				// retried turns, results on sibling branches) were stripped by the
+				// context build; surface a placeholder so the turn's activity is
+				// visibly elided instead of silently vanishing (the "bare thinking
+				// lines" transcript trap).
+				const strippedToolCalls = (message as AgentMessage & StrippedToolCallsMarker).strippedToolCalls ?? 0;
+				if (strippedToolCalls > 0) {
+					this.ctx.chatContainer.addChild(
+						new Text(
+							theme.fg(
+								"dim",
+								theme.italic(
+									`${strippedToolCalls} tool call${strippedToolCalls === 1 ? "" : "s"} elided — no result on this branch`,
+								),
+							),
+							1,
+							0,
+						),
+					);
 				}
 				pendingUsage =
 					this.ctx.settings.get("display.showTokenUsage") && assistantUsageIsBilled(message.usage)
@@ -607,13 +653,14 @@ export class UiHelpers {
 		this.ctx.pendingBashComponents = [];
 		this.ctx.pendingPythonComponents = [];
 
-		// Live display uses the compacted transcript tail; export/resume callers
-		// can still request the full inline compaction history. Mid-turn rebuilds
+		// Live display collapses to the compacted transcript tail unless the
+		// user opted into the full inline history; export/resume callers can
+		// still request either mode. Mid-turn rebuilds
 		// (focus attach/unfocus while a tool executes) keep dangling toolCalls so
 		// the in-flight call re-renders as pending instead of vanishing;
 		// renderSessionContext then keeps it in `pendingTools` for live routing.
 		const context = this.ctx.viewSession.buildTranscriptSessionContext({
-			collapseCompactedHistory: true,
+			collapseCompactedHistory: settings.get("display.collapseCompacted"),
 			keepDanglingToolCalls: this.ctx.viewSession.isStreaming,
 		});
 		this.ctx.renderSessionContext(context, {

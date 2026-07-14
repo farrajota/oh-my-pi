@@ -100,6 +100,7 @@ import {
 	encodeResponsesToolCallId,
 	encodeTextSignatureV1,
 	finalizeCustomToolCallInputDone,
+	finalizeMessageText,
 	finalizePendingResponsesToolCalls,
 	finalizeReasoningThinking,
 	finalizeToolCallArgumentsDone,
@@ -725,6 +726,8 @@ class CodexStreamRuntime {
 	nativeOutputItems: Array<Record<string, unknown>> = [];
 	/** Sequential-cutoff summary sections/emitted text, global to the response (indices span reasoning items). */
 	cutoffSummaries: SequentialCutoffSummaryState = createSequentialCutoffSummaryState();
+	/** Summary deltas buffered while waiting to see whether atomic `.done` events arrive. */
+	pendingSummaryDeltas = new Map<CodexOpenItem, string[]>();
 	websocketStreamRetries = 0;
 	providerRetryAttempt = 0;
 	sawTerminalEvent = false;
@@ -759,6 +762,7 @@ class CodexStreamRuntime {
 		this.currentItem = null;
 		this.currentBlock = null;
 		this.nativeOutputItems.length = 0;
+		this.pendingSummaryDeltas.clear();
 		this.cutoffSummaries = createSequentialCutoffSummaryState();
 	}
 
@@ -779,6 +783,19 @@ class CodexStreamRuntime {
 				: undefined;
 		if (outputIndex !== undefined) return this.openItemsByOutputIndex.get(outputIndex) ?? null;
 		return this.currentEntry;
+	}
+	queueSummaryDelta(entry: CodexOpenItem | null | undefined, delta: string): void {
+		if (entry?.block?.type !== "thinking" || delta.length === 0) return;
+		const pending = this.pendingSummaryDeltas.get(entry) ?? [];
+		pending.push(delta);
+		this.pendingSummaryDeltas.set(entry, pending);
+	}
+
+	takeSummaryDeltas(entry: CodexOpenItem | null | undefined): string[] {
+		if (!entry) return [];
+		const pending = this.pendingSummaryDeltas.get(entry) ?? [];
+		this.pendingSummaryDeltas.delete(entry);
+		return pending;
 	}
 
 	closeOpenItem(entry: CodexOpenItem | null | undefined): void {
@@ -1753,10 +1770,9 @@ class CodexStreamProcessor {
 
 	/**
 	 * Whether the request actually sent (post-`onPayload`) opted into
-	 * sequential-cutoff summary delivery: summaries then arrive as atomic
-	 * `response.reasoning_summary_text.done` events and incremental
-	 * `.delta`/`.part.*` events are ignored (mirrors codex-rs
-	 * `uses_sequential_cutoff_reasoning_summaries`).
+	 * sequential-cutoff summary delivery. Atomic `.done` events are preferred;
+	 * incremental deltas remain buffered as a compatibility fallback when a
+	 * transport emits them instead.
 	 */
 	get #sequentialCutoffSummaries(): boolean {
 		return this.runtime.requestBodyForState.stream_options?.reasoning_summary_delivery === "sequential_cutoff";
@@ -1832,18 +1848,19 @@ class CodexStreamProcessor {
 			}
 			return firstTokenTime;
 		}
-
 		if (eventType === "response.reasoning_summary_text.delta") {
-			if (this.#sequentialCutoffSummaries) return firstTokenTime;
-			if (this.runtime.currentItem?.type === "reasoning" && this.runtime.currentBlock?.type === "thinking") {
-				appendReasoningSummaryTextDelta(
-					this.runtime.currentItem,
-					this.runtime.currentBlock,
-					(rawEvent as { delta?: string }).delta || "",
-					stream,
-					output,
-					output.content.length - 1,
-				);
+			const entry = this.runtime.openItemForEvent(rawEvent);
+			const delta = typeof rawEvent.delta === "string" ? rawEvent.delta : "";
+			if (this.#sequentialCutoffSummaries) {
+				// Some Codex transports still emit incremental summary deltas even
+				// after opting into sequential-cutoff delivery. Buffer them until
+				// output_item.done so atomic `.done` events can supersede them
+				// without duplicate UI output.
+				this.runtime.queueSummaryDelta(entry, delta);
+				return firstTokenTime;
+			}
+			if (entry?.item.type === "reasoning" && entry.block?.type === "thinking") {
+				appendReasoningSummaryTextDelta(entry.item, entry.block, delta, stream, output, entry.contentIndex);
 			}
 			return firstTokenTime;
 		}
@@ -1853,6 +1870,7 @@ class CodexStreamProcessor {
 			if (!this.#sequentialCutoffSummaries) return firstTokenTime;
 			const entry = this.runtime.openItemForEvent(rawEvent);
 			if (entry?.item.type === "reasoning" && entry.block?.type === "thinking") {
+				this.runtime.takeSummaryDeltas(entry);
 				if (!firstTokenTime) firstTokenTime = performance.now();
 				const summaryIndex =
 					typeof rawEvent.summary_index === "number" && Number.isFinite(rawEvent.summary_index)
@@ -1887,15 +1905,13 @@ class CodexStreamProcessor {
 		}
 
 		if (eventType === "response.reasoning_summary_part.done") {
-			if (this.#sequentialCutoffSummaries) return firstTokenTime;
-			if (this.runtime.currentItem?.type === "reasoning" && this.runtime.currentBlock?.type === "thinking") {
-				appendReasoningSummaryPartDone(
-					this.runtime.currentItem,
-					this.runtime.currentBlock,
-					stream,
-					output,
-					output.content.length - 1,
-				);
+			const entry = this.runtime.openItemForEvent(rawEvent);
+			if (this.#sequentialCutoffSummaries) {
+				if (entry && this.runtime.pendingSummaryDeltas.has(entry)) this.runtime.queueSummaryDelta(entry, "\n\n");
+				return firstTokenTime;
+			}
+			if (entry?.item.type === "reasoning" && entry.block?.type === "thinking") {
+				appendReasoningSummaryPartDone(entry.item, entry.block, stream, output, entry.contentIndex);
 			}
 			return firstTokenTime;
 		}
@@ -1990,6 +2006,18 @@ class CodexStreamProcessor {
 		return firstTokenTime;
 	}
 
+	#flushSummaryDeltas(entry: CodexOpenItem | null): void {
+		if (entry?.block?.type !== "thinking") return;
+		for (const delta of this.runtime.takeSummaryDeltas(entry)) {
+			entry.block.thinking += delta;
+			this.stream.push({
+				type: "thinking_delta",
+				contentIndex: entry.contentIndex,
+				delta,
+				partial: this.output,
+			});
+		}
+	}
 	#handleOutputItemDone(rawEvent: Record<string, unknown>): void {
 		const { runtime, output, stream } = this;
 		const rawItem = rawEvent.item;
@@ -2008,6 +2036,7 @@ class CodexStreamProcessor {
 		const contentIndex = entry?.contentIndex ?? output.content.length - 1;
 
 		if (item.type === "reasoning" && block?.type === "thinking") {
+			this.#flushSummaryDeltas(entry);
 			block.thinking = finalizeReasoningThinking(
 				item,
 				block.thinking,
@@ -2025,9 +2054,7 @@ class CodexStreamProcessor {
 		}
 
 		if (item.type === "message" && block?.type === "text") {
-			block.text = item.content
-				.map(content => (content.type === "output_text" ? content.text : content.refusal))
-				.join("");
+			block.text = finalizeMessageText(item, block.text);
 			const phase = item.phase === "commentary" || item.phase === "final_answer" ? item.phase : undefined;
 			block.textSignature = encodeTextSignatureV1(item.id, phase);
 			stream.push({
@@ -3812,32 +3839,40 @@ async function openCodexSseEventStream(
 			? CODEX_MAX_RETRIES + 1
 			: transportAttemptState.maxAttempts - transportAttemptState.attempts;
 	if (maxAttempts < 1) throw new CodexTransportAttemptLimitError();
-	const countingFetch: FetchImpl = async (input, init) => {
-		if (!startCodexTransportAttempt(transportAttemptState)) throw new CodexTransportAttemptLimitError();
-		return (fetchOverride ?? globalThis.fetch)(input, init);
-	};
 	// `wrapCodexSseStream` arms the iterator-level idle watchdog only after this
-	// fetch resolves. A pre-response timer still bounds time-to-first-byte (a
-	// proxy that accepts the POST but never sends headers would otherwise hang
-	// forever, since `timeout: false` disables Bun's native ceiling — issue
-	// #2422). It MUST be cleared the instant headers arrive: an absolute
-	// `AbortSignal.timeout` would keep aborting the actively-streaming body.
-	const watchdog = armPreResponseTimeout(signal, firstEventTimeoutMs);
+	// fetch resolves. Each transport attempt needs its own pre-response timer:
+	// the retry loop's base signal remains reserved for caller cancellation, so
+	// an internal timeout stays retryable while an explicit abort fails fast.
+	let clearPreResponseTimeout: (() => void) | undefined;
+	const fetchAttempt: FetchImpl = async (input, init) => {
+		if (!startCodexTransportAttempt(transportAttemptState)) throw new CodexTransportAttemptLimitError();
+		try {
+			return await (fetchOverride ?? globalThis.fetch)(input, init);
+		} finally {
+			clearPreResponseTimeout?.();
+			clearPreResponseTimeout = undefined;
+		}
+	};
 	let response: Response;
 	try {
 		response = await fetchWithRetry(url, {
 			method: "POST",
 			headers,
 			body: JSON.stringify(body),
-			signal: watchdog.signal,
+			signal,
+			prepareInit: () => {
+				const watchdog = armPreResponseTimeout(signal, firstEventTimeoutMs);
+				clearPreResponseTimeout = watchdog.clear;
+				return { signal: watchdog.signal };
+			},
 			maxAttempts,
 			defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
 			maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
-			fetch: countingFetch,
+			fetch: fetchAttempt,
 			timeout: false,
 		});
 	} finally {
-		watchdog.clear();
+		clearPreResponseTimeout?.();
 	}
 	CODEX_DEBUG &&
 		logger.debug("[codex] codex response", {

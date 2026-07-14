@@ -34,7 +34,11 @@ import { vocalizer } from "../../tts/vocalizer";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { interruptHint } from "../shared";
 import { createAssistantMessageComponent } from "../utils/interactive-context-helpers";
-import { assistantUsageIsBilled } from "../utils/transcript-render-helpers";
+import {
+	assistantHasVisibleContent,
+	assistantUsageIsBilled,
+	splitAssistantMessageToolTimeline,
+} from "../utils/transcript-render-helpers";
 import { StreamingRevealController } from "./streaming-reveal";
 import { streamingStringKeysForTool, ToolArgsRevealController } from "./tool-args-reveal";
 
@@ -154,9 +158,11 @@ export class EventController {
 	#lastVisibleBlockCount = 0;
 	#renderedCustomMessages = new Set<string>();
 	#lastIntent: string | undefined = undefined;
-	#backgroundToolCallIds = new Set<string>();
+	#backgroundTaskCallIds = new Set<string>();
 	#readToolCallArgs = new Map<string, Record<string, unknown>>();
 	#readToolCallAssistantComponents = new Map<string, AssistantMessageComponent>();
+	#toolTimelineComponents = new Map<string, Component>();
+	#postToolAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#lastAssistantComponent: AssistantMessageComponent | undefined = undefined;
 	// Assistant component whose turn-ending error is currently mirrored in the
 	// pinned banner. Its inline `Error: …` line is suppressed while pinned and
@@ -355,6 +361,39 @@ export class EventController {
 		assistantComponent.setToolResultImages(toolCallId, images);
 		return true;
 	}
+
+	#insertAfterTranscriptComponent(anchor: Component | undefined, component: Component): boolean {
+		const children = this.ctx.chatContainer.children;
+		const anchorIndex = anchor ? children.indexOf(anchor) : -1;
+		if (anchorIndex < 0) return false;
+		if (children.slice(anchorIndex + 1).some(child => !this.ctx.chatContainer.isBlockUncommitted(child))) {
+			return false;
+		}
+		this.ctx.chatContainer.addChild(component);
+		children.splice(children.length - 1, 1);
+		children.splice(anchorIndex + 1, 0, component);
+		return true;
+	}
+
+	#upsertPostToolAssistantSegment(
+		toolCallId: string,
+		segment: AssistantMessage | undefined,
+	): AssistantMessageComponent | undefined {
+		if (!segment || !assistantHasVisibleContent(segment)) return undefined;
+		const existing = this.#postToolAssistantComponents.get(toolCallId);
+		if (existing) {
+			existing.updateContent(segment);
+			return existing;
+		}
+		const component = createAssistantMessageComponent(this.ctx);
+		component.updateContent(segment);
+		this.#postToolAssistantComponents.set(toolCallId, component);
+		if (!this.#insertAfterTranscriptComponent(this.#toolTimelineComponents.get(toolCallId), component)) {
+			this.ctx.chatContainer.addChild(component);
+		}
+		return component;
+	}
+
 	#updateWorkingMessageFromIntent(intent: unknown): void {
 		if (this.ctx.session.isAborting) return;
 		// Streamed JSON can deliver non-string `i` (object, number, boolean) before
@@ -382,7 +421,9 @@ export class EventController {
 		this.#lastVisibleBlockCount = 0;
 		this.#renderedCustomMessages.clear();
 		this.#lastIntent = undefined;
-		this.#backgroundToolCallIds.clear();
+		this.#toolTimelineComponents.clear();
+		this.#postToolAssistantComponents.clear();
+		this.#backgroundTaskCallIds.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
@@ -466,6 +507,8 @@ export class EventController {
 	}
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+		this.#toolTimelineComponents.clear();
+		this.#postToolAssistantComponents.clear();
 		this.#lastIntent = undefined;
 		this.#currentRunTokenDelta = 0;
 		this.#currentAssistantMessageTokenEstimate = 0;
@@ -573,7 +616,10 @@ export class EventController {
 			this.ctx.streamingComponent = createAssistantMessageComponent(this.ctx);
 			this.ctx.streamingMessage = event.message;
 			this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
-			this.#streamingReveal.begin(this.ctx.streamingComponent, this.ctx.streamingMessage);
+			this.#streamingReveal.begin(
+				this.ctx.streamingComponent,
+				splitAssistantMessageToolTimeline(this.ctx.streamingMessage).beforeTools,
+			);
 			this.ctx.ui.requestRender();
 		}
 	}
@@ -760,7 +806,8 @@ export class EventController {
 			this.ctx.streamingMessage = event.message;
 			this.#currentAssistantMessageTokenEstimate = estimateMessageTokens(event.message as AgentMessage);
 			this.#updateWorkingMessageRunTokenDelta();
-			this.#streamingReveal.setTarget(this.ctx.streamingMessage);
+			const timeline = splitAssistantMessageToolTimeline(this.ctx.streamingMessage);
+			this.#streamingReveal.setTarget(timeline.beforeTools);
 
 			const visibleBlockCount = this.ctx.streamingMessage.content.filter(
 				content =>
@@ -803,6 +850,7 @@ export class EventController {
 							const group = this.#getReadGroup();
 							group.updateArgs(content.arguments, content.id);
 							this.ctx.pendingTools.set(content.id, group);
+							this.#toolTimelineComponents.set(content.id, group);
 						}
 						continue;
 					}
@@ -849,6 +897,7 @@ export class EventController {
 					component.setExpanded(this.ctx.toolOutputExpanded);
 					this.ctx.chatContainer.addChild(component);
 					this.ctx.pendingTools.set(content.id, component);
+					this.#toolTimelineComponents.set(content.id, component);
 					this.#toolArgsReveal.bind(content.id, component);
 				} else {
 					const component = this.ctx.pendingTools.get(content.id);
@@ -857,6 +906,9 @@ export class EventController {
 						this.#toolArgsReveal.bind(content.id, component);
 					}
 				}
+			}
+			for (const [toolCallId, segment] of timeline.afterToolCalls) {
+				this.#upsertPostToolAssistantSegment(toolCallId, segment);
 			}
 
 			// Update working message with intent from streamed tool arguments
@@ -931,15 +983,18 @@ export class EventController {
 				errorMessage = resolveAbortLabel(this.ctx.streamingMessage, this.ctx.viewSession.retryAttempt);
 				this.ctx.streamingMessage.errorMessage = errorMessage;
 			}
-			if (silentlyAborted || ttsrSilenced) {
-				// Silence the streaming render by downgrading stopReason to "stop" for
-				// display only — does NOT mutate the persisted message's stopReason
-				// (the marker on errorMessage drives replay-side suppression).
-				const msgWithoutAbort = { ...this.ctx.streamingMessage, stopReason: "stop" as const };
-				this.ctx.streamingComponent.updateContent(msgWithoutAbort);
-			} else {
-				this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
-			}
+			const displayMessage: AssistantMessage =
+				silentlyAborted || ttsrSilenced
+					? {
+							// Silence the streaming render by downgrading stopReason to "stop" for
+							// display only — does NOT mutate the persisted message's stopReason
+							// (the marker on errorMessage drives replay-side suppression).
+							...this.ctx.streamingMessage,
+							stopReason: "stop",
+						}
+					: this.ctx.streamingMessage;
+			const displayTimeline = splitAssistantMessageToolTimeline(displayMessage);
+			this.ctx.streamingComponent.updateContent(displayTimeline.beforeTools);
 
 			if (this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error") {
 				for (const [toolCallId, component] of this.ctx.pendingTools.entries()) {
@@ -949,9 +1004,9 @@ export class EventController {
 				// The turn ended without running these calls (abort/error/TTSR rewind),
 				// so they will never produce a result. Seal them so they stop animating
 				// and freeze instead of pinning the transcript live region while a retry
-				// streams fresh blocks below them. Background tools keep updating.
+				// streams fresh blocks below them. Background task calls keep updating.
 				for (const [toolCallId, component] of this.ctx.pendingTools.entries()) {
-					if (!this.#backgroundToolCallIds.has(toolCallId) && component instanceof ToolExecutionComponent) {
+					if (!this.#backgroundTaskCallIds.has(toolCallId) && component instanceof ToolExecutionComponent) {
 						component.seal();
 					}
 				}
@@ -989,7 +1044,14 @@ export class EventController {
 					formatCompletionFooter(elapsedMs, this.#currentRunTokenDelta),
 				);
 			}
-			this.#lastAssistantComponent.markTranscriptBlockFinalized();
+			this.ctx.streamingComponent.markTranscriptBlockFinalized();
+			let lastPostToolAssistantComponent: AssistantMessageComponent | undefined;
+			for (const [toolCallId, segment] of displayTimeline.afterToolCalls) {
+				const component = this.#upsertPostToolAssistantSegment(toolCallId, segment);
+				component?.markTranscriptBlockFinalized();
+				if (component) lastPostToolAssistantComponent = component;
+			}
+			this.#lastAssistantComponent = lastPostToolAssistantComponent ?? this.ctx.streamingComponent;
 			if (settings.get("display.showTokenUsage") && assistantUsageIsBilled(event.message.usage)) {
 				this.ctx.chatContainer.addChild(
 					createUsageRowBlock(event.message.usage, event.message.duration, event.message.ttft),
@@ -1027,6 +1089,7 @@ export class EventController {
 					const group = this.#getReadGroup();
 					group.updateArgs(event.args, event.toolCallId);
 					this.ctx.pendingTools.set(event.toolCallId, group);
+					this.#toolTimelineComponents.set(event.toolCallId, group);
 				}
 				this.ctx.ui.requestRender();
 				return;
@@ -1052,6 +1115,7 @@ export class EventController {
 			component.setExpanded(this.ctx.toolOutputExpanded);
 			this.ctx.chatContainer.addChild(component);
 			this.ctx.pendingTools.set(event.toolCallId, component);
+			this.#toolTimelineComponents.set(event.toolCallId, component);
 			this.ctx.ui.requestRender();
 		} else {
 			// The tool is about to run, so its arguments are final and validated.
@@ -1089,7 +1153,7 @@ export class EventController {
 			// While the call is still executing — a mixed blocking+async task
 			// call whose jobs settle before its blocking subset — treat it as a
 			// partial frame: `tool_execution_end` still owns the terminal result.
-			const isTerminal = isFinalAsyncState && this.#backgroundToolCallIds.has(event.toolCallId);
+			const isTerminal = isFinalAsyncState && this.#backgroundTaskCallIds.has(event.toolCallId);
 			component.updateResult(
 				{ ...event.partialResult, isError: asyncState === "failed" },
 				!isTerminal,
@@ -1097,7 +1161,7 @@ export class EventController {
 			);
 			if (isTerminal) {
 				this.ctx.pendingTools.delete(event.toolCallId);
-				this.#backgroundToolCallIds.delete(event.toolCallId);
+				this.#backgroundTaskCallIds.delete(event.toolCallId);
 			}
 			this.ctx.ui.requestRender();
 		}
@@ -1126,13 +1190,7 @@ export class EventController {
 					component.setElapsedMs?.(event.toolCallId, toolElapsedMs);
 					this.ctx.pendingTools.delete(event.toolCallId);
 				}
-				const asyncState = (event.result.details as { async?: { state?: string } } | undefined)?.async?.state;
-				if (asyncState === "running") {
-					this.#backgroundToolCallIds.add(event.toolCallId);
-				} else {
-					this.#backgroundToolCallIds.delete(event.toolCallId);
-					this.#clearReadToolCall(event.toolCallId);
-				}
+				this.#clearReadToolCall(event.toolCallId);
 				this.ctx.ui.requestRender();
 			} else {
 				let component = this.ctx.pendingTools.get(event.toolCallId);
@@ -1145,33 +1203,26 @@ export class EventController {
 					component = group;
 					this.ctx.pendingTools.set(event.toolCallId, group);
 				}
-				const asyncState = (event.result.details as { async?: { state?: string } } | undefined)?.async?.state;
-				const isBackgroundRunning = asyncState === "running";
-				component.updateResult({ ...event.result, isError: event.isError }, isBackgroundRunning, event.toolCallId);
+				component.updateResult({ ...event.result, isError: event.isError }, false, event.toolCallId);
 				component.setTokenCount?.(event.toolCallId, toolResultTokens);
 				component.setElapsedMs?.(event.toolCallId, toolElapsedMs);
-				if (isBackgroundRunning) {
-					this.#backgroundToolCallIds.add(event.toolCallId);
-				} else {
-					this.ctx.pendingTools.delete(event.toolCallId);
-					this.#backgroundToolCallIds.delete(event.toolCallId);
-					this.#clearReadToolCall(event.toolCallId);
-				}
+				this.ctx.pendingTools.delete(event.toolCallId);
+				this.#clearReadToolCall(event.toolCallId);
 				this.ctx.ui.requestRender();
 			}
 		} else {
 			const component = this.ctx.pendingTools.get(event.toolCallId);
 			if (component) {
 				const asyncState = (event.result.details as { async?: { state?: string } } | undefined)?.async?.state;
-				const isBackgroundRunning = asyncState === "running";
-				component.updateResult({ ...event.result, isError: event.isError }, isBackgroundRunning, event.toolCallId);
+				const isBackgroundTask = event.toolName === "task" && asyncState === "running";
+				component.updateResult({ ...event.result, isError: event.isError }, isBackgroundTask, event.toolCallId);
 				component.setTokenCount?.(event.toolCallId, toolResultTokens);
 				component.setElapsedMs?.(event.toolCallId, toolElapsedMs);
-				if (isBackgroundRunning) {
-					this.#backgroundToolCallIds.add(event.toolCallId);
+				if (isBackgroundTask) {
+					this.#backgroundTaskCallIds.add(event.toolCallId);
 				} else {
 					this.ctx.pendingTools.delete(event.toolCallId);
-					this.#backgroundToolCallIds.delete(event.toolCallId);
+					this.#backgroundTaskCallIds.delete(event.toolCallId);
 				}
 				if (component instanceof ToolExecutionComponent && component.isDisplaceableBlock()) {
 					if (event.toolName === "job" && component.canBeDisplacedBy("job")) {
@@ -1260,7 +1311,7 @@ export class EventController {
 		}
 		await this.ctx.flushPendingModelSwitch();
 		for (const toolCallId of Array.from(this.ctx.pendingTools.keys())) {
-			if (!this.#backgroundToolCallIds.has(toolCallId)) {
+			if (!this.#backgroundTaskCallIds.has(toolCallId)) {
 				// A foreground tool still pending at turn end never delivered a result;
 				// seal it so it freezes (and stops animating) rather than lingering in
 				// the transcript live region as a streaming preview until the next thaw.
@@ -1274,11 +1325,13 @@ export class EventController {
 				this.ctx.pendingTools.delete(toolCallId);
 			}
 		}
-		this.#backgroundToolCallIds = new Set(
-			Array.from(this.#backgroundToolCallIds).filter(toolCallId => this.ctx.pendingTools.has(toolCallId)),
+		this.#backgroundTaskCallIds = new Set(
+			Array.from(this.#backgroundTaskCallIds).filter(toolCallId => this.ctx.pendingTools.has(toolCallId)),
 		);
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
+		this.#toolTimelineComponents.clear();
+		this.#postToolAssistantComponents.clear();
 		this.#resetReadGroup();
 		// The turn is over: nothing else lands this turn, so the waiting poll is
 		// final history — seal it instead of letting its spinner tick while idle.
@@ -1409,7 +1462,19 @@ export class EventController {
 			this.ctx.lastAssistantUsage = undefined;
 			this.ctx.rebuildChatFromMessages();
 			this.ctx.statusLine.invalidate();
-			this.ctx.ui.requestRender();
+			// When history collapses behind the summary divider, the frame
+			// shrinks far below the committed row count; without clearing, the
+			// differential renderer's "duplication, never loss" resync repaints
+			// the whole collapsed transcript (welcome box included) BELOW the
+			// stale pre-compaction scrollback. Compaction is an intentional
+			// transcript replacement then — same as auto-handoff below. With
+			// collapse disabled the rebuilt transcript keeps the full history,
+			// so the resync handles it and scrollback stays.
+			if (settings.get("display.collapseCompacted")) {
+				this.ctx.ui.requestRender(true, { clearScrollback: true });
+			} else {
+				this.ctx.ui.requestRender();
+			}
 		} else if (event.errorMessage) {
 			this.ctx.showWarning(event.errorMessage);
 		} else if (isHandoffAction) {
