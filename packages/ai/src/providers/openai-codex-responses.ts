@@ -60,6 +60,7 @@ import {
 	getOpenAIStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
+import { getProxyForProvider, shouldBypassProxy } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { notifyRawSseEvent } from "../utils/sse-debug";
@@ -1530,6 +1531,7 @@ async function openCodexWebSocketTransport(
 		websocketState,
 		toWebSocketUrl(requestContext.url),
 		websocketHeaders,
+		model.provider,
 		requestSetup.requestSignal,
 	);
 	const eventStream = websocketConnection.streamRequest(
@@ -2700,6 +2702,7 @@ export async function prewarmOpenAICodexResponses(
 		state,
 		toWebSocketUrl(url),
 		headers,
+		model.provider,
 		options?.signal,
 	);
 	state.prewarmed = true;
@@ -3162,11 +3165,13 @@ interface CodexWebSocketRequestTimeouts {
 
 interface CodexWebSocketConnectionOptions {
 	onHandshakeHeaders?: (headers: Headers) => void;
+	proxy?: string;
 }
 
 class CodexWebSocketConnection {
 	#url: string;
 	#headers: Record<string, string>;
+	#proxy?: string;
 	#onHandshakeHeaders?: (headers: Headers) => void;
 	#socket: Bun.WebSocket | null = null;
 	#queue: Array<Record<string, unknown> | Error | null> = [];
@@ -3197,6 +3202,7 @@ class CodexWebSocketConnection {
 	constructor(url: string, headers: Record<string, string>, options: CodexWebSocketConnectionOptions) {
 		this.#url = url;
 		this.#headers = headers;
+		this.#proxy = options.proxy;
 		this.#onHandshakeHeaders = options.onHandshakeHeaders;
 	}
 
@@ -3258,7 +3264,7 @@ class CodexWebSocketConnection {
 		this.#connectPromise = promise;
 		const socket = new (WebSocket as unknown as new (url: string, opts: Bun.WebSocketOptions) => Bun.WebSocket)(
 			this.#url,
-			{ headers: this.#headers },
+			{ headers: this.#headers, proxy: this.#proxy },
 		);
 		socket.binaryType = "nodebuffer";
 		this.#socket = socket;
@@ -3749,8 +3755,18 @@ async function getOrCreateCodexWebSocketConnection(
 	state: CodexWebSocketSessionState,
 	url: string,
 	headers: Headers,
+	provider: string,
 	signal?: AbortSignal,
 ): Promise<CodexWebSocketConnection> {
+	const targetUrl = new URL(url);
+	const proxy = shouldBypassProxy(targetUrl)
+		? undefined
+		: (getProxyForProvider(provider) ??
+			(targetUrl.protocol === "wss:"
+				? Bun.env.HTTPS_PROXY || Bun.env.https_proxy
+				: Bun.env.HTTP_PROXY || Bun.env.http_proxy) ??
+			Bun.env.ALL_PROXY ??
+			Bun.env.all_proxy);
 	const headerRecord = headersToRecord(headers);
 	// Join an in-flight handshake instead of tearing it down: closing a
 	// CONNECTING socket rejects the concurrent caller (prewarm racing the first
@@ -3793,6 +3809,7 @@ async function getOrCreateCodexWebSocketConnection(
 		onHandshakeHeaders: handshakeHeaders => {
 			updateCodexSessionMetadataFromHeaders(state, handshakeHeaders);
 		},
+		proxy,
 	});
 	await state.connection.connect(signal);
 	return state.connection;

@@ -293,11 +293,17 @@ export function extractImagePathFromText(text: string): string | undefined {
 	return undefined;
 }
 
+
 /**
  * Custom editor that handles configurable app-level shortcuts for coding-agent.
  */
 export class CustomEditor extends Editor {
-	readonly tui: TUI;
+	/**
+	 * The host TUI when a plugin constructs this editor through the upstream
+	 * `(tui, theme, keybindings)` factory convention. OMP's own `(theme)` callers
+	 * leave it undefined and drive repaints through interactive-mode wiring.
+	 */
+	readonly tui?: TUI;
 	imageLinks?: readonly (string | undefined)[];
 
 	constructor(theme: EditorTheme);
@@ -305,15 +311,8 @@ export class CustomEditor extends Editor {
 	constructor(tuiOrTheme: TUI | EditorTheme, theme?: EditorTheme, _keybindings?: unknown) {
 		const editorTheme = theme ?? (tuiOrTheme as EditorTheme);
 		super(editorTheme);
-		this.tui = theme ? (tuiOrTheme as TUI) : (undefined as unknown as TUI);
+		this.tui = theme === undefined ? undefined : (tuiOrTheme as TUI);
 	}
-
-	/** Draft images pasted into the composer, consumed on submit. Co-located with
-	 *  {@link imageLinks} so every piece of draft-image state lives on the editor. */
-	pendingImages: ImageContent[] = [];
-	/** Per-image source links (file:// targets) parallel to {@link pendingImages};
-	 *  `undefined` entries are images without a backing reference yet. */
-	pendingImageLinks: (string | undefined)[] = [];
 
 	/** Clear the composer draft: optionally commit `historyText` to history, then
 	 *  reset the editor text and all pending draft-image state. The shared tail of

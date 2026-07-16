@@ -67,6 +67,7 @@ import type {
 	AgentToolResult,
 	AgentTurnEndContext,
 	AsideMessage,
+	SoftToolRequirement,
 	SteeringInterruptSource,
 	SteeringQueueState,
 	StreamFn,
@@ -182,6 +183,7 @@ type AssistantToolCallBlock = Extract<AssistantContentBlock, { type: "toolCall" 
 function snapshotAssistantContentBlock(block: AssistantContentBlock): AssistantContentBlock {
 	switch (block.type) {
 		case "text":
+		case "image":
 			return { ...block };
 		case "thinking":
 			return { ...block };
@@ -223,6 +225,7 @@ function snapshotAssistantMessageEvent(
 		case "text_start":
 		case "text_delta":
 		case "text_end":
+		case "image_end":
 		case "thinking_start":
 		case "thinking_delta":
 		case "thinking_end":
@@ -803,6 +806,7 @@ async function runLoopBody(
 		// getToolChoice is never advanced twice; the flag resets at the message boundary.
 		let hostToolChoice: ToolChoice | undefined;
 		let softRequiredTool: string | undefined;
+		let softSatisfies: SoftToolRequirement["satisfies"];
 		let directiveResolvedForTurn = false;
 
 		// Outer loop: continues when queued follow-up messages arrive after agent would stop
@@ -861,6 +865,7 @@ async function runLoopBody(
 					const softReq = isSoftToolRequirement(directive) ? directive : undefined;
 					hostToolChoice = directive === undefined || isSoftToolRequirement(directive) ? undefined : directive;
 					softRequiredTool = softReq?.toolName;
+					softSatisfies = softReq?.satisfies;
 					if (softReq !== undefined) {
 						if (softReq.id !== softRequirementId) {
 							softRequirementId = softReq.id;
@@ -1024,7 +1029,7 @@ async function runLoopBody(
 				const calledOnlyRequiredTool =
 					softRequiredTool !== undefined &&
 					toolCalls.length > 0 &&
-					toolCalls.every(toolCall => toolCall.name === softRequiredTool);
+					toolCalls.every(toolCall => softSatisfies?.(toolCall) ?? toolCall.name === softRequiredTool);
 				const softGateActive =
 					softRequiredTool !== undefined && !hardToolChoiceBlocks(config.toolChoice, softRequiredTool);
 				const softNonCompliant = softGateActive && !calledOnlyRequiredTool;
@@ -1522,6 +1527,7 @@ async function streamAssistantResponse(
 						case "text_start":
 						case "text_delta":
 						case "text_end":
+						case "image_end":
 						case "thinking_start":
 						case "thinking_delta":
 						case "thinking_end":

@@ -28,7 +28,7 @@ import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.m
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import { truncateForPrompt } from "../tools/approval";
-import { isIrcEnabled } from "../tools/irc";
+import { isIrcEnabled } from "../tools/hub";
 import { formatBytes, formatDuration } from "../tools/render-utils";
 import { resolveSpawnPolicy } from "./spawn-policy";
 import {
@@ -69,7 +69,7 @@ import {
 } from "./permission-profiles";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { repairTaskParams } from "./repair-args";
-import { applyTaskToolProfile, resolveTaskToolProfile } from "./tool-profiles";
+import { applyTaskToolProfile } from "./tool-profiles";
 import { parseIsolationMode } from "./worktree";
 
 function renderSubagentUserPrompt(assignment: string): string {
@@ -149,9 +149,8 @@ export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"web_search",
 	"ast_grep",
 	"yield",
-	"irc",
+	"hub",
 	"ask",
-	"job",
 	"todo",
 	"recall",
 	"reflect",
@@ -160,11 +159,9 @@ export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"inspect_image",
 	"checkpoint",
 	"rewind",
-	"resolve",
-	"report_finding",
-	"search_tool_bm25",
 ]);
 
+const PLAN_MODE_AGENT_TOOL_ALLOWLIST: ReadonlySet<string> = new Set(["ast_grep"]);
 export function isReadOnlyAgent(agent: AgentDefinition): boolean {
 	return !!agent.tools?.length && agent.tools.every(tool => READ_ONLY_TOOL_NAMES.has(tool));
 }
@@ -235,7 +232,6 @@ function renderDescription(
 		agents: renderedAgents,
 		spawningDisabled,
 		defaultAgent: spawnPolicy.defaultAgent,
-		allowedAgentsText: spawnPolicy.allowedPromptText,
 		isolationEnabled,
 		batchEnabled,
 		asyncEnabled,
@@ -457,9 +453,10 @@ export function buildSpecializationAdvisory(agentNames: string[], depthCapacity:
 }
 
 /**
- * Suggestion — never a rejection — nudging the spawner to coordinate via `irc`
- * when one call creates ≥2 live siblings and it still holds spawn capacity.
- * Returns undefined when there is nothing to coordinate or IRC is unavailable.
+ * Suggestion — never a rejection — nudging the spawner to coordinate via the
+ * hub when one call creates ≥2 live siblings and it still holds spawn
+ * capacity. Returns undefined when there is nothing to coordinate or peer
+ * messaging is unavailable.
  */
 export function buildCoordinationAdvisory(
 	items: TaskItem[],
@@ -469,8 +466,8 @@ export function buildCoordinationAdvisory(
 	if (!depthCapacity || !ircEnabled || items.length < 2) return undefined;
 	return (
 		`Coordinate: ${items.length} siblings are running together. If their work overlaps, have them ` +
-		`message each other via \`irc\` (by id, or "all" to broadcast) before editing shared files — ` +
-		`live coordination beats a serial handoff. Check \`irc\` op:"list" to see who is doing what.`
+		`message each other via \`hub\` (by id, or "all" to broadcast) before editing shared files — ` +
+		`live coordination beats a serial handoff. Check \`hub\` op:"list" to see who is doing what.`
 	);
 }
 
@@ -586,7 +583,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly label = "Task";
 	readonly summary = "Spawn subagents to complete delegated tasks";
 	readonly strict = true;
-	readonly loadMode = "discoverable";
+	readonly loadMode = "essential";
 	readonly renderResult = renderResult;
 	// Suppress the streaming call preview once a (partial or final) result exists
 	// so the task renders as ONE block that transitions in place — not a pending
@@ -884,11 +881,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const coordinationHint =
 			started.length === 1
 				? ircEnabled
-					? `DM \`${started[0].agentId}\` via \`irc\` to coordinate while it runs; use \`job\` only to inspect (\`list\`), wait (\`poll\`), or cancel a stuck task.`
-					: `Use \`job\` to inspect (\`list\`), wait (\`poll\`), or cancel a stuck task.`
+					? `DM \`${started[0].agentId}\` via \`hub\` send to coordinate while it runs; use \`hub\` only to inspect (\`jobs\`), wait, or cancel a stuck task.`
+					: `Use \`hub\` to inspect (\`jobs\`), wait, or cancel a stuck task.`
 				: ircEnabled
-					? `DM these ids via \`irc\` to coordinate while they run; use \`job\` only to inspect (\`list\`), wait (\`poll\`), or cancel a stuck task.`
-					: `Use \`job\` to inspect (\`list\`), wait (\`poll\`), or cancel a stuck task by id.`;
+					? `DM these ids via \`hub\` send to coordinate while they run; use \`hub\` only to inspect (\`jobs\`), wait, or cancel a stuck task.`
+					: `Use \`hub\` to inspect (\`jobs\`), wait, or cancel a stuck task by id.`;
 
 		if (syncSpawns.length === 0) {
 			if (spawns.length === 1) {
@@ -1014,12 +1011,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			if (aborted) {
 				const status = AgentRegistry.global().get(agentId)?.status;
 				if (status === "idle" || status === "parked") {
-					const followUp = ircEnabled ? "message it via `irc` to resume; " : "";
+					const followUp = ircEnabled ? "message it via `hub` to resume; " : "";
 					return `\n\n${agentId} was stopped but is still resumable — ${followUp}transcript at history://${agentId}`;
 				}
 				return `\n\n${agentId} was aborted — transcript at history://${agentId}`;
 			}
-			const followUp = ircEnabled ? "message it via `irc` to follow up; " : "";
+			const followUp = ircEnabled ? "message it via `hub` to follow up; " : "";
 			return `\n\n${agentId} is now idle — ${followUp}transcript at history://${agentId}`;
 		};
 		return manager.register(
@@ -1340,30 +1337,39 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const planModeState = this.session.getPlanModeState?.();
-		let effectiveAgent: typeof agent = agent;
-		if (planModeState?.enabled) {
-			const baseToolsForPlan = profiledTools ?? agent.tools;
-			const planModeTools = applyTaskToolProfile(baseToolsForPlan, "plan") ?? resolveTaskToolProfile("plan");
-			if (planModeTools.length === 0) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Plan mode cannot spawn agent "${agent.name}" because its explicit tools do not intersect the plan profile.`,
-						},
-					],
-					details: { projectAgentsDir, results: [], totalDurationMs: 0 },
-				};
-			}
-			effectiveAgent = {
-				...agent,
-				systemPrompt: `${planModeSubagentPrompt}\n\n${agent.systemPrompt}`,
-				tools: planModeTools,
-				spawns: undefined,
+		const planModeBaseTools = ["read", "grep", "glob", "lsp", "web_search"];
+		const planModeTools = [
+			...planModeBaseTools,
+			...(agent.tools ?? []).filter(
+				tool => PLAN_MODE_AGENT_TOOL_ALLOWLIST.has(tool) && !planModeBaseTools.includes(tool),
+			),
+		];
+		const profiledPlanModeTools =
+			params.toolProfile === undefined ? planModeTools : (applyTaskToolProfile(planModeTools, params.toolProfile) ?? []);
+		if (planModeState?.enabled && profiledPlanModeTools.length === 0) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Plan mode cannot spawn agent "${agent.name}" because its tool profile does not permit planning tools.`,
+					},
+				],
+				details: { projectAgentsDir, results: [], totalDurationMs: 0 },
 			};
-		} else if (agent.tools !== undefined || params.toolProfile !== undefined) {
-			effectiveAgent = { ...agent, tools: profiledTools };
 		}
+		const effectiveAgent: typeof agent = planModeState?.enabled
+			? {
+					...agent,
+					systemPrompt: `${planModeSubagentPrompt}\n\n${agent.systemPrompt}`,
+					tools: profiledPlanModeTools,
+					spawns: undefined,
+					// Read-only exploration: never arm prewalk (its plan/implement
+					// nudges assume edit tools the plan-mode toolset doesn't have).
+					prewalk: undefined,
+				}
+			: agent.tools !== undefined || params.toolProfile !== undefined
+				? { ...agent, tools: profiledTools }
+				: agent;
 
 		// Apply per-agent model override from settings (highest priority)
 		const agentModelOverrides = this.session.settings.get("task.agentModelOverrides");
@@ -1504,8 +1510,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						if (allowlistedTools && !allowlistedTools.has(normalized)) return false;
 						return this.session.getToolByName ? this.session.getToolByName(tool) !== undefined : true;
 					});
-					if (ircEnabled && !deniedTools.has("irc") && !nextTools.some(tool => tool.toLowerCase() === "irc")) {
-						nextTools = [...nextTools, "irc"];
+					if (ircEnabled && !deniedTools.has("hub") && !nextTools.some(tool => tool.toLowerCase() === "hub")) {
+						nextTools = [...nextTools, "hub"];
 					}
 					permissionAgent = { ...permissionAgent, tools: nextTools };
 				}

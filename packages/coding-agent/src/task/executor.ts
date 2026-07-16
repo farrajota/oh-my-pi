@@ -14,6 +14,7 @@ import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelSelectorValue,
 	formatModelStringWithRouting,
+	resolveAgentPrewalkPattern,
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
@@ -36,7 +37,7 @@ import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { AgentRegistry } from "../registry/agent-registry";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
-import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-session";
 import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
@@ -45,14 +46,9 @@ import { truncateTail } from "../session/streaming-output";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import type { ContextFileEntry } from "../tools";
 import { normalizeToolNames } from "../tools/builtin-names";
-import { isIrcEnabled } from "../tools/irc";
+import { isIrcEnabled } from "../tools/hub";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
-import {
-	buildOutputValidator,
-	type OutputValidator,
-	summarizeValidationFailure,
-} from "../tools/output-schema-validator";
-import { type ReportFindingDetails, toReviewFinding } from "../tools/review";
+import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice } from "../utils/tool-choice";
@@ -65,7 +61,6 @@ import {
 	type AgentProgress,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
-	type ReviewFinding,
 	type SingleResult,
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
@@ -271,19 +266,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return !Array.isArray(value);
 }
 
-function getReportFindingKey(value: unknown): string | null {
-	if (!isRecord(value)) return null;
-	const title = typeof value.title === "string" ? value.title : null;
-	const filePath = typeof value.file_path === "string" ? value.file_path : null;
-	const lineStart = typeof value.line_start === "number" ? value.line_start : null;
-	const lineEnd = typeof value.line_end === "number" ? value.line_end : null;
-	const priority = typeof value.priority === "string" ? value.priority : null;
-	if (!title || !filePath || lineStart === null || lineEnd === null) {
-		return null;
-	}
-	return `${filePath}:${lineStart}:${lineEnd}:${priority ?? ""}:${title}`;
-}
-
 /** Options for subagent execution */
 export interface ExecutorOptions {
 	cwd: string;
@@ -459,42 +441,6 @@ function extractCompletionData(parsed: unknown): unknown {
 	return parsed;
 }
 
-/**
- * Resolve the final yielded payload, optionally splicing collected
- * `report_finding` entries into a top-level `findings` array.
- *
- * Injection is suppressed when an active validator would reject the augmented
- * payload (e.g. a caller-supplied schema with `additionalProperties: false`
- * that does not declare `findings`). That keeps the in-tool yield validator
- * (which only sees the raw, pre-injection data) in lockstep with this
- * post-mortem validator — honoring the "accepted in-tool ⇒ accepted
- * post-mortem" guarantee documented in `output-schema-validator.ts`. The
- * dropped findings are still preserved verbatim in the agent's progress
- * stream and JSONL artifact, so no information is lost when injection is
- * suppressed.
- */
-function normalizeCompleteData(
-	data: unknown,
-	reportFindings: ReviewFinding[] | undefined,
-	validator: OutputValidator | undefined,
-): unknown {
-	const normalized = parseStringifiedJson(data ?? null);
-	if (
-		!Array.isArray(reportFindings) ||
-		reportFindings.length === 0 ||
-		!normalized ||
-		typeof normalized !== "object" ||
-		Array.isArray(normalized)
-	) {
-		return normalized;
-	}
-	const record = normalized as Record<string, unknown>;
-	if ("findings" in record) return normalized;
-	const injected = { ...record, findings: reportFindings };
-	if (validator && !validator.validate(injected).success) return normalized;
-	return injected;
-}
-
 function resolveFallbackCompletion(rawOutput: string, outputSchema: unknown): { data: unknown } | null {
 	const parsed = tryParseJsonOutput(rawOutput);
 	if (parsed === undefined) return null;
@@ -513,7 +459,6 @@ interface FinalizeSubprocessOutputArgs {
 	doneAborted: boolean;
 	signalAborted: boolean;
 	yieldItems?: YieldItem[];
-	reportFindings?: ReviewFinding[];
 	outputSchema: unknown;
 	lastAssistantText?: string;
 }
@@ -558,7 +503,7 @@ function buildSchemaViolationOutcome(
 
 export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): FinalizeSubprocessOutputResult {
 	let { rawOutput, exitCode, stderr } = args;
-	const { yieldItems, reportFindings, doneAborted, signalAborted, outputSchema, lastAssistantText } = args;
+	const { yieldItems, doneAborted, signalAborted, outputSchema, lastAssistantText } = args;
 	let abortedViaYield = false;
 	const hasYield = Array.isArray(yieldItems) && yieldItems.length > 0;
 	const hadFailureBeforeYield = exitCode !== 0 && stderr.trim().length > 0;
@@ -580,9 +525,7 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 				rawOutput = rawOutput ? `${SUBAGENT_WARNING_NULL_YIELD}\n\n${rawOutput}` : SUBAGENT_WARNING_NULL_YIELD;
 			} else {
 				const { validator, error: schemaError } = buildOutputValidator(outputSchema);
-				const completeData = assembled.rawText
-					? assembled.data
-					: normalizeCompleteData(assembled.data, reportFindings, validator);
+				const completeData = assembled.rawText ? assembled.data : parseStringifiedJson(assembled.data ?? null);
 				const result =
 					schemaError || assembled.schemaOverridden
 						? { success: true as const }
@@ -623,7 +566,7 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 		const fallback = allowFallback ? resolveFallbackCompletion(rawOutput, outputSchema) : null;
 		if (fallback) {
 			const { validator } = buildOutputValidator(outputSchema);
-			const completeData = normalizeCompleteData(fallback.data, reportFindings, validator);
+			const completeData = parseStringifiedJson(fallback.data ?? null);
 			const result = validator?.validate(completeData) ?? { success: true as const };
 			if (!result.success) {
 				const summary = summarizeValidationFailure(result, completeData, validator?.requiredFields ?? []);
@@ -1215,17 +1158,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const recordExtractedToolData = (toolName: string, data: unknown): void => {
 		progress.extractedToolData = progress.extractedToolData || {};
 		const existing = progress.extractedToolData[toolName] || [];
-		const findingKey = toolName === "report_finding" ? getReportFindingKey(data) : null;
-		if (findingKey) {
-			const existingIndex = existing.findIndex(item => getReportFindingKey(item) === findingKey);
-			if (existingIndex >= 0) {
-				existing[existingIndex] = data;
-			} else {
-				existing.push(data);
-			}
-		} else {
-			existing.push(data);
-		}
+		existing.push(data);
 		progress.extractedToolData[toolName] = existing;
 		if (toolName === "yield") {
 			yieldCalled = true;
@@ -1829,8 +1762,6 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	// Use final output if available, otherwise accumulated output
 	let rawOutput = monitor.rawOutput();
 	const yieldItems = progress.extractedToolData?.yield as YieldItem[] | undefined;
-	const reportFindingDetails = progress.extractedToolData?.report_finding as ReportFindingDetails[] | undefined;
-	const reportFindings: ReviewFinding[] | undefined = reportFindingDetails?.map(toReviewFinding);
 	// Breadcrumb the synchronous yield-payload shaping (O(rawOutput)) so a block
 	// here is attributed to this subagent rather than logged as "unknown".
 	pushLoopPhase(`subagent:${id}`);
@@ -1843,7 +1774,6 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 			doneAborted: Boolean(done.aborted),
 			signalAborted: Boolean(signal?.aborted),
 			yieldItems,
-			reportFindings,
 			outputSchema: args.outputSchema,
 			lastAssistantText: monitor.lastAssistantSalvageText(),
 		});
@@ -2215,10 +2145,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	if (atMaxDepth && toolNames?.includes("task")) {
 		toolNames = toolNames.filter(name => name !== "task");
 	}
-	const ircDenied = options.permissionScope?.denyTools.some(tool => tool.toLowerCase() === "irc") ?? false;
-	// IRC is normally available; when a permission profile denies it, do not auto-add it.
-	if (toolNames !== undefined && !toolNames.includes("irc") && !ircDenied) {
-		toolNames = [...toolNames, "irc"];
+	const hubDenied = options.permissionScope?.denyTools.some(tool => tool.toLowerCase() === "hub") ?? false;
+	// Hub carries peer messaging; preserve it for restricted subagents unless a
+	// permission profile explicitly denies it.
+	if (toolNames !== undefined && !toolNames.includes("hub") && !hubDenied) {
+		toolNames = [...toolNames, "hub"];
 	}
 
 	const modelPatterns = normalizeModelPatterns(modelOverride ?? agent.model);
@@ -2393,6 +2324,39 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
 			resolvedAt = performance.now();
+			// Per-agent prewalk: the agent definition's `prewalk` frontmatter or the
+			// `task.agentPrewalk` settings override hands the subagent off to a
+			// fast/cheap target at its first edit/write — the same mechanism as the
+			// session-level --prewalk. The bundled generic `task` agent has no
+			// frontmatter default; the `task.prewalk` toggle (default off) arms it.
+			// Resolution failures skip prewalk instead of failing the spawn.
+			let prewalk: Prewalk | undefined;
+			const genericTaskPrewalk =
+				agent.source === "bundled" && agent.name === "task" && settings.get("task.prewalk") ? true : undefined;
+			const prewalkPattern = resolveAgentPrewalkPattern({
+				settingsOverride: settings.get("task.agentPrewalk")[agent.name],
+				agentPrewalk: agent.prewalk ?? genericTaskPrewalk,
+			});
+			if (prewalkPattern) {
+				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings);
+				const target = resolvedPrewalk.model;
+				if (!target || !modelRegistry.hasConfiguredAuth(target)) {
+					logger.warn("Subagent prewalk target unavailable; skipping prewalk", {
+						agent: agent.name,
+						pattern: prewalkPattern,
+						warning: resolvedPrewalk.warning,
+					});
+				} else if (model && target.provider === model.provider && target.id === model.id) {
+					// Switching to the starting model is a no-op that would still inject
+					// the plan/checklist nudges — skip.
+					logger.debug("Subagent prewalk target equals starting model; skipping prewalk", {
+						agent: agent.name,
+						pattern: prewalkPattern,
+					});
+				} else {
+					prewalk = { target, thinkingLevel: resolvedPrewalk.thinkingLevel };
+				}
+			}
 
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManager = sessionFile
@@ -2492,6 +2456,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				},
 				sessionManager: sessionManagerForRun,
 				hasUI: false,
+				prewalk,
 				spawns: spawnsEnv,
 				taskDepth: childDepth,
 				parentHindsightSessionState: options.parentHindsightSessionState,
@@ -2562,9 +2527,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				});
 			}
 
-			const subagentToolNames = session.getActiveToolNames();
-			const parentOwnedToolNames = new Set(["todo"]);
-			const filteredSubagentTools = subagentToolNames.filter(name => !parentOwnedToolNames.has(name));
+			// Todos are parent-owned bookkeeping and stripped from subagents —
+			// except under prewalk, whose plan nudge + todo gate require the
+			// subagent to commit its own todo list before the hand-off.
+			const isParentOwnedTool = (name: string): boolean => !prewalk && name === "todo";
+			const subagentToolNames = session.getEnabledToolNames();
+			const filteredSubagentTools = subagentToolNames.filter(name => !isParentOwnedTool(name));
 			if (filteredSubagentTools.length !== subagentToolNames.length) {
 				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
 			}
@@ -2619,10 +2587,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						setLabel: (targetId, label) => {
 							session.sessionManager.appendLabelChange(targetId, label);
 						},
-						getActiveTools: () => session.getActiveToolNames(),
+						getActiveTools: () => session.getEnabledToolNames(),
 						getAllTools: () => session.getAllToolNames(),
 						setActiveTools: (toolNames: string[]) =>
-							session.setActiveToolsByName(toolNames.filter(name => !parentOwnedToolNames.has(name))),
+							session.setActiveToolsByName(toolNames.filter(name => !isParentOwnedTool(name))),
 						getCommands: () => getSessionSlashCommands(session),
 						setModel: model => runExtensionSetModel(session, model),
 						getThinkingLevel: () => session.thinkingLevel,
