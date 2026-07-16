@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed interactive prompt submission and resumed sessions crashing with `TypeError` when a custom editor was active after the upstream merge dropped `pendingImages` and `pendingImageLinks` initialization.
+
 ## [17.0.1] - 2026-07-16
 
 ### Changed

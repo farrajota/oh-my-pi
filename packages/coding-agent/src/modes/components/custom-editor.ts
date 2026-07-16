@@ -293,7 +293,6 @@ export function extractImagePathFromText(text: string): string | undefined {
 	return undefined;
 }
 
-
 /**
  * Custom editor that handles configurable app-level shortcuts for coding-agent.
  */
@@ -305,6 +304,10 @@ export class CustomEditor extends Editor {
 	 */
 	readonly tui?: TUI;
 	imageLinks?: readonly (string | undefined)[];
+	/** Images queued to attach to the next submitted message. */
+	pendingImages: ImageContent[] = [];
+	/** Source links corresponding to {@link pendingImages}. */
+	pendingImageLinks: (string | undefined)[] = [];
 
 	constructor(theme: EditorTheme);
 	constructor(tui: TUI, theme: EditorTheme, keybindings?: unknown);

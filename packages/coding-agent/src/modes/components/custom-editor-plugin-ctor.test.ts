@@ -3,6 +3,8 @@ import { ProcessTerminal, TUI } from "@oh-my-pi/pi-tui";
 import { getEditorTheme, initTheme } from "../theme/theme";
 import { CustomEditor } from "./custom-editor";
 
+class UpstreamPluginEditor extends CustomEditor {}
+
 /**
  * Regression for issue #4766: plugins written against upstream pi subclass
  * `CustomEditor`/`Editor` and forward `super(tui, theme, keybindings)`. omp's
@@ -15,7 +17,9 @@ describe("CustomEditor upstream-pi constructor compatibility (#4766)", () => {
 	it("renders when constructed as (tui, theme, keybindings)", async () => {
 		await initTheme();
 		const tui = new TUI(new ProcessTerminal());
-		const editor = new CustomEditor(tui, getEditorTheme(), {});
+		const editor = new UpstreamPluginEditor(tui, getEditorTheme(), {});
+		expect(editor.pendingImages).toEqual([]);
+		expect(editor.pendingImageLinks).toEqual([]);
 		editor.setText("run this workflow");
 		expect(() => editor.render(80)).not.toThrow();
 		// The rounded border glyphs from the resolved theme must reach the frame.
@@ -29,6 +33,8 @@ describe("CustomEditor upstream-pi constructor compatibility (#4766)", () => {
 	it("still accepts omp's own (theme) constructor", async () => {
 		await initTheme();
 		const editor = new CustomEditor(getEditorTheme());
+		expect(editor.pendingImages).toEqual([]);
+		expect(editor.pendingImageLinks).toEqual([]);
 		editor.setText("hello");
 		expect(() => editor.render(80)).not.toThrow();
 		expect(editor.tui).toBeUndefined();
