@@ -13,6 +13,7 @@ import type { Settings } from "../../config/settings";
 import type { Theme } from "../../modes/theme/theme";
 import { evaluateSubagentPermission } from "../../task/permission-profiles";
 import { type ApprovalMode, formatApprovalPrompt, resolveApproval } from "../../tools/approval";
+import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
@@ -37,7 +38,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		private runner: ExtensionRunner,
 	) {
 		applyToolProxy(registeredTool.definition, this);
-		this.loadMode = registeredTool.definition.loadMode ?? "discoverable";
+		this.loadMode = defaultLoadModeForToolName(registeredTool.definition.name, registeredTool.definition.loadMode);
 
 		// Only define render methods when the underlying definition provides them.
 		// If these exist unconditionally on the prototype, ToolExecutionComponent

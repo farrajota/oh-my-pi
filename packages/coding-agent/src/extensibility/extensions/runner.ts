@@ -13,6 +13,7 @@ import { type Theme, theme } from "../../modes/theme/theme";
 import type { SessionManager } from "../../session/session-manager";
 import type { EffectiveSubagentPermissions } from "../../task/permission-profiles";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
+import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
 import type {
 	AfterProviderResponseEvent,
@@ -252,6 +253,18 @@ export class ExtensionRunner {
 	 * {@link MAX_PENDING_CREDENTIAL_DISABLED}; oldest entries are dropped under pressure.
 	 */
 	#pendingCredentialDisabled: CredentialDisabledEvent[] = [];
+
+	/**
+	 * Timers scheduled by extensions through the sanctioned `ctx.setInterval` /
+	 * `ctx.setTimeout` helpers. Callbacks run with the same isolation as handler
+	 * dispatch — a throw is logged and routed through {@link onError} instead of
+	 * escaping to the process `uncaughtException` handler and tearing down the
+	 * whole session (issue #5664). Handles are `unref`'d and every outstanding
+	 * timer is cleared on session teardown via {@link clearManagedTimers}.
+	 */
+	#managedTimers = new ManagedTimers((event, error, stack) =>
+		this.emitError({ extensionPath: "<timer>", event, error, stack }),
+	);
 
 	constructor(
 		private readonly extensions: Extension[],
@@ -594,6 +607,9 @@ export class ExtensionRunner {
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
+			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),
+			setTimeout: (callback, ms, ...args) => this.#managedTimers.setTimeout(callback, ms, ...args),
+			clearTimer: timer => this.#managedTimers.clear(timer),
 		};
 	}
 
@@ -602,6 +618,16 @@ export class ExtensionRunner {
 	 */
 	shutdown(): void {
 		this.#shutdownHandler();
+	}
+
+	/**
+	 * Clear every timer scheduled through `ctx.setInterval` / `ctx.setTimeout`.
+	 * Called during session teardown so extension background work does not
+	 * outlive the session (a self-scheduling interval would otherwise keep
+	 * firing against a disposed session).
+	 */
+	clearManagedTimers(): void {
+		this.#managedTimers.clearAll();
 	}
 
 	createCommandContext(): ExtensionCommandContext {
