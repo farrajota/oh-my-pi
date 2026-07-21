@@ -1,7 +1,14 @@
 {{#if asyncEnabled}}{{#if batchEnabled}}Delegate work to background subagents by passing multiple items in a single `tasks[]` batch.
-Execution does not block — you receive IDs immediately; results deliver when subagents finish.{{else}}Delegate work to ONE background subagent per call.
-Execution does not block — you receive an ID immediately; the result delivers when the subagent finishes.{{/if}}{{#if hasBlockingAgents}}
+Execution does not block — you receive IDs immediately.{{else}}Delegate work to ONE background subagent per call.
+Execution does not block — you receive an ID immediately.{{/if}}{{#if hasBlockingAgents}}
 Agents marked BLOCKING run inline — results return in this call; non-blocking items in the same batch still spawn as background jobs.{{/if}}{{else}}{{#if batchEnabled}}Run subagents synchronously by passing items in a `tasks[]` batch. Execution blocks until all work finishes.{{else}}Run ONE subagent synchronously. Execution blocks until work finishes.{{/if}}{{/if}}
+{{#if asyncEnabled}}
+
+# Async Job Contract
+- Results auto-deliver. A settled `hub jobs`/`hub wait` snapshot is the delivery; no duplicate `async-result` follows.
+- Job IDs are process-local and expire roughly five minutes after settlement. Afterward, use the agent ID with `hub send`, `agent://<id>`, or `history://<id>`.
+- `completed` means successful yield/job exit, not artifact acceptance. Verify claimed changes.
+{{/if}}
 
 # Task Design
 - **Agent typing:** Pick each item's `agent` type. Read-only research MUST use `agent: "scout"` (faster model). Use default worker only when no specialist fits.
@@ -10,18 +17,22 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 
 # Inputs
 {{#if batchEnabled}}
-- `context`: Shared project state for the entire batch — don't duplicate into individual tasks.
-- `tasks[]`: Subagents to spawn.
-  - `name`: CamelCase ≤32 chars (auto-generated if omitted).
-  - `agent`: specialist type (optional).
-  - `task`: Complete, self-contained instructions — no one-liners, no missing acceptance criteria.
+- `context`: Shared project state, constraints, and contracts. Applies to the entire batch; do not duplicate this background into individual tasks.
+- `tasks[]`: Array of subagents to spawn.
+  - `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
+  - `agent`: The agent type running this item (e.g. `scout`, `reviewer`). Omitting it gives you the general-purpose worker (`{{defaultAgent}}`) — NEVER pass that name explicitly. Only omit it after checking the agent list below and finding no specialist that fits.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
+  - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
+  - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
+  - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
 {{#if isolationEnabled}}
   - `isolated`: Run in dedicated worktree, return patches. Destroyed on completion, cannot be addressed afterward.
 {{/if}}
 {{else}}
-- `name`: CamelCase ≤32 chars (auto-generated if omitted).
-- `agent`: specialist type (optional).
-- `task`: Complete, self-contained instructions — no one-liners, no missing acceptance criteria.
+- `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
+- `agent`: The agent type to spawn (e.g. `scout`, `reviewer`). Omitting it gives you the general-purpose worker (`{{defaultAgent}}`) — NEVER pass that name explicitly. Only omit it after checking the agent list below and finding no specialist that fits.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
+- `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
+- `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
+- `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
 {{#if isolationEnabled}}
 - `isolated`: Run in dedicated worktree, return patches.
 {{/if}}

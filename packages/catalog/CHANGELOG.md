@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+## [17.0.6] - 2026-07-20
+
+### Added
+
+- Added static fallback seed for Devin's `swe-1-7` model so it is bundled even when catalog generation runs without a Devin session token.
+
+### Fixed
+
+- Collapsed Devin's six GLM-5.2 variants into two logical entries (`glm-5-2` for 200K free, `glm-5-2-1m` for 1M paid). The 200K entry routes every thinking effort to the free `glm-5-2` wire UID — never to the quota-gated `glm-5-2-max` or `glm-5-2-none` — so GLM-5.2 works even when the weekly usage quota is exhausted.
+
+## [17.0.5] - 2026-07-18
+
+### Added
+
+- Added an Anthropic compatibility flag to allow non-official OAuth endpoints to opt into configured Claude Code fingerprint header overrides.
+
+### Fixed
+
+- Fixed a security issue where sensitive provider-defined request headers (such as API keys or credentials) were serialized in plaintext within the model cache (models.db). The cache now omits these headers, securely invalidates older cached rows, and restores or refetches them dynamically.
+- Fixed OpenAI Codex discovery to respect caller-supplied fetch configurations (such as proxies or custom CAs) and correctly replace stale bundled models with the authenticated account catalog.
+- Fixed stream timeouts and retry loops during long prefills on local loopback or RFC1918 backends (such as litellm proxies fronting local servers) by applying the local stream-timeout floor to these backends.
+- Fixed Kimi K3 models served through generic OpenAI-compatible routes exposing unsupported reasoning efforts instead of the mandatory low/high/max scale.
+
+## [17.0.4] - 2026-07-18
+
+### Changed
+
+- Kimi-family models now use MFJS tool schema on all hosts, including proxies like OpenRouter that forward schemas to Moonshot
+
+## [17.0.3] - 2026-07-17
+
+### Fixed
+
+- Logged LiteLLM rich-metadata endpoint failures once with their endpoint and status before falling back to incomplete `/v1/models` data ([#5801](https://github.com/can1357/oh-my-pi/issues/5801)).
+- Fixed authenticated Kimi Code discovery to preserve live effort levels, default effort, mandatory-thinking state, and per-model protocol metadata ([#5893](https://github.com/can1357/oh-my-pi/issues/5893)).
+- Fixed LiteLLM provider ignoring per-model pricing: `mapLiteLLMRichEntry` now reads `input_cost_per_token` / `output_cost_per_token` (plus cache costs) from LiteLLM rich metadata and maps them to `cost.input` / `cost.output`, falling back to the bundled reference only when LiteLLM omits cost, so proxied models no longer display as free ([#5818](https://github.com/can1357/oh-my-pi/issues/5818)).
+
 ## [17.0.2] - 2026-07-17
 
 ### Changed
