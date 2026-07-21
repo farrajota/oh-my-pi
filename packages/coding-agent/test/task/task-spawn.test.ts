@@ -19,7 +19,12 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
+import {
+	type AgentDefinition,
+	oneLineLabel,
+	type SingleResult,
+	type TaskParams,
+} from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 const taskAgent: AgentDefinition = {
@@ -143,6 +148,38 @@ describe("task spawn routing", () => {
 		expect(job!.resultText).toContain("message it via `hub` to follow up");
 		expect(job!.resultText).toContain("history://Spawnling");
 		expect(runSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("uses a safe capped one-line label without changing the task prompt", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [taskAgent],
+			projectAgentsDir: null,
+		});
+		const runSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+
+		const manager = createManager();
+		const tool = await TaskTool.create(createSession({ manager }));
+		const astral = "🧪";
+		const assignment = `Investigate\nowner\tcleanup\u202e${astral.repeat(200)}`;
+		const result = await tool.execute("tc-label", {
+			agent: "task",
+			name: "LabelTester",
+			task: assignment,
+		} as TaskParams);
+		const job = manager.getJob(result.details!.async!.jobId)!;
+
+		expect(job.label).toBe(oneLineLabel(assignment));
+		expect(job.label).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+		expect(job.label).toContain(astral);
+		expect(job.label.length).toBeGreaterThan([...job.label].length);
+		expect([...job.label].length).toBeLessThan([...assignment].length);
+		expect(job.label).not.toMatch(/[\uD800-\uDBFF]$/);
+		await job.promise;
+		expect(runSpy).toHaveBeenCalledWith(
+			expect.objectContaining({ assignment, task: expect.stringContaining(assignment) }),
+		);
 	});
 
 	it("bounds concurrent job bodies with the session spawn semaphore", async () => {

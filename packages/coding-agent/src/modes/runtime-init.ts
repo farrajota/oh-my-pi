@@ -105,6 +105,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getContextUsage: () => session.getContextUsage(),
 			getSystemPrompt: () => session.systemPrompt,
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
+			getAsyncJobSnapshot: options => session.getAsyncJobSnapshot(options),
 		},
 		// ExtensionCommandContextActions — commands invokable via prompt("/command")
 		{

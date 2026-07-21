@@ -36,6 +36,7 @@ import {
 	type AgentProgress,
 	canSpawnAtDepth,
 	getTaskSchema,
+	oneLineLabel,
 	type SingleResult,
 	type TaskItem,
 	type TaskParams,
@@ -1021,7 +1022,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 		return manager.register(
 			"task",
-			agentId,
+			oneLineLabel(spawnParams.task ?? agentId),
 			async ({ signal: runSignal, reportProgress, markRunning }) => {
 				const startedAt = Date.now();
 				const semaphore = this.#getSpawnSemaphore();
@@ -1345,7 +1346,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			),
 		];
 		const profiledPlanModeTools =
-			params.toolProfile === undefined ? planModeTools : (applyTaskToolProfile(planModeTools, params.toolProfile) ?? []);
+			params.toolProfile === undefined
+				? planModeTools
+				: (applyTaskToolProfile(planModeTools, params.toolProfile) ?? []);
 		if (planModeState?.enabled && profiledPlanModeTools.length === 0) {
 			return {
 				content: [

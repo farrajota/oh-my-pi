@@ -168,7 +168,7 @@ import {
 	resolveAdvisorDeliveryChannel,
 	slugifyAdvisorName,
 } from "../advisor";
-import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
+import { AsyncJobManager, type AsyncJobSnapshot } from "../async";
 import { classifyDifficulty } from "../auto-thinking/classifier";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
@@ -761,7 +761,6 @@ const PRUNE_CACHE_WARM_SUFFIX_TOKENS = 8_000;
  */
 const PRUNE_IDLE_FLUSH_MS = 90 * 60_000;
 export type CommandMetadataChangedListener = () => void | Promise<void>;
-export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime">;
 
 const RETRY_BACKOFF_JITTER_RATIO = 0.25;
 /**
@@ -792,12 +791,6 @@ const NON_WHITESPACE_RE = /\S/;
 
 function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
-}
-
-export interface AsyncJobSnapshot {
-	running: AsyncJobSnapshotItem[];
-	recent: AsyncJobSnapshotItem[];
-	delivery: AsyncJobDeliveryState;
 }
 
 export type { ShakeMode, ShakeResult };
@@ -3669,23 +3662,10 @@ export class AgentSession {
 	getAsyncJobSnapshot(options?: { recentLimit?: number }): AsyncJobSnapshot | null {
 		const manager = this.#asyncJobManager;
 		if (!manager) return null;
-		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
-		const running = manager.getRunningJobs(ownerFilter).map(job => ({
-			id: job.id,
-			type: job.type,
-			status: job.status,
-			label: job.label,
-			startTime: job.startTime,
-		}));
-		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(job => ({
-			id: job.id,
-			type: job.type,
-			status: job.status,
-			label: job.label,
-			startTime: job.startTime,
-		}));
-		const delivery = manager.getDeliveryState(ownerFilter);
-		return { running, recent, delivery };
+		return manager.getSnapshot({
+			recentLimit: options?.recentLimit,
+			filter: { ownerId: this.#agentId },
+		});
 	}
 
 	/**
@@ -3703,9 +3683,11 @@ export class AgentSession {
 	 * No-op when no manager is reachable or this session has no agent id.
 	 */
 	#cancelOwnAsyncJobs(): void {
-		if (!this.#agentId) return;
 		const manager = this.#asyncJobManager;
-		manager?.cancelAll({ ownerId: this.#agentId });
+		if (!manager) return;
+		const ownerFilter = { ownerId: this.#agentId };
+		manager.clearHistory(ownerFilter);
+		manager.cancelAll(ownerFilter);
 	}
 
 	/**
@@ -3721,7 +3703,7 @@ export class AgentSession {
 	#hasPendingAsyncWake(): boolean {
 		const manager = this.#asyncJobManager;
 		if (!manager) return false;
-		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		const ownerFilter = { ownerId: this.#agentId };
 		return (
 			manager.getRunningJobs(ownerFilter).some(job => !manager.isDeliverySuppressed(job.id)) ||
 			manager.hasPendingDeliveries(ownerFilter)
@@ -6605,7 +6587,7 @@ export class AgentSession {
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
 		const manager = this.#asyncJobManager;
 		if (!manager) return false;
-		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		const ownerFilter = { ownerId: this.#agentId };
 		const before = manager.getDeliveryState(ownerFilter);
 		if (before.queued === 0 && !before.delivering) return false;
 		const previousAllowAcpAgentInitiatedTurns = this.#allowAcpAgentInitiatedTurns;
@@ -8476,6 +8458,7 @@ export class AgentSession {
 				await this.reload();
 			},
 			getSystemPrompt: () => this.systemPrompt,
+			getAsyncJobSnapshot: options => this.getAsyncJobSnapshot(options),
 		};
 	}
 

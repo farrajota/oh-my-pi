@@ -2327,6 +2327,7 @@ export class AcpAgent implements Agent {
 				getContextUsage: () => record.session.getContextUsage(),
 				getSystemPrompt: () => record.session.systemPrompt,
 				compact: instructionsOrOptions => runExtensionCompact(record.session, instructionsOrOptions),
+				getAsyncJobSnapshot: options => record.session.getAsyncJobSnapshot(options),
 			},
 			{
 				getContextUsage: () => record.session.getContextUsage(),

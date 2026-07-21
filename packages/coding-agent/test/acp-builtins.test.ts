@@ -12,6 +12,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import { formatDuration } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/format";
 import { removeWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
 
 interface FakeAcpBuiltinSession {
@@ -362,8 +363,26 @@ describe("ACP builtin slash commands", () => {
 	it("jobs: lists running and recent jobs from snapshot", async () => {
 		const { output, runtime } = createRuntime();
 		runtime.session.getAsyncJobSnapshot = () => ({
-			running: [{ id: "j1", type: "bash", status: "running", label: "npm install", startTime: Date.now() - 5000 }],
-			recent: [{ id: "j2", type: "task", status: "completed", label: "build done", startTime: Date.now() - 60_000 }],
+			running: [
+				{
+					id: "j1",
+					type: "bash",
+					status: "running",
+					queued: false,
+					label: "npm install",
+					startTime: Date.now() - 5000,
+				},
+			],
+			recent: [
+				{
+					id: "j2",
+					type: "task",
+					status: "completed",
+					queued: false,
+					label: "build done",
+					startTime: Date.now() - 60_000,
+				},
+			],
 			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
 		});
 
@@ -372,8 +391,86 @@ describe("ACP builtin slash commands", () => {
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain("npm install");
 		expect(output[0]).toContain("build done");
-		expect(output[0]).toContain("Running Jobs");
-		expect(output[0]).toContain("Recent Jobs");
+		expect(output[0]).toContain("Active Jobs");
+		expect(output[0]).toContain("Job History");
+	});
+
+	it("jobs: renders queued active jobs and terminal durations from their end time", async () => {
+		const { output, runtime } = createRuntime();
+		const now = Date.now();
+		const terminalStartTime = now - 60_000;
+		const terminalEndTime = now - 5_000;
+		runtime.session.getAsyncJobSnapshot = () => ({
+			running: [
+				{
+					id: "queued",
+					type: "task",
+					status: "running",
+					queued: true,
+					label: "waiting for a task slot",
+					startTime: now - 10_000,
+				},
+			],
+			recent: [
+				{
+					id: "terminal",
+					type: "bash",
+					status: "completed",
+					label: "fixed terminal duration",
+					startTime: terminalStartTime,
+					endTime: terminalEndTime,
+					queued: false,
+				},
+			],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+		});
+
+		await executeAcpBuiltinSlashCommand("/jobs", runtime);
+
+		expect(output[0]).toContain("(queued)");
+		expect(output[0]).toContain("waiting for a task slot");
+		expect(output[0]).toContain(formatDuration(terminalEndTime - terminalStartTime));
+		expect(output[0]).not.toContain(formatDuration(now - terminalStartTime));
+	});
+
+	it("jobs: renders terminal jobs without end times with a stable unknown duration", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.session.getAsyncJobSnapshot = () => ({
+			running: [],
+			recent: [
+				{
+					id: "missing-end",
+					type: "task",
+					status: "cancelled",
+					queued: false,
+					label: "terminal job without end time",
+					startTime: 10_000,
+				},
+			],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+		});
+		const now = spyOn(Date, "now");
+		const terminalLine = (text: string): string => {
+			const line = text.split("\n").find(candidate => candidate.includes("[missing-end]"));
+			if (!line) throw new Error("missing terminal job row");
+			return line;
+		};
+
+		try {
+			now.mockReturnValue(20_000);
+			await executeAcpBuiltinSlashCommand("/jobs", runtime);
+			now.mockReturnValue(90_000);
+			await executeAcpBuiltinSlashCommand("/jobs", runtime);
+
+			const first = terminalLine(output[0]!);
+			const second = terminalLine(output[1]!);
+			expect(first).toBe(second);
+			expect(first).toContain("unknown");
+			expect(first).not.toContain(formatDuration(20_000 - 10_000));
+			expect(second).not.toContain(formatDuration(90_000 - 10_000));
+		} finally {
+			now.mockRestore();
+		}
 	});
 
 	// /dump

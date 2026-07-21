@@ -1156,6 +1156,57 @@ describe("ExtensionRunner", () => {
 			});
 			delete globalState.__ompMemoryStatus;
 		});
+
+		it("always exposes a callable async job snapshot method and forwards host actions", async () => {
+			const result = await loadTestExtensions([]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const actions = {
+				sendMessage: () => {},
+				sendUserMessage: () => {},
+				appendEntry: () => {},
+				setLabel: () => {},
+				getActiveTools: () => [],
+				getAllTools: () => [],
+				setActiveTools: async () => {},
+				getCommands: () => [],
+				setModel: async () => false,
+				getThinkingLevel: () => undefined,
+				setThinkingLevel: () => {},
+				getSessionName: () => undefined,
+				setSessionName: async () => {},
+			};
+			const contextActions = {
+				getModel: () => undefined,
+				isIdle: () => true,
+				abort: () => {},
+				hasPendingMessages: () => false,
+				shutdown: () => {},
+				getContextUsage: () => undefined,
+				compact: async () => {},
+				getSystemPrompt: () => [],
+			};
+
+			runner.initialize(actions, contextActions);
+			expect(runner.createContext().getAsyncJobSnapshot()).toBeNull();
+
+			const snapshot = { running: [], recent: [], delivery: { queued: 0, delivering: false, pendingJobIds: [] } };
+			let receivedLimit: number | undefined;
+			runner.initialize(actions, {
+				...contextActions,
+				getAsyncJobSnapshot: options => {
+					receivedLimit = options?.recentLimit;
+					return snapshot;
+				},
+			});
+			expect(runner.createContext().getAsyncJobSnapshot({ recentLimit: 3 })).toBe(snapshot);
+			expect(receivedLimit).toBe(3);
+		});
 	});
 
 	describe("session name API", () => {

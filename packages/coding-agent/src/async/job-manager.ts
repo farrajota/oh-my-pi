@@ -32,6 +32,8 @@ export interface AsyncJob {
 	type: "bash" | "task";
 	status: "running" | "completed" | "failed" | "cancelled";
 	startTime: number;
+	/** Timestamp captured when this job became terminal. */
+	endTime?: number;
 	label: string;
 	abortController: AbortController;
 	promise: Promise<void>;
@@ -56,6 +58,33 @@ export interface AsyncJob {
 	 * until the caller invokes `markRunning()` from the run context.
 	 */
 	queued?: boolean;
+}
+
+/** Immutable, metadata-only job row safe to expose to extensions and UIs. */
+export interface AsyncJobSnapshotItem {
+	readonly id: string;
+	readonly type: AsyncJob["type"];
+	readonly status: AsyncJob["status"];
+	readonly label: string;
+	readonly startTime: number;
+	readonly endTime?: number;
+	readonly queued: boolean;
+}
+
+interface TerminalHistoryEntry {
+	snapshot: AsyncJobSnapshotItem;
+	sequence: number;
+}
+
+/** Public view of active jobs and a bounded terminal metadata history. */
+export interface AsyncJobSnapshot {
+	readonly running: readonly AsyncJobSnapshotItem[];
+	readonly recent: readonly AsyncJobSnapshotItem[];
+	readonly delivery: AsyncJobDeliveryState;
+}
+
+export interface AsyncJobSnapshotOptions {
+	recentLimit?: number;
 }
 
 export interface AsyncJobManagerOptions {
@@ -93,9 +122,9 @@ export interface AsyncJobRegisterOptions {
 }
 
 /**
- * Filter applied to job query/cancel APIs. With `ownerId`, results are
- * restricted to jobs registered by that agent (registry id from
- * `AgentRegistry`, e.g. "Main", "AuthLoader").
+ * Filter applied to job query/cancel APIs. When supplied, `ownerId` is matched
+ * exactly — including `undefined` — so an unowned session cannot see another
+ * owner's jobs.
  */
 export interface AsyncJobFilter {
 	ownerId?: string;
@@ -120,6 +149,11 @@ export class AsyncJobManager {
 	}
 
 	readonly #jobs = new Map<string, AsyncJob>();
+	/** Per-owner terminal rows contain metadata only; never retain result or error bodies. */
+	readonly #terminalHistory = new Map<string | undefined, TerminalHistoryEntry[]>();
+	readonly #historySuppressedJobs = new WeakSet<AsyncJob>();
+	readonly #capturedTerminalJobs = new WeakSet<AsyncJob>();
+	#nextTerminalHistorySequence = 0;
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
@@ -132,12 +166,15 @@ export class AsyncJobManager {
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
 
+	#hasOwnerFilter(filter: AsyncJobFilter | undefined): filter is AsyncJobFilter {
+		return filter !== undefined;
+	}
+
 	#filterJobs(jobs: Iterable<AsyncJob>, filter?: AsyncJobFilter): AsyncJob[] {
-		const ownerId = filter?.ownerId;
-		if (!ownerId) return Array.from(jobs);
+		if (!this.#hasOwnerFilter(filter)) return Array.from(jobs);
 		const out: AsyncJob[] = [];
 		for (const job of jobs) {
-			if (job.ownerId === ownerId) out.push(job);
+			if (job.ownerId === filter.ownerId) out.push(job);
 		}
 		return out;
 	}
@@ -222,27 +259,31 @@ export class AsyncJobManager {
 					signal: abortController.signal,
 					reportProgress,
 					markRunning: () => {
-						job.queued = false;
+						if (job.status === "running") job.queued = false;
 					},
 				});
 				if (job.status === "cancelled") {
 					job.resultText = text;
-					this.#scheduleEviction(id);
+					this.#recordTerminalHistory(job);
 					return;
 				}
 				job.status = "completed";
+				job.endTime = Date.now();
 				job.resultText = text;
+				this.#recordTerminalHistory(job);
 				this.#enqueueDelivery(id, text);
 				this.#scheduleEviction(id);
 			} catch (error) {
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
-					this.#scheduleEviction(id);
+					this.#recordTerminalHistory(job);
 					return;
 				}
 				const errorText = error instanceof Error ? error.message : String(error);
 				job.status = "failed";
+				job.endTime = Date.now();
 				job.errorText = errorText;
+				this.#recordTerminalHistory(job);
 				this.#enqueueDelivery(id, errorText);
 				this.#scheduleEviction(id);
 			}
@@ -260,9 +301,11 @@ export class AsyncJobManager {
 	cancel(id: string, filter?: AsyncJobFilter): boolean {
 		const job = this.#jobs.get(id);
 		if (!job) return false;
-		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
+		if (this.#hasOwnerFilter(filter) && job.ownerId !== filter.ownerId) return false;
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
+		job.endTime = Date.now();
+		this.#recordTerminalHistory(job);
 		job.abortController.abort();
 		this.#scheduleEviction(id);
 		return true;
@@ -279,8 +322,44 @@ export class AsyncJobManager {
 	getRecentJobs(limit = 10, filter?: AsyncJobFilter): AsyncJob[] {
 		return this.#filterJobs(this.#jobs.values(), filter)
 			.filter(job => job.status !== "running")
-			.sort((a, b) => b.startTime - a.startTime)
+			.sort((a, b) => (b.endTime ?? b.startTime) - (a.endTime ?? a.startTime))
 			.slice(0, limit);
+	}
+
+	getSnapshot(options?: AsyncJobSnapshotOptions & { filter?: AsyncJobFilter }): AsyncJobSnapshot {
+		const requestedRecentLimit = options?.recentLimit ?? 5;
+		const recentLimit = Number.isNaN(requestedRecentLimit)
+			? 0
+			: Math.min(15, Math.max(0, Math.trunc(requestedRecentLimit)));
+		const filter = options?.filter;
+		const running = this.#filterJobs(this.#jobs.values(), filter)
+			.filter(job => job.status === "running")
+			.map(job => this.#snapshotItem(job));
+		const history = this.#hasOwnerFilter(filter)
+			? (this.#terminalHistory.get(filter.ownerId) ?? [])
+			: Array.from(this.#terminalHistory.values()).flat();
+		const recent = history
+			.slice()
+			.sort(
+				(a, b) =>
+					(b.snapshot.endTime ?? b.snapshot.startTime) - (a.snapshot.endTime ?? a.snapshot.startTime) ||
+					b.sequence - a.sequence,
+			)
+			.slice(0, recentLimit)
+			.map(entry => entry.snapshot);
+		return { running, recent, delivery: this.getDeliveryState(filter) };
+	}
+
+	/** Clear terminal history for an owner and prevent its live jobs from repopulating it during teardown. */
+	clearHistory(filter?: AsyncJobFilter): void {
+		if (this.#hasOwnerFilter(filter)) {
+			this.#terminalHistory.delete(filter.ownerId);
+		} else {
+			this.#terminalHistory.clear();
+		}
+		for (const job of this.#filterJobs(this.#jobs.values(), filter)) {
+			this.#historySuppressedJobs.add(job);
+		}
 	}
 
 	getAllJobs(filter?: AsyncJobFilter): AsyncJob[] {
@@ -397,6 +476,8 @@ export class AsyncJobManager {
 	cancelAll(filter?: AsyncJobFilter): void {
 		for (const job of this.getRunningJobs(filter)) {
 			job.status = "cancelled";
+			job.endTime = Date.now();
+			this.#recordTerminalHistory(job);
 			job.abortController.abort();
 			this.#scheduleEviction(job.id);
 		}
@@ -434,7 +515,7 @@ export class AsyncJobManager {
 		const deadline = hasDeadline ? Date.now() + Math.max(timeoutMs, 0) : Number.POSITIVE_INFINITY;
 
 		while (this.hasPendingDeliveries(filter)) {
-			if (filter?.ownerId) {
+			if (this.#hasOwnerFilter(filter)) {
 				const delivered = await this.#deliverNextFiltered(filter, deadline);
 				if (delivered) continue;
 				return false;
@@ -479,8 +560,10 @@ export class AsyncJobManager {
 		const deadline = Date.now() + timeoutMs;
 		const jobsSettled = await this.#waitForAllUntil(deadline);
 		const drained = await this.drainDeliveries({ timeoutMs: Math.max(deadline - Date.now(), 0) });
-		this.#clearEvictionTimers();
 		this.#jobs.clear();
+		this.#clearEvictionTimers();
+		this.#terminalHistory.clear();
+		this.#nextTerminalHistorySequence = 0;
 		this.#deliveries.length = 0;
 		this.#inFlightDeliveries.length = 0;
 		this.#suppressedDeliveries.clear();
@@ -489,6 +572,27 @@ export class AsyncJobManager {
 		return jobsSettled && drained;
 	}
 
+	#snapshotItem(job: AsyncJob): AsyncJobSnapshotItem {
+		return Object.freeze({
+			id: job.id,
+			type: job.type,
+			status: job.status,
+			label: job.label,
+			startTime: job.startTime,
+			endTime: job.endTime,
+			queued: job.status === "running" && job.queued === true,
+		});
+	}
+
+	#recordTerminalHistory(job: AsyncJob): void {
+		if (job.status === "running" || this.#historySuppressedJobs.has(job) || this.#capturedTerminalJobs.has(job))
+			return;
+		const history = this.#terminalHistory.get(job.ownerId) ?? [];
+		history.unshift({ snapshot: this.#snapshotItem(job), sequence: this.#nextTerminalHistorySequence++ });
+		this.#capturedTerminalJobs.add(job);
+		if (history.length > 15) history.pop();
+		this.#terminalHistory.set(job.ownerId, history);
+	}
 	#resolveJobId(preferredId?: string): string {
 		preferredId = preferredId?.trim();
 		if (!preferredId) {
@@ -544,18 +648,18 @@ export class AsyncJobManager {
 	}
 
 	#filterDeliveries(filter?: AsyncJobFilter): AsyncJobDelivery[] {
-		const ownerId = filter?.ownerId;
-		if (!ownerId) return this.#deliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId));
+		if (!this.#hasOwnerFilter(filter))
+			return this.#deliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId));
 		return this.#deliveries.filter(
-			delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId),
+			delivery => delivery.ownerId === filter.ownerId && !this.isDeliverySuppressed(delivery.jobId),
 		);
 	}
 
 	#filterInFlightDeliveries(filter?: AsyncJobFilter): AsyncJobDelivery[] {
-		const ownerId = filter?.ownerId;
-		if (!ownerId) return this.#inFlightDeliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId));
+		if (!this.#hasOwnerFilter(filter))
+			return this.#inFlightDeliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId));
 		return this.#inFlightDeliveries.filter(
-			delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId),
+			delivery => delivery.ownerId === filter.ownerId && !this.isDeliverySuppressed(delivery.jobId),
 		);
 	}
 

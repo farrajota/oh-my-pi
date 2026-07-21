@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test, vi } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 
 describe("AsyncJobManager", () => {
@@ -113,6 +113,52 @@ describe("AsyncJobManager", () => {
 		expect(completions).toHaveLength(0);
 	});
 
+	test("cancellation retains its eviction deadline when runs settle later", async () => {
+		vi.useFakeTimers();
+		setSystemTime(1_000);
+		const manager = new AsyncJobManager({ retentionMs: 100, onJobComplete: async () => {} });
+		const resolvedRun = Promise.withResolvers<string>();
+		const rejectedRun = Promise.withResolvers<string>();
+		try {
+			const resolvedJobId = manager.register("task", "resolves after cancellation", async () => resolvedRun.promise);
+			const rejectedJobId = manager.register("task", "rejects after cancellation", async () => rejectedRun.promise);
+
+			expect(manager.cancel(resolvedJobId)).toBe(true);
+			expect(manager.cancel(rejectedJobId)).toBe(true);
+			expect(manager.getSnapshot().recent.map(job => [job.id, job.endTime])).toEqual([
+				[rejectedJobId, 1_000],
+				[resolvedJobId, 1_000],
+			]);
+
+			vi.advanceTimersByTime(50);
+			resolvedRun.resolve("late result");
+			rejectedRun.reject(new Error("late error"));
+			await manager.waitForAll();
+
+			expect(manager.getJob(resolvedJobId)?.endTime).toBe(1_000);
+			expect(manager.getJob(rejectedJobId)?.endTime).toBe(1_000);
+			expect(manager.getSnapshot().recent.map(job => [job.id, job.endTime])).toEqual([
+				[rejectedJobId, 1_000],
+				[resolvedJobId, 1_000],
+			]);
+
+			vi.advanceTimersByTime(49);
+			expect(manager.getJob(resolvedJobId)?.status).toBe("cancelled");
+			expect(manager.getJob(rejectedJobId)?.status).toBe("cancelled");
+			vi.advanceTimersByTime(1);
+			expect(manager.getJob(resolvedJobId)).toBeUndefined();
+			expect(manager.getJob(rejectedJobId)).toBeUndefined();
+			expect(manager.getSnapshot().recent.map(job => [job.id, job.endTime])).toEqual([
+				[rejectedJobId, 1_000],
+				[resolvedJobId, 1_000],
+			]);
+		} finally {
+			await manager.dispose();
+			vi.useRealTimers();
+			setSystemTime();
+		}
+	});
+
 	test("enforces maxRunningJobs cap", () => {
 		const manager = new AsyncJobManager({
 			maxRunningJobs: 1,
@@ -174,6 +220,44 @@ describe("AsyncJobManager", () => {
 		release.resolve();
 		await manager.waitForAll();
 		expect(manager.getJob(queuedJobId)?.status).toBe("completed");
+	});
+
+	test("markRunning cannot clear queued state after cancellation", async () => {
+		vi.useFakeTimers();
+		setSystemTime(1_000);
+		let markRunning: (() => void) | undefined;
+		const manager = new AsyncJobManager({ retentionMs: 100, onJobComplete: async () => {} });
+		try {
+			const jobId = manager.register(
+				"task",
+				"queued cancellation race",
+				async ({ markRunning: capturedMarkRunning, signal }) => {
+					markRunning = capturedMarkRunning;
+					await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+					return "late result";
+				},
+				{ queued: true },
+			);
+
+			expect(markRunning).toBeDefined();
+			expect(manager.cancel(jobId)).toBe(true);
+			const terminalBeforeLateCallback = manager.getSnapshot({ recentLimit: 1 }).recent;
+			expect(manager.getJob(jobId)).toMatchObject({ status: "cancelled", queued: true, endTime: 1_000 });
+
+			markRunning!();
+			expect(manager.getJob(jobId)).toMatchObject({ status: "cancelled", queued: true, endTime: 1_000 });
+			expect(manager.getSnapshot({ recentLimit: 1 }).recent).toEqual(terminalBeforeLateCallback);
+
+			await manager.waitForAll();
+			expect(manager.getSnapshot({ recentLimit: 1 }).recent).toEqual(terminalBeforeLateCallback);
+			vi.advanceTimersByTime(100);
+			expect(manager.getJob(jobId)).toBeUndefined();
+			expect(manager.getSnapshot({ recentLimit: 1 }).recent).toEqual(terminalBeforeLateCallback);
+		} finally {
+			await manager.dispose();
+			vi.useRealTimers();
+			setSystemTime();
+		}
 	});
 
 	test("evicts completed jobs after retention period", async () => {
@@ -436,6 +520,158 @@ describe("AsyncJobManager", () => {
 		manager.cancelAll();
 		await manager.waitForAll();
 		expect(manager.getJob(parentJobId)?.status).toBe("cancelled");
+	});
+
+	test("snapshots expose only immutable terminal metadata with fixed durations", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		manager.register("bash", "safe label", async () => "sensitive result body", { id: "metadata", ownerId: "Main" });
+
+		await manager.waitForAll();
+		const snapshot = manager.getSnapshot({ filter: { ownerId: "Main" }, recentLimit: 99 });
+
+		expect(snapshot.running).toEqual([]);
+		expect(snapshot.recent).toHaveLength(1);
+		expect(snapshot.recent[0]).toMatchObject({
+			id: "metadata",
+			label: "safe label",
+			status: "completed",
+			queued: false,
+		});
+		expect(snapshot.recent[0]?.endTime).toEqual(expect.any(Number));
+		expect(Object.keys(snapshot.recent[0] ?? {}).sort()).toEqual([
+			"endTime",
+			"id",
+			"label",
+			"queued",
+			"startTime",
+			"status",
+			"type",
+		]);
+		expect(Object.isFrozen(snapshot.recent[0]!)).toBe(true);
+		expect(snapshot.recent).toHaveLength(1);
+	});
+
+	test("snapshot owner filters include undefined exactly and never limit active rows", async () => {
+		const manager = new AsyncJobManager({ maxRunningJobs: 3, onJobComplete: async () => {} });
+		const gate = Promise.withResolvers<void>();
+		manager.register("bash", "unowned terminal", async () => "done");
+		manager.register("bash", "owned terminal", async () => "done", { ownerId: "Main" });
+		manager.register(
+			"task",
+			"queued active",
+			async () => {
+				await gate.promise;
+				return "done";
+			},
+			{ ownerId: undefined, queued: true },
+		);
+		manager.register(
+			"bash",
+			"running active",
+			async () => {
+				await gate.promise;
+				return "done";
+			},
+			{ ownerId: undefined },
+		);
+
+		await Promise.resolve();
+		const unowned = manager.getSnapshot({ filter: { ownerId: undefined }, recentLimit: 0 });
+		expect(unowned.recent).toEqual([]);
+		expect(unowned.running.map(job => job.label).sort()).toEqual(["queued active", "running active"]);
+		expect(unowned.running.find(job => job.label === "queued active")?.queued).toBe(true);
+		expect(manager.getSnapshot({ filter: { ownerId: "Main" } }).running).toEqual([]);
+
+		gate.resolve();
+		await manager.waitForAll();
+		expect(manager.getSnapshot({ filter: { ownerId: undefined } }).recent.map(job => job.label)).toContain(
+			"unowned terminal",
+		);
+		expect(manager.getSnapshot({ filter: { ownerId: undefined } }).recent.map(job => job.label)).not.toContain(
+			"owned terminal",
+		);
+	});
+
+	test("caps terminal metadata history per owner and clears it without changing live eviction", async () => {
+		const manager = new AsyncJobManager({ maxRunningJobs: 20, retentionMs: 25, onJobComplete: async () => {} });
+		const ids = Array.from({ length: 16 }, (_, index) =>
+			manager.register("task", `job ${index}`, async () => "done", { id: `job-${index}`, ownerId: "Main" }),
+		);
+
+		await manager.waitForAll();
+		expect(manager.getSnapshot({ filter: { ownerId: "Main" }, recentLimit: 15 }).recent).toHaveLength(15);
+		expect(manager.getSnapshot({ filter: { ownerId: "Main" }, recentLimit: -1 }).recent).toEqual([]);
+		expect(manager.getSnapshot({ filter: { ownerId: "Main" }, recentLimit: 2.9 }).recent).toHaveLength(2);
+		expect(manager.getSnapshot({ filter: { ownerId: "Main" }, recentLimit: Number.NaN }).recent).toEqual([]);
+		manager.clearHistory({ ownerId: "Main" });
+		expect(manager.getSnapshot({ filter: { ownerId: "Main" } }).recent).toEqual([]);
+
+		await Bun.sleep(60);
+		expect(ids.every(id => manager.getJob(id) === undefined)).toBe(true);
+	});
+
+	test("orders equal-time terminal history by completion order and records cancellation once", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+		try {
+			manager.register("task", "first", async () => "done", { id: "first", ownerId: "Main" });
+			manager.register("task", "second", async () => "done", { id: "second", ownerId: "Main" });
+			const cancelled = manager.register(
+				"task",
+				"cancelled",
+				async ({ signal }) =>
+					await new Promise<string>((_resolve, reject) => {
+						signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+					}),
+				{ id: "cancelled", ownerId: "Main" },
+			);
+
+			expect(manager.cancel(cancelled)).toBe(true);
+			expect(manager.cancel(cancelled)).toBe(false);
+			await manager.waitForAll();
+
+			const history = manager.getSnapshot({ filter: { ownerId: "Main" }, recentLimit: 15 }).recent;
+			expect(history.map(job => job.id)).toEqual(["second", "first", "cancelled"]);
+			expect(history.filter(job => job.id === "cancelled")).toHaveLength(1);
+		} finally {
+			now.mockRestore();
+			await manager.dispose();
+		}
+	});
+
+	test("retains terminal history for distinct jobs that reuse a default id", async () => {
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		try {
+			const firstId = manager.register("task", "first default job", async () => "first");
+			expect(firstId).toBe("bg_1");
+			await manager.waitForAll();
+			expect(manager.getJob(firstId)).toBeUndefined();
+
+			const secondId = manager.register("task", "second default job", async () => "second");
+			expect(secondId).toBe("bg_1");
+			await manager.waitForAll();
+
+			expect(manager.getSnapshot({ recentLimit: 15 }).recent.map(job => [job.id, job.label])).toEqual([
+				["bg_1", "second default job"],
+				["bg_1", "first default job"],
+			]);
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	test("clears one owner's terminal history without exposing another owner's rows", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		manager.register("task", "main history", async () => "main output", { ownerId: "Main" });
+		manager.register("task", "child history", async () => "child output", { ownerId: "Child" });
+		await manager.waitForAll();
+
+		manager.clearHistory({ ownerId: "Child" });
+		expect(manager.getSnapshot({ filter: { ownerId: "Child" } }).recent).toEqual([]);
+		expect(manager.getSnapshot({ filter: { ownerId: "Main" } }).recent.map(job => job.label)).toEqual([
+			"main history",
+		]);
+		await manager.dispose();
 	});
 });
 

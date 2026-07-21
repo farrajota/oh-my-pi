@@ -177,6 +177,7 @@ export class ExtensionUiController {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
+			getAsyncJobSnapshot: options => this.ctx.session.getAsyncJobSnapshot(options),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -397,6 +398,7 @@ export class ExtensionUiController {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
+			getAsyncJobSnapshot: options => this.ctx.session.getAsyncJobSnapshot(options),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -521,6 +523,7 @@ export class ExtensionUiController {
 							// Signal shutdown request
 						},
 						getSystemPrompt: () => this.ctx.session.systemPrompt,
+						getAsyncJobSnapshot: options => this.ctx.session.getAsyncJobSnapshot(options),
 					});
 				} catch (err) {
 					this.showToolError(registeredTool.definition.name, err instanceof Error ? err.message : String(err));

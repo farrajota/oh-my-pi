@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added owner-scoped extension async-job snapshots that retain all active jobs plus the newest 15 terminal rows for the session lifetime, use safe task-assignment labels, and expose a status-only display in the custom Alt+D dashboard.
 
 ## [17.0.1] - 2026-07-16
 

@@ -1037,6 +1037,14 @@ describe("AgentSession concurrent prompt guard", () => {
 			expect(sessionB.getAsyncJobSnapshot()?.delivery.pendingJobIds).not.toContain("job-a");
 			await expect(sessionB.drainAsyncJobDeliveriesForAcp({ timeoutMs: 1_000 })).resolves.toBe(true);
 			expect(delivered).toEqual(["job-b"]);
+			expect(sessionB.getAsyncJobSnapshot()?.recent.map(job => job.id)).toEqual(["job-b"]);
+			expect(session.getAsyncJobSnapshot()?.recent.map(job => job.id)).toEqual(["job-a"]);
+
+			await sessionB.dispose();
+			expect(asyncJobManager.getSnapshot({ filter: { ownerId: "acp-session-b" } }).recent).toEqual([]);
+			expect(
+				asyncJobManager.getSnapshot({ filter: { ownerId: "acp-session-a" } }).recent.map(job => job.id),
+			).toEqual(["job-a"]);
 		} finally {
 			deliveryGate.resolve();
 			await sessionB.dispose();

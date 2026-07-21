@@ -12,6 +12,7 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
 import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
+import type { AsyncJobSnapshotItem } from "../../async";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
 import { shareSession } from "../../export/share";
@@ -38,7 +39,6 @@ import type { InteractiveModeContext } from "../../modes/types";
 import { computeContextBreakdown, renderContextUsage } from "../../modes/utils/context-usage";
 import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
-import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
 import type { NewSessionOptions } from "../../session/session-entries";
@@ -427,16 +427,16 @@ export class CommandController {
 		const now = Date.now();
 		const lineWidth = Math.max(24, (this.ctx.ui.terminal.columns ?? 100) - 24);
 		let info = `${theme.bold("Background Jobs")}\n\n`;
-		info += `${theme.fg("dim", "Running:")} ${snapshot.running.length}\n`;
+		info += `${theme.fg("dim", "Active:")} ${snapshot.running.length}\n`;
 
 		if (snapshot.running.length === 0 && snapshot.recent.length === 0) {
-			info += `\n${theme.fg("dim", "No async jobs yet.")}\n`;
+			info += `\n${theme.fg("dim", "No active background jobs or history.")}\n`;
 			this.ctx.present([new Spacer(1), new Text(info, 1, 0)]);
 			return;
 		}
 
 		if (snapshot.running.length > 0) {
-			info += `\n${theme.bold("Running Jobs")}\n`;
+			info += `\n${theme.bold("Active Jobs")}\n`;
 			for (const job of snapshot.running) {
 				info += `${renderJobLine(job, now)}\n`;
 				info += `  ${theme.fg("dim", truncateJobLabel(job.label, lineWidth))}\n`;
@@ -444,7 +444,7 @@ export class CommandController {
 		}
 
 		if (snapshot.recent.length > 0) {
-			info += `\n${theme.bold("Recent Jobs")}\n`;
+			info += `\n${theme.bold("Job History")}\n`;
 			for (const job of snapshot.recent) {
 				info += `${renderJobLine(job, now)}\n`;
 				info += `  ${theme.fg("dim", truncateJobLabel(job.label, lineWidth))}\n`;
@@ -1306,9 +1306,14 @@ const BAR_WIDTH_MAX = 24;
 const BAR_WIDTH_MIN = 4;
 
 function renderJobLine(job: AsyncJobSnapshotItem, now: number): string {
-	const duration = formatDuration(Math.max(0, now - job.startTime));
-	const status = formatJobStatus(job.status);
+	const duration = formatJobDuration(job, now);
+	const status = job.queued ? theme.fg("warning", "queued") : formatJobStatus(job.status);
 	return `${theme.fg("dim", job.id)} ${theme.fg("dim", `[${job.type}]`)} ${status} ${theme.fg("dim", `(${duration})`)}`;
+}
+
+function formatJobDuration(job: AsyncJobSnapshotItem, now: number): string {
+	if (job.status !== "running" && job.endTime === undefined) return "unknown";
+	return formatDuration(Math.max(0, (job.endTime ?? now) - job.startTime));
 }
 
 function formatJobStatus(status: AsyncJobSnapshotItem["status"]): string {

@@ -35,6 +35,7 @@ import type { AutocompleteItem, AutocompleteProvider, Component, EditorTheme, Ke
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
 import type { Type as arktype } from "arktype";
 import type * as zod from "zod/v4";
+import type { AsyncJobSnapshot, AsyncJobSnapshotOptions } from "../../async";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
@@ -103,6 +104,7 @@ import type {
 import type { SlashCommandInfo } from "../slash-commands";
 import type * as TypeBox from "../typebox";
 
+export type { AsyncJobSnapshot, AsyncJobSnapshotItem, AsyncJobSnapshotOptions } from "../../async";
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
 export type { AgentToolResult, AgentToolUpdateCallback };
@@ -451,6 +453,8 @@ export interface ExtensionContext {
 	shutdown(): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string[];
+	/** Metadata-only view of this actor's active and recent background jobs. */
+	getAsyncJobSnapshot(options?: AsyncJobSnapshotOptions): AsyncJobSnapshot | null;
 	/** Structured memory runtime for status/search/save across the configured backend. */
 	memory?: MemoryRuntimeContext;
 }
@@ -1465,6 +1469,8 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
+	/** Optional for hosts that do not manage async jobs; ctx always falls back to null. */
+	getAsyncJobSnapshot?: (options?: AsyncJobSnapshotOptions) => AsyncJobSnapshot | null;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

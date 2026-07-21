@@ -2609,6 +2609,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						getContextUsage: () => session.getContextUsage(),
 						getSystemPrompt: () => session.systemPrompt,
 						compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
+						getAsyncJobSnapshot: options => session.getAsyncJobSnapshot(options),
 					},
 				);
 				extensionRunner.onError(err => {

@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { type AutocompleteItem, Spacer } from "@oh-my-pi/pi-tui";
 import { APP_NAME, getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
+import type { AsyncJobSnapshotItem } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import { COLLAB_GUEST_ALLOWED_COMMANDS, CollabGuestLink } from "../collab/guest";
 import { CollabHost } from "../collab/host";
@@ -92,6 +93,11 @@ const AUTOCOMPLETE_DETAIL_LIMIT = 48;
 function shortDetail(value: string, limit = AUTOCOMPLETE_DETAIL_LIMIT): string {
 	const singleLine = value.replace(/\s+/g, " ").trim();
 	return singleLine.length <= limit ? singleLine : `${singleLine.slice(0, limit - 1)}…`;
+}
+
+function formatJobDuration(job: AsyncJobSnapshotItem, now: number): string {
+	if (job.status !== "running" && job.endTime === undefined) return "unknown";
+	return formatDuration((job.endTime ?? now) - job.startTime);
 }
 
 function formatTokenCount(value: number): string {
@@ -1028,34 +1034,38 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "jobs",
-		description: "Show async background jobs status",
-		acpDescription: "Show background jobs",
+		description: "Show async background job status and history",
+		acpDescription: "Show background job status and history",
 		getTuiAutocompleteDescription: runtime => {
 			const snapshot = runtime.ctx.session.getAsyncJobSnapshot({ recentLimit: 5 });
 			if (!snapshot || (snapshot.running.length === 0 && snapshot.recent.length === 0)) return "Jobs: none";
-			return `Jobs: ${snapshot.running.length} running, ${snapshot.recent.length} recent`;
+			return `Jobs: ${snapshot.running.length} active, ${snapshot.recent.length} history`;
 		},
 		handle: async (_command, runtime) => {
 			const snapshot = runtime.session.getAsyncJobSnapshot({ recentLimit: 5 });
 			if (!snapshot || (snapshot.running.length === 0 && snapshot.recent.length === 0)) {
 				await runtime.output(
-					"No background jobs running. (Background jobs run async tools — e.g. long-running bash, debug, or task subagents that would otherwise tie up a turn. They appear here while alive and for ~5 minutes after.)",
+					"No active background jobs or history. (Background jobs run async tools — e.g. long-running bash, debug, or task subagents that would otherwise tie up a turn. Terminal job metadata is kept in this session's history.)",
 				);
 				return commandConsumed();
 			}
 			const now = Date.now();
-			const lines: string[] = ["Background Jobs", `Running: ${snapshot.running.length}`];
+			const lines: string[] = ["Background Jobs", `Active: ${snapshot.running.length}`];
 			if (snapshot.running.length > 0) {
-				lines.push("", "Running Jobs");
+				lines.push("", "Active Jobs");
 				for (const job of snapshot.running) {
-					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatDuration(now - job.startTime)}`);
+					lines.push(
+						`  [${job.id}] ${job.type} (${job.queued ? "queued" : job.status}) — ${formatJobDuration(job, now)}`,
+					);
 					lines.push(`    ${job.label}`);
 				}
 			}
 			if (snapshot.recent.length > 0) {
-				lines.push("", "Recent Jobs");
+				lines.push("", "Job History");
 				for (const job of snapshot.recent) {
-					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatDuration(now - job.startTime)}`);
+					lines.push(
+						`  [${job.id}] ${job.type} (${job.queued ? "queued" : job.status}) — ${formatJobDuration(job, now)}`,
+					);
 					lines.push(`    ${job.label}`);
 				}
 			}
