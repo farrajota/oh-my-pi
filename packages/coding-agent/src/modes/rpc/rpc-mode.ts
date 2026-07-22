@@ -12,7 +12,7 @@
  */
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, readJsonl, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, readLines, Snowflake } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -29,10 +29,13 @@ import type { AgentSession } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
+import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import { RpcFrameEncoder } from "./rpc-frame";
+import { claimRpcInput } from "./rpc-input";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
 	RpcCommand,
@@ -507,7 +510,7 @@ function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostTo
 			description,
 			parameters: tool.parameters,
 			hidden: tool.hidden === true,
-			loadMode: tool.loadMode ?? "discoverable",
+			loadMode: defaultLoadModeForToolName(name, tool.loadMode),
 		};
 	});
 }
@@ -606,6 +609,7 @@ export async function runRpcMode(
 	session: AgentSession,
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
+	input: ReadableStream<Uint8Array> = claimRpcInput(),
 ): Promise<never> {
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
@@ -614,9 +618,10 @@ export async function runRpcMode(
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
 
-	process.stdout.write(`${JSON.stringify({ type: "ready" })}\n`);
+	const frameEncoder = new RpcFrameEncoder();
+	process.stdout.write(frameEncoder.encode({ type: "ready" }));
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		process.stdout.write(`${JSON.stringify(obj)}\n`);
+		process.stdout.write(frameEncoder.encode(obj));
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
 
@@ -1326,7 +1331,10 @@ export async function runRpcMode(
 							return (await uiCtx.input(prompt.message, prompt.placeholder, { timeout: 600_000 })) ?? "";
 						},
 					});
-					await session.modelRegistry.refresh();
+					// Provider-scoped online refresh so the just-persisted credential
+					// re-runs discovery instead of reusing a fresh authoritative cache
+					// row (#5780).
+					await session.modelRegistry.refreshProvider(command.providerId, "online");
 					return success(id, "login", { providerId: command.providerId });
 				} catch (err: unknown) {
 					return error(id, "login", err instanceof Error ? err.message : String(err));
@@ -1375,8 +1383,22 @@ export async function runRpcMode(
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,
 	// ordinary commands serialize through inputDispatcher, and bash remains
-	// background-dispatched so abort_bash can overtake it.
-	for await (const parsed of readJsonl(Bun.stdin.stream())) {
+	// background-dispatched so abort_bash can overtake it. Frames are read
+	// line-by-line and parsed here (not via readJsonl) so a single malformed
+	// line is reported as an error frame and the loop keeps running instead of
+	// throwing out of the generator and killing the whole process (issue #5194).
+	const decoder = new TextDecoder();
+	for await (const line of readLines(input ?? Bun.stdin.stream())) {
+		const text = decoder.decode(line).trim();
+		if (!text) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch (e: unknown) {
+			const message = e instanceof Error ? e.message : String(e);
+			output(error(undefined, "parse", `Failed to parse command: ${message}`));
+			continue;
+		}
 		inputDispatcher.dispatch(parsed);
 	}
 

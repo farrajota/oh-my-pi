@@ -59,12 +59,12 @@ describe("read and write route xd:// device URLs", () => {
 				paths: [filePath],
 			});
 
-			// Approval resolves a tier instead of throwing. A mounted tool whose own
-			// approval is a function (unresolvable statically) falls back to exec.
+			// The write gate decodes the device payload and evaluates the mounted
+			// tool's own approval. ast_edit is write-tier for a filesystem path.
 			const approval = write!.approval;
 			expect(typeof approval).toBe("function");
 			if (typeof approval === "function") {
-				expect(approval({ path: "xd://ast_edit", content })).toBe("exec");
+				expect(approval({ path: "xd://ast_edit", content })).toBe("write");
 			}
 
 			// Execute dispatches through the xdev registry to the mounted ast_edit,
@@ -81,6 +81,49 @@ describe("read and write route xd:// device URLs", () => {
 			expect(invoker).toBeDefined();
 			await invoker!({ action: "apply", reason: "apply xdev ast edit" });
 			expect(await Bun.file(filePath).text()).toContain("modernWrap(x, value)");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("resolves function-valued device approvals per payload and fails closed on bad content", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-approval-"));
+		try {
+			const filePath = path.join(tempDir, "target.ts");
+			await Bun.write(filePath, "legacyWrap(x, value)\n");
+			const tools = await createTools(xdevSession(tempDir));
+			const write = tools.find(entry => entry.name === "write");
+			expect(write).toBeDefined();
+			const approval = write!.approval;
+			expect(typeof approval).toBe("function");
+			if (typeof approval !== "function") throw new Error("expected a function approval");
+			const tier = (path: string, content: string) => approval({ path, content });
+
+			// ast_edit on a filesystem path → write; on internal URLs only → read.
+			const astFsPath = JSON.stringify({
+				ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+				paths: [filePath],
+			});
+			const astInternalPath = JSON.stringify({
+				ops: [{ pat: "a", out: "b" }],
+				paths: ["artifact://abc"],
+			});
+			expect(tier("xd://ast_edit", astFsPath)).toBe("write");
+			expect(tier("xd://ast_edit", astInternalPath)).toBe("read");
+
+			// debug: inspection action → read; a real launch → exec (control).
+			expect(tier("xd://debug", JSON.stringify({ action: "sessions" }))).toBe("read");
+			expect(tier("xd://debug", JSON.stringify({ action: "launch", program: "./app" }))).toBe("exec");
+
+			// Fail closed: malformed JSON, non-object or schema-invalid payloads,
+			// missing content, and unknown devices all stay exec so the gate never
+			// under-prompts.
+			expect(tier("xd://ast_edit", "{ not json")).toBe("exec");
+			expect(tier("xd://ast_edit", "[1,2,3]")).toBe("exec");
+			expect(tier("xd://ast_edit", '"a string"')).toBe("exec");
+			expect(tier("xd://ast_edit", JSON.stringify({ paths: [null] }))).toBe("exec");
+			expect(approval({ path: "xd://ast_edit" })).toBe("exec");
+			expect(tier("xd://no_such_device", "{}")).toBe("exec");
 		} finally {
 			await removeWithRetries(tempDir);
 		}
@@ -158,6 +201,25 @@ describe("read and write route xd:// device URLs", () => {
 			expect(docs).toContain(mounted[0]!.description ?? "");
 			// On-demand docs return the untruncated text.
 			expect(registry.docs("mcp_external_tool")).toContain("TAIL");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+});
+
+describe("web_search stays top-level under xdev", () => {
+	it("keeps web_search a direct tool and off the xd:// registry with default config", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-websearch-"));
+		try {
+			const session = xdevSession(tempDir);
+			// Default config: tools.xdev is on.
+			expect(session.settings.get("tools.xdev")).toBe(true);
+			const tools = await createTools(session);
+			// Regression for #5973: models call web_search directly, so it must
+			// remain a top-level function and never mount behind the xd:// device.
+			expect(tools.some(entry => entry.name === "web_search")).toBe(true);
+			const mounted = session.xdevRegistry ? [...session.xdevRegistry.list()].map(t => t.name) : [];
+			expect(mounted).not.toContain("web_search");
 		} finally {
 			await removeWithRetries(tempDir);
 		}

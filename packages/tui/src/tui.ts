@@ -80,13 +80,15 @@ const CURSOR_BEGIN = `${HIDE_CURSOR}${SYNC_OUTPUT_BEGIN}`;
 const CURSOR_BEGIN_NO_SYNC = HIDE_CURSOR;
 const CURSOR_END = SYNC_OUTPUT_END;
 const CURSOR_END_NO_SYNC = "";
-// Mouse reporting, enabled only for the lifetime of a fullscreen overlay so the
-// rest of the app keeps the terminal's native text selection. 1000h = button
-// click tracking, 1003h = any-motion tracking so overlays can light up hover
-// targets (the pointer moving with no button held), 1006h = SGR extended
-// coordinates so columns/rows past 223 are reported.
+// Mouse reporting is scoped to fullscreen overlays that opt into pointer
+// interaction. 1000h = button click tracking, 1003h = any-motion tracking for
+// hover targets, and 1006h = SGR extended coordinates past column/row 223.
+// Selection-first overlays leave these modes disabled so the terminal retains
+// native text selection.
 const MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h";
 const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1000l";
+const ALT_SCREEN_ENTER = "\x1b[?1049h";
+const ALT_SCREEN_EXIT = "\x1b[?1049l";
 
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
@@ -192,17 +194,22 @@ export interface OverlayFocusOwner {
  * FINAL — byte-stable at the current width for the component's lifetime — and
  * commit to native scrollback as exact, audited content. Rows at/after the
  * boundary repaint in place inside the visible window; when they scroll above
- * the window top they still commit — the tape records what was on screen —
- * but as frozen visual snapshots that are permanently audit-exempt: later
- * re-layout of their source never re-anchors or recommits them. A root that
- * reports no seam commits everything that scrolls as final (shell semantics).
+ * the window top they normally commit as frozen visual snapshots.
+ *
+ * A viewport-pinned region opts out of those mutable snapshot commits. Its
+ * offscreen mutable rows are virtually clipped until the boundary advances;
+ * use this for fixed-height dashboards whose frames replace each other rather
+ * than append. A root that reports no seam commits everything that scrolls as
+ * final (shell semantics).
  *
  * When several root children report a seam in the same frame, the topmost one
- * defines the boundary: exactness is prefix-only, so everything below the
- * first seam is already excluded.
+ * defines the boundary and pinning policy: commits are prefix-only, so
+ * everything below the first seam is already excluded.
  */
 export interface NativeScrollbackLiveRegion {
 	getNativeScrollbackLiveRegionStart(): number | undefined;
+	/** Keeps the mutable suffix viewport-local instead of recording frozen snapshots. */
+	isNativeScrollbackLiveRegionPinned?(): boolean;
 }
 
 export interface NativeScrollbackCommittedRows {
@@ -454,6 +461,11 @@ export interface OverlayOptions {
 	 * unchanged and still draw over the transcript on the normal screen.
 	 */
 	fullscreen?: boolean;
+	/**
+	 * Enable terminal mouse reporting while fullscreen. Defaults on; disable it
+	 * when native terminal text selection takes precedence over pointer events.
+	 */
+	mouseTracking?: boolean;
 }
 
 /**
@@ -632,11 +644,9 @@ interface CursorControlResult extends HardwareCursorUpdate {
 }
 
 /**
- * One root child's contribution to the composed frame: the array reference its
- * render() returned, the frame row it starts at, the row count recorded at
- * compose time (in-place mutators keep the reference but may change length),
- * and the child-local seam report captured at render time — replayed verbatim
- * when a component-scoped frame reuses this segment without re-rendering.
+ * One root child's contribution to the composed frame: its rendered rows,
+ * frame span, and live-region report captured at render time. Component-scoped
+ * frames replay the seam and viewport-pinning policy without re-rendering.
  */
 interface FrameSegment {
 	component: Component;
@@ -644,6 +654,7 @@ interface FrameSegment {
 	start: number;
 	rowCount: number;
 	liveLocalStart?: number;
+	liveRegionPinned: boolean;
 }
 
 /** Depth-first identity search through `Container`-shaped children. */
@@ -1035,6 +1046,7 @@ export class TUI extends Container {
 	// Exactly what is painted on the screen rows (post-composite, prepared).
 	#previousWindow: string[] = [];
 	#nativeScrollbackLiveRegionStart: number | undefined;
+	#nativeScrollbackLiveRegionPinned = false;
 	#fullRedrawCount = 0;
 	// Caps how many inline images render as live graphics; older ones fall back
 	// to text via a purge + full redraw. Cap is configured by the host app.
@@ -1074,6 +1086,11 @@ export class TUI extends Container {
 	// `#fullRedrawCount`: these never enter native scrollback and exist only for
 	// the lifetime of the drag. Exposed for tests/diagnostics.
 	#resizeViewportPaintCount = 0;
+	// During a live resize drag the terminal's normal buffer may reflow full-width
+	// rows before our repaint lands. Borrow the alternate screen for throwaway
+	// resize frames so width changes truncate the transient viewport instead of
+	// pushing wrapped fragments into native scrollback.
+	#resizeAltActive = false;
 	#stopped = false;
 	// Always-on event-loop lag probe. The high default threshold keeps it quiet;
 	// it only logs `ui.loop-blocked` (with the current loop phase) when a frame
@@ -1086,6 +1103,7 @@ export class TUI extends Container {
 	// untouched, so exiting reconciles cleanly against the terminal-restored
 	// normal screen. #altPreviousLines is the last alt frame, for repaint-skip.
 	#altActive = false;
+	#altMouseTrackingActive = false;
 	#altPreviousLines: string[] = [];
 	#altEnterWidth = 0;
 	#altEnterHeight = 0;
@@ -1120,6 +1138,7 @@ export class TUI extends Container {
 	// Target component -> containing root child, so animation-rate requests do
 	// not re-walk a huge transcript subtree every frame.
 	#componentRootCache = new WeakMap<Component, Component>();
+	#scopedInputRenderComponents = new WeakSet<Component>();
 
 	// Persistent prepared frame, row-aligned with #composedFrame. Entries store
 	// normalized, width-fitted content rows without the per-line terminal
@@ -1152,6 +1171,7 @@ export class TUI extends Container {
 	override render(width: number): readonly string[] {
 		width = Math.max(1, width);
 		this.#nativeScrollbackLiveRegionStart = undefined;
+		this.#nativeScrollbackLiveRegionPinned = false;
 		const children = this.children;
 		const previousSegments = this.#frameSegments;
 		const segments: FrameSegment[] = new Array(children.length);
@@ -1172,10 +1192,12 @@ export class TUI extends Container {
 				partialRoots !== null && previous !== undefined && previous.component === child && !partialRoots.has(child);
 			let childLines: readonly string[];
 			let liveLocalStart: number | undefined;
+			let liveRegionPinned = false;
 			let reported: number | undefined;
 			if (reuse) {
 				childLines = previous.lines;
 				liveLocalStart = previous.liveLocalStart;
+				liveRegionPinned = previous.liveRegionPinned;
 			} else {
 				// Feed the engine's committed-row claim (from the previous frame's
 				// emit) before rendering so the child can skip re-deriving blocks
@@ -1195,6 +1217,11 @@ export class TUI extends Container {
 						? Math.max(0, Math.min(childLines.length, Math.trunc(liveRegionStart)))
 						: childLines.length;
 				}
+				if (liveLocalStart !== undefined) {
+					liveRegionPinned =
+						(child as Component & Partial<NativeScrollbackLiveRegion>).isNativeScrollbackLiveRegionPinned?.() ===
+						true;
+				}
 				// Consume the stability report unconditionally for implementers:
 				// reading re-bases the component's baseline to the state this
 				// compose is about to ingest (used or not, the current rows are
@@ -1211,6 +1238,7 @@ export class TUI extends Container {
 			// history.
 			if (liveLocalStart !== undefined && this.#nativeScrollbackLiveRegionStart === undefined) {
 				this.#nativeScrollbackLiveRegionStart = offset + liveLocalStart;
+				this.#nativeScrollbackLiveRegionPinned = liveRegionPinned;
 			}
 			if (chainStable) {
 				if (previous !== undefined && previous.component === child && previous.start === offset) {
@@ -1239,6 +1267,7 @@ export class TUI extends Container {
 				start: offset,
 				rowCount: childLines.length,
 				liveLocalStart,
+				liveRegionPinned,
 			};
 			offset += childLines.length;
 		}
@@ -1332,6 +1361,20 @@ export class TUI extends Container {
 	 */
 	setMaxInlineImages(cap: number): void {
 		this.#imageBudget.setCap(cap);
+	}
+
+	/** Delete every tracked Kitty image from the terminal graphics store. */
+	clearInlineImages(): void {
+		if (this.#stopped) return;
+		this.#purgeInlineImages();
+	}
+
+	#purgeInlineImages(): void {
+		const transmittedIds = this.#imageBudget.takeAllTransmittedIds();
+		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty) return;
+		for (const id of transmittedIds) {
+			this.terminal.write(encodeKittyDeleteImage(id));
+		}
 	}
 
 	/**
@@ -1558,7 +1601,9 @@ export class TUI extends Container {
 				}
 				this.#armMultiplexerResizeTimer(false);
 			},
+			() => this.stop(),
 		);
+		if (this.#stopped) return;
 		for (const listener of this.#startListeners) {
 			try {
 				listener();
@@ -1741,20 +1786,22 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		// Leave the resize alt buffer first so the teardown cursor math below runs
+		// against the restored normal screen (which #previousLines still describes).
+		if (this.#resizeAltActive) {
+			this.terminal.write(this.#leaveResizeAltSequence());
+		}
 		if (this.#altActive || this.#pendingAltExit) {
-			const exitSequence =
-				this.#pendingAltExit || `${MOUSE_TRACKING_OFF}${this.#keyboardEnhancementExit()}\x1b[?1049l`;
+			const mouseExit = this.#altMouseTrackingActive ? MOUSE_TRACKING_OFF : "";
+			const exitSequence = this.#pendingAltExit || `${mouseExit}${this.#keyboardEnhancementExit()}\x1b[?1049l`;
 			this.terminal.write(exitSequence);
 			setAltScreenActive(false);
 			this.#altActive = false;
+			this.#altMouseTrackingActive = false;
 			this.#altPreviousLines = [];
 			this.#pendingAltExit = "";
 		}
-		if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
-			for (const id of this.#imageBudget.takeAllTransmittedIds()) {
-				this.terminal.write(encodeKittyDeleteImage(id));
-			}
-		}
+		this.#purgeInlineImages();
 		this.#clearSixelProbeState();
 		this.#stopped = true;
 		this.#watchdog.stop();
@@ -1869,6 +1916,17 @@ export class TUI extends Container {
 	}
 
 	/**
+	 * Opt `component` into subtree-only renders when input leaves focus stable.
+	 *
+	 * The host must explicitly request renders for every sibling mutated by the
+	 * component's input callbacks. Components without this opt-in retain the
+	 * legacy full-root render after input.
+	 */
+	enableScopedInputRender(component: Component): void {
+		this.#scopedInputRenderComponents.add(component);
+	}
+
+	/**
 	 * Schedule a render on behalf of `component` after a self-contained change
 	 * (spinner frame, blink) that cannot have affected any other component.
 	 *
@@ -1909,7 +1967,7 @@ export class TUI extends Container {
 		if (
 			this.#renderRequested ||
 			this.#postFullPaintSettleTimer !== undefined ||
-			this.#postFullPaintSettleUntilMs > 0
+			this.#postFullPaintSettleDelay() > 0
 		) {
 			this.requestComponentRender(component);
 			return;
@@ -2048,6 +2106,15 @@ export class TUI extends Container {
 		this.#commit(this.#composedFrame, previousWindow, width, height, cursorControl);
 	}
 
+	#postFullPaintSettleDelay(): number {
+		const until = this.#postFullPaintSettleUntilMs;
+		if (until <= 0) return 0;
+		const remaining = until - this.#renderScheduler.now();
+		if (remaining > 0) return remaining;
+		this.#postFullPaintSettleUntilMs = 0;
+		return 0;
+	}
+
 	/** Ordinary (non-forced) scheduling shared by full and component-scoped requests. */
 	#requestOrdinaryRender(): void {
 		// Coalesce non-forced renders inside the post-full-paint ConPTY settle
@@ -2056,20 +2123,17 @@ export class TUI extends Container {
 		// catching up with the previous big paint, and each follow-up viewport
 		// repaint nudges Windows Terminal's viewport tracker further off the
 		// last row (see #2095).
-		if (this.#postFullPaintSettleUntilMs > 0) {
-			const now = this.#renderScheduler.now();
-			if (now < this.#postFullPaintSettleUntilMs) {
-				if (this.#postFullPaintSettleTimer === undefined) {
-					this.#postFullPaintSettleTimer = this.#renderScheduler.scheduleRender(() => {
-						this.#postFullPaintSettleTimer = undefined;
-						this.#postFullPaintSettleUntilMs = 0;
-						if (this.#stopped) return;
-						this.#requestOrdinaryRender();
-					}, this.#postFullPaintSettleUntilMs - now);
-				}
-				return;
+		const settleDelayMs = this.#postFullPaintSettleDelay();
+		if (settleDelayMs > 0) {
+			if (this.#postFullPaintSettleTimer === undefined) {
+				this.#postFullPaintSettleTimer = this.#renderScheduler.scheduleRender(() => {
+					this.#postFullPaintSettleTimer = undefined;
+					this.#postFullPaintSettleUntilMs = 0;
+					if (this.#stopped) return;
+					this.#requestOrdinaryRender();
+				}, settleDelayMs);
 			}
-			this.#postFullPaintSettleUntilMs = 0;
+			return;
 		}
 		if (this.#renderRequested) return;
 		this.#renderRequested = true;
@@ -2347,15 +2411,23 @@ export class TUI extends Container {
 			}
 		}
 
-		// Pass input to focused component (including Ctrl+C)
-		// The focused component can decide how to handle Ctrl+C
-		if (this.#focusedComponent?.handleInput) {
+		// Pass input to focused component (including Ctrl+C).
+		// The focused component can decide how to handle Ctrl+C.
+		// Opted-in components only dirty their focused subtree. Unregistered
+		// components retain the legacy full compose because their callbacks may
+		// mutate siblings; focus changes also require the new surface to paint.
+		const focused = this.#focusedComponent;
+		if (focused?.handleInput) {
 			// Filter out key release events unless component opts in
-			if (isKeyRelease(data) && !this.#focusedComponent.wantsKeyRelease) {
+			if (isKeyRelease(data) && !focused.wantsKeyRelease) {
 				return;
 			}
-			this.#focusedComponent.handleInput(data);
-			this.requestRender();
+			focused.handleInput(data);
+			if (this.#focusedComponent === focused && this.#scopedInputRenderComponents.has(focused)) {
+				this.requestComponentRender(focused);
+			} else {
+				this.requestRender();
+			}
 		}
 	}
 
@@ -2705,24 +2777,29 @@ export class TUI extends Container {
 		// requests it, borrow the terminal's alternate buffer and paint only the
 		// modal there; the normal screen and all accounting stay untouched.
 		let deferredAltExit = this.#pendingAltExit;
-		const wantAlt = this.#wantsAltScreen();
+		const topOverlay = this.#getTopmostVisibleOverlay();
+		const wantAlt = topOverlay?.options?.fullscreen === true;
+		const wantMouseTracking = wantAlt && topOverlay.options?.mouseTracking !== false;
 		if (wantAlt && !this.#altActive) {
 			// Enhanced keyboard modes can be buffer-local: re-push the active
 			// modified-key reporting sequence on the freshly entered alternate
 			// screen, or Esc/modified keys revert to legacy encoding inside
 			// fullscreen overlays (Ghostty/kitty/iTerm2).
-			this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}${MOUSE_TRACKING_ON}`);
+			const mouseEnter = wantMouseTracking ? MOUSE_TRACKING_ON : "";
+			this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}${mouseEnter}`);
 			setAltScreenActive(true);
 			this.terminal.hideCursor();
 			this.#forgetHardwareCursorState();
 			this.#recordHardwareCursorHidden();
 			this.#altActive = true;
+			this.#altMouseTrackingActive = wantMouseTracking;
 			this.#altPreviousLines = [];
 			this.#altEnterWidth = width;
 			this.#altEnterHeight = height;
 		} else if (!wantAlt && this.#altActive) {
+			const mouseExit = this.#altMouseTrackingActive ? MOUSE_TRACKING_OFF : "";
 			const enhancementExit = this.#keyboardEnhancementExit();
-			const exitSequence = `${MOUSE_TRACKING_OFF}${enhancementExit}\x1b[?1049l`;
+			const exitSequence = `${mouseExit}${enhancementExit}\x1b[?1049l`;
 			// Session replacement can finish while a fullscreen selector is still
 			// covering the old normal buffer. Keep the overlay visible until the
 			// replacement is ready, then fuse the buffer restore into that full paint;
@@ -2734,6 +2811,7 @@ export class TUI extends Container {
 			setAltScreenActive(false);
 			this.#forgetHardwareCursorState();
 			this.#altActive = false;
+			this.#altMouseTrackingActive = false;
 			this.#altPreviousLines = [];
 			// A resize while on the alt buffer reflowed the terminal's saved
 			// normal screen; it no longer matches our accounting, so force the
@@ -2741,6 +2819,9 @@ export class TUI extends Container {
 			if (width !== this.#altEnterWidth || height !== this.#altEnterHeight) {
 				this.#resizeEventPending = true;
 			}
+		} else if (wantMouseTracking !== this.#altMouseTrackingActive) {
+			this.terminal.write(wantMouseTracking ? MOUSE_TRACKING_ON : MOUSE_TRACKING_OFF);
+			this.#altMouseTrackingActive = wantMouseTracking;
 		}
 		if (this.#altActive) {
 			this.#componentRenderTargets.clear();
@@ -2831,6 +2912,7 @@ export class TUI extends Container {
 		// known. Ascending by frame row.
 		const cursorMarkers = this.#frameCursorMarkers;
 		const liveRegionStart = this.#nativeScrollbackLiveRegionStart;
+		const liveRegionPinned = this.#nativeScrollbackLiveRegionPinned;
 
 		// Exactness boundary (used by the audit-zone math below). Rows below it
 		// are declared FINAL by the component seam: when they commit, they enter
@@ -2957,7 +3039,7 @@ export class TUI extends Container {
 		if (fullPaint) {
 			committedPrefixResliced = true;
 			windowTop = Math.max(0, frameLength - height);
-			chunkTo = windowTop;
+			chunkTo = liveRegionPinned ? Math.min(windowTop, finalBoundary) : windowTop;
 		} else if (
 			frameLength <= this.#committedRows ||
 			(committedRowsResynced &&
@@ -2977,9 +3059,19 @@ export class TUI extends Container {
 			// "duplication, never loss" is the ED3-unsafe fallback contract.
 			committedPrefixResliced = true;
 			windowTop = Math.max(0, frameLength - height);
-			chunkTo = windowTop;
+			chunkTo = liveRegionPinned ? Math.min(windowTop, finalBoundary) : windowTop;
 			this.#committedRows = chunkTo;
 			this.#committedPrefix = rawFrame.slice(0, chunkTo);
+		} else if (geometryChanged && Math.max(0, frameLength - height) < this.#committedRows) {
+			// Pane growth/reflow can pull rows back out of mux scrollback and into
+			// the viewport. Rebase the commit seam to that exposed frame tail before
+			// the forced rewrite; flooring at the old seam would paint only the live
+			// suffix followed by blanks, then preserve that gap on every stream tick.
+			committedPrefixResliced = true;
+			windowTop = Math.max(0, frameLength - height);
+			chunkTo = windowTop;
+			this.#committedRows = windowTop;
+			this.#committedPrefix = rawFrame.slice(0, windowTop);
 		} else {
 			// Re-anchor to the frame tail, floored at the committed boundary: a
 			// shrink (or overlay close) pulls the window back down, but never
@@ -2996,7 +3088,12 @@ export class TUI extends Container {
 			// history — and re-bases the audit prefix at the new width so the
 			// accepted wrap drift does not read as a violation on the next
 			// ordinary frame.
-			chunkTo = hasVisibleOverlay || geometryChanged ? this.#committedRows : windowTop;
+			chunkTo =
+				hasVisibleOverlay || geometryChanged
+					? this.#committedRows
+					: liveRegionPinned
+						? Math.min(windowTop, Math.max(this.#committedRows, finalBoundary))
+						: windowTop;
 			if (geometryChanged) {
 				committedPrefixResliced = true;
 				this.#committedPrefix = rawFrame.slice(0, this.#committedRows);
@@ -3216,6 +3313,25 @@ export class TUI extends Container {
 			}
 
 			const code = raw.charCodeAt(i);
+			if (code >= 0x20 && code <= 0x7e) {
+				// Printable-ASCII run: every char here is exactly one cell wide, so
+				// the run is copied with a single slice instead of a per-char
+				// slice + visibleWidth call. Stop conditions mirror the general
+				// path: width budget (cells), source budget (maxSourceLength).
+				if (output.length >= maxSourceLength) break;
+				const cap = i + Math.min(safeWidth - cells, maxSourceLength - output.length);
+				let j = i + 1;
+				while (j < raw.length && j < cap) {
+					const c = raw.charCodeAt(j);
+					if (c < 0x20 || c > 0x7e) break;
+					j++;
+				}
+				output += raw.slice(i, j);
+				cells += j - i;
+				i = j;
+				continue;
+			}
+
 			const next = code >= 0xd800 && code <= 0xdbff && i + 1 < raw.length ? i + 2 : i + 1;
 			const char = raw.slice(i, next);
 			const charWidth = visibleWidth(char);
@@ -3478,7 +3594,7 @@ export class TUI extends Container {
 				paintCursorPos = paint.cursorPos;
 			}
 		}
-		let buffer = this.#paintBeginSequence + options.leadingSequence + purgeSequence;
+		let buffer = this.#paintBeginSequence + this.#leaveResizeAltSequence() + options.leadingSequence + purgeSequence;
 		if (options.clearScrollback) {
 			// Clear native history without blanking the live viewport first. The
 			// replay below rewrites every visible row from home, including blanks,
@@ -3678,15 +3794,42 @@ export class TUI extends Container {
 		return this.terminal.kittyEnableSequence ? "\x1b[<u" : "";
 	}
 
+	#enterResizeAltSequence(): string {
+		if (this.#resizeAltActive || this.#altActive) return "";
+		this.#resizeAltActive = true;
+		setAltScreenActive(true);
+		this.#forgetHardwareCursorState();
+		this.#recordHardwareCursorHidden();
+		return `${ALT_SCREEN_ENTER}${this.#keyboardEnhancementEnter()}`;
+	}
+
+	#leaveResizeAltSequence(): string {
+		if (!this.#resizeAltActive) return "";
+		const enhancementExit = this.#keyboardEnhancementExit();
+		this.#resizeAltActive = false;
+		setAltScreenActive(false);
+		this.#forgetHardwareCursorState();
+		return `${enhancementExit}${ALT_SCREEN_EXIT}`;
+	}
+
 	/**
-	 * Emit a throwaway viewport repaint for the resize fast path as an in-place
-	 * per-row overwrite. Switching buffers exposes the saved normal screen before
-	 * the authoritative settle paint on terminals without effective DEC 2026,
-	 * which is the resize flicker this fast path exists to avoid. The normal
-	 * screen is therefore rewritten directly; history is rebuilt once at settle.
+	 * Emit a throwaway viewport repaint for the resize fast path as a per-row
+	 * overwrite. A width change can make the terminal's normal buffer reflow
+	 * full-width rows before the app repaints, so a width drag borrows the
+	 * alternate screen: transient resizes truncate the viewport instead of
+	 * pushing wrapped fragments into native scrollback. A height-only resize
+	 * reflows nothing, so it repaints the normal screen in place — borrowing the
+	 * alt buffer there is pure flicker, and on terminals that re-report their
+	 * size when the alt buffer toggles it is self-sustaining: leaving a
+	 * fullscreen overlay's alt screen fires a height-only SIGWINCH echo, which
+	 * would otherwise re-borrow the alt buffer for one frame (the settings-exit
+	 * flash, #5854). Normal-screen history is rebuilt once at settle via
+	 * `#emitFullPaint`.
 	 */
 	#emitResizeViewport(window: readonly string[], height: number, contentRows: number, width: number): void {
-		let buffer = `${this.#paintBeginSequence}\x1b[H`;
+		const widthChanged = this.#previousWidth > 0 && this.#previousWidth !== width;
+		const altEnter = widthChanged ? this.#enterResizeAltSequence() : "";
+		let buffer = `${this.#paintBeginSequence + altEnter}\x1b[H`;
 		for (let r = 0; r < height; r++) {
 			if (r > 0) buffer += "\r\n";
 			buffer += this.#lineRewriteSequence(window[r] ?? "", width);
@@ -3699,16 +3842,6 @@ export class TUI extends Container {
 		if (parkUp > 0) buffer += `\x1b[${parkUp}A`;
 		buffer += this.#paintEndSequence;
 		this.terminal.write(buffer);
-	}
-
-	/** Topmost visible overlay requests the alternate-screen buffer. */
-	#wantsAltScreen(): boolean {
-		for (let i = this.overlayStack.length - 1; i >= 0; i--) {
-			const entry = this.overlayStack[i]!;
-			if (!this.#isOverlayVisible(entry)) continue;
-			return entry.options?.fullscreen === true;
-		}
-		return false;
 	}
 
 	/**

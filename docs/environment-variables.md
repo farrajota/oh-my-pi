@@ -351,12 +351,13 @@ Extra conditional behavior:
 
 ## 6) Storage and config root paths
 
-These are consumed via `@oh-my-pi/pi-utils/dirs` and affect where coding-agent stores data.
+These affect where coding-agent stores data and which process-local settings overlays it loads.
 
 | Variable              | Default / behavior                                                            |
 | --------------------- | ----------------------------------------------------------------------------- |
 | `PI_CONFIG_DIR`       | Config root dirname under home (default `.omp`)                               |
 | `PI_CODING_AGENT_DIR` | Full override for agent directory (default `~/<PI_CONFIG_DIR or .omp>/agent`) |
+| `PI_CONFIG_FILES`     | Platform path-list of settings overlays (`:` on Unix, `;` on Windows); loaded in order before explicit `--config` overlays |
 | `PWD`                 | Used when matching canonical current working directory in path helpers        |
 
 ---
@@ -407,7 +408,7 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | `PI_NO_DECCARA`           | If set (truthy), disables Kitty DECCARA rectangular-SGR background fills (forces padded-string rendering) |
 | `PI_DEBUG_REDRAW`         | If `1`, enables redraw debug logging                                                  |
 | `PI_FORCE_IMAGE_PROTOCOL` | Forces terminal image protocol detection (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) |
-| `PI_TUI_RESIZE_IN_PLACE`  | `1`/`true` preserves terminal-managed history and repaints after resize settle; `0`/`false` uses viewport-only drag paints followed by one ED3 history rewrap. Neither path switches terminal buffers. Default-on for Warp and multiplexers |
+| `PI_TUI_RESIZE_IN_PLACE`  | `1`/`true` force in-place resize (no alt-screen borrow, no ED3 rewrap); `0`/`false` force the alt-screen fast path. Default-on for Warp, which re-reports its size on alt-screen toggles |
 
 ---
 

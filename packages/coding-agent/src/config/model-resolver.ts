@@ -897,6 +897,10 @@ export function parseModelPattern(
 const DEFAULT_MODEL_ROLE = "default";
 const MODEL_ROLE_ALIAS_PREFIXES = [MODEL_ROLE_ALIAS_PREFIX, LEGACY_MODEL_ROLE_ALIAS_PREFIX];
 
+export interface ModelRoleLookup {
+	getModelRole(role: ModelRole | string): string | undefined;
+}
+
 function isModelRole(role: string): role is ModelRole {
 	return (MODEL_ROLE_IDS as string[]).includes(role);
 }
@@ -913,7 +917,7 @@ function modelRoleAliasPrefixLength(value: string): number | undefined {
 	return MODEL_ROLE_ALIAS_PREFIXES.find(prefix => value.startsWith(prefix))?.length;
 }
 
-function getModelRoleAlias(value: string, settings?: Settings): string | undefined {
+function getModelRoleAlias(value: string, settings?: ModelRoleLookup): string | undefined {
 	const normalized = value.trim();
 	const prefixLength = modelRoleAliasPrefixLength(normalized);
 	if (prefixLength === undefined) return undefined;
@@ -969,7 +973,7 @@ function resolveDefaultInheritedPatterns(
 	role: ModelRole,
 	configuredDefault: string | undefined,
 	roleDefaults: string[],
-	settings: Settings | undefined,
+	settings: ModelRoleLookup | undefined,
 	visited: Set<string>,
 ): string[] {
 	if (!shouldInheritDefaultBeforePriority(role) || !configuredDefault) return [];
@@ -1007,7 +1011,7 @@ function resolveDefaultInheritedPatterns(
 
 function resolveConfiguredRolePattern(
 	value: string,
-	settings?: Settings,
+	settings?: ModelRoleLookup,
 	visited: Set<string> = new Set(),
 ): string[] | undefined {
 	const normalized = value.trim();
@@ -1044,7 +1048,7 @@ function resolveConfiguredRolePattern(
 /**
  * Expand a role alias like "@smol" to the configured model string.
  */
-export function expandRoleAlias(value: string, settings?: Settings): string {
+export function expandRoleAlias(value: string, settings?: ModelRoleLookup): string {
 	const normalized = value.trim();
 	if (normalized === DEFAULT_MODEL_ROLE) {
 		return settings?.getModelRole("default") ?? value;
@@ -1054,7 +1058,10 @@ export function expandRoleAlias(value: string, settings?: Settings): string {
 	return resolved ?? value;
 }
 
-export function resolveConfiguredModelPatterns(value: string | string[] | undefined, settings?: Settings): string[] {
+export function resolveConfiguredModelPatterns(
+	value: string | string[] | undefined,
+	settings?: ModelRoleLookup,
+): string[] {
 	const patterns = normalizeModelPatternList(value);
 	return patterns.flatMap(pattern => {
 		const resolved = resolveConfiguredRolePattern(pattern, settings);
@@ -1131,6 +1138,8 @@ export function resolveAgentPrewalkPattern(options: AgentPrewalkResolutionOption
 export interface ResolvedModelRoleValue {
 	model: Model<Api> | undefined;
 	thinkingLevel?: ConfiguredThinkingLevel;
+	/** matchedPatternIndex identifies the first configured pattern that matched an available model. */
+	matchedPatternIndex?: number;
 	explicitThinkingLevel: boolean;
 	warning: string | undefined;
 }
@@ -1138,7 +1147,7 @@ export interface ResolvedModelRoleValue {
 export function resolveModelRoleValue(
 	roleValue: string | undefined,
 	availableModels: Model<Api>[],
-	options?: { settings?: Settings; matchPreferences?: ModelMatchPreferences },
+	options?: { settings?: Settings; roleLookup?: ModelRoleLookup; matchPreferences?: ModelMatchPreferences },
 ): ResolvedModelRoleValue {
 	if (!roleValue) {
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
@@ -1149,7 +1158,7 @@ export function resolveModelRoleValue(
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
 	}
 
-	const effectivePatterns = resolveConfiguredModelPatterns(normalized, options?.settings);
+	const effectivePatterns = resolveConfiguredModelPatterns(normalized, options?.roleLookup ?? options?.settings);
 	if (!effectivePatterns || effectivePatterns.length === 0) {
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
 	}
@@ -1160,11 +1169,12 @@ export function resolveModelRoleValue(
 	// models) once and reuse it across every fallback pattern instead of
 	// rebuilding it per pattern inside parseModelPattern.
 	const preferenceContext = buildPreferenceContext(availableModels, matchPreferences);
-	for (const effectivePattern of effectivePatterns) {
+	for (const [patternIndex, effectivePattern] of effectivePatterns.entries()) {
 		const resolved = matchPatternWithContext(effectivePattern, availableModels, preferenceContext);
 		if (resolved.model) {
 			return {
 				model: resolved.model,
+				matchedPatternIndex: patternIndex,
 				thinkingLevel: resolved.explicitThinkingLevel
 					? resolved.thinkingLevel === AUTO_THINKING
 						? AUTO_THINKING
@@ -1591,6 +1601,10 @@ export function filterAvailableModelsByEnabledPatterns(
 
 export interface ResolveCliModelResult {
 	model: Model<Api> | undefined;
+	/** configuredPatterns is the full configured fallback chain when the selector resolves through a role. */
+	configuredPatterns?: string[];
+	/** configuredPatternIndex identifies the configured role pattern that matched an available model. */
+	configuredPatternIndex?: number;
 	selector?: string;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	warning: string | undefined;
@@ -1599,6 +1613,8 @@ export interface ResolveCliModelResult {
 
 /**
  * Resolve a single model from CLI flags.
+ *
+ * Exact model names take precedence over configured role names.
  */
 export function resolveCliModel(options: {
 	cliProvider?: string;
@@ -1621,19 +1637,6 @@ export function resolveCliModel(options: {
 			warning: undefined,
 			error: "No models available. Check your installation or add models to models.json.",
 		};
-	}
-
-	if (!cliProvider && modelRoleAliasPrefixLength(cliModel) !== undefined) {
-		const resolved = resolveModelRoleValue(cliModel, availableModels, { settings, matchPreferences: preferences });
-		if (resolved.model) {
-			return {
-				model: resolved.model,
-				selector: formatModelString(resolved.model),
-				thinkingLevel: resolved.thinkingLevel,
-				warning: resolved.warning,
-				error: undefined,
-			};
-		}
 	}
 
 	const providerMap = new Map<string, string>();
@@ -1674,6 +1677,73 @@ export function resolveCliModel(options: {
 				thinkingLevel: undefined,
 				error: undefined,
 			};
+		}
+		const { base: exactBase, level: exactThinkingLevel } = splitThinkingSuffix(
+			trimmedModel,
+			-1,
+			MAX_THINKING_SUFFIX_OPTIONS,
+		);
+		if (exactThinkingLevel) {
+			let exactSuffixed = findExactModelReferenceMatch(exactBase, availableModels);
+			if (!exactSuffixed) {
+				const lowerExactBase = exactBase.toLowerCase();
+				exactSuffixed = availableModels.find(
+					model =>
+						model.id.toLowerCase() === lowerExactBase ||
+						`${model.provider}/${model.id}`.toLowerCase() === lowerExactBase,
+				);
+			}
+			if (exactSuffixed) {
+				return {
+					model: exactSuffixed,
+					selector: formatModelString(exactSuffixed),
+					warning: undefined,
+					thinkingLevel: exactThinkingLevel,
+					error: undefined,
+				};
+			}
+		}
+	}
+	let configuredPatterns: string[] | undefined;
+	if (!cliProvider) {
+		const { base: bareRoleName, level: bareRoleThinkingLevel } = splitThinkingSuffix(
+			trimmedModel,
+			-1,
+			MAX_THINKING_SUFFIX_OPTIONS,
+		);
+		const roleSelector =
+			modelRoleAliasPrefixLength(trimmedModel) !== undefined
+				? trimmedModel
+				: settings?.getModelRole(bareRoleName) !== undefined
+					? `${formatModelRoleAlias(bareRoleName)}${bareRoleThinkingLevel ? `:${bareRoleThinkingLevel}` : ""}`
+					: undefined;
+		if (roleSelector) {
+			configuredPatterns = resolveConfiguredModelPatterns([roleSelector], settings);
+			const resolved = resolveModelRoleValue(roleSelector, availableModels, {
+				settings,
+				matchPreferences: preferences,
+			});
+			if (resolved.model) {
+				return {
+					model: resolved.model,
+					selector: formatModelString(resolved.model),
+					configuredPatterns,
+					configuredPatternIndex: resolved.matchedPatternIndex,
+					thinkingLevel: resolved.thinkingLevel,
+					warning: resolved.warning,
+					error: undefined,
+				};
+			}
+			if (configuredPatterns && configuredPatterns.length > 0) {
+				return {
+					model: undefined,
+					configuredPatterns,
+					selector: undefined,
+					thinkingLevel: undefined,
+					warning: resolved.warning,
+					error: `Model "${trimmedModel}" not found. Run "omp models" to see available models.`,
+				};
+			}
 		}
 	}
 
@@ -1718,6 +1788,7 @@ export function resolveCliModel(options: {
 		const display = provider ? `${provider}/${pattern}` : cliModel;
 		return {
 			model: undefined,
+			configuredPatterns,
 			selector: undefined,
 			thinkingLevel: undefined,
 			warning,

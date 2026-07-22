@@ -274,6 +274,16 @@ Setting-gated, off by default: `github`, `inspect_image`, `tts`, `checkpoint`, `
 
 [Full reference →](https://omp.sh/docs/tools)
 
+### Prompt controls
+
+Three standalone, lowercase words opt a turn into specialized agent behavior:
+
+- `ultrathink` — request careful multi-step reasoning and the highest supported automatic thinking effort.
+- `orchestrate` — run substantial independent work through parallel subagents and verify each phase.
+- `workflowz` — build a deterministic multi-subagent workflow with the active `task` tool.
+
+They trigger only in prose, not inside code spans, fenced code blocks, XML/HTML sections, identifiers, or paths. See [Magic keywords](docs/magic-keywords.md) for exact matching rules and configuration.
+
 ## Forty-plus providers, hundreds of models, _one /model away_.
 
 Roles route work by intent. `default` for normal turns. `smol` for cheap subagent fan-out. `slow` for deep reasoning. `plan` for plan mode. `commit` for changelogs. Override at launch with `--smol`, `--slow`, or `--plan`; cycle through the configured models for the active role with `Ctrl+P`. Swap the active model mid-session with the `/model` slash command.
@@ -297,6 +307,32 @@ Cursor `oauth` · GitHub Copilot `oauth` · GitLab Duo · Kimi Code `plan` · Mo
 OpenAI-compatible `/v1/models`. Local instances skip the key.
 
 Ollama `local` · Ollama Cloud · LM Studio `local` · llama.cpp `local` · vLLM `local` · LiteLLM
+
+### Custom OpenAI-compatible providers
+
+Define custom providers in `~/.omp/agent/models.yml`:
+
+```yaml
+providers:
+  spark:
+    baseUrl: http://192.168.10.223:8000/v1
+    api: openai-completions
+    apiKey: dummy
+    models:
+      - id: minimax-m3
+        name: MiniMax M3
+        contextWindow: 100000
+        maxTokens: 32000
+```
+
+Run `omp models spark` to verify discovery. Then run `omp setup` and choose the model in the default-model step, or open `/model` in a session and assign it to the `default` role.
+
+To preconfigure the default without the picker, add the selector to `~/.omp/agent/config.yml`:
+
+```yaml
+modelRoles:
+  default: spark/minimax-m3
+```
 
 ### Four knobs that make routing useful
 

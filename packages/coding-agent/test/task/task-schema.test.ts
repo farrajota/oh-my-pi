@@ -2,14 +2,15 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TaskTool, taskSchema } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
+import { getTaskSchema } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { type } from "arktype";
 
 // Contract: the single-spawn schema (`task.batch: false`; the exported
-// `taskSchema` instance) carries no batch fields. The batch shape (`tasks[]` +
-// shared `context`) is gated by the `task.batch` setting (default on, covered
-// by test/task/task-batch.test.ts), and a per-call `schema` input no longer
-// exists at all; follow-ups go through `irc` messaging.
+// `taskSchema` instance) carries no batch fields while accepting a caller
+// `outputSchema` and its validation mode. The batch shape (`tasks[]` + shared
+// `context`) is gated by the `task.batch` setting (default on, covered by
+// test/task/task-batch.test.ts).
 
 describe("task schema (single-spawn)", () => {
 	it("accepts {agent, task}", () => {
@@ -30,21 +31,48 @@ describe("task schema (single-spawn)", () => {
 		expect(parsed instanceof type.errors).toBe(true);
 	});
 
-	it("strips tasks/context/schema from the single-spawn schema", () => {
+	it("retains caller outputSchema and schemaMode while stripping stale keys", () => {
+		const outputSchema = { type: "object", properties: { answer: { type: "string" } } };
 		const parsed = taskSchema({
 			agent: "explore",
 			task: "Map the auth module.",
+			outputSchema,
+			schemaMode: "strict",
 			context: "shared background",
 			tasks: [{ name: "A", task: "..." }],
 			schema: '{"properties":{}}',
 		});
 		expect(parsed instanceof type.errors).toBe(false);
 		if (!(parsed instanceof type.errors) && typeof parsed === "object" && parsed !== null) {
+			expect(parsed.outputSchema).toEqual(outputSchema);
+			expect(parsed.schemaMode).toBe("strict");
 			// Unknown keys are stripped: batch/context exist only on the batch
 			// schema and the per-call schema input was removed outright.
 			expect("tasks" in parsed).toBe(false);
 			expect("context" in parsed).toBe(false);
 			expect("schema" in parsed).toBe(false);
+		}
+	});
+
+	it("retains structured output fields when permissions select a dynamic schema", () => {
+		const outputSchema = { type: "object", properties: { answer: { type: "string" } } };
+		const schema = getTaskSchema({
+			isolationEnabled: false,
+			batchEnabled: false,
+			defaultAgent: "task",
+			permissions: { enabled: true, toolsEnabled: true, pathsEnabled: true },
+		});
+		const parsed = schema({
+			task: "Map the auth module.",
+			outputSchema,
+			schemaMode: "strict",
+			permissions: { denyTools: ["write"] },
+		});
+		expect(parsed instanceof type.errors).toBe(false);
+		if (!(parsed instanceof type.errors)) {
+			expect(parsed.outputSchema).toEqual(outputSchema);
+			expect(parsed.schemaMode).toBe("strict");
+			expect(parsed.permissions).toEqual({ denyTools: ["write"] });
 		}
 	});
 });

@@ -45,6 +45,8 @@ export interface BashResult {
 	output: string;
 	exitCode: number | undefined;
 	cancelled: boolean;
+	/** True when the command was killed by its timeout deadline (not a user abort). */
+	timedOut?: boolean;
 	truncated: boolean;
 	totalLines: number;
 	totalBytes: number;
@@ -70,6 +72,9 @@ const shellSessionsInUse = new Set<string>();
  */
 const retainedShells = new Set<Shell>();
 const RETAIN_REAP_INTERVAL_MS = 5_000;
+// Native cancellation may spend two seconds unwinding the shell before its
+// N-API chunk bridge drains. The JS watchdog must not race that teardown.
+const NATIVE_TIMEOUT_FALLBACK_GRACE_MS = 5_000;
 
 async function retainShellWithLiveBackgroundJobs(shell: Shell): Promise<void> {
 	let live: number;
@@ -145,9 +150,56 @@ function isBashShell(shell: string): boolean {
 	return basename.includes("bash");
 }
 
+const UNSUPPORTED_UNQUOTED_CD_CHARS = "\\$`;&|<>(){}*?[]!#\"'";
+
+function hasUnsupportedUnquotedCdSyntax(value: string): boolean {
+	for (const char of value) {
+		if (/\s/.test(char) || UNSUPPORTED_UNQUOTED_CD_CHARS.includes(char)) return true;
+	}
+	return false;
+}
+
+export function isPersistentShellCdCommand(command: string): boolean {
+	if (/[\r\n]/.test(command)) return false;
+
+	const trimmed = command.trim();
+	if (trimmed === "cd") return true;
+	if (!trimmed.startsWith("cd") || !/[ \t]/.test(trimmed[2] ?? "")) return false;
+
+	let rest = trimmed.slice(2).trim();
+	if (rest === "" || rest === "--") return true;
+
+	let hasOptionTerminator = false;
+	if (/^--[ \t]/.test(rest)) {
+		hasOptionTerminator = true;
+		rest = rest.slice(2).trimStart();
+	}
+	if (rest === "") return true;
+
+	const quote = rest[0];
+	let target: string;
+	let quoted = false;
+	if (quote === `"` || quote === "'") {
+		if (rest.length < 2 || rest[rest.length - 1] !== quote) return false;
+		target = rest.slice(1, -1);
+		if (target.includes(quote)) return false;
+		if (quote === `"` && /[\\$`\r\n]/.test(target)) return false;
+		quoted = true;
+	} else {
+		if (hasUnsupportedUnquotedCdSyntax(rest)) return false;
+		target = rest;
+	}
+
+	if (target === "") return false;
+	if (/^[+-]\d+$/.test(target)) return false;
+	if (!hasOptionTerminator && target.startsWith("-") && target !== "-") return false;
+	if (!quoted && target.startsWith("~") && target !== "~" && !target.startsWith("~/")) return false;
+	return true;
+}
+
 function needsInteractiveShellArg(shell: string): boolean {
 	const basename = shellBasename(shell);
-	return basename.includes("zsh");
+	return basename.includes("zsh") || basename.includes("fish");
 }
 
 function supportsAutoUserShell(shell: string): boolean {
@@ -160,19 +212,31 @@ function hasInteractiveShellArg(args: string[]): boolean {
 }
 
 function ensureInteractiveShellArgs(shell: string, args: string[]): string[] {
-	if (!needsInteractiveShellArg(shell) || hasInteractiveShellArg(args)) return args;
+	if (!needsInteractiveShellArg(shell)) return args;
 
-	const commandIndex = args.findIndex(arg => arg === "-c" || arg === "--command");
+	// fish sources the same config files (config.fish + conf.d) for interactive
+	// shells as for login shells, so the inherited `-l` adds nothing — it only
+	// marks the shell as login, firing `status is-login` blocks in user config
+	// (agent/keychain setup, path mutation) on every `!` command. zsh keeps `-l`
+	// because .zprofile is login-only. Args originate from procmgr's
+	// getShellArgs(), so login only ever appears as a standalone `-l`/`--login`.
+	const effectiveArgs = shellBasename(shell).includes("fish")
+		? args.filter(arg => arg !== "-l" && arg !== "--login")
+		: args;
+
+	if (hasInteractiveShellArg(effectiveArgs)) return effectiveArgs;
+
+	const commandIndex = effectiveArgs.findIndex(arg => arg === "-c" || arg === "--command");
 	if (commandIndex !== -1) {
-		return [...args.slice(0, commandIndex), "-i", ...args.slice(commandIndex)];
+		return [...effectiveArgs.slice(0, commandIndex), "-i", ...effectiveArgs.slice(commandIndex)];
 	}
 
-	const compactCommandIndex = args.findIndex(arg => /^-[^-]*c[^-]*$/.test(arg));
+	const compactCommandIndex = effectiveArgs.findIndex(arg => /^-[^-]*c[^-]*$/.test(arg));
 	if (compactCommandIndex !== -1) {
-		return args.map((arg, index) => (index === compactCommandIndex ? arg.replace("c", "ic") : arg));
+		return effectiveArgs.map((arg, index) => (index === compactCommandIndex ? arg.replace("c", "ic") : arg));
 	}
 
-	return [...args, "-i"];
+	return [...effectiveArgs, "-i"];
 }
 
 function quoteShellArg(value: string): string {
@@ -219,8 +283,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	// Apply command prefix if configured
 	const prefixedCommand = prefix ? `${prefix} ${command}` : command;
+	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
 	const finalCommand =
-		options?.useUserShell === true && !bashShell
+		options?.useUserShell === true && !bashShell && !runCdInPersistentShell
 			? buildUserShellCommand(shell, args, prefixedCommand)
 			: prefixedCommand;
 
@@ -306,16 +371,18 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const nativeTimeoutMs = requestedTimeoutMs !== undefined && requestedTimeoutMs > 0 ? requestedTimeoutMs : undefined;
 	const nativeOwnsTimeout = nativeTimeoutMs !== undefined;
 	if (deadlineTimeoutMs !== undefined) {
+		const fallbackTimeoutMs = nativeOwnsTimeout
+			? deadlineTimeoutMs + NATIVE_TIMEOUT_FALLBACK_GRACE_MS
+			: deadlineTimeoutMs;
 		timeoutTimer = setTimeout(() => {
-			// Explicit timeouts are already enforced inside pi-natives via
-			// `timeoutMs`. Do not also abort the JS AbortSignal here: on Windows,
-			// aborting that signal while a piped command is still forwarding output
-			// can terminate the Bun host before the native timeout result resolves.
+			// Explicit timeouts are enforced inside pi-natives via `timeoutMs`.
+			// Give native cancellation time to flush pipeline output and drain the
+			// N-API bridge before this result-only watchdog quarantines the run.
 			if (!nativeOwnsTimeout) {
 				abortCurrentExecution();
 			}
 			timeoutDeferred.resolve("timeout");
-		}, deadlineTimeoutMs);
+		}, fallbackTimeoutMs);
 	}
 
 	let resetSession = false;
@@ -357,6 +424,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			return {
 				exitCode: undefined,
 				cancelled: true,
+				...(winner.kind === "timeout" ? { timedOut: true } : {}),
 				...(await sink.dump(
 					winner.kind === "timeout" && deadlineTimeoutMs !== undefined
 						? `Command timed out after ${Math.round(deadlineTimeoutMs / 1000)} seconds`
@@ -381,6 +449,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			return {
 				exitCode: undefined,
 				cancelled: true,
+				timedOut: true,
 				...(await sink.dump(annotation)),
 			};
 		}

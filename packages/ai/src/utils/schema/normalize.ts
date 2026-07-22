@@ -29,8 +29,11 @@ import { decontaminateZodInstance } from "./zod-decontaminate";
 export type ResidualSchemaIncompatibility = "type-array" | "type-null" | "nullable" | "combiners" | "not";
 
 export interface NormalizeSchemaOptions {
-	/** Coerce JSON Schema boolean subschemas for providers whose wire cannot encode them. */
-	coerceBooleanSubschemas?: boolean;
+	/**
+	 * Coerce boolean subschemas to object forms. `standard` preserves `false`
+	 * with `not`; `permissive` uses `{}` when the provider cannot express it.
+	 */
+	coerceBooleanSubschemas?: "standard" | "permissive";
 	unsupportedFields: (key: string) => boolean;
 	normalizeFieldNames: boolean;
 	collapseNullFields: boolean;
@@ -284,12 +287,12 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 	}
 	if (typeof value === "boolean") {
 		// A bare boolean is a JSON Schema subschema only in a subschema slot.
-		// The Google/CCA protobuf Schema wire has no representation for it
-		// (issue #5604): `true` accepts anything -> `{}`, `false` accepts nothing
-		// -> `{ not: {} }`. In a keyword slot (`nullable`, `enum` entry, …) a
-		// boolean is a plain value and is left untouched.
-		if (!options.coerceBooleanSubschemas || !options.booleanIsSubschema) return value;
-		return value ? {} : { not: {} };
+		// Some provider wires have no boolean-schema representation: `true`
+		// becomes `{}`; `false` uses `not` when supported, or the permissive
+		// `{}` fallback when the provider cannot express an impossible schema.
+		const mode = options.coerceBooleanSubschemas;
+		if (!mode || !options.booleanIsSubschema) return value;
+		return value || mode === "permissive" ? {} : { not: {} };
 	}
 	if (!isJsonObject(value)) {
 		return value;
@@ -993,7 +996,7 @@ export function normalizeSchema(value: unknown, options: NormalizeSchemaOptions)
 
 export function normalizeSchemaForGoogle(value: unknown): unknown {
 	return normalizeSchema(value, {
-		coerceBooleanSubschemas: true,
+		coerceBooleanSubschemas: "standard",
 		unsupportedFields: isGoogleUnsupportedSchemaField,
 		normalizeFieldNames: true,
 		collapseNullFields: true,
@@ -1015,7 +1018,7 @@ export function normalizeSchemaForGoogle(value: unknown): unknown {
 
 export function normalizeSchemaForCCA(value: unknown): unknown {
 	return normalizeSchema(value, {
-		coerceBooleanSubschemas: true,
+		coerceBooleanSubschemas: "standard",
 		unsupportedFields: isGoogleUnsupportedSchemaField,
 		normalizeFieldNames: true,
 		collapseNullFields: false,
@@ -1080,6 +1083,9 @@ export function normalizeSchemaForMCP(value: unknown): unknown {
  *    `default` and `description` are MFJS Meta Data fields and are preserved.
  *  - `additionalProperties` (boolean or schema) and `type: "null"` (incl.
  *    inside `anyOf`) are kept.
+ *  - Boolean subschemas are object-coerced; MFJS has no exact `false` schema,
+ *    so both values become the permissive empty schema while local tool
+ *    validation remains authoritative.
  *
  * Out of scope (absent from the built-in tool surface, spec-ambiguous to
  * rewrite blindly): `allOf` intersection merging, external/recursive `$ref`,
@@ -1087,6 +1093,7 @@ export function normalizeSchemaForMCP(value: unknown): unknown {
  */
 export function normalizeSchemaForMoonshot(value: unknown): unknown {
 	return normalizeSchema(value, {
+		coerceBooleanSubschemas: "permissive",
 		unsupportedFields: isMoonshotUnsupportedSchemaField,
 		normalizeFieldNames: false,
 		collapseNullFields: false,
@@ -1126,18 +1133,19 @@ const OLLAMA_SCHEMA_VALUE_KEYS = new Set([
 ]);
 
 /**
- * Widened stand-in for a `true` / `{}` subschema in an Ollama-bound tool.
+ * Widened stand-in for a `true` / `{}` open subschema on a tool bound for a
+ * backend whose wire cannot encode a bare boolean subschema.
  *
  * `toolWireSchema()` normalizes empty schemas to boolean `true` upstream so
- * grammar-constrained samplers (llama.cpp, etc.) don't treat `{}` as
- * "generate an empty object" (issue #1179). Ollama's Go tool parser can't
- * unmarshal a boolean into its object-shaped `Schema` struct, so this
- * sanitizer replaces every open subschema with an explicit union of every
- * primitive JSON type. Both invariants survive: the wire has no boolean
- * subschema (Go accepts it), and llama.cpp's grammar sees a real value
- * union rather than a closed empty object.
+ * grammar-constrained samplers don't treat `{}` as "generate an empty object"
+ * (issue #1179). Two backends then choke on the bare boolean: Ollama's Go tool
+ * parser can't unmarshal it into its object-shaped `Schema` struct, and
+ * llama.cpp's JSON-schema→GBNF converter has no case for a boolean schema
+ * (issue #5914). Both sanitizers replace the open subschema with an explicit
+ * union of every primitive JSON type — the wire has no boolean subschema, and
+ * a grammar sampler sees a real value union rather than a closed empty object.
  */
-const OLLAMA_OPEN_SUBSCHEMA_WIDENING = Object.freeze({
+const OPEN_SUBSCHEMA_WIDENING = Object.freeze({
 	anyOf: [
 		{ type: "string" },
 		{ type: "number" },
@@ -1154,8 +1162,8 @@ const OLLAMA_OPEN_SUBSCHEMA_WIDENING = Object.freeze({
  */
 export function sanitizeSchemaForOllama(schema: JsonObject): JsonObject {
 	const normalizeNode = (value: unknown): unknown => {
-		if (value === true) return OLLAMA_OPEN_SUBSCHEMA_WIDENING;
-		if (value === false) return { not: OLLAMA_OPEN_SUBSCHEMA_WIDENING };
+		if (value === true) return OPEN_SUBSCHEMA_WIDENING;
+		if (value === false) return { not: OPEN_SUBSCHEMA_WIDENING };
 		if (!isJsonObject(value)) {
 			if (!Array.isArray(value)) return value;
 			let changed = false;
@@ -1226,6 +1234,97 @@ export function sanitizeSchemaForOllama(schema: JsonObject): JsonObject {
 		return changed ? output : value;
 	};
 	return normalizeNode(schema) as JsonObject;
+}
+
+/**
+ * Schema-valued keywords whose bare boolean value must be widened for a
+ * grammar-constrained backend. Excludes `additionalProperties` and
+ * `unevaluatedProperties`: llama.cpp's `_build_object_rule` reads their boolean
+ * form as meaningful closed/open-object semantics, and `additionalProperties:
+ * false` is exactly what `toolWireSchema` emits to pin a strict object shape.
+ */
+const GRAMMAR_SCHEMA_VALUE_KEYS: Record<string, true> = {
+	items: true,
+	additionalItems: true,
+	contains: true,
+	contentSchema: true,
+	propertyNames: true,
+	if: true,
+	// biome-ignore lint/suspicious/noThenProperty: JSON Schema keyword
+	then: true,
+	else: true,
+	not: true,
+	unevaluatedItems: true,
+};
+
+/**
+ * Rewrites the one JSON Schema form that grammar-constrained OpenAI-compatible
+ * backends (llama.cpp, LM Studio, vLLM) cannot compile to GBNF: a bare boolean
+ * subschema. `toolWireSchema` normalizes `{}` open subschemas to boolean `true`
+ * (issue #1179); llama.cpp's `json-schema-to-grammar.cpp` `visit()` has no case
+ * for a boolean schema and throws `Unrecognized schema: true` → HTTP 400 before
+ * the model is consulted (issue #5914).
+ *
+ * Narrower than {@link sanitizeSchemaForOllama}: only genuine subschema slots
+ * are widened. Boolean `additionalProperties`/`unevaluatedProperties` stay
+ * intact because the converter reads those as closed/open-object grammar
+ * semantics, and dropping `additionalProperties: false` would silently reopen
+ * every declared object.
+ */
+export function sanitizeSchemaForGrammar(schema: JsonObject): JsonObject {
+	const normalizeNode = (value: unknown, isSubschema: boolean): unknown => {
+		if (value === true) return isSubschema ? OPEN_SUBSCHEMA_WIDENING : value;
+		if (value === false) return isSubschema ? { not: OPEN_SUBSCHEMA_WIDENING } : value;
+		if (Array.isArray(value)) {
+			let changed = false;
+			const output = value.map(item => {
+				const next = normalizeNode(item, isSubschema);
+				if (next !== item) changed = true;
+				return next;
+			});
+			return changed ? output : value;
+		}
+		if (!isJsonObject(value)) return value;
+
+		let changed = false;
+		const output: JsonObject = {};
+		for (const key in value) {
+			if (!Object.hasOwn(value, key)) continue;
+			const child = value[key];
+			let next = child;
+			if (Object.hasOwn(SUBSCHEMA_MAP_KEYS, key) && isJsonObject(child)) {
+				let mapChanged = false;
+				const mapOutput: JsonObject = {};
+				for (const childKey in child) {
+					if (!Object.hasOwn(child, childKey)) continue;
+					const mapChild = child[childKey];
+					const normalizedChild = normalizeNode(mapChild, true);
+					if (normalizedChild !== mapChild) mapChanged = true;
+					mapOutput[childKey] = normalizedChild;
+				}
+				next = mapChanged ? mapOutput : child;
+			} else if (Object.hasOwn(SUBSCHEMA_ARRAY_KEYS, key) && Array.isArray(child)) {
+				let arrayChanged = false;
+				const arrayOutput = child.map(item => {
+					const normalizedItem = normalizeNode(item, true);
+					if (normalizedItem !== item) arrayChanged = true;
+					return normalizedItem;
+				});
+				next = arrayChanged ? arrayOutput : child;
+			} else if (Object.hasOwn(GRAMMAR_SCHEMA_VALUE_KEYS, key)) {
+				next = normalizeNode(child, true);
+			} else if ((key === "additionalProperties" || key === "unevaluatedProperties") && typeof child !== "boolean") {
+				// Boolean form is meaningful closed/open-object grammar semantics and
+				// stays intact; the object form is a genuine subschema whose interior
+				// may still hold bare booleans emitted by `toolWireSchema`.
+				next = normalizeNode(child, true);
+			}
+			if (next !== child) changed = true;
+			output[key] = next;
+		}
+		return changed ? output : value;
+	};
+	return normalizeNode(schema, true) as JsonObject;
 }
 
 // ---------------------------------------------------------------------------

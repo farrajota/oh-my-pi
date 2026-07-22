@@ -301,14 +301,18 @@ export class UiHelpers {
 		let pendingUsage: Usage | undefined;
 		let pendingUsageDuration: number | undefined;
 		let pendingUsageTtft: number | undefined;
+		let pendingUsageTimestamp: number | undefined;
 		const flushPendingUsage = () => {
 			if (!pendingUsage) return;
 			readGroup?.seal();
 			readGroup = null;
-			this.ctx.chatContainer.addChild(createUsageRowBlock(pendingUsage, pendingUsageDuration, pendingUsageTtft));
+			this.ctx.chatContainer.addChild(
+				createUsageRowBlock(pendingUsage, pendingUsageDuration, pendingUsageTtft, pendingUsageTimestamp),
+			);
 			pendingUsage = undefined;
 			pendingUsageDuration = undefined;
 			pendingUsageTtft = undefined;
+			pendingUsageTimestamp = undefined;
 		};
 		// Rebuild-time mirror of the event controller's displaceable-poll
 		// bookkeeping: a `hub` wait that found every watched job still running is
@@ -509,6 +513,7 @@ export class UiHelpers {
 						: undefined;
 				pendingUsageDuration = message.duration;
 				pendingUsageTtft = message.ttft;
+				pendingUsageTimestamp = message.timestamp;
 			} else if (message.role === "toolResult") {
 				const pendingReadComponent = this.ctx.pendingTools.get(message.toolCallId);
 				const isReadGroupResult =
@@ -519,10 +524,10 @@ export class UiHelpers {
 					const images: ImageContent[] = message.content.filter(
 						(content): content is ImageContent => content.type === "image",
 					);
-					if (images.length > 0 && assistantComponent && settings.get("terminal.showImages")) {
+					if (images.length > 0 && assistantComponent) {
 						assistantComponent.setToolResultImages(message.toolCallId, images);
 						const hasText = message.content.some(c => c.type === "text");
-						if (!hasText) {
+						if (!hasText && settings.get("terminal.showImages")) {
 							readToolCallArgs.delete(message.toolCallId);
 							readToolCallAssistantComponents.delete(message.toolCallId);
 							continue;
@@ -746,6 +751,7 @@ export class UiHelpers {
 			const hintText = theme.fg("dim", `  ${theme.tree.hook} ${dequeueKey} to edit`);
 			this.ctx.pendingMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
 		}
+		this.ctx.ui.requestComponentRender(this.ctx.pendingMessagesContainer);
 	}
 
 	queueCompactionMessage(text: string, mode: "steer" | "followUp", images?: ImageContent[]): void {

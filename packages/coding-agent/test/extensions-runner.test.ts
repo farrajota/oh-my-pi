@@ -7,13 +7,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { discoverAndLoadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { discoverAndLoadExtensions, ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
 	testSetExtensionHandlerTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import type { ExtensionError } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { Type } from "@oh-my-pi/pi-coding-agent/extensibility/typebox";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -480,6 +482,78 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("before_provider_request chaining", () => {
+		it("exposes the request model instead of the primary session model", async () => {
+			const primaryModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+			const requestModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!primaryModel || !requestModel) throw new Error("Expected bundled cross-provider models to exist");
+
+			const extCode = `
+				export default function(pi) {
+					pi.on("before_provider_request", async (_event, ctx) => {
+						const current = ctx.models.current();
+						return {
+							model: ctx.model && {
+								provider: ctx.model.provider,
+								id: ctx.model.id,
+								api: ctx.model.api,
+							},
+							current: current && {
+								provider: current.provider,
+								id: current.id,
+								api: current.api,
+							},
+						};
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "request-model.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => primaryModel,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+
+			const payload = await runner.emitBeforeProviderRequest({}, requestModel);
+
+			const expected = {
+				provider: requestModel.provider,
+				id: requestModel.id,
+				api: requestModel.api,
+			};
+			expect(payload).toEqual({ model: expected, current: expected });
+		});
+
 		it("chains payload replacements across handlers in load order", async () => {
 			const extCode1 = `
 				export default function(pi) {
@@ -2055,6 +2129,122 @@ describe("ExtensionRunner", () => {
 				.split("\n")
 				.map(line => JSON.parse(line));
 			expect(events).toEqual([recoveredEvent, timeoutEvent]);
+		});
+	});
+
+	describe("managed timers (ctx.setInterval / ctx.setTimeout)", () => {
+		it("contains a throwing interval callback instead of letting it escape as uncaughtException", () => {
+			vi.useFakeTimers();
+			try {
+				const runner = new ExtensionRunner(
+					[],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const errors: ExtensionError[] = [];
+				runner.onError(err => errors.push(err));
+
+				const ctx = runner.createContext();
+				let ticks = 0;
+				ctx.setInterval(() => {
+					ticks += 1;
+					throw new Error("boom from interval");
+				}, 1000);
+
+				// Two ticks: the throw is swallowed each time, so the interval keeps firing.
+				expect(() => vi.advanceTimersByTime(2000)).not.toThrow();
+				expect(ticks).toBe(2);
+				expect(errors).toHaveLength(2);
+				expect(errors[0]?.event).toBe("interval_callback");
+				expect(errors[0]?.extensionPath).toBe("<timer>");
+				expect(errors[0]?.error).toContain("boom from interval");
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("contains a throwing timeout callback and reports it once", () => {
+			vi.useFakeTimers();
+			try {
+				const runner = new ExtensionRunner(
+					[],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const errors: ExtensionError[] = [];
+				runner.onError(err => errors.push(err));
+
+				runner.createContext().setTimeout(() => {
+					throw new Error("boom from timeout");
+				}, 500);
+
+				expect(() => vi.advanceTimersByTime(1000)).not.toThrow();
+				expect(errors).toHaveLength(1);
+				expect(errors[0]?.event).toBe("timeout_callback");
+				expect(errors[0]?.error).toContain("boom from timeout");
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("clearTimer stops a managed interval from firing again", () => {
+			vi.useFakeTimers();
+			try {
+				const runner = new ExtensionRunner(
+					[],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const ctx = runner.createContext();
+				let ticks = 0;
+				const timer = ctx.setInterval(() => {
+					ticks += 1;
+				}, 1000);
+
+				vi.advanceTimersByTime(1000);
+				expect(ticks).toBe(1);
+
+				ctx.clearTimer(timer);
+				vi.advanceTimersByTime(3000);
+				expect(ticks).toBe(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("clearManagedTimers cancels every outstanding timer on teardown", () => {
+			vi.useFakeTimers();
+			try {
+				const runner = new ExtensionRunner(
+					[],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const ctx = runner.createContext();
+				let intervalTicks = 0;
+				let timeoutFired = false;
+				ctx.setInterval(() => {
+					intervalTicks += 1;
+				}, 1000);
+				ctx.setTimeout(() => {
+					timeoutFired = true;
+				}, 1000);
+
+				runner.clearManagedTimers();
+				vi.advanceTimersByTime(5000);
+				expect(intervalTicks).toBe(0);
+				expect(timeoutFired).toBe(false);
+			} finally {
+				vi.useRealTimers();
+			}
 		});
 	});
 });
