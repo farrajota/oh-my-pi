@@ -231,6 +231,7 @@ describe("vibe session registry", () => {
 		// Ack is immediate: the job is still running behind the gate.
 		const job = manager.getJob(jobId)!;
 		expect(job.status).toBe("running");
+		expect(job.agentId).toBe(id);
 		expect(registry.screens("Main")[0]?.cli).toBe("fast");
 
 		gate.resolve();

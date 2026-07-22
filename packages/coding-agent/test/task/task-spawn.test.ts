@@ -138,6 +138,7 @@ describe("task spawn routing", () => {
 		expect(text).toContain(`job \`${jobId}\``);
 		const job = manager.getJob(jobId!);
 		expect(job?.status).toBe("running");
+		expect(job?.agentId).toBe("Spawnling");
 		expect(job?.resultText).toBeUndefined();
 
 		gate.resolve();

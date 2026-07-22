@@ -548,7 +548,225 @@ describe("AsyncJobManager", () => {
 			"type",
 		]);
 		expect(Object.isFrozen(snapshot.recent[0]!)).toBe(true);
-		expect(snapshot.recent).toHaveLength(1);
+
+		manager.register("bash", "agent metadata", async () => "sensitive agent result", {
+			id: "agent-metadata",
+			ownerId: "Main",
+			agentId: "MetadataAgent",
+		});
+		await manager.waitForAll();
+		const agentSnapshot = manager
+			.getSnapshot({ filter: { ownerId: "Main" }, recentLimit: 15 })
+			.recent.find(job => job.id === "agent-metadata");
+		expect(agentSnapshot).toMatchObject({ id: "agent-metadata", agentId: "MetadataAgent" });
+		expect(Object.isFrozen(agentSnapshot!)).toBe(true);
+		expect(agentSnapshot).not.toHaveProperty("resultText");
+		expect(agentSnapshot).not.toHaveProperty("errorText");
+		expect(agentSnapshot).not.toHaveProperty("latestDetails");
+	});
+
+	test("filters snapshot rows only when agentId is defined while preserving delivery", async () => {
+		const deliveryGate = Promise.withResolvers<void>();
+		const deliveryStarted = Promise.withResolvers<void>();
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 8,
+			onJobComplete: async jobId => {
+				if (jobId === "agent-completed") {
+					deliveryStarted.resolve();
+					await deliveryGate.promise;
+				}
+			},
+		});
+		const activeGate = Promise.withResolvers<string>();
+		const markerlessTerminal = manager.register("task", "markerless task terminal", async () => "done", {
+			id: "markerless-terminal",
+			ownerId: "Main",
+		});
+		const agentCompleted = manager.register("task", "agent task terminal", async () => "done", {
+			id: "agent-completed",
+			ownerId: "Main",
+			agentId: "",
+		});
+		const agentBash = manager.register("bash", "agent bash terminal", async () => "done", {
+			id: "agent-bash",
+			ownerId: "Main",
+			agentId: "BashAgent",
+		});
+		const agentFailed = manager.register(
+			"task",
+			"agent failed",
+			async () => {
+				throw new Error("failed");
+			},
+			{ id: "agent-failed", ownerId: "Main", agentId: "FailureAgent" },
+		);
+		const agentCancelled = manager.register(
+			"task",
+			"agent cancelled",
+			async ({ signal }) =>
+				await new Promise<string>((_resolve, reject) => {
+					signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+				}),
+			{ id: "agent-cancelled", ownerId: "Main", agentId: "CancelledAgent" },
+		);
+		expect(manager.cancel(agentCancelled)).toBe(true);
+		await manager.waitForAll();
+		await deliveryStarted.promise;
+
+		manager.register("task", "markerless task active", async () => activeGate.promise, {
+			id: "markerless-active",
+			ownerId: "Main",
+		});
+		manager.register("bash", "agent bash active", async () => activeGate.promise, {
+			id: "agent-bash-active",
+			ownerId: "Main",
+			agentId: "ActiveBashAgent",
+		});
+		manager.register("task", "agent queued", async () => activeGate.promise, {
+			id: "agent-queued",
+			ownerId: "Main",
+			agentId: "QueuedAgent",
+			queued: true,
+		});
+		await Promise.resolve();
+
+		const defaultSnapshot = manager.getSnapshot({ filter: { ownerId: "Main" }, recentLimit: 15 });
+		const explicitSnapshot = manager.getSnapshot({
+			filter: { ownerId: "Main" },
+			recentLimit: 15,
+			includeAgentJobs: true,
+		});
+		expect(defaultSnapshot.running).toEqual(explicitSnapshot.running);
+		expect(defaultSnapshot.recent).toEqual(explicitSnapshot.recent);
+		expect(defaultSnapshot.running.map(job => job.id)).toEqual([
+			"markerless-active",
+			"agent-bash-active",
+			"agent-queued",
+		]);
+		expect(defaultSnapshot.running.find(job => job.id === "agent-queued")?.queued).toBe(true);
+
+		const filtered = manager.getSnapshot({
+			filter: { ownerId: "Main" },
+			recentLimit: 15,
+			includeAgentJobs: false,
+		});
+		expect(filtered.running.map(job => job.id)).toEqual(["markerless-active"]);
+		expect(filtered.recent.map(job => job.id)).toEqual([markerlessTerminal]);
+		expect(filtered.recent).not.toContainEqual(expect.objectContaining({ id: agentCompleted }));
+		expect(filtered.recent).not.toContainEqual(expect.objectContaining({ id: agentBash }));
+		expect(filtered.recent).not.toContainEqual(expect.objectContaining({ id: agentFailed }));
+		expect(filtered.recent).not.toContainEqual(expect.objectContaining({ id: agentCancelled }));
+		expect(filtered.delivery.pendingJobIds).toContain(agentCompleted);
+
+		deliveryGate.resolve();
+		activeGate.resolve("done");
+		await manager.waitForAll();
+		await manager.dispose();
+	});
+
+	test("filters before the terminal limit and retains each category independently", async () => {
+		const now = vi.spyOn(Date, "now").mockReturnValue(50);
+		const filterManager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const nonAgentManager = new AsyncJobManager({ maxRunningJobs: 20, onJobComplete: async () => {} });
+		const agentManager = new AsyncJobManager({ maxRunningJobs: 20, onJobComplete: async () => {} });
+		try {
+			filterManager.register("task", "older markerless task", async () => "done", { id: "filtered-markerless" });
+			await filterManager.waitForAll();
+			now.mockReturnValue(100);
+			filterManager.register("task", "newer agent task", async () => "done", {
+				id: "filtered-agent",
+				agentId: "Filtered",
+			});
+			await filterManager.waitForAll();
+			expect(
+				filterManager.getSnapshot({ recentLimit: 1, includeAgentJobs: false }).recent.map(job => job.id),
+			).toEqual(["filtered-markerless"]);
+
+			now.mockReturnValue(100);
+			nonAgentManager.register("task", "older markerless task", async () => "done", {
+				id: "markerless",
+				ownerId: "Main",
+			});
+			await nonAgentManager.waitForAll();
+			now.mockReturnValue(50);
+			for (let index = 0; index < 16; index++) {
+				nonAgentManager.register("task", `agent churn ${index}`, async () => "done", {
+					id: `agent-${index}`,
+					ownerId: "Main",
+					agentId: `Agent${index}`,
+				});
+			}
+			await nonAgentManager.waitForAll();
+			expect(
+				nonAgentManager
+					.getSnapshot({ filter: { ownerId: "Main" }, recentLimit: 15, includeAgentJobs: false })
+					.recent.map(job => job.id),
+			).toEqual(["markerless"]);
+
+			now.mockReturnValue(100);
+			agentManager.register("task", "older agent task", async () => "done", {
+				id: "agent-survivor",
+				ownerId: "Main",
+				agentId: "Survivor",
+			});
+			await agentManager.waitForAll();
+			now.mockReturnValue(50);
+			for (let index = 0; index < 16; index++) {
+				agentManager.register("task", `markerless churn ${index}`, async () => "done", {
+					id: `markerless-${index}`,
+					ownerId: "Main",
+				});
+			}
+			await agentManager.waitForAll();
+			expect(
+				agentManager.getSnapshot({ filter: { ownerId: "Main" }, recentLimit: 1 }).recent.map(job => job.id),
+			).toEqual(["agent-survivor"]);
+		} finally {
+			now.mockRestore();
+			await filterManager.dispose();
+			await nonAgentManager.dispose();
+			await agentManager.dispose();
+		}
+	});
+
+	test("matches owners exactly with agent filtering and suppresses both terminal buckets", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const completionGate = Promise.withResolvers<string>();
+		manager.register("task", "unowned markerless", async () => "done", { id: "unowned-markerless" });
+		manager.register("task", "unowned agent", async () => "done", { id: "unowned-agent", agentId: "Unowned" });
+		manager.register("task", "owned markerless", async () => "done", { id: "owned-markerless", ownerId: "Main" });
+		manager.register("task", "owned agent", async () => "done", {
+			id: "owned-agent",
+			ownerId: "Main",
+			agentId: "Owned",
+		});
+		manager.register("task", "suppressed markerless", async () => completionGate.promise, {
+			id: "suppressed-markerless",
+		});
+		manager.register("task", "suppressed agent", async () => completionGate.promise, {
+			id: "suppressed-agent",
+			agentId: "Suppressed",
+		});
+		await Promise.resolve();
+		manager.clearHistory({ ownerId: undefined });
+		completionGate.resolve("done");
+		await manager.waitForAll();
+
+		expect(
+			manager
+				.getSnapshot({ filter: { ownerId: undefined }, includeAgentJobs: false, recentLimit: 15 })
+				.recent.map(job => job.id),
+		).toEqual([]);
+		expect(manager.getSnapshot({ filter: { ownerId: undefined } }).recent).toEqual([]);
+		expect(
+			manager.getSnapshot({ filter: { ownerId: "Main" }, includeAgentJobs: false }).recent.map(job => job.id),
+		).toEqual(["owned-markerless"]);
+		expect(manager.getSnapshot({ filter: { ownerId: "Main" } }).recent.map(job => job.id)).toEqual([
+			"owned-agent",
+			"owned-markerless",
+		]);
+		await manager.dispose();
+		expect(manager.getSnapshot({ includeAgentJobs: false }).recent).toEqual([]);
 	});
 
 	test("snapshot owner filters include undefined exactly and never limit active rows", async () => {
@@ -590,6 +808,9 @@ describe("AsyncJobManager", () => {
 		expect(manager.getSnapshot({ filter: { ownerId: undefined } }).recent.map(job => job.label)).not.toContain(
 			"owned terminal",
 		);
+		const filteredUnownedHistory = manager.getSnapshot({ filter: { ownerId: undefined }, includeAgentJobs: false });
+		expect(filteredUnownedHistory.recent.map(job => job.label)).toContain("unowned terminal");
+		expect(filteredUnownedHistory.recent.map(job => job.label)).not.toContain("owned terminal");
 	});
 
 	test("caps terminal metadata history per owner and clears it without changing live eviction", async () => {
@@ -610,12 +831,12 @@ describe("AsyncJobManager", () => {
 		expect(ids.every(id => manager.getJob(id) === undefined)).toBe(true);
 	});
 
-	test("orders equal-time terminal history by completion order and records cancellation once", async () => {
+	test("orders equal-time terminal history across agent buckets and records cancellation once", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
 		try {
 			manager.register("task", "first", async () => "done", { id: "first", ownerId: "Main" });
-			manager.register("task", "second", async () => "done", { id: "second", ownerId: "Main" });
+			manager.register("task", "second", async () => "done", { id: "second", ownerId: "Main", agentId: "Second" });
 			const cancelled = manager.register(
 				"task",
 				"cancelled",

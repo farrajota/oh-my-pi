@@ -172,7 +172,7 @@ import {
 	resolveAdvisorDeliveryChannel,
 	slugifyAdvisorName,
 } from "../advisor";
-import { AsyncJobManager, type AsyncJobSnapshot } from "../async";
+import { AsyncJobManager, type AsyncJobSnapshot, type AsyncJobSnapshotOptions } from "../async";
 import { classifyDifficulty } from "../auto-thinking/classifier";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
@@ -4073,11 +4073,12 @@ export class AgentSession {
 		this.#planInternalAbortPending = false;
 	}
 
-	getAsyncJobSnapshot(options?: { recentLimit?: number }): AsyncJobSnapshot | null {
+	getAsyncJobSnapshot(options?: AsyncJobSnapshotOptions): AsyncJobSnapshot | null {
 		const manager = this.#asyncJobManager;
 		if (!manager) return null;
 		return manager.getSnapshot({
 			recentLimit: options?.recentLimit,
+			includeAgentJobs: options?.includeAgentJobs,
 			filter: { ownerId: this.#agentId },
 		});
 	}

@@ -1063,10 +1063,22 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 
 		try {
-			asyncJobManager.register("bash", "A", async () => "A", { id: "job-a", ownerId: "acp-session-a" });
+			asyncJobManager.register("bash", "A", async () => "A", {
+				id: "job-a",
+				ownerId: "acp-session-a",
+				agentId: "SessionAAgent",
+			});
 			await waitFor(() => started.has("job-a"));
+			expect(session.getAsyncJobSnapshot()?.recent.map(job => job.id)).toEqual(["job-a"]);
+			const filteredSessionA = session.getAsyncJobSnapshot({ includeAgentJobs: false });
+			expect(filteredSessionA?.recent).toEqual([]);
+			expect(filteredSessionA?.delivery.pendingJobIds).toContain("job-a");
 			asyncJobManager.register("bash", "B", async () => "B", { id: "job-b", ownerId: "acp-session-b" });
 			await waitFor(() => asyncJobManager.getDeliveryState({ ownerId: "acp-session-b" }).queued > 0);
+			expect(session.getAsyncJobSnapshot({ includeAgentJobs: false })?.recent).toEqual([]);
+			expect(session.getAsyncJobSnapshot({ includeAgentJobs: false })?.delivery.pendingJobIds).not.toContain(
+				"job-b",
+			);
 
 			expect(sessionB.getAsyncJobSnapshot()?.delivery.pendingJobIds).not.toContain("job-a");
 			await expect(sessionB.drainAsyncJobDeliveriesForAcp({ timeoutMs: 1_000 })).resolves.toBe(true);

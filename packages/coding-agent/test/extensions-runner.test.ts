@@ -1270,16 +1270,16 @@ describe("ExtensionRunner", () => {
 			expect(runner.createContext().getAsyncJobSnapshot()).toBeNull();
 
 			const snapshot = { running: [], recent: [], delivery: { queued: 0, delivering: false, pendingJobIds: [] } };
-			let receivedLimit: number | undefined;
+			let receivedOptions: { recentLimit?: number; includeAgentJobs?: boolean } | undefined;
 			runner.initialize(actions, {
 				...contextActions,
 				getAsyncJobSnapshot: options => {
-					receivedLimit = options?.recentLimit;
+					receivedOptions = options;
 					return snapshot;
 				},
 			});
-			expect(runner.createContext().getAsyncJobSnapshot({ recentLimit: 3 })).toBe(snapshot);
-			expect(receivedLimit).toBe(3);
+			expect(runner.createContext().getAsyncJobSnapshot({ recentLimit: 3, includeAgentJobs: false })).toBe(snapshot);
+			expect(receivedOptions).toEqual({ recentLimit: 3, includeAgentJobs: false });
 		});
 	});
 

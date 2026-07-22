@@ -5,6 +5,7 @@ const DELIVERY_RETRY_MAX_MS = 30_000;
 const DELIVERY_RETRY_JITTER_MS = 200;
 const DEFAULT_RETENTION_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_RUNNING_JOBS = 15;
+const TERMINAL_HISTORY_BUCKET_LIMIT = 15;
 
 /**
  * Adaptive ("smart") `hub` poll-wait ladder (ms). A tight poll loop climbs
@@ -71,11 +72,17 @@ export interface AsyncJobSnapshotItem {
 	readonly startTime: number;
 	readonly endTime?: number;
 	readonly queued: boolean;
+	readonly agentId?: string;
 }
 
 interface TerminalHistoryEntry {
 	snapshot: AsyncJobSnapshotItem;
 	sequence: number;
+}
+
+interface TerminalHistory {
+	agent: TerminalHistoryEntry[];
+	nonAgent: TerminalHistoryEntry[];
 }
 
 /** Public view of active jobs and a bounded terminal metadata history. */
@@ -87,6 +94,8 @@ export interface AsyncJobSnapshot {
 
 export interface AsyncJobSnapshotOptions {
 	recentLimit?: number;
+	/** Include rows backed by an AgentRegistry id. Defaults to true. Delivery state is unaffected. */
+	includeAgentJobs?: boolean;
 }
 
 export interface AsyncJobManagerOptions {
@@ -152,7 +161,7 @@ export class AsyncJobManager {
 
 	readonly #jobs = new Map<string, AsyncJob>();
 	/** Per-owner terminal rows contain metadata only; never retain result or error bodies. */
-	readonly #terminalHistory = new Map<string | undefined, TerminalHistoryEntry[]>();
+	readonly #terminalHistory = new Map<string | undefined, TerminalHistory>();
 	readonly #historySuppressedJobs = new WeakSet<AsyncJob>();
 	readonly #capturedTerminalJobs = new WeakSet<AsyncJob>();
 	#nextTerminalHistorySequence = 0;
@@ -333,16 +342,19 @@ export class AsyncJobManager {
 		const requestedRecentLimit = options?.recentLimit ?? 5;
 		const recentLimit = Number.isNaN(requestedRecentLimit)
 			? 0
-			: Math.min(15, Math.max(0, Math.trunc(requestedRecentLimit)));
+			: Math.min(TERMINAL_HISTORY_BUCKET_LIMIT, Math.max(0, Math.trunc(requestedRecentLimit)));
 		const filter = options?.filter;
+		const includeAgentJobs = options?.includeAgentJobs !== false;
 		const running = this.#filterJobs(this.#jobs.values(), filter)
-			.filter(job => job.status === "running")
+			.filter(job => job.status === "running" && (includeAgentJobs || job.agentId === undefined))
 			.map(job => this.#snapshotItem(job));
-		const history = this.#hasOwnerFilter(filter)
-			? (this.#terminalHistory.get(filter.ownerId) ?? [])
-			: Array.from(this.#terminalHistory.values()).flat();
-		const recent = history
-			.slice()
+		const histories = this.#hasOwnerFilter(filter)
+			? [this.#terminalHistory.get(filter.ownerId)].filter(
+					(history): history is TerminalHistory => history !== undefined,
+				)
+			: Array.from(this.#terminalHistory.values());
+		const recent = histories
+			.flatMap(history => (includeAgentJobs ? [...history.agent, ...history.nonAgent] : history.nonAgent))
 			.sort(
 				(a, b) =>
 					(b.snapshot.endTime ?? b.snapshot.startTime) - (a.snapshot.endTime ?? a.snapshot.startTime) ||
@@ -584,16 +596,18 @@ export class AsyncJobManager {
 			startTime: job.startTime,
 			endTime: job.endTime,
 			queued: job.status === "running" && job.queued === true,
+			...(job.agentId !== undefined ? { agentId: job.agentId } : {}),
 		});
 	}
 
 	#recordTerminalHistory(job: AsyncJob): void {
 		if (job.status === "running" || this.#historySuppressedJobs.has(job) || this.#capturedTerminalJobs.has(job))
 			return;
-		const history = this.#terminalHistory.get(job.ownerId) ?? [];
-		history.unshift({ snapshot: this.#snapshotItem(job), sequence: this.#nextTerminalHistorySequence++ });
+		const history = this.#terminalHistory.get(job.ownerId) ?? { agent: [], nonAgent: [] };
+		const bucket = job.agentId !== undefined ? history.agent : history.nonAgent;
+		bucket.unshift({ snapshot: this.#snapshotItem(job), sequence: this.#nextTerminalHistorySequence++ });
 		this.#capturedTerminalJobs.add(job);
-		if (history.length > 15) history.pop();
+		if (bucket.length > TERMINAL_HISTORY_BUCKET_LIMIT) bucket.pop();
 		this.#terminalHistory.set(job.ownerId, history);
 	}
 	#resolveJobId(preferredId?: string): string {
