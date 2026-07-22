@@ -92,7 +92,7 @@ describe("EventController message_start (user role)", () => {
 		});
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent({ type: "message_start", message });
+		await controller.handleEvent(ctx.viewSession, { type: "message_start", message });
 
 		expect(setText).not.toHaveBeenCalled();
 		expect(editor.getText()).toBe("draft typed after queuing");
@@ -113,7 +113,7 @@ describe("EventController message_start (user role)", () => {
 		});
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent({ type: "message_start", message });
+		await controller.handleEvent(ctx.viewSession, { type: "message_start", message });
 
 		expect(setText).toHaveBeenCalledWith("");
 		expect(addMessageToChat).toHaveBeenCalledWith(message);
@@ -131,7 +131,7 @@ describe("EventController message_start (user role)", () => {
 		});
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent({ type: "message_start", message });
+		await controller.handleEvent(ctx.viewSession, { type: "message_start", message });
 
 		expect(addMessageToChat).not.toHaveBeenCalled();
 		expect(setText).not.toHaveBeenCalled();
@@ -161,7 +161,7 @@ describe("EventController message_start (user role)", () => {
 		const controller = new EventController(ctx);
 
 		// Fire WITHOUT awaiting: the bubble must already be appended synchronously.
-		const pending = controller.handleEvent({ type: "message_start", message }).catch(() => {});
+		const pending = controller.handleEvent(ctx.viewSession, { type: "message_start", message }).catch(() => {});
 		expect(addMessageToChat).toHaveBeenCalledTimes(1);
 		expect(addMessageToChat).toHaveBeenCalledWith(message);
 		await pending;
@@ -191,13 +191,15 @@ function createIrcContext(options: { liveBlockAbove?: boolean } = {}) {
 		} as Component);
 	}
 	const requestRender = vi.fn();
+	const session = {};
 	const ctx = {
 		isInitialized: true,
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		ui: { requestRender },
 		chatContainer,
-		session: {},
+		session,
+		viewSession: session,
 	} as unknown as InteractiveModeContext;
 	const helpers = new UiHelpers(ctx);
 	const addMessageToChat: InteractiveModeContext["addMessageToChat"] = vi.fn((message, options) =>
@@ -219,7 +221,7 @@ describe("EventController IRC expiry", () => {
 		const { ctx, chatContainer, requestRender } = createIrcContext({ liveBlockAbove: true });
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent({ type: "irc_message", message });
+		await controller.handleEvent(ctx.session, { type: "irc_message", message });
 
 		expect(chatContainer.children).toHaveLength(2);
 		// One requestRender from the IRC handler mounting the card. The blanket
@@ -242,7 +244,7 @@ describe("EventController IRC expiry", () => {
 		const { ctx, chatContainer } = createIrcContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent({ type: "irc_message", message });
+		await controller.handleEvent(ctx.session, { type: "irc_message", message });
 		expect(chatContainer.children).toHaveLength(1);
 
 		// Render the container and commit its rows to simulate entering native scrollback
@@ -263,7 +265,7 @@ describe("EventController IRC expiry", () => {
 		const controller = new EventController(ctx);
 
 		for (let i = 0; i < 5; i++) {
-			await controller.handleEvent({ type: "irc_message", message: createIrcMessage(100 + i) });
+			await controller.handleEvent(ctx.session, { type: "irc_message", message: createIrcMessage(100 + i) });
 		}
 		// live block + MAX_LIVE_IRC_CARDS (4): the 5th card evicted the 1st.
 		expect(chatContainer.children).toHaveLength(5);
@@ -278,8 +280,8 @@ describe("EventController IRC expiry", () => {
 		const { ctx, chatContainer, addMessageToChat } = createIrcContext({ liveBlockAbove: true });
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent({ type: "irc_message", message });
-		await controller.handleEvent({ type: "irc_message", message });
+		await controller.handleEvent(ctx.session, { type: "irc_message", message });
+		await controller.handleEvent(ctx.session, { type: "irc_message", message });
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(1);
 		expect(chatContainer.children).toHaveLength(2);
@@ -293,7 +295,7 @@ describe("EventController IRC expiry", () => {
 		const { ctx, chatContainer, requestRender } = createIrcContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent({ type: "irc_message", message });
+		await controller.handleEvent(ctx.session, { type: "irc_message", message });
 		controller.dispose();
 		vi.advanceTimersByTime(10_000);
 

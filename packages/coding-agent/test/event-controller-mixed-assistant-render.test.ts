@@ -83,6 +83,8 @@ function createFixture() {
 			hasDisplayableThinkingContent = true;
 			return true;
 		}),
+		setWorkingMessageRunTokenDelta: vi.fn(),
+		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
 		session: viewSession,
 		viewSession,
 		sessionManager: { getCwd: () => process.cwd() },
@@ -92,7 +94,7 @@ function createFixture() {
 		lastAssistantUsage: zeroUsage(),
 	} as unknown as InteractiveModeContext;
 
-	return { controller: new EventController(ctx), chatContainer };
+	return { controller: new EventController(ctx), ctx, chatContainer };
 }
 
 describe("EventController mixed assistant text/tool rendering", () => {
@@ -111,7 +113,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 	});
 
 	it("renders assistant text segments in order around two tool results from one mixed message", async () => {
-		const { controller, chatContainer } = createFixture();
+		const { controller, ctx, chatContainer } = createFixture();
 		const toolCallA: ToolCall = {
 			type: "toolCall",
 			id: TOOL_CALL_A_ID,
@@ -140,11 +142,11 @@ describe("EventController mixed assistant text/tool rendering", () => {
 			{ type: "text", text: FINAL_MARKER },
 		]);
 
-		await controller.handleEvent({ type: "message_start", message: started } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_start", message: started } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "message_update",
 			message: withFirstToolCall,
 			assistantMessageEvent: {
@@ -154,7 +156,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 				partial: withFirstToolCall,
 			},
 		} as Extract<AgentSessionEvent, { type: "message_update" }>);
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "message_update",
 			message: withSecondToolCall,
 			assistantMessageEvent: {
@@ -166,33 +168,33 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		} as Extract<AgentSessionEvent, { type: "message_update" }>);
 		const liveLines = chatContainer.render(120).map(line => Bun.stripANSI(line));
 		expect(lineContaining(liveLines, INTRO_MARKER)).toBeLessThan(lineContaining(liveLines, MIDDLE_MARKER));
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_A_ID,
 			toolName: "contract_probe_a",
 			args: { value: "a" },
 		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_A_ID,
 			toolName: "contract_probe_a",
 			result: { content: [{ type: "text", text: TOOL_RESULT_A_MARKER }] },
 			isError: false,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_B_ID,
 			toolName: "contract_probe_b",
 			args: { value: "b" },
 		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_B_ID,
 			toolName: "contract_probe_b",
 			result: { content: [{ type: "text", text: TOOL_RESULT_B_MARKER }] },
 			isError: false,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-		await controller.handleEvent({ type: "message_end", message: completed } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message: completed } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);

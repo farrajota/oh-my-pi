@@ -538,9 +538,13 @@ export class CollabGuestLink {
 			!this.#assistantStreamSynced
 		) {
 			this.#assistantStreamSynced = true;
-			void this.#ctx.eventController.handleEvent({ type: "message_start", message: event.message });
+			void this.#ctx.eventController.handleEvent(this.#ctx.session, {
+				type: "message_start",
+				message: event.message,
+			});
 		}
-		void this.#ctx.eventController.handleEvent(event);
+		const replicatedRunStartedAt = event.type === "agent_start" ? Date.now() : undefined;
+		void this.#ctx.eventController.handleEvent(this.#ctx.session, event, replicatedRunStartedAt);
 	}
 
 	/**

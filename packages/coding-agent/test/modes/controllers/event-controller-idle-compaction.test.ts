@@ -78,6 +78,7 @@ function createContext(
 		statusContainer: { clear: vi.fn() },
 		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
+		endWorkingMessageRun: vi.fn(),
 		editor: { getText: () => options.editorText ?? "" },
 		sessionManager: { getSessionName: () => options.sessionName },
 		todoPhases: options.todoPhases ?? [],
@@ -91,7 +92,7 @@ function createContext(
 			messages: [createAssistantMessage()],
 			getContextUsage: () => ({ tokens: 210 }),
 			getGoalModeState: () => goalState,
-			agent: { state: { messages: [createAssistantMessage()] } },
+			agent: { state: { isStreaming: options.isStreaming ?? false, messages: [createAssistantMessage()] } },
 		},
 		get viewSession() {
 			return (this as typeof context).session;
@@ -127,7 +128,7 @@ describe("EventController idle compaction teardown", () => {
 		const context = createContext({ runIdleCompaction });
 
 		const controller = new EventController(context);
-		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		await controller.handleEvent(context.viewSession, { type: "agent_end", messages: [] });
 		controller.dispose();
 		vi.advanceTimersByTime(60_000);
 
@@ -160,7 +161,7 @@ describe("EventController idle compaction teardown", () => {
 		});
 
 		const controller = new EventController(context);
-		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		await controller.handleEvent(context.viewSession, { type: "agent_end", messages: [] });
 		vi.advanceTimersByTime(239_999);
 		expect(runEphemeralTurn).not.toHaveBeenCalled();
 
@@ -200,7 +201,7 @@ describe("EventController idle compaction teardown", () => {
 		});
 
 		const controller = new EventController(context);
-		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		await controller.handleEvent(context.viewSession, { type: "agent_end", messages: [] });
 		vi.advanceTimersByTime(1_000);
 
 		expect(showStatus).not.toHaveBeenCalled();
@@ -226,7 +227,7 @@ describe("EventController idle compaction teardown", () => {
 		});
 
 		const controller = new EventController(context);
-		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		await controller.handleEvent(context.viewSession, { type: "agent_end", messages: [] });
 		vi.advanceTimersByTime(1_000);
 
 		expect(showStatus).not.toHaveBeenCalled();
@@ -252,7 +253,7 @@ describe("EventController idle compaction teardown", () => {
 		const context = createContext({ sessionName: "Fix login flow", showStatus, runEphemeralTurn });
 
 		const controller = new EventController(context);
-		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		await controller.handleEvent(context.viewSession, { type: "agent_end", messages: [] });
 		vi.advanceTimersByTime(240_000);
 		await flushMicrotasks();
 

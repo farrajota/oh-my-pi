@@ -19,6 +19,7 @@ export class SessionFocusController {
 	/** Session currently attached while focused; undefined when unfocused. */
 	#attachedSession: AgentSession | undefined;
 	#registryUnsubscribe: (() => void) | undefined;
+	#focusGeneration = 0;
 
 	constructor(
 		private ctx: InteractiveModeContext,
@@ -39,12 +40,19 @@ export class SessionFocusController {
 	async focusAgent(id: string): Promise<void> {
 		if (this.ctx.collabGuest) throw new Error("Viewing agents is unavailable in a collab session.");
 		if (id === MAIN_AGENT_ID) return this.unfocus();
+		const generation = ++this.#focusGeneration;
 		const session = await this.lifecycle().ensureLive(id);
-		if (id === this.#focusedAgentId && session === this.#attachedSession) return;
+		if (generation !== this.#focusGeneration) return;
+		const ref = this.registry.get(id);
+		if (!ref || ref.status === "parked" || ref.status === "aborted" || ref.session !== session) {
+			await this.unfocus();
+			return;
+		}
 		this.#focusedAgentId = id;
 		this.#attachedSession = session;
 		this.#registryUnsubscribe ??= this.registry.onChange(e => this.#onRegistryEvent(e));
-		await this.#attach(session);
+		await this.#attach(session, generation);
+		if (generation !== this.#focusGeneration) return;
 		this.ctx.showStatus(`Viewing agent ${id} — Esc returns to main, ←← hops to parent`);
 	}
 
@@ -60,10 +68,12 @@ export class SessionFocusController {
 
 	/** Return to the main session. No-op when unfocused. */
 	async unfocus(): Promise<void> {
+		const generation = ++this.#focusGeneration;
 		if (!this.#focusedAgentId) return;
 		this.#focusedAgentId = undefined;
 		this.#attachedSession = undefined;
-		await this.#attach(this.ctx.session);
+		await this.#attach(this.ctx.session, generation);
+		if (generation !== this.#focusGeneration) return;
 		this.ctx.showStatus("Returned to main session");
 	}
 
@@ -78,34 +88,40 @@ export class SessionFocusController {
 		const dead = event.type === "status_changed" && (event.ref.status === "parked" || event.ref.status === "aborted");
 		if (!gone && !dead) return;
 		void this.unfocus().then(() => {
-			this.ctx.showStatus(`Agent ${event.ref.id} is ${gone ? "gone" : event.ref.status}; returned to main session`);
+			if (!this.#focusedAgentId) {
+				this.ctx.showStatus(
+					`Agent ${event.ref.id} is ${gone ? "gone" : event.ref.status}; returned to main session`,
+				);
+			}
 		});
 	}
 
 	/** Retarget core, both directions: swap subscription, transcript, and status line onto `target`. */
-	async #attach(target: AgentSession): Promise<void> {
+	async #attach(target: AgentSession, generation: number): Promise<void> {
+		if (generation !== this.#focusGeneration) return;
 		this.ctx.unsubscribe?.();
 		this.ctx.clearTransientSessionUi();
 		this.ctx.eventController.resetTranscriptAnchors();
-		// Orphan-delta guard: when attaching mid-turn the message_start for the
-		// in-flight assistant message predates the attach. message_update carries
-		// the full accumulating message, so synthesize the missing start before
-		// the first orphaned update; every other handler is tolerant of unknown
-		// anchors (guarded by streamingComponent/pendingTools lookups).
 		let assistantStreamSynced = false;
 		this.ctx.unsubscribe = target.subscribe(async event => {
+			if (generation !== this.#focusGeneration || target !== (this.#attachedSession ?? this.ctx.session)) return;
 			if (event.type === "message_start" && event.message.role === "assistant") {
 				assistantStreamSynced = true;
 			} else if (event.type === "message_update" && event.message.role === "assistant" && !assistantStreamSynced) {
 				assistantStreamSynced = true;
-				await this.ctx.eventController.handleEvent({ type: "message_start", message: event.message });
+				if (generation !== this.#focusGeneration || target !== (this.#attachedSession ?? this.ctx.session)) return;
+				await this.ctx.eventController.handleEvent(target, { type: "message_start", message: event.message });
 			}
-			await this.ctx.eventController.handleEvent(event);
+			if (generation !== this.#focusGeneration || target !== (this.#attachedSession ?? this.ctx.session)) return;
+			await this.ctx.eventController.handleEvent(target, event);
 		});
 		this.ctx.statusLine.setSession(target, this.#focusedAgentId);
 		this.ctx.renderInitialMessages({ clearTerminalHistory: true });
-		// Mid-turn attach: no agent_start will arrive; arm the loader/turn state manually.
-		if (target.isStreaming) await this.ctx.eventController.handleEvent({ type: "agent_start" });
+		if (target.isStreaming) {
+			await this.ctx.eventController.rehydrateActiveRun(target);
+			if (generation !== this.#focusGeneration) return;
+		}
+		if (generation !== this.#focusGeneration) return;
 		this.ctx.updateEditorBorderColor();
 		this.ctx.ui.requestRender();
 	}

@@ -72,7 +72,7 @@ describe("issue #4806 command output during streaming", () => {
 		expect(mode.chatContainer.children).toEqual([streamedReply]);
 
 		streaming = false;
-		await mode.eventController.handleEvent({ type: "agent_end", messages: [] } as AgentSessionEvent);
+		await mode.eventController.handleEvent(mode.session, { type: "agent_end", messages: [] } as AgentSessionEvent);
 
 		expect(mode.chatContainer.children).toHaveLength(2);
 		const transcript = mode.chatContainer.render(80).join("\n");
@@ -89,7 +89,7 @@ describe("issue #4806 command output during streaming", () => {
 
 		expect(session.sessionManager.getSessionId()).not.toBe(previousSessionId);
 		streaming = false;
-		await mode.eventController.handleEvent({ type: "agent_end", messages: [] } as AgentSessionEvent);
+		await mode.eventController.handleEvent(mode.session, { type: "agent_end", messages: [] } as AgentSessionEvent);
 
 		expect(mode.chatContainer.children).toEqual([streamedReply]);
 	});

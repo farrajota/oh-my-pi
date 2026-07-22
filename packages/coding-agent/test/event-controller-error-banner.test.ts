@@ -72,7 +72,7 @@ function createFixture(streamingMessage?: AssistantMessage) {
 	};
 
 	const session = { isStreaming: false };
-	const viewSession = { isStreaming: false, isTtsrAbortPending: false, retryAttempt: 0 };
+	const viewSession = { activeRunStartedAt: 1_000, isStreaming: false, isTtsrAbortPending: false, retryAttempt: 0 };
 	let hasDisplayableThinkingContent = false;
 	const noteDisplayableThinkingContent = vi.fn((message: AssistantMessage) => {
 		const hasThinking = message.content.some(
@@ -101,6 +101,11 @@ function createFixture(streamingMessage?: AssistantMessage) {
 		updateEditorTopBorder: vi.fn(),
 		updatePendingMessagesDisplay: vi.fn(),
 		ensureLoadingAnimation: vi.fn(),
+		beginWorkingMessageRun: vi.fn(),
+		rehydrateWorkingMessageRun: vi.fn(() => false),
+		endWorkingMessageRun: vi.fn(),
+		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
+		setWorkingMessageRunTokenDelta: vi.fn(),
 		statusContainer,
 		loadingAnimation: undefined,
 		autoCompactionLoader: undefined,
@@ -139,9 +144,9 @@ describe("EventController error banner", () => {
 	it("pins the provider error above the editor when an assistant turn ends on stopReason error", async () => {
 		const errorMessage = "Output blocked by content filtering policy";
 		const message = makeAssistantMessage({ stopReason: "error", errorMessage });
-		const { controller, showPinnedError, streamingComponent } = createFixture(message);
+		const { controller, ctx, showPinnedError, streamingComponent } = createFixture(message);
 
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -156,15 +161,18 @@ describe("EventController error banner", () => {
 	it("restores the transcript inline error when the next turn starts", async () => {
 		const errorMessage = "Output blocked by content filtering policy";
 		const message = makeAssistantMessage({ stopReason: "error", errorMessage });
-		const { controller, clearPinnedError, streamingComponent } = createFixture(message);
+		const { controller, ctx, clearPinnedError, streamingComponent } = createFixture(message);
 
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
 		streamingComponent.setErrorPinned.mockClear();
 
-		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
+		await controller.handleEvent(ctx.viewSession, { type: "agent_start" } as Extract<
+			AgentSessionEvent,
+			{ type: "agent_start" }
+		>);
 
 		expect(clearPinnedError).toHaveBeenCalledTimes(1);
 		expect(streamingComponent.setErrorPinned).toHaveBeenCalledWith(false);
@@ -177,16 +185,16 @@ describe("EventController error banner", () => {
 			errorMessage,
 			errorId: AIError.create(AIError.Flag.ThinkingLoop),
 		});
-		const { controller, clearPinnedError, streamingComponent } = createFixture(message);
+		const { controller, ctx, clearPinnedError, streamingComponent } = createFixture(message);
 
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
 		clearPinnedError.mockClear();
 		streamingComponent.setErrorPinned.mockClear();
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_start",
 			attempt: 1,
 			maxAttempts: 2,
@@ -197,7 +205,7 @@ describe("EventController error banner", () => {
 
 		expect(clearPinnedError).toHaveBeenCalledTimes(1);
 		expect(streamingComponent.setErrorPinned).not.toHaveBeenCalledWith(false);
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_end",
 			success: true,
 			attempt: 1,
@@ -206,9 +214,9 @@ describe("EventController error banner", () => {
 
 	it("does not pin a banner for a normal assistant stop", async () => {
 		const message = makeAssistantMessage({ stopReason: "stop" });
-		const { controller, showPinnedError } = createFixture(message);
+		const { controller, ctx, showPinnedError } = createFixture(message);
 
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -218,8 +226,8 @@ describe("EventController error banner", () => {
 
 	it("does not pin a banner for an aborted assistant turn", async () => {
 		const message = makeAssistantMessage({ stopReason: "aborted", errorMessage: "Operation aborted" });
-		const { controller, showPinnedError } = createFixture(message);
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		const { controller, ctx, showPinnedError } = createFixture(message);
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -228,9 +236,12 @@ describe("EventController error banner", () => {
 	});
 
 	it("clears the pinned banner when the next turn starts", async () => {
-		const { controller, clearPinnedError } = createFixture();
+		const { controller, ctx, clearPinnedError } = createFixture();
 
-		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
+		await controller.handleEvent(ctx.viewSession, { type: "agent_start" } as Extract<
+			AgentSessionEvent,
+			{ type: "agent_start" }
+		>);
 
 		expect(clearPinnedError).toHaveBeenCalledTimes(1);
 	});
@@ -244,7 +255,7 @@ describe("EventController thinking visibility", () => {
 		});
 		const { controller, ctx } = createFixture();
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "message_start",
 			message: initial,
 		} as Extract<AgentSessionEvent, { type: "message_start" }>);
@@ -253,7 +264,7 @@ describe("EventController thinking visibility", () => {
 			throw new Error("Expected streaming assistant component");
 		}
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "message_update",
 			message,
 			assistantMessageEvent: {
@@ -274,7 +285,7 @@ describe("EventController working loader reconciliation", () => {
 		ctx.autoCompactionLoader = loader;
 		(ctx.viewSession as unknown as { isStreaming: boolean }).isStreaming = true;
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_compaction_end",
 			action: "context-full",
 			result: undefined,
@@ -293,7 +304,7 @@ describe("EventController working loader reconciliation", () => {
 		const { controller, ctx } = createFixture();
 		(ctx.viewSession as unknown as { isStreaming: boolean }).isStreaming = true;
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_update",
 			toolCallId: "missing",
 			partialResult: {},
@@ -316,7 +327,7 @@ describe("EventController working loader reconciliation", () => {
 		const { controller, ctx } = createFixture();
 		(ctx.viewSession as unknown as { isStreaming: boolean }).isStreaming = true;
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: "task-1",
 			toolName: "task",
@@ -332,7 +343,7 @@ describe("EventController working loader reconciliation", () => {
 		ctx.retryLoader = { stop: vi.fn() } as unknown as InteractiveModeContext["retryLoader"];
 		(ctx.viewSession as unknown as { isStreaming: boolean }).isStreaming = true;
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: "task-2",
 			toolName: "task",
@@ -348,7 +359,7 @@ describe("EventController working loader reconciliation", () => {
 		ctx.retryLoader = { stop: vi.fn() } as unknown as InteractiveModeContext["retryLoader"];
 		(ctx.viewSession as unknown as { isStreaming: boolean }).isStreaming = true;
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_update",
 			toolCallId: "missing",
 			partialResult: {},

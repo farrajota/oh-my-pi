@@ -10,6 +10,7 @@ function createContext() {
 	const ensureLoadingAnimation = vi.fn();
 	const pendingTools = new Map<string, unknown>();
 	const session = {
+		activeRunStartedAt: 1_000,
 		getToolByName: () => undefined,
 		isAborting: false,
 	};
@@ -22,6 +23,11 @@ function createContext() {
 		hideThinkingBlock: false,
 		setWorkingMessage,
 		clearPinnedError: vi.fn(),
+		beginWorkingMessageRun: vi.fn(),
+		rehydrateWorkingMessageRun: vi.fn(() => false),
+		endWorkingMessageRun: vi.fn(),
+		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
+		setWorkingMessageRunTokenDelta: vi.fn(),
 		ensureLoadingAnimation,
 		ui: { requestRender: vi.fn() },
 		session,
@@ -63,12 +69,12 @@ describe("EventController aborted-turn working messages", () => {
 	it("suppresses late intent-driven working-message updates while aborting", async () => {
 		const { ctx, pendingTools, setWorkingMessage, session } = createContext();
 		const controller = new EventController(ctx);
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		setWorkingMessage.mockClear();
 		session.isAborting = true;
 
 		pendingTools.set("late-call", {});
-		await controller.handleEvent(toolStartWithIntent("late-call", "Reticulating splines"));
+		await controller.handleEvent(ctx.viewSession, toolStartWithIntent("late-call", "Reticulating splines"));
 
 		expect(setWorkingMessage).not.toHaveBeenCalled();
 	});
@@ -76,11 +82,11 @@ describe("EventController aborted-turn working messages", () => {
 	it("lets intent updates drive the loader when not aborting", async () => {
 		const { ctx, pendingTools, setWorkingMessage } = createContext();
 		const controller = new EventController(ctx);
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		setWorkingMessage.mockClear();
 
 		pendingTools.set("call-1", {});
-		await controller.handleEvent(toolStartWithIntent("call-1", "Searching files"));
+		await controller.handleEvent(ctx.viewSession, toolStartWithIntent("call-1", "Searching files"));
 
 		expect(setWorkingMessage).toHaveBeenCalledTimes(1);
 		expect(setWorkingMessage.mock.calls[0]?.[0]).toContain("Searching files");
@@ -89,16 +95,16 @@ describe("EventController aborted-turn working messages", () => {
 	it("resumes intent updates once aborting clears", async () => {
 		const { ctx, pendingTools, setWorkingMessage, session } = createContext();
 		const controller = new EventController(ctx);
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		session.isAborting = true;
 
 		pendingTools.set("late-call", {});
-		await controller.handleEvent(toolStartWithIntent("late-call", "Reticulating splines"));
+		await controller.handleEvent(ctx.viewSession, toolStartWithIntent("late-call", "Reticulating splines"));
 		setWorkingMessage.mockClear();
 		session.isAborting = false;
 
 		pendingTools.set("call-2", {});
-		await controller.handleEvent(toolStartWithIntent("call-2", "Editing module"));
+		await controller.handleEvent(ctx.viewSession, toolStartWithIntent("call-2", "Editing module"));
 
 		expect(setWorkingMessage).toHaveBeenCalledTimes(1);
 		expect(setWorkingMessage.mock.calls[0]?.[0]).toContain("Editing module");

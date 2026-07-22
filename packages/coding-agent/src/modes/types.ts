@@ -267,10 +267,11 @@ export interface InteractiveModeContext {
 	flushPendingModelSwitch(): Promise<void>;
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
-	beginWorkingMessageRun(): void;
-	endWorkingMessageRun(): void;
-	getWorkingMessageRunElapsedMs(): number | undefined;
-	setWorkingMessageRunTokenDelta(tokenDelta: number): void;
+	beginWorkingMessageRun(session: AgentSession, startedAt: number): void;
+	rehydrateWorkingMessageRun(session: AgentSession, startedAt: number | undefined): boolean;
+	endWorkingMessageRun(session: AgentSession): void;
+	getWorkingMessageRunElapsedMs(session: AgentSession, now?: number): number | undefined;
+	setWorkingMessageRunTokenDelta(session: AgentSession, tokenDelta: number): void;
 	ensureLoadingAnimation(): void;
 	startPendingSubmission(input: {
 		text: string;

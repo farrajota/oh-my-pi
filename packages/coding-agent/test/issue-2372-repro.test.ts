@@ -117,7 +117,7 @@ describe("issue #2372 pre-streaming chat rebuild preserves optimistic submission
 
 		mode.startPendingSubmission({ text: "/jira-task" });
 		mode.rebuildChatFromMessages();
-		await controller.handleEvent({
+		await controller.handleEvent(mode.session, {
 			type: "message_start",
 			message: {
 				role: "user",
@@ -150,7 +150,7 @@ describe("issue #2372 pre-streaming chat rebuild preserves optimistic submission
 		mode.startPendingSubmission({ text: "/jira-task" });
 		mode.locallySubmittedUserSignatures.add("queued before prompt\u00000");
 
-		await controller.handleEvent({
+		await controller.handleEvent(mode.session, {
 			type: "message_start",
 			message: {
 				role: "user",
@@ -164,7 +164,7 @@ describe("issue #2372 pre-streaming chat rebuild preserves optimistic submission
 		expect(mode.chatContainer.children).toHaveLength(2);
 		expect(mode.locallySubmittedUserSignatures.has("queued before prompt\u00000")).toBe(false);
 
-		await controller.handleEvent({
+		await controller.handleEvent(mode.session, {
 			type: "message_start",
 			message: {
 				role: "user",

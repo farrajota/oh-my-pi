@@ -2210,6 +2210,7 @@ export class AgentSession {
 	#acceptTerminalEmptyStopForPrompt = false;
 	#promptGeneration = 0;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
+	#activeRunStartedAt: number | undefined;
 	#pendingContextSnapshot:
 		| {
 				promptTokens: number;
@@ -2442,7 +2443,7 @@ export class AgentSession {
 		const pending = this.#pendingAgentEndEmit;
 		if (!pending) return;
 		this.#pendingAgentEndEmit = undefined;
-		this.#emit(pending);
+		this.#emitLifecycleAwareSessionEvent(pending);
 	}
 
 	/** Advance the one-way prewalk switch at a completed assistant-turn boundary. */
@@ -4151,6 +4152,16 @@ export class AgentSession {
 		}
 	}
 
+	/** Deliver lifecycle events after atomically updating their subscriber-visible state. */
+	#emitLifecycleAwareSessionEvent(event: AgentSessionEvent, agentStartRunStartedAt?: number): void {
+		if (event.type === "agent_start") {
+			this.#activeRunStartedAt = agentStartRunStartedAt;
+		} else if (event.type === "agent_end") {
+			this.#activeRunStartedAt = undefined;
+		}
+		this.#emit(event);
+	}
+
 	/**
 	 * Emit a UI-only notice to the session. Surfaces in interactive mode as a
 	 * `showWarning` / `showError` / `showStatus` line; non-interactive modes
@@ -4246,7 +4257,7 @@ export class AgentSession {
 	 */
 	#subscriberEmitGate: Promise<void> = Promise.resolve();
 
-	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
+	async #emitSessionEvent(event: AgentSessionEvent, agentStartRunStartedAt?: number): Promise<void> {
 		if (event.type === "message_update") {
 			this.#emit(event);
 			void this.#queueExtensionEvent(event);
@@ -4273,7 +4284,7 @@ export class AgentSession {
 				this.#pendingAgentEndEmit = event;
 				return;
 			}
-			this.#emit(event);
+			this.#emitLifecycleAwareSessionEvent(event, agentStartRunStartedAt);
 		} finally {
 			releaseGate();
 		}
@@ -4552,6 +4563,7 @@ export class AgentSession {
 	}
 
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
+		const runStartedAt = event.type === "agent_start" ? Date.now() : undefined;
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
@@ -4659,7 +4671,7 @@ export class AgentSession {
 		}
 
 		try {
-			await this.#emitSessionEvent(displayEvent);
+			await this.#emitSessionEvent(displayEvent, runStartedAt);
 		} catch (error) {
 			messageEndPersistence?.release();
 			throw error;
@@ -7131,6 +7143,10 @@ export class AgentSession {
 	/** Whether agent is currently streaming a response */
 	get isStreaming(): boolean {
 		return this.agent.state.isStreaming || this.#promptInFlightCount > 0;
+	}
+
+	get activeRunStartedAt(): number | undefined {
+		return this.#activeRunStartedAt;
 	}
 
 	get isAborting(): boolean {

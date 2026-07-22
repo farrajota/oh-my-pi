@@ -374,14 +374,12 @@ export class StatusLineComponent implements Component {
 	}
 
 	/**
-	 * Drop a meter's in-flight window when the newly-attached session is no
-	 * longer streaming. Handles the case where the focus controller
-	 * synthesized an `agent_start` on a mid-turn attach but the matching
-	 * real `agent_end` never reached us — the user detached before it
-	 * fired, and re-focusing later (after the agent finished) would
-	 * otherwise tick over the entire detached gap. Crediting that gap to
-	 * `activeMs` would be wrong (the agent finished at some point we never
-	 * observed), so the window is dropped rather than folded in.
+	 * Drop a meter's in-flight window when the newly attached session is no
+	 * longer streaming. The session may have completed while detached, so its
+	 * real `agent_end` was never observed by this status-line instance. Re-focusing
+	 * later would otherwise tick over the entire unobserved gap. Crediting that
+	 * gap to `activeMs` would be wrong (the agent finished at some point we did
+	 * not observe), so the window is dropped rather than folded in.
 	 */
 	#closeStaleActiveWindow(): void {
 		const meter = this.#meter();

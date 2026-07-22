@@ -60,6 +60,8 @@ function createFixture(streamingMessage: AssistantMessage) {
 		streamingMessage,
 		pendingTools: new Map(),
 		noteDisplayableThinkingContent: vi.fn(() => false),
+		setWorkingMessageRunTokenDelta: vi.fn(),
+		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
 		chatContainer: { addChild: vi.fn((child: { seal?(): void }) => mountedComponents.push(child)) },
 		toolOutputExpanded: false,
 		settings,
@@ -70,11 +72,11 @@ function createFixture(streamingMessage: AssistantMessage) {
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);
-	return { controller, markTranscriptBlockFinalized };
+	return { controller, ctx, markTranscriptBlockFinalized };
 }
 
 async function dispatchUpdate(message: AssistantMessage) {
-	const { controller, markTranscriptBlockFinalized } = createFixture(message);
+	const { controller, ctx, markTranscriptBlockFinalized } = createFixture(message);
 	// #handleMessageUpdate only reads `event.message`; the raw provider stream
 	// event is irrelevant to the finalization contract under test.
 	const event = {
@@ -82,7 +84,7 @@ async function dispatchUpdate(message: AssistantMessage) {
 		message,
 		assistantMessageEvent: undefined as never,
 	} as Extract<AgentSessionEvent, { type: "message_update" }>;
-	await controller.handleEvent(event);
+	await controller.handleEvent(ctx.viewSession, event);
 	return markTranscriptBlockFinalized;
 }
 
@@ -138,8 +140,8 @@ describe("EventController finalizes assistant block when tool-call args stream",
 			},
 			timestamp,
 		};
-		const { controller } = createFixture(message);
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		const { controller, ctx } = createFixture(message);
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);

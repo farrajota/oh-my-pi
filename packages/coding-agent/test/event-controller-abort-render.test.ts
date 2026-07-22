@@ -67,6 +67,8 @@ function createFixture(opts: {
 		streamingMessage: opts.streamingMessage,
 		pendingTools: new Map(),
 		noteDisplayableThinkingContent: vi.fn(() => false),
+		setWorkingMessageRunTokenDelta: vi.fn(),
+		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
 	};
 	const sessionMock = {
 		isTtsrAbortPending: opts.isTtsrAbortPending ?? false,
@@ -102,7 +104,7 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 			type: "message_end",
 			message,
 		};
-		await controller.handleEvent(event);
+		await controller.handleEvent(ctx.viewSession, event);
 
 		// `updateContent` was called once with a copy whose `stopReason` is "stop".
 		// The marker on errorMessage is preserved unchanged on that display copy.
@@ -126,9 +128,9 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 			errorMessage: undefined,
 			errorId: AIError.create(AIError.Flag.SilentAbort),
 		});
-		const { controller, streamingComponent } = createFixture({ streamingMessage: message });
+		const { controller, ctx, streamingComponent } = createFixture({ streamingMessage: message });
 
-		await controller.handleEvent({ type: "message_end", message });
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message });
 
 		expect(message.errorMessage).toBeUndefined();
 		expect(streamingComponent.updateContent).toHaveBeenCalledTimes(1);
@@ -139,12 +141,12 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 
 	it("C2: errorMessage undefined (no threaded reason) + aborted + no TTSR -> errorMessage='Operation aborted', updateContent receives original ref", async () => {
 		const message = makeAssistantMessage({ stopReason: "aborted", errorMessage: undefined });
-		const { controller, streamingComponent } = createFixture({
+		const { controller, ctx, streamingComponent } = createFixture({
 			streamingMessage: message,
 			isTtsrAbortPending: false,
 		});
 
-		await controller.handleEvent({ type: "message_end", message });
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message });
 
 		// No threaded reason -> generic operator-facing label stamped in-place.
 		expect(message.errorMessage).toBe("Operation aborted");
@@ -159,12 +161,12 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 
 	it("C2b: threaded user-interrupt reason on aborted message is preserved, not replaced by the generic label", async () => {
 		const message = makeAssistantMessage({ stopReason: "aborted", errorMessage: USER_INTERRUPT_LABEL });
-		const { controller, streamingComponent } = createFixture({
+		const { controller, ctx, streamingComponent } = createFixture({
 			streamingMessage: message,
 			isTtsrAbortPending: false,
 		});
 
-		await controller.handleEvent({ type: "message_end", message });
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message });
 
 		// The Esc-interrupt reason rode the AbortController onto errorMessage; the
 		// controller must surface it verbatim instead of overwriting with "Operation aborted".
@@ -176,12 +178,12 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 
 	it("C3: isTtsrAbortPending=true + aborted -> updateContent stopReason='stop', errorMessage NOT set", async () => {
 		const message = makeAssistantMessage({ stopReason: "aborted", errorMessage: undefined });
-		const { controller, streamingComponent } = createFixture({
+		const { controller, ctx, streamingComponent } = createFixture({
 			streamingMessage: message,
 			isTtsrAbortPending: true,
 		});
 
-		await controller.handleEvent({ type: "message_end", message });
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message });
 
 		// TTSR keeps its existing flag-only render path — `errorMessage` stays undefined,
 		// and the display copy gets `stopReason: "stop"`.

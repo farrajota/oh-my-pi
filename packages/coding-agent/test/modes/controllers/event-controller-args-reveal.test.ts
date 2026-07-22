@@ -53,6 +53,7 @@ function createFixture(streamingMessage: AssistantMessage) {
 		streamingMessage,
 		pendingTools,
 		noteDisplayableThinkingContent: vi.fn(() => false),
+		setWorkingMessageRunTokenDelta: vi.fn(),
 		chatContainer: { addChild: vi.fn() },
 		toolOutputExpanded: false,
 		session: { getToolByName: () => undefined },
@@ -60,23 +61,28 @@ function createFixture(streamingMessage: AssistantMessage) {
 		sessionManager: { getCwd: () => process.cwd() },
 	} as unknown as InteractiveModeContext;
 
-	return { controller: new EventController(ctx), pendingTools };
+	return { controller: new EventController(ctx), ctx, pendingTools };
 }
 
-async function dispatch(controller: EventController, message: AssistantMessage) {
+async function dispatch(
+	controller: EventController,
+	source: InteractiveModeContext["viewSession"],
+	message: AssistantMessage,
+) {
 	const event = {
 		type: "message_update",
 		message,
 		assistantMessageEvent: undefined as never,
 	} as Extract<AgentSessionEvent, { type: "message_update" }>;
-	await controller.handleEvent(event);
+	await controller.handleEvent(source, event);
 }
 
 async function dispatchToolStart(
 	controller: EventController,
+	source: InteractiveModeContext["viewSession"],
 	payload: { toolCallId: string; toolName: string; args: Record<string, unknown> },
 ) {
-	await controller.handleEvent({
+	await controller.handleEvent(source, {
 		type: "tool_execution_start",
 		toolCallId: payload.toolCallId,
 		toolName: payload.toolName,
@@ -107,8 +113,8 @@ describe("EventController paces streamed tool args", () => {
 		const seedStreaming = makeStreamingMessage([
 			{ type: "toolCall", id: "tc-1", name: "write", arguments: {}, [kStreamingPartialJson]: seed },
 		]);
-		const { controller, pendingTools } = createFixture(seedStreaming);
-		await dispatch(controller, seedStreaming);
+		const { controller, ctx, pendingTools } = createFixture(seedStreaming);
+		await dispatch(controller, ctx.viewSession, seedStreaming);
 		expect(pendingTools.size).toBe(1);
 
 		// Component constructor consumes the initial render args directly; no
@@ -122,7 +128,7 @@ describe("EventController paces streamed tool args", () => {
 		const fullStreaming = makeStreamingMessage([
 			{ type: "toolCall", id: "tc-1", name: "write", arguments: {}, [kStreamingPartialJson]: target },
 		]);
-		await dispatch(controller, fullStreaming);
+		await dispatch(controller, ctx.viewSession, fullStreaming);
 
 		for (let i = 0; i < 3; i++) {
 			vi.advanceTimersByTime(STREAMING_REVEAL_FRAME_MS);
@@ -143,6 +149,7 @@ describe("EventController paces streamed tool args", () => {
 		const finalArgs = { path: "/tmp/a.ts", content };
 		await dispatch(
 			controller,
+			ctx.viewSession,
 			makeStreamingMessage([{ type: "toolCall", id: "tc-1", name: "write", arguments: finalArgs }]),
 		);
 		expect(updateArgsSpy.mock.calls.at(-1)?.[0]).toBe(finalArgs);
@@ -168,10 +175,10 @@ describe("EventController paces streamed tool args", () => {
 				[kStreamingPartialJson]: target,
 			},
 		]);
-		const { controller } = createFixture(streaming);
+		const { controller, ctx } = createFixture(streaming);
 
-		await dispatch(controller, streaming);
-		await dispatch(controller, streaming);
+		await dispatch(controller, ctx.viewSession, streaming);
+		await dispatch(controller, ctx.viewSession, streaming);
 
 		const frame = updateArgsSpy.mock.calls.at(-1)?.[0] as Record<string, unknown>;
 		expect(frame.__partialJson).toBe(target);
@@ -188,12 +195,12 @@ describe("EventController paces streamed tool args", () => {
 		const streaming = makeStreamingMessage([
 			{ type: "toolCall", id: "tc-1", name: "write", arguments: {}, [kStreamingPartialJson]: target },
 		]);
-		const { controller, pendingTools } = createFixture(streaming);
+		const { controller, ctx, pendingTools } = createFixture(streaming);
 
 		// Args still streaming, but the reveal now seeds the preview with the
 		// full available partialJson on the very first message_update — so the
 		// path is already visible before the tool starts executing.
-		await dispatch(controller, streaming);
+		await dispatch(controller, ctx.viewSession, streaming);
 		const component = pendingTools.get("tc-1");
 		if (!component) throw new Error("expected a pending write component");
 		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("/tmp/exec.ts");
@@ -202,7 +209,7 @@ describe("EventController paces streamed tool args", () => {
 		// with smoothing off, an owned-dialect projector, or a superseded turn that
 		// still runs the call). The tool executes anyway: tool_execution_start is the
 		// one event every path emits with the validated args, so it must reconcile.
-		await dispatchToolStart(controller, {
+		await dispatchToolStart(controller, ctx.viewSession, {
 			toolCallId: "tc-1",
 			toolName: "write",
 			args: { path: "/tmp/exec.ts", content },

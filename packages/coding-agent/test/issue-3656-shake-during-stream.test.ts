@@ -144,7 +144,7 @@ describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn",
 		const updateArgs = vi.spyOn(pendingTool, "updateArgs");
 
 		mode.rebuildChatFromMessages();
-		await mode.eventController.handleEvent({
+		await mode.eventController.handleEvent(mode.session, {
 			type: "message_update",
 			message: assistantWithBash("echo after"),
 		} as AgentSessionEvent);

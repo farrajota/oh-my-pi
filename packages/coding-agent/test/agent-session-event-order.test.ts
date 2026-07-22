@@ -124,4 +124,57 @@ describe("AgentSession subscriber event order", () => {
 			expect(endIndex).toBeGreaterThan(startIndex);
 		}
 	});
+
+	it("captures agent_start time before a delayed extension and publishes it atomically to subscribers", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled test model to exist");
+
+		let now = 1_000;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const enteredAgentStartExtension = Promise.withResolvers<void>();
+		const releaseAgentStartExtension = Promise.withResolvers<void>();
+		const extensionRunner = {
+			emit: vi.fn(async (event: { type: string }) => {
+				if (event.type !== "agent_start") return;
+				enteredAgentStartExtension.resolve();
+				await releaseAgentStartExtension.promise;
+			}),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			hasHandlers: vi.fn((eventType: string) => eventType === "agent_start"),
+			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+		} as unknown as ExtensionRunner;
+		const agent = new Agent({
+			getApiKey: agentModel => `${agentModel.provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (streamModel, context, options) =>
+				createMockModel({ handler: () => ({ content: ["Done"] }) }).stream(streamModel, context, options),
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			extensionRunner,
+		});
+
+		const observedStartTimes: Array<number | undefined> = [];
+		session.subscribe(event => {
+			if (event.type === "agent_start") {
+				observedStartTimes.push((session as AgentSession & { activeRunStartedAt?: number }).activeRunStartedAt);
+			}
+		});
+		const prompt = session.prompt("time the real run");
+		await enteredAgentStartExtension.promise;
+		expect((session as AgentSession & { activeRunStartedAt?: number }).activeRunStartedAt).toBeUndefined();
+		now = 9_000;
+		releaseAgentStartExtension.resolve();
+		await prompt;
+		await session.waitForIdle();
+
+		// The origin time is captured before the extension await, but is not public
+		// until FIFO subscriber delivery begins.
+		expect(observedStartTimes).toEqual([1_000]);
+	});
 });

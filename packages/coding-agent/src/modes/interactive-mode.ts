@@ -219,6 +219,11 @@ interface WorkingMessageAccentCacheKey {
 	accentSurfaceLuminance: number | undefined;
 	sessionAccentEnabled: boolean;
 }
+interface WorkingMessageRunState {
+	startedAt: number;
+	runTokenDelta: number;
+	sessionFile: string | undefined;
+}
 
 /**
  * Intern the shimmer palettes for each `WorkingMessageAccent` so `compile()`
@@ -494,8 +499,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	autoCompactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
 	#pendingWorkingMessage: string | undefined;
-	#workingMessageStartedAt: number | undefined;
-	#workingMessageRunTokenDelta = 0;
+	#workingMessageRuns = new WeakMap<AgentSession, WorkingMessageRunState>();
+	#pendingSubmissionSession: AgentSession | undefined;
 	#workingMessageAccentCacheKey?: WorkingMessageAccentCacheKey;
 	#workingMessageAccentCacheValue?: WorkingMessageAccent;
 	#workingMessageAccentCacheHasValue = false;
@@ -1504,8 +1509,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			cancelled: false,
 			started: false,
 		};
-		this.beginWorkingMessageRun();
-		this.setWorkingMessageRunTokenDelta(0);
+		const owner = this.viewSession;
+		this.#pendingSubmissionSession = owner;
+		this.beginWorkingMessageRun(owner, Date.now());
 		this.#pendingSubmittedInput = submission;
 		if (!submission.customType) {
 			this.#resetGoalContinuationSuppression();
@@ -1543,7 +1549,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmittedInput = undefined;
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		this.endWorkingMessageRun();
+		const owner = this.#pendingSubmissionSession;
+		if (owner) this.endWorkingMessageRun(owner);
+		this.#pendingSubmissionSession = undefined;
 		if (submission.customType === "goal-continuation") {
 			this.#goalContinuationTurnInFlight = false;
 		}
@@ -1573,6 +1581,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	finishPendingSubmission(input: SubmittedUserInput): void {
 		const wasPendingSubmission = this.#pendingSubmittedInput === input;
 		const pendingSubmissionDispose = this.#pendingSubmissionDispose;
+		const owner = wasPendingSubmission ? this.#pendingSubmissionSession : undefined;
 		if (wasPendingSubmission) {
 			this.#pendingSubmittedInput = undefined;
 			this.#pendingSubmissionDispose = undefined;
@@ -1581,15 +1590,17 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#goalContinuationTurnInFlight = false;
 		}
 
-		if (wasPendingSubmission && !this.session.isStreaming && !this.streamingComponent) {
+		if (wasPendingSubmission && !owner?.isStreaming) {
 			this.optimisticUserMessageSignature = undefined;
 			pendingSubmissionDispose?.();
 			this.#optimisticUserMessageComponents = [];
 			this.#pendingWorkingMessage = undefined;
-			if (this.loadingAnimation) {
+			if (owner) this.endWorkingMessageRun(owner);
+			if (this.viewSession === owner && !this.streamingComponent && this.loadingAnimation) {
 				this.#stopLoadingAnimation(true);
 			}
 		}
+		if (wasPendingSubmission) this.#pendingSubmissionSession = undefined;
 	}
 
 	#computeEditorMaxHeight(): number {
@@ -3927,6 +3938,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	showError(message: string): void {
+		const owner = this.#pendingSubmissionSession;
+		if (owner) this.endWorkingMessageRun(owner);
+		this.#pendingSubmissionSession = undefined;
 		this.#pendingSubmittedInput = undefined;
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
@@ -4045,23 +4059,45 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#cacheWorkingMessageAccent(key, main && dim ? { main, dim } : undefined);
 	}
 
-	beginWorkingMessageRun(now = Date.now()): void {
-		this.#workingMessageStartedAt = now;
-		this.#workingMessageRunTokenDelta = 0;
+	#workingMessageRun(session: AgentSession): WorkingMessageRunState | undefined {
+		const state = this.#workingMessageRuns.get(session);
+		if (!state) return undefined;
+		const sessionFile = session.sessionFile;
+		if (state.sessionFile !== undefined && sessionFile !== undefined && state.sessionFile !== sessionFile) {
+			this.#workingMessageRuns.delete(session);
+			return undefined;
+		}
+		if (state.sessionFile === undefined && sessionFile !== undefined) state.sessionFile = sessionFile;
+		return state;
 	}
 
-	getWorkingMessageRunElapsedMs(now = Date.now()): number | undefined {
-		const startedAt = this.#workingMessageStartedAt;
-		return startedAt === undefined ? undefined : now - startedAt;
+	beginWorkingMessageRun(session: AgentSession, startedAt: number): void {
+		this.#workingMessageRuns.set(session, { startedAt, runTokenDelta: 0, sessionFile: session.sessionFile });
 	}
 
-	setWorkingMessageRunTokenDelta(tokenDelta: number): void {
-		this.#workingMessageRunTokenDelta = Math.max(0, Math.round(tokenDelta));
+	rehydrateWorkingMessageRun(session: AgentSession, startedAt: number | undefined): boolean {
+		const state = this.#workingMessageRun(session);
+		if (startedAt !== undefined) {
+			if (!state || state.startedAt !== startedAt) this.beginWorkingMessageRun(session, startedAt);
+			return true;
+		}
+		if (session === this.#pendingSubmissionSession && state !== undefined) return true;
+		this.#workingMessageRuns.delete(session);
+		return false;
 	}
 
-	endWorkingMessageRun(): void {
-		this.#workingMessageStartedAt = undefined;
-		this.#workingMessageRunTokenDelta = 0;
+	getWorkingMessageRunElapsedMs(session: AgentSession, now = Date.now()): number | undefined {
+		const state = this.#workingMessageRun(session);
+		return state === undefined ? undefined : now - state.startedAt;
+	}
+
+	setWorkingMessageRunTokenDelta(session: AgentSession, tokenDelta: number): void {
+		const state = this.#workingMessageRun(session);
+		if (state) state.runTokenDelta = Math.max(0, Math.round(tokenDelta));
+	}
+
+	endWorkingMessageRun(session: AgentSession): void {
+		this.#workingMessageRuns.delete(session);
 	}
 
 	ensureLoadingAnimation(): void {
@@ -4072,13 +4108,15 @@ export class InteractiveMode implements InteractiveModeContext {
 				const runner = this.session.extensionRunner;
 				let suffix = "";
 				if (runner) {
+					const session = this.viewSession;
 					const now = Date.now();
-					const startedAt = this.#workingMessageStartedAt;
+					const state = this.#workingMessageRun(session);
+					const startedAt = state?.startedAt;
 					const context: WorkingMessageSuffixContext = {
 						now,
 						startedAt,
 						elapsedMs: startedAt === undefined ? undefined : now - startedAt,
-						runTokenDelta: this.#workingMessageRunTokenDelta,
+						runTokenDelta: state?.runTokenDelta ?? 0,
 						cwd: this.sessionManager.getCwd(),
 					};
 					suffix = runner.renderWorkingMessageSuffix(message, context);

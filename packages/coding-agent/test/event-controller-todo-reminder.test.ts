@@ -44,12 +44,12 @@ describe("EventController todo reminder", () => {
 		const { ctx, present } = createContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(reminder(1, "old task"));
+		await controller.handleEvent(ctx.viewSession, reminder(1, "old task"));
 		expect(present).toHaveBeenCalledTimes(1);
 
 		// A second reminder is a distinct escalation, committed as its own block —
 		// not merged into or replacing the first.
-		await controller.handleEvent(reminder(2, "new task"));
+		await controller.handleEvent(ctx.viewSession, reminder(2, "new task"));
 		expect(present).toHaveBeenCalledTimes(2);
 		expect(present.mock.calls[0]![0]).not.toBe(present.mock.calls[1]![0]);
 	});
@@ -59,10 +59,10 @@ describe("EventController todo reminder", () => {
 		const controller = new EventController(ctx);
 		const phases = [{ name: "Implementation", tasks: [{ content: "done task", status: "completed" as const }] }];
 
-		await controller.handleEvent(reminder(1));
+		await controller.handleEvent(ctx.viewSession, reminder(1));
 		expect(present).toHaveBeenCalledTimes(1);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: "todo-1",
 			toolName: "todo",

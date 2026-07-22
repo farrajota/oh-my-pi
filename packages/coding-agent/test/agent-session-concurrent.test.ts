@@ -802,12 +802,31 @@ describe("AgentSession concurrent prompt guard", () => {
 		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
 
 		const observedIsStreamingAtAgentEnd: boolean[] = [];
+		const observedActiveRunStartedAtAtStart: Array<number | undefined> = [];
+		const observedActiveRunStartedAtAtEnd: Array<number | undefined> = [];
 		const reentrantPromptResults: Array<"resolved" | { error: string }> = [];
 		let reentrantPrompted = false;
+		const coreAgentEndDeferred = Promise.withResolvers<void>();
+		const releaseAgentEndMaintenance = Promise.withResolvers<void>();
+		let agentEndMaintenanceCalls = 0;
+		vi.spyOn(GoalRuntime.prototype, "onAgentEnd").mockImplementation(async () => {
+			if (agentEndMaintenanceCalls++ !== 0) return;
+			// #processAgentEvent reaches goal maintenance only after its core
+			// agent_end has been held in #pendingAgentEndEmit. Keep the prompt
+			// in flight here to observe that deferred window deterministically.
+			coreAgentEndDeferred.resolve();
+			await releaseAgentEndMaintenance.promise;
+		});
 
 		session.subscribe(event => {
+			const timedSession = session as AgentSession & { activeRunStartedAt?: number };
+			if (event.type === "agent_start") {
+				observedActiveRunStartedAtAtStart.push(timedSession.activeRunStartedAt);
+				return;
+			}
 			if (event.type !== "agent_end") return;
 			observedIsStreamingAtAgentEnd.push(session.isStreaming);
+			observedActiveRunStartedAtAtEnd.push(timedSession.activeRunStartedAt);
 			if (reentrantPrompted) return;
 			reentrantPrompted = true;
 			void session
@@ -816,10 +835,22 @@ describe("AgentSession concurrent prompt guard", () => {
 				.catch((err: Error) => reentrantPromptResults.push({ error: err.message }));
 		});
 
-		await session.prompt("First message");
+		const firstPrompt = session.prompt("First message");
+		await coreAgentEndDeferred.promise;
+		expect(session.activeRunStartedAt).toEqual(expect.any(Number));
+		expect(observedActiveRunStartedAtAtEnd).toEqual([]);
+		releaseAgentEndMaintenance.resolve();
+		await firstPrompt;
+
+		// The first prompt has now unwound, allowing its deferred agent_end
+		// subscriber to synchronously begin the second prompt.
 		await waitFor(() => reentrantPromptResults.length > 0, 2000);
 		await session.waitForIdle();
 
+		expect(observedActiveRunStartedAtAtStart).toEqual([expect.any(Number), expect.any(Number)]);
+		// agent_end is held until prompt unwind completes; its subscribers observe
+		// the cleared lifecycle field atomically with the externally visible end.
+		expect(observedActiveRunStartedAtAtEnd).toEqual([undefined, undefined]);
 		expect(observedIsStreamingAtAgentEnd).not.toContain(true);
 		expect(reentrantPromptResults).toEqual(["resolved"]);
 	});

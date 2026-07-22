@@ -180,12 +180,18 @@ describe("EventController displaces consecutive waiting polls", () => {
 			viewSession: { getToolByName: () => undefined },
 			sessionManager: { getCwd: () => process.cwd() },
 			setTodos: vi.fn(),
+			setWorkingMessageRunTokenDelta: vi.fn(),
 		} as unknown as InteractiveModeContext;
-		return { controller: new EventController(ctx), children, pendingTools };
+		return { controller: new EventController(ctx), ctx, children, pendingTools };
 	}
 
-	async function runPoll(controller: EventController, children: Component[], toolCallId: string) {
-		await controller.handleEvent({
+	async function runPoll(
+		controller: EventController,
+		source: InteractiveModeContext["viewSession"],
+		children: Component[],
+		toolCallId: string,
+	) {
+		await controller.handleEvent(source, {
 			type: "tool_execution_start",
 			toolCallId,
 			toolName: "hub",
@@ -193,7 +199,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		});
 		const component = children[children.length - 1] as ToolExecutionComponent;
 		trackComponent(created, component);
-		await controller.handleEvent({
+		await controller.handleEvent(source, {
 			type: "tool_execution_end",
 			toolCallId,
 			toolName: "hub",
@@ -203,8 +209,14 @@ describe("EventController displaces consecutive waiting polls", () => {
 		return component;
 	}
 
-	async function runTodo(controller: EventController, children: Component[], toolCallId: string, items?: string[]) {
-		await controller.handleEvent({
+	async function runTodo(
+		controller: EventController,
+		source: InteractiveModeContext["viewSession"],
+		children: Component[],
+		toolCallId: string,
+		items?: string[],
+	) {
+		await controller.handleEvent(source, {
 			type: "tool_execution_start",
 			toolCallId,
 			toolName: "todo",
@@ -212,7 +224,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		});
 		const component = children[children.length - 1] as ToolExecutionComponent;
 		trackComponent(created, component);
-		await controller.handleEvent({
+		await controller.handleEvent(source, {
 			type: "tool_execution_end",
 			toolCallId,
 			toolName: "todo",
@@ -223,12 +235,12 @@ describe("EventController displaces consecutive waiting polls", () => {
 	}
 
 	it("removes the previous waiting poll when the next hub call starts", async () => {
-		const { controller, children } = createFixture();
+		const { controller, ctx, children } = createFixture();
 
-		const first = await runPoll(controller, children, "t1");
+		const first = await runPoll(controller, ctx.viewSession, children, "t1");
 		expect(children).toContain(first);
 
-		const second = await runPoll(controller, children, "t2");
+		const second = await runPoll(controller, ctx.viewSession, children, "t2");
 
 		// The stale "waiting" frame is gone; only the fresh poll remains.
 		expect(children).not.toContain(first);
@@ -238,12 +250,12 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	it("seals the waiting poll in place when a different tool runs next", async () => {
-		const { controller, children } = createFixture();
+		const { controller, ctx, children } = createFixture();
 
-		const poll = await runPoll(controller, children, "t1");
+		const poll = await runPoll(controller, ctx.viewSession, children, "t1");
 		expect(poll.isTranscriptBlockFinalized()).toBe(false);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: "t2",
 			toolName: "bash",
@@ -258,13 +270,13 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	it("removes the previous todo snapshot when a later todo update lands in the same turn", async () => {
-		const { controller, children } = createFixture();
+		const { controller, ctx, children } = createFixture();
 
-		const first = await runTodo(controller, children, "todo-1", ["plan", "read"]);
+		const first = await runTodo(controller, ctx.viewSession, children, "todo-1", ["plan", "read"]);
 		expect(children).toContain(first);
 		expect(first.isTranscriptBlockFinalized()).toBe(false);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: "bash-1",
 			toolName: "bash",
@@ -274,7 +286,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		expect(children).toContain(first);
 		expect(children).toContain(bash);
 
-		const second = await runTodo(controller, children, "todo-2", ["fix", "test"]);
+		const second = await runTodo(controller, ctx.viewSession, children, "todo-2", ["fix", "test"]);
 
 		expect(children).not.toContain(first);
 		expect(children).toContain(bash);
@@ -283,9 +295,9 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	it("displaces a prior todo snapshot when a streamed second todo lands a successful result", async () => {
-		const { controller, children, pendingTools } = createFixture();
+		const { controller, ctx, children, pendingTools } = createFixture();
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: "todo-1",
 			toolName: "todo",
@@ -297,7 +309,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		children.push(second);
 		pendingTools.set("todo-2", second);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: "todo-1",
 			toolName: "todo",
@@ -306,7 +318,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		});
 		expect(first.isTranscriptBlockFinalized()).toBe(false);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: "bash-1",
 			toolName: "bash",
@@ -317,7 +329,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		expect(children).toContain(second);
 		expect(children).toContain(bash);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: "todo-2",
 			toolName: "todo",
@@ -329,7 +341,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		expect(children).toContain(first);
 		expect(first.isTranscriptBlockFinalized()).toBe(false);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: "todo-2",
 			toolName: "todo",
@@ -344,13 +356,13 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	it("keeps the prior todo snapshot when a follow-up todo errors", async () => {
-		const { controller, children } = createFixture();
+		const { controller, ctx, children } = createFixture();
 
-		const first = await runTodo(controller, children, "todo-1", ["plan", "read"]);
+		const first = await runTodo(controller, ctx.viewSession, children, "todo-1", ["plan", "read"]);
 		expect(children).toContain(first);
 		expect(first.isTranscriptBlockFinalized()).toBe(false);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: "todo-2",
 			toolName: "todo",
@@ -358,7 +370,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		});
 		const errored = trackComponent(created, children[children.length - 1] as ToolExecutionComponent);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: "todo-2",
 			toolName: "todo",
@@ -372,16 +384,16 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	it("does not displace a poll that observed completions", async () => {
-		const { controller, children } = createFixture();
+		const { controller, ctx, children } = createFixture();
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: "t1",
 			toolName: "hub",
 			args: { op: "wait", ids: ["j0"] },
 		});
 		const settled = trackComponent(created, children[children.length - 1] as ToolExecutionComponent);
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: "t1",
 			toolName: "hub",
@@ -389,7 +401,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 			isError: false,
 		});
 
-		const next = await runPoll(controller, children, "t2");
+		const next = await runPoll(controller, ctx.viewSession, children, "t2");
 
 		// A poll that carried real results is kept as history.
 		expect(children).toContain(settled);

@@ -116,7 +116,7 @@ describe("mid-turn transcript rebuild keeps in-flight tool calls", () => {
 		// The tool finishes after the rebuild: the result must land in the same
 		// rebuilt component instead of being dropped.
 		const controller = new EventController(ctx);
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: "call-1",
 			toolName: "bash",

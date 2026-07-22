@@ -57,8 +57,10 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 		hideThinkingBlock: false,
 		setWorkingMessage: vi.fn(),
 		beginWorkingMessageRun: vi.fn(),
+		rehydrateWorkingMessageRun: vi.fn(() => false),
 		endWorkingMessageRun: vi.fn(),
 		setWorkingMessageRunTokenDelta: vi.fn(),
+		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
 		clearPinnedError: vi.fn(),
 		loadingAnimation: undefined,
 		autoCompactionLoader: undefined,
@@ -78,11 +80,12 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 		sessionManager: { getSessionName: () => "test-session" },
 		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), terminal: { setProgress } },
 		viewSession: {
+			activeRunStartedAt: 1_000,
 			isCompacting: false,
-			getLastAssistantMessage: () => undefined,
 			get isStreaming() {
 				return streamState.isStreaming;
 			},
+			agent: { state: streamState },
 		},
 		session: {
 			agent: { state: { isStreaming: false } },
@@ -183,7 +186,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		const controller = new EventController(ctx);
 
 		// Turn 1 begins: the working loader is created and attached.
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		const firstWorking = workingLoaders[0];
 		expect(firstWorking).toBeDefined();
 		expect(statusContainer.children).toContain(ctx.loadingAnimation);
@@ -192,7 +195,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		// The original turn's agent_end is held while the prompt is in flight, so the
 		// session keeps reporting streaming throughout.
 		streamState.isStreaming = true;
-		await controller.handleEvent(COMPACTION_START);
+		await controller.handleEvent(ctx.viewSession, COMPACTION_START);
 
 		// The working loader must be fully torn down — not detached-but-referenced —
 		// so the upcoming agent_start can recreate it.
@@ -200,11 +203,11 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		expect(ctx.loadingAnimation).toBeUndefined();
 		expect(statusContainer.children).not.toContain(firstWorking);
 
-		await controller.handleEvent(COMPACTION_END);
+		await controller.handleEvent(ctx.viewSession, COMPACTION_END);
 
 		// The retry continuation starts a fresh turn: the loader must reappear in the
 		// status container so streaming shows "Working…" again (issue: it stayed gone).
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		expect(ctx.loadingAnimation).toBeDefined();
 		expect(statusContainer.children).toContain(ctx.loadingAnimation);
 		expect(workingLoaders).toHaveLength(2);
@@ -214,18 +217,18 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		const { ctx, streamState, statusContainer, workingLoaders } = createContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		const firstWorking = workingLoaders[0];
 		expect(statusContainer.children).toContain(ctx.loadingAnimation);
 
 		// A transient error: the retry loader takes over the status container.
 		streamState.isStreaming = true;
-		await controller.handleEvent(RETRY_START);
+		await controller.handleEvent(ctx.viewSession, RETRY_START);
 		expect(firstWorking?.stop).toHaveBeenCalled();
 		expect(ctx.loadingAnimation).toBeUndefined();
 
 		// The retry attempt re-enters the agent loop, emitting a fresh agent_start.
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		expect(ctx.loadingAnimation).toBeDefined();
 		expect(statusContainer.children).toContain(ctx.loadingAnimation);
 	});
@@ -234,7 +237,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		const { ctx } = createContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(RETRY_START);
+		await controller.handleEvent(ctx.viewSession, RETRY_START);
 
 		expectRetryLoaderText(ctx, "Retrying (1/3) in 1s… (esc to cancel)");
 	});
@@ -243,7 +246,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		const { ctx } = createContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(REPEATED_RETRY_START);
+		await controller.handleEvent(ctx.viewSession, REPEATED_RETRY_START);
 
 		expectRetryLoaderText(ctx, "Waiting for session limit reset (round 2) in 14m… Esc to cancel");
 	});
@@ -253,11 +256,11 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		const controller = new EventController(ctx);
 
 		for (const reason of ["manual-input", "cancelled", "generation-superseded"]) {
-			await controller.handleEvent(REPEATED_RETRY_START);
+			await controller.handleEvent(ctx.viewSession, REPEATED_RETRY_START);
 			expect(ctx.retryLoader).toBeDefined();
 			expect(statusContainer.children).toHaveLength(1);
 
-			await controller.handleEvent(repeatedRetryEnd(reason));
+			await controller.handleEvent(ctx.viewSession, repeatedRetryEnd(reason));
 
 			expect(ctx.retryLoader).toBeUndefined();
 			expect(statusContainer.children).toHaveLength(0);
@@ -269,8 +272,8 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		const { ctx } = createContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(REPEATED_RETRY_START);
-		await controller.handleEvent(repeatedRetryEnd("max-retries"));
+		await controller.handleEvent(ctx.viewSession, REPEATED_RETRY_START);
+		await controller.handleEvent(ctx.viewSession, repeatedRetryEnd("max-retries"));
 
 		expect(ctx.showError).toHaveBeenCalledWith("Retry failed after 3 attempts: session retry ended");
 	});
@@ -280,7 +283,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		const controller = new EventController(ctx);
 
 		// Turn begins: the working loader is created and attached.
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		const firstWorking = workingLoaders[0];
 		expect(firstWorking).toBeDefined();
 
@@ -293,7 +296,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		ctx.loadingAnimation = undefined;
 		statusContainer.clear();
 
-		await controller.handleEvent(TASK_TOOL_EXECUTION_END);
+		await controller.handleEvent(ctx.viewSession, TASK_TOOL_EXECUTION_END);
 
 		expect(ctx.loadingAnimation).toBeDefined();
 		expect(statusContainer.children).toContain(ctx.loadingAnimation);
@@ -304,13 +307,13 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		const { ctx, streamState, statusContainer } = createContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		ctx.loadingAnimation?.stop();
 		ctx.loadingAnimation = undefined;
 		statusContainer.clear();
 		streamState.isStreaming = false;
 
-		await controller.handleEvent(TASK_TOOL_EXECUTION_END);
+		await controller.handleEvent(ctx.viewSession, TASK_TOOL_EXECUTION_END);
 
 		// No streaming → reconciler must stay a no-op; the spinner is not the
 		// post-turn idle state.
@@ -322,19 +325,19 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		const { ctx, setProgress } = createContext({ terminalProgress: true });
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		expect(setProgress).toHaveBeenCalledTimes(1);
 		expect(setProgress).toHaveBeenLastCalledWith(true);
 
-		await controller.handleEvent(COMPACTION_START);
+		await controller.handleEvent(ctx.viewSession, COMPACTION_START);
 		expect(setProgress).toHaveBeenCalledTimes(1);
 
-		await controller.handleEvent(COMPACTION_END);
+		await controller.handleEvent(ctx.viewSession, COMPACTION_END);
 		expect(setProgress).toHaveBeenCalledTimes(2);
 		expect(setProgress).toHaveBeenLastCalledWith(false);
 
-		await controller.handleEvent(AGENT_START);
-		await controller.handleEvent(AGENT_END);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_END);
 		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false, true, false]);
 	});
 });

@@ -23,7 +23,7 @@ import { createUsageRowBlock } from "../../modes/components/usage-row";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
 import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "text" };
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../session/messages";
 import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
@@ -142,7 +142,11 @@ function exposesRawPartialJson(toolName: string, rawInput: boolean, tool: unknow
 }
 
 type AgentSessionEventHandlers = {
-	[E in AgentSessionEventKind]: (event: Extract<AgentSessionEvent, { type: E }>) => Promise<void>;
+	[E in AgentSessionEventKind]: (
+		source: AgentSession,
+		event: Extract<AgentSessionEvent, { type: E }>,
+		replicatedRunStartedAt?: number,
+	) => Promise<void>;
 };
 
 type WorkingMessageLifecycleContext = InteractiveModeContext;
@@ -230,45 +234,38 @@ export class EventController {
 			requestRender: component => this.ctx.ui.requestComponentRender(component),
 		});
 		this.#handlers = {
-			agent_start: e => this.#handleAgentStart(e),
-			agent_end: e => this.#handleAgentEnd(e),
+			agent_start: (source, e, replicatedRunStartedAt) => this.#handleAgentStart(source, e, replicatedRunStartedAt),
+			agent_end: (source, e) => this.#handleAgentEnd(source, e),
 			turn_start: async () => this.#handleTurnStart(),
-			turn_end: async e => this.#handleTurnEnd(e),
-			message_start: e => this.#handleMessageStart(e),
-			message_update: e => this.#handleMessageUpdate(e),
-			message_end: e => this.#handleMessageEnd(e),
-			tool_execution_start: e => this.#handleToolExecutionStart(e),
-			tool_execution_update: e => this.#handleToolExecutionUpdate(e),
-			tool_execution_end: e => this.#handleToolExecutionEnd(e),
-			auto_compaction_start: e => this.#handleAutoCompactionStart(e),
-			auto_compaction_end: e => this.#handleAutoCompactionEnd(e),
-			auto_retry_start: e => this.#handleAutoRetryStart(e),
-			auto_retry_end: e => this.#handleAutoRetryEnd(e),
-			retry_fallback_applied: e => this.#handleRetryFallbackApplied(e),
-			retry_fallback_succeeded: e => this.#handleRetryFallbackSucceeded(e),
-			ttsr_triggered: e => this.#handleTtsrTriggered(e),
-			todo_reminder: e => this.#handleTodoReminder(e),
-			todo_auto_clear: e => this.#handleTodoAutoClear(e),
-			irc_message: e => this.#handleIrcMessage(e),
-			notice: e => this.#handleNotice(e),
+			turn_end: async (_source, e) => this.#handleTurnEnd(e),
+			message_start: (source, e) => this.#handleMessageStart(source, e),
+			message_update: (source, e) => this.#handleMessageUpdate(source, e),
+			message_end: (source, e) => this.#handleMessageEnd(source, e),
+			tool_execution_start: (source, e) => this.#handleToolExecutionStart(source, e),
+			tool_execution_update: (source, e) => this.#handleToolExecutionUpdate(source, e),
+			tool_execution_end: (source, e) => this.#handleToolExecutionEnd(source, e),
+			auto_compaction_start: async (_source, e) => this.#handleAutoCompactionStart(e),
+			auto_compaction_end: (source, e) => this.#handleAutoCompactionEnd(source, e),
+			auto_retry_start: async (_source, e) => this.#handleAutoRetryStart(e),
+			auto_retry_end: (source, e) => this.#handleAutoRetryEnd(source, e),
+			ttsr_triggered: async (_source, e) => this.#handleTtsrTriggered(e),
+			retry_fallback_applied: async (_source, e) => this.#handleRetryFallbackApplied(e),
+			retry_fallback_succeeded: async (_source, e) => this.#handleRetryFallbackSucceeded(e),
+			irc_message: async (_source, e) => this.#handleIrcMessage(e),
+			todo_reminder: async (_source, e) => this.#handleTodoReminder(e),
+			todo_auto_clear: async (_source, e) => this.#handleTodoAutoClear(e),
+			notice: async (_source, e) => this.#handleNotice(e),
 			thinking_level_changed: async () => {
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
 				const hideThinking = this.ctx.effectiveHideThinkingBlock;
-				// Only do the expensive full resetDisplay when the effective
-				// visibility actually changed. Auto-classification (e.g. high→medium)
-				// emits thinking_level_changed without changing visibility — a full
-				// terminal replay for those would be disruptive.
 				if (hideThinking === this.#prevHideThinking) {
 					this.ctx.ui.requestRender();
 					return;
 				}
 				this.#prevHideThinking = hideThinking;
-				// Propagate visibility to existing rendered messages.
 				for (const child of this.ctx.chatContainer.children) {
-					if (child instanceof AssistantMessageComponent) {
-						child.setHideThinkingBlock(hideThinking);
-					}
+					if (child instanceof AssistantMessageComponent) child.setHideThinkingBlock(hideThinking);
 				}
 				if (this.ctx.streamingComponent && this.ctx.streamingMessage) {
 					this.ctx.streamingComponent.setHideThinkingBlock(hideThinking);
@@ -298,14 +295,15 @@ export class EventController {
 		this.#lastReadGroup = undefined;
 	}
 
-	#addRunTokens(tokens: number): void {
+	#addRunTokens(source: AgentSession, tokens: number): void {
 		if (tokens <= 0) return;
 		this.#currentRunTokenDelta += tokens;
-		this.#updateWorkingMessageRunTokenDelta();
+		this.#updateWorkingMessageRunTokenDelta(source);
 	}
 
-	#updateWorkingMessageRunTokenDelta(): void {
+	#updateWorkingMessageRunTokenDelta(source: AgentSession): void {
 		this.ctx.setWorkingMessageRunTokenDelta(
+			source,
 			Math.max(0, this.#currentRunTokenDelta + this.#currentAssistantMessageTokenEstimate),
 		);
 	}
@@ -393,8 +391,8 @@ export class EventController {
 		return component;
 	}
 
-	#updateWorkingMessageFromIntent(intent: unknown): void {
-		if (this.ctx.session.isAborting) return;
+	#updateWorkingMessageFromIntent(source: AgentSession, intent: unknown): void {
+		if (source.isAborting) return;
 		// Streamed JSON can deliver non-string `i` (object, number, boolean) before
 		// schema validation; `?.` only guards null/undefined, so guard the type too.
 		if (typeof intent !== "string") return;
@@ -405,8 +403,9 @@ export class EventController {
 	}
 
 	subscribeToAgent(): void {
-		this.ctx.unsubscribe = this.ctx.session.subscribe(async (event: AgentSessionEvent) => {
-			await this.handleEvent(event);
+		const source = this.ctx.session;
+		this.ctx.unsubscribe = source.subscribe(async (event: AgentSessionEvent) => {
+			await this.handleEvent(source, event);
 		});
 	}
 	/**
@@ -441,20 +440,24 @@ export class EventController {
 		this.#toolArgsReveal.stop();
 	}
 
-	async handleEvent(event: AgentSessionEvent): Promise<void> {
-		if (!this.ctx.isInitialized) {
-			await this.ctx.init();
-		}
+	async handleEvent(source: AgentSession, event: AgentSessionEvent, replicatedRunStartedAt?: number): Promise<void> {
+		if (source !== this.ctx.viewSession) return;
+		if (!this.ctx.isInitialized) await this.ctx.init();
+		if (source !== this.ctx.viewSession) return;
+		const run = this.#handlers[event.type] as (
+			source: AgentSession,
+			event: AgentSessionEvent,
+			replicatedRunStartedAt?: number,
+		) => Promise<void>;
+		await run(source, event, replicatedRunStartedAt);
+	}
 
-		// Each handler explicitly requests a render (or leaves it out, when it
-		// changed nothing visible). A blanket pre-render fired on every event —
-		// including the ~hundreds of `message_update` deltas per streaming turn —
-		// doubled the paint rate: the pre-render's frame fires while the handler
-		// is awaiting, then the handler's own final requestRender schedules a
-		// second identical frame. Removing it lets the render cadence follow real
-		// state changes rather than event volume (issue #4353).
-		const run = this.#handlers[event.type] as (e: AgentSessionEvent) => Promise<void>;
-		await run(event);
+	async rehydrateActiveRun(source: AgentSession): Promise<void> {
+		if (source !== this.ctx.viewSession) return;
+		if (!this.ctx.isInitialized) await this.ctx.init();
+		if (source !== this.ctx.viewSession || !source.isStreaming) return;
+		this.ctx.rehydrateWorkingMessageRun(source, source.activeRunStartedAt);
+		this.#prepareActiveRun();
 	}
 
 	#setTerminalProgress(active: boolean): void {
@@ -505,7 +508,7 @@ export class EventController {
 		this.#retrySupersededAssistantQueue = [];
 	}
 
-	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+	#prepareActiveRun(): void {
 		this.#toolTimelineComponents.clear();
 		this.#postToolAssistantComponents.clear();
 		this.#lastIntent = undefined;
@@ -519,8 +522,6 @@ export class EventController {
 		this.#resolveDisplaceableTodo();
 		this.#lastAssistantComponent = undefined;
 		this.#lastCompletedAssistantMessage = undefined;
-		// Restore the previous turn's inline error in the transcript before dropping
-		// the banner, so the error stays in history once the banner is gone.
 		this.#pinnedErrorComponent?.setErrorPinned(false);
 		this.#pinnedErrorComponent = undefined;
 		this.ctx.clearPinnedError();
@@ -533,14 +534,27 @@ export class EventController {
 		this.#cancelIdleRecap();
 		this.ctx.statusLine.markActivityStart();
 		this.#setTerminalProgress(true);
-		this.ctx.beginWorkingMessageRun();
-		this.ctx.setWorkingMessageRunTokenDelta(0);
 		this.ctx.ensureLoadingAnimation();
 		this.ctx.ui.requestRender();
 	}
 
-	async #handleMessageStart(event: Extract<AgentSessionEvent, { type: "message_start" }>): Promise<void> {
-		this.#ensureWorkingLoaderWhileStreaming();
+	async #handleAgentStart(
+		source: AgentSession,
+		_event: Extract<AgentSessionEvent, { type: "agent_start" }>,
+		replicatedRunStartedAt?: number,
+	): Promise<void> {
+		const startedAt = replicatedRunStartedAt ?? source.activeRunStartedAt;
+		if (startedAt === undefined) throw new Error("AgentSession agent_start missing activeRunStartedAt");
+		this.ctx.beginWorkingMessageRun(source, startedAt);
+		this.ctx.setWorkingMessageRunTokenDelta(source, 0);
+		this.#prepareActiveRun();
+	}
+
+	async #handleMessageStart(
+		source: AgentSession,
+		event: Extract<AgentSessionEvent, { type: "message_start" }>,
+	): Promise<void> {
+		this.#ensureWorkingLoaderWhileStreaming(source);
 		if (event.message.role === "hookMessage" || event.message.role === "custom") {
 			const signature = `${event.message.role}:${event.message.customType}:${event.message.timestamp}`;
 			if (this.#renderedCustomMessages.has(signature)) {
@@ -610,7 +624,7 @@ export class EventController {
 			this.ctx.ui.requestRender();
 		} else if (event.message.role === "assistant") {
 			this.#currentAssistantMessageTokenEstimate = 0;
-			this.#updateWorkingMessageRunTokenDelta();
+			this.#updateWorkingMessageRunTokenDelta(source);
 			this.#lastVisibleBlockCount = 0;
 			this.ctx.streamingComponent = createAssistantMessageComponent(this.ctx);
 			this.ctx.streamingMessage = event.message;
@@ -793,8 +807,11 @@ export class EventController {
 		if (text) vocalizer.speak(text);
 	}
 
-	async #handleMessageUpdate(event: Extract<AgentSessionEvent, { type: "message_update" }>): Promise<void> {
-		this.#ensureWorkingLoaderWhileStreaming();
+	async #handleMessageUpdate(
+		source: AgentSession,
+		event: Extract<AgentSessionEvent, { type: "message_update" }>,
+	): Promise<void> {
+		this.#ensureWorkingLoaderWhileStreaming(source);
 		this.#vocalizeDelta(event);
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
 			const unlockedThinkingVisibility = this.ctx.noteDisplayableThinkingContent(event.message);
@@ -804,7 +821,7 @@ export class EventController {
 			}
 			this.ctx.streamingMessage = event.message;
 			this.#currentAssistantMessageTokenEstimate = estimateMessageTokens(event.message as AgentMessage);
-			this.#updateWorkingMessageRunTokenDelta();
+			this.#updateWorkingMessageRunTokenDelta(source);
 			const timeline = splitAssistantMessageToolTimeline(this.ctx.streamingMessage);
 			this.#streamingReveal.setTarget(timeline.beforeTools);
 
@@ -916,7 +933,7 @@ export class EventController {
 				const args = content.arguments;
 				if (!args || typeof args !== "object") continue;
 				if (INTENT_FIELD in args) {
-					this.#updateWorkingMessageFromIntent(args[INTENT_FIELD]);
+					this.#updateWorkingMessageFromIntent(source, args[INTENT_FIELD]);
 					continue;
 				}
 				const tool = this.ctx.viewSession.getToolByName(content.name);
@@ -924,7 +941,7 @@ export class EventController {
 				try {
 					const derived = tool.intent(args as never)?.trim();
 					if (derived) {
-						this.#updateWorkingMessageFromIntent(derived);
+						this.#updateWorkingMessageFromIntent(source, derived);
 					}
 				} catch {
 					// intent function must never break the UI
@@ -935,16 +952,19 @@ export class EventController {
 		}
 	}
 
-	async #handleMessageEnd(event: Extract<AgentSessionEvent, { type: "message_end" }>): Promise<void> {
+	async #handleMessageEnd(
+		source: AgentSession,
+		event: Extract<AgentSessionEvent, { type: "message_end" }>,
+	): Promise<void> {
 		if (event.message.role === "toolResult") {
 			if (!this.#countedToolResultIds.has(event.message.toolCallId)) {
-				this.#addRunTokens(estimateMessageTokens(event.message as AgentMessage));
+				this.#addRunTokens(source, estimateMessageTokens(event.message as AgentMessage));
 				this.#countedToolResultIds.add(event.message.toolCallId);
 			}
 			return;
 		}
 		if (event.message.role !== "assistant") {
-			this.#addRunTokens(estimateMessageTokens(event.message as AgentMessage));
+			this.#addRunTokens(source, estimateMessageTokens(event.message as AgentMessage));
 			return;
 		}
 		const unlockedThinkingVisibility = this.ctx.noteDisplayableThinkingContent(event.message);
@@ -1028,11 +1048,11 @@ export class EventController {
 			const successfulAssistant =
 				this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error";
 			if (successfulAssistant) {
-				this.#addRunTokens(estimateMessageTokens(event.message as AgentMessage));
+				this.#addRunTokens(source, estimateMessageTokens(event.message as AgentMessage));
 			}
 			this.#currentAssistantMessageTokenEstimate = 0;
-			this.#updateWorkingMessageRunTokenDelta();
-			const elapsedMs = this.ctx.getWorkingMessageRunElapsedMs();
+			this.#updateWorkingMessageRunTokenDelta(source);
+			const elapsedMs = this.ctx.getWorkingMessageRunElapsedMs(source);
 			if (
 				successfulAssistant &&
 				elapsedMs !== undefined &&
@@ -1078,10 +1098,13 @@ export class EventController {
 		this.ctx.ui.requestRender();
 	}
 
-	async #handleToolExecutionStart(event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>): Promise<void> {
+	async #handleToolExecutionStart(
+		source: AgentSession,
+		event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>,
+	): Promise<void> {
 		this.#toolExecutionStartedAt.set(event.toolCallId, Date.now());
-		this.#ensureWorkingLoaderWhileStreaming();
-		this.#updateWorkingMessageFromIntent(event.intent);
+		this.#ensureWorkingLoaderWhileStreaming(source);
+		this.#updateWorkingMessageFromIntent(source, event.intent);
 		this.#resolveDisplaceablePoll(event.toolName);
 		if (!this.ctx.pendingTools.has(event.toolCallId)) {
 			if (event.toolName === "read" && readArgsCollapseIntoGroup(event.args)) {
@@ -1122,41 +1145,25 @@ export class EventController {
 			this.#toolTimelineComponents.set(event.toolCallId, component);
 			this.ctx.ui.requestRender();
 		} else {
-			// The tool is about to run, so its arguments are final and validated.
-			// A pending component created while args streamed (message_update) may
-			// still show a mid-reveal prefix — or, when the closing full-args
-			// `message_update` never lands (smooth-streaming off leaving the
-			// throttled `arguments` stale, an owned-dialect projector, or a
-			// superseded/aborted turn that still executes the call), a stale body
-			// the result render then freezes at its `…` placeholder. Reconcile the
-			// authoritative args here and drop any live reveal so a late tick can't
-			// re-truncate them: tool_execution_start is the one event every
-			// execution path emits with the full args immediately before the result.
 			this.#toolArgsReveal.finish(event.toolCallId);
 			const component = this.ctx.pendingTools.get(event.toolCallId);
 			if (component && typeof component.updateArgs === "function") {
 				component.updateArgs(event.args, event.toolCallId);
-				if (typeof component.setArgsComplete === "function") {
-					component.setArgsComplete(event.toolCallId);
-				}
+				if (typeof component.setArgsComplete === "function") component.setArgsComplete(event.toolCallId);
 				this.ctx.ui.requestRender();
 			}
 		}
 	}
 
 	async #handleToolExecutionUpdate(
+		source: AgentSession,
 		event: Extract<AgentSessionEvent, { type: "tool_execution_update" }>,
 	): Promise<void> {
-		this.#ensureWorkingLoaderWhileStreaming();
+		this.#ensureWorkingLoaderWhileStreaming(source);
 		const component = this.ctx.pendingTools.get(event.toolCallId);
 		if (component) {
 			const asyncState = (event.partialResult.details as { async?: { state?: string } } | undefined)?.async?.state;
 			const isFinalAsyncState = asyncState === "completed" || asyncState === "failed";
-			// A final async snapshot is terminal only for a parked background
-			// block (the call already returned and was kept alive for its jobs).
-			// While the call is still executing — a mixed blocking+async task
-			// call whose jobs settle before its blocking subset — treat it as a
-			// partial frame: `tool_execution_end` still owns the terminal result.
 			const isTerminal = isFinalAsyncState && this.#backgroundTaskCallIds.has(event.toolCallId);
 			component.updateResult(
 				{ ...event.partialResult, isError: asyncState === "failed" },
@@ -1171,20 +1178,17 @@ export class EventController {
 		}
 	}
 
-	async #handleToolExecutionEnd(event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>): Promise<void> {
+	async #handleToolExecutionEnd(
+		source: AgentSession,
+		event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>,
+	): Promise<void> {
 		const toolResultTokens = estimateMessageTokens(toolResultMessageFromEvent(event));
 		const toolElapsedMs = this.#finishToolExecutionElapsedMs(event.toolCallId);
 		if (!this.#countedToolResultIds.has(event.toolCallId)) {
-			this.#addRunTokens(toolResultTokens);
+			this.#addRunTokens(source, toolResultTokens);
 			this.#countedToolResultIds.add(event.toolCallId);
 		}
-		// A transient overlay (auto-compaction / auto-retry / handoff) that ran
-		// between this tool's start and end could have detached the working
-		// loader. `tool_execution_update` already reconciles this so the spinner
-		// reappears mid-tool; mirror it here so subagent (`task`) completions —
-		// which only fire `tool_execution_end`, never `_update` — do not leave
-		// the UI looking idle while the session keeps streaming (#3857).
-		this.#ensureWorkingLoaderWhileStreaming();
+		this.#ensureWorkingLoaderWhileStreaming(source);
 		if (event.toolName === "read") {
 			if (this.#inlineReadToolImages(event.toolCallId, event.result)) {
 				const component = this.ctx.pendingTools.get(event.toolCallId);
@@ -1288,18 +1292,18 @@ export class EventController {
 			}
 		}
 	}
-	async #handleAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		// `session.isStreaming` stays true through prompt unwind (#promptInFlightCount),
-		// so use the live core loop flag only to protect a newer active turn. A
-		// mismatched agent_end while the core loop is idle may be a deferred/superseded
-		// end, but it still owns the old working-message run and loader timer.
+	async #handleAgentEnd(
+		source: AgentSession,
+		event: Extract<AgentSessionEvent, { type: "agent_end" }>,
+	): Promise<void> {
 		const lastEventAssistant = lastAssistantMessage(event.messages);
 		const mismatchedAgentEnd =
 			lastEventAssistant !== undefined &&
 			!isSameAssistantTurnEnd(lastEventAssistant, this.#lastCompletedAssistantMessage);
-		if (mismatchedAgentEnd && this.ctx.session.agent.state.isStreaming) return;
+		if (mismatchedAgentEnd && source.agent.state.isStreaming) return;
 
-		this.ctx.endWorkingMessageRun();
+		this.ctx.endWorkingMessageRun(source);
+		if (source !== this.ctx.viewSession) return;
 		if (mismatchedAgentEnd) {
 			this.#stopWorkingLoader();
 			this.ctx.statusContainer.clear();
@@ -1307,12 +1311,11 @@ export class EventController {
 			return;
 		}
 
-		// Footer text is stamped on assistant message_end before transcript finalization;
-		// matched agent_end owns full turn cleanup once the matching turn settles.
-		await this.#finishAgentEnd();
+		await this.#finishAgentEnd(source);
 	}
 
-	async #finishAgentEnd(): Promise<void> {
+	async #finishAgentEnd(source: AgentSession): Promise<void> {
+		if (source !== this.ctx.viewSession) return;
 		this.#setTerminalProgress(false);
 		this.ctx.statusLine.markActivityEnd();
 		this.#streamingReveal.stop();
@@ -1328,6 +1331,7 @@ export class EventController {
 			this.ctx.streamingMessage = undefined;
 		}
 		await this.ctx.flushPendingModelSwitch();
+		if (source !== this.ctx.viewSession) return;
 		for (const toolCallId of Array.from(this.ctx.pendingTools.keys())) {
 			if (!this.#backgroundTaskCallIds.has(toolCallId)) {
 				// A foreground tool still pending at turn end never delivered a result;
@@ -1365,12 +1369,8 @@ export class EventController {
 
 	/**
 	 * Tear down the live "Working…" loader: stop its animation timer AND clear the
-	 * reference. A transient overlay (auto-compaction / auto-retry) can remove the
-	 * loader from the container while leaving `ctx.loadingAnimation` set, so the
-	 * resumed turn's `agent_start` →
-	 * `ensureLoadingAnimation()` (guarded by `if (!this.loadingAnimation)`) skipped
-	 * re-adding it and the spinner vanished while the agent kept streaming. Nulling
-	 * the reference here lets the next `agent_start` recreate and re-attach it.
+	 * reference. A transient overlay can remove the loader from the container while
+	 * leaving `ctx.loadingAnimation` set.
 	 */
 	#stopWorkingLoader(): void {
 		if (this.ctx.loadingAnimation) {
@@ -1379,13 +1379,9 @@ export class EventController {
 		}
 	}
 
-	/**
-	 * Restore the live "Working…" loader when a streaming event lands after a
-	 * transient status overlay cleared the container. Focus mode dispatches events
-	 * for `viewSession`, so key the reconciler on that session, not the main one.
-	 */
-	#ensureWorkingLoaderWhileStreaming(): void {
-		if (!this.ctx.viewSession.isStreaming) return;
+	/** Restore the live loader after a transient overlay clears it. */
+	#ensureWorkingLoaderWhileStreaming(source: AgentSession): void {
+		if (source !== this.ctx.viewSession || !source.isStreaming) return;
 		if (this.ctx.autoCompactionLoader || this.ctx.retryLoader) return;
 		this.ctx.ensureLoadingAnimation();
 	}
@@ -1436,7 +1432,10 @@ export class EventController {
 		this.ctx.ui.requestRender();
 	}
 
-	async #handleAutoCompactionEnd(event: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>): Promise<void> {
+	async #handleAutoCompactionEnd(
+		source: AgentSession,
+		event: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>,
+	): Promise<void> {
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
 		this.#setTerminalProgress(false);
@@ -1513,7 +1512,7 @@ export class EventController {
 			this.ctx.showWarning("Auto context-full maintenance failed; continuing without maintenance");
 		}
 		await this.ctx.flushCompactionQueue({ willRetry: event.willRetry });
-		this.#ensureWorkingLoaderWhileStreaming();
+		this.#ensureWorkingLoaderWhileStreaming(source);
 		this.ctx.ui.requestRender();
 	}
 
@@ -1545,7 +1544,10 @@ export class EventController {
 		this.ctx.ui.requestRender();
 	}
 
-	async #handleAutoRetryEnd(event: Extract<AgentSessionEvent, { type: "auto_retry_end" }>): Promise<void> {
+	async #handleAutoRetryEnd(
+		source: AgentSession,
+		event: Extract<AgentSessionEvent, { type: "auto_retry_end" }>,
+	): Promise<void> {
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
 			this.ctx.retryLoader = undefined;
@@ -1570,7 +1572,7 @@ export class EventController {
 				this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 			}
 		}
-		this.#ensureWorkingLoaderWhileStreaming();
+		this.#ensureWorkingLoaderWhileStreaming(source);
 		this.ctx.ui.requestRender();
 	}
 

@@ -783,7 +783,7 @@ function createEventControllerFixture() {
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);
-	return { controller, updatePendingMessagesDisplay, addMessageToChat };
+	return { controller, ctx, updatePendingMessagesDisplay, addMessageToChat };
 }
 
 describe("EventController custom queued-message refresh", () => {
@@ -792,7 +792,7 @@ describe("EventController custom queued-message refresh", () => {
 	});
 
 	it("refreshes the pending bar only for custom messages carrying __queueChipText", async () => {
-		const { controller, updatePendingMessagesDisplay, addMessageToChat } = createEventControllerFixture();
+		const { controller, ctx, updatePendingMessagesDisplay, addMessageToChat } = createEventControllerFixture();
 		const queuedEvent: Extract<AgentSessionEvent, { type: "message_start" }> = {
 			type: "message_start",
 			message: {
@@ -810,7 +810,7 @@ describe("EventController custom queued-message refresh", () => {
 				timestamp: Date.now(),
 			},
 		};
-		await controller.handleEvent(queuedEvent);
+		await controller.handleEvent(ctx.viewSession, queuedEvent);
 		expect(updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 		expect(addMessageToChat).toHaveBeenCalledTimes(1);
 
@@ -825,7 +825,7 @@ describe("EventController custom queued-message refresh", () => {
 				timestamp: Date.now() + 1,
 			},
 		};
-		await controller.handleEvent(unqueuedEvent);
+		await controller.handleEvent(ctx.viewSession, unqueuedEvent);
 
 		expect(updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 		expect(addMessageToChat).toHaveBeenCalledTimes(2);

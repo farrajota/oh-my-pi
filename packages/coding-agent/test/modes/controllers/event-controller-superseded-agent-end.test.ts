@@ -23,6 +23,11 @@ function createContext() {
 		pendingTools: new Map<string, unknown>(),
 		hideThinkingBlock: false,
 		setWorkingMessage: vi.fn(),
+		beginWorkingMessageRun: vi.fn(),
+		rehydrateWorkingMessageRun: vi.fn(() => false),
+		endWorkingMessageRun: vi.fn(),
+		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
+		setWorkingMessageRunTokenDelta: vi.fn(),
 		clearPinnedError: vi.fn(),
 		loadingAnimation: undefined,
 		retryLoader: undefined,
@@ -35,7 +40,15 @@ function createContext() {
 		sessionManager: { getSessionName: () => "test-session" },
 		ensureLoadingAnimation: vi.fn(),
 		ui: { requestRender: vi.fn() },
-		viewSession: { isCompacting: false, getLastAssistantMessage: () => undefined },
+		viewSession: {
+			activeRunStartedAt: 1_000,
+			isCompacting: false,
+			getLastAssistantMessage: () => undefined,
+			get isStreaming() {
+				return streamState.isStreaming;
+			},
+			agent: { state: streamState },
+		},
 		session: {
 			get isStreaming() {
 				return streamState.isStreaming;
@@ -50,7 +63,10 @@ function createContext() {
 }
 
 const AGENT_START = { type: "agent_start" } as unknown as AgentSessionEvent;
-const AGENT_END = { type: "agent_end", messages: [] } as unknown as AgentSessionEvent;
+const AGENT_END = {
+	type: "agent_end",
+	messages: [{ role: "assistant", timestamp: 0, content: [] }],
+} as unknown as AgentSessionEvent;
 
 describe("EventController superseded agent_end", () => {
 	beforeAll(async () => {
@@ -74,19 +90,19 @@ describe("EventController superseded agent_end", () => {
 		const controller = new EventController(ctx);
 
 		// Turn 1 begins and creates the loader.
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		expect(ctx.loadingAnimation).toBeDefined();
 
 		// User abort of a queued steer: the resumed turn's agent_start arrives and
 		// the agent is streaming again. The interrupted turn's agent_end is still in
 		// flight through the async event pipeline.
 		streamState.isStreaming = true;
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 
 		// The interrupted turn's agent_end finally propagates. Because the agent is
 		// already streaming the resumed turn, it must not tear down the live loader —
 		// otherwise "Working…" vanishes while the agent keeps running.
-		await controller.handleEvent(AGENT_END);
+		await controller.handleEvent(ctx.viewSession, AGENT_END);
 
 		expect(loader.stop).not.toHaveBeenCalled();
 		expect(ctx.loadingAnimation).toBeDefined();
@@ -97,13 +113,13 @@ describe("EventController superseded agent_end", () => {
 		const { ctx, streamState, loader } = createContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		expect(ctx.loadingAnimation).toBeDefined();
 
 		// A genuine turn boundary: the agent is no longer streaming, so the guard
 		// must not fire and the loader is torn down as before.
 		streamState.isStreaming = false;
-		await controller.handleEvent(AGENT_END);
+		await controller.handleEvent(ctx.viewSession, AGENT_END);
 
 		expect(loader.stop).toHaveBeenCalledTimes(1);
 		expect(ctx.loadingAnimation).toBeUndefined();
