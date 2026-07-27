@@ -774,7 +774,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
 		});
 	}
-
 	/**
 	 * Create a TaskTool instance with async agent discovery.
 	 */
@@ -1617,7 +1616,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			activeModelPattern: parentActiveModelPattern,
 			fallbackModelPattern: this.session.getModelString?.(),
 		});
-		const thinkingLevelOverride = effectiveAgent.thinkingLevel;
 
 		// Caller output schemas take precedence, then agent frontmatter, then the inherited session schema.
 		const hasCallerOutputSchema = Object.hasOwn(params, "outputSchema");
@@ -1795,13 +1793,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 			latestProgress = initialProgress;
 			const emitProgress = () => {
+				const progress = latestProgress;
+				if (!progress) return;
 				onUpdate?.({
 					content: [{ type: "text", text: `Running agent ${agentId}...` }],
 					details: {
 						projectAgentsDir,
 						results: [],
 						totalDurationMs: Date.now() - startTime,
-						progress: [initialProgress],
+						progress: [progress],
 					},
 				});
 			};
@@ -1810,10 +1810,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const buildCommitMessageFn = makeIsolationCommitMessage(this.session);
 			const allowEffortOverride = this.session.settings.get("task.allowEffortOverride");
 
-			const sharedRunOptions = {
+			const sharedRunOptions: ExecutorOptions = {
+				artifactsDir: this.session.getArtifactsDir?.() ?? effectiveArtifactsDir,
+
 				cwd: this.session.cwd,
 				id: agentId,
 				agent: permissionAgent,
+				thinkingLevel: permissionAgent.thinkingLevel,
 				task: renderSubagentUserPrompt(assignment),
 				assignment,
 				context: sharedContext,
@@ -1830,7 +1833,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
 				enableLsp: subagentLspEnabled,
-				thinkingLevel: thinkingLevelOverride,
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 				maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
 				signal,
@@ -1850,6 +1852,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				authStorage: this.session.authStorage,
 				modelRegistry: this.session.modelRegistry,
 				settings: this.session.settings,
+				eventBus: this.session.eventBus,
 				mcpManager,
 				contextFiles,
 				skills: availableSkills,

@@ -4559,6 +4559,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.generateLabels": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Generate Task Labels",
+			description:
+				"Generate a compact background label for task assignments that do not provide one. Disable when a caller must account for every model request.",
+		},
+	},
+
 	"task.maxConcurrency": {
 		type: "number",
 		default: 32,

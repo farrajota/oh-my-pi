@@ -1044,7 +1044,7 @@ export class SettingsSelectorComponent implements Component {
 		def: SettingDef & { type: "submenu" },
 		currentValue: string,
 		done: (value?: string) => void,
-	): Container {
+	): Component {
 		let options = def.options;
 
 		if (def.path === "promptSuggestions.model") {

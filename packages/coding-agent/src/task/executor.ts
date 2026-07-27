@@ -7,7 +7,8 @@
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
+import type { Tool as AiTool, Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
+import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
@@ -44,6 +45,7 @@ import type { ArtifactManager } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
+import type { SessionInitToolDefinition } from "../session/session-entries";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
 import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
@@ -295,8 +297,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return !Array.isArray(value);
 }
 
-/** Options for subagent execution */
-export interface ExecutorOptions {
+/** Options for a subagent run. */
+export interface RunSubprocessOptions {
 	cwd: string;
 	/** Additional workspace directories to seed on the subagent session (multi-root). */
 	additionalDirectories?: string[];
@@ -450,6 +452,8 @@ export interface ExecutorOptions {
 	 */
 	keepAlive?: boolean;
 }
+
+export type ExecutorOptions = RunSubprocessOptions;
 
 function parseStringifiedJson(value: unknown): unknown {
 	if (typeof value !== "string") return value;
@@ -742,6 +746,49 @@ function getUsageTokens(usage: unknown): number {
 	// field breakdown. This total includes cacheRead, but returning it is still better
 	// than silently showing 0 for those providers.
 	return firstNumberField(record, ["totalTokens", "total_tokens"]) ?? 0;
+}
+
+const SENSITIVE_TOOL_METADATA_KEY =
+	/(?:authorization|credential|secret|token|api[_-]?key|cookie|password|private[_-]?key)/i;
+const SENSITIVE_TOOL_METADATA_VALUE = /\b(?:bearer|token|api[_ -]?key|password)\s*[:=]\s*[^\s,;]+/gi;
+
+function sanitizeToolMetadata(value: unknown): unknown {
+	if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+	if (typeof value === "string") return value.replace(SENSITIVE_TOOL_METADATA_VALUE, "[redacted]");
+	if (Array.isArray(value)) return value.map(sanitizeToolMetadata);
+	if (typeof value !== "object") return undefined;
+	const sanitized: Record<string, unknown> = {};
+	for (const [key, child] of Object.entries(value)) {
+		if (SENSITIVE_TOOL_METADATA_KEY.test(key)) continue;
+		const safeChild = sanitizeToolMetadata(child);
+		if (safeChild !== undefined) sanitized[key] = safeChild;
+	}
+	return sanitized;
+}
+
+/** Serialize only active tool descriptors, excluding closures and credential-bearing metadata. */
+export function sanitizeSessionInitToolDefinitions(
+	tools: readonly { name: string; description?: unknown; parameters?: unknown }[],
+	activeToolNames: readonly string[],
+): SessionInitToolDefinition[] {
+	const active = new Set(activeToolNames);
+	const definitions: SessionInitToolDefinition[] = [];
+	for (const tool of tools) {
+		if (!active.has(tool.name)) continue;
+		const parameters = tool.parameters ? sanitizeToolMetadata(toolWireSchema(tool as unknown as AiTool)) : undefined;
+		definitions.push({
+			name: tool.name,
+			description: typeof tool.description === "string" ? (sanitizeToolMetadata(tool.description) as string) : "",
+			parameters: parameters ?? {},
+		});
+	}
+	if (
+		definitions.length !== activeToolNames.length ||
+		new Set(definitions.map(definition => definition.name)).size !== definitions.length
+	) {
+		throw new Error("Unable to persist exactly one sanitized definition for every active tool");
+	}
+	return definitions;
 }
 
 /**
@@ -1236,7 +1283,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	// a late label still lands via the finalize-time reads of `progress.description`;
 	// failures just leave the label unset.
 	const labelSource = assignment?.trim();
-	if (!args.description && args.modelRegistry && args.settings && labelSource) {
+	if (!args.description && args.modelRegistry && args.settings?.get("task.generateLabels") && labelSource) {
 		generateTaskLabel(labelSource, args.modelRegistry, args.settings, id, abortSignal)
 			.then(label => {
 				if (!label || abortSignal.aborted || progress.description) return;
@@ -2399,7 +2446,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 /**
  * Run a single agent in-process.
  */
-export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+export async function runSubprocess(options: RunSubprocessOptions): Promise<SingleResult> {
 	const {
 		cwd,
 		agent,
@@ -2489,11 +2536,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	if (atMaxDepth && toolNames?.includes("task")) {
 		toolNames = toolNames.filter(name => name !== "task");
 	}
-	const hubDenied = options.permissionScope?.denyTools.some(tool => tool.toLowerCase() === "hub") ?? false;
-	// Ordinary agents retain collaboration unless a permission profile denies it.
-	// Restricted sessions must not widen their explicit host tool list with hub.
-	if (toolNames && !options.restrictToolNames && !toolNames.includes("hub") && !hubDenied) {
-		toolNames = [...toolNames, "hub"];
+	const ircDenied = options.permissionScope?.denyTools.some(tool => tool.toLowerCase() === "irc") ?? false;
+	// Ordinary agents retain IRC collaboration when enabled. Restricted benchmark
+	// sessions must not widen their explicit host tool list.
+	if (toolNames && ircEnabled && !options.restrictToolNames && !toolNames.includes("irc") && !ircDenied) {
+		toolNames = [...toolNames, "irc"];
 	}
 
 	const modelPatterns = normalizeModelPatterns(modelOverride ?? agent.model);
@@ -2787,6 +2834,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				authStorage,
 				modelRegistry,
 				settings: subagentSettings,
+				eventBus: options.eventBus,
+
 				model,
 				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
 				modelPatternAuthFallback:
@@ -2913,10 +2962,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
 			}
 
+			const activeToolNames = session.getActiveToolNames();
 			session.sessionManager.appendSessionInit({
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
 				task,
-				tools: session.getActiveToolNames(),
+				tools: activeToolNames,
+				toolDefinitions: sanitizeSessionInitToolDefinitions(session.agent.state.tools, activeToolNames),
 				spawns: spawnsEnv,
 				readSummarize: agent.readSummarize,
 				outputSchema,

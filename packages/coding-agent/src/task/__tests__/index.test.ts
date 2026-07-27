@@ -1,16 +1,18 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { type } from "arktype";
 import { Settings } from "../../config/settings";
 import type { SettingPath } from "../../config/settings-schema";
 import type { PlanModeState } from "../../plan-mode/state";
 import type { ToolSession } from "../../tools";
-import * as taskDiscovery from "../discovery";
+import { EventBus } from "../../utils/event-bus";
 import * as executor from "../executor";
 import { TaskTool } from "../index";
-import { type AgentDefinition, getTaskSchema, type SingleResult } from "../types";
+import { type AgentDefinition, getTaskSchema, type SingleResult, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../types";
 
-const PLAN_PROFILE_FAILURE =
-	'Plan mode cannot spawn agent "synthetic" because its explicit tools do not intersect the plan profile.';
+const temporaryRoots: string[] = [];
 
 function makeAgent(tools?: string[]): AgentDefinition {
 	return {
@@ -74,8 +76,16 @@ function makeSession(
 }
 
 async function makeTaskTool(agent: AgentDefinition, session: ToolSession): Promise<TaskTool> {
-	vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
-	return TaskTool.create(session);
+	const root = await mkdtemp(path.join(os.tmpdir(), "task-index-test-"));
+	temporaryRoots.push(root);
+	const agentsDir = path.join(root, ".omp", "agents");
+	await mkdir(agentsDir, { recursive: true });
+	const tools = agent.tools?.length ? `tools:\n${agent.tools.map(tool => `- ${tool}`).join("\n")}\n` : "";
+	await writeFile(
+		path.join(agentsDir, "synthetic.md"),
+		`---\nname: synthetic\ndescription: Synthetic test agent\n${tools}---\nDo the work.\n`,
+	);
+	return TaskTool.create({ ...session, cwd: root } as ToolSession);
 }
 
 describe("TaskTool toolProfile schema", () => {
@@ -120,8 +130,9 @@ describe("TaskTool toolProfile schema", () => {
 });
 
 describe("TaskTool toolProfile execution", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await Promise.all(temporaryRoots.splice(0).map(root => rm(root, { recursive: true, force: true })));
 	});
 
 	test("plan mode intersects explicit agent tools with the plan profile", async () => {
@@ -134,19 +145,20 @@ describe("TaskTool toolProfile execution", () => {
 
 		await taskTool.execute("tool-call", { agent: "synthetic", task: "read" });
 
-		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read"]);
+		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read", "grep", "glob", "lsp", "web_search"]);
 	});
 
-	test("plan mode fails when explicit agent tools do not intersect the plan profile", async () => {
+	test("plan mode preserves base planning tools when explicit agent tools do not intersect", async () => {
+		const agent = makeAgent(["write"]);
+		const runSpy = vi.spyOn(executor, "runSubprocess").mockResolvedValue(makeResult(agent));
 		const taskTool = await makeTaskTool(
-			makeAgent(["write"]),
+			agent,
 			makeSession(undefined, { getPlanModeState: () => ({ enabled: true }) as PlanModeState }),
 		);
 
-		const result = await taskTool.execute("tool-call", { agent: "synthetic", task: "read" });
+		await taskTool.execute("tool-call", { agent: "synthetic", task: "read" });
 
-		expect(result.content).toEqual([{ type: "text", text: PLAN_PROFILE_FAILURE }]);
-		expect(result.details?.results).toEqual([]);
+		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read", "grep", "glob", "lsp", "web_search"]);
 	});
 
 	test("permissions narrow an edit toolProfile without re-adding edit or write", async () => {
@@ -162,7 +174,7 @@ describe("TaskTool toolProfile execution", () => {
 		});
 
 		const tools = runSpy.mock.calls[0]?.[0].agent.tools?.filter(tool => tool !== "irc");
-		expect(tools).toEqual(["read", "grep", "glob"]);
+		expect(tools).toEqual(["read", "grep", "glob", "hub"]);
 		expect(tools).not.toEqual(expect.arrayContaining(["edit", "write"]));
 	});
 
@@ -178,6 +190,31 @@ describe("TaskTool toolProfile execution", () => {
 			permissions: { profiles: ["focused-edit"] },
 		});
 
-		expect(runSpy.mock.calls[0]?.[0].agent.tools?.filter(tool => tool !== "irc")).toEqual([]);
+		expect(runSpy.mock.calls[0]?.[0].agent.tools?.filter(tool => tool !== "irc")).toEqual(["hub"]);
+	});
+
+	test("forwards synchronous child lifecycle events to the parent event bus", async () => {
+		const agent = makeAgent();
+		const eventBus = new EventBus();
+		const lifecycleEvents: unknown[] = [];
+		eventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+			lifecycleEvents.push(payload);
+		});
+		const runSpy = vi.spyOn(executor, "runSubprocess").mockImplementation(async options => {
+			options.eventBus?.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, { status: "started" });
+			options.eventBus?.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, { status: "completed" });
+			return makeResult(agent);
+		});
+		const taskTool = await makeTaskTool(
+			agent,
+			makeSession({ "async.enabled": false }, { eventBus, getArtifactsDir: () => "/tmp/task-artifacts" }),
+		);
+
+		await taskTool.execute("tool-call", { agent: "synthetic", task: "read" });
+
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(runSpy.mock.calls[0]?.[0].artifactsDir).toBe("/tmp/task-artifacts");
+
+		expect(lifecycleEvents).toEqual([{ status: "started" }, { status: "completed" }]);
 	});
 });

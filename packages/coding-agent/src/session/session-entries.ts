@@ -164,6 +164,13 @@ export interface TtsrInjectionEntry extends SessionEntryBase {
 	injectedRules: string[];
 }
 
+/** Serializable tool metadata retained with a session-init record for faithful audit/replay. */
+export interface SessionInitToolDefinition {
+	name: string;
+	description: string;
+	/** Sanitized JSON-schema-like parameters only; no closures or runtime state. */
+	parameters: unknown;
+}
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
 export interface SessionInitEntry extends SessionEntryBase {
 	type: "session_init";
@@ -173,6 +180,8 @@ export interface SessionInitEntry extends SessionEntryBase {
 	task: string;
 	/** Tools available to the agent */
 	tools: string[];
+	/** Sanitized definitions for the exact active tools. Never contains executable closures or credential runtime state. */
+	toolDefinitions?: SessionInitToolDefinition[];
 	/** Output schema if structured output was requested. */
 	outputSchema?: unknown;
 	/** Enforcement policy recorded with the output schema for faithful revival. */

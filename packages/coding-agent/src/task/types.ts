@@ -172,14 +172,8 @@ function createTaskItemSchema(options: {
 	return type(shape);
 }
 
-const TASK_AGENT_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
-
-function taskAgentSchemaRule(defaultAgent: string): string {
-	const trimmed = defaultAgent.trim();
-	if (TASK_AGENT_NAME_PATTERN.test(trimmed)) {
-		return `string = '${trimmed}'`;
-	}
-	return "string";
+function taskAgentSchemaRule(defaultAgent: string) {
+	return type("string").default(defaultAgent.trim() || "task");
 }
 
 function createTaskSchema(options: {

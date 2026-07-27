@@ -26,6 +26,33 @@ describe("task schema (single-spawn)", () => {
 		}
 	});
 
+	it("defaults a custom agent name containing punctuation", () => {
+		const schema = getTaskSchema({
+			isolationEnabled: false,
+			batchEnabled: false,
+			defaultAgent: "qa's reviewer",
+		});
+		const parsed = schema({ task: "Map the auth module." });
+		expect(parsed instanceof type.errors).toBe(false);
+		if (!(parsed instanceof type.errors)) {
+			expect(parsed.agent).toBe("qa's reviewer");
+		}
+	});
+
+	it("defaults custom agent names in batch items", () => {
+		const schema = getTaskSchema({
+			isolationEnabled: false,
+			batchEnabled: true,
+			defaultAgent: "review agent",
+			permissions: { enabled: true, toolsEnabled: true, pathsEnabled: true },
+		});
+		const parsed = schema({ context: "Shared context", tasks: [{ task: "Review the change." }] });
+		expect(parsed instanceof type.errors).toBe(false);
+		if (!(parsed instanceof type.errors)) {
+			expect(parsed.tasks[0]?.agent).toBe("review agent");
+		}
+	});
+
 	it("requires task", () => {
 		const parsed = taskSchema({ agent: "scout" });
 		expect(parsed instanceof type.errors).toBe(true);

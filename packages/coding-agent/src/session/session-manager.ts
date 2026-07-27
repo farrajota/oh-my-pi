@@ -47,6 +47,7 @@ import {
 	type SessionEntry,
 	type SessionHeader,
 	type SessionInitEntry,
+	type SessionInitToolDefinition,
 	type SessionMessageEntry,
 	type SessionTitleSource,
 	type SessionTreeNode,
@@ -1937,6 +1938,7 @@ export class SessionManager {
 		systemPrompt: string;
 		task: string;
 		tools: string[];
+		toolDefinitions?: SessionInitToolDefinition[];
 		outputSchema?: unknown;
 		outputSchemaMode?: StructuredSubagentSchemaMode;
 		restrictToolNames?: boolean;

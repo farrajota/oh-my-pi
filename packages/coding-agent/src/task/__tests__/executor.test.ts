@@ -7,7 +7,9 @@ import type { MCPManager } from "../../mcp/manager";
 import * as sdk from "../../sdk";
 import type { AgentSession } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
+import { EventBus } from "../../utils/event-bus";
 import { createMCPProxyTools, runSubprocess } from "../executor";
+import * as taskLabel from "../label";
 import type { AgentDefinition } from "../types";
 
 const emptyParams = type({});
@@ -65,7 +67,10 @@ function fakeModelRegistry(): ModelRegistry {
 	} as unknown as ModelRegistry;
 }
 
-async function runWithAgentTools(agentTools: string[] | undefined): Promise<readonly string[] | undefined> {
+async function runWithAgentTools(
+	agentTools: string[] | undefined,
+	settings = Settings.isolated({ "task.agentIdleTtlMs": 0 }),
+): Promise<readonly string[] | undefined> {
 	let capturedToolNames: readonly string[] | undefined;
 	const createSpy = vi.spyOn(sdk, "createAgentSession").mockImplementation(async (options = {}) => {
 		capturedToolNames = options.toolNames;
@@ -75,18 +80,20 @@ async function runWithAgentTools(agentTools: string[] | undefined): Promise<read
 		} as unknown as sdk.CreateAgentSessionResult;
 	});
 
-	await runSubprocess({
-		cwd: process.cwd(),
-		agent: fakeAgent(agentTools),
-		task: "Do the task.",
-		assignment: "Do the task.",
-		index: 0,
-		id: "ExecutorTest",
-		settings: Settings.isolated({ "task.agentIdleTtlMs": 0 }),
-		modelRegistry: fakeModelRegistry(),
-	});
-
-	createSpy.mockRestore();
+	try {
+		await runSubprocess({
+			cwd: process.cwd(),
+			agent: fakeAgent(agentTools),
+			task: "Do the task.",
+			assignment: "Do the task.",
+			index: 0,
+			id: "ExecutorTest",
+			settings,
+			modelRegistry: fakeModelRegistry(),
+		});
+	} finally {
+		createSpy.mockRestore();
+	}
 	return capturedToolNames;
 }
 
@@ -120,5 +127,70 @@ describe("runSubprocess explicit agent tools", () => {
 
 	test("forwards narrow explicit agent tools without treating them as defaults", async () => {
 		expect(await runWithAgentTools(["read"])).toEqual(["read", "irc"]);
+	});
+});
+
+describe("runSubprocess event bus propagation", () => {
+	test("forwards the caller event bus to child session creation", async () => {
+		const eventBus = new EventBus();
+		let capturedEventBus: EventBus | undefined;
+		const createSpy = vi.spyOn(sdk, "createAgentSession").mockImplementation(async (options = {}) => {
+			capturedEventBus = options.eventBus;
+			return {
+				session: fakeSession(),
+				sessionManager: {} as SessionManager,
+			} as unknown as sdk.CreateAgentSessionResult;
+		});
+
+		try {
+			await runSubprocess({
+				cwd: process.cwd(),
+				agent: fakeAgent([]),
+				task: "Do the task.",
+				assignment: "Do the task.",
+				index: 0,
+				id: "EventBusExecutorTest",
+				settings: Settings.isolated({ "task.agentIdleTtlMs": 0, "task.generateLabels": false }),
+				modelRegistry: fakeModelRegistry(),
+				eventBus,
+			});
+			expect(capturedEventBus).toBe(eventBus);
+		} finally {
+			createSpy.mockRestore();
+		}
+	});
+});
+
+describe("runSubprocess task label generation", () => {
+	test("generates a task label by default when an assignment is supplied", async () => {
+		const settings = Settings.isolated({ "task.agentIdleTtlMs": 0 });
+		const labelSpy = vi.spyOn(taskLabel, "generateTaskLabel").mockResolvedValue(null);
+
+		try {
+			expect(settings.get("task.generateLabels")).toBe(true);
+			await runWithAgentTools([], settings);
+			expect(labelSpy).toHaveBeenCalledTimes(1);
+			expect(labelSpy).toHaveBeenCalledWith(
+				"Do the task.",
+				expect.anything(),
+				settings,
+				"ExecutorTest",
+				expect.any(AbortSignal),
+			);
+		} finally {
+			labelSpy.mockRestore();
+		}
+	});
+
+	test("does not create an auxiliary label-model request when the benchmark disables labels", async () => {
+		const settings = Settings.isolated({ "task.agentIdleTtlMs": 0, "task.generateLabels": false });
+		const labelSpy = vi.spyOn(taskLabel, "generateTaskLabel").mockResolvedValue(null);
+
+		try {
+			await runWithAgentTools([], settings);
+			expect(labelSpy).not.toHaveBeenCalled();
+		} finally {
+			labelSpy.mockRestore();
+		}
 	});
 });
