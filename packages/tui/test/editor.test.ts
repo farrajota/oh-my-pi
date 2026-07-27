@@ -17,6 +17,31 @@ describe("Editor component", () => {
 		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
 	});
 
+	describe("Word delete keybindings", () => {
+		it("honors a keybindings.yml remap of deleteWordBackward in the multi-line editor", () => {
+			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, { "tui.editor.deleteWordBackward": "alt+g" }));
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("alfa beta gamma");
+			editor.handleInput("\x1bg"); // Alt+G
+			expect(editor.getText()).toBe("alfa beta ");
+		});
+
+		it("stops firing a hardcoded chord once the config replaces the action's keys", () => {
+			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, { "tui.editor.deleteWordBackward": "alt+g" }));
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("alfa beta gamma");
+			editor.handleInput("\x17"); // Ctrl+W, no longer bound to deleteWordBackward
+			expect(editor.getText()).toBe("alfa beta gamma");
+		});
+
+		it("deletes a word on ctrl+backspace via its registry default key", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("alfa beta gamma");
+			editor.handleInput("\x1b[127;5u"); // kitty CSI-u ctrl+backspace
+			expect(editor.getText()).toBe("alfa beta ");
+		});
+	});
+
 	describe("Prompt history navigation", () => {
 		it("does nothing on Up arrow when history is empty", () => {
 			const editor = new Editor(defaultEditorTheme);

@@ -201,34 +201,37 @@ function appendPermissionDetails(lines: string[], permissions: TaskParams["permi
 	if (denyPaths) lines.push(`Denied paths: ${truncateForPrompt(denyPaths)}`);
 }
 
-/**
- * Render the tool description from a cached agent list and current settings.
- */
-function renderDescription(
-	agents: AgentDefinition[],
-	isolationEnabled: boolean,
-	applyIsolatedChanges: boolean,
-	disabledAgents: string[],
-	batchEnabled: boolean,
-	effortEnabled: boolean,
-	asyncEnabled: boolean,
-	ircEnabled: boolean,
-	parentSpawns: string,
-	permissionsEnabled: boolean,
-	permissionMode: SubagentPermissionMode,
-	permissionToolsEnabled: boolean,
-	permissionPathsEnabled: boolean,
-	permissionProfiles: PermissionProfileSummary[],
-	permissionProfileErrors: string[],
-): string {
-	const spawnPolicy = resolveSpawnPolicy(parentSpawns);
+interface TaskDescriptionOptions {
+	agents: AgentDefinition[];
+	isolationEnabled: boolean;
+	applyIsolatedChanges: boolean;
+	disabledAgents: string[];
+	batchEnabled: boolean;
+	effortEnabled: boolean;
+	asyncEnabled: boolean;
+	ircEnabled: boolean;
+	parentSpawns: string;
+	permissionsEnabled: boolean;
+	permissionMode: SubagentPermissionMode;
+	permissionToolsEnabled: boolean;
+	permissionPathsEnabled: boolean;
+	permissionProfiles: PermissionProfileSummary[];
+	permissionProfileErrors: string[];
+}
+
+/** Render the tool description from a cached agent list and current settings. */
+function renderDescription(options: TaskDescriptionOptions): string {
+	const spawnPolicy = resolveSpawnPolicy(options.parentSpawns);
 	const spawningDisabled = !spawnPolicy.enabled;
-	let filteredAgents = disabledAgents.length > 0 ? agents.filter(a => !disabledAgents.includes(a.name)) : agents;
+	let filteredAgents =
+		options.disabledAgents.length > 0
+			? options.agents.filter(agent => !options.disabledAgents.includes(agent.name))
+			: options.agents;
 	if (spawningDisabled) {
 		filteredAgents = [];
 	} else if (spawnPolicy.allowedAgents !== null) {
 		const allowed = new Set(spawnPolicy.allowedAgents);
-		filteredAgents = filteredAgents.filter(a => allowed.has(a.name));
+		filteredAgents = filteredAgents.filter(agent => allowed.has(agent.name));
 	}
 	const renderedAgents = filteredAgents.map(agent => ({
 		name: agent.name,
@@ -240,19 +243,19 @@ function renderDescription(
 		agents: renderedAgents,
 		spawningDisabled,
 		defaultAgent: spawnPolicy.defaultAgent,
-		isolationEnabled,
-		applyIsolatedChanges,
-		batchEnabled,
-		effortEnabled,
-		asyncEnabled,
+		isolationEnabled: options.isolationEnabled,
+		applyIsolatedChanges: options.applyIsolatedChanges,
+		batchEnabled: options.batchEnabled,
+		effortEnabled: options.effortEnabled,
+		asyncEnabled: options.asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
-		ircEnabled,
-		permissionsEnabled,
-		permissionMode,
-		permissionToolsEnabled,
-		permissionPathsEnabled,
-		permissionProfiles,
-		permissionProfileErrors,
+		ircEnabled: options.ircEnabled,
+		permissionsEnabled: options.permissionsEnabled,
+		permissionMode: options.permissionMode,
+		permissionToolsEnabled: options.permissionToolsEnabled,
+		permissionPathsEnabled: options.permissionPathsEnabled,
+		permissionProfiles: options.permissionProfiles,
+		permissionProfileErrors: options.permissionProfileErrors,
 	});
 }
 
@@ -677,12 +680,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const isolationEnabled = !planMode && this.session.settings.get("task.isolation.mode") !== "none";
 		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
-		const allowEffortOverride = this.session.settings.get("task.allowEffortOverride");
 		return getTaskSchema({
 			isolationEnabled,
 			batchEnabled: this.#isBatchEnabled(),
+			effortEnabled: this.session.settings.get("task.allowEffortOverride"),
 			defaultAgent,
-			allowEffortOverride,
 			permissions: {
 				enabled: permissionMode !== "off",
 				toolsEnabled: this.session.settings.get("task.permissions.tools.enabled"),
@@ -695,30 +697,29 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return renderTaskCall(repairTaskParams(args as TaskParams), options, theme);
 	}
 
-	/** Dynamic description that reflects current disabled-agent settings */
+	/** Dynamic description that reflects current task settings. */
 	get description(): string {
 		const disabledAgents = this.session.settings.get("task.disabledAgents") as string[];
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationMode = this.session.settings.get("task.isolation.mode");
 		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
-		const effortEnabled = this.session.settings.get("task.allowEffortOverride");
-		return renderDescription(
-			this.#discoveredAgents,
-			!planMode && isolationMode !== "none",
-			this.session.settings.get("task.isolation.apply"),
+		return renderDescription({
+			agents: this.#discoveredAgents,
+			isolationEnabled: !planMode && isolationMode !== "none",
+			applyIsolatedChanges: this.session.settings.get("task.isolation.apply"),
 			disabledAgents,
-			this.#isBatchEnabled(),
-			effortEnabled,
-			this.session.settings.get("async.enabled"),
-			isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
-			this.session.getSessionSpawns() ?? "*",
-			permissionMode !== "off",
+			batchEnabled: this.#isBatchEnabled(),
+			effortEnabled: this.session.settings.get("task.allowEffortOverride"),
+			asyncEnabled: this.session.settings.get("async.enabled"),
+			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+			parentSpawns: this.session.getSessionSpawns() ?? "*",
+			permissionsEnabled: permissionMode !== "off",
 			permissionMode,
-			this.session.settings.get("task.permissions.tools.enabled"),
-			this.session.settings.get("task.permissions.paths.enabled"),
-			this.#permissionProfiles,
-			this.#permissionProfileErrors,
-		);
+			permissionToolsEnabled: this.session.settings.get("task.permissions.tools.enabled"),
+			permissionPathsEnabled: this.session.settings.get("task.permissions.paths.enabled"),
+			permissionProfiles: this.#permissionProfiles,
+			permissionProfileErrors: this.#permissionProfileErrors,
+		});
 	}
 	private constructor(
 		private readonly session: ToolSession,
@@ -1815,7 +1816,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				agent: permissionAgent,
 				task: renderSubagentUserPrompt(assignment),
 				assignment,
-				thinkingLevel: permissionAgent.thinkingLevel,
 				context: sharedContext,
 				...(allowEffortOverride && params.effort !== undefined ? { effort: params.effort } : {}),
 				planReference,
@@ -1829,8 +1829,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				modelOverride,
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
-				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
-				blockedAgent: this.#blockedAgent,
 				enableLsp: subagentLspEnabled,
 				thinkingLevel: thinkingLevelOverride,
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
@@ -1876,7 +1874,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				parentServiceTier: this.session.getServiceTierByFamily
 					? (this.session.getServiceTierByFamily() ?? null)
 					: undefined,
-			};
+			} satisfies ExecutorOptions;
 
 			const runTask = async (): Promise<SingleResult> => {
 				if (!isIsolated) {

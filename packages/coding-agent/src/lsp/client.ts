@@ -918,7 +918,7 @@ export async function ensureFileOpen(client: LspClient, filePath: string, signal
 			if (isEnoent(err)) return;
 			throw err;
 		}
-		const languageId = detectLanguageId(filePath);
+		const languageId = client.config.languageId ?? detectLanguageId(filePath);
 		throwIfAborted(signal);
 
 		await sendNotification(
@@ -992,7 +992,7 @@ export async function syncContent(
 
 		if (!info) {
 			// Open file with provided content instead of reading from disk
-			const languageId = detectLanguageId(filePath);
+			const languageId = client.config.languageId ?? detectLanguageId(filePath);
 			throwIfAborted(signal);
 			await sendNotification(
 				client,

@@ -11,6 +11,7 @@ import type { ExtensionRunner } from "../extensibility/extensions";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import { type LocalProtocolOptions, XD_URL_PREFIX } from "../internal-urls";
+import { deduplicateMCPToolsByName } from "../mcp/tool-bridge";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import type { MemoryBackendStartOptions } from "../memory-backend/types";
@@ -1040,7 +1041,8 @@ export class SessionTools {
 		});
 
 		const extensionRunner = this.#host.extensionRunner();
-		for (const customTool of mcpTools) {
+		const uniqueMcpTools = deduplicateMCPToolsByName(mcpTools);
+		for (const customTool of uniqueMcpTools) {
 			const wrapped = wrapToolWithMetaNotice(CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool);
 			const finalTool = (
 				extensionRunner ? new ExtensionToolWrapper(wrapped, extensionRunner) : wrapped
@@ -1050,7 +1052,7 @@ export class SessionTools {
 
 		// Every connected MCP tool is selected; centralized repartitioning owns
 		// presentation pins and write-transport activation/removal.
-		const nextActive = [...new Set([...this.#getActiveNonMCPToolNames(), ...mcpTools.map(tool => tool.name)])];
+		const nextActive = [...new Set([...this.#getActiveNonMCPToolNames(), ...uniqueMcpTools.map(tool => tool.name)])];
 		try {
 			await this.applyActiveToolsByName(nextActive);
 			if (this.#host.isDisposed()) restorePreviousMcpTools();

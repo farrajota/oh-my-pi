@@ -15,7 +15,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
-import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { logger, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 
 const toolActivationExtension: ExtensionFactory = pi => {
@@ -360,6 +360,40 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			// tts is a discoverable custom tool → mounted as an xd:// device, not top-level.
 			expect(session.getXdevToolEntries().map(entry => entry.name)).toContain("tts");
 			expect(session.getActiveToolNames()).not.toContain("tts");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("keeps the stable MCP tool-name collision winner during SDK startup and warns", async () => {
+		const tempDir = makeTempDir();
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const createMcpTool = (serverName: string, label: string): CustomTool => ({
+			name: "mcp__foo_bar_lookup",
+			label,
+			description: `Lookup from ${serverName}`,
+			parameters: type({}),
+			mcpServerName: serverName,
+			mcpToolName: "lookup",
+			async execute() {
+				return { content: [{ type: "text", text: serverName }] };
+			},
+		});
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			customTools: [createMcpTool("foo.bar", "foo.bar/lookup"), createMcpTool("foo_bar", "foo_bar/lookup")],
+		});
+
+		try {
+			expect(session.getToolByName("mcp__foo_bar_lookup")?.label).toBe("foo.bar/lookup");
+			expect(warn).toHaveBeenCalledWith("MCP tool name collision; keeping stable winner", {
+				name: "mcp__foo_bar_lookup",
+				keptServer: "foo.bar",
+				keptTool: "lookup",
+				ignoredServer: "foo_bar",
+				ignoredTool: "lookup",
+			});
 		} finally {
 			await session.dispose();
 		}

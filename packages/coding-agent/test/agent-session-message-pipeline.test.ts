@@ -204,8 +204,9 @@ describe("AgentSession message pipeline", () => {
 		expect(session.messages[0]).toBe(raw);
 		expect(raw.content).toEqual([{ type: "text", text: "steer with <xml> & ampersand" }]);
 		const convertedText = getConvertedUserText(converted[0]);
-		expect(convertedText).toContain("<user_interjection>");
-		expect(convertedText).toContain("<message>\nsteer with <xml> & ampersand\n</message>");
+		expect(convertedText).toContain("<system-notice>");
+		expect(convertedText).not.toContain("<message>");
+		expect(convertedText).toContain("steer with <xml> & ampersand");
 		expect(convertedText).not.toContain("&lt;xml&gt;");
 		expect(convertedText).not.toContain("&amp;");
 	});

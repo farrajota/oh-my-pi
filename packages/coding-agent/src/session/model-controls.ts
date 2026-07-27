@@ -27,6 +27,7 @@ import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
 	clampAutoThinkingEffort,
+	clampThinkingLevelToCeiling,
 	resolveProvisionalAutoLevel,
 	resolveThinkingLevelForModel,
 	shouldDisableReasoning,
@@ -65,6 +66,8 @@ export class ModelControls {
 	readonly #host: ModelControlsHost;
 	#scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 	#thinkingLevel: ThinkingLevel | undefined;
+	/** Hard per-session effort ceiling (e.g. a task spawn's `task.maxEffort` cap); recovery paths re-clamp to it. */
+	readonly #thinkingLevelCeiling: Effort | undefined;
 	#autoThinking = false;
 	#autoResolvedLevel: Effort | undefined;
 	#serviceTierByFamily: ServiceTierByFamily;
@@ -74,18 +77,28 @@ export class ModelControls {
 		options: {
 			scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 			thinkingLevel?: ConfiguredThinkingLevel;
+			thinkingLevelCeiling?: Effort;
 			serviceTierByFamily?: ServiceTierByFamily;
 		},
 	) {
 		this.#host = host;
 		this.#scopedModels = options.scopedModels ?? [];
 		this.#serviceTierByFamily = options.serviceTierByFamily ?? {};
+		this.#thinkingLevelCeiling = options.thinkingLevelCeiling;
 		if (options.thinkingLevel === AUTO_THINKING) {
 			// Keep auto pending until the first turn while exposing a valid wire effort.
 			this.#autoThinking = true;
-			this.#thinkingLevel = resolveProvisionalAutoLevel(this.#model);
+			this.#thinkingLevel = clampThinkingLevelToCeiling(
+				this.#model,
+				resolveProvisionalAutoLevel(this.#model),
+				this.#thinkingLevelCeiling,
+			);
 		} else {
-			this.#thinkingLevel = options.thinkingLevel;
+			this.#thinkingLevel = clampThinkingLevelToCeiling(
+				this.#model,
+				options.thinkingLevel,
+				this.#thinkingLevelCeiling,
+			);
 		}
 		this.#applyThinkingLevelToAgent(this.#thinkingLevel);
 	}
@@ -97,6 +110,11 @@ export class ModelControls {
 	/** Effective metadata-clamped thinking level applied to the agent. */
 	get thinkingLevel(): ThinkingLevel | undefined {
 		return this.#thinkingLevel;
+	}
+
+	/** Hard per-session effort ceiling every thinking-level change is clamped to. */
+	get thinkingLevelCeiling(): Effort | undefined {
+		return this.#thinkingLevelCeiling;
 	}
 
 	/** Configured selector, preserving `auto` while classification is active. */
@@ -130,8 +148,15 @@ export class ModelControls {
 		this.#autoResolvedLevel = undefined;
 		this.#thinkingLevel =
 			level === AUTO_THINKING
-				? resolveProvisionalAutoLevel(this.#model)
-				: resolveThinkingLevelForModel(this.#model, level);
+				? clampThinkingLevelToCeiling(
+						this.#model,
+						resolveProvisionalAutoLevel(this.#model),
+						this.#thinkingLevelCeiling,
+					)
+				: resolveThinkingLevelForModel(
+						this.#model,
+						clampThinkingLevelToCeiling(this.#model, level, this.#thinkingLevelCeiling),
+					);
 		this.#applyThinkingLevelToAgent(this.#thinkingLevel);
 	}
 
@@ -469,7 +494,11 @@ export class ModelControls {
 	 */
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist: boolean = false): void {
 		if (level === AUTO_THINKING) {
-			const provisional = resolveProvisionalAutoLevel(this.#model);
+			const provisional = clampThinkingLevelToCeiling(
+				this.#model,
+				resolveProvisionalAutoLevel(this.#model),
+				this.#thinkingLevelCeiling,
+			);
 			const wasAuto = this.#autoThinking;
 			const previousLevel = this.#thinkingLevel;
 			this.#autoThinking = true;
@@ -493,7 +522,10 @@ export class ModelControls {
 		const wasAuto = this.#autoThinking;
 		this.#autoThinking = false;
 		this.#autoResolvedLevel = undefined;
-		const effectiveLevel = resolveThinkingLevelForModel(this.#model, level);
+		const effectiveLevel = resolveThinkingLevelForModel(
+			this.#model,
+			clampThinkingLevelToCeiling(this.#model, level, this.#thinkingLevelCeiling),
+		);
 		// Leaving auto must persist even when the resolved effort is unchanged (e.g.
 		// auto resolved to medium, then the user pins medium): otherwise the latest
 		// session entry keeps `configured: "auto"` and resume re-enables auto.
@@ -591,7 +623,11 @@ export class ModelControls {
 		// Drop the result if the turn was aborted/superseded while classifying.
 		if (this.#host.promptGeneration() !== generation || !this.#autoThinking) return;
 
-		const effort = resolved ?? resolveProvisionalAutoLevel(model);
+		const effort = clampThinkingLevelToCeiling(
+			model,
+			resolved ?? resolveProvisionalAutoLevel(model),
+			this.#thinkingLevelCeiling,
+		);
 		if (effort === undefined) return;
 		const shouldPersistResolution = this.#thinkingLevel !== effort;
 		this.#autoResolvedLevel = effort;

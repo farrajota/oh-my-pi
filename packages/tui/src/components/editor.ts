@@ -1379,38 +1379,31 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Continue with rest of input handling
-		// Ctrl+K - Delete to end of line
-		if (matchesKey(data, "ctrl+k")) {
+		// Delete to end of line
+		if (kb.matches(data, "tui.editor.deleteToLineEnd")) {
 			this.#deleteToEndOfLine();
 		}
-		// Ctrl+U - Delete to start of line
-		else if (matchesKey(data, "ctrl+u")) {
+		// Delete to start of line
+		else if (kb.matches(data, "tui.editor.deleteToLineStart")) {
 			this.#deleteToStartOfLine();
 		}
-		// Ctrl+W - Delete word backwards
-		else if (matchesKey(data, "ctrl+w")) {
+		// Delete word backward. Registry defaults cover ctrl+w, alt+backspace,
+		// ctrl+backspace, and super+alt+backspace (Ghostty on macOS reports
+		// Option+Backspace as super+alt — kitty mod 11, see #2064).
+		else if (kb.matches(data, "tui.editor.deleteWordBackward")) {
 			this.#deleteWordBackwards();
 		}
-		// Option/Alt+Backspace - Delete word backwards.
-		// Ghostty on macOS reports Option+Backspace as super+alt (kitty mod 11) — see #2064.
-		else if (matchesKey(data, "alt+backspace") || matchesKey(data, "super+alt+backspace")) {
-			this.#deleteWordBackwards();
-		}
-		// Option/Alt+D and Option+Delete - Delete word forwards. Same Ghostty quirk applies.
-		else if (
-			matchesKey(data, "alt+d") ||
-			matchesKey(data, "alt+delete") ||
-			matchesKey(data, "super+alt+d") ||
-			matchesKey(data, "super+alt+delete")
-		) {
+		// Delete word forward. Registry defaults cover alt+d/alt+delete and their
+		// super+alt variants for the same Ghostty quirk.
+		else if (kb.matches(data, "tui.editor.deleteWordForward")) {
 			this.#deleteWordForwards();
 		}
-		// Ctrl+Y - Yank from kill ring
-		else if (matchesKey(data, "ctrl+y")) {
+		// Yank from kill ring
+		else if (kb.matches(data, "tui.editor.yank")) {
 			this.#yankFromKillRing();
 		}
-		// Alt+Y - Yank-pop (cycle kill ring)
-		else if (matchesKey(data, "alt+y")) {
+		// Yank-pop (cycle kill ring)
+		else if (kb.matches(data, "tui.editor.yankPop")) {
 			this.#yankPop();
 		}
 		// Ctrl+A - Move to start of line

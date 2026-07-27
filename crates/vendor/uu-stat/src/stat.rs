@@ -146,8 +146,10 @@ for details about the options it supports.";
 		#[error("{directive}: invalid directive")]
 		InvalidDirective { directive: String },
 		#[error("cannot read table of mounted file systems: {error}")]
+		#[cfg_attr(not(unix), allow(dead_code))]
 		CannotReadFilesystem { error: String },
 		#[error("using '-' to denote standard input does not work in file system mode")]
+		#[cfg_attr(not(unix), allow(dead_code))]
 		StdinFilesystemMode,
 		#[error("cannot read file system information for {file}: {error}")]
 		CannotReadFilesystemInfo { file: String, error: String },
@@ -275,6 +277,7 @@ for details about the options it supports.";
 	#[derive(Debug)]
 	pub enum OutputType<'a> {
 		Str(String),
+		#[cfg_attr(not(unix), allow(dead_code))]
 		OsStr(&'a OsString),
 		Integer(i64),
 		Unsigned(u64),
@@ -413,9 +416,12 @@ for details about the options it supports.";
 		show_fs:            bool,
 		from_user:          bool,
 		files:              Vec<OsString>,
+		#[cfg_attr(not(unix), allow(dead_code))]
 		mount_list:         OnceCell<Option<Vec<OsString>>>,
+		#[cfg_attr(not(unix), allow(dead_code))]
 		mount_list_needed:  bool,
 		default_tokens:     Vec<Token>,
+		#[cfg_attr(not(unix), allow(dead_code))]
 		default_dev_tokens: Vec<Token>,
 	}
 

@@ -1462,9 +1462,15 @@ export class ProcessTerminal implements Terminal {
 		// where Ctrl+D could close the parent shell over SSH.
 		process.stdin.pause();
 
-		// Restore raw mode state
-		if (process.stdin.setRawMode) {
-			process.stdin.setRawMode(this.#wasRaw);
+		// Restore raw mode state. On a disconnected terminal (pane recycled, ssh
+		// dropped) the fd is no longer a tty and Bun's node:tty shim throws; there
+		// is nothing left to restore, and throwing would abort the caller. On a
+		// live terminal the failure still surfaces - swallowing it would silently
+		// leave stdin in raw mode.
+		try {
+			process.stdin.setRawMode?.(this.#wasRaw);
+		} catch (err) {
+			if (!this.#dead) throw err;
 		}
 		this.#stdoutErrorCleanup?.();
 		this.#stdoutErrorCleanup = undefined;
@@ -1482,7 +1488,14 @@ export class ProcessTerminal implements Terminal {
 		const disconnectHandler = this.#disconnectHandler;
 		this.#disconnectHandler = undefined;
 		if (!disconnectHandler) return;
-		disconnectHandler();
+		// The handler tears the TUI down against a terminal that is already gone,
+		// so any step in it can fail. Swallow that: the exit below is the whole
+		// point of this method and must not be preempted by teardown noise.
+		try {
+			disconnectHandler();
+		} catch (handlerErr) {
+			logger.error("Terminal disconnect handler failed; exiting anyway", { err: handlerErr });
+		}
 
 		if (process.platform === "win32") {
 			void postmortem.quit(129);

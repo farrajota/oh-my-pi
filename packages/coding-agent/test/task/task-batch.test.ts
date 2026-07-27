@@ -24,6 +24,7 @@ import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { isRecord } from "@oh-my-pi/pi-utils";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -54,21 +55,14 @@ function createSession(
 }
 
 function getSchemaProperties(tool: TaskTool): Record<string, unknown> {
-	const wire = toolWireSchema(tool) as { properties?: Record<string, unknown> };
-	return wire.properties ?? {};
+	const properties = toolWireSchema(tool).properties;
+	return isRecord(properties) ? properties : {};
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function getBatchItemProperties(properties: Record<string, unknown>): Record<string, unknown> {
-	const tasks = properties.tasks;
-	if (!isRecord(tasks)) return {};
-	const items = tasks.items;
-	if (!isRecord(items)) return {};
-	const itemProperties = items.properties;
-	return isRecord(itemProperties) ? itemProperties : {};
+function getBatchItemProperties(tool: TaskTool): Record<string, unknown> {
+	const tasks = getSchemaProperties(tool).tasks;
+	if (!isRecord(tasks) || !isRecord(tasks.items) || !isRecord(tasks.items.properties)) return {};
+	return tasks.items.properties;
 }
 
 function getFirstText(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -130,13 +124,13 @@ describe("task.batch schema gating", () => {
 		expect(onProperties.agent).toBeUndefined();
 		expect(onProperties.outputSchema).toBeUndefined();
 		expect(onProperties.schemaMode).toBeUndefined();
-		const items = (onProperties.tasks as { items?: { properties?: Record<string, unknown> } }).items;
-		expect(items?.properties?.task).toBeDefined();
-		expect(items?.properties?.name).toBeDefined();
-		expect(items?.properties?.agent).toBeDefined();
-		expect(items?.properties?.outputSchema).toBeDefined();
-		expect(typeof items?.properties?.outputSchema).toBe("object");
-		expect(items?.properties?.schemaMode).toBeDefined();
+		const itemProperties = getBatchItemProperties(on);
+		expect(itemProperties.task).toBeDefined();
+		expect(itemProperties.name).toBeDefined();
+		expect(itemProperties.agent).toBeDefined();
+		expect(itemProperties.outputSchema).toBeDefined();
+		expect(typeof itemProperties.outputSchema).toBe("object");
+		expect(itemProperties.schemaMode).toBeDefined();
 	});
 
 	it("shows effort wire fields and guidance only when overrides are allowed", async () => {
@@ -155,7 +149,7 @@ describe("task.batch schema gating", () => {
 				}
 				const tool = await TaskTool.create(createSession({ settings }));
 				const properties = getSchemaProperties(tool);
-				const effort = batchEnabled ? getBatchItemProperties(properties).effort : properties.effort;
+				const effort = batchEnabled ? getBatchItemProperties(tool).effort : properties.effort;
 
 				if (policy.effortEnabled) {
 					expect(effort).toBeDefined();
@@ -210,13 +204,13 @@ describe("task.batch schema gating", () => {
 		);
 		const properties = getSchemaProperties(tool);
 		expect(properties.isolated).toBeUndefined();
-		const items = (properties.tasks as { items?: { properties?: Record<string, unknown> } }).items;
-		const isolatedSchema = items?.properties?.isolated;
+		const itemProperties = getBatchItemProperties(tool);
+		const isolatedSchema = itemProperties.isolated;
 		if (!isolatedSchema || typeof isolatedSchema !== "object" || !("type" in isolatedSchema)) {
 			throw new Error("Expected isolated to be a boolean schema");
 		}
 		expect(isolatedSchema.type).toBe("boolean");
-		expect(items?.properties?.apply).toBeUndefined();
+		expect(itemProperties.apply).toBeUndefined();
 		expect(tool.description).toContain("automatically applied to the parent checkout");
 
 		const captureTool = await TaskTool.create(
@@ -239,9 +233,8 @@ describe("task.batch schema gating", () => {
 				settings: { "task.batch": true, "task.isolation.mode": "auto" },
 			}),
 		);
-		const properties = getSchemaProperties(tool);
-		const items = (properties.tasks as { items?: { properties?: Record<string, unknown> } }).items;
-		expect(items?.properties?.isolated).toBeUndefined();
+		const itemProperties = getBatchItemProperties(tool);
+		expect(itemProperties.isolated).toBeUndefined();
 		expect(tool.description).not.toContain("`isolated`");
 	});
 
@@ -610,13 +603,13 @@ describe("task.batch spawning", () => {
 		const byId = new Map(seen.map(spawn => [spawn.id, spawn]));
 		const scoutSpawn = byId.get("Scout");
 		const reviewerSpawn = byId.get("Review");
-		expect(scoutSpawn?.agent).toBe(scoutAgent);
+		expect(scoutSpawn?.agent).toEqual(scoutAgent);
 		expect(scoutSpawn?.agent.tools).toEqual(["read"]);
 		expect(scoutSpawn?.modelOverride).toEqual(["anthropic/claude-haiku-4-5:low"]);
 		expect(scoutSpawn?.outputSchema).toBe(scoutSchema);
 		expect(scoutSpawn?.outputSchemaSource).toBe("agent");
 		expect(scoutSpawn?.outputSchemaOverridesAgent).toBe(false);
-		expect(reviewerSpawn?.agent).toBe(reviewerAgent);
+		expect(reviewerSpawn?.agent).toEqual(reviewerAgent);
 		expect(reviewerSpawn?.agent.tools).toEqual(["read", "bash"]);
 		expect(reviewerSpawn?.modelOverride).toEqual(["anthropic/claude-sonnet-4-6:medium"]);
 		expect(reviewerSpawn?.outputSchema).toBe(callerSchema);

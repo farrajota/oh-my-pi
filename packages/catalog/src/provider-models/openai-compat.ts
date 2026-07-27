@@ -6,6 +6,7 @@ import {
 } from "../discovery/openai-compatible";
 import { Effort, THINKING_EFFORTS } from "../effort";
 import { FIREWORKS_FAST_SUFFIX, toFireworksPublicModelId } from "../fireworks-model-id";
+import { getBundledModelReferenceIndex } from "../identity/bundled";
 import {
 	anthropicModelSupportsThinking,
 	isGlmVisionModelId,
@@ -14,6 +15,7 @@ import {
 	isKimiModelId,
 	isReasoningGlmModelId,
 } from "../identity/family";
+import { resolveModelReference } from "../identity/reference";
 import type { ModelManagerOptions } from "../model-manager";
 import { getBundledModels } from "../models";
 import type { Api, FetchImpl, Model, ModelSpec, OpenAICompat, Provider, ThinkingConfig } from "../types";
@@ -91,10 +93,11 @@ function toInputCapabilities(value: unknown): ("text" | "image")[] {
 	return supportsImage ? ["text", "image"] : ["text"];
 }
 
-async function fetchModelsDevPayload(fetchImpl: FetchImpl = discoveryFetch()): Promise<unknown> {
+async function fetchModelsDevPayload(fetchImpl: FetchImpl = discoveryFetch(), signal?: AbortSignal): Promise<unknown> {
 	const response = await fetchImpl(MODELS_DEV_URL, {
 		method: "GET",
 		headers: { Accept: "application/json" },
+		signal,
 	});
 	if (!response.ok) {
 		throw new Error(`models.dev fetch failed: ${response.status}`);
@@ -1436,6 +1439,166 @@ export function deepseekModelManagerOptions(
 ): ModelManagerOptions<"openai-completions"> {
 	return createSimpleOpenAICompletionsOptions("deepseek", "https://api.deepseek.com", config);
 }
+
+// ---------------------------------------------------------------------------
+// 6.6 SiliconFlow
+// ---------------------------------------------------------------------------
+
+export interface SiliconFlowModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+}
+
+/**
+ * SiliconFlow's `/v1/models` lists every served model — including embeddings,
+ * rerankers, image, audio, and video generators that cannot serve chat
+ * completions — and carries no per-model type field, so non-chat entries are
+ * dropped by id to keep the picker usable.
+ */
+const SILICONFLOW_NON_CHAT_MODEL_TOKENS = [
+	"embedding",
+	"reranker",
+	"bge-",
+	"bce-",
+	"stable-diffusion",
+	"image",
+	"flux",
+	"kolors",
+	"sensevoice",
+	"cosyvoice",
+	"fish-speech",
+	"indextts",
+	"sovits",
+	"whisper",
+	"hunyuanvideo",
+	"wan2",
+	"ltx-video",
+	"speech",
+	"moderator",
+	"tts",
+] as const;
+
+export function isLikelySiliconFlowChatModelId(id: string): boolean {
+	const normalized = id.trim().toLowerCase();
+	if (!normalized) {
+		return false;
+	}
+	return !SILICONFLOW_NON_CHAT_MODEL_TOKENS.some(token => normalized.includes(token));
+}
+
+/**
+ * models.dev mappings consulted ONLY as a runtime metadata reference during
+ * dynamic discovery. They are deliberately absent from
+ * `MODELS_DEV_PROVIDER_DESCRIPTORS` so `generate-models.ts` never bundles
+ * SiliconFlow models — the live endpoint decides which models exist, while
+ * these entries hydrate the pricing, limits, and reasoning metadata that the
+ * endpoint's bare `{id}` rows do not carry. No filter: the join against live
+ * discovered ids already restricts hydration to chat models.
+ */
+const SILICONFLOW_MODELS_DEV_DESCRIPTORS: readonly ModelsDevProviderDescriptor[] = [
+	openAiCompletionsDescriptor("siliconflow", "siliconflow", "https://api.siliconflow.com/v1", {
+		filterModel: () => true,
+	}),
+	openAiCompletionsDescriptor("siliconflow-cn", "siliconflow-cn", "https://api.siliconflow.cn/v1", {
+		filterModel: () => true,
+	}),
+];
+
+const SILICONFLOW_MODELS_DEV_REFERENCE_TIMEOUT_MS = 5_000;
+
+async function loadSiliconFlowModelsDevReferences(
+	providerId: "siliconflow" | "siliconflow-cn",
+	fetchImpl?: FetchImpl,
+): Promise<Map<string, ModelSpec<"openai-completions">>> {
+	const descriptor = SILICONFLOW_MODELS_DEV_DESCRIPTORS.find(d => d.providerId === providerId);
+	if (!descriptor) {
+		return new Map();
+	}
+	try {
+		// Bounded: this enrichment is optional, so a stalled models.dev must not
+		// hold back the authoritative endpoint request that runs after it.
+		const payload = await withCatalogDiscoveryTimeout(SILICONFLOW_MODELS_DEV_REFERENCE_TIMEOUT_MS, signal =>
+			fetchModelsDevPayload(fetchImpl, signal),
+		);
+		return createModelsDevReferenceMap<"openai-completions">(
+			mapModelsDevToModels(payload as Record<string, unknown>, [descriptor]),
+		);
+	} catch {
+		return new Map();
+	}
+}
+
+function createSiliconFlowModelManagerOptions(
+	providerId: "siliconflow" | "siliconflow-cn",
+	defaultBaseUrl: string,
+	config?: SiliconFlowModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? defaultBaseUrl;
+	return {
+		providerId,
+		dynamicModelsAuthoritative: true,
+		...(apiKey && {
+			fetchDynamicModels: async () => {
+				const modelsDevReferences = await loadSiliconFlowModelsDevReferences(providerId, config?.fetch);
+				// Resolved here, not at options construction: walking the bundled
+				// reference index is only worth paying for when dynamic discovery
+				// actually runs, keeping the ModelManager cache fast path cheap.
+				const canonicalReferences = getBundledModelReferenceIndex();
+				return fetchOpenAICompatibleModels({
+					api: "openai-completions",
+					provider: providerId,
+					baseUrl,
+					apiKey,
+					filterModel: (_entry, model) => isLikelySiliconFlowChatModelId(model.id),
+					mapModel: (entry, defaults) => {
+						const modelsDevReference = modelsDevReferences.get(defaults.id);
+						if (modelsDevReference) {
+							return mapWithBundledReference(entry, defaults, modelsDevReference);
+						}
+						// ids missing from models.dev (new launches) still recover intrinsic
+						// capabilities and canonical limits from any bundled upstream/reseller
+						// entry — but never its pricing, which is provider-specific.
+						const canonical = resolveModelReference(defaults.id, canonicalReferences) as
+							| ModelSpec<"openai-completions">
+							| undefined;
+						if (!canonical) {
+							return defaults;
+						}
+						const contextWindow = canonical.contextWindow ?? defaults.contextWindow;
+						const maxTokens =
+							canonical.maxTokens != null && contextWindow != null
+								? Math.min(canonical.maxTokens, contextWindow)
+								: (canonical.maxTokens ?? defaults.maxTokens);
+						return {
+							...defaults,
+							name: toModelName(entry.name, canonical.name ?? defaults.name),
+							reasoning: canonical.reasoning,
+							input: canonical.input,
+							contextWindow,
+							maxTokens,
+						};
+					},
+					fetch: config?.fetch,
+				});
+			},
+		}),
+	};
+}
+
+export function siliconflowModelManagerOptions(
+	config?: SiliconFlowModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	return createSiliconFlowModelManagerOptions("siliconflow", "https://api.siliconflow.com/v1", config);
+}
+
+export function siliconflowCnModelManagerOptions(
+	config?: SiliconFlowModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	return createSiliconFlowModelManagerOptions("siliconflow-cn", "https://api.siliconflow.cn/v1", config);
+}
+
 // ---------------------------------------------------------------------------
 // 6.7 Zhipu Coding Plan
 // ---------------------------------------------------------------------------

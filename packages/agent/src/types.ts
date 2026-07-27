@@ -48,6 +48,24 @@ export interface AgentTurnEndContext {
 	willContinue: boolean;
 }
 
+export interface AgentPreModelCallStop {
+	/** Stop the agent loop before sending the next provider request. */
+	stop: true;
+	/** Optional owner-facing reason, logged by the loop when it stops. */
+	reason?: string;
+}
+
+export type AgentPreModelCallResult = AgentPreModelCallStop | undefined;
+
+/**
+ * A pre-model-call gate. Return {@link AgentPreModelCallStop} to refuse the
+ * request, or nothing to proceed; the signal aborts with the run.
+ */
+export type AgentBeforeModelCall = (
+	context: Context,
+	signal?: AbortSignal,
+) => AgentPreModelCallResult | void | Promise<AgentPreModelCallResult | void>;
+
 /**
  * A soft tool requirement: the host wants `toolName` called before the loop
  * runs other tools or yields, but WITHOUT paying the forced-`toolChoice` cost
@@ -86,6 +104,13 @@ export interface SoftToolRequirement {
  * (applied verbatim) or a {@link SoftToolRequirement} (remind-then-escalate).
  */
 export type ToolChoiceDirective = ToolChoice | SoftToolRequirement;
+
+/** Mutable soft-requirement lifecycle retained across stopped agent runs. */
+export interface SoftToolRequirementState {
+	id?: string;
+	forcedToolChoice?: ToolChoice;
+	escalations: number;
+}
 
 /** True when a {@link ToolChoiceDirective} is a soft requirement, not a hard choice. */
 export function isSoftToolRequirement(directive: ToolChoiceDirective | undefined): directive is SoftToolRequirement {
@@ -276,8 +301,22 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Refreshes prompt/tool context from live session state before each model call.
 	 * Use this when tool availability or the system prompt can change mid-turn.
+	 *
+	 * Runs after pending messages are folded in and before provider conversion.
+	 * Mutate the agent context here; use `beforeModelCall` to inspect the
+	 * provider-bound context.
 	 */
 	syncContextBeforeModelCall?: (context: AgentContext) => void | Promise<void>;
+
+	/**
+	 * Asked after the complete provider context has been built, including
+	 * message conversion, provider transforms, normalized tools, and owned
+	 * dialect prompt injection. Returning {@link AgentPreModelCallStop} ends
+	 * the stream without emitting `turn_start`, so no turn is left open and no
+	 * request is billed. Return nothing to proceed. The signal aborts when
+	 * the run is canceled or its deadline expires.
+	 */
+	beforeModelCall?: AgentBeforeModelCall;
 
 	/**
 	 * Optional transform applied to tool call arguments before execution.
@@ -355,6 +394,19 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * to the static `toolChoice`.
 	 */
 	getToolChoice?: () => ToolChoiceDirective | undefined;
+
+	/**
+	 * Soft-requirement lifecycle retained by the host when a pre-model-call
+	 * gate stops a run before its pending reminder or escalation is served.
+	 */
+	softToolRequirementState?: SoftToolRequirementState;
+
+	/**
+	 * Notifies the host that the pre-model-call gate stopped the run after a
+	 * hard tool choice was obtained from {@link getToolChoice} but before it
+	 * was served, so the host can retain it for the next admitted request.
+	 */
+	onToolChoiceRejected?: () => void;
 
 	/**
 	 * Dynamic reasoning effort override, resolved per LLM call.

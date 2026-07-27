@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
@@ -13,6 +13,7 @@ import {
 	projectMountedMCPXdevGuidance,
 } from "@oh-my-pi/pi-coding-agent/session/session-tools";
 import { XdevRegistry } from "@oh-my-pi/pi-coding-agent/tools/xdev";
+import { logger } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 
 // Cache-stability invariant: when MCP servers reconnect with byte-identical tool
@@ -82,6 +83,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
 		}
+		vi.restoreAllMocks();
 	});
 
 	interface NewSessionOptions {
@@ -179,6 +181,24 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 		await session.refreshMCPTools([initialMcp]);
 		expect(rebuildCount).toBe(1);
+	});
+
+	it("warns and keeps the stable winner when distinct MCP tools mint the same name", async () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const { session, toolRegistry } = newSession(async toolNames => `tools:${toolNames.join(",")}`);
+		const dotted = createMcpCustomTool("mcp__foo_bar_lookup", "foo.bar", "lookup", "Lookup from dotted");
+		const underscored = createMcpCustomTool("mcp__foo_bar_lookup", "foo_bar", "lookup", "Lookup from underscored");
+
+		await session.refreshMCPTools([dotted, underscored]);
+
+		expect(toolRegistry.get("mcp__foo_bar_lookup")?.label).toBe("foo.bar/lookup");
+		expect(warn).toHaveBeenCalledWith("MCP tool name collision; keeping stable winner", {
+			name: "mcp__foo_bar_lookup",
+			keptServer: "foo.bar",
+			keptTool: "lookup",
+			ignoredServer: "foo_bar",
+			ignoredTool: "lookup",
+		});
 	});
 
 	it("serializes concurrent MCP refreshes before committing rebuilt prompts", async () => {

@@ -1,0 +1,113 @@
+name: "Compose bazel cache config"
+description: >
+   Single source of truth for how a CI job caches bazel work, emitted as a
+   bazelrc fragment (rc output) consumers pass via `bazelisk --bazelrc=...`.
+
+   omp-kata pods (detected via BAZEL_REMOTE_USER/BAZEL_REMOTE_PASSWORD from the
+   bazel-remote-ci secret) get read-write gRPC access to the in-cluster
+   bazel-remote service — an address that only resolves inside the cluster, so
+   nothing about the infrastructure leaks from this public repo. With
+   `export: true` (the main-push rust job), the kata job additionally writes a
+   bazel disk cache and saves it to the GitHub Actions cache at job end under
+   the main branch scope — that is what makes pull requests warm: PR-created
+   caches are never shared across PRs, main-created ones are readable by every
+   PR.
+
+   GitHub-hosted runners never talk to the cluster: they restore the
+   main-exported disk cache (plus their own branch-scoped refresh saves).
+
+inputs:
+   scope:
+      description: >
+         Disk-cache key discriminator. Every linux-family consumer (validation,
+         TS test jobs, linux/musl/win32 release jobs) shares the `linux` scope
+         so PRs hit the cache exported from main's rust job; darwin release
+         jobs keep per-target scopes and self-populate.
+      required: true
+   export:
+      description: >
+         Write a disk cache during the build and save it to the GitHub cache
+         at job end (main-push rust job only). No-op when the key already
+         exists for the current lockfiles.
+      required: false
+      default: "false"
+
+outputs:
+   rc:
+      description: Path to the generated bazelrc fragment
+      value: ${{ steps.compose.outputs.rc }}
+
+runs:
+   using: composite
+   steps:
+      - name: Restore bazel disk cache (GitHub-hosted)
+        if: env.BAZEL_REMOTE_USER == ''
+        uses: actions/cache@v4
+        with:
+           path: |
+              ~/.cache/omp-bazel-disk
+              ~/.cache/omp-bazel-repo
+           key: bazel-disk-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.Bazel.lock', 'MODULE.bazel', 'rust-toolchain.toml') }}
+           restore-keys: |
+              bazel-disk-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-
+
+      # Combined restore+save: restore is a no-op on the first run for these
+      # lockfiles (that's exactly when we want to build the export), and the
+      # post-job save only fires on a primary-key miss — so the export is
+      # written once per lockfile change, from a trusted main push.
+      - name: Prepare disk cache export (omp-kata)
+        if: env.BAZEL_REMOTE_USER != '' && inputs.export == 'true'
+        id: export
+        uses: actions/cache@v4
+        with:
+           path: ~/.cache/omp-bazel-disk
+           key: bazel-disk-${{ inputs.scope }}-Linux-X64-${{ hashFiles('Cargo.Bazel.lock', 'MODULE.bazel', 'rust-toolchain.toml') }}
+
+      - name: Compose cache config
+        id: compose
+        shell: bash
+        env:
+           EXPORT_DISK: ${{ inputs.export == 'true' && steps.export.outputs.cache-hit != 'true' && 'true' || 'false' }}
+        run: |
+           set -euo pipefail
+           rc="$RUNNER_TEMP/bazel-cache.rc"
+           if [ -n "${BAZEL_REMOTE_USER:-}" ]; then
+             auth="$(printf %s "${BAZEL_REMOTE_USER}:${BAZEL_REMOTE_PASSWORD}" | base64 | tr -d '\n')"
+             {
+               # The PVC repo-cache mount lives OUTSIDE $HOME (/opt): kubelet
+               # creates missing mountpoint parents root-owned, and a
+               # root-owned $HOME/.cache breaks bazel's default
+               # output_user_root and zig's wrapper cache. Pods are
+               # single-job ephemeral, so RUNNER_TEMP hosts the output root.
+               echo "startup --output_user_root=$RUNNER_TEMP/bazel-root"
+               echo "common --config=ci"
+               echo "common --config=cache-rw"
+               echo "common --remote_cache=grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092"
+               echo "common --tls_certificate=infra/bazel-remote/ca.crt"
+               echo "common --remote_header='authorization=Basic ${auth}'"
+               # PVC-backed shared repository cache (pods are ephemeral; without
+               # it every job re-downloads toolchains + crate archives). The
+               # xwin MSVC splat reuses the same PVC via OMP_XWIN_CACHE_DIR
+               # (its ~1GiB CDN payload is not repository-cacheable).
+               echo "common --repository_cache=/opt/bazel-repo-cache"
+               echo "common --repo_env=OMP_XWIN_CACHE_DIR=/opt/bazel-repo-cache/xwin"
+               if [ "$EXPORT_DISK" = "true" ]; then
+                 # Export runs (once per lockfile change) write the disk cache
+                 # PRs restore. They must download everything: with top-level-
+                 # only downloading, remote hits would export action entries
+                 # whose blobs were never materialized.
+                 echo "common --disk_cache=$HOME/.cache/omp-bazel-disk"
+               else
+                 # Cache-hit work stays metadata-only; only requested top-level
+                 # outputs (the .node addons) are actually downloaded.
+                 echo "common --remote_download_toplevel"
+               fi
+             } > "$rc"
+           else
+             {
+               echo "common --config=ci"
+               echo "common --disk_cache=$HOME/.cache/omp-bazel-disk"
+               echo "common --repository_cache=$HOME/.cache/omp-bazel-repo"
+             } > "$rc"
+           fi
+           echo "rc=$rc" >> "$GITHUB_OUTPUT"

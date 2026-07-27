@@ -15,7 +15,11 @@ import {
 	ExtensionRunner,
 	testSetExtensionHandlerTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
-import type { ExtensionError, ExtensionServiceTier } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type {
+	ExtensionError,
+	ExtensionServiceTier,
+	ExtensionUIContext,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { Type } from "@oh-my-pi/pi-coding-agent/extensibility/typebox";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -855,6 +859,81 @@ describe("ExtensionRunner", () => {
 			]);
 		});
 
+		it("observes a session_stop signal aborted synchronously by the handler", async () => {
+			const extensionPath = path.join(tempDir.path(), "self-cancel-session-stop.ts");
+			await Bun.write(
+				extensionPath,
+				`
+				export default function(pi) {
+					pi.on("session_stop", async (_event, ctx) => {
+						ctx.abort();
+						await Promise.withResolvers().promise;
+					});
+				}
+			`,
+			);
+
+			const result = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const controller = new AbortController();
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => controller.abort(),
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+			vi.useFakeTimers();
+			try {
+				testSetExtensionHandlerTimeoutMs(100);
+				const emission = runner.emitSessionStop({
+					messages: [],
+					turn_id: 0,
+					session_id: "session-123",
+					stop_hook_active: false,
+					signal: controller.signal,
+				});
+				let settled = false;
+				void emission.then(() => {
+					settled = true;
+				});
+				for (let attempts = 0; attempts < 10 && !settled; attempts++) {
+					await Promise.resolve();
+				}
+
+				expect(controller.signal.aborted).toBe(true);
+				expect(settled).toBe(true);
+				await emission;
+			} finally {
+				vi.useRealTimers();
+			}
+		});
 		it("continues to later handlers after empty continuation feedback", async () => {
 			await Bun.write(
 				path.join(extensionsDir, "session-stop-empty.ts"),
@@ -1235,6 +1314,95 @@ describe("ExtensionRunner", () => {
 			]);
 
 			warnSpy.mockRestore();
+		});
+
+		it("aborts a tool_call handler's confirmation before returning its timeout block", async () => {
+			const extensionPath = path.join(tempDir.path(), "confirm-tool-call.ts");
+			const markerPath = path.join(tempDir.path(), "confirm-settled.txt");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					import * as fs from "node:fs";
+
+					export default function(pi) {
+						pi.on("tool_call", async (_event, ctx) => {
+							ctx.ui.notify("Waiting for confirmation");
+							await ctx.ui.confirm("High-risk command", "Allow this command?");
+							fs.writeFileSync(${JSON.stringify(markerPath)}, "settled");
+						});
+					}
+				`,
+			);
+
+			const result = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const dialog = Promise.withResolvers<boolean>();
+			let dialogSignal: AbortSignal | undefined;
+			const notify = vi.fn<ExtensionUIContext["notify"]>();
+			const confirm: ExtensionUIContext["confirm"] = async (_title, _message, dialogOptions) => {
+				dialogSignal = dialogOptions?.signal;
+				dialogSignal?.addEventListener("abort", () => dialog.resolve(false), { once: true });
+				return await dialog.promise;
+			};
+			const uiPrototype = Object.create(runner.getUIContext(), {
+				confirm: { value: confirm },
+				notify: { value: notify },
+			});
+			const uiContext: ExtensionUIContext = Object.create(uiPrototype);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+				undefined,
+				uiContext,
+			);
+			testSetExtensionHandlerTimeoutMs(10);
+
+			const tool: AgentTool = {
+				name: "guarded",
+				label: "Guarded",
+				description: "must not execute after the extension gate times out",
+				parameters: Type.Object({}),
+				strict: true,
+				execute: async () => ({ content: [{ type: "text", text: "ran" }] }),
+			};
+			const wrapped = new ExtensionToolWrapper(tool, runner);
+
+			await expect(wrapped.execute("tool-call-id", {})).rejects.toThrow(
+				`Extension ${extensionPath} timed out after 10ms`,
+			);
+			expect(notify).toHaveBeenCalledWith("Waiting for confirmation");
+
+			expect(dialogSignal?.aborted).toBe(true);
+			expect(fs.readFileSync(markerPath, "utf8")).toBe("settled");
 		});
 	});
 
