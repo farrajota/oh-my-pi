@@ -93,7 +93,7 @@ import {
 	withTimeout,
 } from "@oh-my-pi/pi-utils";
 import type { AdvisorConfig, AdvisorRuntimeStatus } from "../advisor";
-import { AsyncJobManager, type AsyncJob, type AsyncJobSnapshot, type AsyncJobSnapshotOptions } from "../async";
+import { type AsyncJob, AsyncJobManager, type AsyncJobSnapshot, type AsyncJobSnapshotOptions } from "../async";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import { type ResolvedModelRoleValue, resolveModelOverride } from "../config/model-resolver";
@@ -203,7 +203,6 @@ import type { AgentSessionEvent, AgentSessionEventListener } from "./agent-sessi
 import type {
 	AgentSessionConfig,
 	AgentSessionDisposeOptions,
-	AsyncJobSnapshot,
 	CommandMetadataChangedListener,
 	ContextUsageBreakdown,
 	FollowUpOptions,
@@ -324,7 +323,6 @@ import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
 
-
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
 // Constants
@@ -362,7 +360,6 @@ const noOpUIContext: ExtensionUIContext = {
 // ============================================================================
 // AgentSession Class
 // ============================================================================
-
 
 type MessageEndPersistenceSlot = {
 	readonly promise: Promise<void>;
@@ -3188,34 +3185,10 @@ export class AgentSession {
 				skipped: event.skipped,
 			});
 		} else if (event.type === "auto_retry_start") {
-			await this.#extensionRunner.emit({
-				type: "auto_retry_start",
-				attempt: event.attempt,
-				maxAttempts: event.maxAttempts,
-				delayMs: event.delayMs,
-				errorMessage: event.errorMessage,
-				errorId: event.errorId,
-				mode: event.mode,
-				round: event.round,
-				deadlineMs: event.deadlineMs,
-				timeoutMs: event.timeoutMs,
-				reason: event.reason,
-				resetAware: event.resetAware,
-			});
+			await this.#extensionRunner.emit(event);
 		} else if (event.type === "auto_retry_end") {
 			if (hasGenericHandlers) {
-				await this.#extensionRunner.emit({
-					type: "auto_retry_end",
-					success: event.success,
-					attempt: event.attempt,
-					finalError: event.finalError,
-					recoveredErrors: event.recoveredErrors,
-					mode: event.mode,
-					round: event.round,
-					deadlineMs: event.deadlineMs,
-					timeoutMs: event.timeoutMs,
-					reason: event.reason,
-				});
+				await this.#extensionRunner.emit(event);
 			}
 			if (hasSpecializedRetryHandlers && event.mode === "repeated" && event.reason === "success") {
 				await this.#extensionRunner.emit({

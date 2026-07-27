@@ -29,7 +29,7 @@ function extension(handlers: Extension["handlers"] = new Map()): Extension {
 
 function runner(
 	extensions: Extension[] = [],
-	sessionScope?: ConstructorParameters<typeof ExtensionRunner>[7],
+	sessionScope?: ConstructorParameters<typeof ExtensionRunner>[8],
 ): ExtensionRunner {
 	return new ExtensionRunner(
 		extensions,
@@ -37,6 +37,7 @@ function runner(
 		cwd,
 		{ getSessionId: () => "session-1" } as ConstructorParameters<typeof ExtensionRunner>[3],
 		{} as ConstructorParameters<typeof ExtensionRunner>[4],
+		undefined,
 		undefined,
 		undefined,
 		sessionScope,

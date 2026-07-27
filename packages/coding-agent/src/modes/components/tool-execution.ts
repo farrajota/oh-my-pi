@@ -29,26 +29,6 @@ import { isFramedBlockComponent, markFramedBlockComponent, renderStatusLine, Wid
 import { sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";
 import { renderDiff } from "./diff";
 
-function formatTokenMeta(tokens: number): string {
-	if (tokens < 1000) return `+${tokens} tokens`;
-	const thousands = tokens / 1000;
-	return `+${thousands >= 10 ? thousands.toFixed(0) : thousands.toFixed(1)}K tokens`;
-}
-
-function formatElapsedMeta(ms: number): string {
-	const totalSeconds = Math.max(0, Math.round(ms / 1000));
-	const minutes = Math.floor(totalSeconds / 60);
-	const seconds = totalSeconds % 60;
-	return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
-}
-
-function formatToolMeta(elapsedMs: number | undefined, tokenCount: number | undefined): string[] | undefined {
-	const meta: string[] = [];
-	if (elapsedMs !== undefined) meta.push(formatElapsedMeta(elapsedMs));
-	if (tokenCount !== undefined) meta.push(formatTokenMeta(tokenCount));
-	return meta.length === 0 ? undefined : meta;
-}
-
 /**
  * Drop trailing removal/hunk-header lines that appear in a streaming diff
  * before the matching `+added` lines have arrived. Without this, a partial
@@ -324,8 +304,6 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		isError?: boolean;
 		details?: any;
 	};
-	#tokenCount: number | undefined;
-	#elapsedMs: number | undefined;
 	// Edit preview state
 	#editMode?: EditMode;
 	#editDiffPreview?: PerFileDiffPreview[];
@@ -616,15 +594,11 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		this.#maybeConvertImagesForKitty();
 	}
 
-	setElapsedMs(_toolCallId: string, elapsedMs: number): void {
-		this.#elapsedMs = Math.max(0, Math.round(elapsedMs));
-		this.#updateDisplay();
-	}
+	// Retained for the transcript handle contract; the generic renderer no
+	// longer consumes per-call timing or token updates.
+	setElapsedMs(_toolCallId: string, _elapsedMs: number): void {}
 
-	setTokenCount(_toolCallId: string, tokens: number): void {
-		this.#tokenCount = Math.max(0, Math.round(tokens));
-		this.#updateDisplay();
-	}
+	setTokenCount(_toolCallId: string, _tokens: number): void {}
 
 	/**
 	 * Get all image blocks from result content and details.images.
@@ -694,7 +668,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		const pendingCallConsumesSpinner =
 			this.#result === undefined &&
 			(renderer === undefined
-				? // Only the generic #formatToolExecution fallback consumes the frame;
+				? // Only the generic WidthAwareText fallback consumes the frame;
 					// a custom renderCall/renderResult pair routes through the custom
 					// branch whose pending label is a static tool-name Text.
 					!this.#tool?.renderCall && !this.#tool?.renderResult
@@ -1385,107 +1359,5 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		}
 
 		return output;
-	}
-
-	/**
-	 * Format a generic tool execution (fallback for tools without custom renderers)
-	 */
-	#formatToolExecution(contentWidth: number): string {
-		const lines: string[] = [];
-		const icon = this.#isPartial
-			? this.#spinnerFrame !== undefined
-				? "running"
-				: "pending"
-			: this.#result?.isError
-				? "error"
-				: "done";
-		lines.push(
-			renderStatusLine(
-				{
-					icon,
-					spinnerFrame: this.#spinnerFrame,
-					title: this.#toolLabel,
-					meta: formatToolMeta(this.#elapsedMs, this.#tokenCount),
-				},
-				theme,
-			),
-		);
-
-		const argsObject = this.#args && typeof this.#args === "object" ? (this.#args as Record<string, unknown>) : null;
-		if (!this.#expanded && argsObject && Object.keys(argsObject).length > 0) {
-			// Budget the inline preview against the render width, leaving room for
-			// the ` └─ ` connector prefix instead of a fixed cap.
-			const inlineBudget = Math.max(20, contentWidth - Bun.stringWidth(theme.tree.last) - 2);
-			const preview = formatArgsInline(argsObject, inlineBudget);
-			if (preview) {
-				lines.push(` ${theme.fg("dim", theme.tree.last)} ${theme.fg("dim", preview)}`);
-			}
-		}
-
-		if (this.#expanded && this.#args !== undefined) {
-			lines.push("");
-			lines.push(theme.fg("dim", "Args"));
-			const tree = renderJsonTreeLines(
-				this.#args,
-				theme,
-				JSON_TREE_MAX_DEPTH_EXPANDED,
-				JSON_TREE_MAX_LINES_EXPANDED,
-				JSON_TREE_SCALAR_LEN_EXPANDED,
-			);
-			lines.push(...tree.lines);
-			if (tree.truncated) {
-				lines.push(theme.fg("dim", "…"));
-			}
-			lines.push("");
-		}
-
-		if (!this.#result) {
-			return lines.join("\n");
-		}
-
-		const textContent = this.#getTextOutput().trimEnd();
-		if (!textContent) {
-			lines.push(theme.fg("dim", "(no output)"));
-			return lines.join("\n");
-		}
-
-		if (textContent.startsWith("{") || textContent.startsWith("[")) {
-			try {
-				const parsed = JSON.parse(textContent);
-				const maxDepth = this.#expanded ? JSON_TREE_MAX_DEPTH_EXPANDED : JSON_TREE_MAX_DEPTH_COLLAPSED;
-				const maxLines = this.#expanded ? JSON_TREE_MAX_LINES_EXPANDED : JSON_TREE_MAX_LINES_COLLAPSED;
-				const maxScalarLen = this.#expanded ? JSON_TREE_SCALAR_LEN_EXPANDED : JSON_TREE_SCALAR_LEN_COLLAPSED;
-				const tree = renderJsonTreeLines(parsed, theme, maxDepth, maxLines, maxScalarLen);
-
-				if (tree.lines.length > 0) {
-					lines.push(...tree.lines);
-					if (!this.#expanded) {
-						lines.push(formatExpandHint(theme, this.#expanded, true));
-					} else if (tree.truncated) {
-						lines.push(theme.fg("dim", "…"));
-					}
-					return lines.join("\n");
-				}
-			} catch {
-				// Fall through to raw output
-			}
-		}
-
-		const outputLines = textContent.split("\n");
-		const maxOutputLines = this.#expanded ? 12 : 4;
-		const displayLines = outputLines.slice(0, maxOutputLines);
-
-		for (const line of displayLines) {
-			lines.push(theme.fg("toolOutput", truncateToWidth(replaceTabs(line), contentWidth)));
-		}
-
-		if (outputLines.length > maxOutputLines) {
-			const remaining = outputLines.length - maxOutputLines;
-			lines.push(`${theme.fg("dim", `… ${remaining} more lines`)} ${formatExpandHint(theme, this.#expanded, true)}`);
-		} else if (!this.#expanded) {
-			lines.push(formatExpandHint(theme, this.#expanded, true));
-		}
-
-		return lines.join("\n");
 	}
 }

@@ -12,6 +12,7 @@
  * test/task/task-schema.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { Effort } from "@oh-my-pi/pi-ai";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -112,7 +113,7 @@ describe("task spawn routing", () => {
 
 	it("returns immediately on spawn and delivers the follow-up hint when the job completes", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
-			agents: [{ ...taskAgent, model: ["anthropic/claude-sonnet-4"] }],
+			agents: [{ ...taskAgent, model: ["anthropic/claude-sonnet-4"], thinkingLevel: Effort.High }],
 			projectAgentsDir: null,
 		});
 		const gate = deferred();
@@ -123,7 +124,10 @@ describe("task spawn routing", () => {
 
 		const manager = createManager();
 		const tool = await TaskTool.create(
-			createSession({ manager, settings: { "task.agentModelOverrides": { task: "openai/gpt-4.1-mini" } } }),
+			createSession({
+				manager,
+				settings: { "task.agentModelOverrides": { task: "openai/gpt-4.1-mini" }, "task.enableLsp": false },
+			}),
 		);
 
 		const result = await tool.execute("tc-spawn", {
@@ -152,6 +156,8 @@ describe("task spawn routing", () => {
 		expect(job!.resultText).toContain("history://Spawnling");
 		expect(runSpy).toHaveBeenCalledTimes(1);
 		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["openai/gpt-4.1-mini"]);
+		expect(runSpy.mock.calls[0]?.[0].enableLsp).toBe(false);
+		expect(runSpy.mock.calls[0]?.[0].thinkingLevel).toBe(Effort.High);
 	});
 
 	it("uses a safe capped one-line label without changing the task prompt", async () => {

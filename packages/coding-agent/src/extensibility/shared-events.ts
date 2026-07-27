@@ -250,21 +250,34 @@ export type AutoRetryRepeatedEndReason =
 	| "not-recoverable"
 	| AutoRetryExhaustionReason;
 
-/** Fired when auto-retry starts */
-export interface AutoRetryStartEvent {
+interface AutoRetryStartEventBase {
 	type: "auto_retry_start";
 	attempt: number;
 	maxAttempts: number;
 	delayMs: number;
 	errorMessage: string;
 	errorId?: number;
-	mode?: AutoRetryMode;
-	round?: number;
-	deadlineMs?: number;
-	timeoutMs?: number;
 	reason?: AutoRetryExhaustionReason;
 	resetAware?: boolean;
 }
+
+/** Fired when a normal auto-retry starts. */
+export interface NormalAutoRetryStartEvent extends AutoRetryStartEventBase {
+	mode?: "normal";
+	round?: number;
+	deadlineMs?: number;
+	timeoutMs?: number;
+}
+
+/** Fired when a session-limit-aware auto-retry starts. */
+export interface RepeatedAutoRetryStartEvent extends AutoRetryStartEventBase {
+	mode: "repeated";
+	round: number;
+	deadlineMs: number;
+	timeoutMs: number;
+}
+
+export type AutoRetryStartEvent = NormalAutoRetryStartEvent | RepeatedAutoRetryStartEvent;
 
 export interface RecoveredRetryError {
 	entryId: string;
@@ -273,19 +286,40 @@ export interface RecoveredRetryError {
 	retryRecovery: AssistantRetryRecovery;
 }
 
-/** Fired when auto-retry ends */
-export interface AutoRetryEndEvent {
+interface AutoRetryEndEventBase {
 	type: "auto_retry_end";
 	success: boolean;
 	attempt: number;
 	finalError?: string;
 	recoveredErrors?: RecoveredRetryError[];
-	mode?: AutoRetryMode;
+	reason?: AutoRetryRepeatedEndReason;
+	resetAware?: boolean;
+}
+
+/** Fired when a normal auto-retry ends. */
+export interface NormalAutoRetryEndEvent extends AutoRetryEndEventBase {
+	mode?: "normal";
 	round?: number;
+	startedAtMs?: number;
+	terminalAtMs?: number;
+	durationMs?: number;
 	deadlineMs?: number;
 	timeoutMs?: number;
-	reason?: AutoRetryRepeatedEndReason;
 }
+
+/** Fired when a session-limit-aware auto-retry ends. */
+export interface RepeatedAutoRetryEndEvent extends AutoRetryEndEventBase {
+	mode: "repeated";
+	round: number;
+	startedAtMs: number;
+	terminalAtMs: number;
+	durationMs: number;
+	deadlineMs: number;
+	timeoutMs: number;
+	reason: AutoRetryRepeatedEndReason;
+}
+
+export type AutoRetryEndEvent = NormalAutoRetryEndEvent | RepeatedAutoRetryEndEvent;
 
 /** Fired when a repeated auto-retry recovers. */
 export interface AutoRetryRecoveredEvent {

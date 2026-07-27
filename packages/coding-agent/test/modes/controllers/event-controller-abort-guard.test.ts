@@ -77,10 +77,31 @@ function makeAgentEndEvent(messages: AssistantMessage[]): Extract<AgentSessionEv
 	return { type: "agent_end", messages } as Extract<AgentSessionEvent, { type: "agent_end" }>;
 }
 
+type StreamingFixtureContext = { streamingComponent: unknown };
+
+async function dispatchAgentEnd(
+	ctx: InteractiveModeContext,
+	controller: EventController,
+	event: Extract<AgentSessionEvent, { type: "agent_end" }>,
+): Promise<void> {
+	const message = event.messages.at(-1);
+	if (message?.role === "assistant") {
+		const streamingContext = ctx as unknown as StreamingFixtureContext;
+		streamingContext.streamingComponent = {
+			updateContent: () => {},
+			markTranscriptBlockFinalized: () => {},
+			setErrorPinned: () => {},
+		};
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message });
+	}
+	await controller.handleEvent(ctx.viewSession, event);
+}
+
 /** Full context needed to drive `#handleAgentEnd` -> `#finishAgentEnd` end to end. */
 function makeTurnEndContext(options: { lastAssistantMessage?: AssistantMessage } = {}): InteractiveModeContext {
 	const session = {
 		isStreaming: false,
+		activeRunStartedAt: 1_000,
 		isCompacting: false,
 		messages: [] as AssistantMessage[],
 		getLastAssistantMessage: () => options.lastAssistantMessage,
@@ -95,16 +116,24 @@ function makeTurnEndContext(options: { lastAssistantMessage?: AssistantMessage }
 		streamingComponent: undefined,
 		streamingMessage: undefined,
 		pendingTools: new Map<string, unknown>(),
+		transcriptMessageComponents: new WeakMap(),
 		flushPendingModelSwitch: async () => {},
 		flushPendingCommandOutput: () => {},
 		ui: { requestRender: () => {}, requestComponentRender: () => {} },
 		chatContainer: { removeChild: () => {} },
 		statusContainer: { clear: () => {}, disposeChildren: () => {}, addChild: () => {} },
-		statusLine: { markActivityEnd: () => {}, markActivityStart: () => {} },
+		statusLine: { invalidate: () => {}, markActivityEnd: () => {}, markActivityStart: () => {} },
 		editor: { getText: () => "" },
 		sessionManager: { getSessionName: () => "test-session" },
 		clearPinnedError: () => {},
 		ensureLoadingAnimation: () => {},
+		beginWorkingMessageRun: () => {},
+		setWorkingMessageRunTokenDelta: () => {},
+		noteDisplayableThinkingContent: () => false,
+		effectiveHideThinkingBlock: false,
+		endWorkingMessageRun: () => {},
+		getWorkingMessageRunElapsedMs: () => undefined,
+		showPinnedError: () => {},
 		showError: () => {},
 		session,
 		viewSession: session,
@@ -244,8 +273,9 @@ describe("EventController — notifications through the real turn-end path (#han
 		// viewSession (active context) reports no assistant at all — the shape a
 		// classifier-refusal prune leaves behind — while the terminal agent_end
 		// event still carries the failed turn.
-		const controller = new EventController(makeTurnEndContext({ lastAssistantMessage: undefined }));
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		const ctx = makeTurnEndContext({ lastAssistantMessage: undefined });
+		const controller = new EventController(ctx);
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(1);
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
 	});
@@ -254,8 +284,9 @@ describe("EventController — notifications through the real turn-end path (#han
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
 		settings.override("completion.notify", "off");
-		const controller = new EventController(makeTurnEndContext());
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("aborted")]));
+		const ctx = makeTurnEndContext();
+		const controller = new EventController(ctx);
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("aborted")]));
 		expect(spy).not.toHaveBeenCalled();
 	});
 
@@ -267,8 +298,9 @@ describe("EventController — notifications through the real turn-end path (#han
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
 		settings.override("completion.notify", "on");
-		const controller = new EventController(makeTurnEndContext({ lastAssistantMessage: undefined }));
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		const ctx = makeTurnEndContext({ lastAssistantMessage: undefined });
+		const controller = new EventController(ctx);
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(1);
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
 	});
@@ -283,27 +315,28 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
 		settings.override("completion.notify", "off");
-		const controller = new EventController(makeTurnEndContext());
+		const ctx = makeTurnEndContext();
+		const controller = new EventController(ctx);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_start",
 			attempt: 1,
 			maxAttempts: 3,
 			delayMs: 100,
 			errorMessage: "overloaded",
 		} as Extract<AgentSessionEvent, { type: "auto_retry_start" }>);
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).not.toHaveBeenCalled();
 
 		// Retries exhausted: the session falls through to its own final agent_end
 		// for the same failed message, now that the retry saga is over.
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_end",
 			success: false,
 			attempt: 3,
 			finalError: "still overloaded",
 		} as Extract<AgentSessionEvent, { type: "auto_retry_end" }>);
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(1);
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
 	});
@@ -311,17 +344,21 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 	it("keeps retry suppression when the next attempt starts before a deferred failed agent_end settles", async () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
-		const controller = new EventController(makeTurnEndContext());
+		const ctx = makeTurnEndContext();
+		const controller = new EventController(ctx);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_start",
 			attempt: 1,
 			maxAttempts: 3,
 			delayMs: 100,
 			errorMessage: "overloaded",
 		} as Extract<AgentSessionEvent, { type: "auto_retry_start" }>);
-		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		await controller.handleEvent(ctx.viewSession, { type: "agent_start" } as Extract<
+			AgentSessionEvent,
+			{ type: "agent_start" }
+		>);
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("error")]));
 
 		expect(spy).not.toHaveBeenCalled();
 	});
@@ -329,9 +366,10 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 	it("clears a retry latch when the view retargets to a session that is not retrying", async () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
-		const controller = new EventController(makeTurnEndContext());
+		const ctx = makeTurnEndContext();
+		const controller = new EventController(ctx);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_start",
 			attempt: 1,
 			maxAttempts: 3,
@@ -339,7 +377,7 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 			errorMessage: "overloaded",
 		} as Extract<AgentSessionEvent, { type: "auto_retry_start" }>);
 		controller.resetTranscriptAnchors();
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("error")]));
 
 		expect(spy).toHaveBeenCalledTimes(1);
 	});
@@ -348,23 +386,24 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
 		settings.override("completion.notify", "off");
-		const controller = new EventController(makeTurnEndContext());
+		const ctx = makeTurnEndContext();
+		const controller = new EventController(ctx);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_start",
 			attempt: 1,
 			maxAttempts: 3,
 			delayMs: 100,
 			errorMessage: "overloaded",
 		} as Extract<AgentSessionEvent, { type: "auto_retry_start" }>);
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
-		await controller.handleEvent({
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("error")]));
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_end",
 			success: true,
 			attempt: 1,
 		} as Extract<AgentSessionEvent, { type: "auto_retry_end" }>);
 		// The recovered turn settles normally with stopReason 'stop'.
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("stop")]));
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("stop")]));
 		expect(spy).not.toHaveBeenCalled();
 	});
 
@@ -378,27 +417,28 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
 		settings.override("completion.notify", "off");
-		const controller = new EventController(makeTurnEndContext());
+		const ctx = makeTurnEndContext();
+		const controller = new EventController(ctx);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_start",
 			attempt: 1,
 			maxAttempts: 3,
 			delayMs: 100,
 			errorMessage: "overloaded",
 		} as Extract<AgentSessionEvent, { type: "auto_retry_start" }>);
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("error")]));
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).not.toHaveBeenCalled();
 
 		// Only once the lifecycle explicitly settles does the next agent_end notify.
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_end",
 			success: false,
 			attempt: 2,
 			finalError: "still overloaded",
 		} as Extract<AgentSessionEvent, { type: "auto_retry_end" }>);
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(1);
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
 	});

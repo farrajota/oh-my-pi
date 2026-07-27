@@ -4067,10 +4067,7 @@ async function openCodexSseEventStream(
 				clearPreResponseTimeout = watchdog.clear;
 				return { signal: watchdog.signal };
 			},
-			maxAttempts: Math.min(
-				maxAttempts,
-				resolveCodexSseMaxAttempts(codexSseMaxAttempts),
-			),
+			maxAttempts: Math.min(maxAttempts, resolveCodexSseMaxAttempts(codexSseMaxAttempts)),
 			defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
 			maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
 			fetch: fetchAttempt,

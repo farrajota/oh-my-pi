@@ -12,7 +12,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import type { postmortem } from "@oh-my-pi/pi-utils";
 import type { AdvisorConfig } from "../advisor";
-import type { AsyncJob, AsyncJobDeliveryState, AsyncJobManager } from "../async";
+import type { AsyncJobManager } from "../async";
 import type { ModelRegistry } from "../config/model-registry";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
@@ -45,15 +45,6 @@ export interface AgentSessionDisposeOptions {
 
 /** Listener notified when command metadata changes. */
 export type CommandMetadataChangedListener = () => void | Promise<void>;
-/** Public summary of an asynchronous job. */
-export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime">;
-
-/** Snapshot of running, recent, and pending-delivery asynchronous jobs. */
-export interface AsyncJobSnapshot {
-	running: AsyncJobSnapshotItem[];
-	recent: AsyncJobSnapshotItem[];
-	delivery: AsyncJobDeliveryState;
-}
 
 export type { ShakeMode, ShakeResult } from "./shake-types";
 

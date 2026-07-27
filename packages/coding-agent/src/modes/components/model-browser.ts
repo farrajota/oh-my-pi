@@ -12,7 +12,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import {
-	type Component,
+	Container,
 	fuzzyRank,
 	Input,
 	matchesKey,
@@ -338,7 +338,7 @@ type PerfMode = "off" | "tps" | "full";
  * (`maxVisible + LIST_ROW_START + DETAIL_ROWS` rows) so host mouse geometry
  * stays stable across renders.
  */
-export class ModelBrowser implements Component {
+export class ModelBrowser extends Container {
 	#settings: Settings;
 	#searchInput = new Input();
 	#baseItems: ModelBrowserItem[] = [];
@@ -371,6 +371,7 @@ export class ModelBrowser implements Component {
 	onCancel?: () => void;
 
 	constructor(settings: Settings, options: ModelBrowserOptions = {}) {
+		super();
 		this.#settings = settings;
 		this.#showProvider = options.showProvider ?? true;
 		const tokens = options.currentContextTokens ?? 0;

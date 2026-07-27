@@ -27,6 +27,7 @@ function schemaWithPermissions(options: SchemaOptions) {
 	return getTaskSchema({
 		isolationEnabled: false,
 		batchEnabled: false,
+		defaultAgent: "task",
 		permissions: {
 			enabled: true,
 			toolsEnabled: options.toolsEnabled,
@@ -39,6 +40,7 @@ function disabledSchema() {
 	return getTaskSchema({
 		isolationEnabled: false,
 		batchEnabled: false,
+		defaultAgent: "task",
 		permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 	});
 }
@@ -83,14 +85,14 @@ describe("task permission schema", () => {
 	it("omits permissions when disabled", () => {
 		const schema = disabledSchema();
 
-		expect(accepts(schema, { agent: "task", assignment: "read" })).toBe(true);
+		expect(accepts(schema, { agent: "task", task: "read" })).toBe(true);
 		expect(
 			parse(schema, {
 				agent: "task",
-				assignment: "read",
+				task: "read",
 				permissions: { profiles: ["read-only"] },
 			}),
-		).toEqual({ agent: "task", assignment: "read" });
+		).toEqual({ agent: "task", task: "read" });
 	});
 
 	it("includes profiles, tool fields, and path fields when both dimensions are enabled", () => {
@@ -99,7 +101,7 @@ describe("task permission schema", () => {
 		expect(
 			accepts(schema, {
 				agent: "task",
-				assignment: "read",
+				task: "read",
 				permissions: {
 					profiles: ["focused-edit"],
 					tools: ["read"],
@@ -112,7 +114,7 @@ describe("task permission schema", () => {
 		expect(
 			accepts(schema, {
 				agent: "task",
-				assignment: "read",
+				task: "read",
 				permissions: { tools: "read" },
 			}),
 		).toBe(false);
@@ -124,7 +126,7 @@ describe("task permission schema", () => {
 		expect(
 			parse(schema, {
 				agent: "task",
-				assignment: "read",
+				task: "read",
 				permissions: {
 					profiles: ["focused-edit"],
 					tools: ["read"],
@@ -135,7 +137,7 @@ describe("task permission schema", () => {
 			}),
 		).toEqual({
 			agent: "task",
-			assignment: "read",
+			task: "read",
 			permissions: {
 				profiles: ["focused-edit"],
 				tools: ["read"],
@@ -150,7 +152,7 @@ describe("task permission schema", () => {
 		expect(
 			parse(schema, {
 				agent: "task",
-				assignment: "read",
+				task: "read",
 				permissions: {
 					profiles: ["focused-edit"],
 					tools: ["read"],
@@ -161,7 +163,7 @@ describe("task permission schema", () => {
 			}),
 		).toEqual({
 			agent: "task",
-			assignment: "read",
+			task: "read",
 			permissions: {
 				profiles: ["focused-edit"],
 				allowPaths: ["src/task/**"],
@@ -185,7 +187,7 @@ describe("task permission schema", () => {
 
 		const result = await taskTool.execute("tool-call", {
 			agent: "task",
-			assignment: "read",
+			task: "read",
 			permissions: { profiles: ["read-only"] },
 		});
 
@@ -209,7 +211,7 @@ describe("task permission schema", () => {
 		const result = await taskTool.execute("tool-call", {
 			agent: "task",
 			context: "Shared context",
-			tasks: [{ assignment: "read", permissions: { profiles: ["read-only"] } }],
+			tasks: [{ task: "read", permissions: { profiles: ["read-only"] } }],
 		});
 
 		expect(result.content).toEqual([{ type: "text", text: DISABLED_PERMISSIONS_ERROR }]);

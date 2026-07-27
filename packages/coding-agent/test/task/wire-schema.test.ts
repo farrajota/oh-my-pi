@@ -77,7 +77,7 @@ describe("task wire schema", () => {
 	});
 
 	it("defaults batch item agents to 'task' on the fast path and keeps names", () => {
-		const batch = getTaskSchema({ isolationEnabled: false, batchEnabled: true });
+		const batch = getTaskSchema({ isolationEnabled: false, batchEnabled: true, defaultAgent: "task" });
 		const items = parsedItems(batch({ context: "ctx", tasks: [{ name: "DbMigrator", task: "x" }] }));
 		expect(items[0]?.agent).toBe("task");
 		expect(items[0]?.name).toBe("DbMigrator");
@@ -91,7 +91,7 @@ describe("task wire schema", () => {
 	});
 
 	it("deletes stale keys from batch items", () => {
-		const batch = getTaskSchema({ isolationEnabled: false, batchEnabled: true });
+		const batch = getTaskSchema({ isolationEnabled: false, batchEnabled: true, defaultAgent: "task" });
 		const items = parsedItems(batch({ context: "ctx", tasks: [{ task: "x", role: "DB migration specialist" }] }));
 		const item = items[0] ?? {};
 		expect("role" in item).toBe(false);

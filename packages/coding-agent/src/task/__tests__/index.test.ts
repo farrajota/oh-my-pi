@@ -83,18 +83,18 @@ describe("TaskTool toolProfile schema", () => {
 		const schema = getTaskSchema({
 			isolationEnabled: false,
 			batchEnabled: false,
+			defaultAgent: "task",
 			permissions: { enabled: true, toolsEnabled: true, pathsEnabled: true },
 		});
 
-		expect(schema({ agent: "synthetic", assignment: "read", toolProfile: "inspect" }) instanceof type.errors).toBe(
-			false,
-		);
+		expect(schema({ agent: "synthetic", task: "read", toolProfile: "inspect" }) instanceof type.errors).toBe(false);
 	});
 
 	test("batch item schema accepts toolProfile", () => {
 		const schema = getTaskSchema({
 			isolationEnabled: false,
 			batchEnabled: true,
+			defaultAgent: "task",
 			permissions: { enabled: true, toolsEnabled: true, pathsEnabled: true },
 		});
 
@@ -102,7 +102,7 @@ describe("TaskTool toolProfile schema", () => {
 			schema({
 				agent: "synthetic",
 				context: "Shared context",
-				tasks: [{ assignment: "review", toolProfile: "review" }],
+				tasks: [{ task: "review", toolProfile: "review" }],
 			}) instanceof type.errors,
 		).toBe(false);
 	});
@@ -111,10 +111,11 @@ describe("TaskTool toolProfile schema", () => {
 		const schema = getTaskSchema({
 			isolationEnabled: false,
 			batchEnabled: false,
+			defaultAgent: "task",
 			permissions: { enabled: true, toolsEnabled: true, pathsEnabled: true },
 		});
 
-		expect(schema({ agent: "synthetic", assignment: "read", toolProfile: "full" }) instanceof type.errors).toBe(true);
+		expect(schema({ agent: "synthetic", task: "read", toolProfile: "full" }) instanceof type.errors).toBe(true);
 	});
 });
 
@@ -131,7 +132,7 @@ describe("TaskTool toolProfile execution", () => {
 			makeSession(undefined, { getPlanModeState: () => ({ enabled: true }) as PlanModeState }),
 		);
 
-		await taskTool.execute("tool-call", { agent: "synthetic", assignment: "read" });
+		await taskTool.execute("tool-call", { agent: "synthetic", task: "read" });
 
 		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read"]);
 	});
@@ -142,7 +143,7 @@ describe("TaskTool toolProfile execution", () => {
 			makeSession(undefined, { getPlanModeState: () => ({ enabled: true }) as PlanModeState }),
 		);
 
-		const result = await taskTool.execute("tool-call", { agent: "synthetic", assignment: "read" });
+		const result = await taskTool.execute("tool-call", { agent: "synthetic", task: "read" });
 
 		expect(result.content).toEqual([{ type: "text", text: PLAN_PROFILE_FAILURE }]);
 		expect(result.details?.results).toEqual([]);
@@ -155,7 +156,7 @@ describe("TaskTool toolProfile execution", () => {
 
 		await taskTool.execute("tool-call", {
 			agent: "synthetic",
-			assignment: "read",
+			task: "read",
 			toolProfile: "edit",
 			permissions: { profiles: ["read-only"] },
 		});
@@ -172,7 +173,7 @@ describe("TaskTool toolProfile execution", () => {
 
 		await taskTool.execute("tool-call", {
 			agent: "synthetic",
-			assignment: "read",
+			task: "read",
 			toolProfile: "none",
 			permissions: { profiles: ["focused-edit"] },
 		});

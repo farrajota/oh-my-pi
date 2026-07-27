@@ -21,6 +21,7 @@ import type {
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+import { createExtensionModelQuery } from "../../extensibility/extensions/model-api";
 import { AskDialogComponent, boundPromptTitle } from "../../modes/components/ask-dialog";
 import { HookEditorComponent } from "../../modes/components/hook-editor";
 import { HookInputComponent } from "../../modes/components/hook-input";

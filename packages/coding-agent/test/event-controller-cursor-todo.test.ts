@@ -39,6 +39,7 @@ function createFixture(): Fixture {
 		updateEditorTopBorder: vi.fn(),
 		clearPinnedError: vi.fn(),
 		ensureLoadingAnimation: vi.fn(),
+		setWorkingMessageRunTokenDelta: vi.fn(),
 		noteDisplayableThinkingContent: () => false,
 		effectiveHideThinkingBlock: false,
 		// A live streaming component: the streamed toolCall block path
@@ -103,6 +104,7 @@ describe("EventController + Cursor todo bridge", () => {
 		const f = createFixture();
 
 		await f.controller.handleEvent(
+			f.ctx.viewSession,
 			todoFailure(`\u001b[31mrejected:\u001b[0m\tid 4\r\n\tconflicts with ${"x".repeat(400)}`),
 		);
 
@@ -124,7 +126,7 @@ describe("EventController + Cursor todo bridge", () => {
 		// dropping to a bare "Todo update failed" hides that local state diverged.
 		const f = createFixture();
 
-		await f.controller.handleEvent(todoFailure(""));
+		await f.controller.handleEvent(f.ctx.viewSession, todoFailure(""));
 
 		expect(f.showWarning).toHaveBeenCalledWith("Todo update failed. Progress may be stale until todo succeeds.");
 	});
@@ -140,12 +142,12 @@ describe("EventController + Cursor todo bridge", () => {
 		const f = createFixture();
 		const phases = [{ name: "Tasks", tasks: [{ content: "step one", status: "completed" }] }];
 
-		await f.controller.handleEvent(todoEnd("cursor-call-1", phases));
+		await f.controller.handleEvent(f.ctx.viewSession, todoEnd("cursor-call-1", phases));
 		// Completion held: nothing rendered yet, nothing pending.
 		expect(f.blocks).toHaveLength(0);
 		expect(f.ctx.pendingTools.size).toBe(0);
 
-		await f.controller.handleEvent(streamedTodoBlock("cursor-call-1"));
+		await f.controller.handleEvent(f.ctx.viewSession, streamedTodoBlock("cursor-call-1"));
 
 		// Exactly one card, created by the stream and immediately settled by the
 		// held completion — not left pending.
@@ -162,10 +164,10 @@ describe("EventController + Cursor todo bridge", () => {
 		// settle the component, not repeat them.
 		const f = createFixture();
 
-		await f.controller.handleEvent(todoFailure("boom"));
+		await f.controller.handleEvent(f.ctx.viewSession, todoFailure("boom"));
 		expect(f.showWarning).toHaveBeenCalledTimes(1);
 
-		await f.controller.handleEvent(streamedTodoBlock("todo-1"));
+		await f.controller.handleEvent(f.ctx.viewSession, streamedTodoBlock("todo-1"));
 
 		expect(f.blocks).toHaveLength(1);
 		expect(f.ctx.pendingTools.size).toBe(0);
@@ -176,8 +178,8 @@ describe("EventController + Cursor todo bridge", () => {
 		const f = createFixture();
 		const phases = [{ name: "Tasks", tasks: [{ content: "step one", status: "completed" }] }];
 
-		await f.controller.handleEvent(todoEnd("cursor-call-1", phases));
-		await f.controller.handleEvent(streamedTodoBlock("cursor-call-1"));
+		await f.controller.handleEvent(f.ctx.viewSession, todoEnd("cursor-call-1", phases));
+		await f.controller.handleEvent(f.ctx.viewSession, streamedTodoBlock("cursor-call-1"));
 
 		expect(f.ctx.setTodos).toHaveBeenCalledTimes(1);
 	});
@@ -190,10 +192,10 @@ describe("EventController + Cursor todo bridge", () => {
 		const f = createFixture();
 		const phases = [{ name: "Tasks", tasks: [{ content: "step one", status: "completed" }] }];
 
-		await f.controller.handleEvent(todoEnd("cursor-call-1", phases));
-		await f.controller.handleEvent(streamedTodoBlock("cursor-call-1"));
-		await f.controller.handleEvent(streamedTodoBlock("cursor-call-1"));
-		await f.controller.handleEvent(streamedTodoBlock("cursor-call-1"));
+		await f.controller.handleEvent(f.ctx.viewSession, todoEnd("cursor-call-1", phases));
+		await f.controller.handleEvent(f.ctx.viewSession, streamedTodoBlock("cursor-call-1"));
+		await f.controller.handleEvent(f.ctx.viewSession, streamedTodoBlock("cursor-call-1"));
+		await f.controller.handleEvent(f.ctx.viewSession, streamedTodoBlock("cursor-call-1"));
 
 		expect(f.blocks).toHaveLength(1);
 		expect(f.ctx.pendingTools.size).toBe(0);
@@ -205,10 +207,10 @@ describe("EventController + Cursor todo bridge", () => {
 		const f = createFixture();
 		const phases = [{ name: "Tasks", tasks: [{ content: "step one", status: "completed" }] }];
 
-		await f.controller.handleEvent(streamedTodoBlock("cursor-call-1"));
+		await f.controller.handleEvent(f.ctx.viewSession, streamedTodoBlock("cursor-call-1"));
 		expect(f.ctx.pendingTools.size).toBe(1);
 
-		await f.controller.handleEvent(todoEnd("cursor-call-1", phases));
+		await f.controller.handleEvent(f.ctx.viewSession, todoEnd("cursor-call-1", phases));
 
 		expect(f.blocks).toHaveLength(1);
 		expect(f.ctx.pendingTools.size).toBe(0);

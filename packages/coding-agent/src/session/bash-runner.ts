@@ -83,6 +83,8 @@ export class BashRunner {
 					command,
 					excludeFromContext,
 					cwd,
+					actor: extensionRunner.getActor(),
+					permissionScope: extensionRunner.getPermissionScope(),
 				});
 				if (hookResult?.result) {
 					targetTransferred = true;

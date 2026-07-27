@@ -27,8 +27,8 @@ import type { Theme } from "../modes/theme/theme";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
-import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
+import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
@@ -42,6 +42,7 @@ import {
 	getTaskSchema,
 	oneLineLabel,
 	type SingleResult,
+	type StructuredSubagentSchemaSource,
 	type TaskItem,
 	type TaskParams,
 	type TaskToolDetails,
@@ -62,7 +63,6 @@ import {
 	prepareIsolationContext,
 	runIsolatedSubprocess,
 } from "./isolation-runner";
-import { resolveEffectiveSubagentPolicy, StructuredSubagentError } from "./structured-subagent";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
@@ -74,6 +74,7 @@ import {
 } from "./permission-profiles";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { repairTaskParams } from "./repair-args";
+import { resolveEffectiveSubagentPolicy, StructuredSubagentError } from "./structured-subagent";
 import { applyTaskToolProfile } from "./tool-profiles";
 import { parseIsolationMode } from "./worktree";
 
@@ -859,7 +860,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return { ...result, content };
 		}
 
-
 		// Coordination only makes sense for spawns that keep running after this
 		// call returns (the async subset). Blocking items have already completed
 		// by then, so a "coordinate while they run" hint would misfire.
@@ -1487,6 +1487,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		launchTiming?: { invokedAt: number; acquiredAt: number },
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
+		let latestProgress: AgentProgress | undefined;
 		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
 		const agentName = params.agent ?? "";
 		const sharedContext = this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined;
@@ -1593,8 +1594,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const hasCallerOutputSchema = Object.hasOwn(params, "outputSchema");
 		const effectiveOutputSchema = hasCallerOutputSchema
 			? params.outputSchema
-			: effectiveAgent.output ?? this.session.outputSchema;
-		const outputSchemaSource = hasCallerOutputSchema
+			: (effectiveAgent.output ?? this.session.outputSchema);
+		const outputSchemaSource: StructuredSubagentSchemaSource = hasCallerOutputSchema
 			? "caller"
 			: effectiveAgent.output !== undefined
 				? "agent"
@@ -1746,7 +1747,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const mcpManager = this.session.mcpManager ?? MCPManager.instance();
 
 			// Progress tracking for the single agent
-			let latestProgress: AgentProgress = {
+			const initialProgress: AgentProgress = {
 				index: spawnIndex,
 				id: agentId,
 				agent: agentName,
@@ -1763,6 +1764,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				durationMs: 0,
 				modelOverride,
 			};
+			latestProgress = initialProgress;
 			const emitProgress = () => {
 				onUpdate?.({
 					content: [{ type: "text", text: `Running agent ${agentId}...` }],
@@ -1770,7 +1772,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						projectAgentsDir,
 						results: [],
 						totalDurationMs: Date.now() - startTime,
-						progress: [latestProgress],
+						progress: [initialProgress],
 					},
 				});
 			};
@@ -1794,23 +1796,26 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				index: spawnIndex,
 				parentToolCallId: toolCallId,
 				detached,
+				modelOverride,
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
 				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 				blockedAgent: this.#blockedAgent,
-				enableLsp: (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp"),
+				enableLsp: subagentLspEnabled,
+				thinkingLevel: thinkingLevelOverride,
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 				maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
 				signal,
-				onProgress: progress => {
-					latestProgress = { ...progress, recentTools: progress.recentTools.slice() };
+				onProgress: (progress: AgentProgress) => {
+					const nextProgress = { ...progress, recentTools: progress.recentTools.slice() };
+					latestProgress = nextProgress;
 					onUpdate?.({
 						content: [{ type: "text", text: `Running agent ${progress.id}...` }],
 						details: {
 							projectAgentsDir: null,
 							results: [],
 							totalDurationMs: Date.now() - startTime,
-							progress: [latestProgress],
+							progress: [nextProgress],
 						},
 					});
 				},

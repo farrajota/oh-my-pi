@@ -288,8 +288,6 @@ export type TaskToolSchemaInstance = DynamicTaskSchema | BaseType;
 
 const taskSchemaCache = new Map<string, BaseType>();
 
-
-
 export function getTaskSchema(options: {
 	isolationEnabled: boolean;
 	batchEnabled: boolean;

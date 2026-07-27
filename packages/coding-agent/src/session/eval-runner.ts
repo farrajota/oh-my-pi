@@ -59,6 +59,8 @@ export class EvalRunner {
 					code,
 					excludeFromContext,
 					cwd,
+					actor: extensionRunner.getActor(),
+					permissionScope: extensionRunner.getPermissionScope(),
 				});
 				this.assertExecutionAllowed();
 				if (hookResult?.result) {

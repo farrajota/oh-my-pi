@@ -254,10 +254,10 @@ describe("EventController error banner", () => {
 		const { controller, ctx } = createFixture();
 		ctx.toolOutputExpanded = true;
 
-		await controller.handleEvent({
-			type: "message_start",
-			message: initial,
-		} as Extract<AgentSessionEvent, { type: "message_start" }>);
+		await controller.handleEvent(ctx.viewSession, { type: "message_start", message: initial } as Extract<
+			AgentSessionEvent,
+			{ type: "message_start" }
+		>);
 		const component = ctx.streamingComponent;
 		if (!(component instanceof AssistantMessageComponent)) {
 			throw new Error("Expected streaming assistant component");

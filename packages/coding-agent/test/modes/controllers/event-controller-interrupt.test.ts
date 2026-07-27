@@ -78,11 +78,11 @@ describe("EventController aborted-turn working messages", () => {
 		const { ctx } = createContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(AGENT_START);
-		await controller.handleEvent({ type: "turn_start" });
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
+		await controller.handleEvent(ctx.viewSession, { type: "turn_start" });
 		expect(clear).not.toHaveBeenCalled();
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "message_start",
 			message: {
 				role: "user",
