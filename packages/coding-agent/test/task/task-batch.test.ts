@@ -38,6 +38,7 @@ function createSession(
 		settings?: Record<string, unknown>;
 		agentId?: string;
 		planMode?: boolean;
+		spawns?: string;
 	} = {},
 ): ToolSession {
 	return {
@@ -45,7 +46,7 @@ function createSession(
 		hasUI: false,
 		settings: Settings.isolated(options.settings ?? {}),
 		getSessionFile: () => null,
-		getSessionSpawns: () => "*",
+		getSessionSpawns: () => options.spawns ?? "*",
 		getAgentId: () => options.agentId ?? null,
 		getPlanModeState: options.planMode ? () => ({ enabled: true }) : undefined,
 		asyncJobManager: options.manager,
@@ -55,6 +56,19 @@ function createSession(
 function getSchemaProperties(tool: TaskTool): Record<string, unknown> {
 	const wire = toolWireSchema(tool) as { properties?: Record<string, unknown> };
 	return wire.properties ?? {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function getBatchItemProperties(properties: Record<string, unknown>): Record<string, unknown> {
+	const tasks = properties.tasks;
+	if (!isRecord(tasks)) return {};
+	const items = tasks.items;
+	if (!isRecord(items)) return {};
+	const itemProperties = items.properties;
+	return isRecord(itemProperties) ? itemProperties : {};
 }
 
 function getFirstText(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -123,6 +137,69 @@ describe("task.batch schema gating", () => {
 		expect(items?.properties?.outputSchema).toBeDefined();
 		expect(typeof items?.properties?.outputSchema).toBe("object");
 		expect(items?.properties?.schemaMode).toBeDefined();
+	});
+
+	it("shows effort wire fields and guidance only when overrides are allowed", async () => {
+		mockDiscovery();
+		const policies: Array<{ allowEffortOverride?: boolean; effortEnabled: boolean }> = [
+			{ effortEnabled: true },
+			{ allowEffortOverride: true, effortEnabled: true },
+			{ allowEffortOverride: false, effortEnabled: false },
+		];
+
+		for (const policy of policies) {
+			for (const batchEnabled of [false, true]) {
+				const settings: Record<string, unknown> = { "task.batch": batchEnabled };
+				if (policy.allowEffortOverride !== undefined) {
+					settings["task.allowEffortOverride"] = policy.allowEffortOverride;
+				}
+				const tool = await TaskTool.create(createSession({ settings }));
+				const properties = getSchemaProperties(tool);
+				const effort = batchEnabled ? getBatchItemProperties(properties).effort : properties.effort;
+
+				if (policy.effortEnabled) {
+					expect(effort).toBeDefined();
+					expect(tool.description).toContain("- `effort`:");
+				} else {
+					expect(effort).toBeUndefined();
+					expect(tool.description).not.toContain("- `effort`:");
+				}
+			}
+		}
+	});
+
+	it("keeps dynamic schema cache entries separate for each effort override state", async () => {
+		mockDiscovery();
+		const createDynamicTool = (spawns: string, allowEffortOverride: boolean) =>
+			TaskTool.create(
+				createSession({
+					spawns,
+					settings: { "task.batch": false, "task.allowEffortOverride": allowEffortOverride },
+				}),
+			);
+
+		const enabledFirst = await createDynamicTool("schema-cache-enabled-first", true);
+		const disabledAfterEnabled = await createDynamicTool("schema-cache-enabled-first", false);
+		const disabledFirst = await createDynamicTool("schema-cache-disabled-first", false);
+		const enabledAfterDisabled = await createDynamicTool("schema-cache-disabled-first", true);
+
+		const enabledFirstParameters = enabledFirst.parameters;
+		const disabledAfterEnabledParameters = disabledAfterEnabled.parameters;
+		const disabledFirstParameters = disabledFirst.parameters;
+		const enabledAfterDisabledParameters = enabledAfterDisabled.parameters;
+		expect(enabledFirst.parameters).toBe(enabledFirstParameters);
+		expect(disabledFirst.parameters).toBe(disabledFirstParameters);
+		expect(enabledFirstParameters).not.toBe(disabledAfterEnabledParameters);
+		expect(disabledFirstParameters).not.toBe(enabledAfterDisabledParameters);
+
+		for (const tool of [enabledFirst, enabledAfterDisabled]) {
+			expect(getSchemaProperties(tool).effort).toBeDefined();
+			expect(tool.description).toContain("- `effort`:");
+		}
+		for (const tool of [disabledAfterEnabled, disabledFirst]) {
+			expect(getSchemaProperties(tool).effort).toBeUndefined();
+			expect(tool.description).not.toContain("- `effort`:");
+		}
 	});
 
 	it("keeps isolation boolean-only and describes the configured apply behavior", async () => {
@@ -261,6 +338,59 @@ describe("task.batch validation", () => {
 		expect(text).toContain("task.batch is disabled");
 		expect(text).not.toContain("was missing");
 	});
+
+	it("rejects invalid effort even when task effort overrides are disabled", async () => {
+		const runSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+
+		const flatText = await executeText(
+			{ agent: "task", task: "Work.", effort: "invalid" },
+			{ "task.batch": false, "task.allowEffortOverride": false },
+		);
+		expect(flatText).toContain('invalid `effort` value "invalid"');
+
+		const batchText = await executeText(
+			{ context: "Background.", tasks: [{ task: "Work.", effort: "invalid" }] },
+			{ "task.batch": true, "task.allowEffortOverride": false },
+		);
+		expect(batchText).toContain('invalid `effort` value "invalid"');
+		expect(runSpy).not.toHaveBeenCalled();
+	});
+
+	it("rejects malformed disabled effort through the raw validator while accepting valid selectors", async () => {
+		mockDiscovery();
+		const flat = await TaskTool.create(
+			createSession({ settings: { "task.batch": false, "task.allowEffortOverride": false } }),
+		);
+		const batch = await TaskTool.create(
+			createSession({ settings: { "task.batch": true, "task.allowEffortOverride": false } }),
+		);
+
+		expect(() => flat.validateRawArguments({ agent: "task", task: "Work.", effort: "invalid" })).toThrow(
+			new Error('The call has an invalid `effort` value "invalid". Use "lo", "med", or "hi".'),
+		);
+		expect(() =>
+			batch.validateRawArguments({
+				context: "Background.",
+				tasks: [{ name: "Invalid", task: "Work.", effort: "invalid" }],
+			}),
+		).toThrow(new Error('Task 1 (`Invalid`) has an invalid `effort` value "invalid". Use "lo", "med", or "hi".'));
+
+		expect(() => {
+			for (const effort of ["lo", "med", "hi"] as const) {
+				flat.validateRawArguments({ agent: "task", task: "Work.", effort });
+			}
+			batch.validateRawArguments({
+				context: "Background.",
+				tasks: [
+					{ task: "Do low work.", effort: "lo" },
+					{ task: "Do medium work.", effort: "med" },
+					{ task: "Do high work.", effort: "hi" },
+				],
+			});
+		}).not.toThrow();
+	});
 });
 
 describe("task.batch spawning", () => {
@@ -297,6 +427,7 @@ describe("task.batch spawning", () => {
 			assignment?: string;
 			parentAgentId?: string;
 			modelOverride?: string | string[];
+			effort?: TaskParams["effort"];
 			outputSchema?: unknown;
 			outputSchemaMode?: "permissive" | "strict";
 			outputSchemaSource?: "caller" | "agent" | "session" | "none";
@@ -309,6 +440,7 @@ describe("task.batch spawning", () => {
 				assignment: options.assignment,
 				parentAgentId: options.parentAgentId,
 				modelOverride: options.modelOverride,
+				effort: options.effort,
 				outputSchema: options.outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
 				outputSchemaSource: options.outputSchemaSource,
@@ -319,7 +451,11 @@ describe("task.batch spawning", () => {
 
 		const manager = createManager();
 		const tool = await TaskTool.create(
-			createSession({ manager, agentId: "ParentA", settings: { "async.enabled": true, "task.batch": true } }),
+			createSession({
+				manager,
+				agentId: "ParentA",
+				settings: { "async.enabled": true, "task.batch": true, "task.allowEffortOverride": true },
+			}),
 		);
 		const alphaSchema = { type: "object", properties: { alpha: { type: "string" } } };
 		const betaSchema = { type: "object", properties: { beta: { type: "number" } } };
@@ -329,12 +465,14 @@ describe("task.batch spawning", () => {
 				{
 					name: "Alpha",
 					task: "Do A.",
+					effort: "lo",
 					outputSchema: alphaSchema,
 					schemaMode: "strict",
 				},
 				{
 					name: "Beta",
 					task: "Do B.",
+					effort: "hi",
 					outputSchema: betaSchema,
 					schemaMode: "permissive",
 				},
@@ -366,8 +504,43 @@ describe("task.batch spawning", () => {
 		expect(byId.get("Alpha")?.outputSchemaMode).toBe("strict");
 		expect(byId.get("Beta")?.outputSchema).toEqual(betaSchema);
 		expect(byId.get("Beta")?.outputSchemaMode).toBe("permissive");
+		expect(byId.get("Alpha")?.effort).toBe("lo");
+		expect(byId.get("Beta")?.effort).toBe("hi");
 		expect(seen.map(spawn => spawn.assignment).sort()).toEqual(["Do A.", "Do B."]);
 		for (const spawn of seen) expect(spawn.parentAgentId).toBe("ParentA");
+	});
+
+	it("accepts valid batch effort but omits it from executor options when overrides are disabled", async () => {
+		mockDiscovery();
+		const runSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+
+		const manager = createManager();
+		const tool = await TaskTool.create(
+			createSession({
+				manager,
+				settings: { "async.enabled": true, "task.batch": true, "task.allowEffortOverride": false },
+			}),
+		);
+		const result = await tool.execute("tc-batch-disabled-effort", {
+			context: "Shared background.",
+			tasks: [
+				{ name: "NoLow", task: "Do low effort work.", effort: "lo" },
+				{ name: "NoHigh", task: "Do high effort work.", effort: "hi" },
+			],
+		} as TaskParams);
+
+		expect(getFirstText(result)).toContain("Spawned 2 background agents");
+		const lowJob = manager.getJob("NoLow")!;
+		const highJob = manager.getJob("NoHigh")!;
+		await Promise.all([lowJob.promise, highJob.promise]);
+		expect(lowJob.status).toBe("completed");
+		expect(highJob.status).toBe("completed");
+		expect(runSpy).toHaveBeenCalledTimes(2);
+		for (const [options] of runSpy.mock.calls) {
+			expect(options).not.toHaveProperty("effort");
+		}
 	});
 
 	it("routes each mixed-agent item through its selected definition while preserving caller overrides", async () => {

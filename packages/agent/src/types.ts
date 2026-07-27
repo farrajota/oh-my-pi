@@ -689,6 +689,13 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * - function: resolved per call from the (raw, pre-validation) arguments
 	 */
 	concurrency?: "shared" | "exclusive" | ((args: Partial<Static<TParameters>>) => "shared" | "exclusive");
+	/**
+	 * Validate raw call arguments after intent stripping and before parameter-schema
+	 * normalization. Use this for constraints on fields that schema normalization may
+	 * delete. Throwing rejects the call; unlike schema validation errors, these
+	 * failures are never bypassed by {@link lenientArgValidation}.
+	 */
+	validateRawArguments?: (args: unknown) => void;
 	/** If true, argument validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM. */
 	lenientArgValidation?: boolean;
 	/**

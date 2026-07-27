@@ -196,4 +196,16 @@ describe("settings layout", () => {
 			group: "Available Tools",
 		});
 	});
+
+	it("exposes task effort overrides as a Subagents boolean", () => {
+		const def = getSettingsForTab("tasks").find(def => def.path === "task.allowEffortOverride");
+
+		expect(def).toMatchObject({
+			path: "task.allowEffortOverride",
+			type: "boolean",
+			tab: "tasks",
+			group: "Subagents",
+			label: "Allow Task Effort Overrides",
+		});
+	});
 });

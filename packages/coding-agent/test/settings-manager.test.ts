@@ -415,6 +415,23 @@ describe("Settings", () => {
 			expect(getDefault("providers.maxInFlightRequests")).toEqual({});
 		});
 
+		it("defaults task effort overrides to enabled and persists an explicit disable", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(await readSettings()).toEqual({});
+			expect(settings.get("task.allowEffortOverride")).toBe(true);
+			expect(getDefault("task.allowEffortOverride")).toBe(true);
+
+			settings.set("task.allowEffortOverride", false);
+			await settings.flush();
+
+			const savedSettings = await readSettings();
+			expect(savedSettings.task).toEqual({ allowEffortOverride: false });
+
+			const reloaded = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			expect(reloaded.get("task.allowEffortOverride")).toBe(false);
+		});
+
 		it("exposes all tool calling mode options", () => {
 			const values = getEnumValues("tools.format");
 			expect(values).toEqual([

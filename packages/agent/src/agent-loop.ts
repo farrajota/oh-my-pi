@@ -2146,6 +2146,25 @@ async function executeToolCalls(
 		stream.push({ type: "message_end", message: toolResultMessage });
 	};
 
+	const emitValidationError = (record: (typeof records)[number], validationError: unknown): void => {
+		emitToolResult(
+			record,
+			{
+				content: [
+					{
+						type: "text" as const,
+						text: validationError instanceof Error ? validationError.message : String(validationError),
+					},
+				],
+				details: {
+					isError: true,
+					error: validationError instanceof Error ? validationError.message : String(validationError),
+				},
+			},
+			true,
+		);
+	};
+
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
 		if (interruptState.triggered) {
 			// Skip both span emission and the collector orphan record here. The
@@ -2179,6 +2198,15 @@ async function executeToolCalls(
 				}
 			}
 		}
+		if (tool?.validateRawArguments) {
+			try {
+				tool.validateRawArguments(argsForExecution);
+			} catch (validationError) {
+				record.args = argsForExecution;
+				emitValidationError(record, validationError);
+				return;
+			}
+		}
 		let effectiveArgs: Record<string, unknown>;
 		try {
 			if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
@@ -2196,22 +2224,7 @@ async function executeToolCalls(
 				} else {
 					record.args = argsForExecution;
 				}
-				emitToolResult(
-					record,
-					{
-						content: [
-							{
-								type: "text" as const,
-								text: validationError instanceof Error ? validationError.message : String(validationError),
-							},
-						],
-						details: {
-							isError: true,
-							error: validationError instanceof Error ? validationError.message : String(validationError),
-						},
-					},
-					true,
-				);
+				emitValidationError(record, validationError);
 				return;
 			}
 		}

@@ -26,9 +26,9 @@
 
 ## Inputs
 
-The wire schema is shape-swapped by `task.batch` (default on). One unit of work is the task item `{ name?, agent?, task, effort?, outputSchema?, schemaMode?, isolated? }` (`isolated` only when `task.isolation.mode` is not `none`):
+The wire schema is shape-swapped by `task.batch` (default on). One unit of work is the task item `{ name?, agent?, task, outputSchema?, schemaMode?, isolated? }` (`isolated` only when `task.isolation.mode` is not `none`); it also includes `effort?` when `task.allowEffortOverride` is enabled:
 
-- **Batch shape** (`task.batch` on): `{ context, tasks: item[] }` — one subagent per item, all run under the same fan-out rules; there is no top-level agent field. `context` is **required** shared background rendered into every spawned subagent's system prompt (`CONTEXT` section); `agent`, `effort`, `outputSchema`, `schemaMode`, and `isolated` are per item, so one call may mix agent types and output contracts.
+- **Batch shape** (`task.batch` on): `{ context, tasks: item[] }` — one subagent per item, all run under the same fan-out rules; there is no top-level agent field. `context` is **required** shared background rendered into every spawned subagent's system prompt (`CONTEXT` section); `agent`, `outputSchema`, `schemaMode`, and `isolated` are per item, and `effort` is also per item when `task.allowEffortOverride` is enabled, so one call may mix agent types and output contracts.
 - **Flat shape** (`task.batch` off): `{ ...item }` — exactly one spawn per call. Shared background goes into a `local://` file (e.g. `local://ctx.md`) that each spawn's `task` references; subagents share the parent's `local://` root.
 
 | Field | Type | Required | Description |
@@ -38,10 +38,14 @@ The wire schema is shape-swapped by `task.batch` (default on). One unit of work 
 | `name` | `string` | No | Stable agent name — becomes the registry/IRC id. Defaults to a generated AdjectiveNoun name. Uniquified per session by `AgentOutputManager`. Item field in batch shape, top-level in flat shape. |
 | `agent` | `string` | No | Agent type to run this item (e.g. `scout`). Defaults to the spawn policy's default agent (usually `task`); items in one batch call may use different agent types. Item field in batch shape, top-level in flat shape. |
 | `task` | `string` | Yes | The work — complete, self-contained instructions. Empty-after-trim is rejected. Item field in batch shape, top-level in flat shape. |
-| `effort` | `"lo" \| "med" \| "hi"` | No | Per-spawn thinking effort, mapped onto the resolved model's supported range (lowest/middle/highest level it tops out at, e.g. `high`/`xhigh`/`max`). Overrides the agent's default selector, including `auto`; omitting it keeps the agent's configured selector — automatic per-prompt classification only for agents configured `auto` (e.g. the bundled `task`); `scout`/`sonic` configure `medium`. Item field in batch shape, top-level in flat shape. |
+| `effort` | `"lo" \| "med" \| "hi"` | No | Available only when `task.allowEffortOverride` is enabled (default `true`). Per-spawn thinking effort maps onto the resolved model's supported range (lowest/middle/highest level it tops out at, e.g. `high`/`xhigh`/`max`). It overrides the agent's default selector, including `auto`; omitting it keeps the agent's configured selector — automatic per-prompt classification only for agents configured `auto` (e.g. the bundled `task`); `scout`/`sonic` configure `medium`. Item field in batch shape, top-level in flat shape. |
 | `outputSchema` | JSON Schema object | No | Invocation-specific structured-output contract. Takes precedence over agent frontmatter `output` and the inherited parent session schema. Item field in batch shape, top-level in flat shape. |
 | `schemaMode` | `"permissive" \| "strict"` | No | Validation mode for the effective output schema. Overrides the parent session mode; defaults to `permissive`. Item field in batch shape, top-level in flat shape. |
 | `isolated` | `boolean` | No | Run in an isolated workspace and return patches. Exists only when `task.isolation.mode` is not `none`; per item in batch shape, top-level in flat shape. Isolated agents are torn down at completion — not revivable. |
+
+### Effort override policy
+
+`task.allowEffortOverride` defaults to `true`. When enabled, `effort` is included in the flat and batch-item schemas and advertised in task guidance. When disabled, it is omitted from those schemas and guidance. Valid `effort` values retained in stale transcripts or sent by internal task callers are accepted but ignored at the task executor boundary; invalid values remain validation errors. The configured explicit model suffix, agent thinking level, or default selection then remains authoritative. This setting applies only to the public `task` tool; eval-agent behavior is unchanged.
 
 There is no wire label field: the one-line UI label shown in the TUI/registry is generated automatically from the `task` text by the tiny/title model (fire-and-forget), so callers never provide it.
 
@@ -106,7 +110,7 @@ Artifacts and side channels:
   - Background job — `async.enabled=true`; non-blocking spawns go through `AsyncJobManager`.
   - Sync inline — `async.enabled=false`, no job manager, or the item's agent declares `blocking: true` (per item: a mixed call runs both modes).
 - Batch mode (`task.batch`, default on)
-  - on — `{ context, tasks[] }`: one independent spawn per item, required `context` shared across the call's spawns, with `agent`, `effort`, `outputSchema`, `schemaMode`, and `isolated` per item. Lifecycle, revival, and concurrency semantics match N parallel single calls.
+  - on — `{ context, tasks[] }`: one independent spawn per item, required `context` shared across the call's spawns, with `agent`, `outputSchema`, `schemaMode`, and `isolated` per item; `effort` is also per item when `task.allowEffortOverride` is enabled. Lifecycle, revival, and concurrency semantics match N parallel single calls.
   - off — single spawn per call; `tasks`/`context` are rejected and removed from the schema.
 - Isolation mode (`task.isolation.mode`): `none`, `auto`, `apfs`, `btrfs`, `zfs`, `reflink`, `overlayfs`, `projfs`, `block-clone`, `rcopy` (legacy `worktree`, `fuse-overlay`, `fuse-projfs` accepted for back-compat); the PAL resolves the actual backend with fallback.
 - Isolation merge strategy: patch mode (capture/apply root patches) or branch mode (commit to `omp/task/<id>`, cherry-pick into parent).

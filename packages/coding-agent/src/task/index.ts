@@ -54,7 +54,7 @@ import type { AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
-import { runSubprocess } from "./executor";
+import { type ExecutorOptions, runSubprocess } from "./executor";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -210,6 +210,7 @@ function renderDescription(
 	applyIsolatedChanges: boolean,
 	disabledAgents: string[],
 	batchEnabled: boolean,
+	effortEnabled: boolean,
 	asyncEnabled: boolean,
 	ircEnabled: boolean,
 	parentSpawns: string,
@@ -242,6 +243,7 @@ function renderDescription(
 		isolationEnabled,
 		applyIsolatedChanges,
 		batchEnabled,
+		effortEnabled,
 		asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
 		ircEnabled,
@@ -303,6 +305,27 @@ function validateShapeParams(
 function validateEffort(effort: TaskEffort | undefined, label: string): string | undefined {
 	if (effort === undefined || TASK_EFFORTS.includes(effort)) return undefined;
 	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
+}
+
+/**
+ * Validate the shallow raw effort fields before Arktype deletes hidden
+ * unknown keys from the active task wire shape.
+ */
+function validateRawEffortArguments(args: unknown): void {
+	if (args === null || typeof args !== "object" || Array.isArray(args)) return;
+	const params = args as { effort?: unknown; tasks?: unknown };
+	const effortError = validateEffort(params.effort as TaskEffort | undefined, "The call");
+	if (effortError) throw new Error(effortError);
+
+	if (!Array.isArray(params.tasks)) return;
+	for (let i = 0; i < params.tasks.length; i++) {
+		const item = params.tasks[i];
+		if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+		const task = item as { effort?: unknown; name?: unknown };
+		const name = typeof task.name === "string" && task.name ? ` (\`${task.name}\`)` : "";
+		const itemEffortError = validateEffort(task.effort as TaskEffort | undefined, `Task ${i + 1}${name}`);
+		if (itemEffortError) throw new Error(itemEffortError);
+	}
 }
 
 function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string | undefined {
@@ -630,6 +653,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	// calls still normalize through arktype; `execute()` resolves `agent`
 	// defaults independently, so the success path is unchanged.
 	readonly lenientArgValidation = true;
+	readonly validateRawArguments = validateRawEffortArguments;
 	readonly renderResult = renderResult;
 	// Suppress the streaming call preview once a (partial or final) result exists
 	// so the task renders as ONE block that transitions in place — not a pending
@@ -653,10 +677,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const isolationEnabled = !planMode && this.session.settings.get("task.isolation.mode") !== "none";
 		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
+		const allowEffortOverride = this.session.settings.get("task.allowEffortOverride");
 		return getTaskSchema({
 			isolationEnabled,
 			batchEnabled: this.#isBatchEnabled(),
 			defaultAgent,
+			allowEffortOverride,
 			permissions: {
 				enabled: permissionMode !== "off",
 				toolsEnabled: this.session.settings.get("task.permissions.tools.enabled"),
@@ -675,12 +701,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationMode = this.session.settings.get("task.isolation.mode");
 		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
+		const effortEnabled = this.session.settings.get("task.allowEffortOverride");
 		return renderDescription(
 			this.#discoveredAgents,
 			!planMode && isolationMode !== "none",
 			this.session.settings.get("task.isolation.apply"),
 			disabledAgents,
 			this.#isBatchEnabled(),
+			effortEnabled,
 			this.session.settings.get("async.enabled"),
 			isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			this.session.getSessionSpawns() ?? "*",
@@ -1779,6 +1807,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			emitProgress();
 
 			const buildCommitMessageFn = makeIsolationCommitMessage(this.session);
+			const allowEffortOverride = this.session.settings.get("task.allowEffortOverride");
 
 			const sharedRunOptions = {
 				cwd: this.session.cwd,
@@ -1786,8 +1815,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				agent: permissionAgent,
 				task: renderSubagentUserPrompt(assignment),
 				assignment,
+				thinkingLevel: permissionAgent.thinkingLevel,
 				context: sharedContext,
-				effort: params.effort,
+				...(allowEffortOverride && params.effort !== undefined ? { effort: params.effort } : {}),
 				planReference,
 				outputSchema: effectiveOutputSchema,
 				outputSchemaMode: params.schemaMode,

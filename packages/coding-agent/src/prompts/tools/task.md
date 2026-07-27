@@ -25,7 +25,9 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
   - `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
   - `agent`: The agent type running this item (e.g. `scout`, `reviewer`). Omitting it gives you the general-purpose worker (`{{defaultAgent}}`) — NEVER pass that name explicitly. Only omit it after checking the agent list below and finding no specialist that fits.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
   - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
-  - `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
+{{#if effortEnabled}}
+  - `effort`: Scale w/ complexity of this task: `"lo"|"med"|"hi"`
+{{/if}}
   - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
   - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
 {{#if isolationEnabled}}
@@ -39,7 +41,9 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 - `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
 - `agent`: The agent type to spawn (e.g. `scout`, `reviewer`). Omitting it gives you the general-purpose worker (`{{defaultAgent}}`) — NEVER pass that name explicitly. Only omit it after checking the agent list below and finding no specialist that fits.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
 - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
-- `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
+{{#if effortEnabled}}
+- `effort`: Scale w/ complexity of this task: `"lo"|"med"|"hi"`
+{{/if}}
 - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
 - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
 {{#if isolationEnabled}}
@@ -82,8 +86,6 @@ Source: {{source}}
 Profile config errors: {{permissionProfileErrors}}
 {{/if}}
 </permission-profiles>
-
-
 # Communication
 Subagents start blank — no conversation history.{{#if ircEnabled}} Parent-to-subagent messages are delivered immediately as steering.{{/if}}
 Pass large payloads via `local://<path>` URIs, NEVER inline text.

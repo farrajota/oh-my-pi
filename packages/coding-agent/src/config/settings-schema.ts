@@ -4548,6 +4548,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.allowEffortOverride": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Allow Task Effort Overrides",
+			description: "Allow caller-provided `task.effort` to override configured agent/model thinking.",
+		},
+	},
+
 	"task.maxConcurrency": {
 		type: "number",
 		default: 32,

@@ -154,17 +154,18 @@ function createTaskItemSchema(options: {
 	isolationEnabled: boolean;
 	permissions: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
 	defaultAgent?: string;
+	allowEffortOverride: boolean;
 }) {
 	const shape: Record<string, unknown> = {
 		"name?": "string",
 		agent: taskAgentSchemaRule(options.defaultAgent ?? "task"),
 		task: "string",
-		"effort?": effortRule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
 		"+": "delete",
 	};
+	if (options.allowEffortOverride) shape["effort?"] = effortRule;
 	if (options.isolationEnabled) shape["isolated?"] = "boolean";
 	const permissionSchema = selectTaskPermissionSchema(options.permissions);
 	if (permissionSchema) shape["permissions?"] = permissionSchema;
@@ -179,6 +180,7 @@ function taskAgentSchemaRule(defaultAgent: string): string {
 		return `string = '${trimmed}'`;
 	}
 	return "string";
+	allowEffortOverride: boolean;
 }
 
 function createTaskSchema(options: {
@@ -189,8 +191,8 @@ function createTaskSchema(options: {
 	const shape: Record<string, unknown> = {
 		"name?": "string",
 		agent: taskAgentSchemaRule(options.defaultAgent ?? "task"),
+	if (options.allowEffortOverride) shape["effort?"] = effortRule;
 		task: "string",
-		"effort?": effortRule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
@@ -200,6 +202,7 @@ function createTaskSchema(options: {
 	const permissionSchema = selectTaskPermissionSchema(options.permissions);
 	if (permissionSchema) shape["permissions?"] = permissionSchema;
 	return type.raw(shape);
+	allowEffortOverride: boolean;
 }
 
 function createBatchTaskSchema(options: {
@@ -211,10 +214,12 @@ function createBatchTaskSchema(options: {
 		context: "string",
 		tasks: createTaskItemSchema(options).array(),
 		"+": "delete",
+	allowEffortOverride: true,
 	});
 }
 
 export const taskItemSchema = createTaskItemSchema({
+	allowEffortOverride: true,
 	isolationEnabled: false,
 	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 });
@@ -287,12 +292,14 @@ export type TaskSchema = typeof taskSchema;
 export type TaskToolSchemaInstance = DynamicTaskSchema | BaseType;
 
 const taskSchemaCache = new Map<string, BaseType>();
+	allowEffortOverride?: boolean;
 
 export function getTaskSchema(options: {
 	isolationEnabled: boolean;
 	batchEnabled: boolean;
 	defaultAgent: string;
 	permissions?: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
+	allowEffortOverride?: boolean;
 }): TaskToolSchemaInstance;
 export function getTaskSchema(options: {
 	isolationEnabled: boolean;
@@ -302,18 +309,19 @@ export function getTaskSchema(options: {
 }): TaskToolSchemaInstance {
 	const permissions = options.permissions ?? { enabled: false, toolsEnabled: false, pathsEnabled: false };
 	const defaultAgent = options.defaultAgent ?? "task";
-	if (!permissions.enabled && defaultAgent === "task") {
+	const allowEffortOverride = options.allowEffortOverride ?? true;
+	if (allowEffortOverride && !permissions.enabled && defaultAgent === "task") {
 		if (options.batchEnabled) {
 			return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		}
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}:${permissions.enabled ? "perm" : "noperm"}:${permissions.toolsEnabled ? "tools" : "notools"}:${permissions.pathsEnabled ? "paths" : "nopaths"}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}:${permissions.enabled ? "perm" : "noperm"}:${permissions.toolsEnabled ? "tools" : "notools"}:${permissions.pathsEnabled ? "paths" : "nopaths"}:${allowEffortOverride ? "effort" : "noeffort"}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
 	const schema = options.batchEnabled
-		? createBatchTaskSchema({ ...options, permissions, defaultAgent })
-		: createTaskSchema({ ...options, permissions, defaultAgent });
+		? createBatchTaskSchema({ ...options, allowEffortOverride, permissions, defaultAgent })
+		: createTaskSchema({ ...options, allowEffortOverride, permissions, defaultAgent });
 	taskSchemaCache.set(key, schema);
 	return schema;
 }

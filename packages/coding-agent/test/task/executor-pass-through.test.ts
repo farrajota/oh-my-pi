@@ -18,6 +18,7 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { resolveTaskEffortLevel } from "@oh-my-pi/pi-coding-agent/thinking";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent) => void }) => void): AgentSession {
@@ -27,7 +28,12 @@ function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent)
 	};
 	const session = {
 		state: { messages: [] },
-		agent: { state: { systemPrompt: ["test"] } },
+		agent: {
+			state: {
+				systemPrompt: ["test"],
+				tools: [{ name: "read" }, { name: "yield" }],
+			},
+		},
 		model: undefined,
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
@@ -231,6 +237,32 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 
 		expect(result.exitCode).toBe(0);
 		expect(Object.hasOwn(result, "structuredOutput")).toBe(false);
+	});
+
+	it("lets caller effort win over configured task-role and agent thinking", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const expectedEffort = resolveTaskEffortLevel(model, "lo");
+		if (!expectedEffort) throw new Error("Expected the bundled model to support task effort");
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${model.provider}/${model.id}:high`);
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-caller-effort-precedence",
+			settings,
+			modelRegistry: createModelRegistry(model),
+			thinkingLevel: ThinkingLevel.Medium,
+			effort: "lo",
+		});
+
+		expect(result.exitCode).toBe(0);
+		// The task caller's coarse effort still takes priority after TaskTool
+		// forwards it, ahead of both the explicit role suffix and agent default.
+		expect(spy.mock.calls[0]?.[0]?.thinkingLevel).toBe(expectedEffort);
 	});
 
 	it("resolves an explicit task-role effort suffix over the agent-definition default", async () => {

@@ -134,6 +134,7 @@ describe("task spawn routing", () => {
 			agent: "task",
 			name: "Spawnling",
 			task: "Do the thing.",
+			effort: "hi",
 		} as TaskParams);
 
 		// Tool returned while the job body is still gated on the deferred.
@@ -158,6 +159,39 @@ describe("task spawn routing", () => {
 		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["openai/gpt-4.1-mini"]);
 		expect(runSpy.mock.calls[0]?.[0].enableLsp).toBe(false);
 		expect(runSpy.mock.calls[0]?.[0].thinkingLevel).toBe(Effort.High);
+		expect(runSpy.mock.calls[0]?.[0].effort).toBe("hi");
+	});
+
+	it("accepts valid flat effort but omits it from executor options when overrides are disabled", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [{ ...taskAgent, thinkingLevel: Effort.Medium }],
+			projectAgentsDir: null,
+		});
+		const runSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+
+		const manager = createManager();
+		const tool = await TaskTool.create(
+			createSession({
+				manager,
+				settings: { "async.enabled": true, "task.allowEffortOverride": false },
+			}),
+		);
+		const result = await tool.execute("tc-flat-disabled-effort", {
+			agent: "task",
+			name: "NoEffort",
+			task: "Do the thing.",
+			effort: "hi",
+		} as TaskParams);
+
+		expect(getFirstText(result)).toContain("Spawned agent `NoEffort`");
+		const job = manager.getJob(result.details!.async!.jobId)!;
+		await job.promise;
+		expect(job.status).toBe("completed");
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(runSpy.mock.calls[0]?.[0]).not.toHaveProperty("effort");
+		expect(runSpy.mock.calls[0]?.[0].thinkingLevel).toBe(Effort.Medium);
 	});
 
 	it("uses a safe capped one-line label without changing the task prompt", async () => {

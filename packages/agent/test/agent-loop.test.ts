@@ -583,6 +583,175 @@ describe("agentLoop with AgentMessage", () => {
 		expect(toolStart.args.__parseError).toBeDefined(); // keeps __parseError for visibility of parse failure
 	});
 
+	it("validates raw arguments after intent stripping and before schema normalization", async () => {
+		const toolSchema = type({ value: "string.trim" });
+		let rawValidationCalls = 0;
+		const rawArguments: unknown[] = [];
+		let sawUndeclaredField = false;
+		let sawIntentField = false;
+		const executedParams: unknown[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			validateRawArguments(args) {
+				rawValidationCalls++;
+				if (args !== null && typeof args === "object") {
+					rawArguments.push({ ...args });
+					sawUndeclaredField = "undeclared" in args;
+					sawIntentField = INTENT_FIELD in args;
+				}
+			},
+			async execute(_toolCallId, params) {
+				executedParams.push(params);
+				return {
+					content: [{ type: "text", text: "echoed" }],
+					details: { value: params.value },
+				};
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tool-1",
+							name: "echo",
+							arguments: {
+								value: " hello ",
+								undeclared: "visible to raw validation",
+								[INTENT_FIELD]: "Validate raw input",
+							},
+						},
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			intentTracing: true,
+		};
+
+		await agentLoop([createUserMessage("run echo")], context, config, undefined, mock.stream).result();
+
+		expect(rawValidationCalls).toBe(1);
+		expect(rawArguments).toEqual([{ value: " hello ", undeclared: "visible to raw validation" }]);
+		expect(sawUndeclaredField).toBe(true);
+		expect(sawIntentField).toBe(false);
+		expect(executedParams).toEqual([{ value: "hello", undeclared: "visible to raw validation" }]);
+	});
+
+	it("does not bypass raw argument validation when schema validation is lenient", async () => {
+		const toolSchema = type({ value: "string" });
+		const validatedArguments: unknown[] = [];
+		let executed = false;
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			lenientArgValidation: true,
+			validateRawArguments(args) {
+				validatedArguments.push(args);
+				throw new Error("Raw arguments are not permitted");
+			},
+			async execute() {
+				executed = true;
+				return { content: [{ type: "text", text: "executed" }], details: { value: "not executed" } };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tool-1",
+							name: "echo",
+							arguments: { value: "hello", undeclared: "must remain visible" },
+						},
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("run echo")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const messages = await stream.result();
+
+		expect(validatedArguments).toEqual([{ value: "hello", undeclared: "must remain visible" }]);
+		expect(executed).toBe(false);
+		const toolStart = events.find(event => event.type === "tool_execution_start");
+		expect(toolStart).toBeDefined();
+		if (toolStart?.type === "tool_execution_start") {
+			expect(toolStart.args).toEqual({ value: "hello", undeclared: "must remain visible" });
+		}
+		const toolEnd = events.find(event => event.type === "tool_execution_end");
+		expect(toolEnd).toBeDefined();
+		if (toolEnd?.type === "tool_execution_end") {
+			expect(toolEnd.isError).toBe(true);
+			expect(toolEnd.result.details).toEqual({ isError: true, error: "Raw arguments are not permitted" });
+		}
+		const toolResult = messages.find((message): message is ToolResultMessage => message.role === "toolResult");
+		expect(toolResult?.isError).toBe(true);
+		expect(toolResult?.content).toEqual([{ type: "text", text: "Raw arguments are not permitted" }]);
+	});
+
+	it("preserves lenient schema validation for tools without raw validation", async () => {
+		const toolSchema = type({ value: "number" });
+		const executed: unknown[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			lenientArgValidation: true,
+			async execute(_toolCallId, params) {
+				executed.push(params);
+				return { content: [{ type: "text", text: "executed" }], details: { value: String(params.value) } };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tool-1",
+							name: "echo",
+							arguments: { value: "42" },
+						},
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const messages = await agentLoop(
+			[createUserMessage("run echo")],
+			context,
+			config,
+			undefined,
+			mock.stream,
+		).result();
+
+		expect(executed).toEqual([{ value: 42 }]);
+		const toolResult = messages.find((message): message is ToolResultMessage => message.role === "toolResult");
+		expect(toolResult?.isError).toBeFalsy();
+	});
+
 	it("runs completed tool calls after a transient stream_read_error", async () => {
 		const executedParams: Array<{ value: string }> = [];
 		const toolSchema = type({ value: "string" });

@@ -4,6 +4,7 @@
 ### Added
 
 - Added owner-scoped extension async-job snapshots that retain all active jobs plus the newest 15 terminal rows for the session lifetime, use safe task-assignment labels, and expose a status-only display in the custom Alt+D dashboard.
+- Added `task.allowEffortOverride` (default `true`) to control whether caller `task.effort` is exposed and can override configured task-agent/model thinking; when disabled, valid stale/internal effort is ignored and eval agents are unchanged.
 
 ### Fixed
 
