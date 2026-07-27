@@ -41,6 +41,14 @@ export interface ModelManagerOptions<TApi extends Api = Api, TModelsDevPayload =
 	dynamicModelsAuthoritative?: boolean;
 	/** Cached model ids to ignore when the cache was written against a different static catalog fingerprint. */
 	dropCachedModelIdsOnStaticMismatch?: readonly string[];
+	/**
+	 * Trusted, provider-wide request headers (compile-time constants, never
+	 * credentials) that the cache may restore by value for any model whose live
+	 * headers matched them at write time. Lets header-bearing dynamic models
+	 * without a bundled static entry survive offline reads instead of being
+	 * dropped as unrestorable (e.g. GitHub Copilot's User-Agent + API version).
+	 */
+	restorableHeaderFallback?: Record<string, string>;
 	/** Optional dynamic endpoint fetcher. */
 	fetchDynamicModels?: () => Promise<readonly ModelSpec<TApi>[] | null>;
 	/** Optional models.dev fallback hook. */
@@ -53,7 +61,8 @@ export interface ModelManagerOptions<TApi extends Api = Api, TModelsDevPayload =
  * Resolution result.
  *
  * `stale` is false when the resolved catalog is authoritative for the selected provider:
- * - dynamic endpoint data was fetched in this call,
+ * - a dynamic endpoint fetch succeeded in this call (an empty catalog is still
+ *   authoritative for the cycle, so downstream pruning of removed models runs),
  * - a still-fresh authoritative cache was reused in `online-if-uncached` mode, or
  * - the provider has no dynamic fetcher configured.
  */
@@ -108,15 +117,22 @@ interface CachedHeaderRestoreResult<TApi extends Api> {
 /**
  * Restore cache-omitted headers from the current static source.
  *
- * Dynamic-only header-bearing models cannot be reconstructed safely without
- * persisting arbitrary credential values; callers must refetch them online or
- * omit them from an offline result rather than return a broken model.
+ * A same-id static match is trusted only when the row did not flag the model
+ * unrestorable (its live headers matched static when cached). Request-model
+ * fallback also honors that marker for current rows. Only legacy rows written
+ * before request-model header matching may bypass it: their id-only writer
+ * necessarily marked every synthesized variant unrestorable (#6037, #6284).
+ * Header-bearing models without a trusted source cannot be reconstructed
+ * safely without persisting arbitrary credential values; callers must refetch
+ * them online or omit them rather than return a broken model.
  */
 function restoreCachedModelHeaders<TApi extends Api>(
 	cachedModels: readonly ModelSpec<TApi>[],
 	staticModels: readonly Model<TApi>[],
 	headerOmittedModelIds: readonly string[],
 	unrestorableHeaderModelIds: readonly string[],
+	legacyHeaderRestoreMarkers: boolean,
+	restorableHeaderFallback: Record<string, string> | undefined,
 ): CachedHeaderRestoreResult<TApi> {
 	const models = passModelList<TApi>(cachedModels);
 	if (headerOmittedModelIds.length === 0) {
@@ -128,12 +144,23 @@ function restoreCachedModelHeaders<TApi extends Api>(
 	const unresolvedModelIds = new Set<string>();
 	const restored = models.map(model => {
 		if (!omittedIds.has(model.id)) return model;
-		if (unrestorableIds.has(model.id)) {
-			unresolvedModelIds.add(model.id);
-			return model;
-		}
-		const staticModel = staticById.get(model.id);
+		const unrestorable = unrestorableIds.has(model.id);
+		// Current unrestorable markers prove that neither same-id nor request-model
+		// static headers matched the live model. Only the old id-only writer's
+		// markers may recover a synthesized variant through `requestModelId`.
+		const staticModel = unrestorable
+			? legacyHeaderRestoreMarkers && model.requestModelId
+				? staticById.get(model.requestModelId)
+				: undefined
+			: (staticById.get(model.id) ?? (model.requestModelId ? staticById.get(model.requestModelId) : undefined));
 		if (!staticModel?.headers) {
+			// A non-unrestorable row whose static source is gone was cached with
+			// headers matching the provider's trusted constant (e.g. a Copilot
+			// model with no bundled entry). Reattach the constant by value instead
+			// of dropping the model on this offline read.
+			if (!unrestorable && restorableHeaderFallback) {
+				return { ...model, headers: { ...restorableHeaderFallback } };
+			}
 			unresolvedModelIds.add(model.id);
 			return model;
 		}
@@ -156,6 +183,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const now = options.now ?? Date.now;
 	const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
 	const dbPath = options.cacheDbPath;
+	const restorableHeaderFallback = options.restorableHeaderFallback;
 	const staticModels = options.staticModels
 		? passModelList<TApi>(options.staticModels)
 		: (getBundledModels(options.providerId as GeneratedProvider) as Model<TApi>[]);
@@ -165,6 +193,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		staticModels,
 		cache?.headerOmittedModelIds ?? [],
 		cache?.unrestorableHeaderModelIds ?? [],
+		cache?.legacyHeaderRestoreMarkers ?? false,
+		restorableHeaderFallback,
 	);
 	const usableCachedModels = restoredCache.models.filter(model => !restoredCache.unresolvedModelIds.has(model.id));
 	const cacheHasUnresolvedHeaders = restoredCache.unresolvedModelIds.size > 0;
@@ -215,6 +245,12 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				options.dropCachedModelIdsOnStaticMismatch,
 			);
 	const dynamicModels = fetchedDynamicModels ?? [];
+	// A successful empty result stays authoritative for THIS cycle (so an
+	// intentional catalog emptying still prunes removed models downstream), but
+	// is NOT pinned into the cache as authoritative — that would suppress the
+	// short retry that recovers a transient empty response (#6620). The two
+	// concerns are deliberately separate: result authority vs. cache retry.
+	const dynamicCacheAuthoritative = dynamicFetchSucceeded && dynamicModels.length > 0;
 	const mergedWithCache = mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), cacheModels);
 	const mergedModels = mergeDynamicModels(mergedWithCache, dynamicModels);
 	const models = collapseBuiltModelVariants(
@@ -231,10 +267,11 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				cacheProviderId,
 				now(),
 				collapseBuiltModelVariants(snapshotModels),
-				true,
+				dynamicCacheAuthoritative,
 				staticFingerprint,
 				dbPath,
 				staticModels,
+				restorableHeaderFallback,
 			);
 		} else {
 			// Dynamic fetch failed — update cache with a non-authoritative snapshot so
@@ -245,28 +282,32 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				staticModels,
 				latestCache?.headerOmittedModelIds ?? cache?.headerOmittedModelIds ?? [],
 				latestCache?.unrestorableHeaderModelIds ?? cache?.unrestorableHeaderModelIds ?? [],
+				latestCache?.legacyHeaderRestoreMarkers ?? cache?.legacyHeaderRestoreMarkers ?? false,
+				restorableHeaderFallback,
 			);
 			const latestUsableCacheModels = latestRestoredCache.models.filter(
 				model => !latestRestoredCache.unresolvedModelIds.has(model.id),
 			);
+			const fallbackSnapshotModels = collapseBuiltModelVariants(
+				mergeDynamicModels(
+					mergeModelSources(staticModels, modelsDevModels),
+					prepareCacheModelsForStaticMismatch(
+						latestUsableCacheModels,
+						staticModels,
+						cacheFingerprintMatches,
+						options.dropCachedModelIdsOnStaticMismatch,
+					),
+				),
+			);
 			writeModelCache(
 				cacheProviderId,
 				now(),
-				collapseBuiltModelVariants(
-					mergeDynamicModels(
-						mergeModelSources(staticModels, modelsDevModels),
-						prepareCacheModelsForStaticMismatch(
-							latestUsableCacheModels,
-							staticModels,
-							cacheFingerprintMatches,
-							options.dropCachedModelIdsOnStaticMismatch,
-						),
-					),
-				),
+				fallbackSnapshotModels,
 				false,
 				staticFingerprint,
 				dbPath,
 				staticModels,
+				restorableHeaderFallback,
 			);
 		}
 	}

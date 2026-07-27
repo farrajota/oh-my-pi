@@ -12,7 +12,7 @@ import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { daemonClientForProject } from "../../launch/client";
 import type { DaemonOperation, DaemonRpcResult, DaemonSnapshot, DaemonSpec, DaemonState } from "../../launch/protocol";
-import { renderTerminalOutput } from "../../launch/terminal-output";
+import type { TerminalOutputOptions } from "../../launch/terminal-output";
 import type { Theme, ThemeColor } from "../../modes/theme/theme";
 import { framedBlock, outputBlockContentWidth, renderStatusLine } from "../../tui";
 import type { ToolSession } from "..";
@@ -73,6 +73,9 @@ const KEY_INPUT: Record<string, string> = {
 	RIGHT: "\u001b[C",
 	LEFT: "\u001b[D",
 };
+
+/** Terminal daemon lifecycle states — the process is no longer running. */
+const TERMINAL_STATES: Partial<Record<DaemonState, true>> = { exited: true, failed: true };
 
 /** Structured launch state retained for compact TUI rendering. */
 export interface LaunchToolDetails {
@@ -158,6 +161,7 @@ function operationFor(params: LaunchParams, session: ToolSession): DaemonOperati
 				grep: params.grep,
 				follow: params.follow ?? false,
 				cursor: params.cursor,
+				renderTerminalRows: true,
 				timeoutMs: timeoutMs(params.timeout, 30),
 			};
 		case "wait":
@@ -229,6 +233,8 @@ function toolContent(result: DaemonRpcResult, params: LaunchParams): string {
 				lines.push(
 					`NOT ready — readiness timed out after ${params.ready?.timeout ?? 30}s${cause}. The process is still running (state: ${daemon.state}); follow its logs or stop it.`,
 				);
+			} else if (params.ready && daemon.readyAt === undefined && TERMINAL_STATES[daemon.state]) {
+				lines.push("Process exited before readiness was observed.");
 			}
 			return lines.join("\n");
 		}
@@ -265,28 +271,38 @@ function toolContent(result: DaemonRpcResult, params: LaunchParams): string {
 	}
 }
 
+interface TerminalOutputRuntime {
+	renderTerminalOutput(output: string, options: TerminalOutputOptions): Promise<string[] | undefined>;
+}
+
+async function renderLegacyTerminalOutput(terminalText: string, params: LaunchParams): Promise<string[] | undefined> {
+	// `require` keeps xterm out of normal main/Hub startup while retaining display
+	// compatibility with a legacy broker that was already running during upgrade.
+	const runtime = require("../../launch/terminal-output") as TerminalOutputRuntime;
+	return runtime.renderTerminalOutput(terminalText, {
+		head: params.head ?? false,
+		maxRows: Math.min(1_000, Math.floor(params.lines ?? 100)),
+	});
+}
+
 async function toolDetails(result: DaemonRpcResult, params: LaunchParams): Promise<LaunchToolDetails> {
 	switch (result.op) {
 		case "start":
 			return { op: "start", daemon: result.daemon, timedOut: result.readyTimedOut };
 		case "list":
 			return { op: "list", daemons: result.daemons };
-		case "logs": {
-			const terminalRows =
-				result.terminalText === undefined
-					? undefined
-					: await renderTerminalOutput(result.terminalText, {
-							head: params.head ?? false,
-							maxRows: Math.min(1_000, Math.floor(params.lines ?? 100)),
-						});
+		case "logs":
 			return {
 				op: "logs",
 				cursor: result.cursor,
 				timedOut: result.timedOut,
 				state: result.state,
-				terminalRows,
+				terminalRows:
+					result.terminalRows ??
+					(result.terminalText === undefined
+						? undefined
+						: await renderLegacyTerminalOutput(result.terminalText, params)),
 			};
-		}
 		case "wait":
 			return { op: "wait", daemon: result.daemon, timedOut: result.timedOut, matched: result.matched };
 		case "send":
@@ -437,6 +453,8 @@ export function launchRenderResult(
 								: "Readiness timed out; the process is still running.",
 						),
 					);
+				} else if (params.ready && daemon && daemon.readyAt === undefined && TERMINAL_STATES[daemon.state]) {
+					body.push(theme.fg("warning", "Process exited before readiness was observed."));
 				}
 				break;
 			}

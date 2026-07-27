@@ -16,6 +16,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import type { ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -24,6 +25,7 @@ import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession subscriber event order", () => {
@@ -125,7 +127,7 @@ describe("AgentSession subscriber event order", () => {
 		}
 	});
 
-	it("captures agent_start time before a delayed extension and publishes it atomically to subscribers", async () => {
+	it("publishes the captured agent-start time only when subscriber delivery begins", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model to exist");
 
@@ -161,20 +163,81 @@ describe("AgentSession subscriber event order", () => {
 
 		const observedStartTimes: Array<number | undefined> = [];
 		session.subscribe(event => {
-			if (event.type === "agent_start") {
-				observedStartTimes.push((session as AgentSession & { activeRunStartedAt?: number }).activeRunStartedAt);
-			}
+			if (event.type === "agent_start") observedStartTimes.push(session?.activeRunStartedAt);
 		});
 		const prompt = session.prompt("time the real run");
 		await enteredAgentStartExtension.promise;
-		expect((session as AgentSession & { activeRunStartedAt?: number }).activeRunStartedAt).toBeUndefined();
+		expect(session.activeRunStartedAt).toBeUndefined();
 		now = 9_000;
 		releaseAgentStartExtension.resolve();
 		await prompt;
 		await session.waitForIdle();
 
-		// The origin time is captured before the extension await, but is not public
-		// until FIFO subscriber delivery begins.
 		expect(observedStartTimes).toEqual([1_000]);
+	});
+
+	it("preserves every completion from a batch of exclusive todo calls", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled test model to exist");
+
+		const tasks = ["one", "two", "three", "four", "five", "six"];
+		const calls: ToolCall[] = tasks.map((task, index) => ({
+			type: "toolCall",
+			id: `todo-${index}`,
+			name: "todo",
+			arguments: { op: "done", task },
+		}));
+		const mock = createMockModel({
+			responses: [{ content: calls }, { content: ["Done"] }],
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": false,
+			"tools.xdev": false,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		const todo = new TodoTool({
+			cwd: tempDir.path(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings,
+			getTodoPhases: () => session?.getTodoPhases() ?? [],
+			setTodoPhases: phases => {
+				session?.setTodoPhases(phases);
+			},
+		});
+		const agent = new Agent({
+			getApiKey: agentModel => `${agentModel.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [todo],
+				messages: [],
+			},
+			streamFn: (streamModel, context, options) => mock.stream(streamModel, context, options),
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.setTodoPhases([
+			{
+				name: "Execution",
+				tasks: tasks.map((content, index) => ({
+					content,
+					status: index === 0 ? "in_progress" : "pending",
+				})),
+			},
+		]);
+
+		await session.prompt("Complete every task");
+		await session.waitForIdle();
+		const toolResults = agent.state.messages.filter(message => message.role === "toolResult");
+		expect(toolResults.map(result => result.toolName)).toEqual(tasks.map(() => "todo"));
+
+		expect(session.getTodoPhases()[0]?.tasks.map(task => task.status)).toEqual(tasks.map(() => "completed"));
 	});
 });

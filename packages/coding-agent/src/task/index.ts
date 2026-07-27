@@ -30,6 +30,7 @@ import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.m
 import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
+import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
 import { formatBytes, formatDuration } from "../tools/render-utils";
@@ -49,6 +50,7 @@ import {
 // Import review tools for side effects (registers subagent tool handlers)
 import "../tools/review";
 import type { AsyncJobManager } from "../async";
+import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { runSubprocess } from "./executor";
@@ -60,6 +62,7 @@ import {
 	prepareIsolationContext,
 	runIsolatedSubprocess,
 } from "./isolation-runner";
+import { resolveEffectiveSubagentPolicy, StructuredSubagentError } from "./structured-subagent";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
@@ -203,6 +206,7 @@ function appendPermissionDetails(lines: string[], permissions: TaskParams["permi
 function renderDescription(
 	agents: AgentDefinition[],
 	isolationEnabled: boolean,
+	applyIsolatedChanges: boolean,
 	disabledAgents: string[],
 	batchEnabled: boolean,
 	asyncEnabled: boolean,
@@ -234,8 +238,8 @@ function renderDescription(
 		agents: renderedAgents,
 		spawningDisabled,
 		defaultAgent: spawnPolicy.defaultAgent,
-		allowedAgentsText: spawnPolicy.allowedPromptText,
 		isolationEnabled,
+		applyIsolatedChanges,
 		batchEnabled,
 		asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
@@ -293,6 +297,13 @@ function validateShapeParams(
  * policy later, in `spawnParamsFor`. Returns a problem description, or
  * undefined when valid.
  */
+
+/** Reject an out-of-range `effort` selector on internal/stale-transcript calls that bypass the wire schema. */
+function validateEffort(effort: TaskEffort | undefined, label: string): string | undefined {
+	if (effort === undefined || TASK_EFFORTS.includes(effort)) return undefined;
+	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
+}
+
 function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string | undefined {
 	const hasTask = typeof params.task === "string" && params.task.trim() !== "";
 	const tasks = params.tasks;
@@ -308,6 +319,8 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			if (!item || typeof item.task !== "string" || item.task.trim() === "") {
 				return `Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""} is missing \`task\`. Every task needs complete, self-contained instructions.`;
 			}
+			const effortError = validateEffort(item.effort, `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`);
+			if (effortError) return effortError;
 		}
 		const seen = new Map<string, string>();
 		for (const item of tasks) {
@@ -330,7 +343,7 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			? "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`."
 			: "Missing `task`. Provide complete, self-contained instructions for the agent.";
 	}
-	return undefined;
+	return validateEffort(params.effort, "The call");
 }
 
 /**
@@ -348,6 +361,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if (params.toolProfile !== undefined) item.toolProfile = params.toolProfile;
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
+	if ("effort" in params) item.effort = params.effort;
 	if ("isolated" in params) item.isolated = params.isolated;
 	return [item];
 }
@@ -370,6 +384,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if (params.context !== undefined) spawn.context = params.context;
 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
+	if ("effort" in item) spawn.effort = item.effort;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -567,19 +582,32 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			lines.push(`Context:\n${truncateForPrompt(params.context)}`);
 		}
 		appendPermissionDetails(lines, params.permissions);
-		const tasks = Array.isArray(params.tasks) ? params.tasks : [];
-		const firstTask = tasks[0];
-		if (firstTask) {
-			if (typeof firstTask.name === "string" && firstTask.name.trim()) {
-				lines.push(`Name: ${truncateForPrompt(firstTask.name)}`);
+		const tasks: TaskItem[] = Array.isArray(params.tasks) ? params.tasks : [];
+		if (tasks.length > 0) {
+			const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
+			const effectiveAgent = (item: TaskItem): string => {
+				if (typeof item.agent === "string" && item.agent.trim()) return item.agent.trim();
+				return defaultAgent;
+			};
+			const agentCounts = new Map<string, number>();
+			for (const item of tasks) {
+				const agent = effectiveAgent(item);
+				agentCounts.set(agent, (agentCounts.get(agent) ?? 0) + 1);
 			}
-			if (typeof firstTask.agent === "string" && firstTask.agent.trim()) {
-				lines.push(`Agent: ${truncateForPrompt(firstTask.agent)}`);
+			const agentSummary = [...agentCounts].map(([agent, count]) => `${agent} ×${count}`).join(", ");
+			lines.push(`Batch agents: ${truncateForPrompt(agentSummary)}`);
+
+			const firstTask = tasks[0];
+			if (firstTask && typeof firstTask === "object") {
+				if ("name" in firstTask && typeof firstTask.name === "string" && firstTask.name.trim()) {
+					lines.push(`Name: ${truncateForPrompt(firstTask.name)}`);
+				}
+				lines.push(`Agent: ${truncateForPrompt(effectiveAgent(firstTask))}`);
+				if ("task" in firstTask && typeof firstTask.task === "string") {
+					lines.push(`Task:\n${truncateForPrompt(firstTask.task)}`);
+				}
 			}
-			if (typeof firstTask.task === "string") {
-				lines.push(`Task:\n${truncateForPrompt(firstTask.task)}`);
-			}
-			appendPermissionDetails(lines, firstTask.permissions);
+			appendPermissionDetails(lines, firstTask?.permissions);
 			if (tasks.length > 1) {
 				lines.push(`+${tasks.length - 1} more task${tasks.length === 2 ? "" : "s"}`);
 			}
@@ -590,6 +618,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly summary = "Spawn subagents to complete delegated tasks";
 	readonly strict = false;
 	readonly loadMode = "essential";
+	// Arktype validates model calls against the active wire schema, but the flat
+	// single-spawn schema carries `"+": "delete"`: a batch `{ context, tasks[] }`
+	// payload has those keys stripped, then fails on the now-missing `task` with
+	// the misleading `task must be a string (was missing)`. That preempts the
+	// tool's own actionable shape checks (`validateShapeParams` /
+	// `validateSpawnParams`), which never run. Lenient validation forwards the
+	// raw args to `execute()` on any arktype failure so those checks surface the
+	// real reason ("enable task.batch, or use the flat `task` shape"). Valid
+	// calls still normalize through arktype; `execute()` resolves `agent`
+	// defaults independently, so the success path is unchanged.
+	readonly lenientArgValidation = true;
 	readonly renderResult = renderResult;
 	// Suppress the streaming call preview once a (partial or final) result exists
 	// so the task renders as ONE block that transitions in place — not a pending
@@ -638,6 +677,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return renderDescription(
 			this.#discoveredAgents,
 			!planMode && isolationMode !== "none",
+			this.session.settings.get("task.isolation.apply"),
 			disabledAgents,
 			this.#isBatchEnabled(),
 			this.session.settings.get("async.enabled"),
@@ -681,6 +721,29 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		this.#getSpawnSemaphore().release();
 	}
 
+	/**
+	 * Resolve the shared policy before detached work exists. The resulting
+	 * policy intentionally stays local: executor dispatch resolves again from
+	 * normalized task params rather than smuggling internal policy over the
+	 * task wire contract.
+	 */
+	#resolveSpawnPreflight(params: TaskParams) {
+		return resolveEffectiveSubagentPolicy({
+			session: this.session,
+			invocationKind: "task",
+			assignment: (params.task ?? "").trim(),
+			context: this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined,
+			agent: params.agent,
+			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
+			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
+			...(params.effort !== undefined ? { effort: params.effort } : {}),
+			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+			blockedAgent: this.#blockedAgent,
+			enableLsp: (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp"),
+			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+			maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
+		});
+	}
 
 	/**
 	 * Create a TaskTool instance with async agent discovery.
@@ -716,26 +779,53 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const spawnItems = resolveSpawnItems(params);
 		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
 		const resolvedAgents = normalizedSpawnParams.map(spawn => spawn.agent ?? defaultAgent);
+		// Resolve every item before choosing an execution path. No executor or
+		// job manager may observe a batch unless every effective policy is valid.
+		const preflights = await Promise.all(
+			normalizedSpawnParams.map(async spawn => {
+				try {
+					return { policy: await this.#resolveSpawnPreflight(spawn) };
+				} catch (error) {
+					return { error: error instanceof StructuredSubagentError ? error.message : String(error) };
+				}
+			}),
+		);
+		const preflightFailures = preflights
+			.map((preflight, index) => ("error" in preflight ? { index, error: preflight.error } : undefined))
+			.filter((failure): failure is { index: number; error: string } => failure !== undefined);
+		if (preflightFailures.length > 0) {
+			if (!batchEnabled) {
+				return createTaskModeError(`Task execution failed: ${preflightFailures[0]!.error}`);
+			}
+			return createTaskModeError(
+				preflightFailures
+					.map(({ index, error }) => {
+						const item = spawnItems[index]!;
+						return `Task ${item.name?.trim() || `#${index + 1}`} failed preflight: ${error}`;
+					})
+					.join("\n"),
+			);
+		}
+		const policies = preflights.map(preflight => preflight.policy!);
+		const itemBlocking = policies.map(policy => policy.effectiveAgent.blocking === true);
+
 		// Execution mode is per item: an item whose agent type declares
 		// `blocking: true` runs inline on this turn (the parent waits on its
 		// result); every other item becomes a background job when async
 		// execution is available.
-		const provisionalBlocking = resolvedAgents.map(
-			name => this.#discoveredAgents.find(agent => agent.name === name)?.blocking === true,
-		);
 		const asyncEnabled = this.session.settings.get("async.enabled");
 		const manager = asyncEnabled ? this.session.asyncJobManager : undefined;
-		const provisionalAsyncItems = manager ? spawnItems.filter((_, index) => !provisionalBlocking[index]) : [];
+		const asyncItems = manager ? spawnItems.filter((_, index) => !itemBlocking[index]) : [];
 		const depthCapacity = canSpawnAtDepth(
 			this.session.settings.get("task.maxRecursionDepth") ?? 2,
 			this.session.taskDepth ?? 0,
 		);
 		const ircEnabled = isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0);
 
-		if (!manager || provisionalAsyncItems.length === 0) {
-			// Sync fallback: async execution is disabled, no job manager is wired,
-			// or every item's agent type declares `blocking: true`. `#runSpawn`
-			// performs the fork's permission-aware execution setup before reserving an id.
+		if (!manager || asyncItems.length === 0) {
+			// Sync fallback: async execution disabled, orphaned host that never
+			// wired a job manager, or every item's agent type declares
+			// `blocking: true`.
 			if (asyncEnabled && !this.session.asyncJobManager) {
 				logger.warn("task: no AsyncJobManager registered; falling back to sync execution");
 			}
@@ -743,7 +833,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				? undefined
 				: composeSpawnAdvisory({
 						agents: resolvedAgents,
-						items: provisionalAsyncItems,
+						items: asyncItems,
 						depthCapacity,
 						ircEnabled,
 						willRunAsync: false,
@@ -769,45 +859,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return { ...result, content };
 		}
 
-		// Validate detached jobs with fresh discovery before allocating IDs. Runtime
-		// execution remains in `#runSpawn`, where per-call permissions and tool
-		// profiles are applied before the executor is invoked.
-		const { agents: freshAgents } = await discoverAgents(this.session.cwd);
-		const preflightFailures: Array<{ index: number; error: string }> = [];
-		const disabledAgents = this.session.settings.get("task.disabledAgents") as string[];
-		for (let index = 0; index < normalizedSpawnParams.length; index++) {
-			const agentName = resolvedAgents[index]!;
-			if (!getAgent(freshAgents, agentName)) {
-				preflightFailures.push({ index, error: `Unknown agent "${agentName}".` });
-			} else if (disabledAgents.includes(agentName)) {
-				preflightFailures.push({ index, error: `Agent "${agentName}" is disabled in settings.` });
-			}
-		}
-		const invalidIndices = new Set(preflightFailures.map(failure => failure.index));
-		const renderPreflightFailures = () =>
-			preflightFailures
-				.map(({ index, error }) => {
-					const item = spawnItems[index]!;
-					return `Task ${item.name?.trim() || `#${index + 1}`} failed preflight: ${error}`;
-				})
-				.join("\n");
-		if (preflightFailures.length === spawnItems.length) {
-			return createTaskModeError(renderPreflightFailures());
-		}
 
-		const validIndices = spawnItems.flatMap((_, index) => (invalidIndices.has(index) ? [] : [index]));
-		const validSpawns = validIndices.map(index => ({ item: spawnItems[index]!, index }));
-		const itemBlocking = resolvedAgents.map(
-			name => getAgent(freshAgents, name)?.blocking === true,
-		);
-		const asyncItems = validIndices.filter(index => !itemBlocking[index]).map(index => spawnItems[index]!);
 		// Coordination only makes sense for spawns that keep running after this
 		// call returns (the async subset). Blocking items have already completed
 		// by then, so a "coordinate while they run" hint would misfire.
 		const advisory = this.session.suppressSpawnAdvisory
 			? undefined
 			: composeSpawnAdvisory({
-					agents: validIndices.map(index => resolvedAgents[index]!),
+					agents: resolvedAgents,
 					items: asyncItems,
 					depthCapacity,
 					ircEnabled,
@@ -829,24 +888,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			if (!appended) content.push({ type: "text", text: advisory });
 			return { ...result, content };
 		};
-		const withPreflightFailures = (result: AgentToolResult<TaskToolDetails>): AgentToolResult<TaskToolDetails> => {
-			if (preflightFailures.length === 0) return result;
-			const failures = renderPreflightFailures();
-			let prepended = false;
-			const content = result.content.map(part => {
-				if (!prepended && part.type === "text" && typeof part.text === "string") {
-					prepended = true;
-					return { ...part, text: `${failures}\n\n${part.text}` };
-				}
-				return part;
-			});
-			if (!prepended) content.unshift({ type: "text", text: failures });
-			return { ...result, content };
-		};
 		if (asyncItems.length === 0) {
-			return withPreflightFailures(
-				withAdvisory(
-					await this.#executeSyncFanout(toolCallId, params, validSpawns, defaultAgent, signal, onUpdate),
+			return withAdvisory(
+				await this.#executeSyncFanout(
+					toolCallId,
+					params,
+					spawnItems.map((item, index) => ({ item, index })),
+					defaultAgent,
+					signal,
+					onUpdate,
 				),
 			);
 		}
@@ -866,12 +916,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			blocking: boolean;
 			progress: AgentProgress;
 		}> = [];
-		for (const index of validIndices) {
-			const item = spawnItems[index]!;
+		for (const [index, item] of spawnItems.entries()) {
 			const agentType = resolvedAgents[index]!;
-			const executionAgent = getAgent(freshAgents, agentType);
-			if (!executionAgent) continue;
-			const agentSource = executionAgent.source;
+			const policy = policies[index]!;
+			const agentSource = policy.agent.source;
 			const agentId = await outputManager.allocate(item.name?.trim() || generateTaskName());
 			const assignment = (item.task ?? "").trim();
 			spawns.push({
@@ -907,7 +955,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// failed. Blocking spawns run inline below and land in `results` before
 		// the call returns, so post-return job updates never drop them.
 		let settledCount = 0;
-		let failedCount = preflightFailures.length;
+		let failedCount = 0;
 		let primaryJobId = asyncSpawns[0].agentId;
 		const syncResults: SingleResult[] = [];
 		let syncUsage: Usage | undefined;
@@ -957,7 +1005,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		if (started.length === 0 && syncSpawns.length === 0) {
-			return withPreflightFailures({
+			return {
 				content: [
 					{
 						type: "text",
@@ -965,7 +1013,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					},
 				],
 				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
-			});
+			};
 		}
 
 		const scheduleFailureSummary =
@@ -990,34 +1038,30 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					content: [{ type: "text", text: `Spawned agent \`${agentId}\`...` }],
 					details: buildAsyncDetails(),
 				});
-				return withPreflightFailures(
-					withAdvisory({
-						content: [
-							{
-								type: "text",
-								text: `Spawned agent \`${agentId}\` (job \`${jobId}\`). Its result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first. ${coordinationHint}`,
-							},
-						],
-						details: buildAsyncDetails(),
-					}),
-				);
+				return withAdvisory({
+					content: [
+						{
+							type: "text",
+							text: `Spawned agent \`${agentId}\` (job \`${jobId}\`). Its result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first. ${coordinationHint}`,
+						},
+					],
+					details: buildAsyncDetails(),
+				});
 			}
 			const startedListing = started.map(({ agentId, jobId }) => `- \`${agentId}\` (job \`${jobId}\`)`).join("\n");
 			onUpdate?.({
 				content: [{ type: "text", text: `Spawned ${started.length} agents...` }],
 				details: buildAsyncDetails(),
 			});
-			return withPreflightFailures(
-				withAdvisory({
-					content: [
-						{
-							type: "text",
-							text: `Spawned ${started.length} background agents using ${agentLabel}.${scheduleFailureSummary} Each result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first.\n${startedListing}\n${coordinationHint}`,
-						},
-					],
-					details: buildAsyncDetails(),
-				}),
-			);
+			return withAdvisory({
+				content: [
+					{
+						type: "text",
+						text: `Spawned ${started.length} background agents using ${agentLabel}.${scheduleFailureSummary} Each result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first.\n${startedListing}\n${coordinationHint}`,
+					},
+				],
+				details: buildAsyncDetails(),
+			});
 		}
 
 		// Mixed call: the async jobs above already run detached; the blocking
@@ -1082,12 +1126,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const text = [merged.contentParts.join("\n\n"), spawnedSummary]
 			.filter(section => section.trim().length > 0)
 			.join("\n\n");
-		return withPreflightFailures(
-			withAdvisory({
-				content: [{ type: "text", text: text.length > 0 ? text : "No results." }],
-				details: buildAsyncDetails(),
-			}),
-		);
+		return withAdvisory({
+			content: [{ type: "text", text: text.length > 0 ? text : "No results." }],
+			details: buildAsyncDetails(),
+		});
 	}
 
 	/**
@@ -1109,14 +1151,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}): string {
 		const { manager, toolCallId, spawnParams, agentId, progress, ircEnabled, buildDetails, onUpdate, onSettled } =
 			options;
-		const buildFollowUpHint = (aborted: boolean): string => {
+		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
 			if (aborted) {
-				const status = AgentRegistry.global().get(agentId)?.status;
-				if (status === "idle" || status === "parked") {
+				const ref = AgentRegistry.global().get(agentId);
+				const transcript = (await hasResolvableTranscript(agentId))
+					? `transcript at history://${agentId}`
+					: "transcript unavailable";
+				if (ref?.status === "idle" || ref?.status === "parked") {
 					const followUp = ircEnabled ? "message it via `hub` to resume; " : "";
-					return `\n\n${agentId} was stopped but is still resumable — ${followUp}transcript at history://${agentId}`;
+					return `\n\n${agentId} was stopped but is still resumable — ${followUp}${transcript}`;
 				}
-				return `\n\n${agentId} was aborted — transcript at history://${agentId}`;
+				return `\n\n${agentId} was aborted — ${transcript}`;
 			}
 			const followUp = ircEnabled ? "message it via `hub` to follow up; " : "";
 			return `\n\n${agentId} is now idle — ${followUp}transcript at history://${agentId}`;
@@ -1171,6 +1216,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							// and running counters without reverting the "running"
 							// status back to the subagent's initial "pending" snapshot.
 							progress.resolvedModel = nextProgress.resolvedModel;
+							progress.resolvedModelIsFallback = nextProgress.resolvedModelIsFallback;
 							progress.tokens = nextProgress.tokens;
 							progress.requests = nextProgress.requests;
 							progress.contextTokens = nextProgress.contextTokens;
@@ -1215,15 +1261,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.retryState = undefined;
 					if (singleResult?.resolvedModel) {
 						progress.resolvedModel = singleResult.resolvedModel;
+						progress.resolvedModelIsFallback = singleResult.resolvedModelIsFallback;
 					} else {
 						delete progress.resolvedModel;
+						delete progress.resolvedModelIsFallback;
 					}
 					onSettled?.(resultFailed);
 					const statusText = resultFailed
 						? `Background task ${agentId} failed.`
 						: `Background task ${agentId} complete.`;
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
-					const deliveryText = `${finalText}${buildFollowUpHint(singleResult?.aborted === true)}`;
+					const deliveryText = `${finalText}${await buildFollowUpHint(singleResult?.aborted === true)}`;
 					if (resultFailed) {
 						// Mark the job itself failed; the failed agent stays interrogable.
 						throw new TaskJobError(deliveryText);
@@ -1239,7 +1287,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const statusText = `Background task ${agentId} failed.`;
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
 					const message = error instanceof Error ? error.message : String(error);
-					const hint = AgentRegistry.global().get(agentId) ? buildFollowUpHint(false) : "";
+					const hint = AgentRegistry.global().get(agentId) ? await buildFollowUpHint(false) : "";
 					throw new TaskJobError(`${message}${hint}`);
 				} finally {
 					releasePermit();
@@ -1737,6 +1785,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				task: renderSubagentUserPrompt(assignment),
 				assignment,
 				context: sharedContext,
+				effort: params.effort,
 				planReference,
 				outputSchema: effectiveOutputSchema,
 				outputSchemaMode: params.schemaMode,

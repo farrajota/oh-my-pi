@@ -19,25 +19,10 @@ import { EDIT_MODE_STRATEGIES, type EditMode, type PerFileDiffPreview } from "..
 import type { Theme } from "../../modes/theme/theme";
 import { getThemeEpoch, theme } from "../../modes/theme/theme";
 import { BASH_DEFAULT_PREVIEW_LINES } from "../../tools/bash";
+import { formatDefaultToolExecution } from "../../tools/default-renderer";
 import { EVAL_DEFAULT_PREVIEW_LINES } from "../../tools/eval";
 import { isWaitingPollDetails } from "../../tools/hub";
-import {
-	formatArgsInline,
-	JSON_TREE_MAX_DEPTH_COLLAPSED,
-	JSON_TREE_MAX_DEPTH_EXPANDED,
-	JSON_TREE_MAX_LINES_COLLAPSED,
-	JSON_TREE_MAX_LINES_EXPANDED,
-	JSON_TREE_SCALAR_LEN_COLLAPSED,
-	JSON_TREE_SCALAR_LEN_EXPANDED,
-	renderJsonTreeLines,
-} from "../../tools/json-tree";
-import {
-	formatExpandHint,
-	formatStatusIcon,
-	replaceTabs,
-	resolveImageOptions,
-	truncateToWidth,
-} from "../../tools/render-utils";
+import { formatStatusIcon, replaceTabs, resolveImageOptions } from "../../tools/render-utils";
 import { type FirstResultViewportRepaint, toolRenderers } from "../../tools/renderers";
 import { TODO_STRIKE_TOTAL_FRAMES, type TodoToolDetails } from "../../tools/todo";
 import { isFramedBlockComponent, markFramedBlockComponent, renderStatusLine, WidthAwareText } from "../../tui";
@@ -426,7 +411,21 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		// strips PLAIN-blank edges, so framed/minimal blocks (no bg set) drop these
 		// lines and keep their tight spacing — only tinted lines survive.
 		this.#contentBox = new Box(0, 1);
-		this.#contentText = new WidthAwareText(contentWidth => this.#formatToolExecution(contentWidth), 1, 1);
+		this.#contentText = new WidthAwareText(
+			contentWidth =>
+				formatDefaultToolExecution(
+					{
+						label: this.#toolLabel,
+						args: this.#args,
+						result: this.#result ? { output: this.#getTextOutput(), isError: this.#result.isError } : undefined,
+						options: this.#renderState,
+					},
+					contentWidth,
+					theme,
+				),
+			1,
+			1,
+		);
 
 		// Use Box for custom tools or built-in tools that have renderers
 		const hasRenderer = toolName in toolRenderers;
@@ -816,9 +815,18 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		return this.isTranscriptBlockFinalized() ? undefined : 0;
 	}
 
-	/** Keeps the in-flight `vibe_wait` TV wall out of immutable native scrollback. */
+	/**
+	 * Keeps in-flight TV-wall frames out of immutable native scrollback: the
+	 * `vibe_wait` wall and displaceable snapshots (`hub` waiting polls, `todo`
+	 * lists). Their frames replace each other rather than append, and their
+	 * rows mutate every spinner tick — an unpinned commit records a per-tick
+	 * frozen snapshot AND force-seals the block (see TranscriptContainer's
+	 * committed-snapshot seal), so the next poll stacks a new frame instead of
+	 * displacing this one.
+	 */
 	isNativeScrollbackLiveRegionPinned(): boolean {
-		return this.#toolName === "vibe_wait" && !this.isTranscriptBlockFinalized();
+		if (this.isTranscriptBlockFinalized()) return false;
+		return this.#toolName === "vibe_wait" || this.#displaceableByToolName !== undefined;
 	}
 
 	/**

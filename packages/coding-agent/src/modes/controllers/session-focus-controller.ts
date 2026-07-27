@@ -12,6 +12,7 @@
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID, type RegistryEvent } from "../../registry/agent-registry";
 import type { AgentSession } from "../../session/agent-session";
+import { setTerminalTitleState } from "../../utils/title-generator";
 import type { InteractiveModeContext } from "../types";
 
 export class SessionFocusController {
@@ -120,6 +121,8 @@ export class SessionFocusController {
 		if (target.isStreaming) {
 			await this.ctx.eventController.rehydrateActiveRun(target);
 			if (generation !== this.#focusGeneration) return;
+		} else {
+			setTerminalTitleState("idle");
 		}
 		if (generation !== this.#focusGeneration) return;
 		this.ctx.updateEditorBorderColor();

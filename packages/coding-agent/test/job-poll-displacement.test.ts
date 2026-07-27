@@ -425,6 +425,7 @@ describe("UiHelpers.renderSessionContext collapses repeated todo snapshots", () 
 		let helpers!: UiHelpers;
 		const ctx = {
 			chatContainer,
+			transcriptMessageComponents: new WeakMap(),
 			pendingTools: new Map(),
 			ui: { requestRender: vi.fn() },
 			statusLine: { invalidate: vi.fn() },
@@ -501,6 +502,7 @@ describe("UiHelpers.renderSessionContext collapses repeated todo snapshots", () 
 		let helpers!: UiHelpers;
 		const ctx = {
 			chatContainer,
+			transcriptMessageComponents: new WeakMap(),
 			pendingTools: new Map(),
 			ui: { requestRender: vi.fn() },
 			statusLine: { invalidate: vi.fn() },

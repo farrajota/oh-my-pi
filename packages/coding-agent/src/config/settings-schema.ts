@@ -2,6 +2,7 @@ import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
 import { DEFAULT_RELAY_URL } from "../collab/protocol";
+import { DEFAULT_LIVE_VOICE, LIVE_VOICE_OPTIONS, LIVE_VOICE_VALUES } from "../live/voices";
 import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS, STT_MODEL_VALUES } from "../stt/models";
 import { STT_SUBMIT_TRIGGER_OPTIONS, STT_SUBMIT_TRIGGER_VALUES } from "../stt/submit-trigger";
 import { AUTO_THINKING, getConfiguredThinkingLevelMetadata, getThinkingLevelMetadata } from "../thinking";
@@ -26,6 +27,7 @@ import {
 	TINY_TITLE_MODEL_OPTIONS,
 	TINY_TITLE_MODEL_VALUES,
 } from "../tiny/models";
+import { IMAGE_PROVIDER_CHOICES, type ImageProvider } from "../tools/image-providers";
 import {
 	DEFAULT_TTS_LOCAL_MODEL_KEY,
 	DEFAULT_TTS_VOICE,
@@ -35,7 +37,7 @@ import {
 	TTS_LOCAL_VOICE_VALUES,
 } from "../tts/models";
 import { EDIT_MODES } from "../utils/edit-mode";
-import { SEARCH_PROVIDER_OPTIONS, SEARCH_PROVIDER_PREFERENCES, type SearchProviderId } from "../web/search/types";
+import { SEARCH_PROVIDER_CHOICES, type SearchProviderId } from "../web/search/types";
 import {
 	SERVICE_TIER_ANTHROPIC_OPTIONS,
 	SERVICE_TIER_ANTHROPIC_VALUES,
@@ -140,6 +142,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Available Tools",
 		"Todos",
 		"Grep & Browser",
+		"Computer",
 		"GitHub",
 		"Output Limits",
 		"Execution",
@@ -209,6 +212,8 @@ interface UiNumber extends UiBase {
 }
 
 interface UiString extends UiBase {
+	/** Mask the value in both the settings row and text editor. */
+	secret?: boolean;
 	/**
 	 * Submenu options.
 	 *  - Array  → submenu with these choices.
@@ -218,43 +223,64 @@ interface UiString extends UiBase {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
 }
 
+interface UiArray extends UiBase {
+	/** Membership choices. Without options, an array setting has no UI representation (config-file only). */
+	options?: ReadonlyArray<SubmenuOption>;
+	/** Selection order is meaningful; the editor renders positions and supports reordering. */
+	ordered?: boolean;
+}
+
 /** Wide ui shape exposed to consumers that walk the schema generically. */
 export type AnyUiMetadata = UiBase & {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
+	secret?: boolean;
+	ordered?: boolean;
 };
 
-interface BooleanDef {
+/**
+ * Marks a setting whose value is a credential.
+ *
+ * Lives at the top level rather than inside `ui` so it can also describe a
+ * setting the settings panel never shows and therefore cannot carry
+ * `ui.secret`. Read it through `isCredential`, which is the single accessor
+ * both the CLI and the settings panel consult.
+ */
+interface CredentialMarker {
+	credential?: true;
+}
+
+interface BooleanDef extends CredentialMarker {
 	type: "boolean";
 	default: boolean | undefined;
 	ui?: UiBoolean;
 }
 
-interface StringDef {
+interface StringDef extends CredentialMarker {
 	type: "string";
 	default: string | undefined;
 	ui?: UiString;
 }
 
-interface NumberDef {
+interface NumberDef extends CredentialMarker {
 	type: "number";
 	default: number | undefined;
 	ui?: UiNumber;
 }
 
-interface EnumDef<T extends readonly string[]> {
+interface EnumDef<T extends readonly string[]> extends CredentialMarker {
 	type: "enum";
 	values: T;
 	default: T[number];
 	ui?: UiEnum<T>;
 }
 
-interface ArrayDef<T> {
+interface ArrayDef<T> extends CredentialMarker {
 	type: "array";
 	default: T[];
-	ui?: UiBase;
+	ui?: UiArray;
 }
 
-interface RecordDef<T> {
+interface RecordDef<T> extends CredentialMarker {
 	type: "record";
 	default: Record<string, T>;
 	ui?: UiBase;
@@ -367,7 +393,7 @@ export const SETTINGS_SCHEMA = {
 	// Env (`OMP_AUTH_BROKER_URL` / `OMP_AUTH_BROKER_TOKEN`) takes precedence so
 	// per-machine overrides remain trivial.
 	"auth.broker.url": { type: "string", default: undefined },
-	"auth.broker.token": { type: "string", default: undefined },
+	"auth.broker.token": { type: "string", default: undefined, credential: true },
 
 	autoResume: {
 		type: "boolean",
@@ -903,6 +929,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tui.titleState": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Terminal Title Run State",
+			description:
+				"Show the agent run state in the terminal title's separator — an animated spinner while working, '>' when it's your turn, '!' when the agent is waiting on you",
+		},
+	},
+
 	"tui.hyperlinks": {
 		type: "enum",
 		values: ["off", "auto", "always"] as const,
@@ -1187,6 +1225,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"workspace.additionalDirectories": {
+		type: "array",
+		default: [] as string[],
+		ui: {
+			tab: "context",
+			group: "General",
+			label: "Additional Workspace Dirs",
+			description:
+				"Extra workspace directories added to every session as additional roots (multi-root workspace). Managed live via /add-dir and /remove-dir. Paths resolve relative to cwd; absolute paths recommended. The agent is told these roots exist and can read/grep/glob them.",
+		},
+	},
+
 	personality: {
 		type: "enum",
 		values: ["default", "friendly", "pragmatic", "none"] as const,
@@ -1459,6 +1509,65 @@ export const SETTINGS_SCHEMA = {
 			description: "Allow retry recovery to switch to configured fallback models",
 		},
 	},
+	"retry.usageAwareFallback": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Usage-Aware Fallback",
+			description:
+				"Use reliable coding-plan quota reports to prefer same-provider accounts, then configured fallback models, before a hard usage limit. Ordinary configured API keys are excluded.",
+		},
+	},
+	"retry.usageReservePct": {
+		type: "number",
+		default: 10,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Reserve Margin",
+			description:
+				"Treat a coding-plan model as near its limit below this remaining percentage. Unknown or unmapped usage keeps the primary model.",
+			condition: "usageAwareFallbackEnabled",
+			options: [
+				{ value: "5", label: "5%", description: "Act only when nearly exhausted" },
+				{ value: "10", label: "10%", description: "Balanced safety margin" },
+				{ value: "15", label: "15%", description: "Conservative" },
+				{ value: "20", label: "20%", description: "Early protection" },
+				{ value: "25", label: "25%", description: "Very conservative" },
+			],
+		},
+	},
+	"retry.usageReservePolicy": {
+		type: "enum",
+		values: ["confirm", "auto", "fail-closed"] as const,
+		default: "confirm",
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Reserve Policy",
+			description: "What to do when every same-provider coding-plan account is inside the reserve margin.",
+			condition: "usageAwareFallbackEnabled",
+			options: [
+				{
+					value: "confirm",
+					label: "Confirm interactively",
+					description: "Keep interactive sessions on the primary until confirmed; background agents auto-fallback",
+				},
+				{
+					value: "auto",
+					label: "Auto-fallback",
+					description: "Always select the next eligible configured fallback",
+				},
+				{
+					value: "fail-closed",
+					label: "Fail closed",
+					description: "Do not spend reserve quota or select a fallback",
+				},
+			],
+		},
+	},
 	"retry.repeated.enabled": {
 		type: "boolean",
 		default: false,
@@ -1505,7 +1614,6 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
-
 	"retry.fallbackChains": {
 		type: "record",
 		default: {} as Record<string, string[]>,
@@ -1840,6 +1948,18 @@ export const SETTINGS_SCHEMA = {
 			group: "Notifications",
 			label: "Completion Notification",
 			description: "Notify when the agent finishes a turn",
+		},
+	},
+
+	"error.notify": {
+		type: "enum",
+		values: ["on", "off"] as const,
+		default: "off",
+		ui: {
+			tab: "interaction",
+			group: "Notifications",
+			label: "Error Notification",
+			description: "Notify when the agent stops with an error",
 		},
 	},
 
@@ -2518,9 +2638,8 @@ export const SETTINGS_SCHEMA = {
 	"memories.summaryInjectionTokenLimit": { type: "number", default: 5000 },
 
 	// Memory backend selector — picks between local memories pipeline,
-	// Mnemopi local SQLite, Hindsight remote memory, or off. Legacy
-	// `memories.enabled` keeps gating the local backend; see config/settings.ts
-	// migration for details.
+	// Mnemopi local SQLite, Hindsight remote memory, or off. The legacy
+	// `memories.enabled` flag is migration input only; see config/settings.ts.
 	"memory.backend": {
 		type: "enum",
 		values: ["off", "local", "hindsight", "mnemopi"] as const,
@@ -2742,6 +2861,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"mnemopi.embeddingApiKey": {
 		type: "string",
+		credential: true,
 		default: undefined,
 		ui: {
 			tab: "memory",
@@ -2786,6 +2906,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"mnemopi.llmApiKey": {
 		type: "string",
+		credential: true,
 		default: undefined,
 		ui: {
 			tab: "memory",
@@ -2826,7 +2947,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"hindsight.apiToken": { type: "string", default: undefined },
+	"hindsight.apiToken": {
+		type: "string",
+		credential: true,
+		default: undefined,
+		ui: {
+			tab: "memory",
+			group: "Hindsight",
+			label: "Hindsight API Token",
+			description: "Bearer token for authenticated Hindsight servers",
+			condition: "hindsightActive",
+		},
+	},
 
 	"hindsight.bankId": {
 		type: "string",
@@ -2933,6 +3065,11 @@ export const SETTINGS_SCHEMA = {
 	"hindsight.recallTypes": { type: "array", default: HINDSIGHT_RECALL_TYPES_DEFAULT },
 
 	"hindsight.debug": { type: "boolean", default: false },
+
+	"hindsight.requestTimeoutMs": { type: "number", default: 30_000 },
+	"hindsight.reflectTimeoutMs": { type: "number", default: 120_000 },
+	"hindsight.recallTimeoutMs": { type: "number", default: 30_000 },
+	"hindsight.retainTimeoutMs": { type: "number", default: 60_000 },
 
 	"hindsight.mentalModelsEnabled": {
 		type: "boolean",
@@ -3162,6 +3299,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"read.renderMarkdown": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "files",
+			group: "Reading",
+			label: "Markdown Previews",
+			description: "Render Markdown read results as formatted terminal Markdown previews instead of raw source",
+		},
+	},
+
 	"read.summarize.enabled": {
 		type: "boolean",
 		default: true,
@@ -3341,6 +3489,17 @@ export const SETTINGS_SCHEMA = {
 			description: "Automatically background long-running bash commands and deliver the result later",
 		},
 	},
+	"bash.patterns": {
+		type: "array",
+		default: [],
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "Bash Approval Patterns",
+			description:
+				"Ordered bash command approval rules. Each item has match and approval fields; only '*' wildcards are supported.",
+		},
+	},
 
 	// Bash interceptor
 	"bashInterceptor.enabled": {
@@ -3355,6 +3514,29 @@ export const SETTINGS_SCHEMA = {
 	},
 	"bashInterceptor.patterns": { type: "array", default: DEFAULT_BASH_INTERCEPTOR_RULES },
 
+	"bash.direnv": {
+		type: "enum",
+		values: ["auto", "off"] as const,
+		default: "auto",
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "direnv Auto-Load",
+			description:
+				"Auto-load a repo's direnv/devenv `.envrc` into the bash session so devenv tools and env vars are present without manual `direnv exec`. Honors direnv's allow list: an `.envrc` you haven't `direnv allow`ed is never executed",
+		},
+	},
+	"bash.direnvLoadTimeoutMs": {
+		type: "number",
+		default: 30_000,
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "direnv Load Timeout (ms)",
+			description:
+				"Max wait for the first `direnv export` (a cold devenv shell can be slow); on timeout the session runs without the direnv env",
+		},
+	},
 	// Shell output minimizer
 	"shellMinimizer.enabled": {
 		type: "boolean",
@@ -3736,6 +3918,85 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"computer.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			group: "Available Tools",
+			label: "Computer",
+			description: "Enable native host-desktop screenshots and input for OpenAI computer use",
+		},
+	},
+
+	"computer.backend": {
+		type: "enum",
+		values: ["auto", "native"] as const,
+		default: "auto",
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Computer Backend",
+			description: "Select automatic or explicit platform-native desktop capture and input",
+			options: [
+				{ value: "auto", label: "Auto" },
+				{ value: "native", label: "Native" },
+			],
+		},
+	},
+
+	"computer.display": {
+		type: "string",
+		default: "all",
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Computer Display",
+			description: "Composite all displays or select a native display id",
+		},
+	},
+
+	"computer.maxWidth": {
+		type: "number",
+		default: 1920,
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Computer Screenshot Width",
+			description: "Maximum composite screenshot width in pixels",
+		},
+	},
+
+	"computer.maxHeight": {
+		type: "number",
+		default: 1200,
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Computer Screenshot Height",
+			description: "Maximum composite screenshot height in pixels",
+		},
+	},
+
+	"inspect_image.timeoutMs": {
+		type: "number",
+		default: 300_000,
+		ui: {
+			tab: "tools",
+			group: "Execution",
+			label: "Inspect Image Timeout",
+			description:
+				"Per-request timeout for the inspect_image vision-model call, in milliseconds. A stalled provider fails fast with a timeout error instead of blocking until manual abort. Set to 0 to disable the timeout.",
+			options: [
+				{ value: "0", label: "Disabled" },
+				{ value: "60000", label: "1 minute" },
+				{ value: "120000", label: "2 minutes" },
+				{ value: "180000", label: "3 minutes" },
+				{ value: "300000", label: "5 minutes" },
+			],
+		},
+	},
+
 	"checkpoint.enabled": {
 		type: "boolean",
 		default: false,
@@ -4001,6 +4262,40 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tools.xdevDocs": {
+		type: "enum",
+		values: ["inline", "builtins", "catalog"] as const,
+		default: "builtins",
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "xd:// Prompt Docs",
+			description:
+				"Choose which mounted-device docs and schemas are inlined in the system prompt. Built-ins keeps core tools inline while MCP and extension tools stay on-demand.",
+			options: [
+				{ value: "inline", label: "All Devices", description: "Inline docs and schemas for every mounted device." },
+				{
+					value: "builtins",
+					label: "Built-ins Only",
+					description: "Inline built-in docs; fetch MCP and extension docs on demand.",
+				},
+				{ value: "catalog", label: "Catalog Only", description: "List every device; fetch all docs on demand." },
+			],
+		},
+	},
+
+	"tools.xdevInlineDevices": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "xd:// Inline Devices",
+			description:
+				"When xd:// Prompt Docs is Built-ins Only, inline dynamic devices whose names match these glob patterns (for example mcp__context_mode_*). Catalog Only ignores this setting.",
+		},
+	},
+
 	// MCP
 	"mcp.enableProjectConfig": {
 		type: "boolean",
@@ -4010,6 +4305,17 @@ export const SETTINGS_SCHEMA = {
 			group: "Discovery & MCP",
 			label: "MCP Project Config",
 			description: "Load .mcp.json/mcp.json from project root",
+		},
+	},
+
+	"mcp.renderMarkdownResults": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "MCP Markdown Results",
+			description: "Render non-JSON MCP text results as Markdown in the transcript",
 		},
 	},
 
@@ -4157,6 +4463,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.isolation.apply": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Isolation",
+			label: "Apply Isolated Changes",
+			description:
+				"Automatically apply successful isolated task changes to the parent checkout; disable to retain patch or branch artifacts",
+		},
+	},
+
 	"task.isolation.merge": {
 		type: "enum",
 		values: ["patch", "branch"] as const,
@@ -4226,7 +4544,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Subagents",
 			label: "Batch Task Calls",
 			description:
-				"Switch the task tool to its batch shape: one call carries { agent, context, tasks[] } — one subagent per item (with per-item isolation) and a required shared context prepended to every assignment. With async.enabled=true, each spawn runs as an independent background agent with the normal idle/parked lifecycle; otherwise the call blocks for merged results. Disable to restore the flat single-spawn schema.",
+				"Switch the task tool to its batch shape: one call carries { context, tasks[] } — one subagent per item, with an optional per-item agent (defaulting to the session spawn-policy agent), per-item isolation, and a required shared context prepended to every assignment. With async.enabled=true, each spawn runs as an independent background agent with the normal idle/parked lifecycle; otherwise the call blocks for merged results. Disable to restore the flat single-spawn schema.",
 		},
 	},
 
@@ -4538,7 +4856,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "providers",
 			group: "Privacy",
 			label: "Hide Secrets",
-			description: "Obfuscate secrets before sending to AI providers",
+			description: "Obfuscate configured secrets and redact credential-shaped tokens before sending to AI providers",
 		},
 	},
 
@@ -4554,16 +4872,17 @@ export const SETTINGS_SCHEMA = {
 				"Maximum concurrent Ollama Cloud subagent runs per process; 0 disables the provider-specific limit",
 		},
 	},
-	"providers.webSearch": {
-		type: "enum",
-		values: SEARCH_PROVIDER_PREFERENCES,
-		default: "auto",
+	"providers.webSearchOrder": {
+		type: "array",
+		default: [] as SearchProviderId[],
 		ui: {
 			tab: "providers",
 			group: "Services",
-			label: "Web Search Provider",
-			description: "Preferred provider for the web_search tool",
-			options: SEARCH_PROVIDER_OPTIONS,
+			label: "Web Search Provider Order",
+			description:
+				"Prioritized providers for the web_search tool; unlisted providers retain their default order afterward",
+			options: SEARCH_PROVIDER_CHOICES,
+			ordered: true,
 		},
 	},
 	"providers.webSearchExclude": {
@@ -4574,6 +4893,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Services",
 			label: "Excluded Web Search Providers",
 			description: "Providers that web_search should never use, even as fallbacks",
+			options: SEARCH_PROVIDER_CHOICES,
 		},
 	},
 	"providers.webSearchGeminiModel": {
@@ -4614,46 +4934,17 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
-	"providers.image": {
-		type: "enum",
-		values: ["auto", "openai", "openai-codex", "antigravity", "xai", "gemini", "openrouter"] as const,
-		default: "auto",
+	"providers.imageOrder": {
+		type: "array",
+		default: [] as ImageProvider[],
 		ui: {
 			tab: "providers",
 			group: "Services",
-			label: "Image Provider",
-			description: "Preferred provider for image generation",
-			options: [
-				{
-					value: "auto",
-					label: "Auto",
-					description:
-						"Priority: per-request provider > configured provider > active session provider > GPT model image tool > Codex subscription > Antigravity > xAI > OpenRouter > Gemini",
-				},
-				{
-					value: "openai",
-					label: "OpenAI",
-					description:
-						"OPENAI_API_KEY (gpt-image-2) or active GPT model; falls back to a connected Codex subscription",
-				},
-				{
-					value: "openai-codex",
-					label: "OpenAI Codex (ChatGPT)",
-					description: "Uses a connected Codex / ChatGPT subscription — no OPENAI_API_KEY needed",
-				},
-				{
-					value: "antigravity",
-					label: "Antigravity",
-					description: "Requires google-antigravity OAuth",
-				},
-				{
-					value: "xai",
-					label: "xAI Grok Imagine",
-					description: "Requires xAI Grok OAuth or XAI_API_KEY",
-				},
-				{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
-				{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
-			],
+			label: "Image Provider Order",
+			description:
+				"Prioritized providers for image generation; unlisted providers follow the active session provider and the built-in order",
+			options: IMAGE_PROVIDER_CHOICES,
+			ordered: true,
 		},
 	},
 	"providers.fireworksTier": {
@@ -4674,6 +4965,18 @@ export const SETTINGS_SCHEMA = {
 					description: "Priority serving path: higher reliability, premium per-token pricing",
 				},
 			],
+		},
+	},
+	"live.voice": {
+		type: "enum",
+		values: LIVE_VOICE_VALUES,
+		default: DEFAULT_LIVE_VOICE,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Live Voice",
+			description: "Voice used by Codex-backed realtime voice sessions",
+			options: LIVE_VOICE_OPTIONS,
 		},
 	},
 	"providers.tts": {
@@ -5113,6 +5416,7 @@ export const SETTINGS_SCHEMA = {
 	"searxng.token": {
 		type: "string",
 		default: undefined,
+		credential: true,
 	},
 
 	"searxng.basicUsername": {
@@ -5123,9 +5427,15 @@ export const SETTINGS_SCHEMA = {
 	"searxng.basicPassword": {
 		type: "string",
 		default: undefined,
+		credential: true,
 	},
 
 	"searxng.categories": {
+		type: "string",
+		default: undefined,
+	},
+
+	"searxng.engines": {
 		type: "string",
 		default: undefined,
 	},
@@ -5149,12 +5459,13 @@ export const SETTINGS_SCHEMA = {
 
 	"dev.autoqa": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "tools",
 			group: "Developer",
 			label: "Auto QA",
-			description: "Enable automated tool issue reporting (report_tool_issue) for all agents",
+			description:
+				"Automated tool issue reporting (xd://report_issue). On by default; the first report asks for consent, and denying it disables reporting until re-enabled explicitly",
 		},
 	},
 
@@ -5172,6 +5483,7 @@ export const SETTINGS_SCHEMA = {
 	"dev.autoqaPush.token": {
 		type: "string",
 		default: undefined,
+		credential: true,
 	},
 
 	/**
@@ -5256,6 +5568,20 @@ export function getDefault<P extends SettingPath>(path: P): SettingValue<P> {
 /** Check if a path has UI metadata (should appear in settings panel) */
 export function hasUi(path: SettingPath): boolean {
 	return "ui" in SETTINGS_SCHEMA[path];
+}
+
+/**
+ * Whether a setting holds a credential and must never be printed or exported
+ * without an explicit request. Drives both CLI redaction and settings-panel
+ * masking, so the two cannot disagree.
+ */
+export function isCredential(path: SettingPath): boolean {
+	const def = SETTINGS_SCHEMA[path];
+	if ("credential" in def && def.credential === true) return true;
+	// `ui.secret` predates this marker and still means "never display". Reading
+	// both here keeps ONE accessor, so the two spellings cannot produce
+	// different behaviour on different surfaces.
+	return getUi(path)?.secret === true;
 }
 
 /** Get UI metadata for a path (undefined if no UI) */
@@ -5345,6 +5671,9 @@ export interface RetrySettings {
 	"repeated.enabled": boolean;
 	"repeated.timerMs": number;
 	"repeated.timeoutMs": number;
+	usageAwareFallback: boolean;
+	usageReservePct: number;
+	usageReservePolicy: "confirm" | "auto" | "fail-closed";
 }
 
 export interface MemoriesSettings {

@@ -7,6 +7,7 @@ import {
 import { Effort, THINKING_EFFORTS } from "../effort";
 import { FIREWORKS_FAST_SUFFIX, toFireworksPublicModelId } from "../fireworks-model-id";
 import {
+	anthropicModelSupportsThinking,
 	isGlmVisionModelId,
 	isGrokReasoningEffortCapable,
 	isKimiK3ModelId,
@@ -17,6 +18,7 @@ import type { ModelManagerOptions } from "../model-manager";
 import { getBundledModels } from "../models";
 import type { Api, FetchImpl, Model, ModelSpec, OpenAICompat, Provider, ThinkingConfig } from "../types";
 import { discoveryFetch, isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber } from "../utils";
+import { ALIBABA_TOKEN_PLAN_BASE_URL, parseAlibabaTokenPlanCredential } from "../wire/alibaba-token-plan";
 import { coreWeaveProjectHeaders } from "../wire/coreweave";
 import {
 	COPILOT_API_HEADERS,
@@ -25,6 +27,7 @@ import {
 	parseGitHubCopilotApiKey,
 } from "../wire/github-copilot";
 import { createBundledReferenceMap, createReferenceResolver, toModelSpec } from "./bundled-references";
+import { getDefaultModelDiscoveryBaseUrl, resolveModelCacheProviderId } from "./cache-provider-id";
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
 
@@ -1824,7 +1827,9 @@ export function fireworksModelManagerOptions(
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? "https://api.fireworks.ai/inference/v1";
-	const bundledReferences = createReferenceResolver(createBundledReferenceMap<"openai-completions">("fireworks"));
+	const bundledReferences = createReferenceResolver(() =>
+		createBundledReferenceMap<"openai-completions">("fireworks"),
+	);
 	return {
 		providerId: "fireworks",
 		...(apiKey && {
@@ -2061,28 +2066,19 @@ function openCodeBaseUrlForApi(api: Api, basePath: string): string {
 	return api === "anthropic-messages" ? basePath : `${basePath}/v1`;
 }
 
-function openCodeModelCacheProviderId(
-	providerId: "opencode-go" | "opencode-zen",
-	apiKey: string | undefined,
-	discoveryBaseUrl: string,
-): string {
-	// OpenCode catalogs are entitlement-scoped; isolate authoritative rows by credential and endpoint.
-	const scope = `${apiKey ?? ""}\u0000${discoveryBaseUrl}`;
-	return `${providerId}:models-v1:${Bun.hash(scope).toString(36)}`;
-}
-
 function openCodeModelManagerOptions(
 	providerId: "opencode-go" | "opencode-zen",
-	defaultBasePath: string,
 	config?: OpenCodeModelManagerConfig,
 ): ModelManagerOptions<Api> {
 	const apiKey = config?.apiKey;
+	const defaultBaseUrl = getDefaultModelDiscoveryBaseUrl(providerId)!;
+	const defaultBasePath = defaultBaseUrl.endsWith("/v1") ? defaultBaseUrl.slice(0, -3) : defaultBaseUrl;
 	const basePath = normalizeOpenCodeBasePath(config?.baseUrl, defaultBasePath);
 	const discoveryBaseUrl = openCodeBaseUrlForApi("openai-completions", basePath);
 	const references = createBundledReferenceMap<Api>(providerId);
 	return {
 		providerId,
-		cacheProviderId: openCodeModelCacheProviderId(providerId, apiKey, discoveryBaseUrl),
+		cacheProviderId: resolveModelCacheProviderId(providerId, { apiKey, baseUrl: discoveryBaseUrl }),
 		dynamicModelsAuthoritative: true,
 		...(apiKey && {
 			fetchDynamicModels: () =>
@@ -2116,11 +2112,11 @@ function openCodeModelManagerOptions(
 }
 
 export function opencodeZenModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
-	return openCodeModelManagerOptions("opencode-zen", "https://opencode.ai/zen", config);
+	return openCodeModelManagerOptions("opencode-zen", config);
 }
 
 export function opencodeGoModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
-	return openCodeModelManagerOptions("opencode-go", "https://opencode.ai/zen/go", config);
+	return openCodeModelManagerOptions("opencode-go", config);
 }
 
 // ---------------------------------------------------------------------------
@@ -2207,7 +2203,7 @@ export function openrouterModelManagerOptions(
 		// Older builds cached OpenRouter discovery rows as `api: "openai-completions"`.
 		// Namespace the refreshed pseudo-API cache separately so those rows cannot
 		// override bundled `api: "openrouter"` models during online-if-uncached startup.
-		cacheProviderId: "openrouter:pseudo-api",
+		cacheProviderId: resolveModelCacheProviderId("openrouter"),
 		fetchDynamicModels: () =>
 			fetchOpenAICompatibleModels({
 				api: "openrouter",
@@ -2430,6 +2426,167 @@ export function alibabaCodingPlanModelManagerOptions(
 }
 
 // ---------------------------------------------------------------------------
+// Alibaba Token Plan
+// ---------------------------------------------------------------------------
+
+export { ALIBABA_TOKEN_PLAN_BASE_URL };
+
+const ALIBABA_TOKEN_PLAN_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
+const ALIBABA_TOKEN_PLAN_COMPAT: OpenAICompat = {
+	supportsDeveloperRole: false,
+};
+const ALIBABA_TOKEN_PLAN_REASONING: ThinkingConfig = {
+	mode: "effort",
+	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
+};
+
+export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-completions">[] = [
+	{
+		id: "qwen3.8-max-preview",
+		name: "Qwen3.8 Max Preview",
+		api: "openai-completions",
+		provider: "alibaba-token-plan",
+		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: ALIBABA_TOKEN_PLAN_COST,
+		contextWindow: 983_616,
+		maxTokens: 131_072,
+		thinking: {
+			mode: "effort",
+			efforts: [Effort.Low, Effort.High, Effort.XHigh],
+			requiresEffort: true,
+		},
+		compat: {
+			...ALIBABA_TOKEN_PLAN_COMPAT,
+			supportsReasoningEffort: true,
+		},
+	},
+	{
+		id: "qwen3.7-max",
+		name: "Qwen3.7 Max",
+		api: "openai-completions",
+		provider: "alibaba-token-plan",
+		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
+		reasoning: true,
+		input: ["text"],
+		cost: ALIBABA_TOKEN_PLAN_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		thinking: ALIBABA_TOKEN_PLAN_REASONING,
+		compat: ALIBABA_TOKEN_PLAN_COMPAT,
+	},
+	{
+		id: "qwen3.7-plus",
+		name: "Qwen3.7 Plus",
+		api: "openai-completions",
+		provider: "alibaba-token-plan",
+		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: ALIBABA_TOKEN_PLAN_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 64_000,
+		thinking: ALIBABA_TOKEN_PLAN_REASONING,
+		compat: ALIBABA_TOKEN_PLAN_COMPAT,
+	},
+	{
+		id: "qwen3.6-flash",
+		name: "Qwen3.6 Flash",
+		api: "openai-completions",
+		provider: "alibaba-token-plan",
+		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: ALIBABA_TOKEN_PLAN_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		thinking: ALIBABA_TOKEN_PLAN_REASONING,
+		compat: ALIBABA_TOKEN_PLAN_COMPAT,
+	},
+	{
+		id: "glm-5.2",
+		name: "GLM-5.2",
+		api: "openai-completions",
+		provider: "alibaba-token-plan",
+		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
+		reasoning: true,
+		input: ["text"],
+		cost: ALIBABA_TOKEN_PLAN_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+		thinking: {
+			mode: "effort",
+			efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.Max],
+		},
+		compat: ALIBABA_TOKEN_PLAN_COMPAT,
+	},
+	{
+		id: "deepseek-v4-pro",
+		name: "DeepSeek V4 Pro",
+		api: "openai-completions",
+		provider: "alibaba-token-plan",
+		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
+		reasoning: true,
+		input: ["text"],
+		cost: ALIBABA_TOKEN_PLAN_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+		thinking: {
+			mode: "effort",
+			efforts: [Effort.High, Effort.Max],
+		},
+		compat: ALIBABA_TOKEN_PLAN_COMPAT,
+	},
+];
+
+export interface AlibabaTokenPlanModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+}
+
+export function alibabaTokenPlanModelManagerOptions(
+	config?: AlibabaTokenPlanModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const credential = config?.apiKey ? parseAlibabaTokenPlanCredential(config.apiKey) : undefined;
+	const apiKey = credential?.token;
+	// A region-locked credential (China/custom) dictates the discovery endpoint:
+	// its key only authenticates against its own region, so fetching /models from
+	// any other base URL would 401 (#6682).
+	const baseUrl = credential?.baseUrl ?? config?.baseUrl ?? ALIBABA_TOKEN_PLAN_BASE_URL;
+	return {
+		providerId: "alibaba-token-plan",
+		dynamicModelsAuthoritative: true,
+		staticModels: ALIBABA_TOKEN_PLAN_STATIC_MODELS,
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-completions",
+					provider: "alibaba-token-plan",
+					baseUrl,
+					apiKey,
+					filterModel: (_entry, model) =>
+						ALIBABA_TOKEN_PLAN_STATIC_MODELS.some(reference => reference.id === model.id),
+					mapModel: (_entry, defaults) => {
+						const reference = ALIBABA_TOKEN_PLAN_STATIC_MODELS.find(model => model.id === defaults.id);
+						return reference
+							? {
+									...reference,
+									id: defaults.id,
+									api: defaults.api,
+									provider: defaults.provider,
+									baseUrl: defaults.baseUrl,
+								}
+							: defaults;
+					},
+					fetch: config?.fetch,
+				}),
+		}),
+	};
+}
+
+// ---------------------------------------------------------------------------
 // 11. Vercel AI Gateway
 // ---------------------------------------------------------------------------
 
@@ -2544,6 +2701,34 @@ function mapKimiApiFormat(protocol: unknown): OpenAICompat["kimiApiFormat"] {
 	return undefined;
 }
 
+/**
+ * Kimi Code output ceilings by model family. The `/coding/v1/models` discovery
+ * envelope carries no output-limit field, so the mapper supplies the documented
+ * per-family caps instead of a blanket constant. Values match models.dev's
+ * `kimi-for-coding` and `moonshotai` kimi-k3 entries. See #6711.
+ */
+export const KIMI_CODE_K3_MAX_TOKENS = 131_072;
+export const KIMI_CODE_FOR_CODING_MAX_TOKENS = 32_768;
+
+/** Fallback output cap for Kimi Code families without a documented ceiling (legacy K2 discovery rows). */
+export const KIMI_CODE_DEFAULT_MAX_TOKENS = 32_000;
+
+/**
+ * Resolve a Kimi Code model's output ceiling from its id: `k3` / `k3-256k` ->
+ * 131072, `kimi-for-coding[-highspeed]` -> 32768, everything else -> `fallback`.
+ */
+export function kimiCodeMaxTokens(modelId: string, fallback?: number): number;
+export function kimiCodeMaxTokens(modelId: string, fallback: number | null): number | null;
+export function kimiCodeMaxTokens(
+	modelId: string,
+	fallback: number | null = KIMI_CODE_DEFAULT_MAX_TOKENS,
+): number | null {
+	const id = modelId.toLowerCase();
+	if (id.startsWith("k3")) return KIMI_CODE_K3_MAX_TOKENS;
+	if (id.startsWith("kimi-for-coding")) return KIMI_CODE_FOR_CODING_MAX_TOKENS;
+	return fallback;
+}
+
 export function kimiCodeModelManagerOptions(
 	config?: KimiCodeModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
@@ -2576,7 +2761,7 @@ export function kimiCodeModelManagerOptions(
 							reasoning,
 							input: entry.supports_image_in === true || id.includes("k2.5") ? ["text", "image"] : ["text"],
 							contextWindow: typeof entry.context_length === "number" ? entry.context_length : 262144,
-							maxTokens: 32000,
+							maxTokens: kimiCodeMaxTokens(id),
 							thinking,
 							compat: {
 								thinkingFormat: thinking ? "kimi" : "zai",
@@ -2631,7 +2816,16 @@ function getLmStudioNativeInput(entry: Record<string, unknown>): ("text" | "imag
 }
 
 function getLmStudioNativeContextWindow(entry: Record<string, unknown>): number | undefined {
+	// LM Studio serves `loaded_context_length` (the window the running instance
+	// actually accepts) alongside `max_context_length` (the architectural
+	// ceiling). A model is routinely loaded below its maximum — the user picks a
+	// smaller window, or MLX context auto-fit shrinks it to fit unified memory —
+	// so prefer what the runtime serves, matching the Ollama/llama.cpp rule from
+	// #3754. Unloaded models report `loaded_context_length: null` and fall
+	// through to the max/train chain unchanged.
+	const loadedContextWindow = entry.state === "loaded" ? toPositiveNumber(entry.loaded_context_length, null) : null;
 	return (
+		loadedContextWindow ??
 		toPositiveNumber(entry.max_context_length, null) ??
 		toPositiveNumber(entry.context_length, null) ??
 		toPositiveNumber(entry.max_model_len, null) ??
@@ -2949,6 +3143,50 @@ export function coreWeaveModelManagerOptions(
 		...config,
 		headers: () => coreWeaveProjectHeaders(Bun.env),
 	});
+}
+
+// ---------------------------------------------------------------------------
+// 15.75 Meta Model API
+// ---------------------------------------------------------------------------
+
+const META_MODEL_API_BASE_URL = "https://api.meta.ai/v1";
+const META_MUSE_SPARK_COST = { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 } as const;
+const META_MUSE_SPARK_THINKING: ThinkingConfig = {
+	mode: "effort",
+	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+};
+
+export const META_MUSE_STATIC_MODELS: readonly ModelSpec<"openai-responses">[] = [
+	{
+		id: "muse-spark-1.1",
+		name: "Muse Spark 1.1",
+		api: "openai-responses",
+		provider: "meta",
+		baseUrl: META_MODEL_API_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: META_MUSE_SPARK_COST,
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		thinking: META_MUSE_SPARK_THINKING,
+		compat: {
+			supportsReasoningEffort: true,
+			includeEncryptedReasoning: true,
+		},
+	},
+];
+
+export interface MetaModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+}
+
+export function metaModelManagerOptions(config?: MetaModelManagerConfig): ModelManagerOptions<"openai-responses"> {
+	return {
+		...createSimpleOpenAIResponsesOptions("meta", META_MODEL_API_BASE_URL, config),
+		staticModels: META_MUSE_STATIC_MODELS,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -3752,7 +3990,7 @@ export function litellmModelManagerOptions(
 	config?: LiteLLMModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? Bun.env.LITELLM_BASE_URL ?? "http://localhost:4000/v1";
+	const baseUrl = config?.baseUrl ?? getDefaultModelDiscoveryBaseUrl("litellm")!;
 	return {
 		providerId: "litellm",
 		// rich-v5 invalidates rows cached before rich metadata pricing was mapped.
@@ -3761,7 +3999,7 @@ export function litellmModelManagerOptions(
 		// and filtered placeholder-only `all-team-models` rows. Bump the version
 		// whenever the mappers below change, or warm authoritative caches keep
 		// serving pre-change rows for the full TTL.
-		cacheProviderId: `litellm:rich-v5:${Bun.hash(baseUrl).toString(36)}`,
+		cacheProviderId: resolveModelCacheProviderId("litellm", { baseUrl }),
 		// litellm is a local-only proxy and is never bundled in models.json (that
 		// would leak the machine's localhost catalog). Prefer the proxy's richer
 		// management metadata, then enrich ids against models.dev with the bundled
@@ -3808,11 +4046,11 @@ export interface VllmModelManagerConfig {
 
 export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "http://127.0.0.1:8000/v1";
+	const baseUrl = config?.baseUrl ?? getDefaultModelDiscoveryBaseUrl("vllm")!;
 	const references = createBundledReferenceMap<"openai-completions">("vllm" as Parameters<typeof getBundledModels>[0]);
 	return {
 		providerId: "vllm",
-		cacheProviderId: `vllm:${Bun.hash(baseUrl).toString(36)}`,
+		cacheProviderId: resolveModelCacheProviderId("vllm", { baseUrl }),
 		fetchDynamicModels: () =>
 			fetchOpenAICompatibleModels({
 				api: "openai-completions",
@@ -3847,7 +4085,7 @@ export function nanoGptModelManagerOptions(
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? "https://nano-gpt.com/api/v1";
-	const resolveReference = createReferenceResolver(
+	const resolveReference = createReferenceResolver(() =>
 		createBundledReferenceMap<"openai-completions">("nanogpt" as Parameters<typeof getBundledModels>[0]),
 	);
 	return {
@@ -4062,11 +4300,19 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 			: parsedApiKey?.enterpriseUrl && configuredBaseUrl.includes("githubcopilot.com")
 				? getGitHubCopilotBaseUrl(parsedApiKey.enterpriseUrl)
 				: configuredBaseUrl;
-	const providerRefs = createBundledReferenceMap<Api>("github-copilot");
-	const resolveReference = createReferenceResolver(providerRefs);
+	let providerReferences: Map<string, ModelSpec<Api>> | undefined;
+	const getProviderReferences = () => (providerReferences ??= createBundledReferenceMap<Api>("github-copilot"));
+	const resolveReference = createReferenceResolver(getProviderReferences);
 	return {
 		providerId: "github-copilot",
 		dropCachedModelIdsOnStaticMismatch: COPILOT_CACHE_INVALIDATED_MODEL_IDS,
+		// COPILOT_API_HEADERS are compile-time constants (User-Agent + API
+		// version), not credentials. The cache omits all request headers for
+		// safety and can only restore them from a bundled static entry — so a
+		// Copilot model with no bundled reference (e.g. a freshly served
+		// claude-opus-5 and its synthesized -1m sibling) is dropped on offline
+		// reads. Declaring the constant lets the cache restore it by value.
+		restorableHeaderFallback: { ...COPILOT_API_HEADERS },
 		...(apiKey && {
 			fetchDynamicModels: async () => {
 				const longContextVariants: ModelSpec<Api>[] = [];
@@ -4145,7 +4391,10 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 									input,
 									contextWindow: defaultTierWindow,
 									maxTokens,
-									headers: { ...COPILOT_API_HEADERS, ...(providerRefs.get(defaults.id)?.headers ?? {}) },
+									headers: {
+										...COPILOT_API_HEADERS,
+										...(getProviderReferences().get(defaults.id)?.headers ?? {}),
+									},
 									...(api === "openai-completions"
 										? {
 												compat: {
@@ -4165,6 +4414,17 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 									contextWindow: defaultTierWindow,
 									maxTokens,
 									headers: { ...COPILOT_API_HEADERS },
+									// Copilot's `/models` advertises no reasoning bit, so a
+									// thinking-capable Claude with no bundled reference would
+									// fall back to `reasoning: false` and lose its effort dial.
+									// Gate on the id classifier (not the transport alone) so a
+									// lagging enterprise catalog serving a pre-thinking Claude
+									// (<= 3.5) over the Messages proxy is not handed a fabricated
+									// dial it would reject; a modern reference-less model (e.g.
+									// claude-opus-5) is marked so `buildModel` derives the ladder.
+									...(api === "anthropic-messages" && anthropicModelSupportsThinking(defaults.id)
+										? { reasoning: true }
+										: {}),
 									...(api === "openai-completions"
 										? {
 												compat: {
@@ -4224,7 +4484,12 @@ export function anthropicModelManagerOptions(
 	config?: AnthropicModelManagerConfig,
 ): ModelManagerOptions<"anthropic-messages"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? ANTHROPIC_BASE_URL;
+	// The registry derives `config.baseUrl` from an existing bundled model, and
+	// bundled Anthropic rows use both `https://api.anthropic.com` and `.../v1`.
+	// Discovery must always hit `/v1/models`, so the `/v1` suffix is enforced on
+	// the discovery URL while model rows keep the provider base (#6563).
+	const baseUrl = normalizeAnthropicBaseUrl(config?.baseUrl, ANTHROPIC_BASE_URL);
+	const discoveryBaseUrl = toAnthropicDiscoveryBaseUrl(baseUrl);
 	return {
 		providerId: "anthropic",
 		modelsDev: {
@@ -4241,7 +4506,7 @@ export function anthropicModelManagerOptions(
 					fetchOpenAICompatibleModels({
 						api: "anthropic-messages",
 						provider: "anthropic",
-						baseUrl,
+						baseUrl: discoveryBaseUrl,
 						headers: buildAnthropicDiscoveryHeaders(apiKey),
 						mapModel: (
 							entry: OpenAICompatibleModelRecord,
@@ -4254,6 +4519,7 @@ export function anthropicModelManagerOptions(
 								return {
 									...defaults,
 									name: discoveredName,
+									baseUrl,
 								};
 							}
 							return {

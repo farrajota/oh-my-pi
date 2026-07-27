@@ -2,7 +2,7 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 import { type BaseType, type } from "arktype";
 import type { AgentSessionEvent } from "../session/agent-session";
-import type { ConfiguredThinkingLevel } from "../thinking";
+import type { ConfiguredThinkingLevel, TaskEffort } from "../thinking";
 import type { TaskPermissionRequest } from "./permission-profiles";
 import type { TaskToolProfileName } from "./tool-profiles";
 import type { NestedRepoPatch } from "./worktree";
@@ -111,6 +111,8 @@ const TASK_TOOL_PROFILE_SCHEMA = "'none' | 'inspect' | 'review' | 'edit' | 'plan
 
 // Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
 const outputSchemaInputSchema = type("object | boolean | string | null");
+// Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
+const effortRule = '"lo" | "med" | "hi"' as const;
 
 const taskPermissionSchema = type({
 	"profiles?": "string[]",
@@ -157,6 +159,7 @@ function createTaskItemSchema(options: {
 		"name?": "string",
 		agent: taskAgentSchemaRule(options.defaultAgent ?? "task"),
 		task: "string",
+		"effort?": effortRule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
@@ -187,6 +190,7 @@ function createTaskSchema(options: {
 		"name?": "string",
 		agent: taskAgentSchemaRule(options.defaultAgent ?? "task"),
 		task: "string",
+		"effort?": effortRule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
@@ -231,6 +235,8 @@ export interface TaskItem {
 	permissions?: TaskPermissionRequest;
 	/** Least-privilege tool-profile shorthand for this spawn. */
 	toolProfile?: TaskToolProfileName;
+	/** Per-spawn thinking effort: lowest/middle/highest level the resolved model supports. Overrides the agent's default selector (e.g. `auto`). */
+	effort?: TaskEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
@@ -243,6 +249,7 @@ export const taskSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	"effort?": effortRule,
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"isolated?": "boolean",
@@ -253,6 +260,7 @@ const taskSchemaNoIsolation = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	"effort?": effortRule,
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
@@ -279,6 +287,7 @@ export type TaskSchema = typeof taskSchema;
 export type TaskToolSchemaInstance = DynamicTaskSchema | BaseType;
 
 const taskSchemaCache = new Map<string, BaseType>();
+
 
 
 export function getTaskSchema(options: {
@@ -324,6 +333,8 @@ export interface TaskParams {
 	agent?: string;
 	/** The work (flat form). */
 	task?: string;
+	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
+	effort?: TaskEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
@@ -464,6 +475,8 @@ export interface AgentProgress {
 	modelOverride?: string | string[];
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Undefined when the model could not be resolved. */
 	resolvedModel?: string;
+	/** True when {@link resolvedModel} is the target of an active retry fallback (not the originally configured model). Lets observer-only UIs (collab guests, Agent Hub rows with no live session) flag the fallback and keep the provider. */
+	resolvedModelIsFallback?: boolean;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/**
@@ -551,6 +564,8 @@ export interface SingleResult {
 	modelOverride?: string | string[];
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Omitted from tool-result JSON when undefined to keep wire payloads small. */
 	resolvedModel?: string;
+	/** True when {@link resolvedModel} is the target of an active retry fallback. Mirrors {@link AgentProgress.resolvedModelIsFallback} onto the settled result. */
+	resolvedModelIsFallback?: boolean;
 	error?: string;
 	aborted?: boolean;
 	abortReason?: string;

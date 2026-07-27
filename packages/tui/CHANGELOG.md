@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+## [17.1.4] - 2026-07-26
+
+### Fixed
+
+- Prevented inline Kitty graphics from covering full-width overlays such as `/switch`.
+- Fixed Ctrl+O (expand tools) truncating the session on ConPTY hosts (native Windows and WSL): the full-view replay routed through the ConPTY frame-truncation intended only for bulk transcript-replacement paints (issue #2115), dropping every row above the retained tail behind an "older lines hidden" marker. The bound now keys on paint intent — bulk replacements (initial resume, `/resume`, handoff, resize geometry rebuilds) stay bounded, while a user-driven `resetDisplay()` (Ctrl+O expand, thinking/setting toggles, display reset) replays the whole transcript ([#4863](https://github.com/can1357/oh-my-pi/issues/4863)).
+
+## [17.1.2] - 2026-07-24
+
+### Fixed
+
+- Fixed the terminal flickering when leaving a fullscreen overlay (e.g. `/settings`, the models page) or resizing on terminals that re-report their size whenever the alternate screen buffer toggles: the alt-toggle size echo no longer arms a destructive full-screen (ED3) rebuild, and the in-place repaint path is now auto-detected for any such terminal instead of only Warp ([#6511](https://github.com/can1357/oh-my-pi/issues/6511)).
+
+## [17.1.1] - 2026-07-24
+
+### Fixed
+
+- Fixed WarpTerminal wrapping streamed Compatibility Jamo at the platform-default width instead of its rendered one-cell width ([#6461](https://github.com/can1357/oh-my-pi/issues/6461)).
+
+## [17.1.0] - 2026-07-24
+
+### Added
+
+- Added Text.setStyleFn() to apply foreground stylers at render time, allowing components to dynamically re-resolve colors after invalidation instead of baking in the palette active at construction.
+
+### Fixed
+
+- Fixed an issue where exiting or tearing down the TUI left the terminal in cursor-key/keypad application mode (DECCKM), which broke arrow keys in the parent shell. Both stop() and emergencyTerminalRestore() now correctly emit standard rmkx resets.
+
+## [17.0.9] - 2026-07-23
+
+### Added
+
+- Added `SelectList.setMaxVisible()` so hosts can refit the visible row budget to available height after construction.
+
+## [17.0.8] - 2026-07-22
+
+### Fixed
+
+- Fixed an issue where OSC 8 hyperlinks with inline markup corrupted Markdown table column widths.
+- Prevented duplicate autocomplete suggestions for slash commands and their matching aliases.
+- Fixed terminal background color detection during screen refreshes (Ctrl+L) inside tmux when passthrough is enabled.
+
 ## [17.0.6] - 2026-07-20
 
 ### Fixed
