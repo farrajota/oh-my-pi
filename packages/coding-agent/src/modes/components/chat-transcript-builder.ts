@@ -243,7 +243,7 @@ export class ChatTranscriptBuilder {
 						this.#trackExpandable(collapsed);
 						this.container.addChild(collapsed);
 					} else {
-						this.container.addChild(new UserMessageComponent(textContent, false));
+						this.container.addChild(new UserMessageComponent(textContent, false, undefined, message.timestamp));
 					}
 				}
 				break;

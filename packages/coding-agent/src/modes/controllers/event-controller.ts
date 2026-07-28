@@ -623,9 +623,7 @@ export class EventController {
 			const replacesOptimistic =
 				this.ctx.optimisticUserMessageSignature !== undefined && !wasOptimistic && !matchedLocalSubmission;
 			const wasLocallySubmitted = matchedLocalSubmission || wasOptimistic || replacesOptimistic;
-			if (wasOptimistic) {
-				this.ctx.clearOptimisticUserMessage();
-			} else if (replacesOptimistic) {
+			if (wasOptimistic || replacesOptimistic) {
 				this.ctx.replaceOptimisticUserMessage(event.message);
 			} else {
 				// Append synchronously: #emit dispatches to this listener fire-and-forget

@@ -1,8 +1,9 @@
-import { type Component, Container, Markdown } from "@oh-my-pi/pi-tui";
+import { type Component, Container, Markdown, Text } from "@oh-my-pi/pi-tui";
 import { formatBytes } from "@oh-my-pi/pi-utils";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 import { imageReferenceHyperlink, renderPlaceholders } from "../image-references";
 import { highlightMagicKeywords } from "../magic-keywords";
+import { formatUsageTimestamp } from "./usage-row";
 
 // OSC 133 shell integration: marks prompt zones for terminal multiplexers
 // Do not emit OSC 133 C ("command start") here: the transcript has no matching
@@ -22,7 +23,7 @@ export class UserMessageComponent extends Container {
 	#zoneSource: readonly string[] | undefined;
 	#zoneLines: string[] | undefined;
 
-	constructor(text: string, synthetic = false, imageLinks?: readonly (string | undefined)[]) {
+	constructor(text: string, synthetic = false, imageLinks?: readonly (string | undefined)[], timestamp?: number) {
 		super();
 		const bgColor = (value: string) => theme.bg("userMessageBg", value);
 		// Paint the magic keywords ("ultrathink"/"orchestrate"/"workflowz") inside the rendered
@@ -49,6 +50,9 @@ export class UserMessageComponent extends Container {
 		});
 		md.setIgnoreTight(true);
 		this.addChild(md);
+		if (!synthetic && timestamp !== undefined && Number.isFinite(timestamp) && timestamp > 0) {
+			this.addChild(new Text(theme.fg("dim", formatUsageTimestamp(timestamp)), 1, 0));
+		}
 	}
 
 	override render(width: number): readonly string[] {

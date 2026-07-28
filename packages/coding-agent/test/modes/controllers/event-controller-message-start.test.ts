@@ -120,20 +120,25 @@ describe("EventController message_start (user role)", () => {
 		expect(addMessageToChat).toHaveBeenCalledWith(message);
 	});
 
-	it("preserves the editor for an optimistic submission and skips the duplicate chat add", async () => {
-		// Optimistic path already added the user message to chat and cleared the
-		// editor at submit time. message_start must not re-add or re-clear.
+	it("preserves the editor while replacing an optimistic submission with its canonical message", async () => {
+		// The optimistic path already added the user message to chat and cleared the
+		// editor at submit time. message_start must replace that component with the
+		// canonical event data without re-clearing a draft typed in the meantime.
 		const message = createUserMessage("optimistic send");
 		const signature = "optimistic send\u00000";
-		const { ctx, setText, addMessageToChat } = createContext({
-			editorText: "",
-			optimisticSignature: signature,
-			locallySubmittedSignatures: [signature],
-		});
+		const { ctx, setText, addMessageToChat, clearOptimisticUserMessage, replaceOptimisticUserMessage } =
+			createContext({
+				editorText: "draft typed after sending",
+				optimisticSignature: signature,
+				locallySubmittedSignatures: [signature],
+			});
 		const controller = new EventController(ctx);
 
 		await controller.handleEvent(ctx.viewSession, { type: "message_start", message });
 
+		expect(replaceOptimisticUserMessage).toHaveBeenCalledTimes(1);
+		expect(replaceOptimisticUserMessage).toHaveBeenCalledWith(message);
+		expect(clearOptimisticUserMessage).not.toHaveBeenCalled();
 		expect(addMessageToChat).not.toHaveBeenCalled();
 		expect(setText).not.toHaveBeenCalled();
 		expect(ctx.optimisticUserMessageSignature).toBeUndefined();

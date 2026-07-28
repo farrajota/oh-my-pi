@@ -6,8 +6,8 @@ import { theme } from "../../modes/theme/theme";
 /** Below this the rate is nonsense (cached/instant responses yield absurd tok/s). */
 const MIN_DURATION_MS = 100;
 
-/** Local `YYYY-MM-DD HH:mm:ss` stamp for the per-turn usage row. */
-function formatUsageTimestamp(ms: number): string {
+/** Local `YYYY-MM-DD HH:mm:ss` stamp for the per-turn usage row and user prompt footer. */
+export function formatUsageTimestamp(ms: number): string {
 	const d = new Date(ms);
 	const pad = (n: number): string => String(n).padStart(2, "0");
 	const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;

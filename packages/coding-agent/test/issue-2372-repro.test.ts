@@ -66,12 +66,16 @@ describe("issue #2372 pre-streaming chat rebuild preserves optimistic submission
 	});
 
 	it("keeps the optimistic user message in chat after rebuildChatFromMessages before streaming starts", () => {
+		let nextTimestamp = 1_700_000_000_000;
+		vi.spyOn(Date, "now").mockImplementation(() => nextTimestamp++);
 		const addMessageSpy = vi.spyOn(mode, "addMessageToChat");
 
 		mode.startPendingSubmission({ text: "hello world" });
 		expect(mode.optimisticUserMessageSignature).toBe("hello world\u00000");
 		expect(addMessageSpy).toHaveBeenCalledTimes(1);
 		expect(mode.chatContainer.children.length).toBeGreaterThan(0);
+		const initialCall = addMessageSpy.mock.calls[0]?.[0];
+		if (initialCall?.role !== "user") throw new Error("Expected initial optimistic user message");
 
 		// Pre-streaming rebuild: no streamingComponent yet, message is NOT in
 		// session entries yet, signature is still set.
@@ -83,11 +87,15 @@ describe("issue #2372 pre-streaming chat rebuild preserves optimistic submission
 		// calls == initial optimistic add + 1 replay during rebuild.
 		expect(addMessageSpy).toHaveBeenCalledTimes(2);
 		const replayCall = addMessageSpy.mock.calls[1]?.[0];
+		if (replayCall?.role !== "user") throw new Error("Expected replayed optimistic user message");
 		expect(replayCall).toMatchObject({
 			role: "user",
 			content: [{ type: "text", text: "hello world" }],
 			attribution: "user",
 		});
+		// Rebuilds must replay the timestamp captured at submission start, not
+		// generate a newer one for the same pending message.
+		expect(replayCall.timestamp).toBe(initialCall.timestamp);
 		// Chat container is non-empty (the optimistic user message is back).
 		expect(mode.chatContainer.children.length).toBeGreaterThan(0);
 	});
