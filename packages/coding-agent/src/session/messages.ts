@@ -1170,7 +1170,7 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 		}
 		case "assistant": {
 			// A user-interrupted turn keeps its trailing thinking run on the
-			// persisted/displayed message so reload and Ctrl+L rebuilds still
+			// persisted/displayed message so reload and display-reset rebuilds still
 			// show it. That run is incomplete/unsigned and gets rejected on
 			// resend, so strip it here — LLM path only — when the hidden
 			// interrupted-thinking continuity message follows.

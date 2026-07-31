@@ -52,7 +52,7 @@ export const CLOUDFLARE_FALLBACK_MODEL: ModelSpec<"anthropic-messages"> = {
 };
 
 /**
- * `models.dev` currently lists `jp.anthropic.claude-opus-5`, but AWS's own
+ * `stencil.so` currently lists `jp.anthropic.claude-opus-5`, but AWS's own
  * Bedrock model card documents only `anthropic.claude-opus-5` plus the `us.`,
  * `eu.`, `au.`, and `global.` Geo/Global inference-profile IDs under
  * Programmatic Access; Japan regions are marked unsupported for Geo inference
@@ -321,7 +321,7 @@ function applyGeneratedModelPolicy(model: ModelSpec<Api>): void {
 }
 
 function applyAnthropicCatalogPolicy(model: ModelSpec<Api>, parsedModel: AnthropicModel): void {
-	// Claude Opus 4.5: models.dev reports 3x the correct cache pricing.
+	// Claude Opus 4.5: stencil.so reports 3x the correct cache pricing.
 	if (model.provider === "anthropic" && parsedModel.kind === "opus" && semverEqual(parsedModel.version, "4.5")) {
 		model.cost.cacheRead = 0.5;
 		model.cost.cacheWrite = 6.25;
@@ -336,7 +336,7 @@ function applyAnthropicCatalogPolicy(model: ModelSpec<Api>, parsedModel: Anthrop
 	}
 
 	// Claude Fable/Mythos 5: Anthropic's /v1/models omits token limits and
-	// pricing, and models.dev lags new releases. Pin authoritative values from
+	// pricing, and stencil.so lags new releases. Pin authoritative values from
 	// the model card (1M context / 128k output) and pricing docs ($10 in / $50
 	// out per MTok).
 	if (model.provider === "anthropic" && isFableOrMythos(parsedModel.kind)) {

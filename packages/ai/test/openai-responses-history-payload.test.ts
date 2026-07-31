@@ -610,6 +610,56 @@ describe("OpenAI responses history payload", () => {
 		expect(collectResponsesInputImageDetails(openaiInput)).toEqual(["original"]);
 	});
 
+	it("preserves encrypted_function_args on replayed Codex function calls", () => {
+		// codex-rs #35845: an empty `encrypted_function_args` array marks plaintext
+		// collaboration arguments; the marker must survive replay verbatim or the
+		// backend would treat the replayed arguments as encrypted.
+		const codexModel = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.5");
+		const nativeItems = [
+			{
+				type: "function_call",
+				id: "fc_plaintext_1",
+				call_id: "call_plaintext_collab",
+				name: "send_message",
+				namespace: "collaboration",
+				arguments: JSON.stringify({ message: "hello", task_name: "worker" }),
+				encrypted_function_args: [],
+				status: "completed",
+			},
+			{
+				type: "function_call_output",
+				call_id: "call_plaintext_collab",
+				output: "delivered",
+			},
+		];
+		const context: Context = {
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "fallback should not be replayed" }],
+					api: "openai-codex-responses",
+					provider: "openai-codex",
+					model: codexModel.id,
+					usage: issue5002ZeroUsage,
+					stopReason: "stop",
+					providerPayload: createOpenAIResponsesHistoryPayload("openai-codex", nativeItems),
+					timestamp: Date.now(),
+				},
+				{ role: "user", content: "continue", timestamp: Date.now() },
+			],
+		};
+
+		const input = convertCodexResponsesMessages(codexModel, context);
+		expect(findResponsesInputItemByCallId(input, "function_call", "call_plaintext_collab")).toEqual({
+			type: "function_call",
+			call_id: "call_plaintext_collab",
+			name: "send_message",
+			namespace: "collaboration",
+			arguments: JSON.stringify({ message: "hello", task_name: "worker" }),
+			encrypted_function_args: [],
+		});
+	});
+
 	it("prepends multiple OpenAI developer instructions in order without changing prompt cache key routing", async () => {
 		const model = getOpenAIReasoningModel("openai", "gpt-5-mini");
 		const payload = (await captureResponsesPayload(
@@ -1218,6 +1268,134 @@ describe("OpenAI responses history payload", () => {
 		expect(replayHistoryItems[3]?.call_id).toBe(opaqueCallId);
 		expect(replayHistoryItems[4]?.status).toBe("completed");
 		expect(replayHistoryItems[6]?.id).toBe(opaqueMessageId);
+	});
+
+	it("preserves the reasoning ID linked to a native computer call in the next request", async () => {
+		const nativeComputerHistory = [
+			{
+				type: "reasoning",
+				id: "rs_interrupted_computer_turn",
+				summary: [],
+				encrypted_content: "encrypted-computer-reasoning",
+				status: "completed",
+			},
+			{
+				type: "computer_call",
+				id: "cu_interrupted_computer_turn",
+				call_id: "call_interrupted_computer_turn",
+				action: { type: "screenshot" },
+				pending_safety_checks: [],
+				status: "completed",
+			},
+			{
+				type: "computer_call_output",
+				call_id: "call_interrupted_computer_turn",
+				output: { type: "computer_screenshot", image_url: "data:image/png;base64,AAEC" },
+			},
+		];
+		const context: Context = {
+			messages: [
+				makeAssistantMessage(nativeComputerHistory, false, "openai", "gpt-5.4"),
+				{ role: "user", content: "continue after interrupt", timestamp: Date.now() },
+			],
+		};
+
+		const model = getOpenAIReasoningModel("openai", "gpt-5.4");
+		const payload = (await captureResponsesPayload(model, context)) as { input?: unknown[] };
+
+		expect(payload.input).toEqual([
+			{
+				type: "reasoning",
+				id: "rs_interrupted_computer_turn",
+				summary: [],
+				encrypted_content: "encrypted-computer-reasoning",
+			},
+			{
+				type: "computer_call",
+				id: "cu_interrupted_computer_turn",
+				call_id: "call_interrupted_computer_turn",
+				action: { type: "screenshot" },
+				pending_safety_checks: [],
+				status: "completed",
+			},
+			{
+				type: "computer_call_output",
+				call_id: "call_interrupted_computer_turn",
+				output: { type: "computer_screenshot", image_url: "data:image/png;base64,AAEC" },
+			},
+			{ role: "user", content: [{ type: "input_text", text: "continue after interrupt" }] },
+		]);
+	});
+
+	it("preserves linked reasoning when the screenshot is a later tool result", async () => {
+		const context: Context = {
+			messages: [
+				{
+					...makeAssistantMessage(
+						[
+							{
+								type: "reasoning",
+								id: "rs_split_computer_turn",
+								summary: [],
+								encrypted_content: "encrypted-split-computer-reasoning",
+								status: "completed",
+							},
+							{
+								type: "computer_call",
+								id: "cu_split_computer_turn",
+								call_id: "call_split_computer_turn",
+								action: { type: "screenshot" },
+								pending_safety_checks: [],
+								status: "completed",
+							},
+						],
+						true,
+						"openai",
+						"gpt-5.4",
+					),
+					content: [
+						{
+							type: "toolCall" as const,
+							id: "call_split_computer_turn|cu_split_computer_turn",
+							name: "computer",
+							arguments: { actions: [{ type: "screenshot" }] },
+							providerMetadata: {
+								type: "computer" as const,
+								providerItemId: "cu_split_computer_turn",
+								actions: [{ type: "screenshot" as const }],
+								pendingSafetyChecks: [],
+							},
+						},
+					],
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_split_computer_turn|cu_split_computer_turn",
+					toolName: "computer",
+					content: [{ type: "image", data: "AAEC", mimeType: "image/png" }],
+					isError: false,
+					timestamp: Date.now(),
+					providerMetadata: {
+						type: "computer",
+						screenshot: { type: "computer_screenshot", image_url: "data:image/png;base64,AAEC" },
+						acknowledgedSafetyChecks: [],
+					},
+				},
+				{ role: "user", content: "continue after split persistence", timestamp: Date.now() },
+			],
+		};
+
+		const model = getOpenAIReasoningModel("openai", "gpt-5.4");
+		const payload = (await captureResponsesPayload(model, context)) as { input?: unknown[] };
+
+		expect(findResponsesInputItem(payload.input, "reasoning")?.id).toBe("rs_split_computer_turn");
+		expect(findResponsesInputItem(payload.input, "computer_call")).toMatchObject({
+			id: "cu_split_computer_turn",
+			call_id: "call_split_computer_turn",
+		});
+		expect(findResponsesInputItem(payload.input, "computer_call_output")).toMatchObject({
+			call_id: "call_split_computer_turn",
+		});
 	});
 
 	it("backward compat: old full-snapshot payloads still replace history for legacy same-provider assistant turns", async () => {

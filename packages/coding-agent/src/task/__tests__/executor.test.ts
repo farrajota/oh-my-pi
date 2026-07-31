@@ -49,6 +49,7 @@ function fakeSession(): AgentSession {
 		getActiveToolNames: () => [],
 		setActiveToolsByName: async () => {},
 		subscribe: () => () => {},
+		setIrcWakeTurnObserver: () => {},
 		prompt: async () => {},
 		waitForIdle: async () => {},
 		getLastAssistantMessage: () => ({ stopReason: "error", errorMessage: "test stop" }),

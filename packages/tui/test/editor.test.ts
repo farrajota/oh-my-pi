@@ -2396,6 +2396,110 @@ describe("Editor component", () => {
 		});
 	});
 
+	describe("Bulk input fast path and paste iteration", () => {
+		it("produces identical state for a chunked paste and a single-sequence paste", () => {
+			const content = "alpha beta\ngamma delta\nepsilon";
+			const single = new Editor(defaultEditorTheme);
+			single.handleInput(`\x1b[200~${content}\x1b[201~`);
+
+			const chunked = new Editor(defaultEditorTheme);
+			chunked.handleInput("\x1b[200~");
+			for (const ch of content) chunked.handleInput(ch);
+			chunked.handleInput("\x1b[201~");
+
+			expect(chunked.getText()).toBe(single.getText());
+			expect(chunked.getCursor()).toEqual(single.getCursor());
+		});
+
+		it("normalizes CRLF identically for single and chunked paste delivery", () => {
+			const single = new Editor(defaultEditorTheme);
+			single.handleInput("\x1b[200~one\r\ntwo\rthree\x1b[201~");
+
+			const chunked = new Editor(defaultEditorTheme);
+			chunked.handleInput("\x1b[200~one\r");
+			chunked.handleInput("\ntwo");
+			chunked.handleInput("\rthree\x1b[201~");
+
+			expect(single.getText()).toBe("one\ntwo\nthree");
+			expect(chunked.getText()).toBe(single.getText());
+			expect(chunked.getCursor()).toEqual(single.getCursor());
+		});
+
+		it("processes paste remainders iteratively, applying every trailing paste and keystroke", () => {
+			const editor = new Editor(defaultEditorTheme);
+			// One read carrying two complete pastes plus trailing typed text: the
+			// remainder after each paste loops back through input handling.
+			editor.handleInput("\x1b[200~ab\x1b[201~\x1b[200~cd\x1b[201~ef");
+			expect(editor.getText()).toBe("abcdef");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 6 });
+		});
+
+		it("handles a long train of pastes in one read without recursing per remainder", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.handleInput("\x1b[200~x\x1b[201~".repeat(2000));
+			expect(editor.getText()).toBe("x".repeat(2000));
+		});
+
+		it("inserts a plain printable run identically to per-scalar delivery", () => {
+			const run = "The quick brown fox 123 -_. naïve 😀 path";
+			const bulk = new Editor(defaultEditorTheme);
+			bulk.handleInput(run);
+
+			const perChar = new Editor(defaultEditorTheme);
+			for (const ch of run) perChar.handleInput(ch);
+
+			expect(bulk.getText()).toBe(perChar.getText());
+			expect(bulk.getCursor()).toEqual(perChar.getCursor());
+		});
+
+		it("keeps escape sequences interleaved with printable runs on the dispatch path", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.handleInput("abc");
+			editor.handleInput("\x1b[D"); // Left
+			editor.handleInput("XY"); // bulk run lands before "c"
+			expect(editor.getText()).toBe("abXYc");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 4 });
+		});
+
+		it("opens @ autocomplete when the trigger arrives inside a bulk printable run", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const { promise: autocompleteUpdated, resolve: resolveAutocompleteUpdated } = Promise.withResolvers<void>();
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					return { items: [{ label: "src/", value: "src/" }], prefix: "@sr" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+			editor.onAutocompleteUpdate = resolveAutocompleteUpdated;
+
+			editor.handleInput("see @sr"); // one bulk run ending in an @-token
+
+			await autocompleteUpdated;
+			expect(editor.isShowingAutocomplete()).toBe(true);
+		});
+
+		it("opens @ autocomplete after a bracketed paste ending in a trigger token", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const { promise: autocompleteUpdated, resolve: resolveAutocompleteUpdated } = Promise.withResolvers<void>();
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					return { items: [{ label: "src/", value: "src/" }], prefix: "@sr" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+			editor.onAutocompleteUpdate = resolveAutocompleteUpdated;
+
+			editor.handleInput("\x1b[200~see @sr\x1b[201~");
+
+			await autocompleteUpdated;
+			expect(editor.isShowingAutocomplete()).toBe(true);
+		});
+	});
+
 	describe("Korean NFC paste normalization", () => {
 		// macOS Finder drag-drops/Copy-As-Pathname emit Korean filenames as
 		// NFD (decomposed) — e.g. `화` becomes `ᄒ`(U+1112) + `ᅪ`(U+116A).

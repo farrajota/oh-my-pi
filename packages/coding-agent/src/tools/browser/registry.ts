@@ -6,7 +6,13 @@ import { ToolAbortError, ToolError } from "../tool-errors";
 import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, killExistingByPath, waitForCdp } from "./attach";
 import type { CmuxKind } from "./cmux/rpc";
 import { CmuxSocketClient } from "./cmux/socket-client";
-import { BROWSER_PROTOCOL_TIMEOUT_MS, launchHeadlessBrowser, loadPuppeteer, type UserAgentOverride } from "./launch";
+import {
+	BROWSER_PROTOCOL_TIMEOUT_MS,
+	launchHeadlessBrowser,
+	loadPuppeteer,
+	removeUserDataDir,
+	type UserAgentOverride,
+} from "./launch";
 
 export type PuppeteerBrowserKind =
 	| { kind: "headless"; headless: boolean }
@@ -35,6 +41,8 @@ export interface PuppeteerBrowserHandle extends BrowserHandleCommon {
 	browser: Browser;
 	cdpUrl?: string;
 	pid?: number;
+	/** OMP-owned temp Chromium profile directory removed on dispose (headless launches). */
+	userDataDir?: string;
 	subprocess?: Subprocess;
 	stealth: { browserSession: CDPSession | null; override: UserAgentOverride | null };
 }
@@ -134,11 +142,15 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		};
 	}
 	if (kind.kind === "headless") {
-		const browser = await launchHeadlessBrowser({ headless: kind.headless, viewport: opts.viewport });
+		const { browser, userDataDir } = await launchHeadlessBrowser({
+			headless: kind.headless,
+			viewport: opts.viewport,
+		});
 		return {
 			key: browserKey(kind),
 			kind,
 			browser,
+			userDataDir,
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
 		};
@@ -259,6 +271,10 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 				if (proc?.pid !== undefined) await gracefulKillTreeOnce(proc.pid).catch(() => undefined);
 			}
 		}
+		// OMP owns the profile directory (puppeteer's temp cleanup is disabled by
+		// our explicit --user-data-dir), so remove it now the process tree has
+		// exited. Tolerant of the Windows lock-held window (issue #7058).
+		if (handle.userDataDir) await removeUserDataDir(handle.userDataDir);
 		return;
 	}
 	if (handle.kind.kind === "connected") {

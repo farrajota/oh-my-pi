@@ -95,6 +95,11 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 		const exe = resolveToCwd(app.path, session.cwd);
 		return { kind: "spawned", path: exe };
 	}
+	// A configured endpoint is a default, not an override: explicit app options win.
+	const configuredCdpUrl = (session.settings.get("browser.cdpUrl") as string | undefined)?.trim();
+	if (configuredCdpUrl) {
+		return { kind: "connected", cdpUrl: configuredCdpUrl.replace(/\/+$/, "") };
+	}
 	const cmuxKind = resolveCmuxKind({
 		settingEnabled: session.settings.get("browser.cmux") as boolean | undefined,
 	});
@@ -163,11 +168,11 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			},
 		},
 		{
-			caption: "Screenshot to look at the page — no save path",
+			caption: "Capture a screenshot and return its saved path",
 			call: {
 				action: "run",
 				name: "docs",
-				code: "await tab.screenshot();",
+				code: "return await tab.screenshot();",
 			},
 		},
 		{

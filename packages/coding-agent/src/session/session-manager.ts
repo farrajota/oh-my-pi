@@ -35,6 +35,7 @@ import { type BuildSessionContextOptions, buildSessionContext, type SessionConte
 import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
+	type CredentialPinEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
@@ -180,6 +181,7 @@ function isDraftOnlyMetadataEntry(entry: SessionEntry): boolean {
 		case "thinking_level_change":
 		case "service_tier_change":
 		case "mode_change":
+		case "credential_pin":
 			return true;
 		default:
 			return false;
@@ -869,9 +871,9 @@ export class SessionManager {
 			return;
 		}
 
-		// Hot path: append synchronously so the entry is durable the instant this
-		// returns (file/memory writers perform the write in-body). Never routed
-		// through the async disk chain — durability must hold without a flush().
+		// Hot path: queue the entry directly on the writer, outside the async disk
+		// chain. File writers batch same-turn appends until their microtask
+		// boundary; flush(), flushSync(), and close() drain that batch explicitly.
 		// A mid-close writer leaves `#writer` undefined, so `#appendWriter` simply
 		// opens a fresh append handle and the entry still lands.
 		try {
@@ -1421,6 +1423,30 @@ export class SessionManager {
 		await this.#rewriteAtomically();
 	}
 
+	/** Persist this session's transcript as a newly identified OMP session. */
+	async persistCopy(
+		options?: { sessionDir?: string; suppressBreadcrumb?: boolean },
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<SessionManager> {
+		const sessionDir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage);
+		const manager = new SessionManager(this.#cwd, sessionDir, true, storage);
+		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
+		manager.#resetToNewSession();
+		manager.#sessionName = this.#sessionName;
+		manager.#titleSource = this.#titleSource;
+		manager.#titleUpdatedAt = this.#titleUpdatedAt;
+		manager.#header.title = this.#sessionName;
+		manager.#header.titleSource = this.#titleSource;
+		manager.#additionalDirectories = [...this.#additionalDirectories];
+		manager.#header.additionalDirectories =
+			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
+		manager.#entries = structuredClone(this.#entries);
+		manager.#index.rebuild(manager.#entries);
+		manager.#forceFileCreation = true;
+		await manager.#rewriteAtomically();
+		return manager;
+	}
+
 	/**
 	 * Stage a synchronous group of entry appends and publish the resulting full
 	 * journal with one atomic replace. A failed publish removes only the staged
@@ -1530,6 +1556,7 @@ export class SessionManager {
 		if (this.#atomicEntryBatch) throw new Error("Cannot synchronously flush during an atomic session batch.");
 		if (this.#diskFailure) throw this.#diskFailure;
 		if (this.#fileIsCurrent && !this.#rewriteRequired) {
+			this.#writer?.flushSync?.();
 			const writerError = this.#writer?.getError();
 			if (writerError) throw writerError;
 			return;
@@ -2038,6 +2065,41 @@ export class SessionManager {
 			for (const name of entry.injectedRules) names.add(name);
 		}
 		return [...names];
+	}
+
+	/** Append a credential pin recording which OAuth account served `provider`. */
+	appendCredentialPin(provider: string, hash: string): string {
+		const entry: CredentialPinEntry = {
+			type: "credential_pin",
+			...this.#freshEntryFields(),
+			provider,
+			hash,
+		};
+		this.#recordEntry(entry);
+		return entry.id;
+	}
+
+	/**
+	 * Latest credential pin per provider on the current branch (root → leaf),
+	 * with the effective last-use time of the pinned account.
+	 *
+	 * Pins are appended only when the serving account *changes*, so a long
+	 * session on one account carries a single old pin entry. Any assistant turn
+	 * for the same provider after that pin was necessarily served by the pinned
+	 * account, so its timestamp advances `lastUsedAt` — a resume seconds after
+	 * the last turn seeds a warm sticky instead of a stale one.
+	 */
+	getCredentialPins(): Map<string, { hash: string; lastUsedAt: number }> {
+		const pins = new Map<string, { hash: string; lastUsedAt: number }>();
+		for (const entry of this.getBranch()) {
+			if (entry.type === "credential_pin") {
+				pins.set(entry.provider, { hash: entry.hash, lastUsedAt: new Date(entry.timestamp).getTime() });
+			} else if (entry.type === "message" && entry.message.role === "assistant") {
+				const pin = pins.get(entry.message.provider);
+				if (pin) pin.lastUsedAt = Math.max(pin.lastUsedAt, entry.message.timestamp);
+			}
+		}
+		return pins;
 	}
 
 	getLeafId(): string | null {

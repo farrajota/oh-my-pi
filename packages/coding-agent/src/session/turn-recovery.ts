@@ -117,10 +117,17 @@ export interface TurnRecoveryHost {
 	scheduleAgentContinue(options: { delayMs?: number; generation?: number; onError?: (error: unknown) => void }): void;
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
 	appendSessionMessage(message: AssistantMessage): void;
+	persistedAssistantEntryId(message: AssistantMessage): string | undefined;
 	sessionMessageAlreadyPersisted(message: AssistantMessage): boolean;
-	setModelWithProviderSessionReset(model: Model): void;
+	setModelWithProviderSessionReset(model: Model): Promise<void>;
 	resetCurrentResponsesProviderSession(reason: string): void;
-	maybeAutoRedeemCodexReset(): Promise<boolean>;
+	/**
+	 * Spend a saved Codex reset for the blocked pool, if eligible.
+	 * `activeBlockUnblockAtMs` is the absolute unblock time parsed from the
+	 * live usage-limit error — authoritative for the active account when the
+	 * usage report still shows a pre-block snapshot.
+	 */
+	maybeAutoRedeemCodexReset(activeBlockUnblockAtMs?: number): Promise<boolean>;
 	runAutoCompaction(
 		reason: "overflow" | "threshold" | "idle" | "incomplete",
 		willRetry: boolean,
@@ -151,6 +158,12 @@ type PendingRecoveredRetryError = {
 	note: string;
 };
 
+type UsageLimitOutcome = {
+	switchedCredential: boolean;
+	retryAfterMs: number;
+	retryAtMs: number | undefined;
+};
+
 /** Owns terminal-stop recovery, automatic retries, and fallback routing. */
 export class TurnRecovery {
 	readonly #host: TurnRecoveryHost;
@@ -160,6 +173,7 @@ export class TurnRecovery {
 	#retryResolve: (() => void) | undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined;
 	#pendingRecoveredRetryErrors: PendingRecoveredRetryError[] = [];
+	#usageLimitOutcomes = new WeakMap<AssistantMessage, Promise<UsageLimitOutcome>>();
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
 	#acceptTerminalEmptyStopForPrompt = false;
@@ -295,6 +309,40 @@ export class TurnRecovery {
 		},
 	): Promise<boolean> {
 		return this.#handleRetryableError(message, options);
+	}
+
+	/**
+	 * Records a usage-limit failure before replay eligibility decides whether the
+	 * failed turn may be discarded. Returns whether credential recovery switched
+	 * the active account.
+	 */
+	async recordUsageLimitOutcome(message: AssistantMessage): Promise<boolean> {
+		if (message.stopReason !== "error") return false;
+		const id = this.#classifyRetryMessage(message);
+		const activeModel = this.#host.model();
+		if (!activeModel || !AIError.is(id, AIError.Flag.UsageLimit)) return false;
+
+		let recorded = this.#usageLimitOutcomes.get(message);
+		if (!recorded) {
+			const errorMessage = message.errorMessage || "Unknown error";
+			const retryAfterMs =
+				this.#parseRetryAfterMsFromError(errorMessage) ??
+				calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
+			recorded = (async (): Promise<UsageLimitOutcome> => {
+				const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
+					activeModel.provider,
+					this.#host.sessionId(),
+					{ retryAfterMs, baseUrl: activeModel.baseUrl, modelId: activeModel.id },
+				);
+				return {
+					switchedCredential: outcome.switched,
+					retryAfterMs,
+					retryAtMs: outcome.retryAtMs,
+				};
+			})();
+			this.#usageLimitOutcomes.set(message, recorded);
+		}
+		return (await recorded).switchedCredential;
 	}
 
 	/** Prompts after transient overlap with a prior agent run. */
@@ -729,16 +777,24 @@ export class TurnRecovery {
 	discardAssistantTurn(assistantMessage: AssistantMessage): void {
 		this.removeAssistantMessageFromActiveContext(assistantMessage);
 
-		const branchEntry = this.#host.sessionManager
-			.getBranch()
-			.slice()
-			.reverse()
-			.find(
-				entry =>
-					entry.type === "message" &&
-					entry.message.role === "assistant" &&
-					this.#isSameAssistantMessage(entry.message as AssistantMessage, assistantMessage),
-			);
+		const branch = this.#host.sessionManager.getBranch();
+		const persistedEntryId = this.#host.persistedAssistantEntryId(assistantMessage);
+		const branchEntry =
+			(persistedEntryId === undefined
+				? undefined
+				: branch.find(
+						entry =>
+							entry.id === persistedEntryId && entry.type === "message" && entry.message.role === "assistant",
+					)) ??
+			branch
+				.slice()
+				.reverse()
+				.find(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						this.#isSameAssistantMessage(entry.message as AssistantMessage, assistantMessage),
+				);
 		if (!branchEntry) {
 			return;
 		}
@@ -757,7 +813,9 @@ export class TurnRecovery {
 			(left.timestamp === right.timestamp &&
 				left.provider === right.provider &&
 				left.model === right.model &&
-				left.stopReason === right.stopReason)
+				left.stopReason === right.stopReason &&
+				left.errorMessage === right.errorMessage &&
+				Bun.hash(JSON.stringify(left.content)) === Bun.hash(JSON.stringify(right.content)))
 		);
 	}
 
@@ -831,8 +889,13 @@ export class TurnRecovery {
 		const contextWindow = this.#host.model()?.contextWindow ?? 0;
 		if (AIError.isContextOverflow(message, contextWindow)) return false;
 
+		// A classifier refusal/sensitivity stop is the model's decision, not a route
+		// failure, but only after we confirm no user-visible output has already been
+		// streamed. Visible text, images, tool calls, or server tools must not be
+		// discarded and replayed.
+		if (this.#hasReplayUnsafeOutput(message)) return false;
 		if (this.isClassifierRefusal(message)) return true;
-		return AIError.retriable(id, { replayUnsafe: this.#hasReplayUnsafeToolOutput(message) });
+		return AIError.retriable(id);
 	}
 
 	/**
@@ -900,12 +963,22 @@ export class TurnRecovery {
 	}
 	/**
 	 * Retried turns remove the failed assistant message from active context.
-	 * Text/thinking-only partials are safe to discard and replay. Retained
-	 * tool calls are not: a completed tool call may already have emitted its
-	 * tool result after this assistant message, so replaying can duplicate work.
+	 * Thinking-only partials are safe to discard and replay: reasoning models
+	 * routinely stall after long thinking with no visible output, and duplicated
+	 * thinking display is materially lower harm than duplicated final text.
+	 * Whitespace-only text is likewise safe since nothing meaningful reached the
+	 * user. Visible text, generated images, server tools, and retained tool calls
+	 * are NOT safe: each has already rendered or may have side effects, so replaying
+	 * the turn can duplicate user-visible output or work.
 	 */
-	#hasReplayUnsafeToolOutput(message: AssistantMessage): boolean {
-		return message.content.some(block => block.type === "toolCall");
+	#hasReplayUnsafeOutput(message: AssistantMessage): boolean {
+		return message.content.some(
+			block =>
+				block.type === "toolCall" ||
+				block.type === "image" ||
+				block.type === "anthropicServerTool" ||
+				(block.type === "text" && block.text.trim().length > 0),
+		);
 	}
 
 	/**
@@ -1028,7 +1101,7 @@ export class TurnRecovery {
 				? requestedThinkingLevel
 				: clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, this.#host.thinkingLevelCeiling());
 		const candidateSelector = formatModelStringWithRouting(candidate);
-		this.#host.setModelWithProviderSessionReset(candidate);
+		await this.#host.setModelWithProviderSessionReset(candidate);
 		this.#host.sessionManager.appendModelChange(candidateSelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(candidateSelector);
 		this.#host.setThinkingLevel(nextThinkingLevel);
@@ -1087,14 +1160,14 @@ export class TurnRecovery {
 	 * transient overload/5xx or a hard "router/model not found / unsupported" —
 	 * is worth retrying on the base id. Skips failures the base model shares:
 	 * context overflow (compaction's job), usage limits and auth errors (same
-	 * account/key), and turns that already emitted a tool call (replaying would
-	 * duplicate work). Requires the base model to exist in the registry.
+	 * account/key), and turns that already emitted any replay-unsafe output.
+	 * Requires the base model to exist in the registry.
 	 */
 	isFireworksFastFallbackEligible(message: AssistantMessage): boolean {
 		const model = this.#activeFireworksFastModel();
 		if (!model) return false;
 		if (message.stopReason !== "error") return false;
-		if (message.content.some(block => block.type === "toolCall")) return false;
+		if (this.#hasReplayUnsafeOutput(message)) return false;
 		// A content refusal/sensitivity stop is the model's decision, not a route
 		// failure — switching to the base model would just re-trigger it.
 		if (this.isClassifierRefusal(message)) return false;
@@ -1113,8 +1186,7 @@ export class TurnRecovery {
 	 * model switch cannot fix or must not replay: cancellations (abort-flavored
 	 * errors are not model faults), context overflow (compaction's job),
 	 * classifier refusals (chain consult is handled on the retryable path with
-	 * `pinFallback`), and turns that already emitted a tool call (replaying
-	 * could duplicate work).
+	 * `pinFallback`), and turns that already emitted replay-unsafe output.
 	 */
 	isHardErrorFallbackEligible(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error") return false;
@@ -1126,7 +1198,7 @@ export class TurnRecovery {
 		const id = this.#classifyRetryMessage(message);
 		if (AIError.is(id, AIError.Flag.Abort) || AIError.is(id, AIError.Flag.UserInterrupt)) return false;
 		if (AIError.isContextOverflow(message, model.contextWindow ?? 0)) return false;
-		if (this.#hasReplayUnsafeToolOutput(message)) return false;
+		if (this.#hasReplayUnsafeOutput(message)) return false;
 		const currentSelector = formatRetryFallbackSelector(model, this.#host.thinkingLevel());
 		const role = this.#activeRetryFallback?.role ?? this.resolveRetryFallbackRole(currentSelector);
 		if (!role) return false;
@@ -1147,7 +1219,7 @@ export class TurnRecovery {
 		const apiKey = await this.#host.modelRegistry.getApiKey(baseModel, this.#host.sessionId());
 		if (!apiKey) return false;
 		const baseSelector = formatModelStringWithRouting(baseModel);
-		this.#host.setModelWithProviderSessionReset(baseModel);
+		await this.#host.setModelWithProviderSessionReset(baseModel);
 		this.#host.sessionManager.appendModelChange(baseSelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(baseSelector);
 		await this.#host.emitSessionEvent({
@@ -1201,7 +1273,7 @@ export class TurnRecovery {
 		const thinkingToApply =
 			currentThinkingLevel === lastAppliedFallbackThinkingLevel ? originalThinkingLevel : currentThinkingLevel;
 		const primarySelector = formatModelStringWithRouting(primaryModel);
-		this.#host.setModelWithProviderSessionReset(primaryModel);
+		await this.#host.setModelWithProviderSessionReset(primaryModel);
 		this.#host.sessionManager.appendModelChange(primarySelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(primarySelector);
 		this.#host.setThinkingLevel(thinkingToApply);
@@ -1308,6 +1380,7 @@ export class TurnRecovery {
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
+		const recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = staleOpenAIResponsesReplayError
 			? 0
@@ -1322,31 +1395,15 @@ export class TurnRecovery {
 			this.#host.resetCurrentResponsesProviderSession("stale replay error");
 		}
 
-		const activeModel = this.#host.model();
-		if (
-			!retryBudgetExhausted &&
-			activeModel &&
-			!staleOpenAIResponsesReplayError &&
-			AIError.is(id, AIError.Flag.UsageLimit)
-		) {
-			const retryAfterMs = parsedRetryAfterMs ?? calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
-			const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
-				activeModel.provider,
-				this.#host.sessionId(),
-				{
-					retryAfterMs,
-					baseUrl: activeModel.baseUrl,
-					modelId: activeModel.id,
-				},
-			);
-			if (outcome.switched) {
-				switchedCredential = true;
-				delayMs = 0;
-			} else if (await this.#host.maybeAutoRedeemCodexReset()) {
-				// A live usage-limit 429 on the active Codex account, with a banked
-				// reset and the opt-in setting on: spend the reset and retry
-				// immediately instead of waiting out the window. Runs after the
-				// free sibling-switch above and before model fallback below.
+		if (!retryBudgetExhausted && !staleOpenAIResponsesReplayError && recordedUsageLimitOutcome) {
+			if (
+				recordedUsageLimitOutcome.switchedCredential ||
+				// Convert the parsed hint to an absolute timestamp NOW, before the
+				// hook's usage IO — a duration re-anchored after slow fetches drifts.
+				(await this.#host.maybeAutoRedeemCodexReset(
+					parsedRetryAfterMs === undefined ? undefined : Date.now() + parsedRetryAfterMs,
+				))
+			) {
 				switchedCredential = true;
 				delayMs = 0;
 			} else {
@@ -1358,9 +1415,10 @@ export class TurnRecovery {
 				// Without this, one short-lived sibling block escalates a
 				// recoverable situation into the provider's multi-hour wait and
 				// trips the fail-fast cap below.
-				usageLimitWaitMs = retryAfterMs;
-				if (outcome.retryAtMs !== undefined) {
-					const siblingWaitMs = Math.max(0, outcome.retryAtMs - Date.now()) + SIBLING_UNBLOCK_BUFFER_MS;
+				usageLimitWaitMs = recordedUsageLimitOutcome.retryAfterMs;
+				if (recordedUsageLimitOutcome.retryAtMs !== undefined) {
+					const siblingWaitMs =
+						Math.max(0, recordedUsageLimitOutcome.retryAtMs - Date.now()) + SIBLING_UNBLOCK_BUFFER_MS;
 					if (siblingWaitMs < usageLimitWaitMs) {
 						usageLimitWaitMs = siblingWaitMs;
 					}
@@ -1398,6 +1456,7 @@ export class TurnRecovery {
 				delayMs = parsedRetryAfterMs;
 			}
 		}
+
 		if (retryBudgetExhausted) {
 			if (!switchedModel) {
 				await this.persistTerminalEmptyErrorTurn(message);

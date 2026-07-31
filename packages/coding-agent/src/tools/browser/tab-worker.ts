@@ -11,7 +11,6 @@ import type {
 	ElementHandle,
 	ElementScreenshotOptions,
 	HTTPResponse,
-	ImageFormat,
 	KeyInput,
 	Page,
 	SerializedAXNode,
@@ -73,6 +72,7 @@ declare global {
 	var innerHeight: number;
 	var document: {
 		elementFromPoint(x: number, y: number): Element | null;
+		readonly visibilityState: "visible" | "hidden";
 	};
 }
 
@@ -217,7 +217,6 @@ export function resolveWaitTimeout(cellTimeoutMs: number, explicit?: number): nu
 interface ScreenshotOptions {
 	selector?: string;
 	fullPage?: boolean;
-	save?: string;
 	silent?: boolean;
 }
 
@@ -233,7 +232,7 @@ interface TabApi {
 	): Promise<void>;
 	observe(opts?: { includeAll?: boolean; viewportOnly?: boolean }): Promise<Observation>;
 	ariaSnapshot(selector?: string, opts?: AriaSnapshotOptions): Promise<string>;
-	screenshot(opts?: ScreenshotOptions): Promise<ScreenshotResult>;
+	screenshot(opts?: ScreenshotOptions): Promise<string>;
 	extract(format?: ReadableFormat): Promise<string>;
 	click(selector: string): Promise<void>;
 	type(selector: string, text: string): Promise<void>;
@@ -713,17 +712,20 @@ export function describeScreenshot(opts?: ScreenshotOptions): string {
 	if (opts?.fullPage) return "tab.screenshot({ fullPage: true })";
 	return "tab.screenshot()";
 }
-
-/** Map an explicit save path's extension to a puppeteer capture format (default png). */
-export function imageFormatForPath(filePath: string): ImageFormat {
-	switch (path.extname(filePath).toLowerCase()) {
-		case ".webp":
-			return "webp";
-		case ".jpg":
-		case ".jpeg":
-			return "jpeg";
-		default:
-			return "png";
+export async function preparePageForScreenshot(
+	page: Pick<Page, "bringToFront" | "evaluate">,
+	signal: AbortSignal | undefined,
+	activate: boolean,
+): Promise<void> {
+	if (activate) {
+		await untilAborted(signal, () => page.bringToFront()).catch(() => undefined);
+		return;
+	}
+	const visible = await untilAborted(signal, () => page.evaluate(() => document.visibilityState === "visible")).catch(
+		() => false,
+	);
+	if (!visible) {
+		throw new ToolError("The attached browser tab is not visible; switch to it before taking a screenshot");
 	}
 }
 
@@ -747,6 +749,7 @@ export class WorkerCore {
 	#runtime: JsRuntime | null = null;
 	#unsub: () => void;
 	#mode?: WorkerInitPayload["mode"];
+	#activateForScreenshot = true;
 	#dialogPolicy?: DialogPolicy;
 	#dialogHandler?: (dialog: Dialog) => void;
 	#openDialog?: OpenDialogInfo;
@@ -795,6 +798,7 @@ export class WorkerCore {
 	async #init(payload: WorkerInitPayload): Promise<void> {
 		try {
 			this.#mode = payload.mode;
+			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			this.#browser = await puppeteer.connect({
 				browserWSEndpoint: payload.browserWSEndpoint,
@@ -825,6 +829,13 @@ export class WorkerCore {
 				this.#page = page;
 				this.#observeDialogs();
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
+				if (payload.url) {
+					await this.#page.goto(payload.url, {
+						// Same default as the headless arm: dev servers with HMR/WS never reach networkidle.
+						waitUntil: payload.waitUntil ?? "load",
+						timeout: payload.timeoutMs,
+					});
+				}
 			}
 			this.#targetId = await targetIdForPage(this.#page);
 			this.#transport.send({ type: "ready", info: await this.#currentReadyInfo() });
@@ -1532,22 +1543,22 @@ export class WorkerCore {
 		screenshots: ScreenshotResult[],
 		signal: AbortSignal | undefined,
 		opts: ScreenshotOptions = {},
-	): Promise<ScreenshotResult> {
+	): Promise<string> {
 		const page = this.#requirePage();
 		// Multiple tabs can share one Chromium (sibling headless tabs on a shared
 		// endpoint, cdp/app attach). CDP `Page.captureScreenshot` reads the
-		// compositor surface, which follows the *active* target — a backgrounded
+		// compositor surface, which follows the *active* target: a backgrounded
 		// page can stall waiting for a fresh frame (the 20s screenshot timeouts)
 		// or hand back a sibling tab's pixels. Activate first; best-effort so an
 		// already-active or freshly-closed target never fails the capture.
-		await untilAborted(signal, () => page.bringToFront()).catch(() => undefined);
+		//
+		// For a user-driven browser, redundant activation would steal window focus.
+		// The supervisor disables it only after adopting the visible tab; if the user
+		// later switches away, reject capture rather than risk sibling-tab pixels.
+		await preparePageForScreenshot(page, signal, this.#activateForScreenshot);
 		const fullPage = opts.selector ? false : (opts.fullPage ?? false);
-		// An explicit save path picks the full-res capture format: puppeteer encodes
-		// png/jpeg/webp natively, so `save: "shot.webp"` gets real WebP bytes instead
-		// of PNG bytes hiding behind a .webp name. Unknown/missing extensions stay PNG.
-		const explicitPath = opts.save ? resolveToCwd(opts.save, session.cwd) : undefined;
-		const captureType = explicitPath ? imageFormatForPath(explicitPath) : "png";
-		const captureMime = `image/${captureType}` as const;
+		const captureType = "png";
+		const captureMime = "image/png" as const;
 		let buffer: Buffer;
 		if (opts.selector) {
 			const handle =
@@ -1581,20 +1592,16 @@ export class WorkerCore {
 			{ type: "image", data: buffer.toBase64(), mimeType: captureMime },
 			{ maxWidth: 1024, maxHeight: 1024, maxBytes: 150 * 1024, jpegQuality: 70, excludeWebP: session.excludeWebP },
 		);
-		const saveFullRes = !!(explicitPath || session.browserScreenshotDir);
+		const saveFullRes = !!session.browserScreenshotDir;
 		const savedBuffer = saveFullRes ? buffer : resized.buffer;
 		const savedMimeType = saveFullRes ? captureMime : resized.mimeType;
-		// Names must match the bytes we actually write: full-res follows the capture
-		// format, the resized buffer is whichever of PNG/JPEG/WebP encoded smallest.
 		const ext = savedMimeType === "image/webp" ? "webp" : savedMimeType === "image/jpeg" ? "jpg" : "png";
-		const dest =
-			explicitPath ??
-			(session.browserScreenshotDir
-				? path.join(
-						session.browserScreenshotDir,
-						`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.${ext}`,
-					)
-				: path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.${ext}`));
+		const dest = session.browserScreenshotDir
+			? path.join(
+					session.browserScreenshotDir,
+					`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.${ext}`,
+				)
+			: path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.${ext}`);
 		await fs.promises.mkdir(path.dirname(dest), { recursive: true });
 		await Bun.write(dest, savedBuffer);
 		const info: ScreenshotResult = {
@@ -1616,7 +1623,7 @@ export class WorkerCore {
 			output.push({ type: "text", text: lines.join("\n") });
 			output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
 		}
-		return info;
+		return dest;
 	}
 
 	async #drag(from: DragTarget, to: DragTarget, signal: AbortSignal): Promise<void> {

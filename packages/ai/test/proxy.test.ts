@@ -24,6 +24,8 @@ async function createSilentProxyServer(): Promise<SilentProxyServer> {
 	const accepted = Promise.withResolvers<net.Socket>();
 	const server = net.createServer(socket => {
 		sockets.add(socket);
+		socket.resume();
+		socket.on("end", () => socket.destroy());
 		socket.once("close", () => sockets.delete(socket));
 		accepted.resolve(socket);
 	});
@@ -61,7 +63,6 @@ async function waitForSocketClose(socket: net.Socket): Promise<void> {
 	socket.once("close", () => closed.resolve());
 	await closed.promise;
 }
-
 const isProxyEnvKey = (k: string): boolean =>
 	k.startsWith("PI_PROXY") ||
 	k === "HTTP_PROXY" ||

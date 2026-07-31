@@ -1,4 +1,11 @@
-import type { Agent, AgentMessage, AgentTool, StreamFn, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type {
+	Agent,
+	AgentMessage,
+	AgentTool,
+	AgentToolContext,
+	StreamFn,
+	ThinkingLevel,
+} from "@oh-my-pi/pi-agent-core";
 import type {
 	Context,
 	Effort,
@@ -17,6 +24,7 @@ import type { AsyncJobManager } from "../async";
 import type { ModelRegistry } from "../config/model-registry";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
+import type { CursorMcpResourceAdapter } from "../cursor";
 import type { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
@@ -26,7 +34,8 @@ import type { Skill, SkillWarning } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { ConfiguredThinkingLevel } from "../thinking";
-import type { XdevRegistry } from "../tools/xdev";
+import type { XdevState } from "../tools/xdev";
+import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
 import type { SessionManager } from "./session-manager";
 
 /** Maximum time the interactive shutdown path waits for Mnemopi consolidation. */
@@ -130,6 +139,8 @@ export interface AgentSessionConfig {
 	createMemoryTools?: () => Promise<AgentTool[]>;
 	/** Creates the built-in `computer` tool for session-scoped runtime enablement (see {@link AgentSession.setComputerToolEnabled}). */
 	createComputerTool?: () => Promise<AgentTool | null>;
+	/** Creates the built-in `inspect_image` tool for session-scoped runtime enablement (see {@link AgentSession.setInspectImageMode}). */
+	createInspectImageTool?: () => Promise<AgentTool | null>;
 	/** Model registry for API key resolution and model discovery. */
 	modelRegistry: ModelRegistry;
 	/** Tool registry for LSP and settings. */
@@ -150,8 +161,12 @@ export interface AgentSessionConfig {
 	sideStreamFn?: StreamFn;
 	/** Stream wrapper for advisor requests. */
 	advisorStreamFn?: StreamFn;
+	/** Advisor spend already recorded for the session being opened, restored on resume. */
+	initialAdvisorCosts?: ReadonlyMap<string, number>;
 	/** Prefer websocket transport for OpenAI Codex requests when supported. */
 	preferWebsockets?: boolean;
+	/** Codex saved-reset coordinator; defaults to the process-wide singleton so concurrent sessions can't double-spend. Inject a fresh one in tests. */
+	codexResetCoordinator?: CodexAutoRedeemCoordinator;
 	/** Provider payload hook used by the active session request path. */
 	onPayload?: SimpleStreamOptions["onPayload"];
 	/** Provider response hook used by the active session request path. */
@@ -163,15 +178,16 @@ export interface AgentSessionConfig {
 	/** Current session message-to-LLM conversion pipeline. */
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. */
-	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>;
+	rebuildSystemPrompt?: (
+		toolNames: string[],
+		tools: Map<string, AgentTool>,
+	) => Promise<{ systemPrompt: string[]; xdevCatalogNames?: readonly string[] }>;
 	/** Local calendar date provider used by prompt-cache invalidation. */
 	getLocalCalendarDate?: () => string;
 	/** Tools mounted under `xd://`, for `/tools` display. */
 	getXdevToolEntries?: () => Array<{ name: string; summary: string }>;
-	/** Session-owned `xd://` registry. */
-	xdevRegistry?: XdevRegistry;
-	/** Discoverable tools mounted under `xd://` in the initial enabled set. */
-	initialMountedXdevToolNames?: string[];
+	/** `xd://` presentation state backed by the canonical tool map. */
+	xdev?: XdevState;
 	/** Names pinned top-level during runtime repartitioning. */
 	presentationPinnedToolNames?: ReadonlySet<string>;
 	/** Accessor for live MCP server instructions. */
@@ -198,6 +214,35 @@ export interface AgentSessionConfig {
 	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Full advisor toolset built against an advisor-scoped tool session. */
 	advisorTools?: AgentTool[];
+	/**
+	 * Build a `grep` honoring a Cursor `pi_grep` frame's own context width and
+	 * match cap, against the advisor-scoped tool session. Without it an advisor
+	 * running on Cursor silently drops both fields.
+	 */
+	advisorCreateGrepTool?(options: { context?: number; totalMatchLimit?: number }): AgentTool | undefined;
+	/**
+	 * Build the `replace`-mode `edit` a Cursor `pi_edit` frame needs, against the
+	 * advisor-scoped tool session. The advisor's ordinary instance follows the
+	 * configured `edit.mode` and rejects the frame's `old_text`/`new_text` pairs.
+	 */
+	advisorCreateEditTool?(): AgentTool | undefined;
+	/**
+	 * The execute-time context the advisor's bridge tools resolve approval from.
+	 *
+	 * `ExtensionToolWrapper` reads `tools.approvalMode`, per-tool
+	 * `tools.approval.<tool>` policies and `autoApprove` only from this context;
+	 * with none it defaults to `yolo` with empty policies, so a bridge tool would
+	 * run a native frame the user configured `ask` or `deny` for.
+	 */
+	advisorGetToolContext?: () => AgentToolContext | undefined;
+	/**
+	 * The live MCP connections the advisor's Cursor resource frames answer from.
+	 *
+	 * Advisors share the session's connections and may be granted tools from
+	 * those same servers; without this their `list_mcp_resources` reports an
+	 * empty catalog and every `read_mcp_resource` a `not_found`.
+	 */
+	advisorMcpResources?: CursorMcpResourceAdapter;
 	/** Preloaded watchdog prompt content for the advisor. */
 	advisorWatchdogPrompt?: string;
 	/** Shared advisor instructions loaded from WATCHDOG.yml. */

@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { $ } from "bun";
 import {
 	conventionOutputPaths,
 	type HostInfo,
@@ -95,21 +99,58 @@ describe("parseBazelFilesOutput", () => {
 });
 
 describe("parseCliArgs", () => {
-	test("splits targets, --dest, and passthrough bazel args", () => {
+	test("splits targets, paths, and passthrough bazel args", () => {
 		expect(
 			parseCliArgs(["linux-x64-baseline", "linux-x64-modern", "--dest", "out", "--", "--config=ci", "--dest"]),
 		).toEqual({
 			targets: ["linux-x64-baseline", "linux-x64-modern"],
 			dest: "out",
+			source: null,
 			bazelArgs: ["--config=ci", "--dest"],
 		});
-		expect(parseCliArgs(["host"])).toEqual({ targets: ["host"], dest: null, bazelArgs: [] });
+		expect(parseCliArgs(["host", "--source", "artifact"])).toEqual({
+			targets: ["host"],
+			dest: null,
+			source: "artifact",
+			bazelArgs: [],
+		});
 	});
 
-	test("rejects missing targets, stray flags, and a valueless --dest", () => {
+	test("rejects invalid build and artifact source combinations", () => {
 		expect(() => parseCliArgs([])).toThrow(/Usage:/);
 		expect(() => parseCliArgs(["--", "--config=ci"])).toThrow(/Usage:/);
 		expect(() => parseCliArgs(["host", "--config=ci"])).toThrow(/Unknown flag --config=ci/);
 		expect(() => parseCliArgs(["host", "--dest"])).toThrow(/--dest requires/);
+		expect(() => parseCliArgs(["host", "--source"])).toThrow(/--source requires/);
+		expect(() => parseCliArgs(["host", "--source", "artifact", "--", "--config=ci"])).toThrow(
+			/--source cannot be combined/,
+		);
+	});
+});
+
+describe("artifact source install", () => {
+	test("installs exact target outputs without invoking Bazel", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-artifacts-"));
+		const source = path.join(root, "source");
+		const dest = path.join(root, "dest");
+		const baseline = "pi_natives.linux-x64-baseline.node";
+		const modern = "pi_natives.linux-x64-modern.node";
+		try {
+			await fs.mkdir(path.join(source, "natives-linux-x64-baseline"), { recursive: true });
+			await fs.mkdir(path.join(source, "natives-linux-x64-modern"), { recursive: true });
+			await Bun.write(path.join(source, "natives-linux-x64-baseline", baseline), "baseline");
+			await Bun.write(path.join(source, "natives-linux-x64-modern", modern), "modern");
+
+			const result =
+				await $`${process.execPath} ${path.join(import.meta.dir, "bazel-natives.ts")} linux-x64-baseline linux-x64-modern --source ${source} --dest ${dest}`
+					.quiet()
+					.nothrow();
+
+			expect(result.exitCode).toBe(0);
+			expect(await Bun.file(path.join(dest, baseline)).text()).toBe("baseline");
+			expect(await Bun.file(path.join(dest, modern)).text()).toBe("modern");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });

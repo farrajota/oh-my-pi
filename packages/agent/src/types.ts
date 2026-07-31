@@ -456,15 +456,22 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getCwd?: () => string | undefined;
 
 	/**
-	 * Called after a tool call has been validated and is about to execute.
+	 * Called once per tool call after argument validation, in call order, before
+	 * the call is scheduled — ahead of concurrency resolution,
+	 * `tool_execution_start`, and `tool.execute`. On the streamed path it runs
+	 * before the assistant message's `message_start`/`message_end` are emitted.
 	 *
 	 * Return `{ block: true }` to prevent execution. The loop emits an error tool
 	 * result instead (using `reason` as the error text, or a default if omitted).
 	 *
-	 * Mutating `context.args` in place changes the arguments passed to `tool.execute`
-	 * — the loop does **not** re-validate after this hook runs.
+	 * Return `{ args }` to replace the arguments the call runs with. The
+	 * replacement is revalidated against the tool schema and written back to the
+	 * tool-call block, making it the single source of truth: history, execution
+	 * events, persistence, provider replay, concurrency scheduling, and
+	 * `tool.execute` all see the revised arguments. Mutating `context.args` in
+	 * place also survives into execution, but a returned `args` object wins.
 	 *
-	 * The hook receives the tool abort signal (`signal`) and is responsible for
+	 * The hook receives the run's request abort signal and is responsible for
 	 * honoring it. Throwing surfaces as a tool-error result and does not abort the
 	 * rest of the batch.
 	 */
@@ -549,12 +556,16 @@ export type AgentToolCall = Extract<AssistantMessage["content"][number], { type:
  * Set `block: true` to prevent the tool from executing. The loop emits an error tool
  * result instead, using `reason` as the error text (or a default if omitted).
  *
- * Mutating the `args` reference passed in `BeforeToolCallContext` is supported and
- * survives into execution — the loop does **not** re-validate after this hook runs.
+ * Set `args` to replace the tool-call arguments. The replacement is revalidated
+ * against the tool schema (a failure surfaces as a validation-error tool result),
+ * written back to the tool-call block on the assistant message, and seen by
+ * history, scheduling, execution events, and `tool.execute` alike. It is
+ * ignored when `block` is true.
  */
 export interface BeforeToolCallResult {
 	block?: boolean;
 	reason?: string;
+	args?: Record<string, unknown>;
 }
 
 /**
@@ -582,9 +593,12 @@ export interface BeforeToolCallContext {
 	assistantMessage: AssistantMessage;
 	/** The raw tool call block from `assistantMessage.content`. */
 	toolCall: AgentToolCall;
+	/** The resolved tool the call dispatches to. */
+	tool: AgentTool<any>;
 	/**
 	 * Validated tool arguments. The same reference is forwarded to `tool.execute`
-	 * (after any `transformToolCallArguments` pass), so in-place mutations stick.
+	 * (after any `transformToolCallArguments` pass), so in-place mutations stick;
+	 * a returned `BeforeToolCallResult.args` replaces them entirely.
 	 */
 	args: Record<string, unknown>;
 	/** Current agent context at the time the tool call is prepared. */

@@ -702,7 +702,7 @@ describe("ModelRegistry", () => {
 			});
 			const fetchMock: FetchImpl = async input => {
 				const url = String(input);
-				if (url === "https://models.dev/api.json") return Response.json({});
+				if (url === "https://catalog.stencil.so/models.json.zstd") return Response.json({});
 				if (url === "https://proxy.example/v1/models") {
 					return Response.json({
 						data: [{ id: "claude-sonnet-5", display_name: "Claude Sonnet 5" }],

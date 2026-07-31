@@ -48,7 +48,13 @@ import {
 	searchSmitheryRegistry,
 	toConfigName,
 } from "../../mcp/smithery-registry";
-import type { MCPAuthChallenge, MCPAuthConfig, MCPServerConfig, MCPServerConnection } from "../../mcp/types";
+import type {
+	MCPAuthChallenge,
+	MCPAuthConfig,
+	MCPConfigFile,
+	MCPServerConfig,
+	MCPServerConnection,
+} from "../../mcp/types";
 import { shortenPath } from "../../tools/render-utils";
 import { urlHyperlinkAlways } from "../../tui";
 import { copyToClipboard } from "../../utils/clipboard";
@@ -245,6 +251,64 @@ type MCPSearchParsed = {
 	semantic: boolean;
 	error?: string;
 };
+
+/**
+ * Collect the de-duplicated union of every MCP server name we know about:
+ * user config, project config, and any runtime-discovered servers not
+ * already present in either config (`ctx.mcpManager.getAllServerNames()`
+ * covers connections, pending connections, and discovered-but-not-yet-
+ * connected sources).
+ *
+ * `includeDisabledOnly` controls names found only in
+ * `userConfig.disabledServers`, while `includeDisabledConfigured` controls
+ * config entries whose `enabled` flag is false. Both default to true because
+ * callers such as `/mcp list` need the complete union. Autocomplete callers
+ * must disable the categories their target operation cannot accept.
+ *
+ * This is the single source of truth for "every known server name": both
+ * `MCPCommandController#handleList()` and the `/mcp` slash-command argument
+ * completer (server-name autocomplete for `enable`/`disable`/`test`/etc.)
+ * call this instead of re-deriving the union themselves.
+ *
+ * `preloaded` lets a caller that already read both config files (e.g.
+ * `#handleList()`) pass them in and skip the redundant re-read.
+ */
+export async function collectMcpServerNames(
+	ctx: InteractiveModeContext,
+	preloaded?: { userConfig: MCPConfigFile; projectConfig: MCPConfigFile },
+	includeDisabledOnly = true,
+	includeDisabledConfigured = true,
+): Promise<string[]> {
+	let userConfig: MCPConfigFile;
+	let projectConfig: MCPConfigFile;
+	if (preloaded) {
+		({ userConfig, projectConfig } = preloaded);
+	} else {
+		const cwd = getProjectDir();
+		[userConfig, projectConfig] = await Promise.all([
+			readMCPConfigFile(getMCPConfigPath("user", cwd)),
+			readMCPConfigFile(getMCPConfigPath("project", cwd)),
+		]);
+	}
+
+	const names = new Set<string>(includeDisabledOnly ? (userConfig.disabledServers ?? []) : []);
+	const addConfiguredNames = (config: MCPConfigFile): void => {
+		const servers = config.mcpServers;
+		if (!servers) return;
+		for (const name in servers) {
+			const server = servers[name];
+			if (server && (includeDisabledConfigured || server.enabled !== false)) names.add(name);
+		}
+	};
+	addConfiguredNames(userConfig);
+	addConfiguredNames(projectConfig);
+	if (ctx.mcpManager) {
+		for (const name of ctx.mcpManager.getAllServerNames()) {
+			names.add(name);
+		}
+	}
+	return [...names].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+}
 
 export class MCPCommandController {
 	constructor(private ctx: InteractiveModeContext) {}
@@ -1164,7 +1228,7 @@ export class MCPCommandController {
 			await addMCPServer(filePath, name, config);
 
 			// Reload MCP manager
-			await this.#reloadMCP();
+			await this.reloadServers();
 			const state =
 				config.enabled === false
 					? "disconnected"
@@ -1271,10 +1335,11 @@ export class MCPCommandController {
 
 			// Collect runtime-discovered servers not in config files
 			const configServerNames = new Set([...userServers, ...projectServers]);
-			const disabledServerNames = new Set(await readDisabledServers(userPath));
+			const disabledServerNames = new Set(userConfig.disabledServers ?? []);
 			const discoveredServers: { name: string; source: SourceMeta }[] = [];
 			if (this.ctx.mcpManager) {
-				for (const name of this.ctx.mcpManager.getAllServerNames()) {
+				const allServerNames = await collectMcpServerNames(this.ctx, { userConfig, projectConfig });
+				for (const name of allServerNames) {
 					if (configServerNames.has(name)) continue;
 					if (disabledServerNames.has(name)) continue;
 					const source = this.ctx.mcpManager.getSource(name);
@@ -1421,7 +1486,7 @@ export class MCPCommandController {
 			await removeMCPServer(filePath, name);
 
 			// Reload MCP manager
-			await this.#reloadMCP();
+			await this.reloadServers();
 
 			this.#showMessage(["", theme.fg("success", `- Removed server "${name}" from ${scope} config`), ""].join("\n"));
 		} catch (error) {
@@ -1671,7 +1736,7 @@ export class MCPCommandController {
 					);
 					return;
 				}
-				await this.#reloadMCP();
+				await this.reloadServers();
 				this.#showMessage(
 					["", theme.fg("success", `- Cleared auth for "${name}" (${found.scope} config)`), ""].join("\n"),
 				);
@@ -1680,7 +1745,7 @@ export class MCPCommandController {
 
 			const updated = this.#stripOAuthAuth(found.config);
 			await updateMCPServer(found.filePath, name, updated);
-			await this.#reloadMCP();
+			await this.reloadServers();
 
 			this.#showMessage(
 				["", theme.fg("success", `- Cleared auth for "${name}" (${found.scope} config)`), ""].join("\n"),
@@ -1791,7 +1856,7 @@ export class MCPCommandController {
 				await updateMCPServer(found.filePath, name, updatedConfig);
 			}
 			if (options.reload !== false) {
-				await this.#reloadMCP();
+				await this.reloadServers();
 				const state = await this.#waitForServerConnectionWithAnimation(name);
 
 				const lines = [
@@ -1826,7 +1891,7 @@ export class MCPCommandController {
 	async #handleReload(): Promise<void> {
 		try {
 			this.#showMessage(["", theme.fg("muted", "Reloading MCP servers and runtime tools..."), ""].join("\n"));
-			await this.#reloadMCP();
+			await this.reloadServers();
 			const connectedCount = this.ctx.mcpManager?.getConnectedServers().length ?? 0;
 			this.#showMessage(
 				[
@@ -1914,18 +1979,35 @@ export class MCPCommandController {
 	}
 
 	/**
-	 * Reload MCP manager with new configs
+	 * Reconnect every configured MCP server and rebind the session's MCP tools.
+	 *
+	 * Disconnects all live connections, rediscovers `.mcp.json` configs, and
+	 * calls `session.refreshMCPTools(...)` so config edits take effect without a
+	 * restart. Public because `/reload-plugins` reuses it alongside `/mcp reload`
+	 * and the config-mutation flows in this controller.
+	 *
+	 * Discovery options are derived from settings so the reload honors the same
+	 * opt-outs as startup — notably `mcp.enableProjectConfig: false`, which must
+	 * keep project `.mcp.json` servers from being started on reload.
 	 */
-	async #reloadMCP(): Promise<void> {
+	async reloadServers(): Promise<void> {
 		if (!this.ctx.mcpManager) {
 			return;
 		}
 
 		// Disconnect all existing servers
 		await this.ctx.mcpManager.disconnectAll();
+		// Prompt enrichment is asynchronous. Clear commands before rediscovery so
+		// removed/disabled servers cannot leave stale `/server:prompt` entries;
+		// newly loaded prompts repopulate them through the manager callback.
+		this.ctx.session.setMCPPromptCommands([]);
 
-		// Rediscover and connect
-		const result = await this.ctx.mcpManager.discoverAndConnect();
+		// Rediscover and connect, mirroring startup's discovery filters.
+		const result = await this.ctx.mcpManager.discoverAndConnect({
+			enableProjectConfig: this.ctx.settings.get("mcp.enableProjectConfig") ?? true,
+			filterExa: true,
+			filterBrowser: this.ctx.settings.get("browser.enabled") ?? false,
+		});
 		await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
 
 		this.#showMCPConnectionErrors(result.errors);

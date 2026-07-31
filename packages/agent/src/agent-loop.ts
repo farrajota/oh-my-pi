@@ -70,9 +70,11 @@ import type {
 	AgentMessage,
 	AgentPreModelCallResult,
 	AgentTool,
+	AgentToolCall,
 	AgentToolResult,
 	AgentTurnEndContext,
 	AsideMessage,
+	BeforeToolCallResult,
 	SoftToolRequirement,
 	SteeringInterruptSource,
 	SteeringQueueState,
@@ -1752,6 +1754,17 @@ async function streamAssistantResponse(
 						if (config.transformAssistantMessage) {
 							await config.transformAssistantMessage(finalMessage, requestSignal);
 						}
+						// Prepare tool dispatch (validation + the `beforeToolCall` hook)
+						// BEFORE the message is snapshotted for consumers: a hook args
+						// revision is written back into this message's toolCall blocks,
+						// so history, the UI, persistence, provider replay, scheduling,
+						// and execution all carry the revised arguments.
+						if (finalMessage.content.some(c => c.type === "toolCall")) {
+							preparedDispatchByMessage.set(
+								finalMessage,
+								await prepareToolCallDispatch(finalMessage, context, config, requestSignal),
+							);
+						}
 						if (addedPartial) {
 							context.messages[context.messages.length - 1] = finalMessage;
 						} else {
@@ -2051,6 +2064,144 @@ function emitAbortedAssistantMessage(
 	return abortedMessage;
 }
 
+/** Per-call outcome of the pre-dispatch prepare phase (validation + `beforeToolCall`). */
+interface PreparedToolCall {
+	tool: AgentTool<any> | undefined;
+	/** Validated (possibly hook-revised) execution args; raw args when validation failed. */
+	args: Record<string, unknown>;
+	validationErrorMessage?: string;
+	blocked?: boolean;
+	blockReason?: string;
+	prepareError?: unknown;
+}
+
+/**
+ * Prepare results computed in the stream-done branch (before `message_start`/
+ * `message_end`) so a `beforeToolCall` args revision is baked into the message
+ * every consumer snapshots. `executeToolCalls` consumes them; a message that
+ * bypassed the streamed path (e.g. Harmony-recovered) is prepared at dispatch
+ * time instead.
+ */
+const preparedDispatchByMessage = new WeakMap<AssistantMessage, Map<string, PreparedToolCall>>();
+
+function resolveToolForCall(
+	tools: AgentTool<any>[] | undefined,
+	toolCall: AgentToolCall,
+	resolveFallbackTool: AgentLoopConfig["resolveFallbackTool"],
+): AgentTool<any> | undefined {
+	// Tools emitted via OpenAI's custom-tool path (e.g. `apply_patch` on GPT-5)
+	// come back under their wire-level name, which may differ from the
+	// harness-internal `name`. Match on either, preferring `name` for
+	// determinism if both somehow collide.
+	return (
+		tools?.find(t => t.name === toolCall.name) ??
+		tools?.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name) ??
+		// Not in the advertised set: let the host route side-transport tools
+		// (e.g. xd:// device mounts) called by their top-level name.
+		resolveFallbackTool?.(toolCall.name)
+	);
+}
+
+/**
+ * Pre-dispatch phase for every pending tool call on `assistantMessage`, run in
+ * call order: intent extraction, argument validation, and the `beforeToolCall`
+ * hook. A hook `args` revision is revalidated against the tool schema and
+ * written back to `toolCall.arguments`; run before `message_start`/`message_end`
+ * (the streamed path) that makes the revision the single source of truth —
+ * history, execution events, persistence, provider replay, concurrency
+ * scheduling, and `tool.execute` all agree. Failures are recorded per call and
+ * surfaced by `executeToolCalls` at the record's scheduled slot.
+ */
+async function prepareToolCallDispatch(
+	assistantMessage: AssistantMessage,
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+): Promise<Map<string, PreparedToolCall>> {
+	const { resolveFallbackTool, intentTracing, beforeToolCall } = config;
+	const prepared = new Map<string, PreparedToolCall>();
+	for (const toolCall of assistantMessage.content) {
+		if (toolCall.type !== "toolCall") continue;
+		if ((toolCall as CursorExecResolvedCarrier)[kCursorExecResolved] === true) continue;
+		const tool = resolveToolForCall(context.tools, toolCall, resolveFallbackTool);
+		const entry: PreparedToolCall = { tool, args: toolCall.arguments as Record<string, unknown> };
+		prepared.set(toolCall.id, entry);
+		let argsForExecution = toolCall.arguments as Record<string, unknown>;
+		if (intentTracing) {
+			const { intent, strippedArgs } = extractIntent(toolCall.arguments);
+			argsForExecution = strippedArgs;
+			if (intent) {
+				toolCall.intent = intent;
+			} else if (typeof tool?.intent === "function") {
+				try {
+					const derived = tool.intent(strippedArgs as never)?.trim();
+					if (derived) {
+						toolCall.intent = derived;
+					}
+				} catch {
+					// intent function must never break tool execution
+				}
+			}
+		}
+		const validate = (args: Record<string, unknown>): Record<string, unknown> | undefined => {
+			try {
+				if (tool?.validateRawArguments) tool.validateRawArguments(args);
+			} catch (validationError) {
+				entry.args = args;
+				entry.validationErrorMessage =
+					validationError instanceof Error ? validationError.message : String(validationError);
+				return undefined;
+			}
+			try {
+				if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
+				return validateToolArguments(tool, { ...toolCall, arguments: args });
+			} catch (validationError) {
+				if (tool?.lenientArgValidation) {
+					const fallback = { ...args };
+					delete fallback.__parseError;
+					delete fallback.__rawJson;
+					return fallback;
+				}
+				entry.args = "__parseError" in args ? { __parseError: args.__parseError } : args;
+				entry.validationErrorMessage =
+					validationError instanceof Error ? validationError.message : String(validationError);
+				return undefined;
+			}
+		};
+		const effectiveArgs = validate(argsForExecution);
+		if (effectiveArgs === undefined) continue;
+		entry.args = effectiveArgs;
+		if (!beforeToolCall || !tool) continue;
+		let beforeResult: BeforeToolCallResult | undefined;
+		try {
+			beforeResult = await beforeToolCall(
+				{ assistantMessage, toolCall, tool, args: effectiveArgs, context },
+				signal,
+			);
+		} catch (e) {
+			// Contract: a throwing hook surfaces as a tool-error result without
+			// aborting the batch — rethrown inside the execution span in runTool.
+			entry.prepareError = e;
+			continue;
+		}
+		if (beforeResult?.block) {
+			entry.blocked = true;
+			entry.blockReason = beforeResult.reason;
+			continue;
+		}
+		if (beforeResult?.args !== undefined) {
+			// Revalidate: a hook revision is untrusted input to the tool schema.
+			const revised = validate(beforeResult.args);
+			if (revised === undefined) continue;
+			// Bake the revision into the message itself. On the streamed path this
+			// precedes every consumer snapshot, so there is exactly one version of
+			// the call anywhere downstream.
+			toolCall.arguments = beforeResult.args;
+			entry.args = revised;
+		}
+	}
+	return prepared;
+}
 /**
  * Execute tool calls from an assistant message.
  */
@@ -2071,8 +2222,6 @@ async function executeToolCalls(
 		getToolContext,
 		transformToolCallArguments,
 		resolveFallbackTool,
-		intentTracing,
-		beforeToolCall,
 		afterToolCall,
 	} = config;
 	type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
@@ -2106,22 +2255,25 @@ async function executeToolCalls(
 		: AbortSignal.any([steeringAbortController.signal, ircAbortController.signal]);
 	const interruptState: { triggered: boolean; source?: SteeringInterruptSource | "irc" } = { triggered: false };
 
+	// Streamed messages were prepared (validation + `beforeToolCall`) before
+	// `message_end`, so hook revisions are already part of the message; anything
+	// that bypassed the streamed path is prepared here instead.
+	const preparedDispatch =
+		preparedDispatchByMessage.get(assistantMessage) ??
+		(await prepareToolCallDispatch(assistantMessage, currentContext, config, signal));
+
 	const records = toolCalls.map(toolCall => {
-		// Tools emitted via OpenAI's custom-tool path (e.g. `apply_patch` on GPT-5)
-		// come back under their wire-level name, which may differ from the
-		// harness-internal `name`. Match on either, preferring `name` for
-		// determinism if both somehow collide.
-		const tool =
-			tools?.find(t => t.name === toolCall.name) ??
-			tools?.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name) ??
-			// Not in the advertised set: let the host route side-transport tools
-			// (e.g. xd:// device mounts) called by their top-level name.
-			resolveFallbackTool?.(toolCall.name);
-		const args = toolCall.arguments as Record<string, unknown>;
+		const prepared = preparedDispatch.get(toolCall.id) ?? {
+			tool: resolveToolForCall(tools, toolCall, resolveFallbackTool),
+			args: toolCall.arguments as Record<string, unknown>,
+		};
+		const { tool, args } = prepared;
 		const interruptibleMode = tool?.interruptible;
 		let interruptible = false;
 		if (typeof interruptibleMode === "function") {
 			try {
+				// Resolved from the prepared (possibly hook-revised) args so an
+				// argument-dependent policy governs the call that actually runs.
 				interruptible = interruptibleMode(args);
 			} catch {
 				// Resolver failures default to preserving the tool's outcome.
@@ -2142,6 +2294,10 @@ async function executeToolCalls(
 			skipped: false,
 			toolResultMessage: undefined as ToolResultMessage | undefined,
 			resultEmitted: false,
+			validationErrorMessage: prepared.validationErrorMessage,
+			blocked: prepared.blocked === true,
+			blockReason: prepared.blockReason,
+			prepareError: prepared.prepareError,
 		};
 	});
 
@@ -2276,55 +2432,21 @@ async function executeToolCalls(
 		if (agentPauseGate.paused) await agentPauseGate.waitUntilResumed(record.signal);
 
 		const { toolCall, tool } = record;
-		let argsForExecution = toolCall.arguments as Record<string, unknown>;
-		if (intentTracing) {
-			const { intent, strippedArgs } = extractIntent(toolCall.arguments);
-			argsForExecution = strippedArgs;
-			if (intent) {
-				toolCall.intent = intent;
-			} else if (typeof tool?.intent === "function") {
-				try {
-					const derived = tool.intent(strippedArgs as never)?.trim();
-					if (derived) {
-						toolCall.intent = derived;
-					}
-				} catch {
-					// intent function must never break tool execution
-				}
-			}
+		// Validation (and the beforeToolCall hook) ran in the prepare phase; a
+		// failure recorded there surfaces here at the record's scheduled slot so
+		// result emission keeps batch order.
+		if (record.validationErrorMessage !== undefined) {
+			emitToolResult(
+				record,
+				{
+					content: [{ type: "text" as const, text: record.validationErrorMessage }],
+					details: { isError: true, error: record.validationErrorMessage },
+				},
+				true,
+			);
+			return;
 		}
-		if (tool?.validateRawArguments) {
-			try {
-				tool.validateRawArguments(argsForExecution);
-			} catch (validationError) {
-				record.args = argsForExecution;
-				emitValidationError(record, validationError);
-				return;
-			}
-		}
-		let effectiveArgs: Record<string, unknown>;
-		try {
-			if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
-			effectiveArgs = validateToolArguments(tool, { ...toolCall, arguments: argsForExecution });
-		} catch (validationError) {
-			if (tool?.lenientArgValidation) {
-				effectiveArgs = { ...argsForExecution };
-				delete effectiveArgs.__parseError;
-				delete effectiveArgs.__rawJson;
-			} else {
-				if ("__parseError" in argsForExecution) {
-					record.args = {
-						__parseError: argsForExecution.__parseError,
-					};
-				} else {
-					record.args = argsForExecution;
-				}
-				emitValidationError(record, validationError);
-				return;
-			}
-		}
-
-		record.args = effectiveArgs;
+		const effectiveArgs = record.args;
 		if (record.signal.aborted) {
 			record.skipped = true;
 			recordSkippedTool(telemetry, {
@@ -2369,24 +2491,9 @@ async function executeToolCalls(
 					return;
 				}
 
-				if (beforeToolCall) {
-					const beforeResult = await beforeToolCall(
-						{
-							assistantMessage,
-							toolCall,
-							args: effectiveArgs,
-							context: currentContext,
-						},
-						record.signal,
-					);
-					if (beforeResult?.block) {
-						throw new ToolCallBlockedError(beforeResult.reason);
-					}
-				}
-				if (record.signal.aborted) {
-					result = createToolSignalAbortedResult(record.signal);
-					isError = true;
-					return;
+				if (record.prepareError !== undefined) throw record.prepareError;
+				if (record.blocked) {
+					throw new ToolCallBlockedError(record.blockReason);
 				}
 				const executionArgs = transformToolCallArguments
 					? transformToolCallArguments(effectiveArgs, toolCall.name)
@@ -2521,32 +2628,6 @@ async function executeToolCalls(
 	let sharedTasks: Promise<void>[] = [];
 	const tasks: Promise<void>[] = [];
 
-	for (let index = 0; index < records.length; index++) {
-		const record = records[index];
-		const concurrencyMode = record.tool?.concurrency;
-		let concurrency: "shared" | "exclusive";
-		if (typeof concurrencyMode === "function") {
-			// Resolved from raw pre-validation args; a throwing resolver must not
-			// take down the whole batch, so fall back to the safe (serial) mode.
-			try {
-				concurrency = concurrencyMode(record.args);
-			} catch {
-				concurrency = "exclusive";
-			}
-		} else {
-			concurrency = concurrencyMode ?? "shared";
-		}
-		const start = concurrency === "exclusive" ? Promise.all([lastExclusive, ...sharedTasks]) : lastExclusive;
-		const task = start.then(() => runTool(record, index));
-		tasks.push(task);
-		if (concurrency === "exclusive") {
-			lastExclusive = task;
-			sharedTasks = [];
-		} else {
-			sharedTasks.push(task);
-		}
-	}
-
 	// While tool calls are in flight, queued steering or interrupting IRC would
 	// otherwise wait out the tools' own window. Poll only non-consuming queues:
 	// detection hard-aborts interruptible waits, soft-signals cooperative tools
@@ -2603,6 +2684,33 @@ async function executeToolCalls(
 					STEERING_INTERRUPT_POLL_MS,
 				)
 			: undefined;
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index];
+		const concurrencyMode = record.tool?.concurrency;
+		let concurrency: "shared" | "exclusive";
+		if (typeof concurrencyMode === "function") {
+			// Resolved from the prepared (possibly hook-revised) args — raw args
+			// only when validation failed, and those records error out before
+			// executing. A throwing resolver must not take down the whole batch,
+			// so fall back to the safe (serial) mode.
+			try {
+				concurrency = concurrencyMode(record.args);
+			} catch {
+				concurrency = "exclusive";
+			}
+		} else {
+			concurrency = concurrencyMode ?? "shared";
+		}
+		const start = concurrency === "exclusive" ? Promise.all([lastExclusive, ...sharedTasks]) : lastExclusive;
+		const task = start.then(() => runTool(record, index));
+		tasks.push(task);
+		if (concurrency === "exclusive") {
+			lastExclusive = task;
+			sharedTasks = [];
+		} else {
+			sharedTasks.push(task);
+		}
+	}
 	try {
 		await Promise.allSettled(tasks);
 	} finally {

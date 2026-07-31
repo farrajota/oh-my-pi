@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [17.2.2] - 2026-07-31
+
+### Fixed
+
+- Fixed a resource leak where SQLite prepared statements were not properly released, keeping the database connection alive after calling close(). This resolves file locking issues on Windows (which prevented deleting, moving, or rotating database files) and silent file handle leaks on POSIX systems.
+
 ## [17.0.8] - 2026-07-22
 
 ### Changed

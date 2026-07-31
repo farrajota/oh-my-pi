@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
-import * as fs from "node:fs/promises";
+import * as fs from "node:fs";
 import * as path from "node:path";
+import { SENSITIVE_TOKEN_RE } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { getAgentDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { regexHasUnresolvableShortMatchFallback, type SecretEntry, sanitizeSecretFriendlyName } from "./obfuscator";
@@ -31,9 +32,9 @@ export async function getSecretPlaceholderKey(keyDir: string = getAgentDir()): P
 	}
 
 	const generated = crypto.randomBytes(32).toString("base64url");
-	await fs.mkdir(keyDir, { recursive: true });
+	await fs.promises.mkdir(keyDir, { recursive: true });
 	try {
-		await fs.writeFile(keyPath, generated, { flag: "wx", mode: 0o600 });
+		await fs.promises.writeFile(keyPath, generated, { flag: "wx", mode: 0o600 });
 		cachedPlaceholderKeys.set(keyPath, generated);
 		return generated;
 	} catch (err) {
@@ -69,6 +70,60 @@ export async function getExistingSecretPlaceholderKey(keyDir: string = getAgentD
 	}
 	if (existing !== undefined) cachedPlaceholderKeys.set(keyPath, existing);
 	return existing;
+}
+
+// Process-stable fallback for the sync lazy path when the key file cannot be
+// persisted (e.g. unwritable config root on a headless run). Memoized so
+// re-obfuscation within the process stays idempotent; placeholders simply lose
+// cross-session stability, matching `defaultPlaceholderKey()` in obfuscator.ts.
+let ephemeralSyncPlaceholderKey: string | undefined;
+
+/**
+ * Synchronous variant of `getSecretPlaceholderKey` for the lazy key provider
+ * `SecretObfuscator` invokes inside its synchronous `obfuscate()` path when a
+ * built-in credential-pattern entry first matches session content. Never
+ * throws: an unreadable or unwritable key file degrades to a process-ephemeral
+ * key (with a warning) instead of breaking the session.
+ */
+export function getSecretPlaceholderKeySync(keyDir: string = getAgentDir()): string {
+	const keyPath = path.join(keyDir, "secret-placeholder.key");
+	const cached = cachedPlaceholderKeys.get(keyPath);
+	if (cached !== undefined) return cached;
+	try {
+		const existing = fs.readFileSync(keyPath, "utf8").trim();
+		if (PLACEHOLDER_KEY_RE.test(existing)) {
+			cachedPlaceholderKeys.set(keyPath, existing);
+			return existing;
+		}
+	} catch {
+		// Missing or unreadable — attempt creation below.
+	}
+	const generated = crypto.randomBytes(32).toString("base64url");
+	try {
+		fs.mkdirSync(keyDir, { recursive: true });
+		fs.writeFileSync(keyPath, generated, { flag: "wx", mode: 0o600 });
+		cachedPlaceholderKeys.set(keyPath, generated);
+		return generated;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+			// Another process won the create race; accept its key if valid.
+			try {
+				const winner = fs.readFileSync(keyPath, "utf8").trim();
+				if (PLACEHOLDER_KEY_RE.test(winner)) {
+					cachedPlaceholderKeys.set(keyPath, winner);
+					return winner;
+				}
+			} catch {
+				// Fall through to the ephemeral key.
+			}
+		}
+		logger.warn("Could not persist secret placeholder key, using a process-ephemeral key", {
+			path: keyPath,
+			error: String(err),
+		});
+		ephemeralSyncPlaceholderKey ??= crypto.randomBytes(32).toString("base64url");
+		return ephemeralSyncPlaceholderKey;
+	}
 }
 
 /** Read and validate the key file, optionally retrying briefly until a valid key lands. */
@@ -143,6 +198,31 @@ export function collectEnvSecrets(): SecretEntry[] {
 		entries.push({ type: "plain", content: value, mode: "obfuscate" });
 	}
 	return entries;
+}
+
+/**
+ * Built-in entries covering credential-shaped tokens (GitHub/GitLab/OpenAI-style
+ * API keys) that are NOT configured via secrets.yml or the environment. Without
+ * these, such a token in a tool result falls through to pi-ai's irreversible
+ * provider-boundary redaction (`[openai_token_redacted]`); the model then echoes
+ * that placeholder into edit-tool `old_text`, which can never match the real
+ * bytes on disk (issue #6968). Routing the same shapes through the obfuscator
+ * mints reversible keyed placeholders that `deobfuscateToolArguments` restores
+ * before tool execution, keeping exact-match edits working while the credential
+ * bytes still never reach the provider. Unlike the pi-ai redaction there is no
+ * entropy gate here — a false positive only over-obfuscates, which stays
+ * transparent because the round trip is lossless.
+ */
+export function builtinCredentialSecretEntries(): SecretEntry[] {
+	return [
+		{
+			type: "regex",
+			content: SENSITIVE_TOKEN_RE.source,
+			flags: "i",
+			mode: "obfuscate",
+			friendlyName: "Credential",
+		},
+	];
 }
 
 async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> {

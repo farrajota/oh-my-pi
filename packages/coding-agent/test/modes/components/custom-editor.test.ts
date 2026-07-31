@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { CURSOR_MARKER } from "@oh-my-pi/pi-tui";
 import { setKittyProtocolActive } from "@oh-my-pi/pi-tui/keys";
 import { $ } from "bun";
@@ -77,6 +78,33 @@ describe("CustomEditor placeholder decoration", () => {
 	it("renders linked image placeholders before theme and settings initialization", async () => {
 		const output = await decorateInFreshProcess("[Image #1]", ["/tmp/example.png"]);
 		expect(output).toBe("[Image #1]");
+	});
+});
+
+describe("CustomEditor restored image drafts", () => {
+	beforeAll(async () => {
+		await initTheme();
+	});
+
+	it("submits restored images with their historical prompt", () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const image: ImageContent = {
+			type: "image",
+			data: "aW1hZ2U=",
+			mimeType: "image/png",
+		};
+		let submitted: { text: string; images: ImageContent[] } | undefined;
+		editor.onSubmit = text => {
+			submitted = { text, images: [...editor.pendingImages] };
+		};
+
+		editor.setDraft("Inspect [Image #1, 1x1]", [image]);
+		editor.submit();
+
+		expect(submitted).toEqual({
+			text: "Inspect [Image #1, 1x1]",
+			images: [image],
+		});
 	});
 });
 

@@ -99,6 +99,25 @@ describe("ExtensionRunner", () => {
 		expect(runner.createContext().localProtocolOptions).toBe(localProtocolOptions);
 	});
 
+	it("reflects SessionManager.moveTo() changes instead of the constructor-time snapshot (/move)", async () => {
+		const dirA = tempDir.join("dirA");
+		const dirB = tempDir.join("dirB");
+		fs.mkdirSync(dirA, { recursive: true });
+		fs.mkdirSync(dirB, { recursive: true });
+		const movableSessionManager = SessionManager.inMemory(dirA);
+
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(result.extensions, result.runtime, dirA, movableSessionManager, modelRegistry);
+
+		expect(runner.cwd).toBe(dirA);
+		expect(runner.createContext().cwd).toBe(dirA);
+
+		await movableSessionManager.moveTo(dirB);
+
+		expect(runner.cwd).toBe(dirB);
+		expect(runner.createContext().cwd).toBe(dirB);
+	});
+
 	describe("shortcut conflicts", () => {
 		it("warns when extension shortcut conflicts with built-in", async () => {
 			const extCode = `
@@ -2158,6 +2177,476 @@ describe("ExtensionRunner", () => {
 				},
 			]);
 		});
+
+		// A tool that records the exact params it executed with, so an input override is observable.
+		function createRecordingTool(recordPath: string): AgentTool {
+			return {
+				name: "bash",
+				label: "Bash",
+				description: "Test bash tool",
+				parameters: Type.Object({ command: Type.String() }),
+				strict: true,
+				execute: async (_id: string, params: unknown) => {
+					fs.appendFileSync(recordPath, `${JSON.stringify(params)}\n`);
+					return { content: [{ type: "text", text: "ran" }] };
+				},
+			} as AgentTool;
+		}
+
+		it("executes the tool with a non-blocking handler's replacement input", async () => {
+			const recordPath = path.join(tempDir.path(), "override-executed.jsonl");
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						return { input: { command: "echo revised" } };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-override.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
+
+			const resultMessage = await wrapped.execute("tool-call-id", { command: "echo original" });
+
+			expect(resultMessage.content).toEqual([{ type: "text", text: "ran" }]);
+			const executed = fs
+				.readFileSync(recordPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(executed).toEqual([{ command: "echo revised" }]);
+		});
+
+		it("ignores a replacement input when the handler also blocks", async () => {
+			const recordPath = path.join(tempDir.path(), "override-blocked.jsonl");
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						return { block: true, reason: "nope", input: { command: "echo revised" } };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-override-blocked.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
+
+			await expect(wrapped.execute("tool-call-id", { command: "echo original" })).rejects.toThrow("nope");
+			expect(fs.existsSync(recordPath)).toBe(false); // tool never executed
+		});
+
+		it("executes with the original input when no handler returns a replacement", async () => {
+			const recordPath = path.join(tempDir.path(), "override-absent.jsonl");
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						// observe only; no input override
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-no-override.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
+
+			await wrapped.execute("tool-call-id", { command: "echo original" });
+
+			const executed = fs
+				.readFileSync(recordPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(executed).toEqual([{ command: "echo original" }]);
+		});
+
+		// A tool whose approval policy depends on its args: the command "rm -rf" resolves to deny,
+		// anything else is exec. Lets a test prove the post-override approval re-check (P1).
+		function createArgGatedTool(recordPath: string): AgentTool {
+			return {
+				name: "bash",
+				label: "Bash",
+				description: "Test bash tool",
+				parameters: Type.Object({ command: Type.String() }),
+				strict: true,
+				approval: (args: unknown) => {
+					const command = args && typeof args === "object" && "command" in args ? args.command : undefined;
+					return command === "rm -rf" ? { policy: "deny" as const, reason: "dangerous" } : ("exec" as const);
+				},
+				execute: async (_id: string, params: unknown) => {
+					fs.appendFileSync(recordPath, `${JSON.stringify(params)}\n`);
+					return { content: [{ type: "text", text: "ran" }] };
+				},
+			} as AgentTool;
+		}
+
+		const yoloContext = {
+			settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+		} as never;
+
+		// Minimal runtime init so the approval gate's interactive `select` is wired for prompt-path tests.
+		const initApprovalRunner = (
+			runner: ExtensionRunner,
+			select: (title: string, options: string[]) => Promise<string | undefined>,
+		) => {
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				} as never,
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				} as never,
+				undefined,
+				{ select, notify: () => {} } as never,
+			);
+		};
+		const alwaysAskContext = {
+			sessionManager,
+			modelRegistry,
+			model: undefined,
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+			settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) },
+		} as never;
+
+		it("blocks a revised input that resolves to a deny policy (approval gates the revised args)", async () => {
+			const recordPath = path.join(tempDir.path(), "regate-blocked.jsonl");
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						return { input: { command: "rm -rf" } };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-regate.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createArgGatedTool(recordPath), runner);
+
+			// Original "echo original" resolves to exec; the handler rewrites it to "rm -rf", which the
+			// tool's approval declares deny. Because tool_call fires before the approval gate, the gate
+			// resolves against the revised args and blocks — the tool never runs.
+			await expect(
+				wrapped.execute("tool-call-id", { command: "echo original" }, undefined, undefined, yoloContext),
+			).rejects.toThrow(/blocked by user policy/);
+			expect(fs.existsSync(recordPath)).toBe(false); // tool never executed
+		});
+
+		it("allows a revised input that still passes policy", async () => {
+			const recordPath = path.join(tempDir.path(), "regate-allowed.jsonl");
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						return { input: { command: "echo revised" } };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-regate-ok.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createArgGatedTool(recordPath), runner);
+
+			await wrapped.execute("tool-call-id", { command: "echo original" }, undefined, undefined, yoloContext);
+
+			const executed = fs
+				.readFileSync(recordPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(executed).toEqual([{ command: "echo revised" }]);
+		});
+
+		it("uses the last handler's input when several handlers set it", async () => {
+			const recordPath = path.join(tempDir.path(), "regate-multi.jsonl");
+			const first = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						return { input: { command: "echo first" } };
+					});
+				}
+			`;
+			const second = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						return { input: { command: "echo second" } };
+					});
+				}
+			`;
+			// File names sort first < second, so the loader loads them in that order and second wins.
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-multi-a.ts"), first);
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-multi-b.ts"), second);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
+
+			await wrapped.execute("tool-call-id", { command: "echo original" });
+
+			const executed = fs
+				.readFileSync(recordPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(executed).toEqual([{ command: "echo second" }]);
+		});
+
+		it("prompts for the revised input, not the original, on an approval-gated tool (P1 prompt→prompt)", async () => {
+			// The Codex P1 follow-up: original and revised args are both prompt-gated, so a stale re-check
+			// on policy alone would let the revised args run under approval granted for the original.
+			// Because tool_call fires before the approval gate, the prompt must reflect the revised args.
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "prompt_tool") return;
+						return { input: { command: "revised-command" } };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-prompt-revise.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			let promptedWith = "";
+			const select = vi.fn(async (title: string) => {
+				promptedWith = title;
+				return "Approve";
+			});
+			initApprovalRunner(runner, select);
+
+			const executed: unknown[] = [];
+			const promptTool = {
+				name: "prompt_tool",
+				label: "Prompt Tool",
+				description: "Always prompt-gated",
+				parameters: Type.Object({ command: Type.String() }),
+				strict: true,
+				approval: "exec" as const,
+				formatApprovalDetails: (args: unknown) =>
+					args && typeof args === "object" && "command" in args ? String(args.command) : "",
+				execute: async (_id: string, params: unknown) => {
+					executed.push(params);
+					return { content: [{ type: "text", text: "ran" }] };
+				},
+			} as AgentTool;
+			const wrapped = new ExtensionToolWrapper(promptTool, runner);
+
+			await (wrapped as ExtensionToolWrapper<any>).execute(
+				"call-p2p",
+				{ command: "original-command" },
+				undefined,
+				undefined,
+				alwaysAskContext,
+			);
+
+			// The user was prompted for the revised command, and that is what executed.
+			expect(promptedWith).toContain("revised-command");
+			expect(promptedWith).not.toContain("original-command");
+			expect(executed).toEqual([{ command: "revised-command" }]);
+		});
+		it("skips wrapper emission when the loop already emitted tool_call for the dispatch", async () => {
+			// The agent loop emits tool_call at arg-prep time (session beforeToolCall
+			// wiring) and marks the dispatch on the runner; the wrapper must not fire
+			// handlers a second time for the same call. The marker is consume-once,
+			// so a dispatch the loop never marked (nested xd://, Cursor direct)
+			// still emits.
+			const recordPath = path.join(tempDir.path(), "loop-marker.jsonl");
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						return { input: { command: "echo revised" } };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-loop-marker.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
+
+			runner.markToolCallEmitted("loop-call-id", "bash");
+			await wrapped.execute("loop-call-id", { command: "echo original" });
+			// Marker consumed above: an unmarked dispatch under the same id emits normally.
+			await wrapped.execute("loop-call-id", { command: "echo original" });
+
+			const executed = fs
+				.readFileSync(recordPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(executed).toEqual([{ command: "echo original" }, { command: "echo revised" }]);
+		});
+
+		it("forfeits the xdevApproved prompt bypass when a handler revises the input", async () => {
+			// write.ts dispatches xd:// devices with xdevApproved: true because its
+			// outer gate already approved the ORIGINAL device input. A tool_call
+			// revision may raise the tier, so revised input must face the full gate
+			// (here: no interactive UI => reject) instead of riding the outer approval.
+			const recordPath = path.join(tempDir.path(), "xdev-revised.jsonl");
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						return { input: { command: "echo revised" } };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-xdev-revise.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
+			const xdevContext = {
+				settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) },
+				xdevApproved: true,
+			} as never;
+
+			await expect(
+				wrapped.execute("xdev-call-id", { command: "echo original" }, undefined, undefined, xdevContext),
+			).rejects.toThrow(/requires approval but no interactive UI available/);
+			expect(fs.existsSync(recordPath)).toBe(false); // tool never executed
+		});
+
+		it("emits tool_call before the approval prompt so approval sees the final input", async () => {
+			const order: string[] = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "prompt_tool") return;
+						globalThis.__orderEvents.push("tool_call");
+						return { input: { command: "revised" } };
+					});
+					pi.on("tool_approval_requested", async () => {
+						globalThis.__orderEvents.push("tool_approval_requested");
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-order.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & { __orderEvents?: string[] };
+			globalState.__orderEvents = order;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async () => {
+				order.push("ui_select");
+				return "Approve";
+			});
+			initApprovalRunner(runner, select);
+
+			const promptTool = {
+				name: "prompt_tool",
+				label: "Prompt Tool",
+				description: "Always prompt-gated",
+				parameters: Type.Object({ command: Type.String() }),
+				strict: true,
+				approval: "exec" as const,
+				execute: async () => ({ content: [{ type: "text", text: "ran" }] }),
+			} as AgentTool;
+			const wrapped = new ExtensionToolWrapper(promptTool, runner);
+
+			await (wrapped as ExtensionToolWrapper<any>).execute(
+				"call-order",
+				{ command: "original" },
+				undefined,
+				undefined,
+				alwaysAskContext,
+			);
+
+			expect(order).toEqual(["tool_call", "tool_approval_requested", "ui_select"]);
+			delete globalState.__orderEvents;
+		});
 	});
 	describe("hasHandlers", () => {
 		it("returns true when handlers exist for event type", async () => {
@@ -2411,63 +2900,121 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("auto_retry lifecycle events", () => {
-		it("delivers recovered and timeout payloads to an extension subscribing to both hooks", async () => {
+		it("delivers recovered and timeout payloads to subscribed extensions", async () => {
 			const eventsPath = path.join(tempDir.path(), "auto-retry-lifecycle-events.jsonl");
-			const extCode = `
-				import * as fs from "node:fs";
-
-				export default function(pi) {
-					pi.on("auto_retry_recovered", async (event) => {
-						fs.appendFileSync(${JSON.stringify(eventsPath)}, JSON.stringify(event) + "\\n");
-					});
-					pi.on("auto_retry_timeout", async (event) => {
-						fs.appendFileSync(${JSON.stringify(eventsPath)}, JSON.stringify(event) + "\\n");
-					});
-				}
-			`;
-			fs.writeFileSync(path.join(extensionsDir, "auto-retry-lifecycle.ts"), extCode);
-
-			const result = await loadTestExtensions();
-			const runner = new ExtensionRunner(
-				result.extensions,
-				result.runtime,
-				tempDir.path(),
-				sessionManager,
-				modelRegistry,
+			fs.writeFileSync(
+				path.join(extensionsDir, "auto-retry-lifecycle.ts"),
+				`
+					import * as fs from "node:fs";
+					export default function(pi) {
+						pi.on("auto_retry_recovered", async (event) => fs.appendFileSync(${JSON.stringify(eventsPath)}, JSON.stringify(event) + "\\n"));
+						pi.on("auto_retry_timeout", async (event) => fs.appendFileSync(${JSON.stringify(eventsPath)}, JSON.stringify(event) + "\\n"));
+					}
+				`,
 			);
-			const recoveredEvent = {
-				type: "auto_retry_recovered" as const,
-				round: 2,
-				startedAtMs: 1_000,
-				recoveredAtMs: 1_250,
-				durationMs: 250,
-				deadlineMs: 5_000,
-				timeoutMs: 4_000,
-				recoveredErrors: [],
-			};
-			const timeoutEvent = {
-				type: "auto_retry_timeout" as const,
-				round: 4,
-				startedAtMs: 1_000,
-				timedOutAtMs: 5_000,
-				durationMs: 4_000,
-				deadlineMs: 5_000,
-				timeoutMs: 4_000,
-				finalError: "provider remained overloaded",
-				recoveredErrors: [],
-			};
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
+            const recoveredEvent = {
+                type: "auto_retry_recovered" as const,
+                round: 2,
+                startedAtMs: 1_000,
+                recoveredAtMs: 1_250,
+                durationMs: 250,
+                deadlineMs: 5_000,
+                timeoutMs: 4_000,
+                recoveredErrors: [],
+            };
+            const timeoutEvent = {
+                type: "auto_retry_timeout" as const,
+                round: 4,
+                startedAtMs: 1_000,
+                timedOutAtMs: 5_000,
+                durationMs: 4_000,
+                deadlineMs: 5_000,
+                timeoutMs: 4_000,
+                finalError: "provider remained overloaded",
+                recoveredErrors: [],
+            };
+            await runner.emit(recoveredEvent);
+            await runner.emit(timeoutEvent);
+            const events = fs.readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+            expect(events).toEqual([recoveredEvent, timeoutEvent]);
+        });
+    });
 
-			await runner.emit(recoveredEvent);
-			await runner.emit(timeoutEvent);
+    describe("mcp_notification", () => {
+        const initializeRunner = (runner: ExtensionRunner) =>
+            runner.initialize({} as never, {
+                getModel: () => undefined,
+                isIdle: () => true,
+                abort: () => {},
+                hasPendingMessages: () => false,
+                shutdown: () => {},
+                getContextUsage: () => undefined,
+                compact: async () => {},
+                getSystemPrompt: () => [],
+            });
 
-			const events = fs
-				.readFileSync(eventsPath, "utf8")
-				.trim()
-				.split("\n")
-				.map(line => JSON.parse(line));
-			expect(events).toEqual([recoveredEvent, timeoutEvent]);
-		});
-	});
+        it("delivers typed notifications to subscribed extensions", async () => {
+            const eventsPath = path.join(tempDir.path(), "mcp-notification-events.jsonl");
+            fs.writeFileSync(
+                path.join(extensionsDir, "mcp-notification.ts"),
+                `
+                    import * as fs from "node:fs";
+                    export default function(pi) {
+                        pi.on("mcp_notification", async (event) => fs.appendFileSync(
+                            ${JSON.stringify(eventsPath)},
+                            JSON.stringify({ type: event.type, server: event.server, method: event.method, params: event.params }) + "\\n",
+                        ));
+                    }
+                `,
+            );
+            const result = await loadTestExtensions();
+            const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
+            initializeRunner(runner);
+            await runner.emitMcpNotification({
+                server: "peers",
+                method: "notifications/peer_message",
+                params: { from: "alice", text: "hi" },
+            });
+            const events = fs.readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+            expect(events).toEqual([
+                {
+                    type: "mcp_notification",
+                    server: "peers",
+                    method: "notifications/peer_message",
+                    params: { from: "alice", text: "hi" },
+                },
+            ]);
+        });
+
+        it("buffers pre-initialize notifications with a bounded drop-oldest queue", async () => {
+            const eventsPath = path.join(tempDir.path(), "mcp-notification-cap.jsonl");
+            fs.writeFileSync(
+                path.join(extensionsDir, "mcp-notification-cap.ts"),
+                `
+                    import * as fs from "node:fs";
+                    export default function(pi) {
+                        pi.on("mcp_notification", async (event) => fs.appendFileSync(
+                            ${JSON.stringify(eventsPath)},
+                            JSON.stringify({ server: event.server, method: event.method }) + "\\n",
+                        ));
+                    }
+                `,
+            );
+            const result = await loadTestExtensions();
+            const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
+            for (let i = 0; i < 101; i++) {
+                await runner.emitMcpNotification({ server: "peers", method: `notifications/test/${i}`, params: null });
+            }
+            initializeRunner(runner);
+            for (let i = 0; i < 5; i++) await Promise.resolve();
+            const events = fs.readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+            expect(events).toHaveLength(100);
+            expect(events[0]?.method).toBe("notifications/test/1");
+            expect(events[99]?.method).toBe("notifications/test/100");
+        });
+    });
 
 	describe("managed timers (ctx.setInterval / ctx.setTimeout)", () => {
 		it("contains a throwing interval callback instead of letting it escape as uncaughtException", () => {
@@ -2582,6 +3129,93 @@ describe("ExtensionRunner", () => {
 			} finally {
 				vi.useRealTimers();
 			}
+		});
+	});
+
+	describe("invokeTool same-tool delegation", () => {
+		// Records what the native tool actually received, so the inherited abort/progress channels and
+		// the caller context are observable.
+		function nativeProbe(seen: { signal?: AbortSignal; onUpdate?: unknown; params?: unknown }): AgentTool {
+			return {
+				name: "bash",
+				label: "Bash",
+				description: "native bash",
+				parameters: Type.Object({ command: Type.String() }),
+				execute: async (_id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => {
+					seen.params = params;
+					seen.signal = signal;
+					seen.onUpdate = onUpdate;
+					return { content: [{ type: "text", text: "native ran" }], details: {} };
+				},
+			} as AgentTool;
+		}
+
+		const runnerWithNative = async (native: AgentTool) => {
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.setNativeToolResolver(name =>
+				name === native.name ? { tool: native, makeContext: () => ({}) as never } : undefined,
+			);
+			return runner;
+		};
+
+		it("inherits the wrapper call's signal and onUpdate for a bare invokeTool", async () => {
+			const seen: { signal?: AbortSignal; onUpdate?: unknown; params?: unknown } = {};
+			const runner = await runnerWithNative(nativeProbe(seen));
+			const controller = new AbortController();
+			const onUpdate = () => {};
+
+			const ctx = runner.createContext(undefined, {
+				toolName: "bash",
+				signal: controller.signal,
+				onUpdate,
+			});
+			await ctx.invokeTool?.({ command: "echo hi" });
+
+			// Aborting the outer tool call must reach the native one, and native progress must stream.
+			expect(seen.signal).toBe(controller.signal);
+			expect(seen.onUpdate).toBe(onUpdate);
+			expect(seen.params).toEqual({ command: "echo hi" });
+		});
+
+		it("lets explicit invokeTool options override the inherited channels", async () => {
+			const seen: { signal?: AbortSignal; onUpdate?: unknown; params?: unknown } = {};
+			const runner = await runnerWithNative(nativeProbe(seen));
+			const outer = new AbortController();
+			const inner = new AbortController();
+			const innerOnUpdate = () => {};
+
+			const ctx = runner.createContext(undefined, {
+				toolName: "bash",
+				signal: outer.signal,
+				onUpdate: () => {},
+			});
+			await ctx.invokeTool?.({ command: "echo hi" }, { signal: inner.signal, onUpdate: innerOnUpdate });
+
+			expect(seen.signal).toBe(inner.signal);
+			expect(seen.onUpdate).toBe(innerOnUpdate);
+		});
+
+		it("omits invokeTool when no native built-in of that name exists", async () => {
+			const runner = await runnerWithNative(nativeProbe({}));
+			expect(runner.createContext(undefined, { toolName: "not_a_builtin" }).invokeTool).toBeUndefined();
+			// Also absent when the context is not scoped to a tool at all.
+			expect(runner.createContext().invokeTool).toBeUndefined();
+		});
+
+		it("bounds recursion per call chain", async () => {
+			const runner = await runnerWithNative(nativeProbe({}));
+			await expect(runner.invokeNativeTool("bash", { command: "echo hi" }, { depth: 8 })).rejects.toThrow(
+				/delegation depth exceeded/,
+			);
+			// A fresh chain at depth 0 is unaffected by another chain's depth.
+			await expect(runner.invokeNativeTool("bash", { command: "echo hi" }, { depth: 0 })).resolves.toBeDefined();
 		});
 	});
 });

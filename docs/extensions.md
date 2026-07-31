@@ -158,6 +158,7 @@ Handlers and tool `execute` receive `ctx` with:
 - `modelRegistry`, `model`
 - `models` (read-only model query — see below)
 - `getContextUsage()`
+- `getAsyncJobSnapshot()` returns the current session's read-only async-job snapshot, or `null` when no session owns the context
 - `compact(...)`
 - `isIdle()`, `hasPendingMessages()`, `abort()`
 - `shutdown()`
@@ -252,7 +253,7 @@ Cancelable pre-events:
 
 ### Tool lifecycle
 
-- `tool_call` (pre-exec, may block)
+- `tool_call` (pre-exec, may block, or revise the tool's execution `input`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike)
 - `tool_result` (post-exec, may patch content/details/isError)
 - `tool_execution_start` / `tool_execution_update` / `tool_execution_end` (observability)
 - `tool_approval_requested` / `tool_approval_resolved` (observability; emitted by `wrapper.ts` only when a tool requires approval and an approval handler is registered)
@@ -267,6 +268,23 @@ Cancelable pre-events:
 - `todo_reminder`
 - `goal_updated`
 - `credential_disabled`
+
+### MCP notifications
+
+- `mcp_notification` — fired for every JSON-RPC notification received from a connected MCP server, AFTER the manager's own handling of known list/update methods (`notifications/tools/list_changed`, `notifications/resources/list_changed`, `notifications/resources/updated`, `notifications/prompts/list_changed`). Unknown or server-custom methods are also delivered. Payload: `{ server: string; method: string; params: unknown }`. Multiple extensions may subscribe; a handler that throws does not prevent other handlers from firing. Notifications received before any listener attaches are buffered (bounded FIFO, cap 100, drop-oldest) and drained into the first subscriber — so startup-time frames aren't lost even if the extension binds after MCP discovery.
+
+Bridging a push-capable MCP into a session steer:
+
+```ts
+pi.on("mcp_notification", event => {
+  if (event.server !== "peer-bus") return;
+  if (event.method !== "notifications/peer_message") return;
+  const params = event.params as { from: string; text: string };
+  pi.sendUserMessage(`[from ${params.from}] ${params.text}`, { deliverAs: "steer" });
+});
+```
+
+The runtime handles the JSON-RPC transport and its own list/update refresh first; the handler runs afterwards and can inject a mid-turn steer via `pi.sendMessage` / `pi.sendUserMessage`.
 
 ### User command interception
 
@@ -293,6 +311,26 @@ execute(
 	ctx,
 ): Promise<AgentToolResult>
 ```
+
+### Delegating to a native built-in (`ctx.invokeTool`)
+
+A tool that re-registers a built-in name (e.g. wrapping `write` to add logging or a policy check) can
+run the original instead of reimplementing it. When your registered tool shadows a built-in, the `ctx`
+passed to `execute` carries:
+
+```ts
+ctx.invokeTool?<TDetails>(
+  params: Record<string, unknown>,
+  options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback },
+): Promise<AgentToolResult<TDetails>>
+```
+
+It runs the **native** built-in of the same name as your tool (delegation is same-tool only, so it
+cannot reach an arbitrary target or escalate past the approval already granted for this call) and
+returns its result, including the native tool's own side effects and internal bookkeeping. It is
+present only when a native built-in of that name exists — `ctx.invokeTool` is `undefined` for a
+net-new tool that shadows no built-in. The native call is not re-gated, since it is the same tool you
+are already approved as, and delegation depth is guarded against accidental self-recursion.
 
 Template:
 
@@ -373,7 +411,7 @@ When no UI context is supplied to runner init, `ctx.hasUI` is `false` and method
 
 ### ACP mode
 
-ACP installs an elicitation-bridged UI context (`createAcpExtensionUiContext` in `acp-agent.ts`). `ctx.hasUI` is `true` while only `select`/`confirm`/`input` round-trip (as ACP elicitations; defaults are returned when the client lacks the `elicitation.form` capability). The non-elicitation surface (widgets, editor, theming, terminal input, autocomplete stacking) is stubbed no-op.
+ACP installs an elicitation-bridged UI context (`createAcpExtensionUiContext` in `acp-agent.ts`). `ctx.hasUI` is `true` while `select`/`confirm`/`input`/`editor` round-trip (as ACP elicitations; defaults are returned when the client lacks the `elicitation.form` capability). The non-elicitation surface (widgets, theming, terminal input, autocomplete stacking) is stubbed no-op.
 
 ## Session and state patterns
 
