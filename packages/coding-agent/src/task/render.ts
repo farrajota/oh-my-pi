@@ -91,6 +91,7 @@ function appendAgentStats(
 		contextWindow?: number;
 		cost: number;
 		resolvedModel?: string;
+		requestedModel?: string;
 		showResolvedModelBadge?: boolean;
 	},
 	theme: Theme,
@@ -111,6 +112,9 @@ function appendAgentStats(
 	}
 	if (opts.cost > 0) {
 		line += `${theme.sep.dot}${theme.fg("statusLineCost", `$${opts.cost.toFixed(2)}`)}`;
+	}
+	if (opts.requestedModel) {
+		line += `${theme.sep.dot}${theme.fg("dim", `requested ${truncateToWidth(replaceTabs(opts.requestedModel), 30)}`)}`;
 	}
 	if (opts.resolvedModel && opts.showResolvedModelBadge) {
 		line += `${theme.sep.dot}${theme.fg("dim", truncateToWidth(replaceTabs(opts.resolvedModel), 30))}`;
@@ -768,6 +772,9 @@ function renderTaskCallLines(args: Partial<TaskParams> | undefined, theme: Theme
 			line += `: ${theme.fg("muted", previewLine(brief, 64))}`;
 		}
 		line += agentTypeBadge(args.agent, theme);
+		if (typeof args.model === "string" && args.model.trim()) {
+			line += ` ${theme.fg("dim", `model ${truncateToWidth(replaceTabs(args.model.trim()), 30)}`)}`;
+		}
 		lines.push(line);
 	}
 	appendPermissionLines(lines, args.permissions, theme);
@@ -803,6 +810,9 @@ function renderTaskItemLines(tasks: TaskItem[] | undefined, theme: Theme): strin
 			line += `: ${theme.fg("muted", previewLine(brief, 64))}`;
 		}
 		line += agentTypeBadge(item?.agent, theme);
+		if (typeof item?.model === "string" && item.model.trim()) {
+			line += ` ${theme.fg("dim", `model ${truncateToWidth(replaceTabs(item.model.trim()), 30)}`)}`;
+		}
 		if (item?.isolated === true) {
 			line += theme.fg("dim", " [isolated]");
 		}
@@ -1303,6 +1313,7 @@ function renderAgentResult(
 			contextTokens: result.contextTokens,
 			contextWindow: result.contextWindow,
 			cost: result.usage?.cost.total ?? 0,
+			requestedModel: result.requestedModel,
 			resolvedModel: result.resolvedModel,
 			showResolvedModelBadge: showBadge,
 		},

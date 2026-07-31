@@ -415,21 +415,25 @@ describe("Settings", () => {
 			expect(getDefault("providers.maxInFlightRequests")).toEqual({});
 		});
 
-		it("defaults task effort overrides to enabled and persists an explicit disable", async () => {
+		it("defaults model overrides off and persists independent gate changes", async () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 
 			expect(await readSettings()).toEqual({});
 			expect(settings.get("task.allowEffortOverride")).toBe(true);
 			expect(getDefault("task.allowEffortOverride")).toBe(true);
+			expect(settings.get("task.allowModelOverride")).toBe(false);
+			expect(getDefault("task.allowModelOverride")).toBe(false);
 
 			settings.set("task.allowEffortOverride", false);
+			settings.set("task.allowModelOverride", true);
 			await settings.flush();
 
 			const savedSettings = await readSettings();
-			expect(savedSettings.task).toEqual({ allowEffortOverride: false });
+			expect(savedSettings.task).toEqual({ allowEffortOverride: false, allowModelOverride: true });
 
 			const reloaded = await Settings.loadIsolated({ cwd: projectDir, agentDir });
 			expect(reloaded.get("task.allowEffortOverride")).toBe(false);
+			expect(reloaded.get("task.allowModelOverride")).toBe(true);
 		});
 
 		it("exposes all tool calling mode options", () => {

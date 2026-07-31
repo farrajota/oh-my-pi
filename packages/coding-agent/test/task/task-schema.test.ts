@@ -7,8 +7,9 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { type } from "arktype";
 
 // Contract: the single-spawn schema (`task.batch: false`; the exported
-// `taskSchema` instance) carries no batch fields while accepting a caller
-// `model`, `outputSchema`, and its validation mode. The batch shape (`tasks[]` + shared
+// `taskSchema` instance) carries no batch fields and keeps model gated by
+// `task.allowModelOverride`; dynamic schemas accept caller `model` only when
+// that independent gate is enabled. The batch shape (`tasks[]` + shared
 // `context`) is gated by the `task.batch` setting (default on, covered by
 // test/task/task-batch.test.ts).
 
@@ -101,6 +102,18 @@ describe("task schema (single-spawn)", () => {
 			expect(parsed.schemaMode).toBe("strict");
 			expect(parsed.permissions).toEqual({ denyTools: ["write"] });
 		}
+	});
+
+	it("retains a request model only when the model gate is enabled", () => {
+		const enabled = getTaskSchema({
+			isolationEnabled: false,
+			batchEnabled: false,
+			defaultAgent: "task",
+			modelEnabled: true,
+		});
+		const parsed = enabled({ task: "Map the auth module.", model: "request/model" });
+		expect(parsed instanceof type.errors).toBe(false);
+		if (!(parsed instanceof type.errors)) expect(parsed.model).toBe("request/model");
 	});
 });
 

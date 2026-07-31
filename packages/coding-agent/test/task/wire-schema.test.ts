@@ -124,10 +124,12 @@ describe("task approval details surface the dispatch", () => {
 			agent: "reviewer",
 			name: "ReviewAuth",
 			task: "audit the auth module",
+			model: "request/model",
 		});
 		expect(lines).toContain("Agent: reviewer");
 		expect(lines).toContain("Name: ReviewAuth");
 		expect(lines).toContain("Task:\naudit the auth module");
+		expect(lines).toContain("Model: request/model");
 	});
 
 	it("summarizes a homogeneous batch whose agents use the session default", async () => {

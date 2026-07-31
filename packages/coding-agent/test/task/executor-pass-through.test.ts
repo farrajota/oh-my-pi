@@ -101,11 +101,11 @@ const baseOptions = {
 	enableLsp: false,
 };
 
-function createModelRegistry(model: Model): ModelRegistry {
+function createModelRegistry(model: Model, ...additionalModels: Model[]): ModelRegistry {
 	return {
 		authStorage: {},
 		refresh: async () => {},
-		getAvailable: () => [model],
+		getAvailable: () => [model, ...additionalModels],
 		getApiKey: async () => "test-key",
 	} as unknown as ModelRegistry;
 }
@@ -384,5 +384,75 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.exitCode).toBe(0);
 		const forwarded = spy.mock.calls[0]?.[0];
 		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Low);
+	});
+
+	it("fails an empty exact override before metadata can select a model", async () => {
+		const metadataModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!metadataModel) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const spy = vi.spyOn(sdkModule, "createAgentSession");
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "exact-empty-selector",
+			modelOverride: ["", "   "],
+			requestedModel: `${metadataModel.provider}/${metadataModel.id}`,
+			exactModelOverride: true,
+			modelRegistry: createModelRegistry(metadataModel),
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("Exact model override is required");
+		expect(result.requestedModel).toBe(`${metadataModel.provider}/${metadataModel.id}`);
+		expect(spy).not.toHaveBeenCalled();
+	});
+
+	it("routes an exact override independently of requested-model audit metadata", async () => {
+		const overrideModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!overrideModel) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const metadataModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+		if (!metadataModel) throw new Error("Expected gpt-5.6-sol model to exist");
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const requestedModel = `${metadataModel.provider}/${metadataModel.id}`;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "exact-mismatched-audit-metadata",
+			modelOverride: `${overrideModel.provider}/${overrideModel.id}`,
+			requestedModel,
+			exactModelOverride: true,
+			modelRegistry: createModelRegistry(overrideModel, metadataModel),
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(spy.mock.calls[0]?.[0]?.model).toMatchObject({
+			provider: overrideModel.provider,
+			id: overrideModel.id,
+		});
+		expect(result.requestedModel).toBe(requestedModel);
+	});
+
+	it("fails an exact unresolved selector instead of using configured fallbacks", async () => {
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!fallback) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${fallback.provider}/${fallback.id}`);
+		const spy = vi.spyOn(sdkModule, "createAgentSession");
+
+		const result = await runSubprocess({
+			...baseOptions,
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "exact-unresolved-selector",
+			settings,
+			modelRegistry: createModelRegistry(fallback),
+			modelOverride: "missing/requested-model",
+			requestedModel: `${fallback.provider}/${fallback.id}`,
+			exactModelOverride: true,
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toLowerCase()).toContain("missing/requested-model");
+		expect(result.requestedModel).toBe(`${fallback.provider}/${fallback.id}`);
+		expect(spy).not.toHaveBeenCalled();
 	});
 });

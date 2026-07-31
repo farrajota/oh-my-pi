@@ -33,8 +33,10 @@ describe("task renderer: streaming call preview", () => {
 			agent: "reviewer",
 			name: "ReviewAuth",
 			task: "Review packages/server/src/auth for missing 401 handling.\nReport findings.",
+			model: "request/model",
 		};
 		const out = render(args);
+		expect(out).toContain("request/model");
 		const lines = out.split("\n");
 
 		expect(lines[0]).toContain("reviewer");

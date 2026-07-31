@@ -4558,6 +4558,17 @@ export const SETTINGS_SCHEMA = {
 			description: "Allow caller-provided `task.effort` to override configured agent/model thinking.",
 		},
 	},
+	"task.allowModelOverride": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Allow Task Model Overrides",
+			description:
+				"Allow caller-provided `task.model` to override the configured subagent model for one invocation.",
+		},
+	},
 
 	"task.generateLabels": {
 		type: "boolean",

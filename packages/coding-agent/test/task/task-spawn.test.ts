@@ -35,7 +35,11 @@ const taskAgent: AgentDefinition = {
 	source: "bundled",
 };
 
-function createSession(options: { manager?: AsyncJobManager; settings?: Record<string, unknown> }): ToolSession {
+function createSession(options: {
+	manager?: AsyncJobManager;
+	settings?: Record<string, unknown>;
+	modelRegistry?: ToolSession["modelRegistry"];
+}): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
@@ -43,6 +47,7 @@ function createSession(options: { manager?: AsyncJobManager; settings?: Record<s
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		asyncJobManager: options.manager,
+		modelRegistry: options.modelRegistry,
 	} as unknown as ToolSession;
 }
 
@@ -156,7 +161,9 @@ describe("task spawn routing", () => {
 		expect(job!.resultText).toContain("message it via `hub` to follow up");
 		expect(job!.resultText).toContain("history://Spawnling");
 		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(runSpy.mock.calls[0]?.[0].requestedModel).toBeUndefined();
 		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["openai/gpt-4.1-mini"]);
+		expect(runSpy.mock.calls[0]?.[0].exactModelOverride).not.toBe(true);
 		expect(runSpy.mock.calls[0]?.[0].enableLsp).toBe(false);
 		expect(runSpy.mock.calls[0]?.[0].thinkingLevel).toBe(Effort.High);
 		expect(runSpy.mock.calls[0]?.[0].effort).toBe("hi");
@@ -192,6 +199,67 @@ describe("task spawn routing", () => {
 		expect(runSpy).toHaveBeenCalledTimes(1);
 		expect(runSpy.mock.calls[0]?.[0]).not.toHaveProperty("effort");
 		expect(runSpy.mock.calls[0]?.[0].thinkingLevel).toBe(Effort.Medium);
+	});
+
+	it("gives an accepted request model precedence over settings and frontmatter", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [{ ...taskAgent, model: ["frontmatter/model"] }],
+			projectAgentsDir: null,
+		});
+		const runSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		const manager = createManager();
+		const tool = await TaskTool.create(
+			createSession({
+				manager,
+				settings: {
+					"async.enabled": true,
+					"task.allowModelOverride": true,
+					"task.agentModelOverrides": { task: "settings/model" },
+				},
+			}),
+		);
+
+		const result = await tool.execute("tc-request-model", {
+			agent: "task",
+			name: "RequestModel",
+			task: "Do the thing.",
+			model: "request/model",
+		} as TaskParams);
+		const job = manager.getJob(result.details!.async!.jobId)!;
+		await job.promise;
+
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(runSpy.mock.calls[0]?.[0].requestedModel).toBe("request/model");
+		expect(runSpy.mock.calls[0]?.[0].exactModelOverride).toBe(true);
+	});
+
+	it("rejects an unresolved request model before creating a background job", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [taskAgent],
+			projectAgentsDir: null,
+		});
+		const runSpy = vi.spyOn(executorModule, "runSubprocess");
+		const manager = createManager();
+		const tool = await TaskTool.create(
+			createSession({
+				manager,
+				modelRegistry: { getAvailable: () => [] } as unknown as ToolSession["modelRegistry"],
+				settings: { "async.enabled": true, "task.allowModelOverride": true },
+			}),
+		);
+
+		const result = await tool.execute("tc-unresolved-request-model", {
+			agent: "task",
+			name: "MissingModel",
+			task: "Do the thing.",
+			model: "missing/requested-model",
+		} as TaskParams);
+
+		expect(getFirstText(result)).toContain("did not resolve to an enabled model");
+		expect(result.details?.async).toBeUndefined();
+		expect(runSpy).not.toHaveBeenCalled();
 	});
 
 	it("uses a safe capped one-line label without changing the task prompt", async () => {

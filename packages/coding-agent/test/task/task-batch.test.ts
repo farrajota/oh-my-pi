@@ -133,23 +133,32 @@ describe("task.batch schema gating", () => {
 		expect(itemProperties.schemaMode).toBeDefined();
 	});
 
-	it("shows effort wire fields and guidance only when overrides are allowed", async () => {
+	it("shows independent effort/model wire fields for all four authorization combinations", async () => {
 		mockDiscovery();
-		const policies: Array<{ allowEffortOverride?: boolean; effortEnabled: boolean }> = [
-			{ effortEnabled: true },
-			{ allowEffortOverride: true, effortEnabled: true },
-			{ allowEffortOverride: false, effortEnabled: false },
+		const policies: Array<{
+			allowEffortOverride: boolean;
+			allowModelOverride: boolean;
+			effortEnabled: boolean;
+			modelEnabled: boolean;
+		}> = [
+			{ allowEffortOverride: false, allowModelOverride: false, effortEnabled: false, modelEnabled: false },
+			{ allowEffortOverride: false, allowModelOverride: true, effortEnabled: false, modelEnabled: true },
+			{ allowEffortOverride: true, allowModelOverride: false, effortEnabled: true, modelEnabled: false },
+			{ allowEffortOverride: true, allowModelOverride: true, effortEnabled: true, modelEnabled: true },
 		];
 
 		for (const policy of policies) {
 			for (const batchEnabled of [false, true]) {
-				const settings: Record<string, unknown> = { "task.batch": batchEnabled };
-				if (policy.allowEffortOverride !== undefined) {
-					settings["task.allowEffortOverride"] = policy.allowEffortOverride;
-				}
+				const settings: Record<string, unknown> = {
+					"task.batch": batchEnabled,
+					"task.allowEffortOverride": policy.allowEffortOverride,
+					"task.allowModelOverride": policy.allowModelOverride,
+				};
 				const tool = await TaskTool.create(createSession({ settings }));
 				const properties = getSchemaProperties(tool);
-				const effort = batchEnabled ? getBatchItemProperties(tool).effort : properties.effort;
+				const itemProperties = getBatchItemProperties(tool);
+				const effort = batchEnabled ? itemProperties.effort : properties.effort;
+				const model = batchEnabled ? itemProperties.model : properties.model;
 
 				if (policy.effortEnabled) {
 					expect(effort).toBeDefined();
@@ -158,42 +167,52 @@ describe("task.batch schema gating", () => {
 					expect(effort).toBeUndefined();
 					expect(tool.description).not.toContain("- `effort`:");
 				}
+				if (policy.modelEnabled) {
+					expect(model).toBeDefined();
+					expect(tool.description).toContain("- `model`:");
+				} else {
+					expect(model).toBeUndefined();
+					expect(tool.description).not.toContain("- `model`:");
+				}
 			}
 		}
 	});
 
-	it("keeps dynamic schema cache entries separate for each effort override state", async () => {
+	it("keeps dynamic schema cache entries separate for each effort/model gate combination", async () => {
 		mockDiscovery();
-		const createDynamicTool = (spawns: string, allowEffortOverride: boolean) =>
+		const createDynamicTool = (spawns: string, allowEffortOverride: boolean, allowModelOverride: boolean) =>
 			TaskTool.create(
 				createSession({
 					spawns,
-					settings: { "task.batch": false, "task.allowEffortOverride": allowEffortOverride },
+					settings: {
+						"task.batch": false,
+						"task.allowEffortOverride": allowEffortOverride,
+						"task.allowModelOverride": allowModelOverride,
+					},
 				}),
 			);
 
-		const enabledFirst = await createDynamicTool("schema-cache-enabled-first", true);
-		const disabledAfterEnabled = await createDynamicTool("schema-cache-enabled-first", false);
-		const disabledFirst = await createDynamicTool("schema-cache-disabled-first", false);
-		const enabledAfterDisabled = await createDynamicTool("schema-cache-disabled-first", true);
+		const disabledDisabled = await createDynamicTool("schema-cache-dd", false, false);
+		const disabledEnabled = await createDynamicTool("schema-cache-de", false, true);
+		const enabledDisabled = await createDynamicTool("schema-cache-ed", true, false);
+		const enabledEnabled = await createDynamicTool("schema-cache-ee", true, true);
+		const disabledDisabledAgain = await createDynamicTool("schema-cache-dd", false, false);
 
-		const enabledFirstParameters = enabledFirst.parameters;
-		const disabledAfterEnabledParameters = disabledAfterEnabled.parameters;
-		const disabledFirstParameters = disabledFirst.parameters;
-		const enabledAfterDisabledParameters = enabledAfterDisabled.parameters;
-		expect(enabledFirst.parameters).toBe(enabledFirstParameters);
-		expect(disabledFirst.parameters).toBe(disabledFirstParameters);
-		expect(enabledFirstParameters).not.toBe(disabledAfterEnabledParameters);
-		expect(disabledFirstParameters).not.toBe(enabledAfterDisabledParameters);
-
-		for (const tool of [enabledFirst, enabledAfterDisabled]) {
-			expect(getSchemaProperties(tool).effort).toBeDefined();
-			expect(tool.description).toContain("- `effort`:");
+		expect(disabledDisabled.parameters).toBe(disabledDisabledAgain.parameters);
+		for (const [tool, effort, model] of [
+			[disabledDisabled, false, false],
+			[disabledEnabled, false, true],
+			[enabledDisabled, true, false],
+			[enabledEnabled, true, true],
+		] as const) {
+			const properties = getSchemaProperties(tool);
+			expect(properties.effort !== undefined).toBe(effort);
+			expect(properties.model !== undefined).toBe(model);
 		}
-		for (const tool of [disabledAfterEnabled, disabledFirst]) {
-			expect(getSchemaProperties(tool).effort).toBeUndefined();
-			expect(tool.description).not.toContain("- `effort`:");
-		}
+		expect(disabledDisabled.parameters).not.toBe(disabledEnabled.parameters);
+		expect(disabledDisabled.parameters).not.toBe(enabledDisabled.parameters);
+		expect(disabledEnabled.parameters).not.toBe(enabledEnabled.parameters);
+		expect(enabledDisabled.parameters).not.toBe(enabledEnabled.parameters);
 	});
 
 	it("keeps isolation boolean-only and describes the configured apply behavior", async () => {
@@ -351,6 +370,69 @@ describe("task.batch validation", () => {
 		expect(runSpy).not.toHaveBeenCalled();
 	});
 
+	it("rejects disabled stale model fields before jobs or subprocesses are created", async () => {
+		mockDiscovery();
+		const runSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		for (const batch of [false, true]) {
+			const manager = new AsyncJobManager({ onJobComplete: () => {} });
+			try {
+				const tool = await TaskTool.create(
+					createSession({
+						manager,
+						settings: { "async.enabled": true, "task.batch": batch, "task.allowModelOverride": false },
+					}),
+				);
+				const params = batch
+					? { context: "ctx", tasks: [{ name: "StaleModel", task: "Work.", model: "manual/model" }] }
+					: { agent: "task", name: "StaleModel", task: "Work.", model: "manual/model" };
+				const result = await tool.execute(`disabled-model-${batch}`, params);
+				const text = getFirstText(result);
+				expect(text.toLowerCase()).toContain("model");
+				expect(runSpy).not.toHaveBeenCalled();
+				expect(manager.getJob("StaleModel")).toBeUndefined();
+			} finally {
+				await manager.dispose({ timeoutMs: 1000 });
+			}
+		}
+	});
+
+	it("rejects disabled flat and batch model fields through the raw validator", async () => {
+		mockDiscovery();
+		const flat = await TaskTool.create(
+			createSession({ settings: { "task.batch": false, "task.allowModelOverride": false } }),
+		);
+		const batch = await TaskTool.create(
+			createSession({ settings: { "task.batch": true, "task.allowModelOverride": false } }),
+		);
+		const error = new Error(
+			"Task model overrides are disabled. Enable task.allowModelOverride before using `model`.",
+		);
+
+		expect(() => flat.validateRawArguments({ agent: "task", task: "Work.", model: "manual/model" })).toThrow(error);
+		expect(() =>
+			batch.validateRawArguments({
+				context: "Background.",
+				tasks: [{ name: "Manual", task: "Work.", model: "manual/model" }],
+			}),
+		).toThrow(error);
+	});
+
+	it("rejects empty and comma-separated model selectors", async () => {
+		const runSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		for (const model of ["", "   ", "first/model,second/model"]) {
+			const text = await executeText(
+				{ agent: "task", task: "Work.", model },
+				{ "task.batch": false, "task.allowModelOverride": true },
+			);
+			expect(text.toLowerCase()).toContain("model");
+		}
+		expect(runSpy).not.toHaveBeenCalled();
+	});
+
 	it("rejects malformed disabled effort through the raw validator while accepting valid selectors", async () => {
 		mockDiscovery();
 		const flat = await TaskTool.create(
@@ -408,7 +490,6 @@ describe("task.batch spawning", () => {
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
 	});
-
 	it("spawns one background job per task item and forwards independent models and schemas with shared context", async () => {
 		mockDiscovery({
 			...taskAgent,
@@ -419,7 +500,8 @@ describe("task.batch spawning", () => {
 			context?: string;
 			assignment?: string;
 			parentAgentId?: string;
-			modelOverride?: string | string[];
+			requestedModel?: string;
+			exactModelOverride?: boolean;
 			effort?: TaskParams["effort"];
 			outputSchema?: unknown;
 			outputSchemaMode?: "permissive" | "strict";
@@ -432,7 +514,8 @@ describe("task.batch spawning", () => {
 				context: options.context,
 				assignment: options.assignment,
 				parentAgentId: options.parentAgentId,
-				modelOverride: options.modelOverride,
+				requestedModel: options.requestedModel,
+				exactModelOverride: options.exactModelOverride,
 				effort: options.effort,
 				outputSchema: options.outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
@@ -447,7 +530,13 @@ describe("task.batch spawning", () => {
 			createSession({
 				manager,
 				agentId: "ParentA",
-				settings: { "async.enabled": true, "task.batch": true, "task.allowEffortOverride": true },
+				settings: {
+					"async.enabled": true,
+					"task.batch": true,
+					"task.allowEffortOverride": true,
+					"task.allowModelOverride": true,
+					"task.agentModelOverrides": { task: "settings/model" },
+				},
 			}),
 		);
 		const alphaSchema = { type: "object", properties: { alpha: { type: "string" } } };
@@ -458,6 +547,7 @@ describe("task.batch spawning", () => {
 				{
 					name: "Alpha",
 					task: "Do A.",
+					model: "request/alpha",
 					effort: "lo",
 					outputSchema: alphaSchema,
 					schemaMode: "strict",
@@ -466,6 +556,7 @@ describe("task.batch spawning", () => {
 					name: "Beta",
 					task: "Do B.",
 					effort: "hi",
+					model: "request/beta",
 					outputSchema: betaSchema,
 					schemaMode: "permissive",
 				},
@@ -477,6 +568,10 @@ describe("task.batch spawning", () => {
 		expect(text).toContain("- `Alpha`");
 		expect(text).toContain("- `Beta`");
 		expect(result.details?.progress?.map(progress => progress.id)).toEqual(["Alpha", "Beta"]);
+		expect(result.details?.progress?.map(progress => progress.requestedModel)).toEqual([
+			"request/alpha",
+			"request/beta",
+		]);
 		expect(result.details?.async?.state).toBe("running");
 
 		const alphaJob = manager.getJob("Alpha");
@@ -497,6 +592,10 @@ describe("task.batch spawning", () => {
 		expect(byId.get("Alpha")?.outputSchemaMode).toBe("strict");
 		expect(byId.get("Beta")?.outputSchema).toEqual(betaSchema);
 		expect(byId.get("Beta")?.outputSchemaMode).toBe("permissive");
+		expect(byId.get("Alpha")?.requestedModel).toBe("request/alpha");
+		expect(byId.get("Beta")?.requestedModel).toBe("request/beta");
+		expect(byId.get("Alpha")?.exactModelOverride).toBe(true);
+		expect(byId.get("Beta")?.exactModelOverride).toBe(true);
 		expect(byId.get("Alpha")?.effort).toBe("lo");
 		expect(byId.get("Beta")?.effort).toBe("hi");
 		expect(seen.map(spawn => spawn.assignment).sort()).toEqual(["Do A.", "Do B."]);
@@ -563,6 +662,7 @@ describe("task.batch spawning", () => {
 		const seen: Array<{
 			id?: string;
 			agent: AgentDefinition;
+			requestedModel?: string;
 			modelOverride?: string | string[];
 			outputSchema?: unknown;
 			outputSchemaSource?: "caller" | "agent" | "session" | "none";
@@ -572,6 +672,7 @@ describe("task.batch spawning", () => {
 			seen.push({
 				id: options.id,
 				agent: options.agent,
+				requestedModel: options.requestedModel,
 				modelOverride: options.modelOverride,
 				outputSchema: options.outputSchema,
 				outputSchemaSource: options.outputSchemaSource,
@@ -605,12 +706,14 @@ describe("task.batch spawning", () => {
 		const reviewerSpawn = byId.get("Review");
 		expect(scoutSpawn?.agent).toEqual(scoutAgent);
 		expect(scoutSpawn?.agent.tools).toEqual(["read"]);
+		expect(scoutSpawn?.requestedModel).toBeUndefined();
 		expect(scoutSpawn?.modelOverride).toEqual(["anthropic/claude-haiku-4-5:low"]);
 		expect(scoutSpawn?.outputSchema).toBe(scoutSchema);
 		expect(scoutSpawn?.outputSchemaSource).toBe("agent");
 		expect(scoutSpawn?.outputSchemaOverridesAgent).toBe(false);
 		expect(reviewerSpawn?.agent).toEqual(reviewerAgent);
 		expect(reviewerSpawn?.agent.tools).toEqual(["read", "bash"]);
+		expect(reviewerSpawn?.requestedModel).toBeUndefined();
 		expect(reviewerSpawn?.modelOverride).toEqual(["anthropic/claude-sonnet-4-6:medium"]);
 		expect(reviewerSpawn?.outputSchema).toBe(callerSchema);
 		expect(reviewerSpawn?.outputSchemaSource).toBe("caller");
@@ -652,6 +755,7 @@ describe("task.batch spawning", () => {
 		});
 		let captured:
 			| {
+					requestedModel?: string;
 					modelOverride?: string | string[];
 					outputSchema?: unknown;
 					outputSchemaMode?: "permissive" | "strict";
@@ -661,6 +765,7 @@ describe("task.batch spawning", () => {
 			| undefined;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			captured = {
+				requestedModel: options.requestedModel,
 				modelOverride: options.modelOverride,
 				outputSchema: options.outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
@@ -695,6 +800,7 @@ describe("task.batch spawning", () => {
 		const job = manager.getJob(result.details!.async!.jobId)!;
 		await job.promise;
 		expect(job.status).toBe("completed");
+		expect(captured?.requestedModel).toBeUndefined();
 		expect(captured?.modelOverride).toEqual(["openai/gpt-4.1-mini"]);
 		expect(captured?.outputSchema).toEqual(callerSchema);
 		expect(captured?.outputSchemaMode).toBe("strict");
@@ -704,34 +810,66 @@ describe("task.batch spawning", () => {
 
 	it("blocks batch execution when async.enabled is false even with a job manager", async () => {
 		mockDiscovery();
-		const seen: Array<{ id?: string; context?: string; assignment?: string }> = [];
+		const seen: Array<{
+			id?: string;
+			context?: string;
+			assignment?: string;
+			modelOverride?: string | string[];
+			requestedModel?: string;
+		}> = [];
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
-			seen.push({ id: options.id, context: options.context, assignment: options.assignment });
-			return makeResult(options.id ?? "?");
+			seen.push({
+				id: options.id,
+				context: options.context,
+				assignment: options.assignment,
+				modelOverride: options.modelOverride,
+				requestedModel: options.requestedModel,
+			});
+			return makeResult(options.id ?? "?", {
+				requestedModel: options.requestedModel,
+				resolvedModel: `resolved/${options.id ?? "?"}`,
+			});
 		});
-
 		const manager = createManager();
 		const tool = await TaskTool.create(
-			createSession({ manager, settings: { "async.enabled": false, "task.batch": true } }),
+			createSession({
+				manager,
+				settings: { "async.enabled": false, "task.batch": true, "task.allowModelOverride": true },
+			}),
 		);
 
 		const result = await tool.execute("tc-sync-batch", {
 			context: "# Goal\nShared synchronous context.",
 			tasks: [
-				{ name: "Alpha", task: "Do A." },
-				{ name: "Beta", task: "Do B." },
+				{ name: "Alpha", task: "Do A.", model: "request/alpha" },
+				{ name: "Beta", task: "Do B.", model: "request/beta" },
+				{ name: "Gamma", task: "Do C." },
 			],
 		} as TaskParams);
 
 		expect(getFirstText(result)).toContain("All done.");
 		expect(result.details?.async).toBeUndefined();
-		expect(result.details?.results.map(item => item.id).sort()).toEqual(["Alpha", "Beta"]);
+		expect(result.details?.results.map(item => item.id).sort()).toEqual(["Alpha", "Beta", "Gamma"]);
+		expect(result.details?.results.map(item => item.requestedModel)).toEqual([
+			"request/alpha",
+			"request/beta",
+			undefined,
+		]);
+		expect(result.details?.results.map(item => item.resolvedModel)).toEqual([
+			"resolved/Alpha",
+			"resolved/Beta",
+			"resolved/Gamma",
+		]);
 		expect(manager.getJob("Alpha")).toBeUndefined();
 		expect(manager.getJob("Beta")).toBeUndefined();
 		expect(seen.map(spawn => spawn.context)).toEqual([
 			"# Goal\nShared synchronous context.",
 			"# Goal\nShared synchronous context.",
+			"# Goal\nShared synchronous context.",
 		]);
+		expect(new Map(seen.map(spawn => [spawn.id, spawn])).get("Alpha")?.requestedModel).toBe("request/alpha");
+		expect(new Map(seen.map(spawn => [spawn.id, spawn])).get("Beta")?.requestedModel).toBe("request/beta");
+		expect(new Map(seen.map(spawn => [spawn.id, spawn])).get("Gamma")?.requestedModel).toBeUndefined();
 	});
 
 	it("settles the batch async aggregate when a queued spawn is cancelled mid-flight", async () => {

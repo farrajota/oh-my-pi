@@ -8,7 +8,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
-import { resolveAgentModelPatterns } from "../config/model-resolver";
+import { resolveAgentModelPatterns, resolveModelOverride } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -277,13 +277,30 @@ export async function resolveEffectiveSubagentPolicy(
 	}
 	const agentModelOverrides = request.session.settings.get("task.agentModelOverrides");
 	const parentActiveModelPattern = request.session.getActiveModelString?.();
-	const modelOverride = resolveAgentModelPatterns({
-		settingsOverride: request.model ?? agentModelOverrides[agentName],
-		agentModel: effectiveAgent.model,
-		settings: request.session.settings,
-		activeModelPattern: parentActiveModelPattern,
-		fallbackModelPattern: request.session.getModelString?.(),
-	});
+	const requestedTaskModel = request.invocationKind === "task" ? request.model : undefined;
+	const modelOverride =
+		request.model !== undefined
+			? resolveAgentModelPatterns({ settingsOverride: request.model, settings: request.session.settings })
+			: resolveAgentModelPatterns({
+					settingsOverride: agentModelOverrides[agentName],
+					agentModel: effectiveAgent.model,
+					settings: request.session.settings,
+					activeModelPattern: parentActiveModelPattern,
+					fallbackModelPattern: request.session.getModelString?.(),
+				});
+	const requestedModelResolution =
+		requestedTaskModel !== undefined && request.session.modelRegistry
+			? resolveModelOverride(modelOverride, request.session.modelRegistry, request.session.settings)
+			: undefined;
+	if (
+		requestedTaskModel !== undefined &&
+		(modelOverride.length === 0 || (requestedModelResolution !== undefined && !requestedModelResolution.model))
+	) {
+		throw new StructuredSubagentError(
+			"preflight",
+			`Task model selector ${JSON.stringify(requestedTaskModel)} did not resolve to an enabled model.`,
+		);
+	}
 	const isolationMode = request.session.settings.get("task.isolation.mode");
 	const isIsolated = request.isolation?.requested === true;
 	if (isIsolated && isolationMode === "none") {
@@ -367,6 +384,8 @@ function buildExecutorOptions(
 	lease: ArtifactLease,
 	id: string,
 ): ExecutorOptions {
+	const requestedModel = typeof request.model === "string" ? request.model : undefined;
+	const exactModelOverride = request.invocationKind === "task" && request.model !== undefined;
 	const { session } = request;
 	const { skills, autoloadSkills } = resolveAutoloadSkills(session, policy.agent);
 	const localProtocolOptions: LocalProtocolOptions = session.localProtocolOptions ?? {
@@ -391,6 +410,8 @@ function buildExecutorOptions(
 		invokedAt: request.invokedAt,
 		acquiredAt: request.acquiredAt,
 		modelOverride: policy.modelOverride,
+		requestedModel,
+		exactModelOverride,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
@@ -473,6 +494,7 @@ function buildFailureResult(
 			tokens: 0,
 			requests: 0,
 			modelOverride: policy.modelOverride,
+			requestedModel: typeof request.model === "string" ? request.model : undefined,
 			error: message,
 		};
 	};

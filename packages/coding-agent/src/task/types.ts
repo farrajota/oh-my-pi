@@ -155,6 +155,7 @@ function createTaskItemSchema(options: {
 	permissions: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
 	defaultAgent?: string;
 	effortEnabled: boolean;
+	modelEnabled: boolean;
 }) {
 	const shape: Record<string, unknown> = {
 		"name?": "string",
@@ -166,6 +167,7 @@ function createTaskItemSchema(options: {
 		"+": "delete",
 	};
 	if (options.effortEnabled) shape["effort?"] = effortRule;
+	if (options.modelEnabled) shape["model?"] = type("string").atLeastLength(1);
 	if (options.isolationEnabled) shape["isolated?"] = "boolean";
 	const permissionSchema = selectTaskPermissionSchema(options.permissions);
 	if (permissionSchema) shape["permissions?"] = permissionSchema;
@@ -181,6 +183,7 @@ function createTaskSchema(options: {
 	permissions: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
 	defaultAgent?: string;
 	effortEnabled: boolean;
+	modelEnabled: boolean;
 }) {
 	const shape: Record<string, unknown> = {
 		"name?": "string",
@@ -192,6 +195,7 @@ function createTaskSchema(options: {
 		"+": "delete",
 	};
 	if (options.effortEnabled) shape["effort?"] = effortRule;
+	if (options.modelEnabled) shape["model?"] = type("string").atLeastLength(1);
 	if (options.isolationEnabled) shape["isolated?"] = "boolean";
 	const permissionSchema = selectTaskPermissionSchema(options.permissions);
 	if (permissionSchema) shape["permissions?"] = permissionSchema;
@@ -203,6 +207,7 @@ function createBatchTaskSchema(options: {
 	permissions: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
 	defaultAgent?: string;
 	effortEnabled: boolean;
+	modelEnabled: boolean;
 }) {
 	return type.raw({
 		context: "string",
@@ -213,11 +218,13 @@ function createBatchTaskSchema(options: {
 
 export const taskItemSchema = createTaskItemSchema({
 	effortEnabled: true,
+	modelEnabled: false,
 	isolationEnabled: false,
 	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 });
 const taskItemSchemaIsolated = createTaskItemSchema({
 	effortEnabled: true,
+	modelEnabled: false,
 	isolationEnabled: true,
 	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 });
@@ -230,6 +237,8 @@ export interface TaskItem {
 	agent?: string;
 	/** The work; required by the schema. */
 	task?: string;
+	/** Request-local model selector for this spawn. */
+	model?: string;
 	/** Least-privilege guardrails for this spawn. */
 	permissions?: TaskPermissionRequest;
 	/** Least-privilege tool-profile shorthand for this spawn. */
@@ -292,24 +301,38 @@ export function getTaskSchema(options: {
 	isolationEnabled: boolean;
 	batchEnabled: boolean;
 	effortEnabled?: boolean;
+	modelEnabled?: boolean;
 	defaultAgent?: string;
 	permissions?: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
 }): TaskToolSchemaInstance {
 	const permissions = options.permissions ?? { enabled: false, toolsEnabled: false, pathsEnabled: false };
 	const defaultAgent = options.defaultAgent ?? "task";
 	const effortEnabled = options.effortEnabled ?? true;
-	if (effortEnabled && !permissions.enabled && defaultAgent === "task") {
+	const modelEnabled = options.modelEnabled ?? false;
+	if (!modelEnabled && effortEnabled && !permissions.enabled && defaultAgent === "task") {
 		if (options.batchEnabled) {
 			return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		}
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}:${permissions.enabled ? "perm" : "noperm"}:${permissions.toolsEnabled ? "tools" : "notools"}:${permissions.pathsEnabled ? "paths" : "nopaths"}:${effortEnabled ? "effort" : "noeffort"}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}:${permissions.enabled ? "perm" : "noperm"}:${permissions.toolsEnabled ? "tools" : "notools"}:${permissions.pathsEnabled ? "paths" : "nopaths"}:${effortEnabled ? "effort" : "noeffort"}:${modelEnabled ? "model" : "nomodel"}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
 	const schema = options.batchEnabled
-		? createBatchTaskSchema({ isolationEnabled: options.isolationEnabled, effortEnabled, permissions, defaultAgent })
-		: createTaskSchema({ isolationEnabled: options.isolationEnabled, effortEnabled, permissions, defaultAgent });
+		? createBatchTaskSchema({
+				isolationEnabled: options.isolationEnabled,
+				effortEnabled,
+				modelEnabled,
+				permissions,
+				defaultAgent,
+			})
+		: createTaskSchema({
+				isolationEnabled: options.isolationEnabled,
+				effortEnabled,
+				modelEnabled,
+				permissions,
+				defaultAgent,
+			});
 	taskSchemaCache.set(key, schema);
 	return schema;
 }
@@ -327,6 +350,8 @@ export interface TaskParams {
 	agent?: string;
 	/** The work (flat form). */
 	task?: string;
+	/** Request-local model selector for this spawn (flat form). */
+	model?: string;
 	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
 	effort?: TaskEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
@@ -467,6 +492,8 @@ export interface AgentProgress {
 	cost: number;
 	durationMs: number;
 	modelOverride?: string | string[];
+	/** Raw request-local model selector, when supplied by the caller. */
+	requestedModel?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Undefined when the model could not be resolved. */
 	resolvedModel?: string;
 	/** True when {@link resolvedModel} is the target of an active retry fallback (not the originally configured model). Lets observer-only UIs (collab guests, Agent Hub rows with no live session) flag the fallback and keep the provider. */
@@ -556,6 +583,8 @@ export interface SingleResult {
 	/** Model's context window in tokens, when known. */
 	contextWindow?: number;
 	modelOverride?: string | string[];
+	/** Raw request-local model selector, when supplied by the caller. */
+	requestedModel?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Omitted from tool-result JSON when undefined to keep wire payloads small. */
 	resolvedModel?: string;
 	/** True when {@link resolvedModel} is the target of an active retry fallback. Mirrors {@link AgentProgress.resolvedModelIsFallback} onto the settled result. */

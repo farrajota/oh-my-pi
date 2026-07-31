@@ -208,4 +208,16 @@ describe("settings layout", () => {
 			label: "Allow Task Effort Overrides",
 		});
 	});
+
+	it("exposes task model overrides as an independent Subagents boolean", () => {
+		const def = getSettingsForTab("tasks").find(def => def.path === "task.allowModelOverride");
+
+		expect(def).toMatchObject({
+			path: "task.allowModelOverride",
+			type: "boolean",
+			tab: "tasks",
+			group: "Subagents",
+			label: "Allow Task Model Overrides",
+		});
+	});
 });

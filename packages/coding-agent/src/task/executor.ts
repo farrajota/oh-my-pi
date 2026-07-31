@@ -327,6 +327,8 @@ export interface RunSubprocessOptions {
 	 */
 	detached?: boolean;
 	modelOverride?: string | string[];
+	requestedModel?: string;
+	exactModelOverride?: boolean;
 	/**
 	 * Active model selector of the parent session, used as an auth-aware fallback
 	 * if the resolved subagent model has no working credentials. See #985.
@@ -920,6 +922,7 @@ interface RunMonitorArgs {
 	/** Parent settings for tiny-model label generation. */
 	settings?: Settings;
 	modelOverride?: string | string[];
+	requestedModel?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	eventBus?: EventBus;
@@ -1035,6 +1038,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		cost: 0,
 		durationMs: 0,
 		modelOverride: args.modelOverride,
+		requestedModel: args.requestedModel,
 	};
 
 	const outputChunks: string[] = [];
@@ -2101,6 +2105,7 @@ interface FinalizeRunArgs {
 	task: string;
 	assignment?: string;
 	modelOverride?: string | string[];
+	requestedModel?: string;
 	outputSchema?: unknown;
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	outputSchemaSource?: StructuredSubagentSchemaSource;
@@ -2120,7 +2125,7 @@ interface FinalizeRunArgs {
  * event.
  */
 async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
-	const { monitor, done, index, id, agent, task, assignment, signal, modelOverride } = args;
+	const { monitor, done, index, id, agent, task, assignment, signal, modelOverride, requestedModel } = args;
 	const progress = monitor.progress;
 	let exitCode = done.exitCode;
 	let stderr = done.error ?? "";
@@ -2244,6 +2249,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		contextTokens: progress.contextTokens,
 		contextWindow: progress.contextWindow,
 		modelOverride,
+		requestedModel,
 		resolvedModel: progress.resolvedModel,
 		resolvedModelIsFallback: progress.resolvedModelIsFallback,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
@@ -2456,6 +2462,8 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		id,
 		worktree,
 		modelOverride,
+		requestedModel,
+		exactModelOverride,
 		thinkingLevel,
 		outputSchema,
 		enableLsp,
@@ -2463,7 +2471,6 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		onProgress,
 	} = options;
 	const startTime = Date.now();
-	// Set by the session's onFirstChatDispatch hook the first time the agent
 	// loop dispatches a chat request to the provider — the launch-complete boundary.
 	let firstChatDispatchAt: number | undefined;
 
@@ -2481,10 +2488,11 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			output: "",
 			stderr: "Cancelled before start",
 			truncated: false,
+			modelOverride,
 			durationMs: 0,
 			tokens: 0,
 			requests: 0,
-			modelOverride,
+			requestedModel,
 			error: "Cancelled before start",
 			aborted: true,
 			abortReason: "Cancelled before start",
@@ -2504,6 +2512,8 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			...(agent.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 			// Isolated runs must not expose roots outside the worktree.
 			...(worktree !== undefined ? { "workspace.additionalDirectories": [] } : undefined),
+			// Exact caller selections may retry the same model, but must not cross into configured fallbacks.
+			...(exactModelOverride ? { "retry.modelFallback": false, "retry.fallbackChains": {} } : undefined),
 		},
 		options.parentServiceTier,
 	);
@@ -2512,8 +2522,6 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		0,
 		Math.trunc(Number(options.maxRuntimeMs ?? settings.get("task.maxRuntimeMs") ?? 0) || 0),
 	);
-	// TTL before an adopted idle subagent is parked by the lifecycle manager.
-	// <= 0 disables parking (the session stays live until process teardown).
 	const agentIdleTtlMs = Math.trunc(Number(settings.get("task.agentIdleTtlMs") ?? 420_000) || 0);
 	const configuredDefaultBudget = Math.max(
 		0,
@@ -2543,7 +2551,9 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		toolNames = [...toolNames, "irc"];
 	}
 
-	const modelPatterns = normalizeModelPatterns(modelOverride ?? agent.model);
+	const normalizedModelOverride = normalizeModelPatterns(modelOverride);
+	const modelPatterns =
+		exactModelOverride || modelOverride != null ? normalizedModelOverride : normalizeModelPatterns(agent.model);
 	const sessionFile = subtaskSessionFile ?? null;
 	const spawnsEnv = atMaxDepth
 		? ""
@@ -2561,11 +2571,12 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		id,
 		agent,
 		task,
+		modelOverride,
 		assignment,
 		description: options.description,
 		modelRegistry: options.modelRegistry,
 		settings,
-		modelOverride,
+		requestedModel,
 		signal,
 		onProgress,
 		eventBus: options.eventBus,
@@ -2638,6 +2649,9 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		let readyAt: number | undefined;
 
 		try {
+			if (exactModelOverride && modelPatterns.length === 0) {
+				throw new Error("Exact model override is required, but modelOverride was empty after normalization.");
+			}
 			checkAbort();
 			// Pin authStorage to modelRegistry.authStorage — mirrors the createAgentSession invariant.
 			const registryFromParent = options.modelRegistry !== undefined;
@@ -2659,25 +2673,33 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			checkAbort();
 
 			const configuredModelPatterns = resolveConfiguredModelPatterns(modelPatterns, settings);
-			const defaultRetryFallbackChain =
-				configuredModelPatterns.length === 1
+			const defaultRetryFallbackChain = exactModelOverride
+				? undefined
+				: configuredModelPatterns.length === 1
 					? resolveSubagentDefaultRetryFallbackChain(subagentSettings)
 					: undefined;
+			const resolution = exactModelOverride
+				? { ...resolveModelOverride(modelPatterns, modelRegistry, settings), authFallbackUsed: false }
+				: await awaitAbortable(
+						resolveModelOverrideWithAuthFallback(
+							modelPatterns,
+							options.parentActiveModelPattern,
+							modelRegistry,
+							settings,
+							id,
+						),
+					);
 			const {
 				model,
 				thinkingLevel: resolvedThinkingLevel,
 				explicitThinkingLevel,
 				authFallbackUsed,
 				warning: modelResolutionWarning,
-			} = await awaitAbortable(
-				resolveModelOverrideWithAuthFallback(
-					modelPatterns,
-					options.parentActiveModelPattern,
-					modelRegistry,
-					settings,
-					id,
-				),
-			);
+			} = resolution;
+			if (exactModelOverride && !model) {
+				const exactSelector = modelPatterns.length === 1 ? modelPatterns[0] : modelPatterns;
+				throw new Error(`Unable to resolve exact model override ${JSON.stringify(exactSelector)}.`);
+			}
 			if (modelResolutionWarning) {
 				logger.warn("Subagent model resolution warning", {
 					warning: modelResolutionWarning,
@@ -2692,14 +2714,16 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					resolvedModel: model.id,
 				});
 			}
-			const retryFallbackRole = installSubagentRetryFallbackChain({
-				settings: subagentSettings,
-				id,
-				candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, settings),
-				defaultFallbackChain: defaultRetryFallbackChain,
-				model,
-				authFallbackUsed,
-			});
+			const retryFallbackRole = exactModelOverride
+				? undefined
+				: installSubagentRetryFallbackChain({
+						settings: subagentSettings,
+						id,
+						candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, settings),
+						defaultFallbackChain: defaultRetryFallbackChain,
+						model,
+						authFallbackUsed,
+					});
 			if (retryFallbackRole) {
 				logger.debug("Configured subagent runtime model fallback chain", {
 					role: retryFallbackRole,
@@ -2744,7 +2768,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				settingsOverride: settings.get("task.agentPrewalk")[agent.name],
 				agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
 			});
-			if (prewalkPattern) {
+			if (!exactModelOverride && prewalkPattern) {
 				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings);
 				const target = resolvedPrewalk.model;
 				if (!target || !modelRegistry.hasConfiguredAuth(target)) {
@@ -2837,13 +2861,15 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				eventBus: options.eventBus,
 
 				model,
-				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
+				modelPattern: model || modelPatterns.length === 0 || exactModelOverride ? undefined : modelPatterns,
 				modelPatternAuthFallback:
-					model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
+					model || modelPatterns.length === 0 || exactModelOverride ? undefined : options.parentActiveModelPattern,
 				modelPatternFallbackRole:
-					model || modelOverride === undefined ? undefined : `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`,
+					model || modelPatterns.length === 0 || exactModelOverride
+						? undefined
+						: `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`,
 				modelPatternDefaultFallbackChain:
-					model || modelOverride === undefined ? undefined : defaultRetryFallbackChain,
+					model || modelPatterns.length === 0 || exactModelOverride ? undefined : defaultRetryFallbackChain,
 				thinkingLevel: effectiveThinkingLevel,
 				thinkingLevelCeiling: spawnEffortCeiling,
 				toolNames,
@@ -3185,6 +3211,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		task,
 		assignment,
 		modelOverride,
+		requestedModel,
 		outputSchema,
 		outputSchemaMode: options.outputSchemaMode,
 		outputSchemaSource: options.outputSchemaSource,

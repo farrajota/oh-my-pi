@@ -306,7 +306,12 @@ describe("runEvalAgent", () => {
 		expect(firstOptions.outputSchemaOverridesAgent).toBe(true);
 		expect(firstOptions.assignment).toBe("hello");
 		expect(firstOptions.description).toBe("My Agent");
+		expect(firstOptions.requestedModel).toBe("p/override");
 		expect(firstOptions.modelOverride).toEqual(["p/override"]);
+		expect(firstOptions.exactModelOverride).not.toBe(true);
+		expect(secondOptions.requestedModel).toBeUndefined();
+		expect(secondOptions.modelOverride).toEqual(["p/current"]);
+		expect(secondOptions.exactModelOverride).not.toBe(true);
 		expect(secondOptions.outputSchema).toBeUndefined();
 		expect(secondOptions.outputSchemaOverridesAgent).toBeUndefined();
 	});

@@ -122,13 +122,22 @@ In spawn execution (`TaskTool.#executeSync` → `#runSpawn`):
 
 `TaskTool.create()` builds the tool description from discovery results at initialization time. `#executeSync` rediscovers agents, so the runtime set can differ from what was listed in the earlier tool description if agent files changed mid-session. The async entry path still uses the initialization-time list to decide whether an agent is marked `blocking` before scheduling.
 
-## Model and structured-output precedence
+## TaskTool model and structured-output routing
 
-Runtime model precedence is resolved by `resolveEffectiveSubagentPolicy()`:
+`task.allowModelOverride` controls whether TaskTool callers may provide a request-local model selector. It defaults to `false` and is independent of `task.allowEffortOverride`. When enabled, the flat call shape accepts `model` at the top level; the batch shape accepts `model` separately on each `tasks[]` item. The value must be one non-empty selector string, not a comma-separated fallback chain. When the gate is disabled, a supplied `model` field is rejected before preflight, job creation, or subprocess execution.
 
-1. `task.agentModelOverrides[agentName]`
-2. agent frontmatter `model`
-3. the parent session model fallback
+TaskTool model precedence is:
+
+1. the request-local TaskTool `model`
+2. `task.agentModelOverrides[agentName]`
+3. agent frontmatter `model`
+4. the parent session's active/default model fallback
+
+An accepted request-local selector is exact for that invocation. Only that selector is resolved through `resolveAgentModelPatterns`; failure to resolve the role or selector fails the invocation instead of falling through to per-agent settings, frontmatter, or the parent model. The invocation also does not use parent-auth fallback, configured runtime model fallback chains, or a prewalk model handoff. Same-model provider transport retries remain allowed. The override does not mutate `task.agentModelOverrides`.
+
+Approval details and streaming call presentation show the raw requested selector. Progress and result metadata expose both the requested selector and the resolved model so operators can distinguish intent from execution.
+
+These rules apply only to TaskTool routing. The eval `agent()` bridge retains its existing model-selection semantics: `task.allowModelOverride` does not add this field to eval calls, and eval does not inherit TaskTool's request-local precedence or exact-routing fallback suppression.
 
 Runtime output schema precedence is:
 
@@ -138,7 +147,7 @@ Runtime output schema precedence is:
 
 The task item's optional `schemaMode` overrides the parent session mode; the default is `permissive`.
 
-The model-facing prompt (`src/prompts/tools/task.md`) no longer carries the old structured-output mismatch warning; it tags read-only agents and warns against offloading reasoning to `scout`/`sonic` instead.
+The model-facing prompt (`src/prompts/tools/task.md`) conditionally documents model placement and exact routing only when `task.allowModelOverride` is enabled. It continues to tag read-only agents and warn against offloading reasoning to `scout`/`sonic` instead.
 
 ## Command discovery interaction
 

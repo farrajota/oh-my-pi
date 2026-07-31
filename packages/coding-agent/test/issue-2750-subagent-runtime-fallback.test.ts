@@ -25,7 +25,7 @@ function model(provider: string, id: string): Model<Api> {
 function createYieldingSession(): AgentSession {
 	const listeners: Array<(event: { type: string; [key: string]: unknown }) => void> = [];
 	const session = {
-		agent: { state: { systemPrompt: ["test"] } },
+		agent: { state: { systemPrompt: ["test"], tools: [{ name: "yield" }] } },
 		state: { messages: [] },
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
@@ -119,6 +119,53 @@ describe("subagent runtime model resolution", () => {
 		expect(inheritedFallbackChain).toEqual(["global/inherited-model"]);
 		expect(result.modelOverride).toEqual(["primary/bad-runtime-model", "fallback/working-model"]);
 		expect(result.resolvedModel).toBe("fallback/working-model");
+	});
+
+	it("removes configured fallback chains for exact model overrides while retaining retry settings", async () => {
+		const primary = model("primary", "exact-model");
+		const fallback = model("fallback", "configured-fallback");
+		let childFallbackChains: Record<string, string[]> | undefined;
+		let childRetryEnabled: boolean | undefined;
+		let childModelFallback: boolean | undefined;
+		let childMaxRetries: number | undefined;
+		let childModel: string | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("Expected createAgentSession options");
+			childFallbackChains = options.settings?.get("retry.fallbackChains") as Record<string, string[]> | undefined;
+			childModelFallback = options.settings?.get("retry.modelFallback");
+			childRetryEnabled = options.settings?.get("retry.enabled");
+			childMaxRetries = options.settings?.get("retry.maxRetries");
+			childModel = options.model ? `${options.model.provider}/${options.model.id}` : undefined;
+			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+		});
+
+		await runSubprocess({
+			cwd: "/tmp",
+			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+			task: "work",
+			index: 0,
+			id: "exact-model-no-runtime-fallback",
+			modelOverride: "primary/exact-model",
+			requestedModel: "primary/exact-model",
+			exactModelOverride: true,
+			settings: Settings.isolated({
+				"retry.enabled": true,
+				"retry.maxRetries": 3,
+				"retry.fallbackChains": { default: ["fallback/configured-fallback"] },
+			}),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [primary, fallback],
+				getApiKey: async () => "test-key",
+			} as never,
+			enableLsp: false,
+		});
+
+		expect(childModel).toBe("primary/exact-model");
+		expect(childModelFallback).toBe(false);
+		expect(childFallbackChains).toEqual({});
+		expect(childRetryEnabled).toBe(true);
+		expect(childMaxRetries).toBe(3);
 	});
 
 	it("inherits an explicitly configured default fallback chain for a single subagent model", async () => {

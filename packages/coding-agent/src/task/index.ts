@@ -208,6 +208,7 @@ interface TaskDescriptionOptions {
 	disabledAgents: string[];
 	batchEnabled: boolean;
 	effortEnabled: boolean;
+	modelEnabled: boolean;
 	asyncEnabled: boolean;
 	ircEnabled: boolean;
 	parentSpawns: string;
@@ -247,6 +248,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		applyIsolatedChanges: options.applyIsolatedChanges,
 		batchEnabled: options.batchEnabled,
 		effortEnabled: options.effortEnabled,
+		modelEnabled: options.modelEnabled,
 		asyncEnabled: options.asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
 		ircEnabled: options.ircEnabled,
@@ -257,6 +259,71 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		permissionProfiles: options.permissionProfiles,
 		permissionProfileErrors: options.permissionProfileErrors,
 	});
+}
+
+function validateModelSelector(model: unknown, label: string): string | undefined {
+	if (typeof model !== "string" || model.trim() === "" || model.includes(",")) {
+		return `${label} must be one non-empty model selector string (comma-separated model chains are not supported).`;
+	}
+	return undefined;
+}
+
+function validateModelParams(params: TaskParams, modelEnabled: boolean): string | undefined {
+	if (Object.hasOwn(params, "model")) {
+		if (!modelEnabled)
+			return "Task model overrides are disabled. Enable task.allowModelOverride before using `model`.";
+		const error = validateModelSelector(params.model, "The call's `model`");
+		if (error) return error;
+	}
+	for (let i = 0; i < (Array.isArray(params.tasks) ? params.tasks.length : 0); i++) {
+		const item = params.tasks![i];
+		if (item === null || typeof item !== "object") continue;
+		if (!Object.hasOwn(item, "model")) continue;
+		if (!modelEnabled)
+			return "Task model overrides are disabled. Enable task.allowModelOverride before using `model`.";
+		const error = validateModelSelector(item.model, `Task ${i + 1}'s \`model\``);
+		if (error) return error;
+	}
+	return undefined;
+}
+
+/** Reject an out-of-range `effort` selector on internal/stale-transcript calls that bypass the wire schema. */
+function validateEffort(effort: TaskEffort | undefined, label: string): string | undefined {
+	if (effort === undefined || TASK_EFFORTS.includes(effort)) return undefined;
+	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
+}
+
+/**
+ * Validate shallow raw fields before Arktype deletes hidden unknown keys from
+ * the active task wire shape.
+ */
+function validateRawTaskArguments(args: unknown, modelEnabled: boolean): void {
+	if (args === null || typeof args !== "object" || Array.isArray(args)) return;
+	const params = args as { effort?: unknown; model?: unknown; tasks?: unknown };
+	const effortError = validateEffort(params.effort as TaskEffort | undefined, "The call");
+	if (effortError) throw new Error(effortError);
+	if (Object.hasOwn(params, "model")) {
+		if (!modelEnabled)
+			throw new Error("Task model overrides are disabled. Enable task.allowModelOverride before using `model`.");
+		const modelError = validateModelSelector(params.model, "The call's `model`");
+		if (modelError) throw new Error(modelError);
+	}
+
+	if (!Array.isArray(params.tasks)) return;
+	for (let i = 0; i < params.tasks.length; i++) {
+		const item = params.tasks[i];
+		if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+		const task = item as { effort?: unknown; model?: unknown; name?: unknown };
+		const name = typeof task.name === "string" && task.name ? ` (\`${task.name}\`)` : "";
+		const itemEffortError = validateEffort(task.effort as TaskEffort | undefined, `Task ${i + 1}${name}`);
+		if (itemEffortError) throw new Error(itemEffortError);
+		if (Object.hasOwn(task, "model")) {
+			if (!modelEnabled)
+				throw new Error("Task model overrides are disabled. Enable task.allowModelOverride before using `model`.");
+			const modelError = validateModelSelector(task.model, `Task ${i + 1}${name}'s \`model\``);
+			if (modelError) throw new Error(modelError);
+		}
+	}
 }
 
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
@@ -303,33 +370,6 @@ function validateShapeParams(
  * policy later, in `spawnParamsFor`. Returns a problem description, or
  * undefined when valid.
  */
-
-/** Reject an out-of-range `effort` selector on internal/stale-transcript calls that bypass the wire schema. */
-function validateEffort(effort: TaskEffort | undefined, label: string): string | undefined {
-	if (effort === undefined || TASK_EFFORTS.includes(effort)) return undefined;
-	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
-}
-
-/**
- * Validate the shallow raw effort fields before Arktype deletes hidden
- * unknown keys from the active task wire shape.
- */
-function validateRawEffortArguments(args: unknown): void {
-	if (args === null || typeof args !== "object" || Array.isArray(args)) return;
-	const params = args as { effort?: unknown; tasks?: unknown };
-	const effortError = validateEffort(params.effort as TaskEffort | undefined, "The call");
-	if (effortError) throw new Error(effortError);
-
-	if (!Array.isArray(params.tasks)) return;
-	for (let i = 0; i < params.tasks.length; i++) {
-		const item = params.tasks[i];
-		if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
-		const task = item as { effort?: unknown; name?: unknown };
-		const name = typeof task.name === "string" && task.name ? ` (\`${task.name}\`)` : "";
-		const itemEffortError = validateEffort(task.effort as TaskEffort | undefined, `Task ${i + 1}${name}`);
-		if (itemEffortError) throw new Error(itemEffortError);
-	}
-}
 
 function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string | undefined {
 	const hasTask = typeof params.task === "string" && params.task.trim() !== "";
@@ -384,6 +424,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 		return params.tasks;
 	}
 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task };
+	if ("model" in params) item.model = params.model;
 	if (params.permissions !== undefined) item.permissions = params.permissions;
 	if (params.toolProfile !== undefined) item.toolProfile = params.toolProfile;
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
@@ -406,6 +447,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	const spawn: TaskParams = { agent: item.agent?.trim() || defaultAgent };
 	if (item.name !== undefined) spawn.name = item.name;
 	if (item.task !== undefined) spawn.task = item.task;
+	if ("model" in item) spawn.model = item.model;
 	if (item.permissions !== undefined) spawn.permissions = item.permissions;
 	if (item.toolProfile !== undefined) spawn.toolProfile = item.toolProfile;
 	if (params.context !== undefined) spawn.context = params.context;
@@ -599,6 +641,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (typeof params.agent === "string") {
 			lines.push(`Agent: ${truncateForPrompt(params.agent)}`);
 		}
+		if (typeof params.model === "string") {
+			lines.push(`Model: ${truncateForPrompt(params.model)}`);
+		}
 		if (typeof params.name === "string" && params.name.trim()) {
 			lines.push(`Name: ${truncateForPrompt(params.name)}`);
 		}
@@ -609,7 +654,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			lines.push(`Context:\n${truncateForPrompt(params.context)}`);
 		}
 		appendPermissionDetails(lines, params.permissions);
-		const tasks: TaskItem[] = Array.isArray(params.tasks) ? params.tasks : [];
+		const tasks: TaskItem[] = Array.isArray(params.tasks)
+			? params.tasks.filter((item): item is TaskItem => item !== null && typeof item === "object")
+			: [];
 		if (tasks.length > 0) {
 			const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 			const effectiveAgent = (item: TaskItem): string => {
@@ -623,6 +670,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 			const agentSummary = [...agentCounts].map(([agent, count]) => `${agent} ×${count}`).join(", ");
 			lines.push(`Batch agents: ${truncateForPrompt(agentSummary)}`);
+			const batchModels = tasks
+				.map(item => (typeof item.model === "string" ? item.model.trim() : ""))
+				.filter(Boolean);
+			if (batchModels.length > 0) lines.push(`Batch models: ${truncateForPrompt(batchModels.join(", "))}`);
 
 			const firstTask = tasks[0];
 			if (firstTask && typeof firstTask === "object") {
@@ -630,6 +681,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					lines.push(`Name: ${truncateForPrompt(firstTask.name)}`);
 				}
 				lines.push(`Agent: ${truncateForPrompt(effectiveAgent(firstTask))}`);
+				if (typeof firstTask.model === "string") lines.push(`Model: ${truncateForPrompt(firstTask.model)}`);
 				if ("task" in firstTask && typeof firstTask.task === "string") {
 					lines.push(`Task:\n${truncateForPrompt(firstTask.task)}`);
 				}
@@ -656,7 +708,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	// calls still normalize through arktype; `execute()` resolves `agent`
 	// defaults independently, so the success path is unchanged.
 	readonly lenientArgValidation = true;
-	readonly validateRawArguments = validateRawEffortArguments;
+	readonly validateRawArguments = (args: unknown): void => {
+		validateRawTaskArguments(args, this.session.settings.get("task.allowModelOverride"));
+	};
 	readonly renderResult = renderResult;
 	// Suppress the streaming call preview once a (partial or final) result exists
 	// so the task renders as ONE block that transitions in place — not a pending
@@ -684,6 +738,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			isolationEnabled,
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: this.session.settings.get("task.allowEffortOverride"),
+			modelEnabled: this.session.settings.get("task.allowModelOverride"),
 			defaultAgent,
 			permissions: {
 				enabled: permissionMode !== "off",
@@ -710,6 +765,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			disabledAgents,
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: this.session.settings.get("task.allowEffortOverride"),
+			modelEnabled: this.session.settings.get("task.allowModelOverride"),
 			asyncEnabled: this.session.settings.get("async.enabled"),
 			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
@@ -764,6 +820,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			assignment: (params.task ?? "").trim(),
 			context: this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined,
 			agent: params.agent,
+			...(params.model !== undefined ? { model: params.model } : {}),
 			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 			...(params.effort !== undefined ? { effort: params.effort } : {}),
@@ -800,7 +857,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
 		const permissionsEnabled = permissionMode !== "off";
 		const validationError =
-			validateShapeParams(batchEnabled, permissionsEnabled, params) ?? validateSpawnParams(params, batchEnabled);
+			validateModelParams(params, this.session.settings.get("task.allowModelOverride")) ??
+			validateShapeParams(batchEnabled, permissionsEnabled, params) ??
+			validateSpawnParams(params, batchEnabled);
 		if (validationError) {
 			return createTaskModeError(validationError);
 		}
@@ -963,6 +1022,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					status: "pending",
 					task: renderSubagentUserPrompt(assignment),
 					assignment,
+					modelOverride: policy.modelOverride,
+					requestedModel: item.model,
 					recentTools: [],
 					recentOutput: [],
 					toolCount: 0,
@@ -1244,6 +1305,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							// and running counters without reverting the "running"
 							// status back to the subagent's initial "pending" snapshot.
 							progress.resolvedModel = nextProgress.resolvedModel;
+							progress.requestedModel = nextProgress.requestedModel;
 							progress.resolvedModelIsFallback = nextProgress.resolvedModelIsFallback;
 							progress.tokens = nextProgress.tokens;
 							progress.requests = nextProgress.requests;
@@ -1287,6 +1349,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.extractedToolData = singleResult?.extractedToolData;
 					progress.retryFailure = singleResult?.retryFailure;
 					progress.retryState = undefined;
+					progress.requestedModel = singleResult?.requestedModel;
 					if (singleResult?.resolvedModel) {
 						progress.resolvedModel = singleResult.resolvedModel;
 						progress.resolvedModelIsFallback = singleResult.resolvedModelIsFallback;
@@ -1605,17 +1668,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				? { ...agent, tools: profiledTools }
 				: agent;
 
-		// Apply per-agent model override from settings (highest priority)
 		const agentModelOverrides = this.session.settings.get("task.agentModelOverrides");
-		const settingsModelOverride = agentModelOverrides[agentName];
+		const requestModel = params.model;
 		const parentActiveModelPattern = this.session.getActiveModelString?.();
-		const modelOverride = resolveAgentModelPatterns({
-			settingsOverride: settingsModelOverride,
-			agentModel: effectiveAgent.model,
-			settings: this.session.settings,
-			activeModelPattern: parentActiveModelPattern,
-			fallbackModelPattern: this.session.getModelString?.(),
-		});
+		const modelOverride =
+			requestModel !== undefined
+				? resolveAgentModelPatterns({ settingsOverride: requestModel, settings: this.session.settings })
+				: resolveAgentModelPatterns({
+						settingsOverride: agentModelOverrides[agentName],
+						agentModel: effectiveAgent.model,
+						settings: this.session.settings,
+						activeModelPattern: parentActiveModelPattern,
+						fallbackModelPattern: this.session.getModelString?.(),
+					});
+		const requestedModel = requestModel;
+		const exactModelOverride = requestModel !== undefined;
 
 		// Caller output schemas take precedence, then agent frontmatter, then the inherited session schema.
 		const hasCallerOutputSchema = Object.hasOwn(params, "outputSchema");
@@ -1790,6 +1857,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				cost: 0,
 				durationMs: 0,
 				modelOverride,
+				requestedModel,
 			};
 			latestProgress = initialProgress;
 			const emitProgress = () => {
@@ -1830,10 +1898,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				parentToolCallId: toolCallId,
 				detached,
 				modelOverride,
+				requestedModel,
+				exactModelOverride,
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
 				enableLsp: subagentLspEnabled,
-				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 				maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
 				signal,
 				onProgress: (progress: AgentProgress) => {
@@ -1912,6 +1981,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							tokens: 0,
 							requests: 0,
 							modelOverride,
+							requestedModel,
 							error: message,
 						};
 					},
