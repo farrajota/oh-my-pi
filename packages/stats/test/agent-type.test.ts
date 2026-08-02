@@ -3,7 +3,13 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getOverviewStats } from "@oh-my-pi/omp-stats/aggregator";
-import { getStatsByAgentType, initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
+import {
+	closeDb,
+	getSessionStatsByModelAndAgentType,
+	getStatsByAgentType,
+	initDb,
+	insertMessageStats,
+} from "@oh-my-pi/omp-stats/db";
 import { classifyAgentType } from "@oh-my-pi/omp-stats/parser";
 import type { AgentType, MessageStats } from "@oh-my-pi/omp-stats/types";
 import { getConfigRootDir, getSessionsDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
@@ -94,6 +100,128 @@ describe("getStatsByAgentType", () => {
 		const overview = await getOverviewStats("all");
 		const types = overview.byAgentType.map(stat => stat.agentType).sort();
 		expect(types).toEqual(["advisor", "main"]);
+	});
+});
+
+describe("getSessionStatsByModelAndAgentType", () => {
+	it("returns no rows when the database or session path is unavailable", () => {
+		closeDb();
+		expect(getSessionStatsByModelAndAgentType("/tmp/session.jsonl")).toEqual([]);
+		expect(getSessionStatsByModelAndAgentType("")).toEqual([]);
+		expect(getSessionStatsByModelAndAgentType("/tmp/session.txt")).toEqual([]);
+	});
+
+	it("groups only the selected session tree by model and normalized actor", async () => {
+		await initDb();
+		const project = path.join(getSessionsDir(), "--work--session-model");
+		const mainFile = path.join(project, "1700000000000_root.jsonl");
+		const artifacts = mainFile.slice(0, -6);
+		const siblingFile = path.join(project, "1700000000000_root-sibling.jsonl");
+
+		insertMessageStats([
+			{
+				...makeMessage("main", "main", { input: 100, output: 10, cacheRead: 1, cacheWrite: 2 }),
+				sessionFile: mainFile,
+				model: "model-a",
+				provider: "provider-a",
+			},
+			{
+				...makeMessage("sub", "subagent", { input: 200, output: 20, cacheRead: 3, cacheWrite: 4 }),
+				sessionFile: path.join(artifacts, "Worker.jsonl"),
+				model: "model-b",
+				provider: "provider-b",
+			},
+			{
+				...makeMessage("advisor", "advisor", { input: 300, output: 30, cacheRead: 5, cacheWrite: 6 }),
+				sessionFile: path.join(artifacts, "__advisor.arch.jsonl"),
+				model: "model-b",
+				provider: "provider-b",
+			},
+			{
+				...makeMessage("nested-sub", "subagent", { input: 400, output: 40, cacheRead: 7, cacheWrite: 8 }),
+				sessionFile: path.join(artifacts, "Worker", "Nested.jsonl"),
+				model: "model-b",
+				provider: "provider-b",
+			},
+			{
+				...makeMessage("nested-advisor", "advisor", { input: 500, output: 50, cacheRead: 9, cacheWrite: 10 }),
+				sessionFile: path.join(artifacts, "Worker", "__advisor.security.jsonl"),
+				model: "model-b",
+				provider: "provider-b",
+			},
+			{
+				...makeMessage("sibling", "main", { input: 999, output: 99, cacheRead: 9, cacheWrite: 9 }),
+				sessionFile: siblingFile,
+				model: "model-c",
+				provider: "provider-c",
+			},
+		]);
+
+		const raw = new Database(getStatsDbPath());
+		raw.prepare(`
+				INSERT INTO messages (
+					session_file, entry_id, folder, model, provider, api, timestamp,
+					duration, ttft, stop_reason, error_message, input_tokens, output_tokens,
+					cache_read_tokens, cache_write_tokens, total_tokens, premium_requests,
+					cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total, agent_type
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`).run(
+			mainFile,
+			"legacy",
+			"/tmp/project",
+			"model-a",
+			"provider-a",
+			"test-api",
+			Date.now(),
+			1000,
+			100,
+			"stop",
+			null,
+			50,
+			5,
+			1,
+			1,
+			57,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0.5,
+			"legacy",
+		);
+		raw.close();
+
+		const rows = getSessionStatsByModelAndAgentType(mainFile);
+		expect(rows.map(({ model, provider, agentType }) => ({ model, provider, agentType }))).toEqual([
+			{ model: "model-a", provider: "provider-a", agentType: "main" },
+			{ model: "model-b", provider: "provider-b", agentType: "advisor" },
+			{ model: "model-b", provider: "provider-b", agentType: "subagent" },
+		]);
+		expect(rows[0]).toMatchObject({
+			totalRequests: 2,
+			totalInputTokens: 150,
+			totalOutputTokens: 15,
+			totalCacheReadTokens: 2,
+			totalCacheWriteTokens: 3,
+			totalCost: 0.53,
+		});
+		expect(rows[1]).toMatchObject({
+			totalRequests: 2,
+			totalInputTokens: 800,
+			totalOutputTokens: 80,
+			totalCacheReadTokens: 14,
+			totalCacheWriteTokens: 16,
+			totalCost: 0.06,
+		});
+		expect(rows[2]).toMatchObject({
+			totalRequests: 2,
+			totalInputTokens: 600,
+			totalOutputTokens: 60,
+			totalCacheReadTokens: 10,
+			totalCacheWriteTokens: 12,
+			totalCost: 0.06,
+		});
 	});
 });
 

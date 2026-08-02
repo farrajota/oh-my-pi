@@ -170,6 +170,14 @@ export interface AgentTypeStats {
 }
 
 /**
+ * Token usage for one model/provider and one normalized session actor type.
+ */
+export interface ModelAgentTypeStats extends AgentTypeStats {
+	model: string;
+	provider: string;
+}
+
+/**
  * Behavior time-series point (daily bucket, per responding model).
  */
 export interface BehaviorTimeSeriesPoint {

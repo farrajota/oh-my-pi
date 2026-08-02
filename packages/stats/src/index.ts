@@ -14,6 +14,7 @@ export {
 	type SyncProgress,
 	smokeTestSyncWorker,
 	syncAllSessions,
+	syncSessionTree,
 } from "./aggregator";
 export { closeDb } from "./db";
 export { getGainDashboardStats } from "./gain-aggregator";
@@ -29,6 +30,7 @@ export type {
 	DashboardStats,
 	FolderStats,
 	MessageStats,
+	ModelAgentTypeStats,
 	ModelPerformancePoint,
 	ModelStats,
 	ModelTimeSeriesPoint,

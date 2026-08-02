@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { workerHostEntry } from "@oh-my-pi/pi-utils";
 import {
 	getRecentErrors as dbGetRecentErrors,
@@ -32,7 +33,13 @@ import {
 	updateToolResults,
 	updateUserMessageLinks,
 } from "./db";
-import { getSessionEntry, listAllSessionFiles, type ParseSessionResult, parseSessionFile } from "./parser";
+import {
+	getSessionEntry,
+	listAllSessionFiles,
+	listSessionFiles,
+	type ParseSessionResult,
+	parseSessionFile,
+} from "./parser";
 import type { SyncWorkerRequest, SyncWorkerResponse } from "./sync-worker";
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
 // hidden argv mode, so the compiled binary and npm bundle only need one
@@ -209,7 +216,7 @@ export async function smokeTestSyncWorker({ timeoutMs = 5_000 }: { timeoutMs?: n
 }
 
 /**
- * Sync all session files to the database.
+ * Synchronize a supplied set of session transcript files.
  *
  * `workers: 1` parses inline. Larger pools fan parsing out across workers
  * (one in-flight job per worker) while DB writes and offset bookkeeping stay on
@@ -217,19 +224,12 @@ export async function smokeTestSyncWorker({ timeoutMs = 5_000 }: { timeoutMs?: n
  * `onProgress` fires once per completed file (skipped files included so the
  * bar walks at a steady rate).
  */
-export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
-	await initDb();
-
-	const files = await listAllSessionFiles();
+async function syncSessionFiles(files: string[], opts?: SyncOptions): Promise<{ processed: number; files: number }> {
 	let totalProcessed = 0;
 	let filesProcessed = 0;
 	let completed = 0;
 	let cursor = 0;
-	const finish = () => {
-		markSessionBackfillsComplete();
-		return { processed: totalProcessed, files: filesProcessed };
-	};
-	if (files.length === 0) return finish();
+	if (files.length === 0) return { processed: 0, files: 0 };
 
 	const report = (sessionFile: string) => {
 		completed++;
@@ -274,11 +274,10 @@ export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: 
 		for (const sessionFile of files) {
 			await processFile(sessionFile, parseSessionFile);
 		}
-		return finish();
+		return { processed: totalProcessed, files: filesProcessed };
 	}
 
 	const poolSize = Math.min(files.length, requestedWorkers);
-
 	const handles: WorkerHandle[] = [];
 	for (let i = 0; i < poolSize; i++) handles.push(spawnWorker());
 
@@ -297,7 +296,32 @@ export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: 
 		for (const handle of handles) handle.worker.terminate();
 	}
 
-	return finish();
+	return { processed: totalProcessed, files: filesProcessed };
+}
+
+/**
+ * Sync every known session file and complete global-scan backfills.
+ */
+export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
+	await initDb();
+	const result = await syncSessionFiles(await listAllSessionFiles(), opts);
+	markSessionBackfillsComplete();
+	return result;
+}
+
+/**
+ * Incrementally synchronize one persisted main session and its transcript tree.
+ */
+export async function syncSessionTree(
+	sessionFile: string,
+	opts?: SyncOptions,
+): Promise<{ processed: number; files: number }> {
+	await initDb();
+	if (path.extname(sessionFile) !== ".jsonl") return { processed: 0, files: 0 };
+
+	const descendants = await listSessionFiles(sessionFile.slice(0, -6));
+	const files = [...new Set([sessionFile, ...descendants])].sort();
+	return syncSessionFiles(files, opts);
 }
 
 const HOUR_MS = 60 * 60 * 1000;

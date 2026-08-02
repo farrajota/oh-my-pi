@@ -530,6 +530,10 @@
       "types": "./src/ssh/*.ts",
       "import": "./src/ssh/*.ts"
     },
+    "./stats-runtime": {
+      "types": "./src/stats-runtime.ts",
+      "import": "./src/stats-runtime.ts"
+    },
     "./stt": {
       "types": "./src/stt/index.ts",
       "import": "./src/stt/index.ts"

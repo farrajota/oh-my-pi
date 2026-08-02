@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import type { GeneratedProvider } from "@oh-my-pi/pi-catalog/models";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -15,6 +16,7 @@ import type {
 	CostTimeSeriesPoint,
 	FolderStats,
 	MessageStats,
+	ModelAgentTypeStats,
 	ModelPerformancePoint,
 	ModelStats,
 	ModelTimeSeriesPoint,
@@ -51,6 +53,18 @@ interface CostBackfillRow {
 	output_tokens: number;
 	cache_read_tokens: number;
 	cache_write_tokens: number;
+}
+
+interface SessionModelAgentTypeRow {
+	model: string;
+	provider: string;
+	normalized_agent_type: AgentType;
+	total_requests: number;
+	total_input_tokens: number;
+	total_output_tokens: number;
+	total_cache_read_tokens: number;
+	total_cache_write_tokens: number;
+	total_cost: number;
 }
 
 let db: Database | null = null;
@@ -580,6 +594,53 @@ export function getStatsByModel(cutoff?: number): ModelStats[] {
 		model: row.model,
 		provider: row.provider,
 		...buildAggregatedStats([row]),
+	}));
+}
+
+/**
+ * Get token usage for one persisted session tree, grouped by model and actor.
+ */
+export function getSessionStatsByModelAndAgentType(sessionFile: string): ModelAgentTypeStats[] {
+	if (!db || !sessionFile.endsWith(".jsonl")) return [];
+
+	const artifactPrefix = `${sessionFile.slice(0, -6)}${path.sep}`;
+	const stmt = db.prepare(`
+		SELECT
+			model,
+			provider,
+			CASE
+				WHEN agent_type IN ('main', 'subagent', 'advisor') THEN agent_type
+				ELSE 'main'
+			END as normalized_agent_type,
+			COUNT(*) as total_requests,
+			SUM(input_tokens) as total_input_tokens,
+			SUM(output_tokens) as total_output_tokens,
+			SUM(cache_read_tokens) as total_cache_read_tokens,
+			SUM(cache_write_tokens) as total_cache_write_tokens,
+			SUM(cost_total) as total_cost
+		FROM messages
+		WHERE session_file = ? OR instr(session_file, ?) = 1
+		GROUP BY
+			model,
+			provider,
+			CASE
+				WHEN agent_type IN ('main', 'subagent', 'advisor') THEN agent_type
+				ELSE 'main'
+			END
+		ORDER BY model, provider, normalized_agent_type
+	`);
+
+	const rows = stmt.all(sessionFile, artifactPrefix) as SessionModelAgentTypeRow[];
+	return rows.map(row => ({
+		model: row.model,
+		provider: row.provider,
+		agentType: row.normalized_agent_type as AgentType,
+		totalRequests: row.total_requests || 0,
+		totalInputTokens: row.total_input_tokens || 0,
+		totalOutputTokens: row.total_output_tokens || 0,
+		totalCacheReadTokens: row.total_cache_read_tokens || 0,
+		totalCacheWriteTokens: row.total_cache_write_tokens || 0,
+		totalCost: row.total_cost || 0,
 	}));
 }
 
