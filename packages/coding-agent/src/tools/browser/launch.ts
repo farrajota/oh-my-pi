@@ -296,19 +296,17 @@ export interface LaunchHeadlessResult {
 	userDataDir?: string;
 }
 
-export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<LaunchHeadlessResult> {
-	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
-	const initialViewport = {
-		width: vp.width,
-		height: vp.height,
-		deviceScaleFactor: vp.deviceScaleFactor ?? DEFAULT_VIEWPORT.deviceScaleFactor,
-	};
-	const puppeteer = await loadPuppeteer();
+/**
+ * Base Chromium argv shared by process-local puppeteer launches and the
+ * broker-owned shared browser: sandbox/stealth flags, window size, and
+ * PUPPETEER_PROXY* env-derived proxy flags.
+ */
+export function buildHeadlessLaunchArgs(viewport: { width: number; height: number }): string[] {
 	const launchArgs = [
 		"--no-sandbox",
 		"--disable-setuid-sandbox",
 		"--disable-blink-features=AutomationControlled",
-		`--window-size=${initialViewport.width},${initialViewport.height}`,
+		`--window-size=${viewport.width},${viewport.height}`,
 	];
 	const proxy = process.env.PUPPETEER_PROXY;
 	if (proxy) {
@@ -324,6 +322,18 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 	if (ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") {
 		launchArgs.push("--ignore-certificate-errors");
 	}
+	return launchArgs;
+}
+
+export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<LaunchHeadlessResult> {
+	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
+	const initialViewport = {
+		width: vp.width,
+		height: vp.height,
+		deviceScaleFactor: vp.deviceScaleFactor ?? DEFAULT_VIEWPORT.deviceScaleFactor,
+	};
+	const puppeteer = await loadPuppeteer();
+	const launchArgs = buildHeadlessLaunchArgs(initialViewport);
 	for (const arg of opts.args ?? []) {
 		if (!launchArgs.includes(arg)) launchArgs.push(arg);
 	}
@@ -355,6 +365,41 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		if (userDataDir) await removeUserDataDir(userDataDir);
 		throw error;
 	}
+}
+
+/** Fully resolved executable and argv for a broker-spawned shared Chromium. */
+export interface SharedBrowserLaunchSpec {
+	executablePath: string;
+	args: string[];
+}
+
+/**
+ * Resolve the executable and complete argv for a shared Chromium the daemon
+ * broker spawns directly (no puppeteer inside the broker). Mirrors
+ * `launchHeadlessBrowser` flag assembly — puppeteer's default args minus the
+ * stealth-suppressed set — plus `--remote-debugging-port=0` so every client
+ * attaches over CDP. Returns null when no Chromium executable resolves;
+ * callers fall back to a process-local launch.
+ */
+export async function resolveSharedBrowserLaunchSpec(opts: {
+	headless: boolean;
+	userDataDir: string;
+	viewport?: { width: number; height: number };
+}): Promise<SharedBrowserLaunchSpec | null> {
+	const executablePath = await ensureChromiumExecutable();
+	if (!executablePath) return null;
+	const puppeteer = await loadPuppeteer();
+	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
+	const ignored = new Set(stealthIgnoreDefaultArgs(executablePath));
+	const defaults = await puppeteer.defaultArgs({
+		headless: opts.headless,
+		args: buildHeadlessLaunchArgs(vp),
+		userDataDir: opts.userDataDir,
+	});
+	return {
+		executablePath,
+		args: [...defaults.filter(arg => !ignored.has(arg)), "--remote-debugging-port=0"],
+	};
 }
 
 /**

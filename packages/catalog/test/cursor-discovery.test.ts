@@ -288,10 +288,13 @@ describe("fetchCursorUsableModels", () => {
 	});
 
 	it("keeps the default window for unlabeled non-max models and max-mode models outside 1M families", async () => {
+		// Unbundled ids: the contract under test is "no 1M signal → fallback
+		// preserved", so neither id may carry a bundled cursor reference whose
+		// snapshot window would replace the 200k default fallback.
 		const response = create(GetUsableModelsResponseSchema, {
 			models: [
 				create(ModelDetailsSchema, { modelId: "cursor-composer-max", maxMode: true }),
-				create(ModelDetailsSchema, { modelId: "claude-opus-4-8-high", displayName: "Opus 4.8" }),
+				create(ModelDetailsSchema, { modelId: "claude-opus-9-high", displayName: "Opus 9" }),
 			],
 		});
 		const defaultBaseUrl = await startCursorDiscoveryServer(toBinary(GetUsableModelsResponseSchema, response));
@@ -299,7 +302,7 @@ describe("fetchCursorUsableModels", () => {
 		const models = await fetchCursorUsableModels({ apiKey: "test-token", baseUrl: defaultBaseUrl, timeoutMs: 1_000 });
 
 		expect(models).toEqual([
-			expect.objectContaining({ id: "claude-opus-4-8-high", cursorMaxMode: false, contextWindow: 200_000 }),
+			expect.objectContaining({ id: "claude-opus-9-high", cursorMaxMode: false, contextWindow: 200_000 }),
 			expect.objectContaining({ id: "cursor-composer-max", cursorMaxMode: true, contextWindow: 200_000 }),
 		]);
 	});

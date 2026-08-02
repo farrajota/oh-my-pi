@@ -574,24 +574,28 @@ export class SessionTools {
 	/** Applies an enabled tool set and reconciles its `xd://` partition. */
 	async applyActiveToolsByName(toolNames: string[]): Promise<void> {
 		toolNames = normalizeToolNames(toolNames);
+		let builtInWriteAvailable = this.#builtInToolNames.has("write");
+		if (toolNames.includes("write") && !builtInWriteAvailable) {
+			builtInWriteAvailable = (await this.#ensureWriteRegistered?.()) === true;
+			if (builtInWriteAvailable) this.#builtInToolNames.add("write");
+		}
 		const selectedTools = toolNames.flatMap(name => {
 			const tool = this.#toolRegistry.get(name);
 			return tool ? [{ name, tool }] : [];
 		});
 		const xdevReadAvailable = this.#builtInToolNames.has("read") && selectedTools.some(({ name }) => name === "read");
+		const xdevWriteAvailable = builtInWriteAvailable && selectedTools.some(({ name }) => name === "write");
 		const isPresentationPinned = (name: string): boolean =>
 			this.#presentationPinnedToolNames?.has(name) === true || this.#runtimeSelectedToolNames?.has(name) === true;
 		const mountCandidates = selectedTools.filter(
 			({ name, tool }) =>
-				this.#xdev !== undefined && xdevReadAvailable && !isPresentationPinned(name) && isMountableUnderXdev(tool),
+				this.#xdev !== undefined &&
+				xdevReadAvailable &&
+				xdevWriteAvailable &&
+				!isPresentationPinned(name) &&
+				isMountableUnderXdev(tool),
 		);
-
-		let builtInWriteAvailable = this.#builtInToolNames.has("write");
-		if (mountCandidates.length > 0 && !builtInWriteAvailable) {
-			builtInWriteAvailable = (await this.#ensureWriteRegistered?.()) === true;
-			if (builtInWriteAvailable) this.#builtInToolNames.add("write");
-		}
-		const mountNames = builtInWriteAvailable ? new Set(mountCandidates.map(({ name }) => name)) : new Set<string>();
+		const mountNames = new Set(mountCandidates.map(({ name }) => name));
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		for (const { name, tool } of selectedTools) {
@@ -831,23 +835,21 @@ export class SessionTools {
 
 	/** Rediscovers reloadable skills and refreshes prompt metadata. */
 	async refreshSkills(): Promise<void> {
-		if (!this.#skillsReloadable) {
-			return;
-		}
-
 		resetCapabilities();
-		const skillsSettings = this.#host.settings.getGroup("skills");
-		const discovered = await loadSkills({
-			...skillsSettings,
-			cwd: this.#host.sessionManager.getCwd(),
-			disabledExtensions: this.#host.settings.get("disabledExtensions") ?? [],
-		});
-		this.#skills = discovered.skills;
-		this.#skillWarnings = discovered.warnings;
-		this.#skillsSettings = skillsSettings;
+		if (this.#skillsReloadable) {
+			const skillsSettings = this.#host.settings.getGroup("skills");
+			const discovered = await loadSkills({
+				...skillsSettings,
+				cwd: this.#host.sessionManager.getCwd(),
+				disabledExtensions: this.#host.settings.get("disabledExtensions") ?? [],
+			});
+			this.#skills = discovered.skills;
+			this.#skillWarnings = discovered.warnings;
+			this.#skillsSettings = skillsSettings;
 
-		if (this.#host.agentKind() === "main") {
-			setActiveSkills(this.#skills);
+			if (this.#host.agentKind() === "main") {
+				setActiveSkills(this.#skills);
+			}
 		}
 		await this.refreshBaseSystemPrompt();
 		this.#host.notifyCommandMetadataChanged();

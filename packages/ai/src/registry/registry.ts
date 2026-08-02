@@ -1,4 +1,5 @@
 import type { KnownProvider } from "@oh-my-pi/pi-catalog";
+import { aiandProvider } from "./aiand";
 import { aimlApiProvider } from "./aimlapi";
 import { alibabaCodingPlanProvider } from "./alibaba-coding-plan";
 import { alibabaTokenPlanProvider } from "./alibaba-token-plan";
@@ -101,6 +102,7 @@ const ALL = [
 	gitLabDuoWorkflowProvider,
 	alibabaCodingPlanProvider,
 	alibabaTokenPlanProvider,
+	aiandProvider,
 	aimlApiProvider,
 	zhipuCodingPlanProvider,
 	umansProvider,

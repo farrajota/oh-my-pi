@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Replaced `DesktopSession.execute(actions, window)` and action batches with per-operation capture, pointer, keyboard, window, and accessibility methods; capture caps now apply per call and coordinate input requires a prior frame for the same target.
+
+### Added
+
+- Added a cross-platform, in-process `ps` shell builtin with BSD/procps selection forms, custom output columns, sorting, process metrics, and header suppression.
+- Added macOS, Win32, X11, and Wayland desktop backends behind one session API, including capture-free window discovery, isolated capture, explicit background/foreground delivery, native AX/UIA/AT-SPI trees with generational refs, and structured errors when a platform cannot honestly deliver background input.
+
+### Fixed
+
+- Fixed the accessibility snapshot marking a window root `(focused)` from its app-local `AXFocused` attribute even when another application held global focus; the root annotation now reflects the global window-roster focus flag.
+- Clarified coordinate-frame errors: pointer input before any capture, out-of-frame coordinates, and between-display points now name the capture-frame contract and the remedy instead of a bare bounds check.
+- Fixed macOS background keyboard events being posted through both CoreGraphics and SkyLight, which duplicated every typed character in AppKit targets; the authenticated SkyLight route now delivers each event once.
+
 ## [17.2.2] - 2026-07-31
 
 ### Changed

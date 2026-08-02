@@ -327,10 +327,10 @@ export class InputController {
 			}
 
 			if (this.ctx.loopModeEnabled) {
-				this.ctx.pauseLoop();
 				if (this.ctx.session.isStreaming) {
 					this.#abortStreamingTurn();
 				} else {
+					this.ctx.pauseLoop();
 					this.ctx.cancelPendingSubmission();
 				}
 				return;

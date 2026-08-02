@@ -38,7 +38,7 @@ describe("worker selector dispatch", () => {
 });
 
 describe("computer worker entry", () => {
-	it("is side-effect-free to import and exposes a named start function", () => {
-		expect(computerWorkerEntry.startComputerWorker).toBeFunction();
+	it("is side-effect-free to import outside a worker and has no manual start hook", () => {
+		expect("startComputerWorker" in computerWorkerEntry).toBe(false);
 	});
 });

@@ -3,9 +3,12 @@ import { consumeWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/wor
 import type { ComputerWorkerInbound, ComputerWorkerTransport } from "./protocol";
 import { ComputerWorkerCore } from "./worker";
 
-export function startComputerWorker(): void {
-	if (!parentPort) throw new Error("computer-worker-entry: missing parentPort");
+let started = false;
 
+/** Starts the computer worker once when running inside a Bun worker thread. */
+export function startComputerWorker(): void {
+	if (started || !parentPort) return;
+	started = true;
 	const port = parentPort;
 	const inbox = consumeWorkerInbox();
 	const transport: ComputerWorkerTransport = {
@@ -26,9 +29,6 @@ export function startComputerWorker(): void {
 	new ComputerWorkerCore(transport);
 }
 
-// Bun workers report `import.meta.main === false`. The source fallback still
-// enters this file directly, while packaged CLI workers carry the selector and
-// start the named entry only after installing its inbox.
-if (!Bun.isMainThread && !process.argv.some(isWorkerHostSelector) && import.meta.path === Bun.main) {
+if (!Bun.argv.some(isWorkerHostSelector)) {
 	startComputerWorker();
 }

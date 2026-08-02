@@ -1362,4 +1362,26 @@ describe("AskDialogComponent", () => {
 		expect(onSubmit).toHaveBeenCalledTimes(1);
 		expect(onSubmit.mock.calls[0][0].results[0].customInput).toBeUndefined();
 	});
+
+	it("normalizes malformed questions so render and submit do not crash", () => {
+		const onSubmit = vi.fn();
+		// A question entry that reaches the live dialog without a string
+		// `question` field (e.g. via the askDialog extension surface) used to
+		// throw `replaceTabs(undefined)` and take down the whole TUI.
+		const questions = [{ id: "q1", options: [{ label: "Option A" }] }] as unknown as ExtensionAskDialogQuestion[];
+
+		const component = new AskDialogComponent(questions, {
+			onSubmit,
+			onCancel: vi.fn(),
+			onPrompt: vi.fn(),
+		});
+
+		expect(() => render(component)).not.toThrow();
+
+		component.handleInput(ENTER);
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		const result = onSubmit.mock.calls[0][0].results[0];
+		expect(result.question).toBe("");
+		expect(result.selectedOptions).toEqual(["Option A"]);
+	});
 });

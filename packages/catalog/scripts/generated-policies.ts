@@ -18,6 +18,7 @@ import { isMimoModelIdOrName } from "../src/identity/family";
 import { getLongestModelLikeIdSegment } from "../src/identity/id";
 import { buildModelReferenceIndex, resolveModelReference } from "../src/identity/reference";
 import { resolveModelThinking } from "../src/model-thinking";
+import { isOllamaCloudOutputCapped, OLLAMA_CLOUD_MAX_OUTPUT_TOKENS } from "../src/provider-models/ollama";
 import {
 	ALIBABA_TOKEN_PLAN_STATIC_MODELS,
 	resolveWaferServerlessThinkingFormat,
@@ -63,6 +64,61 @@ export const CLOUDFLARE_FALLBACK_MODEL: ModelSpec<"anthropic-messages"> = {
  */
 export function dropUnsupportedBedrockGeoIds(models: readonly ModelSpec[]): ModelSpec[] {
 	return models.filter(model => !(model.provider === "amazon-bedrock" && model.id === "jp.anthropic.claude-opus-5"));
+}
+
+/** True when any component of a model's per-million-token cost is nonzero. */
+export function hasBillableCost(cost: ModelSpec["cost"]): boolean {
+	return cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0;
+}
+
+/**
+ * Providers whose first-party list prices back-fill Antigravity's unpriced
+ * rows, in lookup order. Antigravity discovery reports no pricing (the
+ * subscription bills upstream), so without this the whole provider surfaces
+ * $0 cost for every request. Antigravity bills through Google, so Vertex
+ * prices outrank Anthropic list prices for Claude ids.
+ */
+const ANTIGRAVITY_PRICING_PEERS = ["google", "google-vertex", "anthropic"] as const;
+
+/**
+ * Antigravity ids whose Google peer ships under a different id: Gemini
+ * previews carry a `-preview` suffix on the Google API, Claude ids carry a
+ * Vertex `@<version>` suffix. A dangling alias (retired Vertex id) falls back
+ * to the plain-id lookup, i.e. Anthropic list prices for Claude.
+ */
+const ANTIGRAVITY_PRICING_ID_ALIASES: Readonly<Record<string, string>> = {
+	"gemini-3-flash": "gemini-3-flash-preview",
+	"gemini-3-pro": "gemini-3-pro-preview",
+	"gemini-3.1-pro": "gemini-3.1-pro-preview",
+	"claude-opus-4-5": "claude-opus-4-5@20251101",
+	"claude-opus-4-6": "claude-opus-4-6@default",
+	"claude-sonnet-4-5": "claude-sonnet-4-5@20250929",
+	"claude-sonnet-4-6": "claude-sonnet-4-6@default",
+};
+
+/**
+ * Price `google-antigravity` models at their first-party equivalents: Gemini
+ * ids at Google API list prices, Claude ids at Google Vertex list prices
+ * (falling back to Anthropic). Models without a priced peer (gpt-oss,
+ * internal tab models) keep zero cost.
+ */
+export function applyAntigravityPricingFallback(models: readonly ModelSpec[]): ModelSpec[] {
+	const peerCosts = new Map<string, ModelSpec["cost"]>();
+	for (const peer of ANTIGRAVITY_PRICING_PEERS) {
+		for (const model of models) {
+			if (model.provider === peer && hasBillableCost(model.cost) && !peerCosts.has(model.id)) {
+				peerCosts.set(model.id, model.cost);
+			}
+		}
+	}
+	return models.map(model => {
+		if (model.provider !== "google-antigravity" || hasBillableCost(model.cost)) {
+			return model;
+		}
+		const alias = ANTIGRAVITY_PRICING_ID_ALIASES[model.id];
+		const cost = (alias ? peerCosts.get(alias) : undefined) ?? peerCosts.get(model.id);
+		return cost ? { ...model, cost: { ...cost } } : model;
+	});
 }
 
 const CODEX_GPT_5_4_PRIORITY_BY_VARIANT: Partial<Record<OpenAIVariant, number>> = {
@@ -217,6 +273,26 @@ export function applyCanonicalLimitFallback(models: ModelSpec<Api>[]): void {
 				break;
 			}
 		}
+	}
+}
+
+/**
+ * Pin the max-output figure for Ollama Cloud models whose deployment enforces a
+ * lower ceiling than their advertised window.
+ *
+ * Ollama's `/api/show` never reports a per-model output cap, so discovery and
+ * previous snapshots leave `maxTokens` at the full context window (or a stale
+ * conservative fallback, as with `deepseek-v4-flash:0731`). DeepSeek V4
+ * Pro/Flash deployments actually reject any output budget above
+ * {@link OLLAMA_CLOUD_MAX_OUTPUT_TOKENS} (ollama/ollama#16890, #3392/#3394), so
+ * pin those ids to `min(contextWindow, ceiling)` — the true amount the endpoint
+ * accepts (#7266). Other cloud models keep their discovered limits.
+ */
+export function applyOllamaCloudOutputCap(models: ModelSpec<Api>[]): void {
+	for (const model of models) {
+		if (model.provider !== "ollama-cloud" || model.contextWindow === null) continue;
+		if (!isOllamaCloudOutputCapped(model.id)) continue;
+		model.maxTokens = Math.min(model.contextWindow, OLLAMA_CLOUD_MAX_OUTPUT_TOKENS);
 	}
 }
 

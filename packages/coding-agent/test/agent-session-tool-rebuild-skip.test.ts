@@ -457,11 +457,14 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 		// Ordinary xd:// inventory changes travel through mount notices and do
 		// not affect the global MCP-route guidance or its rebuild signature.
-		await session.setActiveToolPresentation(["read", search.name, catalog.name], [search.name, catalog.name]);
+		await session.setActiveToolPresentation(
+			["read", "write", search.name, catalog.name],
+			[search.name, catalog.name],
+		);
 		expect(session.getMountedXdevToolNames()).toContain(catalog.name);
 		expect(rebuildCount).toBe(1);
 
-		await session.setActiveToolPresentation(["read", search.name], [search.name]);
+		await session.setActiveToolPresentation(["read", "write", search.name], [search.name]);
 		expect(session.getMountedXdevToolNames()).not.toContain(catalog.name);
 		expect(rebuildCount).toBe(1);
 	});
@@ -1176,7 +1179,7 @@ These tools became available:
 		expect(delivered[0]).toContain("xd://mcp__nucleus_search");
 	});
 
-	it("keeps lazy write registration while rolling back applied state on rebuild failure", async () => {
+	it("does not register write while rolling back a direct-tool rebuild failure", async () => {
 		let failRebuild = true;
 		const xdevState = createTestXdevState();
 		const { session } = newSession(
@@ -1194,13 +1197,14 @@ These tools became available:
 
 		expect(session.getActiveToolNames()).toEqual(activeBefore);
 		expect(session.getMountedXdevToolNames()).toEqual(mountedBefore);
-		expect(session.getToolByName("write")).toBeDefined();
-		expect(session.hasBuiltInTool("write")).toBe(true);
+		expect(session.getToolByName("write")).toBeUndefined();
+		expect(session.hasBuiltInTool("write")).toBe(false);
 
 		failRebuild = false;
 		await session.refreshMCPTools([search]);
-		expect(session.getActiveToolNames()).toContain("write");
-		expect(session.getMountedXdevToolNames()).toContain(search.name);
+		expect(session.getActiveToolNames()).toContain(search.name);
+		expect(session.getActiveToolNames()).not.toContain("write");
+		expect(session.getMountedXdevToolNames()).not.toContain(search.name);
 	});
 
 	it("rolls back MCP catalog replacement when prompt rebuild fails", async () => {

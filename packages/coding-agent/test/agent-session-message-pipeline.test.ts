@@ -263,8 +263,10 @@ describe("AgentSession message pipeline", () => {
 			contextWindow: 4096,
 			maxTokens: 1024,
 		} as ModelSpec<Api>) as Model<Api>;
+		const promptCacheKey = "inherited-parent-cache";
 		const session = new AgentSession({
 			agent: new Agent({
+				promptCacheKey,
 				initialState: {
 					model,
 					systemPrompt: ["system prompt"],
@@ -283,7 +285,7 @@ describe("AgentSession message pipeline", () => {
 		const result = await session.runEphemeralTurn({ promptText: "Question?" });
 
 		expect(result.replyText).toBe("Answer");
-		expect(capturedOptions?.promptCacheKey).toBe(cacheSessionId);
+		expect(capturedOptions?.promptCacheKey).toBe(promptCacheKey);
 		expect(capturedOptions?.sessionId).toStartWith(`${cacheSessionId}:side:`);
 		expect(capturedOptions?.sessionId).not.toBe(cacheSessionId);
 		expect(capturedOptions?.preferWebsockets).toBe(true);
@@ -1402,9 +1404,10 @@ describe("AgentSession message pipeline", () => {
 			expect(getConvertedUserText(lastMessage)).toBe("Side Question?");
 
 			expect(secondToLast?.role).toBe("developer");
-			expect(secondToLast?.content).toBeDefined();
-			const textContent = secondToLast?.content as { text?: string }[];
-			expect(textContent[0].text).toContain("tool catalog stays attached");
+			const textContent = secondToLast?.content as TextContent[];
+			expect(textContent).toHaveLength(1);
+			expect(textContent[0]?.type).toBe("text");
+			expect(textContent[0]?.text).toMatch(/^<system-reminder>\n[\s\S]+\n<\/system-reminder>\n?$/);
 
 			// Tool choice must be undefined (not "none") for cache hits
 			expect(capturedOptions?.toolChoice).toBeUndefined();

@@ -2443,7 +2443,14 @@ export async function finalizeSubagentLifecycle(args: {
 	const resumableAbort =
 		args.abortKind === "budget" && args.keepAlive && !args.isolated && args.reviveSession !== null;
 	if (args.aborted && !resumableAbort) {
-		if (ref && ownsRef) registry.setStatus(args.id, "aborted", ref);
+		if (ref && ownsRef) {
+			// Terminal hard kill: mark `aborted` and detach the session before
+			// disposing so the ref satisfies the AgentRef invariant (session null
+			// when aborted) — ensureLive/hub focus must treat it as terminal, never
+			// route into the disposed session.
+			registry.setStatus(args.id, "aborted", ref);
+			registry.detachSession(args.id, ref);
+		}
 		await disposeSession();
 		return;
 	}
