@@ -7,6 +7,10 @@
  * - Register commands, keyboard shortcuts, and CLI flags
  * - Interact with the user via UI primitives
  */
+
+import type { Type as arktype } from "@oh-my-pi/omptype";
+import type * as TypeBox from "@oh-my-pi/omptype/typebox";
+import type * as zod from "@oh-my-pi/omptype/zod";
 import type {
 	AgentMessage,
 	AgentToolResult,
@@ -106,7 +110,6 @@ import type {
 	TurnStartEvent,
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
-import type * as TypeBox from "../typebox";
 
 export type { AsyncJobSnapshot, AsyncJobSnapshotItem, AsyncJobSnapshotOptions } from "../../async";
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
@@ -1155,7 +1158,7 @@ export interface ExtensionAPI {
 
 	/** Injected arktype module for arktype-authored extension tools (canonical going forward). */
 	arktype: typeof arktype;
-	/** Injected zod/v4 module for canonical extension tool parameter schemas. */
+	/** Injected omptype-backed zod facade for extension tool parameter schemas. */
 	zod: typeof zod;
 
 	/** Injected pi-coding-agent exports for accessing SDK utilities */

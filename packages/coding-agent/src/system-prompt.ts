@@ -498,7 +498,8 @@ export interface BuildSystemPromptOptions {
 	/**
 	 * Whether provider-native tool calling is active (no owned/in-band syntax).
 	 * When true and `inlineToolDescriptors` is false, the inventory renders as a
-	 * compact tool-name list; otherwise it renders full `# Tool:` sections. Default: true
+	 * compact tool-name list; otherwise it renders the full Harmony-style
+	 * `namespace functions { … }` catalog. Default: true
 	 */
 	nativeTools?: boolean;
 	/** Skills settings for discovery. */
@@ -797,7 +798,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 
 	// List mode shows a compact tool-name list; it only applies when descriptors
 	// stay in provider-native tool schemas AND native tool calling is active.
-	// Otherwise render full `# Tool:` sections inline in the system prompt.
+	// Otherwise render the full functions-namespace catalog in the system prompt.
 	const toolListMode = !inlineToolDescriptors && nativeTools;
 	// Build tool descriptions for system prompt rendering.
 	const toolPromptNames = new Map<string, string>(toolNames.map(name => [name, tools?.get(name)?.wireName ?? name]));
@@ -830,7 +831,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 						examples: meta?.examples,
 					};
 				}),
-				model ?? "",
 			);
 
 	// Filter skills for the rendered system prompt:

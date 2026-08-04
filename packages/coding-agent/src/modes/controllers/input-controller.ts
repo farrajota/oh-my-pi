@@ -8,8 +8,11 @@ import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveLocalRoot } from "../../internal-urls";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { extractImagePathFromText } from "../../modes/components/custom-editor";
+import { ReadToolGroupComponent } from "../../modes/components/read-tool-group";
 import { renderSegmentTrack } from "../../modes/components/segment-track";
+import { StrippedToolCallsPlaceholder } from "../../modes/components/stripped-tool-calls-placeholder";
 import { TinyTitleDownloadProgressComponent } from "../../modes/components/tiny-title-download-progress";
+import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { materializeImageReferenceLinks, shiftImageMarkers } from "../../modes/image-references";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
@@ -247,7 +250,7 @@ export class InputController {
 			this.#btwBranchListenerInstalled = true;
 			this.ctx.ui.addInputListener(data => {
 				if (!matchesKey(data, "b")) return undefined;
-				if (!this.ctx.canBranchBtw()) return undefined;
+				if (!this.ctx.handlesBtwBranchKey()) return undefined;
 				if (this.ctx.ui.getFocused() !== this.ctx.editor) return undefined;
 				if (this.ctx.editor.getText().trim()) return undefined;
 				void this.ctx.handleBtwBranchKey();
@@ -455,6 +458,11 @@ export class InputController {
 		this.ctx.editor.onCopyPrompt = () => this.handleCopyPrompt();
 		this.ctx.editor.setActionKeys("app.tools.expand", this.ctx.keybindings.getKeys("app.tools.expand"));
 		this.ctx.editor.onExpandTools = () => this.toggleToolOutputExpansion();
+		this.ctx.editor.setActionKeys(
+			"app.tools.toggleVisibility",
+			this.ctx.keybindings.getKeys("app.tools.toggleVisibility"),
+		);
+		this.ctx.editor.onToggleToolActivity = () => this.toggleToolActivityVisibility();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
 		this.ctx.editor.onDequeue = () => this.handleDequeue();
 		this.ctx.editor.setActionKeys("app.retry", this.ctx.keybindings.getKeys("app.retry"));
@@ -793,6 +801,19 @@ export class InputController {
 				this.ctx.queueCompactionMessage(text, "steer", images);
 				return;
 			}
+			// Extension commands are local actions. Execute them before the normal
+			// submission path creates an optimistic user message; otherwise a
+			// consumed command remains rendered like a prompt sent to the model.
+			if (this.#isLocalExtensionCommand(text)) {
+				this.ctx.editor.clearDraft(text);
+				try {
+					await this.ctx.session.prompt(text, { images: inputImages });
+				} catch (error) {
+					this.ctx.editor.setText(text);
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
+				}
+				return;
+			}
 
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
@@ -906,14 +927,18 @@ export class InputController {
 	 * Local extension commands are consumed before reaching the shared session
 	 * title gate and must not name the conversation.
 	 */
-	#maybeStartTitleGeneration(text: string): void {
-		const runner = this.ctx.session.extensionRunner;
+	#isLocalExtensionCommand(text: string): boolean {
 		const extensionCommandSpace = text.indexOf(" ");
-		const isLocalExtensionCommand =
+		return (
 			text.startsWith("/") &&
-			runner?.getCommand(extensionCommandSpace === -1 ? text.slice(1) : text.slice(1, extensionCommandSpace)) !==
-				undefined;
-		if (isLocalExtensionCommand) {
+			this.ctx.session.extensionRunner?.getCommand(
+				extensionCommandSpace === -1 ? text.slice(1) : text.slice(1, extensionCommandSpace),
+			) !== undefined
+		);
+	}
+
+	#maybeStartTitleGeneration(text: string): void {
+		if (this.#isLocalExtensionCommand(text)) {
 			return;
 		}
 		this.ctx.session.maybeStartTitleGeneration(text, () => {
@@ -1845,7 +1870,37 @@ export class InputController {
 	}
 
 	toggleToolOutputExpansion(): void {
+		if (this.ctx.hideToolActivity) {
+			const visibilityKey = this.ctx.keybindings.getDisplayString("app.tools.toggleVisibility");
+			const visibilityHint = visibilityKey ? `${visibilityKey} or /settings` : "/settings";
+			this.ctx.showStatus(`Tool activity is hidden — show it with ${visibilityHint} before expanding`);
+			return;
+		}
 		this.setToolsExpanded(!this.ctx.toolOutputExpanded);
+	}
+
+	toggleToolActivityVisibility(): void {
+		this.ctx.hideToolActivity = !this.ctx.hideToolActivity;
+		this.ctx.settings.set("display.hideToolActivity", this.ctx.hideToolActivity);
+
+		if (!this.ctx.hideToolActivity) {
+			this.ctx.toolOutputExpanded = false;
+		}
+
+		for (const child of this.ctx.chatContainer.children) {
+			if (child instanceof ToolExecutionComponent || child instanceof ReadToolGroupComponent) {
+				if (!this.ctx.hideToolActivity) child.setExpanded(false);
+				child.setToolActivityVisible(!this.ctx.hideToolActivity);
+			} else if (child instanceof AssistantMessageComponent) {
+				child.setToolResultImagesVisible(!this.ctx.hideToolActivity);
+			} else if (child instanceof StrippedToolCallsPlaceholder) {
+				child.setToolActivityVisible(!this.ctx.hideToolActivity);
+			}
+		}
+
+		if (this.ctx.hideToolActivity) this.ctx.ui.clearInlineImages();
+		this.ctx.ui.resetDisplay();
+		this.ctx.showStatus(`Tool activity: ${this.ctx.hideToolActivity ? "hidden" : "visible"}`);
 	}
 
 	setToolsExpanded(expanded: boolean): void {

@@ -254,6 +254,65 @@ export interface RunCmuxCodeOptions {
 	snapshot: SessionSnapshot;
 }
 
+interface ActiveCmuxRun {
+	filename: string;
+	floatingRejections: unknown[];
+}
+
+const RECENT_CMUX_RUN_FILES_MAX = 256;
+const activeCmuxRuns = new Map<string, ActiveCmuxRun>();
+const recentCmuxRunFiles = new Set<string>();
+
+function consumeCmuxRunRejection(reason: unknown): boolean {
+	// cmux runs guest JS in the shared main-process realm (TTS/STT/MCP and other
+	// subsystems live here too), so — like the eval inline fallback — only a
+	// guest-file stack frame can safely attribute a rejection. A stackless or
+	// non-run-stack reason is indistinguishable from a subsystem failure and
+	// keeps the default fatal path; worker isolation is the long-term fix.
+	const stack = reason instanceof Error && typeof reason.stack === "string" ? reason.stack : undefined;
+	if (!stack) return false;
+
+	let owner: ActiveCmuxRun | undefined;
+	let ownerIndex = -1;
+	for (const run of activeCmuxRuns.values()) {
+		const index = stack.lastIndexOf(run.filename);
+		if (index > ownerIndex) {
+			ownerIndex = index;
+			owner = run;
+		}
+	}
+	if (owner) {
+		owner.floatingRejections.push(reason);
+		return true;
+	}
+
+	let recent: string | undefined;
+	let recentIndex = -1;
+	for (const filename of recentCmuxRunFiles) {
+		const index = stack.lastIndexOf(filename);
+		if (index > recentIndex) {
+			recentIndex = index;
+			recent = filename;
+		}
+	}
+	if (!recent) return false;
+	logger.warn("Unhandled rejection from a finished cmux browser run (missing await?)", {
+		filename: recent,
+		error: reason,
+	});
+	return true;
+}
+
+function rememberCmuxRunFile(filename: string): void {
+	recentCmuxRunFiles.delete(filename);
+	recentCmuxRunFiles.add(filename);
+	if (recentCmuxRunFiles.size <= RECENT_CMUX_RUN_FILES_MAX) return;
+	const oldest = recentCmuxRunFiles.values().next().value;
+	if (oldest !== undefined) recentCmuxRunFiles.delete(oldest);
+}
+
+postmortem.interceptUnhandledRejections(consumeCmuxRunRejection);
+
 export class CmuxTab {
 	readonly #client: CmuxSocketClient;
 	readonly #surfaceId: string;
@@ -1312,6 +1371,9 @@ export async function runCmuxCode(tab: CmuxTab, opts: RunCmuxCodeOptions): Promi
 	const output = new RunOutput();
 	const screenshots: ScreenshotResult[] = [];
 	const runId = crypto.randomUUID();
+	const filename = `cmux-run-${runId}.js`;
+	const activeRun: ActiveCmuxRun = { filename, floatingRejections: [] };
+	activeCmuxRuns.set(filename, activeRun);
 	tab.setRunContext({ session: opts.snapshot, output, screenshots, signal, timeoutMs: opts.timeoutMs });
 
 	const { promise: cancelRejection, reject } = Promise.withResolvers<never>();
@@ -1378,14 +1440,40 @@ export async function runCmuxCode(tab: CmuxTab, opts: RunCmuxCodeOptions): Promi
 		};
 		// Like the inline worker fallback, cmux runs user JS in-process: awaited cmux/tool calls
 		// observe this abort signal, but a synchronous infinite loop cannot be interrupted here.
-		const returnValue = await Promise.race([
-			runtime.run(opts.code, `cmux-run-${runId}.js`, hooks, { runId, cwd: opts.snapshot.cwd }),
-			cancelRejection,
-		]);
+		let returnValue: unknown;
+		let runError: unknown;
+		let runFailed = false;
+		try {
+			returnValue = await Promise.race([
+				runtime.run(opts.code, filename, hooks, { runId, cwd: opts.snapshot.cwd }),
+				cancelRejection,
+			]);
+		} catch (error) {
+			runFailed = true;
+			runError = error;
+		}
+		// Let rejection callbacks run while this run can still own guest-created promises.
+		await Bun.sleep(0);
+		if (runFailed) {
+			for (const reason of activeRun.floatingRejections) {
+				logger.warn("Unhandled rejection accompanied a failed cmux browser run", { filename, error: reason });
+			}
+			throw runError;
+		}
+		if (activeRun.floatingRejections.length > 0) {
+			const messages = activeRun.floatingRejections.map(reason =>
+				reason instanceof Error ? reason.message : String(reason),
+			);
+			throw new ToolError(`Unhandled rejection (missing await?): ${messages.join("\n[unhandled rejection] ")}`, {
+				rejections: activeRun.floatingRejections,
+			});
+		}
 		return { displays: output.finish(), returnValue: cloneSafe(returnValue), screenshots };
 	} finally {
 		signal.removeEventListener("abort", onAbort);
 		runAc.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Browser run ended")));
+		activeCmuxRuns.delete(filename);
+		rememberCmuxRunFile(filename);
 		tab.clearRunContext();
 	}
 }

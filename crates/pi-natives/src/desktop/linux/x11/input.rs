@@ -1209,29 +1209,31 @@ const BTN_LEFT: u16 = 272;
 const BTN_RIGHT: u16 = 273;
 const BTN_MIDDLE: u16 = 274;
 
-const fn ioc(dir: u64, type_: u64, nr: u64, size: u64) -> libc::c_ulong {
-	((dir << 30) | (type_ << 8) | nr | (size << 16)) as libc::c_ulong
+// `libc::Ioctl` is `c_ulong` on glibc but `c_int` on musl; the wrapping cast
+// mirrors how C truncates request codes on 32-bit-int ABIs.
+const fn ioc(dir: u64, type_: u64, nr: u64, size: u64) -> libc::Ioctl {
+	((dir << 30) | (type_ << 8) | nr | (size << 16)) as libc::Ioctl
 }
-const fn ui_set_evbit() -> libc::c_ulong {
+const fn ui_set_evbit() -> libc::Ioctl {
 	ioc(1, b'U' as u64, 100, std::mem::size_of::<libc::c_int>() as u64)
 }
-const fn ui_set_keybit() -> libc::c_ulong {
+const fn ui_set_keybit() -> libc::Ioctl {
 	ioc(1, b'U' as u64, 101, std::mem::size_of::<libc::c_int>() as u64)
 }
-const fn ui_set_relbit() -> libc::c_ulong {
+const fn ui_set_relbit() -> libc::Ioctl {
 	ioc(1, b'U' as u64, 102, std::mem::size_of::<libc::c_int>() as u64)
 }
-const fn ui_dev_create() -> libc::c_ulong {
+const fn ui_dev_create() -> libc::Ioctl {
 	ioc(0, b'U' as u64, 1, 0)
 }
-const fn ui_dev_destroy() -> libc::c_ulong {
+const fn ui_dev_destroy() -> libc::Ioctl {
 	ioc(0, b'U' as u64, 2, 0)
 }
-const fn ui_dev_setup() -> libc::c_ulong {
+const fn ui_dev_setup() -> libc::Ioctl {
 	ioc(1, b'U' as u64, 3, std::mem::size_of::<UInputSetup>() as u64)
 }
 
-fn ioctl_int(fd: libc::c_int, request: libc::c_ulong, value: u16) -> CoreResult<()> {
+fn ioctl_int(fd: libc::c_int, request: libc::Ioctl, value: u16) -> CoreResult<()> {
 	// SAFETY: fd is an open uinput descriptor and this request takes an integer
 	// argument by value.
 	let result = unsafe { libc::ioctl(fd, request, libc::c_ulong::from(value)) };
@@ -1244,7 +1246,7 @@ fn ioctl_int(fd: libc::c_int, request: libc::c_ulong, value: u16) -> CoreResult<
 		Ok(())
 	}
 }
-fn ioctl_none(fd: libc::c_int, request: libc::c_ulong) -> CoreResult<()> {
+fn ioctl_none(fd: libc::c_int, request: libc::Ioctl) -> CoreResult<()> {
 	// SAFETY: fd is an open uinput descriptor and this request takes no third
 	// argument.
 	let result = unsafe { libc::ioctl(fd, request) };
@@ -1257,7 +1259,7 @@ fn ioctl_none(fd: libc::c_int, request: libc::c_ulong) -> CoreResult<()> {
 		Ok(())
 	}
 }
-fn ioctl_ptr(fd: libc::c_int, request: libc::c_ulong, setup: &UInputSetup) -> CoreResult<()> {
+fn ioctl_ptr(fd: libc::c_int, request: libc::Ioctl, setup: &UInputSetup) -> CoreResult<()> {
 	// SAFETY: setup points to a valid UInputSetup for the duration of the ioctl.
 	let result = unsafe { libc::ioctl(fd, request, setup as *const UInputSetup) };
 	if result < 0 {

@@ -2,13 +2,21 @@
 
 ## [Unreleased]
 
+## [17.2.6] - 2026-08-03
+
 ### Added
 
-- Added `parseFlag()` (boolean-ish env value parsing backing `$flag()`), `getBrowserRelayDir()` (~/.omp/browser-relay, XDG data category), and `getGlobalDaemonRuntimeDir()` (profile-independent broker state) for the browser relay mode.
+- Added a shared `file-lock` utility backed by process-owned native OS locks with automatic crash release and bounded asynchronous retry.
+
+## [17.2.5] - 2026-08-03
+
+### Added
+
+- Added utility functions `parseFlag()`, `getBrowserRelayDir()`, and `getGlobalDaemonRuntimeDir()` to support browser relay mode and global daemon runtime directory resolution.
 
 ### Changed
 
-- Added static command metadata support to the lightweight CLI runner so root help can render without importing command implementations.
+- Updated the lightweight CLI runner to support static command metadata, allowing root help to render without importing full command implementations.
 
 ## [17.2.4] - 2026-08-01
 

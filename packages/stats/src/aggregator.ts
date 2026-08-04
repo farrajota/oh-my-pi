@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { workerHostEntry } from "@oh-my-pi/pi-utils";
+import { getStatsDbPath, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import {
 	getRecentErrors as dbGetRecentErrors,
 	getRecentRequests as dbGetRecentRequests,
@@ -54,6 +55,24 @@ import type {
 	ToolDashboardStats,
 } from "./types";
 import { computeUsageWindowStats, fetchUsageSnapshots } from "./usage-windows";
+
+const STATS_SYNC_LOCK_RETRY_MS = 25;
+const STATS_SYNC_LOCK_WAIT_MS = 60 * 60 * 1000;
+
+/**
+ * Serialize stats ingestion and archive reconciliation across processes.
+ * The lock covers file discovery, parsing, and the final SQLite write so a
+ * parse result for a session moved by GC can never commit after cleanup.
+ * The native lock is owned by an operating-system primitive, so an interrupted
+ * owner is released automatically and a live owner is never displaced.
+ */
+export async function withStatsSyncLock<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
+	await fs.promises.mkdir(path.dirname(dbPath), { recursive: true });
+	return await withFileLock(`${dbPath}.sync`, fn, {
+		retryDelayMs: STATS_SYNC_LOCK_RETRY_MS,
+		retries: Math.ceil(STATS_SYNC_LOCK_WAIT_MS / STATS_SYNC_LOCK_RETRY_MS),
+	});
+}
 
 /**
  * Apply a freshly parsed result to the database. Runs entirely on the
@@ -303,10 +322,12 @@ async function syncSessionFiles(files: string[], opts?: SyncOptions): Promise<{ 
  * Sync every known session file and complete global-scan backfills.
  */
 export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
-	await initDb();
-	const result = await syncSessionFiles(await listAllSessionFiles(), opts);
-	markSessionBackfillsComplete();
-	return result;
+	return withStatsSyncLock(getStatsDbPath(), async () => {
+		await initDb();
+		const result = await syncSessionFiles(await listAllSessionFiles(), opts);
+		markSessionBackfillsComplete();
+		return result;
+	});
 }
 
 /**

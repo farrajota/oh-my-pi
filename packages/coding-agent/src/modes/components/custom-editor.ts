@@ -31,6 +31,7 @@ type ConfigurableEditorAction = Extract<
 	| "app.model.select"
 	| "app.model.selectTemporary"
 	| "app.tools.expand"
+	| "app.tools.toggleVisibility"
 	| "app.thinking.toggle"
 	| "app.editor.external"
 	| "app.history.search"
@@ -53,6 +54,7 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.model.select": ["alt+m"],
 	"app.model.selectTemporary": ["alt+p"],
 	"app.tools.expand": ["ctrl+o"],
+	"app.tools.toggleVisibility": ["ctrl+shift+o"],
 	"app.thinking.toggle": ["ctrl+t"],
 	"app.editor.external": ["ctrl+g"],
 	"app.history.search": ["ctrl+r"],
@@ -509,6 +511,7 @@ export class CustomEditor extends Editor {
 	onCycleModelBackward?: () => void;
 	onSelectModel?: () => void;
 	onExpandTools?: () => void;
+	onToggleToolActivity?: () => void;
 	onToggleThinking?: () => void;
 	onExternalEditor?: () => void;
 	onHistorySearch?: () => void;
@@ -866,6 +869,12 @@ export class CustomEditor extends Editor {
 			// Intercept configured tool output expansion shortcut
 			if (this.#matchesAction(canonical, "app.tools.expand") && this.onExpandTools) {
 				this.onExpandTools();
+				return;
+			}
+
+			// Intercept configured tool activity visibility toggle
+			if (this.#matchesAction(canonical, "app.tools.toggleVisibility") && this.onToggleToolActivity) {
+				this.onToggleToolActivity();
 				return;
 			}
 

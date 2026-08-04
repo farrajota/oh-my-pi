@@ -39,7 +39,8 @@ describe("DesktopSession", () => {
 
 			const capabilities = session.capabilities;
 			expect(BACKENDS).toContain(capabilities.backend);
-			expect(capabilities).toHaveProperty("displayServer");
+			// displayServer is optional (`displayServer?: string`): napi omits the
+			// key entirely when the backend reports None (headless CI).
 			expect(["string", "undefined"]).toContain(typeof capabilities.displayServer);
 			expect(typeof capabilities.capture).toBe("boolean");
 			expect(typeof capabilities.input).toBe("boolean");

@@ -248,9 +248,9 @@ describe("system prompt tool inventory", () => {
 			inlineToolDescriptors: false,
 		});
 		const firstText = firstPrompt.systemPrompt.join("\n\n");
-		expect(firstText.indexOf("# Tool: edit_wire_r1")).toBeLessThan(firstText.indexOf("# Tool: read_wire_r1"));
+		expect(firstText.indexOf("type edit_wire_r1 = (")).toBeLessThan(firstText.indexOf("type read_wire_r1 = ("));
 		expect(firstText).toContain("edit description r1");
-		expect(firstText).toContain("arg_r1: string;");
+		expect(firstText).toContain("arg_r1: string,");
 
 		revision = 2;
 		const second = projectSystemPromptToolMetadata(tools, { mode: "full" });
@@ -274,9 +274,9 @@ describe("system prompt tool inventory", () => {
 			inlineToolDescriptors: false,
 		});
 		const secondText = secondPrompt.systemPrompt.join("\n\n");
-		expect(secondText.indexOf("# Tool: edit_wire_r2")).toBeLessThan(secondText.indexOf("# Tool: read_wire_r2"));
+		expect(secondText.indexOf("type edit_wire_r2 = (")).toBeLessThan(secondText.indexOf("type read_wire_r2 = ("));
 		expect(secondText).toContain("edit description r2");
-		expect(secondText).toContain("arg_r2: string;");
+		expect(secondText).toContain("arg_r2: string,");
 		expect(secondText).not.toContain("edit description r1");
 	});
 
@@ -416,7 +416,7 @@ describe("system prompt tool inventory", () => {
 		expect(text).toContain("- Read: `read`");
 		expect(text).toContain("- Bash: `bash`");
 		// No full per-tool sections in list mode.
-		expect(text).not.toContain("# Tool: read");
+		expect(text).not.toContain("namespace functions");
 		expect(text).not.toContain("Reads files from disk.");
 	});
 
@@ -442,19 +442,20 @@ describe("system prompt tool inventory", () => {
 		expect(text).toContain("# Computer Use");
 	});
 
-	it("renders `# Tool:` sections (not a name list) when tools are not native", async () => {
+	it("renders the functions namespace (not a name list) when tools are not native", async () => {
 		const text = await render({ nativeTools: false, inlineToolDescriptors: false });
-		expect(text).toContain("# Tool: read");
-		expect(text).toContain("# Tool: bash");
+		expect(text).toContain("namespace functions {");
+		expect(text).toContain("type read = (_: {");
+		expect(text).toContain("type bash = (_: {");
 		expect(text).toContain("Reads files from disk.");
 		expect(text).not.toContain("- Read: `read`");
 		// The legacy `<tool>` wrapper is gone.
 		expect(text).not.toContain("<tool name=");
 	});
 
-	it("renders `# Tool:` sections when descriptors are inlined even with native tools", async () => {
+	it("renders the functions namespace when descriptors are inlined even with native tools", async () => {
 		const text = await render({ nativeTools: true, inlineToolDescriptors: true });
-		expect(text).toContain("# Tool: read");
+		expect(text).toContain("type read = (_: {");
 		expect(text).toContain("Executes a shell command.");
 		expect(text).not.toContain("- Read: `read`");
 	});
@@ -465,8 +466,8 @@ describe("system prompt tool inventory", () => {
 	] as const)("omits xd-only tools from the %s inventory", async (_mode, nativeTools) => {
 		const { text, inventory } = await renderMountedWebSearch({ nativeTools, directDefinition: false });
 
-		expect(inventory).toContain(nativeTools ? "`read`" : "# Tool: read");
-		expect(inventory).not.toContain(nativeTools ? "`web_search`" : "# Tool: web_search");
+		expect(inventory).toContain(nativeTools ? "`read`" : "type read = (_: {");
+		expect(inventory).not.toContain(nativeTools ? "`web_search`" : "type web_search = (");
 		expect(text).toContain("# xd:// Tool Devices");
 		expect(text).toContain("Mounted web search documentation.");
 	});
@@ -477,7 +478,7 @@ describe("system prompt tool inventory", () => {
 	] as const)("keeps direct tools that share an xd device name in the %s inventory", async (_mode, nativeTools) => {
 		const { inventory } = await renderMountedWebSearch({ nativeTools, directDefinition: true });
 
-		expect(inventory).toContain(nativeTools ? "- Direct Web: `web_search`" : "# Tool: web_search");
+		expect(inventory).toContain(nativeTools ? "- Direct Web: `web_search`" : "type web_search = (");
 		if (!nativeTools) expect(inventory).toContain(DIRECT_WEB_SEARCH.description);
 	});
 
@@ -679,7 +680,7 @@ describe("system prompt tool inventory", () => {
 			})
 		).systemPrompt.join("\n\n");
 
-		expect(withScout).toContain("a read-only scout keeping bulk exploration");
+		expect(withScout).toContain("a single read-only scout while you keep working is fine");
 		expect(withoutScout).not.toContain("read-only scout");
 	});
 });

@@ -1598,6 +1598,18 @@ export async function runRootCommand(
 			stdoutIsTTY: process.stdout.isTTY,
 		});
 
+		// Startup changelog is only consumed by interactive mode below; kick the
+		// CHANGELOG.md parse off now so it overlaps session creation instead of
+		// serializing after it.
+		const startupChangelogPromise = isInteractive
+			? logger.time(
+					"main:getChangelogForDisplay",
+					getChangelogForDisplay,
+					parsedArgs,
+					settingsInstance.get("startup.changelogMode"),
+				)
+			: undefined;
+
 		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager } = await createSession({
 			...sessionOptions,
 			eventBus,
@@ -1657,12 +1669,7 @@ export async function runRootCommand(
 			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
 		} else if (isInteractive) {
 			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
-			const startupChangelog = await logger.time(
-				"main:getChangelogForDisplay",
-				getChangelogForDisplay,
-				parsedArgs,
-				settingsInstance.get("startup.changelogMode"),
-			);
+			const startupChangelog = await startupChangelogPromise;
 
 			const modelScopeNotification = buildModelScopeNotification(
 				scopedModels,

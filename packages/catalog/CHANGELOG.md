@@ -2,10 +2,29 @@
 
 ## [Unreleased]
 
+## [17.2.7] - 2026-08-03
+
 ### Fixed
 
-- Fixed `alibaba-token-plan` dynamic discovery dropping newly advertised chat models by replacing the stale static allowlist with dedicated non-chat media-model filters ([#7391](https://github.com/can1357/oh-my-pi/issues/7391)).
-- Fixed DeepSeek reasoning models on the OpenCode Zen/Go gateways (e.g. `opencode-zen/deepseek-v4-flash-free`) failing with `400 Thinking mode does not support this tool_choice` when a specific tool was forced. Dropping `reasoning_effort` does not disable the gateway's default thinking mode, so the OpenAI-compat descriptor now marks forced `tool_choice` unsupported for DeepSeek reasoning models, downgrading the selector to `auto` while keeping the tool advertised ([#7315](https://github.com/can1357/oh-my-pi/issues/7315)).
+- Fixed an issue where setting `thinking-level: off` failed to disable reasoning on direct DeepSeek V4 requests.
+
+## [17.2.6] - 2026-08-03
+
+### Added
+
+- Added the `bedrock-mantle` provider with authenticated model discovery for OpenAI GPT-5.4, GPT-5.5, and GPT-5.6 models (including Luna and Terra variants with corrected pricing) served through Amazon Bedrock's Responses endpoint.
+
+### Fixed
+
+- Fixed dynamic discovery for the `deepseek-v4` model family (such as `deepseek-v4-flash-0731`) under `alibaba-token-plan` missing reasoning configuration and maximum thinking effort.
+- Fixed GitHub Copilot dynamic discovery retaining stale bundled prices for default-context models instead of using the provider's reported default-tier prices.
+
+## [17.2.5] - 2026-08-03
+
+### Fixed
+
+- Fixed an issue where newly advertised chat models were dropped during dynamic discovery for the `alibaba-token-plan` provider.
+- Fixed a `400` error when forcing a specific tool with DeepSeek reasoning models on OpenCode Zen/Go gateways by automatically downgrading the tool selection mode to `auto` while keeping the tool advertised.
 
 ## [17.2.4] - 2026-08-01
 
