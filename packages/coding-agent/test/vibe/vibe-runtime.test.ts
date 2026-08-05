@@ -833,30 +833,22 @@ describe("vibe session registry", () => {
 		});
 		await started.promise;
 
-		vi.useFakeTimers();
-		try {
-			const suspension = registry.suspendScope(registry.ownerScope(session), manager);
-			await disposed.promise;
-			await flushMicrotasks();
-			expect(vi.getTimerCount()).toBeGreaterThan(0);
-			vi.advanceTimersByTime(250);
+		registry.setTeardownGraceForTesting(20);
+		const suspension = registry.suspendScope(registry.ownerScope(session), manager);
+		await disposed.promise;
 
-			expect(await suspension).toBe(1);
-			expect(manager.getJob(jobId)!.status).toBe("cancelled");
-			expect(fake.isDisposed()).toBe(true);
-			expect(AgentRegistry.global().get("IgnoresSuspendAbort")).toBeUndefined();
-			expect(registry.listIds(session)).toEqual([]);
+		expect(await suspension).toBe(1);
+		expect(manager.getJob(jobId)!.status).toBe("cancelled");
+		expect(fake.isDisposed()).toBe(true);
+		expect(AgentRegistry.global().get("IgnoresSuspendAbort")).toBeUndefined();
+		expect(registry.listIds(session)).toEqual([]);
 
-			gate.resolve();
-			await manager.getJob(jobId)!.promise;
-			expect(manager.getJob(jobId)!.status).toBe("cancelled");
-			expect(fake.isDisposed()).toBe(true);
-			expect(AgentRegistry.global().get("IgnoresSuspendAbort")).toBeUndefined();
-			expect(registry.listIds(session)).toEqual([]);
-		} finally {
-			gate.resolve();
-			vi.useRealTimers();
-		}
+		gate.resolve();
+		await manager.getJob(jobId)!.promise;
+		expect(manager.getJob(jobId)!.status).toBe("cancelled");
+		expect(fake.isDisposed()).toBe(true);
+		expect(AgentRegistry.global().get("IgnoresSuspendAbort")).toBeUndefined();
+		expect(registry.listIds(session)).toEqual([]);
 	});
 
 	it("restores an interrupted turn as idle without replay and continues only after send", async () => {
@@ -1920,37 +1912,29 @@ describe("vibe session registry", () => {
 		});
 		await started.promise;
 
-		vi.useFakeTimers();
-		try {
-			const kill = registry.kill(session, "IgnoresKillAbort");
-			await disposed.promise;
-			await flushMicrotasks();
-			expect(vi.getTimerCount()).toBeGreaterThan(0);
-			vi.advanceTimersByTime(250);
+		registry.setTeardownGraceForTesting(20);
+		const kill = registry.kill(session, "IgnoresKillAbort");
+		await disposed.promise;
 
-			const outcome = await kill;
-			expect(outcome.cancelledTurn).toBe(true);
-			expect(manager.getJob(jobId)!.status).toBe("cancelled");
-			expect(fake.isDisposed()).toBe(true);
-			expect(AgentRegistry.global().get("IgnoresKillAbort")).toBeUndefined();
-			expect(registry.screens(session)[0]?.state).toBe("dead");
-			await expect(registry.send(session, { session: "IgnoresKillAbort", message: "hello?" })).rejects.toThrow(
-				"dead",
-			);
+		const outcome = await kill;
+		expect(outcome.cancelledTurn).toBe(true);
+		expect(manager.getJob(jobId)!.status).toBe("cancelled");
+		expect(fake.isDisposed()).toBe(true);
+		expect(AgentRegistry.global().get("IgnoresKillAbort")).toBeUndefined();
+		expect(registry.screens(session)[0]?.state).toBe("dead");
+		await expect(registry.send(session, { session: "IgnoresKillAbort", message: "hello?" })).rejects.toThrow(
+			"dead",
+		);
 
-			gate.resolve();
-			await manager.getJob(jobId)!.promise;
-			expect(manager.getJob(jobId)!.status).toBe("cancelled");
-			expect(fake.isDisposed()).toBe(true);
-			expect(AgentRegistry.global().get("IgnoresKillAbort")).toBeUndefined();
-			expect(registry.screens(session)[0]?.state).toBe("dead");
-			await expect(registry.send(session, { session: "IgnoresKillAbort", message: "still there?" })).rejects.toThrow(
-				"dead",
-			);
-		} finally {
-			gate.resolve();
-			vi.useRealTimers();
-		}
+		gate.resolve();
+		await manager.getJob(jobId)!.promise;
+		expect(manager.getJob(jobId)!.status).toBe("cancelled");
+		expect(fake.isDisposed()).toBe(true);
+		expect(AgentRegistry.global().get("IgnoresKillAbort")).toBeUndefined();
+		expect(registry.screens(session)[0]?.state).toBe("dead");
+		await expect(registry.send(session, { session: "IgnoresKillAbort", message: "still there?" })).rejects.toThrow(
+			"dead",
+		);
 	});
 
 	it("keeps a persisted in-flight kill terminal when the old executor finalizes late", async () => {
