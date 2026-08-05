@@ -37,11 +37,13 @@ export type AgentReviver = (expected: AgentRef) => Promise<AgentSession>;
 
 const AGENT_RELEASE_GRACE_MS = 5000;
 
-async function persistAgentTombstone(sessionFile: string): Promise<void> {
+async function persistAgentTombstone(sessionFile: string): Promise<boolean> {
 	try {
 		await fs.writeFile(getAgentTombstonePath(sessionFile), "", { encoding: "utf8", flag: "wx", mode: 0o600 });
+		return true;
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+		throw error;
 	}
 }
 
@@ -378,6 +380,7 @@ export class AgentLifecycleManager {
 		const adoptedMatches =
 			adopted && (expected === undefined || adopted.ref === expected || adopted.ref.session === expected);
 		const ref = currentMatches ? current : adoptedMatches ? adopted.ref : undefined;
+		if (expected !== undefined && current && !currentMatches) return false;
 		if (!ref) return false;
 		if (adopted?.ref === ref) {
 			clearTimeout(adopted.timer);
@@ -390,16 +393,25 @@ export class AgentLifecycleManager {
 			if (!park.detached) park.cancel();
 			await park.promise;
 		}
+		if (this.#registry.get(id) !== ref) return false;
+		const live = ref.session;
 
 		if (options?.tombstone) {
-			// Persist the terminal decision before detaching the session. The
-			// sidecar prevents a later discovery pass from reviving this transcript
-			// as a fresh parked ref.
-			if (ref.sessionFile) await persistAgentTombstone(ref.sessionFile);
-			this.#registry.setStatus(id, "aborted", ref);
+			if (!this.#registry.beginTermination(id, ref)) return false;
+			let createdTombstone = false;
+			try {
+				if (ref.sessionFile) createdTombstone = await persistAgentTombstone(ref.sessionFile);
+				if (this.#registry.get(id) !== ref) {
+					if (createdTombstone && ref.sessionFile)
+						await fs.rm(getAgentTombstonePath(ref.sessionFile), { force: true });
+					return false;
+				}
+				this.#registry.setStatus(id, "aborted", ref);
+				this.#registry.detachSession(id, ref);
+			} finally {
+				this.#registry.endTermination(id, ref);
+			}
 		}
-		const live = this.#registry.get(id) === ref ? ref.session : null;
-		if (options?.tombstone) this.#registry.detachSession(id, ref);
 		if (live) {
 			try {
 				await live.dispose();

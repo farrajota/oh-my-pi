@@ -8,11 +8,11 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import type { AsyncJob, AsyncJobManager } from "../../async";
+import { terminateSubagent } from "../../registry/agent-control";
 import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
-import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import type { ToolSession } from "..";
 import {
@@ -365,34 +365,19 @@ async function cancelAgentRegistration(
 ): Promise<CancelOutcome> {
 	const registry = session.agentRegistry;
 	const ref = registry?.get(id);
-	if (ref?.kind !== "sub") {
+	if (!registry || ref?.kind !== "sub") {
 		return { id, status: "not_found", message: `Background job not found: ${id}` };
 	}
-	if (id === ownerId) {
-		return { id, status: "not_found", message: `Cannot cancel yourself (${id}).` };
+	const result = await terminateSubagent({
+		registry,
+		lifecycle: session.agentLifecycle?.(),
+		targetId: id,
+		policy: ownerId ? { scope: "direct-child", ownerId } : { scope: "unrestricted" },
+	});
+	if (result.status === "cancelled") {
+		return { id, status: "cancelled", message: `Cancelled agent ${id} (killed session, dropped registration).` };
 	}
-	if (ownerId && ref.parentId !== ownerId) {
-		return { id, status: "not_found", message: `Agent ${id} was not spawned by you and cannot be cancelled.` };
-	}
-	const lifecycle = session.agentLifecycle?.();
-	try {
-		if (ref.status === "running" && ref.session) {
-			await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
-		}
-		if (lifecycle) {
-			await lifecycle.release(id);
-		} else {
-			await ref.session?.dispose();
-			registry?.unregister(id);
-		}
-	} catch (error) {
-		return {
-			id,
-			status: "already_completed",
-			message: `Agent ${id} could not be fully cancelled: ${error instanceof Error ? error.message : String(error)}.`,
-		};
-	}
-	return { id, status: "cancelled", message: `Cancelled agent ${id} (killed session, dropped registration).` };
+	return result;
 }
 
 /** `jobs`: read-only snapshot of every job plus the jobless running-agent roster. */

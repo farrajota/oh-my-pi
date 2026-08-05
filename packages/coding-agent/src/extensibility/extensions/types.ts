@@ -40,9 +40,12 @@ import type {
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import type { AutocompleteItem, AutocompleteProvider, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { Type as arktype } from "arktype";
-import type * as zod from "zod/v4";
-import type { AsyncJobSnapshot, AsyncJobSnapshotOptions } from "../../async";
+import type {
+	AsyncJobOutputSnapshot,
+	AsyncJobSnapshot,
+	AsyncJobSnapshotOptions,
+	BackgroundControlResult,
+} from "../../async";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
@@ -54,7 +57,6 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
-import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -111,7 +113,15 @@ import type {
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
 
-export type { AsyncJobSnapshot, AsyncJobSnapshotItem, AsyncJobSnapshotOptions } from "../../async";
+export type {
+	AsyncJobOutputSnapshot,
+	AsyncJobOutputSource,
+	AsyncJobSnapshot,
+	AsyncJobSnapshotItem,
+	AsyncJobSnapshotOptions,
+	BackgroundControlResult,
+	BackgroundControlStatus,
+} from "../../async";
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
 export type { AgentToolResult, AgentToolUpdateCallback };
@@ -430,8 +440,6 @@ export interface ExtensionContext {
 	ui: ExtensionUIContext;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
-	/** Get a read-only snapshot of async jobs owned by this session. */
-	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
 	/** Whether UI is available (false in print/RPC mode) */
@@ -464,6 +472,12 @@ export interface ExtensionContext {
 	getSystemPrompt(): string[];
 	/** Metadata-only view of this actor's active and recent background jobs. */
 	getAsyncJobSnapshot(options?: AsyncJobSnapshotOptions): AsyncJobSnapshot | null;
+	/** Get bounded output for one async job owned by this session. Returns null after retention or on owner mismatch. */
+	getAsyncJobOutput(jobId: string): AsyncJobOutputSnapshot | null;
+	/** Cancel one running async job owned by this session. */
+	cancelAsyncJob(jobId: string): Promise<BackgroundControlResult>;
+	/** Permanently terminate one owned descendant subagent. */
+	terminateSubagent(agentId: string): Promise<BackgroundControlResult>;
 	/** Structured memory runtime for status/search/save across the configured backend. */
 	memory?: MemoryRuntimeContext;
 	/**
@@ -1567,6 +1581,12 @@ export interface ExtensionContextActions {
 	getSystemPrompt: () => string[];
 	/** Optional for hosts that do not manage async jobs; ctx always falls back to null. */
 	getAsyncJobSnapshot?: (options?: AsyncJobSnapshotOptions) => AsyncJobSnapshot | null;
+	/** Optional for hosts that do not manage async job output; ctx always falls back to null. */
+	getAsyncJobOutput?: (jobId: string) => AsyncJobOutputSnapshot | null;
+	/** Optional for hosts that do not manage async jobs; ctx returns a safe not-found result. */
+	cancelAsyncJob?: (jobId: string) => Promise<BackgroundControlResult>;
+	/** Optional for hosts that do not manage subagents; ctx returns a safe not-found result. */
+	terminateSubagent?: (agentId: string) => Promise<BackgroundControlResult>;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

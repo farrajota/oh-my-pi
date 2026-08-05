@@ -130,12 +130,24 @@ export class AgentRegistry {
 
 	readonly #refs = new Map<string, AgentRef>();
 	readonly #listeners = new Set<RegistryListener>();
+	readonly #terminating = new Map<string, AgentRef>();
 
 	#matchesExpected(ref: AgentRef, expected?: AgentRefExpectation): boolean {
 		return expected === undefined || ref === expected || ref.session === expected;
 	}
 
+	beginTermination(id: string, expected: AgentRef): boolean {
+		if (this.#refs.get(id) !== expected || this.#terminating.has(id)) return false;
+		this.#terminating.set(id, expected);
+		return true;
+	}
+
+	endTermination(id: string, expected: AgentRef): void {
+		if (this.#terminating.get(id) === expected) this.#terminating.delete(id);
+	}
+
 	register(input: RegisterInput): AgentRef {
+		if (this.#terminating.has(input.id)) throw new Error(`Agent "${input.id}" is being terminated.`);
 		const now = Date.now();
 		const ref: AgentRef = {
 			id: input.id,

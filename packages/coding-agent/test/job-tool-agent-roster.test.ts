@@ -8,8 +8,9 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { terminateSubagent } from "@oh-my-pi/pi-coding-agent/registry/agent-control";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { type AgentRef, AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { type CoordinationDetails, HubTool } from "../src/tools/hub";
 
@@ -162,12 +163,13 @@ describe("hub wait with no matching jobs", () => {
 });
 
 describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
-	function fakeSession() {
+	function fakeSession(onAbort?: () => void) {
 		let aborts = 0;
 		let disposes = 0;
 		const session = {
 			abort: async () => {
 				aborts += 1;
+				onAbort?.();
 			},
 			dispose: async () => {
 				disposes += 1;
@@ -195,8 +197,9 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 
 		expect((result.details as CoordinationDetails)?.cancelled).toEqual([{ id: "Zombie", status: "cancelled" }]);
 		expect(resultText(result)).toContain("Cancelled agent Zombie");
-		// The registration is gone: dropped from the registry and lifecycle.
-		expect(registry.get("Zombie")).toBeUndefined();
+		const killed = registry.get("Zombie");
+		expect(killed?.status).toBe("aborted");
+		expect(killed?.session).toBeNull();
 		expect(lifecycle.has("Zombie")).toBe(false);
 		expect(fake.disposeCalls()).toBe(1);
 	});
@@ -221,7 +224,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 		expect((result.details as CoordinationDetails)?.cancelled).toEqual([{ id: "Runner", status: "cancelled" }]);
 		expect(fake.abortCalls()).toBe(1);
 		expect(fake.disposeCalls()).toBe(1);
-		expect(registry.get("Runner")).toBeUndefined();
+		expect(registry.get("Runner")?.status).toBe("aborted");
 	});
 
 	test("cancel refuses an agent spawned by someone else", async () => {
@@ -278,7 +281,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 		const result = await tool.execute("call", { op: "cancel", ids: ["Zombie"] });
 
 		expect((result.details as CoordinationDetails)?.cancelled).toEqual([{ id: "Zombie", status: "cancelled" }]);
-		expect(registry.get("Zombie")).toBeUndefined();
+		expect(registry.get("Zombie")?.status).toBe("aborted");
 		expect(lifecycle.has("Zombie")).toBe(false);
 		expect(fake.disposeCalls()).toBe(1);
 	});
@@ -297,5 +300,145 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 			{ id: "DoneJob", status: "already_completed" },
 		]);
 		expect(resultText(result)).toContain("already completed");
+	});
+
+	test("descendant scope terminates nested children while direct-child scope fails closed", async () => {
+		const registry = new AgentRegistry();
+		const lifecycle = new AgentLifecycleManager(registry);
+		registry.register({
+			id: "Child",
+			displayName: "Child",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "idle",
+		});
+		const grandchild = fakeSession();
+		registry.register({
+			id: "Grandchild",
+			displayName: "Grandchild",
+			kind: "sub",
+			parentId: "Child",
+			session: grandchild.session as never,
+			status: "idle",
+		});
+		lifecycle.adopt("Grandchild", { idleTtlMs: 0 });
+
+		await expect(
+			terminateSubagent({
+				registry,
+				lifecycle,
+				targetId: "Grandchild",
+				policy: { scope: "direct-child", ownerId: "Main" },
+			}),
+		).resolves.toMatchObject({ status: "not_found" });
+		await expect(
+			terminateSubagent({
+				registry,
+				lifecycle,
+				targetId: "Grandchild",
+				policy: { scope: "descendant", ownerId: "Main" },
+			}),
+		).resolves.toMatchObject({ status: "cancelled" });
+		expect(registry.get("Grandchild")?.status).toBe("aborted");
+		expect(grandchild.disposeCalls()).toBe(1);
+	});
+
+	test("a stale termination cannot kill a replacement generation", async () => {
+		const registry = new AgentRegistry();
+		const lifecycle = new AgentLifecycleManager(registry);
+		let replacement: AgentRef | undefined;
+		const stale = fakeSession(() => {
+			replacement = registry.register({
+				id: "Runner",
+				displayName: "Replacement",
+				kind: "sub",
+				parentId: "Main",
+				session: null,
+				status: "idle",
+			});
+		});
+		registry.register({
+			id: "Runner",
+			displayName: "Runner",
+			kind: "sub",
+			parentId: "Main",
+			session: stale.session as never,
+			status: "running",
+		});
+		lifecycle.adopt("Runner", { idleTtlMs: 0 });
+
+		await expect(
+			terminateSubagent({
+				registry,
+				lifecycle,
+				targetId: "Runner",
+				policy: { scope: "direct-child", ownerId: "Main" },
+			}),
+		).resolves.toMatchObject({ status: "already_completed" });
+		expect(registry.get("Runner")).toBe(replacement);
+		expect(replacement?.status).toBe("idle");
+	});
+
+	test("rejects a replacement that appeared after caller authorization", async () => {
+		const registry = new AgentRegistry();
+		const lifecycle = new AgentLifecycleManager(registry);
+		const authorized = registry.register({
+			id: "Runner",
+			displayName: "Authorized",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "idle",
+		});
+		expect(registry.unregister("Runner", authorized)).toBe(true);
+		const replacement = registry.register({
+			id: "Runner",
+			displayName: "Replacement",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "idle",
+		});
+
+		await expect(
+			terminateSubagent({
+				registry,
+				lifecycle,
+				targetId: "Runner",
+				expectedRef: authorized,
+				policy: { scope: "direct-child", ownerId: "Main" },
+			}),
+		).resolves.toMatchObject({ status: "not_found" });
+		expect(registry.get("Runner")).toBe(replacement);
+		expect(replacement.status).toBe("idle");
+	});
+	test("blocks same-id replacement while tombstone publication is pending", () => {
+		const registry = new AgentRegistry();
+		const current = registry.register({
+			id: "Runner",
+			displayName: "Runner",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "idle",
+		});
+
+		expect(registry.beginTermination("Runner", current)).toBe(true);
+		expect(() =>
+			registry.register({
+				id: "Runner",
+				displayName: "Replacement",
+				kind: "sub",
+				parentId: "Main",
+				session: null,
+				status: "idle",
+			}),
+		).toThrow('Agent "Runner" is being terminated.');
+		expect(registry.get("Runner")).toBe(current);
+		registry.endTermination("Runner", current);
+		expect(
+			registry.register({ id: "Runner", displayName: "Replacement", kind: "sub", parentId: "Main", session: null }),
+		).not.toBe(current);
 	});
 });

@@ -874,7 +874,7 @@ describe("AsyncJobManager", () => {
 		}
 	});
 
-	test("retains terminal history for distinct jobs that reuse a default id", async () => {
+	test("does not reuse a default id while terminal history retains it", async () => {
 		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
 		try {
 			const firstId = manager.register("task", "first default job", async () => "first");
@@ -883,11 +883,11 @@ describe("AsyncJobManager", () => {
 			expect(manager.getJob(firstId)).toBeUndefined();
 
 			const secondId = manager.register("task", "second default job", async () => "second");
-			expect(secondId).toBe("bg_1");
+			expect(secondId).toBe("bg_2");
 			await manager.waitForAll();
 
 			expect(manager.getSnapshot({ recentLimit: 15 }).recent.map(job => [job.id, job.label])).toEqual([
-				["bg_1", "second default job"],
+				["bg_2", "second default job"],
 				["bg_1", "first default job"],
 			]);
 		} finally {
@@ -977,6 +977,83 @@ describe("AsyncJobManager", () => {
 		manager.cancelAll({ ownerId: "Sub" });
 		await expect(reap).resolves.toBe(true);
 		expect(manager.getJob("hung-1")?.status).toBe("cancelled");
+	});
+	test("returns bounded owner-scoped output with deterministic source precedence", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const progressGate = Promise.withResolvers<void>();
+		const progressReported = Promise.withResolvers<void>();
+		const runningId = manager.register(
+			"bash",
+			"progress",
+			async ({ reportProgress }) => {
+				await reportProgress("first");
+				await reportProgress(`${"x".repeat(60_000)}tail`);
+				progressReported.resolve();
+				await progressGate.promise;
+				return "done";
+			},
+			{ ownerId: "Main" },
+		);
+		await progressReported.promise;
+		const progress = manager.getOutput(runningId, { ownerId: "Main" });
+		expect(progress?.source).toBe("progress");
+		expect(progress?.truncated).toBe(true);
+		expect(progress?.text.endsWith("tail")).toBe(true);
+		expect(manager.getOutput(runningId, { ownerId: "Other" })).toBeNull();
+		expect(manager.getJob(runningId, { ownerId: "Other" })).toBeUndefined();
+
+		progressGate.resolve();
+		await manager.waitForAll();
+		expect(manager.getOutput(runningId, { ownerId: "Main" })).toMatchObject({
+			status: "completed",
+			source: "result",
+			text: "done",
+			truncated: false,
+		});
+
+		const failedId = manager.register(
+			"bash",
+			"failed",
+			async () => {
+				throw new Error(`${"e".repeat(60_000)}failure-tail`);
+			},
+			{ ownerId: "Main" },
+		);
+		await manager.waitForAll();
+		const failed = manager.getOutput(failedId, { ownerId: "Main" });
+		expect(failed?.source).toBe("error");
+		expect(failed?.truncated).toBe(true);
+		expect(failed?.text.endsWith("failure-tail")).toBe(true);
+
+		const cancelledId = manager.register(
+			"bash",
+			"cancelled",
+			async ({ signal }) => {
+				const aborted = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => aborted.reject(new Error("cancelled-error")), { once: true });
+				await aborted.promise;
+				return "unreachable";
+			},
+			{ ownerId: "Main" },
+		);
+		expect(manager.cancel(cancelledId, { ownerId: "Main" })).toBe(true);
+		await manager.waitForAll();
+		expect(manager.getOutput(cancelledId, { ownerId: "Main" })).toMatchObject({
+			status: "cancelled",
+			source: "error",
+			text: "cancelled-error",
+		});
+		await manager.dispose();
+	});
+
+	test("returns null after live output is evicted while metadata history remains", async () => {
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		const id = manager.register("bash", "short", async () => "retained only while live", { ownerId: "Main" });
+		await manager.waitForAll();
+		expect(manager.getJob(id, { ownerId: "Main" })).toBeUndefined();
+		expect(manager.getOutput(id, { ownerId: "Main" })).toBeNull();
+		expect(manager.getSnapshot({ filter: { ownerId: "Main" } }).recent.map(job => job.id)).toContain(id);
+		await manager.dispose();
 	});
 });
 

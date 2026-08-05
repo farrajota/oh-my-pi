@@ -198,6 +198,9 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			getAsyncJobSnapshot: options => this.ctx.session.getAsyncJobSnapshot(options),
+			getAsyncJobOutput: jobId => this.ctx.session.getAsyncJobOutput(jobId),
+			cancelAsyncJob: jobId => this.ctx.session.cancelAsyncJob(jobId),
+			terminateSubagent: agentId => this.ctx.session.terminateSubagent(agentId),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -432,6 +435,9 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			getAsyncJobSnapshot: options => this.ctx.session.getAsyncJobSnapshot(options),
+			getAsyncJobOutput: jobId => this.ctx.session.getAsyncJobOutput(jobId),
+			cancelAsyncJob: jobId => this.ctx.session.cancelAsyncJob(jobId),
+			terminateSubagent: agentId => this.ctx.session.terminateSubagent(agentId),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),

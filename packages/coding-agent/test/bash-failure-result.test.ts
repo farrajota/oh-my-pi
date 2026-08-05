@@ -1,16 +1,20 @@
 import { describe, expect, it } from "bun:test";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 
-function makeSession(): ToolSession {
+function makeSession(asyncJobManager?: AsyncJobManager): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		skills: [],
 		getSessionFile: () => null,
+		getSessionId: () => "bash-label-test",
+		getAgentId: () => "bash-label-owner",
+		asyncJobManager,
 		settings: {
 			get(key: string) {
-				if (key === "async.enabled") return false;
+				if (key === "async.enabled") return asyncJobManager !== undefined;
 				if (key === "bash.autoBackground.enabled") return false;
 				if (key === "bash.autoBackground.thresholdMs") return 60_000;
 				if (key === "bashInterceptor.enabled") return false;
@@ -29,6 +33,27 @@ function makeSession(): ToolSession {
 }
 
 describe("BashTool execution results", () => {
+	it("executes async Bash unchanged without retaining the raw command as job metadata", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const secret = "ASYNC_BASH_SENTINEL_SECRET";
+		const command = `printf '%s' '${secret}'`;
+		try {
+			const tool = new BashTool(makeSession(manager));
+			const started = await tool.execute("call-async-label", { command, async: true });
+			const jobId = started.details?.async?.jobId;
+			expect(started.details?.async?.type).toBe("bash");
+			expect(jobId).toBeDefined();
+
+			await manager.waitForAll();
+			const job = manager.getSnapshot({ recentLimit: 99 }).recent.find(item => item.id === jobId);
+			expect(job).toMatchObject({ type: "bash", label: "Bash background job" });
+			expect(job?.label).not.toContain(secret);
+			expect(manager.getOutput(jobId!)?.text).toContain(secret);
+		} finally {
+			await manager.dispose();
+		}
+	});
+
 	it("resolves with an error result carrying execution details instead of throwing", async () => {
 		const tool = new BashTool(makeSession());
 		const result = await tool.execute("call-fail", { command: "exit 3" });

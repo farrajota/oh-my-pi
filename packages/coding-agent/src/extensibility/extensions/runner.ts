@@ -11,7 +11,12 @@ import type {
 import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMetadata } from "@oh-my-pi/pi-ai";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
-import type { AsyncJobSnapshot, AsyncJobSnapshotOptions } from "../../async";
+import type {
+	AsyncJobOutputSnapshot,
+	AsyncJobSnapshot,
+	AsyncJobSnapshotOptions,
+	BackgroundControlResult,
+} from "../../async";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
@@ -347,6 +352,17 @@ export class ExtensionRunner {
 	#getSystemPromptFn: () => string[] = () => [];
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getAsyncJobSnapshotFn: (options?: AsyncJobSnapshotOptions) => AsyncJobSnapshot | null = () => null;
+	#getAsyncJobOutputFn: (jobId: string) => AsyncJobOutputSnapshot | null = () => null;
+	#cancelAsyncJobFn: (jobId: string) => Promise<BackgroundControlResult> = async jobId => ({
+		id: jobId,
+		status: "not_found",
+		message: "Background job control is unavailable in this session.",
+	});
+	#terminateSubagentFn: (agentId: string) => Promise<BackgroundControlResult> = async agentId => ({
+		id: agentId,
+		status: "not_found",
+		message: "Subagent control is unavailable in this session.",
+	});
 	private readonly sessionScope?: {
 		actor?: ExtensionActorIdentity;
 		permissionScope?: EffectiveSubagentPermissions;
@@ -557,6 +573,21 @@ export class ExtensionRunner {
 		this.#shutdownHandler = contextActions.shutdown;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 		this.#getAsyncJobSnapshotFn = contextActions.getAsyncJobSnapshot ?? (() => null);
+		this.#getAsyncJobOutputFn = contextActions.getAsyncJobOutput ?? (() => null);
+		this.#cancelAsyncJobFn =
+			contextActions.cancelAsyncJob ??
+			(async jobId => ({
+				id: jobId,
+				status: "not_found",
+				message: "Background job control is unavailable in this session.",
+			}));
+		this.#terminateSubagentFn =
+			contextActions.terminateSubagent ??
+			(async agentId => ({
+				id: agentId,
+				status: "not_found",
+				message: "Subagent control is unavailable in this session.",
+			}));
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -917,6 +948,9 @@ export class ExtensionRunner {
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			getAsyncJobSnapshot: options => this.#getAsyncJobSnapshotFn(options),
+			getAsyncJobOutput: jobId => this.#getAsyncJobOutputFn(jobId),
+			cancelAsyncJob: jobId => this.#cancelAsyncJobFn(jobId),
+			terminateSubagent: agentId => this.#terminateSubagentFn(agentId),
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
 			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),

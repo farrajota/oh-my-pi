@@ -1,4 +1,5 @@
 import { logger } from "@oh-my-pi/pi-utils";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "../session/streaming-output";
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -40,6 +41,10 @@ export interface AsyncJob {
 	promise: Promise<void>;
 	resultText?: string;
 	errorText?: string;
+	/** Latest bounded progress text reported by the running job. */
+	latestText?: string;
+	/** Whether latestText was truncated while retained. */
+	latestTextTruncated?: boolean;
 	/** Latest tool-render details reported by the running job. */
 	latestDetails?: Record<string, unknown>;
 	/**
@@ -96,6 +101,24 @@ export interface AsyncJobSnapshotOptions {
 	recentLimit?: number;
 	/** Include rows backed by an AgentRegistry id. Defaults to true. Delivery state is unaffected. */
 	includeAgentJobs?: boolean;
+}
+
+export type AsyncJobOutputSource = "progress" | "result" | "error" | "none";
+
+export interface AsyncJobOutputSnapshot {
+	readonly id: string;
+	readonly status: AsyncJob["status"];
+	readonly source: AsyncJobOutputSource;
+	readonly text: string;
+	readonly truncated: boolean;
+}
+
+export type BackgroundControlStatus = "cancelled" | "not_found" | "already_completed";
+
+export interface BackgroundControlResult {
+	readonly id: string;
+	readonly status: BackgroundControlStatus;
+	readonly message: string;
 }
 /** Delivery callback for a settled job's result text. */
 export type AsyncJobDeliverySink = (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
@@ -270,6 +293,9 @@ export class AsyncJobManager {
 		};
 
 		const reportProgress = async (text: string, details?: Record<string, unknown>): Promise<void> => {
+			const latest = truncateTail(text, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
+			job.latestText = latest.content;
+			job.latestTextTruncated = latest.truncated === true;
 			if (details) job.latestDetails = details;
 			if (!options?.onProgress) return;
 			try {
@@ -340,8 +366,46 @@ export class AsyncJobManager {
 		return true;
 	}
 
-	getJob(id: string): AsyncJob | undefined {
-		return this.#jobs.get(id);
+	getJob(id: string, filter?: AsyncJobFilter): AsyncJob | undefined {
+		const job = this.#jobs.get(id);
+		if (!job) return undefined;
+		if (this.#hasOwnerFilter(filter) && job.ownerId !== filter.ownerId) return undefined;
+		return job;
+	}
+
+	getOutput(id: string, filter?: AsyncJobFilter): AsyncJobOutputSnapshot | null {
+		const job = this.getJob(id, filter);
+		if (!job) return null;
+
+		if (job.status === "running") {
+			return {
+				id,
+				status: job.status,
+				source: job.latestText === undefined ? "none" : "progress",
+				text: job.latestText ?? "",
+				truncated: job.latestTextTruncated ?? false,
+			};
+		}
+
+		const sourceText =
+			job.status === "completed"
+				? { source: "result" as const, text: job.resultText }
+				: job.status === "failed"
+					? { source: "error" as const, text: job.errorText }
+					: job.errorText !== undefined
+						? { source: "error" as const, text: job.errorText }
+						: { source: "result" as const, text: job.resultText };
+		if (sourceText.text === undefined) {
+			return { id, status: job.status, source: "none", text: "", truncated: false };
+		}
+		const bounded = truncateTail(sourceText.text, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
+		return {
+			id,
+			status: job.status,
+			source: sourceText.source,
+			text: bounded.content,
+			truncated: bounded.truncated === true,
+		};
 	}
 
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[] {
@@ -717,13 +781,22 @@ export class AsyncJobManager {
 		if (bucket.length > TERMINAL_HISTORY_BUCKET_LIMIT) bucket.pop();
 		this.#terminalHistory.set(job.ownerId, history);
 	}
+	#hasJobId(id: string): boolean {
+		if (this.#jobs.has(id)) return true;
+		for (const history of this.#terminalHistory.values()) {
+			if (history.agent.some(entry => entry.snapshot.id === id)) return true;
+			if (history.nonAgent.some(entry => entry.snapshot.id === id)) return true;
+		}
+		return false;
+	}
+
 	#resolveJobId(preferredId?: string): string {
 		preferredId = preferredId?.trim();
 		if (!preferredId) {
 			let candidate = 1;
 			while (true) {
 				const id = `bg_${candidate}`;
-				if (!this.#jobs.has(id)) {
+				if (!this.#hasJobId(id)) {
 					return id;
 				}
 				candidate += 1;
@@ -731,11 +804,11 @@ export class AsyncJobManager {
 		}
 
 		const base = preferredId.trim();
-		if (!this.#jobs.has(base)) return base;
+		if (!this.#hasJobId(base)) return base;
 
 		let suffix = 2;
 		let candidate = `${base}-${suffix}`;
-		while (this.#jobs.has(candidate)) {
+		while (this.#hasJobId(candidate)) {
 			suffix += 1;
 			candidate = `${base}-${suffix}`;
 		}

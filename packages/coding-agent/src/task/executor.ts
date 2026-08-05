@@ -3255,6 +3255,9 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 						getSystemPrompt: () => session.systemPrompt,
 						compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 						getAsyncJobSnapshot: options => session.getAsyncJobSnapshot(options),
+						getAsyncJobOutput: jobId => session.getAsyncJobOutput(jobId),
+						cancelAsyncJob: jobId => session.cancelAsyncJob(jobId),
+						terminateSubagent: agentId => session.terminateSubagent(agentId),
 					},
 				);
 				extensionRunner.onError(err => {

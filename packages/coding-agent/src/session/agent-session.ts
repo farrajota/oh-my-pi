@@ -97,7 +97,14 @@ import {
 	withTimeout,
 } from "@oh-my-pi/pi-utils";
 import { type AdvisorConfig, type AdvisorRuntimeStatus, loadAdvisorTranscriptCosts } from "../advisor";
-import { type AsyncJob, AsyncJobManager, type AsyncJobSnapshot, type AsyncJobSnapshotOptions } from "../async";
+import {
+	type AsyncJob,
+	AsyncJobManager,
+	type AsyncJobOutputSnapshot,
+	type AsyncJobSnapshot,
+	type AsyncJobSnapshotOptions,
+	type BackgroundControlResult,
+} from "../async";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
@@ -167,6 +174,9 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 import rewindReportTemplate from "../prompts/system/rewind-report.md" with { type: "text" };
 import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import vibeModeActivePrompt from "../prompts/system/vibe-mode-active.md" with { type: "text" };
+import { terminateSubagent as terminateRegisteredSubagent } from "../registry/agent-control";
+import { AgentLifecycleManager } from "../registry/agent-lifecycle";
+import { AgentRegistry } from "../registry/agent-registry";
 import {
 	deobfuscateAssistantContent,
 	deobfuscateSessionContext,
@@ -1741,6 +1751,63 @@ export class AgentSession {
 			recentLimit: options?.recentLimit,
 			includeAgentJobs: options?.includeAgentJobs,
 			filter: { ownerId: this.#agentId },
+		});
+	}
+
+	getAsyncJobOutput(id: string): AsyncJobOutputSnapshot | null {
+		const manager = this.#asyncJobManager;
+		if (!manager) return null;
+		return manager.getOutput(id, { ownerId: this.#agentId });
+	}
+
+	async cancelAsyncJob(id: string): Promise<BackgroundControlResult> {
+		const manager = this.#asyncJobManager;
+		if (!manager) {
+			return { id, status: "not_found", message: "Background job is unavailable in this session." };
+		}
+		const ownerFilter = { ownerId: this.#agentId };
+		const job = manager.getJob(id, ownerFilter);
+		if (!job) return { id, status: "not_found", message: "Background job not found." };
+		if (job.status !== "running") {
+			return { id, status: "already_completed", message: "Background job is already complete." };
+		}
+		if (manager.cancel(id, ownerFilter)) {
+			return { id, status: "cancelled", message: "Background job cancelled." };
+		}
+		const current = manager.getJob(id, ownerFilter);
+		return current
+			? { id, status: "already_completed", message: "Background job completed before cancellation." }
+			: { id, status: "not_found", message: "Background job is no longer available." };
+	}
+
+	terminateSubagent(id: string): Promise<BackgroundControlResult> {
+		const ownerId = this.#agentId;
+		if (!ownerId) {
+			return Promise.resolve({
+				id,
+				status: "not_found",
+				message: "Subagent control is unavailable in this session.",
+			});
+		}
+		const registry = AgentRegistry.global();
+		const ref = registry.get(id);
+		if (ref) {
+			const ownerSessionFile = this.sessionManager.getSessionFile();
+			const ownerRoot = ownerSessionFile?.endsWith(".jsonl")
+				? path.resolve(ownerSessionFile.slice(0, -6))
+				: undefined;
+			const candidate = ref.sessionFile ? path.resolve(ref.sessionFile) : undefined;
+			const relative = ownerRoot && candidate ? path.relative(ownerRoot, candidate) : undefined;
+			if (!relative || path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
+				return Promise.resolve({ id, status: "not_found", message: `Subagent not found: ${id}` });
+			}
+		}
+		return terminateRegisteredSubagent({
+			registry,
+			lifecycle: AgentLifecycleManager.global(),
+			targetId: id,
+			expectedRef: ref ?? null,
+			policy: { scope: "descendant", ownerId },
 		});
 	}
 
@@ -5424,7 +5491,6 @@ export class AgentSession {
 				void this.dispose().finally(() => process.exit(0));
 			},
 			getContextUsage: () => this.getContextUsage(),
-			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),
 			waitForIdle: () => this.waitForIdle(),
 			newSession: async options => {
 				const success = await this.newSession({ parentSession: options?.parentSession });
@@ -5459,6 +5525,9 @@ export class AgentSession {
 			},
 			getSystemPrompt: () => this.systemPrompt,
 			getAsyncJobSnapshot: options => this.getAsyncJobSnapshot(options),
+			getAsyncJobOutput: id => this.getAsyncJobOutput(id),
+			cancelAsyncJob: id => this.cancelAsyncJob(id),
+			terminateSubagent: id => this.terminateSubagent(id),
 			setInterval: (callback, ms, ...args) => this.#fallbackTimers().setInterval(callback, ms, ...args),
 			setTimeout: (callback, ms, ...args) => this.#fallbackTimers().setTimeout(callback, ms, ...args),
 			clearTimer: timer => this.#fallbackTimers().clear(timer),

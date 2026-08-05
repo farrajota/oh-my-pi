@@ -160,7 +160,9 @@ Handlers and tool `execute` receive `ctx` with:
 - `models` (read-only model query — see below)
 - `localProtocolOptions` (optional calling-session `local://` root mapping for external tool bridges)
 - `getContextUsage()`
-- `getAsyncJobSnapshot()` returns the current session's read-only async-job snapshot, or `null` when no session owns the context
+- `getAsyncJobSnapshot()` returns the current session's read-only, metadata-only async-job snapshot, or `null` when no session owns the context. Overview snapshots do not include job output or other execution details.
+- `getAsyncJobOutput(id)` performs a bounded pull for the selected job's latest progress or terminal result/error text. It may return `null` after the job leaves normal in-memory retention.
+- `cancelAsyncJob(id)` cancels a background job, while `terminateSubagent(id)` permanently kills a subagent. Both methods are implicitly scoped to the owning session/tree; extensions never pass owner IDs. Subagent termination creates a tombstoned record rather than merely aborting the current turn.
 - `compact(...)`
 - `isIdle()`, `hasPendingMessages()`, `abort()`
 - `shutdown()`

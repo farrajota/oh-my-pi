@@ -16,7 +16,7 @@
 import * as fs from "node:fs";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type Component, Editor, matchesKey, routeSgrMouseInput, ScrollView, type TUI } from "@oh-my-pi/pi-tui";
-import { formatDuration, formatNumber, logger } from "@oh-my-pi/pi-utils";
+import { formatDuration, formatNumber, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import type { AgentLifecycleManager } from "../../registry/agent-lifecycle";
@@ -57,6 +57,23 @@ export interface AgentTranscriptViewerDeps {
 	onHubClose: () => void;
 }
 
+export type ReadOnlyAgentTranscriptViewerDeps = Omit<AgentTranscriptViewerDeps, "remote" | "lifecycle"> & {
+	remote?: never;
+	lifecycle?: never;
+};
+
+export function createReadOnlyAgentTranscriptViewer(deps: ReadOnlyAgentTranscriptViewerDeps): AgentTranscriptViewer {
+	const expectedRef = deps.registry.get(deps.agentId);
+	const pinnedRegistry = {
+		get: (id: string) => {
+			if (id !== deps.agentId || !expectedRef) return undefined;
+			return deps.registry.get(id) === expectedRef ? expectedRef : undefined;
+		},
+	} as AgentRegistry;
+	const { remote: _remote, lifecycle: _lifecycle, ...safeDeps } = deps as AgentTranscriptViewerDeps;
+	return new AgentTranscriptViewer({ ...safeDeps, registry: pinnedRegistry, remote: undefined, lifecycle: undefined });
+}
+
 /** How often to re-stat a file-backed transcript for growth (advisor/live tail). */
 const POLL_MS = 250;
 
@@ -72,6 +89,10 @@ function sanitizeErrorLine(text: string, maxWidth: number): string {
 		.replace(/[\r\n]+/g, " ")
 		.replace(/\/[^\s'")\]]+/g, p => shortenPath(p));
 	return truncateToWidth(singleLine, Math.max(10, maxWidth));
+}
+
+function sanitizeMetadata(text: string): string {
+	return replaceTabs(sanitizeText(text)).replace(/[\r\n]+/g, " ");
 }
 
 interface LocalTranscriptSentinel {
@@ -559,7 +580,7 @@ export class AgentTranscriptViewer implements Component {
 		const contentWidth = Math.max(1, width - 1);
 		const ref = this.deps.registry.get(this.deps.agentId);
 
-		const headerLines = this.#headerLines(ref?.status, ref?.kind, ref?.parentId);
+		const headerLines = this.#headerLines(ref?.status, ref?.kind, ref?.parentId, innerWidth);
 		const footerLines = this.#footerLines();
 		const noticeLine = this.#notice
 			? ` ${theme.fg("error", sanitizeErrorLine(this.#notice, innerWidth))}`
@@ -591,12 +612,24 @@ export class AgentTranscriptViewer implements Component {
 		return lines;
 	}
 
-	#headerLines(status: AgentStatus | undefined, kind: string | undefined, parentId: string | undefined): string[] {
-		const lines = [theme.fg("accent", `Agent Hub ${theme.sep.dot} ${this.deps.agentId}`)];
+	#headerLines(
+		status: AgentStatus | undefined,
+		kind: string | undefined,
+		parentId: string | undefined,
+		maxWidth: number,
+	): string[] {
+		const agentId = sanitizeMetadata(this.deps.agentId);
+		const lines = [truncateToWidth(theme.fg("accent", `Agent Hub ${theme.sep.dot} ${agentId}`), maxWidth)];
 		if (status && kind) {
-			const kindTag = theme.fg("dim", ` ${parentId ? `${kind} ${theme.sep.dot} of ${parentId}` : kind}`);
-			const modelLabel = this.#model ? theme.fg("muted", `${theme.sep.dot}${this.#model}`) : "";
-			lines.push(`${theme.bold(this.deps.agentId)} ${statusBadge(status)}${kindTag}${modelLabel}`);
+			const safeKind = sanitizeMetadata(kind);
+			const safeParentId = parentId ? sanitizeMetadata(parentId) : undefined;
+			const kindTag = theme.fg(
+				"dim",
+				` ${safeParentId ? `${safeKind} ${theme.sep.dot} of ${safeParentId}` : safeKind}`,
+			);
+			const model = this.#model ? sanitizeMetadata(this.#model) : undefined;
+			const modelLabel = model ? theme.fg("muted", `${theme.sep.dot}${model}`) : "";
+			lines.push(truncateToWidth(`${theme.bold(agentId)} ${statusBadge(status)}${kindTag}${modelLabel}`, maxWidth));
 		}
 		return lines;
 	}
