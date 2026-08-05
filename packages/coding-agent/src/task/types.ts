@@ -492,6 +492,8 @@ export interface AgentProgress {
 	cost: number;
 	durationMs: number;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
 	/** Raw request-local model selector, when supplied by the caller. */
 	requestedModel?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Undefined when the model could not be resolved. */
@@ -583,6 +585,8 @@ export interface SingleResult {
 	/** Model's context window in tokens, when known. */
 	contextWindow?: number;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
 	/** Raw request-local model selector, when supplied by the caller. */
 	requestedModel?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Omitted from tool-result JSON when undefined to keep wire payloads small. */

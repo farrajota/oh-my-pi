@@ -5608,14 +5608,25 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_BEDROCK: readonly ModelsDevProviderDescrip
 				id: crossRegionId,
 				name: toModelName(m.name, crossRegionId),
 			};
-			// Also emit EU variants for Claude models
+			// Also emit EU and AWS GovCloud (`us-gov.`) geo inference-profile
+			// variants for Claude models. GovCloud accounts list system profiles
+			// under the `us-gov.` prefix (e.g. us-gov.anthropic.claude-sonnet-4-5-…);
+			// without these rows the catalog only has commercial geos (`us.`/`eu.`/…)
+			// and model resolution rejects the GovCloud id (or misroutes commercial
+			// geos onto us-east-1 with GovCloud credentials → 403).
 			if (modelId.startsWith("anthropic.claude-")) {
+				const displayName = toModelName(m.name, modelId);
 				return [
 					bedrockModel,
 					{
 						...bedrockModel,
 						id: `eu.${modelId}`,
-						name: `${toModelName(m.name, modelId)} (EU)`,
+						name: `${displayName} (EU)`,
+					},
+					{
+						...bedrockModel,
+						id: `us-gov.${modelId}`,
+						name: `${displayName} (GovCloud)`,
 					},
 				];
 			}

@@ -20,7 +20,11 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "..";
-import { resolveAgentModelPatterns } from "../config/model-resolver";
+import {
+	resolveAgentModelPatterns,
+	resolveAgentModelSource,
+	resolveExplicitModelRole,
+} from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { MCPManager } from "../mcp/manager";
 import type { Theme } from "../modes/theme/theme";
@@ -34,6 +38,7 @@ import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
 import { formatBytes, formatDuration } from "../tools/render-utils";
+import { isReadOnlyAgent } from "./read-only-policy";
 import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
 import {
 	type AgentDefinition,
@@ -128,6 +133,7 @@ export { loadBundledAgents as BUNDLED_AGENTS } from "./agents";
 export { discoverCommands, expandCommand, getCommand } from "./commands";
 export { discoverAgents, getAgent } from "./discovery";
 export { AgentOutputManager } from "./output-manager";
+export * from "./read-only-policy";
 export type {
 	AgentDefinition,
 	AgentProgress,
@@ -145,32 +151,6 @@ export {
 	taskSchema,
 } from "./types";
 
-// Built-in tools whose approval tier is "read" (see tool classes' `approval`).
-// An agent is read-only iff its declared tools are a non-empty subset of this set.
-// Fail-safe: any unknown tool makes the agent not read-only.
-export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
-	"read",
-	"grep",
-	"glob",
-	"web_search",
-	"ast_grep",
-	"yield",
-	"hub",
-	"ask",
-	"todo",
-	"recall",
-	"reflect",
-	"retain",
-	"memory_edit",
-	"inspect_image",
-	"checkpoint",
-	"rewind",
-]);
-
-const PLAN_MODE_AGENT_TOOL_ALLOWLIST: ReadonlySet<string> = new Set(["ast_grep"]);
-export function isReadOnlyAgent(agent: AgentDefinition): boolean {
-	return !!agent.tools?.length && agent.tools.every(tool => READ_ONLY_TOOL_NAMES.has(tool));
-}
 
 /**
  * Preview text for a child result. Falls back to "(no output)" — annotated
@@ -1034,6 +1014,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					id: agentId,
 					agent: agentType,
 					agentSource,
+					modelRole: policy.modelRole,
 					status: "pending",
 					task: renderSubagentUserPrompt(assignment),
 					assignment,
@@ -1319,9 +1300,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							// polling row reflects the resolved model, reasoning level,
 							// and running counters without reverting the "running"
 							// status back to the subagent's initial "pending" snapshot.
+							progress.modelRole = nextProgress.modelRole ?? progress.modelRole;
 							progress.resolvedModel = nextProgress.resolvedModel;
 							progress.requestedModel = nextProgress.requestedModel;
-							progress.resolvedModelIsFallback = nextProgress.resolvedModelIsFallback;
+							progress.resolvedModelIsFallback =
+								nextProgress.resolvedModelIsFallback ?? progress.resolvedModelIsFallback;
 							progress.tokens = nextProgress.tokens;
 							progress.requests = nextProgress.requests;
 							progress.contextTokens = nextProgress.contextTokens;
@@ -1364,10 +1347,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.extractedToolData = singleResult?.extractedToolData;
 					progress.retryFailure = singleResult?.retryFailure;
 					progress.retryState = undefined;
+					progress.modelRole = singleResult?.modelRole ?? progress.modelRole;
 					progress.requestedModel = singleResult?.requestedModel;
 					if (singleResult?.resolvedModel) {
 						progress.resolvedModel = singleResult.resolvedModel;
-						progress.resolvedModelIsFallback = singleResult.resolvedModelIsFallback;
+						progress.resolvedModelIsFallback =
+							singleResult.resolvedModelIsFallback ?? progress.resolvedModelIsFallback;
 					} else {
 						delete progress.resolvedModel;
 						delete progress.resolvedModelIsFallback;
@@ -1686,16 +1671,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agentModelOverrides = this.session.settings.get("task.agentModelOverrides");
 		const requestModel = params.model;
 		const parentActiveModelPattern = this.session.getActiveModelString?.();
-		const modelOverride =
-			requestModel !== undefined
-				? resolveAgentModelPatterns({ settingsOverride: requestModel, settings: this.session.settings })
-				: resolveAgentModelPatterns({
-						settingsOverride: agentModelOverrides[agentName],
-						agentModel: effectiveAgent.model,
-						settings: this.session.settings,
-						activeModelPattern: parentActiveModelPattern,
-						fallbackModelPattern: this.session.getModelString?.(),
-					});
+		const modelResolution = {
+			requestModel,
+			settingsOverride: agentModelOverrides[agentName],
+			agentModel: effectiveAgent.model,
+			settings: this.session.settings,
+			activeModelPattern: parentActiveModelPattern,
+			fallbackModelPattern: this.session.getModelString?.(),
+		};
+		const modelRole = resolveExplicitModelRole(resolveAgentModelSource(modelResolution), this.session.settings);
+		const modelOverride = resolveAgentModelPatterns(modelResolution);
 		const requestedModel = requestModel;
 		const exactModelOverride = requestModel !== undefined;
 
@@ -1872,6 +1857,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				cost: 0,
 				durationMs: 0,
 				modelOverride,
+				modelRole,
 				requestedModel,
 			};
 			latestProgress = initialProgress;
@@ -1913,6 +1899,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				parentToolCallId: toolCallId,
 				detached,
 				modelOverride,
+				modelRole,
 				requestedModel,
 				exactModelOverride,
 				invokedAt: launchTiming?.invokedAt,
@@ -1996,6 +1983,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							tokens: 0,
 							requests: 0,
 							modelOverride,
+							modelRole,
 							requestedModel,
 							error: message,
 						};

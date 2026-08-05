@@ -7,8 +7,7 @@
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import type { Tool as AiTool, Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
-import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
@@ -18,6 +17,7 @@ import {
 	formatModelStringWithRouting,
 	resolveAgentPrewalkPattern,
 	resolveConfiguredModelPatterns,
+	resolveExplicitModelRole,
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
@@ -45,7 +45,6 @@ import type { ArtifactManager } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
-import type { SessionInitToolDefinition } from "../session/session-entries";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
 import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
@@ -56,11 +55,13 @@ import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
+import { trackLateCleanup } from "../utils/late-cleanup";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { generateTaskLabel } from "./label";
 import { type EffectiveSubagentPermissions, formatPermissionScopeForPrompt } from "./permission-profiles";
 import { resolveAgentPrewalkDefault } from "./prewalk";
+import { isReadOnlyAgent } from "./read-only-policy";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
 	type AgentDefinition,
@@ -82,6 +83,7 @@ import { arrayValuedLabels, assembleYieldResult } from "./yield-assembly";
 export type { YieldItem } from "./types";
 
 const MCP_CALL_TIMEOUT_MS = 60_000;
+const TASK_ABORT_CLEANUP_GRACE_MS = 10_000;
 
 /**
  * Soft per-agent request budgets (assistant requests per run). Crossing the
@@ -176,9 +178,11 @@ function resolveSubagentRetryFallbackCandidates(
 ): SubagentRetryFallbackCandidate[] {
 	const candidates: SubagentRetryFallbackCandidate[] = [];
 	const seen = new Set<string>();
+	const disabledProviders = new Set(settings.get("disabledProviders"));
 	for (const pattern of modelPatterns) {
 		const resolved = resolveModelOverride([pattern], modelRegistry, settings);
 		if (!resolved.model) continue;
+		if (disabledProviders.has(resolved.model.provider)) continue;
 		const selector = resolved.explicitThinkingLevel
 			? formatModelSelectorValue(formatModelStringWithRouting(resolved.model), resolved.thinkingLevel)
 			: formatModelStringWithRouting(resolved.model);
@@ -189,7 +193,10 @@ function resolveSubagentRetryFallbackCandidates(
 	return candidates;
 }
 
-function resolveSubagentDefaultRetryFallbackChain(settings: Settings): string[] | undefined {
+function resolveSubagentDefaultRetryFallbackChain(
+	settings: Settings,
+	modelRegistry: ModelRegistry,
+): string[] | undefined {
 	const fallbackChain = settings.get("retry.fallbackChains")?.default;
 	if (
 		!Array.isArray(fallbackChain) ||
@@ -198,7 +205,11 @@ function resolveSubagentDefaultRetryFallbackChain(settings: Settings): string[] 
 	) {
 		return undefined;
 	}
-	return fallbackChain;
+	const disabledProviders = new Set(settings.get("disabledProviders"));
+	return fallbackChain.filter(entry => {
+		const resolved = resolveModelOverride([entry], modelRegistry, settings);
+		return !resolved.model || !disabledProviders.has(resolved.model.provider);
+	});
 }
 
 function installSubagentRetryFallbackChain(args: {
@@ -343,7 +354,11 @@ export interface RunSubprocessOptions {
 	 */
 	detached?: boolean;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
+	/** Raw request-local model selector, retained for task result rendering. */
 	requestedModel?: string;
+	/** A caller-selected task model must not fall back to another model. */
 	exactModelOverride?: boolean;
 	/**
 	 * Active model selector of the parent session, used as an auth-aware fallback
@@ -469,6 +484,8 @@ export interface RunSubprocessOptions {
 	 * set this false so disposal unregisters them instead of leaving idle peers.
 	 */
 	keepAlive?: boolean;
+	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
+	onCleanupDeferred?: (completion: Promise<void>) => void;
 }
 
 export type ExecutorOptions = RunSubprocessOptions;
@@ -766,49 +783,6 @@ function getUsageTokens(usage: unknown): number {
 	return firstNumberField(record, ["totalTokens", "total_tokens"]) ?? 0;
 }
 
-const SENSITIVE_TOOL_METADATA_KEY =
-	/(?:authorization|credential|secret|token|api[_-]?key|cookie|password|private[_-]?key)/i;
-const SENSITIVE_TOOL_METADATA_VALUE = /\b(?:bearer|token|api[_ -]?key|password)\s*[:=]\s*[^\s,;]+/gi;
-
-function sanitizeToolMetadata(value: unknown): unknown {
-	if (value === null || typeof value === "boolean" || typeof value === "number") return value;
-	if (typeof value === "string") return value.replace(SENSITIVE_TOOL_METADATA_VALUE, "[redacted]");
-	if (Array.isArray(value)) return value.map(sanitizeToolMetadata);
-	if (typeof value !== "object") return undefined;
-	const sanitized: Record<string, unknown> = {};
-	for (const [key, child] of Object.entries(value)) {
-		if (SENSITIVE_TOOL_METADATA_KEY.test(key)) continue;
-		const safeChild = sanitizeToolMetadata(child);
-		if (safeChild !== undefined) sanitized[key] = safeChild;
-	}
-	return sanitized;
-}
-
-/** Serialize only active tool descriptors, excluding closures and credential-bearing metadata. */
-export function sanitizeSessionInitToolDefinitions(
-	tools: readonly { name: string; description?: unknown; parameters?: unknown }[],
-	activeToolNames: readonly string[],
-): SessionInitToolDefinition[] {
-	const active = new Set(activeToolNames);
-	const definitions: SessionInitToolDefinition[] = [];
-	for (const tool of tools) {
-		if (!active.has(tool.name)) continue;
-		const parameters = tool.parameters ? sanitizeToolMetadata(toolWireSchema(tool as unknown as AiTool)) : undefined;
-		definitions.push({
-			name: tool.name,
-			description: typeof tool.description === "string" ? (sanitizeToolMetadata(tool.description) as string) : "",
-			parameters: parameters ?? {},
-		});
-	}
-	if (
-		definitions.length !== activeToolNames.length ||
-		new Set(definitions.map(definition => definition.name)).size !== definitions.length
-	) {
-		throw new Error("Unable to persist exactly one sanitized definition for every active tool");
-	}
-	return definitions;
-}
-
 /**
  * Create proxy tools that reuse the parent's MCP connections.
  *
@@ -938,6 +912,9 @@ interface RunMonitorArgs {
 	/** Parent settings for tiny-model label generation. */
 	settings?: Settings;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
+	/** Raw request-local model selector, retained for task progress rendering. */
 	requestedModel?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
@@ -1054,6 +1031,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		cost: 0,
 		durationMs: 0,
 		modelOverride: args.modelOverride,
+		modelRole: args.modelRole,
 		requestedModel: args.requestedModel,
 	};
 
@@ -2041,9 +2019,7 @@ async function driveSessionToYield(
 			// yield: the next iteration's ladder demands a fresh one.
 		}
 
-		if (monitor.yieldCalled()) {
-			await session.waitForIdle();
-		} else {
+		if (!monitor.yieldCalled()) {
 			await awaitAbortable(session.waitForIdle());
 		}
 
@@ -2121,6 +2097,9 @@ interface FinalizeRunArgs {
 	task: string;
 	assignment?: string;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
+	/** Raw request-local model selector, retained for task result rendering. */
 	requestedModel?: string;
 	outputSchema?: unknown;
 	outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -2141,7 +2120,7 @@ interface FinalizeRunArgs {
  * event.
  */
 async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
-	const { monitor, done, index, id, agent, task, assignment, signal, modelOverride, requestedModel } = args;
+	const { monitor, done, index, id, agent, task, assignment, signal, modelOverride, modelRole, requestedModel } = args;
 	const progress = monitor.progress;
 	let exitCode = done.exitCode;
 	let stderr = done.error ?? "";
@@ -2218,14 +2197,17 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		exitCode = 1;
 	}
 	const wasAborted =
-		runtimeLimitExceeded || abortedViaYield || (!hasYield && (done.aborted || signal?.aborted || false));
+		runtimeLimitExceeded || Boolean(done.aborted) || abortedViaYield || (!hasYield && Boolean(signal?.aborted));
 	const finalAbortReason = wasAborted
 		? runtimeLimitExceeded
 			? monitor.resolveAbortReasonText()
-			: abortedViaYield
-				? yieldAbortReason
-				: (done.abortReason ??
-					(signal?.aborted ? monitor.resolveSignalAbortReason() : monitor.resolveAbortReasonText()))
+			: done.aborted
+				? (done.abortReason ?? monitor.resolveAbortReasonText())
+				: abortedViaYield
+					? yieldAbortReason
+					: signal?.aborted
+						? monitor.resolveSignalAbortReason()
+						: monitor.resolveAbortReasonText()
 		: undefined;
 	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	monitor.scheduleProgress(true);
@@ -2265,6 +2247,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		contextTokens: progress.contextTokens,
 		contextWindow: progress.contextWindow,
 		modelOverride,
+		modelRole,
 		requestedModel,
 		resolvedModel: progress.resolvedModel,
 		resolvedModelIsFallback: progress.resolvedModelIsFallback,
@@ -2287,6 +2270,8 @@ export interface IrcWakeTurnMonitorOptions {
 	agent: AgentDefinition;
 	description?: string;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
 	eventBus?: EventBus;
 	parentToolCallId?: string;
 	/** Fallback session file when the registry ref carries none. */
@@ -2331,6 +2316,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			task: ircTask,
 			description: options.description,
 			modelOverride: options.modelOverride,
+			modelRole: options.modelRole,
 			eventBus: options.eventBus,
 			parentToolCallId: options.parentToolCallId,
 			detached: true,
@@ -2388,6 +2374,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					agent,
 					task: ircTask,
 					modelOverride: options.modelOverride,
+					modelRole: options.modelRole,
 					outputSchema: options.outputSchema,
 					outputSchemaMode: options.outputSchemaMode,
 					outputSchemaSource: options.outputSchemaSource,
@@ -2425,15 +2412,27 @@ export async function finalizeSubagentLifecycle(args: {
 	isolated: boolean;
 	agentIdleTtlMs: number;
 	reviveSession: AgentReviver | null;
+	cleanupDeadlineAt?: number;
+	onCleanupDeferred?: (completion: Promise<void>) => void;
 }): Promise<void> {
 	const registry = AgentRegistry.global();
 	const ref = registry.get(args.id);
 	const ownsRef = Boolean(ref && ref.session === args.session);
+	const cleanupDeadlineAt = args.cleanupDeadlineAt ?? Date.now() + 5000;
 	const disposeSession = async (): Promise<void> => {
+		const disposal = args.session.dispose();
+		const remainingMs = Math.max(0, cleanupDeadlineAt - Date.now());
 		try {
-			await untilAborted(AbortSignal.timeout(5000), () => args.session.dispose());
-		} catch {
-			// Ignore cleanup errors
+			await untilAborted(AbortSignal.timeout(remainingMs), () => disposal);
+		} catch (error) {
+			if (Date.now() >= cleanupDeadlineAt) {
+				args.onCleanupDeferred?.(disposal);
+				return;
+			}
+			logger.warn("Subagent session cleanup failed", {
+				id: args.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 
@@ -2444,14 +2443,20 @@ export async function finalizeSubagentLifecycle(args: {
 		args.abortKind === "budget" && args.keepAlive && !args.isolated && args.reviveSession !== null;
 	if (args.aborted && !resumableAbort) {
 		if (ref && ownsRef) {
-			// Terminal hard kill: mark `aborted` and detach the session before
-			// disposing so the ref satisfies the AgentRef invariant (session null
-			// when aborted) — ensureLive/hub focus must treat it as terminal, never
-			// route into the disposed session.
-			registry.setStatus(args.id, "aborted", ref);
-			registry.detachSession(args.id, ref);
+			// Route hard kills through the lifecycle owner so the terminal
+			// decision is durable and a restart cannot rediscover the transcript
+			// as a revivable parked agent.
+			try {
+				await AgentLifecycleManager.global().release(args.id, ref, { tombstone: true });
+			} catch (error) {
+				logger.warn("runSubagent: failed to persist kill tombstone", { id: args.id, error: String(error) });
+				registry.setStatus(args.id, "aborted", ref);
+				registry.detachSession(args.id, ref);
+				await disposeSession();
+			}
+		} else {
+			await disposeSession();
 		}
-		await disposeSession();
 		return;
 	}
 
@@ -2500,6 +2505,8 @@ export interface FollowUpTurnOptions {
 	message: string;
 	index?: number;
 	description?: string;
+	/** Explicit pre-expansion model role alias retained from the original run. */
+	modelRole?: string;
 	/** Structured-output state retained from the original invocation. */
 	outputSchema?: unknown;
 	outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -2539,6 +2546,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		agent,
 		task: message,
 		description: options.description,
+		modelRole: options.modelRole,
 		signal,
 		onProgress: options.onProgress,
 		eventBus: options.eventBus,
@@ -2588,6 +2596,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		id,
 		agent,
 		task: message,
+		modelRole: options.modelRole,
 		outputSchema: options.outputSchema,
 		outputSchemaMode: options.outputSchemaMode,
 		outputSchemaSource: options.outputSchemaSource,
@@ -2614,6 +2623,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		id,
 		worktree,
 		modelOverride,
+		modelRole,
 		requestedModel,
 		exactModelOverride,
 		thinkingLevel,
@@ -2644,6 +2654,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			durationMs: 0,
 			tokens: 0,
 			requests: 0,
+			modelRole,
 			requestedModel,
 			error: "Cancelled before start",
 			aborted: true,
@@ -2727,6 +2738,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		description: options.description,
 		modelRegistry: options.modelRegistry,
 		settings,
+		modelRole,
 		requestedModel,
 		signal,
 		onProgress,
@@ -2761,6 +2773,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			agent,
 			description: options.description,
 			modelOverride,
+			modelRole,
 			eventBus: options.eventBus,
 			parentToolCallId: options.parentToolCallId,
 			sessionFile: subtaskSessionFile,
@@ -2844,7 +2857,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			const defaultRetryFallbackChain = exactModelOverride
 				? undefined
 				: configuredModelPatterns.length === 1
-					? resolveSubagentDefaultRetryFallbackChain(subagentSettings)
+					? resolveSubagentDefaultRetryFallbackChain(subagentSettings, modelRegistry)
 					: undefined;
 			const resolution = exactModelOverride
 				? { ...resolveModelOverride(modelPatterns, modelRegistry, settings), authFallbackUsed: false }
@@ -2887,7 +2900,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				: installSubagentRetryFallbackChain({
 						settings: subagentSettings,
 						id,
-						candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, settings),
+						candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, subagentSettings),
 						defaultFallbackChain: defaultRetryFallbackChain,
 						model,
 						authFallbackUsed,
@@ -3161,12 +3174,14 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
 			}
 
-			const activeToolNames = session.getActiveToolNames();
 			session.sessionManager.appendSessionInit({
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
 				task,
-				tools: activeToolNames,
-				toolDefinitions: sanitizeSessionInitToolDefinitions(session.agent.state.tools, activeToolNames),
+				tools: session.getActiveToolNames(),
+				agent: agent.name,
+				modelRole: modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings),
+				resolvedModel: progress.resolvedModel,
+				readOnly: isReadOnlyAgent(agent),
 				spawns: spawnsEnv,
 				readSummarize: agent.readSummarize,
 				outputSchema,
@@ -3282,6 +3297,20 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				error = err instanceof Error ? err.stack || err.message : String(err);
 			}
 		} finally {
+			const cleanupDeadlineAt = Date.now() + TASK_ABORT_CLEANUP_GRACE_MS;
+			const cleanupChangeStatus =
+				worktree === undefined
+					? "This task was not isolated, so its changes may remain in the working directory."
+					: "No isolated changes were applied.";
+			const lateCleanups: Promise<void>[] = [];
+			let deferredSessionShutdown: Promise<void> | undefined;
+			const deferCleanup = (completion: Promise<void>): void => {
+				lateCleanups.push(completion);
+				exitCode = 1;
+				aborted = true;
+				abortReasonText = `cleanup exceeded ${TASK_ABORT_CLEANUP_GRACE_MS} ms`;
+				error ??= `Task aborted. Cleanup did not finish within ${TASK_ABORT_CLEANUP_GRACE_MS} ms. ${cleanupChangeStatus}`;
+			};
 			if (abortSignal.aborted) {
 				aborted = monitor.isAbortedRun();
 				if (aborted) {
@@ -3290,10 +3319,21 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				if (exitCode === 0) exitCode = 1;
 			}
 			sessionAbortController.abort();
+			const activeSessionAbort = monitor.waitForActiveSessionAbort();
 			try {
-				await untilAborted(AbortSignal.timeout(5000), () => monitor.waitForActiveSessionAbort());
-			} catch {
-				// Ignore abort cleanup timeouts/errors; terminal disposal below is still best-effort.
+				await untilAborted(
+					AbortSignal.timeout(Math.max(0, cleanupDeadlineAt - Date.now())),
+					() => activeSessionAbort,
+				);
+			} catch (cleanupError) {
+				if (Date.now() >= cleanupDeadlineAt) {
+					deferCleanup(activeSessionAbort);
+				} else {
+					logger.warn("Subagent abort cleanup failed", {
+						id,
+						error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+					});
+				}
 			}
 			if (unsubscribe) {
 				try {
@@ -3302,6 +3342,17 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					// Ignore unsubscribe errors
 				}
 				unsubscribe = null;
+			}
+			const jobManager = AsyncJobManager.instance();
+			if (jobManager) {
+				const reap = await jobManager.cancelAndReapOwnerJobs(id, cleanupDeadlineAt);
+				if (!reap.settled) {
+					deferCleanup(reap.completion);
+					logger.warn("Subagent async job cleanup exceeded its deadline", {
+						id,
+						pendingJobIds: reap.pendingJobIds,
+					});
+				}
 			}
 			const session = monitor.takeActiveSession();
 			if (session) {
@@ -3318,21 +3369,35 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					isolated: worktree !== undefined,
 					agentIdleTtlMs,
 					reviveSession,
+					cleanupDeadlineAt,
+					onCleanupDeferred: completion => {
+						deferredSessionShutdown = completion;
+						deferCleanup(completion);
+					},
 				});
 			}
-			// Structured-concurrency reap: cancel and await ALL surviving owner
-			// jobs (abort paths; suppressed/watched jobs the model left behind)
-			// so isolation capture/cleanup never races a live process writing
-			// into the worktree. This never proceeds while an owner process is
-			// live: cancellation SIGKILL-escalates, so settlement is expected
-			// within one interval — an unkillable process blocks here visibly
-			// (with periodic warnings) instead of silently racing teardown.
-			const jobManager = AsyncJobManager.instance();
 			if (jobManager) {
-				jobManager.cancelAll({ ownerId: id });
-				while (!(await jobManager.waitForOwnerJobs(id, { timeoutMs: 10_000 }))) {
-					logger.warn("Subagent async jobs still settling; delaying teardown until process exit", { id });
+				if (deferredSessionShutdown) {
+					const finalReap = Promise.allSettled([deferredSessionShutdown]).then(async () => {
+						const reap = await jobManager.cancelAndReapOwnerJobs(id, Date.now());
+						await reap.completion;
+					});
+					lateCleanups.push(finalReap);
+				} else {
+					const reap = await jobManager.cancelAndReapOwnerJobs(id, cleanupDeadlineAt);
+					if (!reap.settled) {
+						deferCleanup(reap.completion);
+						logger.warn("Subagent async job cleanup exceeded its deadline after session shutdown", {
+							id,
+							pendingJobIds: reap.pendingJobIds,
+						});
+					}
 				}
+			}
+			if (lateCleanups.length > 0) {
+				const completion = Promise.allSettled(lateCleanups).then(() => {});
+				trackLateCleanup(completion, { id, resource: "subagent" });
+				options.onCleanupDeferred?.(completion);
 			}
 		}
 
@@ -3378,7 +3443,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 	const done = await runSubagent();
 	monitor.finish();
 
-	return finalizeRunResult({
+	const result = await finalizeRunResult({
 		monitor,
 		done,
 		index,
@@ -3387,6 +3452,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		task,
 		assignment,
 		modelOverride,
+		modelRole,
 		requestedModel,
 		outputSchema,
 		outputSchemaMode: options.outputSchemaMode,
@@ -3399,4 +3465,6 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		sessionFile: subtaskSessionFile,
 		startTime,
 	});
+	AgentRegistry.global().setHistory(id, { outputPath: result.outputPath });
+	return result;
 }
