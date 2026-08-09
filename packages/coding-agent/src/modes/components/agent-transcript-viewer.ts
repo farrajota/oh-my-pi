@@ -57,6 +57,12 @@ export interface AgentTranscriptViewerDeps {
 	onHubClose: () => void;
 }
 
+export type ReadOnlyAgentTranscriptViewerDeps = Omit<AgentTranscriptViewerDeps, "remote" | "lifecycle">;
+
+export function createReadOnlyAgentTranscriptViewer(deps: ReadOnlyAgentTranscriptViewerDeps): AgentTranscriptViewer {
+	return new AgentTranscriptViewer({ ...deps, remote: undefined, lifecycle: undefined });
+}
+
 /** How often to re-stat a file-backed transcript for growth (advisor/live tail). */
 const POLL_MS = 250;
 

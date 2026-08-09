@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createReadOnlyAgentTranscriptViewer } from "@oh-my-pi/pi-coding-agent";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentHubRemote } from "@oh-my-pi/pi-coding-agent/modes/components/agent-hub";
 import { AgentTranscriptViewer } from "@oh-my-pi/pi-coding-agent/modes/components/agent-transcript-viewer";
@@ -644,6 +645,45 @@ describe("AgentTranscriptViewer", () => {
 			expect(body()).not.toContain("BEFORE_ROTATE");
 		} finally {
 			viewer.dispose();
+		}
+	});
+
+	it("renders read-only footer guidance for a local non-advisor agent", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "read-only-viewer-"));
+		const file = path.join(dir, "__agent.jsonl");
+		fs.writeFileSync(file, buildJsonl());
+		const agents = new AgentRegistry();
+		agents.register({
+			id: "Main/worker",
+			displayName: "worker",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			sessionFile: file,
+			status: "parked",
+		});
+		const viewer = createReadOnlyAgentTranscriptViewer({
+			agentId: "Main/worker",
+			registry: agents,
+			ui: { requestRender: () => {}, requestComponentRender: () => {} } as never,
+			cwd: "/tmp",
+			expandKeys: ["ctrl+o"],
+			hubKeys: ["ctrl+s"],
+			requestRender: () => {},
+			onClose: () => {},
+			onHubClose: () => {},
+		});
+		try {
+			const rendered = viewer
+				.render(80)
+				.map(line => Bun.stripANSI(line))
+				.join("\n");
+			expect(rendered).not.toContain("Enter:send");
+			expect(rendered).toMatch(/(?:esc|escape).*close/i);
+			expect(rendered).toMatch(/scroll/i);
+		} finally {
+			viewer.dispose();
+			removeSyncWithRetries(dir);
 		}
 	});
 
