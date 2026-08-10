@@ -2033,6 +2033,7 @@ export class SelectorController {
 			remote: this.ctx.collabGuest?.hubRemote,
 			ui: this.ctx.ui,
 			getTool: name => this.ctx.session.getToolByName(name),
+			isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
 			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
 			cwd: this.ctx.sessionManager.getCwd(),
 			hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,

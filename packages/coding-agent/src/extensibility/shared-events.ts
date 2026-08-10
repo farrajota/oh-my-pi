@@ -260,7 +260,6 @@ interface AutoRetryStartEventBase {
 	reason?: AutoRetryExhaustionReason;
 	resetAware?: boolean;
 }
-
 /** Fired when a normal auto-retry starts. */
 export interface NormalAutoRetryStartEvent extends AutoRetryStartEventBase {
 	mode?: "normal";
@@ -279,6 +278,10 @@ export interface RepeatedAutoRetryStartEvent extends AutoRetryStartEventBase {
 
 export type AutoRetryStartEvent = NormalAutoRetryStartEvent | RepeatedAutoRetryStartEvent;
 
+/** Persisted retry error whose transcript presentation changed when the retry saga settled. */
+export interface RetryErrorUpdate extends RecoveredRetryError {}
+
+/** Retry error recovered by the repeated-retry event shape. */
 export interface RecoveredRetryError {
 	entryId: string;
 	persistenceKey?: string;
@@ -291,6 +294,7 @@ interface AutoRetryEndEventBase {
 	success: boolean;
 	attempt: number;
 	finalError?: string;
+	retryErrors?: RetryErrorUpdate[];
 	recoveredErrors?: RecoveredRetryError[];
 	reason?: AutoRetryRepeatedEndReason;
 	resetAware?: boolean;

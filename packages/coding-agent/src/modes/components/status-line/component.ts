@@ -1554,6 +1554,7 @@ export class StatusLineComponent implements Component {
 		return {
 			session: this.session,
 			focusedAgentId: this.#focusedAgentId,
+			sessionAccent: this.#resolveSettings().sessionAccent !== false,
 			activeRepo: activeRepoCache.activeRepo,
 			width,
 			options: segmentOptions ?? {},

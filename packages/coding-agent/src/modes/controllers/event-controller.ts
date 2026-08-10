@@ -1202,6 +1202,7 @@ export class EventController {
 						content.name,
 						renderArgs,
 						{
+							useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(content.name),
 							snapshots: getFileSnapshotStore(this.ctx.viewSession),
 							clipboard: getEditClipboard(this.ctx.viewSession),
 							showImages: settings.get("terminal.showImages"),
@@ -1489,6 +1490,7 @@ export class EventController {
 				event.toolName,
 				event.args,
 				{
+					useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(event.toolName),
 					snapshots: getFileSnapshotStore(this.ctx.viewSession),
 					clipboard: getEditClipboard(this.ctx.viewSession),
 					showImages: settings.get("terminal.showImages"),
@@ -1760,11 +1762,29 @@ export class EventController {
 				typeof details.title === "string" &&
 				typeof details.planExists === "boolean"
 			) {
-				await this.ctx.handlePlanApproval({
-					planFilePath: details.planFilePath,
-					title: details.title,
-					planExists: details.planExists,
-				});
+				// Dispatch the approval WITHOUT blocking the serialized event
+				// dispatch chain. `handlePlanApproval` -> `#approvePlan` awaits
+				// `session.prompt` for the ENTIRE approved-execution turn; awaiting
+				// it here (this handler runs inside `#runSerialized`) would hold the
+				// single dispatch link for the whole run, so the run's own
+				// agent_start / message_start / tool / coalesced message_update
+				// events queue behind it on `#dispatchTail` and the chat stays blank
+				// until execution finishes (issue #7684, follow-up to #5688 which
+				// only closed the overlay). Detaching frees the link the moment this
+				// handler returns; the approval overlay and the turn's live events
+				// then render. The approval flow surfaces its own failures via
+				// `showError`, so only an unexpected rejection is logged here.
+				void this.ctx
+					.handlePlanApproval({
+						planFilePath: details.planFilePath,
+						title: details.title,
+						planExists: details.planExists,
+					})
+					.catch(err => {
+						logger.warn("Plan approval dispatch failed", {
+							error: err instanceof Error ? err.message : String(err),
+						});
+					});
 			}
 		}
 	}
@@ -1786,6 +1806,12 @@ export class EventController {
 		// applying any model switch that was deferred until the stream ended.
 		if (event.isTerminal === false) {
 			await this.ctx.flushPendingModelSwitch();
+			// Reaching here means the first guard passed, so `isStreaming` is already
+			// false: a command issued from now on mounts immediately. Leaving earlier
+			// panels queued would render them out of order, minutes later, after the
+			// user was told they were only waiting for the turn. The transcript is
+			// quiescent at a settle, which is the condition #4806 wanted.
+			this.ctx.flushPendingCommandOutput();
 			return;
 		}
 
@@ -2063,24 +2089,27 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
-		if (event.success) {
-			let appliedRecovered = false;
-			for (const recovered of event.recoveredErrors ?? []) {
-				const component = this.#takeRetrySupersededAssistantComponent(recovered.persistenceKey);
-				if (!component) continue;
-				component.applyRetryRecovery(recovered.retryRecovery);
-				if (this.#pinnedErrorComponent === component) this.#pinnedErrorComponent = undefined;
-				appliedRecovered = true;
-			}
-			if (appliedRecovered || (event.recoveredErrors?.length ?? 0) > 0) {
-				this.ctx.clearPinnedError();
-			}
-			this.#clearRetrySupersededAssistantComponents();
-		} else {
-			this.#clearRetrySupersededAssistantComponents();
-			if (!isIntentionalRepeatedRetryEnd(event)) {
-				this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
-			}
+		let appliedRetryUpdate = false;
+		for (const recovered of event.recoveredErrors ?? []) {
+			const component = this.#takeRetrySupersededAssistantComponent(recovered.persistenceKey);
+			if (!component) continue;
+			component.applyRetryRecovery(recovered.retryRecovery);
+			if (this.#pinnedErrorComponent === component) this.#pinnedErrorComponent = undefined;
+			appliedRetryUpdate = true;
+		}
+		for (const retryError of event.retryErrors ?? []) {
+			const component = this.#takeRetrySupersededAssistantComponent(retryError.persistenceKey);
+			if (!component) continue;
+			component.applyRetryRecovery(retryError.retryRecovery);
+			if (this.#pinnedErrorComponent === component) this.#pinnedErrorComponent = undefined;
+			appliedRetryUpdate = true;
+		}
+		if (appliedRetryUpdate || (event.recoveredErrors?.length ?? 0) > 0 || (event.retryErrors?.length ?? 0) > 0) {
+			this.ctx.clearPinnedError();
+		}
+		this.#clearRetrySupersededAssistantComponents();
+		if (!event.success && !isIntentionalRepeatedRetryEnd(event)) {
+			this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 		}
 		this.#ensureWorkingLoaderWhileStreaming(source);
 		this.ctx.ui.requestRender();
