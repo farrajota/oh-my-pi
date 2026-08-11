@@ -20,11 +20,7 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "..";
-import {
-	resolveAgentModelPatterns,
-	resolveAgentModelSource,
-	resolveExplicitModelRole,
-} from "../config/model-resolver";
+import { resolveAgentModelSelection } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { MCPManager } from "../mcp/manager";
 import type { Theme } from "../modes/theme/theme";
@@ -1694,8 +1690,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			activeModelPattern: parentActiveModelPattern,
 			fallbackModelPattern: this.session.getModelString?.(),
 		};
-		const modelRole = resolveExplicitModelRole(resolveAgentModelSource(modelResolution), this.session.settings);
-		const modelOverride = resolveAgentModelPatterns(modelResolution);
+		const { patterns: modelOverride, role: modelRole } = resolveAgentModelSelection(modelResolution);
 		const requestedModel = requestModel;
 		const exactModelOverride = requestModel !== undefined;
 
