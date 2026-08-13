@@ -258,8 +258,8 @@ describe("EventController paces streamed tool args", () => {
 		};
 		const streaming = makeStreamingMessage([{ type: "toolCall", id: "tc-approval", name: "edit", arguments: args }]);
 		const tool = { mode: "replace" } as unknown as AgentTool;
-		const { controller, pendingTools, getApprovalWaiter } = createFixture(streaming, tool);
-		await dispatch(controller, streaming);
+		const { controller, ctx, pendingTools, getApprovalWaiter } = createFixture(streaming, tool);
+		await dispatch(controller, ctx.viewSession, streaming);
 
 		const waiter = getApprovalWaiter();
 		if (!waiter) throw new Error("expected the TUI approval-preview waiter");
@@ -267,7 +267,7 @@ describe("EventController paces streamed tool args", () => {
 		const waiting = waiter("tc-approval").then(() => {
 			approvalReady = true;
 		});
-		await dispatchToolStart(controller, {
+		await dispatchToolStart(controller, ctx.viewSession, {
 			toolCallId: "tc-approval",
 			toolName: "edit",
 			args,

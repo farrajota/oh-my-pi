@@ -117,7 +117,7 @@ export class SessionFocusController {
 			await this.ctx.eventController.handleEvent(target, event);
 		});
 		this.ctx.statusLine.setSession(target, this.#focusedAgentId);
-		this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+		await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 		if (target.isStreaming) {
 			await this.ctx.eventController.rehydrateActiveRun(target);
 			if (generation !== this.#focusGeneration) return;

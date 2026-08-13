@@ -813,7 +813,7 @@ export class ModelBrowser extends Container {
 		return [line1, line2];
 	}
 
-	render(width: number): string[] {
+	override render(width: number): string[] {
 		const lines: string[] = [];
 
 		const searchIcon = theme.fg("accent", theme.symbol("icon.search"));
@@ -885,5 +885,5 @@ export class ModelBrowser extends Container {
 		return lines;
 	}
 
-	invalidate(): void {}
+	override invalidate(): void {}
 }

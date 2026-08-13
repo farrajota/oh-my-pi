@@ -79,6 +79,8 @@ import { resolveEffectiveSubagentPolicy, StructuredSubagentError } from "./struc
 import { applyTaskToolProfile } from "./tool-profiles";
 import { parseIsolationMode } from "./worktree";
 
+const PLAN_MODE_AGENT_TOOL_ALLOWLIST = new Set(["ast_grep"]);
+
 function renderSubagentUserPrompt(assignment: string): string {
 	return prompt.render(subagentUserPromptTemplate, {
 		assignment: assignment.trim(),

@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+## [17.3.0] - 2026-08-13
+
+### Breaking Changes
+
+- Renamed `withGeminiThinkingLoopGuard` to `withThinkingLoopGuard`; the guard applies to Gemini, DeepSeek, and Grok model-id families.
+
+### Changed
+
+- Updated OpenCode Go integration to use the official usage endpoint, removing hardcoded caps, enabling real-time credential validation, and routing multi-key pools based on rolling and weekly headroom.
+- Optimized Anthropic prompt caching with rolling 5-minute breakpoints and idle refreshes to keep the prompt prefix warm.
+
+### Fixed
+
+- Fixed Ollama chat adapter to correctly forward sampling parameters like temperature and topP to the provider.
+- Fixed OpenAI agent turns ending prematurely after a web search with no visible answer, ensuring the agent continues processing the search results.
+- Fixed a resource leak where completed model streams retained provider concurrency permits longer than necessary.
+- Fixed image input support for qwen3.8-max and newer models when using DashScope compatible-mode.
+- Fixed xAI usage reporting falling back to a stale cache when a new weekly cycle starts with 0% consumed credits.
+- Fixed Together AI login validation failures by querying the authenticated models list instead of a hardcoded model.
+- Fixed credential-health probes and usage fetches failing when using reference-stored API keys (such as environment variables or commands) by ensuring secrets are correctly resolved.
+- Fixed Perplexity email-OTP login by preserving the session cookies required for verification.
+- Fixed thinking configuration for OpenAI and Daybreak models to correctly send reasoning.effort: "none" when thinking is disabled.
+- Fixed Grok runaway thinking streams bypassing the thinking-loop guard.
+
+### Removed
+
+- Removed legacy local request-cost estimation machinery and database schemas previously used for OpenCode Go estimates.
+
+## [17.2.15] - 2026-08-12
+
+### Fixed
+
+- Fixed an issue where AWS_BEDROCK_SKIP_AUTH failed to expose Amazon Bedrock models when AWS credential files were unavailable.
+- Fixed an issue where forceReasoningOff was ignored by Anthropic and Google transports, which allowed native thinking alongside a caller-supplied external scratchpad.
+
 ## [17.2.14] - 2026-08-11
 
 ### Added

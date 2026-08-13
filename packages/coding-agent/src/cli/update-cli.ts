@@ -20,6 +20,7 @@ const REPO = "can1357/oh-my-pi";
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
 const MISE_TOOL = "github:can1357/oh-my-pi";
+const NIX_STORE_DIR = "/nix/store";
 /**
  * Official npm registry origin.
  *
@@ -66,11 +67,27 @@ function currentNativeTag(): string {
 /** Distribution channel advertised by a release's published npm manifest. */
 export type ReleaseDist = "npm" | "binary";
 
-interface ReleaseInfo {
+/** npm package names a release installs: the agent package and its natives companion. */
+export interface ReleasePackages {
+	pkg: string;
+	natives: string;
+}
+
+/** Parsed `omp.rename` pointer: the new agent package name and optional new natives name. */
+export interface ReleaseRename {
+	pkg: string;
+	natives?: string;
+}
+
+const CURRENT_PACKAGES: ReleasePackages = { pkg: PACKAGE, natives: NATIVES_PACKAGE };
+
+export interface ReleaseInfo {
 	tag: string;
 	version: string;
 	/** Parsed `omp.dist` from the registry manifest; undefined when absent. */
 	dist?: ReleaseDist;
+	/** npm names to install, resolved after following any `omp.rename` pointers. */
+	packages: ReleasePackages;
 }
 
 export interface ReleaseBinaryAsset {
@@ -100,6 +117,34 @@ export function resolveReleaseDist(manifest: unknown): ReleaseDist | undefined {
 	const dist = manifest.omp.dist;
 	if (dist === undefined) return undefined;
 	return dist === "npm" ? "npm" : "binary";
+}
+
+/**
+ * Parse the `omp.rename` pointer from a published package manifest.
+ *
+ * Forward-compatibility contract for renaming the npm package: the final
+ * version published under an old name is a stub whose manifest carries
+ * `"omp": { "rename": { "package": "<new-agent-pkg>", "natives": "<new-natives-pkg>" }, "dist": "binary" }`.
+ * Updaters that understand `rename` follow the pointer and resolve the
+ * release from the renamed package instead ({@link getLatestRelease});
+ * older deployed updaters ignore it and take the `dist: "binary"` escape
+ * hatch, replacing the install with the GitHub release binary rather than
+ * installing the stub via bun/npm.
+ *
+ * The renamed package's own manifest MUST declare `"dist": "npm"` (so
+ * package-manager installs stay package-managed across a major bump) and
+ * MUST continue the old version line (a version reset would compare as
+ * "already up to date" against the running build).
+ */
+export function resolveReleaseRename(manifest: unknown): ReleaseRename | undefined {
+	if (!isRecord(manifest) || !isRecord(manifest.omp)) return undefined;
+	const rename = manifest.omp.rename;
+	if (!isRecord(rename) || typeof rename.package !== "string" || rename.package.length === 0) return undefined;
+	const natives = rename.natives;
+	return {
+		pkg: rename.package,
+		natives: typeof natives === "string" && natives.length > 0 ? natives : undefined,
+	};
 }
 
 function majorVersion(version: string): number {
@@ -421,7 +466,7 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	return isPathInDirectoryLexical(resolvedFile, dirReal);
 }
 
-type UpdateMethod = "brew" | "mise" | "bun" | "npm" | "binary";
+type UpdateMethod = "brew" | "mise" | "nix" | "bun" | "npm" | "binary";
 
 interface UpdateMethodResolutionOptions {
 	homebrewPrefix?: string;
@@ -440,6 +485,7 @@ interface UpdateMethodResolutionOptions {
 type UpdateTarget =
 	| { method: "brew" }
 	| { method: "mise" }
+	| { method: "nix" }
 	| { method: "bun"; path?: string }
 	| { method: "npm"; path?: string }
 	| { method: "binary"; path: string; replacesSymlink: boolean };
@@ -453,6 +499,7 @@ function resolveUpdateMethod(
 	const launcherExtension = path.extname(ompPath).toLowerCase();
 	const isWindowsScriptLauncher =
 		launcherExtension === ".cmd" || launcherExtension === ".ps1" || launcherExtension === ".bat";
+	if (isPathInDirectory(ompPath, NIX_STORE_DIR)) return "nix";
 	if (homebrewPrefix && isPathInDirectory(ompPath, path.join(homebrewPrefix, "bin"))) return "brew";
 	if (miseBinDirs.some(dir => isPathInDirectory(ompPath, dir))) return "mise";
 	if (miseDataDir && isPathInDirectory(ompPath, path.join(miseDataDir, "shims"))) return "mise";
@@ -526,36 +573,63 @@ async function resolveUpdateTarget(options: { allowPackageManagers: boolean }): 
 	throw new Error(`Could not resolve ${APP_NAME} binary path in PATH`);
 }
 
-/**
- * Get the latest release info from the npm registry.
- * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
- */
-async function getLatestRelease(): Promise<ReleaseInfo> {
+/** Bound on `omp.rename` hops so a broken pointer chain cannot loop forever. */
+const MAX_RENAME_HOPS = 3;
+
+async function fetchLatestManifest(
+	pkg: string,
+	timeoutMs: number,
+): Promise<{ version: string; manifest: Record<string, unknown> }> {
 	let response: Response;
 	try {
-		response = await fetch(`${NPM_REGISTRY}${PACKAGE}/latest`, {
-			signal: withTimeoutSignal(RELEASE_METADATA_TIMEOUT_MS),
+		response = await fetch(`${NPM_REGISTRY}${pkg}/latest`, {
+			signal: withTimeoutSignal(timeoutMs),
 		});
 	} catch (err) {
 		if (isTimeoutError(err)) {
-			throw new Error("Timed out fetching release info after 30s", { cause: err });
+			throw new Error(`Timed out fetching release info for ${pkg} after ${Math.round(timeoutMs / 1000)}s`, {
+				cause: err,
+			});
 		}
 		throw err;
 	}
 	if (!response.ok) {
-		throw new Error(`Failed to fetch release info: ${response.statusText}`);
+		throw new Error(`Failed to fetch release info for ${pkg}: ${response.statusText}`);
 	}
 
 	const data: unknown = await response.json();
 	if (!isRecord(data) || typeof data.version !== "string") {
-		throw new Error("Malformed npm registry response: missing version");
+		throw new Error(`Malformed npm registry response for ${pkg}: missing version`);
 	}
-	const version = data.version;
+	return { version: data.version, manifest: data };
+}
+
+/**
+ * Get the latest release info from the npm registry, following `omp.rename`
+ * pointers ({@link resolveReleaseRename}) when the package has moved to a new
+ * npm name. Version, dist, and install names all come from the final manifest
+ * in the chain. Uses npm instead of GitHub API to avoid unauthenticated rate
+ * limiting.
+ */
+export async function getLatestRelease(options: { timeoutMs?: number } = {}): Promise<ReleaseInfo> {
+	const timeoutMs = options.timeoutMs ?? RELEASE_METADATA_TIMEOUT_MS;
+	const packages: ReleasePackages = { ...CURRENT_PACKAGES };
+	const visited = new Set([packages.pkg]);
+	let latest = await fetchLatestManifest(packages.pkg, timeoutMs);
+	for (let hop = 0; hop < MAX_RENAME_HOPS; hop++) {
+		const rename = resolveReleaseRename(latest.manifest);
+		if (!rename || visited.has(rename.pkg)) break;
+		visited.add(rename.pkg);
+		packages.pkg = rename.pkg;
+		if (rename.natives) packages.natives = rename.natives;
+		latest = await fetchLatestManifest(packages.pkg, timeoutMs);
+	}
 
 	return {
-		tag: `v${version}`,
-		version,
-		dist: resolveReleaseDist(data),
+		tag: `v${latest.version}`,
+		version: latest.version,
+		dist: resolveReleaseDist(latest.manifest),
+		packages,
 	};
 }
 
@@ -991,10 +1065,14 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 }
 
-function buildVersionedPackageInstallArgs(expectedVersion: string, nativeTag: string): string[] {
-	const args = [`${PACKAGE}@${expectedVersion}`, `${NATIVES_PACKAGE}@${expectedVersion}`];
+function buildVersionedPackageInstallArgs(
+	expectedVersion: string,
+	nativeTag: string,
+	packages: ReleasePackages,
+): string[] {
+	const args = [`${packages.pkg}@${expectedVersion}`, `${packages.natives}@${expectedVersion}`];
 	if (SUPPORTED_NATIVE_TAGS.has(nativeTag)) {
-		args.push(`${NATIVES_PACKAGE}-${nativeTag}@${expectedVersion}`);
+		args.push(`${packages.natives}-${nativeTag}@${expectedVersion}`);
 	}
 	return args;
 }
@@ -1029,25 +1107,41 @@ function buildVersionedPackageInstallArgs(expectedVersion: string, nativeTag: st
  * the original "no matching version" message instead of `EBADPLATFORM`.
  * See #1824.
  */
-export function buildBunInstallArgs(expectedVersion: string, nativeTag: string = currentNativeTag()): string[] {
+export function buildBunInstallArgs(
+	expectedVersion: string,
+	nativeTag: string = currentNativeTag(),
+	packages: ReleasePackages = CURRENT_PACKAGES,
+): string[] {
 	return [
 		"install",
 		"-g",
 		"--no-cache",
 		`--registry=${NPM_REGISTRY}`,
-		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag),
+		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag, packages),
 	];
 }
 
-/** Build the npm argv used to update npm-managed global installs. */
-export function buildNpmInstallArgs(expectedVersion: string, nativeTag: string = currentNativeTag()): string[] {
-	const args = [
+/**
+ * Build the npm argv used to update npm-managed global installs.
+ *
+ * `force` is set only for rename migrations: npm refuses to write the `omp`
+ * bin while the old package still owns it (`EEXIST`), and the migration
+ * installs the new package BEFORE removing the old one so a failed install
+ * never leaves the user without a working `omp`.
+ */
+export function buildNpmInstallArgs(
+	expectedVersion: string,
+	nativeTag: string = currentNativeTag(),
+	packages: ReleasePackages = CURRENT_PACKAGES,
+	flags: { force?: boolean } = {},
+): string[] {
+	return [
 		"install",
 		"-g",
+		...(flags.force ? ["--force"] : []),
 		`--registry=${NPM_REGISTRY}`,
-		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag),
+		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag, packages),
 	];
-	return args;
 }
 
 export function buildHomebrewUpdateArgs(force: boolean): string[] {
@@ -1063,17 +1157,122 @@ export function buildMiseForceInstallArgs(expectedVersion: string): string[] {
 }
 
 /**
- * Update via package manager.
+ * Old-name globals a rename migration removes after the new install exists:
+ * the set difference between the old install's top-level globals
+ * ({@link buildVersionedPackageInstallArgs} installs the agent, natives core,
+ * and platform leaf explicitly) and the resolved install's. An agent-only
+ * rename keeps the natives names, and removing them would strip the addon
+ * the new install just pinned.
  */
-async function updateViaBun(expectedVersion: string): Promise<void> {
-	console.log(chalk.dim("Updating via bun..."));
-	const args = buildBunInstallArgs(expectedVersion);
-	const result = await $`bun ${args}`.nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`bun install failed with exit code ${result.exitCode}`);
+export function buildRenameCleanupPackages(
+	packages: ReleasePackages,
+	nativeTag: string = currentNativeTag(),
+): string[] {
+	const old = [PACKAGE, NATIVES_PACKAGE];
+	if (SUPPORTED_NATIVE_TAGS.has(nativeTag)) {
+		old.push(`${NATIVES_PACKAGE}-${nativeTag}`);
+	}
+	const newLeaf = `${packages.natives}-${nativeTag}`;
+	return old.filter(name => name !== packages.pkg && name !== packages.natives && name !== newLeaf);
+}
+
+/** Injectable shell steps for {@link migrateRenamedInstall}; commands return process exit codes. */
+export interface RenameMigrationSteps {
+	/** Globally install the new package names. MUST be idempotent: re-running re-links the `omp` bin. */
+	install(): Promise<number>;
+	/** Remove the old-name globals. */
+	removeOld(): Promise<number>;
+	/** Check the PATH-resolved `omp` against the expected version. */
+	verify(): Promise<InstalledVersionVerification>;
+}
+
+/** Production {@link RenameMigrationSteps}: bun/npm global installs plus PATH verification. */
+function packageManagerMigrationSteps(manager: "bun" | "npm", release: ReleaseInfo): RenameMigrationSteps {
+	const nativeTag = currentNativeTag();
+	return {
+		async install() {
+			if (manager === "bun") {
+				const args = buildBunInstallArgs(release.version, nativeTag, release.packages);
+				return (await $`bun ${args}`.nothrow()).exitCode;
+			}
+			const args = buildNpmInstallArgs(release.version, nativeTag, release.packages, { force: true });
+			return (await $`npm ${args}`.nothrow()).exitCode;
+		},
+		async removeOld() {
+			// One invocation per package: a single batched remove fails wholesale
+			// when any name is absent (e.g. the platform leaf on an old install),
+			// which would skip the agent package that actually owns the bin.
+			let agentExit = 0;
+			for (const pkg of buildRenameCleanupPackages(release.packages, nativeTag)) {
+				const result =
+					manager === "bun"
+						? await $`bun remove -g ${pkg}`.quiet().nothrow()
+						: await $`npm uninstall -g ${pkg}`.quiet().nothrow();
+				if (pkg === PACKAGE) agentExit = result.exitCode;
+			}
+			return agentExit;
+		},
+		verify: () => verifyInstalledVersion(release.version),
+	};
+}
+
+/**
+ * Migrate a package-manager install across an `omp.rename` hop without a
+ * window where no working `omp` exists:
+ *
+ * 1. Install the new package FIRST. Nothing has been removed yet, so a
+ *    failure here leaves the old install fully functional.
+ * 2. Remove the old-name globals. Failure is non-fatal: a stale package
+ *    wastes disk, but the bin already points at the new install.
+ * 3. Verify the PATH-resolved `omp`. If the removal deleted the shared bin
+ *    link (manager-dependent), re-run the idempotent install to restore it
+ *    and verify again; only a repeated failure aborts, with a recovery hint.
+ */
+export async function migrateRenamedInstall(release: ReleaseInfo, steps: RenameMigrationSteps): Promise<void> {
+	console.log(chalk.dim(`npm package renamed to ${release.packages.pkg}; migrating this install.`));
+	const installExit = await steps.install();
+	if (installExit !== 0) {
+		throw new Error(
+			`install of ${release.packages.pkg} failed with exit code ${installExit}; the existing install was left untouched`,
+		);
 	}
 
-	await printVerification(expectedVersion);
+	const removeExit = await steps.removeOld();
+	if (removeExit !== 0) {
+		console.log(chalk.yellow(`Warning: could not remove the old ${PACKAGE} package; remove it manually later.`));
+	}
+
+	let verification = await steps.verify();
+	if (!verification.ok) {
+		// Removing the old package may have taken the shared bin link with it;
+		// reinstalling the new package restores the link.
+		if ((await steps.install()) === 0) {
+			verification = await steps.verify();
+		}
+	}
+	if (!verification.ok) {
+		throw new Error(
+			`${formatVerificationFailure(verification, release.version)}; reinstall with: curl -fsSL https://omp.sh/install | sh`,
+		);
+	}
+	printVerifiedVersion(release.version);
+}
+
+/**
+ * Update via package manager.
+ */
+async function updateViaBun(release: ReleaseInfo): Promise<void> {
+	console.log(chalk.dim("Updating via bun..."));
+	if (release.packages.pkg !== PACKAGE) {
+		await migrateRenamedInstall(release, packageManagerMigrationSteps("bun", release));
+	} else {
+		const args = buildBunInstallArgs(release.version, currentNativeTag(), release.packages);
+		const result = await $`bun ${args}`.nothrow();
+		if (result.exitCode !== 0) {
+			throw new Error(`bun install failed with exit code ${result.exitCode}`);
+		}
+		await printVerification(release.version);
+	}
 	try {
 		const pruneResult = await pruneBunCacheAfterGlobalInstall();
 		if (pruneResult && pruneResult.removedEntries > 0) {
@@ -1084,15 +1283,19 @@ async function updateViaBun(expectedVersion: string): Promise<void> {
 	}
 }
 
-async function updateViaNpm(expectedVersion: string): Promise<void> {
+async function updateViaNpm(release: ReleaseInfo): Promise<void> {
 	console.log(chalk.dim("Updating via npm..."));
-	const args = buildNpmInstallArgs(expectedVersion);
+	if (release.packages.pkg !== PACKAGE) {
+		await migrateRenamedInstall(release, packageManagerMigrationSteps("npm", release));
+		return;
+	}
+	const args = buildNpmInstallArgs(release.version, currentNativeTag(), release.packages);
 	const result = await $`npm ${args}`.nothrow();
 	if (result.exitCode !== 0) {
 		throw new Error(`npm install failed with exit code ${result.exitCode}`);
 	}
 
-	await printVerification(expectedVersion);
+	await printVerification(release.version);
 }
 
 async function updateViaHomebrew(expectedVersion: string, force: boolean): Promise<void> {
@@ -1342,6 +1545,9 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	} else {
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
 	}
+	if (release.packages.pkg !== PACKAGE) {
+		console.log(chalk.cyan(`The npm package moved to ${release.packages.pkg}; updating migrates this install.`));
+	}
 
 	if (opts.check) {
 		// Just check, don't install
@@ -1355,7 +1561,10 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	try {
 		const forceBinary = shouldForceBinaryUpdate(release);
 		const target = await resolveUpdateTarget({ allowPackageManagers: !forceBinary });
-		if (target.method === "brew") {
+		if (target.method === "nix") {
+			console.log(chalk.yellow("This installation is managed by Nix and cannot update itself."));
+			console.log(chalk.dim("Update the flake input or profile that provides omp, then rebuild."));
+		} else if (target.method === "brew") {
 			await updateViaHomebrew(release.version, opts.force);
 		} else if (target.method === "mise") {
 			await updateViaMise(release.version, opts.force);
@@ -1373,9 +1582,9 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 					),
 				);
 			} else if (target.method === "bun") {
-				await updateViaBun(release.version);
+				await updateViaBun(release);
 			} else {
-				await updateViaNpm(release.version);
+				await updateViaNpm(release);
 			}
 		} else {
 			if (forceBinary && target.replacesSymlink) {

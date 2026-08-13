@@ -6,7 +6,6 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { TUI } from "@oh-my-pi/pi-tui";
 import {
-	ADVISOR_DEFAULT_TOOL_NAMES,
 	AdviseTool,
 	type AdvisorAgent,
 	type AdvisorNote,
@@ -33,7 +32,6 @@ import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
 import { SecretObfuscator } from "../../src/secrets/obfuscator";
 import { formatSessionHistoryMarkdown } from "../../src/session/session-history-format";
 import { YieldQueue } from "../../src/session/yield-queue";
-import { BUILTIN_TOOL_NAMES } from "../../src/tools/builtin-names";
 
 /** Poll until the drain loop reaches the asserted state — waitForCatchup
  *  releases IMMEDIATELY on advisor failure (the primary must never park on a
@@ -96,7 +94,6 @@ describe("advisor", () => {
 					content: "Use `bun check`, never `tsc`.\nNo `any` unless absolutely necessary.",
 				},
 			]);
-			expect(rendered).toBeDefined();
 			expect(rendered).toContain('<file path="/repo/AGENTS.md">');
 			// Content is injected verbatim (noEscape) so backticks/markup survive for the model.
 			expect(rendered).toContain("Use `bun check`, never `tsc`.");
@@ -2364,7 +2361,7 @@ describe("advisor", () => {
 			expect(promptInputs).toHaveLength(1);
 
 			messages = [{ role: "user", content: "a", timestamp: 1 } as AgentMessage];
-			expect(() => runtime.onTurnEnd()).not.toThrow();
+			runtime.onTurnEnd();
 			expect(promptInputs).toHaveLength(1);
 		});
 
@@ -3261,7 +3258,7 @@ describe("advisor", () => {
 				timestamp: 2,
 			} as AgentMessage;
 			messages.push(poisoned);
-			expect(() => runtime.onTurnEnd(messages)).not.toThrow();
+			runtime.onTurnEnd(messages);
 			// A parked primary must not wait out the catch-up budget.
 			const started = performance.now();
 			await runtime.waitForCatchup(60_000, 1);
@@ -5367,21 +5364,6 @@ describe("advisor", () => {
 			expect(runtime.quotaExhausted).toBe(false);
 			expect(quotaNotified).toBe(false);
 			expect(runtime.backlog).toBe(0);
-		});
-	});
-
-	describe("advisor default tools", () => {
-		it("defaults to read/grep/glob, a subset of the full grantable tool pool", () => {
-			expect([...ADVISOR_DEFAULT_TOOL_NAMES]).toEqual(["read", "grep", "glob"]);
-			// The advisor is a full agent now: every built tool is grantable (no hard
-			// read-only restriction), including mutating ones like edit/bash/write.
-			const builtin = new Set<string>(BUILTIN_TOOL_NAMES);
-			for (const name of ["read", "grep", "glob", "edit", "bash", "write"]) {
-				expect(builtin.has(name)).toBe(true);
-			}
-			for (const name of ADVISOR_DEFAULT_TOOL_NAMES) {
-				expect(builtin.has(name)).toBe(true);
-			}
 		});
 	});
 

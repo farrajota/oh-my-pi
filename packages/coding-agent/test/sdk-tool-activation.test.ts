@@ -109,6 +109,12 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
 	});
 
+	const requireBundledModel = (provider: "anthropic" | "google" | "openai" | "xai", id: string): Model => {
+		const bundled = getBundledModel(provider, id);
+		if (!bundled) throw new Error(`Expected ${provider}/${id} model to exist`);
+		return bundled;
+	};
+
 	afterEach(() => {
 		for (const tempDir of tempDirs.splice(0)) {
 			removeSyncWithRetries(tempDir);
@@ -152,6 +158,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const settings = Settings.isolated();
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
+			model: requireBundledModel("openai", "gpt-5"),
 			settings,
 		});
 
@@ -174,18 +181,43 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
-	it("activates the private think tool at startup when external thinking is configured", async () => {
+	it("exposes the private think tool only on transports that can disable native reasoning", async () => {
 		const tempDir = makeTempDir();
 		const settings = Settings.isolated({ externalThinking: true });
+		const unsupported = requireBundledModel("xai", "grok-4");
+		const fable = requireBundledModel("anthropic", "claude-fable-5");
+		const responses = requireBundledModel("openai", "gpt-5");
+		const gemini = requireBundledModel("google", "gemini-2.5-flash");
+		const mandatoryGemini = requireBundledModel("google", "gemini-2.5-pro");
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
 			settings,
+			model: unsupported,
 		});
+		const authStorage = session.modelRegistry.authStorage;
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		authStorage.setRuntimeApiKey("google", "test-key");
+		authStorage.setRuntimeApiKey("xai", "test-key");
 
 		try {
+			expect(session.getActiveToolNames()).not.toContain("think");
+
+			await session.setModel(fable);
 			expect(session.getToolByName("think")).toBeDefined();
 			expect(session.getActiveToolNames()).toContain("think");
-			expect(session.getXdevToolEntries().map(entry => entry.name)).not.toContain("think");
+			expect(session.systemPrompt.join("\n")).toContain("private scratchpad; not shown to user");
+
+			await session.setModel(responses);
+			expect(session.getActiveToolNames()).toContain("think");
+			await session.setModel(gemini);
+			expect(session.getActiveToolNames()).toContain("think");
+			await session.setModel(mandatoryGemini);
+			expect(session.getActiveToolNames()).not.toContain("think");
+
+			await session.setModel(unsupported);
+			expect(session.getActiveToolNames()).not.toContain("think");
+			expect(session.systemPrompt.join("\n")).not.toContain("private scratchpad; not shown to user");
 		} finally {
 			await session.dispose();
 		}
@@ -267,8 +299,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 				]);
 			},
 		});
-		const model = getBundledModel("openai", "gpt-5");
-		if (!model) throw new Error("Expected gpt-5 model to exist");
+		const model = requireBundledModel("openai", "gpt-5");
 		// The prompt preflight validates the key through the registry (not the
 		// per-request `getApiKey` override), so seed it for keyless CI runners.
 		modelRegistry.authStorage.setRuntimeApiKey("openai", "test-key");
@@ -1085,7 +1116,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			const mountedBefore = session.getMountedXdevToolNames();
 			const promptBefore = session.systemPrompt;
 			const originalTool = session.getToolByName("bash");
-			expect(originalTool).toBeDefined();
 			expect(session.hasBuiltInTool("bash")).toBe(true);
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
@@ -1900,7 +1930,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		try {
 			expect(session.getAllToolNames()).toEqual(["read", "sdk_custom_tool"]);
 			expect(session.getActiveToolNames()).toEqual(["read", "sdk_custom_tool"]);
-			expect(session.getToolByName("sdk_custom_tool")).toBeDefined();
 		} finally {
 			await session.dispose();
 		}

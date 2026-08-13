@@ -119,6 +119,7 @@ describe("EventController + Cursor todo bridge", () => {
 		// The prefix is ours and fixed; only the untrusted tail is bounded.
 		expect(message.startsWith("Todo update failed: ")).toBe(true);
 		expect(Bun.stringWidth(message.slice("Todo update failed: ".length))).toBeLessThanOrEqual(TRUNCATE_LENGTHS.LINE);
+		expect(f.showWarning.mock.calls[0]![1]).toEqual({ hideWithToolActivity: true });
 	});
 
 	it("keeps the standalone hint when the failure carries no text", async () => {
@@ -128,7 +129,9 @@ describe("EventController + Cursor todo bridge", () => {
 
 		await f.controller.handleEvent(f.ctx.viewSession, todoFailure(""));
 
-		expect(f.showWarning).toHaveBeenCalledWith("Todo update failed. Progress may be stale until todo succeeds.");
+		expect(f.showWarning).toHaveBeenCalledWith("Todo update failed. Progress may be stale until todo succeeds.", {
+			hideWithToolActivity: true,
+		});
 	});
 
 	it("settles a card whose completion arrived before the streamed block created it", async () => {

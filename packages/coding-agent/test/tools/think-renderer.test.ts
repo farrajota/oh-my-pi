@@ -13,7 +13,7 @@ describe("thinkToolRenderer", () => {
 		const uiTheme = theme!;
 
 		const callComponent = thinkToolRenderer.renderCall(
-			{ thoughts: "Analyzing the solution step by step." },
+			{ thoughts: "Cache the parsed config, then check invalidation." },
 			{ expanded: true, isPartial: false },
 			uiTheme,
 		);
@@ -22,8 +22,8 @@ describe("thinkToolRenderer", () => {
 		const lines = callComponent.render(100);
 		const fullText = lines.join("\n");
 
-		expect(fullText).toContain("Analyzing the solution step by step.");
-		expect(fullText).toContain(uiTheme.fg("thinkingText", "Analyzing the solution step by step."));
+		expect(fullText).toContain("Cache the parsed config, then check invalidation.");
+		expect(fullText).toContain(uiTheme.fg("thinkingText", "Cache the parsed config, then check invalidation."));
 	});
 
 	it("has inline set to true", () => {

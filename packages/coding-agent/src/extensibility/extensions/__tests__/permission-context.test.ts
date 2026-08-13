@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "bun:test";
 import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import type { TSchema } from "@oh-my-pi/pi-ai";
 import { type } from "arktype";
 import type { EffectiveSubagentPermissions } from "../../../task/permission-profiles";
 import { ExtensionRunner } from "../runner";
@@ -10,8 +11,7 @@ const cwd = "/workspace/project";
 const paramsSchema = type({
 	"path?": "string",
 	"+": "delete",
-});
-
+}) as unknown as TSchema;
 function extension(handlers: Extension["handlers"] = new Map()): Extension {
 	return {
 		path: "/extensions/test.ts",

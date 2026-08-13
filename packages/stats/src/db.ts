@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import type { GeneratedProvider } from "@oh-my-pi/pi-catalog/models";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { calculateUncachedInputCost, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { getConfigRootDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
 import { classifyAgentType } from "./parser";
 import type {
@@ -35,7 +35,7 @@ import type {
 
 type ModelCost = { input: number; output: number; cacheRead: number; cacheWrite: number };
 type UsageCost = Usage["cost"];
-type CostTokens = Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite">;
+type CostTokens = Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "orchestration">;
 
 const ZERO_USAGE_COST: UsageCost = {
 	input: 0,
@@ -65,6 +65,42 @@ interface SessionModelAgentTypeRow {
 	total_cache_read_tokens: number;
 	total_cache_write_tokens: number;
 	total_cost: number;
+}
+
+interface NoCacheInputCostBackfillRow {
+	id: number;
+	provider: string;
+	model: string;
+	input_tokens: number;
+	cache_read_tokens: number;
+	cache_write_tokens: number;
+}
+
+interface AggregatedStatsRow {
+	total_requests: number;
+	failed_requests: number | null;
+	total_input_tokens: number | null;
+	total_output_tokens: number | null;
+	total_cache_read_tokens: number | null;
+	total_cache_write_tokens: number | null;
+	total_premium_requests: number | null;
+	total_cost: number | null;
+	total_cached_prompt_cost: number | null;
+	total_no_cache_input_cost: number | null;
+	avg_duration: number | null;
+	avg_ttft: number | null;
+	avg_tokens_per_second: number | null;
+	first_timestamp: number | null;
+	last_timestamp: number | null;
+}
+
+interface ModelStatsRow extends AggregatedStatsRow {
+	model: string;
+	provider: string;
+}
+
+interface FolderStatsRow extends AggregatedStatsRow {
+	folder: string;
 }
 
 let db: Database | null = null;
@@ -126,6 +162,7 @@ export async function initDb(): Promise<Database> {
 			cost_cache_read REAL NOT NULL,
 			cost_cache_write REAL NOT NULL,
 			cost_total REAL NOT NULL,
+			cost_no_cache_input REAL,
 			agent_type TEXT NOT NULL DEFAULT 'main',
 			UNIQUE(session_file, entry_id)
 		);
@@ -196,6 +233,9 @@ export async function initDb(): Promise<Database> {
 	const messageColumns = db.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
 	if (!messageColumns.some(column => column.name === "premium_requests")) {
 		db.run("ALTER TABLE messages ADD COLUMN premium_requests REAL NOT NULL DEFAULT 0");
+	}
+	if (!messageColumns.some(column => column.name === "cost_no_cache_input")) {
+		db.run("ALTER TABLE messages ADD COLUMN cost_no_cache_input REAL");
 	}
 	db.run("UPDATE messages SET premium_requests = 0 WHERE premium_requests IS NULL");
 	// Token-usage-by-agent: each message is classified main / subagent / advisor
@@ -279,6 +319,7 @@ export async function initDb(): Promise<Database> {
 	backfillPriorityPremiumRequests(db);
 	backfillAgentType(db);
 	backfillMissingCatalogCosts(db);
+	backfillNoCacheInputCosts(db);
 	backfillForkDuplicates(db);
 	return db;
 }
@@ -337,6 +378,18 @@ function resolveStoredCost(stats: MessageStats): UsageCost {
 	return calculateCatalogCost(stats.provider, stats.model, stats.usage) ?? storedCost ?? ZERO_USAGE_COST;
 }
 
+function calculateNoCacheInputCost(provider: string, modelId: string, tokens: CostTokens): number | null {
+	const cost = getCatalogCost(provider, modelId);
+	if (!cost) return null;
+	const promptInputTokens =
+		tokens.input +
+		tokens.cacheRead +
+		tokens.cacheWrite +
+		(tokens.orchestration?.input ?? 0) +
+		(tokens.orchestration?.cacheRead ?? 0);
+	return calculateUncachedInputCost(cost, promptInputTokens);
+}
+
 function backfillMissingCatalogCosts(database: Database): void {
 	const rows = database
 		.prepare(`
@@ -369,6 +422,31 @@ function backfillMissingCatalogCosts(database: Database): void {
 		}
 	});
 
+	applyBackfill();
+}
+
+function backfillNoCacheInputCosts(database: Database): void {
+	const rows = database
+		.prepare(`
+			SELECT id, provider, model, input_tokens, cache_read_tokens, cache_write_tokens
+			FROM messages
+			WHERE cost_no_cache_input IS NULL
+		`)
+		.all() as NoCacheInputCostBackfillRow[];
+	if (rows.length === 0) return;
+
+	const update = database.prepare("UPDATE messages SET cost_no_cache_input = ? WHERE id = ?");
+	const applyBackfill = database.transaction(() => {
+		for (const row of rows) {
+			const cost = calculateNoCacheInputCost(row.provider, row.model, {
+				input: row.input_tokens,
+				output: 0,
+				cacheRead: row.cache_read_tokens,
+				cacheWrite: row.cache_write_tokens,
+			});
+			update.run(cost ?? 0, row.id);
+		}
+	});
 	applyBackfill();
 }
 
@@ -420,9 +498,9 @@ export function insertMessageStats(stats: MessageStats[]): number {
 			session_file, entry_id, folder, model, provider, api, timestamp,
 			duration, ttft, stop_reason, error_message,
 			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, premium_requests,
-			cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total, agent_type
+			cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total, cost_no_cache_input, agent_type
 		)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE NOT EXISTS (
 			SELECT 1 FROM messages
 			WHERE entry_id = ? AND timestamp = ? AND session_file <> ?
@@ -436,6 +514,7 @@ export function insertMessageStats(stats: MessageStats[]): number {
 	const insert = db.transaction(() => {
 		for (const s of stats) {
 			const cost = resolveStoredCost(s);
+			const noCacheInputCost = calculateNoCacheInputCost(s.provider, s.model, s.usage) ?? 0;
 			const result = stmt.run(
 				s.sessionFile,
 				s.entryId,
@@ -459,6 +538,7 @@ export function insertMessageStats(stats: MessageStats[]): number {
 				cost.cacheRead,
 				cost.cacheWrite,
 				cost.total,
+				noCacheInputCost,
 				s.agentType,
 				// `WHERE NOT EXISTS` binds: skip when a different session_file
 				// already holds this (entry_id, timestamp).
@@ -477,7 +557,7 @@ export function insertMessageStats(stats: MessageStats[]): number {
 /**
  * Build aggregated stats from query results.
  */
-function buildAggregatedStats(rows: any[]): AggregatedStats {
+function buildAggregatedStats(rows: AggregatedStatsRow[]): AggregatedStats {
 	if (rows.length === 0) {
 		return {
 			totalRequests: 0,
@@ -489,6 +569,7 @@ function buildAggregatedStats(rows: any[]): AggregatedStats {
 			totalCacheReadTokens: 0,
 			totalCacheWriteTokens: 0,
 			cacheRate: 0,
+			cacheSavings: 0,
 			totalCost: 0,
 			totalPremiumRequests: 0,
 			avgDuration: null,
@@ -506,6 +587,8 @@ function buildAggregatedStats(rows: any[]): AggregatedStats {
 	const totalInputTokens = row.total_input_tokens || 0;
 	const totalCacheReadTokens = row.total_cache_read_tokens || 0;
 	const totalPremiumRequests = row.total_premium_requests || 0;
+	const noCacheInputCost = row.total_no_cache_input_cost || 0;
+	const cachedPromptCost = row.total_cached_prompt_cost || 0;
 
 	return {
 		totalRequests,
@@ -520,6 +603,7 @@ function buildAggregatedStats(rows: any[]): AggregatedStats {
 			totalInputTokens + totalCacheReadTokens > 0
 				? totalCacheReadTokens / (totalInputTokens + totalCacheReadTokens)
 				: 0,
+		cacheSavings: noCacheInputCost > 0 ? (noCacheInputCost - cachedPromptCost) / noCacheInputCost : 0,
 		totalCost: row.total_cost || 0,
 		totalPremiumRequests,
 		avgDuration: row.avg_duration,
@@ -547,6 +631,10 @@ export function getOverallStats(cutoff?: number): AggregatedStats {
 			SUM(cache_write_tokens) as total_cache_write_tokens,
 			SUM(premium_requests) as total_premium_requests,
 			SUM(cost_total) as total_cost,
+			SUM(CASE WHEN cost_no_cache_input > 0
+				THEN cost_input + cost_cache_read + cost_cache_write
+				ELSE 0 END) as total_cached_prompt_cost,
+			SUM(cost_no_cache_input) as total_no_cache_input_cost,
 			AVG(duration) as avg_duration,
 			AVG(ttft) as avg_ttft,
 			AVG(CASE WHEN duration > 0 THEN output_tokens * 1000.0 / duration ELSE NULL END) as avg_tokens_per_second,
@@ -557,7 +645,7 @@ export function getOverallStats(cutoff?: number): AggregatedStats {
 	`);
 
 	const rows = hasCutoff ? stmt.all(cutoff) : stmt.all();
-	return buildAggregatedStats(rows as any[]);
+	return buildAggregatedStats(rows as AggregatedStatsRow[]);
 }
 /**
  * Get stats grouped by model.
@@ -578,6 +666,10 @@ export function getStatsByModel(cutoff?: number): ModelStats[] {
 			SUM(cache_write_tokens) as total_cache_write_tokens,
 			SUM(premium_requests) as total_premium_requests,
 			SUM(cost_total) as total_cost,
+			SUM(CASE WHEN cost_no_cache_input > 0
+				THEN cost_input + cost_cache_read + cost_cache_write
+				ELSE 0 END) as total_cached_prompt_cost,
+			SUM(cost_no_cache_input) as total_no_cache_input_cost,
 			AVG(duration) as avg_duration,
 			AVG(ttft) as avg_ttft,
 			AVG(CASE WHEN duration > 0 THEN output_tokens * 1000.0 / duration ELSE NULL END) as avg_tokens_per_second,
@@ -589,7 +681,7 @@ export function getStatsByModel(cutoff?: number): ModelStats[] {
 		ORDER BY total_requests DESC
 	`);
 
-	const rows = (hasCutoff ? stmt.all(cutoff) : stmt.all()) as any[];
+	const rows = (hasCutoff ? stmt.all(cutoff) : stmt.all()) as ModelStatsRow[];
 	return rows.map(row => ({
 		model: row.model,
 		provider: row.provider,
@@ -662,6 +754,10 @@ export function getStatsByFolder(cutoff?: number): FolderStats[] {
 			SUM(cache_write_tokens) as total_cache_write_tokens,
 			SUM(premium_requests) as total_premium_requests,
 			SUM(cost_total) as total_cost,
+			SUM(CASE WHEN cost_no_cache_input > 0
+				THEN cost_input + cost_cache_read + cost_cache_write
+				ELSE 0 END) as total_cached_prompt_cost,
+			SUM(cost_no_cache_input) as total_no_cache_input_cost,
 			AVG(duration) as avg_duration,
 			AVG(ttft) as avg_ttft,
 			AVG(CASE WHEN duration > 0 THEN output_tokens * 1000.0 / duration ELSE NULL END) as avg_tokens_per_second,
@@ -673,7 +769,7 @@ export function getStatsByFolder(cutoff?: number): FolderStats[] {
 		ORDER BY total_requests DESC
 	`);
 
-	const rows = (hasCutoff ? stmt.all(cutoff) : stmt.all()) as any[];
+	const rows = (hasCutoff ? stmt.all(cutoff) : stmt.all()) as FolderStatsRow[];
 	return rows.map(row => ({
 		folder: row.folder,
 		...buildAggregatedStats([row]),

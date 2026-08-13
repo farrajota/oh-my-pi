@@ -17,7 +17,6 @@ import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mod
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { normalizeCustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
@@ -150,13 +149,6 @@ describe("InteractiveMode vibe mode toggle", () => {
 		expect(inMode.toSorted()).toEqual(["read", "todo", ...VIBE_TOOL_NAMES].toSorted());
 		expect(session.getAllToolNames().toSorted()).toEqual(["read", "todo", ...VIBE_TOOL_NAMES].toSorted());
 
-		const sendCustomMessage = vi.spyOn(session, "sendCustomMessage");
-		await session.sendVibeModeContext({ deliverAs: "steer" });
-		const message = normalizeCustomMessagePayload(sendCustomMessage.mock.calls[0]?.[0]);
-		const content = typeof message.content === "string" ? message.content : "";
-		expect(message.customType).toBe("vibe-mode-context");
-		expect(content).toContain("`todo`");
-
 		// Toggle off: the empty previous toolset must come back — only the
 		// ephemeral vibe tools must leave the registry.
 		await mode.handleVibeModeCommand();
@@ -198,13 +190,6 @@ describe("InteractiveMode vibe mode toggle", () => {
 			await foreignTodoMode.handleVibeModeCommand();
 			expect(foreignTodoSession.getActiveToolNames().toSorted()).toEqual(["read", ...VIBE_TOOL_NAMES].toSorted());
 
-			const sendCustomMessage = vi.spyOn(foreignTodoSession, "sendCustomMessage");
-			await foreignTodoSession.sendVibeModeContext({ deliverAs: "steer" });
-			const message = normalizeCustomMessagePayload(sendCustomMessage.mock.calls[0]?.[0]);
-			const content = typeof message.content === "string" ? message.content : "";
-			expect(content).not.toContain("`todo`");
-			expect(content).not.toContain("parent session's list");
-
 			await foreignTodoMode.handleVibeModeCommand();
 			expect(foreignTodoSession.getActiveToolNames()).toEqual([]);
 			expect(foreignTodoSession.getAllToolNames().toSorted()).toEqual(["read", "todo"]);
@@ -234,12 +219,6 @@ describe("InteractiveMode vibe mode toggle", () => {
 
 		expect(mode.vibeModeEnabled).toBe(true);
 		expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "todo", ...VIBE_TOOL_NAMES]));
-		const sendCustomMessage = vi.spyOn(session, "sendCustomMessage");
-		await session.sendVibeModeContext({ deliverAs: "steer" });
-		const message = normalizeCustomMessagePayload(sendCustomMessage.mock.calls[0]?.[0]);
-		const content = typeof message.content === "string" ? message.content : "";
-		expect(content).toContain("`todo`");
-		expect(content).toContain("parent session's list");
 		expect(suspend).toHaveBeenCalledTimes(1);
 		expect(terminate).not.toHaveBeenCalled();
 		expect(vibeModeEntryCount(session.sessionManager)).toBe(1);

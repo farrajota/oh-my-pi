@@ -35,7 +35,6 @@ describe("parseClaudePluginsRegistry", () => {
 		});
 
 		const result = parseClaudePluginsRegistry(content);
-		expect(result).not.toBeNull();
 		expect(result?.version).toBe(2);
 		expect(result?.plugins["my-plugin@marketplace"]).toHaveLength(1);
 	});
@@ -414,10 +413,8 @@ describe("listClaudePluginRoots", () => {
 
 		const result = await loadCapability<Skill>("skills", { cwd: tempDir });
 		expect(result.warnings).toEqual([]);
-		expect(result.all.length).toBeGreaterThan(0);
 		const found = result.all.find(skill => skill.name === "manifest-skill");
 
-		expect(found).toBeDefined();
 		expect(found?.path).toContain(path.join(".claude", "skills", "manifest-skill", "SKILL.md"));
 	});
 	test("keeps plugin skills out of slash commands while loading them as skills", async () => {
@@ -504,7 +501,6 @@ describe("listClaudePluginRoots", () => {
 			});
 			const server = result.all.find(item => item.name === "context7:context7");
 
-			expect(server).toBeDefined();
 			expect(server?.url).toBe("https://mcp.context7.example/mcp");
 			expect(server?.headers).toEqual({ CONTEXT7_API_KEY: "ctx7sk-test-key" });
 		} finally {
@@ -625,7 +621,6 @@ describe("listClaudePluginRoots", () => {
 
 		expect(result.warnings).toEqual([]);
 		const server = result.all.find(item => item.name === "inline-mcp:local");
-		expect(server).toBeDefined();
 		expect(server?.command).toBe(path.join(pluginPath, "bin", "server"));
 		expect(server?.args).toEqual(["run"]);
 	});
@@ -800,10 +795,8 @@ describe("listClaudePluginRoots", () => {
 
 		const result = await loadCapability<SlashCommand>("slash-commands", { cwd: tempDir });
 		expect(result.warnings).toEqual([]);
-		expect(result.all.length).toBeGreaterThan(0);
 		const found = result.all.find(command => command.name === "manifest-commands:ship");
 
-		expect(found).toBeDefined();
 		expect(found?.path).toContain(path.join(".claude", "commands", "ship.md"));
 	});
 
@@ -840,7 +833,6 @@ describe("listClaudePluginRoots", () => {
 		expect(result.warnings).toEqual([]);
 		const found = result.all.find(command => command.name === "manifest-commands-key:plan");
 
-		expect(found).toBeDefined();
 		expect(found?.path).toContain(path.join(".claude", "commands", "plan.md"));
 	});
 
@@ -1368,7 +1360,6 @@ describe("discoverAgents plugin precedence", () => {
 		const result = await discoverAgents(tempDir, tempDir);
 		const found = result.agents.find(agent => agent.name === agentName);
 
-		expect(found).toBeDefined();
 		expect(found?.source).toBe("project");
 		expect(found?.filePath).toContain(projectPluginPath);
 	});

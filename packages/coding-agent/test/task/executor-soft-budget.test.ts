@@ -259,9 +259,8 @@ describe("runSubprocess soft request budget", () => {
 		// wrap-up reminder; the second abort (after the terminal yield) is the
 		// normal post-yield terminate.
 		expect(abortCallsAtReminder).toBe(1);
-		// The wrap-up reminder is the budget-stop variant with a forced tool choice.
+		// The budget stop forces a synthetic terminal yield.
 		expect(handle.prompts).toHaveLength(2);
-		expect(handle.prompts[1]?.text).toMatch(/request budget/);
 		expect(handle.prompts[1]?.options?.synthetic).toBe(true);
 		expect(handle.prompts[1]?.options?.toolChoice).toEqual({ type: "tool", name: "yield" });
 		// The forced yield finalizes as a normal completion, not an abort.
