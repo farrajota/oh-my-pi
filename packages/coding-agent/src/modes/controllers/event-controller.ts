@@ -223,6 +223,8 @@ export class EventController {
 	// restored when the banner clears at the next `agent_start` (see
 	// #handleMessageEnd / #handleAgentStart).
 	#pinnedErrorComponent: AssistantMessageComponent | undefined = undefined;
+	#pinnedErrorMessage: AssistantMessage | undefined = undefined;
+	#restorePinnedErrorInline = true;
 	#retrySupersededAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#retrySupersededAssistantQueue: AssistantMessageComponent[] = [];
 	// Set when `auto_retry_start` fires and cleared by `auto_retry_end` (both
@@ -752,6 +754,8 @@ export class EventController {
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
 		this.#pinnedErrorComponent = undefined;
+		this.#pinnedErrorMessage = undefined;
+		this.#restorePinnedErrorInline = true;
 		this.#retryPending = this.ctx.viewSession.isRetrying;
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
@@ -854,8 +858,13 @@ export class EventController {
 		this.#resolveDisplaceableTodo();
 		this.#lastAssistantComponent = undefined;
 		this.#lastCompletedAssistantMessage = undefined;
-		this.#pinnedErrorComponent?.setErrorPinned(false);
+		// Restore terminal errors in transcript history when their banner clears.
+		// Recoverable empty-output attempts are discarded by session recovery and
+		// must stay hidden rather than resurfacing as a stale inline error.
+		if (this.#restorePinnedErrorInline) this.#pinnedErrorComponent?.setErrorPinned(false);
 		this.#pinnedErrorComponent = undefined;
+		this.#pinnedErrorMessage = undefined;
+		this.#restorePinnedErrorInline = true;
 		this.ctx.clearPinnedError();
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
@@ -1481,14 +1490,20 @@ export class EventController {
 			}
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
-			// Pin a turn-ending provider error (e.g. Anthropic content-filter block)
-			// above the editor so it survives transcript scroll. Cleared at the next
-			// turn's agent_start. Suppress the transcript's inline `Error: …` line for
-			// the same message while pinned so the error isn't rendered twice.
+			// Pin a turn-ending provider error above the editor so it survives
+			// transcript scroll and suppress its duplicate inline row. Empty-output
+			// errors are known intermediate attempts: hide them entirely while
+			// session recovery continues, but retain the component so a terminal
+			// retry-cap event can promote its final error into the one banner.
 			if (event.message.stopReason === "error" && event.message.errorMessage && !isSilentAbort(event.message)) {
+				const recoverableEmptyOutput =
+					!event.message.errorMessage.startsWith("Retry budget exhausted") &&
+					AIError.is(AIError.classifyMessage(event.message), AIError.Flag.EmptyResponse);
 				this.#lastAssistantComponent?.setErrorPinned(true);
 				this.#pinnedErrorComponent = this.#lastAssistantComponent;
-				this.ctx.showPinnedError(event.message.errorMessage);
+				this.#pinnedErrorMessage = event.message;
+				this.#restorePinnedErrorInline = !recoverableEmptyOutput;
+				if (!recoverableEmptyOutput) this.ctx.showPinnedError(event.message.errorMessage);
 			}
 			this.ctx.statusLine.invalidate();
 			this.ctx.ui.requestRender();
@@ -2106,6 +2121,8 @@ export class EventController {
 			// restore its inline Error row; just unpin the fixed-region banner so the
 			// retry UI is the visible state.
 			this.#pinnedErrorComponent = undefined;
+			this.#pinnedErrorMessage = undefined;
+			this.#restorePinnedErrorInline = true;
 			this.ctx.clearPinnedError();
 		}
 		const loaderText =
@@ -2135,6 +2152,21 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
+		const pinnedError = this.#pinnedErrorMessage?.errorMessage;
+		const terminalFailurePinned =
+			!event.success &&
+			this.#pinnedErrorComponent !== undefined &&
+			pinnedError !== undefined &&
+			pinnedError === event.finalError;
+		let stalePinnedErrorCleared = false;
+		if (!event.success && this.#pinnedErrorComponent && !terminalFailurePinned) {
+			this.#pinnedErrorComponent.setErrorPinned(false);
+			this.#pinnedErrorComponent = undefined;
+			this.#pinnedErrorMessage = undefined;
+			this.#restorePinnedErrorInline = true;
+			this.ctx.clearPinnedError();
+			stalePinnedErrorCleared = true;
+		}
 		let appliedRetryUpdate = false;
 		for (const recovered of event.recoveredErrors ?? []) {
 			const component = this.#takeRetrySupersededAssistantComponent(recovered.persistenceKey);
@@ -2147,15 +2179,31 @@ export class EventController {
 			const component = this.#takeRetrySupersededAssistantComponent(retryError.persistenceKey);
 			if (!component) continue;
 			component.applyRetryRecovery(retryError.retryRecovery);
-			if (this.#pinnedErrorComponent === component) this.#pinnedErrorComponent = undefined;
+			if (!terminalFailurePinned && this.#pinnedErrorComponent === component) {
+				this.#pinnedErrorComponent = undefined;
+				this.#pinnedErrorMessage = undefined;
+				this.#restorePinnedErrorInline = true;
+			}
 			appliedRetryUpdate = true;
 		}
-		if (appliedRetryUpdate || (event.recoveredErrors?.length ?? 0) > 0 || (event.retryErrors?.length ?? 0) > 0) {
+		if (
+			!terminalFailurePinned &&
+			!stalePinnedErrorCleared &&
+			(appliedRetryUpdate || (event.recoveredErrors?.length ?? 0) > 0 || (event.retryErrors?.length ?? 0) > 0)
+		) {
 			this.ctx.clearPinnedError();
 		}
 		this.#clearRetrySupersededAssistantComponents();
 		if (!event.success && !isIntentionalRepeatedRetryEnd(event)) {
-			this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+			if (terminalFailurePinned) {
+				const terminalError = this.#restorePinnedErrorInline
+					? `Retry failed after ${event.attempt} attempts: ${event.finalError || pinnedError || "Unknown error"}`
+					: (pinnedError ?? event.finalError);
+				if (terminalError) this.ctx.showPinnedError(terminalError);
+				this.#restorePinnedErrorInline = true;
+			} else {
+				this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+			}
 		}
 		this.#ensureWorkingLoaderWhileStreaming(source);
 		this.ctx.ui.requestRender();

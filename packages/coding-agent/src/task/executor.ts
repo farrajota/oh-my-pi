@@ -6,7 +6,7 @@
 
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
-import { recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
+import { EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
@@ -507,6 +507,8 @@ export interface RunSubprocessOptions {
 	keepAlive?: boolean;
 	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
 	onCleanupDeferred?: (completion: Promise<void>) => void;
+	/** Internal cleanup grace override for deterministic lifecycle tests. */
+	cleanupGraceMs?: number;
 }
 
 export type ExecutorOptions = RunSubprocessOptions;
@@ -1901,6 +1903,7 @@ async function driveSessionToYield(
 	monitor: SubagentRunMonitor,
 	task: string,
 ): Promise<DriveOutcome> {
+	using _keepalive = new EventLoopKeepalive();
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
 	let error: string | undefined;
@@ -2697,6 +2700,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		signal,
 		onProgress,
 	} = options;
+	const cleanupGraceMs = options.cleanupGraceMs ?? TASK_ABORT_CLEANUP_GRACE_MS;
 	const startTime = Date.now();
 	// loop dispatches a chat request to the provider — the launch-complete boundary.
 	let firstChatDispatchAt: number | undefined;
@@ -3381,7 +3385,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				error = err instanceof Error ? err.stack || err.message : String(err);
 			}
 		} finally {
-			const cleanupDeadlineAt = Date.now() + TASK_ABORT_CLEANUP_GRACE_MS;
+			const cleanupDeadlineAt = Date.now() + cleanupGraceMs;
 			const cleanupChangeStatus =
 				worktree === undefined
 					? "This task was not isolated, so its changes may remain in the working directory."
@@ -3392,8 +3396,8 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				lateCleanups.push(completion);
 				exitCode = 1;
 				aborted = true;
-				abortReasonText = `cleanup exceeded ${TASK_ABORT_CLEANUP_GRACE_MS} ms`;
-				error ??= `Task aborted. Cleanup did not finish within ${TASK_ABORT_CLEANUP_GRACE_MS} ms. ${cleanupChangeStatus}`;
+				abortReasonText = `cleanup exceeded ${cleanupGraceMs} ms`;
+				error ??= `Task aborted. Cleanup did not finish within ${cleanupGraceMs} ms. ${cleanupChangeStatus}`;
 			};
 			if (abortSignal.aborted) {
 				aborted = monitor.isAbortedRun();
