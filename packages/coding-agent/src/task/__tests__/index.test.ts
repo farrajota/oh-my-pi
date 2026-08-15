@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { type } from "arktype";
+import { type } from "@oh-my-pi/omptype";
 import { Settings } from "../../config/settings";
 import type { SettingPath } from "../../config/settings-schema";
 import type { PlanModeState } from "../../plan-mode/state";
@@ -145,7 +145,20 @@ describe("TaskTool toolProfile execution", () => {
 
 		await taskTool.execute("tool-call", { agent: "synthetic", task: "read" });
 
-		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read", "grep", "glob", "lsp", "web_search"]);
+		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read", "grep", "glob", "web_search"]);
+	});
+
+	test("plan mode preserves an explicitly declared ast_grep tool", async () => {
+		const agent = makeAgent(["ast_grep"]);
+		const runSpy = vi.spyOn(executor, "runSubprocess").mockResolvedValue(makeResult(agent));
+		const taskTool = await makeTaskTool(
+			agent,
+			makeSession(undefined, { getPlanModeState: () => ({ enabled: true }) as PlanModeState }),
+		);
+
+		await taskTool.execute("tool-call", { agent: "synthetic", task: "read" });
+
+		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read", "grep", "glob", "web_search", "ast_grep"]);
 	});
 
 	test("plan mode preserves base planning tools when explicit agent tools do not intersect", async () => {
@@ -158,7 +171,7 @@ describe("TaskTool toolProfile execution", () => {
 
 		await taskTool.execute("tool-call", { agent: "synthetic", task: "read" });
 
-		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read", "grep", "glob", "lsp", "web_search"]);
+		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read", "grep", "glob", "web_search"]);
 	});
 
 	test("permissions narrow an edit toolProfile without re-adding edit or write", async () => {

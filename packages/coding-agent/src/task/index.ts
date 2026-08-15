@@ -149,7 +149,6 @@ export {
 	taskSchema,
 } from "./types";
 
-
 /**
  * Preview text for a child result. Falls back to "(no output)" — annotated
  * with the request count when the child actually did work, so the parent can
@@ -1645,7 +1644,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const planModeState = this.session.getPlanModeState?.();
-		const planModeBaseTools = ["read", "grep", "glob", "lsp", "web_search"];
+		const planModeBaseTools = ["read", "grep", "glob", "web_search"];
 		const planModeTools = [
 			...planModeBaseTools,
 			...(agent.tools ?? []).filter(
@@ -1916,7 +1915,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				exactModelOverride,
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
-				enableLsp: subagentLspEnabled,
+				enableLsp: planModeState?.enabled ? false : subagentLspEnabled,
+				enableIrc: planModeState?.enabled ? false : ircEnabled,
+				restrictToolNames: planModeState?.enabled || undefined,
 				maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
 				signal,
 				onProgress: (progress: AgentProgress) => {
