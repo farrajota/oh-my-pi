@@ -66,6 +66,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.completeHelp,
 	},
 	{
+		name: "compress",
+		load: () => import("./commands/compress").then(m => m.default),
+		help: commandHelp.compressHelp,
+	},
+	{
 		name: "config",
 		load: () => import("./commands/config").then(m => m.default),
 		help: commandHelp.configHelp,
@@ -119,6 +124,11 @@ export const commands: CommandEntry[] = [
 		name: "say",
 		load: () => import("./commands/say").then(m => m.default),
 		help: commandHelp.sayHelp,
+	},
+	{
+		name: "share",
+		load: () => import("./commands/share").then(m => m.default),
+		help: commandHelp.shareHelp,
 	},
 	{
 		name: "setup",

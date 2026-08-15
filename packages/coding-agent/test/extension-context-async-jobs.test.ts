@@ -4,12 +4,12 @@ import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type {
 	AsyncJobOutputSnapshot,
-	AsyncJobSnapshot,
 	BackgroundControlResult,
 	ExtensionRuntime,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";

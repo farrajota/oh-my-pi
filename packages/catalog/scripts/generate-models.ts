@@ -45,6 +45,7 @@ import {
 	META_MUSE_STATIC_MODELS,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
+	OPENAI_DAYBREAK_CURATED_FALLBACK_MODELS,
 	projectOpenAIProReasoningAliases,
 	SAKANA_FUGU_STATIC_MODELS,
 	stripFireworksDeepSeekThinkingToggle,
@@ -546,12 +547,9 @@ async function generateModels() {
 	// persisted `modelRoles.default = "xai-oauth/<id>"` is honored before the
 	// async refresh fires (interactive boot does not await refresh).
 	allModels.push(...buildXaiOAuthStaticSeed());
-	// Seed QwenCloud's documented Token Plan models when credentialed
-	// discovery is unavailable. A successful `/models` response is authoritative
-	// for the subscribed edition and must not be widened by the fallback.
-	if (!authoritativeCatalogProviders.has("alibaba-token-plan")) {
-		allModels.push(...ALIBABA_TOKEN_PLAN_STATIC_MODELS);
-	}
+	// Daybreak is separately provisioned and absent from stencil.so. Keep its
+	// documented aliases and current Cyber snapshot in every generated bundle.
+	allModels.push(...OPENAI_DAYBREAK_CURATED_FALLBACK_MODELS);
 	// Seed Anthropic models that are live on the first-party API or in limited
 	// release but that stencil.so has not catalogued yet (e.g. Claude Fable 5 /
 	// Mythos 5). Deduped behind upstream entries; metadata is pinned in
@@ -656,6 +654,14 @@ async function generateModels() {
 	}
 
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
+	// Seed QwenCloud's documented Token Plan models when credentialed
+	// discovery is unavailable. A successful `/models` response is authoritative
+	// for the subscribed edition and must not be widened by the fallback.
+	// Deduplication keeps earlier rows, so prepend the curated seed to prevent
+	// incomplete upstream metadata from replacing its capabilities.
+	if (!authoritativeCatalogProviders.has("alibaba-token-plan")) {
+		allModels.unshift(...ALIBABA_TOKEN_PLAN_STATIC_MODELS);
+	}
 	allModels = applyUmansPricingFallback(allModels, modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);

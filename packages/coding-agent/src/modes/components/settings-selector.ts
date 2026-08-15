@@ -1064,7 +1064,7 @@ export class SettingsSelectorComponent implements Component {
 			sortModelItems(items, { mruOrder });
 			const picker = new ModelBrowser(this.context.settings, {
 				currentContextTokens: this.context.currentContextTokens,
-				disableOverContext: true,
+				markOverContext: true,
 			});
 			picker.setMruOrder(mruOrder);
 			picker.setPerfStats(storage?.getModelPerf() ?? new Map());

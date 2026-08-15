@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "bun:test";
 import { type } from "arktype";
+import type { TSchema } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { CustomTool } from "../../extensibility/custom-tools/types";
@@ -12,7 +13,7 @@ import { createMCPProxyTools, runSubprocess } from "../executor";
 import * as taskLabel from "../label";
 import type { AgentDefinition } from "../types";
 
-const emptyParams = type({});
+const emptyParams = type({}) as unknown as TSchema;
 
 function fakeMcpTool(name: string): CustomTool {
 	return {

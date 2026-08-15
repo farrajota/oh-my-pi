@@ -10,9 +10,9 @@ import { AssistantMessageComponent } from "../../modes/components/assistant-mess
 import { extractImagePathFromText } from "../../modes/components/custom-editor";
 import { ReadToolGroupComponent } from "../../modes/components/read-tool-group";
 import { renderSegmentTrack } from "../../modes/components/segment-track";
-import { StrippedToolCallsPlaceholder } from "../../modes/components/stripped-tool-calls-placeholder";
 import { TinyTitleDownloadProgressComponent } from "../../modes/components/tiny-title-download-progress";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
+import { TreeSelectorComponent } from "../../modes/components/tree-selector";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { materializeImageReferenceLinks, shiftImageMarkers } from "../../modes/image-references";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
@@ -22,6 +22,7 @@ import type { InteractiveModeContext } from "../../modes/types";
 import manualContinuePrompt from "../../prompts/system/manual-continue.md" with { type: "text" };
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
+import { parseSlashCommand } from "../../slash-commands/helpers/parse";
 import { isTinyTitleLocalModelKey } from "../../tiny/models";
 import { tinyTitleClient } from "../../tiny/title-client";
 import type { TinyTitleProgressEvent } from "../../tiny/title-protocol";
@@ -177,6 +178,7 @@ export class InputController {
 	#focusedPasteListenerInstalled = false;
 	#btwBranchListenerInstalled = false;
 	#btwCopyListenerInstalled = false;
+	#expandToolsListenerInstalled = false;
 	// Tap counter for the double-← gesture; reset whenever a quiet gap
 	// (>= LEFT_DOUBLE_TAP_MAX_GAP_MS) starts a fresh sequence. See
 	// #detectLeftDoubleTap.
@@ -275,6 +277,24 @@ export class InputController {
 				if (!focused || focused === this.ctx.editor || !hasPasteText(focused)) return undefined;
 				if (!this.ctx.keybindings.matches(data, "app.clipboard.pasteImage")) return undefined;
 				void this.handleImagePaste();
+				return { consume: true };
+			});
+		}
+		if (!this.#expandToolsListenerInstalled) {
+			this.#expandToolsListenerInstalled = true;
+			// `app.tools.expand` (Ctrl+O) toggles the transcript's tool-output
+			// preview. It must fire regardless of focus so a truncated edit stays
+			// expandable while an approval prompt / select dialog holds keyboard
+			// focus (#7837). Defers when the main transcript is not the active
+			// surface (a fullscreen/anchored overlay — agent hub, transcript
+			// viewer, log viewer, model picker) or when the focused component
+			// rebinds Ctrl+O for its own use (the tree selector's filter cycle).
+			this.ctx.ui.addInputListener(data => {
+				if (!this.ctx.keybindings.matches(data, "app.tools.expand")) return undefined;
+				if (this.ctx.ui.hasOverlay()) return undefined;
+				if (this.ctx.ui.getFocused() instanceof TreeSelectorComponent && matchesKey(data, "ctrl+o"))
+					return undefined;
+				this.toggleToolOutputExpansion();
 				return { consume: true };
 			});
 		}
@@ -456,8 +476,6 @@ export class InputController {
 			this.ctx.keybindings.getKeys("app.clipboard.copyPrompt"),
 		);
 		this.ctx.editor.onCopyPrompt = () => this.handleCopyPrompt();
-		this.ctx.editor.setActionKeys("app.tools.expand", this.ctx.keybindings.getKeys("app.tools.expand"));
-		this.ctx.editor.onExpandTools = () => this.toggleToolOutputExpansion();
 		this.ctx.editor.setActionKeys(
 			"app.tools.toggleVisibility",
 			this.ctx.keybindings.getKeys("app.tools.toggleVisibility"),
@@ -660,6 +678,7 @@ export class InputController {
 			let inputImageLinks =
 				this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
 			let hasInputImages = (inputImages?.length ?? 0) > 0;
+			const submittedImages = inputImages;
 
 			if (runner?.hasHandlers("input")) {
 				const result = await runner.emitInput(text, inputImages, "interactive");
@@ -679,6 +698,22 @@ export class InputController {
 				}
 				hasInputImages = (inputImages?.length ?? 0) > 0;
 			}
+			const submittedMode = parseSlashCommand(text)?.name;
+			const draftDetached =
+				submittedMode === "plan" ||
+				submittedMode === "vibe" ||
+				submittedMode === "goal" ||
+				submittedMode === "guided-goal";
+			if (
+				draftDetached &&
+				submittedImages?.length &&
+				submittedImages.every((image, index) => this.ctx.editor.pendingImages[index] === image)
+			) {
+				this.ctx.editor.pendingImages.splice(0, submittedImages.length);
+				this.ctx.editor.pendingImageLinks.splice(0, submittedImages.length);
+				this.ctx.editor.imageLinks =
+					this.ctx.editor.pendingImageLinks.length > 0 ? this.ctx.editor.pendingImageLinks : undefined;
+			}
 
 			if (!text && !hasInputImages) return;
 
@@ -694,9 +729,11 @@ export class InputController {
 
 			// Handle built-in slash commands
 			if (text) {
-				const slashResult = await executeBuiltinSlashCommand(text, {
-					ctx: this.ctx,
-				});
+				const input =
+					(inputImages?.length ?? 0) > 0 || (inputImageLinks?.length ?? 0) > 0
+						? { images: inputImages, imageLinks: inputImageLinks }
+						: undefined;
+				const slashResult = await executeBuiltinSlashCommand(text, { ctx: this.ctx, input, draftDetached });
 				if (slashResult === true) {
 					if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
 					return;
@@ -1312,9 +1349,8 @@ export class InputController {
 		}
 
 		if (text) {
-			const slashResult = await executeBuiltinSlashCommand(text, {
-				ctx: this.ctx,
-			});
+			const input = (images?.length ?? 0) > 0 || (imageLinks?.length ?? 0) > 0 ? { images, imageLinks } : undefined;
+			const slashResult = await executeBuiltinSlashCommand(text, { ctx: this.ctx, input });
 			if (slashResult === true) {
 				if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
 				return;
@@ -1888,15 +1924,16 @@ export class InputController {
 		}
 
 		for (const child of this.ctx.chatContainer.children) {
-			if (child instanceof ToolExecutionComponent || child instanceof ReadToolGroupComponent) {
-				if (!this.ctx.hideToolActivity) child.setExpanded(false);
-				child.setToolActivityVisible(!this.ctx.hideToolActivity);
+			if (
+				!this.ctx.hideToolActivity &&
+				(child instanceof ToolExecutionComponent || child instanceof ReadToolGroupComponent)
+			) {
+				child.setExpanded(false);
 			} else if (child instanceof AssistantMessageComponent) {
 				child.setToolResultImagesVisible(!this.ctx.hideToolActivity);
-			} else if (child instanceof StrippedToolCallsPlaceholder) {
-				child.setToolActivityVisible(!this.ctx.hideToolActivity);
 			}
 		}
+		this.ctx.chatContainer.setToolActivityVisible(!this.ctx.hideToolActivity);
 
 		if (this.ctx.hideToolActivity) this.ctx.ui.clearInlineImages();
 		this.ctx.ui.resetDisplay();

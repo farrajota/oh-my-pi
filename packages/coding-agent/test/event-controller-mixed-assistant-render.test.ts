@@ -53,6 +53,7 @@ function lineContaining(lines: string[], marker: string): number {
 
 function createFixture(hideToolActivity = false) {
 	const chatContainer = new TranscriptContainer();
+	chatContainer.setToolActivityVisible(!hideToolActivity);
 	const pendingTools = new Map();
 	const ui = {
 		requestRender: vi.fn(),
@@ -61,6 +62,7 @@ function createFixture(hideToolActivity = false) {
 	} as unknown as TUI;
 	const viewSession = {
 		getToolByName: () => undefined,
+		hasBuiltInTool: () => true,
 		extensionRunner: undefined,
 		isTtsrAbortPending: false,
 		retryAttempt: 0,
@@ -219,7 +221,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 	});
 
 	it("keeps assistant text streaming while hiding bash failures and grouped read activity", async () => {
-		const { controller, chatContainer } = createFixture(true);
+		const { controller, chatContainer, ctx } = createFixture(true);
 		const bashCall: ToolCall = {
 			type: "toolCall",
 			id: TOOL_CALL_A_ID,
@@ -241,11 +243,11 @@ describe("EventController mixed assistant text/tool rendering", () => {
 			{ type: "text", text: FINAL_MARKER },
 		]);
 
-		await controller.handleEvent({ type: "message_start", message: started } as Extract<
+        await controller.handleEvent(ctx.viewSession, { type: "message_start", message: started } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-		await controller.handleEvent({
+        await controller.handleEvent(ctx.viewSession, {
 			type: "message_update",
 			message: streaming,
 			assistantMessageEvent: {
@@ -255,33 +257,33 @@ describe("EventController mixed assistant text/tool rendering", () => {
 				partial: streaming,
 			},
 		} as Extract<AgentSessionEvent, { type: "message_update" }>);
-		await controller.handleEvent({
+        await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_A_ID,
 			toolName: "bash",
 			args: bashCall.arguments,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
-		await controller.handleEvent({
+        await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_A_ID,
 			toolName: "bash",
 			result: { content: [{ type: "text", text: HIDDEN_BASH_FAILURE_MARKER }] },
 			isError: true,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-		await controller.handleEvent({
+        await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_B_ID,
 			toolName: "read",
 			args: readCall.arguments,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
-		await controller.handleEvent({
+        await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_B_ID,
 			toolName: "read",
 			result: { content: [{ type: "text", text: "read result must stay hidden" }] },
 			isError: false,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-		await controller.handleEvent({ type: "message_end", message: streaming } as Extract<
+        await controller.handleEvent(ctx.viewSession, { type: "message_end", message: streaming } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);

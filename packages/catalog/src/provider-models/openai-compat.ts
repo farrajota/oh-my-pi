@@ -1,6 +1,7 @@
-import { VERSION } from "@oh-my-pi/pi-utils";
+import { USER_AGENT } from "@oh-my-pi/pi-utils";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import {
+	DEFAULT_OPENAI_COMPATIBLE_DISCOVERY_TIMEOUT_MS,
 	fetchOpenAICompatibleModels,
 	type OpenAICompatibleModelMapperContext,
 	type OpenAICompatibleModelRecord,
@@ -18,13 +19,14 @@ import {
 } from "../identity/family";
 import { resolveModelReference } from "../identity/reference";
 import type { ModelManagerOptions } from "../model-manager";
-import { getBundledModels } from "../models";
+import { type GeneratedProvider, getBundledModels } from "../models";
 import type { Api, FetchImpl, Model, ModelSpec, OpenAICompat, Provider, ThinkingConfig } from "../types";
 import { discoveryFetch, isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber } from "../utils";
 import { ALIBABA_TOKEN_PLAN_BASE_URL, parseAlibabaTokenPlanCredential } from "../wire/alibaba-token-plan";
 import { coreWeaveProjectHeaders } from "../wire/coreweave";
 import {
 	COPILOT_API_HEADERS,
+	discoverGitHubCopilotApiEndpoint,
 	getGitHubCopilotBaseUrl,
 	isPersonalGitHubCopilotBaseUrl,
 	parseGitHubCopilotApiKey,
@@ -111,7 +113,7 @@ const catalogSession: {
 	hasPayload: boolean;
 } = { inflight: null, payload: undefined, etag: null, hasPayload: false };
 
-const CATALOG_USER_AGENT = `omp/${VERSION} (+https://omp.sh)`;
+const CATALOG_USER_AGENT = USER_AGENT;
 
 /**
  * Fetches the models.dev catalog via catalog.stencil.so, which serves a
@@ -592,60 +594,68 @@ function resolveSimpleProviderHeaders(
 	return typeof headers === "function" ? headers() : headers;
 }
 
-export function createSimpleOpenAICompletionsOptions(
-	providerId: Parameters<typeof getBundledModels>[0],
-	defaultBaseUrl: string,
-	config?: SimpleProviderConfig,
-): ModelManagerOptions<"openai-completions"> {
-	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? defaultBaseUrl;
-	const references = createBundledReferenceMap<"openai-completions">(providerId);
+type OpenAICompatibleModelManagerBuilderOptions<TApi extends Api> = {
+	api: TApi;
+	providerId: GeneratedProvider;
+	defaultBaseUrl: string;
+	config?: SimpleProviderConfig;
+	headers?: SimpleProviderDiscoveryHeaders;
+	dynamicModelsAuthoritative?: true;
+	requireApiKey?: true;
+	filterModel?: (
+		entry: OpenAICompatibleModelRecord,
+		model: ModelSpec<TApi>,
+		references: Map<string, ModelSpec<TApi>>,
+	) => boolean;
+	mapModel: (
+		entry: OpenAICompatibleModelRecord,
+		defaults: ModelSpec<TApi>,
+		reference: ModelSpec<TApi> | undefined,
+	) => ModelSpec<TApi> | null;
+};
+
+function createOpenAICompatibleModelManagerOptions<TApi extends Api>(
+	options: OpenAICompatibleModelManagerBuilderOptions<TApi>,
+): ModelManagerOptions<TApi> {
+	const apiKey = options.config?.apiKey;
+	const baseUrl = options.config?.baseUrl ?? options.defaultBaseUrl;
+	const references = createBundledReferenceMap<TApi>(options.providerId);
+	const filterModel = options.filterModel;
 	return {
-		providerId,
-		...(apiKey && {
+		providerId: options.providerId,
+		...(options.dynamicModelsAuthoritative && { dynamicModelsAuthoritative: true }),
+		...((!options.requireApiKey || apiKey) && {
 			fetchDynamicModels: () =>
 				fetchOpenAICompatibleModels({
-					api: "openai-completions",
-					provider: providerId,
+					api: options.api,
+					provider: options.providerId,
 					baseUrl,
 					apiKey,
-					headers: resolveSimpleProviderHeaders(config?.headers),
-					mapModel: (entry, defaults) => {
-						const reference = references.get(defaults.id);
-						return mapWithBundledReference(entry, defaults, reference);
-					},
-					fetch: config?.fetch,
+					...(options.headers && { headers: resolveSimpleProviderHeaders(options.headers) }),
+					...(filterModel && {
+						filterModel: (entry, model) => filterModel(entry, model, references),
+					}),
+					mapModel: (entry, defaults) => options.mapModel(entry, defaults, references.get(defaults.id)),
+					fetch: options.config?.fetch,
 				}),
 		}),
 	};
 }
 
-function createSimpleOpenAIResponsesOptions(
+export function createSimpleOpenAICompletionsOptions(
 	providerId: Parameters<typeof getBundledModels>[0],
 	defaultBaseUrl: string,
 	config?: SimpleProviderConfig,
-): ModelManagerOptions<"openai-responses"> {
-	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? defaultBaseUrl;
-	const references = createBundledReferenceMap<"openai-responses">(providerId);
-	return {
+): ModelManagerOptions<"openai-completions"> {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-completions",
 		providerId,
-		...(apiKey && {
-			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels({
-					api: "openai-responses",
-					provider: providerId,
-					baseUrl,
-					apiKey,
-					headers: resolveSimpleProviderHeaders(config?.headers),
-					mapModel: (entry, defaults) => {
-						const reference = references.get(defaults.id);
-						return mapWithBundledReference(entry, defaults, reference);
-					},
-					fetch: config?.fetch,
-				}),
-		}),
-	};
+		defaultBaseUrl,
+		config,
+		headers: config?.headers,
+		requireApiKey: true,
+		mapModel: mapWithBundledReference,
+	});
 }
 
 function createSimpleAnthropicProviderOptions(
@@ -858,6 +868,44 @@ export function umansModelManagerOptions(config?: UmansModelManagerConfig): Mode
 // 1. OpenAI
 // ---------------------------------------------------------------------------
 
+const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
+export const OPENAI_GPT_56_LONG_CONTEXT_COSTS = {
+	luna: {
+		inputThreshold: 272_000,
+		input: 0.4,
+		output: 1.8,
+		cacheRead: 0.04,
+		cacheWrite: 0.5,
+	},
+	sol: {
+		inputThreshold: 272_000,
+		input: 10,
+		output: 45,
+		cacheRead: 1,
+		cacheWrite: 12.5,
+	},
+	terra: {
+		inputThreshold: 272_000,
+		input: 4,
+		output: 18,
+		cacheRead: 0.4,
+		cacheWrite: 5,
+	},
+} as const;
+const OPENAI_GPT_56_SOL_STANDARD_COST = {
+	input: 5,
+	output: 30,
+	cacheRead: 0.5,
+	cacheWrite: 6.25,
+	longContext: OPENAI_GPT_56_LONG_CONTEXT_COSTS.sol,
+} as const;
+const OPENAI_GPT_56_CYBER_STANDARD_COST = {
+	input: 12.5,
+	output: 75,
+	cacheRead: 1.25,
+	cacheWrite: 15.625,
+} as const;
+
 export interface OpenAIModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
@@ -865,28 +913,60 @@ export interface OpenAIModelManagerConfig {
 }
 
 export function openaiModelManagerOptions(config?: OpenAIModelManagerConfig): ModelManagerOptions<"openai-responses"> {
-	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://api.openai.com/v1";
-	const references = createBundledReferenceMap<"openai-responses">("openai");
-	return {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-responses",
 		providerId: "openai",
-		...(apiKey && {
-			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels({
-					api: "openai-responses",
-					provider: "openai",
-					baseUrl,
-					apiKey,
-					filterModel: (_entry, model) => isLikelyOpenAIResponsesModelId(model.id, references),
-					mapModel: (entry, defaults) => {
-						const reference = references.get(defaults.id);
-						return mapWithBundledReference(entry, defaults, reference);
-					},
-					fetch: config?.fetch,
-				}),
-		}),
-	};
+		defaultBaseUrl: OPENAI_API_BASE_URL,
+		config,
+		requireApiKey: true,
+		filterModel: (_entry, model, references) => isLikelyOpenAIResponsesModelId(model.id, references),
+		mapModel: mapWithBundledReference,
+	});
 }
+
+/**
+ * Daybreak models are approval-gated first-party Responses models that are not
+ * yet present in stencil.so. Seed the documented aliases and current Cyber
+ * snapshot so fresh installs expose them without credentialed discovery.
+ */
+export const OPENAI_DAYBREAK_CURATED_FALLBACK_MODELS: readonly ModelSpec<"openai-responses">[] = [
+	{
+		id: "daybreak-blue-latest",
+		name: "Daybreak Blue",
+		api: "openai-responses",
+		provider: "openai",
+		baseUrl: OPENAI_API_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: OPENAI_GPT_56_SOL_STANDARD_COST,
+		contextWindow: 1_050_000,
+		maxTokens: 128_000,
+	},
+	{
+		id: "daybreak-red-latest",
+		name: "Daybreak Red",
+		api: "openai-responses",
+		provider: "openai",
+		baseUrl: OPENAI_API_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: OPENAI_GPT_56_CYBER_STANDARD_COST,
+		contextWindow: 400_000,
+		maxTokens: 128_000,
+	},
+	{
+		id: "gpt-5.6-cyber",
+		name: "GPT-5.6 Cyber",
+		api: "openai-responses",
+		provider: "openai",
+		baseUrl: OPENAI_API_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: OPENAI_GPT_56_CYBER_STANDARD_COST,
+		contextWindow: 400_000,
+		maxTokens: 128_000,
+	},
+];
 
 /** First-party gpt-5.6 SKUs that accept `reasoning: { mode: "pro" }` on the Responses APIs. */
 const OPENAI_PRO_REASONING_BASE_IDS: Record<string, true> = {
@@ -1036,27 +1116,15 @@ export interface CerebrasModelManagerConfig {
 export function cerebrasModelManagerOptions(
 	config?: CerebrasModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
-	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://api.cerebras.ai/v1";
-	const references = createBundledReferenceMap<"openai-completions">("cerebras");
-	return {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-completions",
 		providerId: "cerebras",
-		...(apiKey && {
-			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels({
-					api: "openai-completions",
-					provider: "cerebras",
-					baseUrl,
-					apiKey,
-					mapModel: (entry, defaults) => {
-						const reference = references.get(defaults.id);
-						const model = mapWithBundledReference(entry, defaults, reference);
-						return applyCerebrasDiscoveryOverrides(model);
-					},
-					fetch: config?.fetch,
-				}),
-		}),
-	};
+		defaultBaseUrl: "https://api.cerebras.ai/v1",
+		config,
+		requireApiKey: true,
+		mapModel: (entry, defaults, reference) =>
+			applyCerebrasDiscoveryOverrides(mapWithBundledReference(entry, defaults, reference)),
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,31 +1228,23 @@ function mapNovitaModel(
 export function novitaModelManagerOptions(
 	config?: NovitaModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
-	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://api.novita.ai/openai/v1";
-	const references = createBundledReferenceMap<"openai-completions">("novita");
-	return {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-completions",
 		providerId: "novita",
+		defaultBaseUrl: "https://api.novita.ai/openai/v1",
+		config,
 		dynamicModelsAuthoritative: true,
-		fetchDynamicModels: async () =>
-			fetchOpenAICompatibleModels({
-				api: "openai-completions",
-				provider: "novita",
-				baseUrl,
-				apiKey,
-				mapModel: (entry, defaults) => mapNovitaModel(entry, defaults, references.get(defaults.id)),
-				filterModel: (entry, model) => {
-					const active = typeof entry.status !== "number" || entry.status === 1;
-					return (
-						active &&
-						isPublicNovitaModelId(model.id) &&
-						novitaArrayIncludes(entry.endpoints, "chat/completions") &&
-						toPositiveNumber(entry.max_output_tokens, 0) > 0
-					);
-				},
-				fetch: config?.fetch,
-			}),
-	};
+		filterModel: (entry, model) => {
+			const active = typeof entry.status !== "number" || entry.status === 1;
+			return (
+				active &&
+				isPublicNovitaModelId(model.id) &&
+				novitaArrayIncludes(entry.endpoints, "chat/completions") &&
+				toPositiveNumber(entry.max_output_tokens, 0) > 0
+			);
+		},
+		mapModel: mapNovitaModel,
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,11 +1513,14 @@ export function xaiOAuthModelManagerOptions(
 ): ModelManagerOptions<"openai-responses"> {
 	const defaultBaseUrl = "https://api.x.ai/v1";
 	const resolvedBaseUrl = config?.baseUrl ?? defaultBaseUrl;
-	const base = createSimpleOpenAIResponsesOptions(
-		"xai-oauth" as Parameters<typeof getBundledModels>[0],
+	const base = createOpenAICompatibleModelManagerOptions({
+		api: "openai-responses",
+		providerId: "xai-oauth",
 		defaultBaseUrl,
 		config,
-	);
+		requireApiKey: true,
+		mapModel: mapWithBundledReference,
+	});
 	// Static seed handed to the runtime model manager so the picker populates on
 	// a fresh login even before `fetchDynamicModels` fires (it is gated on
 	// `config.apiKey` at construction time, and OAuth tokens resolve later via
@@ -1510,28 +1573,16 @@ export interface AimlApiModelManagerConfig {
 export function aimlApiModelManagerOptions(
 	config?: AimlApiModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
-	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://api.aimlapi.com/v1";
-	const references = createBundledReferenceMap<"openai-completions">("aimlapi");
-	return {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-completions",
 		providerId: "aimlapi",
+		defaultBaseUrl: "https://api.aimlapi.com/v1",
+		config,
 		dynamicModelsAuthoritative: true,
-		...(apiKey && {
-			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels({
-					api: "openai-completions",
-					provider: "aimlapi",
-					baseUrl,
-					apiKey,
-					filterModel: (_entry, model) => isLikelyAimlApiChatModelId(model.id),
-					mapModel: (entry, defaults) => {
-						const reference = references.get(defaults.id);
-						return mapWithBundledReference(entry, defaults, reference);
-					},
-					fetch: config?.fetch,
-				}),
-		}),
-	};
+		requireApiKey: true,
+		filterModel: (_entry, model) => isLikelyAimlApiChatModelId(model.id),
+		mapModel: mapWithBundledReference,
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -1845,6 +1896,7 @@ const FIREWORKS_FAST_VARIANT_SPECS: ReadonlyArray<{
 	{ base: "kimi-k2.7-code", name: "Kimi K2.7 Code Fast", cost: { input: 1.9, output: 8, cacheRead: 0.38 } },
 	{ base: "kimi-k2.6", name: "Kimi K2.6 Fast", cost: { input: 2, output: 8, cacheRead: 0.3 } },
 	{ base: "glm-5.1", name: "GLM-5.1 Fast", cost: { input: 2.8, output: 8.8, cacheRead: 0.52 } },
+	{ base: "glm-5.2", name: "GLM-5.2 Fast", cost: { input: 2.1, output: 6.6, cacheRead: 0.21 } },
 ];
 
 /**
@@ -2699,24 +2751,13 @@ export interface AlibabaCodingPlanModelManagerConfig {
 export function alibabaCodingPlanModelManagerOptions(
 	config?: AlibabaCodingPlanModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
-	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://coding-intl.dashscope.aliyuncs.com/v1";
-	const references = createBundledReferenceMap<"openai-completions">("alibaba-coding-plan");
-	return {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-completions",
 		providerId: "alibaba-coding-plan",
-		fetchDynamicModels: () =>
-			fetchOpenAICompatibleModels({
-				api: "openai-completions",
-				provider: "alibaba-coding-plan",
-				baseUrl,
-				apiKey,
-				mapModel: (entry, defaults) => {
-					const reference = references.get(defaults.id);
-					return mapWithBundledReference(entry, defaults, reference);
-				},
-				fetch: config?.fetch,
-			}),
-	};
+		defaultBaseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1",
+		config,
+		mapModel: mapWithBundledReference,
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -2732,6 +2773,17 @@ const ALIBABA_TOKEN_PLAN_COMPAT: OpenAICompat = {
 const ALIBABA_TOKEN_PLAN_REASONING: ThinkingConfig = {
 	mode: "effort",
 	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
+};
+// Qwen3.8-Max combines Qwen's binary thinking toggle with OpenAI-style
+// `reasoning_effort`. The base Qwen view encodes disabled turns; reasoning
+// requests swap to the OpenAI effort dialect and explicitly enable thinking.
+const ALIBABA_TOKEN_PLAN_QWEN_EFFORT_COMPAT: OpenAICompat = {
+	...ALIBABA_TOKEN_PLAN_COMPAT,
+	supportsReasoningEffort: true,
+	whenThinking: {
+		thinkingFormat: "openai",
+		extraBody: { enable_thinking: true },
+	},
 };
 
 export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-completions">[] = [
@@ -2755,6 +2807,24 @@ export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-comple
 			...ALIBABA_TOKEN_PLAN_COMPAT,
 			supportsReasoningEffort: true,
 		},
+	},
+	{
+		id: "qwen3.8-max",
+		name: "Qwen3.8 Max",
+		api: "openai-completions",
+		provider: "alibaba-token-plan",
+		baseUrl: ALIBABA_TOKEN_PLAN_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: ALIBABA_TOKEN_PLAN_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+		thinking: {
+			mode: "effort",
+			efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
+			defaultLevel: Effort.XHigh,
+		},
+		compat: ALIBABA_TOKEN_PLAN_QWEN_EFFORT_COMPAT,
 	},
 	{
 		id: "qwen3.7-max",
@@ -2834,6 +2904,64 @@ export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-comple
 	},
 ];
 
+/**
+ * Metadata for Alibaba Token Plan models that are dynamically discovered but not
+ * in the static catalog. Context window and max tokens are sourced from
+ * official model documentation and provider catalogs. Unknown future models
+ * remain available with null limits instead of assigning unsafe guessed limits.
+ */
+export interface AlibabaTokenPlanModelLimits {
+	contextWindow: number;
+	maxTokens: number;
+}
+
+export const ALIBABA_TOKEN_PLAN_DISCOVERED_MODEL_LIMITS: Readonly<Record<string, AlibabaTokenPlanModelLimits>> = {
+	"qwen3.6-plus": {
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+	},
+	"qwen3.8-max": {
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+	},
+	"deepseek-v4-flash": {
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+	},
+	"deepseek-v4-flash-0731": {
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+	},
+	"deepseek-v3.2": {
+		contextWindow: 131_072,
+		maxTokens: 65_536,
+	},
+	"glm-5.1": {
+		contextWindow: 202_752,
+		maxTokens: 128_000,
+	},
+	"glm-5": {
+		contextWindow: 202_752,
+		maxTokens: 16_384,
+	},
+	"kimi-k2.7-code": {
+		contextWindow: 262_144,
+		maxTokens: 262_144,
+	},
+	"kimi-k2.6": {
+		contextWindow: 262_144,
+		maxTokens: 262_144,
+	},
+	"kimi-k2.5": {
+		contextWindow: 262_144,
+		maxTokens: 98_304,
+	},
+	"minimax-m2.5": {
+		contextWindow: 196_608,
+		maxTokens: 32_768,
+	},
+};
+
 const ALIBABA_TOKEN_PLAN_NON_CHAT_MODEL_PREFIXES = [
 	"fun-asr",
 	"happyhorse-",
@@ -2888,10 +3016,19 @@ export function alibabaTokenPlanModelManagerOptions(
 								baseUrl: defaults.baseUrl,
 							};
 						}
-						// DeepSeek V4 family models discovered dynamically need reasoning config
-						if (defaults.id.startsWith("deepseek-v4")) {
+						const normalizedId = defaults.id.trim().toLowerCase();
+						const limits = ALIBABA_TOKEN_PLAN_DISCOVERED_MODEL_LIMITS[normalizedId];
+						const enriched = limits
+							? {
+									...defaults,
+									contextWindow: limits.contextWindow,
+									maxTokens: limits.maxTokens,
+								}
+							: defaults;
+
+						if (normalizedId.startsWith("deepseek-v4")) {
 							return {
-								...defaults,
+								...enriched,
 								reasoning: true,
 								thinking: {
 									mode: "effort" as const,
@@ -2899,7 +3036,7 @@ export function alibabaTokenPlanModelManagerOptions(
 								},
 							};
 						}
-						return defaults;
+						return enriched;
 					},
 					fetch: config?.fetch,
 				}),
@@ -3452,29 +3589,20 @@ export interface VeniceModelManagerConfig {
 export function veniceModelManagerOptions(
 	config?: VeniceModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
-	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://api.venice.ai/api/v1";
-	const references = createBundledReferenceMap<"openai-completions">("venice");
-	return {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-completions",
 		providerId: "venice",
-		fetchDynamicModels: () =>
-			fetchOpenAICompatibleModels({
-				api: "openai-completions",
-				provider: "venice",
-				baseUrl,
-				apiKey,
-				mapModel: (entry, defaults) => {
-					const reference = references.get(defaults.id);
-					const model = mapWithBundledReference(entry, defaults, reference);
-					return {
-						...model,
-						maxTokens: clampKimiK27CodeMaxTokens(defaults.id, model.maxTokens),
-						compat: { ...model.compat, supportsUsageInStreaming: false },
-					};
-				},
-				fetch: config?.fetch,
-			}),
-	};
+		defaultBaseUrl: "https://api.venice.ai/api/v1",
+		config,
+		mapModel: (entry, defaults, reference) => {
+			const model = mapWithBundledReference(entry, defaults, reference);
+			return {
+				...model,
+				maxTokens: clampKimiK27CodeMaxTokens(defaults.id, model.maxTokens),
+				compat: { ...model.compat, supportsUsageInStreaming: false },
+			};
+		},
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -3490,83 +3618,65 @@ export interface BasetenModelManagerConfig {
 export function basetenModelManagerOptions(
 	config?: BasetenModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
-	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://inference.baseten.co/v1";
-	const references = createBundledReferenceMap<"openai-completions">("baseten");
-	return {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-completions",
 		providerId: "baseten",
+		defaultBaseUrl: "https://inference.baseten.co/v1",
+		config,
 		dynamicModelsAuthoritative: true,
-		...(apiKey && {
-			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels({
-					api: "openai-completions",
-					provider: "baseten",
-					baseUrl,
-					apiKey,
-					mapModel: (entry, defaults) => {
-						const reference = references.get(defaults.id);
-						const raw = entry as Record<string, unknown> & {
-							supported_features?: unknown;
-							input_modalities?: unknown;
-							pricing?: Record<string, unknown>;
-						};
-						const features = Array.isArray(raw.supported_features) ? raw.supported_features : [];
-						const modalities = Array.isArray(raw.input_modalities) ? raw.input_modalities : [];
+		requireApiKey: true,
+		mapModel: (entry, defaults, reference) => {
+			const raw = entry as Record<string, unknown> & {
+				supported_features?: unknown;
+				input_modalities?: unknown;
+				pricing?: Record<string, unknown>;
+			};
+			const features = Array.isArray(raw.supported_features) ? raw.supported_features : [];
+			const modalities = Array.isArray(raw.input_modalities) ? raw.input_modalities : [];
 
-						const isBasetenNativeReasoning =
-							defaults.id === "openai/gpt-oss-120b" ||
-							defaults.id === "deepseek-ai/DeepSeek-V4-Pro" ||
-							defaults.id === "zai-org/GLM-5.2";
-						const reasoning =
-							isBasetenNativeReasoning &&
-							(features.includes("reasoning") || features.includes("reasoning_effort"));
-						const supportsTools = features.includes("tools") ? undefined : false;
-						const vision = modalities.includes("image") || (reference?.input.includes("image") ?? false);
+			// Baseten's reasoning router accepts only the high/max
+			// effort tiers for its GLM-5.2 and gpt-oss routes.
+			const isEffortReasoning =
+				defaults.id === "openai/gpt-oss-120b" ||
+				defaults.id === "zai-org/GLM-5.2" ||
+				defaults.id === "zai-org/GLM-5.2-Fast";
+			const isBasetenNativeReasoning = isEffortReasoning || defaults.id === "deepseek-ai/DeepSeek-V4-Pro";
+			const reasoning =
+				isBasetenNativeReasoning && (features.includes("reasoning") || features.includes("reasoning_effort"));
+			const supportsTools = features.includes("tools") ? undefined : false;
+			const vision = modalities.includes("image") || (reference?.input.includes("image") ?? false);
 
-						const pricing = raw.pricing ?? {};
-						const cost = {
-							input: toPositiveNumber(pricing.prompt, 0) * 1_000_000,
-							output: toPositiveNumber(pricing.completion, 0) * 1_000_000,
-							cacheRead: toPositiveNumber(pricing.input_cache_read, 0) * 1_000_000,
-							cacheWrite: 0,
-						};
+			const pricing = raw.pricing ?? {};
+			const cost = {
+				input: toPositiveNumber(pricing.prompt, 0) * 1_000_000,
+				output: toPositiveNumber(pricing.completion, 0) * 1_000_000,
+				cacheRead: toPositiveNumber(pricing.input_cache_read, 0) * 1_000_000,
+				cacheWrite: 0,
+			};
 
-						const contextWindow = toPositiveNumber(
-							raw.context_length,
-							reference?.contextWindow ?? defaults.contextWindow,
-						);
-						const maxTokens = toPositiveNumber(
-							raw.max_completion_tokens,
-							reference?.maxTokens ?? defaults.maxTokens,
-						);
+			const contextWindow = toPositiveNumber(raw.context_length, reference?.contextWindow ?? defaults.contextWindow);
+			const maxTokens = toPositiveNumber(raw.max_completion_tokens, reference?.maxTokens ?? defaults.maxTokens);
 
-						const baseModel = mapWithBundledReference(entry, defaults, reference);
+			const baseModel = mapWithBundledReference(entry, defaults, reference);
+			const thinking = isEffortReasoning
+				? {
+						mode: "effort" as const,
+						efforts: [Effort.High, Effort.Max],
+					}
+				: undefined;
 
-						// Baseten's reasoning router accepts only the high/max
-						// effort tiers for its GLM-5.2 and gpt-oss routes.
-						const isEffortReasoning = defaults.id === "openai/gpt-oss-120b" || defaults.id === "zai-org/GLM-5.2";
-						const thinking = isEffortReasoning
-							? {
-									mode: "effort" as const,
-									efforts: [Effort.High, Effort.Max],
-								}
-							: undefined;
-
-						return {
-							...baseModel,
-							reasoning,
-							input: vision ? ["text", "image"] : ["text"],
-							cost,
-							contextWindow,
-							maxTokens,
-							...(thinking ? { thinking } : {}),
-							...(supportsTools === false ? { supportsTools } : {}),
-						};
-					},
-					fetch: config?.fetch,
-				}),
-		}),
-	};
+			return {
+				...baseModel,
+				reasoning,
+				input: vision ? ["text", "image"] : ["text"],
+				cost,
+				contextWindow,
+				maxTokens,
+				...(thinking ? { thinking } : {}),
+				...(supportsTools === false ? { supportsTools } : {}),
+			};
+		},
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -3625,6 +3735,40 @@ export const META_MUSE_STATIC_MODELS: readonly ModelSpec<"openai-responses">[] =
 		reasoning: true,
 		input: ["text", "image"],
 		cost: META_MUSE_SPARK_COST,
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		thinking: META_MUSE_SPARK_THINKING,
+		compat: {
+			supportsReasoningEffort: true,
+			includeEncryptedReasoning: true,
+		},
+	},
+	{
+		id: "muse-spark-1.2",
+		name: "Muse Spark 1.2",
+		api: "openai-responses",
+		provider: "meta",
+		baseUrl: META_MODEL_API_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: META_MUSE_SPARK_COST,
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		thinking: META_MUSE_SPARK_THINKING,
+		compat: {
+			supportsReasoningEffort: true,
+			includeEncryptedReasoning: true,
+		},
+	},
+	{
+		id: "muse-spark-1.2-contributor",
+		name: "Muse Spark 1.2 Contributor (Data Used for Training)",
+		api: "openai-responses",
+		provider: "meta",
+		baseUrl: META_MODEL_API_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
 		contextWindow: 1_048_576,
 		maxTokens: 131_072,
 		thinking: META_MUSE_SPARK_THINKING,
@@ -3763,7 +3907,14 @@ export interface MetaModelManagerConfig {
 
 export function metaModelManagerOptions(config?: MetaModelManagerConfig): ModelManagerOptions<"openai-responses"> {
 	return {
-		...createSimpleOpenAIResponsesOptions("meta", META_MODEL_API_BASE_URL, config),
+		...createOpenAICompatibleModelManagerOptions({
+			api: "openai-responses",
+			providerId: "meta",
+			defaultBaseUrl: META_MODEL_API_BASE_URL,
+			config,
+			requireApiKey: true,
+			mapModel: mapWithBundledReference,
+		}),
 		staticModels: META_MUSE_STATIC_MODELS,
 	};
 }
@@ -3798,67 +3949,56 @@ const MOONSHOT_KIMI_K3_THINKING: ThinkingConfig = { mode: "effort", efforts: [Ef
 export function moonshotModelManagerOptions(
 	config?: MoonshotModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
-	const apiKey = config?.apiKey;
-	// `MOONSHOT_BASE_URL` redirects discovery (and the streaming request that
-	// inherits this baseUrl) at the Kimi China platform `api.moonshot.cn`; an
-	// explicit `config.baseUrl` still wins. Mirrors LITELLM_BASE_URL/LM_STUDIO_BASE_URL. (#2883)
-	const baseUrl = config?.baseUrl ?? Bun.env.MOONSHOT_BASE_URL ?? "https://api.moonshot.ai/v1";
-	const references = createBundledReferenceMap<"openai-completions">("moonshot");
-	return {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-completions",
 		providerId: "moonshot",
-		...(apiKey && {
-			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels({
-					api: "openai-completions",
-					provider: "moonshot",
-					baseUrl,
-					apiKey,
-					mapModel: (entry, defaults) => {
-						const reference = references.get(defaults.id);
-						const model = mapWithBundledReference(entry, defaults, reference);
-						const id = model.id.toLowerCase();
-						// Kimi K3 is discovered but has no bundled/models.dev reference, so the
-						// generic dynamic defaults would report it "Free" with no capabilities
-						// (#5756). Stamp the official pricing/limits when the endpoint doesn't
-						// carry them, and mark it reasoning + vision. K3 always reasons via
-						// `reasoning_effort: "max"` and does NOT use the K2.x `thinking` block,
-						// so its thinking config is the single-tier `max` scale — the wire path
-						// routes it through `reasoning_effort` (see `buildOpenAICompat`).
-						if (!reference && isKimiK3ModelId(id)) {
-							const isZeroCost = model.cost.input === 0 && model.cost.output === 0 && model.cost.cacheRead === 0;
-							return {
-								...model,
-								reasoning: true,
-								input: ["text", "image"],
-								cost: isZeroCost ? { ...MOONSHOT_KIMI_K3_COST } : model.cost,
-								contextWindow: model.contextWindow ?? MOONSHOT_KIMI_K3_CONTEXT_WINDOW,
-								maxTokens: model.maxTokens ?? MOONSHOT_KIMI_K3_MAX_TOKENS,
-								thinking: model.thinking ?? { ...MOONSHOT_KIMI_K3_THINKING },
-							};
-						}
-						// Moonshot's K2.x family (K2.5, K2.6, kimi-k2-thinking, …) is reasoning-capable
-						// and vision-capable on the native API. Without these flags the openai-completions
-						// path skips the z.ai-format `thinking` block, and Moonshot K2.6 stalls on first
-						// turn because its endpoint expects an explicit `thinking: {type}` (#2113). Match
-						// the bundled K2.5 metadata for every K2.x id we discover.
-						const isKimiK2Reasoning = id.includes("thinking") || /(^|\/)kimi-k2(?:\.\d+)?(?:[-:]|$)/.test(id);
-						const isVision =
-							id.includes("vision") || id.includes("vl") || /(^|\/)kimi-k2(?:\.\d+)?(?:[-:]|$)/.test(id);
-						return {
-							...model,
-							reasoning: isKimiK2Reasoning || model.reasoning,
-							input: isVision ? ["text", "image"] : model.input,
-							thinking:
-								model.thinking ??
-								(isKimiK2Reasoning
-									? { mode: "effort", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] }
-									: undefined),
-						};
-					},
-					fetch: config?.fetch,
-				}),
-		}),
-	};
+		// `MOONSHOT_BASE_URL` redirects discovery (and the streaming request that
+		// inherits this baseUrl) at the Kimi China platform `api.moonshot.cn`; an
+		// explicit `config.baseUrl` still wins. Mirrors LITELLM_BASE_URL/LM_STUDIO_BASE_URL. (#2883)
+		defaultBaseUrl: Bun.env.MOONSHOT_BASE_URL ?? "https://api.moonshot.ai/v1",
+		config,
+		requireApiKey: true,
+		mapModel: (entry, defaults, reference) => {
+			const model = mapWithBundledReference(entry, defaults, reference);
+			const id = model.id.toLowerCase();
+			// Kimi K3 is discovered but has no bundled/models.dev reference, so the
+			// generic dynamic defaults would report it "Free" with no capabilities
+			// (#5756). Stamp the official pricing/limits when the endpoint doesn't
+			// carry them, and mark it reasoning + vision. K3 always reasons via
+			// `reasoning_effort: "max"` and does NOT use the K2.x `thinking` block,
+			// so its thinking config is the single-tier `max` scale — the wire path
+			// routes it through `reasoning_effort` (see `buildOpenAICompat`).
+			if (!reference && isKimiK3ModelId(id)) {
+				const isZeroCost = model.cost.input === 0 && model.cost.output === 0 && model.cost.cacheRead === 0;
+				return {
+					...model,
+					reasoning: true,
+					input: ["text", "image"],
+					cost: isZeroCost ? { ...MOONSHOT_KIMI_K3_COST } : model.cost,
+					contextWindow: model.contextWindow ?? MOONSHOT_KIMI_K3_CONTEXT_WINDOW,
+					maxTokens: model.maxTokens ?? MOONSHOT_KIMI_K3_MAX_TOKENS,
+					thinking: model.thinking ?? { ...MOONSHOT_KIMI_K3_THINKING },
+				};
+			}
+			// Moonshot's K2.x family (K2.5, K2.6, kimi-k2-thinking, …) is reasoning-capable
+			// and vision-capable on the native API. Without these flags the openai-completions
+			// path skips the z.ai-format `thinking` block, and Moonshot K2.6 stalls on first
+			// turn because its endpoint expects an explicit `thinking: {type}` (#2113). Match
+			// the bundled K2.5 metadata for every K2.x id we discover.
+			const isKimiK2Reasoning = id.includes("thinking") || /(^|\/)kimi-k2(?:\.\d+)?(?:[-:]|$)/.test(id);
+			const isVision = id.includes("vision") || id.includes("vl") || /(^|\/)kimi-k2(?:\.\d+)?(?:[-:]|$)/.test(id);
+			return {
+				...model,
+				reasoning: isKimiK2Reasoning || model.reasoning,
+				input: isVision ? ["text", "image"] : model.input,
+				thinking:
+					model.thinking ??
+					(isKimiK2Reasoning
+						? { mode: "effort", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] }
+						: undefined),
+			};
+		},
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -5053,6 +5193,7 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 	const resolveReference = createReferenceResolver(getProviderReferences);
 	return {
 		providerId: "github-copilot",
+		cacheProviderId: resolveModelCacheProviderId("github-copilot", { apiKey: rawApiKey, baseUrl }),
 		dropCachedModelIdsOnStaticMismatch: COPILOT_CACHE_INVALIDATED_MODEL_IDS,
 		// COPILOT_API_HEADERS are compile-time constants (User-Agent + API
 		// version), not credentials. The cache omits all request headers for
@@ -5063,11 +5204,17 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 		restorableHeaderFallback: { ...COPILOT_API_HEADERS },
 		...(apiKey && {
 			fetchDynamicModels: async () => {
+				const fetchImpl = discoveryFetch(config?.fetch);
+				const requestBaseUrl = isPersonalGitHubCopilotBaseUrl(baseUrl)
+					? ((await withCatalogDiscoveryTimeout(DEFAULT_OPENAI_COMPATIBLE_DISCOVERY_TIMEOUT_MS, signal =>
+							discoverGitHubCopilotApiEndpoint(apiKey, fetchImpl, signal),
+						)) ?? baseUrl)
+					: baseUrl;
 				const longContextVariants: ModelSpec<Api>[] = [];
 				const models = await fetchOpenAICompatibleModels<Api>({
 					api: "openai-completions",
 					provider: "github-copilot",
-					baseUrl,
+					baseUrl: requestBaseUrl,
 					apiKey,
 					headers: COPILOT_API_HEADERS,
 					mapModel: (
@@ -5113,7 +5260,7 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 						const input: ModelSpec<Api>["input"] =
 							supportsVision === true
 								? ["text", "image"]
-								: supportsVision === false || !isPersonalGitHubCopilotBaseUrl(baseUrl)
+								: supportsVision === false || !isPersonalGitHubCopilotBaseUrl(requestBaseUrl)
 									? ["text"]
 									: (reference?.input ?? defaults.input);
 						// With COPILOT_API_HEADERS the served window is the long-context
@@ -5134,7 +5281,7 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 									...reference,
 									api,
 									provider: "github-copilot",
-									baseUrl,
+									baseUrl: requestBaseUrl,
 									name,
 									input,
 									contextWindow: defaultTierWindow,
@@ -5156,7 +5303,7 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 							: {
 									...defaults,
 									api,
-									baseUrl,
+									baseUrl: requestBaseUrl,
 									name,
 									input,
 									contextWindow: defaultTierWindow,
@@ -5202,7 +5349,7 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 						}
 						return base;
 					},
-					fetch: config?.fetch,
+					fetch: fetchImpl,
 				});
 				if (models === null) {
 					return null;
@@ -5508,7 +5655,14 @@ const OPENCODE_ZEN_API_RESOLUTION = createOpenCodeApiResolution("https://opencod
 // anthropic-style requests to /v1/messages and the gateway would return its
 // `Page Not Found` HTML (issue #887 for the qwen/m2.7 entries; minimax-m3
 // and minimax-m3-free added under #1617 for the same root cause).
+//
+// deepseek-v4-flash is the inverse case: it falls through to
+// openai-completions by default, but the Go gateway's
+// /zen/go/v1/chat/completions route does not work for this model while
+// /zen/go/v1/responses does (user-verified against the live gateway,
+// 2026-08-08; Flash only — deepseek-v4-pro serves fine on chat completions).
 const OPENCODE_GO_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen/go", {
+	"deepseek-v4-flash": "openai-responses",
 	"minimax-m2.7": "openai-completions",
 	"minimax-m3": "openai-completions",
 	"minimax-m3-free": "openai-completions",

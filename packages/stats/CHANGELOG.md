@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [17.3.0] - 2026-08-13
+
+### Added
+
+- Added cost-weighted `cacheSavings` metric alongside `cacheRate`, accounting for cache-read discounts and write premiums against equivalent uncached prompt costs.
+
+### Fixed
+
+- Ensured the embedded dashboard archive is byte-reproducible by sorting entries and zeroing tar and gzip timestamps during compilation.
+
+## [17.2.10] - 2026-08-06
+
+### Changed
+
+- Optimized package dependencies by replacing `date-fns` with `@oh-my-pi/pi-utils/dates` and removing unused test dependencies.
+
 ## [17.2.9] - 2026-08-05
 
 ### Fixed

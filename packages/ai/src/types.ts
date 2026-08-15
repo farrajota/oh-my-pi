@@ -36,7 +36,6 @@ import type {
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { isOpenAIModelId } from "@oh-my-pi/pi-catalog/identity/family";
 import type { Api, FetchImpl, KnownApi, Model, Provider, ThinkingBudgets, Usage } from "@oh-my-pi/pi-catalog/types";
-import type { ZodType, z } from "zod/v4";
 import type { ApiKey } from "./auth-retry";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
@@ -414,6 +413,16 @@ export interface StreamOptions {
 	apiKey?: string;
 	cacheRetention?: CacheRetention;
 	/**
+	 * Keep Anthropic's 5-minute prompt cache warm across bounded idle gaps.
+	 *
+	 * This is an ownership flag, not a general provider default: exactly one
+	 * primary agent loop sharing `providerSessionState` should enable it.
+	 * Side-channel and advisor requests must leave it unset.
+	 */
+	anthropicCacheRefresh?: boolean;
+	/** @internal Marks a replay-only Anthropic request that must use non-streaming `max_tokens: 0`. */
+	anthropicCacheRefreshRequest?: boolean;
+	/**
 	 * Additional headers to include in provider requests.
 	 * These are merged on top of model-defined headers.
 	 */
@@ -485,6 +494,12 @@ export interface StreamOptions {
 	 * `false` so `previous_response_id` cannot explain a result.
 	 */
 	statefulResponses?: boolean;
+	/**
+	 * Disable native reasoning when the caller supplies an external scratchpad.
+	 * OpenAI Responses emits `reasoning: { effort: "none" }`; Anthropic and
+	 * Google transports use their native thinking-off controls.
+	 */
+	forceReasoningOff?: boolean;
 	/**
 	 * Provider-scoped mutable state store for this agent session.
 	 * Providers can use this to persist transport/session state between turns.
@@ -559,6 +574,13 @@ export interface StreamOptions {
 	 * Optional retry delay hook for tests and transports that need custom scheduling.
 	 */
 	providerRetryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+	/**
+	 * Accept a normal provider stop with no visible text or tool call as a
+	 * successful completion. Passive callers and zero-output cache refreshes use
+	 * this because silence is their expected result; interactive agent turns
+	 * retain empty-response retries by default.
+	 */
+	acceptEmptyResponse?: boolean;
 	/**
 	 * Optional `fetch` implementation override. Providers route every HTTP
 	 * request — direct calls, SDK clients, and retry helpers — through this
@@ -837,22 +859,32 @@ export interface DeveloperMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/** How an automatic retry recovered or ultimately settled a failed attempt. */
 export type AssistantRetryRecoveryKind = "credential" | "model" | "wait" | "plain";
 
-export interface AssistantRetryRecovery {
-	kind: "auto-retry";
-	status: "recovered";
-	attempt: number;
-	recoveredAt: string;
-	recovery: AssistantRetryRecoveryKind;
-	note: string;
-	supersededBy?: {
-		timestamp: number;
-		responseId?: string;
-		provider: string;
-		model: string;
-	};
-}
+/** Persisted presentation state for an assistant error superseded by an automatic retry saga. */
+export type AssistantRetryRecovery =
+	| {
+			kind: "auto-retry";
+			status: "recovered";
+			attempt: number;
+			recoveredAt: string;
+			recovery: AssistantRetryRecoveryKind;
+			note: string;
+			supersededBy?: {
+				timestamp: number;
+				responseId?: string;
+				provider: string;
+				model: string;
+			};
+	  }
+	| {
+			kind: "auto-retry";
+			status: "superseded";
+			attempt: number;
+			recovery: AssistantRetryRecoveryKind;
+			note: string;
+	  };
 
 export interface ContextSnapshot {
 	promptTokens: number; // authoritative provider prompt/input tokens
@@ -1148,19 +1180,13 @@ export type TJsonSchema = Record<string, unknown>;
 /**
  * Schema type accepted by the {@link Tool} interface.
  *
- * Canonical authoring uses Zod or ArkType. Extension compat may supply a JSON
- * Schema object (including TypeBox static schema objects).
+ * Canonical authoring uses ArkType. Extension compat may supply a JSON Schema
+ * object (including TypeBox static schema objects).
  */
-export type TSchema = ZodType | Type | TJsonSchema;
+export type TSchema = Type | TJsonSchema;
 
 /** Resolve parameter types for tool execution / handlers. */
-export type Static<S> = S extends ZodType
-	? z.infer<S>
-	: S extends Type
-		? S["infer"]
-		: S extends { static: infer T }
-			? T
-			: unknown;
+export type Static<S> = S extends Type ? S["infer"] : S extends { static: infer T } ? T : unknown;
 
 export interface ToolCallExample<TArgs = Record<string, unknown>> {
 	caption?: string;

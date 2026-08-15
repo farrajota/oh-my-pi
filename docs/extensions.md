@@ -70,7 +70,7 @@ Important constraint from `loader.ts`:
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
-  const { z } = pi.zod;
+  const z = pi.zod;
 
   pi.setLabel("Safety + Utilities");
 
@@ -132,9 +132,9 @@ In interactive mode, `input` handlers run before the built-in first-message auto
 Also exposed:
 
 - `pi.logger`
-- `pi.arktype` (the ArkType `Type` runtime; this is not ArkType's `type(...)` schema builder)
-- `pi.zod` (injected `zod/v4` module for Zod-authored tool parameter schemas)
-- `pi.typebox` (zod-backed compatibility shim for legacy TypeBox-style schemas)
+- `pi.arktype` (the omptype `type(...)` schema builder)
+- `pi.zod` (Zod-compatible builder backed by omptype)
+- `pi.typebox` (legacy TypeBox-compatible shim)
 - `pi.pi` (package exports)
 
 ### Message delivery semantics
@@ -253,7 +253,7 @@ Cancelable pre-events:
 - `agent_start` / `agent_end` — agent loop lifecycle notification; `agent_end` remains notification-only
 - `session_stop` — main-session stop hook, awaited before settle; may continue with `{ continue: true, additionalContext }` or `{ decision: "block", reason }`; capped at 8 consecutive continuations and never fires for task/subagent sessions
 - `turn_start` / `turn_end`
-- `message_start` / `message_update` / `message_end`
+- `message_start` / `message_update` / `message_end` — lifecycle notifications; `message_end` receives a detached message snapshot, so use `tool_result` or `context` when an extension needs to change provider context
 
 ### Tool lifecycle
 
@@ -304,7 +304,7 @@ Current runtime note: `ExtensionRunner.emitResourcesDiscover(...)` is implemente
 
 ## Tool authoring details
 
-`registerTool` uses `ToolDefinition` from `types.ts`. Its `parameters` field accepts ArkType or Zod schemas; the injected TypeBox compatibility shim remains available for legacy extensions.
+`registerTool` uses `ToolDefinition` from `types.ts`. Its `parameters` field accepts omptype schemas; the injected TypeBox compatibility shim remains available for legacy extensions.
 
 Current `execute` signature:
 
@@ -341,7 +341,7 @@ are already approved as, and delegation depth is guarded against accidental self
 Template:
 
 ```ts
-const { z } = pi.zod;
+const z = pi.zod;
 
 pi.registerTool({
   name: "my_tool",
