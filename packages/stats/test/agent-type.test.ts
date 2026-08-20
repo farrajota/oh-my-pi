@@ -198,6 +198,15 @@ describe("getSessionStatsByModelAndAgentType", () => {
 			{ model: "model-b", provider: "provider-b", agentType: "advisor" },
 			{ model: "model-b", provider: "provider-b", agentType: "subagent" },
 		]);
+		const persisted = new Database(getStatsDbPath());
+		const roots = persisted
+			.prepare("SELECT session_file, root_session_file FROM messages ORDER BY session_file, entry_id")
+			.all() as Array<{ session_file: string; root_session_file: string }>;
+		persisted.close();
+		expect(
+			roots.filter(row => row.session_file !== siblingFile).every(row => row.root_session_file === mainFile),
+		).toBe(true);
+		expect(roots.find(row => row.session_file === siblingFile)?.root_session_file).toBe(siblingFile);
 		expect(rows[0]).toMatchObject({
 			totalRequests: 2,
 			totalInputTokens: 150,
@@ -307,5 +316,17 @@ describe("agent_type migration backfill", () => {
 		expect(byType.get("main")).toBe(1);
 		expect(byType.get("subagent")).toBe(1);
 		expect(byType.get("advisor")).toBe(1);
+		const migrated = new Database(getStatsDbPath());
+		const migratedRoots = migrated
+			.prepare("SELECT session_file, root_session_file FROM messages ORDER BY session_file")
+			.all() as Array<{ session_file: string; root_session_file: string }>;
+		migrated.close();
+		expect(new Map(migratedRoots.map(row => [row.session_file, row.root_session_file]))).toEqual(
+			new Map([
+				[advisorFile, mainFile],
+				[mainFile, mainFile],
+				[subFile, mainFile],
+			]),
+		);
 	});
 });

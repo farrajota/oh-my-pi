@@ -4,7 +4,7 @@ import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import type { GeneratedProvider } from "@oh-my-pi/pi-catalog/models";
 import { calculateUncachedInputCost, getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { getConfigRootDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, getSessionsDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
 import { classifyAgentType } from "./parser";
 import type {
 	AgentType,
@@ -116,6 +116,36 @@ const TOOL_CALLS_BACKFILL_KEY = "tool_calls_v1";
 function shouldResetBackfill(value: string | undefined): boolean {
 	return value !== BACKFILL_COMPLETE && value !== BACKFILL_PENDING;
 }
+const SESSION_FILE_EXTENSION = ".jsonl";
+
+/**
+ * Normalize a transcript to its top-level session file. Session artifacts use
+ * the root filename stem as their directory: <project>/<root>/<nested>.jsonl.
+ * Paths outside the configured sessions directory remain unchanged so simple
+ * unit-test fixtures and unrelated files are not grouped accidentally.
+ */
+function deriveRootSessionFile(sessionFile: string): string {
+	if (!sessionFile.endsWith(SESSION_FILE_EXTENSION)) return sessionFile;
+
+	const relative = path.relative(getSessionsDir(), sessionFile);
+	if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return sessionFile;
+	const parts = relative.split(path.sep);
+	if (parts.length < 3) return sessionFile;
+	return path.join(getSessionsDir(), parts[0], `${parts[1]}${SESSION_FILE_EXTENSION}`);
+}
+
+/** Populate normalized roots for rows inserted by older callers. */
+function backfillRootSessionFiles(database: Database): void {
+	const missingRows = database
+		.prepare("SELECT DISTINCT session_file FROM messages WHERE root_session_file IS NULL OR root_session_file = ''")
+		.all() as Array<{ session_file: string }>;
+	if (missingRows.length === 0) return;
+
+	const update = database.prepare("UPDATE messages SET root_session_file = ? WHERE session_file = ?");
+	database.transaction(() => {
+		for (const row of missingRows) update.run(deriveRootSessionFile(row.session_file), row.session_file);
+	})();
+}
 /**
  * Initialize the database and create tables.
  */
@@ -141,6 +171,7 @@ export async function initDb(): Promise<Database> {
 		CREATE TABLE IF NOT EXISTS messages (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_file TEXT NOT NULL,
+			root_session_file TEXT NOT NULL DEFAULT '',
 			entry_id TEXT NOT NULL,
 			folder TEXT NOT NULL,
 			model TEXT NOT NULL,
@@ -238,6 +269,10 @@ export async function initDb(): Promise<Database> {
 		db.run("ALTER TABLE messages ADD COLUMN cost_no_cache_input REAL");
 	}
 	db.run("UPDATE messages SET premium_requests = 0 WHERE premium_requests IS NULL");
+	if (!messageColumns.some(column => column.name === "root_session_file")) {
+		db.run("ALTER TABLE messages ADD COLUMN root_session_file TEXT NOT NULL DEFAULT ''");
+	}
+	db.run("CREATE INDEX IF NOT EXISTS idx_messages_root_session_file ON messages(root_session_file)");
 	// Token-usage-by-agent: each message is classified main / subagent / advisor
 	// from its transcript path. A brand-new table gets the column from CREATE
 	// TABLE and the parser labels rows at insert time; a pre-existing table gets
@@ -318,6 +353,7 @@ export async function initDb(): Promise<Database> {
 	repairUserMessageLinks(db);
 	backfillPriorityPremiumRequests(db);
 	backfillAgentType(db);
+	backfillRootSessionFiles(db);
 	backfillMissingCatalogCosts(db);
 	backfillNoCacheInputCosts(db);
 	backfillForkDuplicates(db);
@@ -507,19 +543,20 @@ export function insertMessageStats(stats: MessageStats[]): number {
 
 	const stmt = db.prepare(`
 		INSERT INTO messages (
-			session_file, entry_id, folder, model, provider, api, timestamp,
+			session_file, root_session_file, entry_id, folder, model, provider, api, timestamp,
 			duration, ttft, stop_reason, error_message,
 			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, premium_requests,
 			cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total, cost_no_cache_input, agent_type
 		)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE NOT EXISTS (
 			SELECT 1 FROM messages
 			WHERE entry_id = ? AND timestamp = ? AND session_file <> ?
 		)
 		ON CONFLICT(session_file, entry_id) DO UPDATE SET
+			root_session_file = excluded.root_session_file,
 			premium_requests = excluded.premium_requests
-		WHERE messages.premium_requests < excluded.premium_requests
+		WHERE messages.premium_requests < excluded.premium_requests OR messages.root_session_file = ''
 	`);
 
 	let inserted = 0;
@@ -529,6 +566,7 @@ export function insertMessageStats(stats: MessageStats[]): number {
 			const noCacheInputCost = calculateNoCacheInputCost(s.provider, s.model, s.usage) ?? 0;
 			const result = stmt.run(
 				s.sessionFile,
+				deriveRootSessionFile(s.sessionFile),
 				s.entryId,
 				s.folder,
 				s.model,
@@ -707,7 +745,8 @@ export function getStatsByModel(cutoff?: number): ModelStats[] {
 export function getSessionStatsByModelAndAgentType(sessionFile: string): ModelAgentTypeStats[] {
 	if (!db || !sessionFile.endsWith(".jsonl")) return [];
 
-	const artifactPrefix = `${sessionFile.slice(0, -6)}${path.sep}`;
+	backfillRootSessionFiles(db);
+	const rootSessionFile = deriveRootSessionFile(sessionFile);
 	const stmt = db.prepare(`
 		SELECT
 			model,
@@ -723,7 +762,7 @@ export function getSessionStatsByModelAndAgentType(sessionFile: string): ModelAg
 			SUM(cache_write_tokens) as total_cache_write_tokens,
 			SUM(cost_total) as total_cost
 		FROM messages
-		WHERE session_file = ? OR instr(session_file, ?) = 1
+		WHERE root_session_file = ?
 		GROUP BY
 			model,
 			provider,
@@ -734,7 +773,7 @@ export function getSessionStatsByModelAndAgentType(sessionFile: string): ModelAg
 		ORDER BY model, provider, normalized_agent_type
 	`);
 
-	const rows = stmt.all(sessionFile, artifactPrefix) as SessionModelAgentTypeRow[];
+	const rows = stmt.all(rootSessionFile) as SessionModelAgentTypeRow[];
 	return rows.map(row => ({
 		model: row.model,
 		provider: row.provider,
