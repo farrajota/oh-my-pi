@@ -1,5 +1,4 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -26,7 +25,7 @@ import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
 import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "text" };
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
-import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../session/messages";
+import { isSilentAbort, isUserInvokedSkillPrompt, readQueueChipText, resolveAbortLabel } from "../../session/messages";
 import { type ApprovalMode, resolveApproval } from "../../tools/approval";
 import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
@@ -92,8 +91,8 @@ function formatCompletionFooter(elapsedMs: number, runTokenDelta?: number): stri
 	return `${base} · +${formatCompactTokens(runTokenDelta)} tokens`;
 }
 
-function estimateMessageTokens(message: AgentMessage): number {
-	return Math.max(0, Math.round(estimateTokens(message)));
+function estimateMessageTokens(source: AgentSession, message: AgentMessage): number {
+	return Math.max(0, Math.round(source.agent.tokenizer.countMessage(message)));
 }
 
 function toolResultMessageFromEvent(event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>): AgentMessage {
@@ -904,7 +903,17 @@ export class EventController {
 			}
 			this.#renderedCustomMessages.add(signature);
 			this.#resetReadGroup();
-			this.ctx.addMessageToChat(event.message);
+			if (
+				event.message.role === "custom" &&
+				this.ctx.optimisticSkillMessagePending &&
+				isUserInvokedSkillPrompt(event.message)
+			) {
+				// The optimistic `/skill:` row painted at submit time (issue #8895):
+				// swap it for the canonical message instead of appending a duplicate.
+				this.ctx.reconcileOptimisticSkillMessage(event.message);
+			} else {
+				this.ctx.addMessageToChat(event.message);
+			}
 			// Queued custom-message chips are derived from the agent queue; refresh the
 			// pending bar when the queued custom is consumed so the chip disappears
 			// immediately.
@@ -1159,7 +1168,7 @@ export class EventController {
 				this.#streamingReveal.resyncVisibility();
 			}
 			this.ctx.streamingMessage = event.message;
-			this.#currentAssistantMessageTokenEstimate = estimateMessageTokens(event.message as AgentMessage);
+			this.#currentAssistantMessageTokenEstimate = estimateMessageTokens(source, event.message as AgentMessage);
 			this.#updateWorkingMessageRunTokenDelta(source);
 			const timeline = splitAssistantMessageToolTimeline(this.ctx.streamingMessage);
 			this.#streamingReveal.setTarget(timeline.beforeTools);
@@ -1325,13 +1334,13 @@ export class EventController {
 	): Promise<void> {
 		if (event.message.role === "toolResult") {
 			if (!this.#countedToolResultIds.has(event.message.toolCallId)) {
-				this.#addRunTokens(source, estimateMessageTokens(event.message as AgentMessage));
+				this.#addRunTokens(source, estimateMessageTokens(source, event.message as AgentMessage));
 				this.#countedToolResultIds.add(event.message.toolCallId);
 			}
 			return;
 		}
 		if (event.message.role !== "assistant") {
-			this.#addRunTokens(source, estimateMessageTokens(event.message as AgentMessage));
+			this.#addRunTokens(source, estimateMessageTokens(source, event.message as AgentMessage));
 			return;
 		}
 		const unlockedThinkingVisibility = this.ctx.noteDisplayableThinkingContent(event.message);
@@ -1438,7 +1447,7 @@ export class EventController {
 			const successfulAssistant =
 				this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error";
 			if (successfulAssistant) {
-				this.#addRunTokens(source, estimateMessageTokens(event.message as AgentMessage));
+				this.#addRunTokens(source, estimateMessageTokens(source, event.message as AgentMessage));
 			}
 			this.#currentAssistantMessageTokenEstimate = 0;
 			this.#updateWorkingMessageRunTokenDelta(source);
@@ -1671,7 +1680,7 @@ export class EventController {
 				syntheticFailureDetails.source === "assistant_stop_aborted")
 				? this.ctx.pendingTools.get(event.toolCallId)
 				: undefined;
-		const toolResultTokens = estimateMessageTokens(toolResultMessageFromEvent(event));
+		const toolResultTokens = estimateMessageTokens(source, toolResultMessageFromEvent(event));
 		const toolElapsedMs = this.#finishToolExecutionElapsedMs(event.toolCallId);
 		if (!this.#countedToolResultIds.has(event.toolCallId)) {
 			this.#addRunTokens(source, toolResultTokens);
@@ -1998,13 +2007,15 @@ export class EventController {
 						? "Idle "
 						: "";
 		const actionLabel =
-			event.action === "handoff"
-				? "Auto-handoff"
-				: event.action === "shake"
-					? "Auto-shake"
-					: event.action === "snapcompact"
-						? "Auto-snapcompact"
-						: "Auto context-full maintenance";
+			event.action === "remote"
+				? "Auto server compaction"
+				: event.action === "handoff"
+					? "Auto-handoff"
+					: event.action === "shake"
+						? "Auto-shake"
+						: event.action === "snapcompact"
+							? "Auto-snapcompact"
+							: "Auto context-full maintenance";
 		this.ctx.autoCompactionLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -2029,17 +2040,20 @@ export class EventController {
 			this.ctx.statusContainer.disposeChildren();
 		}
 		const isHandoffAction = event.action === "handoff";
+		const isRemoteAction = event.action === "remote";
 		const isShakeAction = event.action === "shake";
 		const isSnapcompactAction = event.action === "snapcompact";
 		if (event.aborted) {
 			this.ctx.showStatus(
 				isHandoffAction
 					? "Auto-handoff cancelled"
-					: isShakeAction
-						? "Auto-shake cancelled"
-						: isSnapcompactAction
-							? "Auto-snapcompact cancelled"
-							: "Auto context-full maintenance cancelled",
+					: isRemoteAction
+						? "Auto server compaction cancelled"
+						: isShakeAction
+							? "Auto-shake cancelled"
+							: isSnapcompactAction
+								? "Auto-snapcompact cancelled"
+								: "Auto context-full maintenance cancelled",
 			);
 		} else if (isShakeAction) {
 			// Shake produces no CompactionResult; rebuild on success, suppress benign skips.
@@ -2092,6 +2106,8 @@ export class EventController {
 			// to compact yet. Not a failure — suppress the warning.
 		} else if (isSnapcompactAction) {
 			this.ctx.showWarning("Auto-snapcompact maintenance failed; continuing without maintenance");
+		} else if (isRemoteAction) {
+			this.ctx.showWarning("Auto server compaction failed; continuing without maintenance");
 		} else {
 			this.ctx.showWarning("Auto context-full maintenance failed; continuing without maintenance");
 		}

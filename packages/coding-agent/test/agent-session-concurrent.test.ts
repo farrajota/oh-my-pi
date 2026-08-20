@@ -847,6 +847,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		const observedActiveRunStartedAtAtStart: Array<number | undefined> = [];
 		const observedActiveRunStartedAtAtEnd: Array<number | undefined> = [];
 		const reentrantPromptResults: Array<"resolved" | { error: string }> = [];
+		const observedIsStreamingAtRunIdle: boolean[] = [];
 		let reentrantPrompted = false;
 		const coreAgentEndDeferred = Promise.withResolvers<void>();
 		const releaseAgentEndMaintenance = Promise.withResolvers<void>();
@@ -860,6 +861,9 @@ describe("AgentSession concurrent prompt guard", () => {
 			await releaseAgentEndMaintenance.promise;
 		});
 
+		session.subscribeRunState(state => {
+			if (state === "idle") observedIsStreamingAtRunIdle.push(session.isStreaming);
+		});
 		session.subscribe(event => {
 			const timedSession = session as AgentSession & { activeRunStartedAt?: number };
 			if (event.type === "agent_start") {
@@ -894,6 +898,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		// the cleared lifecycle field atomically with the externally visible end.
 		expect(observedActiveRunStartedAtAtEnd).toEqual([undefined, undefined]);
 		expect(observedIsStreamingAtAgentEnd).not.toContain(true);
+		expect(observedIsStreamingAtRunIdle).toContain(true);
 		expect(reentrantPromptResults).toEqual(["resolved"]);
 	});
 

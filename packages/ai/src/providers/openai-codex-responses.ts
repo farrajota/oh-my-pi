@@ -2035,6 +2035,8 @@ async function handleCodexStreamFailure(context: CodexStreamFailureContext, erro
 	}
 	const result = await AIError.finalize(error, {
 		api: context.model.api,
+		provider: context.model.provider,
+		model: context.model.id,
 		signal: context.options?.signal,
 		rawRequestDump: context.requestContext.rawRequestDump,
 	});
