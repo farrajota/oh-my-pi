@@ -12,6 +12,7 @@ import {
 	getFileOffset,
 	getMessageById,
 	getMessageCount,
+	getMetaValue,
 	getModelPerformanceSeries,
 	getModelTimeSeries,
 	getOverallStats,
@@ -31,6 +32,7 @@ import {
 	insertUserMessageStats,
 	markSessionBackfillsComplete,
 	setFileOffset,
+	setMetaValue,
 	updateToolResults,
 	updateUserMessageLinks,
 } from "./db";
@@ -58,6 +60,21 @@ import { computeUsageWindowStats, fetchUsageData } from "./usage-windows";
 
 const STATS_SYNC_LOCK_RETRY_MS = 25;
 const STATS_SYNC_LOCK_WAIT_MS = 60 * 60 * 1000;
+const FULL_SYNC_COMPLETED_AT_KEY = "stats_full_sync_completed_at";
+
+function lockRetriesForWait(waitMs: number): number {
+	return waitMs <= 0 ? 1 : Math.ceil(waitMs / STATS_SYNC_LOCK_RETRY_MS) + 1;
+}
+
+function isFreshSync(completedAt: string | undefined, maxAgeMs: number): boolean {
+	if (maxAgeMs <= 0 || !completedAt) return false;
+	const timestamp = Number(completedAt);
+	return Number.isFinite(timestamp) && Date.now() - timestamp < maxAgeMs;
+}
+
+function isLockTimeout(error: unknown): boolean {
+	return error instanceof Error && error.message.startsWith("Failed to acquire lock for ");
+}
 
 /**
  * Serialize stats ingestion and archive reconciliation across processes.
@@ -66,11 +83,16 @@ const STATS_SYNC_LOCK_WAIT_MS = 60 * 60 * 1000;
  * The native lock is owned by an operating-system primitive, so an interrupted
  * owner is released automatically and a live owner is never displaced.
  */
-export async function withStatsSyncLock<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
+export async function withStatsSyncLock<T>(
+	dbPath: string,
+	fn: () => Promise<T>,
+	options?: { waitMs?: number },
+): Promise<T> {
 	await fs.promises.mkdir(path.dirname(dbPath), { recursive: true });
+	const waitMs = options?.waitMs ?? STATS_SYNC_LOCK_WAIT_MS;
 	return await withFileLock(`${dbPath}.sync`, fn, {
 		retryDelayMs: STATS_SYNC_LOCK_RETRY_MS,
-		retries: Math.ceil(STATS_SYNC_LOCK_WAIT_MS / STATS_SYNC_LOCK_RETRY_MS),
+		retries: lockRetriesForWait(waitMs),
 	});
 }
 
@@ -110,6 +132,12 @@ export interface SyncOptions {
 	 * force serial parsing without spawning workers.
 	 */
 	workers?: number;
+	/** Return cached database rows when the global lock is briefly busy. */
+	skipIfBusy?: boolean;
+	/** Skip the global scan when another process completed one recently. */
+	freshnessMs?: number;
+	/** Maximum time to wait for another process's global sync lock. */
+	lockWaitMs?: number;
 }
 
 function defaultWorkerCount(): number {
@@ -322,12 +350,27 @@ async function syncSessionFiles(files: string[], opts?: SyncOptions): Promise<{ 
  * Sync every known session file and complete global-scan backfills.
  */
 export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
-	return withStatsSyncLock(getStatsDbPath(), async () => {
-		await initDb();
-		const result = await syncSessionFiles(await listAllSessionFiles(), opts);
-		markSessionBackfillsComplete();
-		return result;
-	});
+	try {
+		return await withStatsSyncLock(
+			getStatsDbPath(),
+			async () => {
+				await initDb();
+				if (
+					opts?.freshnessMs !== undefined &&
+					isFreshSync(getMetaValue(FULL_SYNC_COMPLETED_AT_KEY), opts.freshnessMs)
+				)
+					return { processed: 0, files: 0 };
+				const result = await syncSessionFiles(await listAllSessionFiles(), opts);
+				markSessionBackfillsComplete();
+				setMetaValue(FULL_SYNC_COMPLETED_AT_KEY, String(Date.now()));
+				return result;
+			},
+			{ waitMs: opts?.lockWaitMs },
+		);
+	} catch (error) {
+		if (!opts?.skipIfBusy || !isLockTimeout(error)) throw error;
+		return { processed: 0, files: 0 };
+	}
 }
 
 /**

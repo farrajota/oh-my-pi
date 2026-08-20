@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { syncAllSessions, syncSessionTree } from "@oh-my-pi/omp-stats/aggregator";
 import { getOverallStats, initDb } from "@oh-my-pi/omp-stats/db";
 import { getSessionsDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-sync-serial-");
@@ -108,6 +109,33 @@ describe("stats sync serial mode", () => {
 		expect(synced.files).toBe(1);
 		expect(overall.totalRequests).toBe(1);
 		expect(workerSpy).not.toHaveBeenCalled();
+	});
+
+	it("skips a fresh global scan after a prior process completed it", async () => {
+		await writeSessionFile();
+
+		expect(await syncAllSessions({ workers: 1, freshnessMs: 60_000 })).toEqual({
+			processed: 1,
+			files: 1,
+		});
+		expect(await syncAllSessions({ workers: 1, freshnessMs: 60_000 })).toEqual({
+			processed: 0,
+			files: 0,
+		});
+	});
+
+	it("returns cached-data fallback immediately when the global lock is busy", async () => {
+		await initDb();
+		await withFileLock(
+			`${getStatsDbPath()}.sync`,
+			async () => {
+				expect(await syncAllSessions({ workers: 1, lockWaitMs: 0, skipIfBusy: true })).toEqual({
+					processed: 0,
+					files: 0,
+				});
+			},
+			{ retries: 1 },
+		);
 	});
 
 	it("syncs legacy session usage without a cost breakdown", async () => {

@@ -323,6 +323,18 @@ export async function initDb(): Promise<Database> {
 	backfillForkDuplicates(db);
 	return db;
 }
+/** Read a small process-shared value from the stats metadata table. */
+export function getMetaValue(key: string): string | undefined {
+	if (!db) return undefined;
+	const row = db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | undefined;
+	return row?.value;
+}
+
+/** Write a small process-shared value to the stats metadata table. */
+export function setMetaValue(key: string, value: string): void {
+	if (!db) return;
+	db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(key, value);
+}
 
 function hasBillableCost(cost: ModelCost): boolean {
 	return cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0;
