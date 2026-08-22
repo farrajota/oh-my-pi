@@ -104,3 +104,41 @@ it("collapses duplicate prompts and keeps the latest project metadata", async ()
 		verify.close();
 	}
 });
+it("normalizes per-line trailing whitespace so padded resubmissions upsert instead of duplicating", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-normalize-");
+	const storage = HistoryStorage.open(tempDir.join("history.db"));
+
+	await storage.add("line one   \t\r\nline two  ", "/projects/first", "first-session");
+	await storage.add("line one\nline two", "/projects/second", "second-session");
+
+	const entries = storage.getRecent(10);
+	expect(entries).toHaveLength(1);
+	expect(entries[0]?.prompt).toBe("line one\nline two");
+	expect(entries[0]?.sessionId).toBe("second-session");
+});
+
+it("collapses preexisting whitespace-padded duplicates on open, keeping the latest provenance", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-padded-");
+	const dbPath = tempDir.join("history.db");
+	HistoryStorage.open(dbPath);
+	HistoryStorage.resetInstance();
+
+	const raw = new Database(dbPath);
+	const insert = raw.prepare("INSERT INTO history (prompt, created_at, cwd, session_id) VALUES (?, ?, ?, ?)");
+	insert.run("keep me tidy\nplease", 1, "/projects/old", "old-session");
+	insert.run("keep me tidy   \nplease", 2, "/projects/new", "new-session");
+	raw.run("PRAGMA user_version = 0");
+	raw.close();
+
+	const storage = HistoryStorage.open(dbPath);
+	const entries = storage.getRecent(10);
+	expect(entries).toHaveLength(1);
+	expect(entries[0]).toMatchObject({
+		prompt: "keep me tidy\nplease",
+		created_at: 2,
+		cwd: "/projects/new",
+		sessionId: "new-session",
+	});
+	// FTS was rebuilt after the delete+update, so no stale index rows remain.
+	expect(storage.search("tidy", 10).map(entry => entry.sessionId)).toEqual(["new-session"]);
+});

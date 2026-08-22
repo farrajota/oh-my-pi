@@ -33,6 +33,33 @@ function escapeLikePattern(text: string): string {
 	return text.replace(/[\\%_]/g, "\\$&");
 }
 
+/**
+ * Canonical stored form of a prompt: CRLF/CR folded to LF, trailing whitespace
+ * stripped from every line, outer whitespace trimmed. Terminal copies pad each
+ * line with spaces to the screen width, so without this a resubmitted copy of
+ * an existing prompt lands as a byte-distinct duplicate row.
+ */
+function normalizePrompt(prompt: string): string {
+	return prompt
+		.replace(/\r\n?/g, "\n")
+		.replace(/[^\S\n]+\n/g, "\n")
+		.trim();
+}
+/** Bumped when stored rows need the one-time dump-and-rebuild pass on open; see `#rebuildHistory`. */
+const HISTORY_DATA_VERSION = 1;
+
+/** Canonical `history` schema; `#rebuildHistory` recreates the table from this exact DDL. */
+const HISTORY_TABLE_DDL = `
+CREATE TABLE IF NOT EXISTS history (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	prompt TEXT NOT NULL UNIQUE,
+	created_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH}),
+	cwd TEXT,
+	session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
+`;
+
 /** Stores searchable prompts with only their latest project and session metadata. */
 export class HistoryStorage {
 	#db: Database;
@@ -61,21 +88,10 @@ export class HistoryStorage {
 		this.#db.run(`
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
-
-CREATE TABLE IF NOT EXISTS history (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	prompt TEXT NOT NULL UNIQUE,
-	created_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH}),
-	cwd TEXT,
-	session_id TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
+${HISTORY_TABLE_DDL}
 		`);
 
-		const needsMigration = this.#historySchemaNeedsMigration();
-		if (needsMigration) {
-			this.#migrateHistorySchema();
-		}
+		const rebuilt = this.#rebuildHistory();
 
 		this.#db.run(`
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(prompt, content='history', content_rowid='id');
@@ -85,14 +101,13 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 END;
 		`);
 
-		if (needsMigration || !hadFts) {
+		if (rebuilt || !hadFts) {
 			try {
 				this.#db.run("INSERT INTO history_fts(history_fts) VALUES('rebuild')");
 			} catch (error) {
 				logger.warn("HistoryStorage FTS rebuild failed", { error: String(error) });
 			}
 		}
-
 		this.#recentStmt = this.#db.prepare(
 			"SELECT id, prompt, created_at, cwd, session_id FROM history ORDER BY created_at DESC, id DESC LIMIT ?",
 		);
@@ -152,7 +167,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 
 	/** Stores a prompt and replaces its provenance with the latest submission. */
 	add(prompt: string, cwd?: string, sessionId?: string): Promise<void> {
-		const trimmed = prompt.trim();
+		const trimmed = normalizePrompt(prompt);
 		if (!trimmed) return Promise.resolve();
 		const session = sessionId ?? this.#sessionResolver?.();
 		return this.#drain.push({ prompt: trimmed, cwd: cwd ?? undefined, sessionId: session || undefined }, rows => {
@@ -244,75 +259,64 @@ ON CONFLICT(prompt) DO UPDATE SET
 		fs.mkdirSync(dir, { recursive: true });
 	}
 
-	#historySchemaUsesUnixEpoch(): boolean {
-		const row = this.#db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'history'").get() as
-			| { sql?: string | null }
-			| undefined;
-		return row?.sql?.includes("unixepoch(") ?? false;
-	}
-
 	#historySchemaHasColumn(column: string): boolean {
 		const columns = this.#db.prepare("PRAGMA table_info(history)").all() as Array<{ name: string }>;
 		return columns.some(col => col.name === column);
 	}
 
-	#historyPromptIsUnique(): boolean {
-		const row = this.#db
-			.prepare(`
-SELECT 1 AS present
-FROM pragma_index_list('history') AS indexes
-WHERE indexes."unique" = 1
-	AND indexes.partial = 0
-	AND (SELECT COUNT(*) FROM pragma_index_info(indexes.name)) = 1
-	AND (SELECT name FROM pragma_index_info(indexes.name) LIMIT 1) = 'prompt'
-LIMIT 1
-			`)
-			.get() as { present?: number } | undefined;
-		return row?.present === 1;
-	}
-
-	#historySchemaNeedsMigration(): boolean {
-		return (
-			this.#historySchemaUsesUnixEpoch() ||
-			!this.#historySchemaHasColumn("session_id") ||
-			!this.#historyPromptIsUnique()
-		);
-	}
-
-	#migrateHistorySchema(): void {
-		const hasSessionId = this.#historySchemaHasColumn("session_id");
-		const sessionIdSelection = hasSessionId ? "session_id" : "NULL AS session_id";
-		const migrate = this.#db.transaction(() => {
+	/**
+	 * One-time dump-and-rebuild pass, gated by `PRAGMA user_version` (owned by
+	 * this pass — nothing else versions history.db). Dumps every row, folds each
+	 * prompt through {@link normalizePrompt} in JS, keeps the most recent
+	 * submission per normalized prompt (the upsert's "latest wins" rule), and
+	 * recreates the table from {@link HISTORY_TABLE_DDL}. Subsumes every legacy
+	 * shape at once — unixepoch defaults, missing session_id, non-unique prompt,
+	 * per-line trailing padding — without per-shape SQL migrations. Returns
+	 * whether it ran so the caller can rebuild the FTS index.
+	 */
+	#rebuildHistory(): boolean {
+		const versionRow = this.#db.prepare("PRAGMA user_version").get() as { user_version: number };
+		if (versionRow.user_version >= HISTORY_DATA_VERSION) return false;
+		let rows: HistoryRow[];
+		try {
+			const sessionIdSelection = this.#historySchemaHasColumn("session_id") ? "session_id" : "NULL AS session_id";
+			rows = this.#db
+				.prepare(`SELECT id, prompt, created_at, cwd, ${sessionIdSelection} FROM history`)
+				.all() as HistoryRow[];
+		} catch (error) {
+			logger.error("HistoryStorage rebuild dump failed", { error: String(error) });
+			return false;
+		}
+		const winners = new Map<string, HistoryRow>();
+		for (const row of rows) {
+			const prompt = normalizePrompt(row.prompt);
+			if (!prompt) continue;
+			const incumbent = winners.get(prompt);
+			// Most recent submission wins, matching the upsert's "latest provenance" rule.
+			const rowWins =
+				!incumbent ||
+				row.created_at > incumbent.created_at ||
+				(row.created_at === incumbent.created_at && row.id > incumbent.id);
+			if (rowWins) winners.set(prompt, { ...row, prompt });
+		}
+		this.#db.transaction(() => {
 			this.#db.run("DROP INDEX IF EXISTS idx_history_created_at");
 			this.#db.run("DROP TRIGGER IF EXISTS history_ai");
 			this.#db.run("DROP TABLE IF EXISTS history_fts");
-			this.#db.run("ALTER TABLE history RENAME TO history_legacy");
-			this.#db.run(`
-CREATE TABLE history (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	prompt TEXT NOT NULL UNIQUE,
-	created_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH}),
-	cwd TEXT,
-	session_id TEXT
-);
-CREATE INDEX idx_history_created_at ON history(created_at DESC);
-INSERT INTO history (id, prompt, created_at, cwd, session_id)
-SELECT id, prompt, created_at, cwd, session_id
-FROM (
-	SELECT
-		id,
-		prompt,
-		created_at,
-		cwd,
-		${sessionIdSelection},
-		ROW_NUMBER() OVER (PARTITION BY prompt ORDER BY created_at DESC, id DESC) AS recency_rank
-	FROM history_legacy
-)
-WHERE recency_rank = 1;
-DROP TABLE history_legacy;
-			`);
-		});
-		migrate();
+			this.#db.run("DROP TABLE history");
+			this.#db.run(HISTORY_TABLE_DDL);
+			const insert = this.#db.prepare(
+				"INSERT INTO history (id, prompt, created_at, cwd, session_id) VALUES (?, ?, ?, ?, ?)",
+			);
+			for (const row of winners.values()) {
+				insert.run(row.id, row.prompt, row.created_at, row.cwd, row.session_id);
+			}
+			this.#db.run(`PRAGMA user_version = ${HISTORY_DATA_VERSION}`);
+		})();
+		if (winners.size < rows.length) {
+			logger.debug("HistoryStorage collapsed rows during rebuild", { before: rows.length, after: winners.size });
+		}
+		return true;
 	}
 
 	#normalizeLimit(limit: number): number {
