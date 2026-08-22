@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [17.4.2] - 2026-08-21
+
+### Added
+
+- Editor atom table: `insertAtom`/`registerAtom` stage compact atomic tokens whose registered expansion is emitted on submit (`getExpandedText`), alongside the existing paste-marker store.
+
+## [17.4.1] - 2026-08-21
+
+### Added
+
+- Added optional `getNativeScrollbackLiveRegionPinnedStart()` hook to allow nested transcripts to pin a later dashboard without shifting the earliest live seam.
+
 ## [17.4.0] - 2026-08-20
 
 ### Added

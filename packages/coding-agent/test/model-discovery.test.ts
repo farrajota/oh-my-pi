@@ -2363,6 +2363,7 @@ providers:
 					data: [
 						{
 							model_group: "gpt-big",
+							providers: ["openai"],
 							max_input_tokens: 262_144,
 							max_output_tokens: 16_384,
 							supports_vision: true,
@@ -2383,6 +2384,7 @@ providers:
 		expect(model?.maxTokens).toBe(16_384);
 		expect(model?.input).toEqual(["text", "image"]);
 		expect(model?.reasoning).toBe(true);
+		expect(model?.api).toBe("openai-responses");
 	});
 
 	test("litellm discovery enriches configured proxy models with bundled references", async () => {
@@ -2432,7 +2434,7 @@ providers:
 				return new Response("{}", { status: 404 });
 			}
 			if (url === "http://localhost:4000/v1/models") {
-				return Response.json({ data: [{ id: "default-litellm" }] });
+				return Response.json({ data: [{ id: "default-litellm" }, { id: "openai/gpt-5" }] });
 			}
 			throw new Error(`Unexpected URL: ${url}`);
 		};
@@ -2440,6 +2442,7 @@ providers:
 		await registry.refresh();
 
 		expect(registry.find("litellm-test", "default-litellm")?.baseUrl).toBe("http://localhost:4000/v1");
+		expect(registry.find("litellm-test", "openai/gpt-5")?.api).toBe("openai-responses");
 	});
 
 	test("litellm discovery reuses configured bearer on rich and fallback requests", async () => {
@@ -2542,7 +2545,7 @@ providers:
 		expect(registry.find("litellm-test", "deployment-id")).toBeUndefined();
 	});
 
-	test("startup restores a legacy stale-marked Copilot -1m variant via requestModelId", () => {
+	test("startup restores a legacy stale-marked Copilot -1m variant via requestModelId", async () => {
 		// Regression for #6037/#6284: a synthesized Copilot `-1m` long-context
 		// variant keeps the base model's transport headers via `requestModelId`.
 		// The v10 cache omits headers, and legacy rows written by the old id-only
@@ -2562,13 +2565,15 @@ providers:
 		});
 		// Emulate a legacy write: the variant has no same-id static header source,
 		// so it is flagged unrestorable even though its base carries the headers.
-		const cacheProviderId = resolveModelCacheProviderId("github-copilot");
+		authStorage.setRuntimeApiKey("github-copilot", "ghp_test_token");
+		const cacheProviderId = resolveModelCacheProviderId("github-copilot", { apiKey: "ghp_test_token" });
 		writeModelCache(cacheProviderId, Date.now(), [cachedVariant], true, "", cacheDbPath);
 		const db = new Database(cacheDbPath);
 		db.run("UPDATE model_cache SET header_restore_version = 0 WHERE provider_id = ?", [cacheProviderId]);
 		db.close();
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.hydrateCredentialScopedModelCaches();
 
 		const restored = registry.find("github-copilot", "gpt-5.6-sol-1m");
 		expect(restored?.headers).toEqual(bundledBase.headers);

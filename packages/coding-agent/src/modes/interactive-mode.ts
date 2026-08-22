@@ -42,7 +42,6 @@ import type { TerminalAppearanceRequestToken } from "@oh-my-pi/pi-tui/terminal";
 import { isInsideTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import {
 	$env,
-	APP_NAME,
 	adjustHsv,
 	formatNumber,
 	getProjectDir,
@@ -140,6 +139,7 @@ import { formatStartupChangelogSummary, type StartupChangelogSelection } from ".
 import { copyToClipboard } from "../utils/clipboard";
 import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
+import { resumeCommand } from "../utils/resume-command";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { messageHasDisplayableThinking } from "../utils/thinking-display";
 import {
@@ -156,6 +156,7 @@ import {
 	VibeSessionRegistry,
 } from "../vibe/runtime";
 import type { AssistantMessageComponent } from "./components/assistant-message";
+import { AttachmentChipsBand } from "./components/attachment-chips";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import { ChatBlock, type ChatBlockHost } from "./components/chat-block";
 import { CodexResetFireworksController } from "./components/codex-reset-fireworks";
@@ -185,6 +186,7 @@ import { SessionFocusController } from "./controllers/session-focus-controller";
 import { SSHCommandController } from "./controllers/ssh-command-controller";
 import { TanCommandController } from "./controllers/tan-command-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
+import { materializeImageReferenceLinks } from "./image-references";
 import {
 	consumeLoopLimitIteration,
 	createLoopLimitRuntime,
@@ -543,6 +545,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	deferredCommandContainer: Container;
 	editor: CustomEditor;
 	editorContainer: Container;
+	/** Composer attachment band (chip cards) rendered directly above the prompt box. */
+	attachmentChipsContainer: Container;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
 	statusLine: StatusLineComponent;
@@ -633,6 +637,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	optimisticSkillMessagePending = false;
 	lastSigintTime = 0;
 	lastEscapeTime = 0;
+	/** Owns Esc for every `/mcp test` that is active or whose cancellation hint may still be visible. */
+	mcpTestEscapeHandlers = new Set<() => void>();
 	lastLeftTapTime = 0;
 	shutdownRequested = false;
 	#isShuttingDown = false;
@@ -865,6 +871,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hookWidgetContainerAbove = new Container();
 		this.hookWidgetContainerAbove.addChild(new Spacer(1));
 		this.hookWidgetContainerBelow = new Container();
+		this.attachmentChipsContainer = new Container();
+		this.attachmentChipsContainer.addChild(new AttachmentChipsBand(this.editor, this.ui.imageBudget));
+		// Restored drafts (esc-esc, /tree, branch) re-materialize blob-store links off the render
+		// path so their chip tokens become clickable again instead of degrading to dead text.
+		this.editor.draftImageLinkMaterializer = images =>
+			materializeImageReferenceLinks(images, this.sessionManager.putBlob.bind(this.sessionManager));
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor);
 		this.statusLine = new StatusLineComponent(session);
@@ -1106,6 +1118,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// HUDs, just above the editor's hook-widget top margin — so it reads next to
 		// the prompt while keeping the one-line gap above the editor.
 		this.ui.addChild(this.statusContainer);
+		this.ui.addChild(this.attachmentChipsContainer);
 		this.ui.addChild(this.hookWidgetContainerAbove);
 		this.ui.addChild(this.editorContainer);
 		this.ui.addChild(this.hookWidgetContainerBelow);
@@ -2905,13 +2918,23 @@ export class InteractiveMode implements InteractiveModeContext {
 		// prompt, which predictably invalidates the cache.
 		this.lastAssistantUsage = undefined;
 
-		await this.session.setActiveToolsByName(uniquePlanTools);
+		// Plan mode state must land before the tool partition: under Code Mode the
+		// direct surface keeps `write` only while a transport needs it, and plan
+		// approval is a top-level `write` to `xd://propose`.
+		const previousPlanModeState = this.session.getPlanModeState();
 		this.session.setPlanModeState({
 			enabled: true,
 			planFilePath,
 			workflow: options?.workflow ?? "parallel",
 			reentry: this.#planModeHasEntered,
 		});
+		try {
+			await this.session.setActiveToolsByName(uniquePlanTools);
+		} catch (error) {
+			this.session.setPlanModeState(previousPlanModeState);
+			this.planModeEnabled = false;
+			throw error;
+		}
 		this.session.setPlanProposalHandler?.(title => this.session.preparePlanForReview(title));
 		if (this.session.isStreaming) {
 			await this.session.sendPlanModeContext({ deliverAs: "steer" });
@@ -3224,25 +3247,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#hidePlanReview();
 	}
 
-	#getEditorTerminalPath(): string | null {
-		if (process.platform === "win32") {
-			return null;
-		}
-		return "/dev/tty";
-	}
-
-	async #openEditorTerminalHandle(): Promise<fs.FileHandle | null> {
-		const terminalPath = this.#getEditorTerminalPath();
-		if (!terminalPath) {
-			return null;
-		}
-		try {
-			return await fs.open(terminalPath, "r+");
-		} catch {
-			return null;
-		}
-	}
-
 	#getPlanApprovalContextUsage(): ContextUsage | undefined {
 		const executionModel = this.#planModePreviousModelState?.model ?? this.session.model;
 		const contextWindow = executionModel?.contextWindow;
@@ -3296,18 +3300,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		let ttyHandle: fs.FileHandle | null = null;
 		try {
-			ttyHandle = await this.#openEditorTerminalHandle();
 			this.ui.stop();
-
-			const stdio: [number | "inherit", number | "inherit", number | "inherit"] = ttyHandle
-				? [ttyHandle.fd, ttyHandle.fd, ttyHandle.fd]
-				: ["inherit", "inherit", "inherit"];
-
 			const result = await openInEditor(editorCmd, currentText, {
 				extension: path.extname(resolvedPath) || ".md",
-				stdio,
 				trimTrailingNewline: false,
 			});
 			if (result !== null) {
@@ -3318,9 +3314,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		} catch (error) {
 			this.showWarning(`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
-			if (ttyHandle) {
-				await ttyHandle.close();
-			}
 			this.ui.start();
 			this.ui.requestRender(true);
 		}
@@ -3333,25 +3326,15 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		let ttyHandle: fs.FileHandle | null = null;
 		try {
-			ttyHandle = await this.#openEditorTerminalHandle();
 			this.ui.stop();
-
-			const stdio: [number | "inherit", number | "inherit", number | "inherit"] = ttyHandle
-				? [ttyHandle.fd, ttyHandle.fd, ttyHandle.fd]
-				: ["inherit", "inherit", "inherit"];
-
-			const result = await openInEditor(editorCmd, draft, { extension: ".md", stdio });
+			const result = await openInEditor(editorCmd, draft, { extension: ".md" });
 			if (result !== null) {
 				commit(result);
 			}
 		} catch (error) {
 			this.showWarning(`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
-			if (ttyHandle) {
-				await ttyHandle.close();
-			}
 			this.ui.start();
 			this.ui.requestRender(true);
 		}
@@ -4429,7 +4412,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const sessionId = this.sessionManager.getSessionId();
 		const sessionFile = this.sessionManager.getSessionFile();
 		if (sessionId && sessionFile && this.sessionManager.isSessionOnDisk()) {
-			process.stderr.write(`\n${chalk.dim(`Resume this session with ${APP_NAME} --resume ${sessionId}`)}\n`);
+			process.stderr.write(`\n${chalk.dim(`Resume this session with ${resumeCommand(sessionId)}`)}\n`);
 		}
 
 		await postmortem.quit(0);

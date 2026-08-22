@@ -320,6 +320,8 @@ export interface SessionMaintenanceHost {
 /** Owns compaction, pruning, shake, promotion, and automatic context maintenance. */
 export class SessionMaintenance {
 	#compactionAbortController: AbortController | undefined;
+	/** Resolves after an active manual compaction has reconnected the agent subscription. */
+	#manualCompactionCleanup: Promise<void> | undefined;
 	#autoCompactionAbortController: AbortController | undefined;
 	/**
 	 * Live tool-loop contexts parked after mid-turn maintenance hit a no-progress
@@ -674,8 +676,10 @@ export class SessionMaintenance {
 		let compactionCommitted = false;
 		let methodAttempted = false;
 		const compactionAbortController = retryController ?? new AbortController();
+		const manualCompactionCleanup = ownsCompactionController ? Promise.withResolvers<void>() : undefined;
 		if (ownsCompactionController) {
 			this.#compactionAbortController = compactionAbortController;
+			this.#manualCompactionCleanup = manualCompactionCleanup?.promise;
 		}
 		// A manual pass supersedes any background speculation; running both would
 		// double-bill the summarizer and race the commit.
@@ -949,17 +953,24 @@ export class SessionMaintenance {
 					preserveData = mergeLlmCompactionPreserveData(compactionPrep.preserveData, result.preserveData);
 				} catch (err) {
 					if (err instanceof CompactionCancelledError) {
-						throw err;
+						if (!compactionAbortController.signal.aborted || err.cause !== undefined) throw err;
+						throw new CompactionCancelledError(err.message, {
+							cause: compactionAbortController.signal.reason,
+						});
 					}
 					if (compactionAbortController.signal.aborted && err instanceof Error && err.name === "AbortError") {
-						throw new CompactionCancelledError();
+						throw new CompactionCancelledError(undefined, {
+							cause: compactionAbortController.signal.reason,
+						});
 					}
 					throw err;
 				}
 			}
 
 			if (compactionAbortController.signal.aborted) {
-				throw new CompactionCancelledError();
+				throw new CompactionCancelledError(undefined, {
+					cause: compactionAbortController.signal.reason,
+				});
 			}
 
 			compactionCommitted = true;
@@ -1018,6 +1029,10 @@ export class SessionMaintenance {
 				// queues, so nothing else resumes them: re-drain now that the listener is back
 				// and `isCompacting` is false, or the queued turn hangs until the next prompt.
 				this.#host.drainStrandedQueuedMessages();
+				if (this.#manualCompactionCleanup === manualCompactionCleanup?.promise) {
+					this.#manualCompactionCleanup = undefined;
+				}
+				manualCompactionCleanup?.resolve();
 			}
 		}
 	}
@@ -1049,12 +1064,25 @@ export class SessionMaintenance {
 	}
 
 	/**
-	 * Cancel in-progress context maintenance (manual compaction, auto-compaction, or auto-handoff).
+	 * Cancel in-progress context maintenance and return the active manual pass's
+	 * cleanup barrier. The barrier resolves only after its agent subscription reconnects.
 	 */
-	abortCompaction(): void {
-		this.#compactionAbortController?.abort();
-		this.#autoCompactionAbortController?.abort();
+	abortCompaction(reason?: unknown): Promise<void> | undefined {
+		const manualCompactionCleanup = this.#manualCompactionCleanup;
+		this.#compactionAbortController?.abort(reason);
+		this.#autoCompactionAbortController?.abort(reason);
 		this.#host.abortHandoff();
+		return manualCompactionCleanup;
+	}
+
+	/**
+	 * Resolves once an in-flight manual compaction has reconnected the agent
+	 * subscription and re-drained its preserved queues; `undefined` when no manual
+	 * compaction is active. Callers that must not start a turn against the
+	 * disconnected session (e.g. ordinary prompts) await this first.
+	 */
+	get manualCompactionCleanup(): Promise<void> | undefined {
+		return this.#manualCompactionCleanup;
 	}
 
 	/** Cancel only automatic maintenance while preserving a manual compaction. */
@@ -2186,7 +2214,13 @@ export class SessionMaintenance {
 	 */
 	#computeSnapcompactMaxFrames(preparation: CompactionPreparation, settings: EngineCompactionSettings): number {
 		const ctxWindow = this.#model?.contextWindow ?? 0;
-		if (ctxWindow <= 0) return Math.min(snapcompact.MAX_FRAMES_DEFAULT, snapcompact.maxFramesForDataBudget());
+		if (ctxWindow <= 0) {
+			return Math.min(
+				snapcompact.MAX_FRAMES_DEFAULT,
+				snapcompact.maxFramesForDataBudget(),
+				snapcompact.providerFrameBudget(this.#model?.provider),
+			);
+		}
 		const reserve = effectiveReserveTokens(ctxWindow, settings);
 		let baseTokens = computeNonMessageTokens(this.#host.nonMessageTokenSource(), this.#tokenizer);
 		baseTokens += this.#tokenizer.countMessages(preparation.recentMessages);
@@ -2227,6 +2261,7 @@ export class SessionMaintenance {
 			Math.floor(frameBudget / snapcompact.FRAME_TOKEN_ESTIMATE),
 			snapcompact.MAX_FRAMES_DEFAULT,
 			snapcompact.maxFramesForDataBudget(),
+			snapcompact.providerFrameBudget(this.#model?.provider),
 		);
 	}
 
@@ -2498,7 +2533,13 @@ export class SessionMaintenance {
 	 */
 	#computeSnapcompactRescueMaxFrames(settings: EngineCompactionSettings, keptTailTokens: number): number {
 		const ctxWindow = this.#model?.contextWindow ?? 0;
-		if (ctxWindow <= 0) return Math.min(snapcompact.MAX_FRAMES_DEFAULT, snapcompact.maxFramesForDataBudget());
+		if (ctxWindow <= 0) {
+			return Math.min(
+				snapcompact.MAX_FRAMES_DEFAULT,
+				snapcompact.maxFramesForDataBudget(),
+				snapcompact.providerFrameBudget(this.#model?.provider),
+			);
+		}
 		const thresholdTokens = resolveThresholdTokens(ctxWindow, settings);
 		const recoveryBandTokens = Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
 		const baseTokens = computeNonMessageTokens(this.#host.nonMessageTokenSource(), this.#tokenizer);
@@ -2509,12 +2550,14 @@ export class SessionMaintenance {
 		const frameBudget = recoveryBandTokens - baseTokens - keptTailTokens - textEdgeTokens - SUMMARY_TEMPLATE_TOKENS;
 		if (frameBudget < snapcompact.FRAME_TOKEN_ESTIMATE) return 0;
 		// Same hard caps as #computeSnapcompactMaxFrames: a threshold-derived
-		// count above the per-request payload budget would "shrink" a huge
-		// archive to a frame count the rebuilt prompt can never attach anyway.
+		// count above the per-request payload or provider image budget would
+		// "shrink" a huge archive to a frame count the rebuilt prompt can never
+		// attach anyway.
 		return Math.min(
 			Math.floor(frameBudget / snapcompact.FRAME_TOKEN_ESTIMATE),
 			snapcompact.MAX_FRAMES_DEFAULT,
 			snapcompact.maxFramesForDataBudget(),
+			snapcompact.providerFrameBudget(this.#model?.provider),
 		);
 	}
 

@@ -7,6 +7,7 @@ import { ChatTranscriptBuilder } from "@oh-my-pi/pi-coding-agent/modes/component
 import { CustomEditor } from "@oh-my-pi/pi-coding-agent/modes/components/custom-editor";
 import { formatUsageTimestamp } from "@oh-my-pi/pi-coding-agent/modes/components/usage-row";
 import { UserMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/user-message";
+import { chipLabel } from "@oh-my-pi/pi-coding-agent/modes/image-references";
 import { getEditorTheme, initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
@@ -84,11 +85,12 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 		expect(countOccurrences(raw, "\x1b]133;D;0\x07")).toBe(1);
 	});
 
-	it("bolds and underlines image references in the rendered message bubble", () => {
-		const raw = render("please inspect [Image #1] before continuing");
-		expect(Bun.stripANSI(raw)).toContain("[Image #1]");
+	it("collapses image markers to identity-colored chip tokens in the rendered bubble", () => {
+		// Wire format stays `[Image #1, WxH]`; the bubble shows the composer's compact chip.
+		const raw = render("please inspect [Image #1, 800x600] before continuing");
+		expect(Bun.stripANSI(raw)).toContain(`${chipLabel("image", 1)} before continuing`);
+		expect(Bun.stripANSI(raw)).not.toContain("[Image #1");
 		expect(raw).toContain("\x1b[1m");
-		expect(raw).toContain("\x1b[4m");
 	});
 
 	it("preserves image hyperlinks when timestamp is the trailing constructor argument", () => {
@@ -97,7 +99,7 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 		const raw = new UserMessageComponent("please inspect [Image #1]", false, [imagePath], ISSUED_AT)
 			.render(80)
 			.join("\n");
-		expect(Bun.stripANSI(raw)).toContain("[Image #1]");
+		expect(Bun.stripANSI(raw)).toContain(chipLabel("image", 1));
 		expect(raw).toContain("\x1b]8;id=");
 		expect(raw).toContain(imageUri);
 		expect(Bun.stripANSI(raw)).toContain(ISSUED_AT_LABEL);
@@ -150,7 +152,7 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 		const component = chatContainer.children.at(-1);
 		if (!component) throw new Error("Expected user message component to be appended");
 		const raw = component.render(80).join("\n");
-		expect(Bun.stripANSI(raw)).toContain("[Image #1]");
+		expect(Bun.stripANSI(raw)).toContain(chipLabel("image", 1));
 		expect(raw).toContain("\x1b]8;id=");
 		expect(raw).toContain(displayUri);
 		expect(Bun.stripANSI(raw)).toContain(ISSUED_AT_LABEL);

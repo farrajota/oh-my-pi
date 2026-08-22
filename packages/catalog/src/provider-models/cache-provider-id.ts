@@ -5,6 +5,17 @@ export interface ModelCacheProviderIdOptions {
 	baseUrl?: string;
 }
 
+const CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS: Readonly<Record<string, true>> = {
+	"opencode-go": true,
+	"opencode-zen": true,
+	"github-copilot": true,
+};
+
+/** Whether a provider's model-cache namespace requires its resolved credential. */
+export function isCredentialScopedModelCacheProvider(providerId: string): boolean {
+	return CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS[providerId] === true;
+}
+
 export function getDefaultModelDiscoveryBaseUrl(providerId: string): string | undefined {
 	switch (providerId) {
 		case "ollama":
@@ -48,15 +59,17 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 			return "cursor:max-mode-v3";
 		case "litellm": {
 			const baseUrl = options.baseUrl ?? getDefaultModelDiscoveryBaseUrl(providerId)!;
-			return `litellm:rich-v5:${Bun.hash(baseUrl).toString(36)}`;
+			return `litellm:rich-v6:${Bun.hash(baseUrl).toString(36)}`;
 		}
 		case "opencode-go":
 		case "opencode-zen": {
+			// v2: muse-spark-1.2 rows cached before the reasoning/thinking
+			// recovery carry `reasoning: false` and must be refetched.
 			const configuredBaseUrl = options.baseUrl ?? getDefaultModelDiscoveryBaseUrl(providerId)!;
 			const trimmedBaseUrl = configuredBaseUrl.endsWith("/") ? configuredBaseUrl.slice(0, -1) : configuredBaseUrl;
 			const discoveryBaseUrl = trimmedBaseUrl.endsWith("/v1") ? trimmedBaseUrl : `${trimmedBaseUrl}/v1`;
 			const scope = `${options.apiKey ?? ""}\u0000${discoveryBaseUrl}`;
-			return `${providerId}:models-v1:${Bun.hash(scope).toString(36)}`;
+			return `${providerId}:models-v2:${Bun.hash(scope).toString(36)}`;
 		}
 		case "github-copilot": {
 			// Copilot model specs bake in the plan-specific endpoint (personal vs

@@ -1,6 +1,11 @@
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
+import {
+	type BlobDestinationId,
+	type BlobDestinationMetadata,
+	BUILTIN_BLOB_DESTINATIONS,
+} from "../blob-broker/destinations";
 import { DEFAULT_RELAY_URL } from "../collab/protocol";
 import { DEFAULT_LIVE_VOICE, LIVE_VOICE_OPTIONS, LIVE_VOICE_VALUES } from "../live/voices";
 import {
@@ -80,6 +85,19 @@ import {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export type ModelRoleStorage = "global" | "project";
+
+const BUILTIN_BLOB_DESTINATION_METADATA: readonly BlobDestinationMetadata<BlobDestinationId>[] =
+	Object.values(BUILTIN_BLOB_DESTINATIONS);
+
+const BLOB_BACKEND_CHOICES = BUILTIN_BLOB_DESTINATION_METADATA.filter(
+	destination =>
+		destination.id === "provider-files" ||
+		(destination.directImage && destination.status !== "incompatible" && destination.status !== "defunct"),
+).map(destination => ({
+	value: destination.id,
+	label: destination.label,
+	description: destination.reason ?? destination.family,
+}));
 
 /** Composer shape id; extensions may register additional values at runtime. */
 export type ComposerShape = string;
@@ -593,6 +611,31 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"providers.openai-codex.codeMode": {
+		type: "enum",
+		values: ["off", "on", "auto"] as const,
+		default: "off",
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Codex Code Mode",
+			description:
+				"Route Codex code_mode_only models (GPT-5.6) through the eval tool as a programmatic execution surface: the direct tool surface collapses to eval/ask/todo and every other session tool is invoked from eval cells. Mirrors codex-rs Code Mode. 'auto' follows the model catalog flag.",
+		},
+	},
+
+	"providers.openai-codex.codeModeDirectTools": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Codex Code Mode Direct Tools",
+			description:
+				"Extra tool names to keep directly callable alongside eval/ask/todo when Codex Code Mode is active.",
+		},
+	},
+
 	disabledExtensions: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	modelRoleStorage: {
@@ -742,7 +785,7 @@ export const SETTINGS_SCHEMA = {
 	"statusLine.contextLine": {
 		type: "enum",
 		values: CONTEXT_LINE_MODE_VALUES,
-		default: "annotated",
+		default: "embedded",
 		ui: {
 			tab: "appearance",
 			group: "Status Line",
@@ -969,6 +1012,110 @@ export const SETTINGS_SCHEMA = {
 			label: "Describe Images for Text Models",
 			description:
 				"When an image is attached to a model without vision support, save it under local:// and inject a description from a vision-capable model instead of dropping it",
+		},
+	},
+
+	"images.urls.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Vision",
+			label: "Serve Images as URLs",
+			description:
+				"Publish outgoing images through the configured backend chain and send URL-fetching providers short URLs instead of inline base64. Falls back to inline automatically when every backend or a provider fetch fails",
+		},
+	},
+
+	"images.urls.backends": {
+		type: "array",
+		default: ["provider-files", "tailscale", "cloudflared", "litterbox"] as BlobDestinationId[],
+		ui: {
+			tab: "model",
+			group: "Vision",
+			label: "Image URL Backends",
+			description: "Ordered destinations tried when publishing images for provider access",
+			options: BLOB_BACKEND_CHOICES,
+			ordered: true,
+		},
+	},
+
+	"images.urls.options": {
+		type: "record",
+		default: {} as Partial<Record<BlobDestinationId, Record<string, unknown>>>,
+	},
+
+	"images.urls.credentials": {
+		type: "record",
+		default: {} as Partial<Record<BlobDestinationId, Record<string, string>>>,
+		credential: true,
+	},
+
+	"images.urls.command": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "model",
+			group: "Vision",
+			label: "Image Upload Command",
+			description:
+				"Argv template for the command backend; {file} is the image path, {mime}/{ext} optional. The last URL printed on stdout is used (e.g. pasta -b -f {file})",
+		},
+	},
+
+	"images.urls.publicBaseUrl": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "model",
+			group: "Vision",
+			label: "Image URL Public Base",
+			description: "Externally reachable base URL fronting the blob server (required for ssh, optional for direct)",
+		},
+	},
+
+	"images.urls.ttlHours": {
+		type: "number",
+		default: 72,
+		ui: {
+			tab: "model",
+			group: "Vision",
+			label: "Image URL Lifetime (hours)",
+			description:
+				"Serving window for locally hosted image URLs, measured from the last time a conversation sent them; resuming a conversation re-arms the window at the same link. 0 keeps links alive while the broker runs",
+		},
+	},
+
+	"images.urls.bindHost": {
+		type: "string",
+		default: "127.0.0.1",
+		ui: {
+			tab: "model",
+			group: "Vision",
+			label: "Image URL Bind Host",
+			description: "Host the blob server binds to; loopback for tunnels, 0.0.0.0 for direct serving",
+		},
+	},
+
+	"images.urls.sshTarget": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "model",
+			group: "Vision",
+			label: "Image URL SSH Target",
+			description: "user@host destination for the ssh reverse forward",
+		},
+	},
+
+	"images.urls.sshRemotePort": {
+		type: "number",
+		default: 8787,
+		ui: {
+			tab: "model",
+			group: "Vision",
+			label: "Image URL SSH Remote Port",
+			description: "Remote listen port of the ssh reverse forward that your web server proxies to",
 		},
 	},
 

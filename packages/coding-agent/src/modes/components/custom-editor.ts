@@ -13,7 +13,14 @@ import {
 import { BracketedPasteHandler } from "@oh-my-pi/pi-tui/bracketed-paste";
 import type { AppKeybinding } from "../../config/keybindings";
 import { isSettingsInitialized, settings } from "../../config/settings";
-import { imageReferenceHyperlink, PLACEHOLDER_REGEX, renderPlaceholders } from "../image-references";
+import {
+	attachmentSgr,
+	COMPOSER_TOKEN_REGEX,
+	chipLabel,
+	collapseImageMarkers,
+	imageReferenceHyperlink,
+	renderPlaceholders,
+} from "../image-references";
 import { hasMagicKeyword, highlightMagicKeywords } from "../magic-keywords";
 import { isQueuedMessageList, parseQueueShorthand, QUEUE_LIST_MARKER_RE } from "../queue-input";
 import { fgOrPlain, theme } from "../theme/theme";
@@ -352,6 +359,47 @@ export function extractImagePathFromText(text: string): string | undefined {
 }
 
 /**
+ * Resolve the {@link EditorTheme} from a `CustomEditor`/`Editor` constructor
+ * argument list, tolerating both the omp `(theme)` and upstream-pi
+ * `(tui, theme, keybindings)` conventions (see {@link CustomEditor}'s
+ * constructor). A real `EditorTheme` is identified structurally — it exposes a
+ * `borderColor` function and a `symbols` object — so a `TUI` passed in the first
+ * slot is skipped rather than mistaken for the theme.
+ */
+function pickEditorTheme(args: readonly unknown[]): EditorTheme {
+	for (const arg of args) {
+		if (isEditorTheme(arg)) return arg;
+	}
+	// Fall back to the first argument so a caller passing a bare theme that
+	// somehow fails the shape probe still reaches the base constructor.
+	return args[0] as EditorTheme;
+}
+
+function isEditorTheme(value: unknown): value is EditorTheme {
+	if (typeof value !== "object" || value === null) return false;
+	const candidate = value as Partial<EditorTheme>;
+	return (
+		typeof candidate.borderColor === "function" && typeof candidate.symbols === "object" && candidate.symbols !== null
+	);
+}
+
+/** A large text paste staged as a composer chip. `content` feeds the band card's snippet and
+ *  captions; the submit-time expansion (verbatim content or a wrapped block) lives in the
+ *  editor's atom table under `label`. */
+export interface TextAttachment {
+	n: number;
+	label: string;
+	content: string;
+	lineCount: number;
+	charCount: number;
+}
+
+/** One visible composer attachment, in band order (images first, then text pastes). */
+export type ComposerChipDescriptor =
+	| { kind: "image"; n: number; image: ImageContent; link: string | undefined }
+	| { kind: "paste"; n: number; text: TextAttachment };
+
+/**
  * Custom editor that handles configurable app-level shortcuts for coding-agent.
  */
 export class CustomEditor extends Editor {
@@ -366,6 +414,14 @@ export class CustomEditor extends Editor {
 	pendingImages: ImageContent[] = [];
 	/** Source links corresponding to {@link pendingImages}. */
 	pendingImageLinks: (string | undefined)[] = [];
+	/** Large text pastes staged as compact chip tokens; expansion lives in the atom table.
+	 *  Numbered by a per-draft monotonic counter so a deleted chip never recycles its number
+	 *  (labels key the atom table). */
+	pendingTexts: TextAttachment[] = [];
+	#textAttachmentCounter = 0;
+	/** Host-wired producer of per-image `file://` links (session blob store); drives clickable
+	 *  chip tokens for restored drafts (esc-esc, `/tree`, branch). */
+	draftImageLinkMaterializer?: (images: readonly ImageContent[]) => Promise<(string | undefined)[] | undefined>;
 
 	constructor(theme: EditorTheme);
 	constructor(tui: TUI, theme: EditorTheme, keybindings?: unknown);
@@ -381,25 +437,91 @@ export class CustomEditor extends Editor {
 	clearDraft(historyText?: string): void {
 		if (historyText !== undefined) this.addToHistory(historyText);
 		this.setText("");
+		this.clearAtoms();
 		this.imageLinks = undefined;
 		this.pendingImages = [];
 		this.pendingImageLinks = [];
+		this.pendingTexts = [];
+		this.#textAttachmentCounter = 0;
 	}
 
-	/** Replace the composer draft with a restored historical prompt: sets the text and
-	 *  re-attaches the message's images so positional `[Image #N]` markers resolve on
-	 *  resubmit instead of degrading to literal text (esc-esc branch, `/tree`). Source
-	 *  links are unknown for restored drafts, so every link slot is `undefined`. */
+	/** Replace the composer draft with a restored historical prompt: re-attaches the message's
+	 *  images, collapses stored `[Image #N, WxH]` markers back into compact chip tokens (so the
+	 *  chips band and atomic deletion return), and re-materializes `file://` links so the tokens
+	 *  are clickable again instead of degrading to dead text (esc-esc branch, `/tree`). */
 	setDraft(text: string, images?: readonly ImageContent[]): void {
-		this.setText(text);
+		this.clearAtoms();
+		this.pendingTexts = [];
+		this.#textAttachmentCounter = 0;
 		this.imageLinks = undefined;
 		this.pendingImages = images ? [...images] : [];
 		this.pendingImageLinks = images ? images.map(() => undefined) : [];
+		this.setCollapsedText(text);
+		void this.#materializeDraftLinks();
 	}
 
-	/** Treat image/paste markers as indivisible: a stray backspace deletes the whole token
-	 *  instead of corrupting `[Paste #1, +30 lines]` into plain text. */
-	override atomicTokenPattern = PLACEHOLDER_REGEX;
+	/** Set the buffer text with bracketed `[Image #N]` markers collapsed into chip tokens and
+	 *  registered in the atom table (queued-message dequeue, failed-submit restore). Leaves the
+	 *  pending image/text state untouched — callers own that. */
+	setCollapsedText(text: string): void {
+		this.setText(
+			collapseImageMarkers(text, this.pendingImages.length, (label, expansion) =>
+				this.registerAtom(label, expansion),
+			),
+		);
+	}
+
+	/** Stage `content` as a text-attachment chip: inserts the compact token at the cursor and
+	 *  registers `expansion` (default: the content itself) in the atom table for submit. */
+	insertTextAttachment(content: string, expansion: string = content): void {
+		this.#textAttachmentCounter++;
+		const n = this.#textAttachmentCounter;
+		const label = chipLabel("paste", n);
+		this.pendingTexts.push({
+			n,
+			label,
+			content,
+			lineCount: content.split("\n").length,
+			charCount: content.length,
+		});
+		this.insertAtom(label, expansion);
+	}
+
+	/** Attachments whose chip token (or legacy bracketed marker) is still present in the buffer —
+	 *  deleting the inline token hides the chip and drops the attachment from the submission. */
+	composerChips(): ComposerChipDescriptor[] {
+		const text = this.getText();
+		const chips: ComposerChipDescriptor[] = [];
+		for (let i = 0; i < this.pendingImages.length; i++) {
+			const n = i + 1;
+			const visible =
+				text.includes(chipLabel("image", n)) || text.includes(`[Image #${n}]`) || text.includes(`[Image #${n},`);
+			if (!visible) continue;
+			chips.push({ kind: "image", n, image: this.pendingImages[i], link: this.pendingImageLinks[i] });
+		}
+		for (const entry of this.pendingTexts) {
+			if (!text.includes(entry.label)) continue;
+			chips.push({ kind: "paste", n: entry.n, text: entry });
+		}
+		return chips;
+	}
+
+	/** Resolve draft-image links off the render path and repaint when they land; guarded against
+	 *  the draft being replaced while the blob writes were in flight. */
+	async #materializeDraftLinks(): Promise<void> {
+		const materialize = this.draftImageLinkMaterializer;
+		const images = this.pendingImages;
+		if (!materialize || images.length === 0) return;
+		const links = await materialize(images);
+		if (!links || this.pendingImages !== images) return;
+		this.pendingImageLinks = links;
+		this.imageLinks = links;
+		this.#requestShimmerRepaint?.();
+	}
+
+	/** Treat image/paste references — compact chip tokens and bracketed markers alike — as
+	 *  indivisible: a stray backspace deletes the whole token instead of corrupting it. */
+	override atomicTokenPattern = COMPOSER_TOKEN_REGEX;
 
 	/** Magic-keyword shimmer cadence — drives one editor repaint every 70 ms while
 	 *  a keyword is on screen and the prompt is focused. ~14 frames/s is smooth
@@ -451,12 +573,18 @@ export class CustomEditor extends Editor {
 				}
 				return highlighted;
 			},
-			renderReference: (value, kind, index) =>
-				kind === "image"
+			renderReference: (value, kind, index, form) => {
+				if (form === "chip") {
+					// Chip tokens carry their attachment identity color (matches the band card).
+					const styled = `${attachmentSgr(kind, index)}\x1b[1m${value}\x1b[22m\x1b[39m`;
+					return kind === "image" ? imageReferenceHyperlink(value, index, this.imageLinks, () => styled) : styled;
+				}
+				return kind === "image"
 					? imageReferenceHyperlink(value, index, this.imageLinks, label =>
 							fgOrPlain("accent", label, `\x1b[1m\x1b[4m${label}\x1b[24m\x1b[22m`),
 						)
-					: fgOrPlain("accent", value, `\x1b[1m${value}\x1b[22m`),
+					: fgOrPlain("accent", value, `\x1b[1m${value}\x1b[22m`);
+			},
 		});
 	};
 

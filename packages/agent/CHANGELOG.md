@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [17.4.1] - 2026-08-21
+
+### Fixed
+
+- Fixed Codex remote compaction requests failing for region-pinned enterprise ChatGPT workspaces when requests egress from a different region.
+
 ## [17.4.0] - 2026-08-20
 
 ### Breaking Changes

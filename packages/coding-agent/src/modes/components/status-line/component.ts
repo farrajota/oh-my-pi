@@ -1989,9 +1989,9 @@ export class StatusLineComponent implements Component {
 	 * by `statusLine.contextLine`:
 	 * - `off`: solid accent line (no context feedback).
 	 * - `percentage`: used portion in accent, remainder in the border color.
-	 * - `annotated` (default): percentage plus preset-aware markers where
+	 * - `annotated` : percentage plus preset-aware markers where
 	 *   speculative compaction starts and where auto-compaction fires.
-	 * - `embedded`: annotated markers plus percentage/window labels absorbed
+	 * - `embedded` (default): annotated markers plus percentage/window labels absorbed
 	 *   from configured context segments.
 	 */
 	#buildContextGaugeFill(
@@ -2007,7 +2007,7 @@ export class StatusLineComponent implements Component {
 			: undefined;
 		const usedColor = getSessionAccentAnsi(accentHex) ?? theme.getFgAnsi("borderAccent");
 		const horizontal = theme.boxRound.horizontal;
-		const mode = effectiveSettings.contextLine ?? "annotated";
+		const mode = effectiveSettings.contextLine ?? "embedded";
 		const pct = ctx.contextPercent;
 		if (mode === "off" || pct === null || pct === undefined) {
 			return `\x1b[49m${usedColor}${horizontal.repeat(gapWidth)}\x1b[39m`;

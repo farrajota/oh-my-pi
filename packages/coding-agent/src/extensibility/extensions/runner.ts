@@ -1257,6 +1257,7 @@ export class ExtensionRunner {
 			modelRegistry: this.modelRegistry,
 			actor: this.getActor(),
 			permissionScope: this.getPermissionScope(),
+			isProjectTrusted: () => true,
 			get model() {
 				return getModel();
 			},
