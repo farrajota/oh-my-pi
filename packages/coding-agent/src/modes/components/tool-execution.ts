@@ -266,6 +266,7 @@ export interface ToolExecutionHandle extends Component {
 		toolCallId?: string,
 	): void;
 	setArgsComplete(toolCallId?: string): void;
+	setExecutionStarted(toolCallId?: string): void;
 	setExpanded(expanded: boolean): void;
 	setTokenCount?(toolCallId: string, tokens: number): void;
 	setElapsedMs?(toolCallId: string, elapsedMs: number): void;
@@ -365,6 +366,12 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	#clipboard?: Clipboard;
 	#isPartial = true;
 	#resultVersion = 0;
+	// Post-finalize mutation counter (see FinalizableBlock.getTranscriptBlockVersion):
+	// a tool block can keep changing after isTranscriptBlockFinalized() first
+	// returns true — an async task's terminal result settlement, seal(), or an
+	// expansion toggle — and the transcript's width-epoch resolution and
+	// committed-render bypass must observe those mutations.
+	#blockVersion = 0;
 	#lastDisplayKey: string | undefined;
 	// Bumped whenever a render input that #rebuildDisplay consumes but the memo
 	// key cannot cheaply hash changes: streamed call args, the async edit-diff
@@ -409,6 +416,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	#todoStrikeInterval?: NodeJS.Timeout;
 	// Track if args are still being streamed (for edit/write spinner)
 	#argsComplete = false;
+	#executionStarted = false;
 	// Sealed once the tool reaches a terminal state (result delivered, or the
 	// turn abandoned it without one). Drives `isTranscriptBlockFinalized`: until
 	// sealed the block stays in the transcript's repaintable live region so a
@@ -450,10 +458,14 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		spinnerFrame?: number;
 		expanded: boolean;
 		isPartial: boolean;
+		argsComplete?: boolean;
+		executionStarted?: boolean;
 		renderContext?: Record<string, unknown>;
 	} = {
 		expanded: false,
 		isPartial: true,
+		argsComplete: false,
+		executionStarted: false,
 	};
 
 	constructor(
@@ -524,9 +536,28 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	 * This triggers an immediate final diff computation for edit-like tools.
 	 */
 	setArgsComplete(_toolCallId?: string): void {
+		const alreadyComplete = this.#argsComplete;
 		this.#argsComplete = true;
 		this.#updateSpinnerAnimation();
 		this.#schedulePreviewDiff();
+		if (alreadyComplete) return;
+		this.#displayInputVersion++;
+		this.#updateDisplay();
+	}
+
+	/**
+	 * Signal that this specific call has begun executing (`tool_execution_start`).
+	 * Distinct from {@link setArgsComplete}: exclusive writes are marked complete
+	 * at `message_end` but stay queued until this fires for that call.
+	 */
+	setExecutionStarted(_toolCallId?: string): void {
+		if (this.#executionStarted) return;
+		this.#executionStarted = true;
+		this.#argsComplete = true;
+		this.#updateSpinnerAnimation();
+		this.#schedulePreviewDiff();
+		this.#displayInputVersion++;
+		this.#updateDisplay();
 	}
 
 	/**
@@ -551,6 +582,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	 * stream at the rate the diffs can sustain.
 	 */
 	#schedulePreviewDiff(): void {
+		if (!this.#editMode) return;
 		this.#editDiffDirty = true;
 		if (this.#editDiffInFlight) return;
 		this.#editDiffInFlight = this.#drainPreviewDiff().finally(() => {
@@ -559,13 +591,30 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	}
 
 	async #drainPreviewDiff(): Promise<void> {
+		// One microtask of deferral so a same-tick settled result (transcript
+		// rebuild: construct → updateResult within one sync replay chunk) cancels
+		// the compute before the edit engine runs instead of after. Session
+		// restore settles thousands of historical edit calls this way; without
+		// the deferral each one re-ran the full sloppy matcher + whole-file diff
+		// to produce a preview the renderer discards in favor of `details.diff`.
+		await undefined;
 		while (this.#editDiffDirty) {
 			this.#editDiffDirty = false;
 			await this.#computePreviewDiff();
 		}
 	}
 
+	/**
+	 * True once a terminal result makes the streaming preview moot: renderResult
+	 * prefers `details.diff` and renders errors from the result text, consulting
+	 * the computed preview only for a non-error result that carries no details.
+	 */
+	#previewDiffSettled(): boolean {
+		const result = this.#result;
+		return result !== undefined && !this.#isPartial && (result.isError === true || result.details != null);
+	}
 	async #computePreviewDiff(): Promise<void> {
+		if (this.#previewDiffSettled()) return;
 		const editMode = this.#editMode;
 		if (!editMode) return;
 		const strategy = EDIT_MODE_STRATEGIES[editMode];
@@ -576,9 +625,10 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 
 		const previewArgs = getArgsWithStreamedTextInput(args);
 		const partialJson = partialJsonOf(previewArgs);
+		const isStreaming = !this.#argsComplete;
 		let effectiveArgs: unknown;
 		try {
-			effectiveArgs = strategy.extractCompleteEdits(previewArgs, partialJson);
+			effectiveArgs = strategy.extractCompleteEdits(previewArgs, partialJson, isStreaming);
 		} catch {
 			effectiveArgs = previewArgs;
 		}
@@ -611,7 +661,6 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		this.#editDiffAbort = controller;
 
 		try {
-			const isStreaming = !this.#argsComplete;
 			if (editMode === "hashline" && !this.#snapshots) return;
 			const previews = await strategy.computeDiffPreview(effectiveArgs, {
 				cwd: this.#cwd,
@@ -665,11 +714,18 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		this.#partialResultShapePainted = false;
 		this.#result = result;
 		this.#resultVersion++;
+		this.#blockVersion++;
 		this.#isPartial = isPartial;
 		this.#displaceableByToolName = displaceableToolName(this.#toolName, result, isPartial);
 		// When tool is complete, ensure args are marked complete so spinner stops
 		if (!isPartial) {
 			this.#argsComplete = true;
+		}
+		if (this.#editMode && this.#previewDiffSettled()) {
+			// Stop the streaming-preview pipeline: a queued or in-flight compute
+			// would produce a diff the renderer ignores once details exist.
+			this.#editDiffDirty = false;
+			this.#editDiffAbort?.abort();
 		}
 		this.#updateSpinnerAnimation();
 		this.#updateTodoStrikeAnimation();
@@ -932,6 +988,10 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		return (this.#result.details as { async?: { state?: string } } | undefined)?.async?.state === "running";
 	}
 
+	getTranscriptBlockVersion(): number {
+		return this.#blockVersion;
+	}
+
 	/**
 	 * Mark the tool terminal even though no result arrived (the turn aborted or
 	 * abandoned it) and stop animating, so it can freeze and stops pinning the
@@ -940,6 +1000,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	seal(): void {
 		if (this.#sealed) return;
 		this.#sealed = true;
+		this.#blockVersion++;
 		this.#displaceableByToolName = undefined;
 		// A sealed detached task is abandoned history: settle its progress rows
 		// on static gray — but only while none of them are committed; a recolor
@@ -988,6 +1049,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	}
 
 	setExpanded(expanded: boolean): void {
+		if (this.#expanded !== expanded) this.#blockVersion++;
 		this.#expanded = expanded;
 		this.#updateDisplay();
 	}
@@ -1012,7 +1074,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		// TUI startup, so a result rendered before it lands must re-shape once it
 		// does (it gates Image children vs text fallback in #rebuildDisplay); keyed
 		// here for the same reason markdown.ts keys its render cache on it.
-		const key = `${this.#resultVersion}|${this.#expanded}|${this.#isPartial}|${this.#spinnerFrame ?? "-"}|${this.#showImages}|${getThemeEpoch()}|${this.#displayInputVersion}|${this.#backgroundTaskFrozenStyled}|${TERMINAL.imageProtocol ?? "-"}|${this.#imageSizeKey()}`;
+		const key = `${this.#resultVersion}|${this.#expanded}|${this.#isPartial}|${this.#argsComplete ? "1" : "0"}|${this.#executionStarted ? "1" : "0"}|${this.#spinnerFrame ?? "-"}|${this.#showImages}|${getThemeEpoch()}|${this.#displayInputVersion}|${this.#backgroundTaskFrozenStyled}|${TERMINAL.imageProtocol ?? "-"}|${this.#imageSizeKey()}`;
 		if (key === this.#lastDisplayKey && this.#displayBuilt) return;
 		this.#lastDisplayKey = key;
 
@@ -1080,6 +1142,8 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		// Sync shared mutable render state for component closures
 		this.#renderState.expanded = this.#expanded;
 		this.#renderState.isPartial = this.#isPartial;
+		this.#renderState.argsComplete = this.#argsComplete;
+		this.#renderState.executionStarted = this.#executionStarted;
 		this.#renderState.spinnerFrame = this.#spinnerFrame;
 
 		// Non-self-framing tools (custom/extension renderers and the generic

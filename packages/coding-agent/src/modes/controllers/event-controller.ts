@@ -197,6 +197,7 @@ export class EventController {
 	// those calls arrive so the normal no-pending path cannot recreate the
 	// retracted card below the rewind's fresh blocks (#6879).
 	#retractedToolCallIds = new Set<string>();
+	#executionStartedCallIds = new Set<string>();
 	// Cards settled by a synthetic aborted/error `tool_execution_end` (agent-loop
 	// emits one per never-run call on a terminal error/abort). They stay visible
 	// for a genuinely terminal failure, but if an auto-retry then supersedes the
@@ -507,6 +508,9 @@ export class EventController {
 		// The reveal controller is id-keyed; drop the stale target so the loop's
 		// setTarget/bind under the new id owns the paced reveal.
 		this.#toolArgsReveal.finish(oldId);
+		if (this.#executionStartedCallIds.delete(oldId)) {
+			this.#executionStartedCallIds.add(newId);
+		}
 		const readArgs = this.#readToolCallArgs.get(oldId);
 		if (readArgs !== undefined) {
 			this.#readToolCallArgs.delete(oldId);
@@ -725,6 +729,12 @@ export class EventController {
 		this.#pendingMessageUpdate = undefined;
 		await this.handleEvent(pendingUpdate.source, pendingUpdate.event);
 	}
+
+	/** Whether `#handleToolExecutionStart` has fired for this call id this turn. */
+	hasToolExecutionStarted(toolCallId: string): boolean {
+		return this.#executionStartedCallIds.has(toolCallId);
+	}
+
 	/**
 	 * Clear every transcript-anchored/turn-scoped piece of state. Used by the
 	 * session focus proxy when re-pointing the transcript at another session:
@@ -744,6 +754,7 @@ export class EventController {
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#retractedToolCallIds.clear();
+		this.#executionStartedCallIds.clear();
 		this.#syntheticFailureCards.clear();
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
@@ -843,6 +854,7 @@ export class EventController {
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#retractedToolCallIds.clear();
+		this.#executionStartedCallIds.clear();
 		this.#syntheticFailureCards.clear();
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
@@ -1572,6 +1584,8 @@ export class EventController {
 				event.toolCallId,
 			);
 			component.setArgsComplete(event.toolCallId);
+			component.setExecutionStarted(event.toolCallId);
+			this.#executionStartedCallIds.add(event.toolCallId);
 			component.setExpanded(this.ctx.toolOutputExpanded);
 			this.ctx.chatContainer.addChild(component);
 			this.ctx.pendingTools.set(event.toolCallId, component);
@@ -1582,7 +1596,13 @@ export class EventController {
 			const component = this.ctx.pendingTools.get(event.toolCallId);
 			if (component && typeof component.updateArgs === "function") {
 				component.updateArgs(event.args, event.toolCallId);
-				if (typeof component.setArgsComplete === "function") component.setArgsComplete(event.toolCallId);
+				if (typeof component.setArgsComplete === "function") {
+					component.setArgsComplete(event.toolCallId);
+				}
+				if (typeof component.setExecutionStarted === "function") {
+					component.setExecutionStarted(event.toolCallId);
+				}
+				this.#executionStartedCallIds.add(event.toolCallId);
 				this.ctx.ui.requestRender();
 			}
 		}
@@ -1667,6 +1687,7 @@ export class EventController {
 		// assistant message. The matching card was deliberately retracted at
 		// message_end; consume the completion instead of recreating/updating UI.
 		if (this.#retractedToolCallIds.delete(event.toolCallId)) return;
+		this.#executionStartedCallIds.delete(event.toolCallId);
 		// A synthetic aborted/error completion (agent-loop's placeholder for a
 		// never-run call on a terminal error/abort) settles the card in place so a
 		// terminal failure stays visible. Remember it so #handleAutoRetryStart can
@@ -1943,6 +1964,7 @@ export class EventController {
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#retractedToolCallIds.clear();
+		this.#executionStartedCallIds.clear();
 		this.#syntheticFailureCards.clear();
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();

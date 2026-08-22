@@ -157,6 +157,7 @@ export type OpenAIReasoningDisableMode =
 	| "lowest-effort"
 	| "none-effort"
 	| "openrouter-enabled-false"
+	| "venice-disable-thinking"
 	| "zai-thinking-disabled"
 	| "qwen-enable-thinking-false"
 	| "qwen-template-false";
@@ -881,6 +882,12 @@ export type ModelTokenizer =
 export interface Model<TApi extends Api = Api> {
 	id: string;
 	/**
+	 * Whether provider-bound private-use glyphs require reversible ASCII tokenization.
+	 * Materialized by `buildModel`; request handlers read this capability instead of
+	 * inferring it from the transport API.
+	 */
+	requiresGlyphTokenization?: boolean;
+	/**
 	 * Model id to send on the wire when it differs from `id`. Used by catalog
 	 * variants that present one upstream model under several local entries —
 	 * e.g. GitHub Copilot long-context variants (`claude-opus-4.7-1m` requests
@@ -1007,7 +1014,7 @@ export interface Model<TApi extends Api = Api> {
  * sparse override shape and nothing is resolved yet.
  */
 export interface ModelSpec<TApi extends Api = Api>
-	extends Omit<Model<TApi>, "compat" | "compatConfig" | "supportsComputerUseConfig"> {
+	extends Omit<Model<TApi>, "compat" | "compatConfig" | "requiresGlyphTokenization" | "supportsComputerUseConfig"> {
 	/** Sparse compatibility overrides; resolved into `Model.compat` by `buildModel`. */
 	compat?: CompatConfigOf<TApi>;
 }

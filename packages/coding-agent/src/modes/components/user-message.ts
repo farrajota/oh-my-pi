@@ -1,7 +1,8 @@
 import { type Component, Container, Markdown, Text } from "@oh-my-pi/pi-tui";
 import { formatBytes } from "@oh-my-pi/pi-utils";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
-import { attachmentSgr, collapseImageMarkers, imageReferenceHyperlink, renderPlaceholders } from "../image-references";
+import { attachmentSgr, collapseImageMarkers, renderPlaceholders } from "../composer-attachments";
+import { imageReferenceHyperlink } from "../image-references";
 import { highlightMagicKeywords } from "../magic-keywords";
 import { formatUsageTimestamp } from "./usage-row";
 

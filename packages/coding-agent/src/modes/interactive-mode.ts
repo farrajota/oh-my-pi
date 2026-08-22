@@ -29,13 +29,12 @@ import {
 	getComposerStyle,
 	Loader,
 	Markdown,
-	ProcessTerminal,
 	Spacer,
 	setTerminalTextSizing,
 	setTuiTight,
 	TERMINAL,
 	Text,
-	TUI,
+	type TUI,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import type { TerminalAppearanceRequestToken } from "@oh-my-pi/pi-tui/terminal";
@@ -95,6 +94,7 @@ import {
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approved-plan";
 import { resolvePlanModelTransition } from "../plan-mode/model-transition";
 import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
+import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type: "text" };
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
@@ -123,8 +123,8 @@ import { agentTypeBadge, formatTaskId } from "../task/render";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import { tinyTitleClient } from "../tiny/title-client";
 import type { LspStartupServerInfo } from "../tools";
-import { normalizeLocalScheme } from "../tools/path-utils";
-import { formatMoreItems, replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
+import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
+import { formatMoreItems, replaceTabs, shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import {
 	formatPhaseDisplayName,
@@ -168,10 +168,13 @@ import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent, HookSelectorSlider } from "./components/hook-selector";
 import { type PlanReviewAnnotationState, PlanReviewOverlay } from "./components/plan-review-overlay";
+import { PlanSaveOverlay, type PlanSaveOverlayResult } from "./components/plan-save-overlay";
 import { StatusLineComponent } from "./components/status-line";
 import { stopSharedSpinnerTicker, type ToolExecutionHandle } from "./components/tool-execution";
 import { TranscriptContainer } from "./components/transcript-container";
-import { WelcomeComponent, type LspServerInfo as WelcomeLspServerInfo } from "./components/welcome";
+import type { LspServerInfo as WelcomeLspServerInfo } from "./components/welcome";
+import { Composer } from "./composer";
+import { writeComposerWelcomeCache } from "./composer-cache";
 import { BtwController } from "./controllers/btw-controller";
 import { CleanseCommandController } from "./controllers/cleanse-command-controller";
 import { CommandController } from "./controllers/command-controller";
@@ -186,7 +189,7 @@ import { SessionFocusController } from "./controllers/session-focus-controller";
 import { SSHCommandController } from "./controllers/ssh-command-controller";
 import { TanCommandController } from "./controllers/tan-command-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
-import { materializeImageReferenceLinks } from "./image-references";
+import { imageReferenceHyperlink, materializeImageReferenceLinks } from "./image-references";
 import {
 	consumeLoopLimitIteration,
 	createLoopLimitRuntime,
@@ -220,6 +223,7 @@ import {
 	startMacOSAppearanceReprobeFallback,
 	theme,
 } from "./theme/theme";
+import { getSlashCommandTypeIcon } from "./theme/tui-adapters";
 import type {
 	CompactionQueuedMessage,
 	InteractiveModeContext,
@@ -344,6 +348,37 @@ type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop" | "budget";
 const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop", "budget"]);
 const PLAN_KEEP_CONTEXT_OPTION_INDEX = 2;
 const PLAN_KEEP_CONTEXT_DISABLE_THRESHOLD_PERCENT = 95;
+const PLAN_SAVE_AND_QUIT_OPTION = "Save and quit";
+const PLAN_SAVE_TITLE_LINE_LIMIT = 6;
+
+const PLAN_SAVE_STEM_MAX_LENGTH = 32;
+const PLAN_FILENAME_SYSTEM_PROMPT = prompt.render(planFilenamePrompt);
+/** Suggested save filename for an approved plan: `<TOPIC>_PLAN.md` from the
+ *  tiny-model topic (e.g. `PYO3_METHODS_PLAN.md`), trimmed to a word boundary
+ *  when a verbose fallback title sneaks through. */
+export function planSaveFileName(title: string): string {
+	let stem = title
+		.normalize("NFC")
+		.replace(/[^\p{L}\p{N}]+/gu, "_")
+		.replace(/_+/g, "_")
+		.replace(/^_+|_+$/g, "")
+		.toUpperCase();
+	if (stem.length > PLAN_SAVE_STEM_MAX_LENGTH) {
+		const cut = stem.lastIndexOf("_", PLAN_SAVE_STEM_MAX_LENGTH);
+		stem = cut > 0 ? stem.slice(0, cut) : stem.slice(0, PLAN_SAVE_STEM_MAX_LENGTH);
+	}
+	if (!stem || stem === "PLAN") return "PLAN.md";
+	return `${stem.endsWith("_PLAN") ? stem : `${stem}_PLAN`}.md`;
+}
+
+function planSaveTitleExcerpt(planContent: string): string {
+	return planContent
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(Boolean)
+		.slice(0, PLAN_SAVE_TITLE_LINE_LIMIT)
+		.join("\n");
+}
 
 function parseGoalSubcommand(args: string): { sub: GoalSubcommand | undefined; rest: string } {
 	const trimmed = args.trim();
@@ -524,6 +559,8 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 
 export class InteractiveMode implements InteractiveModeContext {
+	#ownsStartedUi: boolean;
+	#startupSubmitGated: boolean;
 	session: AgentSession;
 	sessionManager: SessionManager;
 	settings: Settings;
@@ -531,6 +568,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	agent: Agent;
 	historyStorage?: HistoryStorage;
 
+	/** Canonical composer shared by cold prepaint and the session-aware runtime. */
+	readonly composer: Composer;
 	ui: TUI;
 	chatContainer: TranscriptContainer;
 	pendingMessagesContainer: Container;
@@ -779,7 +818,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	#mcpPendingServers = new Set<string>();
 	#mcpConnectedServers = new Set<string>();
 	#mcpFailedServers = new Map<string, { error: string; sourcePath?: string }>();
-	#welcomeComponent?: WelcomeComponent;
 	readonly #chatHost: ChatBlockHost = { requestRender: () => this.ui.requestRender() };
 
 	constructor(
@@ -790,10 +828,47 @@ export class InteractiveMode implements InteractiveModeContext {
 		lspServers: LspStartupServerInfo[] | undefined = undefined,
 		mcpManager?: MCPManager,
 		eventBus?: EventBus,
+		composer?: Composer,
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
 		this.settings = session.settings;
+		const preferences = {
+			quiet: settings.get("startup.quiet"),
+			composerShape: settings.get("composer.shape") ?? "box",
+			showHardwareCursor: settings.get("showHardwareCursor"),
+			maxInlineImages: settings.get("tui.maxInlineImages"),
+			scrollbackRebuild: settings.get("tui.scrollbackRebuild"),
+			resizeScrollback: settings.get("tui.resizeScrollback"),
+			imeSafeCursor: settings.get("tui.imeSafeCursor"),
+			autocompleteMaxVisible: settings.get("autocompleteMaxVisible"),
+			spellingTypoDetection: settings.get("spelling.typoDetection"),
+			spellingAutocomplete: settings.get("spelling.autocomplete"),
+			spellingAutocorrect: settings.get("spelling.autocorrect"),
+		};
+		const wasStarted = composer?.started ?? false;
+		this.composer =
+			composer ??
+			new Composer({
+				preferences,
+				welcome: {
+					version,
+					modelName: session.model?.name ?? "Unknown",
+					providerName: session.model?.provider ?? "Unknown",
+					lspServers: lspServers?.map(server => ({
+						name: server.name,
+						status: server.status,
+						fileTypes: server.fileTypes,
+					})),
+				},
+			});
+		this.composer.setPreferences(preferences);
+		this.ui = this.composer.ui;
+		this.editor = this.composer.editor;
+		this.editor.magicKeywordsEnabled = () => this.settings.get("magicKeywords.enabled");
+		this.editor.imageReferenceHyperlink = imageReferenceHyperlink;
+		this.#ownsStartedUi = wasStarted;
+		this.#startupSubmitGated = true;
 		this.keybindings = KeybindingsManager.inMemory();
 		this.agent = session.agent;
 		this.#version = version;
@@ -825,13 +900,16 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		setTuiTight(settings.get("tui.tight"));
 		setMarkdownMermaidRendering(settings.get("tui.renderMermaid"));
-		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"));
+		// A cold-start composer already owns the terminal. Reuse it so input
+		// buffered during startup remains in the same editor instance.
 		this.ui.setMaxInlineImages(settings.get("tui.maxInlineImages"));
 		this.ui.setScrollbackRebuild(settings.get("tui.scrollbackRebuild"));
+		this.ui.setResizeScrollback(settings.get("tui.resizeScrollback"));
+		this.ui.setShowHardwareCursor(settings.get("showHardwareCursor"));
 		// OSC 66 text-sizing is Kitty-only; resolve the setting against the terminal's
-		// capability (`TERMINAL.textSizing` defaults on for Kitty) so it stays off
+		// capability (`TERMINAL.supportsTextSizing` defaults on for Kitty) so it stays off
 		// unless the user opts in, and never emits raw escapes on other terminals.
-		setTerminalTextSizing(settings.get("tui.textSizing") && TERMINAL.textSizing);
+		setTerminalTextSizing(settings.get("tui.textSizing") && TERMINAL.supportsTextSizing);
 		this.chatContainer = new TranscriptContainer();
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
 		this.statusContainer = new AnchoredLiveContainer();
@@ -843,11 +921,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.errorBannerContainer = new AnchoredLiveContainer();
 		this.modelCycleContainer = new AnchoredLiveContainer();
 		this.deferredCommandContainer = new AnchoredLiveContainer();
-		this.editor = new CustomEditor(getEditorTheme());
 		this.ui.enableScopedInputRender(this.editor);
 		this.editor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		this.editor.setImeSafeCursorLayout(settings.get("tui.imeSafeCursor"));
 		this.editor.setAutocompleteMaxVisible(settings.get("autocompleteMaxVisible"));
+		this.syncEditorSpelling();
+		this.editor.viewportRowsProvider = () => this.ui.terminal.rows;
 		this.editor.onAutocompleteCancel = () => {
 			this.ui.requestRender(true);
 		};
@@ -856,9 +935,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		};
 		this.editor.setShimmerRepaintHandler(() => this.ui.requestDirectWrite(this.editor));
 		this.#syncEditorMaxHeight();
+		// Sync editor geometry only; never request a render here. This listener is
+		// registered before ProcessTerminal's own stdout "resize" listener (added in
+		// tui.start()), so it runs first on every SIGWINCH. The TUI's resize path
+		// already owns the repaint on every route (viewport fast path + settle,
+		// multiplexer debounce, alt-overlay repaint) and its settled render picks up
+		// the new editor max height. Requesting an ordinary render here additionally
+		// marked every resize as "render pending" (TUI hasPendingRender), which forced
+		// the multiplexer width epoch's conservative full-transcript replay — one
+		// duplicated transcript copy in pane history per tmux width change.
 		this.#resizeHandler = () => {
 			this.#syncEditorMaxHeight();
-			this.ui.requestRender();
 		};
 		process.stdout.on("resize", this.#resizeHandler);
 		try {
@@ -872,7 +959,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hookWidgetContainerAbove.addChild(new Spacer(1));
 		this.hookWidgetContainerBelow = new Container();
 		this.attachmentChipsContainer = new Container();
-		this.attachmentChipsContainer.addChild(new AttachmentChipsBand(this.editor, this.ui.imageBudget));
+		this.attachmentChipsContainer.addChild(
+			new AttachmentChipsBand(this.editor, this.ui.imageBudget, () => this.ui.requestRender()),
+		);
 		// Restored drafts (esc-esc, /tree, branch) re-materialize blob-store links off the render
 		// path so their chip tokens become clickable again instead of degrading to dead text.
 		this.editor.draftImageLinkMaterializer = images =>
@@ -892,12 +981,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.statusLine.setVibeWorkerTokenRateProvider(() =>
 			aggregateVibeWorkerTokensPerSecond(this.session.getAgentId() ?? MAIN_AGENT_ID),
 		);
-		// Lazy provider — the top border rebuild coalesces to at most one
-		// invocation per painted frame instead of firing on every session event
-		// (#4145). The TUI throttles renders at ~30fps, so a long-running eval
-		// spraying events no longer runs `getTopBorder` synchronously in the
-		// hot path where the render never gets to paint the result.
-		this.editor.setTopBorderProvider(availableWidth => this.statusLine.getTopBorder(availableWidth));
 
 		this.hideToolActivity = settings.get("display.hideToolActivity");
 		this.chatContainer.setToolActivityVisible(!this.hideToolActivity);
@@ -909,6 +992,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		).map(cmd => ({
 			name: cmd.name,
 			description: cmd.description ?? "(hook command)",
+			icon: getSlashCommandTypeIcon("extension"),
 			getArgumentCompletions: cmd.getArgumentCompletions,
 		}));
 
@@ -916,11 +1000,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		const customCommands: SlashCommand[] = this.session.customCommands.map(loaded => ({
 			name: loaded.command.name,
 			description: `${loaded.command.description} (${loaded.source})`,
+			icon: getSlashCommandTypeIcon(loaded.path.startsWith("mcp:") ? "mcp" : "prompt"),
 		}));
 
 		const skillCommandList = this.#rebuildSkillCommandsFromSession();
 
-		const builtinCommands = buildTuiBuiltinSlashCommands({ ctx: this });
+		const builtinCommands: SlashCommand[] = buildTuiBuiltinSlashCommands({ ctx: this }).map(cmd => ({
+			...cmd,
+			icon: getSlashCommandTypeIcon(cmd.icon ?? "action"),
+		}));
 		// Store pending commands for init() where file commands are loaded async
 		this.#pendingSlashCommands = [...builtinCommands, ...hookCommands, ...customCommands, ...skillCommandList];
 
@@ -996,10 +1084,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	playWelcomeIntro(): void {
-		const welcome = this.#welcomeComponent;
-		// Component-scoped: the intro only mutates the welcome box's own rows,
-		// so a resumed long transcript is not re-walked per animation frame.
-		welcome?.playIntro(() => this.ui.requestComponentRender(welcome));
+		this.composer.playWelcomeIntro();
 	}
 
 	async init(options: InteractiveModeInitOptions = {}): Promise<void> {
@@ -1018,7 +1103,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// callback and `shutdown()` share one promise-memoized teardown, so a
 		// signal arriving mid-Ctrl+C no-ops instead of racing a second dispose.
 		this.#signalTeardown = createSessionTeardown({
-			getDraftText: () => this.editor.getText(),
+			getDraftText: () => this.#inputController.getDraftText(),
 			beginDispose: () => this.session.beginDispose(),
 			saveDraft: text => this.sessionManager.saveDraft(text),
 			disposeSession: reason =>
@@ -1058,71 +1143,64 @@ export class InteractiveMode implements InteractiveModeContext {
 				})),
 			),
 		);
-
 		const startupQuiet = settings.get("startup.quiet");
-		this.#welcomeComponent = undefined;
-
+		this.composer.setPreferences({ quiet: startupQuiet });
+		this.composer.updateWelcome({
+			version: this.#version,
+			modelName,
+			providerName,
+			recentSessions,
+			lspServers: this.#getWelcomeLspServers(),
+		});
+		this.#persistComposerWelcome(modelName, providerName);
+		const headerBefore: Component[] = [];
 		for (const warning of this.session.configWarnings) {
-			this.ui.addChild(new Text(theme.fg("warning", `Warning: ${warning}`), 1, 0));
-			this.ui.addChild(new Spacer(1));
+			headerBefore.push(new Text(theme.fg("warning", `Warning: ${warning}`), 1, 0), new Spacer(1));
 		}
-
-		if (!startupQuiet) {
-			// Add welcome header
-			this.#welcomeComponent = new WelcomeComponent(
-				this.#version,
-				modelName,
-				providerName,
-				recentSessions,
-				this.#getWelcomeLspServers(),
+		const headerAfter: Component[] = [];
+		if (!startupQuiet && this.#startupChangelog && settings.get("startup.changelogMode") !== "hidden") {
+			headerAfter.push(
+				new DynamicBorder(),
+				new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0),
+				new Spacer(1),
 			);
-
-			// Setup UI layout
-			this.ui.addChild(new Spacer(1));
-			this.ui.addChild(this.#welcomeComponent);
-			this.ui.addChild(new Spacer(1));
-			if (!options.suppressWelcomeIntro) {
-				this.playWelcomeIntro();
+			if (settings.get("startup.changelogMode") === "summary") {
+				const summary = formatStartupChangelogSummary(this.#startupChangelog).replace(
+					/\/changelog(?: full)?/g,
+					command => theme.bold(command),
+				);
+				headerAfter.push(new Text(summary, 1, 0));
+			} else {
+				headerAfter.push(new Markdown(this.#startupChangelog.markdown?.trim() ?? "", 1, 0, getMarkdownTheme()));
 			}
-
-			// Add changelog if provided
-			if (this.#startupChangelog && settings.get("startup.changelogMode") !== "hidden") {
-				this.ui.addChild(new DynamicBorder());
-				this.ui.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
-				this.ui.addChild(new Spacer(1));
-				if (settings.get("startup.changelogMode") === "summary") {
-					const summary = formatStartupChangelogSummary(this.#startupChangelog).replace(
-						/\/changelog(?: full)?/g,
-						command => theme.bold(command),
-					);
-					this.ui.addChild(new Text(summary, 1, 0));
-				} else {
-					this.ui.addChild(new Markdown(this.#startupChangelog.markdown?.trim() ?? "", 1, 0, getMarkdownTheme()));
-				}
-				this.ui.addChild(new Spacer(1));
-				this.ui.addChild(new DynamicBorder());
-			}
+			headerAfter.push(new Spacer(1), new DynamicBorder());
 		}
+		this.composer.setHeaderExtras(headerBefore, headerAfter);
+		this.statusLine.watchBranch(() => {
+			this.ui.requestRender();
+		});
+		this.composer.setStatusComponent(this.statusLine);
 
-		this.ui.addChild(this.chatContainer);
-		this.ui.addChild(this.pendingMessagesContainer);
-		this.ui.addChild(this.todoContainer);
-		this.ui.addChild(this.subagentContainer);
-		this.ui.addChild(this.btwContainer);
-		this.ui.addChild(this.omfgContainer);
-		this.ui.addChild(this.cleanseContainer);
-		this.ui.addChild(this.errorBannerContainer);
-		this.ui.addChild(this.modelCycleContainer);
-		this.ui.addChild(this.deferredCommandContainer);
-		// Working loader / transient status sits below the sticky todo + subagent
-		// HUDs, just above the editor's hook-widget top margin — so it reads next to
-		// the prompt while keeping the one-line gap above the editor.
-		this.ui.addChild(this.statusContainer);
-		this.ui.addChild(this.attachmentChipsContainer);
-		this.ui.addChild(this.hookWidgetContainerAbove);
-		this.ui.addChild(this.editorContainer);
-		this.ui.addChild(this.hookWidgetContainerBelow);
-		this.ui.addChild(this.statusLine);
+		this.composer.setRuntimeChildren([
+			this.chatContainer,
+			this.pendingMessagesContainer,
+			this.todoContainer,
+			this.subagentContainer,
+			this.btwContainer,
+			this.omfgContainer,
+			this.cleanseContainer,
+			this.errorBannerContainer,
+			this.modelCycleContainer,
+			this.deferredCommandContainer,
+			// Working loader / transient status sits below the sticky todo + subagent
+			// HUDs, just above the editor's hook-widget top margin — so it reads next to
+			// the prompt while keeping the one-line gap above the editor.
+			this.statusContainer,
+			this.attachmentChipsContainer,
+			this.hookWidgetContainerAbove,
+			this.editorContainer,
+			this.hookWidgetContainerBelow,
+		]);
 		this.ui.setFocus(this.editor);
 		this.syncComposerShape();
 
@@ -1149,9 +1227,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#eventBusUnsubscribers.push(startMacOSAppearanceReprobeFallback(this.ui.terminal));
 		}
 
-		// Start the UI. Cold `omp` launch opts into clearing on the first paint so
-		// the initial welcome frame does not append over the previous run's scrollback.
-		this.ui.start({ clearScrollback: options.clearInitialTerminalHistory === true });
+		// A prepaint Composer may already own raw mode and the render loop.
+		if (!this.#ownsStartedUi) {
+			this.composer.start({
+				clearScrollback: options.clearInitialTerminalHistory === true,
+				playWelcomeIntro: !options.suppressWelcomeIntro,
+			});
+			this.#ownsStartedUi = true;
+		}
 		pushTerminalTitle();
 		setTerminalTitleStateEnabled(this.settings.get("tui.titleState"));
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
@@ -1324,13 +1407,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			// replay with the newly detected palette.
 			onTerminalAppearanceChange(mode, appearanceRefreshWasRequested ? {} : undefined);
 		});
-
-		// A branch change (checkout, worktree switch, `git switch`) invalidates
-		// the status-line git segments; the lazy top-border provider picks up
-		// the fresh branch on the next painted frame.
-		this.statusLine.watchBranch(() => {
-			this.ui.requestRender();
-		});
 	}
 
 	/** Reload the title-generation system prompt override for the provided working
@@ -1349,10 +1425,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		const commands: SlashCommand[] = [];
 		this.skillCommands.clear();
 		if (this.session.skillsSettings?.enableSkillCommands !== false) {
+			const icon = getSlashCommandTypeIcon("skill");
 			for (const skill of this.session.skills) {
 				const commandName = `skill:${skill.name}`;
 				this.skillCommands.set(commandName, skill);
-				commands.push({ name: commandName, description: skill.description });
+				commands.push({ name: commandName, description: skill.description, icon });
 			}
 		}
 		return commands;
@@ -1371,9 +1448,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		const basePath = cwd ?? this.sessionManager.getCwd();
 		const fileCommands = await loadSlashCommands({ cwd: basePath });
 		this.fileSlashCommands = new Set(fileCommands.map(cmd => cmd.name));
+		const promptIcon = getSlashCommandTypeIcon("prompt");
 		const fileSlashCommands: SlashCommand[] = fileCommands.map(cmd => ({
 			name: cmd.name,
 			description: cmd.description,
+			icon: promptIcon,
 		}));
 		// Surface discovered prompt templates in the picker. AgentSession.prompt() expands
 		// `expandSlashCommand` before `expandPromptTemplate`, and builtin command
@@ -1396,6 +1475,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				// `PromptTemplate.description` from `loadTemplatesFromDir` already includes the
 				// source suffix (e.g. "Review code (project)"), so pass it through verbatim.
 				description: template.description,
+				icon: promptIcon,
 			}));
 		this.#baseAutocompleteProvider = this.#inputController.createAutocompleteProvider(
 			[...this.#pendingSlashCommands, ...fileSlashCommands, ...promptTemplateCommands],
@@ -1479,6 +1559,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.onInputCallback = undefined;
 			resolve(input);
 		};
+		if (this.#startupSubmitGated) {
+			this.#startupSubmitGated = false;
+			this.editor.disableSubmit = false;
+			this.ui.requestRender();
+		}
 		this.#scheduleLoopAutoSubmit();
 		this.#scheduleGoalContinuation();
 
@@ -1936,6 +2021,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editor.setMaxHeight(this.#computeEditorMaxHeight());
 	}
 
+	syncEditorSpelling(): void {
+		this.editor.setSpellingFeatures({
+			typoDetection: this.settings.get("spelling.typoDetection"),
+			autocomplete: this.settings.get("spelling.autocomplete"),
+			autocorrect: this.settings.get("spelling.autocorrect"),
+		});
+	}
+
 	#syncStatusLineSettings(): void {
 		this.statusLine.updateSettings({
 			preset: settings.get("statusLine.preset"),
@@ -1953,7 +2046,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	syncComposerShape(): void {
 		const shape = settings.get("composer.shape") ?? "box";
 		const style = getComposerStyle(shape);
-		this.editor.setBorderStyle(shape);
+		this.composer.setPreferences({ composerShape: shape });
 		this.statusLine.setAutocompleteActiveProbe(() => this.editor.isAutocompleteActive());
 		switch (style.statusAttachment) {
 			case "top-border":
@@ -3280,6 +3373,82 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
+	async #promptPlanSavePath(planContent: string, title: string): Promise<string | undefined> {
+		let suggestedPath = planSaveFileName(title);
+		let overlay: PlanSaveOverlay | undefined;
+		const excerpt = planSaveTitleExcerpt(planContent);
+		if (excerpt) {
+			void this.session
+				.generateTitle(excerpt, PLAN_FILENAME_SYSTEM_PROMPT)
+				.then(generatedTitle => {
+					if (!generatedTitle) return;
+					suggestedPath = planSaveFileName(generatedTitle);
+					overlay?.setSuggestedPath(suggestedPath);
+					this.ui.requestRender();
+				})
+				.catch(error => {
+					logger.debug("plan-save: filename generation failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+		}
+		try {
+			const result = await this.showHookCustom<PlanSaveOverlayResult | undefined>(
+				(_tui, _theme, _keybindings, done) => {
+					overlay = new PlanSaveOverlay(suggestedPath, done);
+					return overlay;
+				},
+				{ overlay: true },
+			);
+			return result?.path;
+		} finally {
+			overlay = undefined;
+		}
+	}
+
+	async #savePlanAndQuit(planContent: string, title: string, annotationStateKey: string): Promise<void> {
+		const selectedPath = await this.#promptPlanSavePath(planContent, title);
+		if (!selectedPath) return;
+
+		let destination: string;
+		try {
+			destination = resolveToCwd(selectedPath, this.sessionManager.getCwd());
+		} catch (error) {
+			this.showError(`Invalid plan save path: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
+		try {
+			await Bun.write(destination, planContent);
+		} catch (error) {
+			this.showError(
+				`Failed to save plan to ${shortenPath(destination)}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return;
+		}
+		try {
+			await this.#exitPlanMode({ silent: true });
+		} catch (error) {
+			this.showError(
+				`Saved plan to ${shortenPath(destination)}, but could not exit plan mode: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+			return;
+		}
+
+		this.#planReviewAnnotationState.delete(annotationStateKey);
+		try {
+			await this.handleClearCommand();
+			this.showStatus(`Saved plan to ${shortenPath(destination)}.`);
+		} catch (error) {
+			this.showError(
+				`Saved plan to ${shortenPath(destination)}, but could not start a new session: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
 	async #openPlanInExternalEditor(planFilePath: string): Promise<void> {
 		const editorCmd = getEditorCommand();
 		if (!editorCmd) {
@@ -4138,7 +4307,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		const choice = await this.showPlanReview(
 			planContent,
 			"Plan mode - next step",
-			["Approve and execute", "Approve and compact context", keepContextLabel, "Refine plan"],
+			[
+				"Approve and execute",
+				"Approve and compact context",
+				keepContextLabel,
+				"Refine plan",
+				PLAN_SAVE_AND_QUIT_OPTION,
+			],
 			{
 				helpText,
 				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
@@ -4162,6 +4337,21 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#hidePlanReview();
 			this.ui.requestRender();
 		};
+
+		if (choice === PLAN_SAVE_AND_QUIT_OPTION) {
+			closePlanReview();
+			try {
+				const latestPlanContent = editedContent ?? (await this.#readPlanFile(planFilePath));
+				if (latestPlanContent === null) {
+					this.showError(`Plan file not found at ${planFilePath}`);
+					return;
+				}
+				await this.#savePlanAndQuit(latestPlanContent, details.title, annotationStateKey);
+			} catch (error) {
+				this.showError(`Failed to save plan: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			return;
+		}
 
 		if (choice === "Approve and execute" || choice === "Approve and compact context" || choice === keepContextLabel) {
 			try {
@@ -4346,10 +4536,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Clear the process-global consent handler so it doesn't outlive this
 		// InteractiveMode instance (e.g. test harnesses, headless re-init).
 		setAutoQaConsentHandler(null, null);
-		if (this.isInitialized) {
+		if (this.#ownsStartedUi) {
 			this.ui.stop();
-			this.isInitialized = false;
+			this.#ownsStartedUi = false;
 		}
+		this.isInitialized = false;
 	}
 
 	async shutdown(): Promise<void> {
@@ -4445,6 +4636,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		nextEditor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		nextEditor.setImeSafeCursorLayout(this.settings.get("tui.imeSafeCursor"));
 		nextEditor.setAutocompleteMaxVisible(this.settings.get("autocompleteMaxVisible"));
+		nextEditor.setSpellingFeatures({
+			typoDetection: this.settings.get("spelling.typoDetection"),
+			autocomplete: this.settings.get("spelling.autocomplete"),
+			autocorrect: this.settings.get("spelling.autocorrect"),
+		});
+		nextEditor.viewportRowsProvider = () => this.ui.terminal.rows;
+		nextEditor.magicKeywordsEnabled = () => this.settings.get("magicKeywords.enabled");
+		nextEditor.imageReferenceHyperlink = imageReferenceHyperlink;
 		nextEditor.onAutocompleteCancel = () => {
 			this.ui.requestRender(true);
 		};
@@ -4453,6 +4652,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		};
 		nextEditor.setShimmerRepaintHandler(() => this.ui.requestDirectWrite(nextEditor));
 		this.editor = nextEditor;
+		this.composer.setEditor(nextEditor);
 		this.syncComposerShape();
 		nextEditor.setMaxHeight(this.#computeEditorMaxHeight());
 		if (this.historyStorage) {
@@ -4461,7 +4661,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		nextEditor.setText(previousText);
 
 		this.editorContainer.clear();
-		this.editor = nextEditor;
 		this.editorContainer.addChild(nextEditor);
 		this.ui.setFocus(nextEditor);
 
@@ -4634,21 +4833,21 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#updateWelcomeModel(): void {
-		if (!this.#welcomeComponent) {
-			return;
-		}
+		const modelName = this.session.model?.name ?? "Unknown";
+		const providerName = this.session.model?.provider ?? "Unknown";
+		this.composer.updateWelcome({ modelName, providerName });
+		this.#persistComposerWelcome(modelName, providerName);
+	}
 
-		this.#welcomeComponent.setModel(this.session.model?.name ?? "Unknown", this.session.model?.provider ?? "Unknown");
-		this.ui.requestRender();
+	#persistComposerWelcome(modelName: string, providerName: string): void {
+		if (!this.sessionManager.getSessionFile()) return;
+		void writeComposerWelcomeCache(this.sessionManager.getCwd(), { modelName, providerName }).catch(error => {
+			logger.debug("composer welcome cache write failed", { error });
+		});
 	}
 
 	#updateWelcomeLspServers(): void {
-		if (!this.#welcomeComponent) {
-			return;
-		}
-
-		this.#welcomeComponent.setLspServers(this.#getWelcomeLspServers());
-		this.ui.requestRender();
+		this.composer.updateWelcome({ lspServers: this.#getWelcomeLspServers() });
 	}
 
 	#clearWorkingMessageAccentCache(): void {
@@ -4859,7 +5058,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	addMessageToChat(
 		message: AgentMessage,
 		options?: {
-			populateHistory?: boolean;
 			imageLinks?: readonly (string | undefined)[];
 			reuseSettledComponent?: boolean;
 		},
@@ -4891,6 +5089,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		clearTerminalHistory?: boolean;
 	}): Promise<void> {
 		await this.#uiHelpers.renderInitialMessages(options);
+	}
+
+	truncateTranscriptFromMessage(message: AgentMessage): boolean {
+		return this.#uiHelpers.truncateTranscriptFromMessage(message);
 	}
 
 	getUserMessageText(message: Message): string {

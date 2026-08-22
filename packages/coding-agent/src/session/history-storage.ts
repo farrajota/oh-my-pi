@@ -3,12 +3,17 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { AsyncDrain, getDbBusyTimeoutMs, getHistoryDbPath, logger } from "@oh-my-pi/pi-utils";
 
+/** A unique prompt with provenance from its most recent submission. */
 export interface HistoryEntry {
+	/** Stable row identifier used by the full-text index. */
 	id: number;
+	/** Trimmed prompt text, unique across the history database. */
 	prompt: string;
+	/** Unix timestamp of the most recent submission. */
 	created_at: number;
+	/** Project working directory of the most recent submission. */
 	cwd?: string;
-	/** ID of the session the prompt was submitted from, if known. */
+	/** Session ID of the most recent submission, if known. */
 	sessionId?: string;
 }
 
@@ -28,6 +33,7 @@ function escapeLikePattern(text: string): string {
 	return text.replace(/[\\%_]/g, "\\$&");
 }
 
+/** Stores searchable prompts with only their latest project and session metadata. */
 export class HistoryStorage {
 	#db: Database;
 	static #instance?: HistoryStorage;
@@ -35,15 +41,11 @@ export class HistoryStorage {
 	#sessionResolver?: () => string | undefined;
 
 	// Prepared statements
-	#insertRowStmt: Statement;
+	#upsertRowStmt: Statement;
 	#recentStmt: Statement;
 	#searchStmt: Statement;
-	#lastPromptStmt: Statement;
 	// Cache substring-fallback prepared statements keyed by token count.
 	#substringStmts = new Map<number, Statement>();
-
-	// In-memory cache of last prompt to avoid sync DB reads on add
-	#lastPromptCache: string | null = null;
 
 	private constructor(dbPath: string) {
 		this.#ensureDir(dbPath);
@@ -55,36 +57,35 @@ export class HistoryStorage {
 		// protocol loop for the full interactive timeout.
 		this.#db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
 
-		const hasFts = this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_fts'").get();
+		const hadFts = this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_fts'").get();
 		this.#db.run(`
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
 CREATE TABLE IF NOT EXISTS history (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	prompt TEXT NOT NULL,
+	prompt TEXT NOT NULL UNIQUE,
 	created_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH}),
 	cwd TEXT,
 	session_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
+		`);
 
+		const needsMigration = this.#historySchemaNeedsMigration();
+		if (needsMigration) {
+			this.#migrateHistorySchema();
+		}
+
+		this.#db.run(`
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(prompt, content='history', content_rowid='id');
 
 CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 	INSERT INTO history_fts(rowid, prompt) VALUES (new.id, new.prompt);
-	END;
-	`);
+END;
+		`);
 
-		if (this.#historySchemaUsesUnixEpoch()) {
-			this.#migrateHistorySchema();
-		}
-
-		if (!this.#historySchemaHasColumn("session_id")) {
-			this.#db.run("ALTER TABLE history ADD COLUMN session_id TEXT");
-		}
-
-		if (!hasFts) {
+		if (needsMigration || !hadFts) {
 			try {
 				this.#db.run("INSERT INTO history_fts(history_fts) VALUES('rebuild')");
 			} catch (error) {
@@ -98,14 +99,17 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		this.#searchStmt = this.#db.prepare(
 			"SELECT h.id, h.prompt, h.created_at, h.cwd, h.session_id FROM history_fts f JOIN history h ON h.id = f.rowid WHERE history_fts MATCH ? ORDER BY h.created_at DESC, h.id DESC LIMIT ?",
 		);
-		this.#lastPromptStmt = this.#db.prepare("SELECT prompt FROM history ORDER BY id DESC LIMIT 1");
-
-		this.#insertRowStmt = this.#db.prepare("INSERT INTO history (prompt, cwd, session_id) VALUES (?, ?, ?)");
-
-		const last = this.#lastPromptStmt.get() as { prompt?: string } | undefined;
-		this.#lastPromptCache = last?.prompt ?? null;
+		this.#upsertRowStmt = this.#db.prepare(`
+INSERT INTO history (prompt, created_at, cwd, session_id)
+VALUES (?, ${SQLITE_NOW_EPOCH}, ?, ?)
+ON CONFLICT(prompt) DO UPDATE SET
+	created_at = excluded.created_at,
+	cwd = excluded.cwd,
+	session_id = excluded.session_id
+		`);
 	}
 
+	/** Opens the process-wide prompt history database. */
 	static open(dbPath: string = getHistoryDbPath()): HistoryStorage {
 		if (!HistoryStorage.#instance) {
 			HistoryStorage.#instance = new HistoryStorage(dbPath);
@@ -123,17 +127,16 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 	#close(): void {
 		for (const stmt of this.#substringStmts.values()) stmt.finalize();
 		this.#substringStmts.clear();
-		this.#insertRowStmt.finalize();
+		this.#upsertRowStmt.finalize();
 		this.#recentStmt.finalize();
 		this.#searchStmt.finalize();
-		this.#lastPromptStmt.finalize();
 		this.#db.close();
 	}
 
 	#insertBatch(rows: Array<Pick<HistoryEntry, "prompt" | "cwd" | "sessionId">>): void {
 		this.#db.transaction((rows: Array<Pick<HistoryEntry, "prompt" | "cwd" | "sessionId">>) => {
 			for (const row of rows) {
-				this.#insertRowStmt.run(row.prompt, row.cwd ?? null, row.sessionId ?? null);
+				this.#upsertRowStmt.run(row.prompt, row.cwd ?? null, row.sessionId ?? null);
 			}
 		})(rows);
 	}
@@ -147,17 +150,17 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		this.#sessionResolver = resolver;
 	}
 
+	/** Stores a prompt and replaces its provenance with the latest submission. */
 	add(prompt: string, cwd?: string, sessionId?: string): Promise<void> {
 		const trimmed = prompt.trim();
 		if (!trimmed) return Promise.resolve();
-		if (this.#lastPromptCache === trimmed) return Promise.resolve();
-		this.#lastPromptCache = trimmed;
 		const session = sessionId ?? this.#sessionResolver?.();
 		return this.#drain.push({ prompt: trimmed, cwd: cwd ?? undefined, sessionId: session || undefined }, rows => {
 			this.#insertBatch(rows);
 		});
 	}
 
+	/** Returns unique prompts ordered by their most recent submission. */
 	getRecent(limit: number): HistoryEntry[] {
 		const safeLimit = this.#normalizeLimit(limit);
 		if (safeLimit === 0) return [];
@@ -171,6 +174,7 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		}
 	}
 
+	/** Finds unique prompts matching every query token, newest first. */
 	search(query: string, limit: number): HistoryEntry[] {
 		const safeLimit = this.#normalizeLimit(limit);
 		if (safeLimit === 0) return [];
@@ -252,31 +256,61 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		return columns.some(col => col.name === column);
 	}
 
+	#historyPromptIsUnique(): boolean {
+		const row = this.#db
+			.prepare(`
+SELECT 1 AS present
+FROM pragma_index_list('history') AS indexes
+WHERE indexes."unique" = 1
+	AND indexes.partial = 0
+	AND (SELECT COUNT(*) FROM pragma_index_info(indexes.name)) = 1
+	AND (SELECT name FROM pragma_index_info(indexes.name) LIMIT 1) = 'prompt'
+LIMIT 1
+			`)
+			.get() as { present?: number } | undefined;
+		return row?.present === 1;
+	}
+
+	#historySchemaNeedsMigration(): boolean {
+		return (
+			this.#historySchemaUsesUnixEpoch() ||
+			!this.#historySchemaHasColumn("session_id") ||
+			!this.#historyPromptIsUnique()
+		);
+	}
+
 	#migrateHistorySchema(): void {
+		const hasSessionId = this.#historySchemaHasColumn("session_id");
+		const sessionIdSelection = hasSessionId ? "session_id" : "NULL AS session_id";
 		const migrate = this.#db.transaction(() => {
-			this.#db.run("ALTER TABLE history RENAME TO history_legacy");
 			this.#db.run("DROP INDEX IF EXISTS idx_history_created_at");
 			this.#db.run("DROP TRIGGER IF EXISTS history_ai");
 			this.#db.run("DROP TABLE IF EXISTS history_fts");
+			this.#db.run("ALTER TABLE history RENAME TO history_legacy");
 			this.#db.run(`
 CREATE TABLE history (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	prompt TEXT NOT NULL,
+	prompt TEXT NOT NULL UNIQUE,
 	created_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH}),
 	cwd TEXT,
 	session_id TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
-INSERT INTO history (id, prompt, created_at, cwd)
-SELECT id, prompt, created_at, cwd
-FROM history_legacy;
+CREATE INDEX idx_history_created_at ON history(created_at DESC);
+INSERT INTO history (id, prompt, created_at, cwd, session_id)
+SELECT id, prompt, created_at, cwd, session_id
+FROM (
+	SELECT
+		id,
+		prompt,
+		created_at,
+		cwd,
+		${sessionIdSelection},
+		ROW_NUMBER() OVER (PARTITION BY prompt ORDER BY created_at DESC, id DESC) AS recency_rank
+	FROM history_legacy
+)
+WHERE recency_rank = 1;
 DROP TABLE history_legacy;
-CREATE VIRTUAL TABLE history_fts USING fts5(prompt, content='history', content_rowid='id');
-CREATE TRIGGER history_ai AFTER INSERT ON history BEGIN
-	INSERT INTO history_fts(rowid, prompt) VALUES (new.id, new.prompt);
-END;
 			`);
-			this.#db.run("INSERT INTO history_fts(history_fts) VALUES('rebuild')");
 		});
 		migrate();
 	}

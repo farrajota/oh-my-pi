@@ -163,6 +163,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.readHelp,
 	},
 	{
+		name: "render",
+		load: () => import("./commands/render").then(m => m.default),
+		help: commandHelp.renderHelp,
+	},
+	{
 		name: "ssh",
 		load: () => import("./commands/ssh").then(m => m.default),
 		help: commandHelp.sshHelp,

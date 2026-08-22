@@ -96,7 +96,6 @@ export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions & Pick<H
 
 export interface RenderSessionContextOptions {
 	updateFooter?: boolean;
-	populateHistory?: boolean;
 	reuseSettledComponents?: boolean;
 	/** Tool calls whose existing live component remains the sole render owner across a rebuild. */
 	preservedLiveToolCallIds?: ReadonlySet<string>;
@@ -122,6 +121,7 @@ export interface InteractiveModeContext {
 	hookWidgetContainerBelow: Container;
 	statusLine: StatusLineComponent;
 	syncComposerShape(): void;
+	syncEditorSpelling(): void;
 
 	// Session access
 	session: AgentSession;
@@ -337,7 +337,6 @@ export interface InteractiveModeContext {
 	addMessageToChat(
 		message: AgentMessage,
 		options?: {
-			populateHistory?: boolean;
 			imageLinks?: readonly (string | undefined)[];
 			reuseSettledComponent?: boolean;
 		},
@@ -350,6 +349,13 @@ export interface InteractiveModeContext {
 		renderChunk?: () => void,
 	): Promise<void>;
 	renderInitialMessages(options?: { preserveExistingChat?: boolean; clearTerminalHistory?: boolean }): Promise<void>;
+	/**
+	 * In-place transcript rewind: drop the rendered components at/after
+	 * `message` when none of their rows reached native scrollback. Returns
+	 * false when the caller must fall back to a destructive
+	 * `renderInitialMessages({ clearTerminalHistory: true })` replay.
+	 */
+	truncateTranscriptFromMessage(message: AgentMessage): boolean;
 	getUserMessageText(message: Message): string;
 	findLastAssistantMessage(): AssistantMessage | undefined;
 	extractAssistantText(message: AssistantMessage): string;

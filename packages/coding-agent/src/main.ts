@@ -59,12 +59,22 @@ import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
+import { discoverStartupLspServers } from "./lsp/servers";
 import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
 import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
-import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
+import type * as SetupWizardModule from "./modes/setup-wizard";
+import type { SetupScene } from "./modes/setup-wizard";
+import {
+	applyStartupComposerPreferences,
+	type ComposerLease,
+	setStartupComposerLspServers,
+	stopPendingStartupComposer,
+	takeStartupComposerLease,
+} from "./modes/startup-composer";
+import { ensureTheme, initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import { createWarpEventBridgeExtension } from "./modes/warp-events";
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
@@ -484,41 +494,58 @@ async function runInteractiveMode(
 	initialMessage?: string,
 	initialImages?: ImageContent[],
 	joinLink?: string,
+	startupLease?: ComposerLease,
 ): Promise<void> {
-	const mode = new InteractiveMode(
-		session,
-		version,
-		startupChangelog,
-		setExtensionUIContext,
-		lspServers,
-		mcpManager,
-		eventBus,
-	);
+	let mode: InteractiveMode;
+	try {
+		mode = new InteractiveMode(
+			session,
+			version,
+			startupChangelog,
+			setExtensionUIContext,
+			lspServers,
+			mcpManager,
+			eventBus,
+			startupLease?.composer,
+		);
+		startupLease?.adopt();
+	} catch (error) {
+		startupLease?.dispose();
+		throw error;
+	}
 
-	// Cold-launch gate: the full setup wizard (every scene + the overlay and
-	// their TUI/OAuth/search/theme deps) is heavy, yet the common case only needs
-	// to know whether the stored setup version is current. Lazy-load the wizard
-	// barrel only when setup is stale, forced, or the explicit startup splash
-	// setting needs the shared setup splash renderer.
-	const storedSetupVersion = settings.get("setupVersion");
-	const setupWizard =
-		forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash
-			? await import("./modes/setup-wizard")
-			: undefined;
-	const setupScenes = setupWizard
-		? await setupWizard.selectSetupScenes(storedSetupVersion, setupWizard.ALL_SCENES, mode, {
-				resuming,
-				isTTY: process.stdin.isTTY && process.stdout.isTTY,
-				setupWizardEnabled: settings.get("startup.setupWizard"),
-				force: forceSetupWizard,
-			})
-		: [];
-	const playStartupSplash = showStartupSplash && setupScenes.length === 0;
+	let setupWizard: typeof SetupWizardModule | undefined;
+	let setupScenes: SetupScene[] = [];
+	let playStartupSplash = false;
+	try {
+		// Cold-launch gate: the full setup wizard (every scene + the overlay and
+		// their TUI/OAuth/search/theme deps) is heavy, yet the common case only needs
+		// to know whether the stored setup version is current. Lazy-load the wizard
+		// barrel only when setup is stale, forced, or the explicit startup splash
+		// setting needs the shared setup splash renderer.
+		const storedSetupVersion = settings.get("setupVersion");
+		setupWizard =
+			forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash
+				? await import("./modes/setup-wizard")
+				: undefined;
+		setupScenes = setupWizard
+			? await setupWizard.selectSetupScenes(storedSetupVersion, setupWizard.ALL_SCENES, mode, {
+					resuming,
+					isTTY: process.stdin.isTTY && process.stdout.isTTY,
+					setupWizardEnabled: settings.get("startup.setupWizard"),
+					force: forceSetupWizard,
+				})
+			: [];
+		playStartupSplash = showStartupSplash && setupScenes.length === 0;
 
-	await mode.init({
-		suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
-		clearInitialTerminalHistory: true,
-	});
+		await mode.init({
+			suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
+			clearInitialTerminalHistory: true,
+		});
+	} catch (error) {
+		mode.stop();
+		throw error;
+	}
 
 	if (setupWizard && playStartupSplash) {
 		await setupWizard.runStartupSplash(mode);
@@ -1307,9 +1334,9 @@ export async function runRootCommand(
 	logger.startTiming();
 	startStartupWatchdog();
 	try {
-		// Initialize theme early with defaults (CLI commands need symbols)
-		// Will be re-initialized with user preferences later
-		await logger.time("initTheme:initial", initTheme);
+		// Non-prepaint commands still need a default theme; an existing Composer
+		// already initialized its cached theme synchronously for the first frame.
+		await logger.time("initTheme:initial", ensureTheme);
 
 		const parsedArgs = parsed;
 		await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
@@ -1383,6 +1410,9 @@ export async function runRootCommand(
 		// tree; declare it so headless subagent optimizations (e.g. skipping replan
 		// title refresh) can tell a focusable process from a print/RPC/eval one.
 		setInteractiveHost(isInteractive);
+		if (!isInteractive) {
+			stopPendingStartupComposer();
+		}
 		// Create AuthStorage upfront. A configured-but-unreachable auth broker throws
 		// here; convert it to an actionable stderr message + clean exit instead of a
 		// raw uncaught stack trace (issue #8096).
@@ -1475,6 +1505,27 @@ export async function runRootCommand(
 			settingsInstance.get("theme.dark"),
 			settingsInstance.get("theme.light"),
 		);
+
+		applyStartupComposerPreferences({
+			quiet: settingsInstance.get("startup.quiet"),
+			composerShape: settingsInstance.get("composer.shape") ?? "box",
+			showHardwareCursor: settingsInstance.get("showHardwareCursor"),
+			maxInlineImages: settingsInstance.get("tui.maxInlineImages"),
+			scrollbackRebuild: settingsInstance.get("tui.scrollbackRebuild"),
+			resizeScrollback: settingsInstance.get("tui.resizeScrollback"),
+			imeSafeCursor: settingsInstance.get("tui.imeSafeCursor"),
+			autocompleteMaxVisible: settingsInstance.get("autocompleteMaxVisible"),
+			spellingTypoDetection: settingsInstance.get("spelling.typoDetection"),
+			spellingAutocomplete: settingsInstance.get("spelling.autocomplete"),
+			spellingAutocorrect: settingsInstance.get("spelling.autocorrect"),
+			theme: {
+				symbolPreset: settingsInstance.get("symbolPreset"),
+				colorBlindMode: settingsInstance.get("colorBlindMode"),
+				darkTheme: settingsInstance.get("theme.dark"),
+				lightTheme: settingsInstance.get("theme.light"),
+			},
+		});
+		setStartupComposerLspServers(discoverStartupLspServers(cwd, "connecting"));
 
 		let scopedModels = await logger.time(
 			"resolveModelScope",
@@ -1914,27 +1965,32 @@ export async function runRootCommand(
 						process.exit(0);
 					}
 				}
-
-				stopStartupWatchdog();
-				logger.endTiming();
-				await runInteractiveMode(
-					session,
-					VERSION,
-					startupChangelog,
-					notifs,
-					versionCheckPromise,
-					initialArgs.messages,
-					setToolUIContext,
-					lspServers,
-					mcpManager,
-					Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
-					deps.forceSetupWizard === true,
-					showStartupSplash,
-					eventBus,
-					initialMessage,
-					initialImages,
-					parsedArgs.join,
-				);
+				const startupLease = takeStartupComposerLease();
+				try {
+					stopStartupWatchdog();
+					logger.endTiming();
+					await runInteractiveMode(
+						session,
+						VERSION,
+						startupChangelog,
+						notifs,
+						versionCheckPromise,
+						initialArgs.messages,
+						setToolUIContext,
+						lspServers,
+						mcpManager,
+						Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
+						deps.forceSetupWizard === true,
+						showStartupSplash,
+						eventBus,
+						initialMessage,
+						initialImages,
+						parsedArgs.join,
+						startupLease,
+					);
+				} finally {
+					startupLease?.dispose();
+				}
 			} else {
 				// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
 				stopStartupWatchdog();
@@ -1956,6 +2012,7 @@ export async function runRootCommand(
 			}
 		}
 	} catch (error) {
+		stopPendingStartupComposer();
 		stopStartupWatchdog();
 		throw error;
 	}

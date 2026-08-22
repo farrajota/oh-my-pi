@@ -88,6 +88,7 @@ import {
 	BUILT_IN_DISCOVERY_CACHE_TTL_MS,
 	BUILT_IN_DISCOVERY_NON_AUTHORITATIVE_RETRY_MS,
 	type BuiltInDiscoveryResult,
+	extractGoogleOAuthProjectId,
 	extractGoogleOAuthToken,
 	getOAuthCredentialsForProvider,
 	isAuthenticated,
@@ -258,6 +259,8 @@ export class ModelRegistry {
 			ignoreLocalModelConfig?: boolean;
 			/** Settings source for availability and context-window policies. */
 			settings?: Settings;
+			/** Model discovery cache database. Defaults beside an explicit models config. */
+			cacheDbPath?: string;
 			fetch?: FetchImpl;
 		},
 	) {
@@ -269,7 +272,8 @@ export class ModelRegistry {
 				? () => Promise.reject(new Error("network disabled in model-registry runtime test"))
 				: wrapFetchForExtraCa(fetch));
 		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath ?? path.join(getAgentDir(), "models.yml"));
-		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
+		this.#cacheDbPath =
+			options?.cacheDbPath ?? (modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined);
 		// Set up fallback resolver for custom provider API keys
 		this.authStorage.setFallbackResolver(provider => {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
@@ -985,13 +989,14 @@ export class ModelRegistry {
 
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
+		const hasOllamaEndpointOverride = Boolean(Bun.env.OLLAMA_BASE_URL?.trim() || Bun.env.OLLAMA_HOST?.trim());
 		if (!configuredProviders.has("ollama") && !disabledProviders.has("ollama")) {
 			this.#discoverableProviders.push({
 				provider: "ollama",
 				api: "openai-responses",
 				baseUrl: getImplicitOllamaBaseUrl(),
 				discovery: { type: "ollama" },
-				optional: true,
+				optional: !hasOllamaEndpointOverride,
 			});
 			this.#keylessProviders.add("ollama");
 		}
@@ -1001,7 +1006,7 @@ export class ModelRegistry {
 				api: "openai-responses",
 				baseUrl: Bun.env.LLAMA_CPP_BASE_URL || "http://127.0.0.1:8080",
 				discovery: { type: "llama.cpp" },
-				optional: true,
+				optional: !Bun.env.LLAMA_CPP_BASE_URL,
 			});
 			// Only mark as keyless if no API key is configured
 			if (!this.authStorage.hasAuth("llama.cpp")) {
@@ -1014,7 +1019,7 @@ export class ModelRegistry {
 				api: "openai-completions",
 				baseUrl: Bun.env.LM_STUDIO_BASE_URL || "http://127.0.0.1:1234/v1",
 				discovery: { type: "lm-studio" },
-				optional: true,
+				optional: !Bun.env.LM_STUDIO_BASE_URL,
 			});
 			this.#keylessProviders.add("lm-studio");
 		}
@@ -1422,6 +1427,20 @@ export class ModelRegistry {
 		}
 	}
 
+	/**
+	 * Resolve the GCP project id for Gemini CLI quota discovery from the stored
+	 * OAuth credential matched to the token in use. Used only as a fallback for
+	 * the discovery fast path, where `peekApiKey` returns the bare access token
+	 * (stripping the structured identity); matching strictly by `access` avoids
+	 * attaching an unrelated account's project. Workspace/Standard accounts
+	 * require the id because project-less `loadCodeAssist` cannot resolve one.
+	 */
+	#resolveGeminiCliDiscoveryProjectId(oauthToken: string): string | undefined {
+		const credentials = getOAuthCredentialsForProvider(this.authStorage, "google-gemini-cli");
+		const projectId = credentials.find(credential => credential.access === oauthToken)?.projectId?.trim();
+		return projectId ? projectId : undefined;
+	}
+
 	async #collectBuiltInModelManagerOptions(
 		strategy: ModelRefreshStrategy,
 		providerFilter: ReadonlySet<string> | undefined,
@@ -1431,7 +1450,7 @@ export class ModelRegistry {
 			providerId: string;
 			authoritative: boolean;
 			resolveKey: (value: string | undefined) => string | undefined;
-			createOptions: (key: string) => ModelManagerOptions<Api>;
+			createOptions: (key: string, raw: string | undefined) => ModelManagerOptions<Api>;
 		}> = [
 			{
 				providerId: "google-antigravity",
@@ -1448,9 +1467,10 @@ export class ModelRegistry {
 				providerId: "google-gemini-cli",
 				authoritative: false,
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken =>
+				createOptions: (oauthToken, raw) =>
 					googleGeminiCliModelManagerOptions({
 						oauthToken,
+						projectId: extractGoogleOAuthProjectId(raw) ?? this.#resolveGeminiCliDiscoveryProjectId(oauthToken),
 						endpoint: this.#descriptorBaseUrl("google-gemini-cli"),
 						fetch: this.#fetch,
 					}),
@@ -1526,7 +1546,7 @@ export class ModelRegistry {
 			if (!isAuthenticated(key)) {
 				continue;
 			}
-			options.push(descriptor.createOptions(key));
+			options.push(descriptor.createOptions(key, specialKeys[i]));
 		}
 		// Append runtime model managers registered by extensions via fetchDynamicModels.
 		for (const { options: managerOpts } of this.#runtimeModelManagers.values()) {
