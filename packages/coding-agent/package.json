@@ -71,6 +71,7 @@
     "@opentelemetry/sdk-metrics": "catalog:",
     "@opentelemetry/sdk-trace-base": "catalog:",
     "@opentelemetry/sdk-trace-node": "catalog:",
+    "mupdf": "catalog:",
     "puppeteer-core": "catalog:"
   },
   "optionalDependencies": {

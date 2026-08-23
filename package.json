@@ -59,6 +59,7 @@
       "ghostty-web": "^0.4.0",
       "lint-staged": "^17.0.8",
       "lucide-react": "^1.24.0",
+      "mupdf": "1.28.0",
       "onnxruntime-node": "1.26.0",
       "postcss": "^8.5.16",
       "prettier": "^3.9.5",
