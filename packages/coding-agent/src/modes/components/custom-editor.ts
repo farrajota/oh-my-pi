@@ -9,7 +9,7 @@ import {
 	type KeyId,
 	parseKey,
 	parseKittySequence,
-	type TUI,
+	TUI,
 } from "@oh-my-pi/pi-tui";
 import { BracketedPasteHandler } from "@oh-my-pi/pi-tui/bracketed-paste";
 import type { AppKeybinding } from "../../config/keybindings";
