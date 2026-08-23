@@ -166,6 +166,11 @@ describe("EventController displaces consecutive waiting polls", () => {
 		const chatContainer = new TranscriptContainer();
 		const children = chatContainer.children;
 		const pendingTools = new Map();
+		const session = {
+			agent: { tokenizer: { countMessage: () => 0 } },
+			getToolByName: () => undefined,
+			hasBuiltInTool: () => true,
+		};
 		const ctx = {
 			isInitialized: true,
 			init: vi.fn(async () => {}),
@@ -175,9 +180,9 @@ describe("EventController displaces consecutive waiting polls", () => {
 			toolOutputExpanded: false,
 			pendingTools,
 			chatContainer,
-			session: { getToolByName: () => undefined, hasBuiltInTool: () => true },
+			session,
 			showWarning: vi.fn(),
-			viewSession: { getToolByName: () => undefined, hasBuiltInTool: () => true },
+			viewSession: session,
 			sessionManager: { getCwd: () => process.cwd() },
 			setTodos: vi.fn(),
 			setWorkingMessageRunTokenDelta: vi.fn(),
@@ -253,7 +258,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		const { controller, ctx, children } = createFixture();
 
 		const poll = await runPoll(controller, ctx.viewSession, children, "t1");
-		expect(poll.isTranscriptBlockFinalized()).toBe(false);
+		expect(poll.isDisplaceableBlock()).toBe(true);
 
 		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",

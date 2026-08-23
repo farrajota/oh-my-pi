@@ -253,9 +253,10 @@ describe("EventController IRC expiry", () => {
 		await controller.handleEvent(ctx.session, { type: "irc_message", message });
 		expect(chatContainer.children).toHaveLength(1);
 
-		// Render the container and commit its rows to simulate entering native scrollback
-		const lines = chatContainer.render(80);
-		chatContainer.setNativeScrollbackCommittedRows(lines.length);
+		// Offer and acknowledge the finalized batch to simulate native scrollback.
+		const batch = chatContainer.peekFinalizedBatch(80, 0);
+		expect(batch).toBeDefined();
+		chatContainer.acknowledgeFinalizedBatch(batch!.id);
 
 		// Everything above the card is finalized, so its rows may already be in
 		// native scrollback. Removing it would be an interior deletion of the
