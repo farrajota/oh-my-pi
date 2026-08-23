@@ -1139,6 +1139,34 @@ export const SETTINGS_SCHEMA = {
 		description:
 			"Maximum number of inline images kept as live terminal graphics (default 8). Older images fall back to a text placeholder via a full redraw once the limit is exceeded. Set to 0 to keep every image (no limit).",
 	},
+	"tui.resizeScrollback": {
+		type: "enum",
+		values: ["append", "rebuild", "preserve"] as const,
+		default: "rebuild",
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Resize Scrollback",
+			description: "How a settled terminal resize refreshes transcript rows retained in terminal scrollback",
+			options: [
+				{
+					value: "append",
+					label: "Append",
+					description: "Replay the transcript at the new width below retained history",
+				},
+				{
+					value: "rebuild",
+					label: "Rebuild",
+					description: "Erase all terminal scrollback, then replay one current-width transcript",
+				},
+				{
+					value: "preserve",
+					label: "Preserve",
+					description: "Repaint only the viewport and keep history wrapped at its old width",
+				},
+			],
+		},
+	},
 
 	"terminal.showProgress": {
 		type: "boolean",
@@ -1218,47 +1246,6 @@ export const SETTINGS_SCHEMA = {
 			group: "Display",
 			label: "Tight Layout",
 			description: "Remove the 1-character horizontal padding from the left and right of the terminal output",
-		},
-	},
-	"tui.scrollbackRebuild": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "appearance",
-			group: "Display",
-			label: "Rewrite Scrollback",
-			description:
-				"Erase and replay terminal scrollback when a block's final form replaces its live preview. When off (default), stale preview copies remain in history and the final content is appended below.",
-		},
-	},
-	"tui.resizeScrollback": {
-		type: "enum",
-		values: ["append", "rebuild", "preserve"] as const,
-		default: "append",
-		ui: {
-			tab: "appearance",
-			group: "Display",
-			label: "Resize Scrollback",
-			description:
-				"How a settled width resize refreshes terminal scrollback when the pane repaints in place (tmux/screen/zellij, or in-place direct terminals). The host rewraps old output naively on resize; these modes decide whether the transcript is re-emitted at the new width.",
-			options: [
-				{
-					value: "append",
-					label: "Append",
-					description: "Replay the transcript at the new width below the old history (one fresh copy per resize)",
-				},
-				{
-					value: "rebuild",
-					label: "Rebuild",
-					description:
-						"DESTRUCTIVE: erases the pane's ENTIRE scrollback (including pre-session shell output) and replays the transcript, leaving exactly one current-width copy. Needs a host that honors ED3: tmux does; when nested, the innermost honoring host clears; hosts that ignore it (GNU screen) behave like Append",
-				},
-				{
-					value: "preserve",
-					label: "Preserve",
-					description: "Repaint the viewport only; history keeps its old-width wrap (zero growth)",
-				},
-			],
 		},
 	},
 
@@ -2210,6 +2197,21 @@ export const SETTINGS_SCHEMA = {
 			group: "Startup & Updates",
 			label: "Check for Updates",
 			description: "Check for omp updates on startup",
+		},
+	},
+	"update.channel": {
+		type: "enum",
+		values: ["stable", "canary"] as const,
+		default: "stable",
+		ui: {
+			tab: "interaction",
+			group: "Startup & Updates",
+			label: "Update Channel",
+			description: "Update channel used by omp update and the startup update check",
+			options: [
+				{ value: "stable", label: "Stable" },
+				{ value: "canary", label: "Canary" },
+			],
 		},
 	},
 
@@ -3638,6 +3640,17 @@ export const SETTINGS_SCHEMA = {
 			description: "Append full before/after source when an edit introduces an AST parse failure",
 		},
 	},
+	"edit.autoRepair.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "files",
+			group: "Editing",
+			label: "Auto-Repair Parse Regressions",
+			description:
+				"When an edit breaks a file's AST parse, ask the smol model to fix the broken region (validated by re-parse; falls back to a warning)",
+		},
+	},
 
 	readLineNumbers: {
 		type: "boolean",
@@ -3862,7 +3875,7 @@ export const SETTINGS_SCHEMA = {
 
 	"bash.autoBackground.enabled": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "shell",
 			group: "Bash",
@@ -5674,14 +5687,28 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"features.unexpectedStopDetection": {
-		type: "boolean",
-		default: false,
+		type: "enum",
+		values: ["none", "mechanical", "smart"] as const,
+		default: "mechanical",
 		ui: {
 			tab: "interaction",
 			group: "Agent",
-			label: "Detect unexpected stops",
+			label: "Unexpected Stops",
 			description:
-				"Use a small model to detect when the assistant says it will continue but stops without tool calls; automatically prompt it to continue.",
+				"Automatically recover when the assistant stops without a visible message. Smart also classifies text-only stops with a small model.",
+			options: [
+				{ value: "none", label: "None", description: "Disabled" },
+				{
+					value: "mechanical",
+					label: "Mechanical",
+					description: "Retry stops with no visible assistant message; tool calls are excluded (default)",
+				},
+				{
+					value: "smart",
+					label: "Smart",
+					description: "Mechanical + small-model classification of text-only stops",
+				},
+			],
 		},
 	},
 	"providers.unexpectedStopModel": {
@@ -5693,8 +5720,8 @@ export const SETTINGS_SCHEMA = {
 			group: "Tiny Model",
 			label: "Unexpected Stop Model",
 			description:
-				"Classifier for unexpected-stop detection: online (the TINY role from /models, else smol) by default, or a local on-device model.",
-			condition: "unexpectedStopDetection",
+				"Classifier for Smart unexpected-stop detection: online (the TINY role from /models, else smol) by default, or a local on-device model.",
+			condition: "unexpectedStopSmart",
 			options: TINY_MEMORY_MODEL_OPTIONS,
 		},
 	},

@@ -1006,6 +1006,18 @@ export interface Model<TApi extends Api = Api> {
 	 * `options.isOAuth = true` for the underlying provider call.
 	 */
 	isOAuth?: boolean;
+	/**
+	 * Amazon Bedrock Guardrail id or ARN attached to every Converse request for
+	 * this model. Set from `providers.amazon-bedrock.guardrailIdentifier`; the
+	 * streaming layer forwards it as `options.guardrailIdentifier` so accounts
+	 * that gate `bedrock:InvokeModel*` on the `bedrock:GuardrailIdentifier`
+	 * condition key stop returning an explicit deny.
+	 */
+	guardrailIdentifier?: string;
+	/** Bedrock guardrail version. Defaults to `"DRAFT"` at request time when unset. */
+	guardrailVersion?: string;
+	/** Bedrock guardrail trace verbosity. */
+	guardrailTrace?: "enabled" | "disabled" | "enabled_full";
 }
 
 /**

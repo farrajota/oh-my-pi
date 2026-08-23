@@ -75,11 +75,9 @@ const MCP_MANUAL_LOGIN_TIP = "Headless? Paste the redirect URL or code with /log
 const MCP_TEST_ESCAPE_GRACE_MS = 5_000;
 
 /**
- * Hint block for an in-flight `/mcp test`. Stays unfinalized (so
- * TranscriptContainer keeps re-rendering it, even once scrolled into the
- * native-scrollback live-region seam) until settlement seals its final text.
- * A plain TranscriptBlock would be treated as immutable after finalize and a
- * settled rewrite could be lost to committed-history replay.
+ * Hint block for an in-flight `/mcp test`. It remains active until settlement
+ * seals its final text, after which TranscriptContainer can retire it as an
+ * immutable history batch.
  */
 class MutableHintBlock extends TranscriptBlock {
 	#sealed = false;
@@ -1632,7 +1630,14 @@ export class MCPCommandController {
 			this.ctx.ui.requestRender();
 		});
 		try {
-			const found = await this.#resolveServerForAuth(name);
+			// Race the config read against Esc: a slow/stuck `#resolveServerForAuth()`
+			// (e.g. config on a network FS) must surface cancellation immediately
+			// via the catch branch below, not stay suspended until the read settles.
+			const found = await raceAbortSignal(
+				this.#resolveServerForAuth(name),
+				abortController.signal,
+				() => new DOMException("Aborted", "AbortError"),
+			);
 
 			if (!found) {
 				this.ctx.mcpTestEscapeHandlers.delete(handleEscape);

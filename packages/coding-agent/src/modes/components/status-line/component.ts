@@ -345,7 +345,7 @@ export class StatusLineComponent implements Component {
 	#standalone: false | "full" | "left-only" = false;
 	#standaloneGap = false;
 	#autocompleteActiveProbe: (() => boolean) | undefined;
-	#widthEpochRevision = 0;
+	#renderRevision = 0;
 	#settings: StatusLineSettings = {};
 	#effectiveSettings: EffectiveStatusLineSettings | undefined;
 	#cachedBranch: string | null | undefined = undefined;
@@ -790,7 +790,7 @@ export class StatusLineComponent implements Component {
 	}
 
 	invalidate(): void {
-		this.#widthEpochRevision++;
+		this.#renderRevision++;
 		// Generic repaint invalidation (theme change, message event, model
 		// switch, …). Must NOT abort or restart a live reftable HEAD/PR resolve:
 		// the render path self-invalidates via cwd/context cache-miss checks, so
@@ -2203,7 +2203,7 @@ export class StatusLineComponent implements Component {
 		return {
 			content,
 			width: visibleWidth(content),
-			revision: this.#widthEpochRevision,
+			revision: this.#renderRevision,
 		};
 	}
 	/**
@@ -2234,7 +2234,7 @@ export class StatusLineComponent implements Component {
 		return {
 			content,
 			width: visibleWidth(content),
-			revision: this.#widthEpochRevision,
+			revision: this.#renderRevision,
 		};
 	}
 

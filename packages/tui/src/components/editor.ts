@@ -520,9 +520,6 @@ export class Editor implements Component, Focusable {
 		cursorLine: 0,
 		cursorCol: 0,
 	};
-	#widthEpochText = "";
-	#widthEpochRevision = 0;
-
 	/** Focusable interface - set by TUI when focus changes */
 	focused: boolean = false;
 
@@ -642,9 +639,6 @@ export class Editor implements Component, Focusable {
 	// per-event rebuilds down to one per rendered frame (see #4145).
 	#topBorderContent?: EditorTopBorder;
 	#topBorderProvider?: (availableWidth: number) => EditorTopBorder | undefined;
-	#topBorderProviderWidth: number | undefined;
-	#topBorderProviderSignature: string | undefined;
-	#topBorderProviderRevision: number | undefined;
 	#borderVisible = true;
 
 	#borderStyle: EditorBorderStyle = "box";
@@ -666,7 +660,6 @@ export class Editor implements Component, Focusable {
 	/** Install prose assistance without changing command/file autocomplete. */
 	setTextAssistProvider(provider: EditorTextAssistProvider | undefined): void {
 		this.#textAssistProvider = provider;
-		this.#widthEpochRevision++;
 	}
 
 	/**
@@ -682,7 +675,6 @@ export class Editor implements Component, Focusable {
 		if (this.#topBorderContent?.content === content?.content && this.#topBorderContent?.width === content?.width)
 			return;
 		this.#topBorderContent = content;
-		this.#widthEpochRevision++;
 	}
 
 	/**
@@ -693,16 +685,10 @@ export class Editor implements Component, Focusable {
 	 * Use this when the top border derives from state that mutates far faster
 	 * than the render cadence (session events, streaming, subagent updates).
 	 * The TUI already throttles renders, so a provider is invoked exactly once
-	 * per frame and does no work between paints. Return a logical `revision` to
-	 * distinguish concurrent status mutations from pure width reflow.
-	 */
+	 * per frame and does no work between paints. 	 */
 	setTopBorderProvider(provider: ((availableWidth: number) => EditorTopBorder | undefined) | undefined): void {
 		if (this.#topBorderProvider === provider) return;
 		this.#topBorderProvider = provider;
-		this.#topBorderProviderWidth = undefined;
-		this.#topBorderProviderSignature = undefined;
-		this.#topBorderProviderRevision = undefined;
-		this.#widthEpochRevision++;
 	}
 
 	/**
@@ -711,7 +697,6 @@ export class Editor implements Component, Focusable {
 	setBorderVisible(borderVisible: boolean): void {
 		if (this.#borderVisible === borderVisible) return;
 		this.#borderVisible = borderVisible;
-		this.#widthEpochRevision++;
 	}
 
 	setPromptGutter(promptGutter: string | undefined): void {
@@ -724,7 +709,6 @@ export class Editor implements Component, Focusable {
 	setBorderStyle(style: EditorBorderStyle): void {
 		if (this.#borderStyle === style) return;
 		this.#borderStyle = style;
-		this.#widthEpochRevision++;
 	}
 
 	/** True while the autocomplete/slash-command menu is open below the editor. */
@@ -748,14 +732,12 @@ export class Editor implements Component, Focusable {
 	setUseTerminalCursor(useTerminalCursor: boolean): void {
 		if (this.#useTerminalCursor === useTerminalCursor) return;
 		this.#useTerminalCursor = useTerminalCursor;
-		this.#widthEpochRevision++;
 	}
 
 	/** Render a dedicated bottom border so terminal-local IME preedit cannot shift editor chrome. */
 	setImeSafeCursorLayout(enabled: boolean): void {
 		if (this.#imeSafeCursorLayout === enabled) return;
 		this.#imeSafeCursorLayout = enabled;
-		this.#widthEpochRevision++;
 	}
 
 	getUseTerminalCursor(): boolean {
@@ -765,7 +747,6 @@ export class Editor implements Component, Focusable {
 	setMaxHeight(maxHeight: number | undefined): void {
 		if (this.#maxHeight === maxHeight) return;
 		this.#maxHeight = maxHeight;
-		this.#widthEpochRevision++;
 		// Don't reset scrollOffset — #updateScrollOffset will clamp it on next render
 	}
 
@@ -788,7 +769,6 @@ export class Editor implements Component, Focusable {
 			this.#autocompleteMaxVisible = newMaxVisible;
 			if (this.#autocompleteState !== null) {
 				this.#autocompleteList?.setMaxVisible(newMaxVisible);
-				this.#widthEpochRevision++;
 			}
 		}
 	}
@@ -1111,28 +1091,13 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Resolve the custom top-border content once per frame; the style decides
-		// how (and whether) to draw it. Provider caching stays editor-owned so
-		// per-event rebuilds keep coalescing to one per painted frame.
+		// how (and whether) to draw it. Provider evaluation stays editor-owned,
+		// coalescing per-event rebuilds to one per painted frame.
 		const topFillWidth = Math.max(0, width - borderWidth * 2);
 		let topBorder: EditorTopBorder | undefined;
 		if (style.statusAttachment !== "none") {
 			if (this.#topBorderProvider) {
-				const previousWidth = this.#topBorderProviderWidth;
 				topBorder = this.#topBorderProvider(topFillWidth);
-				const signature = topBorder ? `${topBorder.width}\0${topBorder.content}` : "";
-				const revision = topBorder?.revision;
-				if (
-					(previousWidth !== undefined &&
-						revision !== undefined &&
-						this.#topBorderProviderRevision !== undefined &&
-						revision !== this.#topBorderProviderRevision) ||
-					(previousWidth === topFillWidth && signature !== this.#topBorderProviderSignature)
-				) {
-					this.#widthEpochRevision++;
-				}
-				this.#topBorderProviderWidth = topFillWidth;
-				this.#topBorderProviderSignature = signature;
-				this.#topBorderProviderRevision = revision;
 			} else {
 				topBorder = this.#topBorderContent;
 			}
@@ -1489,7 +1454,6 @@ export class Editor implements Component, Focusable {
 					kb.matchesCanonical(canonical, "tui.select.pageDown")
 				) {
 					this.#autocompleteList.handleInput(data);
-					this.#widthEpochRevision++;
 					this.onAutocompleteUpdate?.();
 					return;
 				}
@@ -1943,15 +1907,6 @@ export class Editor implements Component, Focusable {
 
 	getText(): string {
 		return this.#state.lines.join("\n");
-	}
-
-	getNativeScrollbackWidthEpochRevision(): number {
-		const text = this.getText();
-		if (text !== this.#widthEpochText) {
-			this.#widthEpochText = text;
-			this.#widthEpochRevision++;
-		}
-		return this.#widthEpochRevision;
 	}
 
 	/** Whether the buffer text equals `value`, without `getText()`'s full join —
@@ -3563,7 +3518,6 @@ export class Editor implements Component, Focusable {
 			cursorOffset:
 				replacements.line === this.#state.cursorLine ? Math.max(0, this.#state.cursorCol - replacements.endCol) : 0,
 		};
-		this.#widthEpochRevision++;
 		this.onAutocompleteUpdate?.();
 	}
 
@@ -3610,7 +3564,6 @@ export class Editor implements Component, Focusable {
 		this.#autocompleteList = undefined;
 		this.#textAssistReplacement = undefined;
 		this.#autocompletePrefix = "";
-		if (wasAutocompleting) this.#widthEpochRevision++;
 		if (notifyCancel && wasAutocompleting) {
 			this.onAutocompleteCancel?.();
 		}
@@ -3699,7 +3652,6 @@ export class Editor implements Component, Focusable {
 			this.#autocompletePrefix = suggestions.prefix;
 			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
 			this.#autocompleteState = request.kind === "force" ? "force" : "regular";
-			this.#widthEpochRevision++;
 			this.onAutocompleteUpdate?.();
 			return;
 		}

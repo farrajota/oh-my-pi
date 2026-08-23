@@ -264,7 +264,6 @@ describe("EventController IRC expiry", () => {
 		vi.advanceTimersByTime(10_000);
 		expect(chatContainer.children).toHaveLength(1);
 	});
-
 	it("evicts the oldest live-region card beyond the cap", async () => {
 		vi.useFakeTimers();
 		const { ctx, chatContainer } = createIrcContext({ liveBlockAbove: true });

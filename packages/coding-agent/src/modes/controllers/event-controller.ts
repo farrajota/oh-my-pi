@@ -361,7 +361,7 @@ export class EventController {
 					this.ctx.streamingComponent.setHideThinkingBlock(hideThinking);
 					this.#streamingReveal.resyncVisibility();
 				}
-				this.ctx.ui.resetDisplay();
+				this.ctx.ui.requestRender(true);
 			},
 			goal_updated: async () => {},
 		} satisfies AgentSessionEventHandlers;
@@ -559,7 +559,7 @@ export class EventController {
 		const children = this.ctx.chatContainer.children;
 		const anchorIndex = anchor ? children.indexOf(anchor) : -1;
 		if (anchorIndex < 0) return false;
-		if (children.slice(anchorIndex + 1).some(child => !this.ctx.chatContainer.isBlockUncommitted(child))) {
+		if (children.slice(anchorIndex + 1).some(child => !this.ctx.chatContainer.canRemoveBlock(child))) {
 			return false;
 		}
 		this.ctx.chatContainer.addChild(component);
@@ -979,7 +979,7 @@ export class EventController {
 				}
 				this.ctx.updatePendingMessagesDisplay();
 			}
-			this.ctx.ui.requestRender();
+			this.ctx.ui.requestRender(true);
 		} else if (event.message.role === "fileMention") {
 			this.#resetReadGroup();
 			this.ctx.addMessageToChat(event.message);
@@ -1025,13 +1025,9 @@ export class EventController {
 	}
 
 	/**
-	 * Remove an expired/evicted IRC card — but only while it still sits below a
-	 * live block, where its rows cannot have entered native scrollback. Once
-	 * everything above it has finalized, its rows may already be committed;
-	 * removing them then is an interior deletion of the committed prefix, which
-	 * the engine can only repair by recommitting every row below the gap —
-	 * exactly the duplicated-block artifact this guard exists to prevent. Such
-	 * a card simply stays: it is final history, and the window scrolls past it.
+	 * Remove an expired/evicted IRC card only while its transcript entry remains
+	 * active. Pending or committed entries already belong to an immutable
+	 * ordered history batch and remain as final history.
 	 */
 	#retireIrcCard(signature: string): void {
 		const components = this.#liveIrcCards.get(signature);
@@ -1039,7 +1035,7 @@ export class EventController {
 		if (!components) return;
 		let removed = false;
 		for (const component of components) {
-			if (!this.ctx.chatContainer.isBlockUncommitted(component)) continue;
+			if (!this.ctx.chatContainer.canRemoveBlock(component)) continue;
 			this.ctx.chatContainer.removeChild(component);
 			removed = true;
 		}
@@ -1073,11 +1069,7 @@ export class EventController {
 		const previous = this.#displaceablePollComponent;
 		if (!previous) return;
 		this.#displaceablePollComponent = undefined;
-		if (
-			nextToolName === "hub" &&
-			previous.isDisplaceableBlock() &&
-			this.ctx.chatContainer.isBlockUncommitted(previous)
-		) {
+		if (nextToolName === "hub" && previous.isDisplaceableBlock() && this.ctx.chatContainer.canRemoveBlock(previous)) {
 			this.ctx.chatContainer.removeChild(previous);
 		}
 		// Sealing stops the waiting-poll spinner and freezes the block (for a
@@ -1095,7 +1087,7 @@ export class EventController {
 		}
 		if (previous.canBeDisplacedBy(nextToolName)) {
 			this.#displaceableTodoComponent = undefined;
-			if (this.ctx.chatContainer.isBlockUncommitted(previous)) {
+			if (this.ctx.chatContainer.canRemoveBlock(previous)) {
 				this.ctx.chatContainer.removeChild(previous);
 			}
 			previous.seal();
@@ -1432,7 +1424,7 @@ export class EventController {
 						) {
 							continue;
 						}
-						if (this.ctx.chatContainer.isBlockUncommitted(component)) {
+						if (this.ctx.chatContainer.canRemoveBlock(component)) {
 							this.#retractToolCardEntry(toolCallId, component);
 							this.#retractedToolCallIds.add(toolCallId);
 						} else {
@@ -1574,9 +1566,6 @@ export class EventController {
 					snapshots: getFileSnapshotStore(this.ctx.viewSession),
 					clipboard: getEditClipboard(this.ctx.viewSession),
 					showImages: settings.get("terminal.showImages"),
-					editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
-					editAllowFuzzy: settings.get("edit.fuzzyMatch"),
-					liveRegion: this.ctx.chatContainer,
 				},
 				tool,
 				this.ctx.ui,
@@ -1669,7 +1658,7 @@ export class EventController {
 			const previous = this.#displaceableTodoComponent;
 			if (previous && previous !== component && previous.isDisplaceableBlock()) {
 				this.#displaceableTodoComponent = undefined;
-				if (this.ctx.chatContainer.isBlockUncommitted(previous)) {
+				if (this.ctx.chatContainer.canRemoveBlock(previous)) {
 					this.ctx.chatContainer.removeChild(previous);
 				}
 				previous.seal();
@@ -1771,6 +1760,7 @@ export class EventController {
 				component.setTokenCount?.(event.toolCallId, toolResultTokens);
 				component.setElapsedMs?.(event.toolCallId, toolElapsedMs);
 				if (isBackgroundTask) {
+					component.parkAsBackground();
 					this.#backgroundTaskCallIds.add(event.toolCallId);
 				} else {
 					this.ctx.pendingTools.delete(event.toolCallId);
@@ -1787,7 +1777,7 @@ export class EventController {
 						const previous = this.#displaceableTodoComponent;
 						if (previous && previous !== component && previous.isDisplaceableBlock()) {
 							this.#displaceableTodoComponent = undefined;
-							if (this.ctx.chatContainer.isBlockUncommitted(previous)) {
+							if (this.ctx.chatContainer.canRemoveBlock(previous)) {
 								this.ctx.chatContainer.removeChild(previous);
 							}
 							previous.seal();
@@ -2147,7 +2137,7 @@ export class EventController {
 		// fresh cards don't render the same call twice (#6879). Only uncommitted
 		// cards are removable; one already on the scrollback tape stays as history.
 		for (const [toolCallId, component] of this.#syntheticFailureCards) {
-			if (this.ctx.chatContainer.isBlockUncommitted(component)) {
+			if (this.ctx.chatContainer.canRemoveBlock(component)) {
 				this.#retractToolCardEntry(toolCallId, component);
 			}
 		}
@@ -2269,7 +2259,7 @@ export class EventController {
 		if (
 			previous &&
 			this.ctx.chatContainer.children.at(-1) === previous &&
-			this.ctx.chatContainer.isBlockUncommitted(previous)
+			this.ctx.chatContainer.canRemoveBlock(previous)
 		) {
 			previous.addRules(event.rules);
 			this.ctx.ui.requestRender();

@@ -184,6 +184,69 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("defers online runtime discovery until the UI starts it after first paint", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("missing bundled startup model");
+		let fetches = 0;
+		const extension: ExtensionFactory = pi => {
+			pi.registerProvider("deferred-runtime-provider", {
+				baseUrl: "https://runtime.example.com/v1",
+				apiKey: "RUNTIME_KEY",
+				api: "openai-completions",
+				fetchDynamicModels: async () => {
+					fetches += 1;
+					return [
+						{
+							id: "deferred-runtime-model",
+							name: "Deferred Runtime Model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128_000,
+							maxTokens: 8192,
+						},
+					];
+				},
+			});
+		};
+
+		const result = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry,
+			model,
+			sessionManager: SessionManager.inMemory(),
+			disableExtensionDiscovery: true,
+			extensions: [extension],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			rules: [],
+			preloadedCustomToolPaths: [],
+			toolNames: ["read"],
+			hasUI: true,
+		});
+
+		try {
+			expect(fetches).toBe(0);
+			expect(result.startBackgroundModelDiscovery).toBeDefined();
+			await result.startBackgroundModelDiscovery?.();
+			expect(fetches).toBe(1);
+			expect(modelRegistry.find("deferred-runtime-provider", "deferred-runtime-model")).toBeDefined();
+		} finally {
+			await result.session.dispose();
+		}
+	});
+
 	test("hydrates credential-scoped model caches before fallback validation", async () => {
 		const authStorage = createInMemoryAuthStorage();
 		authStoragesToClose.push(authStorage);
