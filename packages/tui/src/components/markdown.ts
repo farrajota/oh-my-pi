@@ -38,6 +38,27 @@ function normalizeOsc8Terminators(text: string): string {
 	return text.replace(OSC8_ST_PREFIX_REGEX, "$1\x07");
 }
 
+/** The longest suffix of `text` a future append could still complete into a
+ *  full `\x1b]8;[^\x07\x1b]*\x1b\\` match: the last `\x1b]8;` plus clean
+ *  body (or that plus the pending ST-ESC `\x1b`), or a strict prefix of the
+ *  escape start. Any other suffix is already normalized or uncompletable
+ *  (a BEL or an ESC follows it), so this is exactly the region a crossing
+ *  match can occupy. */
+function trailingOsc8Partial(text: string): string | undefined {
+	const start = text.lastIndexOf("\x1b]8;");
+	if (start !== -1) {
+		const body = text.slice(start + 4);
+		const cut = body.search(/[\x07\x1b]/);
+		if (cut === -1 || (cut === body.length - 1 && body.charCodeAt(cut) === 0x1b)) {
+			return text.slice(start);
+		}
+	}
+	if (text.endsWith("\x1b]8;") || text.endsWith("\x1b]8") || text.endsWith("\x1b]") || text.endsWith("\x1b")) {
+		return text.slice(text.lastIndexOf("\x1b"));
+	}
+	return undefined;
+}
+
 const MARKDOWN_FENCE_LINE = /^ {0,3}(`{3,}|~{3,})[ \t]*(.*)$/;
 const MARKDOWN_HEADING_LINE = /^ {0,3}#{1,6}[ \t]+\S/;
 const FENCED_SOURCE_INTRO = /\b(?:code|example|markdown|output|snippet|source)\s*:?\s*$/i;
@@ -1020,12 +1041,22 @@ const NO_BLOCK_BOUNDARY = { end: 0, count: 0 } as const;
  *  - A preceding `list` must be provably closed: CommonMark lets a same-marker
  *    item continue the list across the blank line, and marked merges both into
  *    one renumbered loose list (`listMayContinueAt`).
+ *
+ * `startIndex` resumes the scan at `tokens[startIndex]` (positions still
+ * accumulate from `base`). The streaming freeze passes the frozen-prefix
+ * token count: that prefix's boundary is permanent under append-only growth
+ * (re-verified when frozen), so only the mutable tail can hold a new one.
  */
-function stableBlockBoundary(text: string, base: number, tokens: Token[]): { end: number; count: number } {
+function stableBlockBoundary(
+	text: string,
+	base: number,
+	tokens: Token[],
+	startIndex = 0,
+): { end: number; count: number } {
 	let pos = base;
 	let end = 0;
 	let count = 0;
-	for (let i = 0; i < tokens.length; i++) {
+	for (let i = startIndex; i < tokens.length; i++) {
 		const raw = tokens[i].raw;
 		const tokenEnd = pos + raw.length;
 		if (raw.endsWith("\n\n")) {
@@ -1455,6 +1486,57 @@ interface StreamPrefixLineCache extends RenderSignature {
 	tokenCount: number;
 	lines: readonly string[];
 }
+/**
+ * Per-token row cache for the *unfrozen tail* (PoC H). The tail re-lexes every
+ * streaming frame, but the token sequence is prefix-stable under append-only
+ * growth: only the last block token grows, and a closed block's raw bytes and
+ * token type never change once later text arrives (a growing structure — open
+ * fence, lazy list, setext underline — is always the last token; when it
+ * closes, later appends cannot re-segment it). Cached rows are therefore
+ * byte-identical to a fresh render of the same token, and splicing them skips
+ * the O(tail) styled-text + wrap cost that remains after the lex is skipped.
+ *
+ * Validity gates (checked on every reuse):
+ *  - signature equality (width, padding, theme probes — same set as the
+ *    prefix cache) and token-list alignment (`tokenStart` matches the frozen
+ *    prefix count);
+ *  - token raw equality against the cached snapshot (string equality, so the
+ *    cache works both with reused token objects and with a fresh lex that
+ *    re-produces the same raw text);
+ *  - `nextTypes[i]`: `#renderToken` decides trailing spacing rows from the
+ *    next token's type, so a cached row is only valid while the following
+ *    token keeps the type it had when the row was produced;
+ *  - token type: `table` tokens are never cached — their layout depends on
+ *    the whole token and the width budget, and the splice path is not
+ *    covered by the byte-identity suite, so they stay conservative.
+ *    `code` tokens are cacheable: the open-fence highlight stream is
+ *    deterministic on the cumulative token text, and whole-block highlight
+ *    fidelity applies only to fences that already have a closing fence.
+ */
+interface TailRowCache extends RenderSignature {
+	tokenStart: number;
+	// Upper bound (exclusive) of absolute token indices covered by `rows`.
+	cachedThrough: number;
+	// Per-token final content rows (1:1 with the rendered content lines),
+	// indexed relative to `tokenStart`; undefined for uncacheable tokens.
+	rows: (readonly string[] | undefined)[];
+	// Raw snapshot per token (string value gate).
+	raws: (string | undefined)[];
+	// type of token[i+1] when the rows were produced (blank/spacing gate).
+	nextTypes: (string | undefined)[];
+}
+/**
+ * Mutable per-token record collector passed to #renderContentLines while
+ * rendering the streaming tail. The render loop fills `raws`/`nextTypes`
+ * per token as it goes and stores each token's final content rows into
+ * `rows` (relative to the render's `start`), so the tail cache can splice byte-identical
+ * rows for every token whose raw text and following-token type match.
+ */
+interface TailRenderRecorder {
+	rows: (readonly string[] | undefined)[];
+	raws: (string | undefined)[];
+	nextTypes: (string | undefined)[];
+}
 interface StreamingHighlightCache extends RenderSignature {
 	lang: string | undefined;
 	text: string;
@@ -1474,6 +1556,9 @@ function splitPushedHighlightLines(pushed: string): string[] {
 
 export class Markdown implements Component {
 	#text: string;
+	// Suffix of #text a future append could still complete into a match
+	// (see trailingOsc8Partial); drives the append-only fast path.
+	#oscPartialEscape?: string;
 	#paddingX: number; // Left/right padding
 	#paddingY: number; // Top/bottom padding
 	#defaultTextStyle?: DefaultTextStyle;
@@ -1500,6 +1585,30 @@ export class Markdown implements Component {
 	#streamPrefixText?: string;
 	#streamPrefixTokens?: Token[];
 	#streamPrefixLineCache?: StreamPrefixLineCache;
+	// Guard-scan memo (PoC C): the ref-def/CR verdict with the exact text
+	// length it was checked on. Reuse is sound only while setText has been
+	// append-only since (tracked via the startsWith that setText performs): a
+	// FALSE verdict stays valid — appending cannot remove an offending ref or
+	// CR; a TRUE verdict can flip only when the delta gains a "[" at a fresh
+	// line or a "]" / ":" completing a dangling "[…" that straddles the scan
+	// edge, or "\n" / "\r". Byte-identity of the checked region: replaceTabs
+	// is a per-char map and normalizeOsc8Terminators changes old bytes only
+	// when an OSC8 terminator straddles the boundary (which breaks startsWith
+	// — the flag then reads non-append), so transient-mode appends are
+	// byte-identical. Non-transient repairOrphanClosingFence can additionally
+	// delete a bare fence line; its triggers (heading + table lines) always
+	// bring "\n" with them, so such frames take the suspicious-delta path,
+	// and a deletion that shortens the text trips the length gate — either
+	// way the verdict is re-derived, never reused across the deletion.
+	#lastScanLength = -1;
+	#lastScanCanStream = false;
+	#lastScanValid = false;
+	#appendOnlySinceLastScan = true;
+	// PoC H: per-token row cache for the unfrozen tail. Invalidated together
+	// with the prefix cache (width/signature changes, non-append edits) — see
+	// the blank-replacement branch of setText and the fallback branch of
+	// #lexTokens.
+	#tailRowCache?: TailRowCache;
 	// True while #renderStreamingContentLines renders the frozen token range:
 	// frozen code blocks highlight even in transient mode so their bytes match
 	// the finalized render (they render once into the prefix line cache, so
@@ -1527,6 +1636,7 @@ export class Markdown implements Component {
 		codeBlockIndent: number = 2,
 	) {
 		this.#text = normalizeOsc8Terminators(text);
+		this.#oscPartialEscape = trailingOsc8Partial(this.#text);
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 		this.#theme = theme;
@@ -1535,13 +1645,46 @@ export class Markdown implements Component {
 	}
 
 	setText(text: string): boolean {
+		// Identical re-emit (throttled tick): fully normalized already.
+		if (text === this.#text) return false;
+		// Streaming path: append-only growth. Only the memoized pending escape
+		// suffix plus the delta can hold a not-yet-normalized match (a crossing
+		// match starts in the pending suffix; everything else is in the delta).
+		// Normalize that region alone and splice it onto the old prefix;
+		// String.replace returns the input unchanged when nothing matches, so
+		// the common clean-delta frame allocates nothing. Once a match is
+		// rewritten (ST → BEL), the caller's raw text no longer aligns with
+		// #text (2-byte ST vs 1-byte BEL), so later frames fall back to the
+		// cold full-document pass — still byte-correct, just not faster.
+		if (text.length > this.#text.length && text.startsWith(this.#text)) {
+			const memoized = this.#oscPartialEscape;
+			const pending = (memoized ?? "") + text.slice(this.#text.length);
+			const normalized = normalizeOsc8Terminators(pending);
+			if (normalized !== pending) {
+				// A stored byte was rewritten (ST → BEL on a crossing match): the
+				// stream-prefix lex caches self-invalidate via startsWith guards
+				// against #text, so nothing else needs clearing.
+				text = this.#text.slice(0, this.#text.length - (memoized?.length ?? 0)) + normalized;
+			}
+			this.#oscPartialEscape = trailingOsc8Partial(normalized);
+			this.#text = text;
+			this.invalidate();
+			return true;
+		}
+		// Non-append edits / cold path: full-document pass.
 		text = normalizeOsc8Terminators(text);
+		this.#oscPartialEscape = trailingOsc8Partial(text);
 		// Equality guard: streaming re-emits identical text on ticks that carried
 		// no delta (throttled provider frames, reconciled tool-execution updates).
 		// Without this, the caller-side `#cachedLines` gets thrown away and the
 		// full lex + wrap runs per re-emit — one of the top CPU hotspots during
 		// streaming (issue #4353). Mirrors `Text.setText`'s guard.
 		if (text === this.#text) return false;
+		if (!text.startsWith(this.#text)) {
+			// Non-append edit: the previous frame's guard verdict cannot be
+			// reused — the checked region may have changed anywhere.
+			this.#appendOnlySinceLastScan = false;
+		}
 		this.#text = text;
 		if (!text.trim()) {
 			// Blank replacement: render() early-returns before #lexTokens can see
@@ -1550,6 +1693,7 @@ export class Markdown implements Component {
 			this.#streamPrefixText = undefined;
 			this.#streamPrefixTokens = undefined;
 			this.#streamPrefixLineCache = undefined;
+			this.#tailRowCache = undefined;
 		}
 		this.invalidate();
 		return true;
@@ -1568,6 +1712,11 @@ export class Markdown implements Component {
 		const next = value === true;
 		if (this.#transientRenderCache === next) return;
 		this.#transientRenderCache = next;
+		// The mode switch changes which normalization applies to the raw text
+		// (transient: replaceTabs; final: repairOrphanClosingFence(replaceTabs)),
+		// so a memo computed on the other mode's buffer must not be reused —
+		// re-derive on the next frame instead.
+		this.#appendOnlySinceLastScan = false;
 		this.invalidate();
 	}
 
@@ -1582,13 +1731,52 @@ export class Markdown implements Component {
 		// frozen (#freezeStablePrefix only runs when canStream was true). The prefix
 		// ends at a "\n\n" block boundary (stableBlockBoundary), so the tail starts
 		// at a fresh line — scanning only the tail for ref defs is sufficient and
-		// avoids re-scanning the growing prefix every frame (O(n²) → O(n) overall).
+		// avoids re-scanning the grown prefix every frame (O(n²) → O(n) overall).
 		const prefix = this.#streamPrefixText;
 		const prefixTokens = this.#streamPrefixTokens;
 		const hasPrefix =
 			prefix !== undefined && prefixTokens !== undefined && text.length > prefix.length && text.startsWith(prefix);
 		const refDefText = hasPrefix ? text.slice(prefix.length) : text;
-		const canStream = !HAS_REF_DEF.test(refDefText) && !refDefText.includes("\r");
+		// Guard-scan memo (PoC C): while setText has been append-only and the
+		// grown delta introduces no "[", "]", ":", "\n" or "\r", the previous
+		// verdict stays valid — the checked region is byte-identical (OSC8/tab
+		// normalization is prefix-stable on appends) and none of the chars a
+		// ref-def or CR needs crossed the scan edge. A false verdict is monotone
+		// (appends cannot delete an existing ref def or CR), so it is reused
+		// even when the delta is suspicious; only a true verdict on a suspicious
+		// delta re-runs the tail scan (PR #9303). The tail scan is also the
+		// cold path after non-append edits, which clear the memo. A FALSE
+		// verdict is monotone under appends alone (transient mode: no repair,
+		// appends cannot delete a ref-def or CR), so there it is reused even
+		// on a suspicious delta. Final mode is the exception: render() detects
+		// repairOrphanClosingFence deletions (the normalized buffer shrank)
+		// and invalidates the memo on the affected frame, so the re-derive
+		// happens exactly when the CR/ref-def trigger behind a false verdict
+		// may have been deleted — never left stale, and never re-scanned on
+		// frames where the memo is sound.
+		let canStream: boolean;
+		if (this.#lastScanValid && this.#appendOnlySinceLastScan && text.length > this.#lastScanLength) {
+			const delta = text.slice(this.#lastScanLength);
+			if (
+				!delta.includes("[") &&
+				!delta.includes("]") &&
+				!delta.includes(":") &&
+				!delta.includes("\n") &&
+				!delta.includes("\r")
+			) {
+				canStream = this.#lastScanCanStream;
+			} else if (this.#lastScanCanStream) {
+				canStream = !HAS_REF_DEF.test(refDefText) && !refDefText.includes("\r");
+			} else {
+				canStream = false;
+			}
+		} else {
+			canStream = !HAS_REF_DEF.test(refDefText) && !refDefText.includes("\r");
+		}
+		this.#lastScanLength = text.length;
+		this.#lastScanCanStream = canStream;
+		this.#lastScanValid = true;
+		this.#appendOnlySinceLastScan = true;
 		if (canStream && hasPrefix) {
 			const tailTokens = lexDocument(refDefText);
 			const tokens = [...prefixTokens, ...tailTokens];
@@ -1602,6 +1790,7 @@ export class Markdown implements Component {
 			this.#streamPrefixText = undefined;
 			this.#streamPrefixTokens = undefined;
 			this.#streamPrefixLineCache = undefined;
+			this.#tailRowCache = undefined;
 		}
 		return tokens;
 	}
@@ -1612,7 +1801,21 @@ export class Markdown implements Component {
 	// reference definitions, so each token's `raw` is a verbatim slice of `text`
 	// and the summed offsets address `text` exactly.
 	#freezeStablePrefix(text: string, tokens: Token[], opts: { preserveExisting: boolean }): void {
-		const frozen = stableBlockBoundary(text, 0, tokens);
+		// On the streaming-concat path (preserveExisting), tokens[0..prefixCount)
+		// ARE the previously frozen prefix and the text above it is byte-
+		// identical, so its boundary cannot move: re-walking those tokens every
+		// frame is pure overhead (O(prefix) per frame, O(n²) over a stream).
+		// Skip them and resume at the first tail token; `base` starts at the
+		// prefix length so accumulated offsets stay global. The cold full-lex
+		// path (preserveExisting: false) re-derives the whole stream, so it
+		// must keep walking from 0.
+		const skipPrefix = opts.preserveExisting ? (this.#streamPrefixTokens?.length ?? 0) : 0;
+		const frozen = stableBlockBoundary(
+			text,
+			skipPrefix > 0 ? (this.#streamPrefixText?.length ?? 0) : 0,
+			tokens,
+			skipPrefix,
+		);
 		if (frozen.count > 0) {
 			this.#streamPrefixText = text.slice(0, frozen.end);
 			this.#streamPrefixTokens = tokens.slice(0, frozen.count);
@@ -1623,6 +1826,7 @@ export class Markdown implements Component {
 			this.#streamPrefixText = undefined;
 			this.#streamPrefixTokens = undefined;
 			this.#streamPrefixLineCache = undefined;
+			this.#tailRowCache = undefined;
 		}
 	}
 
@@ -1647,10 +1851,17 @@ export class Markdown implements Component {
 			return EMPTY_RENDER_LINES;
 		}
 
-		// Replace tabs with 3 spaces for consistent rendering
-		const normalizedText = this.transientRenderCache
-			? replaceTabs(this.#text)
-			: repairOrphanClosingFence(replaceTabs(this.#text));
+		// Replace tabs with spaces, then repair orphan fences in final mode.
+		const tabbed = replaceTabs(this.#text);
+		const normalizedText = this.transientRenderCache ? tabbed : repairOrphanClosingFence(tabbed);
+		if (!this.transientRenderCache && normalizedText.length < tabbed.length) {
+			// repairOrphanClosingFence deleted bytes this frame (orphan fence
+			// removed): the guard-scan memo's checked region is no longer
+			// byte-identical, and a cached false verdict may have been based
+			// on the very CR/ref-def line that was deleted. Invalidate so the
+			// next #lexTokens re-derives on the repaired buffer.
+			this.#lastScanValid = false;
+		}
 		const signature = this.#renderSignature(width, paddingX);
 
 		// L2: module-level LRU — survives component disposal/recreation across
@@ -1741,7 +1952,7 @@ export class Markdown implements Component {
 		const stableText = this.#streamPrefixText;
 		const stableTokenCount = this.#streamPrefixTokens?.length ?? 0;
 		if (stableText === undefined || stableTokenCount === 0 || !normalizedText.startsWith(stableText)) {
-			return this.#renderContentLines(tokens, 0, tokens.length, contentWidth, signature);
+			return this.#renderStreamingTail(tokens, 0, contentWidth, signature);
 		}
 
 		const contentLines: string[] = [];
@@ -1774,7 +1985,7 @@ export class Markdown implements Component {
 		};
 
 		if (renderedUntil < tokens.length) {
-			contentLines.push(...this.#renderContentLines(tokens, renderedUntil, tokens.length, contentWidth, signature));
+			contentLines.push(...this.#renderStreamingTail(tokens, renderedUntil, contentWidth, signature));
 		}
 
 		return contentLines;
@@ -1802,17 +2013,115 @@ export class Markdown implements Component {
 		return cache;
 	}
 
+	/**
+	 * Render the unfrozen tail, splicing byte-identical rows from
+	 * {@link #tailRowCache} for every token whose raw text and following-token
+	 * type still match the cached snapshot. The splice reuses the exact content
+	 * lines a fresh render would produce — the row offsets are implicit in the
+	 * array order, so no offset recomputation is needed. The growing last token
+	 * is never spliced (its raw text always differs); it renders fresh and is
+	 * recorded again, so the cache trails the stream by one token.
+	 */
+	#renderStreamingTail(tokens: Token[], start: number, contentWidth: number, signature: RenderSignature): string[] {
+		const out: string[] = [];
+		let spliceEnd = start;
+		const cache = this.#tailRowCache;
+		if (cache !== undefined) {
+			spliceEnd = this.#tailSpliceEnd(cache, start, signature, tokens);
+			for (let i = start; i < spliceEnd; i++) {
+				out.push(...cache.rows[i - start]!);
+			}
+		}
+
+		const recorder: TailRenderRecorder = {
+			rows: new Array(tokens.length - spliceEnd).fill(undefined),
+			raws: new Array(tokens.length - spliceEnd).fill(undefined),
+			nextTypes: new Array(tokens.length - spliceEnd).fill(undefined),
+		};
+		const fresh = this.#renderContentLines(tokens, spliceEnd, tokens.length, contentWidth, signature, recorder);
+		out.push(...fresh);
+
+		// Refresh the cache: keep entries for spliced tokens (their raws stay
+		// valid), overlay the fresh entries, and re-derive the contiguous
+		// covered prefix (splicing stops at the first uncacheable or
+		// changed token). All arrays are tail-relative (index 0 = token
+		// `start`), so a mostly-frozen document allocates only for the
+		// unfrozen tail instead of the whole token list every frame.
+		const tailCount = tokens.length - start;
+		const rows: (readonly string[] | undefined)[] = new Array(tailCount).fill(undefined);
+		const raws: (string | undefined)[] = new Array(tailCount).fill(undefined);
+		const nextTypes: (string | undefined)[] = new Array(tailCount).fill(undefined);
+		if (cache !== undefined && cache.tokenStart === start) {
+			for (let i = start; i < Math.min(cache.cachedThrough, spliceEnd); i++) {
+				rows[i - start] = cache.rows[i - start];
+				raws[i - start] = cache.raws[i - start];
+				nextTypes[i - start] = cache.nextTypes[i - start];
+			}
+		}
+		for (let i = spliceEnd; i < tokens.length; i++) {
+			rows[i - start] = recorder.rows[i - spliceEnd];
+			raws[i - start] = recorder.raws[i - spliceEnd];
+			nextTypes[i - start] = recorder.nextTypes[i - spliceEnd];
+		}
+		let cachedThrough = start;
+		while (cachedThrough < tokens.length && rows[cachedThrough - start] !== undefined) cachedThrough++;
+		this.#tailRowCache = {
+			...signature,
+			tokenStart: start,
+			cachedThrough,
+			rows,
+			raws,
+			nextTypes,
+		};
+		return out;
+	}
+
+	// Longest cache-spliceable prefix: every cached row from `start` up to
+	// (but not including) the returned index is byte-identical to a fresh
+	// render of the same token. Stops at the first uncacheable token (rows
+	// undefined), the first token whose raw text changed (the growing tail
+	// token), or a following-token type change.
+	#tailSpliceEnd(cache: TailRowCache, start: number, signature: RenderSignature, tokens: Token[]): number {
+		if (cache.tokenStart !== start) return start;
+		if (cache.width !== signature.width) return start;
+		if (cache.paddingX !== signature.paddingX) return start;
+		if (cache.paddingY !== signature.paddingY) return start;
+		if (cache.codeBlockIndent !== signature.codeBlockIndent) return start;
+		if (cache.themeId !== signature.themeId) return start;
+		if (cache.defaultTextStyleId !== signature.defaultTextStyleId) return start;
+		if (cache.imageProtocol !== signature.imageProtocol) return start;
+		if (cache.hyperlinks !== signature.hyperlinks) return start;
+		if (cache.textSizing !== signature.textSizing) return start;
+		if (cache.bgColorProbe !== signature.bgColorProbe) return start;
+		if (cache.headingProbe !== signature.headingProbe) return start;
+		const limit = Math.min(cache.cachedThrough, tokens.length);
+		for (let i = start; i < limit; i++) {
+			if (cache.rows[i - start] === undefined) return i; // uncacheable token stops the splice
+			const cachedRaw = cache.raws[i - start];
+			const token = tokens[i];
+			if (cachedRaw === undefined || token === undefined) return start;
+			if (token.raw !== cachedRaw) return i; // changed/growing token: fresh-render from here
+			if ((tokens[i + 1]?.type ?? undefined) !== cache.nextTypes[i - start]) return i;
+		}
+		return limit;
+	}
+
 	#renderContentLines(
 		tokens: Token[],
 		start: number,
 		end: number,
 		contentWidth: number,
 		signature: RenderSignature,
+		tailRecorder?: TailRenderRecorder,
 	): string[] {
 		const wrappedLines: RenderedLine[] = [];
+		// Wrapped-row span per absolute token index. Call-local: stale values
+		// are never read across renders.
+		const tokenWrappedRowCounts: number[] = [];
 		for (let i = start; i < end; i++) {
 			const token = tokens[i];
 			const nextToken = tokens[i + 1];
+			const tokenWrappedRowStart = wrappedLines.length;
 			const renderedTokenLines = this.#renderToken(token, contentWidth, nextToken?.type);
 			for (const renderedRow of renderedTokenLines) {
 				// Lists wrap while their structural prefixes are still available, so
@@ -1831,6 +2140,7 @@ export class Markdown implements Component {
 					}
 				}
 			}
+			tokenWrappedRowCounts[i] = wrappedLines.length - tokenWrappedRowStart;
 		}
 
 		const leftMargin = padding(signature.paddingX);
@@ -1873,6 +2183,36 @@ export class Markdown implements Component {
 				const visibleLen = visibleWidth(lineWithMargins);
 				const paddingNeeded = Math.max(0, signature.width - visibleLen);
 				contentLines.push(lineWithMargins + padding(paddingNeeded));
+			}
+		}
+
+		// PoC H: record per-token row slices for the tail cache. The pad pass
+		// maps every wrapped row to exactly one content line (structural blanks
+		// after OSC 66 sized headings are pushed unpadded but still present), so
+		// slicing by the per-token wrap spans recovers each token's exact rows.
+		if (tailRecorder !== undefined) {
+			const rows = tailRecorder.rows;
+			const raws = tailRecorder.raws;
+			const nextTypes = tailRecorder.nextTypes;
+			let wrappedStart = 0;
+			let contentCursor = 0;
+			for (let i = start; i < end; i++) {
+				const token = tokens[i]!;
+				const wrappedEnd = wrappedStart + tokenWrappedRowCounts[i]!;
+				const rowCount = wrappedEnd - wrappedStart;
+				raws[i - start] = token.raw;
+				nextTypes[i - start] = tokens[i + 1]?.type;
+				// Tables are never cached: their layout depends on the whole
+				// token and the width budget, and the splice path is not
+				// covered by the byte-identity suite. Keep the raw/nextTypes
+				// gates but drop rows.
+				if (token.type === "table") {
+					rows[i - start] = undefined;
+				} else {
+					rows[i - start] = contentLines.slice(contentCursor, contentCursor + rowCount);
+				}
+				contentCursor += rowCount;
+				wrappedStart = wrappedEnd;
 			}
 		}
 
@@ -2011,7 +2351,15 @@ export class Markdown implements Component {
 	 */
 	#createHighlightStream(lang: string | undefined): HighlightStreamSession | null {
 		const factory = this.#theme.createHighlightStream;
-		if (factory) return factory(lang);
+		if (factory) {
+			try {
+				return factory(lang);
+			} catch {
+				// Render must not throw: a broken theme factory (stale natives
+				// `HighlightStream`, napi error) falls through to the unhighlighted
+				// path / diff-family per-line emulation below.
+			}
+		}
 		const highlightCode = this.#theme.highlightCode;
 		if (!highlightCode) return null;
 		const normalizedLang = lang?.toLowerCase();

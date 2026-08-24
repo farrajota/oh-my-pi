@@ -987,6 +987,18 @@ export class EventController {
 		} else if (event.message.role === "assistant") {
 			this.#currentAssistantMessageTokenEstimate = 0;
 			this.#updateWorkingMessageRunTokenDelta(source);
+			// A streaming component left over from an attempt that never saw its
+			// message_end (a mid-stream throw the loop could not pair) must not stay
+			// live: one unfinalized block at the transcript frontier blocks history
+			// retirement — and therefore transcript layout — forever. Drop it when
+			// still removable, and finalize it regardless so it can retire.
+			const abandoned = this.ctx.streamingComponent;
+			if (abandoned) {
+				if (this.ctx.chatContainer.canRemoveBlock(abandoned)) {
+					this.ctx.chatContainer.removeChild(abandoned);
+				}
+				abandoned.markTranscriptBlockFinalized();
+			}
 			this.#lastVisibleBlockCount = 0;
 			this.#streamedToolCallIdByIndex.clear();
 			this.ctx.streamingComponent = createAssistantMessageComponent(this.ctx);
@@ -1925,6 +1937,9 @@ export class EventController {
 		}
 		if (this.ctx.streamingComponent) {
 			this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);
+			// Removal is refused for blocks already offered/committed to history;
+			// finalize so a kept block can never jam transcript retirement.
+			this.ctx.streamingComponent.markTranscriptBlockFinalized();
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
 		}
