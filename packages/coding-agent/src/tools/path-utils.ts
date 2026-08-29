@@ -20,14 +20,14 @@ export function isFilesystemSourcePath(value: string): boolean {
 // `-` in parseLineRangeChunk. Keep this fragment and LINE_RANGE_CHUNK_RE in sync.
 const RANGE_CHUNK_SRC = String.raw`L?\d+(?:(?:[-+]|\.\.)L?\d+|-|\.\.)?`;
 const RANGE_LIST_SRC = `${RANGE_CHUNK_SRC}(?:,${RANGE_CHUNK_SRC})*`;
-const FILE_LINE_RANGE_RE = new RegExp(`^(?:${RANGE_LIST_SRC}|raw|conflicts)$`, "i");
+const FILE_LINE_RANGE_RE = new RegExp(`^(?:${RANGE_LIST_SRC}|raw|conflicts|img)$`, "i");
 const FILE_LINE_RANGE_ONLY_RE = new RegExp(`^${RANGE_LIST_SRC}$`, "i");
 const FILE_RAW_ONLY_RE = /^raw$/i;
 // Permissive selector chunk for internal URLs — accepts well-formed selectors
 // plus common malformed shapes (e.g. `:-N`) so the read tool peels the entire
 // selector chain off before dispatching to a protocol handler.
 const INTERNAL_URL_SELECTOR_PART_RE = new RegExp(
-	String.raw`^(?:raw|conflicts|${RANGE_LIST_SRC}|-\d+(?:[-+]\d+)?)$`,
+	String.raw`^(?:raw|conflicts|img|${RANGE_LIST_SRC}|-\d+(?:[-+]\d+)?)$`,
 	"i",
 );
 // Schemes whose host grammar is identifier-shaped, so any trailing
@@ -378,6 +378,36 @@ export async function splitPathAndSelPreferringLiteral(
 	const strict = splitPathAndSel(rawPath);
 	if (strict.sel === undefined) return strict;
 	const probe = await probeLiteralPathExists(rawPath, cwd);
+	return probe === "missing" ? strict : { path: rawPath };
+}
+
+/**
+ * Synchronous sibling of {@link probeLiteralPathExists}. Some callers resolve
+ * paths on a synchronous hot path (the ACP event mapper builds tool-call
+ * notifications synchronously), so the async `lstat` probe is unavailable. The
+ * error-code handling matches the async version exactly.
+ */
+export function probeLiteralPathExistsSync(filePath: string, cwd: string): "exists" | "missing" | "unknown" {
+	const resolved = resolveReadPath(filePath, cwd);
+	try {
+		fs.lstatSync(resolved);
+		return "exists";
+	} catch (err) {
+		if (isEnoent(err) || isEnotdir(err) || hasFsCode(err, "ENAMETOOLONG")) return "missing";
+		return "unknown";
+	}
+}
+
+/**
+ * Synchronous sibling of {@link splitPathAndSelPreferringLiteral}. Identical
+ * literal-path precedence — a real file named `report:1-20` keeps its colon —
+ * for callers that cannot await, such as the ACP event mapper's location
+ * builder.
+ */
+export function splitPathAndSelPreferringLiteralSync(rawPath: string, cwd: string): { path: string; sel?: string } {
+	const strict = splitPathAndSel(rawPath);
+	if (strict.sel === undefined) return strict;
+	const probe = probeLiteralPathExistsSync(rawPath, cwd);
 	return probe === "missing" ? strict : { path: rawPath };
 }
 
@@ -1436,6 +1466,8 @@ export interface ToolScopeOptions {
 	localProtocolOptions?: LocalProtocolOptions;
 	/** Calling session's loaded skills — lets skill:// resolve without process-global state. */
 	skills?: readonly Skill[];
+	/** Calling session's session file — lets history:///agent:// resolve against the caller's root. */
+	sessionFile?: string;
 	/** Materialize readable external URLs to local text files before scope derivation. */
 	resolveExternalUrl?: (rawPath: string) => Promise<ResolvedExternalSearchUrl | undefined>;
 }
@@ -1523,6 +1555,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 			cwd,
 			settings: opts.settings,
 			signal: opts.signal,
+			sessionFile: opts.sessionFile,
 			localProtocolOptions: opts.localProtocolOptions,
 			skills: opts.skills,
 			// Tool-scope resolution only needs `sourcePath`; skip content

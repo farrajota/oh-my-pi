@@ -15,6 +15,11 @@ export function sanitizeStatusText(text: string): string {
 		.trim();
 }
 
+/** Render the current terminal-specific escape hint used by the working loader. */
+export function interruptHint(): string {
+	return ` ${theme.format.bracketLeft}esc${theme.format.bracketRight}`;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tab Bar Theme
 // ═══════════════════════════════════════════════════════════════════════════
@@ -29,22 +34,6 @@ export function getTabBarTheme(): TabBarTheme {
 		hoverTab: (text: string) => theme.bg("selectedBg", theme.fg("text", text)),
 		hint: (text: string) => theme.fg("dim", text),
 	};
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Working-message hint
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Suffix appended to the loader's working message to remind users they can
- * abort with Esc. Rendered with the active theme's bracket glyphs so it stays
- * visually consistent with badges and other bracketed UI affordances.
- *
- * The leading space separates the hint from the message body and is consumed
- * by `endsWith`/`slice` matching in the loader renderer.
- */
-export function interruptHint(): string {
-	return ` ${theme.format.bracketLeft}esc${theme.format.bracketRight}`;
 }
 
 export { parseCommandArgs } from "../utils/command-args";

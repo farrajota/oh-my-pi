@@ -29,6 +29,7 @@ function makeSessionStub(
 				unsubscribeCalls++;
 			};
 		},
+		async settleInFlightMessagePersistence() {},
 	};
 	return {
 		session: stub as unknown as AgentSession,
@@ -56,6 +57,7 @@ interface Harness {
 	handledEvents: Array<{ source: AgentSession; event: AgentSessionEvent }>;
 	rehydrated: AgentSession[];
 	setSessionCalls: Array<[AgentSession, string | undefined]>;
+	reloadTodoSessions: AgentSession[];
 	counts: {
 		clearTransientSessionUi(): number;
 		resetTranscriptAnchors(): number;
@@ -64,11 +66,18 @@ interface Harness {
 	};
 }
 
-function makeHarness(ensureLive?: (id: string) => Promise<AgentSession>): Harness {
+function makeHarness(
+	options:
+		| { renderInitialMessages?: () => void | Promise<void>; ensureLive?: (id: string) => Promise<AgentSession> }
+		| ((id: string) => Promise<AgentSession>) = {},
+): Harness {
+	const ensureLive = typeof options === "function" ? options : options.ensureLive;
+	const renderInitialMessagesHook = typeof options === "function" ? undefined : options.renderInitialMessages;
 	const main = makeSessionStub({ sessionFile: "main.jsonl" });
 	const handledEvents: Array<{ source: AgentSession; event: AgentSessionEvent }> = [];
 	const rehydrated: AgentSession[] = [];
 	const setSessionCalls: Array<[AgentSession, string | undefined]> = [];
+	const reloadTodoSessions: AgentSession[] = [];
 	let clearTransientSessionUi = 0;
 	let resetTranscriptAnchors = 0;
 	let renderInitialMessages = 0;
@@ -98,8 +107,12 @@ function makeHarness(ensureLive?: (id: string) => Promise<AgentSession>): Harnes
 		clearTransientSessionUi: () => {
 			clearTransientSessionUi++;
 		},
-		renderInitialMessages: () => {
+		renderInitialMessages: async () => {
 			renderInitialMessages++;
+			await renderInitialMessagesHook?.();
+		},
+		reloadTodos: async (source?: AgentSession) => {
+			reloadTodoSessions.push(source ?? main.session);
 		},
 		updateEditorBorderColor() {},
 		ui: { requestRender() {} },
@@ -118,6 +131,7 @@ function makeHarness(ensureLive?: (id: string) => Promise<AgentSession>): Harnes
 		handledEvents,
 		rehydrated,
 		setSessionCalls,
+		reloadTodoSessions,
 		counts: {
 			clearTransientSessionUi: () => clearTransientSessionUi,
 			resetTranscriptAnchors: () => resetTranscriptAnchors,
@@ -158,10 +172,63 @@ describe("SessionFocusController", () => {
 		registerSub(h.registry, "Worker", worker.session);
 		await h.controller.focusAgent("Worker");
 		expect(h.rehydrated).toEqual([]);
+		expect(h.reloadTodoSessions).toEqual([worker.session]);
 		expect(h.setSessionCalls).toEqual([[worker.session, "Worker"]]);
 	});
 
-	it("rehydrates each streaming main, parent, and nested-child attachment independently", async () => {
+	it("re-attaching the main session refreshes the todo HUD so it can't freeze at the pre-focus snapshot (#9571)", async () => {
+		// While a subagent is focused the main session's `todo` completions never
+		// reach the HUD (the event subscription points at the subagent). Returning
+		// to the main session rebuilds the transcript from committed messages but
+		// must also reload the HUD, or it stays stuck on the pre-focus snapshot
+		// (e.g. a `todo init` 0/N) while the transcript shows current progress.
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+
+		await h.controller.focusAgent("Worker");
+		expect(h.reloadTodoSessions).toEqual([worker.session]);
+
+		await h.controller.unfocus();
+		expect(h.controller.focusedAgentId).toBeUndefined();
+		expect(h.setSessionCalls.at(-1)).toEqual([h.main.session, undefined]);
+		expect(h.reloadTodoSessions).toEqual([worker.session, h.main.session]);
+	});
+
+	it("does not let a superseded focus attachment restore the worker todo HUD after unfocusing", async () => {
+		let releaseWorkerRender: (() => void) | undefined;
+		let markWorkerRenderStarted: (() => void) | undefined;
+		const workerRender = new Promise<void>(resolve => {
+			releaseWorkerRender = resolve;
+		});
+		const workerRenderStarted = new Promise<void>(resolve => {
+			markWorkerRenderStarted = resolve;
+		});
+		let renderCalls = 0;
+		const h = makeHarness({
+			renderInitialMessages: () => {
+				renderCalls++;
+				if (renderCalls !== 1) return;
+				markWorkerRenderStarted?.();
+				return workerRender;
+			},
+		});
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+
+		const focus = h.controller.focusAgent("Worker");
+		await workerRenderStarted;
+		await h.controller.unfocus();
+		expect(h.reloadTodoSessions).toEqual([h.main.session]);
+
+		releaseWorkerRender?.();
+		await focus;
+		expect(h.controller.focusedAgentId).toBeUndefined();
+		expect(h.setSessionCalls.at(-1)).toEqual([h.main.session, undefined]);
+		expect(h.reloadTodoSessions).toEqual([h.main.session]);
+	});
+
+	it("mid-turn attach synthesizes agent_start, and an orphaned assistant message_update gets a synthesized message_start", async () => {
 		const h = makeHarness();
 		const parent = makeSessionStub({ isStreaming: true, activeRunStartedAt: 2_000 });
 		const child = makeSessionStub({ isStreaming: true, activeRunStartedAt: 3_000 });

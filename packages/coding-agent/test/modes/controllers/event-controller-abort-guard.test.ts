@@ -120,6 +120,7 @@ function makeTurnEndContext(options: { lastAssistantMessage?: AssistantMessage }
 		transcriptMessageComponents: new WeakMap(),
 		flushPendingModelSwitch: async () => {},
 		flushPendingCommandOutput: () => {},
+		syncRetryHintRow: () => {},
 		ui: { requestRender: () => {}, requestComponentRender: () => {} },
 		chatContainer: { removeChild: () => {} },
 		statusContainer: { clear: () => {}, disposeChildren: () => {}, addChild: () => {} },
