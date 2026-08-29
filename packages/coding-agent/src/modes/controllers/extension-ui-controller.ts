@@ -21,7 +21,6 @@ import type {
 	SendUserMessageHandler,
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
-import type { AsyncJobSnapshotOptions } from "../../async";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { createExtensionModelQuery } from "../../extensibility/extensions/model-api";
 import { AskDialogComponent, boundPromptTitle } from "../../modes/components/ask-dialog";

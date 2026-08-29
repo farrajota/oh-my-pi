@@ -87,10 +87,10 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 			get isStreaming() {
 				return streamState.isStreaming;
 			},
-			agent: { state: streamState },
+			agent: { state: streamState, tokenizer: { countMessage: () => 0 } },
 		},
 		session: {
-			agent: { state: { isStreaming: false } },
+			agent: { state: { isStreaming: false }, tokenizer: { countMessage: () => 0 } },
 			get isStreaming() {
 				return streamState.isStreaming;
 			},
@@ -108,13 +108,9 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 	return { ctx, streamState, statusContainer, workingLoaders, setProgress };
 }
 
-function ownStringValues(value: unknown): string[] {
-	if (!value || typeof value !== "object") return [];
-	return Object.values(value).filter((entry): entry is string => typeof entry === "string");
-}
-
 function expectRetryLoaderText(ctx: InteractiveModeContext, expected: string): void {
-	expect(ownStringValues(ctx.retryLoader).some(text => text.includes(expected))).toBe(true);
+	const rendered = ctx.retryLoader?.render(80).join("\n") ?? "";
+	expect(rendered).toContain(expected);
 }
 
 const AGENT_START = { type: "agent_start" } as unknown as AgentSessionEvent;
@@ -241,7 +237,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 
 		await controller.handleEvent(ctx.viewSession, RETRY_START);
 
-		expectRetryLoaderText(ctx, "Retrying (1/3) in 1s… (esc to cancel)");
+		expectRetryLoaderText(ctx, "Retrying (1/3) in 1.0s… (esc to cancel)");
 	});
 
 	it("uses explicit session-limit wait text for repeated auto-retry", async () => {
@@ -285,7 +281,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		const visible = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
 		streamState.isStreaming = true;
-		await controller.handleEvent(RETRY_START);
+		await controller.handleEvent(ctx.viewSession, RETRY_START);
 		expect(ctx.retryLoader).toBeDefined();
 
 		// Initial paint shows the full delay: RETRY_START carries delayMs 1000.

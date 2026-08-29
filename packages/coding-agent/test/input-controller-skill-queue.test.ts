@@ -931,7 +931,7 @@ describe("EventController custom queued-message refresh", () => {
 	});
 
 	it("reconciles the optimistic skill row instead of duplicating it on the canonical message_start", async () => {
-		const { controller, addMessageToChat, reconcileOptimisticSkillMessage } = createEventControllerFixture({
+		const { controller, ctx, addMessageToChat, reconcileOptimisticSkillMessage } = createEventControllerFixture({
 			optimisticSkillMessagePending: true,
 		});
 		const event: Extract<AgentSessionEvent, { type: "message_start" }> = {
@@ -946,7 +946,7 @@ describe("EventController custom queued-message refresh", () => {
 				timestamp: Date.now(),
 			},
 		};
-		await controller.handleEvent(event);
+		await controller.handleEvent(ctx.viewSession, event);
 
 		expect(reconcileOptimisticSkillMessage).toHaveBeenCalledTimes(1);
 		expect(reconcileOptimisticSkillMessage.mock.calls[0]?.[0]).toBe(event.message);
@@ -954,7 +954,7 @@ describe("EventController custom queued-message refresh", () => {
 	});
 
 	it("renders normally when no optimistic skill row is pending", async () => {
-		const { controller, addMessageToChat, reconcileOptimisticSkillMessage } = createEventControllerFixture({
+		const { controller, ctx, addMessageToChat, reconcileOptimisticSkillMessage } = createEventControllerFixture({
 			optimisticSkillMessagePending: false,
 		});
 		const event: Extract<AgentSessionEvent, { type: "message_start" }> = {
@@ -969,7 +969,7 @@ describe("EventController custom queued-message refresh", () => {
 				timestamp: Date.now(),
 			},
 		};
-		await controller.handleEvent(event);
+		await controller.handleEvent(ctx.viewSession, event);
 
 		expect(reconcileOptimisticSkillMessage).not.toHaveBeenCalled();
 		expect(addMessageToChat).toHaveBeenCalledTimes(1);

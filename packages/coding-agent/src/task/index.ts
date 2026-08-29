@@ -20,10 +20,10 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "..";
+import type { EffectiveExtensionRoots } from "../capability/types";
 import { resolveAgentModelSelection } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { MCPManager } from "../mcp/manager";
-import type { EffectiveExtensionRoots } from "../capability/types";
 import type { Theme } from "../modes/theme/theme";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };

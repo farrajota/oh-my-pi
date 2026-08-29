@@ -24,6 +24,9 @@ function extension(handlers: Extension["handlers"] = new Map()): Extension {
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
+		fileWriteFallbackHandlers: [],
+		fileDeleteFallbackHandlers: [],
+		composerShapes: new Map(),
 	};
 }
 
@@ -35,7 +38,7 @@ function runner(
 		extensions,
 		{} as ExtensionRuntime,
 		cwd,
-		{ getSessionId: () => "session-1" } as ConstructorParameters<typeof ExtensionRunner>[3],
+		{ getSessionId: () => "session-1", getCwd: () => cwd } as ConstructorParameters<typeof ExtensionRunner>[3],
 		{} as ConstructorParameters<typeof ExtensionRunner>[4],
 		undefined,
 		undefined,

@@ -188,7 +188,7 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 			errorMessage: "TTSR matched rule: no-unwrap",
 			errorId: AIError.create(AIError.Flag.SilentAbort),
 		});
-		const { controller, streamingComponent } = createFixture({
+		const { controller, ctx, streamingComponent } = createFixture({
 			streamingMessage: message,
 			isTtsrAbortPending: true,
 		});

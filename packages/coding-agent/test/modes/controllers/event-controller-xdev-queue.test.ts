@@ -54,8 +54,11 @@ function createFixture(streamingMessage: AssistantMessage) {
 		init: vi.fn(async () => {}),
 		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), resetDisplay: vi.fn() },
 		settings,
+		sessionManager: { getCwd: () => process.cwd() },
 		statusLine: { invalidate: vi.fn() },
-		updateEditorTopBorder: vi.fn(),
+		setWorkingMessageRunTokenDelta: vi.fn(),
+		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
+		endWorkingMessageRun: vi.fn(),
 		streamingComponent: { updateContent: vi.fn(), markTranscriptBlockFinalized: vi.fn() },
 		streamingMessage,
 		transcriptMessageComponents: new WeakMap(),
@@ -66,23 +69,32 @@ function createFixture(streamingMessage: AssistantMessage) {
 		lastAssistantUsage: undefined,
 		showPinnedError: vi.fn(),
 		session: {
+			activeRunStartedAt: 1_000,
+			isStreaming: false,
 			getToolByName: () => undefined,
 			hasBuiltInTool: () => true,
 			isTtsrAbortPending: false,
 			retryAttempt: 0,
+			agent: { tokenizer: { countMessage: () => 0 } },
+			getSessionId: () => "session-1",
+			sessionManager: { getCwd: () => process.cwd() },
 		},
 		viewSession: {
+			activeRunStartedAt: 1_000,
 			getToolByName: () => undefined,
 			hasBuiltInTool: () => true,
 			isTtsrAbortPending: false,
 			retryAttempt: 0,
+			isStreaming: false,
+			getSessionId: () => "session-1",
+			agent: { tokenizer: { countMessage: () => 0 } },
+			sessionManager: { getCwd: () => process.cwd() },
 		},
-		sessionManager: { getCwd: () => process.cwd() },
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);
 	ctx.eventController = controller;
-	return { controller, pendingTools };
+	return { controller, pendingTools, ctx };
 }
 
 function cardText(pendingTools: Map<string, ToolExecutionComponent>, id: string): string {
@@ -107,9 +119,9 @@ describe("EventController queues exclusive device writes until execution starts"
 			deviceWrite("write-1", "mcp__ecoport_search", searchArgs),
 			deviceWrite("write-2", "mcp__ecoport_scripts", scriptsArgs),
 		]);
-		const { controller, pendingTools } = createFixture(streaming);
+		const { controller, pendingTools, ctx } = createFixture(streaming);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "message_update",
 			message: streaming,
 			assistantMessageEvent: undefined as never,
@@ -120,7 +132,7 @@ describe("EventController queues exclusive device writes until execution starts"
 		expect(cardText(pendingTools, "write-2")).toContain("queued");
 		expect(cardText(pendingTools, "write-2")).toContain("ecoport/scripts");
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "message_end",
 			message: streaming,
 		} as Extract<AgentSessionEvent, { type: "message_end" }>);
@@ -129,7 +141,7 @@ describe("EventController queues exclusive device writes until execution starts"
 		expect(controller.hasToolExecutionStarted("write-1")).toBe(false);
 		expect(controller.hasToolExecutionStarted("write-2")).toBe(false);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: "write-1",
 			toolName: "write",
@@ -140,7 +152,7 @@ describe("EventController queues exclusive device writes until execution starts"
 		expect(cardText(pendingTools, "write-1")).not.toContain("queued");
 		expect(cardText(pendingTools, "write-2")).toContain("queued");
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: "write-2",
 			toolName: "write",

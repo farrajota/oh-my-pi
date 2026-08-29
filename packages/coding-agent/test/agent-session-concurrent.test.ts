@@ -42,6 +42,14 @@ const originalSchedulerWait = scheduler.wait.bind(scheduler);
 function collapseSchedulerSettleDelays(): void {
 	vi.spyOn(scheduler, "wait").mockImplementation((_delayMs, options) => originalSchedulerWait(0, options));
 }
+
+async function waitFor(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() >= deadline) throw new Error(`Condition not met within ${timeoutMs}ms`);
+		await scheduler.wait(10);
+	}
+}
 let sharedDir: string;
 let sharedAuthStorage: AuthStorage;
 let sharedModelRegistry: ModelRegistry;

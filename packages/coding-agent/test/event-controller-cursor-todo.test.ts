@@ -29,6 +29,16 @@ interface Fixture {
 function createFixture(): Fixture {
 	const showWarning = vi.fn();
 	const blocks: unknown[] = [];
+	const session = {
+		isAborting: false,
+		isStreaming: false,
+		getToolByName: () => undefined,
+		hasBuiltInTool: () => true,
+		agent: { tokenizer: { countMessage: () => 0 } },
+		getSessionId: () => "session-1",
+		sessionManager: { getCwd: () => "/tmp" },
+	};
+	const viewSession = session;
 	const ctx = {
 		isInitialized: true,
 		init: vi.fn(async () => {}),
@@ -36,7 +46,7 @@ function createFixture(): Fixture {
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn() },
-		session: { isAborting: false },
+		session,
 		settings: { get: () => false },
 		updateEditorTopBorder: vi.fn(),
 		clearPinnedError: vi.fn(),
@@ -48,7 +58,7 @@ function createFixture(): Fixture {
 		// (`#handleMessageUpdate`) only runs while one exists.
 		streamingComponent: { setHideThinkingBlock: vi.fn(), markTranscriptBlockFinalized: vi.fn() },
 		streamingMessage: undefined,
-		viewSession: { isStreaming: false, getToolByName: () => undefined, hasBuiltInTool: () => true },
+		viewSession,
 		sessionManager: { getCwd: () => "/tmp" },
 		chatContainer: {
 			addChild: (block: unknown) => blocks.push(block),
@@ -201,8 +211,9 @@ describe("EventController + Cursor todo bridge", () => {
 	it("settles a fast eval completion that outruns its streamed block", async () => {
 		const f = createFixture();
 
-		await f.controller.handleEvent(evalEnd("eval-call-1"));
+		await f.controller.handleEvent(f.ctx.viewSession, evalEnd("eval-call-1"));
 		await f.controller.handleEvent(
+			f.ctx.viewSession,
 			streamedToolBlock("eval-call-1", "eval", { language: "py", code: "print('done')" }),
 		);
 
@@ -216,8 +227,8 @@ describe("EventController + Cursor todo bridge", () => {
 	it("settles a held completion when execution start creates the card", async () => {
 		const f = createFixture();
 
-		await f.controller.handleEvent(evalEnd("eval-call-1"));
-		await f.controller.handleEvent(evalStart("eval-call-1"));
+		await f.controller.handleEvent(f.ctx.viewSession, evalEnd("eval-call-1"));
+		await f.controller.handleEvent(f.ctx.viewSession, evalStart("eval-call-1"));
 
 		expect(f.blocks).toHaveLength(1);
 		expect(f.ctx.pendingTools.size).toBe(0);

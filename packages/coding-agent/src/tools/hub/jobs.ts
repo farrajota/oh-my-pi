@@ -8,11 +8,11 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import type { AsyncJob, AsyncJobManager, AsyncJobType } from "../../async";
-import { terminateSubagent } from "../../registry/agent-control";
 import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
+import { terminateSubagent } from "../../registry/agent-control";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import type { ToolSession } from "..";
 import {

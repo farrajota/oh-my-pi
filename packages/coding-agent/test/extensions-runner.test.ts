@@ -3595,53 +3595,63 @@ describe("ExtensionRunner", () => {
 				`,
 			);
 			const result = await loadTestExtensions();
-			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
-            const recoveredEvent = {
-                type: "auto_retry_recovered" as const,
-                round: 2,
-                startedAtMs: 1_000,
-                recoveredAtMs: 1_250,
-                durationMs: 250,
-                deadlineMs: 5_000,
-                timeoutMs: 4_000,
-                recoveredErrors: [],
-            };
-            const timeoutEvent = {
-                type: "auto_retry_timeout" as const,
-                round: 4,
-                startedAtMs: 1_000,
-                timedOutAtMs: 5_000,
-                durationMs: 4_000,
-                deadlineMs: 5_000,
-                timeoutMs: 4_000,
-                finalError: "provider remained overloaded",
-                recoveredErrors: [],
-            };
-            await runner.emit(recoveredEvent);
-            await runner.emit(timeoutEvent);
-            const events = fs.readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
-            expect(events).toEqual([recoveredEvent, timeoutEvent]);
-        });
-    });
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const recoveredEvent = {
+				type: "auto_retry_recovered" as const,
+				round: 2,
+				startedAtMs: 1_000,
+				recoveredAtMs: 1_250,
+				durationMs: 250,
+				deadlineMs: 5_000,
+				timeoutMs: 4_000,
+				recoveredErrors: [],
+			};
+			const timeoutEvent = {
+				type: "auto_retry_timeout" as const,
+				round: 4,
+				startedAtMs: 1_000,
+				timedOutAtMs: 5_000,
+				durationMs: 4_000,
+				deadlineMs: 5_000,
+				timeoutMs: 4_000,
+				finalError: "provider remained overloaded",
+				recoveredErrors: [],
+			};
+			await runner.emit(recoveredEvent);
+			await runner.emit(timeoutEvent);
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toEqual([recoveredEvent, timeoutEvent]);
+		});
+	});
 
-    describe("mcp_notification", () => {
-        const initializeRunner = (runner: ExtensionRunner) =>
-            runner.initialize({} as never, {
-                getModel: () => undefined,
-                isIdle: () => true,
-                abort: () => {},
-                hasPendingMessages: () => false,
-                shutdown: () => {},
-                getContextUsage: () => undefined,
-                compact: async () => {},
-                getSystemPrompt: () => [],
-            });
+	describe("mcp_notification", () => {
+		const initializeRunner = (runner: ExtensionRunner) =>
+			runner.initialize({} as never, {
+				getModel: () => undefined,
+				isIdle: () => true,
+				abort: () => {},
+				hasPendingMessages: () => false,
+				shutdown: () => {},
+				getContextUsage: () => undefined,
+				compact: async () => {},
+				getSystemPrompt: () => [],
+			});
 
-        it("delivers typed notifications to subscribed extensions", async () => {
-            const eventsPath = path.join(tempDir.path(), "mcp-notification-events.jsonl");
-            fs.writeFileSync(
-                path.join(extensionsDir, "mcp-notification.ts"),
-                `
+		it("delivers typed notifications to subscribed extensions", async () => {
+			const eventsPath = path.join(tempDir.path(), "mcp-notification-events.jsonl");
+			fs.writeFileSync(
+				path.join(extensionsDir, "mcp-notification.ts"),
+				`
                     import * as fs from "node:fs";
                     export default function(pi) {
                         pi.on("mcp_notification", async (event) => fs.appendFileSync(
@@ -3650,31 +3660,41 @@ describe("ExtensionRunner", () => {
                         ));
                     }
                 `,
-            );
-            const result = await loadTestExtensions();
-            const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
-            initializeRunner(runner);
-            await runner.emitMcpNotification({
-                server: "peers",
-                method: "notifications/peer_message",
-                params: { from: "alice", text: "hi" },
-            });
-            const events = fs.readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
-            expect(events).toEqual([
-                {
-                    type: "mcp_notification",
-                    server: "peers",
-                    method: "notifications/peer_message",
-                    params: { from: "alice", text: "hi" },
-                },
-            ]);
-        });
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			initializeRunner(runner);
+			await runner.emitMcpNotification({
+				server: "peers",
+				method: "notifications/peer_message",
+				params: { from: "alice", text: "hi" },
+			});
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toEqual([
+				{
+					type: "mcp_notification",
+					server: "peers",
+					method: "notifications/peer_message",
+					params: { from: "alice", text: "hi" },
+				},
+			]);
+		});
 
-        it("buffers pre-initialize notifications with a bounded drop-oldest queue", async () => {
-            const eventsPath = path.join(tempDir.path(), "mcp-notification-cap.jsonl");
-            fs.writeFileSync(
-                path.join(extensionsDir, "mcp-notification-cap.ts"),
-                `
+		it("buffers pre-initialize notifications with a bounded drop-oldest queue", async () => {
+			const eventsPath = path.join(tempDir.path(), "mcp-notification-cap.jsonl");
+			fs.writeFileSync(
+				path.join(extensionsDir, "mcp-notification-cap.ts"),
+				`
                     import * as fs from "node:fs";
                     export default function(pi) {
                         pi.on("mcp_notification", async (event) => fs.appendFileSync(
@@ -3683,20 +3703,30 @@ describe("ExtensionRunner", () => {
                         ));
                     }
                 `,
-            );
-            const result = await loadTestExtensions();
-            const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
-            for (let i = 0; i < 101; i++) {
-                await runner.emitMcpNotification({ server: "peers", method: `notifications/test/${i}`, params: null });
-            }
-            initializeRunner(runner);
-            for (let i = 0; i < 5; i++) await Promise.resolve();
-            const events = fs.readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
-            expect(events).toHaveLength(100);
-            expect(events[0]?.method).toBe("notifications/test/1");
-            expect(events[99]?.method).toBe("notifications/test/100");
-        });
-    });
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			for (let i = 0; i < 101; i++) {
+				await runner.emitMcpNotification({ server: "peers", method: `notifications/test/${i}`, params: null });
+			}
+			initializeRunner(runner);
+			for (let i = 0; i < 5; i++) await Promise.resolve();
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toHaveLength(100);
+			expect(events[0]?.method).toBe("notifications/test/1");
+			expect(events[99]?.method).toBe("notifications/test/100");
+		});
+	});
 
 	describe("managed timers (ctx.setInterval / ctx.setTimeout)", () => {
 		it("contains a throwing interval callback instead of letting it escape as uncaughtException", () => {

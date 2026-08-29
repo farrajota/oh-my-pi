@@ -337,14 +337,17 @@ describe("focus-attach mid-turn keeps the prompt→yield delta", () => {
 			imageBudget: undefined,
 		} as unknown as TUI;
 		const viewSession = {
+			activeRunStartedAt: 1_000,
 			getToolByName: () => undefined,
 			hasBuiltInTool: () => true,
 			extensionRunner: undefined,
 			isTtsrAbortPending: false,
 			retryAttempt: 0,
 			isStreaming: false,
+			agent: { tokenizer: { countMessage: () => 0 } },
+			getSessionId: () => "session-1",
 			sessionManager: { getCwd: () => process.cwd(), putBlobSync: () => undefined, getSessionName: () => undefined },
-		};
+		} as unknown as AgentSession & { isStreaming: boolean };
 		const ctx = {
 			isInitialized: true,
 			init: vi.fn(async () => {}),
@@ -358,6 +361,10 @@ describe("focus-attach mid-turn keeps the prompt→yield delta", () => {
 			effectiveHideThinkingBlock: false,
 			proseOnlyThinking: true,
 			statusLine: { invalidate: vi.fn(), markActivityEnd: vi.fn(), markActivityStart: vi.fn() },
+			setWorkingMessageRunTokenDelta: vi.fn(),
+			getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
+			beginWorkingMessageRun: vi.fn(),
+			endWorkingMessageRun: vi.fn(),
 			updateEditorTopBorder: vi.fn(),
 			editor: { getText: () => "busy", setText: vi.fn() },
 			noteDisplayableThinkingContent: vi.fn(() => false),
@@ -388,12 +395,16 @@ describe("focus-attach mid-turn keeps the prompt→yield delta", () => {
 		return { controller, helpers, chatContainer, viewSession };
 	}
 
-	async function driveAssistantTurn(controller: EventController, message: AssistantFixture): Promise<void> {
-		await controller.handleEvent({ type: "message_start", message } as Extract<
+	async function driveAssistantTurn(
+		controller: EventController,
+		source: Parameters<EventController["handleEvent"]>[0],
+		message: AssistantFixture,
+	): Promise<void> {
+		await controller.handleEvent(source, { type: "message_start", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		await controller.handleEvent(source, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -411,7 +422,7 @@ describe("focus-attach mid-turn keeps the prompt→yield delta", () => {
 
 		// The in-flight assistant message ends on the live controller — no user
 		// message_start follows, so only the handoff keeps the delta available.
-		await driveAssistantTurn(controller, assistantMessage());
+		await driveAssistantTurn(controller, viewSession, assistantMessage());
 
 		const rendered = renderedText(chatContainer);
 		expect(rendered).toContain(TURN_ELAPSED_LABEL);
@@ -419,17 +430,17 @@ describe("focus-attach mid-turn keeps the prompt→yield delta", () => {
 	});
 
 	it("clears a stale prompt anchor for a synthetic-only run", async () => {
-		const { controller, chatContainer } = createFixture();
+		const { controller, chatContainer, viewSession } = createFixture();
 
 		// Turn 1: a real user prompt anchors the delta in the controller.
 		controller.resetTranscriptAnchors();
-		await controller.handleEvent({ type: "message_start", message: userMessage() } as Extract<
+		await controller.handleEvent(viewSession, { type: "message_start", message: userMessage() } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-		await driveAssistantTurn(controller, assistantMessage());
+		await driveAssistantTurn(controller, viewSession, assistantMessage());
 		expect(renderedText(chatContainer)).toContain(TURN_ELAPSED_LABEL);
-		await controller.handleEvent({ type: "agent_end", isTerminal: true, messages: [] } as Extract<
+		await controller.handleEvent(viewSession, { type: "agent_end", isTerminal: true, messages: [] } as Extract<
 			AgentSessionEvent,
 			{ type: "agent_end" }
 		>);
@@ -437,15 +448,18 @@ describe("focus-attach mid-turn keeps the prompt→yield delta", () => {
 		// Synthetic-only run (`/goal` kickoff, approved-plan execution): agent_start
 		// with no user message must not measure prompt→yield from the completed
 		// turn's prompt (which would fold the idle gap into the delta).
-		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
-		await driveAssistantTurn(controller, assistantMessage());
+		await controller.handleEvent(viewSession, { type: "agent_start" } as Extract<
+			AgentSessionEvent,
+			{ type: "agent_start" }
+		>);
+		await driveAssistantTurn(controller, viewSession, assistantMessage());
 
 		// Turn 1 keeps its row's delta; the synthetic run must not add another.
 		const occurrences = renderedText(chatContainer).match(/Δ1m/g)?.length ?? 0;
 		expect(occurrences).toBe(1);
 	});
 	it("seeds the delta from a user-invoked skill prompt in the live path", async () => {
-		const { controller, chatContainer } = createFixture();
+		const { controller, chatContainer, viewSession } = createFixture();
 		controller.resetTranscriptAnchors();
 		const skill = {
 			role: "custom",
@@ -455,21 +469,21 @@ describe("focus-attach mid-turn keeps the prompt→yield delta", () => {
 			display: false,
 			timestamp: PROMPT_AT,
 		} as unknown as AgentMessage;
-		await controller.handleEvent({ type: "message_start", message: skill } as Extract<
+		await controller.handleEvent(viewSession, { type: "message_start", message: skill } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-		await driveAssistantTurn(controller, assistantMessage());
+		await driveAssistantTurn(controller, viewSession, assistantMessage());
 		expect(renderedText(chatContainer)).toContain(TURN_ELAPSED_LABEL);
 	});
 	it("clears the live anchor when a synthetic developer prompt drains inside the run", async () => {
-		const { controller, chatContainer } = createFixture();
+		const { controller, chatContainer, viewSession } = createFixture();
 		controller.resetTranscriptAnchors();
-		await controller.handleEvent({ type: "message_start", message: userMessage() } as Extract<
+		await controller.handleEvent(viewSession, { type: "message_start", message: userMessage() } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-		await driveAssistantTurn(controller, assistantMessage());
+		await driveAssistantTurn(controller, viewSession, assistantMessage());
 		expect(renderedText(chatContainer)).toContain(TURN_ELAPSED_LABEL);
 
 		// Queued synthetic follow-up (plan approval, /goal) drained inside the same
@@ -482,11 +496,11 @@ describe("focus-attach mid-turn keeps the prompt→yield delta", () => {
 			synthetic: true,
 			timestamp: RESPONSE_CREATED_AT + 5_000,
 		} as unknown as AgentMessage;
-		await controller.handleEvent({ type: "message_start", message: developer } as Extract<
+		await controller.handleEvent(viewSession, { type: "message_start", message: developer } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-		await driveAssistantTurn(controller, assistantMessage());
+		await driveAssistantTurn(controller, viewSession, assistantMessage());
 
 		const occurrences = renderedText(chatContainer).match(/Δ1m/g)?.length ?? 0;
 		expect(occurrences).toBe(1); // the synthetic run's row adds no delta
@@ -523,7 +537,12 @@ describe("AgentSession synthetic follow-up marking", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
 			modelRegistry,
-			extensionRunner: {} as unknown as ExtensionRunner,
+			extensionRunner: {
+				emit: vi.fn(async () => undefined),
+				emitBeforeAgentStart: vi.fn(async () => undefined),
+				hasHandlers: vi.fn(() => false),
+				emitSessionStop: vi.fn(async () => undefined),
+			} as unknown as ExtensionRunner,
 		});
 		try {
 			// The approved-plan execution path queues the hidden directive this way

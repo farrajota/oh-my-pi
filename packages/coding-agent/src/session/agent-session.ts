@@ -1988,7 +1988,6 @@ export class AgentSession {
 		});
 	}
 
-
 	/**
 	 * Cancel async jobs registered by *this* agent only. Used by lifecycle
 	 * transitions (newSession, switchSession, handoff, dispose) so a subagent
@@ -2274,7 +2273,8 @@ export class AgentSession {
 		const agentStartRunStartedAt =
 			typeof agentStartRunStartedAtOrOptions === "number" ? agentStartRunStartedAtOrOptions : undefined;
 		const detachExtensions =
-			typeof agentStartRunStartedAtOrOptions === "object" && agentStartRunStartedAtOrOptions.detachExtensions === true;
+			typeof agentStartRunStartedAtOrOptions === "object" &&
+			agentStartRunStartedAtOrOptions.detachExtensions === true;
 		if (event.type === "message_update") {
 			this.#emit(event);
 			void this.#queueExtensionEvent(event);

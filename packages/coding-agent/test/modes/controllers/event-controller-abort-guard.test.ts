@@ -453,7 +453,7 @@ describe("EventController — terminal title across a non-terminal agent_end", (
 		const markActivityEnd = vi.spyOn(ctx.statusLine, "markActivityEnd");
 		const flushPendingModelSwitch = vi.spyOn(ctx, "flushPendingModelSwitch");
 		const controller = new EventController(ctx);
-        await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent(ctx.viewSession, {
 			...makeAgentEndEvent([makeAssistantMessage("stop")]),
 			isTerminal: false,
 		} as Extract<AgentSessionEvent, { type: "agent_end" }> & { isTerminal: false });
@@ -469,7 +469,7 @@ describe("EventController — terminal title across a non-terminal agent_end", (
 		const ctx = makeTurnEndContext();
 		const markActivityEnd = vi.spyOn(ctx.statusLine, "markActivityEnd");
 		const controller = new EventController(ctx);
-        await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("stop")]));
+		await dispatchAgentEnd(ctx, controller, makeAgentEndEvent([makeAssistantMessage("stop")]));
 		expect(stateSpy).toHaveBeenCalledWith("idle");
 		expect(markActivityEnd).toHaveBeenCalledTimes(1);
 	});

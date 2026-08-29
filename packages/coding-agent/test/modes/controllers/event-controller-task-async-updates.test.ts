@@ -68,14 +68,30 @@ describe("EventController async update finalization", () => {
 			transcriptMessageComponents: new WeakMap(),
 			pendingTools,
 			chatContainer,
-			session: { getToolByName: () => undefined, hasBuiltInTool: () => true, isStreaming: true },
+			session: {
+				getToolByName: () => undefined,
+				hasBuiltInTool: () => true,
+				isStreaming: true,
+				agent: { tokenizer: { countMessage: () => 0 } },
+			},
 			showWarning: vi.fn(),
-			viewSession: { getToolByName: () => undefined, hasBuiltInTool: () => true, isStreaming: false },
+			viewSession: {
+				activeRunStartedAt: 1_000,
+				getToolByName: () => undefined,
+				hasBuiltInTool: () => true,
+				isStreaming: false,
+				agent: { tokenizer: { countMessage: () => 0 } },
+			},
 			sessionManager: { getCwd: () => process.cwd() },
 			setTodos: vi.fn(),
+			setWorkingMessage: vi.fn(),
+			beginWorkingMessageRun: vi.fn(),
+			rehydrateWorkingMessageRun: vi.fn(() => false),
+			endWorkingMessageRun: vi.fn(),
+			getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
 			setWorkingMessageRunTokenDelta: vi.fn(),
 			clearPinnedError: vi.fn(),
-			statusContainer: { disposeChildren: vi.fn() },
+			statusContainer: { disposeChildren: vi.fn(), addChild: vi.fn(), removeChild: vi.fn() },
 			ensureLoadingAnimation: vi.fn(),
 		} as unknown as InteractiveModeContext;
 		return { controller: new EventController(ctx), pendingTools, chatContainer, ctx };
@@ -175,7 +191,7 @@ describe("EventController async update finalization", () => {
 
 	it("seals a foreground card orphaned before the next agent turn", async () => {
 		const { controller, chatContainer, ctx } = createFixture();
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: "tc-stale",
 			toolName: "hub",
@@ -196,16 +212,16 @@ describe("EventController async update finalization", () => {
 
 		expect(component.isTranscriptBlockFinalized()).toBe(false);
 		expect(chatContainer.peekFinalizedBatch(80, 0)).toBeUndefined();
-		await controller.handleEvent({ type: "agent_start" });
+		await controller.handleEvent(ctx.viewSession, { type: "agent_start" });
 
 		expect(component.isTranscriptBlockFinalized()).toBe(true);
 		expect(chatContainer.peekFinalizedBatch(80, 0)?.rows).toBeDefined();
 	});
 
 	it("keeps a parked task card available across the next agent turn", async () => {
-		const { controller, pendingTools } = createFixture();
-		const component = await startTask(controller, pendingTools);
-		await controller.handleEvent({
+		const { controller, pendingTools, ctx } = createFixture();
+		const component = await startTask(controller, ctx.viewSession, pendingTools);
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: "tc-task",
 			toolName: "task",
@@ -213,7 +229,7 @@ describe("EventController async update finalization", () => {
 			isError: false,
 		});
 
-		await controller.handleEvent({ type: "agent_start" });
+		await controller.handleEvent(ctx.viewSession, { type: "agent_start" });
 
 		expect(pendingTools.get("tc-task")).toBe(component);
 	});

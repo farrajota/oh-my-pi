@@ -49,8 +49,8 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	ToolDefinition,
-	WorkingMessageSuffixRenderer,
 	ToolInfo,
+	WorkingMessageSuffixRenderer,
 } from "./types";
 
 installLegacyPiSpecifierShim();

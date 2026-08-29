@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "bun:test";
-import { type } from "arktype";
 import type { TSchema } from "@oh-my-pi/pi-ai";
+import { type } from "arktype";
 import type { ModelRegistry } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { CustomTool } from "../../extensibility/custom-tools/types";

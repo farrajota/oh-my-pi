@@ -1922,9 +1922,7 @@ describe("vibe session registry", () => {
 		expect(fake.isDisposed()).toBe(true);
 		expect(AgentRegistry.global().get("IgnoresKillAbort")).toBeUndefined();
 		expect(registry.screens(session)[0]?.state).toBe("dead");
-		await expect(registry.send(session, { session: "IgnoresKillAbort", message: "hello?" })).rejects.toThrow(
-			"dead",
-		);
+		await expect(registry.send(session, { session: "IgnoresKillAbort", message: "hello?" })).rejects.toThrow("dead");
 
 		gate.resolve();
 		await manager.getJob(jobId)!.promise;

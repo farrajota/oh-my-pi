@@ -21,6 +21,9 @@ function extension(resolvedPath: string, suffixes: Extension["workingMessageSuff
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
+		fileWriteFallbackHandlers: [],
+		fileDeleteFallbackHandlers: [],
+		composerShapes: new Map(),
 	};
 }
 
@@ -29,8 +32,12 @@ function runner(extensions: Extension[]): ExtensionRunner {
 		extensions,
 		{} as ExtensionRuntime,
 		"/workspace/project",
-		{} as ConstructorParameters<typeof ExtensionRunner>[3],
+		{ getSessionId: () => "session-1" } as ConstructorParameters<typeof ExtensionRunner>[3],
 		{} as ConstructorParameters<typeof ExtensionRunner>[4],
+		undefined,
+		undefined,
+		undefined,
+		undefined,
 	);
 }
 

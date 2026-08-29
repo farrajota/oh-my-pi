@@ -42,7 +42,15 @@ function createStreamingFixture() {
 		requestRender: vi.fn(),
 		requestComponentRender: vi.fn(),
 	} as unknown as TUI;
-	const viewSession = { isStreaming: true, getToolByName: () => undefined };
+	const viewSession = {
+		isStreaming: true,
+		getToolByName: () => undefined,
+		agent: { tokenizer: { countMessage: () => 0 } },
+		subscribe: (listener: (event: AgentSessionEvent) => void) => {
+			listeners.push(listener);
+			return () => {};
+		},
+	};
 	const ctx = {
 		isInitialized: true,
 		init: vi.fn(async () => {}),
@@ -59,15 +67,13 @@ function createStreamingFixture() {
 		noteDisplayableThinkingContent: vi.fn(() => false),
 		ensureLoadingAnimation: vi.fn(),
 		statusLine: { invalidate: vi.fn() },
+		setWorkingMessageRunTokenDelta: vi.fn(),
+		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
+		endWorkingMessageRun: vi.fn(),
 		updateEditorTopBorder: vi.fn(),
 		setWorkingMessage: vi.fn(),
 		viewSession,
-		session: {
-			subscribe: (listener: (event: AgentSessionEvent) => void) => {
-				listeners.push(listener);
-				return () => {};
-			},
-		} as unknown as InteractiveModeContext["session"],
+		session: viewSession as unknown as InteractiveModeContext["session"],
 	} as unknown as InteractiveModeContext;
 	const controller = new EventController(ctx);
 	controller.subscribeToAgent();

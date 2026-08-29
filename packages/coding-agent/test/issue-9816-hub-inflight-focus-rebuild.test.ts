@@ -184,7 +184,7 @@ function createFixture() {
 	ctx.eventController = eventController;
 	ctx.renderInitialMessages = options => helpers.renderInitialMessages(options);
 	focus = new SessionFocusController(ctx, registry, () => lifecycle);
-	ctx.unsubscribe = main.session.subscribe(event => eventController.handleEvent(event));
+	ctx.unsubscribe = main.session.subscribe(event => eventController.handleEvent(main.session, event));
 	return { ctx, focus, main };
 }
 
