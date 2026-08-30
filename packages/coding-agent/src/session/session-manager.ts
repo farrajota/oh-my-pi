@@ -474,6 +474,8 @@ export class SessionManager {
 	#sessionName: string | undefined;
 	#titleSource: SessionTitleSource | undefined;
 	#sessionFile: string | undefined;
+	#sessionFileSwitchGeneration = 0;
+	#sessionFileSwitching = false;
 	#header!: SessionHeader;
 	#titleUpdatedAt = "";
 	#hasTitleSlot = true;
@@ -1394,71 +1396,77 @@ export class SessionManager {
 	}
 
 	async #setSessionFile(sessionFile: string, loadedSession?: SessionLoadResult): Promise<void> {
-		await this.#drainAndCloseWriter();
-		this.#clearDiskError();
-		this.#draftOnlySessionCleanupArmed = false;
+		const switchGeneration = ++this.#sessionFileSwitchGeneration;
+		this.#sessionFileSwitching = true;
+		try {
+			await this.#drainAndCloseWriter();
+			this.#clearDiskError();
+			this.#draftOnlySessionCleanupArmed = false;
 
-		const resolvedSessionFile = path.resolve(sessionFile);
-		const loaded = loadedSession ?? (await loadSessionFile(resolvedSessionFile, this.#storage));
-		if (loaded.invalidHeader) {
-			throw new Error(
-				`Cannot resume session "${resolvedSessionFile}": the session header is missing or malformed. The file was not modified.`,
-			);
-		}
+			const resolvedSessionFile = path.resolve(sessionFile);
+			const loaded = loadedSession ?? (await loadSessionFile(resolvedSessionFile, this.#storage));
+			if (loaded.invalidHeader) {
+				throw new Error(
+					`Cannot resume session "${resolvedSessionFile}": the session header is missing or malformed. The file was not modified.`,
+				);
+			}
 
-		this.#sessionFile = resolvedSessionFile;
-		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
-
-		const { entries: fileEntries, titleSlot } = loaded;
-		if (fileEntries.length === 0) {
-			// Explicit but empty/missing path (e.g. --session flag): start fresh but
-			// keep the requested path and materialize the header immediately.
-			this.#resetToNewSession(undefined, resolvedSessionFile);
-			this.#forceFileCreation = true;
-			await this.#rewriteAtomically();
-			this.#fileIsCurrent = true;
-			return;
-		}
-
-		const migrated = migrateToCurrentVersion(fileEntries);
-		await resolveBlobRefsInEntries(fileEntries, this.#blobs);
-		// loadEntriesFromFile guarantees entries[0] is a valid session header.
-		const header = fileEntries[0] as SessionHeader;
-
-		// Adopt the loaded session's working directory only when it is verifiably
-		// accessible. Sessions live in a dir keyed by their cwd, so resuming a
-		// session from another project must re-point cwd/sessionDir at that
-		// project — but a deleted OR permission-blocked directory (macOS TCC
-		// denial) must not be adopted: callers without a cwd-change callback
-		// (extension UI, RPC) would otherwise track a directory the process
-		// cannot enter. Keep the current cwd so the session stays where the
-		// user already is.
-		const headerCwd = header.cwd ? path.resolve(header.cwd) : undefined;
-		if (headerCwd && headerCwd !== path.resolve(this.#cwd) && (await directoryIsEnterable(headerCwd))) {
-			this.#cwd = headerCwd;
-			this.#sessionDir = path.dirname(resolvedSessionFile);
-			this.#fallbackRuntimeOnly = false;
+			this.#sessionFile = resolvedSessionFile;
 			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
-		} else if (headerCwd && headerCwd !== path.resolve(this.#cwd)) {
-			// Header cwd not enterable: keep runtime cwd but mark fallback
-			// so workspace changes stay runtime-only until the transcript
-			// is relocated.
-			this.#fallbackRuntimeOnly = true;
-		} else {
-			this.#fallbackRuntimeOnly = false;
+
+			const { entries: fileEntries, titleSlot } = loaded;
+			if (fileEntries.length === 0) {
+				// Explicit but empty/missing path (e.g. --session flag): start fresh but
+				// keep the requested path and materialize the header immediately.
+				this.#resetToNewSession(undefined, resolvedSessionFile);
+				this.#forceFileCreation = true;
+				await this.#rewriteAtomically();
+				this.#fileIsCurrent = true;
+				return;
+			}
+
+			const migrated = migrateToCurrentVersion(fileEntries);
+			await resolveBlobRefsInEntries(fileEntries, this.#blobs);
+			// loadEntriesFromFile guarantees entries[0] is a valid session header.
+			const header = fileEntries[0] as SessionHeader;
+
+			// Adopt the loaded session's working directory only when it is verifiably
+			// accessible. Sessions live in a dir keyed by their cwd, so resuming a
+			// session from another project must re-point cwd/sessionDir at that
+			// project — but a deleted OR permission-blocked directory (macOS TCC
+			// denial) must not be adopted: callers without a cwd-change callback
+			// (extension UI, RPC) would otherwise track a directory the process
+			// cannot enter. Keep the current cwd so the session stays where the
+			// user already is.
+			const headerCwd = header.cwd ? path.resolve(header.cwd) : undefined;
+			if (headerCwd && headerCwd !== path.resolve(this.#cwd) && (await directoryIsEnterable(headerCwd))) {
+				this.#cwd = headerCwd;
+				this.#sessionDir = path.dirname(resolvedSessionFile);
+				this.#fallbackRuntimeOnly = false;
+				this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
+			} else if (headerCwd && headerCwd !== path.resolve(this.#cwd)) {
+				// Header cwd not enterable: keep runtime cwd but mark fallback
+				// so workspace changes stay runtime-only until the transcript
+				// is relocated.
+				this.#fallbackRuntimeOnly = true;
+			} else {
+				this.#fallbackRuntimeOnly = false;
+			}
+
+			this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
+			this.#additionalDirectories = header.additionalDirectories ?? [];
+			this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
+			this.#hasTitleSlot = titleSlot !== undefined;
+			this.#fileIsCurrent = true;
+			this.#rewriteRequired = migrated || loaded.malformedRecords > 0;
+			this.#forceFileCreation = true;
+			this.#artifactManager = null;
+			this.#artifactManagerSessionFile = null;
+
+			if (this.sanitizeLoadedOpenAIResponsesReplayMetadata()) this.#rewriteRequired = true;
+		} finally {
+			if (this.#sessionFileSwitchGeneration === switchGeneration) this.#sessionFileSwitching = false;
 		}
-
-		this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
-		this.#additionalDirectories = header.additionalDirectories ?? [];
-		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
-		this.#hasTitleSlot = titleSlot !== undefined;
-		this.#fileIsCurrent = true;
-		this.#rewriteRequired = migrated || loaded.malformedRecords > 0;
-		this.#forceFileCreation = true;
-		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
-
-		if (this.sanitizeLoadedOpenAIResponsesReplayMetadata()) this.#rewriteRequired = true;
 	}
 
 	/** Start a new session. Drains and closes any existing writer first. */
@@ -2065,6 +2073,10 @@ export class SessionManager {
 
 	getSessionId(): string {
 		return this.#sessionId;
+	}
+
+	isSessionFileSwitching(): boolean {
+		return this.#sessionFileSwitching;
 	}
 
 	getSessionFile(): string | undefined {

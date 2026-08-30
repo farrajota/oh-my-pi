@@ -105,6 +105,7 @@ function makeTurnEndContext(options: { lastAssistantMessage?: AssistantMessage }
 		activeRunStartedAt: 1_000,
 		isCompacting: false,
 		messages: [] as AssistantMessage[],
+		agent: { tokenizer: { countMessage: () => 0 } },
 		getLastAssistantMessage: () => options.lastAssistantMessage,
 		getContextUsage: () => undefined,
 	};

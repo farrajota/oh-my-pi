@@ -130,6 +130,16 @@ class SwitchGatedSessionStorage extends FaultInjectingSessionStorage {
 		return { started: started.promise, release: release.resolve };
 	}
 
+	override async readText(filePath: string): Promise<string> {
+		const gate = this.#readGate;
+		if (gate?.filePath === filePath) {
+			this.#readGate = undefined;
+			gate.started.resolve();
+			await gate.release.promise;
+		}
+		return super.readText(filePath);
+	}
+
 	override async readTextSlices(
 		filePath: string,
 		prefixBytes: number,

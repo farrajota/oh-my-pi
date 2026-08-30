@@ -91,7 +91,13 @@ export interface VibeParentSession {
 	getSessionFile: () => string | null;
 	sessionManager?: ToolSession["sessionManager"] &
 		Partial<
-			Pick<SessionManager, "appendModeChange" | "appendEntriesAtomically" | "recoverPersistenceFromCurrentState">
+			Pick<
+				SessionManager,
+				| "appendModeChange"
+				| "appendEntriesAtomically"
+				| "recoverPersistenceFromCurrentState"
+				| "isSessionFileSwitching"
+			>
 		>;
 	asyncJobManager?: AsyncJobManager;
 	settings: ToolSession["settings"];
@@ -252,7 +258,6 @@ async function waitForVibeTeardown(tasks: readonly TrackedVibeTeardown[], deadli
 	if (remainingMs <= 0) return false;
 	const timeout = Promise.withResolvers<void>();
 	const timer = setTimeout(timeout.resolve, remainingMs);
-	timer.unref?.();
 	try {
 		return await Promise.race([
 			Promise.allSettled(tasks.map(task => task.promise)).then(() => true),
@@ -426,9 +431,9 @@ export class VibeSessionRegistry {
 				path.resolve(currentSessionFile) === expectedParentSessionFile
 			);
 		};
-		if (!matchesCurrentScope()) return false;
+		if (!matchesCurrentScope() || session.sessionManager.isSessionFileSwitching?.()) return false;
 		await session.sessionManager.ensureOnDisk();
-		if (!matchesCurrentScope()) return false;
+		if (!matchesCurrentScope() || session.sessionManager.isSessionFileSwitching?.()) return false;
 		session.sessionManager.appendCustomEntry(VIBE_LIFECYCLE_CUSTOM_TYPE, event);
 		await session.sessionManager.flush();
 		return true;

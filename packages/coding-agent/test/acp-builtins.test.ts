@@ -473,11 +473,11 @@ describe("ACP builtin slash commands", () => {
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain("npm install");
 		expect(output[0]).toContain("build done");
-		expect(output[0]).toContain("Active Jobs");
-		expect(output[0]).toContain("Job History");
+		expect(output[0]).toContain("Running Jobs");
+		expect(output[0]).toContain("Recent Jobs");
 	});
 
-	it("jobs: renders queued active jobs and terminal durations from their end time", async () => {
+	it("jobs: renders active jobs and terminal durations from their start time", async () => {
 		const { output, runtime } = createRuntime();
 		const now = Date.now();
 		const terminalStartTime = now - 60_000;
@@ -509,13 +509,13 @@ describe("ACP builtin slash commands", () => {
 
 		await executeAcpBuiltinSlashCommand("/jobs", runtime);
 
-		expect(output[0]).toContain("(queued)");
+		expect(output[0]).toContain("(running)");
 		expect(output[0]).toContain("waiting for a task slot");
-		expect(output[0]).toContain(formatDuration(terminalEndTime - terminalStartTime));
-		expect(output[0]).not.toContain(formatDuration(now - terminalStartTime));
+		expect(output[0]).toContain(formatDuration(now - terminalStartTime));
+		expect(output[0]).not.toContain(formatDuration(terminalEndTime - terminalStartTime));
 	});
 
-	it("jobs: renders terminal jobs without end times with a stable unknown duration", async () => {
+	it("jobs: renders terminal jobs without end times using current elapsed duration", async () => {
 		const { output, runtime } = createRuntime();
 		runtime.session.getAsyncJobSnapshot = () => ({
 			running: [],
@@ -546,10 +546,9 @@ describe("ACP builtin slash commands", () => {
 
 			const first = terminalLine(output[0]!);
 			const second = terminalLine(output[1]!);
-			expect(first).toBe(second);
-			expect(first).toContain("unknown");
-			expect(first).not.toContain(formatDuration(20_000 - 10_000));
-			expect(second).not.toContain(formatDuration(90_000 - 10_000));
+			expect(first).not.toBe(second);
+			expect(first).toContain(formatDuration(20_000 - 10_000));
+			expect(second).toContain(formatDuration(90_000 - 10_000));
 		} finally {
 			now.mockRestore();
 		}
