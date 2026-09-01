@@ -30,6 +30,7 @@ function makeSessionStub(
 			};
 		},
 		async settleInFlightMessagePersistence() {},
+		activeToolExecutionUpdates: () => [],
 	};
 	return {
 		session: stub as unknown as AgentSession,
