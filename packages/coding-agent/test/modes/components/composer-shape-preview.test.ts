@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { COMPOSER_SHAPE_VALUES, type ComposerShape } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import {
 	ComposerShapePreview,
@@ -9,7 +9,10 @@ import {
 	getComposerShapeOptions,
 	installExtensionComposerShape,
 } from "@oh-my-pi/pi-coding-agent/modes/components/composer-shape-registry";
-import { SettingsSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/settings-selector";
+import {
+	type SettingsRuntimeContext,
+	SettingsSelectorComponent,
+} from "@oh-my-pi/pi-coding-agent/modes/components/settings-selector";
 import { initTheme, setTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { ComposerStyle } from "@oh-my-pi/pi-tui";
 
@@ -45,6 +48,16 @@ describe("composer shape preview", () => {
 		expect(joined).toContain("Ask anything");
 	});
 
+	it("resolves transparent composer preview text away from the terminal default", async () => {
+		// The built-in `light` theme leaves `text` empty; a transparent shape must
+		// still emit an explicit contrast foreground instead of ESC[39m, matching
+		// the live editor so the preview stays readable on a light terminal.
+		await setTheme("light");
+		const box = renderComposerShapePreview("box", 80).join("\n");
+		expect(box).not.toContain("\x1b[39mAsk anything");
+		expect(box).toMatch(/\x1b\[38[;0-9]*mAsk anything/);
+	});
+
 	it("updates preview when setValue is called on ComposerShapePreview component", async () => {
 		await setTheme("dark");
 		let renderRequested = false;
@@ -75,6 +88,10 @@ describe("composer shape preview", () => {
 				const content = `CHIP ${previewTitle ?? ""}`;
 				return { content, width: content.length };
 			},
+			getBandTopBorder: (_width: number, previewTitle?: string) => {
+				const content = `BAND ${previewTitle ?? ""}`;
+				return { content, width: content.length };
+			},
 			renderBottomBar: (_width: number, groups: "left" | "full", previewTitle?: string) =>
 				`BOTTOM-${groups.toUpperCase()} ${previewTitle ?? ""}`,
 		};
@@ -83,6 +100,10 @@ describe("composer shape preview", () => {
 		expect(box).toContain("TOPBAR"); // embedded in the top border
 		expect(box).toContain("omp"); // stand-in title forwarded to the status source
 		expect(box).not.toContain("BOTTOM"); // box has no standalone bottom bar
+		const band = renderComposerShapePreview("band", 80, status).join("\n");
+		expect(band).toContain("BAND"); // flush band row above the prompt
+		expect(band).toContain("omp");
+		expect(band).not.toContain("BOTTOM"); // the band replaces the bottom bar
 
 		const claude = renderComposerShapePreview("claude", 80, status).join("\n");
 		expect(claude).toContain("CHIP"); // right group chips onto the top rule
@@ -162,6 +183,10 @@ describe("composer shape preview", () => {
 				availableThemes: ["dark", "light"],
 				providers: [],
 				cwd: process.cwd(),
+				tui: {} as SettingsRuntimeContext["tui"],
+				settings,
+				modelRegistry: {} as SettingsRuntimeContext["modelRegistry"],
+				scopedModels: [],
 			},
 			{
 				onChange: () => {},

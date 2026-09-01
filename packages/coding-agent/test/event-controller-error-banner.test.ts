@@ -72,8 +72,19 @@ function createFixture(streamingMessage?: AssistantMessage) {
 		addChild: vi.fn(),
 	};
 
-	const session = { isStreaming: false };
-	const viewSession = { activeRunStartedAt: 1_000, isStreaming: false, isTtsrAbortPending: false, retryAttempt: 0 };
+	const session = {
+		activeRunStartedAt: 1_000,
+		isStreaming: false,
+		isTtsrAbortPending: false,
+		retryAttempt: 0,
+		isAborting: false,
+		getToolByName: () => undefined,
+		hasBuiltInTool: () => true,
+		agent: { tokenizer: { countMessage: () => 0 } },
+		getSessionId: () => "session-1",
+		sessionManager: { getCwd: () => process.cwd() },
+	};
+	const viewSession = session;
 	let hasDisplayableThinkingContent = false;
 	const noteDisplayableThinkingContent = vi.fn((message: AssistantMessage) => {
 		const hasThinking = message.content.some(
@@ -140,7 +151,15 @@ function createFixture(streamingMessage?: AssistantMessage) {
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);
-	return { controller, ctx, showPinnedError, clearPinnedError, showError, streamingComponent, componentCalls };
+	return {
+		controller,
+		ctx,
+		showPinnedError,
+		clearPinnedError,
+		showError,
+		streamingComponent,
+		componentCalls,
+	};
 }
 
 describe("EventController error banner", () => {
@@ -168,9 +187,9 @@ describe("EventController error banner", () => {
 			errorId: AIError.create(AIError.Flag.Transient, AIError.Flag.EmptyResponse),
 			errorMessage: "Cloud Code Assist API returned a thought-only response without final output",
 		});
-		const { controller, showPinnedError, streamingComponent } = createFixture(message);
+		const { controller, ctx, showPinnedError, streamingComponent } = createFixture(message);
 
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -179,7 +198,10 @@ describe("EventController error banner", () => {
 		expect(showPinnedError).not.toHaveBeenCalled();
 		streamingComponent.setErrorPinned.mockClear();
 
-		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
+		await controller.handleEvent(ctx.viewSession, { type: "agent_start" } as Extract<
+			AgentSessionEvent,
+			{ type: "agent_start" }
+		>);
 
 		expect(streamingComponent.setErrorPinned).not.toHaveBeenCalled();
 	});
@@ -191,9 +213,9 @@ describe("EventController error banner", () => {
 			errorId: AIError.create(AIError.Flag.Transient, AIError.Flag.EmptyResponse),
 			errorMessage: "Cloud Code Assist API returned a thought-only response without final output",
 		});
-		const { controller, showPinnedError, clearPinnedError, showError } = createFixture(message);
+		const { controller, ctx, showPinnedError, clearPinnedError, showError } = createFixture(message);
 
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -205,7 +227,7 @@ describe("EventController error banner", () => {
 		clearPinnedError.mockClear();
 		showPinnedError.mockClear();
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_end",
 			success: false,
 			attempt: 3,
@@ -224,15 +246,15 @@ describe("EventController error banner", () => {
 			errorId: AIError.create(AIError.Flag.Transient),
 			errorMessage,
 		});
-		const { controller, showPinnedError, showError } = createFixture(message);
+		const { controller, ctx, showPinnedError, showError } = createFixture(message);
 
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
 		showPinnedError.mockClear();
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_end",
 			success: false,
 			attempt: 3,
@@ -250,13 +272,14 @@ describe("EventController error banner", () => {
 			errorId: AIError.create(AIError.Flag.Transient),
 			errorMessage: providerError,
 		});
-		const { controller, showPinnedError, clearPinnedError, showError, streamingComponent } = createFixture(message);
+		const { controller, ctx, showPinnedError, clearPinnedError, showError, streamingComponent } =
+			createFixture(message);
 
-		await controller.handleEvent({ type: "message_end", message } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_start",
 			attempt: 1,
 			maxAttempts: 2,
@@ -270,7 +293,7 @@ describe("EventController error banner", () => {
 		streamingComponent.setErrorPinned.mockClear();
 
 		const finalError = `Retry continuation failed locally: local hook failed. Original error: ${providerError}`;
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_end",
 			success: false,
 			attempt: 1,
@@ -284,9 +307,9 @@ describe("EventController error banner", () => {
 	});
 
 	it("shows a failed retry banner when no terminal assistant error exists", async () => {
-		const { controller, showError } = createFixture();
+		const { controller, ctx, showError } = createFixture();
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "auto_retry_end",
 			success: false,
 			attempt: 3,

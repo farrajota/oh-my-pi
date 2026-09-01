@@ -20,6 +20,7 @@ function createContext() {
 		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		flushPendingCommandOutput: vi.fn(),
+		syncRetryHintRow: vi.fn(),
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map<string, unknown>(),
 		hideThinkingBlock: false,
@@ -130,13 +131,13 @@ describe("EventController superseded agent_end", () => {
 		const { ctx, streamState } = createContext();
 		const controller = new EventController(ctx);
 
-        await controller.handleEvent(ctx.viewSession, AGENT_START);
+		await controller.handleEvent(ctx.viewSession, AGENT_START);
 		// An async fan-out settles the loop without ending the run. `isStreaming`
 		// is already false here, so any command issued now mounts immediately —
 		// panels queued during the turn have to mount too, or they render out of
 		// order whenever the terminal settle finally lands.
 		streamState.isStreaming = false;
-        await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent(ctx.viewSession, {
 			type: "agent_end",
 			messages: [],
 			isTerminal: false,

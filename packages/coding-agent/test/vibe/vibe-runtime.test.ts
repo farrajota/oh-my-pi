@@ -130,6 +130,16 @@ class SwitchGatedSessionStorage extends FaultInjectingSessionStorage {
 		return { started: started.promise, release: release.resolve };
 	}
 
+	override async readText(filePath: string): Promise<string> {
+		const gate = this.#readGate;
+		if (gate?.filePath === filePath) {
+			this.#readGate = undefined;
+			gate.started.resolve();
+			await gate.release.promise;
+		}
+		return super.readText(filePath);
+	}
+
 	override async readTextSlices(
 		filePath: string,
 		prefixBytes: number,
@@ -1922,9 +1932,7 @@ describe("vibe session registry", () => {
 		expect(fake.isDisposed()).toBe(true);
 		expect(AgentRegistry.global().get("IgnoresKillAbort")).toBeUndefined();
 		expect(registry.screens(session)[0]?.state).toBe("dead");
-		await expect(registry.send(session, { session: "IgnoresKillAbort", message: "hello?" })).rejects.toThrow(
-			"dead",
-		);
+		await expect(registry.send(session, { session: "IgnoresKillAbort", message: "hello?" })).rejects.toThrow("dead");
 
 		gate.resolve();
 		await manager.getJob(jobId)!.promise;

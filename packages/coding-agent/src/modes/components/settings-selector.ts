@@ -48,9 +48,9 @@ import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { AUTO_THINKING, type ConfiguredThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
-import { buildBrowserItems, ModelBrowser, sortModelItems } from "./model-browser";
 import { type ComposerPreviewStatusSource, ComposerShapePreview } from "./composer-shape-preview";
 import { getComposerShapeOptions } from "./composer-shape-registry";
+import { buildBrowserItems, ModelBrowser, sortModelItems } from "./model-browser";
 import { bottomBorder, divider, row, topBorder } from "./overlay-box";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingDef, getSettingsForTab, type SettingDef } from "./settings-defs";
@@ -814,12 +814,13 @@ export class SettingsSelectorComponent implements Component {
 			return true;
 		}
 		if (overContent && list) {
-			const id = list.hitTest(contentLine, innerCol);
+			const itemId = list.hoverTest(contentLine, innerCol);
+			const id = itemId ?? list.hitTest(contentLine, innerCol);
 			if (id !== undefined) {
 				const wasSelected = list.getSelectedItem()?.id === id;
 				list.selectItem(id);
-				// Click-again activates: toggle booleans, open submenus.
-				if (wasSelected) list.handleInput("\n");
+				// Only repeated setting-row clicks activate. Sidebar section clicks navigate.
+				if (wasSelected && itemId !== undefined) list.handleInput("\n");
 			}
 		}
 		return true;
@@ -1188,7 +1189,7 @@ export class SettingsSelectorComponent implements Component {
 			onPreview = value => shapePreview.setValue(value);
 			footer = shapePreview;
 		} else if (def.path === "composer.shape") {
-			const shapePreview = new ComposerShapePreview(String(currentValue ?? "box"), {
+			const shapePreview = new ComposerShapePreview(String(currentValue ?? "band"), {
 				requestRender: this.context.requestRender,
 				status: this.context.composerPreviewStatus,
 			});
@@ -1455,6 +1456,7 @@ export class SettingsSelectorComponent implements Component {
 		this.#pluginComponent = new PluginSettingsComponent(this.context.cwd, {
 			onClose: () => this.callbacks.onCancel(),
 			onPluginChanged: () => this.callbacks.onPluginsChanged?.(),
+			requestRender: this.context.requestRender,
 		});
 	}
 

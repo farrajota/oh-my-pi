@@ -14,7 +14,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { formatDuration } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/format";
-import { removeWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
+import { getProjectDir, removeWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
 
 interface FakeAcpBuiltinSession {
 	fastMode: boolean;
@@ -44,7 +44,12 @@ interface FakeAcpBuiltinSession {
 	markMovedFromEmptySessionFile(sessionFile: string): void;
 	fork(): Promise<boolean>;
 	handoff(instr?: string): Promise<{ document: string; savedPath?: string } | undefined>;
+	dispose(): Promise<void>;
 	exportToHtml(outputPath?: string): Promise<string>;
+	effectiveExtensionRoots: unknown;
+	setTitleSystemPrompt(prompt: string | undefined): void;
+	setSlashCommands(commands: unknown[]): void;
+	refreshSkills(): Promise<void>;
 	getTodoPhases(): Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	setTodoPhases(phases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>): void;
 	refreshBaseSystemPrompt(): Promise<void>;
@@ -73,6 +78,9 @@ interface FakeAcpBuiltinSessionManager {
 	appendCustomEntry(customType: string, data?: unknown): string;
 	flush(): Promise<void>;
 	moveTo(newCwd: string): Promise<void>;
+	captureState(): { cwd: string; sessionDir: string };
+	restoreState(snapshot: { cwd: string }): void;
+	rollbackMove(snapshot: { cwd: string; sessionDir: string }): Promise<void>;
 	setSessionFile(sessionFile: string): Promise<void>;
 	dropSession(sessionPath: string): Promise<void>;
 	getCwd(): string;
@@ -93,6 +101,11 @@ function createRuntime() {
 		_todoPhases: [],
 		_switchedTo: undefined,
 		_movedFromEmptySessionFile: undefined,
+		dispose: async () => {},
+		effectiveExtensionRoots: undefined,
+		setTitleSystemPrompt: (_prompt: string | undefined) => {},
+		setSlashCommands: (_commands: unknown[]) => {},
+		refreshSkills: async () => {},
 		toggleFastMode() {
 			this.fastMode = !this.fastMode;
 			return this.fastMode;
@@ -192,6 +205,17 @@ function createRuntime() {
 		async moveTo(newCwd: string) {
 			this._cwd = newCwd;
 			this._movedTo = newCwd;
+		},
+		captureState() {
+			return { cwd: this._cwd, sessionDir: "/tmp/fake-sessions", movedTo: this._movedTo };
+		},
+		restoreState(snapshot: { cwd: string }) {
+			this._cwd = snapshot.cwd;
+			this._movedTo = snapshot.cwd;
+		},
+		async rollbackMove(snapshot: { cwd: string; sessionDir: string }) {
+			await this.moveTo(snapshot.cwd);
+			this.restoreState(snapshot);
 		},
 		async setSessionFile(sessionFile: string) {
 			this._sessionFile = path.resolve(sessionFile);
@@ -449,11 +473,11 @@ describe("ACP builtin slash commands", () => {
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain("npm install");
 		expect(output[0]).toContain("build done");
-		expect(output[0]).toContain("Active Jobs");
-		expect(output[0]).toContain("Job History");
+		expect(output[0]).toContain("Running Jobs");
+		expect(output[0]).toContain("Recent Jobs");
 	});
 
-	it("jobs: renders queued active jobs and terminal durations from their end time", async () => {
+	it("jobs: renders active jobs and terminal durations from their start time", async () => {
 		const { output, runtime } = createRuntime();
 		const now = Date.now();
 		const terminalStartTime = now - 60_000;
@@ -485,13 +509,13 @@ describe("ACP builtin slash commands", () => {
 
 		await executeAcpBuiltinSlashCommand("/jobs", runtime);
 
-		expect(output[0]).toContain("(queued)");
+		expect(output[0]).toContain("(running)");
 		expect(output[0]).toContain("waiting for a task slot");
-		expect(output[0]).toContain(formatDuration(terminalEndTime - terminalStartTime));
-		expect(output[0]).not.toContain(formatDuration(now - terminalStartTime));
+		expect(output[0]).toContain(formatDuration(now - terminalStartTime));
+		expect(output[0]).not.toContain(formatDuration(terminalEndTime - terminalStartTime));
 	});
 
-	it("jobs: renders terminal jobs without end times with a stable unknown duration", async () => {
+	it("jobs: renders terminal jobs without end times using current elapsed duration", async () => {
 		const { output, runtime } = createRuntime();
 		runtime.session.getAsyncJobSnapshot = () => ({
 			running: [],
@@ -522,10 +546,9 @@ describe("ACP builtin slash commands", () => {
 
 			const first = terminalLine(output[0]!);
 			const second = terminalLine(output[1]!);
-			expect(first).toBe(second);
-			expect(first).toContain("unknown");
-			expect(first).not.toContain(formatDuration(20_000 - 10_000));
-			expect(second).not.toContain(formatDuration(90_000 - 10_000));
+			expect(first).not.toBe(second);
+			expect(first).toContain(formatDuration(20_000 - 10_000));
+			expect(second).toContain(formatDuration(90_000 - 10_000));
 		} finally {
 			now.mockRestore();
 		}
@@ -648,7 +671,6 @@ describe("ACP builtin slash commands", () => {
 			"/btw hi",
 			"/new",
 			"/drop",
-			"/handoff",
 			"/fork",
 		];
 		for (const cmd of removedCommands) {
@@ -875,6 +897,13 @@ describe("wave 3 commands", () => {
 		const result = await executeAcpBuiltinSlashCommand("/todo edit", runtime);
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain("TUI editor");
+	});
+
+	it("/todo expand: returns HUD-only usage message in ACP mode", async () => {
+		const { output, runtime } = createRuntime();
+		const result = await executeAcpBuiltinSlashCommand("/todo expand", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("interactive HUD");
 	});
 
 	it("/todo unknown: returns usage message", async () => {
@@ -1313,6 +1342,27 @@ describe("wave 5 — adapters and polish", () => {
 });
 
 describe("/move preflight flush", () => {
+	it("disposes the session when headless workspace rollback cannot recover", async () => {
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-acp-move-fatal-"));
+		const originalProjectDir = getProjectDir();
+		const { output, runtime, session } = createRuntime();
+		const dispose = spyOn(session, "dispose");
+		const reloadForCwd = spyOn(runtime.settings, "reloadForCwd").mockRejectedValue(
+			new Error("workspace reload failed"),
+		);
+		try {
+			const result = await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(dispose).toHaveBeenCalledTimes(1);
+			expect(output.some(text => text.includes("failed to re-align workspace"))).toBe(true);
+		} finally {
+			reloadForCwd.mockRestore();
+			dispose.mockRestore();
+			setProjectDir(originalProjectDir);
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
 	it("aborts text-mode /move when pending settings flush fails", async () => {
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-acp-move-"));
 		try {
@@ -1345,6 +1395,9 @@ describe("/move preflight flush", () => {
 			expect(flushed).toBe(true);
 			expect(fakeSessionManager!._movedTo).toBe(targetDir);
 			expect(output[0]).toContain("Moved to");
+			// The success path must chdir the process and project-dir cache to the
+			// target; otherwise bash tools and discovery run in the wrong project.
+			expect(getProjectDir()).toBe(path.resolve(targetDir));
 		} finally {
 			setProjectDir(originalProjectDir);
 			await fs.rm(targetDir, { recursive: true, force: true });

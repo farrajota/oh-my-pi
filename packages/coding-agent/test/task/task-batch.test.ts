@@ -33,6 +33,14 @@ const taskAgent: AgentDefinition = {
 	source: "bundled",
 };
 
+const scoutAgent: AgentDefinition = {
+	name: "scout",
+	description: "Read-only research agent",
+	systemPrompt: "You are a scout agent.",
+	tools: ["read"],
+	source: "bundled",
+};
+
 function createSession(
 	options: {
 		manager?: AsyncJobManager;
@@ -133,6 +141,48 @@ describe("task.batch schema gating", () => {
 		expect(itemProperties.schemaMode).toBeDefined();
 	});
 
+	it("requires coordination instead of promising same-file auto-resolution", async () => {
+		mockDiscovery();
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
+
+		expect(tool.description).toContain("Same-file edits are not guaranteed to merge");
+		expect(tool.description).toContain("coordinate through `hub` before editing shared files");
+		expect(tool.description).toContain("Name one integration owner");
+		expect(tool.description).not.toContain("Concurrent edits to the same files auto-resolve");
+	});
+
+	it("describes a restricted specialist as the spawn-policy default", async () => {
+		mockDiscovery(scoutAgent);
+		const tool = await TaskTool.create(createSession({ spawns: "scout" }));
+
+		expect(tool.description).toContain("spawn-policy default (`scout`)");
+		expect(tool.description).not.toContain("general-purpose worker");
+		expect(tool.description).not.toContain("default worker");
+		expect(tool.description).toContain("Omit `agent` when the spawn-policy default is the best fit");
+		expect(tool.description).toContain("### scout (READ-ONLY)");
+	});
+
+	it("hides effort by default and exposes it when task.allowEffortOverride is enabled", async () => {
+		mockDiscovery();
+
+		const flatSession = createSession({ settings: { "task.batch": false, "task.allowEffortOverride": false } });
+		const flat = await TaskTool.create(flatSession);
+		expect(getSchemaProperties(flat).effort).toBeUndefined();
+		expect(flat.description).not.toContain("`effort`");
+
+		flatSession.settings.override("task.allowEffortOverride", true);
+		expect(getSchemaProperties(flat).effort).toBeDefined();
+		expect(flat.description).toContain("`effort`");
+
+		const batchSession = createSession({ settings: { "task.batch": true, "task.allowEffortOverride": false } });
+		const batch = await TaskTool.create(batchSession);
+		expect(getBatchItemProperties(batch).effort).toBeUndefined();
+		expect(batch.description).not.toContain("`effort`");
+
+		batchSession.settings.override("task.allowEffortOverride", true);
+		expect(getBatchItemProperties(batch).effort).toBeDefined();
+		expect(batch.description).toContain("`effort`");
+	});
 	it("shows independent effort/model wire fields for all four authorization combinations", async () => {
 		mockDiscovery();
 		const policies: Array<{
@@ -858,6 +908,27 @@ describe("task.batch spawning", () => {
 		expect(new Map(seen.map(spawn => [spawn.id, spawn])).get("Alpha")?.requestedModel).toBe("request/alpha");
 		expect(new Map(seen.map(spawn => [spawn.id, spawn])).get("Beta")?.requestedModel).toBe("request/beta");
 		expect(new Map(seen.map(spawn => [spawn.id, spawn])).get("Gamma")?.requestedModel).toBeUndefined();
+	});
+
+	it("keeps a long result inline when no readable output artifact exists", async () => {
+		mockDiscovery();
+		const fullOutput = `REPORT:${"x".repeat(6_000)}:END`;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options =>
+			makeResult(options.id ?? "?", {
+				output: fullOutput,
+				outputMeta: { lineCount: 1, charCount: fullOutput.length },
+			}),
+		);
+
+		const tool = await TaskTool.create(createSession({ settings: { "async.enabled": false, "task.batch": false } }));
+		const result = await tool.execute("tc-missing-artifact", {
+			name: "MissingArtifact",
+			task: "Return a long report.",
+		} as TaskParams);
+		const text = getFirstText(result);
+
+		expect(text).not.toContain("agent://MissingArtifact");
+		expect(text).toContain(":END");
 	});
 
 	it("settles the batch async aggregate when a queued spawn is cancelled mid-flight", async () => {

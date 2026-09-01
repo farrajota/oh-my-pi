@@ -27,6 +27,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 type StubEditor = {
 	setText: (text: string) => void;
+	setCollapsedText: (text: string) => void;
 	getText: () => string;
 	getExpandedText: () => string;
 	clearDraft: (historyText?: string) => void;
@@ -64,6 +65,10 @@ function createStubInputControllerContext(opts: {
 	let editorText = "";
 	const editor: StubEditor = {
 		setText(text) {
+			editorText = text;
+		},
+		// The stub skips chip collapsing so assertions read the wire-format text.
+		setCollapsedText(text) {
 			editorText = text;
 		},
 		getText() {
@@ -250,11 +255,11 @@ describe("InputController skill queue chip metadata", () => {
 		const controller = new InputController(ctx);
 
 		controller.setupEditorSubmitHandler();
-		editor.setText("/skill:test-skill inspect this");
+		editor.setText("/skill:test-skill inspect this [Image #1]");
 		editor.pendingImages = [image];
 		editor.pendingImageLinks = ["file:///tmp/skill-image.png"];
 		editor.imageLinks = editor.pendingImageLinks;
-		await editor.onSubmit?.("/skill:test-skill inspect this");
+		await editor.onSubmit?.("/skill:test-skill inspect this [Image #1]");
 
 		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
 		const message = promptCustomMessage.mock.calls[0]?.[0];
@@ -718,6 +723,10 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 		setText(text) {
 			editorText = text;
 		},
+		// The stub skips chip collapsing so assertions read the wire-format text.
+		setCollapsedText(text) {
+			editorText = text;
+		},
 		getText() {
 			return editorText;
 		},
@@ -922,7 +931,7 @@ describe("EventController custom queued-message refresh", () => {
 	});
 
 	it("reconciles the optimistic skill row instead of duplicating it on the canonical message_start", async () => {
-		const { controller, addMessageToChat, reconcileOptimisticSkillMessage } = createEventControllerFixture({
+		const { controller, ctx, addMessageToChat, reconcileOptimisticSkillMessage } = createEventControllerFixture({
 			optimisticSkillMessagePending: true,
 		});
 		const event: Extract<AgentSessionEvent, { type: "message_start" }> = {
@@ -937,7 +946,7 @@ describe("EventController custom queued-message refresh", () => {
 				timestamp: Date.now(),
 			},
 		};
-		await controller.handleEvent(event);
+		await controller.handleEvent(ctx.viewSession, event);
 
 		expect(reconcileOptimisticSkillMessage).toHaveBeenCalledTimes(1);
 		expect(reconcileOptimisticSkillMessage.mock.calls[0]?.[0]).toBe(event.message);
@@ -945,7 +954,7 @@ describe("EventController custom queued-message refresh", () => {
 	});
 
 	it("renders normally when no optimistic skill row is pending", async () => {
-		const { controller, addMessageToChat, reconcileOptimisticSkillMessage } = createEventControllerFixture({
+		const { controller, ctx, addMessageToChat, reconcileOptimisticSkillMessage } = createEventControllerFixture({
 			optimisticSkillMessagePending: false,
 		});
 		const event: Extract<AgentSessionEvent, { type: "message_start" }> = {
@@ -960,7 +969,7 @@ describe("EventController custom queued-message refresh", () => {
 				timestamp: Date.now(),
 			},
 		};
-		await controller.handleEvent(event);
+		await controller.handleEvent(ctx.viewSession, event);
 
 		expect(reconcileOptimisticSkillMessage).not.toHaveBeenCalled();
 		expect(addMessageToChat).toHaveBeenCalledTimes(1);

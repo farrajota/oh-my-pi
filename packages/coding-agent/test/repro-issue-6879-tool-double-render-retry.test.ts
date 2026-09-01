@@ -185,10 +185,10 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 			result: { content: [{ type: "text", text: "(no output)" }] },
 			isError: true,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-		await ec.handleEvent(session, { type: "message_end", message: assistantMessage([bashToolCall(id)], "toolUse") } as Extract<
-			AgentSessionEvent,
-			{ type: "message_end" }
-		>);
+		await ec.handleEvent(session, {
+			type: "message_end",
+			message: assistantMessage([bashToolCall(id)], "toolUse"),
+		} as Extract<AgentSessionEvent, { type: "message_end" }>);
 	}
 
 	function enableTtsrRewind(pending: boolean): void {
@@ -217,7 +217,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 
 	it("keeps a terminally failed turn's tool card visible via its synthetic result", async () => {
 		const ec = mode.eventController;
-		await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+		await ec.handleEvent(
+			session,
+			{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+			1_000,
+		);
 
 		// The turn errors after streaming the call; agent-loop then emits a
 		// synthetic aborted result for the never-run call. No retry follows.
@@ -230,7 +234,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 
 	it("removes a synthetic-settled failed card when an auto-retry supersedes the turn", async () => {
 		const ec = mode.eventController;
-		await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+		await ec.handleEvent(
+			session,
+			{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+			1_000,
+		);
 
 		// Attempt 1 errors; the synthetic result settles the card in place.
 		await streamToolCall("call-attempt-1", "error");
@@ -269,7 +277,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 				name: "write",
 				arguments: { path: "out.txt", content: "pending content", i: "Write output" },
 			};
-			await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+			await ec.handleEvent(
+				session,
+				{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+				1_000,
+			);
 			await ec.handleEvent(session, { type: "message_start", message: assistantMessage([], "toolUse") } as Extract<
 				AgentSessionEvent,
 				{ type: "message_start" }
@@ -307,7 +319,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 
 	it("resets a detached read group on a TTSR rewind so the re-run stays visible", async () => {
 		const ec = mode.eventController;
-		await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+		await ec.handleEvent(
+			session,
+			{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+			1_000,
+		);
 
 		enableTtsrRewind(true);
 		await streamReadToolCall("read-rewound", "aborted");
@@ -341,7 +357,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 		const ec = mode.eventController;
 		const keptPath = "/tmp/kept.ts";
 		const supersededPath = "/tmp/superseded.ts";
-		await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+		await ec.handleEvent(
+			session,
+			{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+			1_000,
+		);
 
 		await streamReadToolCall("read-kept", "toolUse", keptPath);
 		await ec.handleEvent(session, {
@@ -376,7 +396,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 			name: "read",
 			arguments: { path: memoryPath, i: "Read successful memory" },
 		};
-		await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+		await ec.handleEvent(
+			session,
+			{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+			1_000,
+		);
 		await ec.handleEvent(session, { type: "message_start", message: assistantMessage([], "toolUse") } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
@@ -462,7 +486,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 
 	it("retracts a TTSR-rewound turn's tool card so the re-run renders it once", async () => {
 		const ec = mode.eventController;
-		await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+		await ec.handleEvent(
+			session,
+			{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+			1_000,
+		);
 
 		// Attempt 1: card streams, turn is aborted for a TTSR rewind.
 		enableTtsrRewind(true);
@@ -479,7 +507,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 
 	it("re-keys a streamed tool card when its id is populated after the block appears", async () => {
 		const ec = mode.eventController;
-		await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+		await ec.handleEvent(
+			session,
+			{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+			1_000,
+		);
 		await ec.handleEvent(session, { type: "message_start", message: assistantMessage([], "toolUse") } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
@@ -526,7 +558,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 			name: "read",
 			arguments: { path: READ_PATH, i: "Inspect entrypoint" },
 		});
-		await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+		await ec.handleEvent(
+			session,
+			{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+			1_000,
+		);
 		await ec.handleEvent(session, { type: "message_start", message: assistantMessage([], "toolUse") } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
@@ -561,7 +597,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 
 	it("re-keys a streamed tool card when its id grows across deltas (piped copilot id)", async () => {
 		const ec = mode.eventController;
-		await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+		await ec.handleEvent(
+			session,
+			{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+			1_000,
+		);
 		await ec.handleEvent(session, { type: "message_start", message: assistantMessage([], "toolUse") } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
@@ -597,7 +637,11 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 	it("settles a held server-resolved completion after the tool-call id is re-keyed", async () => {
 		const ec = mode.eventController;
 		const todoAt = (id: string): ToolCall => ({ type: "toolCall", id, name: "todo", arguments: {} });
-		await ec.handleEvent(session, { type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>, 1_000);
+		await ec.handleEvent(
+			session,
+			{ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>,
+			1_000,
+		);
 		await ec.handleEvent(session, { type: "message_start", message: assistantMessage([], "toolUse") } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }

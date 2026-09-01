@@ -716,6 +716,8 @@ export class ExtensionRunner {
 		this.#abortFn = contextActions.abort;
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#shutdownHandler = contextActions.shutdown;
+		this.#getContextUsageFn = contextActions.getContextUsage;
+		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 		this.#getAsyncJobSnapshotFn = contextActions.getAsyncJobSnapshot ?? (() => null);
 		this.#getAsyncJobOutputFn = contextActions.getAsyncJobOutput ?? (() => null);
@@ -1257,6 +1259,7 @@ export class ExtensionRunner {
 			modelRegistry: this.modelRegistry,
 			actor: this.getActor(),
 			permissionScope: this.getPermissionScope(),
+			isProjectTrusted: () => true,
 			get model() {
 				return getModel();
 			},

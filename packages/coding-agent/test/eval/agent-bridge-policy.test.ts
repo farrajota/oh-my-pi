@@ -369,7 +369,7 @@ describe("runEvalAgent", () => {
 		]);
 	});
 
-	it("inherits non-plan LSP and IRC policy for bridge subagents", async () => {
+	it("keeps bridge kernels independent while inheriting non-plan LSP and IRC policy", async () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 		// makeSession() defaults to enableLsp: true and task.enableLsp: true.
@@ -382,6 +382,7 @@ describe("runEvalAgent", () => {
 		expect(options.enableLsp).toBe(true);
 		expect(options.enableIrc).toBe(true);
 		expect(options.keepAlive).toBe(false);
+		expect(options.parentEvalSessionId).toBeUndefined();
 	});
 
 	it("registers temp artifact dirs for in-memory handle results so agent URLs resolve", async () => {
@@ -402,9 +403,18 @@ describe("runEvalAgent", () => {
 	it("unregisters eval subagents through the bridge cleanup path", async () => {
 		AgentRegistry.resetGlobalForTests();
 		mockAgents();
+		const order: string[] = [];
 		let disposed = false;
 		const cleanupSession = {
+			prepareForHeadlessAdvisorDrain: () => {
+				order.push("prepare");
+			},
+			waitForAdvisorCatchup: async () => {
+				order.push("catchup");
+				return true;
+			},
 			dispose: async () => {
+				order.push("dispose");
 				disposed = true;
 			},
 		} as unknown as AgentSession;
@@ -431,6 +441,9 @@ describe("runEvalAgent", () => {
 		await runEvalAgent({ prompt: "hello", label: "Cleanup" }, { session: makeSession() });
 
 		expect(disposed).toBe(true);
+		// The advisor's final-turn review is drained before the runtime is torn
+		// down (#9505): a graceful subagent finish must not abandon the yield.
+		expect(order).toEqual(["prepare", "catchup", "dispose"]);
 		expect(AgentRegistry.global().get("Cleanup")).toBeUndefined();
 		expect(
 			AgentRegistry.global()

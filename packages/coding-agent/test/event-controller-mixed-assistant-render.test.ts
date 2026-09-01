@@ -6,7 +6,7 @@ import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/eve
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { TUI } from "@oh-my-pi/pi-tui";
+import type { Component, TUI } from "@oh-my-pi/pi-tui";
 
 const TOOL_CALL_A_ID = "toolu_mixed_text_order_a";
 const TOOL_CALL_B_ID = "toolu_mixed_text_order_b";
@@ -65,7 +65,10 @@ function createFixture(hideToolActivity = false) {
 		hasBuiltInTool: () => true,
 		extensionRunner: undefined,
 		isTtsrAbortPending: false,
-		retryAttempt: 0,
+		isStreaming: false,
+		agent: { tokenizer: { countMessage: () => 0 } },
+		getSessionId: () => "session-1",
+		sessionManager: { getCwd: () => process.cwd() },
 	};
 	let hasDisplayableThinkingContent = false;
 	const ctx = {
@@ -117,6 +120,37 @@ describe("EventController mixed assistant text/tool rendering", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		resetSettingsForTest();
+	});
+
+	it("finalizes and removes an orphaned streaming component on the next message_start", async () => {
+		// Regression: a stream that died between message_start and message_end
+		// (transport drop, hook throw) left its component live in the transcript.
+		// One unfinalized block at the retirement frontier blocks history commits
+		// for everything after it, so the whole transcript tail stayed in the
+		// mutable viewport in pressure mode (no separators, compacted blocks).
+		const { controller, ctx, chatContainer } = createFixture();
+
+		await controller.handleEvent(ctx.viewSession, { type: "message_start", message: assistantMessage([]) } as Extract<
+			AgentSessionEvent,
+			{ type: "message_start" }
+		>);
+		await controller.handleEvent(ctx.viewSession, {
+			type: "message_update",
+			message: assistantMessage([{ type: "thinking", thinking: "**dead attempt**" }]),
+		} as Extract<AgentSessionEvent, { type: "message_update" }>);
+		const orphan = chatContainer.children.at(-1) as Component & {
+			isTranscriptBlockFinalized(): boolean;
+		};
+		expect(orphan.isTranscriptBlockFinalized()).toBe(false);
+
+		// Retry attempt streams a fresh message without the dead one ever ending.
+		await controller.handleEvent(ctx.viewSession, { type: "message_start", message: assistantMessage([]) } as Extract<
+			AgentSessionEvent,
+			{ type: "message_start" }
+		>);
+
+		expect(chatContainer.children).not.toContain(orphan);
+		expect(orphan.isTranscriptBlockFinalized()).toBe(true);
 	});
 
 	it("renders assistant text segments in order around two tool results from one mixed message", async () => {
@@ -243,11 +277,11 @@ describe("EventController mixed assistant text/tool rendering", () => {
 			{ type: "text", text: FINAL_MARKER },
 		]);
 
-        await controller.handleEvent(ctx.viewSession, { type: "message_start", message: started } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_start", message: started } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-        await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent(ctx.viewSession, {
 			type: "message_update",
 			message: streaming,
 			assistantMessageEvent: {
@@ -257,33 +291,33 @@ describe("EventController mixed assistant text/tool rendering", () => {
 				partial: streaming,
 			},
 		} as Extract<AgentSessionEvent, { type: "message_update" }>);
-        await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_A_ID,
 			toolName: "bash",
 			args: bashCall.arguments,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
-        await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_A_ID,
 			toolName: "bash",
 			result: { content: [{ type: "text", text: HIDDEN_BASH_FAILURE_MARKER }] },
 			isError: true,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-        await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_B_ID,
 			toolName: "read",
 			args: readCall.arguments,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
-        await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_B_ID,
 			toolName: "read",
 			result: { content: [{ type: "text", text: "read result must stay hidden" }] },
 			isError: false,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-        await controller.handleEvent(ctx.viewSession, { type: "message_end", message: streaming } as Extract<
+		await controller.handleEvent(ctx.viewSession, { type: "message_end", message: streaming } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);

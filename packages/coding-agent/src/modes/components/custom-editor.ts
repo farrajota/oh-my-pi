@@ -4,16 +4,23 @@ import {
 	addKeyAliases,
 	canonicalKeyId,
 	Editor,
+	type EditorTextDecorationContext,
 	type EditorTheme,
 	type KeyId,
 	parseKey,
 	parseKittySequence,
-	type TUI,
+	TUI,
 } from "@oh-my-pi/pi-tui";
 import { BracketedPasteHandler } from "@oh-my-pi/pi-tui/bracketed-paste";
 import type { AppKeybinding } from "../../config/keybindings";
-import { isSettingsInitialized, settings } from "../../config/settings";
-import { imageReferenceHyperlink, PLACEHOLDER_REGEX, renderPlaceholders } from "../image-references";
+import {
+	attachmentSgr,
+	COMPOSER_TOKEN_REGEX,
+	chipLabel,
+	collapseImageMarkers,
+	renderPlaceholders,
+} from "../composer-attachments";
+import { MacOSSpellingProvider, type SpellingFeatures } from "../macos-spelling";
 import { hasMagicKeyword, highlightMagicKeywords } from "../magic-keywords";
 import { isQueuedMessageList, parseQueueShorthand, QUEUE_LIST_MARKER_RE } from "../queue-input";
 import { fgOrPlain, theme } from "../theme/theme";
@@ -57,7 +64,7 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.editor.external": ["ctrl+g"],
 	"app.history.search": ["ctrl+r"],
 	"app.message.dequeue": ["alt+up", "shift+up"],
-	"app.retry": ["alt+r"],
+	"app.retry": ["f5", "alt+r"],
 	"app.clipboard.pasteImage": ["ctrl+v"],
 	"app.clipboard.pasteTextRaw": ["ctrl+shift+v", "alt+shift+v"],
 	"app.clipboard.copyPrompt": ["alt+shift+c"],
@@ -85,7 +92,6 @@ const BRACKETED_IMAGE_PATH_REGEX = /\.(?:png|jpe?g|gif|webp)$/i;
 const SHELL_ESCAPED_PATH_CHAR_REGEX = /\\([\\\s'"()[\]{}&;<>|?*!$`])/g;
 const URI_SCHEME_REGEX = /^[a-z][a-z0-9+.-]*:/i;
 const FILE_URI_REGEX = /^file:\/\//i;
-const WINDOWS_DRIVE_PATH_REGEX = /^[a-z]:[\\/]/i;
 /**
  * Alternation of the filesystem prefixes that make a path unambiguously
  * absolute (POSIX root, home, `file://`, UNC, Windows drive). Shared by
@@ -172,9 +178,9 @@ function normalizePastedPath(path: string): string {
 }
 
 function isExplicitPastedPath(path: string): boolean {
-	if (WINDOWS_DRIVE_PATH_REGEX.test(path) || FILE_URI_REGEX.test(path)) return true;
+	if (ABSOLUTE_PATH_PREFIX_REGEX.test(path) || /^\.\.?[\\/]/.test(path)) return true;
 	if (URI_SCHEME_REGEX.test(path)) return false;
-	return path.includes("/") || path.includes("\\");
+	return path.includes("\\");
 }
 
 function isImagePath(path: string): boolean {
@@ -227,9 +233,9 @@ function splitPastedPathSegments(payload: string): string[] | undefined {
 /**
  * Extract whitespace/quoted-separated path-like segments from `payload`.
  * Shared backend of {@link extractBracketedPastePaths} and {@link extractPastePathsFromText}.
- * Returns the segments only when EVERY segment looks like an explicit path
- * (`/`, `\`, drive letter, or `file://`); otherwise undefined so the caller
- * falls back to a plain text paste.
+ * Returns the segments only when EVERY segment looks like an anchored local
+ * path or uses Windows separators; otherwise undefined so ambiguous relative
+ * URL/path text falls back to a plain text paste.
  */
 function extractExplicitPathSegments(payload: string): string[] | undefined {
 	const pasted = payload.trim();
@@ -352,27 +358,102 @@ export function extractImagePathFromText(text: string): string | undefined {
 }
 
 /**
+ * Resolve the {@link EditorTheme} from a `CustomEditor`/`Editor` constructor
+ * argument list, tolerating both the omp `(theme)` and upstream-pi
+ * `(tui, theme, keybindings)` conventions (see {@link CustomEditor}'s
+ * constructor). A real `EditorTheme` is identified structurally — it exposes a
+ * `borderColor` function and a `symbols` object — so a `TUI` passed in the first
+ * slot is skipped rather than mistaken for the theme.
+ */
+function pickEditorTheme(args: readonly unknown[]): EditorTheme {
+	for (const arg of args) {
+		if (isEditorTheme(arg)) return arg;
+	}
+	// Fall back to the first argument so a caller passing a bare theme that
+	// somehow fails the shape probe still reaches the base constructor.
+	return args[0] as EditorTheme;
+}
+
+function isEditorTheme(value: unknown): value is EditorTheme {
+	if (typeof value !== "object" || value === null) return false;
+	const candidate = value as Partial<EditorTheme>;
+	return (
+		typeof candidate.borderColor === "function" && typeof candidate.symbols === "object" && candidate.symbols !== null
+	);
+}
+
+/** A large text paste staged as a composer chip. `content` feeds the band card's snippet and
+ *  captions; the submit-time expansion (verbatim content or a wrapped block) lives in the
+ *  editor's atom table under `label`. */
+export interface TextAttachment {
+	n: number;
+	label: string;
+	content: string;
+	lineCount: number;
+	charCount: number;
+}
+
+/** One visible composer attachment, in band order (images first, then text pastes). */
+export type ComposerChipDescriptor =
+	| { kind: "image"; n: number; image: ImageContent; link: string | undefined }
+	| { kind: "paste"; n: number; text: TextAttachment };
+
+/**
  * Custom editor that handles configurable app-level shortcuts for coding-agent.
  */
 export class CustomEditor extends Editor {
-	/**
-	 * The host TUI when a plugin constructs this editor through the upstream
-	 * `(tui, theme, keybindings)` factory convention. OMP's own `(theme)` callers
-	 * leave it undefined and drive repaints through interactive-mode wiring.
-	 */
-	readonly tui?: TUI;
+	#spelling = new MacOSSpellingProvider();
 	imageLinks?: readonly (string | undefined)[];
 	/** Images queued to attach to the next submitted message. */
 	pendingImages: ImageContent[] = [];
 	/** Source links corresponding to {@link pendingImages}. */
 	pendingImageLinks: (string | undefined)[] = [];
+	/** Large text pastes staged as compact chip tokens; expansion lives in the atom table.
+	 *  Numbered by a per-draft monotonic counter so a deleted chip never recycles its number
+	 *  (labels key the atom table). */
+	pendingTexts: TextAttachment[] = [];
+	#textAttachmentCounter = 0;
+	/** Host-wired producer of per-image `file://` links (session blob store); drives clickable
+	 *  chip tokens for restored drafts (esc-esc, `/tree`, branch). */
+	draftImageLinkMaterializer?: (images: readonly ImageContent[]) => Promise<(string | undefined)[] | undefined>;
 
-	constructor(theme: EditorTheme);
-	constructor(tui: TUI, theme: EditorTheme, keybindings?: unknown);
-	constructor(tuiOrTheme: TUI | EditorTheme, theme?: EditorTheme, _keybindings?: unknown) {
-		const editorTheme = theme ?? (tuiOrTheme as EditorTheme);
-		super(editorTheme);
-		this.tui = theme === undefined ? undefined : (tuiOrTheme as TUI);
+	/**
+	 * The host {@link TUI}, captured when a plugin constructs this editor through
+	 * the upstream-pi `(tui, theme, keybindings)` convention. Undefined for omp's
+	 * own `new CustomEditor(theme)` callers (they drive repaints through the
+	 * interactive-mode wiring instead). Plugins that call `this.tui.requestRender()`
+	 * in their overrides read it here (issue #4766).
+	 */
+	tui?: TUI;
+
+	/**
+	 * Accept both the omp constructor convention — `new CustomEditor(theme)` —
+	 * and the upstream-pi `Editor` convention — `new Editor(tui, theme, keybindings)`
+	 * — that {@link ExtensionUIContext.setEditorComponent}'s factory contract
+	 * advertises `(tui, theme, keybindings)`. Plugins written against upstream pi
+	 * subclass `CustomEditor`/`Editor` and forward `super(tui, theme, keybindings)`;
+	 * without this shim the `TUI` lands in the `theme` slot and every render throws
+	 * `undefined is not an object (evaluating 'this.#theme.symbols.boxRound')`
+	 * (issue #4766). We locate the real {@link EditorTheme} among the args by shape
+	 * (it carries `symbols`/`borderColor`) rather than by position, and capture a
+	 * leading {@link TUI} so plugin overrides calling `this.tui.requestRender()`
+	 * keep working.
+	 */
+	constructor(...args: readonly unknown[]) {
+		super(pickEditorTheme(args));
+		const requestTextAssistRepaint = (): void => {
+			this.invalidate();
+			this.#requestShimmerRepaint?.();
+		};
+		this.#spelling.onUpdate = requestTextAssistRepaint;
+		this.onTextAssistApplied = requestTextAssistRepaint;
+		this.setTextAssistProvider(this.#spelling);
+		if (args[0] instanceof TUI) this.tui = args[0];
+	}
+
+	/** Independently configure typo detection, word autocomplete, and autocorrect. */
+	setSpellingFeatures(features: SpellingFeatures): void {
+		this.#spelling.setFeatures(features);
 	}
 
 	/** Clear the composer draft: optionally commit `historyText` to history, then
@@ -381,25 +462,91 @@ export class CustomEditor extends Editor {
 	clearDraft(historyText?: string): void {
 		if (historyText !== undefined) this.addToHistory(historyText);
 		this.setText("");
+		this.clearAtoms();
 		this.imageLinks = undefined;
 		this.pendingImages = [];
 		this.pendingImageLinks = [];
+		this.pendingTexts = [];
+		this.#textAttachmentCounter = 0;
 	}
 
-	/** Replace the composer draft with a restored historical prompt: sets the text and
-	 *  re-attaches the message's images so positional `[Image #N]` markers resolve on
-	 *  resubmit instead of degrading to literal text (esc-esc branch, `/tree`). Source
-	 *  links are unknown for restored drafts, so every link slot is `undefined`. */
+	/** Replace the composer draft with a restored historical prompt: re-attaches the message's
+	 *  images, collapses stored `[Image #N, WxH]` markers back into compact chip tokens (so the
+	 *  chips band and atomic deletion return), and re-materializes `file://` links so the tokens
+	 *  are clickable again instead of degrading to dead text (esc-esc branch, `/tree`). */
 	setDraft(text: string, images?: readonly ImageContent[]): void {
-		this.setText(text);
+		this.clearAtoms();
+		this.pendingTexts = [];
+		this.#textAttachmentCounter = 0;
 		this.imageLinks = undefined;
 		this.pendingImages = images ? [...images] : [];
 		this.pendingImageLinks = images ? images.map(() => undefined) : [];
+		this.setCollapsedText(text);
+		void this.#materializeDraftLinks();
 	}
 
-	/** Treat image/paste markers as indivisible: a stray backspace deletes the whole token
-	 *  instead of corrupting `[Paste #1, +30 lines]` into plain text. */
-	override atomicTokenPattern = PLACEHOLDER_REGEX;
+	/** Set the buffer text with bracketed `[Image #N]` markers collapsed into chip tokens and
+	 *  registered in the atom table (queued-message dequeue, failed-submit restore). Leaves the
+	 *  pending image/text state untouched — callers own that. */
+	setCollapsedText(text: string): void {
+		this.setText(
+			collapseImageMarkers(text, this.pendingImages.length, (label, expansion) =>
+				this.registerAtom(label, expansion),
+			),
+		);
+	}
+
+	/** Stage `content` as a text-attachment chip: inserts the compact token at the cursor and
+	 *  registers `expansion` (default: the content itself) in the atom table for submit. */
+	insertTextAttachment(content: string, expansion: string = content): void {
+		this.#textAttachmentCounter++;
+		const n = this.#textAttachmentCounter;
+		const label = chipLabel("paste", n);
+		this.pendingTexts.push({
+			n,
+			label,
+			content,
+			lineCount: content.split("\n").length,
+			charCount: content.length,
+		});
+		this.insertAtom(label, expansion);
+	}
+
+	/** Attachments whose chip token (or legacy bracketed marker) is still present in the buffer —
+	 *  deleting the inline token hides the chip and drops the attachment from the submission. */
+	composerChips(): ComposerChipDescriptor[] {
+		const text = this.getText();
+		const chips: ComposerChipDescriptor[] = [];
+		for (let i = 0; i < this.pendingImages.length; i++) {
+			const n = i + 1;
+			const visible =
+				text.includes(chipLabel("image", n)) || text.includes(`[Image #${n}]`) || text.includes(`[Image #${n},`);
+			if (!visible) continue;
+			chips.push({ kind: "image", n, image: this.pendingImages[i], link: this.pendingImageLinks[i] });
+		}
+		for (const entry of this.pendingTexts) {
+			if (!text.includes(entry.label)) continue;
+			chips.push({ kind: "paste", n: entry.n, text: entry });
+		}
+		return chips;
+	}
+
+	/** Resolve draft-image links off the render path and repaint when they land; guarded against
+	 *  the draft being replaced while the blob writes were in flight. */
+	async #materializeDraftLinks(): Promise<void> {
+		const materialize = this.draftImageLinkMaterializer;
+		const images = this.pendingImages;
+		if (!materialize || images.length === 0) return;
+		const links = await materialize(images);
+		if (!links || this.pendingImages !== images) return;
+		this.pendingImageLinks = links;
+		this.imageLinks = links;
+		this.#requestShimmerRepaint?.();
+	}
+
+	/** Treat image/paste references — compact chip tokens and bracketed markers alike — as
+	 *  indivisible: a stray backspace deletes the whole token instead of corrupting it. */
+	override atomicTokenPattern = COMPOSER_TOKEN_REGEX;
 
 	/** Magic-keyword shimmer cadence — drives one editor repaint every 70 ms while
 	 *  a keyword is on screen and the prompt is focused. ~14 frames/s is smooth
@@ -417,26 +564,45 @@ export class CustomEditor extends Editor {
 	 *  listening (tests, headless callers); the timer chain still self-cleans. */
 	#requestShimmerRepaint: (() => void) | undefined;
 	#queueDecorationText: string | undefined;
+	#decorationLines: readonly string[] = [""];
 	#queueShorthandActive = false;
 	#queueListActive = false;
 
 	/** Decorate magic keywords, attachments, and the queue-composer header/list markers.
 	 *  Queue shorthand reserves its first logical line as a dim `Queueing` label; sequential
 	 *  item markers use the accent color so separate follow-ups remain visible while composing. */
-	override decorateText = (text: string): string => {
+	override decorateText = (text: string, context: EditorTextDecorationContext): string => {
 		const editorText = this.getText();
 		const animated = this.focused && this.#shimmerEnabled() && hasMagicKeyword(editorText);
 		const phase = animated ? (Date.now() % CustomEditor.SHIMMER_PERIOD_MS) / CustomEditor.SHIMMER_PERIOD_MS : 0;
 		if (animated) this.#scheduleShimmerFrame();
 		if (this.#queueDecorationText !== editorText) {
 			this.#queueDecorationText = editorText;
+			this.#decorationLines = this.getLines();
 			const queueBody = parseQueueShorthand(editorText);
 			this.#queueShorthandActive = queueBody !== undefined;
 			this.#queueListActive = queueBody !== undefined && isQueuedMessageList(queueBody);
 		}
+		let sourceSearchOffset = 0;
+		const locateSource = (value: string): number => {
+			const offset = text.indexOf(value, sourceSearchOffset);
+			if (offset === -1) return sourceSearchOffset;
+			sourceSearchOffset = offset + value.length;
+			return offset;
+		};
 		return renderPlaceholders(text, {
 			renderText: value => {
-				const highlighted = highlightMagicKeywords(value, undefined, phase);
+				const sourceOffset = locateSource(value);
+				const highlighted = this.#spelling.decorateTypos(
+					value,
+					{
+						editorText,
+						lines: this.#decorationLines,
+						line: context.line,
+						startCol: context.startCol + sourceOffset,
+					},
+					span => highlightMagicKeywords(span, undefined, phase),
+				);
 				if (this.#queueShorthandActive && (value.startsWith("->") || value.startsWith("=>"))) {
 					const icon = typeof theme === "undefined" ? "➤" : theme.nav.selected;
 					return `${fgOrPlain("dim", `Queueing ${icon}`)}${highlighted.slice(2)}`;
@@ -451,31 +617,46 @@ export class CustomEditor extends Editor {
 				}
 				return highlighted;
 			},
-			renderReference: (value, kind, index) =>
-				kind === "image"
-					? imageReferenceHyperlink(value, index, this.imageLinks, label =>
+			renderReference: (value, kind, index, form) => {
+				locateSource(value);
+				if (form === "chip") {
+					// Chip tokens carry their attachment identity color (matches the band card).
+					const styled = `${attachmentSgr(kind, index)}\x1b[1m${value}\x1b[22m\x1b[39m`;
+					return kind === "image"
+						? this.imageReferenceHyperlink(value, index, this.imageLinks, () => styled)
+						: styled;
+				}
+				return kind === "image"
+					? this.imageReferenceHyperlink(value, index, this.imageLinks, label =>
 							fgOrPlain("accent", label, `\x1b[1m\x1b[4m${label}\x1b[24m\x1b[22m`),
 						)
-					: fgOrPlain("accent", value, `\x1b[1m${value}\x1b[22m`),
+					: fgOrPlain("accent", value, `\x1b[1m${value}\x1b[22m`);
+			},
 		});
 	};
 
-	/** Optional test/host override for the magic-keyword shimmer gate. When
-	 *  defined, takes precedence over the global `magicKeywords.enabled` setting,
-	 *  letting tests assert the gating behaviour without mutating the
-	 *  process-wide Settings singleton (which races with parallel test files —
-	 *  see issue #2582). Production wires this through the host's Settings
-	 *  reader and updates it on the relevant setting change. */
+	/** Optional test override for the magic-keyword shimmer gate. */
 	magicKeywordsEnabledOverride: boolean | undefined;
 
-	/** Whether the shimmer should advance this frame. Defaults to "on" before
-	 *  settings have initialised (tests, early boot) so the animation does not
-	 *  silently disappear during a race; settings disabling the feature wins
-	 *  once they are loaded. An explicit `magicKeywordsEnabledOverride` overrides
-	 *  both paths. */
+	/**
+	 * Host-owned setting reader. Startup defaults to enabled without loading the
+	 * settings graph; InteractiveMode replaces this with the live session setting.
+	 */
+	magicKeywordsEnabled: () => boolean = () => true;
+
+	/**
+	 * Late-bound OSC hyperlink renderer. Startup stays plain until the full
+	 * interactive graph supplies the settings-aware implementation.
+	 */
+	imageReferenceHyperlink: (
+		label: string,
+		index: number,
+		imageLinks: readonly (string | undefined)[] | undefined,
+		renderLabel: (text: string) => string,
+	) => string = (label, _index, _imageLinks, renderLabel) => renderLabel(label);
+
 	#shimmerEnabled(): boolean {
-		if (this.magicKeywordsEnabledOverride !== undefined) return this.magicKeywordsEnabledOverride;
-		return isSettingsInitialized() ? settings.get("magicKeywords.enabled") : true;
+		return this.magicKeywordsEnabledOverride ?? this.magicKeywordsEnabled();
 	}
 
 	/** Bind the host's render request callback. Idempotent — the host wires this
