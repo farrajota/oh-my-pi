@@ -550,7 +550,7 @@ export class AgentSession {
 	#eventListeners: AgentSessionEventListener[] = [];
 	#runStateListeners = new Set<(state: "running" | "idle") => void>();
 	#commandMetadataChangedListeners: CommandMetadataChangedListener[] = [];
-	#sessionChangeCallbacks = new Set<() => void>();
+	#sessionChangeCallbacks = new Set<() => void | Promise<void>>();
 	#observedSessionId: string | undefined;
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
@@ -4099,8 +4099,8 @@ export class AgentSession {
 		return () => this.#runStateListeners.delete(listener);
 	}
 
-	/** Register cleanup that runs when this AgentSession adopts a different session ID. */
-	registerSessionChangeCallback(callback: () => void): () => void {
+	/** Register cleanup that is awaited when this AgentSession adopts a different session ID. */
+	registerSessionChangeCallback(callback: () => void | Promise<void>): () => void {
 		this.#sessionChangeCallbacks.add(callback);
 		return () => this.#sessionChangeCallbacks.delete(callback);
 	}
@@ -4179,13 +4179,14 @@ export class AgentSession {
 	 * (login/logout, token refresh that surfaces a new account UUID) without
 	 * needing to re-call `#syncAgentSessionId()` on every such event.
 	 */
-	#syncAgentSessionId(sessionId?: string, notifyChange = true): void {
+	#syncAgentSessionId(sessionId?: string, notifyChange = true): Promise<void> | undefined {
 		const currentSessionId = this.sessionManager.getSessionId();
+		let notification: Promise<void> | undefined;
 		if (this.#observedSessionId === undefined) {
 			this.#observedSessionId = currentSessionId;
 		} else if (this.#observedSessionId !== currentSessionId) {
 			this.#observedSessionId = currentSessionId;
-			if (notifyChange) this.#notifySessionChangeCallbacks();
+			if (notifyChange) notification = this.#notifySessionChangeCallbacks();
 		}
 		const sid = this.#activeProviderSessionId(sessionId);
 		this.agent.sessionId = sid;
@@ -4206,15 +4207,16 @@ export class AgentSession {
 		// conversation's session id/metadata (issue #6625). Guarded because this
 		// runs once during construction before the advisor controller exists.
 		if (this.#advisors) this.#advisors.refreshProviderIdentity();
+		return notification;
 	}
 
-	#notifySessionChangeCallbacks(): void {
-		for (const callback of [...this.#sessionChangeCallbacks]) {
-			try {
-				callback();
-			} catch (error) {
-				logger.warn("Session change callback failed", { error: String(error) });
-			}
+	async #notifySessionChangeCallbacks(): Promise<void> {
+		const results = await Promise.allSettled(
+			[...this.#sessionChangeCallbacks].map(callback => Promise.resolve().then(callback)),
+		);
+		for (const result of results) {
+			if (result.status === "rejected")
+				logger.warn("Session change callback failed", { error: String(result.reason) });
 		}
 	}
 
@@ -7358,7 +7360,7 @@ export class AgentSession {
 			this.setTodoPhases([]);
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
-			this.#syncAgentSessionId();
+			await this.#syncAgentSessionId();
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 			this.#pendingNextTurnMessages = [];
@@ -7468,7 +7470,7 @@ export class AgentSession {
 			// Update agent session ID
 			this.#freshProviderSessionId = undefined;
 			this.#adoptInheritedProviderPromptCacheKey();
-			this.#syncAgentSessionId();
+			await this.#syncAgentSessionId();
 			this.#memory.rekeyForCurrentSessionId();
 			this.#advisors.reattachRecorderFeeds();
 			advisorRecordersDetached = false;
@@ -8644,7 +8646,7 @@ export class AgentSession {
 			}
 			this.#bash.finishSessionTransition(bashTransition, true);
 			if (previousSessionState.sessionId !== this.sessionManager.getSessionId()) {
-				this.#notifySessionChangeCallbacks();
+				await this.#notifySessionChangeCallbacks();
 			}
 			return true;
 		} catch (error) {
@@ -8805,7 +8807,7 @@ export class AgentSession {
 			this.#todo.syncFromBranch();
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
-			this.#syncAgentSessionId();
+			await this.#syncAgentSessionId();
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 
@@ -8935,7 +8937,7 @@ export class AgentSession {
 			this.sessionManager.appendMessage(sanitizeAssistantForReparentedHistory(assistantMessage));
 			this.#todo.syncFromBranch();
 			this.#freshProviderSessionId = undefined;
-			this.#syncAgentSessionId();
+			await this.#syncAgentSessionId();
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 

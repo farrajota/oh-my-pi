@@ -100,6 +100,33 @@ describe("TaskTool toolProfile schema", () => {
 		expect(schema({ agent: "synthetic", task: "read", toolProfile: "inspect" }) instanceof type.errors).toBe(false);
 	});
 
+	test("batch item schema accepts an omitted toolProfile", () => {
+		const schema = getTaskSchema({
+			isolationEnabled: false,
+			batchEnabled: true,
+			defaultAgent: "task",
+			permissions: { enabled: true, toolsEnabled: true, pathsEnabled: true },
+		});
+
+		const parsed = schema({
+			context: "Shared context",
+			tasks: [{ task: "review" }],
+		});
+
+		expect(parsed instanceof type.errors).toBe(false);
+		if (
+			parsed instanceof type.errors ||
+			typeof parsed !== "object" ||
+			parsed === null ||
+			!("tasks" in parsed) ||
+			!Array.isArray(parsed.tasks)
+		)
+			throw new Error("Expected the batch schema to return a tasks array");
+		const firstTask = parsed.tasks[0];
+		expect(firstTask).toBeDefined();
+		if (firstTask && typeof firstTask === "object") expect(firstTask).not.toHaveProperty("toolProfile");
+	});
+
 	test("batch item schema accepts toolProfile", () => {
 		const schema = getTaskSchema({
 			isolationEnabled: false,
@@ -133,6 +160,20 @@ describe("TaskTool toolProfile execution", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		await Promise.all(temporaryRoots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+	});
+
+	test("batch item omission carries undefined toolProfile and preserves the agent browser tool", async () => {
+		const agent = makeAgent(["browser"]);
+		const runSpy = vi.spyOn(executor, "runSubprocess").mockResolvedValue(makeResult(agent));
+		const taskTool = await makeTaskTool(agent, makeSession({ "task.batch": true }));
+
+		await taskTool.execute("tool-call", {
+			context: "Shared context",
+			tasks: [{ agent: "synthetic", task: "audit the page" }],
+		});
+
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["browser", "yield"]);
 	});
 
 	test("plan mode intersects explicit agent tools with the plan profile", async () => {

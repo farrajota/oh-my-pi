@@ -16,7 +16,7 @@ const TASK_ISOLATION_DIR_PREFIX = "t";
 const TASK_ISOLATION_DIR_DIGEST_CHARS = 9;
 const TASK_ISOLATION_MOUNT_DIR = "m";
 const GIT_NETWORK_TIMEOUT_MS = 30 * 60 * 1000;
-type IsoBackendKind = natives.IsoBackendKind;
+export type IsoBackendKind = natives.IsoBackendKind;
 async function diffTreeOrEmpty(repo: VcsGitRepo, base: string, head: string): Promise<string> {
 	try {
 		return await repo.diffTree(base, head, true);

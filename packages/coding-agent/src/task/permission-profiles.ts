@@ -75,6 +75,12 @@ export const BUILTIN_PERMISSION_PROFILES: Record<string, PermissionProfile> = {
 			"Small scoped tasks that should not fan out further; use alongside a role profile or inline permissions.tools in enforce mode.",
 		denyTools: ["task"],
 	},
+	"browser-audit": {
+		description: "Fail-closed browser audit with no raw browser or child delegation capability.",
+		useWhen: "Host-authorized browser inspection and interaction in a spawned specialist.",
+		tools: ["browser_audit"],
+		denyTools: ["browser", "task", "irc", "web_search"],
+	},
 };
 
 type ProfileSource = PermissionProfileSummary["source"];
@@ -109,6 +115,10 @@ export async function loadPermissionProfiles(cwd: string): Promise<{
 		}
 		const fileProfiles = readProfileMap(parsed);
 		if (!fileProfiles) continue;
+		if (Object.hasOwn(BUILTIN_PERMISSION_PROFILES, "browser-audit") && Object.hasOwn(fileProfiles, "browser-audit")) {
+			errors.push(`${file.relativePath}: permission profile "browser-audit" is reserved and cannot be overridden`);
+			delete fileProfiles["browser-audit"];
+		}
 		for (const [name, profile] of Object.entries(fileProfiles)) {
 			profiles[name] = profile;
 			sources.set(name, file.source);

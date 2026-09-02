@@ -136,6 +136,13 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
  * - `close` → release a named tab handle (or all handles); attached/relay pages remain open, and spawned pages remain unless killed.
  * - `run`   → execute JS code against an existing tab with `page`/`browser`/`tab` helpers in scope.
  */
+export interface BrowserToolOptions {
+	/** Force a private headless browser instead of inheriting user/session browser settings. */
+	readonly isolatedHeadless?: boolean;
+	/** One non-pooled browser/profile owned by an exact Browser Audit run. */
+	readonly dedicatedAuditId?: string;
+}
+
 export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolDetails> {
 	readonly name = "browser";
 	readonly approval = "exec" as const;
@@ -209,7 +216,10 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		},
 	];
 
-	constructor(private readonly session: ToolSession) {}
+	constructor(
+		private readonly session: ToolSession,
+		private readonly options: BrowserToolOptions = {},
+	) {}
 	#description?: string;
 	get description(): string {
 		this.#description ??= prompt.render(browserDescription, {});
@@ -261,11 +271,15 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
-		const kind = resolveBrowserKind(params, this.session);
+		const kind = this.options.dedicatedAuditId
+			? ({ kind: "audit", auditId: this.options.dedicatedAuditId } satisfies BrowserKind)
+			: this.options.isolatedHeadless
+				? ({ kind: "headless", headless: true } satisfies BrowserKind)
+				: resolveBrowserKind(params, this.session);
 		details.browser = kind.kind;
 
 		// If a tab with this name already exists on a different browser kind, fail fast — caller must close first.
-		const existing = getTab(name);
+		const existing = getTab(name, this.options.dedicatedAuditId);
 		if (existing && !sameBrowserKind(existing.browser.kind, kind)) {
 			throw new ToolError(
 				`Tab ${JSON.stringify(name)} is bound to a different browser (${describeKind(existing.browser.kind)}). Close it first.`,
@@ -327,6 +341,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 						dialogs: params.dialogs,
 						signal: openSignal,
 						ownerSessionId: this.session.getSessionId?.() ?? undefined,
+						auditId: this.options.dedicatedAuditId,
 					}),
 				);
 			} catch (error) {
@@ -368,11 +383,15 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 	): Promise<AgentToolResult<BrowserToolDetails>> {
 		const kill = !!params.kill;
 		if (params.all) {
-			const count = await untilAborted(signal, () => releaseAllTabs({ kill, timeoutMs }));
+			const count = await untilAborted(signal, () =>
+				releaseAllTabs({ kill, timeoutMs, auditId: this.options.dedicatedAuditId }),
+			);
 			details.result = `Released ${count} managed tab${count === 1 ? "" : "s"}`;
 			return toolResult(details).text(details.result).done();
 		}
-		const closed = await untilAborted(signal, () => releaseTab(name, { kill, timeoutMs }));
+		const closed = await untilAborted(signal, () =>
+			releaseTab(name, { kill, timeoutMs, auditId: this.options.dedicatedAuditId }),
+		);
 		details.result = closed ? `Released managed tab ${JSON.stringify(name)}` : `No tab named ${JSON.stringify(name)}`;
 		return toolResult(details).text(details.result).done();
 	}
@@ -387,7 +406,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		if (!params.code?.trim()) {
 			throw new ToolError("Missing required parameter 'code' for action 'run'.");
 		}
-		const tab = getTab(name);
+		const tab = getTab(name, this.options.dedicatedAuditId);
 		if (tab) {
 			details.browser = tab.browser.kind.kind;
 			details.url = tab.info.url;
@@ -398,6 +417,8 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			timeoutMs,
 			signal,
 			session: this.session,
+			preserveRequestInterception: this.options.dedicatedAuditId !== undefined,
+			auditId: this.options.dedicatedAuditId,
 		});
 
 		if (screenshots.length) details.screenshots = screenshots;
@@ -450,6 +471,8 @@ function describeBrowser(handle: BrowserHandle): string {
 	switch (handle.kind.kind) {
 		case "headless":
 			return `headless browser (${handle.kind.headless ? "hidden" : "visible"}${handle.sharedDaemon ? ", shared" : ""})`;
+		case "audit":
+			return "dedicated audit browser";
 		case "spawned":
 			return `spawned ${handle.kind.path} (pid ${handle.pid ?? "?"})`;
 		case "connected":
@@ -463,6 +486,8 @@ function describeKind(kind: BrowserKind): string {
 	switch (kind.kind) {
 		case "headless":
 			return `headless ${kind.headless ? "hidden" : "visible"}`;
+		case "audit":
+			return "dedicated audit";
 		case "spawned":
 			return `spawned:${kind.path}`;
 		case "connected":

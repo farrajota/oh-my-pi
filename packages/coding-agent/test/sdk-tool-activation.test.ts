@@ -26,6 +26,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { BUILTIN_TOOLS } from "@oh-my-pi/pi-coding-agent/tools";
 import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 import { logger, removeSyncWithRetries, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 
@@ -149,6 +150,159 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getActiveToolNames()).not.toContain("default_inactive_tool");
 			expect(session.systemPrompt.join("\n")).toContain("default_active_tool");
 			expect(session.systemPrompt.join("\n")).not.toContain("default_inactive_tool");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("keeps browser_audit disabled during ordinary SDK session construction", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession(baseOptions(tempDir));
+		try {
+			expect(session.getAllToolNames()).not.toContain("browser_audit");
+			expect(session.getActiveToolNames()).not.toContain("browser_audit");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("rejects structural browser_audit authority through the public SDK and direct factory", async () => {
+		const tempDir = makeTempDir();
+		const structuralCapability = {
+			dispatch: {
+				expected_spawn_id: "audit-spawn",
+				expected_parent_actor_id: "parent",
+				tool_call_fingerprint: "d".repeat(64),
+			},
+			spawn_id: "audit-spawn",
+			actor: { actor_kind: "sub", actor_id: "audit-spawn", parent_actor_id: "parent" },
+		};
+		expect(
+			BUILTIN_TOOLS.browser_audit({
+				isDisposed: () => false,
+				browserAuditCapability: structuralCapability,
+			} as never),
+		).toBeNull();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			toolNames: ["browser_audit"],
+			restrictToolNames: true,
+			browserAuditCapability: structuralCapability,
+		} as never);
+		try {
+			expect(session.getAllToolNames()).not.toContain("browser_audit");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("rejects a visible reserved SDK custom tool before session registry mutation", async () => {
+		const tempDir = makeTempDir();
+		const reservedTool = { ...sdkCustomTool, name: "browser_audit" };
+
+		await expect(
+			createAgentSession({
+				...baseOptions(tempDir),
+				customTools: [reservedTool],
+			}),
+		).rejects.toThrow('Tool name "browser_audit" is reserved by the core runtime');
+	});
+	it("rejects a hidden reserved late ExtensionAPI registration before replacing a safe SDK tool", async () => {
+		const tempDir = makeTempDir();
+		const safeTool = { ...sdkCustomTool, name: "safe_sdk_tool" };
+		const lateReservedExtension: ExtensionFactory = pi => {
+			pi.on("session_start", async () => {
+				await Promise.resolve();
+				pi.registerTool({
+					name: "browser_audit",
+					label: "Browser Audit",
+					description: "Reserved late extension tool.",
+					parameters: type({}),
+					hidden: true,
+					async execute() {
+						return { content: [{ type: "text", text: "reserved" }] };
+					},
+				});
+			});
+		};
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			extensions: [lateReservedExtension],
+			customTools: [safeTool],
+		});
+
+		try {
+			const safeBefore = session.getToolByName(safeTool.name);
+			if (!safeBefore) throw new Error("Expected safe SDK tool");
+			const errors: string[] = [];
+			await initializeExtensions(session, {
+				reportSendError: vi.fn(),
+				reportRuntimeError: error => errors.push(error.error),
+			});
+
+			expect(errors).toEqual(['Tool name "browser_audit" is reserved by the core runtime']);
+			expect(session.getToolByName(safeTool.name)).toBe(safeBefore);
+			expect(session.getAllToolNames()).toContain(safeTool.name);
+			expect(session.getAllToolNames()).not.toContain("browser_audit");
+			expect(session.getEnabledToolNames()).not.toContain("browser_audit");
+			expect(session.getToolByName("browser_audit")).toBeUndefined();
+			await expect(safeBefore.execute("safe-sdk", {}, undefined)).resolves.toEqual({
+				content: [{ type: "text", text: "sdk custom" }],
+			});
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("rejects a visible late ExtensionAPI registration before replacing an existing extension definition", async () => {
+		const tempDir = makeTempDir();
+		const safeName = "safe_extension_tool";
+		const lateReservedExtension: ExtensionFactory = pi => {
+			pi.registerTool({
+				name: safeName,
+				label: "Safe Extension Tool",
+				description: "Safe extension definition retained after rejected registration.",
+				parameters: type({}),
+				async execute() {
+					return { content: [{ type: "text", text: "safe extension" }] };
+				},
+			});
+			pi.on("session_start", async () => {
+				await Promise.resolve();
+				pi.registerTool({
+					name: "browser_audit",
+					label: "Browser Audit",
+					description: "Reserved late extension tool.",
+					parameters: type({}),
+					async execute() {
+						return { content: [{ type: "text", text: "reserved" }] };
+					},
+				});
+			});
+		};
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			extensions: [lateReservedExtension],
+		});
+
+		try {
+			const safeBefore = session.getToolByName(safeName);
+			const runner = session.extensionRunner;
+			if (!safeBefore || !runner) throw new Error("Expected safe extension tool and runner");
+			const definitionBefore = runner.getRegisteredTool(safeName);
+			if (!definitionBefore) throw new Error("Expected safe extension definition");
+			const errors: string[] = [];
+			await initializeExtensions(session, {
+				reportSendError: vi.fn(),
+				reportRuntimeError: error => errors.push(error.error),
+			});
+
+			expect(errors).toEqual(['Tool name "browser_audit" is reserved by the core runtime']);
+			expect(runner.getRegisteredTool(safeName)).toBe(definitionBefore);
+			expect(runner.getRegisteredTool("browser_audit")).toBeUndefined();
+			expect(session.getToolByName(safeName)).toBe(safeBefore);
+			expect(session.getToolByName("browser_audit")).toBeUndefined();
+			expect(session.getAllToolNames()).not.toContain("browser_audit");
+			expect(session.getEnabledToolNames()).not.toContain("browser_audit");
+			await expect(safeBefore.execute("safe-extension", {}, undefined)).resolves.toEqual({
+				content: [{ type: "text", text: "safe extension" }],
+			});
 		} finally {
 			await session.dispose();
 		}

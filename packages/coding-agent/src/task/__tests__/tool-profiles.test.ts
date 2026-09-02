@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyTaskToolProfile, resolveTaskToolProfile } from "../tool-profiles";
+import { applyTaskToolProfile, resolveTaskToolProfile, TASK_TOOL_PROFILE_NAMES } from "../tool-profiles";
 
 describe("task tool profiles", () => {
 	test("none resolves to an explicit empty tool list", () => {
@@ -24,5 +24,13 @@ describe("task tool profiles", () => {
 	test("profile application preserves only the intersection with explicit agent tools", () => {
 		expect(applyTaskToolProfile(["read"], "plan")).toEqual(["read"]);
 		expect(applyTaskToolProfile(["write"], "plan")).toEqual([]);
+	});
+
+	test("omitting a profile preserves an explicitly declared browser tool", () => {
+		expect(applyTaskToolProfile(["browser"], undefined)).toEqual(["browser"]);
+	});
+
+	test("browser remains agent-declared rather than becoming a native Task profile", () => {
+		expect(TASK_TOOL_PROFILE_NAMES).not.toContain("browser");
 	});
 });

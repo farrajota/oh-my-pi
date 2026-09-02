@@ -7,6 +7,7 @@ import { RpcHostToolBridge } from "@oh-my-pi/pi-coding-agent/modes/rpc/host-tool
 import type {
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
+	RpcHostToolDefinition,
 	RpcHostToolUpdate,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -24,6 +25,20 @@ afterEach(async () => {
 });
 
 describe("RpcHostToolBridge", () => {
+	const hostDefinition = (name: string, label = name): RpcHostToolDefinition => ({
+		name,
+		label,
+		description: `${label} host tool`,
+		parameters: { type: "object", properties: {}, additionalProperties: false },
+	});
+
+	it("rejects an initial reserved RPC definition before bridge mutation", () => {
+		const bridge = new RpcHostToolBridge(() => {});
+		expect(() => bridge.setTools([hostDefinition("browser_audit", "Browser Audit")])).toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+		expect(bridge.getToolNames()).toEqual([]);
+	});
 	it("forwards host tool updates and results to the pending execution", async () => {
 		const frames: Array<RpcHostToolCallRequest | RpcHostToolCancelRequest> = [];
 		const bridge = new RpcHostToolBridge(frame => {
@@ -78,6 +93,40 @@ describe("RpcHostToolBridge", () => {
 		await expect(execution).resolves.toEqual({
 			content: [{ type: "text", text: "5" }],
 		});
+	});
+
+	it("retains a safe RPC bridge definition when a reserved update is rejected", () => {
+		const bridge = new RpcHostToolBridge(() => {});
+		bridge.setTools([hostDefinition("safe_host", "Safe Host")]);
+
+		expect(() => bridge.setTools([hostDefinition("browser_audit", "Browser Audit")])).toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+		expect(bridge.getToolNames()).toEqual(["safe_host"]);
+	});
+
+	it("keeps a reactivated safe RPC bridge definition when a reserved update is rejected", () => {
+		const bridge = new RpcHostToolBridge(() => {});
+		bridge.setTools([hostDefinition("safe_reactivated", "Safe Reactivated")]);
+		bridge.setTools([]);
+		bridge.setTools([hostDefinition("safe_reactivated", "Safe Reactivated")]);
+
+		expect(() => bridge.setTools([hostDefinition("browser_audit", "Browser Audit")])).toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+		expect(bridge.getToolNames()).toEqual(["safe_reactivated"]);
+	});
+
+	it("preserves a replacement safe RPC bridge definition when a reserved replacement is rejected", () => {
+		const bridge = new RpcHostToolBridge(() => {});
+		bridge.setTools([hostDefinition("safe_replacement", "Original Safe")]);
+		const [replacement] = bridge.setTools([hostDefinition("safe_replacement", "Replacement Safe")]);
+
+		expect(() => bridge.setTools([hostDefinition("browser_audit", "Browser Audit")])).toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+		expect(bridge.getToolNames()).toEqual(["safe_replacement"]);
+		expect(replacement?.label).toBe("Replacement Safe");
 	});
 
 	it("emits a cancel frame when the host tool execution is aborted", async () => {

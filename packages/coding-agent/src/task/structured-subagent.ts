@@ -9,6 +9,7 @@ import * as os from "node:os";
 import path from "node:path";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { resolveAgentModelSelection, resolveModelOverride } from "../config/model-resolver";
+import type { Settings } from "../config/settings";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -82,6 +83,10 @@ export interface StructuredSubagentIdentity {
 export interface StructuredSubagentRequest {
 	session: ToolSession;
 	invocationKind: "task" | "eval";
+	/** Point-in-time settings used by exact Task preparation. */
+	settings?: Settings;
+	/** Optional descriptor-frozen discovery snapshot supplied by an exact-preparation caller. */
+	discovery?: DiscoveryResult;
 	assignment: string;
 	context?: string;
 	agent?: string;
@@ -94,6 +99,8 @@ export interface StructuredSubagentRequest {
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
+	/** Invocation-entry task depth for exact preparation. */
+	taskDepth?: number;
 	detached?: boolean;
 	invokedAt?: number;
 	acquiredAt?: number;
@@ -213,8 +220,9 @@ function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode:
 }
 
 function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentName: string): void {
-	const taskDepth = request.session.taskDepth ?? 0;
-	const maxDepth = request.session.settings.get("task.maxRecursionDepth") ?? 2;
+	const settings = request.settings ?? request.session.settings;
+	const taskDepth = request.taskDepth ?? request.session.taskDepth ?? 0;
+	const maxDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	if (!canSpawnAtDepth(maxDepth, taskDepth)) {
 		throw new StructuredSubagentError(
 			"preflight",
@@ -245,20 +253,23 @@ function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentNam
 export async function resolveEffectiveSubagentPolicy(
 	request: StructuredSubagentRequest,
 ): Promise<EffectiveSubagentPolicy> {
-	await request.session.settings.reloadFromDisk();
+	const settings = request.settings ?? request.session.settings;
+	if (!request.settings) await settings.reloadFromDisk();
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
 	const agentName = request.agent?.trim() || spawnPolicy.defaultAgent;
 	const planMode = request.session.getPlanModeState?.()?.enabled === true;
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
 
-	const discovery = await discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.());
+	const discovery =
+		request.discovery ??
+		(await discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.()));
 	const agent = getAgent(discovery.agents, agentName);
 	if (!agent) {
 		const available = discovery.agents.map(candidate => candidate.name).join(", ") || "none";
 		throw new StructuredSubagentError("preflight", `Unknown agent "${agentName}". Available: ${available}`);
 	}
-	const disabledAgents = request.session.settings.get("task.disabledAgents") as string[];
+	const disabledAgents = settings.get("task.disabledAgents") as string[];
 	if (disabledAgents.includes(agentName)) {
 		const enabled = discovery.agents
 			.filter(candidate => !disabledAgents.includes(candidate.name))
@@ -279,13 +290,13 @@ export async function resolveEffectiveSubagentPolicy(
 			throw new StructuredSubagentError("preflight", `Invalid ${scope} output schema: ${error}`);
 		}
 	}
-	const agentModelOverrides = request.session.settings.get("task.agentModelOverrides");
+	const agentModelOverrides = settings.get("task.agentModelOverrides");
 	const parentActiveModelPattern = request.session.getActiveModelString?.();
 	const modelResolution = {
 		requestModel: request.model,
 		settingsOverride: agentModelOverrides[agentName],
 		agentModel: effectiveAgent.model,
-		settings: request.session.settings,
+		settings,
 		activeModelPattern: parentActiveModelPattern,
 		fallbackModelPattern: request.session.getModelString?.(),
 	};
@@ -296,7 +307,7 @@ export async function resolveEffectiveSubagentPolicy(
 	const requestedTaskModel = request.invocationKind === "task" ? request.model : undefined;
 	const requestedModelResolution =
 		requestedTaskModel !== undefined && request.session.modelRegistry
-			? resolveModelOverride(modelOverride, request.session.modelRegistry, request.session.settings)
+			? resolveModelOverride(modelOverride, request.session.modelRegistry, settings)
 			: undefined;
 	if (
 		requestedTaskModel !== undefined &&
@@ -307,7 +318,7 @@ export async function resolveEffectiveSubagentPolicy(
 			`Task model selector ${JSON.stringify(requestedTaskModel)} did not resolve to an enabled model.`,
 		);
 	}
-	const isolationMode = request.session.settings.get("task.isolation.mode");
+	const isolationMode = settings.get("task.isolation.mode");
 	const isIsolated = request.isolation?.requested === true;
 	if (isIsolated && isolationMode === "none") {
 		throw new StructuredSubagentError(
@@ -326,18 +337,15 @@ export async function resolveEffectiveSubagentPolicy(
 		schema,
 		planMode,
 		isIsolated,
-		mergeMode: request.isolation?.merge ?? request.session.settings.get("task.isolation.merge"),
+		mergeMode: request.isolation?.merge ?? settings.get("task.isolation.merge"),
 		applyChanges:
-			request.isolation?.apply ??
-			(request.invocationKind === "task" ? request.session.settings.get("task.isolation.apply") : true),
+			request.isolation?.apply ?? (request.invocationKind === "task" ? settings.get("task.isolation.apply") : true),
 		enableLsp:
-			!planMode &&
-			(request.enableLsp ?? ((request.session.enableLsp ?? true) && request.session.settings.get("task.enableLsp"))),
+			!planMode && (request.enableLsp ?? ((request.session.enableLsp ?? true) && settings.get("task.enableLsp"))),
 		enableIrc:
 			!planMode &&
 			(request.enableIrc ??
-				(request.session.enableIrc !== false &&
-					isIrcEnabled(request.session.settings, request.session.taskDepth ?? 0))),
+				(request.session.enableIrc !== false && isIrcEnabled(settings, request.session.taskDepth ?? 0))),
 	};
 }
 

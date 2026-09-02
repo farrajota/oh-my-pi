@@ -30,6 +30,13 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
 	await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+const BROWSER_AUDIT_PROFILES: Record<string, PermissionProfile> = {
+	"browser-audit": {
+		description: "Read pages with the browser and inspect results.",
+		tools: ["read", "browser"],
+	},
+};
+
 function enforceScope(input: {
 	profiles?: string[];
 	request?: TaskPermissionRequest;
@@ -108,6 +115,25 @@ describe("permission profile loading", () => {
 		expect(loaded.profiles.custom?.tools).toEqual(["search"]);
 		expect(loaded.summaries.find(summary => summary.name === "read-only")?.source).toBe("project");
 		expect(loaded.summaries.find(summary => summary.name === "custom")?.source).toBe("local");
+	});
+
+	test("rejects attempts to override the reserved browser-audit profile", async () => {
+		const cwd = await tempCwd();
+		await writeJson(path.join(cwd, ".omp", "permissions.json"), {
+			profiles: {
+				"browser-audit": {
+					description: "Unsafe replacement",
+					tools: ["browser", "bash"],
+				},
+			},
+		});
+		const loaded = await loadPermissionProfiles(cwd);
+
+		expect(loaded.errors).toContain(
+			'.omp/permissions.json: permission profile "browser-audit" is reserved and cannot be overridden',
+		);
+		expect(loaded.profiles["browser-audit"]).toEqual(BUILTIN_PERMISSION_PROFILES["browser-audit"]);
+		expect(loaded.summaries.find(summary => summary.name === "browser-audit")?.source).toBe("built-in");
 	});
 
 	test("parse errors are reported while built-ins remain available", async () => {
@@ -207,6 +233,57 @@ describe("permission profile composition and evaluation", () => {
 		expect(evaluate(scope, "read", { path: "src/bar/a.ts" }, cwd)).toMatchObject({
 			action: "deny",
 			matched: "subagent:path-allowlist",
+		});
+	});
+
+	test("browser-audit keeps browser in suggest and enforce without inherited restrictions", async () => {
+		const cwd = await tempCwd();
+
+		for (const mode of ["suggest", "enforce"] as const) {
+			const scope = enforceScope({
+				mode,
+				request: { profiles: ["browser-audit"] },
+				profilesMap: BROWSER_AUDIT_PROFILES,
+			});
+
+			expect(scope.tools).toEqual(["read", "browser"]);
+			expect(scope.denyTools).not.toContain("browser");
+			expect(evaluate(scope, "browser", {}, cwd)).toMatchObject({ action: "allow" });
+		}
+	});
+
+	test("inherited browser deny remains a permission limitation instead of widening the child", async () => {
+		const cwd = await tempCwd();
+		const parent = enforceScope({ request: { tools: ["read", "browser"], denyTools: ["browser"] } });
+		const child = enforceScope({
+			request: { profiles: ["browser-audit"] },
+			profilesMap: BROWSER_AUDIT_PROFILES,
+			inherited: parent,
+		});
+
+		expect(child.tools).toEqual(["read", "browser"]);
+		expect(child.denyTools).toContain("browser");
+		expect(evaluate(child, "browser", {}, cwd)).toMatchObject({
+			action: "deny",
+			reason: "BLOCKED: Subagent permission profile denied tool 'browser'.",
+			matched: "subagent:tool-deny:browser",
+		});
+	});
+
+	test("inherited allowlist without browser remains a permission limitation instead of widening the child", async () => {
+		const cwd = await tempCwd();
+		const parent = enforceScope({ request: { tools: ["read"] } });
+		const child = enforceScope({
+			request: { profiles: ["browser-audit"] },
+			profilesMap: BROWSER_AUDIT_PROFILES,
+			inherited: parent,
+		});
+
+		expect(child.tools).toEqual(["read"]);
+		expect(evaluate(child, "browser", {}, cwd)).toMatchObject({
+			action: "deny",
+			reason: "BLOCKED: Subagent permission profile does not allow tool 'browser'.",
+			matched: "subagent:tool-allowlist",
 		});
 	});
 

@@ -17,6 +17,11 @@ import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
+import {
+	bindRegisteredBrowserAuditTaskAuthority,
+	clearBrowserAuditToolSession,
+	createRegisteredBrowserAuditTool,
+} from "../internal/browser-audit-authority";
 import type { LocalProtocolOptions } from "../internal-urls";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { LspTool } from "../lsp";
@@ -44,6 +49,7 @@ import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
+
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
 import { ComputerTool } from "./computer";
@@ -82,6 +88,13 @@ export * from "./ast-edit";
 export * from "./ast-grep";
 export * from "./bash";
 export * from "./browser";
+export {
+	type BrowserAuditBindingInput,
+	buildBrowserAuditInterceptionCode,
+	buildBrowserAuditViewportCode,
+	handoffBrowserAuditSnapshot,
+	readPinnedBrowserAuditFile,
+} from "./browser-audit-production";
 export * from "./checkpoint";
 export * from "./computer";
 export * from "./computer/supervisor";
@@ -438,10 +451,10 @@ export interface ToolSession {
 	queueDeferredMessage?(message: CustomMessage): void;
 	/** Queue a broker supervised-process completion for the owning session. */
 	queueLaunchCompletion?(notification: DaemonCompletionNotification): Promise<void>;
-	/** Register cleanup that runs when this session is disposed; returns a handle that removes the cleanup. */
-	registerDisposeCallback?(callback: () => void): (() => void) | void;
-	/** Register cleanup that runs when this ToolSession adopts a different session ID. */
-	registerSessionChangeCallback?(callback: () => void): (() => void) | void;
+	/** Register cleanup awaited when this session is disposed; returns a handle that removes the cleanup. */
+	registerDisposeCallback?(callback: () => void | Promise<void>): (() => void) | void;
+	/** Register cleanup awaited when this ToolSession adopts a different session ID. */
+	registerSessionChangeCallback?(callback: () => void | Promise<void>): (() => void) | void;
 	/** Queue late LSP diagnostics (arrived after an edit/write returned) to be shown
 	 *  in the transcript and delivered to the model at the next yield, like background
 	 *  job results. */
@@ -464,7 +477,7 @@ export type ToolFactory = (session: ToolSession) => Tool | null | Promise<Tool |
  * Public callable factory map. External callers may invoke `BUILTIN_TOOLS.read(session)` or
  * `BUILTIN_TOOLS[name](session)` to construct a tool directly.
  */
-export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
+export const BUILTIN_TOOLS: Readonly<Record<BuiltinToolName, ToolFactory>> = Object.freeze({
 	read: s => new ReadTool(s),
 	security_scan: s => new SecurityScanTool(s),
 	bash: s => new BashTool(s),
@@ -481,9 +494,13 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
 	computer: s => new ComputerTool(s),
+	browser_audit: createRegisteredBrowserAuditTool,
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
-	task: s => TaskTool.create(s),
+	task: s => {
+		bindRegisteredBrowserAuditTaskAuthority(s);
+		return TaskTool.create(s);
+	},
 	hub: s => new HubTool(s),
 	todo: s => new TodoTool(s),
 	web_search: s => new WebSearchTool(s),
@@ -494,7 +511,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	reflect: MemoryReflectTool.createIf,
 	learn: LearnTool.createIf,
 	manage_skill: ManageSkillTool.createIf,
-};
+});
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {
 	think: () => new ThinkTool(),
@@ -664,16 +681,15 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			return (!includeYield || session.prewalkArmed === true) && session.settings.get("todo.enabled");
 		if (name === "glob") return session.settings.get("glob.enabled");
 		if (name === "grep") return session.settings.get("grep.enabled");
+		if (name === "browser_audit") return requestedTools?.includes("browser_audit") === true;
 		if (name === "github") return session.settings.get("github.enabled");
 		if (name === "ast_grep") return session.settings.get("astGrep.enabled");
 		if (name === "ast_edit") return session.settings.get("astEdit.enabled");
 		if (name === "inspect_image") return isInspectImageToolActive(session);
 		if (name === "web_search") return session.settings.get("web_search.enabled");
-		if (name === "security_scan") return session.settings.get("security.enabled");
-		if (name === "think") return externalThinkingActive;
-		if (name === "ask") return session.settings.get("ask.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
 		if (name === "computer") return session.settings.get("computer.enabled");
+		if (name === "ask") return session.settings.get("ask.enabled");
 		if (name === "checkpoint" || name === "rewind")
 			return (
 				session.settings.get("checkpoint.enabled") &&
@@ -729,12 +745,17 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		session.isToolActive = name => activeToolNames.has(name);
 	}
 
-	const baseResults = await Promise.all(
-		baseEntries.map(async ([name, factory]) => {
-			const tool = await logger.time(`createTools:${name}`, factory as ToolFactory, session);
-			return tool ? wrapToolWithMetaNotice(tool) : null;
-		}),
-	);
+	let baseResults: Array<Tool | null> = [];
+	try {
+		baseResults = await Promise.all(
+			baseEntries.map(async ([name, factory]) => {
+				const tool = await logger.time(`createTools:${name}`, factory as ToolFactory, session);
+				return tool ? wrapToolWithMetaNotice(tool) : null;
+			}),
+		);
+	} finally {
+		clearBrowserAuditToolSession(session);
+	}
 	let tools = baseResults.filter((r): r is Tool => r !== null);
 	const toolRegistry = session.toolRegistry ?? new Map<string, Tool>();
 	session.toolRegistry = toolRegistry;

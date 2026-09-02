@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, expectTyp
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "@oh-my-pi/omptype/typebox";
-import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { AgentMessage, AgentTool, AgentToolPreparedExecution } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -31,6 +31,7 @@ import type {
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("ExtensionRunner", () => {
@@ -366,6 +367,25 @@ describe("ExtensionRunner", () => {
 
 			expect(tools.length).toBe(2);
 			expect(tools.map(t => t.definition.name).sort()).toEqual(["tool_a", "tool_b"]);
+		});
+		it("rejects reserved core tool names before extension registry mutation", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "reserved-tool.ts"),
+				`export default function(pi) {
+					const { Type } = pi.typebox;
+					pi.registerTool({
+						name: "browser_audit",
+						label: "Browser Audit",
+						description: "reserved",
+						parameters: Type.Object({}),
+						execute: async () => ({ content: [{ type: "text", text: "nope" }], details: {} }),
+					});
+				}`,
+			);
+
+			const result = await loadTestExtensions();
+			expect(result.extensions).toHaveLength(0);
+			expect(result.errors[0]?.error).toContain('Tool name "browser_audit" is reserved by the core runtime');
 		});
 	});
 
@@ -2448,6 +2468,144 @@ describe("ExtensionRunner", () => {
 				"Deny",
 			]);
 			delete globalState.__approvalEvents;
+		});
+
+		it("prepares revised input exactly once before approval and consumes it during execution", async () => {
+			const order: string[] = [];
+			const globalState = globalThis as typeof globalThis & { __preparedOrder?: string[] };
+			globalState.__preparedOrder = order;
+			fs.writeFileSync(
+				path.join(extensionsDir, "prepared-input.ts"),
+				`export default function(pi) {
+					pi.on("tool_call", async () => {
+						globalThis.__preparedOrder.push("tool_call");
+						return { input: { value: "revised" } };
+					});
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			initializeRunner(
+				runner,
+				vi.fn(async () => {
+					order.push("ui_select");
+					return "Approve";
+				}),
+			);
+			const parameters = Type.Object({ value: Type.String() });
+			const tool: AgentTool<typeof parameters> = {
+				name: "prepared_tool",
+				label: "Prepared Tool",
+				description: "Prepared tool",
+				parameters,
+				approval: "exec",
+				formatApprovalDetails: args => {
+					const value = args && typeof args === "object" && "value" in args ? args.value : undefined;
+					order.push(`approval:${String(value)}`);
+					return [];
+				},
+				prepareExecution: async (toolCallId, params, _signal, _context, executionKey) => {
+					order.push(`prepare:${params.value}`);
+					let consumed = false;
+					return {
+						consume: <T>(owner: object, expectedToolCallId: string): T => {
+							if (owner !== tool || expectedToolCallId !== toolCallId || consumed || !executionKey) {
+								throw new Error("invalid prepared execution");
+							}
+							consumed = true;
+							order.push("consume");
+							return params as T;
+						},
+						dispose: () => {
+							order.push(consumed ? "dispose:consumed" : "dispose:unused");
+						},
+					};
+				},
+				execute: async function (toolCallId, params, _signal, _onUpdate, _context, preparedExecution) {
+					order.push(`execute:${params.value}`);
+					preparedExecution?.consume(this, toolCallId);
+					return { content: [{ type: "text", text: "ok" }] };
+				},
+			};
+			const wrapper = new ExtensionToolWrapper(wrapToolWithMetaNotice(tool), runner);
+
+			await (wrapper as ExtensionToolWrapper<any>).execute(
+				"call-prepared",
+				{ value: "original" },
+				undefined,
+				undefined,
+				{
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+				},
+			);
+
+			expect(order).toEqual([
+				"tool_call",
+				"prepare:revised",
+				"approval:revised",
+				"ui_select",
+				"execute:revised",
+				"consume",
+				"dispose:consumed",
+			]);
+			delete globalState.__preparedOrder;
+		});
+
+		it("disposes unconsumed preparation when approval is denied", async () => {
+			const order: string[] = [];
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			initializeRunner(runner, async () => "Deny");
+			const tool = {
+				...approvalTool,
+				prepareExecution: async (): Promise<AgentToolPreparedExecution> => {
+					order.push("prepare");
+					return {
+						consume: () => {
+							throw new Error("must not consume");
+						},
+						dispose: () => {
+							order.push("dispose");
+						},
+					};
+				},
+				execute: async () => {
+					order.push("execute");
+					return { content: [{ type: "text" as const, text: "ok" }] };
+				},
+			};
+			const wrapper = new ExtensionToolWrapper(tool, runner);
+
+			await expect(
+				(wrapper as ExtensionToolWrapper<any>).execute("call-prepared-denied", {}, undefined, undefined, {
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+				}),
+			).rejects.toThrow("Tool call denied by user");
+			expect(order).toEqual(["prepare", "dispose"]);
 		});
 
 		it("does not present approval before canonical or wire-aliased tool previews are ready", async () => {

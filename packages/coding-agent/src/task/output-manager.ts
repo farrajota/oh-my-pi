@@ -25,6 +25,8 @@ export class AgentOutputManager {
 	#initializing: Promise<void> | undefined;
 	/** Final ids already handed out, relative to this manager's scope. */
 	readonly #taken = new Set<string>();
+	/** Segments allocated by this live manager and therefore safe to release before use. */
+	readonly #allocated = new Set<string>();
 	readonly #getArtifactsDir: () => string | null;
 	readonly #parentPrefix: string | undefined;
 
@@ -83,6 +85,7 @@ export class AgentOutputManager {
 			candidate = `${id}-${n}`;
 		}
 		this.#taken.add(candidate);
+		this.#allocated.add(candidate);
 		return this.#parentPrefix ? `${this.#parentPrefix}.${candidate}` : candidate;
 	}
 
@@ -111,5 +114,16 @@ export class AgentOutputManager {
 	async allocate(id: string): Promise<string> {
 		await this.#ensureInitialized();
 		return this.#allocateUnique(id);
+	}
+
+	/** Release an ID allocated by this manager before any output or child launch used it. */
+	async release(id: string): Promise<boolean> {
+		await this.#ensureInitialized();
+		const prefix = this.#parentPrefix ? `${this.#parentPrefix}.` : "";
+		if (prefix && !id.startsWith(prefix)) return false;
+		const rest = prefix ? id.slice(prefix.length) : id;
+		if (!rest || rest.includes(".") || !this.#allocated.delete(rest)) return false;
+		this.#taken.delete(rest);
+		return true;
 	}
 }

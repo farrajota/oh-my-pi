@@ -13,6 +13,7 @@ import type * as TypeBox from "@oh-my-pi/omptype/typebox";
 import type * as zod from "@oh-my-pi/omptype/zod";
 import type {
 	AgentMessage,
+	AgentToolPreparedExecution,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ThinkingLevel,
@@ -682,6 +683,7 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 		signal: AbortSignal | undefined,
 		onUpdate: AgentToolUpdateCallback<TDetails> | undefined,
 		ctx: ExtensionContext,
+		preparedExecution?: AgentToolPreparedExecution,
 	): Promise<AgentToolResult<TDetails>>;
 
 	/** Called on session lifecycle events - use to reconstruct state or cleanup resources */

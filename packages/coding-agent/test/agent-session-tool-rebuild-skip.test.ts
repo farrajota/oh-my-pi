@@ -238,6 +238,134 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await session.refreshMCPTools([initialMcp]);
 		expect(rebuildCount).toBe(1);
 	});
+	it("rejects reserved names before MCP, RPC, or active-set mutation", async () => {
+		const { session, toolRegistry } = newSession(async toolNames => `tools:${toolNames.join(",")}`);
+		const safeMcp = createMcpCustomTool("mcp__safe_host", "safe", "host", "Safe MCP tool");
+		const safeRpc = createBasicTool("safe_rpc", "Safe RPC");
+		await session.refreshMCPTools([safeMcp]);
+		await session.refreshRpcHostTools([safeRpc]);
+		const registryBefore = [...toolRegistry.keys()];
+		const activeBefore = session.getEnabledToolNames();
+		const reservedTool = createBasicTool("browser_audit", "Browser Audit");
+		await expect(session.refreshMCPTools([reservedTool as unknown as CustomTool])).rejects.toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+		await expect(session.refreshRpcHostTools([reservedTool])).rejects.toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+		await expect(session.setActiveToolsByName([...activeBefore, "browser_audit"])).rejects.toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+
+		expect([...toolRegistry.keys()]).toEqual(registryBefore);
+		expect(session.getEnabledToolNames()).toEqual(activeBefore);
+		expect(session.getToolByName("browser_audit")).toBeUndefined();
+		expect(session.hasBuiltInTool("browser_audit")).toBe(false);
+		expect(session.getAllToolInfos().some(tool => tool.name === "browser_audit")).toBe(false);
+	});
+	it("rejects reserved SessionTools provenance mutations before visible, hidden, or MCP ownership state changes", () => {
+		const { session, toolRegistry } = newSession(async toolNames => `tools:${toolNames.join(",")}`);
+		const registryBefore = [...toolRegistry.entries()];
+		const reservedTool = createBasicTool("browser_audit", "Browser Audit");
+
+		expect(() => session.setToolBuiltIn("browser_audit", true)).toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+		expect(() => session.setToolBuiltIn("browser_audit", false)).toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+		expect(() => session.setMCPManagerTool("browser_audit", true)).toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+		expect(() => session.setExtensionMCPTool("browser_audit", reservedTool)).toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+
+		expect([...toolRegistry.entries()]).toEqual(registryBefore);
+		expect(session.hasBuiltInTool("browser_audit")).toBe(false);
+		expect(session.hasMCPManagerTool("browser_audit")).toBe(false);
+		expect(session.getExtensionMCPTool("browser_audit")).toBeUndefined();
+	});
+	it("rejects an initial reserved RPC tool before bridge or registry activation", async () => {
+		const { session, toolRegistry } = newSession(async toolNames => `tools:${toolNames.join(",")}`);
+		const registryBefore = [...toolRegistry.entries()];
+		const activeBefore = session.getEnabledToolNames();
+		const reservedTool = createBasicTool("browser_audit", "Browser Audit");
+
+		await expect(session.refreshRpcHostTools([reservedTool])).rejects.toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+
+		expect([...toolRegistry.entries()]).toEqual(registryBefore);
+		expect(session.getEnabledToolNames()).toEqual(activeBefore);
+		expect(session.hasRpcHostTool("browser_audit")).toBe(false);
+		expect(session.getToolByName("browser_audit")).toBeUndefined();
+	});
+
+	it("retains a safe RPC definition when a reserved update is rejected before registry mutation", async () => {
+		const { session, toolRegistry } = newSession(async toolNames => `tools:${toolNames.join(",")}`);
+		const safeTool = createBasicTool("rpc_retained", "Retained RPC");
+		await session.refreshRpcHostTools([safeTool]);
+		const safeBefore = toolRegistry.get(safeTool.name);
+		if (!safeBefore) throw new Error("Expected retained RPC tool");
+
+		await expect(session.refreshRpcHostTools([createBasicTool("browser_audit", "Browser Audit")])).rejects.toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+
+		expect(toolRegistry.get(safeTool.name)).toBe(safeBefore);
+		expect(session.hasRpcHostTool(safeTool.name)).toBe(true);
+		expect(session.getActiveToolNames()).toContain(safeTool.name);
+		await expect(safeBefore.execute("retained-rpc", {}, undefined)).resolves.toEqual({
+			content: [{ type: "text", text: "rpc_retained executed" }],
+		});
+	});
+
+	it("keeps a deactivated safe RPC definition intact until it is reactivated after reserved rejection", async () => {
+		const { session, toolRegistry } = newSession(async toolNames => `tools:${toolNames.join(",")}`);
+		const safeTool = createBasicTool("rpc_reactivated", "Reactivated RPC");
+		await session.refreshRpcHostTools([safeTool]);
+		const safeBefore = toolRegistry.get(safeTool.name);
+		if (!safeBefore) throw new Error("Expected reactivatable RPC tool");
+		await session.setActiveToolsByName(session.getEnabledToolNames().filter(name => name !== safeTool.name));
+		expect(session.getActiveToolNames()).not.toContain(safeTool.name);
+
+		await expect(session.refreshRpcHostTools([createBasicTool("browser_audit", "Browser Audit")])).rejects.toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+
+		expect(toolRegistry.get(safeTool.name)).toBe(safeBefore);
+		expect(session.getActiveToolNames()).not.toContain(safeTool.name);
+		await session.setActiveToolsByName([...session.getEnabledToolNames(), safeTool.name]);
+		expect(session.getToolByName(safeTool.name)).toBe(safeBefore);
+		expect(session.getActiveToolNames()).toContain(safeTool.name);
+		await expect(safeBefore.execute("reactivated-rpc", {}, undefined)).resolves.toEqual({
+			content: [{ type: "text", text: "rpc_reactivated executed" }],
+		});
+	});
+
+	it("preserves a replacement safe RPC definition when a reserved replacement is rejected", async () => {
+		const { session, toolRegistry } = newSession(async toolNames => `tools:${toolNames.join(",")}`);
+		const originalTool = createBasicTool("rpc_replacement", "Original RPC");
+		const replacementTool = createBasicTool("rpc_replacement", "Replacement RPC");
+		await session.refreshRpcHostTools([originalTool]);
+		const original = toolRegistry.get(originalTool.name);
+		await session.refreshRpcHostTools([replacementTool]);
+		const replacement = toolRegistry.get(replacementTool.name);
+		if (!original || !replacement) throw new Error("Expected RPC replacement definitions");
+		expect(replacement).not.toBe(original);
+
+		await expect(session.refreshRpcHostTools([createBasicTool("browser_audit", "Browser Audit")])).rejects.toThrow(
+			'Tool name "browser_audit" is reserved by the core runtime',
+		);
+
+		expect(toolRegistry.get(replacementTool.name)).toBe(replacement);
+		expect(session.getToolByName(replacementTool.name)).toBe(replacement);
+		expect(session.getActiveToolNames()).toContain(replacementTool.name);
+		await expect(replacement.execute("replacement-rpc", {}, undefined)).resolves.toEqual({
+			content: [{ type: "text", text: "rpc_replacement executed" }],
+		});
+	});
 
 	it("warns and keeps the stable winner when distinct MCP tools mint the same name", async () => {
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});

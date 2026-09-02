@@ -607,6 +607,15 @@ export class Settings {
 		return resolved as SettingValue<P>;
 	}
 
+	/** Create an in-memory point-in-time copy of the effective configured layers. */
+	snapshot(): Settings {
+		const snapshot = new Settings({ cwd: this.#cwd, agentDir: this.#agentDir, inMemory: true });
+		snapshot.#storage = this.#storage;
+		snapshot.#overrides = structuredClone(this.#merged);
+		snapshot.#rebuildMerged();
+		return snapshot;
+	}
+
 	/**
 	 * Whether `path` has an explicitly configured value (global config, project
 	 * config, or runtime override) rather than falling back to the schema default.

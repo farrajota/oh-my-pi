@@ -46,6 +46,8 @@ function describeBrowser(args: BrowserRenderArgs, details: BrowserToolDetails | 
 	switch (details?.browser) {
 		case "headless":
 			return "headless";
+		case "audit":
+			return "dedicated audit";
 		case "spawned":
 			return "spawned";
 		case "connected":

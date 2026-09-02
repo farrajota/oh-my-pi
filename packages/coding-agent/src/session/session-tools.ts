@@ -19,7 +19,12 @@ import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import type { MemoryBackendStartOptions } from "../memory-backend/types";
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { usesCodexTaskPrompt } from "../task/prompt-policy";
-import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
+import {
+	assertToolNameNotReserved,
+	isMCPToolName,
+	isReservedCoreToolName,
+	normalizeToolNames,
+} from "../tools/builtin-names";
 import { computerExposureMode } from "../tools/computer/exposure";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { isFilesystemSourcePath } from "../tools/path-utils";
@@ -266,6 +271,18 @@ export class SessionTools {
 	#skillsReloadable: boolean;
 	#acpPermissionDecisions = new Map<string, "allow_always" | "reject_always">();
 
+	#assertNativeOrUnreserved(name: string): void {
+		if (
+			name === "browser_audit" &&
+			isReservedCoreToolName(name) &&
+			this.#builtInToolNames.has(name) &&
+			this.#toolRegistry.has(name)
+		) {
+			return;
+		}
+		assertToolNameNotReserved(name);
+	}
+
 	constructor(host: SessionToolsHost, options: SessionToolsOptions) {
 		this.#host = host;
 		this.#autoApprove = options.autoApprove === true;
@@ -275,7 +292,12 @@ export class SessionTools {
 		this.#createThinkTool = options.createThinkTool;
 		this.#createInspectImageTool = options.createInspectImageTool;
 		this.#builtInToolNames = new Set(options.builtInToolNames ?? []);
+		for (const name of this.#builtInToolNames) this.#assertNativeOrUnreserved(name);
+
 		this.#mcpManagerToolNames = new Set(options.mcpManagerToolNames ?? []);
+		for (const name of this.#mcpManagerToolNames) assertToolNameNotReserved(name);
+		for (const name of this.#toolRegistry.keys()) this.#assertNativeOrUnreserved(name);
+
 		if (options.mcpManagerToolNames === undefined) {
 			for (const name of this.#toolRegistry.keys()) {
 				if (isMCPToolName(name)) this.#mcpManagerToolNames.add(name);
@@ -312,8 +334,14 @@ export class SessionTools {
 		// model resolution) landing while the live set is transiently narrow
 		// commits that narrow set as the sticky slate — the session keeps almost
 		// no tools and the prompt rebuild without `read` empties the skill list.
-		for (const tool of host.agent.state.tools) this.#enabledToolNames.add(tool.name);
-		for (const name of this.#xdev?.mountedNames ?? []) this.#enabledToolNames.add(name);
+		for (const tool of host.agent.state.tools) {
+			this.#assertNativeOrUnreserved(tool.name);
+			this.#enabledToolNames.add(tool.name);
+		}
+		for (const name of this.#xdev?.mountedNames ?? []) {
+			assertToolNameNotReserved(name);
+			this.#enabledToolNames.add(name);
+		}
 		this.#promptModelKey = this.#currentPromptModelKey();
 	}
 
@@ -469,6 +497,7 @@ export class SessionTools {
 
 	/** Updates source provenance when a live registry entry is replaced or restored. */
 	setToolBuiltIn(name: string, builtIn: boolean): void {
+		assertToolNameNotReserved(name);
 		if (builtIn) {
 			this.#builtInToolNames.add(name);
 		} else {
@@ -488,6 +517,7 @@ export class SessionTools {
 
 	/** Restores manager ownership after a lifecycle registration rollback. */
 	setMCPManagerTool(name: string, managerOwned: boolean): void {
+		assertToolNameNotReserved(name);
 		if (managerOwned) {
 			this.#mcpManagerToolNames.add(name);
 		} else {
@@ -502,6 +532,7 @@ export class SessionTools {
 
 	/** Updates extension ownership when a lifecycle registration commits or rolls back. */
 	setExtensionMCPTool(name: string, tool: AgentTool | undefined): void {
+		assertToolNameNotReserved(name);
 		if (!isMCPToolName(name)) return;
 		if (tool) {
 			this.#extensionMcpTools.set(name, tool);
@@ -554,7 +585,12 @@ export class SessionTools {
 				scope: "temporary",
 				origin: "top-level",
 			};
-			return { name, description: tool.description, parameters: tool.parameters, sourceInfo };
+			return {
+				name,
+				description: tool.description,
+				parameters: tool.parameters,
+				sourceInfo,
+			};
 		});
 	}
 
@@ -573,6 +609,8 @@ export class SessionTools {
 			}
 
 			const tools = createVibeTools();
+			for (const tool of tools) assertToolNameNotReserved(tool.name);
+
 			const vibeToolNames = tools.map(tool => tool.name);
 			if (new Set(vibeToolNames).size !== vibeToolNames.length) {
 				throw new Error("Vibe tool names must be unique.");
@@ -861,6 +899,7 @@ export class SessionTools {
 
 	async #applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
 		signal?.throwIfAborted();
+		for (const name of toolNames) this.#assertNativeOrUnreserved(name);
 		toolNames = normalizeToolNames(toolNames);
 		const codeMode = resolveCodeMode({
 			provider: this.#host.model()?.provider ?? "",
@@ -1338,6 +1377,8 @@ export class SessionTools {
 		forcePromptRefresh = false,
 		signal?: AbortSignal,
 	): Promise<void> {
+		for (const name of normalized) this.#assertNativeOrUnreserved(name);
+		for (const name of mounted) assertToolNameNotReserved(name);
 		const retainedMountedDevice = [...mounted].some(name => normalized.includes(name));
 		const retainedDeferrableTool = normalized.some(name => this.#toolRegistry.get(name)?.deferrable === true);
 		const deviceOnlyWriteActive = this.#isDeviceOnlyWrite?.() === true;
@@ -1363,6 +1404,7 @@ export class SessionTools {
 	/** Replaces memory-backend tools while preserving unrelated selections. */
 	replaceMemoryTools(tools: AgentTool[]): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
+			for (const tool of tools) assertToolNameNotReserved(tool.name);
 			const removed = new Set<string>(MEMORY_BACKEND_TOOL_NAMES.filter(name => this.#builtInToolNames.has(name)));
 			const nextActive = this.getEnabledToolNames().filter(name => !removed.has(name));
 			for (const name of removed) {
@@ -1741,9 +1783,11 @@ export class SessionTools {
 	 */
 	refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
 		const snapshot = [...mcpTools];
-		return this.runToolRegistryMutation(() =>
-			this.#host.isDisposed() ? Promise.resolve() : this.#applyMCPToolRefresh(snapshot),
-		);
+		return this.runToolRegistryMutation(async () => {
+			for (const tool of snapshot) assertToolNameNotReserved(tool.name);
+			if (this.#host.isDisposed()) return;
+			await this.#applyMCPToolRefresh(snapshot);
+		});
 	}
 
 	async #applyMCPToolRefresh(mcpTools: CustomTool[]): Promise<void> {
@@ -1815,10 +1859,14 @@ export class SessionTools {
 	/** Replaces RPC host-owned tools and refreshes the active set before the next model call. */
 	refreshRpcHostTools(rpcTools: AgentTool[]): Promise<void> {
 		const snapshot = [...rpcTools];
-		return this.runToolRegistryMutation(() => this.#applyRpcHostToolRefresh(snapshot));
+		return this.runToolRegistryMutation(async () => {
+			for (const tool of snapshot) assertToolNameNotReserved(tool.name);
+			await this.#applyRpcHostToolRefresh(snapshot);
+		});
 	}
 
 	async #applyRpcHostToolRefresh(rpcTools: AgentTool[]): Promise<void> {
+		for (const tool of rpcTools) assertToolNameNotReserved(tool.name);
 		const nextToolNames = rpcTools.map(tool => tool.name);
 		const uniqueToolNames = new Set(nextToolNames);
 		if (uniqueToolNames.size !== nextToolNames.length) {

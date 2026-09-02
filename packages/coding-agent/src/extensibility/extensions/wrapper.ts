@@ -4,6 +4,7 @@
 import type {
 	AgentTool,
 	AgentToolContext,
+	AgentToolPreparedExecution,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ToolLoadMode,
@@ -73,6 +74,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<any>,
 		context?: AgentToolContext,
+		preparedExecution?: AgentToolPreparedExecution,
 	) {
 		// Bind the extension context to this tool's own name so `ctx.invokeTool` delegates to the
 		// native built-in of the same name (present only when this tool re-registers a built-in). The
@@ -91,6 +93,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 				signal,
 				onUpdate,
 			}),
+			preparedExecution,
 		);
 	}
 }
@@ -181,6 +184,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
 		context?: AgentToolContext,
+		preparedExecution?: AgentToolPreparedExecution,
 	): Promise<AgentToolResult<TDetails, TParameters>> {
 		const permissionDecision = evaluateSubagentPermission({
 			scope: this.runner.getPermissionScope?.(),
@@ -249,177 +253,196 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
-
-		// 2. Full approval gate against the (possibly revised) input that will actually run — resolves
-		// policy and prompts on `effectiveParams`, so the user approves exactly what executes. A revised
-		// input that newly resolves to `deny` is caught here even though the original passed the
-		// short-circuit above.
-		const resolvedArgs = approvalArgs(effectiveParams, context);
-		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies);
-		context?.xdevTierResolved?.(resolved.tier);
-		if (resolved.policy === "deny") {
-			throw denyError(resolved, this.tool.name);
-		}
-		const pendingSafetyChecks = computerSafetyChecks(context);
-		// An xd:// device dispatch already cleared the write tool's outer gate at
-		// this tool's tier — re-prompting would double-ask for one action. The
-		// bypass only holds while the input is exactly what that outer gate
-		// approved: a handler revision here may have raised the tier, so revised
-		// input always faces the full gate. Explicit per-tool "prompt" policies
-		// and tool-demanded overrides still prompt. Provider safety checks are
-		// stronger: yolo, per-tool allow, and xdev approval never acknowledge
-		// them on the user's behalf.
-		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
-		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
-		const approvalCheck = {
-			required: pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
-			reason: resolved.reason,
-		};
-
-		if (approvalCheck.required) {
-			const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
-			if (
-				scheduledCall?.id === toolCallId &&
-				(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
-			) {
-				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
-			}
-
-			const hasApprovalHandlers =
-				this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
-			const sessionId = context?.sessionManager?.getSessionId() ?? "";
-			if (hasApprovalHandlers) {
-				await this.runner.emit({
-					type: "tool_approval_requested",
-					sessionId,
-					toolName: this.tool.name,
+		// Native tools may freeze exact one-use execution state after every input revision,
+		// before approval. A handle supplied by an outer wrapper is already prepared and
+		// remains owned by that wrapper; otherwise this wrapper owns its handle.
+		const ownsPreparation = preparedExecution === undefined;
+		const executionKey = ownsPreparation ? Object.freeze({}) : undefined;
+		let effectivePreparedExecution = preparedExecution;
+		try {
+			if (effectivePreparedExecution === undefined) {
+				effectivePreparedExecution = await this.tool.prepareExecution?.(
 					toolCallId,
-					...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
-					approvalMode,
-				});
-			}
-
-			const emitApprovalResolved = async (approved: boolean, reason?: string) => {
-				if (!hasApprovalHandlers) return;
-				await this.runner.emit({
-					type: "tool_approval_resolved",
-					sessionId,
-					toolName: this.tool.name,
-					toolCallId,
-					approved,
-					...(reason ? { reason } : {}),
-				});
-			};
-
-			// Provider safety checks fail closed without an interactive prompt. Unlike
-			// ordinary tier approval, no setting or yolo mode may bypass this gate.
-			if (!this.runner.hasUI()) {
-				const reason = "no interactive UI available";
-				await emitApprovalResolved(false, reason);
-				if (pendingSafetyChecks.length > 0) {
-					throw new Error(
-						`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
-					);
-				}
-				throw new Error(
-					`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
-						`Options:\n` +
-						`  1. Set tools.approvalMode: yolo in /settings\n` +
-						`  2. Add tools.approval.${this.tool.name}: allow to config\n` +
-						`  3. Use an interactive UI to approve the tool call`,
+					effectiveParams,
+					signal,
+					context,
+					executionKey!,
 				);
 			}
-
-			const uiContext = this.runner.getUIContext();
-			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-			const safetyPrompt =
-				pendingSafetyChecks.length > 0
-					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-					: basePrompt;
-			let choice: string | undefined;
-			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
-			} catch (err) {
-				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
-				throw err;
+			// 2. Full approval gate against the (possibly revised) input that will actually run — resolves
+			// policy and prompts on `effectiveParams`, so the user approves exactly what executes. A revised
+			// input that newly resolves to `deny` is caught here even though the original passed the
+			// short-circuit above.
+			const resolvedArgs = approvalArgs(effectiveParams, context);
+			const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies);
+			context?.xdevTierResolved?.(resolved.tier);
+			if (resolved.policy === "deny") {
+				throw denyError(resolved, this.tool.name);
 			}
-			const approved = choice === "Approve";
-			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
-			if (!approved) {
-				throw new Error(`Tool call denied by user: ${this.tool.name}`);
-			}
-			if (pendingSafetyChecks.length > 0) {
-				if (!context) throw new Error("Provider safety approval context is unavailable");
-				context.providerSafetyApproved = true;
-			}
-		}
-
-		// Execute the actual tool
-		let result: AgentToolResult<TDetails, TParameters>;
-		let executionError: Error | undefined;
-
-		try {
-			// A denied file write or delete inside this tool can be brokered to an
-			// extension handler, and that registry is PROCESS-WIDE — so the session is
-			// named here, the one place where every tool's execution and the runner
-			// that owns the handlers are both in scope (`sdk.ts` wraps the whole tool
-			// registry with this class whenever a runner exists). Inert with no
-			// fallback registered: no scope is entered.
-			result = await withFileMutationSession(this.runner.sessionId, () =>
-				this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
-			);
-		} catch (err) {
-			executionError = err instanceof Error ? err : new Error(String(err));
-			result = {
-				content: [{ type: "text", text: executionError.message }],
-				details: undefined as TDetails,
+			const pendingSafetyChecks = computerSafetyChecks(context);
+			// An xd:// device dispatch already cleared the write tool's outer gate at
+			// this tool's tier — re-prompting would double-ask for one action. The
+			// bypass only holds while the input is exactly what that outer gate
+			// approved: a handler revision here may have raised the tier, so revised
+			// input always faces the full gate. Explicit per-tool "prompt" policies
+			// and tool-demanded overrides still prompt. Provider safety checks are
+			// stronger: yolo, per-tool allow, and xdev approval never acknowledge
+			// them on the user's behalf.
+			const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
+			const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
+			const approvalCheck = {
+				required:
+					pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
+				reason: resolved.reason,
 			};
-		}
 
-		// Emit tool_result event - extensions can modify the result and error status
-		if (this.runner.hasHandlers("tool_result")) {
-			const resultResult = await this.runner.emitToolResult({
-				type: "tool_result",
-				toolName: this.tool.name,
-				toolCallId,
-				input: normalizeToolEventInput(
-					this.tool.name,
-					resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
-				),
-				content: result.content,
-				details: result.details,
-				isError: !!executionError,
-			});
+			if (approvalCheck.required) {
+				const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
+				if (
+					scheduledCall?.id === toolCallId &&
+					(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
+				) {
+					await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
+				}
 
-			if (resultResult) {
-				const modifiedContent: (TextContent | ImageContent)[] = resultResult.content ?? result.content;
-				const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
+				const hasApprovalHandlers =
+					this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
+				const sessionId = context?.sessionManager?.getSessionId() ?? "";
+				if (hasApprovalHandlers) {
+					await this.runner.emit({
+						type: "tool_approval_requested",
+						sessionId,
+						toolName: this.tool.name,
+						toolCallId,
+						...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+						approvalMode,
+					});
+				}
 
-				// Effective error state: an explicit handler override wins; otherwise the
-				// original execution outcome stands. This lets a handler rewrite a failed
-				// call's model-visible content/details while keeping it an error, flip a
-				// failure to success, or flag a success as an error.
-				const effectiveError = resultResult.isError ?? !!executionError;
+				const emitApprovalResolved = async (approved: boolean, reason?: string) => {
+					if (!hasApprovalHandlers) return;
+					await this.runner.emit({
+						type: "tool_approval_resolved",
+						sessionId,
+						toolName: this.tool.name,
+						toolCallId,
+						approved,
+						...(reason ? { reason } : {}),
+					});
+				};
 
-				// Return the (possibly modified) result carrying the error flag rather than
-				// rethrowing the original exception. The agent loop honors
-				// `AgentToolResult.isError` and surfaces it as a tool error on the wire (see
-				// `coerceToolResult` in agent-loop), so replacement failure content reaches
-				// the model while the call remains an error — the original exception text is
-				// no longer forced through, which previously discarded the replacement.
-				return {
-					content: modifiedContent,
-					details: modifiedDetails,
-					providerMetadata: result.providerMetadata,
-					...(effectiveError ? { isError: true } : {}),
+				// Provider safety checks fail closed without an interactive prompt. Unlike
+				// ordinary tier approval, no setting or yolo mode may bypass this gate.
+				if (!this.runner.hasUI()) {
+					const reason = "no interactive UI available";
+					await emitApprovalResolved(false, reason);
+					if (pendingSafetyChecks.length > 0) {
+						throw new Error(
+							`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
+						);
+					}
+					throw new Error(
+						`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
+							`Options:\n` +
+							`  1. Set tools.approvalMode: yolo in /settings\n` +
+							`  2. Add tools.approval.${this.tool.name}: allow to config\n` +
+							`  3. Use an interactive UI to approve the tool call`,
+					);
+				}
+
+				const uiContext = this.runner.getUIContext();
+				const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
+				const safetyPrompt =
+					pendingSafetyChecks.length > 0
+						? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
+						: basePrompt;
+				let choice: string | undefined;
+				try {
+					choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				} catch (err) {
+					await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
+					throw err;
+				}
+				const approved = choice === "Approve";
+				await emitApprovalResolved(approved, approved ? undefined : "denied by user");
+				if (!approved) {
+					throw new Error(`Tool call denied by user: ${this.tool.name}`);
+				}
+				if (pendingSafetyChecks.length > 0) {
+					if (!context) throw new Error("Provider safety approval context is unavailable");
+					context.providerSafetyApproved = true;
+				}
+			}
+
+			// Execute the actual tool
+			let result: AgentToolResult<TDetails, TParameters>;
+			let executionError: Error | undefined;
+
+			try {
+				// A denied file write or delete inside this tool can be brokered to an
+				// extension handler, and that registry is PROCESS-WIDE — so the session is
+				// named here, the one place where every tool's execution and the runner
+				// that owns the handlers are both in scope (`sdk.ts` wraps the whole tool
+				// registry with this class whenever a runner exists). Inert with no
+				// fallback registered: no scope is entered.
+				result = await withFileMutationSession(this.runner.sessionId, () =>
+					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context, effectivePreparedExecution),
+				);
+			} catch (err) {
+				executionError = err instanceof Error ? err : new Error(String(err));
+				result = {
+					content: [{ type: "text", text: executionError.message }],
+					details: undefined as TDetails,
 				};
 			}
-		}
 
-		// No extension modification
-		if (executionError) {
-			throw executionError;
+			// Emit tool_result event - extensions can modify the result and error status
+			if (this.runner.hasHandlers("tool_result")) {
+				const resultResult = await this.runner.emitToolResult({
+					type: "tool_result",
+					toolName: this.tool.name,
+					toolCallId,
+					input: normalizeToolEventInput(
+						this.tool.name,
+						resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
+					),
+					content: result.content,
+					details: result.details,
+					isError: !!executionError,
+				});
+
+				if (resultResult) {
+					const modifiedContent: (TextContent | ImageContent)[] = resultResult.content ?? result.content;
+					const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
+
+					// Effective error state: an explicit handler override wins; otherwise the
+					// original execution outcome stands. This lets a handler rewrite a failed
+					// call's model-visible content/details while keeping it an error, flip a
+					// failure to success, or flag a success as an error.
+					const effectiveError = resultResult.isError ?? !!executionError;
+
+					// Return the (possibly modified) result carrying the error flag rather than
+					// rethrowing the original exception. The agent loop honors
+					// `AgentToolResult.isError` and surfaces it as a tool error on the wire (see
+					// `coerceToolResult` in agent-loop), so replacement failure content reaches
+					// the model while the call remains an error — the original exception text is
+					// no longer forced through, which previously discarded the replacement.
+					return {
+						content: modifiedContent,
+						details: modifiedDetails,
+						providerMetadata: result.providerMetadata,
+						...(effectiveError ? { isError: true } : {}),
+					};
+				}
+			}
+
+			// No extension modification
+			if (executionError) {
+				throw executionError;
+			}
+			return result;
+		} finally {
+			if (ownsPreparation) await effectivePreparedExecution?.dispose();
 		}
-		return result;
 	}
 }

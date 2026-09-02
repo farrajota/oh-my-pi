@@ -3,6 +3,8 @@ import type { Static, TSchema } from "@oh-my-pi/pi-ai";
 import { Snowflake } from "@oh-my-pi/pi-utils";
 import { applyToolProxy } from "../../extensibility/tool-proxy";
 import type { Theme } from "../../modes/theme/theme";
+
+import { assertToolNameNotReserved } from "../../tools/builtin-names";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type {
 	RpcHostToolCallRequest,
@@ -89,6 +91,7 @@ export class RpcHostToolBridge {
 	}
 
 	setTools(tools: RpcHostToolDefinition[]): AgentTool[] {
+		for (const tool of tools) assertToolNameNotReserved(tool.name);
 		this.#definitions = new Map(tools.map(tool => [tool.name, tool]));
 		return tools.map(tool => new RpcHostToolAdapter(tool, this));
 	}

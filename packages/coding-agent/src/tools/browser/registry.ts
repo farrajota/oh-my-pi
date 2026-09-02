@@ -21,6 +21,8 @@ import { ensureSharedBrowser } from "./shared-daemon";
 
 export type PuppeteerBrowserKind =
 	| { kind: "headless"; headless: boolean }
+	/** A non-pooled, OMP-owned browser/profile reserved for one Browser Audit run. */
+	| { kind: "audit"; auditId: string }
 	| { kind: "spawned"; path: string }
 	| { kind: "connected"; cdpUrl: string }
 	| RelayKind;
@@ -41,6 +43,14 @@ const HEADLESS_CLOSE_TIMEOUT_MS = 5_000;
  * the wait must cover one full alarm period plus the dial.
  */
 const RELAY_EXTENSION_WAIT_MS = 35_000;
+const AUDIT_CHROMIUM_ARGS = Object.freeze([
+	"--disable-background-networking",
+	"--disable-component-update",
+	"--disable-domain-reliability",
+	"--disable-sync",
+	"--metrics-recording-only",
+	"--no-first-run",
+]);
 
 interface BrowserHandleCommon {
 	key: string;
@@ -79,11 +89,42 @@ export interface ReleaseBrowserOptions {
 const browsers = new Map<string, BrowserHandle>();
 /** In-flight opens by browser key, so concurrent acquisitions share one launch instead of storming Chromium. */
 const pendingOpens = new Map<string, Promise<BrowserHandle>>();
+interface AuditBrowserLaunchState {
+	attempted: boolean;
+	failed: boolean;
+	handle: BrowserHandle | null;
+}
+
+const auditBrowserLaunches = new Map<string, AuditBrowserLaunchState>();
+
+export interface SettledAuditBrowserLaunch {
+	readonly attempted: boolean;
+	readonly failed: boolean;
+	readonly handle: BrowserHandle | null;
+}
+
+/** Waits until a dedicated audit acquisition cannot publish another handle. */
+export async function settleAuditBrowserLaunch(auditId: string): Promise<SettledAuditBrowserLaunch> {
+	const key = `audit:${auditId}`;
+	await pendingOpens.get(key)?.catch(() => undefined);
+	const state = auditBrowserLaunches.get(auditId);
+	return {
+		attempted: state?.attempted === true,
+		failed: state?.failed === true,
+		handle: browsers.get(key) ?? state?.handle ?? null,
+	};
+}
+
+export function forgetAuditBrowserLaunch(auditId: string): void {
+	auditBrowserLaunches.delete(auditId);
+}
 
 function browserKey(kind: BrowserKind): string {
 	switch (kind.kind) {
 		case "headless":
 			return `headless:${kind.headless ? "1" : "0"}`;
+		case "audit":
+			return `audit:${kind.auditId}`;
 		case "spawned":
 			return `spawned:${kind.path}`;
 		case "connected":
@@ -127,9 +168,25 @@ export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOpti
 			await pending.catch(() => undefined);
 			continue;
 		}
+		if (kind.kind === "audit") {
+			auditBrowserLaunches.set(kind.auditId, { attempted: true, failed: false, handle: null });
+		}
 		const open = openBrowserHandle(kind, opts).finally(() => pendingOpens.delete(key));
 		pendingOpens.set(key, open);
-		const handle = await open;
+		let handle: BrowserHandle;
+		try {
+			handle = await open;
+			if (kind.kind === "audit") {
+				const state = auditBrowserLaunches.get(kind.auditId);
+				if (state) state.handle = handle;
+			}
+		} catch (error) {
+			if (kind.kind === "audit") {
+				const state = auditBrowserLaunches.get(kind.auditId);
+				if (state) state.failed = true;
+			}
+			throw error;
+		}
 		// The launch may resolve AFTER the caller has already aborted (the outer
 		// `untilAborted` rejects immediately on abort but does not cancel the
 		// inner promise, and `launchHeadlessBrowser` does not accept a signal).
@@ -173,18 +230,17 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			refCount: 0,
 		};
 	}
-	if (kind.kind === "headless") {
-		// Every real omp process (session, subagent, worker — anything with a CLI
-		// worker host) MUST go through the project-shared broker-owned Chromium:
-		// per-process launches are what produced launch storms and orphaned
-		// process trees. The process-local launch survives only for hosts that
-		// cannot spawn the broker (bun test, SDK embedding without a CLI entry).
-		if (isCompiledBinary() || workerHostEntry() !== null) {
+	if (kind.kind === "headless" || kind.kind === "audit") {
+		// Audit browsers deliberately bypass the process/project headless pool.
+		// Their unique registry key and separately launched temporary profile prevent
+		// cookies, storage, default context, and ownership from crossing an audit boundary.
+		if (kind.kind === "headless" && (isCompiledBinary() || workerHostEntry() !== null)) {
 			return await openSharedHeadlessHandle(kind, opts);
 		}
 		const { browser, userDataDir } = await launchHeadlessBrowser({
-			headless: kind.headless,
+			headless: true,
 			viewport: opts.viewport,
+			args: kind.kind === "audit" ? AUDIT_CHROMIUM_ARGS : opts.appArgs,
 		});
 		return {
 			key: browserKey(kind),
@@ -330,12 +386,17 @@ export async function releaseBrowser(handle: BrowserHandle, opts: ReleaseBrowser
 	}
 }
 
+/** Whether this exact handle is still live in the browser registry. */
+export function isBrowserRegistered(handle: BrowserHandle): boolean {
+	return browsers.get(handle.key) === handle;
+}
+
 async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserOptions): Promise<void> {
 	if ("client" in handle) {
 		handle.client.close();
 		return;
 	}
-	if (handle.kind.kind === "headless") {
+	if (handle.kind.kind === "headless" || handle.kind.kind === "audit") {
 		if (handle.sharedDaemon) {
 			// The broker owns the Chromium; this process only drops its CDP
 			// connection. `kill` is scoped to spawned-app browsers — stopping the

@@ -107,12 +107,15 @@ export interface SubagentLifecyclePayload {
 
 /** Display cap for a normalized one-line label (roster line, registry `displayName`, prompt field). */
 export const LABEL_MAX = 80;
-const TASK_TOOL_PROFILE_SCHEMA = "'none' | 'inspect' | 'review' | 'edit' | 'plan' | 'web-research' | 'vision'" as const;
+const TASK_TOOL_PROFILE_SCHEMA =
+	"'none' | 'inspect' | 'review' | 'edit' | 'plan' | 'web-research' | 'vision' | 'browser-audit'" as const;
 
 // Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
 const outputSchemaInputSchema = type("object | boolean | string | null");
 // Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
 const effortRule = '"lo" | "med" | "hi"' as const;
+const agentSourceRule = '"bundled" | "user" | "project"' as const;
+const sha256Rule = type("string").matching(/^[0-9a-f]{64}$/);
 
 const taskPermissionSchema = type({
 	"profiles?": "string[]",
@@ -161,6 +164,8 @@ function createTaskItemSchema(options: {
 		"name?": "string",
 		agent: taskAgentSchemaRule(options.defaultAgent ?? "task"),
 		task: "string",
+		"agentSource?": agentSourceRule,
+		"agentDefinitionSha256?": sha256Rule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
@@ -189,6 +194,8 @@ function createTaskSchema(options: {
 		"name?": "string",
 		agent: taskAgentSchemaRule(options.defaultAgent ?? "task"),
 		task: "string",
+		"agentSource?": agentSourceRule,
+		"agentDefinitionSha256?": sha256Rule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
@@ -237,6 +244,10 @@ export interface TaskItem {
 	agent?: string;
 	/** The work; required by the schema. */
 	task?: string;
+	/** Exact discovered source required for this spawn. */
+	agentSource?: AgentSource;
+	/** SHA-256 of the exact file-backed agent definition bytes required for this spawn. */
+	agentDefinitionSha256?: string;
 	/** Request-local model selector for this spawn. */
 	model?: string;
 	/** Least-privilege guardrails for this spawn. */
@@ -258,6 +269,8 @@ export const taskSchema = type({
 	agent: "string = 'task'",
 	"effort?": effortRule,
 	task: "string",
+	"agentSource?": agentSourceRule,
+	"agentDefinitionSha256?": sha256Rule,
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"isolated?": "boolean",
@@ -270,6 +283,8 @@ const taskSchemaNoIsolation = type({
 	task: "string",
 	"effort?": effortRule,
 	"outputSchema?": outputSchemaInputSchema,
+	"agentSource?": agentSourceRule,
+	"agentDefinitionSha256?": sha256Rule,
 	"schemaMode?": '"permissive" | "strict"',
 	"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
 	"+": "delete",
@@ -352,6 +367,10 @@ export interface TaskParams {
 	task?: string;
 	/** Request-local model selector for this spawn (flat form). */
 	model?: string;
+	/** Exact discovered source required for this spawn. */
+	agentSource?: AgentSource;
+	/** SHA-256 of the exact file-backed agent definition bytes required for this spawn. */
+	agentDefinitionSha256?: string;
 	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
 	effort?: TaskEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
@@ -423,6 +442,12 @@ export interface ReviewData {
 
 /** Agent definition (bundled or discovered) */
 export interface AgentDefinition {
+	/** SHA-256 of exact file bytes when the definition was descriptor-read and frozen for execution. */
+	definitionSha256?: string;
+	/** Device identity captured from the descriptor opened with O_NOFOLLOW. */
+	definitionDevice?: string;
+	/** Inode identity captured from the descriptor opened with O_NOFOLLOW. */
+	definitionInode?: string;
 	name: string;
 	description: string;
 	systemPrompt: string;

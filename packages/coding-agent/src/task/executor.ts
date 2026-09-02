@@ -34,6 +34,11 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { PreparedExtension } from "../extensibility/extensions/types";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
+import {
+	type BrowserAuditToolCapability,
+	bindBrowserAuditSessionOptions,
+	takeBrowserAuditRunCapability,
+} from "../internal/browser-audit-authority";
 import type { LocalProtocolOptions } from "../internal-urls";
 import type { MCPManager } from "../mcp/manager";
 import type { MnemopiSessionState } from "../mnemopi/state";
@@ -54,6 +59,7 @@ import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
 import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
 import type { ContextFileEntry } from "../tools";
+
 import { normalizeToolNames } from "../tools/builtin-names";
 import { isIrcEnabled } from "../tools/hub";
 import { LIST_STATUS_ORDER } from "../tools/hub/messaging";
@@ -448,6 +454,8 @@ export interface RunSubprocessOptions {
 	outputSchemaOverridesAgent?: boolean;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
+	/** Effective least-privilege scope resolved for this spawn. */
+	permissionScope?: EffectiveSubagentPermissions;
 	/**
 	 * Override the `task.maxRuntimeMs` wall-clock cap for this run. When provided
 	 * it wins over the settings value; `0` disables the per-subagent wall-clock
@@ -545,19 +553,9 @@ export interface RunSubprocessOptions {
 	parentTelemetry?: AgentTelemetryConfig;
 	/** Skills to autoload via sendCustomMessage before the first prompt */
 	autoloadSkills?: Skill[];
-	/**
-	 * Registry id of the spawning agent, recorded as this subagent's parent.
-	 * Forwarded verbatim to the SDK; the executor never derives it (the spawner
-	 * passes its own `getAgentId()`).
-	 */
+	/** Registry id of the spawning agent, recorded as this subagent's parent. */
 	parentAgentId?: string;
-	/** Per-spawn guardrail scope composed by the task tool. */
-	permissionScope?: EffectiveSubagentPermissions;
-	/**
-	 * Keep the finished subagent addressable in the registry for IRC/revival.
-	 * Defaults to true. Eval bridge agents are programmatic one-shot helpers and
-	 * set this false so disposal unregisters them instead of leaving idle peers.
-	 */
+	/** Keep the finished subagent addressable in the registry for IRC/revival. */
 	keepAlive?: boolean;
 	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
 	onCleanupDeferred?: (completion: Promise<void>) => void;
@@ -2796,6 +2794,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		onProgress,
 	} = options;
 	const cleanupGraceMs = options.cleanupGraceMs ?? TASK_ABORT_CLEANUP_GRACE_MS;
+	let browserAuditCapability: BrowserAuditToolCapability | undefined = takeBrowserAuditRunCapability(options.agent);
 	const startTime = Date.now();
 	// loop dispatches a chat request to the provider — the launch-complete boundary.
 	let firstChatDispatchAt: number | undefined;
@@ -3204,93 +3203,100 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			const buildSubagentSessionOptions = (
 				sessionManagerForRun: SessionManager,
 				expectedAgentRef: CreateAgentSessionOptions["expectedAgentRef"],
-			): CreateAgentSessionOptions => ({
-				cwd: worktree ?? cwd,
-				additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
-				authStorage,
-				modelRegistry,
-				getApiKey: options.getApiKey,
-				settings: subagentSettings,
-				eventBus: options.eventBus,
+			): CreateAgentSessionOptions => {
+				const sessionOptions: CreateAgentSessionOptions = {
+					cwd: worktree ?? cwd,
+					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
+					authStorage,
+					modelRegistry,
+					getApiKey: options.getApiKey,
+					settings: subagentSettings,
+					eventBus: options.eventBus,
 
-				model,
-				modelPattern: model || modelPatterns.length === 0 || exactModelOverride ? undefined : modelPatterns,
-				modelPatternAuthFallback:
-					model || modelPatterns.length === 0 || exactModelOverride ? undefined : options.parentActiveModelPattern,
-				modelPatternFallbackRole:
-					model || modelPatterns.length === 0 || exactModelOverride
-						? undefined
-						: `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`,
-				modelPatternDefaultFallbackChain:
-					model || modelPatterns.length === 0 || exactModelOverride ? undefined : inheritedRetryFallbackChain,
-				thinkingLevel: effectiveThinkingLevel,
-				thinkingLevelCeiling: spawnEffortCeiling,
-				toolNames,
-				outputSchema,
-				outputSchemaMode: options.outputSchemaMode,
-				restrictToolNames: options.restrictToolNames,
-				requireYieldTool: true,
-				contextFiles: options.contextFiles,
-				skills: options.skills,
-				promptTemplates: options.promptTemplates,
-				workspaceTree: options.workspaceTree,
-				rules: options.rules,
-				extensionRoots: options.extensionRoots,
-				preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
-				preloadedPreparedExtensions: restrictToolNames ? [] : options.preloadedPreparedExtensions,
-				preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
-				systemPrompt: defaultPrompt => {
-					const ircRoster = ircEnabled
-						? collectIrcPeerRoster(AgentRegistry.global(), id, ircRootSessionFile)
-						: undefined;
-					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-						agent: agent.systemPrompt,
-						context: options.context?.trim() ?? "",
-						planReference: options.planReference?.content ?? "",
-						planReferencePath: options.planReference?.path ?? "",
-						worktree: worktree ?? "",
-						outputSchema: normalizedOutputSchema,
-						outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
-						ircPeers: ircRoster?.peers ?? [],
-						ircParkedCount: ircRoster?.parkedCount ?? 0,
-						ircOmittedCount: ircRoster?.omittedCount ?? 0,
-						ircSelfId: ircEnabled ? id : "",
-						permissionBlock: formatPermissionScopeForPrompt(options.permissionScope),
-					});
-					return defaultPrompt.length === 0
-						? [subagentPrompt]
-						: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
-				},
-				sessionManager: sessionManagerForRun,
-				hasUI: false,
-				prewalk,
-				spawns: spawnsEnv,
-				taskDepth: childDepth,
-				// The whole spawn tree shares the root session's observability bus,
-				// so nested lifecycle/progress/event frames reach its surfaces
-				// without leaking into another root session's traffic.
-				subagentEventBus: options.subagentEventBus,
-				parentHindsightSessionState: options.parentHindsightSessionState,
-				parentMnemopiSessionState: options.parentMnemopiSessionState,
-				parentTaskPrefix: id,
-				parentAgentId: options.parentAgentId,
-				agentId: id,
-				agentDisplayName: agent.name,
-				expectedAgentRef,
-				enableLsp: lspEnabled,
-				enableIrc: options.enableIrc,
-				skipPythonPreflight,
-				enableMCP,
-				mcpManager,
-				customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
-				localProtocolOptions: options.localProtocolOptions,
-				telemetry: subagentTelemetry,
-				parentEvalSessionId: options.parentEvalSessionId,
-				permissionScope: options.permissionScope,
-				onFirstChatDispatch: () => {
-					firstChatDispatchAt ??= performance.now();
-				},
-			});
+					model,
+					modelPattern: model || modelPatterns.length === 0 || exactModelOverride ? undefined : modelPatterns,
+					modelPatternAuthFallback:
+						model || modelPatterns.length === 0 || exactModelOverride
+							? undefined
+							: options.parentActiveModelPattern,
+					modelPatternFallbackRole:
+						model || modelPatterns.length === 0 || exactModelOverride
+							? undefined
+							: `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`,
+					modelPatternDefaultFallbackChain:
+						model || modelPatterns.length === 0 || exactModelOverride ? undefined : inheritedRetryFallbackChain,
+					thinkingLevel: effectiveThinkingLevel,
+					thinkingLevelCeiling: spawnEffortCeiling,
+					toolNames,
+					outputSchema,
+					outputSchemaMode: options.outputSchemaMode,
+					restrictToolNames: options.restrictToolNames,
+					requireYieldTool: true,
+					contextFiles: options.contextFiles,
+					skills: options.skills,
+					promptTemplates: options.promptTemplates,
+					workspaceTree: options.workspaceTree,
+					rules: options.rules,
+					extensionRoots: options.extensionRoots,
+					preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
+					preloadedPreparedExtensions: restrictToolNames ? [] : options.preloadedPreparedExtensions,
+					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
+					systemPrompt: defaultPrompt => {
+						const ircRoster = ircEnabled
+							? collectIrcPeerRoster(AgentRegistry.global(), id, ircRootSessionFile)
+							: undefined;
+						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
+							agent: agent.systemPrompt,
+							context: options.context?.trim() ?? "",
+							planReference: options.planReference?.content ?? "",
+							planReferencePath: options.planReference?.path ?? "",
+							worktree: worktree ?? "",
+							outputSchema: normalizedOutputSchema,
+							outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
+							ircPeers: ircRoster?.peers ?? [],
+							ircParkedCount: ircRoster?.parkedCount ?? 0,
+							ircOmittedCount: ircRoster?.omittedCount ?? 0,
+							ircSelfId: ircEnabled ? id : "",
+							permissionBlock: formatPermissionScopeForPrompt(options.permissionScope),
+						});
+						return defaultPrompt.length === 0
+							? [subagentPrompt]
+							: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
+					},
+					sessionManager: sessionManagerForRun,
+					hasUI: false,
+					prewalk,
+					spawns: spawnsEnv,
+					taskDepth: childDepth,
+					// The whole spawn tree shares the root session's observability bus,
+					// so nested lifecycle/progress/event frames reach its surfaces
+					// without leaking into another root session's traffic.
+					subagentEventBus: options.subagentEventBus,
+					parentHindsightSessionState: options.parentHindsightSessionState,
+					parentMnemopiSessionState: options.parentMnemopiSessionState,
+					parentTaskPrefix: id,
+					parentAgentId: options.parentAgentId,
+					agentId: id,
+					agentDisplayName: agent.name,
+					expectedAgentRef,
+					enableLsp: lspEnabled,
+					enableIrc: options.enableIrc,
+					skipPythonPreflight,
+					enableMCP,
+					mcpManager,
+					customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
+					localProtocolOptions: options.localProtocolOptions,
+					telemetry: subagentTelemetry,
+					parentEvalSessionId: options.parentEvalSessionId,
+					permissionScope: options.permissionScope,
+					onFirstChatDispatch: () => {
+						firstChatDispatchAt ??= performance.now();
+					},
+				};
+				bindBrowserAuditSessionOptions(sessionOptions, browserAuditCapability);
+				browserAuditCapability = undefined;
+				return sessionOptions;
+			};
 
 			const sessionManager = await awaitAbortable(sessionManagerPromise);
 			if (options.parentArtifactManager) {

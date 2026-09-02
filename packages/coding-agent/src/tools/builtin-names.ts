@@ -13,6 +13,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"lsp",
 	"inspect_image",
 	"browser",
+	"browser_audit",
 	"computer",
 	"checkpoint",
 	"rewind",
@@ -29,6 +30,24 @@ export const BUILTIN_TOOL_NAMES = [
 	"learn",
 	"manage_skill",
 ] as const;
+
+/** Browser Audit is a native core capability, but its external ingress name is immutable. */
+const RESERVED_CORE_TOOL_NAMES: Record<string, true> = { browser_audit: true };
+
+/** Whether a name is reserved for a core runtime integration. */
+export function isReservedCoreToolName(name: string): boolean {
+	return Object.hasOwn(RESERVED_CORE_TOOL_NAMES, name);
+}
+
+/** Create the deterministic error used by every reserved-name ingress. */
+export function reservedCoreToolNameError(name: string): Error {
+	return new Error(`Tool name "${name}" is reserved by the core runtime`);
+}
+
+/** Reject names reserved for core runtime integrations. */
+export function assertToolNameNotReserved(name: string): void {
+	if (isReservedCoreToolName(name)) throw reservedCoreToolNameError(name);
+}
 
 export type BuiltinToolName = (typeof BUILTIN_TOOL_NAMES)[number];
 

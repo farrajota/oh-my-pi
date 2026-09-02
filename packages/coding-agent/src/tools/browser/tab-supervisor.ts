@@ -126,6 +126,8 @@ export interface AcquireTabOptions {
 	 * dispose. Optional — omitting it opts the tab out of session-scoped reap.
 	 */
 	ownerSessionId?: string;
+	/** Exact dedicated audit owner; omitted callers cannot observe or mutate audit tabs. */
+	auditId?: string;
 }
 
 export interface AcquireTabResult {
@@ -138,12 +140,18 @@ export interface RunInTabOptions {
 	timeoutMs: number;
 	signal?: AbortSignal;
 	session: ToolSession;
+	/** Retain host-owned request handlers until the dedicated browser is torn down. */
+	preserveRequestInterception?: boolean;
+	/** Exact dedicated audit owner; omitted callers cannot execute against audit tabs. */
+	auditId?: string;
 }
 
 export interface ReleaseTabOptions {
 	kill?: boolean;
 	/** Maximum time for each asynchronous cleanup resource before close fails with diagnostics. */
 	timeoutMs?: number;
+	/** Exact dedicated audit owner; omitted callers cannot close audit tabs. */
+	auditId?: string;
 }
 
 const tabs = new Map<string, TabSession>();
@@ -203,8 +211,17 @@ async function waitForTabCleanup<T>(
 	}
 }
 
-export function getTab(name: string): TabSession | undefined {
-	return tabs.get(name);
+function canAccessTab(tab: TabSession, auditId: string | undefined): boolean {
+	if (tab.browser.kind.kind !== "audit") return auditId === undefined;
+	return auditId !== undefined && tab.browser.kind.auditId === auditId;
+}
+
+export function getTab(name: string, auditId?: string): TabSession | undefined {
+	const tab = tabs.get(name);
+	return tab && canAccessTab(tab, auditId) ? tab : undefined;
+}
+export function hasTab(name: string): boolean {
+	return tabs.has(name);
 }
 
 export function acquireTab(name: string, browser: BrowserHandle, opts: AcquireTabOptions): Promise<AcquireTabResult> {
@@ -261,17 +278,20 @@ async function acquireTabImpl(
 	// to reuse (e.g. reopening the sole tab with a different dialogs policy).
 	let tempHold = false;
 	const existing = tabs.get(name);
+	if (existing && !canAccessTab(existing, opts.auditId)) {
+		throw new ToolError(`Tab ${JSON.stringify(name)} is owned by a dedicated browser audit.`);
+	}
 	if (existing) {
 		if (existing.browser === browser && existing.state === "alive") {
 			const requestedCmuxSurface = "client" in browser ? (opts.cmuxSurface ?? browser.surface) : undefined;
 			if (existing.backend === "cmux" && existing.cmuxAttachedSurface !== requestedCmuxSurface) {
 				holdBrowser(browser);
 				tempHold = true;
-				await releaseTab(name, { kill: false });
+				await releaseTab(name, { kill: false, auditId: opts.auditId });
 			} else if (opts.dialogs !== undefined && opts.dialogs !== existing.dialogPolicy) {
 				holdBrowser(browser);
 				tempHold = true;
-				await releaseTab(name, { kill: false });
+				await releaseTab(name, { kill: false, auditId: opts.auditId });
 			} else {
 				const reuseSteps: string[] = [];
 				if (opts.viewport && browser.kind.kind !== "cmux") {
@@ -292,6 +312,7 @@ async function acquireTabImpl(
 							code: reuseSteps.join("\n"),
 							timeoutMs: opts.timeoutMs,
 							signal: opts.signal,
+							auditId: opts.auditId,
 						},
 						{ cwd: getProjectDir() },
 					);
@@ -303,7 +324,7 @@ async function acquireTabImpl(
 				holdBrowser(browser);
 				tempHold = true;
 			}
-			await releaseTab(name, { kill: false });
+			await releaseTab(name, { kill: false, auditId: opts.auditId });
 		}
 	}
 
@@ -494,7 +515,14 @@ async function acquireCmuxTab(
 export async function runInTab(name: string, opts: RunInTabOptions): Promise<RunResultOk> {
 	return await runInTabWithSnapshot(
 		name,
-		{ code: opts.code, timeoutMs: opts.timeoutMs, signal: opts.signal, session: opts.session },
+		{
+			code: opts.code,
+			timeoutMs: opts.timeoutMs,
+			signal: opts.signal,
+			session: opts.session,
+			preserveRequestInterception: opts.preserveRequestInterception,
+			auditId: opts.auditId,
+		},
 		{
 			cwd: opts.session.cwd,
 			browserScreenshotDir: expandBrowserScreenshotDir(opts.session),
@@ -505,10 +533,20 @@ export async function runInTab(name: string, opts: RunInTabOptions): Promise<Run
 
 async function runInTabWithSnapshot(
 	name: string,
-	opts: { code: string; timeoutMs: number; signal?: AbortSignal; session?: ToolSession },
+	opts: {
+		code: string;
+		timeoutMs: number;
+		signal?: AbortSignal;
+		session?: ToolSession;
+		preserveRequestInterception?: boolean;
+		auditId?: string;
+	},
 	snapshot: SessionSnapshot,
 ): Promise<RunResultOk> {
 	const tab = tabs.get(name);
+	if (tab && !canAccessTab(tab, opts.auditId)) {
+		throw new ToolError(`Tab ${JSON.stringify(name)} is owned by a dedicated browser audit.`);
+	}
 	if (!tab || tab.state === "dead") {
 		const killed = killedTabs.get(name);
 		throw new ToolError(
@@ -579,6 +617,7 @@ async function runInTabWithSnapshot(
 			code: opts.code,
 			timeoutMs: opts.timeoutMs,
 			session: snapshot,
+			preserveRequestInterception: opts.preserveRequestInterception,
 		});
 		try {
 			return await raceWithTimeout(
@@ -617,6 +656,9 @@ async function runInTabWithSnapshot(
 
 export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Promise<boolean> {
 	const tab = tabs.get(name);
+	if (tab && !canAccessTab(tab, opts.auditId)) {
+		throw new ToolError(`Tab ${JSON.stringify(name)} is owned by a dedicated browser audit.`);
+	}
 	if (!tab) {
 		logger.debug("releaseTab: unknown tab", { name });
 		return false;
@@ -720,7 +762,7 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 }
 
 export async function releaseAllTabs(opts: ReleaseTabOptions = {}): Promise<number> {
-	const names = [...tabs.keys()];
+	const names = [...tabs.values()].filter(tab => canAccessTab(tab, opts.auditId)).map(tab => tab.name);
 	let count = 0;
 	for (const name of names) {
 		if (await releaseTab(name, opts)) count++;
@@ -748,7 +790,9 @@ export async function dropHeadlessTabs(): Promise<void> {
  */
 export async function releaseTabsForOwner(ownerId: string, opts: ReleaseTabOptions = {}): Promise<number> {
 	if (!ownerId) return 0;
-	const names = [...tabs.values()].filter(tab => tab.ownerSessionId === ownerId).map(tab => tab.name);
+	const names = [...tabs.values()]
+		.filter(tab => tab.ownerSessionId === ownerId && canAccessTab(tab, opts.auditId))
+		.map(tab => tab.name);
 	let count = 0;
 	for (const name of names) {
 		if (await releaseTab(name, opts)) count++;
@@ -770,14 +814,13 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 	const safeDir = getPuppeteerDir();
 	const browserWSEndpoint = browser.browser.wsEndpoint();
 	if (!browserWSEndpoint) throw new ToolError("Browser websocket endpoint is unavailable");
-	if (browser.kind.kind === "headless") {
+	if (browser.kind.kind === "headless" || browser.kind.kind === "audit") {
 		return {
 			mode: "headless",
 			browserWSEndpoint,
 			safeDir,
-			// Visible launches still need an OMP-owned page, stealth setup, and
-			// independent lifecycle; only their fixed device emulation is disabled.
-			emulateViewport: browser.kind.headless,
+			// Dedicated audit browsers always own a page with fixed device emulation.
+			emulateViewport: browser.kind.kind === "audit" ? true : browser.kind.headless,
 			viewport: opts.viewport,
 			dialogs: opts.dialogs,
 			url: opts.url,

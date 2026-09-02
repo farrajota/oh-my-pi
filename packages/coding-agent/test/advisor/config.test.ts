@@ -96,6 +96,42 @@ describe("discoverAdvisorConfigs", () => {
 		expect(result.advisors).toEqual([]);
 		expect(result.sharedInstructions).toBeUndefined();
 	});
+
+	it("discovers the unchanged active default and paused or explicitly enabled specialist", async () => {
+		const defaultModel = "cliproxy-codex/gpt-5.6-sol:high";
+		const config = [
+			"advisors:",
+			"  - name: default",
+			`    model: ${defaultModel}`,
+			"  - name: deterministic-simplification",
+			"    enabled: false",
+			"    tools: [read, grep, glob]",
+			"    instructions: Use the bounded deterministic review contract.",
+		].join("\n");
+
+		await Bun.write(path.join(tmp, "WATCHDOG.yml"), config);
+		const paused = (await discoverAdvisorConfigs(tmp, agentDir)).advisors;
+		expect(paused.map(advisor => advisor.name)).toEqual(["default", "deterministic-simplification"]);
+		expect(paused[0]).toMatchObject({ name: "default", model: defaultModel });
+		expect(paused[0].enabled).toBeUndefined();
+		expect(paused[1]).toMatchObject({
+			name: "deterministic-simplification",
+			enabled: false,
+			tools: ["read", "grep", "glob"],
+		});
+		expect(paused[1].model).toBeUndefined();
+
+		await Bun.write(path.join(tmp, "WATCHDOG.yml"), config.replace("enabled: false", "enabled: true"));
+		const enabled = (await discoverAdvisorConfigs(tmp, agentDir)).advisors;
+		expect(enabled[0]).toMatchObject({ name: "default", model: defaultModel });
+		expect(enabled[0].enabled).toBeUndefined();
+		expect(enabled[1]).toMatchObject({
+			name: "deterministic-simplification",
+			enabled: true,
+			tools: ["read", "grep", "glob"],
+		});
+		expect(enabled[1].model).toBeUndefined();
+	});
 });
 
 describe("slugifyAdvisorName", () => {

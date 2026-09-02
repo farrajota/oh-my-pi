@@ -29,6 +29,8 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
   - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
 {{#if modelEnabled}}  - `model`: Available only when `task.allowModelOverride` is enabled. Pass one non-empty request-local selector for this item (for example, `pi/taskpro`), never a comma-separated fallback chain. It overrides `task.agentModelOverrides`, agent frontmatter, and the parent model for this invocation only. Resolution is exact: no parent-auth fallback, configured runtime fallback chain, or prewalk handoff. Approval/call output shows the requested selector; progress/results show requested and resolved models.
 {{/if}}
+  - `agentSource`: Optional exact source pin: `bundled`, `user`, or `project`.
+  - `agentDefinitionSha256`: Optional lowercase SHA-256 pin for the exact file-backed agent definition bytes. A pin mismatch blocks before launch.
 {{#if effortEnabled}}  - `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
 {{/if}}
   - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
@@ -48,6 +50,8 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
 {{#if modelEnabled}}- `model`: Available only when `task.allowModelOverride` is enabled. Pass one non-empty request-local selector (for example, `pi/taskpro`), never a comma-separated fallback chain. It overrides `task.agentModelOverrides`, agent frontmatter, and the parent model for this invocation only. Resolution is exact: no parent-auth fallback, configured runtime fallback chain, or prewalk handoff. Approval/call output shows the requested selector; progress/results show requested and resolved models.
 {{/if}}
+- `agentSource`: Optional exact source pin: `bundled`, `user`, or `project`.
+- `agentDefinitionSha256`: Optional lowercase SHA-256 pin for the exact file-backed agent definition bytes. A pin mismatch blocks before launch.
 {{#if effortEnabled}}- `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
 {{/if}}
 - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
@@ -60,7 +64,7 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 {{/if}}
 {{/if}}
 {{/if}}
-- `toolProfile`: Optional least-privilege tool shorthand: `none`, `inspect`, `review`, `edit`, `plan`, `web-research`, or `vision`. It can only restrict an agent's tools.
+- `toolProfile`: Optional least-privilege tool shorthand: `none`, `inspect`, `review`, `edit`, `plan`, `web-research`, or `vision`. Profiles can only restrict an agent's tools.
 {{#if permissionsEnabled}}
 - `permissions`: Least-privilege guardrails. In a batch, set this on each `tasks[]` item. With a `toolProfile`, the effective tools are their intersection; permissions never widen the profile.
   - `profiles`: Permission profile names. Combine a tool-granting profile with modifier profiles as needed.

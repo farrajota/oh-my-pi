@@ -1,6 +1,15 @@
 import { normalizeToolNames } from "../tools/builtin-names";
 
-export const TASK_TOOL_PROFILE_NAMES = ["none", "inspect", "review", "edit", "plan", "web-research", "vision"] as const;
+export const TASK_TOOL_PROFILE_NAMES = [
+	"none",
+	"inspect",
+	"review",
+	"edit",
+	"plan",
+	"web-research",
+	"vision",
+	"browser-audit",
+] as const;
 export type TaskToolProfileName = (typeof TASK_TOOL_PROFILE_NAMES)[number];
 
 const TASK_TOOL_PROFILE_DEFINITIONS: Record<TaskToolProfileName, readonly string[]> = {
@@ -8,10 +17,11 @@ const TASK_TOOL_PROFILE_DEFINITIONS: Record<TaskToolProfileName, readonly string
 	inspect: ["read", "search", "find"],
 	review: ["read", "search", "find", "ast_grep"],
 	edit: ["read", "search", "find", "ast_grep", "edit", "write"],
-	plan: ["read", "search", "find", "lsp", "web_search"],
-	"web-research": ["web_search", "read"],
-	vision: ["read", "inspect_image"],
-} as const;
+	plan: ["read", "search", "find", "ast_grep", "task", "todo"],
+	"web-research": ["read", "search", "find", "web_search"],
+	vision: ["read", "search", "find", "inspect_image"],
+	"browser-audit": ["browser_audit"],
+};
 
 export function isTaskToolProfileName(value: string): value is TaskToolProfileName {
 	return TASK_TOOL_PROFILE_NAMES.includes(value as TaskToolProfileName);

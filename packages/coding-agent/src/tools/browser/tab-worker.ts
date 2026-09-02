@@ -545,7 +545,7 @@ function redactUrlCredentials(url: string): string {
 
 class RequestInterceptionCleanupError extends ToolError {}
 
-interface RunPageScope {
+export interface RunPageScope {
 	page: Page;
 	cleanup(): Promise<void>;
 }
@@ -555,7 +555,7 @@ interface RunPageScope {
  * Puppeteer's Page wraps an internal emitter, so `removeAllListeners("request")`
  * would also remove its forwarding listener; the facade removes only user handlers.
  */
-function createRunPageScope(page: Page): RunPageScope {
+export function createRunPageScope(page: Page, preserveRequestInterception = false): RunPageScope {
 	const requestHandlers: unknown[] = [];
 	const on = page.on;
 	const off = page.off;
@@ -628,21 +628,23 @@ function createRunPageScope(page: Page): RunPageScope {
 			else Reflect.deleteProperty(page, "once");
 			if (removeAllDescriptor) Object.defineProperty(page, "removeAllListeners", removeAllDescriptor);
 			else Reflect.deleteProperty(page, "removeAllListeners");
-			for (const handler of requestHandlers) Reflect.apply(off, page, ["request", handler]);
-			requestHandlers.length = 0;
-			try {
-				await withTimeout(
-					page.setRequestInterception(false),
-					REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS,
-					"Timed out clearing browser request interception",
-				);
-			} catch (error) {
-				throw new RequestInterceptionCleanupError(
-					"Failed to clear browser request interception after browser.run",
-					{
-						error: error instanceof Error ? error.message : String(error),
-					},
-				);
+			if (!preserveRequestInterception) {
+				for (const handler of requestHandlers) Reflect.apply(off, page, ["request", handler]);
+				requestHandlers.length = 0;
+				try {
+					await withTimeout(
+						page.setRequestInterception(false),
+						REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS,
+						"Timed out clearing browser request interception",
+					);
+				} catch (error) {
+					throw new RequestInterceptionCleanupError(
+						"Failed to clear browser request interception after browser.run",
+						{
+							error: error instanceof Error ? error.message : String(error),
+						},
+					);
+				}
 			}
 		},
 	};
@@ -1279,7 +1281,7 @@ export class WorkerCore {
 		let runPage: RunPageScope | undefined;
 		try {
 			throwIfAborted(signal);
-			runPage = createRunPageScope(this.#requirePage());
+			runPage = createRunPageScope(this.#requirePage(), msg.preserveRequestInterception === true);
 			const browser = this.#requireBrowser();
 			const tabApi = this.#createTabApi(msg.name, msg.timeoutMs, signal, msg.session, output, screenshots, active);
 			const runtime = this.#ensureRuntime(msg.session);

@@ -335,6 +335,7 @@
       "types": "./src/extensibility/plugins/marketplace/*.ts",
       "import": "./src/extensibility/plugins/marketplace/*.ts"
     },
+    "./internal/*": null,
     "./internal-urls": {
       "types": "./src/internal-urls/index.ts",
       "import": "./src/internal-urls/index.ts"

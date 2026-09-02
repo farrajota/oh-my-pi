@@ -14,6 +14,10 @@
  *    runtime for internal callers.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
+import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import { Effort, type ServiceTierByFamily } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -23,8 +27,22 @@ import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { BUILTIN_TOOLS, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import {
+	BROWSER_AUDIT_CORE_PACKAGE_IDENTITY,
+	BROWSER_AUDIT_TOOL_IMPLEMENTATION_REVISION,
+	type BrowserAuditActor,
+	type BrowserAuditAuthorization,
+	type BrowserAuditDispatch,
+	type BrowserAuditTuple,
+} from "@oh-my-pi/pi-coding-agent/tools/browser-audit";
+import type { BrowserAuditBindingInput } from "@oh-my-pi/pi-coding-agent/tools/browser-audit-production";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
+import {
+	bindBrowserAuditToolSession,
+	installRegisteredBrowserAuditBinding,
+	takeBrowserAuditRunCapability,
+} from "../../src/internal/browser-audit-authority";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -47,6 +65,8 @@ function createSession(
 		settings?: Record<string, unknown>;
 		agentId?: string;
 		planMode?: boolean;
+		taskDepth?: number;
+		serviceTier?: ServiceTierByFamily;
 		spawns?: string;
 	} = {},
 ): ToolSession {
@@ -57,9 +77,10 @@ function createSession(
 		getSessionFile: () => null,
 		getSessionSpawns: () => options.spawns ?? "*",
 		getAgentId: () => options.agentId ?? null,
+		getServiceTierByFamily: () => options.serviceTier,
+		taskDepth: options.taskDepth,
 		getPlanModeState: options.planMode ? () => ({ enabled: true }) : undefined,
-		asyncJobManager: options.manager,
-	} as unknown as ToolSession;
+	} as ToolSession;
 }
 
 function getSchemaProperties(tool: TaskTool): Record<string, unknown> {
@@ -97,8 +118,8 @@ function makeResult(id: string, overrides: Partial<SingleResult> = {}): SingleRe
 	};
 }
 
-function mockDiscovery(agent: AgentDefinition | AgentDefinition[] = taskAgent): void {
-	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+function mockDiscovery(agent: AgentDefinition | AgentDefinition[] = taskAgent) {
+	return vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 		agents: Array.isArray(agent) ? agent : [agent],
 		projectAgentsDir: null,
 	});
@@ -117,6 +138,8 @@ describe("task.batch schema gating", () => {
 		expect(offProperties.context).toBeUndefined();
 		expect(offProperties.task).toBeDefined();
 		expect(offProperties.name).toBeDefined();
+		expect(offProperties.agentSource).toBeDefined();
+		expect(offProperties.agentDefinitionSha256).toBeDefined();
 		expect(offProperties.outputSchema).toBeDefined();
 		expect(typeof offProperties.outputSchema).toBe("object");
 		expect(offProperties.schemaMode).toBeDefined();
@@ -137,6 +160,8 @@ describe("task.batch schema gating", () => {
 		expect(itemProperties.name).toBeDefined();
 		expect(itemProperties.agent).toBeDefined();
 		expect(itemProperties.outputSchema).toBeDefined();
+		expect(itemProperties.agentSource).toBeDefined();
+		expect(itemProperties.agentDefinitionSha256).toBeDefined();
 		expect(typeof itemProperties.outputSchema).toBe("object");
 		expect(itemProperties.schemaMode).toBeDefined();
 	});
@@ -935,7 +960,7 @@ describe("task.batch spawning", () => {
 		mockDiscovery();
 		const started: string[] = [];
 		const gates = new Map<string, { promise: Promise<void>; resolve: () => void }>();
-		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+		const runSubprocess = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			const id = options.id ?? "?";
 			started.push(id);
 			const { promise, resolve } = Promise.withResolvers<void>();
@@ -999,5 +1024,535 @@ describe("task.batch spawning", () => {
 		expect(last?.async?.state).toBe("failed");
 		expect(last?.progress?.find(p => p.id === "Second")?.status).toBe("aborted");
 		expect(last?.progress?.find(p => p.id === "First")?.status).toBe("completed");
+
+		runSubprocess.mockImplementation(async options => {
+			started.push(options.id ?? "?");
+			return makeResult(options.id ?? "?");
+		});
+		const retryParams = {
+			context: "retry",
+			tasks: [{ name: "Second", agent: "task", task: "Retry B." }],
+		} as TaskParams;
+		const retryPreparation = await tool.prepareExecution(
+			"tc-cancelled-id-reuse",
+			retryParams,
+			undefined,
+			undefined,
+			{},
+		);
+		const retryResult = await tool.execute(
+			"tc-cancelled-id-reuse",
+			retryParams,
+			undefined,
+			undefined,
+			undefined,
+			retryPreparation,
+		);
+		const retryJobId = retryResult.details?.async?.jobId;
+		expect(retryJobId).toBeDefined();
+		expect(retryJobId).toBe("Second-2");
+		const retryJob = manager.getJob(retryJobId!);
+		expect(retryJob).toBeDefined();
+		await retryJob!.promise;
+		expect(retryJob!.errorText).toBeUndefined();
+		expect(retryJob!.status).toBe("completed");
+		expect(started).toEqual(["First", "Second"]);
+	});
+});
+
+describe("task exact preparation", () => {
+	const managers: AsyncJobManager[] = [];
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 1000 });
+	});
+
+	it("binds prepared state to one tool call and rejects replay", async () => {
+		mockDiscovery();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => makeResult(options.id ?? "?"));
+		const tool = await TaskTool.create(createSession({ settings: { "async.enabled": false, "task.batch": false } }));
+		const params = { name: "Pinned", agent: "task", task: "Do exact work." } as TaskParams;
+		const prepared = await tool.prepareExecution("call-pinned", params, undefined, undefined, {});
+
+		const wrongCall = await tool.execute("call-other", params, undefined, undefined, undefined, prepared);
+		expect(getFirstText(wrongCall)).toContain("execution key does not match");
+
+		const result = await tool.execute("call-pinned", params, undefined, undefined, undefined, prepared);
+		expect(result.details?.results.map(item => item.id)).toEqual(["Pinned"]);
+
+		const replay = await tool.execute("call-pinned", params, undefined, undefined, undefined, prepared);
+		expect(getFirstText(replay)).toContain("already disposed");
+
+		await expect(tool.prepareExecution("call-pinned", params, undefined, undefined, {})).rejects.toThrow(
+			"already has prepared execution state",
+		);
+	});
+
+	it("claims the call key before asynchronous preparation", async () => {
+		mockDiscovery();
+		const tool = await TaskTool.create(createSession({ settings: { "async.enabled": false, "task.batch": false } }));
+		const params = { name: "Concurrent", agent: "task", task: "Do exact work." } as TaskParams;
+		const first = tool.prepareExecution("call-concurrent", params, undefined, undefined, {});
+
+		await expect(tool.prepareExecution("call-concurrent", params, undefined, undefined, {})).rejects.toThrow(
+			"already has prepared execution state",
+		);
+		await (await first).dispose();
+	});
+
+	it("rolls back the call key and output id after preparation failure", async () => {
+		mockDiscovery();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => makeResult(options.id ?? "?"));
+		const tool = await TaskTool.create(
+			createSession({
+				settings: { "async.enabled": false, "task.batch": false, "task.permissions.mode": "enforce" },
+			}),
+		);
+		const invalid = {
+			name: "PreparedFailure",
+			agent: "task",
+			task: "Fail preparation.",
+			permissions: { profiles: ["missing-profile"] },
+		} as TaskParams;
+		await expect(
+			tool.prepareExecution("call-preparation-retry", invalid, undefined, undefined, {}),
+		).rejects.toThrow();
+		const valid = { name: "PreparedFailure", agent: "task", task: "Retry preparation." } as TaskParams;
+		const prepared = await tool.prepareExecution("call-preparation-retry", valid, undefined, undefined, {});
+
+		const result = await tool.execute("call-preparation-retry", valid, undefined, undefined, undefined, prepared);
+
+		expect(result.details?.results.map(item => item.id)).toEqual(["PreparedFailure"]);
+	});
+
+	it("freezes descriptor-read project agent bytes before execution", async () => {
+		const temp = TempDir.createSync("@task-pinned-agent-");
+		try {
+			const targetPath = temp.join("browser-audit-specialist-target.md");
+			const filePath = temp.join("browser-audit-specialist.md");
+			fs.writeFileSync(
+				targetPath,
+				"---\nname: browser-audit-specialist\ndescription: Browser audit\n---\nFrozen prompt.\n",
+			);
+			fs.symlinkSync(targetPath, filePath);
+			const bytes = fs.readFileSync(targetPath);
+			const sha256 = createHash("sha256").update(bytes).digest("hex");
+			const projectAgent: AgentDefinition = {
+				name: "browser-audit-specialist",
+				description: "Browser audit",
+				systemPrompt: "Stale discovery prompt.",
+				source: "project",
+				filePath,
+			};
+			mockDiscovery(projectAgent);
+			let executedPrompt: string | undefined;
+			vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+				executedPrompt = options.agent.systemPrompt;
+				return makeResult(options.id ?? "?", { agent: projectAgent.name, agentSource: "project" });
+			});
+			const tool = await TaskTool.create(
+				createSession({
+					planMode: true,
+					settings: {
+						"async.enabled": false,
+						"task.batch": false,
+						"task.allowModelOverride": true,
+						"task.agentModelOverrides": { "browser-audit-specialist": "fixture/model" },
+					},
+				}),
+			);
+			const params = {
+				name: "FrozenAgent",
+				agent: projectAgent.name,
+				agentSource: "project",
+				agentDefinitionSha256: sha256,
+				task: "Audit exact bytes.",
+				model: "pi/task",
+			} as TaskParams;
+			await expect(
+				tool.prepareExecution(
+					"call-stale-hash",
+					{ ...params, agentDefinitionSha256: "0".repeat(64) },
+					undefined,
+					undefined,
+					{},
+				),
+			).rejects.toThrow("SHA-256 mismatch");
+			const prepared = await tool.prepareExecution("call-frozen", params, undefined, undefined, {});
+			fs.writeFileSync(
+				targetPath,
+				"---\nname: browser-audit-specialist\ndescription: Browser audit\n---\nChanged prompt.\n",
+			);
+
+			const result = await tool.execute("call-frozen", params, undefined, undefined, undefined, prepared);
+
+			expect(result.details?.results[0]?.agentSource).toBe("project");
+			expect(executedPrompt).toContain("Frozen prompt.");
+			expect(executedPrompt).not.toContain("Stale discovery prompt.");
+		} finally {
+			temp.removeSync();
+		}
+	});
+
+	it("issues one browser audit capability through the registered Task and child factories", async () => {
+		const temp = TempDir.createSync("@task-audit-binding-");
+		try {
+			const filePath = temp.join("browser-audit-specialist.md");
+			fs.writeFileSync(
+				filePath,
+				"---\nname: browser-audit-specialist\ndescription: Browser audit\ntools: [browser_audit]\nblocking: true\n---\nAudit only through the reserved tool.\n",
+			);
+			const sha256 = createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+			mockDiscovery({
+				name: "browser-audit-specialist",
+				description: "Browser audit",
+				systemPrompt: "stale",
+				source: "user",
+				filePath,
+			});
+			let capturedOptions: executorModule.ExecutorOptions | undefined;
+			vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+				capturedOptions = options;
+				const nativeSession = createSession({ agentId: options.id });
+				const capability = takeBrowserAuditRunCapability(options.agent);
+				bindBrowserAuditToolSession(nativeSession, capability);
+				const childTool = await BUILTIN_TOOLS.browser_audit(nativeSession);
+				expect(childTool?.name).toBe("browser_audit");
+				bindBrowserAuditToolSession(nativeSession, capability);
+				expect(() => BUILTIN_TOOLS.browser_audit(nativeSession)).toThrow(
+					"activation is not bound to this registry authority",
+				);
+				return makeResult(options.id ?? "?", { agent: options.agent.name, agentSource: options.agent.source });
+			});
+			const session = createSession({
+				agentId: "parent",
+				settings: {
+					"async.enabled": false,
+					"task.batch": false,
+					"task.allowModelOverride": true,
+					"task.permissions.mode": "enforce",
+				},
+			});
+			const registered = await BUILTIN_TOOLS.task(session);
+			if (!(registered instanceof TaskTool)) throw new Error("registered Task factory did not create TaskTool");
+			const params = {
+				name: "AuditBound",
+				agent: "browser-audit-specialist",
+				agentSource: "user",
+				agentDefinitionSha256: sha256,
+				task: "Audit exact artifact.",
+				model: "pi/slow",
+				toolProfile: "browser-audit",
+				permissions: { profiles: ["browser-audit"], tools: ["browser_audit"] },
+			} as TaskParams;
+			const executionKey = {};
+			const prepared = await registered.prepareExecution(
+				"call-audit-bound",
+				params,
+				undefined,
+				undefined,
+				executionKey,
+			);
+			const spawnId = prepared.metadata?.spawnId;
+			if (typeof spawnId !== "string") throw new Error("prepared audit spawn ID is missing");
+			const toolCallFingerprint = prepared.metadata?.toolCallFingerprint;
+			if (typeof toolCallFingerprint !== "string") throw new Error("prepared audit fingerprint is missing");
+			const actor: BrowserAuditActor = { actor_kind: "sub", actor_id: spawnId, parent_actor_id: "parent" };
+			const dispatch: BrowserAuditDispatch = {
+				schema: "browser-audit-dispatch/v2",
+				audit_id: "browser-audit-00000000000000aa",
+				request_sha256: "a".repeat(64),
+				task_sha256: "b".repeat(64),
+				request_byte_count: 1,
+				task_byte_count: 1,
+				agent_source: "user",
+				agent_logical_path: "agents/browser-audit-specialist.md",
+				agent_definition_sha256: sha256,
+				tool_origin_class: "builtin",
+				tool_implementation_revision: BROWSER_AUDIT_TOOL_IMPLEMENTATION_REVISION,
+				core_package_identity: BROWSER_AUDIT_CORE_PACKAGE_IDENTITY,
+				expected_spawn_id: spawnId,
+				expected_parent_actor_id: "parent",
+				tool_call_fingerprint: toolCallFingerprint,
+			};
+			const authorization: BrowserAuditAuthorization = {
+				document_locators: ["https://example.test/audit"],
+				origins: ["https://example.test"],
+				route_states: [
+					{
+						route_state_id: "route",
+						locator: "https://example.test/audit",
+						state_assertions: [],
+						allowed_action_ids: [],
+					},
+				],
+				viewports: [{ viewport_id: "viewport", width: 800, height: 600, device_scale_factor: 1 }],
+				actions: [],
+				mutation_policy: { mode: "deny", allowed_action_ids: [] },
+				credential_policy: { mode: "deny-raw", pre_established_state_ids: [] },
+				screenshot_policy: { mode: "deny", max_count: 0, max_bytes: 0, allowed_check_ids: [] },
+				resource_policy: {
+					mode: "allow-listed",
+					allowed_origins: ["https://example.test"],
+					allow_file_subresources: false,
+				},
+				protected_actions: [],
+			};
+			const tuples: readonly BrowserAuditTuple[] = [
+				{ tuple_id: "check@route@viewport", check_id: "check", route_state_id: "route", viewport_id: "viewport" },
+			];
+			const binding: BrowserAuditBindingInput = {
+				dispatch,
+				actor,
+				spawn_id: spawnId,
+				authorization,
+				tuples,
+				file_document_authority: null,
+			};
+			installRegisteredBrowserAuditBinding(executionKey, binding);
+
+			const result = await registered.execute("call-audit-bound", params, undefined, undefined, undefined, prepared);
+			const replay = await registered.execute("call-audit-bound", params, undefined, undefined, undefined, prepared);
+			expect(getFirstText(replay)).toContain("already disposed");
+			expect(result.details?.results[0]?.id).toBe(spawnId);
+			expect(capturedOptions?.agent.tools).toEqual(["browser_audit"]);
+			expect(capturedOptions?.agent.spawns).toEqual([]);
+			expect(capturedOptions?.restrictToolNames).toBe(true);
+			expect(capturedOptions?.enableIrc).toBe(false);
+			expect(capturedOptions?.enableLsp).toBe(false);
+			expect(capturedOptions?.preloadedExtensionPaths).toBeUndefined();
+			expect(capturedOptions?.preloadedCustomToolPaths).toBeUndefined();
+		} finally {
+			temp.removeSync();
+		}
+	});
+
+	it("releases an unconsumed reserved output id on dispose", async () => {
+		mockDiscovery();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => makeResult(options.id ?? "?"));
+		const tool = await TaskTool.create(createSession({ settings: { "async.enabled": false, "task.batch": false } }));
+		const params = { name: "Reusable", agent: "task", task: "Do work." } as TaskParams;
+		const denied = await tool.prepareExecution("call-denied", params, undefined, undefined, {});
+		await denied.dispose();
+		const approved = await tool.prepareExecution("call-approved", params, undefined, undefined, {});
+
+		const result = await tool.execute("call-approved", params, undefined, undefined, undefined, approved);
+
+		expect(result.details?.results.map(item => item.id)).toEqual(["Reusable"]);
+	});
+
+	it("keeps the prepared permission scope after settings change", async () => {
+		mockDiscovery({ ...taskAgent, tools: ["read", "write"] });
+		let observedMode: string | undefined;
+		let observedTools: string[] | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			observedMode = options.permissionScope?.mode;
+			observedTools = options.agent.tools;
+			return makeResult(options.id ?? "?");
+		});
+		const session = createSession({
+			settings: {
+				"async.enabled": false,
+				"task.batch": false,
+				"task.permissions.mode": "enforce",
+				"task.permissions.tools.enabled": true,
+			},
+		});
+		const tool = await TaskTool.create(session);
+		const params = {
+			name: "FrozenPermissions",
+			agent: "task",
+			task: "Use only prepared tools.",
+			permissions: { tools: ["read"] },
+		} as TaskParams;
+		const prepared = await tool.prepareExecution("call-permissions", params, undefined, undefined, {});
+		session.settings.set("task.permissions.mode", "off");
+
+		await tool.execute("call-permissions", params, undefined, undefined, undefined, prepared);
+
+		expect(observedMode).toBe("enforce");
+		expect(observedTools).toEqual(["read", "hub"]);
+	});
+
+	it("keeps prepared model effort prewalk and child feature settings", async () => {
+		mockDiscovery();
+		let observed: {
+			modelOverride?: string | string[];
+			maxEffort?: unknown;
+			prewalk?: unknown;
+			agentPrewalk?: unknown;
+			maxDepth?: unknown;
+			enableLsp?: boolean;
+			enableIrc?: boolean;
+		} = {};
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			observed = {
+				modelOverride: options.modelOverride,
+				maxEffort: options.settings?.get("task.maxEffort"),
+				prewalk: options.settings?.get("task.prewalk"),
+				agentPrewalk: options.settings?.get("task.agentPrewalk"),
+				maxDepth: options.settings?.get("task.maxRecursionDepth"),
+				enableLsp: options.enableLsp,
+				enableIrc: options.enableIrc,
+			};
+			return makeResult(options.id ?? "?");
+		});
+		const session = createSession({
+			settings: {
+				"async.enabled": false,
+				"task.batch": false,
+				"task.agentModelOverrides": { task: "prepared/model" },
+				"task.maxEffort": "med",
+				"task.prewalk": true,
+				"task.agentPrewalk": { task: "prepared/prewalk" },
+				"task.maxRecursionDepth": 2,
+				"task.enableLsp": true,
+			},
+		});
+		const tool = await TaskTool.create(session);
+		const params = { name: "FrozenPolicy", agent: "task", task: "Use prepared policy." } as TaskParams;
+		const prepared = await tool.prepareExecution("call-frozen-policy", params, undefined, undefined, {});
+		session.settings.set("task.agentModelOverrides", { task: "mutated/model" });
+		session.settings.set("task.maxEffort", Effort.High);
+		session.settings.set("task.prewalk", false);
+		session.settings.set("task.agentPrewalk", {});
+		session.settings.set("task.maxRecursionDepth", 0);
+		session.settings.set("task.enableLsp", false);
+
+		await tool.execute("call-frozen-policy", params, undefined, undefined, undefined, prepared);
+
+		expect(observed).toEqual({
+			modelOverride: ["prepared/model"],
+			maxEffort: "med",
+			prewalk: true,
+			agentPrewalk: { task: "prepared/prewalk" },
+			maxDepth: 2,
+			enableLsp: true,
+			enableIrc: true,
+		});
+	});
+
+	it("keeps prepared async dispatch and parent service tier", async () => {
+		mockDiscovery();
+		let observedTier: ServiceTierByFamily | null | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			observedTier = options.parentServiceTier;
+			return makeResult(options.id ?? "?");
+		});
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		managers.push(manager);
+		const session = createSession({
+			manager,
+			serviceTier: { openai: "flex" },
+			settings: { "async.enabled": false, "task.batch": false },
+		});
+		const tool = await TaskTool.create(session);
+		const params = { name: "FrozenDispatch", agent: "task", task: "Use prepared dispatch." } as TaskParams;
+		const prepared = await tool.prepareExecution("call-frozen-dispatch", params, undefined, undefined, {});
+		session.settings.set("async.enabled", true);
+		(session as ToolSession & { getServiceTierByFamily: () => ServiceTierByFamily }).getServiceTierByFamily = () => ({
+			openai: "priority",
+		});
+
+		const result = await tool.execute("call-frozen-dispatch", params, undefined, undefined, undefined, prepared);
+
+		expect(result.details?.async).toBeUndefined();
+		expect(result.details?.results.map(item => item.id)).toEqual(["FrozenDispatch"]);
+		expect(observedTier).toEqual({ openai: "flex" });
+	});
+
+	it("captures depth dispatch and tier before discovery awaits", async () => {
+		const discovery = mockDiscovery();
+		let observedIrc: boolean | undefined;
+		let observedTier: ServiceTierByFamily | null | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			observedIrc = options.enableIrc;
+			observedTier = options.parentServiceTier;
+			return makeResult(options.id ?? "?");
+		});
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		managers.push(manager);
+		const session = createSession({
+			manager,
+			serviceTier: { openai: "flex" },
+			taskDepth: 0,
+			settings: { "async.enabled": false, "task.batch": false, "task.maxRecursionDepth": 2 },
+		});
+		const tool = await TaskTool.create(session);
+		const gate = Promise.withResolvers<{ agents: AgentDefinition[]; projectAgentsDir: null }>();
+		const entered = Promise.withResolvers<void>();
+		discovery.mockImplementationOnce(async () => {
+			entered.resolve();
+			return gate.promise;
+		});
+		const params = { name: "EntrySnapshot", agent: "task", task: "Use entry snapshot." } as TaskParams;
+		const preparing = tool.prepareExecution("call-entry-snapshot", params, undefined, undefined, {});
+		await entered.promise;
+		(session as ToolSession & { taskDepth: number }).taskDepth = 2;
+		session.settings.set("async.enabled", true);
+		(session as ToolSession & { getServiceTierByFamily: () => ServiceTierByFamily }).getServiceTierByFamily = () => ({
+			openai: "priority",
+		});
+		gate.resolve({ agents: [taskAgent], projectAgentsDir: null });
+		const prepared = await preparing;
+
+		const result = await tool.execute("call-entry-snapshot", params, undefined, undefined, undefined, prepared);
+
+		expect(result.details?.async).toBeUndefined();
+		expect(observedIrc).toBe(true);
+		expect(observedTier).toEqual({ openai: "flex" });
+	});
+
+	it("keeps prepared batch context after batch mode changes", async () => {
+		mockDiscovery();
+		let observedContext: string | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			observedContext = options.context;
+			return makeResult(options.id ?? "?");
+		});
+		const session = createSession({ settings: { "async.enabled": false, "task.batch": true } });
+		const tool = await TaskTool.create(session);
+		const params = {
+			context: "Frozen shared context.",
+			tasks: [{ name: "FrozenBatch", agent: "task", task: "Use shared context." }],
+		} as TaskParams;
+		const prepared = await tool.prepareExecution("call-batch-context", params, undefined, undefined, {});
+		session.settings.set("task.batch", false);
+
+		await tool.execute("call-batch-context", params, undefined, undefined, undefined, prepared);
+
+		expect(observedContext).toBe("Frozen shared context.");
+	});
+
+	it("releases a reserved output id on a proven prelaunch failure", async () => {
+		mockDiscovery();
+		vi.spyOn(fsPromises, "mkdir").mockRejectedValueOnce(new Error("prelaunch failed"));
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => makeResult(options.id ?? "?"));
+		const tool = await TaskTool.create(createSession({ settings: { "async.enabled": false, "task.batch": false } }));
+		const params = { name: "Retryable", agent: "task", task: "Run once." } as TaskParams;
+		const first = await tool.prepareExecution("call-failed-prelaunch", params, undefined, undefined, {});
+		const failed = await tool.execute("call-failed-prelaunch", params, undefined, undefined, undefined, first);
+		expect(getFirstText(failed)).toContain("prelaunch failed");
+		const second = await tool.prepareExecution("call-retried-prelaunch", params, undefined, undefined, {});
+
+		const retried = await tool.execute("call-retried-prelaunch", params, undefined, undefined, undefined, second);
+
+		expect(retried.details?.results.map(item => item.id)).toEqual(["Retryable"]);
+	});
+
+	it("retains an output id when cleanup fails after execution", async () => {
+		mockDiscovery();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => makeResult(options.id ?? "?"));
+		vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(new Error("cleanup failed"));
+		const tool = await TaskTool.create(createSession({ settings: { "async.enabled": false, "task.batch": false } }));
+		const params = { name: "Used", agent: "task", task: "Run once." } as TaskParams;
+		const first = await tool.prepareExecution("call-postrun-failure", params, undefined, undefined, {});
+		const failed = await tool.execute("call-postrun-failure", params, undefined, undefined, undefined, first);
+		expect(getFirstText(failed)).toContain("cleanup failed");
+		const second = await tool.prepareExecution("call-after-postrun-failure", params, undefined, undefined, {});
+
+		const retried = await tool.execute("call-after-postrun-failure", params, undefined, undefined, undefined, second);
+
+		expect(retried.details?.results.map(item => item.id)).toEqual(["Used-2"]);
 	});
 });

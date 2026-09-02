@@ -8,6 +8,7 @@ import type {
 	AgentTool,
 	AgentToolContext,
 	AgentToolExecFn,
+	AgentToolPreparedExecution,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
@@ -846,11 +847,12 @@ async function wrappedExecute(
 	signal?: AbortSignal,
 	onUpdate?: AgentToolUpdateCallback,
 	context?: AgentToolContext,
+	preparedExecution?: AgentToolPreparedExecution,
 ): Promise<AgentToolResult> {
 	const originalExecute = this[kUnwrappedExecute];
 
 	try {
-		let result = await originalExecute.call(this, toolCallId, params, signal, onUpdate, context);
+		let result = await originalExecute.call(this, toolCallId, params, signal, onUpdate, context, preparedExecution);
 
 		// Spill large results to artifact, truncate to tail
 		result = await spillLargeResultToArtifact(result, this.name, context);

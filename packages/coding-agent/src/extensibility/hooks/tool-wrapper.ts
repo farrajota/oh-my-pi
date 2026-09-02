@@ -1,7 +1,12 @@
 /**
  * Tool wrapper - wraps tools with hook callbacks for interception.
  */
-import type { AgentTool, AgentToolContext, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentTool,
+	AgentToolContext,
+	AgentToolPreparedExecution,
+	AgentToolUpdateCallback,
+} from "@oh-my-pi/pi-agent-core";
 import type { Static, TSchema } from "@oh-my-pi/pi-ai";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
@@ -38,6 +43,7 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
 		context?: AgentToolContext,
+		preparedExecution?: AgentToolPreparedExecution,
 	) {
 		// Emit tool_call event - hooks can block execution or revise the input the tool runs with.
 		// If hook errors/times out, block by default (fail-safe)
@@ -75,7 +81,14 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 
 		// Execute the actual tool, forwarding onUpdate for progress streaming
 		try {
-			const result = await this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context);
+			const result = await this.tool.execute(
+				toolCallId,
+				effectiveParams,
+				signal,
+				onUpdate,
+				context,
+				preparedExecution,
+			);
 
 			// Emit tool_result event - hooks can modify the result
 			if (this.hookRunner.hasHandlers("tool_result")) {

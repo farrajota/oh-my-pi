@@ -6,7 +6,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { Type } from "@oh-my-pi/omptype/typebox";
-import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolPreparedExecution } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { HookRunner, type LoadedHook } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
 import { HookToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/tool-wrapper";
@@ -91,5 +91,32 @@ describe("HookToolWrapper tool_call input override", () => {
 		await wrapped.execute("call-3", { command: "echo original" } as never);
 
 		expect(executed).toEqual([{ command: "echo original" }]);
+	});
+
+	it("forwards prepared execution to the wrapped tool", async () => {
+		const prepared: AgentToolPreparedExecution = {
+			consume: () => "prepared" as never,
+			dispose: () => {},
+		};
+		let observed: AgentToolPreparedExecution | undefined;
+		const tool = {
+			...makeRecordingTool([]),
+			execute: async (
+				_id: string,
+				_params: unknown,
+				_signal: AbortSignal | undefined,
+				_onUpdate: unknown,
+				_context: unknown,
+				preparedExecution: AgentToolPreparedExecution | undefined,
+			) => {
+				observed = preparedExecution;
+				return { content: [{ type: "text" as const, text: "ran" }] };
+			},
+		} as AgentTool;
+		const wrapped = new HookToolWrapper(tool, makeRunner(makeHook(() => undefined)));
+
+		await wrapped.execute("call-prepared", { command: "echo" } as never, undefined, undefined, undefined, prepared);
+
+		expect(observed).toBe(prepared);
 	});
 });

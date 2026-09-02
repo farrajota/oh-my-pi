@@ -119,6 +119,7 @@ import {
 } from "./extensibility/skills";
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
 import type { HindsightSessionState } from "./hindsight/state";
+import { bindBrowserAuditToolSession, takeBrowserAuditSessionCapability } from "./internal/browser-audit-authority";
 import { LocalProtocolHandler, type LocalProtocolOptions } from "./internal-urls";
 import { setSharedLspEnabled } from "./lsp/client";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
@@ -227,7 +228,8 @@ import {
 	xdevDocsAll,
 	xdevEntries,
 } from "./tools";
-import { isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
+
+import { assertToolNameNotReserved, isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
 import { ToolContextStore } from "./tools/context";
 import { isIrcEnabled } from "./tools/hub";
 import { getImageGenTools } from "./tools/image-gen";
@@ -532,6 +534,8 @@ export interface CreateAgentSessionOptions {
 	lspReadOnly?: boolean;
 	/** Whether this invocation may expose IRC. `false` removes it even for subagents. */
 	enableIrc?: boolean;
+	/** Parent task recursion depth inherited by subagent sessions. */
+	taskDepth?: number;
 	/** Skip subprocess-kernel availability checks and prelude warmup */
 	skipPythonPreflight?: boolean;
 	/** Tool names explicitly requested (enables disabled-by-default tools) */
@@ -551,8 +555,6 @@ export interface CreateAgentSessionOptions {
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	/** Whether to include the yield tool by default */
 	requireYieldTool?: boolean;
-	/** Task recursion depth (for subagent sessions). Default: 0 */
-	taskDepth?: number;
 	/** Parent Hindsight state to alias for subagent memory tools. */
 	parentHindsightSessionState?: HindsightSessionState;
 	/** Parent Mnemopi state to alias for subagent memory tools. */
@@ -988,6 +990,7 @@ function registerEvalCleanup(): void {
 }
 
 export function customToolToDefinition(tool: CustomTool, sourcePath?: string): ToolDefinition {
+	assertToolNameNotReserved(tool.name);
 	const definition: ToolDefinition & { [TOOL_DEFINITION_MARKER]: true } = {
 		name: tool.name,
 		label: tool.label,
@@ -1025,6 +1028,7 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 }
 
 function createCustomToolsExtension(tools: CustomTool[], sourcePaths?: ReadonlyMap<string, string>): ExtensionFactory {
+	for (const tool of tools) assertToolNameNotReserved(tool.name);
 	const uniqueTools = deduplicateMCPToolsByName(tools);
 	return api => {
 		for (const tool of uniqueTools) {
@@ -1746,7 +1750,28 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// entries capture it at fetch time and are dropped at injection if a newer
 		// mutation (any tool) bumped it in the meantime.
 		const fileMutationVersions = new Map<string, number>();
-		const disposeCallbacks = new Set<() => void>();
+		const disposeCallbacks = new Set<() => void | Promise<void>>();
+		const sessionChangeCallbacks = new Set<() => void | Promise<void>>();
+		const notifyToolSessionChangeCallbacks = async (): Promise<void> => {
+			const results = await Promise.allSettled(
+				[...sessionChangeCallbacks].map(callback => Promise.resolve().then(callback)),
+			);
+			for (const result of results) {
+				if (result.status === "rejected")
+					logger.warn("Tool session change callback failed", { error: String(result.reason) });
+			}
+		};
+		const drainDisposeCallbacks = async (): Promise<void> => {
+			while (disposeCallbacks.size > 0) {
+				const callbacks = [...disposeCallbacks];
+				disposeCallbacks.clear();
+				const cleanup = await Promise.allSettled(callbacks.map(callback => Promise.resolve().then(callback)));
+				for (const result of cleanup) {
+					if (result.status === "rejected")
+						logger.warn("Session dispose callback failed", { error: String(result.reason) });
+				}
+			}
+		};
 		const activeToolNames = new Set<string>();
 		const toolRegistry = new Map<string, Tool & Pick<ToolDefinition, "defaultInactive">>();
 		const setActiveToolNames = (names: Iterable<string>): void => {
@@ -1841,7 +1866,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				disposeCallbacks.add(callback);
 				return () => disposeCallbacks.delete(callback);
 			},
-			registerSessionChangeCallback: callback => session?.registerSessionChangeCallback(callback),
+			registerSessionChangeCallback: callback => {
+				sessionChangeCallbacks.add(callback);
+				return () => sessionChangeCallbacks.delete(callback);
+			},
 			bumpFileMutationVersion: path => {
 				const next = (fileMutationVersions.get(path) ?? 0) + 1;
 				fileMutationVersions.set(path, next);
@@ -1924,6 +1952,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : undefined,
 		);
 
+		// Only executor-bound options carry an internal capability. Structurally
+		// similar public SDK options are ignored and fail at the registered factory.
+		const browserAuditCapability = takeBrowserAuditSessionCapability(options);
+		bindBrowserAuditToolSession(toolSession, browserAuditCapability);
 		// Create built-in tools (already wrapped with meta notice formatting)
 		await logger.time("createAllTools", createTools, toolSession, options.toolNames);
 
@@ -2031,7 +2063,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// to mirror the AsyncJobManager ownership rule.
 		if (mcpManager && !options.parentTaskPrefix) MCPManager.setInstance(mcpManager);
 
-		const builtInToolNames = [...toolRegistry.keys()];
+		const builtInToolNames = [...toolRegistry.keys()] as string[];
 		let customToolPaths: ToolPathWithSource[] = [];
 		const inlineExtensions: ExtensionFactory[] = [];
 		if (!restrictToolNames) {
@@ -2796,6 +2828,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			restrictToolNames && options.allowRestrictedCustomTools !== true
 				? []
 				: (options.customTools?.filter(tool => !isLegacyBuiltinToolDefinition(tool)) ?? []);
+		for (const registered of registeredTools) assertToolNameNotReserved(registered.definition.name);
+		for (const tool of sdkCustomTools) {
+			assertToolNameNotReserved(tool.name);
+		}
+
 		const sdkCustomToolNames = new Set(sdkCustomTools.map(tool => tool.name));
 		const allCustomTools = [
 			...registeredTools,
@@ -3751,6 +3788,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			advisorMcpResources: cursorMcpResources,
 			titleSystemPrompt: options.titleSystemPrompt,
 		});
+		const unregisterToolSessionChangeCallbacks = session.registerSessionChangeCallback(
+			notifyToolSessionChangeCallbacks,
+		);
+		disposeCallbacks.add(unregisterToolSessionChangeCallbacks);
 		hasSession = true;
 		// Backfill the resumed advisor spend without blocking startup: the scan
 		// runs after the session is live, so `--resume` no longer scales with the
@@ -3766,9 +3807,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (scheduled) return scheduled;
 			const activationSignal = signal ?? AbortSignal.timeout(EXTENSION_HANDLER_TIMEOUT_MS);
 
+			const name = registered.definition.name;
+			assertToolNameNotReserved(name);
 			const [wrapped] = wrapRegisteredTools([registered], extensionRunner);
 			if (!wrapped) return Promise.resolve();
-			const name = registered.definition.name;
 			const liveTool = new ExtensionToolWrapper(wrapToolWithMetaNotice(wrapped), extensionRunner);
 			// Capture ordinary extension precedence while the listener observes this exact registration.
 			// A later same-name registration may replace the extension map before serialized activation runs.
@@ -3905,6 +3947,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					// begins — the lifecycle await below opens an async gap before
 					// AgentSession.dispose() would otherwise set its guards.
 					session.beginDispose();
+					await drainDisposeCallbacks();
 					if (agentKind === "main") {
 						// Top-level teardown owns the global agent lifecycle: park timers,
 						// adopted subagent sessions, revivers. Tear it down while shared
@@ -3929,8 +3972,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					unsubscribeCredentialDisabled?.();
 					unsubscribeMcpNotifications?.();
 					unregisterMcpPostmortem?.();
-					for (const callback of disposeCallbacks) callback();
-					disposeCallbacks.clear();
+					await drainDisposeCallbacks();
 					// Drop refs so the process-global postmortem list doesn't retain
 					// the bridge closure past explicit dispose.
 					unsubscribeMcpNotifications = undefined;

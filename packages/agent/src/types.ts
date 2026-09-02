@@ -749,6 +749,26 @@ export interface AgentToolContext {
 	// Empty by default - apps extend via declaration merging
 }
 
+/** Opaque native-tool state prepared before approval and consumed exactly once by execution. */
+export interface AgentToolPreparedExecution {
+	/** Frozen scalar metadata safe for approval and lifecycle observers. */
+	readonly metadata?: Readonly<Record<string, string | number | boolean | null>>;
+	/** Consume private state for the exact tool owner and call. Implementations MUST reject replay or mismatch. */
+	consume<T>(owner: object, toolCallId: string): T;
+	/** Idempotently release unconsumed resources. */
+	dispose(): void | Promise<void>;
+}
+
+/** Optional pre-approval preparation hook for native tools with one-use execution state. */
+export type AgentToolPrepareExecutionFn<TParameters extends TSchema = TSchema> = (
+	this: AgentTool<TParameters>,
+	toolCallId: string,
+	params: Static<TParameters>,
+	signal: AbortSignal | undefined,
+	context: AgentToolContext | undefined,
+	executionKey: object,
+) => AgentToolPreparedExecution | Promise<AgentToolPreparedExecution>;
+
 export type AgentToolExecFn<TParameters extends TSchema = TSchema, TDetails = any, TTheme = unknown> = (
 	this: AgentTool<TParameters, TDetails, TTheme>,
 	toolCallId: string,
@@ -756,6 +776,7 @@ export type AgentToolExecFn<TParameters extends TSchema = TSchema, TDetails = an
 	signal?: AbortSignal,
 	onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
 	context?: AgentToolContext,
+	preparedExecution?: AgentToolPreparedExecution,
 ) => Promise<AgentToolResult<TDetails, TParameters>>;
 
 // AgentTool extends Tool but adds the execute function
@@ -842,6 +863,9 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 
 	/** Lines appended after the standard approval prompt header. */
 	formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
+
+	/** Prepare exact one-use native execution state after input revision and before approval. */
+	prepareExecution?: AgentToolPrepareExecutionFn<TParameters>;
 
 	/** The main execution callback for this tool. */
 	execute: AgentToolExecFn<TParameters, TDetails, TTheme>;
