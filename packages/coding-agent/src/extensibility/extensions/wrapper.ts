@@ -153,9 +153,10 @@ function safetyCheckLines(checks: readonly ComputerSafetyCheck[]): string[] {
  * - Emits tool_call event before execution (can block)
  * - Emits tool_result event after execution (can modify result)
  */
-export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetails = unknown>
-	implements AgentTool<TParameters, TDetails>
-{
+export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetails = unknown> implements AgentTool<
+	TParameters,
+	TDetails
+> {
 	declare name: string;
 	declare description: string;
 	declare parameters: TParameters;
@@ -385,8 +386,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				// that owns the handlers are both in scope (`sdk.ts` wraps the whole tool
 				// registry with this class whenever a runner exists). Inert with no
 				// fallback registered: no scope is entered.
-				result = await withFileMutationSession(this.runner.sessionId, () =>
-					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context, effectivePreparedExecution),
+				result = await this.runner.runScoped(() =>
+					withFileMutationSession(this.runner.sessionId, () =>
+						this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context, effectivePreparedExecution),
+					),
 				);
 			} catch (err) {
 				executionError = err instanceof Error ? err : new Error(String(err));

@@ -24,6 +24,7 @@ describe("reserved core tool names", () => {
 
 	it("rejects external mutation without disabling the trusted core factory", () => {
 		expect("RESERVED_CORE_TOOL_NAMES" in builtinNames).toBe(false);
+		// oxlint-disable-next-line no-import-assign -- verifies namespace immutability
 		expect(Reflect.set(builtinNames, "RESERVED_CORE_TOOL_NAMES", {})).toBe(false);
 		expect(() => assertToolNameNotReserved("browser_audit")).toThrow(
 			'Tool name "browser_audit" is reserved by the core runtime',

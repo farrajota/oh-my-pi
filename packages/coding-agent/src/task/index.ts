@@ -1499,7 +1499,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			let failedCount = 0;
 			let primaryJobId = asyncSpawns[0].agentId;
 			const syncResults: SingleResult[] = [];
+			// oxlint-disable-next-line prefer-const -- updated after async job registration
 			let syncUsage: Usage | undefined;
+			// oxlint-disable-next-line prefer-const -- updated after async job registration
 			let syncOutputPaths: string[] | undefined;
 			let syncProjectAgentsDir: string | null = null;
 			const buildAsyncDetails = (): TaskToolDetails => ({

@@ -527,6 +527,7 @@ class HarnessEmitter {
 	}
 
 	async emit(event: string, ...args: unknown[]): Promise<void> {
+		// oxlint-disable-next-line unicorn/no-useless-spread -- snapshot listeners before awaits
 		for (const listener of [...(this.#listeners.get(event) ?? [])]) await listener(...args);
 	}
 }

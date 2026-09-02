@@ -128,6 +128,18 @@ export class SessionFocusController {
 		this.ctx.statusLine.setSession(target, this.#focusedAgentId);
 		await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 		if (generation !== this.#focusGeneration) return;
+		// Partial tool results are display events, not persisted messages. Replay
+		// each target's latest snapshot after rebuilding so focus navigation does
+		// not collapse a live task board back to its bare call arguments (#10446).
+		for (const event of target.activeToolExecutionUpdates()) {
+			await this.ctx.eventController.handleEvent(target, event);
+			if (generation !== this.#focusGeneration) return;
+		}
+		// Retarget the sticky Todo HUD too. While a subagent is focused the main
+		// session's `todo` completions never reach this controller; returning to
+		// main must therefore reload its current state instead of retaining the
+		// pre-focus snapshot. Passing `target` also restores a focused subagent's
+		// own todos rather than overwriting them with the main session's list.
 		await this.ctx.reloadTodos(target);
 		if (generation !== this.#focusGeneration) return;
 		if (target.isStreaming) {

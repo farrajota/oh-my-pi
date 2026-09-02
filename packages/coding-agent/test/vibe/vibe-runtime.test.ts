@@ -266,10 +266,12 @@ function createFakeWorkerSession(options: { streaming?: boolean; onDispose?: () 
 			script = undefined;
 			if (active) {
 				for (const event of active.events) {
+					// oxlint-disable-next-line unicorn/no-useless-spread -- snapshot listeners before dispatch
 					for (const listener of [...listeners]) listener(event);
 				}
 				lastAssistant = { stopReason: "stop", content: [{ type: "text", text: active.responseText }] };
 				const end = { type: "message_end", message: { role: "assistant", content: lastAssistant.content } };
+				// oxlint-disable-next-line unicorn/no-useless-spread -- snapshot listeners before dispatch
 				for (const listener of [...listeners]) listener(end);
 			}
 			return true;

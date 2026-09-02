@@ -137,6 +137,7 @@ function waitForRepeatedStart(harness: Harness, round = 1): Promise<SessionEvent
 	if (!realSchedulerWait) throw new Error("Original scheduler is unavailable");
 	const { promise, resolve, reject } = Promise.withResolvers<SessionEvent>();
 	const timeoutController = new AbortController();
+	// oxlint-disable-next-line prefer-const -- assigned after timeout callback captures it
 	let unsubscribe: (() => void) | undefined;
 	const timeout = realSchedulerWait.call(scheduler, 1_000, { signal: timeoutController.signal });
 	void timeout.then(
@@ -249,6 +250,7 @@ async function createHarness(
 	const mockModel = createMockModel({ responses });
 	let providerCalls = 0;
 	const providerMaxAttemptsAtCall: Array<number | undefined> = [];
+	// oxlint-disable-next-line prefer-const -- streamFn captures the agent before construction
 	let agent: Agent | undefined;
 	const streamFn = (...args: Parameters<typeof mockModel.stream>) => {
 		providerCalls++;
