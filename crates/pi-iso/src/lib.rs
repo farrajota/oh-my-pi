@@ -293,7 +293,7 @@ pub fn default_backend() -> &'static dyn IsolationBackend {
 /// return their own platform stub which fails
 /// [`probe`](IsolationBackend::probe) with `available = false` and rejects
 /// [`start`](IsolationBackend::start) with [`IsoError::Unavailable`]. This way
-/// the napi shim can mirror the user's `task.isolation.mode` setting without an
+/// the napi shim can mirror the user's `isolation.backend` setting without an
 /// extra "is this platform" check.
 pub fn backend(kind: BackendKind) -> &'static dyn IsolationBackend {
 	match kind {

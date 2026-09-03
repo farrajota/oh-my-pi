@@ -384,8 +384,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				// extension handler, and that registry is PROCESS-WIDE — so the session is
 				// named here, the one place where every tool's execution and the runner
 				// that owns the handlers are both in scope (`sdk.ts` wraps the whole tool
-				// registry with this class whenever a runner exists). Inert with no
-				// fallback registered: no scope is entered.
+				// registry with this class whenever a runner exists). Enter both the active
+				// Settings scope and the file-mutation fallback scope for every execution.
 				result = await this.runner.runScoped(() =>
 					withFileMutationSession(this.runner.sessionId, () =>
 						this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context, effectivePreparedExecution),
