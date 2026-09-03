@@ -26,22 +26,37 @@
 - Added `--service-tier` to override the OpenAI service tier for a session. The flag takes precedence over the configured `tier.openai` setting and over a resumed session's recorded tier, leaves the Anthropic and Google tiers alone, and persists across resumes; `none` omits `service_tier` from the request.
 - Added a configurable per-request web search timeout via `providers.webSearchTimeoutSeconds` ([#7197](https://github.com/can1357/oh-my-pi/pull/7197) by [@will-bogusz](https://github.com/will-bogusz)).
 - Added turn-aware `/tree` navigation: Alt+Up/Alt+Down traverses previous/next user or assistant turns while skipping tool and bookkeeping entries, Home/End jumps to the first/last visible item, and PageUp/PageDown moves by a visible page.
+### Breaking Changes
+
+- Replaced the local session-title model choices with LFM2.5 230M, LFM2.5 350M, and Falcon H1 Tiny 90M.
+
 ### Added
 
+- Video files can be attached or read through system ffmpeg as preview grids with metadata; use `:412` or `:1h5m42s` to inspect individual frames.
+- The model picker now shows a brain-icon intelligence column and uses catalog TPS as an estimate until local performance data exists.
 - Added `report` field to scout agent definitions for detailed, non-summarized findings
 - Subagents now automatically relay turn results to the originating agent, enabling read-only agents to return data
 
 ### Changed
 
+- Session history is now sorted by modification time, then creation time, then file path
+- Cleaned up trailing periods from agent activity descriptions in the UI
+- Increased maximum file snapshot size to 4MB
+- Edit tool engines (replace/patch/apply_patch/hashline/sloppy) now run natively with streamed diff previews computed off the main thread
 - Inlined approved plan content directly into agent history to reduce redundant read operations
 
 ### Fixed
 
+- Fixed embedded title models receiving online few-shot examples and failing on tokenizer templates containing generation-mask statements.
+- Fixed Alt+P model searches retaining the current model's list position after results changed; selection now moves to the best match unless every preceding choice remains unchanged
+- Fixed model picker searches ignoring provider preferences; explicitly ordered, role-assigned, and recently used providers now rank first among similarly relevant matches
+- Fixed `/new` reviving the previous conversation in-process or after a restart, including across terminal changes and delayed extension events
 - Fixed protocol handler incorrectly escaping raw text content from agent responses
 - Fixed `<task-result>` previews of structured subagent yields collapsing to a lone `{` when the JSON's second line exceeded the preview budget
 - Fixed `/usage` freezing the TUI for several seconds while it loaded the activity heatmap on a large stats database; the dashboard now opens immediately and the heatmap plus session sync load from a background subprocess.
-- Fixed the status line missing from the first frame at startup and appearing only after the session loaded; the last run's status row is cached per project and painted immediately, then replaced in place by the live one.
+- Fixed the status line missing from the first frame at startup; its normal icons, colors, and chrome now appear immediately with ellipses in dynamic fields until the live values replace them in place.
 - Fixed Bash builtins (`cut`, `sed`, `ls`, `sort`, `uniq`, `cat`, and the rest) printing `<name>: Broken pipe (os error 32)` / `write error` and exiting 1 when a downstream stage quit early (`cut f | head`, `cut f | sed 'bad'`); they now die silently with status 141 like standalone utilities under SIGPIPE.
+- Fixed provider-qualified model roles written with a dotted revision (`anthropic/claude-fable-5.1:high`) silently resolving to OpenRouter's same-named flat id instead of the first-party `claude-fable-5-1`, which surfaced when a plan-mode tier or cycle-order role was applied; the dotted spelling now binds inside the named provider and fails closed when that provider is unavailable.
 
 ## [18.1.5] - 2026-09-03
 
