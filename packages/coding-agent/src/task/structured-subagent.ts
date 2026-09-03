@@ -42,7 +42,7 @@ import {
 	type SingleResult,
 	type StructuredSubagentOutput,
 } from "./types";
-import { type NestedRepoPatch, parseIsolationMode } from "./worktree";
+import { type NestedRepoPatch, parseIsolationBackend } from "./worktree";
 
 /** Validation behavior requested for an effective output schema. */
 export type StructuredSubagentSchemaMode = "permissive" | "strict";
@@ -318,12 +318,12 @@ export async function resolveEffectiveSubagentPolicy(
 			`Task model selector ${JSON.stringify(requestedTaskModel)} did not resolve to an enabled model.`,
 		);
 	}
-	const isolationMode = settings.get("task.isolation.mode");
+	const isolationEnabled = !planMode && settings.get("task.isolation.enabled");
 	const isIsolated = request.isolation?.requested === true;
-	if (isIsolated && isolationMode === "none") {
+	if (isIsolated && !isolationEnabled) {
 		throw new StructuredSubagentError(
 			"preflight",
-			`Subagent isolated execution requires task.isolation.mode to be set; current mode is "none".`,
+			"Subagent isolated execution requires task.isolation.enabled; it is currently false.",
 		);
 	}
 	return {
@@ -623,7 +623,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			result = await runIsolatedSubprocess({
 				baseOptions,
 				context: isolationContext,
-				preferredBackend: parseIsolationMode(request.session.settings.get("task.isolation.mode")),
+				preferredBackend: parseIsolationBackend(request.session.settings.get("isolation.backend")),
 				agentId: id,
 				mergeMode: policy.mergeMode,
 				artifactsDir: lease.artifactsDir,

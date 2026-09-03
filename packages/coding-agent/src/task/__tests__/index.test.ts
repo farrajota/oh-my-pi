@@ -51,7 +51,7 @@ function makeSession(
 		"async.enabled": false,
 		"task.batch": false,
 		"task.enableLsp": true,
-		"task.isolation.mode": "none",
+		"task.isolation.enabled": false,
 		"task.maxConcurrency": 4,
 		"task.permissions.mode": "off",
 		"task.permissions.paths.enabled": true,

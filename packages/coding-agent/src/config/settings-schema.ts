@@ -602,6 +602,8 @@ export const SETTINGS_SCHEMA = {
 
 	enabledModels: { type: "array", default: EMPTY_STRING_ARRAY },
 
+	enabledProviders: { type: "array", default: EMPTY_STRING_ARRAY },
+
 	disabledProviders: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	"providers.maxInFlightRequests": {
@@ -2039,13 +2041,14 @@ export const SETTINGS_SCHEMA = {
 	// Input and startup
 	doubleEscapeAction: {
 		type: "enum",
-		values: ["rewind", "none"] as const,
+		values: ["rewind", "tree", "none"] as const,
 		default: "rewind",
 		ui: {
 			tab: "interaction",
 			group: "Input",
 			label: "Double-Escape Action",
-			description: "Pressing Escape twice with an empty editor opens the transcript rewind selector",
+			description:
+				"What pressing Escape twice with an empty editor does: open the transcript rewind selector, open the session tree, or nothing",
 		},
 	},
 
@@ -4915,29 +4918,27 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	// Delegation
-	"task.isolation.mode": {
-		type: "enum",
-		values: [
-			"none",
-			"auto",
-			"apfs",
-			"btrfs",
-			"zfs",
-			"reflink",
-			"overlayfs",
-			"projfs",
-			"block-clone",
-			"rcopy",
-		] as const,
-		default: "none",
+	"task.isolation.enabled": {
+		type: "boolean",
+		default: false,
 		ui: {
 			tab: "tasks",
 			group: "Isolation",
-			label: "Isolation Mode",
-			description:
-				'Isolation backend for subagents. "auto" lets the native PAL pick the best available backend (CoW-aware filesystems, then overlayfs/ProjFS, then a git worktree / recursive-copy fallback).',
+			label: "Isolate Subagents",
+			description: "Run subagents in an isolated copy of the checkout and integrate their changes afterwards",
+		},
+	},
+
+	"isolation.backend": {
+		type: "enum",
+		values: ["auto", "apfs", "btrfs", "zfs", "reflink", "overlayfs", "projfs", "block-clone", "rcopy"] as const,
+		default: "auto",
+		ui: {
+			tab: "tasks",
+			group: "Isolation",
+			label: "Isolation Backend",
+			description: "Backend used for subagent isolation and worktree cloning",
 			options: [
-				{ value: "none", label: "None", description: "No isolation" },
 				{ value: "auto", label: "Auto", description: "Let the PAL pick the best available backend" },
 				{ value: "apfs", label: "APFS", description: "macOS clonefile reflink (APFS)" },
 				{ value: "btrfs", label: "btrfs", description: "btrfs subvolume snapshot" },
@@ -4960,6 +4961,18 @@ export const SETTINGS_SCHEMA = {
 					description: "git worktree if available, otherwise recursive copy",
 				},
 			],
+		},
+	},
+
+	"worktree.clone": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Isolation",
+			label: "Clone Checkout into Worktrees",
+			description:
+				"New worktrees from `github pr_checkout` and `git worktree add` in bash start as a copy-on-write clone of the current checkout so ignored build artifacts (node_modules, target) carry over; falls back to a plain checkout when the filesystem cannot clone",
 		},
 	},
 
@@ -5335,9 +5348,9 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"skills.enableCodexUser": { type: "boolean", default: true },
+	"skills.enableCodexUser": { type: "boolean", default: false },
 
-	"skills.enableClaudeUser": { type: "boolean", default: true },
+	"skills.enableClaudeUser": { type: "boolean", default: false },
 
 	"skills.enableClaudeProject": { type: "boolean", default: true },
 
@@ -5358,7 +5371,7 @@ export const SETTINGS_SCHEMA = {
 	// Commands
 	"commands.enableClaudeUser": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "tasks",
 			group: "Commands & Skills",
@@ -5380,7 +5393,7 @@ export const SETTINGS_SCHEMA = {
 
 	"commands.enableOpencodeUser": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "tasks",
 			group: "Commands & Skills",

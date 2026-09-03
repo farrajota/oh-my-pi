@@ -43,14 +43,13 @@ import { loadOverallPlanReference, type OverallPlanReference } from "../plan-mod
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
-import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { canonicalBytes } from "../tools/browser-audit";
 
 import { isIrcEnabled } from "../tools/hub";
-import { formatBytes, formatDuration } from "../tools/render-utils";
 import { isReadOnlyAgent } from "./read-only-policy";
+import { formatTaskResultSummary } from "./result-summary";
 import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
 import {
 	type AgentDefinition,
@@ -98,7 +97,7 @@ import {
 	StructuredSubagentError,
 } from "./structured-subagent";
 import { applyTaskToolProfile } from "./tool-profiles";
-import { type IsoBackendKind, parseIsolationMode } from "./worktree";
+import { type IsoBackendKind, parseIsolationBackend } from "./worktree";
 
 function renderSubagentUserPrompt(assignment: string): string {
 	return prompt.render(subagentUserPromptTemplate, {
@@ -161,6 +160,7 @@ export type {
 	TaskParams,
 	TaskToolDetails,
 } from "./types";
+export * from "./result-summary";
 export {
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
@@ -196,7 +196,6 @@ function appendPermissionDetails(lines: string[], permissions: TaskParams["permi
 	const denyPaths = formatListForDetails(permissions.denyPaths);
 	if (denyPaths) lines.push(`Denied paths: ${truncateForPrompt(denyPaths)}`);
 }
-
 interface TaskDescriptionOptions {
 	agents: AgentDefinition[];
 	isolationEnabled: boolean;
@@ -907,7 +906,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 	get parameters(): TaskToolSchemaInstance {
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
-		const isolationEnabled = !planMode && this.session.settings.get("task.isolation.mode") !== "none";
+		const isolationEnabled = !planMode && this.session.settings.get("task.isolation.enabled");
 		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		return getTaskSchema({
@@ -932,13 +931,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	get description(): string {
 		const disabledAgents = this.session.settings.get("task.disabledAgents") as string[];
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
-		const isolationMode = this.session.settings.get("task.isolation.mode");
+		const isolationEnabled = !planMode && this.session.settings.get("task.isolation.enabled");
 		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
 		return renderDescription({
 			agents:
 				discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
 				this.#discoveredAgents,
-			isolationEnabled: !planMode && isolationMode !== "none",
+			isolationEnabled: !planMode && isolationEnabled,
 			applyIsolatedChanges: this.session.settings.get("task.isolation.apply"),
 			disabledAgents,
 			batchEnabled: this.#isBatchEnabled(),
@@ -1130,7 +1129,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			getSessionId: this.session.getSessionId ?? (() => null),
 		};
 		const maxRuntimeMs = preparedSettings.get("task.maxRuntimeMs");
-		const preferredIsolationBackend = parseIsolationMode(preparedSettings.get("task.isolation.mode"));
+		const preferredIsolationBackend = parseIsolationBackend(preparedSettings.get("isolation.backend"));
 		signal?.throwIfAborted();
 
 		const manager = this.#getOutputManager();
@@ -2322,45 +2321,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		totalDurationMs: number,
 		mergeSummary: string,
 	): AgentToolResult<TaskToolDetails> {
-		const status = result.aborted
-			? "cancelled"
-			: result.exitCode === 0 && result.error
-				? "merge failed"
-				: result.exitCode === 0
-					? "completed"
-					: `failed (exit ${result.exitCode})`;
-		const output = formatResultOutputFallback(result);
-		const outputCharCount = result.outputMeta?.charCount ?? output.length;
-		const fullOutputThreshold = 5000;
-		let preview = output;
-		let truncated = false;
-		if (outputCharCount > fullOutputThreshold && result.outputPath) {
-			const slice = output.slice(0, fullOutputThreshold);
-			const lastNewline = slice.lastIndexOf("\n");
-			preview = lastNewline >= 0 ? slice.slice(0, lastNewline) : slice;
-			truncated = true;
-		}
-		// A stopped-but-adopted agent (soft-budget stop) stays messageable; tell
-		// the parent so it can resume via irc instead of redoing the work.
-		const refStatus = AgentRegistry.global().get(result.id)?.status;
-		const resumable = result.aborted && (refStatus === "idle" || refStatus === "parked");
-		const summary = prompt.render(taskSummaryTemplate, {
-			agentName: result.agent,
-			id: result.id,
-			status,
-			duration: formatDuration(totalDurationMs),
-			abortReason: result.aborted ? result.abortReason : undefined,
-			resumable,
-			preview,
-			truncated,
-			meta: result.outputMeta
-				? {
-						lineCount: result.outputMeta.lineCount,
-						charSize: formatBytes(result.outputMeta.charCount),
-					}
-				: undefined,
-			mergeSummary,
-		});
+		const summary = formatTaskResultSummary(result, { totalDurationMs, mergeSummary });
 
 		return {
 			content: [{ type: "text", text: summary }],

@@ -442,21 +442,28 @@ export class AgentLifecycleManager {
 
 		if (options?.tombstone) {
 			if (!this.#registry.beginTermination(id, ref)) return false;
-			let createdTombstone = false;
 			try {
-				if (ref.sessionFile) createdTombstone = await persistAgentTombstone(ref.sessionFile);
-				if (this.#registry.get(id) !== ref) {
-					if (createdTombstone && ref.sessionFile)
-						await fs.rm(getAgentTombstonePath(ref.sessionFile), { force: true });
-					return false;
+				// Transition synchronously before awaiting persistence so the dying
+				// session cannot unregister the ref during the tombstone write.
+				if (!this.#registry.detachSession(id, ref) || !this.#registry.setStatus(id, "aborted", ref)) {
+					logger.warn("AgentLifecycleManager.release: terminal transition rejected", { id });
 				}
-				this.#registry.setStatus(id, "aborted", ref);
-				this.#registry.detachSession(id, ref);
+				try {
+					if (ref.sessionFile) await persistAgentTombstone(ref.sessionFile);
+				} finally {
+					// Always dispose the captured session, even if persistence fails.
+					if (live) {
+						try {
+							await live.dispose();
+						} catch (error) {
+							logger.warn("AgentLifecycleManager.release: session dispose failed", { id, error: String(error) });
+						}
+					}
+				}
 			} finally {
 				this.#registry.endTermination(id, ref);
 			}
-		}
-		if (live) {
+		} else if (live) {
 			try {
 				await live.dispose();
 			} catch (error) {

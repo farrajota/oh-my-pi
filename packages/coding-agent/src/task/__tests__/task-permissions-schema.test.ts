@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { type } from "arktype";
+import { type } from "@oh-my-pi/omptype";
 import { Settings } from "../../config/settings";
 import type { ToolSession } from "../../tools";
 import * as taskDiscovery from "../discovery";
@@ -7,7 +7,7 @@ import { TaskTool } from "../index";
 import { type AgentDefinition, getTaskSchema, type TaskToolSchemaInstance } from "../types";
 
 const DISABLED_PERMISSIONS_ERROR =
-	"Subagent permissions are disabled. Enable task.permissions.mode in /settings before using `permissions`.";
+	"Task execution failed: Subagent permissions are disabled. Enable task.permissions.mode in /settings before using `permissions`.";
 
 const taskAgent = {
 	name: "task",
@@ -177,7 +177,7 @@ describe("task permission schema", () => {
 			Settings.isolated({
 				"async.enabled": false,
 				"task.batch": false,
-				"task.isolation.mode": "none",
+				"task.isolation.enabled": false,
 				"task.enableLsp": true,
 				"task.permissions.mode": "off",
 				"task.permissions.tools.enabled": true,
@@ -200,7 +200,7 @@ describe("task permission schema", () => {
 			Settings.isolated({
 				"async.enabled": false,
 				"task.batch": true,
-				"task.isolation.mode": "none",
+				"task.isolation.enabled": false,
 				"task.enableLsp": true,
 				"task.permissions.mode": "off",
 				"task.permissions.tools.enabled": true,

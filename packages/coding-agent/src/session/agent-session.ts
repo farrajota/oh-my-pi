@@ -88,7 +88,6 @@ import {
 	formatDuration,
 	getAgentDbPath,
 	isBunTestRuntime,
-	isEnoent,
 	isInteractiveHost,
 	isRecord,
 	logger,
@@ -173,6 +172,7 @@ import { computeNonMessageTokens } from "../modes/utils/context-usage";
 import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
 import { type PlanApprovalDetails, resolveApprovedPlan } from "../plan-mode/approved-plan";
 import { listPlanFiles, readPlanFile } from "../plan-mode/plan-files";
+import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import type { PlanModeState } from "../plan-mode/state";
 import goalModeContextPrompt from "../prompts/goals/goal-mode-context.md" with { type: "text" };
 import goalTodoContextPrompt from "../prompts/goals/goal-todo-context.md" with { type: "text" };
@@ -329,6 +329,7 @@ import {
 	SKILL_PROMPT_MESSAGE_TYPE,
 	sanitizeAssistantForReparentedHistory,
 	USER_INTERRUPT_LABEL,
+	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
 import { ModelControls, type ModelControlsHost } from "./model-controls";
 import { isPrewalkPlanNudge, PrewalkCoordinator, type PrewalkCoordinatorHost } from "./prewalk";
@@ -619,6 +620,8 @@ export class AgentSession {
 	#titleSystemPrompt: string | undefined;
 	#titleGenerationStart: (() => void) | undefined;
 	#titleGenerationInFlightFor: string | undefined;
+	#titleProviderSessionId: string | undefined;
+	#titleProviderParentSessionId: string | undefined;
 	/** Host hook invoked when a typed user prompt is dropped before dispatch;
 	 *  see {@link setPromptDropped}. */
 	#promptDropped: ((prompt: DroppedPrompt) => void) | undefined;
@@ -772,6 +775,7 @@ export class AgentSession {
 
 	#resetPromptMaintenanceState(): void {
 		this.#recovery.resetForNewPrompt();
+		this.#maintenance.resetForNewPrompt();
 		this.#yieldTerminationPending = false;
 	}
 
@@ -1175,6 +1179,7 @@ export class AgentSession {
 			getEnabledToolNames: () => this.getEnabledToolNames(),
 			toolRegistry: () => this.#tools.registry,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
+			prewalkWillHandoff: () => this.#prewalk.willHandoff,
 			consumeLastServedToolChoiceLabel: () => this.#toolChoiceQueue.consumeLastServedLabel(),
 		};
 		this.#todo = new TodoTracker(todoHost);
@@ -1890,6 +1895,26 @@ export class AgentSession {
 
 	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
 		this.#sessionSwitchReconciler = reconciler ?? undefined;
+	}
+
+	/**
+	 * Re-anchor mode state to the session a branch just minted. Branching mints a
+	 * new session id/file (see {@link SessionManager.createBranchedSession}), so
+	 * without this the interactive-mode reconciler keeps the pre-branch vibe owner
+	 * scope and disabling vibe mode trips the stale-scope guard in
+	 * `VibeRuntime.#persistModeExit` (issue #10468). Mirrors the reconcile step
+	 * `switchSession` runs for the same reason. Best-effort: a reconcile failure
+	 * must not roll back an otherwise-successful branch.
+	 */
+	async #reconcileModeAfterBranch(): Promise<void> {
+		try {
+			await this.#sessionSwitchReconciler?.();
+		} catch (error) {
+			logger.warn("Failed to reconcile session mode after branch", {
+				sessionFile: this.sessionFile,
+				error: String(error),
+			});
+		}
 	}
 
 	/** Provider-scoped mutable state store for transport/session caches. */
@@ -2645,9 +2670,9 @@ export class AgentSession {
 
 	#persistMessageEnd(message: AgentMessage): void {
 		if (message.role === "hookMessage" || message.role === "custom") {
-			// Prewalk's plan nudge is a one-run steering instruction. Persisting it would
-			// resurrect the consumed prompt on resume, fork, or any context rebuild.
-			if (!isPrewalkPlanNudge(message)) {
+			// One-run instructions must not return from persisted history: prewalk
+			// nudges are consumed once, and Vibe context is rebuilt only while active.
+			if (!isPrewalkPlanNudge(message) && message.customType !== VIBE_MODE_CONTEXT_MESSAGE_TYPE) {
 				this.sessionManager.appendCustomMessageEntry(
 					message.customType,
 					message.content,
@@ -3362,6 +3387,13 @@ export class AgentSession {
 					await emitAgentEndNotification({ willContinue: true });
 					return;
 				}
+			} else if (this.#recovery.handleMalformedFunctionCallStop(msg)) {
+				// A malformed call with committed text cannot be replayed, but it
+				// never executed anything either: keep the turn and continue with a
+				// corrective reminder rather than stopping on a pinned error.
+				maintenanceRoute("malformed-function-call-handled");
+				await emitAgentEndNotification({ willContinue: true });
+				return;
 			} else if (this.#recovery.isHardErrorFallbackEligible(msg)) {
 				// A non-retryable hard error on a model covered by a configured
 				// fallback chain: retrying the SAME model is pointless, but a
@@ -5412,6 +5444,28 @@ export class AgentSession {
 
 	setVibeModeState(state: VibeModeState | undefined): void {
 		this.#vibeModeState = state;
+		if (state?.enabled) return;
+
+		const isVibeContext = (message: AgentMessage): boolean =>
+			message.role === "custom" && message.customType === VIBE_MODE_CONTEXT_MESSAGE_TYPE;
+		const messages = this.agent.state.messages;
+		const filtered = messages.filter(message => !isVibeContext(message));
+		const historyChanged = filtered.length !== messages.length;
+		if (historyChanged) this.agent.replaceMessages(filtered);
+
+		const steering = this.agent.peekSteeringQueue();
+		const followUp = this.agent.peekFollowUpQueue();
+		const filteredSteering = steering.filter(message => !isVibeContext(message));
+		const filteredFollowUp = followUp.filter(message => !isVibeContext(message));
+		if (filteredSteering.length !== steering.length || filteredFollowUp.length !== followUp.length) {
+			this.agent.replaceQueues(filteredSteering, filteredFollowUp);
+			this.#reconcileQueuedMessageDrain();
+		}
+		this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(message => !isVibeContext(message));
+
+		if (!historyChanged) return;
+		this.#advisors.resetAllRuntimes("vibe-mode-exit");
+		this.#closeCodexProviderSessionsForHistoryRewrite();
 	}
 
 	#assertVibeSessionTransitionAllowed(action: string): void {
@@ -5629,27 +5683,22 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
-	 * Build a plan mode message.
-	 * Returns null if plan mode is not enabled.
-	 * @returns The plan mode message, or null if plan mode is not enabled.
+	 * Build the approved-plan reference message re-injected after a history
+	 * rewrite (new session, compaction, edit). Inlines the plan body so the
+	 * executor need not re-read it; the durable `local://` path stays in the
+	 * prompt as the recovery route when a compressor expires the inline copy.
+	 * Returns null during plan mode, once already sent, or when no plan exists.
 	 */
 	async #buildPlanReferenceMessage(): Promise<CustomMessage | null> {
 		if (this.#planModeState?.enabled) return null;
 		if (this.#planReferenceSent) return null;
 
-		const planFilePath = this.#planReferencePath;
-		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, this.#localProtocolOptions());
-		try {
-			await fs.promises.access(resolvedPlanPath, fs.constants.R_OK);
-		} catch (error) {
-			if (isEnoent(error)) {
-				return null;
-			}
-			throw error;
-		}
+		const plan = await loadOverallPlanReference(this.#planReferencePath, this.#localProtocolOptions());
+		if (!plan) return null;
 
 		const content = prompt.render(planModeReferencePrompt, {
-			planFilePath,
+			planFilePath: plan.path,
+			planContent: plan.content,
 		});
 
 		return {
@@ -5726,7 +5775,7 @@ export class AgentSession {
 		if (!this.#vibeModeState?.enabled) return null;
 		return {
 			role: "custom",
-			customType: "vibe-mode-context",
+			customType: VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 			content: prompt.render(vibeModeActivePrompt, {
 				todoAvailable: this.getActiveToolNames().includes("todo"),
 			}),
@@ -6044,13 +6093,20 @@ export class AgentSession {
 		return true;
 	}
 
+	/**
+	 * @returns true when the message is (or will be) picked up by an agent turn
+	 * — queued into a running turn, or a new turn started synchronously. false
+	 * when dispatch bailed before invoking the agent (e.g. a concurrent abort
+	 * won the generation race), so hosts waiting on a terminal `agent_end` can
+	 * stop instead of hanging.
+	 */
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice"> & {
 			queueChipText?: string;
 			queueOnly?: boolean;
 		},
-	): Promise<void> {
+	): Promise<boolean> {
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -6086,7 +6142,7 @@ export class AgentSession {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
 			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText);
-			return;
+			return true;
 		}
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
@@ -6096,7 +6152,7 @@ export class AgentSession {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
 			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText);
-			return;
+			return true;
 		}
 
 		const customMessage: CustomMessage<T> = {
@@ -6109,7 +6165,7 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 
-		await this.#promptWithMessage(customMessage, textContent, {
+		return this.#promptWithMessage(customMessage, textContent, {
 			...options,
 			prependMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
 		});
@@ -6204,10 +6260,10 @@ export class AgentSession {
 				return false;
 			}
 
-			// A pending xd:// delta accompanies the next user-authored prompt,
-			// never an agent-initiated continuation. Reserve its pre-user position,
-			// but consume it only after before_agent_start determines whether the
-			// final provider prompt still carries the base xd:// catalog.
+			// Pending tool-roster and xd:// deltas accompany the next user-authored
+			// prompt, never an agent-initiated continuation. Reserve their pre-user
+			// position, but consume xd:// only after before_agent_start determines
+			// whether the final provider prompt still carries the base catalog.
 			const xdevMountNoticeIndex = messages.length;
 			messages.push(message);
 			// Inject any pending "nextTurn" messages as context alongside the user message
@@ -6307,8 +6363,14 @@ export class AgentSession {
 			const xdevMountNotice = isUserQueuedMessage(message)
 				? this.#tools.takePendingXdevMountNotice(baseXdevCatalogDelivered)
 				: undefined;
-			if (xdevMountNotice) {
-				messages.splice(xdevMountNoticeIndex, 0, xdevMountNotice);
+			const toolRosterNotice = isUserQueuedMessage(message) ? this.#tools.takePendingToolRosterNotice() : undefined;
+			if (xdevMountNotice || toolRosterNotice) {
+				messages.splice(
+					xdevMountNoticeIndex,
+					0,
+					...(xdevMountNotice ? [xdevMountNotice] : []),
+					...(toolRosterNotice ? [toolRosterNotice] : []),
+				);
 			}
 
 			await this.#maintenance.runPrePromptCompactionIfNeeded(messages);
@@ -7133,6 +7195,7 @@ export class AgentSession {
 	}
 
 	#scheduleReplanTitleRefresh(): void {
+		if ($env.PI_NO_TITLE) return;
 		// Headless subagent sessions have no operator-visible title, so a todo-init
 		// replan refresh only burns a tiny-model call whose result lands in JSONL
 		// and is never shown (issue #5910). In an interactive host the operator can
@@ -7217,23 +7280,38 @@ export class AgentSession {
 			});
 	}
 
+	#resolveTitleProviderSessionId(parentSessionId: string): string {
+		if (this.#titleProviderParentSessionId === parentSessionId && this.#titleProviderSessionId) {
+			return this.#titleProviderSessionId;
+		}
+		const titleSessionId = Bun.randomUUIDv7();
+		this.#titleProviderParentSessionId = parentSessionId;
+		this.#titleProviderSessionId = titleSessionId;
+		return titleSessionId;
+	}
+
 	/**
 	 * Generate an automatic session title tied to this session's lifecycle.
 	 * Input and replan callers share the signal so disposal cancels provider and
 	 * local-worker requests instead of leaving background inference alive.
+	 * Online calls use a stable side-request identity so they cannot advance the
+	 * foreground provider session while its request is waiting.
 	 * `customSystemPrompt` swaps the title prompt for special-purpose titling
 	 * (e.g. plan-save filename topics) without touching the session override.
 	 */
 	generateTitle(firstMessage: string, customSystemPrompt?: string): Promise<string | null> {
+		const parentSessionId = this.sessionId;
+		const sessionId = this.#resolveTitleProviderSessionId(parentSessionId);
 		return generateSessionTitle(
 			firstMessage,
 			this.#modelRegistry,
 			this.settings,
-			this.sessionId,
+			sessionId,
 			this.model,
-			provider => this.agent.metadataForProvider(provider),
+			provider => buildSessionMetadata(sessionId, provider, this.#modelRegistry.authStorage),
 			customSystemPrompt ?? this.#titleSystemPrompt,
 			this.#titleGenerationAbortController.signal,
+			parentSessionId,
 		);
 	}
 
@@ -8270,9 +8348,14 @@ export class AgentSession {
 		return this.#irc.deliver(msg, opts);
 	}
 
-	/** Waits for side-channel IRC auto-replies currently owned by this session. */
-	waitForIrcAutoReplies(): Promise<void> {
-		return this.#irc.waitForAutoReplies();
+	/** Waits for every IRC reply this session still owes a peer (auto-replies, wake-turn relays). */
+	waitForIrcReplies(): Promise<void> {
+		return this.#irc.waitForReplies();
+	}
+
+	/** Registers an in-flight IRC reply obligation; peers awaiting an answer hold their stop verdict on it. */
+	trackIrcReply(pending: Promise<void>): void {
+		this.#irc.trackReply(pending);
 	}
 
 	/** Installs task-executor monitoring around autonomous IRC wake turns. */
@@ -8902,6 +8985,7 @@ export class AgentSession {
 
 			this.#advisors.reattachRecorderFeeds();
 			advisorRecordersDetached = false;
+			await this.#reconcileModeAfterBranch();
 			return { selectedText, selectedImages, cancelled: false };
 		} finally {
 			if (advisorRecordersDetached) {
@@ -9026,6 +9110,7 @@ export class AgentSession {
 			this.#advisors.resetSessionState();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 			advisorRecordersDetached = false;
+			await this.#reconcileModeAfterBranch();
 
 			return { cancelled: false, sessionFile: this.sessionFile };
 		} finally {
@@ -9113,15 +9198,19 @@ export class AgentSession {
 			targetEntry.type === "message" &&
 			targetEntry.message.role === "toolResult" &&
 			targetEntry.message.toolName === "ask";
+		const targetIsUserMessage = targetEntry.type === "message" && targetEntry.message.role === "user";
 
-		// No-op if already at target — except mid-flight through the `ask`
-		// re-answer protocol (issue #5642): a probe or completion call can
-		// legitimately target the *current* leaf (e.g. the user interrupted
-		// right after answering `ask`, before a follow-up assistant message
-		// landed, or another caller navigated straight onto the ask result),
-		// and must still return `reopenAsk` / branch the new answer instead of
-		// silently reporting a no-op (chatgpt-codex review on #5895).
-		if (targetId === oldLeafId && !(options.allowAskReopen && targetIsAskResult)) {
+		// No-op if already at target — except for a user message, which always
+		// rewinds PAST itself (leaf → parent, text → editor), so a leaf user
+		// prompt (turn aborted before any assistant reply) is still a real move
+		// — and except mid-flight through the `ask` re-answer protocol (issue
+		// #5642): a probe or completion call can legitimately target the
+		// *current* leaf (e.g. the user interrupted right after answering
+		// `ask`, before a follow-up assistant message landed, or another caller
+		// navigated straight onto the ask result), and must still return
+		// `reopenAsk` / branch the new answer instead of silently reporting a
+		// no-op (chatgpt-codex review on #5895).
+		if (targetId === oldLeafId && !targetIsUserMessage && !(options.allowAskReopen && targetIsAskResult)) {
 			return { cancelled: false };
 		}
 
