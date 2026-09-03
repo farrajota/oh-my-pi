@@ -67,8 +67,17 @@ function createFixture(streamingMessage: AssistantMessage, tool?: AgentTool) {
 		setWorkingMessageRunTokenDelta: vi.fn(),
 		chatContainer: { addChild: vi.fn() },
 		toolOutputExpanded: false,
-		session: { getToolByName: () => tool, hasBuiltInTool: () => true, extensionRunner },
-		viewSession: { getToolByName: () => tool, hasBuiltInTool: () => true },
+		session: {
+			getToolByName: () => tool,
+			hasBuiltInTool: () => true,
+			agent: { tokenizer: { countMessage: () => 0 } },
+			extensionRunner,
+		},
+		viewSession: {
+			getToolByName: () => tool,
+			hasBuiltInTool: () => true,
+			agent: { tokenizer: { countMessage: () => 0 } },
+		},
 		sessionManager: { getCwd: () => process.cwd() },
 	} as unknown as InteractiveModeContext;
 
@@ -280,7 +289,7 @@ describe("EventController paces streamed tool args", () => {
 		await Promise.resolve();
 		expect(approvalReady).toBe(false);
 
-		await controller.handleEvent({
+		await controller.handleEvent(ctx.viewSession, {
 			type: "tool_stream_update",
 			toolCallId: "tc-approval",
 			toolName: "edit",
