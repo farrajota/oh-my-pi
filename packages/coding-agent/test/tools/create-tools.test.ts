@@ -19,7 +19,6 @@ function makeSession(
 		"eval.py": true,
 		"glob.enabled": true,
 		"grep.enabled": true,
-		"inspect_image.enabled": true,
 		"lsp.enabled": true,
 		"task.maxRecursionDepth": 0,
 		"web_search.enabled": true,

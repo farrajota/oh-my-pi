@@ -204,7 +204,6 @@ interface TaskDescriptionOptions {
 	disabledAgents: string[];
 	batchEnabled: boolean;
 	effortEnabled: boolean;
-	effortEnabled: boolean;
 	modelEnabled: boolean;
 	evalToolsEnabled: boolean;
 	asyncEnabled: boolean;
@@ -1727,7 +1726,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return manager.register(
 			"task",
 			oneLineLabel(spawnParams.task ?? agentId),
-			async ({ signal: runSignal, reportProgress, markRunning }) => {
+			async ({ jobId, signal: runSignal, reportProgress, markRunning }) => {
 				const startedAt = Date.now();
 				const semaphore = this.#getSpawnSemaphore();
 				let semaphoreHeld = false;

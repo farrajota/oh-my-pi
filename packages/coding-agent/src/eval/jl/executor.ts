@@ -161,12 +161,10 @@ async function executeWithKernel(
 		options,
 		runIdPrefix: "jl",
 		errorLogLabel: "Julia",
-		isJulia: true,
 		cancelledErrorClass: JuliaExecutionCancelledError,
 		buildKernelEnvPatch: opts => buildManagedKernelEnvPatch(opts, { sparse: true }),
 		formatKernelTimeoutAnnotation,
 		formatTimeoutAnnotation,
-		resolveDeadlineMs: opts => opts?.deadlineMs,
 	});
 }
 

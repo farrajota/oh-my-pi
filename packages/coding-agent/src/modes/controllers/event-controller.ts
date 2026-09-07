@@ -859,7 +859,17 @@ export class EventController {
 		this.#toolArgsReveal.stop();
 	}
 
-	async handleEvent(source: AgentSession, event: AgentSessionEvent, replicatedRunStartedAt?: number): Promise<void> {
+	async handleEvent(event: AgentSessionEvent): Promise<void>;
+	async handleEvent(source: AgentSession, event: AgentSessionEvent, replicatedRunStartedAt?: number): Promise<void>;
+	async handleEvent(
+		sourceOrEvent: AgentSession | AgentSessionEvent,
+		eventOrReplicated?: AgentSessionEvent | number,
+		replicatedRunStartedAt?: number,
+	): Promise<void> {
+		const hasExplicitSource = eventOrReplicated !== undefined && typeof eventOrReplicated !== "number";
+		const source = hasExplicitSource ? (sourceOrEvent as AgentSession) : this.ctx.viewSession;
+		const event = hasExplicitSource ? eventOrReplicated : (sourceOrEvent as AgentSessionEvent);
+		const runStartedAt = typeof eventOrReplicated === "number" ? eventOrReplicated : replicatedRunStartedAt;
 		if (source !== this.ctx.viewSession) return;
 		if (!this.ctx.isInitialized) await this.ctx.init();
 		if (source !== this.ctx.viewSession) return;
@@ -868,7 +878,7 @@ export class EventController {
 			event: AgentSessionEvent,
 			replicatedRunStartedAt?: number,
 		) => Promise<void>;
-		await run(source, event, replicatedRunStartedAt);
+		await run(source, event, runStartedAt);
 	}
 
 	async rehydrateActiveRun(source: AgentSession): Promise<void> {

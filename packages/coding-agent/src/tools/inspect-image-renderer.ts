@@ -56,7 +56,7 @@ export const inspectImageToolRenderer = {
 		const header = renderStatusLine(
 			success
 				? {
-						iconOverride: uiTheme.styledSymbol("tool.inspectImage", "accent"),
+						iconOverride: uiTheme.styledSymbol("lang.image", "accent"),
 						title: "Inspect",
 						description: pathDisplay,
 					}

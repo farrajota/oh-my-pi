@@ -61,6 +61,7 @@ import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
 import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
 import type { ContextFileEntry } from "../tools";
+import { resolveEvalBackends } from "../tools/eval-backends";
 
 import { normalizeToolNames } from "../tools/builtin-names";
 import { isIrcEnabled } from "../tools/hub";
@@ -3063,7 +3064,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		toolNames = [...toolNames, "hub"];
 	}
 	if (toolNames?.includes("exec")) {
-		const backends = resolveEvalBackends({ settings } as ToolSession);
+		const backends = resolveEvalBackends({ settings });
 		const expanded = toolNames.filter(name => name !== "exec");
 		if (backends.python || backends.js) expanded.push("eval");
 		expanded.push("bash");
@@ -3455,6 +3456,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					// without leaking into another root session's traffic.
 					subagentEventBus: options.subagentEventBus,
 					parentHindsightSessionState: options.parentHindsightSessionState,
+					agentName: agent.name,
 					parentMnemopiSessionState: options.parentMnemopiSessionState,
 					parentTaskPrefix: id,
 					parentAgentId: options.parentAgentId,
