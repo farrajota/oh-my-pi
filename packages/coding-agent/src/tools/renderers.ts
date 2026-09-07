@@ -21,6 +21,7 @@ import { githubToolRenderer } from "./gh-renderer";
 import { globToolRenderer } from "./glob";
 import { grepToolRenderer } from "./grep";
 import { hubToolRenderer } from "./hub";
+import { inspectImageToolRenderer } from "./inspect-image-renderer";
 import { recallToolRenderer, reflectToolRenderer, retainToolRenderer } from "./memory-render";
 import { readToolRenderer } from "./read";
 import { resolveRenderer } from "./resolve";
@@ -111,6 +112,7 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	get hub(): ToolRenderer {
 		return hubToolRenderer as ToolRenderer;
 	},
+	inspect_image: inspectImageToolRenderer as ToolRenderer,
 	read: readToolRenderer as ToolRenderer,
 	// Keyed by xd:// resolution-device names: the write dispatch delegates here
 	// by dispatch tool, and historical `resolve` tool transcripts still render

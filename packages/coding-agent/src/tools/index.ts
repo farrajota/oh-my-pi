@@ -57,6 +57,7 @@ import { GithubTool } from "./gh";
 import { GlobTool } from "./glob";
 import { GrepTool } from "./grep";
 import { HubTool, isIrcEnabled } from "./hub";
+import { InspectImageTool } from "./inspect-image";
 import { LearnTool } from "./learn";
 import { ManageSkillTool } from "./manage-skill";
 import { MemoryEditTool } from "./memory-edit";
@@ -104,6 +105,7 @@ export * from "./glob";
 export * from "./grep";
 export * from "./hub";
 export * from "./image-gen";
+export * from "./inspect-image";
 export * from "./learn";
 export * from "./manage-skill";
 export * from "./memory-edit";
@@ -490,7 +492,6 @@ export const BUILTIN_TOOLS: Readonly<Record<BuiltinToolName, ToolFactory>> = Obj
 	lsp: LspTool.createIf,
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
-	computer: s => new ComputerTool(s),
 	browser_audit: createRegisteredBrowserAuditTool,
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,

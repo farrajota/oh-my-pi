@@ -14,7 +14,6 @@ export const BUILTIN_TOOL_NAMES = [
 	"inspect_image",
 	"browser",
 	"browser_audit",
-	"computer",
 	"checkpoint",
 	"rewind",
 	"security_scan",
