@@ -2,13 +2,22 @@
 
 ## [Unreleased]
 
+## [18.1.10] - 2026-09-04
+
+### Fixed
+
+- Fixed Codex V2 remote compaction ignoring explicit thinking-off.
+- Fixed Codex V2 remote compaction rebuilding the request prefix differently from normal turns, restoring prompt-cache reuse ([#10786](https://github.com/can1357/oh-my-pi/issues/10786)).
+
+## [18.1.6] - 2026-09-03
+
 ### Added
 
-- Enabled support for streaming tool argument updates to improve interactivity
+- Added support for streaming tool argument updates, providing more responsive tool-call progress.
 
 ### Changed
 
-- Normalize trailing periods in tool intents
+- Improved steering behavior so queued steering commands preserve already-emitted non-interruptible tool calls while aborting or skipping only interruptible waits.
 
 ## [18.1.2] - 2026-09-01
 

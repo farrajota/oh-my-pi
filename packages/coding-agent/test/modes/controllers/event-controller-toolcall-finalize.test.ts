@@ -12,10 +12,12 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { Component } from "@oh-my-pi/pi-tui";
+import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 beforeAll(async () => {
 	await initTheme();
@@ -43,63 +45,24 @@ function makeStreamingMessage(content: AssistantMessage["content"]): AssistantMe
 
 // Components the controller mounts during a dispatch (pending tool previews).
 // Sealed in afterEach so their spinner intervals never outlive the test file.
-const mountedComponents: { seal?(): void }[] = [];
+const mountedComponents: Component[] = [];
 
 function createFixture(streamingMessage: AssistantMessage) {
-	const markTranscriptBlockFinalized = vi.fn();
-	const streamingComponent = {
-		updateContent: vi.fn(),
-		markTranscriptBlockFinalized,
-	};
-	const chatChildren: unknown[] = [];
-	const chatContainer = {
-		children: chatChildren,
-		addChild: vi.fn((child: { seal?(): void }) => {
-			chatChildren.push(child);
-			mountedComponents.push(child);
-		}),
-		removeChild: vi.fn((child: unknown) => {
-			const index = chatChildren.indexOf(child);
-			if (index >= 0) chatChildren.splice(index, 1);
-		}),
-		canRemoveBlock: vi.fn(() => true),
-	};
-	const ctx = {
-		isInitialized: true,
-		init: vi.fn(async () => {}),
-		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
-		statusLine: { invalidate: vi.fn() },
-		updateEditorTopBorder: vi.fn(),
-		streamingComponent,
-		streamingMessage,
-		transcriptMessageComponents: new WeakMap(),
-		pendingTools: new Map(),
-		noteDisplayableThinkingContent: vi.fn(() => false),
-		setWorkingMessageRunTokenDelta: vi.fn(),
-		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
-		chatContainer,
-		toolOutputExpanded: false,
-		settings,
-		session: {
-			getToolByName: () => undefined,
-			hasBuiltInTool: () => true,
-			agent: { tokenizer: { countMessage: () => 0 } },
-		},
-		viewSession: {
-			getToolByName: () => undefined,
-			hasBuiltInTool: () => true,
-			agent: { tokenizer: { countMessage: () => 0 } },
-		},
-		clearTransientSessionUi: () => {},
-		sessionManager: { getCwd: () => process.cwd() },
-	} as unknown as InteractiveModeContext;
+	const streamingComponent = new AssistantMessageComponent();
+	const markTranscriptBlockFinalized = vi.spyOn(streamingComponent, "markTranscriptBlockFinalized");
+	const ctx = createInteractiveModeContext({ streamingComponent, streamingMessage });
+	const addChild = ctx.chatContainer.addChild.bind(ctx.chatContainer);
+	vi.spyOn(ctx.chatContainer, "addChild").mockImplementation(child => {
+		mountedComponents.push(child);
+		addChild(child);
+	});
 
 	const controller = new EventController(ctx);
 	return { controller, markTranscriptBlockFinalized, ctx };
 }
 
 async function dispatchUpdate(message: AssistantMessage) {
-	const { controller, ctx, markTranscriptBlockFinalized } = createFixture(message);
+	const { controller, markTranscriptBlockFinalized } = createFixture(message);
 	// #handleMessageUpdate only reads `event.message`; the raw provider stream
 	// event is irrelevant to the finalization contract under test.
 	const event = {
@@ -107,13 +70,15 @@ async function dispatchUpdate(message: AssistantMessage) {
 		message,
 		assistantMessageEvent: undefined as never,
 	} as Extract<AgentSessionEvent, { type: "message_update" }>;
-	await controller.handleEvent(ctx.viewSession, event);
+	await controller.handleEvent(event);
 	return markTranscriptBlockFinalized;
 }
 
 describe("EventController finalizes assistant block when tool-call args stream", () => {
 	afterEach(() => {
-		for (const component of mountedComponents.splice(0)) component.seal?.();
+		for (const component of mountedComponents.splice(0)) {
+			if (component instanceof ToolExecutionComponent) component.seal();
+		}
 		resetSettingsForTest();
 		vi.restoreAllMocks();
 	});
@@ -163,8 +128,8 @@ describe("EventController finalizes assistant block when tool-call args stream",
 			},
 			timestamp,
 		};
-		const { controller, ctx } = createFixture(message);
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
+		const { controller } = createFixture(message);
+		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -175,7 +140,9 @@ describe("EventController finalizes assistant block when tool-call args stream",
 });
 describe("EventController finalizes orphaned post-tool assistant segments", () => {
 	afterEach(() => {
-		for (const component of mountedComponents.splice(0)) component.seal?.();
+		for (const component of mountedComponents.splice(0)) {
+			if (component instanceof ToolExecutionComponent) component.seal();
+		}
 		resetSettingsForTest();
 		vi.restoreAllMocks();
 	});
@@ -192,7 +159,7 @@ describe("EventController finalizes orphaned post-tool assistant segments", () =
 			{ type: "text", text: "post-tool commentary" },
 		]);
 		const { controller, ctx } = createFixture(message);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "message_update",
 			message,
 			assistantMessageEvent: undefined as never,
@@ -201,7 +168,7 @@ describe("EventController finalizes orphaned post-tool assistant segments", () =
 		expect(segment).toBeInstanceOf(AssistantMessageComponent);
 		expect((segment as AssistantMessageComponent).isTranscriptBlockFinalized()).toBe(false);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "message_start",
 			message: makeStreamingMessage([]),
 		} as Extract<AgentSessionEvent, { type: "message_start" }>);

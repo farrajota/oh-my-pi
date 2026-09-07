@@ -31,6 +31,8 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 {{/if}}
   - `agentSource`: Optional exact source pin: `bundled`, `user`, or `project`.
   - `agentDefinitionSha256`: Optional lowercase SHA-256 pin for the exact file-backed agent definition bytes. A pin mismatch blocks before launch.
+{{#if evalToolsEnabled}}  - `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
+{{/if}}
 {{#if effortEnabled}}  - `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
 {{/if}}
   - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
@@ -52,6 +54,8 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 {{/if}}
 - `agentSource`: Optional exact source pin: `bundled`, `user`, or `project`.
 - `agentDefinitionSha256`: Optional lowercase SHA-256 pin for the exact file-backed agent definition bytes. A pin mismatch blocks before launch.
+{{#if evalToolsEnabled}}- `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
+{{/if}}
 {{#if effortEnabled}}- `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
 {{/if}}
 - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.

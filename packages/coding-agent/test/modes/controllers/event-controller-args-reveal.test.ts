@@ -10,12 +10,13 @@ import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { kStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { STREAMING_REVEAL_FRAME_MS } from "@oh-my-pi/pi-coding-agent/modes/controllers/streaming-reveal";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 beforeAll(async () => {
 	await initTheme();
@@ -52,62 +53,34 @@ function createFixture(streamingMessage: AssistantMessage, tool?: AgentTool) {
 			};
 		},
 	};
-	const ctx = {
-		isInitialized: true,
-		init: vi.fn(async () => {}),
-		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
-		settings,
-		statusLine: { invalidate: vi.fn() },
-		updateEditorTopBorder: vi.fn(),
-		streamingComponent: { updateContent: vi.fn(), markTranscriptBlockFinalized: vi.fn() },
+	const ctx = createInteractiveModeContext({
+		streamingComponent: new AssistantMessageComponent(),
 		streamingMessage,
-		transcriptMessageComponents: new WeakMap(),
 		pendingTools,
-		noteDisplayableThinkingContent: vi.fn(() => false),
-		setWorkingMessageRunTokenDelta: vi.fn(),
-		chatContainer: { addChild: vi.fn() },
-		toolOutputExpanded: false,
-		session: {
-			getToolByName: () => tool,
-			hasBuiltInTool: () => true,
-			agent: { tokenizer: { countMessage: () => 0 } },
-			extensionRunner,
-		},
-		viewSession: {
-			getToolByName: () => tool,
-			hasBuiltInTool: () => true,
-			agent: { tokenizer: { countMessage: () => 0 } },
-		},
-		sessionManager: { getCwd: () => process.cwd() },
-	} as unknown as InteractiveModeContext;
+		session: { getToolByName: () => tool, extensionRunner },
+	});
 
 	return {
 		controller: new EventController(ctx),
-		ctx,
 		pendingTools,
 		getApprovalWaiter: () => approvalWaiter,
 	};
 }
 
-async function dispatch(
-	controller: EventController,
-	source: InteractiveModeContext["viewSession"],
-	message: AssistantMessage,
-) {
+async function dispatch(controller: EventController, message: AssistantMessage) {
 	const event = {
 		type: "message_update",
 		message,
 		assistantMessageEvent: undefined as never,
 	} as Extract<AgentSessionEvent, { type: "message_update" }>;
-	await controller.handleEvent(source, event);
+	await controller.handleEvent(event);
 }
 
 async function dispatchToolStart(
 	controller: EventController,
-	source: InteractiveModeContext["viewSession"],
 	payload: { toolCallId: string; toolName: string; args: Record<string, unknown> },
 ) {
-	await controller.handleEvent(source, {
+	await controller.handleEvent({
 		type: "tool_execution_start",
 		toolCallId: payload.toolCallId,
 		toolName: payload.toolName,
@@ -138,8 +111,8 @@ describe("EventController paces streamed tool args", () => {
 		const seedStreaming = makeStreamingMessage([
 			{ type: "toolCall", id: "tc-1", name: "write", arguments: {}, [kStreamingPartialJson]: seed },
 		]);
-		const { controller, ctx, pendingTools } = createFixture(seedStreaming);
-		await dispatch(controller, ctx.viewSession, seedStreaming);
+		const { controller, pendingTools } = createFixture(seedStreaming);
+		await dispatch(controller, seedStreaming);
 		expect(pendingTools.size).toBe(1);
 
 		// Component constructor consumes the initial render args directly; no
@@ -153,7 +126,7 @@ describe("EventController paces streamed tool args", () => {
 		const fullStreaming = makeStreamingMessage([
 			{ type: "toolCall", id: "tc-1", name: "write", arguments: {}, [kStreamingPartialJson]: target },
 		]);
-		await dispatch(controller, ctx.viewSession, fullStreaming);
+		await dispatch(controller, fullStreaming);
 
 		for (let i = 0; i < 3; i++) {
 			vi.advanceTimersByTime(STREAMING_REVEAL_FRAME_MS);
@@ -174,7 +147,6 @@ describe("EventController paces streamed tool args", () => {
 		const finalArgs = { path: "/tmp/a.ts", content };
 		await dispatch(
 			controller,
-			ctx.viewSession,
 			makeStreamingMessage([{ type: "toolCall", id: "tc-1", name: "write", arguments: finalArgs }]),
 		);
 		expect(updateArgsSpy.mock.calls.at(-1)?.[0]).toBe(finalArgs);
@@ -200,10 +172,10 @@ describe("EventController paces streamed tool args", () => {
 				[kStreamingPartialJson]: target,
 			},
 		]);
-		const { controller, ctx } = createFixture(streaming);
+		const { controller } = createFixture(streaming);
 
-		await dispatch(controller, ctx.viewSession, streaming);
-		await dispatch(controller, ctx.viewSession, streaming);
+		await dispatch(controller, streaming);
+		await dispatch(controller, streaming);
 
 		const frame = updateArgsSpy.mock.calls.at(-1)?.[0] as Record<string, unknown>;
 		expect(frame.__partialJson).toBe(target);
@@ -220,12 +192,12 @@ describe("EventController paces streamed tool args", () => {
 		const streaming = makeStreamingMessage([
 			{ type: "toolCall", id: "tc-1", name: "write", arguments: {}, [kStreamingPartialJson]: target },
 		]);
-		const { controller, ctx, pendingTools } = createFixture(streaming);
+		const { controller, pendingTools } = createFixture(streaming);
 
 		// Args still streaming, but the reveal now seeds the preview with the
 		// full available partialJson on the very first message_update — so the
 		// path is already visible before the tool starts executing.
-		await dispatch(controller, ctx.viewSession, streaming);
+		await dispatch(controller, streaming);
 		const component = pendingTools.get("tc-1");
 		if (!component) throw new Error("expected a pending write component");
 		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("/tmp/exec.ts");
@@ -234,7 +206,7 @@ describe("EventController paces streamed tool args", () => {
 		// with smoothing off, an owned-dialect projector, or a superseded turn that
 		// still runs the call). The tool executes anyway: tool_execution_start is the
 		// one event every path emits with the validated args, so it must reconcile.
-		await dispatchToolStart(controller, ctx.viewSession, {
+		await dispatchToolStart(controller, {
 			toolCallId: "tc-1",
 			toolName: "write",
 			args: { path: "/tmp/exec.ts", content },
@@ -255,10 +227,9 @@ describe("EventController paces streamed tool args", () => {
 		};
 		const streaming = makeStreamingMessage([{ type: "toolCall", id: "tc-approval", name: "edit", arguments: args }]);
 		const tool = { mode: "replace" } as unknown as AgentTool;
-		const { controller, ctx, pendingTools, getApprovalWaiter } = createFixture(streaming, tool);
-		await dispatch(controller, ctx.viewSession, streaming);
+		const { controller, pendingTools, getApprovalWaiter } = createFixture(streaming, tool);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_stream_update",
 			toolCallId: "tc-approval",
 			toolName: "edit",
@@ -273,7 +244,8 @@ describe("EventController paces streamed tool args", () => {
 					},
 				],
 			},
-		} as Extract<AgentSessionEvent, { type: "tool_stream_update" }>);
+		});
+		await dispatch(controller, streaming);
 
 		const waiter = getApprovalWaiter();
 		if (!waiter) throw new Error("expected the TUI approval-preview waiter");
@@ -281,7 +253,7 @@ describe("EventController paces streamed tool args", () => {
 		const waiting = waiter("tc-approval").then(() => {
 			approvalReady = true;
 		});
-		await dispatchToolStart(controller, ctx.viewSession, {
+		await dispatchToolStart(controller, {
 			toolCallId: "tc-approval",
 			toolName: "edit",
 			args,
@@ -289,7 +261,7 @@ describe("EventController paces streamed tool args", () => {
 		await Promise.resolve();
 		expect(approvalReady).toBe(false);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_stream_update",
 			toolCallId: "tc-approval",
 			toolName: "edit",

@@ -1,6 +1,12 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
+import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
+// @ts-expect-error Bun imports this declaration source as text instead of a TypeScript module.
+import browserDeclarations from "./browser/declarations.d.ts" with { type: "text" };
+// @ts-expect-error Bun imports this JavaScript source as text instead of evaluating its module shape.
+import browserJavascript from "./browser/prelude.js" with { type: "text" };
+import browserPython from "./browser/prelude.py" with { type: "text" };
 import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
@@ -26,6 +32,8 @@ import {
 	releaseTab,
 	runInTab,
 } from "./browser/tab-supervisor";
+import { renderTabCall } from "./browser/tab-call";
+import { renderFunctionRun } from "./run-code";
 import type { OutputMeta } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
@@ -40,6 +48,7 @@ export { DEFAULT_RELAY_URL, type RelayKind, resolveRelayKind } from "./browser/r
 export type { Observation, ObservationEntry } from "./browser/tab-protocol";
 
 const DEFAULT_TAB_NAME = "main";
+const BROWSER_RUN_SCOPE: readonly string[] = ["tab", "page", "browser", "wait", "assert"];
 
 const appSchema = type({
 	"path?": type("string").describe("binary path to spawn"),
@@ -49,8 +58,13 @@ const appSchema = type({
 	"target?": type("string").describe("substring to pick a window"),
 });
 
+const tabCallStepSchema = type({
+	method: "string",
+	args: "unknown[]",
+});
+
 const browserSchema = type({
-	action: type("'open' | 'close' | 'run'").describe("operation"),
+	action: type("'open' | 'close' | 'run' | 'call'").describe("operation"),
 	"name?": type("string").describe("tab id (default 'main')"),
 	"url?": type("string").describe("url to open"),
 	"app?": appSchema,
@@ -64,10 +78,52 @@ const browserSchema = type({
 	),
 	"dialogs?": type("'accept' | 'dismiss'").describe("auto-handle dialogs"),
 	"code?": type("string").describe("js body to run in tab"),
+	"fn?": type("string").describe("serialized JavaScript function to run in tab"),
+	"args?": type("unknown[]").describe("arguments passed to a serialized function"),
+	"chain?": tabCallStepSchema.array(),
 	"timeout?": type("number").describe("timeout in seconds"),
 	"all?": type("boolean").describe("release every managed tab"),
 	"kill?": type("boolean").describe("also kill spawned-app browsers"),
 });
+
+
+/** Create the enabled-only browser host prelude for one tool session. */
+export function createBrowserPrelude(session: ToolSession): EvalPreludeDefinition {
+	return {
+		name: "browser",
+		documentation: browserDescription,
+		javascript: browserJavascript,
+		python: browserPython,
+		exports: ["browser"],
+		codeModeDeclarations: browserDeclarations,
+		approval: "exec",
+		enabled: () => session.settings.get("browser.enabled"),
+		invoke: (parameters, context) => invokeBrowser(session, parameters, context),
+	};
+}
+
+async function invokeBrowser(
+	session: ToolSession,
+	parameters: unknown,
+	context: EvalPreludeContext,
+): Promise<AgentToolResult<unknown>> {
+	const parsed = browserSchema(parameters);
+	if (parsed instanceof type.errors) {
+		throw new ToolError(`browser received invalid arguments: ${parsed.summary}`);
+	}
+	return new BrowserTool(session).execute(
+		context.toolCallId,
+		parsed,
+		context.signal,
+		context.onUpdate as AgentToolUpdateCallback<BrowserToolDetails> | undefined,
+		context.context,
+	);
+}
+
+/** Drop headless tabs so a browser mode change applies to the next open. */
+export async function restartBrowserForModeChange(): Promise<void> {
+	await dropHeadlessTabs();
+}
 
 /** Input schema for the browser tool. */
 export type BrowserParams = typeof browserSchema.infer;
@@ -247,6 +303,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 				case "close":
 					return await this.#close(name, params, details, timeoutMs, signal);
 				case "run":
+				case "call":
 					return await this.#run(name, params, details, timeoutMs, signal);
 				default:
 					throw new ToolError(`Unsupported action: ${(params as BrowserParams).action}`);
@@ -399,8 +456,18 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
-		if (!params.code?.trim()) {
-			throw new ToolError("Missing required parameter 'code' for action 'run'.");
+		const code =
+			params.action === "call"
+				? renderTabCall(params.chain ?? [])
+				: params.fn
+					? renderFunctionRun(params.fn, BROWSER_RUN_SCOPE, params.args ?? [])
+					: params.code;
+		if (!code?.trim()) {
+			throw new ToolError(
+				params.action === "call"
+					? "Missing required parameter 'chain' for action 'call'."
+					: "Missing required parameter 'code' or 'fn' for action 'run'.",
+			);
 		}
 		const tab = getTab(name, this.options.dedicatedAuditId);
 		if (tab) {
@@ -409,7 +476,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		}
 
 		const { displays, returnValue, screenshots } = await runInTab(name, {
-			code: params.code,
+			code,
 			timeoutMs,
 			signal,
 			session: this.session,

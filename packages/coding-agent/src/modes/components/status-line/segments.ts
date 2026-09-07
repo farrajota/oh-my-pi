@@ -875,6 +875,7 @@ const usageSegment: StatusLineSegment = {
 
 export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	pi: piSegment,
+	status: statusSegment,
 	omp_version: ompVersionSegment,
 	docker_container: dockerContainerSegment,
 	model: modelSegment,

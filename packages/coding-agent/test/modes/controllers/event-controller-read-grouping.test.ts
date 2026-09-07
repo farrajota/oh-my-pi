@@ -20,9 +20,9 @@ import { ReadToolGroupComponent } from "@oh-my-pi/pi-coding-agent/modes/componen
 import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { type Component, Image, ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
+import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 beforeAll(async () => {
 	await initTheme(false, undefined, undefined, "dark", "light");
@@ -76,41 +76,15 @@ function assistantMessage(content: Block[]): AssistantMessage {
 }
 
 function createFixture() {
-	const chatContainer = new TranscriptContainer();
-	const sessionMock = { getToolByName: () => undefined, hasBuiltInTool: () => true, extensionRunner: undefined };
-	const ctx = {
-		isInitialized: true,
-		init: vi.fn(async () => {}),
-		statusLine: { invalidate: vi.fn() },
-		updateEditorTopBorder: vi.fn(),
-		ui: { requestRender: vi.fn(), imageBudget: undefined },
-		chatContainer,
-		transcriptMessageComponents: new WeakMap(),
-		pendingTools: new Map(),
-		noteDisplayableThinkingContent: vi.fn(() => false),
-		settings: { get: () => false },
-		toolOutputExpanded: false,
-		hideThinkingBlock: false,
-		setWorkingMessage: vi.fn(),
-		setWorkingMessageRunTokenDelta: vi.fn(),
-		getWorkingMessageRunElapsedMs: vi.fn(() => 0),
-		clearTransientSessionUi: () => {},
-		session: sessionMock,
-		sessionManager: { getCwd: () => process.cwd() },
-		viewSession: sessionMock,
-	} as unknown as InteractiveModeContext;
-	return { controller: new EventController(ctx), ctx, chatContainer };
+	const ctx = createInteractiveModeContext();
+	return { controller: new EventController(ctx), chatContainer: ctx.chatContainer };
 }
 
 /** Drive one assistant completion: message_start then a single full message_update. */
-async function streamCompletion(
-	controller: EventController,
-	source: InteractiveModeContext["viewSession"],
-	content: Block[],
-): Promise<void> {
+async function streamCompletion(controller: EventController, content: Block[]): Promise<void> {
 	const message = assistantMessage(content);
-	await controller.handleEvent(source, { type: "message_start", message } as AgentSessionEvent);
-	await controller.handleEvent(source, { type: "message_update", message } as AgentSessionEvent);
+	await controller.handleEvent({ type: "message_start", message } as AgentSessionEvent);
+	await controller.handleEvent({ type: "message_update", message } as AgentSessionEvent);
 }
 
 function readGroups(chatContainer: TranscriptContainer): ReadToolGroupComponent[] {
@@ -129,18 +103,15 @@ function hasImageComponent(component: Component): boolean {
 
 describe("EventController read-group accretion", () => {
 	it("collapses a run of single-read completions into one group (mixed/empty thinking)", async () => {
-		const { controller, ctx, chatContainer } = createFixture();
+		const { controller, chatContainer } = createFixture();
 
 		// Mirrors the reported session: first read carries reasoning, the rest have
 		// empty or absent thinking. None of them should break the run. Distinct files
 		// keep one aggregated row per read so the count reflects the run size.
-		await streamCompletion(controller, ctx.viewSession, [
-			thinking("Considering performance optimizations"),
-			read("a.ts:180-250"),
-		]);
-		await streamCompletion(controller, ctx.viewSession, [thinking(""), read("b.ts:1-120")]);
-		await streamCompletion(controller, ctx.viewSession, [read("c.ts:1-220")]);
-		await streamCompletion(controller, ctx.viewSession, [read("d.ts:450-535")]);
+		await streamCompletion(controller, [thinking("Considering performance optimizations"), read("a.ts:180-250")]);
+		await streamCompletion(controller, [thinking(""), read("b.ts:1-120")]);
+		await streamCompletion(controller, [read("c.ts:1-220")]);
+		await streamCompletion(controller, [read("d.ts:450-535")]);
 
 		const groups = readGroups(chatContainer);
 		expect(groups.length).toBe(1);
@@ -149,7 +120,7 @@ describe("EventController read-group accretion", () => {
 
 	it("nests a read-only completion's usage inside the active group", async () => {
 		settings.set("display.showTokenUsage", true);
-		const { controller, ctx, chatContainer } = createFixture();
+		const { controller, chatContainer } = createFixture();
 		const message = assistantMessage([thinking("Reviewing the target"), read("usage.ts:1-50")]);
 		message.usage = {
 			input: 1234,
@@ -161,9 +132,9 @@ describe("EventController read-group accretion", () => {
 		};
 		message.timestamp = new Date(2026, 0, 2, 3, 4, 5).getTime();
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message } as AgentSessionEvent);
-		await controller.handleEvent(ctx.viewSession, { type: "message_update", message } as AgentSessionEvent);
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_start", message } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_update", message } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_end", message } as AgentSessionEvent);
 
 		const [group] = readGroups(chatContainer);
 		expect(group).toBeDefined();
@@ -175,7 +146,7 @@ describe("EventController read-group accretion", () => {
 
 	it("keeps usage standalone when visible content follows a read", async () => {
 		settings.set("display.showTokenUsage", true);
-		const { controller, ctx, chatContainer } = createFixture();
+		const { controller, chatContainer } = createFixture();
 		const message = assistantMessage([read("usage.ts:1-50"), thinking("Read complete")]);
 		message.usage = {
 			input: 1234,
@@ -187,9 +158,9 @@ describe("EventController read-group accretion", () => {
 		};
 		message.timestamp = new Date(2026, 0, 2, 3, 4, 5).getTime();
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message } as AgentSessionEvent);
-		await controller.handleEvent(ctx.viewSession, { type: "message_update", message } as AgentSessionEvent);
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_start", message } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_update", message } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_end", message } as AgentSessionEvent);
 
 		const [group] = readGroups(chatContainer);
 		expect(group).toBeDefined();
@@ -202,7 +173,7 @@ describe("EventController read-group accretion", () => {
 
 	it("starts a fresh group after standalone usage for a mixed-tool turn ending in read", async () => {
 		settings.set("display.showTokenUsage", true);
-		const { controller, ctx, chatContainer } = createFixture();
+		const { controller, chatContainer } = createFixture();
 		const message = assistantMessage([toolCall("bash", "bash-mixed", { command: "true" }), read("first.ts:1-50")]);
 		message.usage = {
 			input: 1234,
@@ -214,10 +185,10 @@ describe("EventController read-group accretion", () => {
 		};
 		message.timestamp = new Date(2026, 0, 2, 3, 4, 5).getTime();
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message } as AgentSessionEvent);
-		await controller.handleEvent(ctx.viewSession, { type: "message_update", message } as AgentSessionEvent);
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as AgentSessionEvent);
-		await streamCompletion(controller, ctx.viewSession, [read("second.ts:1-50")]);
+		await controller.handleEvent({ type: "message_start", message } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_update", message } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_end", message } as AgentSessionEvent);
+		await streamCompletion(controller, [read("second.ts:1-50")]);
 
 		const groups = readGroups(chatContainer);
 		expect(groups).toHaveLength(2);
@@ -231,16 +202,13 @@ describe("EventController read-group accretion", () => {
 	});
 
 	it("starts a new group after a completion that renders visible reasoning", async () => {
-		const { controller, ctx, chatContainer } = createFixture();
+		const { controller, chatContainer } = createFixture();
 
-		await streamCompletion(controller, ctx.viewSession, [read("a.ts:1-50")]);
-		await streamCompletion(controller, ctx.viewSession, [read("b.ts:1-50")]);
+		await streamCompletion(controller, [read("a.ts:1-50")]);
+		await streamCompletion(controller, [read("b.ts:1-50")]);
 		// Visible reasoning is a separator: the next reads form a distinct group.
-		await streamCompletion(controller, ctx.viewSession, [
-			thinking("Now let me check the other files"),
-			read("c.ts:1-40"),
-		]);
-		await streamCompletion(controller, ctx.viewSession, [read("d.ts:1-40")]);
+		await streamCompletion(controller, [thinking("Now let me check the other files"), read("c.ts:1-40")]);
+		await streamCompletion(controller, [read("d.ts:1-40")]);
 
 		const groups = readGroups(chatContainer);
 		expect(groups.length).toBe(2);
@@ -249,9 +217,9 @@ describe("EventController read-group accretion", () => {
 	});
 
 	it("keeps the active group repaintable until it is finalized", async () => {
-		const { controller, ctx, chatContainer } = createFixture();
+		const { controller, chatContainer } = createFixture();
 
-		await streamCompletion(controller, ctx.viewSession, [read("a.ts:1-50")]);
+		await streamCompletion(controller, [read("a.ts:1-50")]);
 		const [group] = readGroups(chatContainer);
 		// While it is the active run the block must stay in the live region so its
 		// header can re-layout from `Read <path>` to `Read (N)` on risk terminals.
@@ -264,23 +232,23 @@ describe("EventController read-group accretion", () => {
 		expect(group!.isTranscriptBlockFinalized()).toBe(false);
 
 		// A visible-reasoning completion breaks the run and finalizes the prior group.
-		await streamCompletion(controller, ctx.viewSession, [thinking("done exploring"), read("b.ts:1-50")]);
+		await streamCompletion(controller, [thinking("done exploring"), read("b.ts:1-50")]);
 		expect(group!.isTranscriptBlockFinalized()).toBe(true);
 	});
 
 	it("retains live read images while hidden so the visibility toggle can reveal them", async () => {
 		Settings.instance.override("terminal.showImages", false);
 		setTerminalImageProtocol(ImageProtocol.Sixel);
-		const { controller, ctx, chatContainer } = createFixture();
+		const { controller, chatContainer } = createFixture();
 		const toolCall = read("hidden.png");
-		await streamCompletion(controller, ctx.viewSession, [toolCall]);
+		await streamCompletion(controller, [toolCall]);
 		const image: ImageContent = {
 			type: "image",
 			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
 			mimeType: "image/png",
 		};
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: toolCall.type === "toolCall" ? toolCall.id : "",
 			toolName: "read",

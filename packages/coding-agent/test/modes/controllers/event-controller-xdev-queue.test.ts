@@ -5,11 +5,12 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import type { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 beforeAll(async () => {
 	await initTheme();
@@ -49,52 +50,15 @@ function deviceWrite(id: string, name: string, inner: Record<string, unknown>) {
 
 function createFixture(streamingMessage: AssistantMessage) {
 	const pendingTools = new Map<string, ToolExecutionComponent>();
-	const ctx = {
-		isInitialized: true,
-		init: vi.fn(async () => {}),
-		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), resetDisplay: vi.fn() },
-		settings,
-		sessionManager: { getCwd: () => process.cwd() },
-		statusLine: { invalidate: vi.fn() },
-		setWorkingMessageRunTokenDelta: vi.fn(),
-		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
-		endWorkingMessageRun: vi.fn(),
-		streamingComponent: { updateContent: vi.fn(), markTranscriptBlockFinalized: vi.fn() },
+	const ctx = createInteractiveModeContext({
+		streamingComponent: new AssistantMessageComponent(),
 		streamingMessage,
-		transcriptMessageComponents: new WeakMap(),
 		pendingTools,
-		noteDisplayableThinkingContent: vi.fn(() => false),
-		chatContainer: { addChild: vi.fn(), canRemoveBlock: () => true },
-		toolOutputExpanded: false,
-		lastAssistantUsage: undefined,
-		showPinnedError: vi.fn(),
-		session: {
-			activeRunStartedAt: 1_000,
-			isStreaming: false,
-			getToolByName: () => undefined,
-			hasBuiltInTool: () => true,
-			isTtsrAbortPending: false,
-			retryAttempt: 0,
-			agent: { tokenizer: { countMessage: () => 0 } },
-			getSessionId: () => "session-1",
-			sessionManager: { getCwd: () => process.cwd() },
-		},
-		viewSession: {
-			activeRunStartedAt: 1_000,
-			getToolByName: () => undefined,
-			hasBuiltInTool: () => true,
-			isTtsrAbortPending: false,
-			retryAttempt: 0,
-			isStreaming: false,
-			getSessionId: () => "session-1",
-			agent: { tokenizer: { countMessage: () => 0 } },
-			sessionManager: { getCwd: () => process.cwd() },
-		},
-	} as unknown as InteractiveModeContext;
+	});
 
 	const controller = new EventController(ctx);
 	ctx.eventController = controller;
-	return { controller, pendingTools, ctx };
+	return { controller, pendingTools };
 }
 
 function cardText(pendingTools: Map<string, ToolExecutionComponent>, id: string): string {
@@ -119,9 +83,9 @@ describe("EventController queues exclusive device writes until execution starts"
 			deviceWrite("write-1", "mcp__ecoport_search", searchArgs),
 			deviceWrite("write-2", "mcp__ecoport_scripts", scriptsArgs),
 		]);
-		const { controller, pendingTools, ctx } = createFixture(streaming);
+		const { controller, pendingTools } = createFixture(streaming);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "message_update",
 			message: streaming,
 			assistantMessageEvent: undefined as never,
@@ -132,7 +96,7 @@ describe("EventController queues exclusive device writes until execution starts"
 		expect(cardText(pendingTools, "write-2")).toContain("queued");
 		expect(cardText(pendingTools, "write-2")).toContain("ecoport/scripts");
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "message_end",
 			message: streaming,
 		} as Extract<AgentSessionEvent, { type: "message_end" }>);
@@ -141,7 +105,7 @@ describe("EventController queues exclusive device writes until execution starts"
 		expect(controller.hasToolExecutionStarted("write-1")).toBe(false);
 		expect(controller.hasToolExecutionStarted("write-2")).toBe(false);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "write-1",
 			toolName: "write",
@@ -152,7 +116,7 @@ describe("EventController queues exclusive device writes until execution starts"
 		expect(cardText(pendingTools, "write-1")).not.toContain("queued");
 		expect(cardText(pendingTools, "write-2")).toContain("queued");
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "write-2",
 			toolName: "write",

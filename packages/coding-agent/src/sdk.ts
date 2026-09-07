@@ -231,6 +231,8 @@ import {
 	xdevEntries,
 } from "./tools";
 
+import { createBrowserPrelude } from "./tools/browser";
+import { createComputerPrelude } from "./tools/computer";
 import { assertToolNameNotReserved, isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
 import { ToolContextStore } from "./tools/context";
 import { isIrcEnabled } from "./tools/hub";

@@ -1,13 +1,14 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
+import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolCall, Usage } from "@oh-my-pi/pi-ai";
-import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { Component, TUI } from "@oh-my-pi/pi-tui";
+import type { Component } from "@oh-my-pi/pi-tui";
+import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 
 const TOOL_CALL_A_ID = "toolu_mixed_text_order_a";
 const TOOL_CALL_B_ID = "toolu_mixed_text_order_b";
@@ -54,41 +55,12 @@ function lineContaining(lines: string[], marker: string): number {
 
 function createFixture(
 	hideToolActivity = false,
-	toolByName: (name: string) => { name: string; label?: string } | undefined = () => undefined,
+	toolByName: (name: string) => AgentTool | undefined = () => undefined,
 ) {
-	const chatContainer = new TranscriptContainer();
-	chatContainer.setToolActivityVisible(!hideToolActivity);
-	const pendingTools = new Map();
-	const ui = {
-		requestRender: vi.fn(),
-		requestComponentRender: vi.fn(),
-		imageBudget: undefined,
-	} as unknown as TUI;
-	const viewSession = {
-		getToolByName: toolByName,
-		hasBuiltInTool: () => true,
-		sessionManager: { getCwd: () => process.cwd() },
-		extensionRunner: undefined,
-		isTtsrAbortPending: false,
-		isStreaming: false,
-		agent: { tokenizer: { countMessage: () => 0 } },
-		getSessionId: () => "session-1",
-	};
 	let hasDisplayableThinkingContent = false;
-	const ctx = {
-		isInitialized: true,
-		init: vi.fn(async () => {}),
-		ui,
-		settings,
-		chatContainer,
-		transcriptMessageComponents: new WeakMap(),
-		pendingTools,
-		toolOutputExpanded: false,
+	const ctx = createInteractiveModeContext({
+		session: { getToolByName: toolByName },
 		hideToolActivity,
-		effectiveHideThinkingBlock: false,
-		proseOnlyThinking: true,
-		statusLine: { invalidate: vi.fn() },
-		updateEditorTopBorder: vi.fn(),
 		noteDisplayableThinkingContent: vi.fn((message: AssistantMessage) => {
 			const hasThinking = message.content.some(
 				content => content.type === "thinking" && content.thinking.trim() !== "",
@@ -97,18 +69,11 @@ function createFixture(
 			hasDisplayableThinkingContent = true;
 			return true;
 		}),
-		setWorkingMessageRunTokenDelta: vi.fn(),
-		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
-		session: viewSession,
-		viewSession,
-		sessionManager: { getCwd: () => process.cwd() },
-		showWarning: vi.fn(),
-		showPinnedError: vi.fn(),
-		clearTransientSessionUi: vi.fn(),
 		lastAssistantUsage: zeroUsage(),
-	} as unknown as InteractiveModeContext;
+	});
+	ctx.chatContainer.setToolActivityVisible(!hideToolActivity);
 
-	return { controller: new EventController(ctx), chatContainer, ctx };
+	return { controller: new EventController(ctx), chatContainer: ctx.chatContainer, ctx };
 }
 
 describe("EventController mixed assistant text/tool rendering", () => {
@@ -132,13 +97,13 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		// One unfinalized block at the retirement frontier blocks history commits
 		// for everything after it, so the whole transcript tail stayed in the
 		// mutable viewport in pressure mode (no separators, compacted blocks).
-		const { controller, ctx, chatContainer } = createFixture();
+		const { controller, chatContainer } = createFixture();
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message: assistantMessage([]) } as Extract<
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "message_update",
 			message: assistantMessage([{ type: "thinking", thinking: "**dead attempt**" }]),
 		} as Extract<AgentSessionEvent, { type: "message_update" }>);
@@ -148,7 +113,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(orphan.isTranscriptBlockFinalized()).toBe(false);
 
 		// Retry attempt streams a fresh message without the dead one ever ending.
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message: assistantMessage([]) } as Extract<
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
@@ -158,7 +123,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 	});
 
 	it("renders assistant text segments in order around two tool results from one mixed message", async () => {
-		const { controller, ctx, chatContainer } = createFixture();
+		const { controller, chatContainer } = createFixture();
 		const toolCallA: ToolCall = {
 			type: "toolCall",
 			id: TOOL_CALL_A_ID,
@@ -187,11 +152,11 @@ describe("EventController mixed assistant text/tool rendering", () => {
 			{ type: "text", text: FINAL_MARKER },
 		]);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message: started } as Extract<
+		await controller.handleEvent({ type: "message_start", message: started } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "message_update",
 			message: withFirstToolCall,
 			assistantMessageEvent: {
@@ -201,7 +166,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 				partial: withFirstToolCall,
 			},
 		} as Extract<AgentSessionEvent, { type: "message_update" }>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "message_update",
 			message: withSecondToolCall,
 			assistantMessageEvent: {
@@ -213,33 +178,33 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		} as Extract<AgentSessionEvent, { type: "message_update" }>);
 		const liveLines = chatContainer.render(120).map(line => Bun.stripANSI(line));
 		expect(lineContaining(liveLines, INTRO_MARKER)).toBeLessThan(lineContaining(liveLines, MIDDLE_MARKER));
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_A_ID,
 			toolName: "contract_probe_a",
 			args: { value: "a" },
 		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_A_ID,
 			toolName: "contract_probe_a",
 			result: { content: [{ type: "text", text: TOOL_RESULT_A_MARKER }] },
 			isError: false,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_B_ID,
 			toolName: "contract_probe_b",
 			args: { value: "b" },
 		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_B_ID,
 			toolName: "contract_probe_b",
 			result: { content: [{ type: "text", text: TOOL_RESULT_B_MARKER }] },
 			isError: false,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message: completed } as Extract<
+		await controller.handleEvent({ type: "message_end", message: completed } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -259,7 +224,13 @@ describe("EventController mixed assistant text/tool rendering", () => {
 	});
 
 	it("uses the canonical mounted-tool renderer for prefixed calls live and after transcript rebuild", async () => {
-		const githubTool = { name: "github", label: "GitHub" };
+		const githubTool: AgentTool = {
+			name: "github",
+			label: "GitHub",
+			description: "GitHub test tool",
+			parameters: type({}),
+			execute: async () => ({ content: [] }),
+		};
 		const toolByName = (name: string) => (name === "github" || name === "xd://github" ? githubTool : undefined);
 		const toolCall: ToolCall = {
 			type: "toolCall",
@@ -270,11 +241,11 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		const streaming = assistantMessage([toolCall]);
 
 		const live = createFixture(false, toolByName);
-		await live.controller.handleEvent(live.ctx.viewSession, {
-			type: "message_start",
-			message: assistantMessage([]),
-		} as Extract<AgentSessionEvent, { type: "message_start" }>);
-		await live.controller.handleEvent(live.ctx.viewSession, {
+		await live.controller.handleEvent({ type: "message_start", message: assistantMessage([]) } as Extract<
+			AgentSessionEvent,
+			{ type: "message_start" }
+		>);
+		await live.controller.handleEvent({
 			type: "message_update",
 			message: streaming,
 			assistantMessageEvent: {
@@ -287,7 +258,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(Bun.stripANSI(live.chatContainer.render(120).join("\n"))).toContain("GitHub Repo can1357/oh-my-pi");
 
 		const executionOnly = createFixture(false, toolByName);
-		await executionOnly.controller.handleEvent(executionOnly.ctx.viewSession, {
+		await executionOnly.controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
@@ -313,7 +284,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 	});
 
 	it("keeps assistant text streaming while hiding bash failures and grouped read activity", async () => {
-		const { controller, chatContainer, ctx } = createFixture(true);
+		const { controller, chatContainer } = createFixture(true);
 		const bashCall: ToolCall = {
 			type: "toolCall",
 			id: TOOL_CALL_A_ID,
@@ -335,11 +306,11 @@ describe("EventController mixed assistant text/tool rendering", () => {
 			{ type: "text", text: FINAL_MARKER },
 		]);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message: started } as Extract<
+		await controller.handleEvent({ type: "message_start", message: started } as Extract<
 			AgentSessionEvent,
 			{ type: "message_start" }
 		>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "message_update",
 			message: streaming,
 			assistantMessageEvent: {
@@ -349,33 +320,33 @@ describe("EventController mixed assistant text/tool rendering", () => {
 				partial: streaming,
 			},
 		} as Extract<AgentSessionEvent, { type: "message_update" }>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_A_ID,
 			toolName: "bash",
 			args: bashCall.arguments,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_A_ID,
 			toolName: "bash",
 			result: { content: [{ type: "text", text: HIDDEN_BASH_FAILURE_MARKER }] },
 			isError: true,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_B_ID,
 			toolName: "read",
 			args: readCall.arguments,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_B_ID,
 			toolName: "read",
 			result: { content: [{ type: "text", text: "read result must stay hidden" }] },
 			isError: false,
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message: streaming } as Extract<
+		await controller.handleEvent({ type: "message_end", message: streaming } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);

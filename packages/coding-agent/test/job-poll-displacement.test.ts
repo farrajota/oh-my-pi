@@ -13,14 +13,16 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
-import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
+import {
+	ToolExecutionComponent,
+	type ToolExecutionHandle,
+} from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import type { SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { Component, TUI } from "@oh-my-pi/pi-tui";
+import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 
 const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 
@@ -163,40 +165,14 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	function createFixture() {
-		const chatContainer = new TranscriptContainer();
-		const children = chatContainer.children;
-		const pendingTools = new Map();
-		const session = {
-			agent: { tokenizer: { countMessage: () => 0 } },
-			getToolByName: () => undefined,
-			hasBuiltInTool: () => true,
-		};
-		const ctx = {
-			isInitialized: true,
-			init: vi.fn(async () => {}),
-			ui: { requestRender: vi.fn() },
-			statusLine: { invalidate: vi.fn() },
-			updateEditorTopBorder: vi.fn(),
-			toolOutputExpanded: false,
-			pendingTools,
-			chatContainer,
-			session,
-			showWarning: vi.fn(),
-			viewSession: session,
-			sessionManager: { getCwd: () => process.cwd() },
-			setTodos: vi.fn(),
-			setWorkingMessageRunTokenDelta: vi.fn(),
-		} as unknown as InteractiveModeContext;
-		return { controller: new EventController(ctx), ctx, children, pendingTools };
+		const pendingTools = new Map<string, ToolExecutionHandle>();
+		const ctx = createInteractiveModeContext({ pendingTools });
+		const children = ctx.chatContainer.children;
+		return { controller: new EventController(ctx), children, pendingTools };
 	}
 
-	async function runPoll(
-		controller: EventController,
-		source: InteractiveModeContext["viewSession"],
-		children: Component[],
-		toolCallId: string,
-	) {
-		await controller.handleEvent(source, {
+	async function runPoll(controller: EventController, children: Component[], toolCallId: string) {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId,
 			toolName: "hub",
@@ -204,7 +180,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		});
 		const component = children[children.length - 1] as ToolExecutionComponent;
 		trackComponent(created, component);
-		await controller.handleEvent(source, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId,
 			toolName: "hub",
@@ -214,14 +190,8 @@ describe("EventController displaces consecutive waiting polls", () => {
 		return component;
 	}
 
-	async function runTodo(
-		controller: EventController,
-		source: InteractiveModeContext["viewSession"],
-		children: Component[],
-		toolCallId: string,
-		items?: string[],
-	) {
-		await controller.handleEvent(source, {
+	async function runTodo(controller: EventController, children: Component[], toolCallId: string, items?: string[]) {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId,
 			toolName: "todo",
@@ -229,7 +199,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		});
 		const component = children[children.length - 1] as ToolExecutionComponent;
 		trackComponent(created, component);
-		await controller.handleEvent(source, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId,
 			toolName: "todo",
@@ -240,12 +210,12 @@ describe("EventController displaces consecutive waiting polls", () => {
 	}
 
 	it("removes the previous waiting poll when the next hub call starts", async () => {
-		const { controller, ctx, children } = createFixture();
+		const { controller, children } = createFixture();
 
-		const first = await runPoll(controller, ctx.viewSession, children, "t1");
+		const first = await runPoll(controller, children, "t1");
 		expect(children).toContain(first);
 
-		const second = await runPoll(controller, ctx.viewSession, children, "t2");
+		const second = await runPoll(controller, children, "t2");
 
 		// The stale "waiting" frame is gone; only the fresh poll remains.
 		expect(children).not.toContain(first);
@@ -255,12 +225,12 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	it("seals the waiting poll in place when a different tool runs next", async () => {
-		const { controller, ctx, children } = createFixture();
+		const { controller, children } = createFixture();
 
-		const poll = await runPoll(controller, ctx.viewSession, children, "t1");
+		const poll = await runPoll(controller, children, "t1");
 		expect(poll.isDisplaceableBlock()).toBe(true);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "t2",
 			toolName: "bash",
@@ -275,13 +245,13 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	it("removes the previous todo snapshot when a later todo update lands in the same turn", async () => {
-		const { controller, ctx, children } = createFixture();
+		const { controller, children } = createFixture();
 
-		const first = await runTodo(controller, ctx.viewSession, children, "todo-1", ["plan", "read"]);
+		const first = await runTodo(controller, children, "todo-1", ["plan", "read"]);
 		expect(children).toContain(first);
 		expect(first.isDisplaceableBlock()).toBe(true);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "bash-1",
 			toolName: "bash",
@@ -291,7 +261,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		expect(children).toContain(first);
 		expect(children).toContain(bash);
 
-		const second = await runTodo(controller, ctx.viewSession, children, "todo-2", ["fix", "test"]);
+		const second = await runTodo(controller, children, "todo-2", ["fix", "test"]);
 
 		expect(children).not.toContain(first);
 		expect(children).toContain(bash);
@@ -300,9 +270,9 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	it("displaces a prior todo snapshot when a streamed second todo lands a successful result", async () => {
-		const { controller, ctx, children, pendingTools } = createFixture();
+		const { controller, children, pendingTools } = createFixture();
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "todo-1",
 			toolName: "todo",
@@ -314,7 +284,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		children.push(second);
 		pendingTools.set("todo-2", second);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "todo-1",
 			toolName: "todo",
@@ -323,7 +293,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		});
 		expect(first.isDisplaceableBlock()).toBe(true);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "bash-1",
 			toolName: "bash",
@@ -334,7 +304,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		expect(children).toContain(second);
 		expect(children).toContain(bash);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "todo-2",
 			toolName: "todo",
@@ -346,7 +316,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		expect(children).toContain(first);
 		expect(first.isDisplaceableBlock()).toBe(true);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "todo-2",
 			toolName: "todo",
@@ -361,13 +331,13 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	it("keeps the prior todo snapshot when a follow-up todo errors", async () => {
-		const { controller, ctx, children } = createFixture();
+		const { controller, children } = createFixture();
 
-		const first = await runTodo(controller, ctx.viewSession, children, "todo-1", ["plan", "read"]);
+		const first = await runTodo(controller, children, "todo-1", ["plan", "read"]);
 		expect(children).toContain(first);
 		expect(first.isDisplaceableBlock()).toBe(true);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "todo-2",
 			toolName: "todo",
@@ -375,7 +345,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 		});
 		const errored = trackComponent(created, children[children.length - 1] as ToolExecutionComponent);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "todo-2",
 			toolName: "todo",
@@ -389,16 +359,16 @@ describe("EventController displaces consecutive waiting polls", () => {
 	});
 
 	it("does not displace a poll that observed completions", async () => {
-		const { controller, ctx, children } = createFixture();
+		const { controller, children } = createFixture();
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "t1",
 			toolName: "hub",
 			args: { op: "wait", ids: ["j0"] },
 		});
 		const settled = trackComponent(created, children[children.length - 1] as ToolExecutionComponent);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "t1",
 			toolName: "hub",
@@ -406,7 +376,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 			isError: false,
 		});
 
-		const next = await runPoll(controller, ctx.viewSession, children, "t2");
+		const next = await runPoll(controller, children, "t2");
 
 		// A poll that carried real results is kept as history.
 		expect(children).toContain(settled);
@@ -426,31 +396,10 @@ describe("UiHelpers.renderSessionContext collapses repeated todo snapshots", () 
 	});
 
 	it("removes the earlier todo snapshot when an assistant message replays two todo calls", () => {
-		const chatContainer = new TranscriptContainer();
-		const ctx = {
-			chatContainer,
-			transcriptMessageComponents: new WeakMap(),
-			pendingTools: new Map(),
-			ui: { requestRender: vi.fn() },
-			statusLine: { invalidate: vi.fn() },
-			updateEditorBorderColor: vi.fn(),
-			settings: { get: () => false },
-			addMessageToChat: (message: AgentMessage) => helpers.addMessageToChat(message),
-			session: {
-				retryAttempt: 0,
-				getToolByName: () => undefined,
-				hasBuiltInTool: () => true,
-				sessionManager: { getCwd: () => process.cwd() },
-			},
-			get viewSession() {
-				return (this as { session: unknown }).session;
-			},
-			toolOutputExpanded: false,
-			hideThinkingBlock: false,
-			lastAssistantUsage: undefined,
-			clearTransientSessionUi: () => {},
-		} as unknown as InteractiveModeContext;
+		const ctx = createInteractiveModeContext();
+		const chatContainer = ctx.chatContainer;
 		const helpers = new UiHelpers(ctx);
+		ctx.addMessageToChat = helpers.addMessageToChat.bind(helpers);
 
 		const usage = {
 			input: 1,
@@ -502,34 +451,13 @@ describe("UiHelpers.renderSessionContext collapses repeated todo snapshots", () 
 	});
 
 	it("hands the trailing todo snapshot to the controller during mid-turn rebuild", () => {
-		const chatContainer = new TranscriptContainer();
-		const inheritDisplaceableTodo = vi.fn();
-		const ctx = {
-			chatContainer,
-			transcriptMessageComponents: new WeakMap(),
-			pendingTools: new Map(),
-			ui: { requestRender: vi.fn() },
-			statusLine: { invalidate: vi.fn() },
-			updateEditorBorderColor: vi.fn(),
-			settings: { get: () => false },
-			addMessageToChat: (message: AgentMessage) => helpers.addMessageToChat(message),
-			session: {
-				retryAttempt: 0,
-				getToolByName: () => undefined,
-				hasBuiltInTool: () => true,
-				sessionManager: { getCwd: () => process.cwd() },
-				isStreaming: true,
-			},
-			get viewSession() {
-				return (this as { session: unknown }).session;
-			},
-			eventController: { inheritDisplaceableTodo, inheritTurnStart: vi.fn() },
-			toolOutputExpanded: false,
-			hideThinkingBlock: false,
-			lastAssistantUsage: undefined,
-			clearTransientSessionUi: () => {},
-		} as unknown as InteractiveModeContext;
+		const ctx = createInteractiveModeContext({ session: { isStreaming: true } });
+		const chatContainer = ctx.chatContainer;
 		const helpers = new UiHelpers(ctx);
+		ctx.addMessageToChat = helpers.addMessageToChat.bind(helpers);
+		const eventController = new EventController(ctx);
+		ctx.eventController = eventController;
+		const inheritDisplaceableTodo = vi.spyOn(eventController, "inheritDisplaceableTodo");
 
 		const usage = {
 			input: 1,

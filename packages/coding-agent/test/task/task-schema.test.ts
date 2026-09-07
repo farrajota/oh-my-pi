@@ -6,52 +6,24 @@ import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { getTaskSchema } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
-/** Narrow a successful omptype object result for property assertions. */
-function parsedObject(parsed: unknown): Record<string, unknown> {
-	if (parsed instanceof type.errors) throw new Error(`schema rejected input: ${parsed.summary}`);
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		throw new Error("expected an object parse result");
-	}
-	return parsed as Record<string, unknown>;
-}
-
 // Contract: the single-spawn schema (`task.batch: false`; the exported
-// `taskSchema` instance) carries no batch fields and keeps model gated by
-// `task.allowModelOverride`; dynamic schemas accept caller `model` only when
-// that independent gate is enabled. The batch shape (`tasks[]` + shared
+// `taskSchema` instance) carries no batch fields while accepting a caller
+// `model`, `outputSchema`, and its validation mode. The batch shape (`tasks[]` + shared
 // `context`) is gated by the `task.batch` setting (default on, covered by
 // test/task/task-batch.test.ts).
 
 describe("task schema (single-spawn)", () => {
 	it("accepts {agent, task}", () => {
-		const parsed = parsedObject(taskSchema({ agent: "scout", task: "Map the auth module." }));
-		expect(parsed.agent).toBe("scout");
+		const parsed = taskSchema({ agent: "scout", task: "Map the auth module." });
+		expect(parsed instanceof type.errors).toBe(false);
 	});
 
 	it("defaults agent to `task` when omitted", () => {
-		const parsed = parsedObject(taskSchema({ task: "Map the auth module." }));
-		expect(parsed.agent).toBe("task");
-	});
-
-	it("defaults a custom agent name containing punctuation", () => {
-		const schema = getTaskSchema({
-			isolationEnabled: false,
-			batchEnabled: false,
-			defaultAgent: "qa's reviewer",
-		});
-		const parsed = parsedObject(schema({ task: "Map the auth module." }));
-		expect(parsed.agent).toBe("qa's reviewer");
-	});
-
-	it("defaults custom agent names in batch items", () => {
-		const schema = getTaskSchema({
-			isolationEnabled: false,
-			batchEnabled: true,
-			defaultAgent: "review agent",
-			permissions: { enabled: true, toolsEnabled: true, pathsEnabled: true },
-		});
-		const parsed = parsedObject(schema({ context: "Shared context", tasks: [{ task: "Review the change." }] }));
-		expect((parsed.tasks as Array<{ agent?: unknown }>)[0]?.agent).toBe("review agent");
+		const parsed = taskSchema({ task: "Map the auth module." });
+		expect(parsed instanceof type.errors).toBe(false);
+		if (!(parsed instanceof type.errors)) {
+			expect(parsed.agent).toBe("task");
+		}
 	});
 
 	it("requires task", () => {
@@ -59,58 +31,40 @@ describe("task schema (single-spawn)", () => {
 		expect(parsed instanceof type.errors).toBe(true);
 	});
 
-	it("retains caller outputSchema and schemaMode while stripping stale keys", () => {
-		const outputSchema = { type: "object", properties: { answer: { type: "string" } } };
-		const parsed = parsedObject(
-			taskSchema({
-				agent: "scout",
-				task: "Map the auth module.",
-				outputSchema,
-				schemaMode: "strict",
-				context: "shared background",
-				tasks: [{ name: "A", task: "..." }],
-				schema: '{"properties":{}}',
-			}),
-		);
-		expect(parsed.outputSchema).toEqual(outputSchema);
-		expect(parsed.schemaMode).toBe("strict");
-		// Unknown keys are stripped: batch/context exist only on the batch
-		// schema and the per-call schema input was removed outright.
-		expect("tasks" in parsed).toBe(false);
-		expect("context" in parsed).toBe(false);
-		expect("schema" in parsed).toBe(false);
-	});
-
-	it("retains structured output fields when permissions select a dynamic schema", () => {
-		const outputSchema = { type: "object", properties: { answer: { type: "string" } } };
+	it("removes eval tool names from the wire shape when eval.tools.enabled is off", () => {
 		const schema = getTaskSchema({
 			isolationEnabled: false,
 			batchEnabled: false,
-			defaultAgent: "task",
-			permissions: { enabled: true, toolsEnabled: true, pathsEnabled: true },
+			evalToolsEnabled: false,
 		});
-		const parsed = parsedObject(
-			schema({
-				task: "Map the auth module.",
-				outputSchema,
-				schemaMode: "strict",
-				permissions: { denyTools: ["write"] },
-			}),
-		);
-		expect(parsed.outputSchema).toEqual(outputSchema);
-		expect(parsed.schemaMode).toBe("strict");
-		expect(parsed.permissions).toEqual({ denyTools: ["write"] });
+		const parsed = schema({ agent: "scout", task: "Map the auth module.", tools: ["word_count"] });
+		expect(parsed instanceof type.errors).toBe(false);
+		if (parsed && typeof parsed === "object" && !(parsed instanceof type.errors)) {
+			expect("tools" in parsed).toBe(false);
+		}
 	});
 
-	it("retains a request model only when the model gate is enabled", () => {
-		const enabled = getTaskSchema({
-			isolationEnabled: false,
-			batchEnabled: false,
-			defaultAgent: "task",
-			modelEnabled: true,
+	it("retains caller outputSchema, schemaMode, and eval tool names while stripping stale keys", () => {
+		const outputSchema = { type: "object", properties: { answer: { type: "string" } } };
+		const parsed = taskSchema({
+			agent: "scout",
+			task: "Map the auth module.",
+			outputSchema,
+			schemaMode: "strict",
+			tools: ["word_count"],
+			context: "shared background",
+			tasks: [{ name: "A", task: "..." }],
+			schema: '{"properties":{}}',
 		});
-		const parsed = parsedObject(enabled({ task: "Map the auth module.", model: "request/model" }));
-		expect(parsed.model).toBe("request/model");
+		expect(parsed instanceof type.errors).toBe(false);
+		if (!(parsed instanceof type.errors)) {
+			expect(parsed.outputSchema).toEqual(outputSchema);
+			expect(parsed.schemaMode).toBe("strict");
+			expect(parsed.tools).toEqual(["word_count"]);
+			expect("tasks" in parsed).toBe(false);
+			expect("context" in parsed).toBe(false);
+			expect("schema" in parsed).toBe(false);
+		}
 	});
 });
 

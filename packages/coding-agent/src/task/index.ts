@@ -65,11 +65,12 @@ import {
 } from "./types";
 // Import review tools for side effects (registers subagent tool handlers)
 import "../tools/review";
-import type { AsyncJobManager } from "../async";
+import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { parseAgent } from "./agents";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
+import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { type ExecutorOptions, runSubprocess } from "./executor";
 import {
 	applyEligibleNestedPatches,
@@ -203,7 +204,9 @@ interface TaskDescriptionOptions {
 	disabledAgents: string[];
 	batchEnabled: boolean;
 	effortEnabled: boolean;
+	effortEnabled: boolean;
 	modelEnabled: boolean;
+	evalToolsEnabled: boolean;
 	asyncEnabled: boolean;
 	ircEnabled: boolean;
 	parentSpawns: string;
@@ -246,6 +249,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		batchEnabled: options.batchEnabled,
 		effortEnabled: options.effortEnabled,
 		modelEnabled: options.modelEnabled,
+		evalToolsEnabled: options.evalToolsEnabled,
 		asyncEnabled: options.asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
 		ircEnabled: options.ircEnabled,
@@ -455,6 +459,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if (params.toolProfile !== undefined) item.toolProfile = params.toolProfile;
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
+	if ("tools" in params) item.tools = params.tools;
 	if ("effort" in params) item.effort = params.effort;
 	if ("isolated" in params) item.isolated = params.isolated;
 	return [item];
@@ -481,6 +486,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if (params.context !== undefined) spawn.context = params.context;
 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
+	if ("tools" in item) spawn.tools = item.tools;
 	if ("effort" in item) spawn.effort = item.effort;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
@@ -621,7 +627,7 @@ export function composeSpawnAdvisory(args: {
 }
 
 /** Sentinel for async jobs whose subagent finished with a failing result; progress is already updated. */
-class TaskJobError extends Error {}
+class TaskJobError extends AsyncJobError {}
 
 /**
  * Process-level create-time discovery memo and published reload snapshots,
@@ -914,6 +920,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: this.session.settings.get("task.allowEffortOverride"),
 			modelEnabled: this.session.settings.get("task.allowModelOverride"),
+			evalToolsEnabled: evalToolsEnabled(this.session),
 			defaultAgent,
 			permissions: {
 				enabled: permissionMode !== "off",
@@ -943,6 +950,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: this.session.settings.get("task.allowEffortOverride"),
 			modelEnabled: this.session.settings.get("task.allowModelOverride"),
+			evalToolsEnabled: evalToolsEnabled(this.session),
 			asyncEnabled: this.session.settings.get("async.enabled"),
 			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
@@ -1798,6 +1806,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						progress.index,
 						true,
 						{ invokedAt: startedAt, acquiredAt },
+						cleanup => {
+							// Tie the retained temp directory's lifetime to this job
+							// row: the manager runs `cleanup` exactly once, on
+							// eviction or manager disposal, instead of it leaking
+							// for the process lifetime. Look up by the resolved
+							// `jobId`, not the requested `agentId` — `register()`
+							// suffixes `jobId` on collision, and looking up the
+							// requested id would hit an unrelated pre-existing row.
+							const job = manager.getJob(jobId);
+							if (job) job.retainedArtifactsCleanup = cleanup;
+							else void cleanup();
+						},
 					);
 					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 					const singleResult = result.details?.results[0];
@@ -1830,11 +1850,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						: `Background task ${agentId} complete.`;
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
 					const deliveryText = `${finalText}${await buildFollowUpHint(singleResult?.aborted === true)}`;
+					const structured = singleResult?.structuredOutput;
 					if (resultFailed) {
 						// Mark the job itself failed; the failed agent stays interrogable.
-						throw new TaskJobError(deliveryText);
+						throw new TaskJobError(deliveryText, structured);
 					}
-					return deliveryText;
+					return structured ? { text: deliveryText, structured } : deliveryText;
 				} catch (error) {
 					if (error instanceof TaskJobError) {
 						throw error;
@@ -2030,8 +2051,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		spawnIndex = 0,
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
+		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
 	): Promise<AgentToolResult<TaskToolDetails>> {
-		return this.#runSpawn(toolCallId, params, signal, onUpdate, preAllocatedId, spawnIndex, detached, launchTiming);
+		return this.#runSpawn(
+			toolCallId,
+			params,
+			signal,
+			onUpdate,
+			preAllocatedId,
+			spawnIndex,
+			detached,
+			launchTiming,
+			onArtifactsRetained,
+		);
 	}
 
 	/** Spawn a fresh subagent and run it to completion. */
@@ -2044,6 +2076,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		spawnIndex = 0,
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
+		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		let latestProgress: AgentProgress | undefined;
@@ -2155,6 +2188,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			emitProgress();
 
 			const buildCommitMessageFn = makeIsolationCommitMessage(this.session);
+			const evalCustomTools = params.tools?.length
+				? createEvalCustomTools(this.session, await describeEvalTools(this.session, params.tools, signal))
+				: [];
 
 			const sharedRunOptions: ExecutorOptions = {
 				settings: preparedSettings,
@@ -2173,9 +2209,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				outputSchemaMode,
 				outputSchemaSource,
 				outputSchemaOverridesAgent,
+				customTools: evalCustomTools.length > 0 ? evalCustomTools : undefined,
 				index: spawnIndex,
 				parentToolCallId: toolCallId,
 				detached,
+				persistArtifacts: detached,
 				modelOverride,
 				modelRole,
 				requestedModel,

@@ -10,13 +10,14 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import { ErrorBannerComponent } from "@oh-my-pi/pi-coding-agent/modes/components/error-banner";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { Loader } from "@oh-my-pi/pi-tui";
+import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 
 function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
 	return {
@@ -46,6 +47,7 @@ beforeAll(async () => {
 beforeEach(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
+	settings.set("display.smoothStreaming", false);
 });
 
 afterEach(() => {
@@ -54,37 +56,21 @@ afterEach(() => {
 
 function createFixture(streamingMessage?: AssistantMessage) {
 	const componentCalls: string[] = [];
-	const streamingComponent = {
-		updateContent: vi.fn(() => componentCalls.push("update")),
-		setComplete: vi.fn(),
-		markTranscriptBlockFinalized: vi.fn(),
-		setErrorPinned: vi.fn(),
-		setHideThinkingBlock: vi.fn((hide: boolean) => componentCalls.push(`hide:${hide}`)),
-		messagePersistenceKey: vi.fn(() => "test-persistence-key"),
-		applyRetryRecovery: vi.fn(),
-	};
-	const showPinnedError = vi.fn();
-	const clearPinnedError = vi.fn();
-	const showError = vi.fn();
-	const statusContainer = {
-		clear: vi.fn(),
-		disposeChildren: vi.fn(),
-		addChild: vi.fn(),
-	};
-
-	const session = {
-		activeRunStartedAt: 1_000,
-		isStreaming: false,
-		isTtsrAbortPending: false,
-		retryAttempt: 0,
-		isAborting: false,
-		getToolByName: () => undefined,
-		hasBuiltInTool: () => true,
-		agent: { tokenizer: { countMessage: () => 0 } },
-		getSessionId: () => "session-1",
-		sessionManager: { getCwd: () => process.cwd() },
-	};
-	const viewSession = session;
+	const streamingComponent = new AssistantMessageComponent();
+	const updateContentImpl = streamingComponent.updateContent.bind(streamingComponent);
+	vi.spyOn(streamingComponent, "updateContent").mockImplementation((message, opts) => {
+		componentCalls.push("update");
+		updateContentImpl(message, opts);
+	});
+	const setHideThinkingBlockImpl = streamingComponent.setHideThinkingBlock.bind(streamingComponent);
+	vi.spyOn(streamingComponent, "setHideThinkingBlock").mockImplementation(hide => {
+		componentCalls.push(`hide:${hide}`);
+		setHideThinkingBlockImpl(hide);
+	});
+	const setErrorPinned = vi.spyOn(streamingComponent, "setErrorPinned");
+	vi.spyOn(streamingComponent, "messagePersistenceKey").mockReturnValue("test-persistence-key");
+	vi.spyOn(streamingComponent, "applyRetryRecovery");
+	const sessionState = { isStreaming: false };
 	let hasDisplayableThinkingContent = false;
 	const noteDisplayableThinkingContent = vi.fn((message: AssistantMessage) => {
 		const hasThinking = message.content.some(
@@ -94,47 +80,14 @@ function createFixture(streamingMessage?: AssistantMessage) {
 		hasDisplayableThinkingContent = true;
 		return true;
 	});
-	const chatChildren: unknown[] = [];
-	const chatContainer = {
-		children: chatChildren,
-		addChild: vi.fn((child: unknown) => {
-			chatChildren.push(child);
-		}),
-		clear: vi.fn(() => {
-			chatChildren.length = 0;
-		}),
-	};
-	const ctx = {
-		isInitialized: true,
-		init: vi.fn(async () => {}),
-		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
-		settings: { get: vi.fn(() => false) },
-		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
-		updateEditorTopBorder: vi.fn(),
-		updatePendingMessagesDisplay: vi.fn(),
-		ensureLoadingAnimation: vi.fn(),
-		beginWorkingMessageRun: vi.fn(),
-		rehydrateWorkingMessageRun: vi.fn(() => false),
-		endWorkingMessageRun: vi.fn(),
-		getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
-		setWorkingMessageRunTokenDelta: vi.fn(),
-		statusContainer,
-		loadingAnimation: undefined,
-		autoCompactionLoader: undefined,
-		retryLoader: undefined,
-		editor: {},
+	const ctx = createInteractiveModeContext({
 		streamingComponent: streamingMessage ? streamingComponent : undefined,
 		streamingMessage,
-		chatContainer,
-		proseOnlyThinking: true,
-		toolOutputExpanded: false,
-		transcriptMessageComponents: new WeakMap(),
-		pendingTools: new Map(),
-		flushCompactionQueue: vi.fn(async () => {}),
-		showPinnedError,
-		clearPinnedError,
-		showError,
-		showStatus: vi.fn(),
+		session: {
+			get isStreaming() {
+				return sessionState.isStreaming;
+			},
+		},
 		noteDisplayableThinkingContent,
 		get hasDisplayableThinkingContent() {
 			return hasDisplayableThinkingContent;
@@ -142,14 +95,12 @@ function createFixture(streamingMessage?: AssistantMessage) {
 		get effectiveHideThinkingBlock() {
 			return !hasDisplayableThinkingContent;
 		},
-		showWarning: vi.fn(),
-		session,
-		get viewSession() {
-			return viewSession;
-		},
-		clearTransientSessionUi: () => {},
-	} as unknown as InteractiveModeContext;
+	});
+	vi.spyOn(ctx.statusContainer, "disposeChildren");
 
+	const showPinnedError = vi.spyOn(ctx, "showPinnedError");
+	const clearPinnedError = vi.spyOn(ctx, "clearPinnedError");
+	const showError = vi.spyOn(ctx, "showError");
 	const controller = new EventController(ctx);
 	return {
 		controller,
@@ -158,7 +109,9 @@ function createFixture(streamingMessage?: AssistantMessage) {
 		clearPinnedError,
 		showError,
 		streamingComponent,
+		setErrorPinned,
 		componentCalls,
+		sessionState,
 	};
 }
 
@@ -166,9 +119,9 @@ describe("EventController error banner", () => {
 	it("pins the provider error above the editor when an assistant turn ends on stopReason error", async () => {
 		const errorMessage = "Output blocked by content filtering policy";
 		const message = makeAssistantMessage({ stopReason: "error", errorMessage });
-		const { controller, ctx, showPinnedError, streamingComponent } = createFixture(message);
+		const { controller, showPinnedError, setErrorPinned } = createFixture(message);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
+		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -177,7 +130,7 @@ describe("EventController error banner", () => {
 		expect(showPinnedError).toHaveBeenCalledWith(errorMessage);
 		// The same error is mirrored in the banner, so the transcript's inline
 		// `Error: …` line is suppressed to avoid a duplicate render.
-		expect(streamingComponent.setErrorPinned).toHaveBeenCalledWith(true);
+		expect(setErrorPinned).toHaveBeenCalledWith(true);
 	});
 
 	it("suppresses a recoverable empty-output error while session continuation starts", async () => {
@@ -187,23 +140,20 @@ describe("EventController error banner", () => {
 			errorId: AIError.create(AIError.Flag.Transient, AIError.Flag.EmptyResponse),
 			errorMessage: "Cloud Code Assist API returned a thought-only response without final output",
 		});
-		const { controller, ctx, showPinnedError, streamingComponent } = createFixture(message);
+		const { controller, showPinnedError, setErrorPinned } = createFixture(message);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
+		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
 
-		expect(streamingComponent.setErrorPinned).toHaveBeenCalledWith(true);
+		expect(setErrorPinned).toHaveBeenCalledWith(true);
 		expect(showPinnedError).not.toHaveBeenCalled();
-		streamingComponent.setErrorPinned.mockClear();
+		setErrorPinned.mockClear();
 
-		await controller.handleEvent(ctx.viewSession, { type: "agent_start" } as Extract<
-			AgentSessionEvent,
-			{ type: "agent_start" }
-		>);
+		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
 
-		expect(streamingComponent.setErrorPinned).not.toHaveBeenCalled();
+		expect(setErrorPinned).not.toHaveBeenCalled();
 	});
 
 	it("keeps a terminal empty-output error pinned without adding a duplicate failure banner", async () => {
@@ -213,9 +163,9 @@ describe("EventController error banner", () => {
 			errorId: AIError.create(AIError.Flag.Transient, AIError.Flag.EmptyResponse),
 			errorMessage: "Cloud Code Assist API returned a thought-only response without final output",
 		});
-		const { controller, ctx, showPinnedError, clearPinnedError, showError } = createFixture(message);
+		const { controller, showPinnedError, clearPinnedError, showError } = createFixture(message);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
+		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -227,7 +177,7 @@ describe("EventController error banner", () => {
 		clearPinnedError.mockClear();
 		showPinnedError.mockClear();
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "auto_retry_end",
 			success: false,
 			attempt: 3,
@@ -246,15 +196,15 @@ describe("EventController error banner", () => {
 			errorId: AIError.create(AIError.Flag.Transient),
 			errorMessage,
 		});
-		const { controller, ctx, showPinnedError, showError } = createFixture(message);
+		const { controller, showPinnedError, showError } = createFixture(message);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
+		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
 		showPinnedError.mockClear();
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "auto_retry_end",
 			success: false,
 			attempt: 3,
@@ -272,14 +222,13 @@ describe("EventController error banner", () => {
 			errorId: AIError.create(AIError.Flag.Transient),
 			errorMessage: providerError,
 		});
-		const { controller, ctx, showPinnedError, clearPinnedError, showError, streamingComponent } =
-			createFixture(message);
+		const { controller, showPinnedError, clearPinnedError, showError, setErrorPinned } = createFixture(message);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
+		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "auto_retry_start",
 			attempt: 1,
 			maxAttempts: 2,
@@ -290,10 +239,10 @@ describe("EventController error banner", () => {
 		showPinnedError.mockClear();
 		clearPinnedError.mockClear();
 		showError.mockClear();
-		streamingComponent.setErrorPinned.mockClear();
+		setErrorPinned.mockClear();
 
 		const finalError = `Retry continuation failed locally: local hook failed. Original error: ${providerError}`;
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "auto_retry_end",
 			success: false,
 			attempt: 1,
@@ -302,14 +251,14 @@ describe("EventController error banner", () => {
 
 		expect(showPinnedError).not.toHaveBeenCalled();
 		expect(clearPinnedError).toHaveBeenCalledTimes(1);
-		expect(streamingComponent.setErrorPinned).toHaveBeenCalledWith(false);
+		expect(setErrorPinned).toHaveBeenCalledWith(false);
 		expect(showError).toHaveBeenCalledWith(`Retry failed after 1 attempts: ${finalError}`);
 	});
 
 	it("shows a failed retry banner when no terminal assistant error exists", async () => {
-		const { controller, ctx, showError } = createFixture();
+		const { controller, showError } = createFixture();
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "auto_retry_end",
 			success: false,
 			attempt: 3,
@@ -324,21 +273,18 @@ describe("EventController error banner", () => {
 	it("restores the transcript inline error when the next turn starts", async () => {
 		const errorMessage = "Output blocked by content filtering policy";
 		const message = makeAssistantMessage({ stopReason: "error", errorMessage });
-		const { controller, ctx, clearPinnedError, streamingComponent } = createFixture(message);
+		const { controller, clearPinnedError, setErrorPinned } = createFixture(message);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
+		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
-		streamingComponent.setErrorPinned.mockClear();
+		setErrorPinned.mockClear();
 
-		await controller.handleEvent(ctx.viewSession, { type: "agent_start" } as Extract<
-			AgentSessionEvent,
-			{ type: "agent_start" }
-		>);
+		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
 
 		expect(clearPinnedError).toHaveBeenCalledTimes(1);
-		expect(streamingComponent.setErrorPinned).toHaveBeenCalledWith(false);
+		expect(setErrorPinned).toHaveBeenCalledWith(false);
 	});
 
 	it("clears retryable thinking-loop banners without restoring the dropped inline error", async () => {
@@ -348,16 +294,16 @@ describe("EventController error banner", () => {
 			errorMessage,
 			errorId: AIError.create(AIError.Flag.ThinkingLoop),
 		});
-		const { controller, ctx, clearPinnedError, streamingComponent } = createFixture(message);
+		const { controller, clearPinnedError, setErrorPinned } = createFixture(message);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
+		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
 		clearPinnedError.mockClear();
-		streamingComponent.setErrorPinned.mockClear();
+		setErrorPinned.mockClear();
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "auto_retry_start",
 			attempt: 1,
 			maxAttempts: 2,
@@ -367,8 +313,8 @@ describe("EventController error banner", () => {
 		} as Extract<AgentSessionEvent, { type: "auto_retry_start" }>);
 
 		expect(clearPinnedError).toHaveBeenCalledTimes(1);
-		expect(streamingComponent.setErrorPinned).not.toHaveBeenCalledWith(false);
-		await controller.handleEvent(ctx.viewSession, {
+		expect(setErrorPinned).not.toHaveBeenCalledWith(false);
+		await controller.handleEvent({
 			type: "auto_retry_end",
 			success: true,
 			attempt: 1,
@@ -377,9 +323,9 @@ describe("EventController error banner", () => {
 
 	it("does not pin a banner for a normal assistant stop", async () => {
 		const message = makeAssistantMessage({ stopReason: "stop" });
-		const { controller, ctx, showPinnedError } = createFixture(message);
+		const { controller, showPinnedError } = createFixture(message);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
+		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -389,8 +335,8 @@ describe("EventController error banner", () => {
 
 	it("does not pin a banner for an aborted assistant turn", async () => {
 		const message = makeAssistantMessage({ stopReason: "aborted", errorMessage: "Operation aborted" });
-		const { controller, ctx, showPinnedError } = createFixture(message);
-		await controller.handleEvent(ctx.viewSession, { type: "message_end", message } as Extract<
+		const { controller, showPinnedError } = createFixture(message);
+		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
@@ -399,12 +345,9 @@ describe("EventController error banner", () => {
 	});
 
 	it("clears the pinned banner when the next turn starts", async () => {
-		const { controller, ctx, clearPinnedError } = createFixture();
+		const { controller, clearPinnedError } = createFixture();
 
-		await controller.handleEvent(ctx.viewSession, { type: "agent_start" } as Extract<
-			AgentSessionEvent,
-			{ type: "agent_start" }
-		>);
+		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
 
 		expect(clearPinnedError).toHaveBeenCalledTimes(1);
 	});
@@ -415,10 +358,10 @@ describe("EventController error banner", () => {
 		const { controller, ctx } = createFixture();
 		ctx.toolOutputExpanded = true;
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message: initial } as Extract<
-			AgentSessionEvent,
-			{ type: "message_start" }
-		>);
+		await controller.handleEvent({
+			type: "message_start",
+			message: initial,
+		} as Extract<AgentSessionEvent, { type: "message_start" }>);
 		const component = ctx.streamingComponent;
 		if (!(component instanceof AssistantMessageComponent)) {
 			throw new Error("Expected streaming assistant component");
@@ -445,7 +388,7 @@ describe("EventController thinking visibility", () => {
 		});
 		const { controller, ctx } = createFixture();
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "message_start",
 			message: initial,
 		} as Extract<AgentSessionEvent, { type: "message_start" }>);
@@ -454,7 +397,7 @@ describe("EventController thinking visibility", () => {
 			throw new Error("Expected streaming assistant component");
 		}
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "message_update",
 			message,
 			assistantMessageEvent: {
@@ -470,12 +413,17 @@ describe("EventController thinking visibility", () => {
 
 describe("EventController working loader reconciliation", () => {
 	it("restores the working loader after compaction clears status while the focused session streams", async () => {
-		const { controller, ctx } = createFixture();
-		const loader = { stop: vi.fn() } as unknown as InteractiveModeContext["autoCompactionLoader"];
+		const { controller, ctx, sessionState } = createFixture();
+		const loader = new Loader(
+			ctx.ui,
+			text => text,
+			text => text,
+		);
+		const stop = vi.spyOn(loader, "stop");
 		ctx.autoCompactionLoader = loader;
-		(ctx.viewSession as unknown as { isStreaming: boolean }).isStreaming = true;
+		sessionState.isStreaming = true;
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "auto_compaction_end",
 			action: "context-full",
 			result: undefined,
@@ -484,17 +432,17 @@ describe("EventController working loader reconciliation", () => {
 			skipped: true,
 		} as Extract<AgentSessionEvent, { type: "auto_compaction_end" }>);
 
-		expect(loader?.stop).toHaveBeenCalledTimes(1);
+		expect(stop).toHaveBeenCalledTimes(1);
 		expect(ctx.statusContainer.disposeChildren).toHaveBeenCalledTimes(1);
 		expect(ctx.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
 		expect(ctx.ensureLoadingAnimation).toHaveBeenCalledTimes(1);
 	});
 
 	it("self-heals missing working loader on live tool updates", async () => {
-		const { controller, ctx } = createFixture();
-		(ctx.viewSession as unknown as { isStreaming: boolean }).isStreaming = true;
+		const { controller, ctx, sessionState } = createFixture();
+		sessionState.isStreaming = true;
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_update",
 			toolCallId: "missing",
 			partialResult: {},
@@ -514,10 +462,10 @@ describe("EventController working loader reconciliation", () => {
 		// the `tool_execution_update` reconciler. Without this the spinner stays
 		// gone for the remainder of the parent turn even though the agent keeps
 		// streaming (the user-visible regression in #3858).
-		const { controller, ctx } = createFixture();
-		(ctx.viewSession as unknown as { isStreaming: boolean }).isStreaming = true;
+		const { controller, ctx, sessionState } = createFixture();
+		sessionState.isStreaming = true;
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "task-1",
 			toolName: "task",
@@ -529,11 +477,16 @@ describe("EventController working loader reconciliation", () => {
 	});
 
 	it("does not restore the working loader while an overlay loader (auto-retry) owns the status container at tool_execution_end", async () => {
-		const { controller, ctx } = createFixture();
-		ctx.retryLoader = { stop: vi.fn() } as unknown as InteractiveModeContext["retryLoader"];
-		(ctx.viewSession as unknown as { isStreaming: boolean }).isStreaming = true;
+		const { controller, ctx, sessionState } = createFixture();
+		const loader = new Loader(
+			ctx.ui,
+			text => text,
+			text => text,
+		);
+		ctx.retryLoader = loader;
+		sessionState.isStreaming = true;
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "task-2",
 			toolName: "task",
@@ -542,20 +495,27 @@ describe("EventController working loader reconciliation", () => {
 		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
 
 		expect(ctx.ensureLoadingAnimation).not.toHaveBeenCalled();
+		loader.stop();
 	});
 
 	it("keeps transient retry status exclusive while a retry loader is visible", async () => {
-		const { controller, ctx } = createFixture();
-		ctx.retryLoader = { stop: vi.fn() } as unknown as InteractiveModeContext["retryLoader"];
-		(ctx.viewSession as unknown as { isStreaming: boolean }).isStreaming = true;
+		const { controller, ctx, sessionState } = createFixture();
+		const loader = new Loader(
+			ctx.ui,
+			text => text,
+			text => text,
+		);
+		ctx.retryLoader = loader;
+		sessionState.isStreaming = true;
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_update",
 			toolCallId: "missing",
 			partialResult: {},
 		} as Extract<AgentSessionEvent, { type: "tool_execution_update" }>);
 
 		expect(ctx.ensureLoadingAnimation).not.toHaveBeenCalled();
+		loader.stop();
 	});
 });
 

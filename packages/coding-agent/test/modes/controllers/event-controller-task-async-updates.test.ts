@@ -16,12 +16,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
-import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { BashToolDetails } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 function taskResult(asyncState: "running" | "completed" | "failed" | undefined, text: string) {
 	const details: TaskToolDetails = {
@@ -56,53 +55,17 @@ describe("EventController async update finalization", () => {
 	});
 
 	function createFixture() {
-		const chatContainer = new TranscriptContainer();
 		const pendingTools = new Map<string, ToolExecutionComponent>();
-		const ctx = {
-			isInitialized: true,
-			init: vi.fn(async () => {}),
-			ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
-			statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
-			updateEditorTopBorder: vi.fn(),
-			toolOutputExpanded: false,
-			transcriptMessageComponents: new WeakMap(),
+		const ctx = createInteractiveModeContext({
 			pendingTools,
-			chatContainer,
-			session: {
-				getToolByName: () => undefined,
-				hasBuiltInTool: () => true,
-				isStreaming: true,
-				agent: { tokenizer: { countMessage: () => 0 } },
-			},
-			showWarning: vi.fn(),
-			viewSession: {
-				activeRunStartedAt: 1_000,
-				getToolByName: () => undefined,
-				hasBuiltInTool: () => true,
-				isStreaming: false,
-				agent: { tokenizer: { countMessage: () => 0 } },
-			},
-			sessionManager: { getCwd: () => process.cwd() },
-			setTodos: vi.fn(),
-			setWorkingMessage: vi.fn(),
-			beginWorkingMessageRun: vi.fn(),
-			rehydrateWorkingMessageRun: vi.fn(() => false),
-			endWorkingMessageRun: vi.fn(),
-			getWorkingMessageRunElapsedMs: vi.fn(() => undefined),
-			setWorkingMessageRunTokenDelta: vi.fn(),
-			clearPinnedError: vi.fn(),
-			statusContainer: { disposeChildren: vi.fn(), addChild: vi.fn(), removeChild: vi.fn() },
-			ensureLoadingAnimation: vi.fn(),
-		} as unknown as InteractiveModeContext;
-		return { controller: new EventController(ctx), pendingTools, chatContainer, ctx };
+			session: { isStreaming: true },
+			viewSession: { isStreaming: false },
+		});
+		return { controller: new EventController(ctx), pendingTools, chatContainer: ctx.chatContainer, ctx };
 	}
 
-	async function startTask(
-		controller: EventController,
-		source: InteractiveModeContext["viewSession"],
-		pendingTools: Map<string, ToolExecutionComponent>,
-	) {
-		await controller.handleEvent(source, {
+	async function startTask(controller: EventController, pendingTools: Map<string, ToolExecutionComponent>) {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "tc-task",
 			toolName: "task",
@@ -114,11 +77,11 @@ describe("EventController async update finalization", () => {
 	}
 
 	it("keeps the block tracked when a final async frame precedes tool_execution_end", async () => {
-		const { controller, ctx, pendingTools } = createFixture();
-		const component = await startTask(controller, ctx.viewSession, pendingTools);
+		const { controller, pendingTools } = createFixture();
+		const component = await startTask(controller, pendingTools);
 
 		// The job settled while the call is still executing (mixed call).
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_update",
 			toolCallId: "tc-task",
 			toolName: "task",
@@ -129,7 +92,7 @@ describe("EventController async update finalization", () => {
 		expect(component.isTranscriptBlockFinalized()).toBe(false);
 
 		// The call's own result still lands and finalizes the block.
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "tc-task",
 			toolName: "task",
@@ -141,10 +104,10 @@ describe("EventController async update finalization", () => {
 	});
 
 	it("finalizes a parked background block when its jobs settle after the end", async () => {
-		const { controller, ctx, pendingTools } = createFixture();
-		const component = await startTask(controller, ctx.viewSession, pendingTools);
+		const { controller, pendingTools } = createFixture();
+		const component = await startTask(controller, pendingTools);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "tc-task",
 			toolName: "task",
@@ -155,7 +118,7 @@ describe("EventController async update finalization", () => {
 		expect(pendingTools.get("tc-task")).toBe(component);
 		expect(component.isTranscriptBlockFinalized()).toBe(true);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_update",
 			toolCallId: "tc-task",
 			toolName: "task",
@@ -167,8 +130,8 @@ describe("EventController async update finalization", () => {
 	});
 
 	it("finalizes a backgrounded Bash block without tracking later job updates", async () => {
-		const { controller, ctx, pendingTools } = createFixture();
-		await controller.handleEvent(ctx.viewSession, {
+		const { controller, pendingTools } = createFixture();
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "tc-bash",
 			toolName: "bash",
@@ -177,7 +140,7 @@ describe("EventController async update finalization", () => {
 		const component = pendingTools.get("tc-bash")!;
 		sealed.push(component);
 
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "tc-bash",
 			toolName: "bash",
@@ -191,7 +154,7 @@ describe("EventController async update finalization", () => {
 
 	it("seals a foreground card orphaned before the next agent turn", async () => {
 		const { controller, chatContainer, ctx } = createFixture();
-		await controller.handleEvent(ctx.viewSession, {
+		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "tc-stale",
 			toolName: "hub",
@@ -212,16 +175,16 @@ describe("EventController async update finalization", () => {
 
 		expect(component.isTranscriptBlockFinalized()).toBe(false);
 		expect(chatContainer.peekFinalizedBatch(80, 0)).toBeUndefined();
-		await controller.handleEvent(ctx.viewSession, { type: "agent_start" });
+		await controller.handleEvent({ type: "agent_start" });
 
 		expect(component.isTranscriptBlockFinalized()).toBe(true);
 		expect(chatContainer.peekFinalizedBatch(80, 0)?.rows).toBeDefined();
 	});
 
 	it("keeps a parked task card available across the next agent turn", async () => {
-		const { controller, pendingTools, ctx } = createFixture();
-		const component = await startTask(controller, ctx.viewSession, pendingTools);
-		await controller.handleEvent(ctx.viewSession, {
+		const { controller, pendingTools } = createFixture();
+		const component = await startTask(controller, pendingTools);
+		await controller.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "tc-task",
 			toolName: "task",
@@ -229,7 +192,7 @@ describe("EventController async update finalization", () => {
 			isError: false,
 		});
 
-		await controller.handleEvent(ctx.viewSession, { type: "agent_start" });
+		await controller.handleEvent({ type: "agent_start" });
 
 		expect(pendingTools.get("tc-task")).toBe(component);
 	});

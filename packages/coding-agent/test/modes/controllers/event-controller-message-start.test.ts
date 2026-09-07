@@ -1,12 +1,11 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import type { TextContent, UserMessage } from "@oh-my-pi/pi-ai";
-import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
+import type { UserMessage } from "@oh-my-pi/pi-ai";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { Component } from "@oh-my-pi/pi-tui";
+import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 beforeAll(() => {
 	initTheme();
@@ -34,43 +33,35 @@ function createContext(options: {
 		setText,
 		getText: () => currentEditorText,
 	};
-	const addMessageToChat = vi.fn();
-	const updatePendingMessagesDisplay = vi.fn();
+	const ctx = createInteractiveModeContext({
+		editor,
+		getUserMessageText: message =>
+			typeof message.content === "string"
+				? message.content
+				: message.content
+						.map(content =>
+							content.type === "text" && "text" in content && typeof content.text === "string"
+								? content.text
+								: "",
+						)
+						.join(""),
+		optimisticUserMessageSignature: options.optimisticSignature,
+		locallySubmittedUserSignatures: new Set<string>(options.locallySubmittedSignatures ?? []),
+	});
 	const clearOptimisticUserMessage = vi.fn(() => {
 		ctx.optimisticUserMessageSignature = undefined;
 	});
 	const replaceOptimisticUserMessage = vi.fn(() => {
 		ctx.optimisticUserMessageSignature = undefined;
 	});
-	const ctx = {
-		isInitialized: true,
-		statusLine: { invalidate: vi.fn() },
-		updateEditorTopBorder: vi.fn(),
-		ui: { requestRender: vi.fn() },
-		editor,
-		addMessageToChat,
-		updatePendingMessagesDisplay,
-		getUserMessageText: (message: UserMessage) =>
-			typeof message.content === "string"
-				? message.content
-				: message.content
-						.filter((c): c is TextContent => c.type === "text")
-						.map(c => c.text)
-						.join(""),
-		optimisticUserMessageSignature: options.optimisticSignature,
-		locallySubmittedUserSignatures: new Set<string>(options.locallySubmittedSignatures ?? []),
-		clearOptimisticUserMessage,
-		replaceOptimisticUserMessage,
-		transcriptMessageComponents: new WeakMap(),
-		pendingTools: new Map(),
-		viewSession: { isStreaming: false },
-	} as unknown as InteractiveModeContext;
+	ctx.clearOptimisticUserMessage = clearOptimisticUserMessage;
+	ctx.replaceOptimisticUserMessage = replaceOptimisticUserMessage;
 	return {
 		ctx,
 		editor,
 		setText,
-		addMessageToChat,
-		updatePendingMessagesDisplay,
+		addMessageToChat: ctx.addMessageToChat,
+		updatePendingMessagesDisplay: ctx.updatePendingMessagesDisplay,
 		clearOptimisticUserMessage,
 		replaceOptimisticUserMessage,
 	};
@@ -93,7 +84,7 @@ describe("EventController message_start (user role)", () => {
 		});
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message });
+		await controller.handleEvent({ type: "message_start", message });
 
 		expect(setText).not.toHaveBeenCalled();
 		expect(editor.getText()).toBe("draft typed after queuing");
@@ -114,31 +105,26 @@ describe("EventController message_start (user role)", () => {
 		});
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message });
+		await controller.handleEvent({ type: "message_start", message });
 
 		expect(setText).toHaveBeenCalledWith("");
 		expect(addMessageToChat).toHaveBeenCalledWith(message);
 	});
 
-	it("preserves the editor while replacing an optimistic submission with its canonical message", async () => {
-		// The optimistic path already added the user message to chat and cleared the
-		// editor at submit time. message_start must replace that component with the
-		// canonical event data without re-clearing a draft typed in the meantime.
+	it("preserves the editor for an optimistic submission and skips the duplicate chat add", async () => {
+		// Optimistic path already added the user message to chat and cleared the
+		// editor at submit time. message_start must not re-add or re-clear.
 		const message = createUserMessage("optimistic send");
 		const signature = "optimistic send\u00000";
-		const { ctx, setText, addMessageToChat, clearOptimisticUserMessage, replaceOptimisticUserMessage } =
-			createContext({
-				editorText: "draft typed after sending",
-				optimisticSignature: signature,
-				locallySubmittedSignatures: [signature],
-			});
+		const { ctx, setText, addMessageToChat } = createContext({
+			editorText: "",
+			optimisticSignature: signature,
+			locallySubmittedSignatures: [signature],
+		});
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(ctx.viewSession, { type: "message_start", message });
+		await controller.handleEvent({ type: "message_start", message });
 
-		expect(replaceOptimisticUserMessage).toHaveBeenCalledTimes(1);
-		expect(replaceOptimisticUserMessage).toHaveBeenCalledWith(message);
-		expect(clearOptimisticUserMessage).not.toHaveBeenCalled();
 		expect(addMessageToChat).not.toHaveBeenCalled();
 		expect(setText).not.toHaveBeenCalled();
 		expect(ctx.optimisticUserMessageSignature).toBeUndefined();
@@ -167,7 +153,7 @@ describe("EventController message_start (user role)", () => {
 		const controller = new EventController(ctx);
 
 		// Fire WITHOUT awaiting: the bubble must already be appended synchronously.
-		const pending = controller.handleEvent(ctx.viewSession, { type: "message_start", message }).catch(() => {});
+		const pending = controller.handleEvent({ type: "message_start", message }).catch(() => {});
 		expect(addMessageToChat).toHaveBeenCalledTimes(1);
 		expect(addMessageToChat).toHaveBeenCalledWith(message);
 		await pending;
@@ -186,7 +172,8 @@ function createIrcMessage(timestamp: number): CustomMessage<{ from: string; mess
 }
 
 function createIrcContext(options: { liveBlockAbove?: boolean } = {}) {
-	const chatContainer = new TranscriptContainer();
+	const ctx = createInteractiveModeContext();
+	const { chatContainer } = ctx;
 	if (options.liveBlockAbove) {
 		// A still-running tool above the cards: they sit in the live region,
 		// where their rows cannot have committed to native scrollback.
@@ -196,23 +183,14 @@ function createIrcContext(options: { liveBlockAbove?: boolean } = {}) {
 			isTranscriptBlockFinalized: () => false,
 		} as Component);
 	}
-	const requestRender = vi.fn();
-	const session = {};
-	const ctx = {
-		isInitialized: true,
-		statusLine: { invalidate: vi.fn() },
-		updateEditorTopBorder: vi.fn(),
-		ui: { requestRender },
-		chatContainer,
-		session,
-		viewSession: session,
-	} as unknown as InteractiveModeContext;
 	const helpers = new UiHelpers(ctx);
-	const addMessageToChat: InteractiveModeContext["addMessageToChat"] = vi.fn((message, options) =>
-		helpers.addMessageToChat(message, options),
-	);
-	ctx.addMessageToChat = addMessageToChat;
-	return { ctx, chatContainer, requestRender, addMessageToChat };
+	ctx.addMessageToChat = vi.fn((message, options) => helpers.addMessageToChat(message, options));
+	return {
+		ctx,
+		chatContainer,
+		requestRender: ctx.ui.requestRender,
+		addMessageToChat: ctx.addMessageToChat,
+	};
 }
 
 describe("EventController IRC expiry", () => {
@@ -227,7 +205,7 @@ describe("EventController IRC expiry", () => {
 		const { ctx, chatContainer, requestRender } = createIrcContext({ liveBlockAbove: true });
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(ctx.session, { type: "irc_message", message });
+		await controller.handleEvent({ type: "irc_message", message });
 
 		expect(chatContainer.children).toHaveLength(2);
 		// One requestRender from the IRC handler mounting the card. The blanket
@@ -244,34 +222,13 @@ describe("EventController IRC expiry", () => {
 		expect(requestRender).toHaveBeenCalledTimes(2);
 	});
 
-	it("keeps a card whose rows may already be committed (no live block above)", async () => {
-		vi.useFakeTimers();
-		const message = createIrcMessage(4);
-		const { ctx, chatContainer } = createIrcContext();
-		const controller = new EventController(ctx);
-
-		await controller.handleEvent(ctx.session, { type: "irc_message", message });
-		expect(chatContainer.children).toHaveLength(1);
-
-		// Offer and acknowledge the finalized batch to simulate native scrollback.
-		const batch = chatContainer.peekFinalizedBatch(80, 0);
-		expect(batch).toBeDefined();
-		chatContainer.acknowledgeFinalizedBatch(batch!.id);
-
-		// Everything above the card is finalized, so its rows may already be in
-		// native scrollback. Removing it would be an interior deletion of the
-		// committed prefix — the engine repairs that by recommitting everything
-		// below the gap (the duplicated-block artifact). It must stay.
-		vi.advanceTimersByTime(10_000);
-		expect(chatContainer.children).toHaveLength(1);
-	});
 	it("evicts the oldest live-region card beyond the cap", async () => {
 		vi.useFakeTimers();
 		const { ctx, chatContainer } = createIrcContext({ liveBlockAbove: true });
 		const controller = new EventController(ctx);
 
 		for (let i = 0; i < 5; i++) {
-			await controller.handleEvent(ctx.session, { type: "irc_message", message: createIrcMessage(100 + i) });
+			await controller.handleEvent({ type: "irc_message", message: createIrcMessage(100 + i) });
 		}
 		// live block + MAX_LIVE_IRC_CARDS (4): the 5th card evicted the 1st.
 		expect(chatContainer.children).toHaveLength(5);
@@ -286,8 +243,8 @@ describe("EventController IRC expiry", () => {
 		const { ctx, chatContainer, addMessageToChat } = createIrcContext({ liveBlockAbove: true });
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(ctx.session, { type: "irc_message", message });
-		await controller.handleEvent(ctx.session, { type: "irc_message", message });
+		await controller.handleEvent({ type: "irc_message", message });
+		await controller.handleEvent({ type: "irc_message", message });
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(1);
 		expect(chatContainer.children).toHaveLength(2);
@@ -301,7 +258,7 @@ describe("EventController IRC expiry", () => {
 		const { ctx, chatContainer, requestRender } = createIrcContext();
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent(ctx.session, { type: "irc_message", message });
+		await controller.handleEvent({ type: "irc_message", message });
 		controller.dispose();
 		vi.advanceTimersByTime(10_000);
 

@@ -159,6 +159,7 @@ function createTaskItemSchema(options: {
 	defaultAgent?: string;
 	effortEnabled: boolean;
 	modelEnabled: boolean;
+	evalToolsEnabled?: boolean;
 }) {
 	const shape: Record<string, unknown> = {
 		"name?": "string",
@@ -173,6 +174,7 @@ function createTaskItemSchema(options: {
 	};
 	if (options.effortEnabled) shape["effort?"] = effortRule;
 	if (options.modelEnabled) shape["model?"] = type("string").atLeastLength(1);
+	if (options.evalToolsEnabled) shape["tools?"] = "string[]";
 	if (options.isolationEnabled) shape["isolated?"] = "boolean";
 	const permissionSchema = selectTaskPermissionSchema(options.permissions);
 	if (permissionSchema) shape["permissions?"] = permissionSchema;
@@ -189,6 +191,7 @@ function createTaskSchema(options: {
 	defaultAgent?: string;
 	effortEnabled: boolean;
 	modelEnabled: boolean;
+	evalToolsEnabled?: boolean;
 }) {
 	const shape: Record<string, unknown> = {
 		"name?": "string",
@@ -203,6 +206,7 @@ function createTaskSchema(options: {
 	};
 	if (options.effortEnabled) shape["effort?"] = effortRule;
 	if (options.modelEnabled) shape["model?"] = type("string").atLeastLength(1);
+	if (options.evalToolsEnabled) shape["tools?"] = "string[]";
 	if (options.isolationEnabled) shape["isolated?"] = "boolean";
 	const permissionSchema = selectTaskPermissionSchema(options.permissions);
 	if (permissionSchema) shape["permissions?"] = permissionSchema;
@@ -215,6 +219,7 @@ function createBatchTaskSchema(options: {
 	defaultAgent?: string;
 	effortEnabled: boolean;
 	modelEnabled: boolean;
+	evalToolsEnabled?: boolean;
 }) {
 	return type.raw({
 		context: "string",
@@ -226,12 +231,14 @@ function createBatchTaskSchema(options: {
 export const taskItemSchema = createTaskItemSchema({
 	effortEnabled: true,
 	modelEnabled: false,
+	evalToolsEnabled: true,
 	isolationEnabled: false,
 	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 });
 const taskItemSchemaIsolated = createTaskItemSchema({
 	effortEnabled: true,
 	modelEnabled: false,
+	evalToolsEnabled: true,
 	isolationEnabled: true,
 	permissions: { enabled: false, toolsEnabled: false, pathsEnabled: false },
 });
@@ -260,6 +267,8 @@ export interface TaskItem {
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
 	schemaMode?: "permissive" | "strict";
+	/** Eval-defined tool names exposed to this child. */
+	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
 }
@@ -273,6 +282,7 @@ export const taskSchema = type({
 	"agentDefinitionSha256?": sha256Rule,
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
+	"tools?": "string[]",
 	"isolated?": "boolean",
 	"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
 	"+": "delete",
@@ -287,6 +297,7 @@ const taskSchemaNoIsolation = type({
 	"agentDefinitionSha256?": sha256Rule,
 	"schemaMode?": '"permissive" | "strict"',
 	"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
+	"tools?": "string[]",
 	"+": "delete",
 });
 const taskSchemaBatch = type({
@@ -311,12 +322,15 @@ export type TaskToolSchemaInstance = DynamicTaskSchema | BaseType;
 
 const taskSchemaCache = new Map<string, BaseType>();
 
+
 /** Build the task wire schema for the current settings and spawn policy. */
 export function getTaskSchema(options: {
 	isolationEnabled: boolean;
 	batchEnabled: boolean;
 	effortEnabled?: boolean;
 	modelEnabled?: boolean;
+	/** Advertise the `tools` field for eval-defined tools (`eval.tools.enabled`, default on). */
+	evalToolsEnabled?: boolean;
 	defaultAgent?: string;
 	permissions?: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
 }): TaskToolSchemaInstance {
@@ -324,13 +338,14 @@ export function getTaskSchema(options: {
 	const defaultAgent = options.defaultAgent ?? "task";
 	const effortEnabled = options.effortEnabled ?? true;
 	const modelEnabled = options.modelEnabled ?? false;
-	if (!modelEnabled && effortEnabled && !permissions.enabled && defaultAgent === "task") {
+	const evalToolsEnabled = options.evalToolsEnabled ?? true;
+	if (!modelEnabled && effortEnabled && evalToolsEnabled && !permissions.enabled && defaultAgent === "task") {
 		if (options.batchEnabled) {
 			return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		}
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}:${permissions.enabled ? "perm" : "noperm"}:${permissions.toolsEnabled ? "tools" : "notools"}:${permissions.pathsEnabled ? "paths" : "nopaths"}:${effortEnabled ? "effort" : "noeffort"}:${modelEnabled ? "model" : "nomodel"}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}:${permissions.enabled ? "perm" : "noperm"}:${permissions.toolsEnabled ? "tools" : "notools"}:${permissions.pathsEnabled ? "paths" : "nopaths"}:${effortEnabled ? "effort" : "noeffort"}:${modelEnabled ? "model" : "nomodel"}:${evalToolsEnabled ? "evaltools" : "noevaltools"}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
 	const schema = options.batchEnabled
@@ -338,6 +353,7 @@ export function getTaskSchema(options: {
 				isolationEnabled: options.isolationEnabled,
 				effortEnabled,
 				modelEnabled,
+				evalToolsEnabled,
 				permissions,
 				defaultAgent,
 			})
@@ -345,6 +361,7 @@ export function getTaskSchema(options: {
 				isolationEnabled: options.isolationEnabled,
 				effortEnabled,
 				modelEnabled,
+				evalToolsEnabled,
 				permissions,
 				defaultAgent,
 			});
@@ -377,6 +394,8 @@ export interface TaskParams {
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
 	schemaMode?: "permissive" | "strict";
+	/** Eval-defined tool names exposed to the flat-form child. */
+	tools?: string[];
 	/** Batch form (`task.batch`): one subagent per item. */
 	tasks?: TaskItem[];
 	/** Batch form: shared background prepended to every assignment; required by the batch schema. */
@@ -477,6 +496,8 @@ export interface YieldItem {
 	type?: string | string[];
 	/** Resolve this yield's payload from the latest durable assistant text instead of `data`. */
 	useLastTurn?: boolean;
+	/** True when an incremental workpool yield completed every item in its batch. */
+	complete?: boolean;
 	/**
 	 * Set by the in-tool yield validator when it exhausted its retry budget and
 	 * accepted schema-invalid data anyway. The executor preserves that override

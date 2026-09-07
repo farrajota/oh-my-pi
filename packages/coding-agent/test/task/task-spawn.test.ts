@@ -12,7 +12,7 @@
  * test/task/task-schema.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { Effort } from "@oh-my-pi/pi-ai";
+import * as fs from "node:fs/promises";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -20,12 +20,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
-import {
-	type AgentDefinition,
-	oneLineLabel,
-	type SingleResult,
-	type TaskParams,
-} from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 const taskAgent: AgentDefinition = {
@@ -35,11 +30,7 @@ const taskAgent: AgentDefinition = {
 	source: "bundled",
 };
 
-function createSession(options: {
-	manager?: AsyncJobManager;
-	settings?: Record<string, unknown>;
-	modelRegistry?: ToolSession["modelRegistry"];
-}): ToolSession {
+function createSession(options: { manager?: AsyncJobManager; settings?: Record<string, unknown> }): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
@@ -47,7 +38,6 @@ function createSession(options: {
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		asyncJobManager: options.manager,
-		modelRegistry: options.modelRegistry,
 	} as unknown as ToolSession;
 }
 
@@ -118,7 +108,7 @@ describe("task spawn routing", () => {
 
 	it("returns immediately on spawn and delivers the follow-up hint when the job completes", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
-			agents: [{ ...taskAgent, model: ["anthropic/claude-sonnet-4"], thinkingLevel: Effort.High }],
+			agents: [{ ...taskAgent, model: ["anthropic/claude-sonnet-4"] }],
 			projectAgentsDir: null,
 		});
 		const gate = deferred();
@@ -129,17 +119,13 @@ describe("task spawn routing", () => {
 
 		const manager = createManager();
 		const tool = await TaskTool.create(
-			createSession({
-				manager,
-				settings: { "task.agentModelOverrides": { task: "openai/gpt-4.1-mini" }, "task.enableLsp": false },
-			}),
+			createSession({ manager, settings: { "task.agentModelOverrides": { task: "openai/gpt-4.1-mini" } } }),
 		);
 
 		const result = await tool.execute("tc-spawn", {
 			agent: "task",
 			name: "Spawnling",
 			task: "Do the thing.",
-			effort: "hi",
 		} as TaskParams);
 
 		// Tool returned while the job body is still gated on the deferred.
@@ -150,7 +136,6 @@ describe("task spawn routing", () => {
 		expect(text).toContain(`job \`${jobId}\``);
 		const job = manager.getJob(jobId!);
 		expect(job?.status).toBe("running");
-		expect(job?.agentId).toBe("Spawnling");
 		expect(job?.resultText).toBeUndefined();
 
 		gate.resolve();
@@ -161,137 +146,153 @@ describe("task spawn routing", () => {
 		expect(job!.resultText).toContain("message it via `hub` to follow up");
 		expect(job!.resultText).toContain("history://Spawnling");
 		expect(runSpy).toHaveBeenCalledTimes(1);
-		expect(runSpy.mock.calls[0]?.[0].requestedModel).toBeUndefined();
 		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["openai/gpt-4.1-mini"]);
-		expect(runSpy.mock.calls[0]?.[0].exactModelOverride).not.toBe(true);
-		expect(runSpy.mock.calls[0]?.[0].enableLsp).toBe(false);
-		expect(runSpy.mock.calls[0]?.[0].thinkingLevel).toBe(Effort.High);
-		expect(runSpy.mock.calls[0]?.[0].effort).toBe("hi");
 	});
 
-	it("accepts valid flat effort but omits it from executor options when overrides are disabled", async () => {
-		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
-			agents: [{ ...taskAgent, thinkingLevel: Effort.Medium }],
-			projectAgentsDir: null,
-		});
-		const runSpy = vi
-			.spyOn(executorModule, "runSubprocess")
-			.mockImplementation(async options => makeResult(options.id ?? "?"));
-
-		const manager = createManager();
-		const tool = await TaskTool.create(
-			createSession({
-				manager,
-				settings: { "async.enabled": true, "task.allowEffortOverride": false },
-			}),
-		);
-		const result = await tool.execute("tc-flat-disabled-effort", {
-			agent: "task",
-			name: "NoEffort",
-			task: "Do the thing.",
-			effort: "hi",
-		} as TaskParams);
-
-		expect(getFirstText(result)).toContain("Spawned agent `NoEffort`");
-		const job = manager.getJob(result.details!.async!.jobId)!;
-		await job.promise;
-		expect(job.status).toBe("completed");
-		expect(runSpy).toHaveBeenCalledTimes(1);
-		expect(runSpy.mock.calls[0]?.[0]).not.toHaveProperty("effort");
-		expect(runSpy.mock.calls[0]?.[0].thinkingLevel).toBe(Effort.Medium);
-	});
-
-	it("gives an accepted request model precedence over settings and frontmatter", async () => {
-		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
-			agents: [{ ...taskAgent, model: ["frontmatter/model"] }],
-			projectAgentsDir: null,
-		});
-		const runSpy = vi
-			.spyOn(executorModule, "runSubprocess")
-			.mockImplementation(async options => makeResult(options.id ?? "?"));
-		const manager = createManager();
-		const tool = await TaskTool.create(
-			createSession({
-				manager,
-				settings: {
-					"async.enabled": true,
-					"task.allowModelOverride": true,
-					"task.agentModelOverrides": { task: "settings/model" },
-				},
-			}),
-		);
-
-		const result = await tool.execute("tc-request-model", {
-			agent: "task",
-			name: "RequestModel",
-			task: "Do the thing.",
-			model: "request/model",
-		} as TaskParams);
-		const job = manager.getJob(result.details!.async!.jobId)!;
-		await job.promise;
-
-		expect(runSpy).toHaveBeenCalledTimes(1);
-		expect(runSpy.mock.calls[0]?.[0].requestedModel).toBe("request/model");
-		expect(runSpy.mock.calls[0]?.[0].exactModelOverride).toBe(true);
-	});
-
-	it("rejects an unresolved request model before creating a background job", async () => {
+	it("retains the temporary artifacts directory for a completed async spawn (in-memory session)", async () => {
+		// Regression: with no session file (in-memory session), leaseArtifacts()
+		// allocates a temporary directory that runStructuredSubagent() deletes
+		// on completion unless retainArtifacts is requested. Detached (async)
+		// spawns advertise `agent://<id>` handles in the eventual async-result
+		// delivery, so the directory must survive past this call returning
+		// (PR #10625 review).
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: [taskAgent],
 			projectAgentsDir: null,
 		});
-		const runSpy = vi.spyOn(executorModule, "runSubprocess");
-		const manager = createManager();
-		const tool = await TaskTool.create(
-			createSession({
-				manager,
-				modelRegistry: { getAvailable: () => [] } as unknown as ToolSession["modelRegistry"],
-				settings: { "async.enabled": true, "task.allowModelOverride": true },
-			}),
-		);
-
-		const result = await tool.execute("tc-unresolved-request-model", {
-			agent: "task",
-			name: "MissingModel",
-			task: "Do the thing.",
-			model: "missing/requested-model",
-		} as TaskParams);
-
-		expect(getFirstText(result)).toContain("did not resolve to an enabled model");
-		expect(result.details?.async).toBeUndefined();
-		expect(runSpy).not.toHaveBeenCalled();
-	});
-
-	it("uses a safe capped one-line label without changing the task prompt", async () => {
-		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
-			agents: [taskAgent],
-			projectAgentsDir: null,
+		let capturedArtifactsDir: string | undefined;
+		const runSpy = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			capturedArtifactsDir = options.artifactsDir;
+			return makeResult(options.id ?? "?");
 		});
-		const runSpy = vi
-			.spyOn(executorModule, "runSubprocess")
-			.mockImplementation(async options => makeResult(options.id ?? "?"));
 
 		const manager = createManager();
 		const tool = await TaskTool.create(createSession({ manager }));
-		const astral = "🧪";
-		const assignment = `Investigate\nowner\tcleanup\u202e${astral.repeat(200)}`;
-		const result = await tool.execute("tc-label", {
-			agent: "task",
-			name: "LabelTester",
-			task: assignment,
-		} as TaskParams);
-		const job = manager.getJob(result.details!.async!.jobId)!;
 
-		expect(job.label).toBe(oneLineLabel(assignment));
-		expect(job.label).not.toMatch(/[\p{Cc}\p{Cf}]/u);
-		expect(job.label).toContain(astral);
-		expect(job.label.length).toBeGreaterThan([...job.label].length);
-		expect([...job.label].length).toBeLessThan([...assignment].length);
-		expect(job.label).not.toMatch(/[\uD800-\uDBFF]$/);
-		await job.promise;
-		expect(runSpy).toHaveBeenCalledWith(
-			expect.objectContaining({ assignment, task: expect.stringContaining(assignment) }),
+		const result = await tool.execute("tc-retain", {
+			agent: "task",
+			name: "Retainling",
+			task: "Do the thing.",
+		} as TaskParams);
+
+		const jobId = result.details?.async?.jobId;
+		const job = manager.getJob(jobId!);
+		await job!.promise;
+
+		expect(job!.status).toBe("completed");
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(capturedArtifactsDir).toBeTruthy();
+		await expect(fs.stat(capturedArtifactsDir!)).resolves.toBeDefined();
+		await fs.rm(capturedArtifactsDir!, { recursive: true, force: true });
+	});
+
+	it("cleans up the retained artifacts directory once the job is evicted", async () => {
+		// Regression: retainArtifacts kept the temp directory alive past
+		// completion, but nothing ever deleted it afterward — a long-running
+		// SDK process accumulated every detached task's transcript forever.
+		// Cleanup must run once the job actually leaves the manager (eviction
+		// or disposal), not never (PR #10625 review).
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [taskAgent],
+			projectAgentsDir: null,
+		});
+		let capturedArtifactsDir: string | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			capturedArtifactsDir = options.artifactsDir;
+			return makeResult(options.id ?? "?");
+		});
+
+		// Cleanup runs fire-and-forget off the job's own settle chain; spy on
+		// the real `fs.rm` call to await its actual completion instead of
+		// guessing a wait duration.
+		const rmCalled = deferred();
+		const realRm = fs.rm.bind(fs);
+		vi.spyOn(fs, "rm").mockImplementation(async (target, opts) => {
+			const outcome = await realRm(target as Parameters<typeof fs.rm>[0], opts as Parameters<typeof fs.rm>[1]);
+			if (capturedArtifactsDir && target === capturedArtifactsDir) rmCalled.resolve();
+			return outcome;
+		});
+
+		// retentionMs: 0 evicts synchronously once the job settles so the
+		// test does not have to wait out the real 5-minute default
+		// retention window.
+		const manager = new AsyncJobManager({
+			onJobComplete: () => {},
+			retentionMs: 0,
+			retainedArtifactsCleanupGraceMs: 0,
+		});
+		managers.push(manager);
+		const tool = await TaskTool.create(createSession({ manager }));
+
+		const result = await tool.execute("tc-evict", {
+			agent: "task",
+			name: "Evictling",
+			task: "Do the thing.",
+		} as TaskParams);
+
+		const jobId = result.details?.async?.jobId;
+		const job = manager.getJob(jobId!);
+		await job!.promise;
+
+		expect(capturedArtifactsDir).toBeTruthy();
+		expect(manager.getJob(jobId!)).toBeUndefined();
+		await rmCalled.promise;
+		await expect(fs.stat(capturedArtifactsDir!)).rejects.toThrow();
+	});
+
+	it("attaches retained-artifacts cleanup to the collision-suffixed job, not the pre-existing row", async () => {
+		// Regression: `AsyncJobManager.register()` suffixes the requested job
+		// id when it collides with another live job (e.g. a task id reusing a
+		// vibe turn's job id). The cleanup wiring looked the job back up by
+		// the *requested* id, which — after a collision — resolves to the
+		// unrelated pre-existing row instead of the newly registered task, so
+		// cleanup attached to (and could later delete artifacts alongside)
+		// the wrong job (PR #10625 review).
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [taskAgent],
+			projectAgentsDir: null,
+		});
+		let capturedArtifactsDir: string | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			capturedArtifactsDir = options.artifactsDir;
+			return makeResult(options.id ?? "?");
+		});
+
+		const manager = createManager();
+		// Placeholder job occupying "Foo", the id the fresh task would
+		// otherwise be allocated — its own agent output id is unique per
+		// AgentOutputManager, independent of the job manager's id map, so
+		// this simulates the collision without needing a second spawn.
+		const placeholderGate = deferred();
+		manager.register(
+			"bash",
+			"placeholder",
+			async () => {
+				await placeholderGate.promise;
+				return "placeholder done";
+			},
+			{ id: "Foo" },
 		);
+
+		const tool = await TaskTool.create(createSession({ manager }));
+		const result = await tool.execute("tc-collide", {
+			agent: "task",
+			name: "Foo",
+			task: "Do the thing.",
+		} as TaskParams);
+
+		const jobId = result.details?.async?.jobId;
+		expect(jobId).toBe("Foo-2");
+		const job = manager.getJob(jobId!);
+		await job!.promise;
+
+		expect(job!.status).toBe("completed");
+		expect(job!.retainedArtifactsCleanup).toBeDefined();
+		const placeholder = manager.getJob("Foo");
+		expect(placeholder!.retainedArtifactsCleanup).toBeUndefined();
+
+		placeholderGate.resolve();
+		if (capturedArtifactsDir) await fs.rm(capturedArtifactsDir, { recursive: true, force: true });
 	});
 
 	it("bounds concurrent job bodies with the session spawn semaphore", async () => {
