@@ -184,6 +184,21 @@ function brandTimer(elapsedMs: number): string {
 	if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
 	return `${Math.min(99, Math.floor(seconds / 3600))}h`;
 }
+const statusSegment: StatusLineSegment = {
+	id: "status",
+	render(ctx) {
+		let text = "";
+		for (const status of ctx.hookStatuses ?? []) {
+			const sanitized = sanitizeStatusText(status);
+			if (!sanitized) continue;
+			text += text ? `${theme.sep.dot}${sanitized}` : sanitized;
+		}
+		return {
+			content: text ? accentFg(ctx, "accent", text) : "",
+			visible: text.length > 0,
+		};
+	},
+};
 
 const modelSegment: StatusLineSegment = {
 	id: "model",
