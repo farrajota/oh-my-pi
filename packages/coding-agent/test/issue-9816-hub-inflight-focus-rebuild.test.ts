@@ -274,6 +274,13 @@ function createFixture(main = makeSession([danglingHubWait], true)) {
 		session: main.session,
 		initialChatRendered: false,
 	});
+	Object.defineProperty(ctx, "session", {
+		configurable: true,
+		enumerable: true,
+		writable: true,
+		value: main.session,
+	});
+	ctx.rehydrateWorkingMessageRun = () => true;
 	ctx.clearTransientSessionUi = () => {
 		ctx.pendingMessagesContainer.disposeChildren();
 		ctx.pendingTools.clear();

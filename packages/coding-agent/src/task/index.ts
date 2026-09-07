@@ -2331,7 +2331,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			// Cleanup temp directory if used
 			const shouldCleanupTempArtifacts =
 				tempArtifactsDir && (!isIsolated || changesApplied === true || changesApplied === null);
-			if (shouldCleanupTempArtifacts) {
+			if (tempArtifactsDir && onArtifactsRetained) {
+				const retainedArtifactsDir = tempArtifactsDir;
+				onArtifactsRetained(() => fs.rm(retainedArtifactsDir, { recursive: true, force: true }));
+			} else if (shouldCleanupTempArtifacts) {
 				await fs.rm(tempArtifactsDir, { recursive: true, force: true });
 			}
 

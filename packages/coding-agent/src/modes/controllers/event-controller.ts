@@ -2066,6 +2066,7 @@ export class EventController {
 		const lastEventAssistant = lastAssistantMessage(event.messages);
 		const mismatchedAgentEnd =
 			lastEventAssistant !== undefined &&
+			this.#lastCompletedAssistantMessage !== undefined &&
 			!isSameAssistantTurnEnd(lastEventAssistant, this.#lastCompletedAssistantMessage);
 		// A mismatched end from an interrupted attempt must not tear down the
 		// active stream. The session-level check covers a superseded end that was
