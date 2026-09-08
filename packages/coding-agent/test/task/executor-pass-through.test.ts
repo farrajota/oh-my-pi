@@ -17,6 +17,7 @@ import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { resolveTaskEffortLevel } from "@oh-my-pi/pi-coding-agent/thinking";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 function createMockSession(
 	onPrompt: (params: { text: string; emit: (event: AgentSessionEvent) => void }) => void,
@@ -26,6 +27,7 @@ function createMockSession(
 		for (const listener of listeners) listener(event);
 	};
 	const session = {
+		...createSessionDefaults(),
 		state: { messages: [] },
 		agent: {
 			state: {
@@ -38,7 +40,6 @@ function createMockSession(
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
-		setActiveToolsByName: async (_toolNames: string[]) => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {
@@ -49,14 +50,6 @@ function createMockSession(
 		prompt: async (text: string, _options?: PromptOptions) => {
 			onPrompt({ text, emit });
 		},
-		waitForIdle: async () => {},
-		prepareForHeadlessAdvisorDrain: () => {},
-		waitForAdvisorCatchup: async () => true,
-		getLastAssistantMessage: () => undefined,
-		abort: async () => {},
-		dispose: async () => {},
-		setIrcWakeTurnObserver: () => {},
-		subscribeRunState: () => () => {},
 	};
 	return session as unknown as AgentSession;
 }
