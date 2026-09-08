@@ -7,7 +7,7 @@ import browserDeclarations from "./browser/declarations.d.ts" with { type: "text
 // @ts-expect-error Bun imports this JavaScript source as text instead of evaluating its module shape.
 import browserJavascript from "./browser/prelude.js" with { type: "text" };
 import browserPython from "./browser/prelude.py" with { type: "text" };
-import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { enforceInlineByteCap } from "../session/streaming-output";
@@ -26,9 +26,11 @@ import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import {
 	type AcquireTabResult,
 	acquireTab,
+	cancelIdleCloseForOwner,
 	dropHeadlessTabs,
 	getTab,
 	releaseAllTabs,
+	releaseIdleTabsForOwner,
 	releaseTab,
 	runInTab,
 } from "./browser/tab-supervisor";
@@ -84,6 +86,7 @@ const browserSchema = type({
 	"timeout?": type("number").describe("timeout in seconds"),
 	"all?": type("boolean").describe("release every managed tab"),
 	"kill?": type("boolean").describe("also kill spawned-app browsers"),
+	"persist?": type("boolean").describe("keep tab live across turn settle and idle close"),
 });
 
 /** Create the enabled-only browser host prelude for one tool session. */
@@ -122,6 +125,27 @@ async function invokeBrowser(
 /** Drop headless tabs so a browser mode change applies to the next open. */
 export async function restartBrowserForModeChange(): Promise<void> {
 	await dropHeadlessTabs();
+}
+
+/**
+ * Best-effort idle-close sweep for the calling session's owned headless
+ * tabs. Never throws — callers detach it (`void`) so a slow reap cannot
+ * delay the open it follows.
+ */
+function sweepIdleOwnedTabs(session: ToolSession): Promise<number> {
+   const ownerId = session.getSessionId?.() ?? undefined;
+   if (!ownerId) return Promise.resolve(0);
+   const idleSec = session.settings.get("browser.idleCloseSec");
+   if (!(idleSec > 0)) {
+      cancelIdleCloseForOwner(ownerId);
+      return Promise.resolve(0);
+   }
+   return releaseIdleTabsForOwner(ownerId, { idleMs: idleSec * 1000 }).catch((error: unknown) => {
+      logger.debug("Browser idle-close sweep failed", {
+         error: error instanceof Error ? error.message : String(error),
+      });
+      return 0;
+   });
 }
 
 /** Input schema for the browser tool. */
@@ -393,6 +417,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 						dialogs: params.dialogs,
 						signal: openSignal,
 						ownerSessionId: this.session.getSessionId?.() ?? undefined,
+						persist: params.persist,
 						auditId: this.options.dedicatedAuditId,
 					}),
 				);
@@ -403,6 +428,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 				throw error;
 			}
 			await releaseBrowser(browser, { kill: false });
+			void sweepIdleOwnedTabs(this.session);
 
 			const tab = result.tab;
 			const url = tab.info.url;
