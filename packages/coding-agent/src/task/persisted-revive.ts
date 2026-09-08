@@ -4,7 +4,7 @@ import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelRoleAlias } from "../config/model-roles";
 import type { Settings } from "../config/settings";
-import { MCPManager } from "../mcp/manager";
+import type { MCPManager } from "../mcp/manager";
 import { initializeExtensions } from "../modes/runtime-init";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -29,12 +29,10 @@ export interface PersistedSubagentReviveContext {
 	settings: Settings;
 	/** LSP policy of the top-level session; revived subagents inherit it rather than defaulting on. */
 	enableLsp: boolean;
-	/**
-	 * Shared event bus feeding RPC/collab subagent subscriptions. Passed through
-	 * to the wake-turn monitor so an IRC send to a cold-revived subagent emits
-	 * the same lifecycle/progress frames a live run does.
-	 */
-	eventBus?: EventBus;
+	/** Current root-session MCP policy; a persisted child grant cannot exceed it. */
+	enableMCP: boolean;
+	/** Explicit session-owned manager, never the process-global singleton. */
+	mcpManager?: MCPManager;
 	/** Root-scoped observability bus the revived run's frames also publish to. */
 	subagentEventBus?: EventBus;
 }
@@ -88,17 +86,22 @@ export function createPersistedSubagentReviverFactory(
 		// advisor-role model, anything else = the explicit pattern stamped onto
 		// this session's `modelRoles.advisor`. Absent = unadvised (the
 		// createSubagentSettings default).
-		const subagentSettings = createSubagentSettings(ctx.settings, {
-			...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
-			...(init.advisor
-				? {
-						"advisor.enabled": true,
-						...(init.advisor !== "on"
-							? { modelRoles: { ...ctx.settings.getModelRoles(), advisor: init.advisor } }
-							: undefined),
-					}
-				: undefined),
-		});
+		const subagentSettings = createSubagentSettings(
+			ctx.settings,
+			{
+				...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
+				...(init.advisor
+					? {
+							"advisor.enabled": true,
+							...(init.advisor !== "on"
+								? { modelRoles: { ...ctx.settings.getModelRoles(), advisor: init.advisor } }
+								: undefined),
+						}
+					: undefined),
+			},
+			undefined,
+			{ cwd: peek.cwd, agentDir: ctx.settings.getAgentDir() },
+		);
 		const persistedModelPattern =
 			init.modelRole && init.modelRole !== "default"
 				? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]
@@ -118,13 +121,13 @@ export function createPersistedSubagentReviverFactory(
 			});
 			const artifactManager = ctx.session.sessionManager.getArtifactManager();
 			if (artifactManager) reopened.adoptArtifactManager(artifactManager);
-			// A restricted persisted contract must not consult process-global MCP
-			// state: same-name MCP tools are untrusted capability sources.
 			const restrictToolNames = init.restrictToolNames === true;
-			const mcpManager = restrictToolNames ? undefined : MCPManager.instance();
+			const enableMCP = !restrictToolNames && (init.enableMCP ?? true) && ctx.enableMCP;
+			const mcpManager = enableMCP ? ctx.mcpManager : undefined;
 			const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
 			const { session } = await createAgentSession({
-				cwd: ctx.session.sessionManager.getCwd(),
+				cwd: peek.cwd,
+				agentDir: subagentSettings.getAgentDir(),
 				authStorage: ctx.authStorage,
 				// Revived agents join the root session tree, so their observability
 				// frames ride the same bus the RPC/collab surfaces subscribed to.
@@ -169,19 +172,14 @@ export function createPersistedSubagentReviverFactory(
 				spawns: init.spawns ?? "",
 				hasUI: false,
 				enableLsp: restrictToolNames ? false : ctx.enableLsp,
-				...(restrictToolNames
+				enableIrc: restrictToolNames ? false : undefined,
+				enableMCP,
+				...(mcpManager
 					? {
-							enableIrc: false,
-							enableMCP: false,
-							preloadedExtensionPaths: [],
-							preloadedPreparedExtensions: [],
-							preloadedCustomToolPaths: [],
-						}
-					: {
-							enableMCP: !mcpManager,
 							mcpManager,
 							customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
-						}),
+						}
+					: {}),
 			});
 			// Clamp the active set to the persisted list: createAgentSession's
 			// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
@@ -214,7 +212,6 @@ export function createPersistedSubagentReviverFactory(
 			attachIrcWakeTurnMonitor(session, {
 				id: ref.id,
 				agent: wakeAgent,
-				eventBus: ctx.eventBus,
 				subagentEventBus: ctx.subagentEventBus,
 				sessionFile,
 				outputSchema: init.outputSchema,

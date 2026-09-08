@@ -14,7 +14,6 @@ import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
 import { terminateSubagent } from "../../registry/agent-control";
 import { renderStructuredJson } from "../../session/async-job-delivery";
-import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { StructuredSubagentOutput } from "../../task/types";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import type { ToolSession } from "..";

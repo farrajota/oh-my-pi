@@ -607,9 +607,9 @@ export class Settings {
 	 */
 	static isolated(
 		overrides: Partial<Record<SettingPath, unknown>> = {},
-		options: { storage?: AgentStorage | null } = {},
+		options: { storage?: AgentStorage | null; cwd?: string; agentDir?: string } = {},
 	): Settings {
-		const instance = new Settings({ inMemory: true, overrides });
+		const instance = new Settings({ cwd: options.cwd, agentDir: options.agentDir, inMemory: true, overrides });
 		instance.#storage = options.storage ?? null;
 		instance.#rebuildMerged();
 		return instance;
@@ -1821,7 +1821,7 @@ export class Settings {
 		let shellPathSource: string | undefined;
 		let merged: RawSettings = {};
 		try {
-			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
+			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd, agentDir: this.#agentDir });
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level === "project") {
 					merged = this.#deepMerge(merged, dropSettingsGroupShadows(item.data as RawSettings, item.path));

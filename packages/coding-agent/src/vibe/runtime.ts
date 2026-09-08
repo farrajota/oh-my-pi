@@ -18,10 +18,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
+import { snapshotEffectiveExtensionRoots } from "../capability/types";
 import { resolveAgentModelSelection } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
-import { MCPManager } from "../mcp/manager";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -1331,6 +1331,8 @@ export class VibeSessionRegistry {
 		};
 		return {
 			cwd: session.cwd,
+			additionalDirectories: session.additionalDirectories,
+			getApiKey: session.getApiKey,
 			agent: record.agent,
 			task: message,
 			assignment: message,
@@ -1348,27 +1350,17 @@ export class VibeSessionRegistry {
 			artifactsDir,
 			enableLsp: (session.enableLsp ?? true) && session.settings.get("task.enableLsp"),
 			signal,
-			eventBus: session.eventBus,
 			subagentEventBus: session.subagentEventBus,
 			onProgress,
 			authStorage: session.authStorage,
 			modelRegistry: session.modelRegistry,
 			settings: session.settings,
-			mcpManager: session.mcpManager ?? MCPManager.instance(),
-			contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),
-			skills: [...(session.skills ?? [])],
-			workspaceTree: session.workspaceTree,
-			promptTemplates: session.promptTemplates,
-			rules: session.rules,
-			preloadedExtensionPaths: session.extensionPaths,
-			preloadedPreparedExtensions: session.preparedExtensions,
-			preloadedCustomToolPaths: session.customToolPaths,
+			mcpManager: session.mcpManager,
+			enableMCP: session.enableMCP ?? true,
+			extensionRoots: snapshotEffectiveExtensionRoots(session.effectiveExtensionRoots?.()),
 			localProtocolOptions,
 			parentArtifactManager: session.getArtifactManager?.() ?? undefined,
-			parentHindsightSessionState: session.getHindsightSessionState?.(),
-			parentMnemopiSessionState: session.getMnemopiSessionState?.(),
 			parentTelemetry: session.getTelemetry?.(),
-			parentEvalSessionId: session.getEvalSessionId?.() ?? undefined,
 			parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
 			parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 			keepAlive: true,
@@ -1437,7 +1429,6 @@ export class VibeSessionRegistry {
 								description: `vibe ${record.cli} session`,
 								signal,
 								onProgress,
-								eventBus: session.eventBus,
 								subagentEventBus: session.subagentEventBus,
 								artifactsDir: session.getSessionFile()?.slice(0, -6),
 							});

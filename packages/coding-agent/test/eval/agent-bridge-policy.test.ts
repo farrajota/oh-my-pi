@@ -413,7 +413,7 @@ describe("runEvalAgent", () => {
 		expect(options.enableLsp).toBe(true);
 		expect(options.enableIrc).toBe(true);
 		expect(options.keepAlive).toBe(true);
-		expect(options.parentEvalSessionId).toBeUndefined();
+		expect(Object.hasOwn(options, "parentEvalSessionId")).toBe(false);
 	});
 
 	it("registers temp artifact dirs for in-memory handle results so agent URLs resolve", async () => {

@@ -1,11 +1,10 @@
-import { applyBackgroundToLine, type Component, Container, Markdown, Text, padding, visibleWidth } from "@oh-my-pi/pi-tui";
+import { type Component, Container, Markdown, Text } from "@oh-my-pi/pi-tui";
 import { formatBytes } from "@oh-my-pi/pi-utils";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 import { attachmentSgr, collapseImageMarkers, renderPlaceholders } from "../composer-attachments";
 import { imageReferenceHyperlink } from "../image-references";
 import { highlightMagicKeywords } from "../magic-keywords";
 import { formatUsageTimestamp } from "./usage-row";
-import type { ReactionTarget } from "./reaction";
 
 // OSC 133 shell integration: marks prompt zones for terminal multiplexers.
 //

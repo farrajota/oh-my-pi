@@ -37,6 +37,7 @@ import {
 	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
@@ -160,6 +161,7 @@ interface TestSessionOptions {
 	sessionManager?: SessionManager;
 	ownerId?: string;
 	parentSessionId?: string;
+	overrides?: Partial<ToolSession>;
 }
 
 function createSession(options: TestSessionOptions = {}): ToolSession {
@@ -175,6 +177,7 @@ function createSession(options: TestSessionOptions = {}): ToolSession {
 		getSessionSpawns: () => "*",
 		sessionManager,
 		asyncJobManager: options.manager,
+		...options.overrides,
 	};
 }
 
@@ -283,6 +286,7 @@ function createFakeWorkerSession(options: { streaming?: boolean; onDispose?: () 
 		getLastAssistantMessage() {
 			return lastAssistant;
 		},
+		setWorkPoolYieldItems: (_items: unknown[]) => {},
 		async abort(): Promise<void> {},
 		async dispose(): Promise<void> {
 			disposed = true;
@@ -504,6 +508,82 @@ describe("vibe session registry", () => {
 		const entry = registry.screens(session)[0]!;
 		expect(entry.state).toBe("idle");
 		expect(entry.turns).toBe(1);
+	});
+
+	it("captures one fresh Vibe envelope while preserving explicit infrastructure", async () => {
+		let captured: ExecutorOptions | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			captured = options;
+			AgentRegistry.global().register({
+				id: options.id,
+				displayName: options.id,
+				kind: "sub",
+				parentId: options.parentAgentId ?? "Main",
+				session: createFakeWorkerSession().session,
+				status: "running",
+			});
+			AgentRegistry.global().setStatus(options.id, "idle");
+			return makeResult(options.id, { output: "Fresh worker ready." });
+		});
+		const extensionRoots = {
+			explicit: ["/vibe/explicit"],
+			mode: "explicit-only" as const,
+			configured: ["/vibe/configured"],
+			configuredLevel: "project" as const,
+		};
+		const getApiKey = async () => "vibe-account-key";
+		const mcpManager = { getTools: () => [] } as never;
+		const manager = createManager();
+		const session = createSession({
+			manager,
+			overrides: {
+				additionalDirectories: ["/vibe/shared-worktree"],
+				getApiKey,
+				enableMCP: true,
+				mcpManager,
+				effectiveExtensionRoots: () => extensionRoots,
+				contextFiles: [{ path: "/parent/PRIVATE.md", content: "PARENT_VIBE_CONTEXT" }],
+				skills: [{ name: "parent-vibe-skill" }] as never,
+				promptTemplates: [{ name: "parent-vibe-template" }] as never,
+				workspaceTree: { rendered: "PARENT_VIBE_TREE" } as never,
+				rules: [{ name: "parent-vibe-rule" }] as never,
+			},
+		});
+
+		const spawned = await VibeSessionRegistry.global().spawn(session, {
+			cli: "fast",
+			name: "FreshVibe",
+			prompt: "VIBE_ASSIGNMENT_SENTINEL",
+		});
+		await manager.getJob(spawned.jobId)!.promise;
+
+		expect(captured?.assignment).toBe("VIBE_ASSIGNMENT_SENTINEL");
+		expect(captured?.additionalDirectories).toEqual(["/vibe/shared-worktree"]);
+		expect(captured?.getApiKey).toBe(getApiKey);
+		expect(captured?.enableMCP).toBe(true);
+		expect(captured?.mcpManager).toBe(mcpManager);
+		extensionRoots.explicit.push("/late/vibe-extension");
+		expect(captured?.extensionRoots).toEqual({
+			explicit: ["/vibe/explicit"],
+			mode: "explicit-only",
+			configured: ["/vibe/configured"],
+			configuredLevel: "project",
+		});
+		for (const channel of [
+			"contextFiles",
+			"skills",
+			"promptTemplates",
+			"workspaceTree",
+			"rules",
+			"preloadedExtensionPaths",
+			"preloadedPreparedExtensions",
+			"preloadedCustomToolPaths",
+			"parentHindsightSessionState",
+			"parentMnemopiSessionState",
+			"parentEvalSessionId",
+		] as const) {
+			expect(Object.hasOwn(captured ?? {}, channel)).toBe(false);
+		}
 	});
 
 	it("retains a failed spawn when its tombstone cannot flush and retries it on mode exit", async () => {

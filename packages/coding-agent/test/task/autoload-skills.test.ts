@@ -74,7 +74,7 @@ function createSessionResult(session: AgentSession): CreateAgentSessionResult {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
-describe("autoloadSkills in executor", () => {
+describe("child-discovered autoload skills in executor", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -142,10 +142,10 @@ describe("autoloadSkills in executor", () => {
 			},
 		}));
 
+		Object.assign(session, { skills: mockSkills });
 		await runSubprocess({
 			...baseOptions,
-			skills: mockSkills,
-			autoloadSkills: mockSkills,
+			autoloadSkillNames: mockSkills.map(skill => skill.name),
 		});
 
 		const sendCustomMessage = session.sendCustomMessage as Mock<any>;
@@ -176,7 +176,7 @@ describe("autoloadSkills in executor", () => {
 		);
 	});
 
-	it("does not call sendCustomMessage when autoloadSkills is empty", async () => {
+	it("does not call sendCustomMessage when no autoload names are supplied", async () => {
 		const session = createMockSession(({ emit }) => {
 			emit({
 				type: "tool_execution_end",
@@ -198,7 +198,7 @@ describe("autoloadSkills in executor", () => {
 		expect(sendCustomMessage).not.toHaveBeenCalled();
 	});
 
-	it("does not call sendCustomMessage when autoloadSkills is undefined", async () => {
+	it("omits missing child-discovered autoload names", async () => {
 		const session = createMockSession(({ emit }) => {
 			emit({
 				type: "tool_execution_end",
@@ -211,10 +211,8 @@ describe("autoloadSkills in executor", () => {
 				isError: false,
 			});
 		});
-
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		await runSubprocess({ ...baseOptions, autoloadSkills: undefined });
+		await runSubprocess({ ...baseOptions, autoloadSkillNames: ["not-discovered"] });
 
 		const sendCustomMessage = session.sendCustomMessage as Mock<any>;
 		expect(sendCustomMessage).not.toHaveBeenCalled();
@@ -262,10 +260,10 @@ describe("autoloadSkills in executor", () => {
 			details: { name: "user-created-skill", path: "/skills/user-created-skill/SKILL.md", lineCount: 1 },
 		});
 
+		Object.assign(session, { skills: [mockSkill] });
 		await runSubprocess({
 			...baseOptions,
-			skills: [mockSkill],
-			autoloadSkills: [mockSkill],
+			autoloadSkillNames: [mockSkill.name],
 		});
 
 		expect(callOrder).toEqual(["sendCustomMessage", "prompt"]);

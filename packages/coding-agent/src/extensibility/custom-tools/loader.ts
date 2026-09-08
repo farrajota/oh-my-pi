@@ -11,10 +11,10 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import { toolCapability } from "../../capability/tool";
 import { type CustomTool, loadCapability } from "../../discovery";
+import type { EffectiveExtensionRoots } from "../../capability/types";
 import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 import type { HookUIContext } from "../../extensibility/hooks/types";
-import { getAllPluginToolPaths } from "../../extensibility/plugins/loader";
 import * as PiCodingAgent from "../../index";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as typebox from "../legacy-typebox";
@@ -223,19 +223,19 @@ export async function loadCustomTools(
 }
 
 /**
- * Collect the absolute tool-source paths to load, without importing or
- * binding factories. Hot path on session startup — the scan walks
- * `.omp/tools/`, `.claude/tools/`, the plugin tree, and any configured paths.
- *
- * Subagents reuse the parent's collected paths via the SDK's
- * `preloadedCustomToolPaths` option, then call `loadCustomTools` themselves
- * so each session re-binds factories with its own session-scoped
- * `CustomToolAPI` (cwd, exec, pushPendingAction, UI).
- *
- * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
- * @param cwd - Current working directory
+ * Collect the absolute tool-source paths to load without importing or binding
+ * factories. Discovery runs under the session's own cwd, agent directory, and
+ * immutable extension-root policy.
  */
-export async function discoverCustomToolPaths(configuredPaths: string[], cwd: string): Promise<ToolPathWithSource[]> {
+export async function discoverCustomToolPaths(
+	configuredPaths: string[],
+	cwd: string,
+	options: {
+		agentDir?: string;
+		disabledExtensions?: string[];
+		extensionRoots?: EffectiveExtensionRoots;
+	} = {},
+): Promise<ToolPathWithSource[]> {
 	const allPathsWithSources: ToolPathWithSource[] = [];
 	const seen = new Set<string>();
 
@@ -248,8 +248,13 @@ export async function discoverCustomToolPaths(configuredPaths: string[], cwd: st
 		}
 	};
 
-	// 1. Discover tools via capability system (user + project from all providers)
-	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, { cwd });
+	// Discover tools via the capability system under the supplied session scope.
+	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, {
+		cwd,
+		agentDir: options.agentDir,
+		disabledExtensions: options.disabledExtensions,
+		extensionRoots: options.extensionRoots,
+	});
 	for (const tool of discoveredTools.items) {
 		addPath(tool.path, {
 			provider: tool._source.provider,
@@ -258,12 +263,7 @@ export async function discoverCustomToolPaths(configuredPaths: string[], cwd: st
 		});
 	}
 
-	// 2. Plugin tools: ~/.omp/plugins/node_modules/*/
-	for (const pluginPath of await getAllPluginToolPaths(cwd)) {
-		addPath(pluginPath, { provider: "plugin", providerName: "Plugin", level: "user" });
-	}
-
-	// 3. Explicitly configured paths (can override/add)
+	// Explicitly configured paths can override or add sources.
 	for (const configPath of configuredPaths) {
 		addPath(resolvePath(configPath, cwd), { provider: "config", providerName: "Config", level: "project" });
 	}
@@ -272,14 +272,8 @@ export async function discoverCustomToolPaths(configuredPaths: string[], cwd: st
 }
 
 /**
- * Discover and load tools from standard locations via capability system:
- * 1. User and project tools discovered by capability providers
- * 2. Installed plugins (~/.omp/plugins/node_modules/*)
- * 3. Explicitly configured paths from settings or CLI
- *
- * Composed of {@link discoverCustomToolPaths} (FS scan) + {@link loadCustomTools}
- * (per-session binding). Subagents skip the first step and just call
- * `loadCustomTools` against the parent's collected paths.
+ * Discover and load tools through the capability system, add explicitly
+ * configured paths, then bind the resulting modules to one session.
  *
  * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
  * @param cwd - Current working directory

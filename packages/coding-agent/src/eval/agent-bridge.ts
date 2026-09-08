@@ -223,7 +223,6 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 						...(customTools ? { customTools } : {}),
 						retainArtifacts: true,
 						keepAlive: true,
-						shareEvalSession: false,
 						signal,
 						onProgress: progress => {
 							latestProgress = progress;

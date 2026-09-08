@@ -188,7 +188,7 @@ describe("runSubprocess soft request budget", () => {
 		tempDir[Symbol.dispose]();
 	});
 
-	function baseOptions(id: string, eventBus?: EventBus, subagentEventBus?: EventBus) {
+	function baseOptions(id: string, subagentEventBus?: EventBus) {
 		return {
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -199,8 +199,7 @@ describe("runSubprocess soft request budget", () => {
 			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 			enableLsp: false,
 			artifactsDir: tempDir.path(),
-			eventBus,
-			subagentEventBus: subagentEventBus ?? eventBus,
+			subagentEventBus,
 		};
 	}
 
@@ -465,8 +464,7 @@ describe("runSubprocess soft request budget", () => {
 
 	it("a nested spawn reaches the root RPC surface through the inherited observability bus", async () => {
 		const id = "WiringScout";
-		// Separate session and observability buses, the way the CLI wires them.
-		const sessionBus = new EventBus();
+		// The lifecycle bus is explicitly inherited by nested spawns.
 		const treeBus = new EventBus();
 		const frames: RpcSubagentFrame[] = [];
 		let resolveTerminalLatch: (() => void) | undefined;
@@ -511,10 +509,10 @@ describe("runSubprocess soft request budget", () => {
 		registerRunning(id, handle.session);
 
 		const terminal = waitForTerminal();
-		await runSubprocess(baseOptions(id, sessionBus, treeBus));
+		await runSubprocess(baseOptions(id, treeBus));
 		await terminal;
 
-		// The spawn wiring inherited the tree bus into the nested session.
+		// The spawn wiring inherited the lifecycle bus into the nested session.
 		expect(capturedOptions?.subagentEventBus).toBe(treeBus);
 		// The root RPC surface observed the depth-1 run…
 		expect(frames.some(frame => frame.type === "subagent_lifecycle" && frame.payload.id === id)).toBe(true);
@@ -526,8 +524,8 @@ describe("runSubprocess soft request budget", () => {
 
 	it("an aliased observability bus does not duplicate lifecycle frames", async () => {
 		const id = "AliasScout";
-		// An SDK caller wiring the same EventBus into both slots must not see
-		// every frame twice — the executor skips the aliased re-emit.
+		// The lifecycle bus may be used both by the caller and child without
+		// producing duplicate lifecycle frames.
 		const sharedBus = new EventBus();
 		const settled: string[] = [];
 		const terminal = Promise.withResolvers<void>();
@@ -554,7 +552,7 @@ describe("runSubprocess soft request budget", () => {
 		});
 		registerRunning(id, handle.session);
 
-		await runSubprocess(baseOptions(id, sharedBus, sharedBus));
+		await runSubprocess(baseOptions(id, sharedBus));
 		await terminal.promise;
 
 		expect(settled).toEqual(["completed"]);

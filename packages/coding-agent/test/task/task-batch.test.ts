@@ -77,6 +77,7 @@ function createSession(
 		getSessionFile: () => null,
 		getSessionSpawns: () => options.spawns ?? "*",
 		getAgentId: () => options.agentId ?? null,
+		asyncJobManager: options.manager,
 		getServiceTierByFamily: () => options.serviceTier,
 		taskDepth: options.taskDepth,
 		getPlanModeState: options.planMode ? () => ({ enabled: true }) : undefined,
@@ -1320,8 +1321,9 @@ describe("task exact preparation", () => {
 			expect(capturedOptions?.restrictToolNames).toBe(true);
 			expect(capturedOptions?.enableIrc).toBe(false);
 			expect(capturedOptions?.enableLsp).toBe(false);
-			expect(capturedOptions?.preloadedExtensionPaths).toBeUndefined();
-			expect(capturedOptions?.preloadedCustomToolPaths).toBeUndefined();
+			for (const channel of ["preloadedExtensionPaths", "preloadedCustomToolPaths"] as const) {
+				expect(Object.hasOwn(capturedOptions ?? {}, channel)).toBe(false);
+			}
 		} finally {
 			temp.removeSync();
 		}

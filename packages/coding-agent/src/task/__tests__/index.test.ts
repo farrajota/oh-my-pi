@@ -247,7 +247,7 @@ describe("TaskTool toolProfile execution", () => {
 		expect(runSpy.mock.calls[0]?.[0].agent.tools?.filter(tool => tool !== "irc")).toEqual(["hub"]);
 	});
 
-	test("forwards synchronous child lifecycle events to the parent event bus", async () => {
+	test("forwards synchronous child lifecycle events to the root observability bus", async () => {
 		const agent = makeAgent();
 		const eventBus = new EventBus();
 		const lifecycleEvents: unknown[] = [];
@@ -255,13 +255,16 @@ describe("TaskTool toolProfile execution", () => {
 			lifecycleEvents.push(payload);
 		});
 		const runSpy = vi.spyOn(executor, "runSubprocess").mockImplementation(async options => {
-			options.eventBus?.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, { status: "started" });
-			options.eventBus?.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, { status: "completed" });
+			options.subagentEventBus?.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, { status: "started" });
+			options.subagentEventBus?.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, { status: "completed" });
 			return makeResult(agent);
 		});
 		const taskTool = await makeTaskTool(
 			agent,
-			makeSession({ "async.enabled": false }, { eventBus, getArtifactsDir: () => "/tmp/task-artifacts" }),
+			makeSession(
+				{ "async.enabled": false },
+				{ subagentEventBus: eventBus, getArtifactsDir: () => "/tmp/task-artifacts" },
+			),
 		);
 
 		await taskTool.execute("tool-call", { agent: "synthetic", task: "read" });

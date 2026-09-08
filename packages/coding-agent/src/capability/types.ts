@@ -26,6 +26,19 @@ export interface EffectiveExtensionRoots {
 	configuredLevel: "user" | "project";
 }
 
+/** Materialize extension-root policy so a child cannot observe later parent mutations. */
+export function snapshotEffectiveExtensionRoots(
+	roots: EffectiveExtensionRoots | undefined,
+): EffectiveExtensionRoots | undefined {
+	if (!roots) return undefined;
+	return Object.freeze({
+		explicit: Object.freeze([...roots.explicit]),
+		mode: roots.mode,
+		configured: Object.freeze([...roots.configured]),
+		configuredLevel: roots.configuredLevel,
+	});
+}
+
 /**
  * Context passed to every provider loader.
  */
@@ -34,6 +47,8 @@ export interface LoadContext {
 	cwd: string;
 	/** User home directory */
 	home: string;
+	/** Agent directory for user-scoped native discovery */
+	agentDir?: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
 	/**
@@ -102,6 +117,8 @@ export interface LoadOptions<T = unknown> {
 	excludeProviders?: string[];
 	/** Custom cwd. Default: getProjectDir() */
 	cwd?: string;
+	/** Custom agent directory for user-scoped discovery. Default: getAgentDir() */
+	agentDir?: string;
 	/** Include items even if they fail validation. Default: false */
 	includeInvalid?: boolean;
 	/** Include items disabled via settings. Default: false */

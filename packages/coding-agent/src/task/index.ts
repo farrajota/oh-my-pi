@@ -28,7 +28,7 @@ import type {
 import type { ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { $env, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "..";
-import type { EffectiveExtensionRoots } from "../capability/types";
+import { type EffectiveExtensionRoots, snapshotEffectiveExtensionRoots } from "../capability/types";
 import type { Settings } from "../config/settings";
 import {
 	type BrowserAuditTaskAuthority,
@@ -37,7 +37,6 @@ import {
 	takeBrowserAuditTaskAuthority,
 } from "../internal/browser-audit-authority";
 import type { LocalProtocolOptions } from "../internal-urls";
-import { MCPManager } from "../mcp/manager";
 import type { Theme } from "../modes/theme/theme";
 import { loadOverallPlanReference, type OverallPlanReference } from "../plan-mode/plan-handoff";
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
@@ -2135,21 +2134,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			const agentId = preAllocatedId!;
 
-			const availableSkills = [...(this.session.skills ?? [])];
-			// Resolve autoload skills from agent definition against available skills
-			const resolvedAutoloadSkills =
-				agent.autoloadSkills?.length && availableSkills.length > 0
-					? agent.autoloadSkills
-							.map(name => availableSkills.find(s => s.name === name))
-							.filter((s): s is NonNullable<typeof s> => s !== undefined)
-					: [];
-			const contextFiles = this.session.contextFiles?.filter(
-				file => path.basename(file.path).toLowerCase() !== "agents.md",
-			);
-			const promptTemplates = this.session.promptTemplates;
-			const parentEvalSessionId = this.session.getEvalSessionId?.() ?? undefined;
-			const mcpManager = this.session.mcpManager ?? MCPManager.instance();
-
 			// Progress tracking for the single agent
 			const initialProgress: AgentProgress = {
 				index: spawnIndex,
@@ -2196,6 +2180,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				artifactsDir: this.session.getArtifactsDir?.() ?? effectiveArtifactsDir,
 
 				cwd: this.session.cwd,
+				additionalDirectories: this.session.additionalDirectories,
+				getApiKey: this.session.getApiKey,
 				id: agentId,
 				agent: permissionAgent,
 				thinkingLevel: permissionAgent.thinkingLevel,
@@ -2239,22 +2225,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				},
 				authStorage: this.session.authStorage,
 				modelRegistry: this.session.modelRegistry,
-				eventBus: this.session.eventBus,
-				mcpManager,
-				contextFiles,
-				skills: availableSkills,
-				autoloadSkills: resolvedAutoloadSkills,
-				workspaceTree: this.session.workspaceTree,
-				promptTemplates,
-				rules: this.session.rules,
-				preloadedExtensionPaths: auditConstrained ? undefined : this.session.extensionPaths,
-				preloadedCustomToolPaths: auditConstrained ? undefined : this.session.customToolPaths,
+				mcpManager: this.session.mcpManager,
+				enableMCP: this.session.enableMCP ?? true,
+				subagentEventBus: this.session.subagentEventBus,
+				extensionRoots: snapshotEffectiveExtensionRoots(this.session.effectiveExtensionRoots?.()),
 				localProtocolOptions,
 				parentArtifactManager,
-				parentHindsightSessionState: this.session.getHindsightSessionState?.(),
-				parentMnemopiSessionState: this.session.getMnemopiSessionState?.(),
 				parentTelemetry: this.session.getTelemetry?.(),
-				parentEvalSessionId,
+				autoloadSkillNames: agent.autoloadSkills,
 				parentAgentId: this.session.getAgentId?.() ?? MAIN_AGENT_ID,
 				permissionScope,
 				parentServiceTier,

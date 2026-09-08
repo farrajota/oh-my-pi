@@ -132,12 +132,12 @@ describe("runSubprocess explicit agent tools", () => {
 	});
 });
 
-describe("runSubprocess event bus propagation", () => {
-	test("forwards the caller event bus to child session creation", async () => {
-		const eventBus = new EventBus();
-		let capturedEventBus: EventBus | undefined;
+describe("runSubprocess subagent event bus propagation", () => {
+	test("forwards the lifecycle bus without forwarding a general session bus", async () => {
+		const subagentEventBus = new EventBus();
+		let capturedOptions: sdk.CreateAgentSessionOptions | undefined;
 		const createSpy = vi.spyOn(sdk, "createAgentSession").mockImplementation(async (options = {}) => {
-			capturedEventBus = options.eventBus;
+			capturedOptions = options;
 			return {
 				session: fakeSession(),
 				sessionManager: {} as SessionManager,
@@ -154,9 +154,10 @@ describe("runSubprocess event bus propagation", () => {
 				id: "EventBusExecutorTest",
 				settings: Settings.isolated({ "task.agentIdleTtlMs": 0, "task.generateLabels": false }),
 				modelRegistry: fakeModelRegistry(),
-				eventBus,
+				subagentEventBus,
 			});
-			expect(capturedEventBus).toBe(eventBus);
+			expect(capturedOptions?.subagentEventBus).toBe(subagentEventBus);
+			expect(Object.hasOwn(capturedOptions ?? {}, "eventBus")).toBe(false);
 		} finally {
 			createSpy.mockRestore();
 		}

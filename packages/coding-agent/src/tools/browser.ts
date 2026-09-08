@@ -86,7 +86,6 @@ const browserSchema = type({
 	"kill?": type("boolean").describe("also kill spawned-app browsers"),
 });
 
-
 /** Create the enabled-only browser host prelude for one tool session. */
 export function createBrowserPrelude(session: ToolSession): EvalPreludeDefinition {
 	return {

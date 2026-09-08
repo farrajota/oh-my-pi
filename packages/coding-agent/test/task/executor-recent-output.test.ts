@@ -23,7 +23,6 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, AgentProgress } from "@oh-my-pi/pi-coding-agent/task/types";
-import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 const TAIL_BYTES = 8 * 1024;
 
@@ -259,7 +258,6 @@ async function runScenario(ops: Op[], options?: { abortAfterOps?: boolean }): Pr
 		modelRegistry: { refresh: async () => {} } as ModelRegistry,
 		enableLsp: false,
 		signal: abortController.signal,
-		eventBus: new EventBus(),
 		onProgress: (progress: AgentProgress) => {
 			observations.push({ got: [...progress.recentOutput], want: ref.expected() });
 			immutability.push({ live: progress.recentOutput, copy: [...progress.recentOutput] });

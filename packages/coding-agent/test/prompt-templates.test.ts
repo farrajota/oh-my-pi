@@ -397,7 +397,7 @@ describe("renderYieldSchema", () => {
 describe("subagent peer roster prompt", () => {
 	const templatePath = path.resolve(import.meta.dir, "../src/prompts/system/subagent-system-prompt.md");
 
-	test("production prompt includes live peers and omits parked identity and activity", async () => {
+	test("production prompt includes live peer identity but omits all peer activity", async () => {
 		const registry = new AgentRegistry();
 		registry.register({
 			id: MAIN_AGENT_ID,
@@ -441,7 +441,7 @@ describe("subagent peer roster prompt", () => {
 			ircOmittedCount: roster.omittedCount,
 		});
 		expect(rendered).toContain("LiveWorker");
-		expect(rendered).toContain("editing auth.ts");
+		expect(rendered).not.toContain("editing auth.ts");
 		expect(rendered).toContain("IdleReviewer");
 		expect(rendered).toContain("1 parked peer(s) omitted");
 		expect(rendered).toContain("Idle peers are not gone: messaging them wakes them.");

@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
-import { getProjectDir, prompt } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getProjectDir, prompt } from "@oh-my-pi/pi-utils";
 import {
 	isValidManagedSkillName,
 	MANAGED_SKILLS_PROVIDER_ID,
@@ -93,7 +93,7 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 	const providerId = rawProviderId || "custom";
 	const level: "user" | "project" = rawLevel === "project" ? "project" : "user";
 	const result = await scanSkillsFromDir(
-		{ cwd: getProjectDir(), home: os.homedir(), repoRoot: null },
+		{ cwd: getProjectDir(), home: os.homedir(), agentDir: getAgentDir(), repoRoot: null },
 		{
 			dir: options.dir,
 			providerId,
@@ -120,6 +120,8 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 export interface LoadSkillsOptions extends SkillsSettings {
 	/** Working directory for project-local skills. Default: getProjectDir() */
 	cwd?: string;
+	/** Agent directory for user-scoped skills. Default: getAgentDir() */
+	agentDir?: string;
 	/**
 	 * Session-local extension roots. Post-startup reloads pass their live
 	 * session value so explicit roots, discovery mode, and configured
@@ -135,6 +137,7 @@ export interface LoadSkillsOptions extends SkillsSettings {
 export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadSkillsResult> {
 	const {
 		cwd = getProjectDir(),
+		agentDir,
 		enabled = true,
 		enableCodexUser = false,
 		enableClaudeUser = false,
@@ -178,9 +181,9 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		return true;
 	}
 
-	// Use capability API to load all skills
 	const result = await loadCapability<CapabilitySkill>(skillCapability.id, {
 		cwd,
+		agentDir,
 		disabledExtensions,
 		extensionRoots,
 	});
@@ -265,7 +268,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		customDirectories.map(async dir => {
 			const expandedDir = expandTilde(dir);
 			const scanResult = await scanSkillsFromDir(
-				{ cwd, home: os.homedir(), repoRoot: null },
+				{ cwd, home: os.homedir(), agentDir: agentDir ?? getAgentDir(), repoRoot: null },
 				{
 					dir: expandedDir,
 					providerId: "custom",

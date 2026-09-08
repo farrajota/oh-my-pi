@@ -1,19 +1,14 @@
-/**
- * Verifies parent-discovered rules, extensions, and custom tools are forwarded
- * to `createAgentSession` so subagents skip the FS scans the parent already
- * paid for. Regression guard for issue #2190.
- */
+/** Regression tests for the fresh child-session option boundary. */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { parseAgentFields } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
-import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
-import type { LoadExtensionsResult, PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
+import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -23,7 +18,9 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { resolveTaskEffortLevel } from "@oh-my-pi/pi-coding-agent/thinking";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
-function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent) => void }) => void): AgentSession {
+function createMockSession(
+	onPrompt: (params: { text: string; emit: (event: AgentSessionEvent) => void }) => void,
+): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const emit = (event: AgentSessionEvent) => {
 		for (const listener of listeners) listener(event);
@@ -49,8 +46,8 @@ function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent)
 				if (index >= 0) listeners.splice(index, 1);
 			};
 		},
-		prompt: async (_text: string, _options?: PromptOptions) => {
-			onPrompt({ emit });
+		prompt: async (text: string, _options?: PromptOptions) => {
+			onPrompt({ text, emit });
 		},
 		waitForIdle: async () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
@@ -64,8 +61,9 @@ function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent)
 	return session as unknown as AgentSession;
 }
 
-function yieldEmittingSession(): AgentSession {
-	return createMockSession(({ emit }) => {
+function yieldEmittingSession(observePrompt?: (text: string) => void): AgentSession {
+	return createMockSession(({ text, emit }) => {
+		observePrompt?.(text);
 		emit({
 			type: "tool_execution_end",
 			toolCallId: "tool-pass-through",
@@ -115,53 +113,81 @@ function createModelRegistry(model: Model, ...additionalModels: Model[]): ModelR
 	} as unknown as ModelRegistry;
 }
 
-describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
+describe("runSubprocess fresh child-session boundary", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
 
-	it("forwards rules, extension-root policy, prepared extensions, and preloaded source paths to createAgentSession", async () => {
-		const session = yieldEmittingSession();
+	it("creates the actual first child session and prompt from only approved explicit channels", async () => {
+		let firstPrompt = "";
+		const session = yieldEmittingSession(text => {
+			firstPrompt = text;
+		});
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		const rules: Rule[] = [{ name: "rule-a" } as unknown as Rule];
-		const preloadedExtensionPaths = ["/abs/parent/.omp/extensions/foo.ts"];
-		const preloadedPreparedExtensions: PreparedExtension[] = [
-			{
-				path: preloadedExtensionPaths[0]!,
-				resolvedPath: preloadedExtensionPaths[0]!,
-				factory: () => {},
-				error: null,
-			},
-		];
-		const preloadedCustomToolPaths: ToolPathWithSource[] = [
-			{ path: "tools/x.ts", source: { provider: "config", providerName: "Config", level: "project" } },
-		];
-		const extensionRoots = () => ({
+		const extensionRoots = {
 			explicit: ["/abs/parent/explicit-extension"],
 			mode: "explicit-only" as const,
 			configured: ["/abs/parent/configured-extension"],
 			configuredLevel: "project" as const,
-		});
+		};
+		const customTools = [{ name: "explicit-tool", label: "explicit" }] as unknown as CustomTool[];
+		const subagentEventBus = new EventBus();
+		const getApiKey = async () => "child-account-key";
+		const mcpManager = { getTools: () => [] } as never;
 
 		const result = await runSubprocess({
 			...baseOptions,
-			rules,
+			context: "EXPLICIT_CONTEXT_SENTINEL",
 			extensionRoots,
-			preloadedExtensionPaths,
-			preloadedPreparedExtensions,
-			preloadedCustomToolPaths,
+			customTools,
+			subagentEventBus,
+			additionalDirectories: ["/abs/shared-worktree"],
+			getApiKey,
+			enableMCP: true,
+			mcpManager,
 		});
-
 		expect(result.exitCode).toBe(0);
-		expect(spy).toHaveBeenCalledTimes(1);
-		const forwarded = spy.mock.calls[0]?.[0];
-		// Identity, not equality: passing a clone would defeat the perf fix.
-		expect(forwarded?.rules).toBe(rules);
-		expect(forwarded?.extensionRoots).toBe(extensionRoots);
-		expect(forwarded?.preloadedExtensionPaths).toBe(preloadedExtensionPaths);
-		expect(forwarded?.preloadedPreparedExtensions).toBe(preloadedPreparedExtensions);
-		expect(forwarded?.preloadedCustomToolPaths).toBe(preloadedCustomToolPaths);
+		expect(firstPrompt).toBe("do work");
+		const created = spy.mock.calls[0]?.[0];
+		const frozenRoots = created?.extensionRoots?.();
+		extensionRoots.explicit.push("/late/parent-extension");
+		extensionRoots.configured.push("/late/parent-configured-extension");
+		expect(frozenRoots).toEqual({
+			explicit: ["/abs/parent/explicit-extension"],
+			mode: "explicit-only",
+			configured: ["/abs/parent/configured-extension"],
+			configuredLevel: "project",
+		});
+		expect(Object.isFrozen(frozenRoots)).toBe(true);
+		expect(Object.isFrozen(frozenRoots?.explicit)).toBe(true);
+		expect(created?.customTools).toEqual(customTools);
+		expect(created?.subagentEventBus).toBe(subagentEventBus);
+		if (typeof created?.systemPrompt !== "function") throw new Error("Expected child-owned system prompt callback");
+		const renderedSystemPrompt = created.systemPrompt(["SDK_BASE", "SDK_TAIL"]);
+		const systemPrompt =
+			typeof renderedSystemPrompt === "string" ? renderedSystemPrompt : renderedSystemPrompt.join("\n");
+		expect(systemPrompt).toContain("EXPLICIT_CONTEXT_SENTINEL");
+		expect(created?.additionalDirectories).toEqual(["/abs/shared-worktree"]);
+		expect(created?.getApiKey).toBe(getApiKey);
+		expect(created?.enableMCP).toBe(true);
+		expect(created?.mcpManager).toBe(mcpManager);
+		expect(systemPrompt).toContain(baseAgent.systemPrompt);
+		for (const channel of [
+			"eventBus",
+			"contextFiles",
+			"skills",
+			"promptTemplates",
+			"workspaceTree",
+			"rules",
+			"preloadedExtensionPaths",
+			"preloadedPreparedExtensions",
+			"preloadedCustomToolPaths",
+			"parentHindsightSessionState",
+			"parentMnemopiSessionState",
+			"parentEvalSessionId",
+		] as const) {
+			expect(Object.hasOwn(created ?? {}, channel)).toBe(false);
+		}
 	});
 
 	it("forwards an exact credential resolver without replacing it", async () => {
@@ -173,19 +199,6 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 
 		expect(result.exitCode).toBe(0);
 		expect(spy.mock.calls[0]?.[0]?.getApiKey).toBe(getApiKey);
-	});
-
-	it("forwards undefined when the parent has not pre-discovered state", async () => {
-		const session = yieldEmittingSession();
-		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		const result = await runSubprocess({ ...baseOptions });
-
-		expect(result.exitCode).toBe(0);
-		const forwarded = spy.mock.calls[0]?.[0];
-		expect(forwarded?.rules).toBeUndefined();
-		expect(forwarded?.preloadedExtensionPaths).toBeUndefined();
-		expect(forwarded?.preloadedCustomToolPaths).toBeUndefined();
 	});
 	it("preserves empty and absent agent tool declarations through session creation", async () => {
 		const session = yieldEmittingSession();
@@ -233,7 +246,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.parentTaskPrefix).toBe("ChildAgent");
 	});
 
-	it("removes all MCP and discovered capability sources for a restricted child", async () => {
+	it("keeps a restricted child free of MCP capabilities and discovery preloads", async () => {
 		const session = yieldEmittingSession();
 		const persistedInits: Array<{ restrictToolNames?: boolean; tools: string[] }> = [];
 		vi.spyOn(session.sessionManager, "appendSessionInit").mockImplementation(init => {
@@ -241,18 +254,6 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			return "session-init";
 		});
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-		const preloadedExtensionPaths = ["/hostile/extensions/read.ts"];
-		const preloadedPreparedExtensions: PreparedExtension[] = [
-			{
-				path: preloadedExtensionPaths[0]!,
-				resolvedPath: preloadedExtensionPaths[0]!,
-				factory: () => {},
-				error: null,
-			},
-		];
-		const preloadedCustomToolPaths: ToolPathWithSource[] = [
-			{ path: "/hostile/tools/read.ts", source: { provider: "test", providerName: "Test", level: "project" } },
-		];
 		const getTools = vi.fn(() => [{ name: "read", label: "hostile/read" }]);
 		const mcpManager = { getTools } as unknown as MCPManager;
 
@@ -261,26 +262,27 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			id: "restricted-child",
 			restrictToolNames: true,
 			mcpManager,
-			preloadedExtensionPaths,
-			preloadedPreparedExtensions,
-			preloadedCustomToolPaths,
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
 			outputSchemaMode: "strict",
 		});
 
 		expect(result.exitCode).toBe(0);
-		const forwarded = spy.mock.calls[0]?.[0];
-		expect(forwarded?.restrictToolNames).toBe(true);
-		expect(forwarded?.enableMCP).toBe(false);
-		expect(forwarded?.mcpManager).toBeUndefined();
-		expect(forwarded?.customTools).toBeUndefined();
-		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
-		expect(forwarded?.preloadedPreparedExtensions).toEqual([]);
-		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
+		const created = spy.mock.calls[0]?.[0];
+		expect(created?.restrictToolNames).toBe(true);
+		expect(created?.enableMCP).toBe(false);
+		expect(created?.mcpManager).toBeUndefined();
+		expect(created?.customTools).toBeUndefined();
+		for (const channel of [
+			"preloadedExtensionPaths",
+			"preloadedPreparedExtensions",
+			"preloadedCustomToolPaths",
+		] as const) {
+			expect(Object.hasOwn(created ?? {}, channel)).toBe(false);
+		}
 		expect(getTools).not.toHaveBeenCalled();
-		expect(forwarded?.outputSchemaMode).toBe("strict");
+		expect(created?.outputSchemaMode).toBe("strict");
 		expect(persistedInits).toHaveLength(1);
-		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, tools: ["read", "yield"] });
+		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, enableMCP: false, tools: ["read", "yield"] });
 	});
 
 	it("persists bridge-only tools in the enabled Code Mode set", async () => {

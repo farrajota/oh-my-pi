@@ -102,9 +102,8 @@ export type SourceId = keyof typeof SOURCE_PATHS;
  * goes through {@link getUserPath}.
  */
 export function resolveUserPath(ctx: LoadContext, source: SourceId, subpath: string): string | null {
-	// Native user config is profile-scoped via getAgentDir() (the active profile's
-	// agent dir), matching builtin.ts and getMCPConfigPath("user").
-	if (source === "native") return path.join(getAgentDir(), subpath);
+	// Native user config follows the loading session's agent directory.
+	if (source === "native") return path.join(ctx.agentDir ?? getAgentDir(), subpath);
 	if (source === "claude") return path.join(resolveClaudePaths(ctx.home).configDir, subpath);
 	const paths = SOURCE_PATHS[source];
 	if (!paths.userAgent) return null;

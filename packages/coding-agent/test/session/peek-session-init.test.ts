@@ -50,7 +50,7 @@ function assistantMessage(text: string) {
 }
 
 describe("SessionManager.peekSessionInit", () => {
-	it("returns the latest session_init contract (tools/spawns/readSummarize) and the header cwd", async () => {
+	it("returns the latest session_init capability contract and the header cwd", async () => {
 		const cwd = makeTempDir("@pi-peek-cwd-");
 		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 		const sessionFile = manager.getSessionFile();
@@ -64,6 +64,7 @@ describe("SessionManager.peekSessionInit", () => {
 			spawns: "task",
 			readSummarize: false,
 			restrictToolNames: true,
+			enableMCP: true,
 		});
 		// Flush buffered entries (header + inits) so the lock-free peek can read them off disk.
 		manager.appendMessage(assistantMessage("flush"));
@@ -76,6 +77,7 @@ describe("SessionManager.peekSessionInit", () => {
 		expect(peek?.init?.spawns).toBe("task");
 		expect(peek?.init?.readSummarize).toBe(false);
 		expect(peek?.init?.restrictToolNames).toBe(true);
+		expect(peek?.init?.enableMCP).toBe(true);
 	});
 
 	it("streams large file-backed sessions without a full read", async () => {

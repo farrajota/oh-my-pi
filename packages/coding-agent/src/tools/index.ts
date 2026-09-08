@@ -187,53 +187,41 @@ export interface ToolSession {
 	suppressSpawnAdvisory?: boolean;
 	/** Optional fetch implementation injected into the URL read pipeline (tests, proxies). Defaults to global fetch. */
 	fetch?: FetchImpl;
-	/** Provider credential resolver forwarded unchanged to restricted child sessions. */
+	/** Provider credential resolver preserved for explicitly constructed child sessions. */
 	getApiKey?: AgentOptions["getApiKey"];
 	/** Skip subprocess-kernel availability checks and warmup */
 	skipPythonPreflight?: boolean;
-	/** Pre-loaded context files (AGENTS.md, etc) */
+	/** Context files materialized for this session; fresh children rediscover their own. */
 	contextFiles?: ContextFileEntry[];
-	/** Pre-loaded workspace tree (forwarded to subagents to skip re-scanning) */
+	/** Workspace tree materialized for this session; fresh children rescan. */
 	workspaceTree?: WorkspaceTree;
-	/** Pre-loaded skills */
+	/** Skills materialized for this session; fresh children rediscover by identity. */
 	skills?: readonly Skill[];
 	/** Rediscover live session skills after a tool mutates their backing files. */
 	refreshSkills?: () => Promise<void>;
-	/** Pre-loaded prompt templates */
+	/** Prompt templates materialized for this session. */
 	promptTemplates?: PromptTemplate[];
-	/** Pre-loaded rules (forwarded to subagents to skip re-discovery). */
+	/** Full unfiltered rule discovery result for this session. */
 	rules?: Rule[];
 	/**
 	 * This session's agent-scoped applicable rule set — rulebook + always-apply
 	 * + triggered TTSR rules, already bucketed against this session's `agents`
 	 * frontmatter. Distinct from {@link rules} (the full unfiltered discovery
-	 * result forwarded to children): this is what `rule://` resolution needs so
-	 * a subagent-only rule stays readable from inside that subagent, instead of
-	 * only from the top-level session's process-global snapshot.
+	 * result): this is what `rule://` resolution needs so a subagent-only rule
+	 * stays readable from inside that subagent.
 	 */
 	activeRules?: readonly Rule[];
-	/**
-	 * Pre-discovered extension source paths. Forwarded to subagents so they
-	 * skip the FS scan but still re-bind extensions to their own session-scoped
-	 * `ExtensionAPI` (cwd, eventBus, runtime). Inline extension factories
-	 * (`<inline-N>`) are NOT included — those are session-local.
-	 */
+	/** Pre-discovered extension paths retained for this session's reload surfaces. */
 	extensionPaths?: string[];
-	/** Imported extension factories safe to rebind in child sessions. */
+	/** Imported extension factories retained for deliberate SDK composition. */
 	preparedExtensions?: PreparedExtension[];
 	/**
 	 * Session-local extension roots for post-startup sub-discovery: explicit SDK
-	 * roots, discovery mode, and configured `extensions:`. A provider (not a
-	 * stored value) so it is materialized live per discovery call — a runtime
-	 * override or settings reload is reflected, never a construction-time
-	 * snapshot. Keeps the task surface byte-identical to the scoped load.
+	 * roots, discovery mode, and configured `extensions:`. Fresh spawn adapters
+	 * materialize this provider once so the child cannot observe later mutation.
 	 */
 	effectiveExtensionRoots?(): EffectiveExtensionRoots;
-	/**
-	 * Pre-discovered custom-tool source paths from `.omp/tools/`, `.claude/tools/`,
-	 * plugins, etc. Forwarded to subagents so they skip the FS scan but still
-	 * re-bind tools to their own session-scoped `CustomToolAPI`.
-	 */
+	/** Pre-discovered custom-tool paths retained for this session's reload surfaces. */
 	customToolPaths?: ToolPathWithSource[];
 	/** Whether LSP integrations are enabled */
 	enableLsp?: boolean;
@@ -273,7 +261,7 @@ export interface ToolSession {
 	restrictToolNames?: boolean;
 	/** Task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
-	/** Get shared eval executor session ID. Subagents inherit this to share JS/Python state. */
+	/** Get this session's eval executor ID; fresh child spawns never inherit it. */
 	getEvalSessionId?: () => string | null;
 	/** Get session file */
 	getSessionFile: () => string | null;
@@ -403,8 +391,6 @@ export interface ToolSession {
 	setTodoPhases?: (phases: TodoPhase[]) => void;
 	/** Active workpool items whose incremental yields complete the current turn. */
 	getWorkPoolYieldItems?: () => readonly WorkPoolYieldItem[];
-	/** Replace the active workpool item contract before a pooled turn starts. */
-	setWorkPoolYieldItems?: (items: readonly WorkPoolYieldItem[]) => void;
 	/** The tool-choice queue used to force forthcoming tool invocations and carry invocation handlers. */
 	getToolChoiceQueue?(): ToolChoiceQueue;
 	/** Build a model-provider-specific ToolChoice that targets the named tool, or undefined if unsupported. */

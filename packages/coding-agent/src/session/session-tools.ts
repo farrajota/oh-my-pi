@@ -26,7 +26,6 @@ import {
 	isReservedCoreToolName,
 	normalizeToolNames,
 } from "../tools/builtin-names";
-import { computerExposureMode } from "../tools/computer/exposure";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { isFilesystemSourcePath } from "../tools/path-utils";
 import { supportsExternalThinking } from "../tools/think";

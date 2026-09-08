@@ -19,6 +19,7 @@ import {
 	prompt,
 } from "@oh-my-pi/pi-utils";
 import { contextFileCapability } from "./capability/context-file";
+import type { EffectiveExtensionRoots } from "./capability/types";
 import { systemPromptCapability } from "./capability/system-prompt";
 import { findConfigFile } from "./config";
 import type { Personality, SkillsSettings } from "./config/settings";
@@ -54,8 +55,8 @@ const PERSONALITY_SPECS: Record<Exclude<Personality, "none">, string> = {
  * preset. Read failures other than a missing file warn instead of failing the
  * build.
  */
-async function loadPersonalityOverride(): Promise<string | null> {
-	const filePath = path.join(getAgentDir(), "PERSONALITY.md");
+async function loadPersonalityOverride(agentDir?: string): Promise<string | null> {
+	const filePath = path.join(agentDir ?? getAgentDir(), "PERSONALITY.md");
 	try {
 		const content = (await Bun.file(filePath).text()).trim();
 		if (content) return content;
@@ -404,8 +405,12 @@ export async function resolvePromptInput(input: string | undefined, description:
 export interface LoadContextFilesOptions {
 	/** Working directory to start walking up from. Default: getProjectDir() */
 	cwd?: string;
+	/** Agent directory for user-scoped context files. Default: getAgentDir() */
+	agentDir?: string;
 	/** Disabled extension IDs to honor instead of the process-global settings. */
 	disabledExtensions?: string[];
+	/** Session-local extension roots for extension-package context discovery. */
+	extensionRoots?: EffectiveExtensionRoots;
 }
 
 /**
@@ -455,7 +460,9 @@ export async function loadProjectContextFiles(
 
 	const result = await loadCapability(contextFileCapability.id, {
 		cwd: resolvedCwd,
+		agentDir: options.agentDir,
 		disabledExtensions: options.disabledExtensions,
+		extensionRoots: options.extensionRoots,
 	});
 
 	// Materialize ContextFile items, expanding any `@path/to/file` includes
@@ -491,7 +498,10 @@ export async function loadProjectContextFiles(
 export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {}): Promise<string | null> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
 
-	const result = await loadCapability<SystemPromptFile>(systemPromptCapability.id, { cwd: resolvedCwd });
+	const result = await loadCapability<SystemPromptFile>(systemPromptCapability.id, {
+		cwd: resolvedCwd,
+		agentDir: options.agentDir,
+	});
 
 	if (result.items.length === 0) return null;
 
@@ -608,6 +618,8 @@ export interface BuildSystemPromptOptions {
 	skillsSettings?: SkillsSettings;
 	/** Working directory. Default: getProjectDir() */
 	cwd?: string;
+	/** Agent directory for user-scoped prompt and context discovery. */
+	agentDir?: string;
 	/** Additional workspace directories beyond cwd (multi-root), absolute. Injected into the project prompt. */
 	additionalWorkspaceRoots?: string[];
 	/** Pre-loaded context files (skips discovery if provided). */
@@ -703,6 +715,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		toolNames: providedToolNames,
 		directToolNames,
 		cwd,
+		agentDir,
 		additionalWorkspaceRoots = [],
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
@@ -794,16 +807,16 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		(typeof customPrompt === "string" && customPrompt.length > 0);
 	const systemPromptCustomizationPromise: Promise<string | null> = callerControlsCustomPrompt
 		? Promise.resolve(null)
-		: logger.time("loadSystemPromptFiles", loadSystemPromptFiles, { cwd: resolvedCwd });
+		: logger.time("loadSystemPromptFiles", loadSystemPromptFiles, { cwd: resolvedCwd, agentDir });
 	const contextFilesPromise = (async () => {
 		const primary = providedContextFiles
 			? providedContextFiles
-			: await logger.time("loadProjectContextFiles", loadProjectContextFiles, { cwd: resolvedCwd });
+			: await logger.time("loadProjectContextFiles", loadProjectContextFiles, { cwd: resolvedCwd, agentDir });
 		// Also discover context files (AGENTS.md, rules, etc.) for each additional workspace root.
 		const additionalRoots = additionalWorkspaceRoots.filter(d => path.resolve(d) !== path.resolve(resolvedCwd));
 		if (additionalRoots.length === 0) return primary;
 		const extra = await Promise.all(
-			additionalRoots.map(root => loadProjectContextFiles({ cwd: root }).catch(() => [])),
+			additionalRoots.map(root => loadProjectContextFiles({ cwd: root, agentDir }).catch(() => [])),
 		);
 		return dedupeContainedContextFiles([...primary, ...extra.flat()]);
 	})();
@@ -849,7 +862,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		personality === "none"
 			? Promise.resolve("")
 			: logger
-					.time("loadPersonalityOverride", loadPersonalityOverride)
+					.time("loadPersonalityOverride", loadPersonalityOverride, agentDir)
 					.then(override => override ?? bundledPersonality);
 
 	const [

@@ -38,7 +38,7 @@ You NEVER modify files outside this tree or in the original repository.
 You can reach other live agents via the `hub` tool. Your id is `{{ircSelfId}}`. Currently visible peers:
 {{#if ircPeers}}
 {{#each ircPeers}}
-- `{{this.id}}` — {{this.displayName}} ({{this.kind}}, {{this.status}}){{#if this.activity}}: {{this.activity}}{{/if}}
+- `{{this.id}}` — {{this.displayName}} ({{this.kind}}, {{this.status}})
 {{/each}}
 {{#if ircOmittedCount}}
 {{ircOmittedCount}} more live peer(s) omitted.

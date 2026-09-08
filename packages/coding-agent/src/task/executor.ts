@@ -11,8 +11,7 @@ import { EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/p
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
-import type { Rule } from "../capability/rule";
-import type { EffectiveExtensionRoots } from "../capability/types";
+import { snapshotEffectiveExtensionRoots, type EffectiveExtensionRoots } from "../capability/types";
 import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelSelectorValue,
@@ -24,17 +23,13 @@ import {
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
-import type { PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, resolveSubagentServiceTier } from "../config/service-tier";
 import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
-import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
-import type { PreparedExtension } from "../extensibility/extensions/types";
-import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
-import type { HindsightSessionState } from "../hindsight/state";
+import { buildSkillPromptMessage } from "../extensibility/skills";
 import {
 	type BrowserAuditToolCapability,
 	bindBrowserAuditSessionOptions,
@@ -43,7 +38,6 @@ import {
 import type { LocalProtocolOptions } from "../internal-urls";
 import { IrcBus } from "../irc/bus";
 import type { MCPManager } from "../mcp/manager";
-import type { MnemopiSessionState } from "../mnemopi/state";
 import { initializeExtensions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
@@ -60,7 +54,6 @@ import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/mess
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
 import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
-import type { ContextFileEntry } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
 
 import { normalizeToolNames } from "../tools/builtin-names";
@@ -73,7 +66,6 @@ import { ToolAbortError } from "../tools/tool-errors";
 import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { buildNamedToolChoice } from "../utils/tool-choice";
-import type { WorkspaceTree } from "../workspace-tree";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
 import { type EffectiveSubagentPermissions, formatPermissionScopeForPrompt } from "./permission-profiles";
@@ -307,7 +299,6 @@ export interface IrcPeerRosterRow {
 	displayName: string;
 	kind: string;
 	status: string;
-	activity?: string;
 }
 
 export interface IrcPeerRosterData {
@@ -340,7 +331,6 @@ export function collectIrcPeerRoster(
 		displayName: peer.displayName,
 		kind: peer.kind,
 		status: peer.status,
-		activity: peer.activity,
 	}));
 	let parkedCount = 0;
 	for (const ref of registry.list()) {
@@ -501,33 +491,10 @@ export interface RunSubprocessOptions {
 	sessionFile?: string | null;
 	persistArtifacts?: boolean;
 	artifactsDir?: string;
-	eventBus?: EventBus;
+	/** Root-scoped lifecycle and progress observability channel. */
 	subagentEventBus?: EventBus;
-	contextFiles?: ContextFileEntry[];
-	skills?: Skill[];
-	promptTemplates?: PromptTemplate[];
-	workspaceTree?: WorkspaceTree;
-	/** Parent-discovered rules, forwarded to skip rule discovery in the subagent. */
-	rules?: Rule[];
-	/**
-	 * Parent session's live extension-root policy. Forwarded separately from
-	 * `preloadedExtensionPaths`, which only controls extension module loading.
-	 */
-	extensionRoots?: () => EffectiveExtensionRoots;
-	/**
-	 * Parent's discovered extension source paths. Forwarded to skip the
-	 * extension FS scan in the subagent; the subagent then re-binds each
-	 * extension against its own `ExtensionAPI` (cwd, eventBus, runtime).
-	 */
-	preloadedExtensionPaths?: string[];
-	/** Parent-imported extension factories rebound to the child runtime. */
-	preloadedPreparedExtensions?: readonly PreparedExtension[];
-	/**
-	 * Parent's discovered custom-tool source paths. Forwarded to skip the
-	 * `.omp/tools/` FS scan in the subagent; the subagent then re-binds each
-	 * tool against its own `CustomToolAPI` (cwd, exec, pushPendingAction, UI).
-	 */
-	preloadedCustomToolPaths?: ToolPathWithSource[];
+	/** Immutable extension-root policy captured at the spawn boundary. */
+	extensionRoots?: EffectiveExtensionRoots;
 	mcpManager?: MCPManager;
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
@@ -547,10 +514,6 @@ export interface RunSubprocessOptions {
 	 * artifacts directory (no per-subagent subdir).
 	 */
 	parentArtifactManager?: ArtifactManager;
-	parentHindsightSessionState?: HindsightSessionState;
-	parentMnemopiSessionState?: MnemopiSessionState;
-	/** Parent agent's eval executor session id. Subagents reuse it so eval state is shared. */
-	parentEvalSessionId?: string;
 	/**
 	 * Parent agent's OpenTelemetry configuration. When defined, the subagent's
 	 * loop is started with the same tracer/hooks but its own agent identity
@@ -560,8 +523,8 @@ export interface RunSubprocessOptions {
 	 * transition explicitly.
 	 */
 	parentTelemetry?: AgentTelemetryConfig;
-	/** Skills to autoload via sendCustomMessage before the first prompt */
-	autoloadSkills?: Skill[];
+	/** Names resolved against the child session's discovered skills before its first prompt. */
+	autoloadSkillNames?: string[];
 	/** Registry id of the spawning agent, recorded as this subagent's parent. */
 	parentAgentId?: string;
 	/** Keep the finished subagent addressable in the registry for IRC/revival. */
@@ -959,6 +922,7 @@ export function createSubagentSettings(
 	baseSettings: Settings,
 	overrides?: Partial<Record<SettingPath, unknown>>,
 	inheritedServiceTier?: ServiceTierByFamily | null,
+	scope?: { cwd?: string; agentDir?: string },
 ): Settings {
 	const snapshot: Partial<Record<SettingPath, unknown>> = {};
 	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
@@ -998,7 +962,11 @@ export function createSubagentSettings(
 			"advisor.enabled": false,
 			...overrides,
 		},
-		{ storage: baseSettings.getStorage() },
+		{
+			storage: baseSettings.getStorage(),
+			cwd: scope?.cwd ?? baseSettings.getCwd(),
+			agentDir: scope?.agentDir ?? baseSettings.getAgentDir(),
+		},
 	);
 }
 
@@ -1025,7 +993,6 @@ interface RunMonitorArgs {
 	requestedModel?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
-	eventBus?: EventBus;
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	detached?: boolean;
@@ -1345,10 +1312,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	// Recompute progress.recentOutput from the capped tail. Deferred: text_delta
 	// appends only extend the tail and mark it dirty; the (up to 8KB) split/filter
 	// runs synchronously here, immediately before the ONLY places the progress
-	// object is snapshotted ({...progress} for onProgress and the eventBus
-	// progress channel, both inside emitProgressNow — including the
-	// scheduleProgress(flush) finalize/error/cancel paths). Observers therefore
-	// always see exact state; no staleness beyond the existing 150ms coalescing.
+	// object is snapshotted ({...progress} for onProgress and the subagent event
+	// channel, both inside emitProgressNow — including the scheduleProgress(flush)
+	// finalize/error/cancel paths). Observers therefore always see exact state.
 	const refreshRecentOutput = () => {
 		if (!recentOutputDirty) return;
 		recentOutputDirty = false;
@@ -1374,7 +1340,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			progress: { ...progress },
 			sessionFile: args.sessionFile,
 		};
-		emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_PROGRESS_CHANNEL, progressPayload);
+		emitSubagentFrame(undefined, args.subagentEventBus, TASK_SUBAGENT_PROGRESS_CHANNEL, progressPayload);
 		lastProgressEmitMs = Date.now();
 	};
 
@@ -1474,7 +1440,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 
 	const emitSubagentEvent = (event: AgentSessionEvent) => {
 		const payload = { id, event };
-		emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_EVENT_CHANNEL, payload);
+		emitSubagentFrame(undefined, args.subagentEventBus, TASK_SUBAGENT_EVENT_CHANNEL, payload);
 	};
 
 	const recordExtractedToolData = (toolName: string, data: unknown): void => {
@@ -2244,7 +2210,6 @@ interface FinalizeRunArgs {
 	outputSchemaSource?: StructuredSubagentSchemaSource;
 	signal?: AbortSignal;
 	artifactsDir?: string;
-	eventBus?: EventBus;
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	detached?: boolean;
@@ -2426,7 +2391,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		sessionFile: args.sessionFile,
 		index,
 	};
-	emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, settledPayload);
+	emitSubagentFrame(undefined, args.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, settledPayload);
 
 	return {
 		index,
@@ -2473,7 +2438,6 @@ export interface IrcWakeTurnMonitorOptions {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
-	eventBus?: EventBus;
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	/** Fallback session file when the registry ref carries none. */
@@ -2604,7 +2568,6 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			description: options.description,
 			modelOverride: options.modelOverride,
 			modelRole: options.modelRole,
-			eventBus: options.eventBus,
 			subagentEventBus: options.subagentEventBus,
 			parentToolCallId: options.parentToolCallId,
 			detached: true,
@@ -2625,7 +2588,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			sessionFile,
 			index,
 		} as const;
-		emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
+		emitSubagentFrame(undefined, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
 
 		turnMonitor.setActiveSession(session);
 		const unsubscribeTurn = turnMonitor.attach(session);
@@ -2669,7 +2632,6 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					outputSchemaMode: options.outputSchemaMode,
 					outputSchemaSource: options.outputSchemaSource,
 					artifactsDir: options.artifactsDir,
-					eventBus: options.eventBus,
 					subagentEventBus: options.subagentEventBus,
 					parentToolCallId: options.parentToolCallId,
 					detached: true,
@@ -2833,7 +2795,6 @@ export interface FollowUpTurnOptions {
 	outputSchemaSource?: StructuredSubagentSchemaSource;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
-	eventBus?: EventBus;
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	/**
@@ -2877,7 +2838,6 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		modelRole: options.modelRole,
 		signal,
 		onProgress: options.onProgress,
-		eventBus: options.eventBus,
 		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: true,
@@ -2898,7 +2858,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		sessionFile,
 		index,
 	} as const;
-	emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
+	emitSubagentFrame(undefined, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
 
 	monitor.setActiveSession(session);
 	const unsubscribe = monitor.attach(session);
@@ -2930,7 +2890,6 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		outputSchemaSource: options.outputSchemaSource,
 		signal,
 		artifactsDir: options.artifactsDir,
-		eventBus: options.eventBus,
 		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: true,
@@ -2962,6 +2921,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		signal,
 		onProgress,
 	} = options;
+	const extensionRoots = snapshotEffectiveExtensionRoots(options.extensionRoots);
 	const cleanupGraceMs = options.cleanupGraceMs ?? TASK_ABORT_CLEANUP_GRACE_MS;
 	let browserAuditCapability: BrowserAuditToolCapability | undefined = takeBrowserAuditRunCapability(options.agent);
 	const startTime = Date.now();
@@ -3025,6 +2985,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				: undefined),
 		},
 		options.parentServiceTier,
+		{ cwd: worktree ?? cwd, agentDir: settings.getAgentDir() },
 	);
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	const maxRuntimeMs = Math.max(
@@ -3100,7 +3061,6 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		requestedModel,
 		signal,
 		onProgress,
-		eventBus: options.eventBus,
 		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: options.detached,
@@ -3120,7 +3080,6 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			description: options.description,
 			modelOverride,
 			modelRole,
-			eventBus: options.eventBus,
 			subagentEventBus: options.subagentEventBus,
 			parentToolCallId: options.parentToolCallId,
 			sessionFile: subtaskSessionFile,
@@ -3388,13 +3347,14 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			): CreateAgentSessionOptions => {
 				const sessionOptions: CreateAgentSessionOptions = {
 					cwd: worktree ?? cwd,
-					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
+					agentDir: subagentSettings.getAgentDir(),
+					...(worktree === undefined && options.additionalDirectories
+						? { additionalDirectories: options.additionalDirectories }
+						: {}),
 					authStorage,
 					modelRegistry,
 					getApiKey: options.getApiKey,
 					settings: subagentSettings,
-					eventBus: options.eventBus,
-
 					model,
 					modelPattern: model || modelPatterns.length === 0 || exactModelOverride ? undefined : modelPatterns,
 					modelPatternAuthFallback:
@@ -3414,15 +3374,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					outputSchemaMode: options.outputSchemaMode,
 					restrictToolNames: options.restrictToolNames,
 					requireYieldTool: true,
-					contextFiles: options.contextFiles,
-					skills: options.skills,
-					promptTemplates: options.promptTemplates,
-					workspaceTree: options.workspaceTree,
-					rules: options.rules,
-					extensionRoots: options.extensionRoots,
-					preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
-					preloadedPreparedExtensions: restrictToolNames ? [] : options.preloadedPreparedExtensions,
-					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
+					extensionRoots: extensionRoots ? () => extensionRoots : undefined,
 					systemPrompt: defaultPrompt => {
 						const ircRoster = ircEnabled
 							? collectIrcPeerRoster(AgentRegistry.global(), id, ircRootSessionFile)
@@ -3451,13 +3403,8 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					prewalk,
 					spawns: spawnsEnv,
 					taskDepth: childDepth,
-					// The whole spawn tree shares the root session's observability bus,
-					// so nested lifecycle/progress/event frames reach its surfaces
-					// without leaking into another root session's traffic.
 					subagentEventBus: options.subagentEventBus,
-					parentHindsightSessionState: options.parentHindsightSessionState,
 					agentName: agent.name,
-					parentMnemopiSessionState: options.parentMnemopiSessionState,
 					parentTaskPrefix: id,
 					parentAgentId: options.parentAgentId,
 					agentId: id,
@@ -3471,7 +3418,6 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					customTools: sessionCustomTools.length > 0 ? sessionCustomTools : undefined,
 					localProtocolOptions: options.localProtocolOptions,
 					telemetry: subagentTelemetry,
-					parentEvalSessionId: options.parentEvalSessionId,
 					permissionScope: options.permissionScope,
 					onFirstChatDispatch: () => {
 						firstChatDispatchAt ??= performance.now();
@@ -3566,7 +3512,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				sessionFile: subtaskSessionFile,
 				index,
 			};
-			emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
+			emitSubagentFrame(undefined, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
 
 			// Todos are parent-owned bookkeeping and stripped from subagents —
 			// except under prewalk, whose plan nudge + todo gate require the
@@ -3602,6 +3548,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: restrictToolNames || undefined,
+				enableMCP,
 			});
 
 			abortSignal.addEventListener(
@@ -3687,9 +3634,11 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			unsubscribe = monitor.attach(session);
 
 			checkAbort();
-			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>)
-			if (options.autoloadSkills?.length) {
-				for (const skill of options.autoloadSkills) {
+			// Resolve names only after the child has performed its own skill discovery.
+			if (options.autoloadSkillNames?.length) {
+				for (const name of options.autoloadSkillNames) {
+					const skill = session.skills.find(candidate => candidate.name === name);
+					if (!skill) continue;
 					const { message } = await buildSkillPromptMessage(skill, "", "autoload");
 					await session.sendCustomMessage(
 						{
@@ -3885,7 +3834,6 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		outputSchemaSource: options.outputSchemaSource,
 		signal,
 		artifactsDir: options.artifactsDir,
-		eventBus: options.eventBus,
 		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: options.detached,

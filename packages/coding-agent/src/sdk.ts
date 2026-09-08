@@ -54,7 +54,7 @@ import { createAutoresearchExtension } from "./autoresearch";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
-import type { EffectiveExtensionRoots } from "./capability/types";
+import { snapshotEffectiveExtensionRoots, type EffectiveExtensionRoots } from "./capability/types";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
@@ -458,9 +458,9 @@ export interface CreateAgentSessionOptions {
 	/** Disable extension discovery (explicit paths still load). */
 	disableExtensionDiscovery?: boolean;
 	/**
-	 * Live extension-root policy inherited by a child session. Keeps recursive
-	 * sub-discovery aligned with the parent while `preloadedExtensionPaths` only
-	 * optimizes extension-module loading.
+	 * Construction-time extension-root policy provider. `createAgentSession`
+	 * snapshots its value once and retains a session-owned immutable provider for
+	 * initial discovery and reloads.
 	 *
 	 * @internal
 	 */
@@ -496,15 +496,9 @@ export interface CreateAgentSessionOptions {
 	 */
 	preloadedPreparedExtensions?: readonly PreparedExtension[];
 	/**
-	 * Pre-discovered custom-tool source paths from `.omp/tools/`, `.claude/tools/`,
-	 * plugins, etc. When provided, the filesystem-scan inside
-	 * `discoverCustomToolPaths()` is skipped — subagents inherit the parent's
-	 * scan result and call `loadCustomTools()` themselves so each session binds
-	 * tools to its OWN `CustomToolAPI` (cwd, exec, pushPendingAction, UI).
-	 *
-	 * Forwarding the loaded `LoadedCustomTool[]` instances directly would reuse
-	 * the parent's session-bound API and route tool execution back through the
-	 * parent — wrong for isolated tasks and for pending-action routing.
+	 * Pre-discovered custom-tool source paths. Supplying these skips discovery,
+	 * while factories are still rebound to this session's `CustomToolAPI`.
+	 * Internal fresh child spawns intentionally omit this option and rediscover.
 	 */
 	preloadedCustomToolPaths?: ToolPathWithSource[];
 
@@ -524,7 +518,7 @@ export interface CreateAgentSessionOptions {
 	rules?: Rule[];
 	/** Context files (AGENTS.md content). Default: discovered walking up from cwd */
 	contextFiles?: Array<{ path: string; content: string }>;
-	/** Pre-built workspace tree (skips re-scanning; passed by parents to subagents). */
+	/** Pre-built workspace tree for deliberate SDK composition (skips re-scanning). */
 	workspaceTree?: WorkspaceTree;
 	/** Prompt templates. Default: discovered from cwd/.omp/prompts/ + agentDir/prompts/ */
 	promptTemplates?: PromptTemplate[];
@@ -757,25 +751,30 @@ export async function discoverExtensions(cwd?: string): Promise<LoadExtensionsRe
 }
 
 /**
- * Path-only counterpart of {@link loadSessionExtensions}: the FS-heavy scan
- * without the per-session module load. Subagents reuse the parent's path list
- * (cached on {@link ToolSession.extensionPaths}) and rebuild Extension
- * instances themselves so each session's `ExtensionAPI` (cwd, eventBus,
- * runtime) is its own.
+ * Path-only counterpart of {@link loadSessionExtensions}: the filesystem scan
+ * without the per-session module load. Callers may cache this for deliberate
+ * SDK composition; internal fresh child spawns rediscover instead.
  */
 export async function discoverSessionExtensionPaths(
-	options: Pick<CreateAgentSessionOptions, "disableExtensionDiscovery" | "additionalExtensionPaths">,
+	options: Pick<
+		CreateAgentSessionOptions,
+		"disableExtensionDiscovery" | "additionalExtensionPaths" | "extensionRoots"
+	>,
 	cwd: string,
 	settings: Settings,
 ): Promise<string[]> {
-	const configuredPaths = options.disableExtensionDiscovery
-		? (options.additionalExtensionPaths ?? [])
-		: [...(options.additionalExtensionPaths ?? []), ...(settings.get("extensions") ?? [])];
-	const disabledExtensionIds = options.disableExtensionDiscovery
-		? undefined
-		: (settings.get("disabledExtensions") ?? []);
+	const roots = options.extensionRoots?.();
+	const mode = roots?.mode ?? (options.disableExtensionDiscovery ? "explicit-only" : "merge");
+	const configuredPaths = roots
+		? mode === "explicit-only"
+			? [...roots.explicit]
+			: [...roots.explicit, ...roots.configured]
+		: options.disableExtensionDiscovery
+			? (options.additionalExtensionPaths ?? [])
+			: [...(options.additionalExtensionPaths ?? []), ...(settings.get("extensions") ?? [])];
+	const disabledExtensionIds = mode === "explicit-only" ? undefined : (settings.get("disabledExtensions") ?? []);
 	return discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, {
-		ambient: !options.disableExtensionDiscovery,
+		ambient: mode === "merge",
 	});
 }
 
@@ -789,7 +788,10 @@ export async function discoverSessionExtensionPaths(
  * repeated. Keep this the single source of the discovery branch logic.
  */
 export async function loadSessionExtensions(
-	options: Pick<CreateAgentSessionOptions, "disableExtensionDiscovery" | "additionalExtensionPaths">,
+	options: Pick<
+		CreateAgentSessionOptions,
+		"disableExtensionDiscovery" | "additionalExtensionPaths" | "extensionRoots"
+	>,
 	cwd: string,
 	settings: Settings,
 	eventBus: EventBus,
@@ -838,12 +840,15 @@ export async function loadCliExtensionProviders(
  */
 export async function discoverSkills(
 	cwd?: string,
-	_agentDir?: string,
+	agentDir?: string,
 	settings?: SkillsSettings,
+	extensionRoots?: EffectiveExtensionRoots,
 ): Promise<{ skills: Skill[]; warnings: SkillWarning[] }> {
 	return await loadSkillsInternal({
 		...settings,
 		cwd: cwd ?? getProjectDir(),
+		agentDir,
+		extensionRoots,
 	});
 }
 
@@ -853,12 +858,15 @@ export async function discoverSkills(
  */
 export async function discoverContextFiles(
 	cwd?: string,
-	_agentDir?: string,
+	agentDir?: string,
 	disabledExtensions?: string[],
+	extensionRoots?: EffectiveExtensionRoots,
 ): Promise<Array<{ path: string; content: string; depth?: number }>> {
 	return await loadContextFilesInternal({
 		cwd: cwd ?? getProjectDir(),
+		agentDir,
 		disabledExtensions,
+		extensionRoots,
 	});
 }
 
@@ -875,8 +883,18 @@ export async function discoverPromptTemplates(cwd?: string, agentDir?: string): 
 /**
  * Discover file-based slash commands from commands/ directories.
  */
-export async function discoverSlashCommands(cwd?: string): Promise<FileSlashCommand[]> {
-	return loadSlashCommandsInternal({ cwd: cwd ?? getProjectDir() });
+export async function discoverSlashCommands(
+	cwd?: string,
+	agentDir?: string,
+	disabledExtensions?: string[],
+	extensionRoots?: EffectiveExtensionRoots,
+): Promise<FileSlashCommand[]> {
+	return loadSlashCommandsInternal({
+		cwd: cwd ?? getProjectDir(),
+		agentDir,
+		disabledExtensions,
+		extensionRoots,
+	});
 }
 
 /**
@@ -910,6 +928,7 @@ export interface BuildSystemPromptOptions {
 	skills?: Skill[];
 	contextFiles?: Array<{ path: string; content: string }>;
 	cwd?: string;
+	agentDir?: string;
 	customPrompt?: string;
 	appendPrompt?: string;
 	inlineToolDescriptors?: boolean;
@@ -935,9 +954,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		: undefined;
 	return await buildSystemPromptInternal({
 		cwd: options.cwd,
-		customPrompt: options.customPrompt,
+		agentDir: options.agentDir,
 		skills: options.skills,
 		contextFiles: options.contextFiles,
+		customPrompt: options.customPrompt,
 		appendSystemPrompt: options.appendPrompt,
 		inlineToolDescriptors: options.inlineToolDescriptors,
 		includeWorkspaceTree: options.includeWorkspaceTree,
@@ -1296,10 +1316,11 @@ export function createAutoLearnCaptureRunner(
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	const extensionRoots = options.extensionRoots?.();
+	const extensionRoots = snapshotEffectiveExtensionRoots(options.extensionRoots?.());
+	const scopedOptions = extensionRoots ? { ...options, extensionRoots: () => extensionRoots } : options;
 	const explicit = extensionRoots?.explicit ?? options.additionalExtensionPaths ?? [];
 	const mode = extensionRoots?.mode ?? (options.disableExtensionDiscovery ? "explicit-only" : "merge");
-	return await withOmpExtensionRootScope(explicit, mode, () => createAgentSessionScoped(options));
+	return await withOmpExtensionRootScope(explicit, mode, () => createAgentSessionScoped(scopedOptions));
 }
 
 async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
@@ -1323,6 +1344,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		extensionRoots?.configured ?? settings.get("extensions") ?? [],
 		extensionRoots?.configuredLevel ?? settings.extensionsSourceLevel(),
 	);
+	const skillsSettings = settings.getGroup("skills");
+	const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
 
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
@@ -1364,10 +1387,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	if (!options.modelRegistry) {
 		modelRegistry.refreshInBackground();
 	}
-	// Kick off workspace tree discovery early. The native workspace scan returns
-	// both the rendered-tree input and the AGENTS.md directory-context index, so
-	// startup does not perform a second recursive filesystem search. Subagents
-	// inherit the parent's resolved values via options.
+	// Kick off workspace tree discovery early. The native scan returns both the
+	// rendered tree and AGENTS.md directory index; fresh child sessions omit a
+	// parent snapshot and build under their own cwd.
 	const STARTUP_SCAN_DEADLINE_MS = 5000;
 	const includeWorkspaceTree = settings.get("includeWorkspaceTree") ?? false;
 	const workspaceTreePromise: Promise<WorkspaceTree> = options.workspaceTree
@@ -1377,12 +1399,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			: Promise.resolve({ rootPath: cwd, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] });
 	workspaceTreePromise.catch(() => {});
 
-	// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
-	// at their respective consumer sites. Their work can overlap with model resolution, secret loading,
-	// session-context build, tool creation, MCP discovery, and extension discovery.
+	// Independent discoveries that depend only on this session's cwd, agentDir,
+	// and immutable extension policy are kicked off in parallel.
 	const contextFilesPromise = options.contextFiles
 		? Promise.resolve(options.contextFiles)
-		: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir);
+		: logger.time("discoverContextFiles", () =>
+				discoverContextFiles(cwd, agentDir, disabledExtensionIds, extensionRoots),
+			);
 	contextFilesPromise.catch(() => {});
 	const resolveRepoContext = async (repoCwd: string) => {
 		try {
@@ -1404,21 +1427,25 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	promptTemplatesPromise.catch(() => {});
 	const slashCommandsPromise = options.slashCommands
 		? Promise.resolve(options.slashCommands)
-		: logger.time("discoverSlashCommands", discoverSlashCommands, cwd);
+		: logger.time("discoverSlashCommands", () =>
+				discoverSlashCommands(cwd, agentDir, disabledExtensionIds, extensionRoots),
+			);
 	slashCommandsPromise.catch(() => {});
 	const customCommandsPromise =
 		options.disableExtensionDiscovery || options.restrictToolNames === true
 			? Promise.resolve<CustomCommandsLoadResult>({ commands: [], errors: [] })
 			: logger.time("discoverCustomCommands", loadCustomCommandsInternal, { cwd, agentDir });
 	customCommandsPromise.catch(() => {});
-	const skillsSettings = settings.getGroup("skills");
-	const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
 	const discoveredSkillsPromise =
 		options.skills === undefined
-			? logger.time("discoverSkills", discoverSkills, cwd, agentDir, {
-					...skillsSettings,
-					disabledExtensions: disabledExtensionIds,
-				})
+			? logger.time("discoverSkills", () =>
+					discoverSkills(
+						cwd,
+						agentDir,
+						{ ...skillsSettings, disabledExtensions: disabledExtensionIds },
+						extensionRoots,
+					),
+				)
 			: undefined;
 	discoveredSkillsPromise?.catch(() => {});
 
@@ -1656,13 +1683,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const rulesResult =
 				options.rules !== undefined
 					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd });
+					: await loadCapability<Rule>(ruleCapability.id, {
+							cwd,
+							agentDir,
+							disabledExtensions: disabledExtensionIds,
+							extensionRoots,
+						});
 			const { rulebookRules, alwaysApplyRules } = bucketRules(rulesResult.items, ttsrManager, {
 				builtinRules: ttsrSettings.builtinRules,
 				disabledRules: ttsrSettings.disabledRules,
 				agentName:
-					options.agentName ??
-					((options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? undefined : "main"),
+					options.agentName ?? ((options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? undefined : "main"),
 			});
 			if (existingSession.injectedTtsrRules.length > 0) {
 				ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
@@ -2005,9 +2036,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (event.type === "connecting" && event.serverNames.length === 0) return;
 			eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, event);
 		};
-		// Provider, never a stored value: inherited child policy remains linked to
-		// the owning session, while top-level sessions materialize their own live
-		// settings on every discovery call.
+		// A construction callback was snapshotted by createAgentSession. Sessions
+		// without one derive their own live top-level settings for later reloads.
 		const buildSessionExtensionRoots =
 			options.extensionRoots ??
 			((): EffectiveExtensionRoots => ({
@@ -2115,16 +2145,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				customTools.push(ttsTool as unknown as CustomTool);
 			}
 
-			// Discover custom tools from `.omp/tools/`, `.claude/tools/`, plugins, etc.
-			// Subagents reuse the parent's scan via `preloadedCustomToolPaths` to skip
-			// the FS walk, but ALWAYS re-call `loadCustomTools` here so factories bind
-			// to THIS session's `CustomToolAPI` (cwd, exec, pushPendingAction, UI).
-			// Forwarding the parent's `LoadedCustomTool[]` directly would route tool
-			// execution back through the parent — wrong for isolated tasks and for
-			// pending-action queueing.
+			// Discover and bind custom tools under this session's own discovery identity.
 			customToolPaths =
 				options.preloadedCustomToolPaths ??
-				(await logger.time("discoverCustomToolPaths", () => discoverCustomToolPaths([], cwd)));
+				(await logger.time("discoverCustomToolPaths", () =>
+					discoverCustomToolPaths([], cwd, {
+						agentDir,
+						disabledExtensions: disabledExtensionIds,
+						extensionRoots,
+					}),
+				));
 			const customToolsLoadResult = await logger.time("loadCustomTools", () =>
 				loadCustomTools(customToolPaths, cwd, builtInToolNames, action => queueResolveHandler(toolSession, action)),
 			);
@@ -2147,8 +2177,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				inlineExtensions.push(createCustomToolsExtension(customTools, customToolSourcePaths));
 			}
 		}
-		// Forward the path list (NOT the loaded tools) to subagents so they
-		// re-bind under their own `CustomToolAPI` while skipping the FS scan.
+		// Retain paths for this session's reload and diagnostics surfaces. Fresh
+		// internal child spawns intentionally rediscover rather than forwarding them.
 		toolSession.customToolPaths = customToolPaths;
 
 		// Load extensions. Three paths:
@@ -3193,8 +3223,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? `${appendPrompt}\n\n${options.appendSystemPrompt}`
 					: options.appendSystemPrompt;
 			}
+			const evalPreludes = getEvalPreludes();
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
+				agentDir,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
 				xdevTools: toolSession.xdev ? xdevEntries(toolSession.xdev) : [],
 				xdevDocs: toolSession.xdev
@@ -3230,6 +3262,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				includeWorkspaceTree,
 				memoryRootEnabled: memoryBackend?.id === "local",
 				securityEnabled: settings.get("security.enabled"),
+				browserEnabled: evalPreludes.some(definition => definition.name === "browser"),
+				computerEnabled: evalPreludes.some(definition => definition.name === "computer"),
 				model: getActiveModelString(),
 				includeModelInPrompt: settings.get("includeModelInPrompt"),
 				personality: agentKind === "sub" ? "none" : settings.get("personality"),
@@ -3803,6 +3837,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			preferWebsockets: preferOpenAICodexWebsockets,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
+			getEvalPreludes,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
 			xdev: toolSession.xdev,
 			presentationPinnedToolNames: explicitlyRequestedToolNameSet,
@@ -3828,6 +3863,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							);
 						}
 						return out;
+					}
+				: undefined,
+			reconcileBrowserMcpFilter: mcpManager
+				? async enabled => {
+						await mcpManager.reconcileBrowserFilter(enabled);
+						return mcpManager.getTools();
 					}
 				: undefined,
 			disconnectOwnedMcpManager: ownedMcpManager ? () => ownedMcpManager.disconnectAll() : undefined,

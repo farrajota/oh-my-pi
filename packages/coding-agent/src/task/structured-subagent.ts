@@ -8,12 +8,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { snapshotEffectiveExtensionRoots } from "../capability/types";
 import { resolveAgentModelSelection, resolveModelOverride } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
-import { MCPManager } from "../mcp/manager";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
@@ -121,8 +121,6 @@ export interface StructuredSubagentRequest {
 	onArtifactsRetained?: (cleanup: () => Promise<void>) => void;
 	/** Task UI agents keep live registry references; eval one-shots normally do not. */
 	keepAlive?: boolean;
-	/** Task subagents share their parent's eval kernel; eval bridge children must not. */
-	shareEvalSession?: boolean;
 	/** Task frontends may inherit LSP; eval frontends normally set this false. */
 	enableLsp?: boolean;
 	/** Explicitly pass false for plan mode or invocation kinds that must not use IRC. */
@@ -402,14 +400,6 @@ async function leaseArtifacts(
 	return { sessionFile: null, artifactsDir, temporary: true, unregister: registerArtifactsDir(artifactsDir) };
 }
 
-function resolveAutoloadSkills(session: ToolSession, agent: AgentDefinition) {
-	const skills = [...(session.skills ?? [])];
-	const autoloadSkills = agent.autoloadSkills?.length
-		? agent.autoloadSkills.map(name => skills.find(skill => skill.name === name)).filter(skill => skill !== undefined)
-		: [];
-	return { skills, autoloadSkills };
-}
-
 function buildExecutorOptions(
 	request: StructuredSubagentRequest,
 	policy: EffectiveSubagentPolicy,
@@ -419,7 +409,6 @@ function buildExecutorOptions(
 	const requestedModel = typeof request.model === "string" ? request.model : undefined;
 	const exactModelOverride = request.invocationKind === "task" && request.model !== undefined;
 	const { session } = request;
-	const { skills, autoloadSkills } = resolveAutoloadSkills(session, policy.agent);
 	const localProtocolOptions: LocalProtocolOptions = session.localProtocolOptions ?? {
 		getArtifactsDir: session.getArtifactsDir ?? (() => null),
 		getSessionId: session.getSessionId ?? (() => null),
@@ -435,8 +424,6 @@ function buildExecutorOptions(
 		assignment: request.assignment.trim(),
 		context: request.context?.trim() || undefined,
 		planReference: undefined,
-		// Task `name` is the spawn handle (id allocation). Eval `label` is a
-		// real UI description. Copy it only for eval so generateTaskLabel can run.
 		description: request.invocationKind === "eval" ? trimToUndefined(request.identity?.label) : undefined,
 		index: request.index ?? 0,
 		parentToolCallId: request.parentToolCallId,
@@ -469,35 +456,20 @@ function buildExecutorOptions(
 		restrictToolNames,
 		keepAlive: request.keepAlive,
 		signal: request.signal,
-		eventBus: session.eventBus,
 		subagentEventBus: session.subagentEventBus,
 		onProgress: request.onProgress,
 		authStorage: session.authStorage,
 		modelRegistry: session.modelRegistry,
 		settings: session.settings,
-		mcpManager: enableMCP ? (session.mcpManager ?? MCPManager.instance()) : undefined,
+		mcpManager: enableMCP ? session.mcpManager : undefined,
 		enableMCP,
 		customTools: request.customTools,
 		workPoolYieldItems: request.workPoolYieldItems,
-		contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),
-		skills,
-		autoloadSkills,
-		workspaceTree: session.workspaceTree,
-		promptTemplates: session.promptTemplates,
-		rules: session.rules,
-		// Root policy and module paths have separate jobs: the live policy drives
-		// recursive sub-discovery; preloaded paths only avoid re-scanning/reusing
-		// parent-bound extension instances while constructing the child.
-		extensionRoots: session.effectiveExtensionRoots?.bind(session),
-		preloadedExtensionPaths: restrictToolNames ? [] : session.extensionPaths,
-		preloadedPreparedExtensions: restrictToolNames ? [] : session.preparedExtensions,
-		preloadedCustomToolPaths: restrictToolNames ? [] : session.customToolPaths,
+		extensionRoots: snapshotEffectiveExtensionRoots(session.effectiveExtensionRoots?.()),
 		localProtocolOptions,
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,
-		parentHindsightSessionState: session.getHindsightSessionState?.(),
-		parentMnemopiSessionState: session.getMnemopiSessionState?.(),
 		parentTelemetry: session.getTelemetry?.(),
-		parentEvalSessionId: request.shareEvalSession === false ? undefined : (session.getEvalSessionId?.() ?? undefined),
+		autoloadSkillNames: policy.agent.autoloadSkills,
 		parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
 		parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 	};

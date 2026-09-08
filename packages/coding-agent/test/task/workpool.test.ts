@@ -209,6 +209,7 @@ describe("WorkPool dispatch", () => {
 		await until(() => workpool.agents[0]?.queue.length === 1);
 		first.resolve();
 		await until(() => followSpy.mock.calls.length === 1);
+		expect(followSpy.mock.calls[0]?.[0].id).toBe(workpool.agents[0]?.id);
 		expect(workpool.batches.map(batch => batch.items.map(item => item.id))).toEqual([["handoff#1"], ["handoff#2"]]);
 		expect(followSpy.mock.calls[0]?.[0].workPoolYieldItems).toEqual([{ id: "handoff#2", index: 1 }]);
 		expect(followSpy.mock.calls[0]?.[0].message).toContain("After EACH item");

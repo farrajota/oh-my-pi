@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { buildSystemPrompt as buildSdkSystemPrompt } from "@oh-my-pi/pi-coding-agent/sdk";
 import {
 	buildSystemPrompt,
 	loadProjectContextFiles,
@@ -66,6 +67,20 @@ describe("SYSTEM.md prompt assembly", () => {
 		expect(promptText).not.toContain(normalizedProjectDir);
 		expect(promptText).not.toContain("Today");
 		expect(promptText).not.toContain("current working directory");
+	});
+
+	it("forwards an explicit custom prompt through the SDK wrapper", async () => {
+		const customPrompt = "Explicit SDK custom prompt.";
+		const { systemPrompt } = await buildSdkSystemPrompt({
+			cwd: path.join(tempDir, "project"),
+			customPrompt,
+			contextFiles: [],
+			skills: [],
+			tools: [],
+			includeWorkspaceTree: false,
+		});
+
+		expect(systemPrompt.join("\n\n")).toContain(customPrompt);
 	});
 
 	it("renders SYSTEM.md exactly once when it is used as the custom base prompt", async () => {

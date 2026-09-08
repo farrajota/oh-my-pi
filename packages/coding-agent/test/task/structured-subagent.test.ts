@@ -497,23 +497,11 @@ describe("structured subagent primitive", () => {
 		for (const run of settled) await fs.rm(run.artifactsDir, { recursive: true, force: true });
 	});
 
-	it("suppresses plan capability sources while preserving non-plan propagation", async () => {
+	it("suppresses restricted capabilities while preserving immutable non-plan infrastructure", async () => {
 		mockDiscovery();
 		const mcpManager = {} as NonNullable<ToolSession["mcpManager"]>;
-		const extensionPaths = ["/plugins/example.ts"];
-		const preparedExtensions = [
-			{
-				path: extensionPaths[0]!,
-				resolvedPath: extensionPaths[0]!,
-				factory: () => {},
-				error: null,
-			},
-		] as NonNullable<ToolSession["preparedExtensions"]>;
-		const customToolPaths = [{ path: "/tools/example.ts", source: "project" }] as unknown as NonNullable<
-			ToolSession["customToolPaths"]
-		>;
 		const planSession = session({ planMode: true });
-		Object.assign(planSession, { mcpManager, extensionPaths, customToolPaths });
+		Object.assign(planSession, { mcpManager });
 		const nonPlanSession = session();
 		let explicitRoot = "/plugins/explicit";
 		const extensionRoots = () => ({
@@ -522,13 +510,7 @@ describe("structured subagent primitive", () => {
 			configured: ["/plugins/configured"],
 			configuredLevel: "project" as const,
 		});
-		Object.assign(nonPlanSession, {
-			mcpManager,
-			extensionPaths,
-			customToolPaths,
-			preparedExtensions,
-			effectiveExtensionRoots: extensionRoots,
-		});
+		Object.assign(nonPlanSession, { mcpManager, effectiveExtensionRoots: extensionRoots });
 		const mcpDisabledSession = session();
 		mcpDisabledSession.enableMCP = false;
 		const restrictedSession = session();
@@ -537,8 +519,6 @@ describe("structured subagent primitive", () => {
 			restrictToolNames: true,
 			getApiKey,
 			mcpManager,
-			extensionPaths,
-			customToolPaths,
 		});
 		const options = [] as executorModule.ExecutorOptions[];
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async executorOptions => {
@@ -553,34 +533,27 @@ describe("structured subagent primitive", () => {
 		);
 		const restrictedRun = await runStructuredSubagent(request({ session: restrictedSession, retainArtifacts: true }));
 
-		expect(options[0]).toMatchObject({
-			enableMCP: false,
-			restrictToolNames: true,
-			preloadedExtensionPaths: [],
-			preloadedCustomToolPaths: [],
-		});
+		expect(options[0]).toMatchObject({ enableMCP: false, restrictToolNames: true });
 		expect(options[0]?.mcpManager).toBeUndefined();
-		expect(options[1]).toMatchObject({
-			enableMCP: true,
-			mcpManager,
-			preloadedExtensionPaths: extensionPaths,
-			preloadedPreparedExtensions: preparedExtensions,
-			preloadedCustomToolPaths: customToolPaths,
-		});
+		expect(options[1]).toMatchObject({ enableMCP: true, mcpManager });
 		expect(options[1]?.restrictToolNames).toBe(false);
-		expect(options[1]?.extensionRoots?.()).toEqual(extensionRoots());
+		expect(options[1]?.extensionRoots).toEqual(extensionRoots());
 		explicitRoot = "/plugins/explicit-after-spawn";
-		expect(options[1]?.extensionRoots?.().explicit).toEqual([explicitRoot]);
+		expect(options[1]?.extensionRoots?.explicit).toEqual(["/plugins/explicit"]);
 		expect(options[2]).toMatchObject({ enableMCP: false });
 		expect(options[2]?.mcpManager).toBeUndefined();
-		expect(options[3]).toMatchObject({
-			enableMCP: false,
-			restrictToolNames: true,
-			preloadedExtensionPaths: [],
-			preloadedCustomToolPaths: [],
-		});
+		expect(options[3]).toMatchObject({ enableMCP: false, restrictToolNames: true });
 		expect(options[3]?.mcpManager).toBeUndefined();
 		expect(options[3]?.getApiKey).toBe(getApiKey);
+		for (const optionsForChild of options) {
+			for (const channel of [
+				"preloadedExtensionPaths",
+				"preloadedPreparedExtensions",
+				"preloadedCustomToolPaths",
+			] as const) {
+				expect(Object.hasOwn(optionsForChild, channel)).toBe(false);
+			}
+		}
 		await fs.rm(planRun.artifactsDir, { recursive: true, force: true });
 		await fs.rm(nonPlanRun.artifactsDir, { recursive: true, force: true });
 		await fs.rm(mcpDisabledRun.artifactsDir, { recursive: true, force: true });

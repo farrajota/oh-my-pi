@@ -322,7 +322,6 @@ export type TaskToolSchemaInstance = DynamicTaskSchema | BaseType;
 
 const taskSchemaCache = new Map<string, BaseType>();
 
-
 /** Build the task wire schema for the current settings and spawn policy. */
 export function getTaskSchema(options: {
 	isolationEnabled: boolean;

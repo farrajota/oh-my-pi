@@ -155,5 +155,8 @@ describe("AgentSession eval preludes", () => {
 		expect(session.getEvalPreludes()).toEqual([]);
 		expect(session.getAllToolNames()).not.toContain("browser");
 		expect(session.getAllToolNames()).not.toContain("computer");
+		const systemPrompt = session.agent.state.systemPrompt.join("\n\n");
+		expect(systemPrompt).not.toContain("browser.open");
+		expect(systemPrompt).not.toContain("# Computer Use");
 	});
 });
