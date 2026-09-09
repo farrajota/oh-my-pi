@@ -46,7 +46,7 @@ function createYieldingSession(
 	const listeners: Array<(event: { type: string; [key: string]: unknown }) => void> = [];
 	const session = {
 		...createSessionDefaults(),
-		agent: { state: { systemPrompt: ["test"], tools: [{ name: "yield" }] } }
+		agent: { state: { systemPrompt: ["test"], tools: [{ name: "yield" }] } },
 		state: { messages: [] },
 		model: model("primary", "bad-runtime-model"),
 		servingModel: { selector: "primary/bad-runtime-model", isFallback: false } as ServingModel | undefined,

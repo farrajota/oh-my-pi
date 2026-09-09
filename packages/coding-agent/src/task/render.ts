@@ -1053,7 +1053,6 @@ function renderAgentProgress(
 		statusLine += ` ${formatBadge(statusLabel, iconColor, theme)}`;
 	}
 
-	const showBadge = settings.get("task.showResolvedModelBadge");
 	if (progress.status === "running") {
 		if (!fullDescription) {
 			const taskPreview = previewLine(sanitizeText(progress.assignment ?? progress.task), 40);
@@ -1397,6 +1396,7 @@ function renderAgentResult(
 		success && !needsWarning ? "text" : "accent",
 		titlePart,
 	)}${badges}`;
+	const showBadge = isFeedModelBadgeEnabled();
 	statusLine = appendAgentStats(
 		statusLine,
 		{
