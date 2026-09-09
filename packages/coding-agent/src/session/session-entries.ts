@@ -252,6 +252,10 @@ export interface SessionInitEntry extends SessionEntryBase {
 	modelRole?: string;
 	/** Initially resolved provider/model selector for historical display. */
 	resolvedModel?: string;
+	/** Exact permission profiles requested by the original invocation, in request order. */
+	requestedPermissionProfiles?: string[];
+	/** Effective inherited plus requested permission profiles, in composition order. */
+	effectivePermissionProfiles?: string[];
 	/** Whether the agent definition is read-only, allowing an exact zero-LoC attribution. */
 	readOnly?: boolean;
 	/** Output schema if structured output was requested. */

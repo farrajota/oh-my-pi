@@ -65,6 +65,8 @@ describe("SessionManager.peekSessionInit", () => {
 			readSummarize: false,
 			restrictToolNames: true,
 			enableMCP: true,
+			requestedPermissionProfiles: ["no-network", "focused-edit"],
+			effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
 		});
 		// Flush buffered entries (header + inits) so the lock-free peek can read them off disk.
 		manager.appendMessage(assistantMessage("flush"));
@@ -78,6 +80,8 @@ describe("SessionManager.peekSessionInit", () => {
 		expect(peek?.init?.readSummarize).toBe(false);
 		expect(peek?.init?.restrictToolNames).toBe(true);
 		expect(peek?.init?.enableMCP).toBe(true);
+		expect(peek?.init?.requestedPermissionProfiles).toEqual(["no-network", "focused-edit"]);
+		expect(peek?.init?.effectivePermissionProfiles).toEqual(["read-only", "no-network", "focused-edit"]);
 	});
 
 	it("streams large file-backed sessions without a full read", async () => {

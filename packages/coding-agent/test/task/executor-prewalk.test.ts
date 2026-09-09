@@ -27,14 +27,23 @@ import { createSessionDefaults } from "../helpers/session-defaults";
 
 function yieldEmittingSession(
 	initialTools: string[] = ["read", "yield"],
-	modelSwitch?: { from: Model; to: Model },
+	modelSwitch?: {
+		from: Model;
+		to: Model;
+		toIsFallback?: boolean;
+		onBeforeSwitch?: () => void;
+		onAfterSwitch?: () => void;
+	},
 ): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	let activeTools = initialTools;
 	// `servingModel` mirrors the real session: attribution names the model that
 	// produced output, so a prewalk hand-off moves it along with `model`.
-	const serving = (model: Model | undefined): { selector: string; isFallback: boolean } | undefined =>
-		model ? { selector: `${model.provider}/${model.id}`, isFallback: false } : undefined;
+	const serving = (
+		model: Model | undefined,
+		isFallback = false,
+	): { selector: string; isFallback: boolean } | undefined =>
+		model ? { selector: `${model.provider}/${model.id}`, isFallback } : undefined;
 	const session = {
 		...createSessionDefaults(),
 		state: { messages: [] },
@@ -58,11 +67,13 @@ function yieldEmittingSession(
 		},
 		prompt: async (_text: string, _options?: PromptOptions) => {
 			if (modelSwitch) {
+				modelSwitch.onBeforeSwitch?.();
 				session.model = modelSwitch.to;
-				session.servingModel = serving(modelSwitch.to);
+				session.servingModel = serving(modelSwitch.to, modelSwitch.toIsFallback);
 				for (const listener of listeners) {
 					listener({ type: "notice", level: "info", message: "Prewalk switched", source: "prewalk" });
 				}
+				modelSwitch.onAfterSwitch?.();
 			}
 			for (const listener of listeners) {
 				listener({
@@ -130,8 +141,15 @@ describe("runSubprocess per-agent prewalk", () => {
 		};
 	}
 
+	beforeEach(() => {
+		AgentRegistry.resetGlobalForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+	});
+
 	afterEach(() => {
 		vi.restoreAllMocks();
+		AgentLifecycleManager.resetGlobalForTests();
+		AgentRegistry.resetGlobalForTests();
 	});
 
 	it("resolves a frontmatter prewalk pattern to a target for the spawned session", async () => {
@@ -202,6 +220,88 @@ describe("runSubprocess per-agent prewalk", () => {
 
 		expect(result.exitCode).toBe(0);
 		expect(progressModels.at(-1)).toBe(`${target.provider}/${target.id}`);
+	});
+
+	it("keeps registry history synchronized with an authoritative fallback model through detach", async () => {
+		const id = "subagent-serving-model-history";
+		const requestedPermissionProfiles = ["focused-edit", "no-network"];
+		const effectivePermissionProfiles = ["focused-edit", "no-network"];
+		const historySnapshots: Array<{
+			modelRole?: string;
+			resolvedModel?: string;
+			resolvedModelIsFallback?: boolean;
+			requestedPermissionProfiles?: string[];
+			effectivePermissionProfiles?: string[];
+		}> = [];
+		const snapshotHistory = () => {
+			const history = AgentRegistry.global().get(id)?.history;
+			historySnapshots.push({
+				modelRole: history?.modelRole,
+				resolvedModel: history?.resolvedModel,
+				resolvedModelIsFallback: history?.resolvedModelIsFallback,
+				requestedPermissionProfiles: history?.requestedPermissionProfiles,
+				effectivePermissionProfiles: history?.effectivePermissionProfiles,
+			});
+		};
+		const session = yieldEmittingSession(["read", "yield"], {
+			from: primary,
+			to: target,
+			toIsFallback: true,
+			onBeforeSwitch: snapshotHistory,
+			onAfterSwitch: snapshotHistory,
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+			AgentRegistry.global().register({
+				id,
+				displayName: "task",
+				kind: "sub",
+				parentId: "Main",
+				session,
+				status: "running",
+			});
+			return createSessionResult(session);
+		});
+
+		const result = await runSubprocess({
+			...baseOptions(id, Settings.isolated()),
+			agent: { ...baseAgent, model: [`${primary.provider}/${primary.id}`] },
+			modelRole: "reviewer",
+			requestedPermissionProfiles,
+			effectivePermissionProfiles,
+			detached: true,
+			worktree: "/tmp",
+		});
+
+		expect(historySnapshots[0]).toMatchObject({
+			modelRole: "reviewer",
+			resolvedModel: `${primary.provider}/${primary.id}`,
+			requestedPermissionProfiles,
+			effectivePermissionProfiles,
+		});
+		expect(historySnapshots[0]?.resolvedModelIsFallback).toBeUndefined();
+		expect(historySnapshots[1]).toEqual({
+			modelRole: "reviewer",
+			resolvedModel: `${target.provider}/${target.id}`,
+			resolvedModelIsFallback: true,
+			requestedPermissionProfiles,
+			effectivePermissionProfiles,
+		});
+		expect(result).toMatchObject({
+			exitCode: 0,
+			resolvedModel: `${target.provider}/${target.id}`,
+			resolvedModelIsFallback: true,
+		});
+		expect(AgentRegistry.global().get(id)).toMatchObject({
+			status: "parked",
+			session: null,
+			history: {
+				modelRole: "reviewer",
+				resolvedModel: `${target.provider}/${target.id}`,
+				resolvedModelIsFallback: true,
+				requestedPermissionProfiles,
+				effectivePermissionProfiles,
+			},
+		});
 	});
 
 	it("resolves prewalk: true through the smol role default target", async () => {

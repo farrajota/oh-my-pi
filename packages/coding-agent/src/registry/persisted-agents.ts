@@ -75,6 +75,13 @@ function finiteNumber(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+/** A transition role is only legacy provenance; retry-state labels are never dispatch roles. */
+function isLegacyModelChangeRole(role: unknown): role is string {
+	return (
+		typeof role === "string" && role !== EPHEMERAL_MODEL_CHANGE_ROLE && role !== "temporary" && role !== "fallback"
+	);
+}
+
 function inferBundledAgent(systemPrompt: string): { agent?: string; modelRole?: string; readOnly?: boolean } {
 	const matches = loadBundledAgents().filter(agent => {
 		const rolePrompt = agent.systemPrompt.trim();
@@ -151,6 +158,7 @@ async function readPersistedAgentHistory(
 	const parents = new Map<string, string | undefined>();
 	const assistantById = new Map<string, AssistantMetrics>();
 	const modelChangeById = new Map<string, { model: string; role?: string; resolvedModelIsFallback: boolean }>();
+	let sessionInitModelRole: string | undefined;
 	let leafId: string | undefined;
 	let leafTimestamp: number | undefined;
 	try {
@@ -166,6 +174,10 @@ async function readPersistedAgentHistory(
 				leafId = id;
 				const parsedTimestamp = timestampOf(record.timestamp);
 				if (parsedTimestamp !== undefined) leafTimestamp = parsedTimestamp;
+				if (record.type === "session_init" && typeof record.modelRole === "string") {
+					sessionInitModelRole ??= record.modelRole;
+					return;
+				}
 				if (record.type === "model_change" && typeof record.model === "string") {
 					modelChangeById.set(id, {
 						model: record.model,
@@ -217,7 +229,7 @@ async function readPersistedAgentHistory(
 	// run to it would report work the previous model did.
 	let resolvedModel: string | undefined;
 	let resolvedModelIsFallback: boolean | undefined;
-	let modelRole: string | undefined;
+	let modelRole: string | undefined = sessionInitModelRole;
 	let contextTokens: number | undefined;
 	let servedModel: string | undefined;
 	let latestModelChange: { model: string; resolvedModelIsFallback: boolean } | undefined;
@@ -227,8 +239,8 @@ async function readPersistedAgentHistory(
 		const modelChange = modelChangeById.get(id);
 		if (modelChange) {
 			latestModelChange ??= modelChange;
-			if (modelChange.role && modelChange.role !== EPHEMERAL_MODEL_CHANGE_ROLE) {
-				modelRole ??= modelChange.role;
+			if (modelRole === undefined && isLegacyModelChangeRole(modelChange.role)) {
+				modelRole = modelChange.role;
 			}
 			// The transition that installed the serving model: it carries the
 			// fallback flag the raw message lacks. Every writer records the selector
@@ -308,7 +320,7 @@ async function readPersistedAgentMetadata(sessionFile: string): Promise<Persiste
 				}
 				if (record.type === "model_change") {
 					if (typeof record.model === "string") history.resolvedModel = record.model;
-					if (typeof record.role === "string" && record.role !== EPHEMERAL_MODEL_CHANGE_ROLE) {
+					if (isLegacyModelChangeRole(record.role)) {
 						history.modelRole = record.role;
 					}
 					if (typeof record.resolvedModelIsFallback === "boolean") {
@@ -332,6 +344,16 @@ async function readPersistedAgentMetadata(sessionFile: string): Promise<Persiste
 					modelRole:
 						typeof record.modelRole === "string" ? record.modelRole : (history.modelRole ?? inferred.modelRole),
 					resolvedModel: typeof record.resolvedModel === "string" ? record.resolvedModel : history.resolvedModel,
+					requestedPermissionProfiles: Array.isArray(record.requestedPermissionProfiles)
+						? record.requestedPermissionProfiles.filter(
+								(profile): profile is string => typeof profile === "string",
+							)
+						: history.requestedPermissionProfiles,
+					effectivePermissionProfiles: Array.isArray(record.effectivePermissionProfiles)
+						? record.effectivePermissionProfiles.filter(
+								(profile): profile is string => typeof profile === "string",
+							)
+						: history.effectivePermissionProfiles,
 					readOnly: typeof record.readOnly === "boolean" ? record.readOnly : inferred.readOnly,
 				};
 				return false;

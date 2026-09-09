@@ -53,7 +53,10 @@ function transcriptHead(): string[] {
 			parentId: "m1",
 			timestamp: "2026-08-07T10:34:38.000Z",
 			agent: "task",
+			modelRole: "task",
 			task: "build the thing",
+			requestedPermissionProfiles: ["no-network", "focused-edit"],
+			effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
 		}),
 	];
 }
@@ -84,6 +87,8 @@ describe("persisted agent model attribution", () => {
 		expect(history?.resolvedModelIsFallback).toBe(false);
 		// The role label survives the ephemeral fallback transition on top of it.
 		expect(history?.modelRole).toBe("task");
+		expect(history?.requestedPermissionProfiles).toEqual(["no-network", "focused-edit"]);
+		expect(history?.effectivePermissionProfiles).toEqual(["read-only", "no-network", "focused-edit"]);
 		// Every assistant turn still counts toward the row's telemetry.
 		expect(history?.metrics?.requests).toBe(3);
 	});
@@ -178,20 +183,45 @@ describe("persisted agent model attribution", () => {
 		expect(history?.metrics?.requests).toBe(2);
 	});
 
-	it("labels the row with the newest role a transition assigned, skipping ephemeral ones", async () => {
+	it("keeps the session-init dispatch role across later transitions while attributing the served model", async () => {
 		using tempDir = TempDir.createSync("@omp-attribution-role-");
-		// Two real role transitions plus an ephemeral fallback on top: the label
-		// must be the latest deliberate role, not the first one nor the fallback.
 		const registry = await historyFor(tempDir.path(), "Rerolled", [
 			...transcriptHead(),
-			assistant("a1", "si", SONNET, "stop", [{ type: "text", text: "first role" }]),
+			assistant("a1", "si", SONNET, "stop", [{ type: "text", text: "first model output" }]),
 			modelChange("m2", "a1", "openai-codex/gpt-5.6-sol", "slow", false),
-			assistant("a2", "m2", SOL, "stop", [{ type: "text", text: "second role" }]),
-			modelChange("m3", "a2", "openai-codex/gpt-5.6-sol", "fallback", true),
+			assistant("a2", "m2", SOL, "stop", [{ type: "text", text: "served after role transition" }]),
+			modelChange("m3", "a2", "openai-codex/gpt-5.6-sol", "temporary", false),
+			modelChange("m4", "m3", "openai-codex/gpt-5.6-sol", "fallback", true),
 		]);
 
 		const history = registry.get("Rerolled")?.history;
-		expect(history?.modelRole).toBe("slow");
+		expect(history?.modelRole).toBe("task");
+		expect(history?.resolvedModel).toBe("openai-codex/gpt-5.6-sol");
+		expect(history?.resolvedModelIsFallback).toBe(false);
+	});
+
+	it("recovers an eligible legacy transition role when session init has no dispatch role", async () => {
+		using tempDir = TempDir.createSync("@omp-attribution-legacy-role-");
+		const registry = await historyFor(tempDir.path(), "LegacyRole", [
+			JSON.stringify({ type: "session", id: "s0", parentId: null, timestamp: "2026-08-07T10:34:37.300Z" }),
+			modelChange("m1", "s0", "anthropic/claude-sonnet-5", "taskpro", false),
+			JSON.stringify({
+				type: "session_init",
+				id: "si",
+				parentId: "m1",
+				timestamp: "2026-08-07T10:34:38.000Z",
+				agent: "task",
+				task: "legacy task",
+			}),
+			assistant("a1", "si", SONNET, "stop", [{ type: "text", text: "serving model output" }]),
+			modelChange("m2", "a1", "openai-codex/gpt-5.6-sol", "temporary", false),
+			modelChange("m3", "m2", "openai-codex/gpt-5.6-sol", "fallback", true),
+			assistant("e1", "m3", SOL, "error", []),
+		]);
+		const history = registry.get("LegacyRole")?.history;
+		expect(history?.modelRole).toBe("taskpro");
+		expect(history?.resolvedModel).toBe("anthropic/claude-sonnet-5");
+		expect(history?.resolvedModelIsFallback).toBe(false);
 	});
 
 	it("reports the fallback once it has served a turn", async () => {

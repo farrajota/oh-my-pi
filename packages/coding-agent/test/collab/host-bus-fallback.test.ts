@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
-import { COLLAB_PROTO, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
+import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -104,6 +104,82 @@ describe("collab host bus fallback", () => {
 			expect(mirrored.length).toBe(1);
 			expect(mirrored[0]?.id).toBe("FallbackScout");
 			expect(mirrored[0]?.status).toBe("started");
+		} finally {
+			guestSocket.close();
+			await host.stop("test cleanup").catch(() => {});
+		}
+	}, 20000);
+
+	it("publishes the final registry model, role, and permission metadata in host snapshots", async () => {
+		const registry = AgentRegistry.global();
+		registry.register({
+			id: "MetadataWorker",
+			displayName: "Metadata Worker",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "parked",
+			history: {
+				modelRole: "taskpro",
+				resolvedModel: "anthropic/claude-sonnet-4-5",
+				resolvedModelIsFallback: false,
+				requestedPermissionProfiles: ["no-network", "focused-edit"],
+				effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+			},
+		});
+		registry.setHistory("MetadataWorker", {
+			resolvedModel: "anthropic/claude-sonnet-4-6",
+			resolvedModelIsFallback: true,
+		});
+		registry.register({
+			id: "NonFallbackWorker",
+			displayName: "Non-Fallback Worker",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "parked",
+			history: {
+				resolvedModel: "anthropic/claude-sonnet-4-5",
+				resolvedModelIsFallback: false,
+			},
+		});
+		const host = new CollabHost(makeHostContext(new EventBus()));
+		await host.start("ws://localhost:8788");
+		const parsed = parseCollabLink(host.link);
+		if ("error" in parsed) throw new Error(parsed.error);
+		const guestSocket = new CollabSocket({
+			wsUrl: parsed.wsUrl,
+			role: "guest",
+			key: await importRoomKey(parsed.key),
+		});
+		const welcomed = Promise.withResolvers<Extract<CollabFrame, { t: "welcome" }>>();
+		guestSocket.onFrame = frame => {
+			if (frame.t === "welcome") welcomed.resolve(frame);
+		};
+		guestSocket.onOpen = () => {
+			guestSocket.send({
+				t: "hello",
+				proto: COLLAB_PROTO,
+				name: "metadata-probe",
+				writeToken: parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined,
+			});
+		};
+		guestSocket.connect();
+
+		try {
+			const agents = (await welcomed.promise).agents;
+			const metadata = agents.find(agent => agent.id === "MetadataWorker");
+			expect(metadata).toMatchObject({
+				modelRole: "taskpro",
+				resolvedModel: "anthropic/claude-sonnet-4-6",
+				resolvedModelIsFallback: true,
+				requestedPermissionProfiles: ["no-network", "focused-edit"],
+				effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+			});
+			expect(agents.find(agent => agent.id === "NonFallbackWorker")).toMatchObject({
+				resolvedModel: "anthropic/claude-sonnet-4-5",
+				resolvedModelIsFallback: false,
+			});
 		} finally {
 			guestSocket.close();
 			await host.stop("test cleanup").catch(() => {});

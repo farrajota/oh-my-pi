@@ -426,6 +426,10 @@ export interface RunSubprocessOptions {
 	modelRole?: string;
 	/** Raw request-local model selector, retained for task result rendering. */
 	requestedModel?: string;
+	/** Exact permission profiles requested by the original invocation, in request order. */
+	requestedPermissionProfiles?: string[];
+	/** Effective inherited plus requested permission profiles, in composition order. */
+	effectivePermissionProfiles?: string[];
 	/** A caller-selected task model must not fall back to another model. */
 	exactModelOverride?: boolean;
 	/**
@@ -499,6 +503,17 @@ export interface RunSubprocessOptions {
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
+	contextFiles?: CreateAgentSessionOptions["contextFiles"];
+	skills?: CreateAgentSessionOptions["skills"];
+	promptTemplates?: CreateAgentSessionOptions["promptTemplates"];
+	workspaceTree?: CreateAgentSessionOptions["workspaceTree"];
+	rules?: CreateAgentSessionOptions["rules"];
+	preloadedExtensionPaths?: CreateAgentSessionOptions["preloadedExtensionPaths"];
+	preloadedPreparedExtensions?: CreateAgentSessionOptions["preloadedPreparedExtensions"];
+	preloadedCustomToolPaths?: CreateAgentSessionOptions["preloadedCustomToolPaths"];
+	parentHindsightSessionState?: CreateAgentSessionOptions["parentHindsightSessionState"];
+	parentMnemopiSessionState?: CreateAgentSessionOptions["parentMnemopiSessionState"];
+	parentEvalSessionId?: CreateAgentSessionOptions["parentEvalSessionId"];
 	/**
 	 * Parent session's live per-family service tiers, the source of truth for a
 	 * subagent whose `tier.subagent` is `"inherit"`. `null` = the parent
@@ -1786,6 +1801,14 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			progress.resolvedModelIdentity = serving.modelIdentity;
 			progress.resolvedThinkingLevel = serving.thinkingLevel;
 			progress.resolvedModelIsFallback = isFallback;
+			AgentRegistry.global().setHistory(
+				id,
+				{
+					resolvedModel: serving.selector,
+					resolvedModelIsFallback: isFallback,
+				},
+				session.sessionManager.getSessionFile?.() ?? args.sessionFile ?? undefined,
+			);
 			scheduleProgress(true);
 		};
 		return session.subscribe(event => {
@@ -3451,98 +3474,98 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				forRevive = false,
 			): CreateAgentSessionOptions => {
 				const sessionOptions: CreateAgentSessionOptions = {
-				cwd: worktree ?? cwd,
-				additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
-				agentDir: subagentSettings.getAgentDir(),
-				authStorage,
-				modelRegistry,
-				getApiKey: options.getApiKey,
-				settings: subagentSettings,
-				model,
-				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
-				modelPatternAuthFallback:
-					model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
-				modelPatternFallbackRole:
-					model || modelOverride === undefined ? undefined : `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`,
-				modelPatternDefaultFallbackChain:
-					model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
-				thinkingLevel: effectiveThinkingLevel,
-				thinkingLevelCeiling: spawnEffortCeiling,
-				toolNames,
-				outputSchema,
-				outputSchemaMode: options.outputSchemaMode,
-				restrictToolNames: options.restrictToolNames,
-				requireYieldTool: true,
-				contextFiles: options.contextFiles,
-				skills: options.skills,
-				promptTemplates: options.promptTemplates,
-				workspaceTree: options.workspaceTree,
-				rules: options.rules,
-				extensionRoots: extensionRoots ? () => extensionRoots : undefined,
-				preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
-				preloadedPreparedExtensions: restrictToolNames ? [] : options.preloadedPreparedExtensions,
-				preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
-				systemPrompt: defaultPrompt => {
-					const ircRoster = ircEnabled
-						? collectIrcPeerRoster(AgentRegistry.global(), id, ircRootSessionFile)
-						: undefined;
-					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-						agent: agent.systemPrompt,
-						context: options.context?.trim() ?? "",
-						planReference: options.planReference?.content ?? "",
-						planReferencePath: options.planReference?.path ?? "",
-						worktree: worktree ?? "",
-						outputSchema: normalizedOutputSchema,
-						outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
-						// Read the live item set through the registry instead of capturing
-						// the session: this callback outlives the turn via the lifecycle
-						// reviver, and a captured session would pin its whole graph past
-						// TTL park disposal. Parked revivals build while the registry
-						// session is null, so render the cleared set rather than
-						// resurrecting the launch-time pooled instructions.
-						workPoolYieldItems:
-							AgentRegistry.global().get(id)?.session?.getWorkPoolYieldItems?.() ??
-							(forRevive ? [] : (options.workPoolYieldItems ?? [])),
-						ircPeers: ircRoster?.peers ?? [],
-						ircParkedCount: ircRoster?.parkedCount ?? 0,
-						ircOmittedCount: ircRoster?.omittedCount ?? 0,
-						ircSelfId: ircEnabled ? id : "",
-						permissionBlock: formatPermissionScopeForPrompt(options.permissionScope),
-					});
-					return defaultPrompt.length === 0
-						? [subagentPrompt]
-						: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
-				},
-				sessionManager: sessionManagerForRun,
-				hasUI: false,
-				prewalk,
-				spawns: spawnsEnv,
-				taskDepth: childDepth,
-				// The whole spawn tree shares the root session's observability bus,
-				// so nested lifecycle/progress/event frames reach its surfaces
-				// without leaking into another root session's traffic.
-				subagentEventBus: options.subagentEventBus,
-				parentHindsightSessionState: options.parentHindsightSessionState,
-				parentMnemopiSessionState: options.parentMnemopiSessionState,
-				parentTaskPrefix: id,
-				parentAgentId: options.parentAgentId,
-				agentId: id,
-				agentDisplayName: agent.name,
-				agentName: agent.name,
-				expectedAgentRef,
-				enableLsp: lspEnabled,
-				enableIrc: options.enableIrc,
-				skipPythonPreflight,
-				enableMCP,
-				mcpManager,
-				customTools: sessionCustomTools.length > 0 ? sessionCustomTools : undefined,
-				localProtocolOptions: options.localProtocolOptions,
-				telemetry: subagentTelemetry,
-				permissionScope: options.permissionScope,
-				parentEvalSessionId: options.parentEvalSessionId,
-				onFirstChatDispatch: () => {
-					firstChatDispatchAt ??= performance.now();
-				},
+					cwd: worktree ?? cwd,
+					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
+					agentDir: subagentSettings.getAgentDir(),
+					authStorage,
+					modelRegistry,
+					getApiKey: options.getApiKey,
+					settings: subagentSettings,
+					model,
+					modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
+					modelPatternAuthFallback:
+						model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
+					modelPatternFallbackRole:
+						model || modelOverride === undefined ? undefined : `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`,
+					modelPatternDefaultFallbackChain:
+						model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
+					thinkingLevel: effectiveThinkingLevel,
+					thinkingLevelCeiling: spawnEffortCeiling,
+					toolNames,
+					outputSchema,
+					outputSchemaMode: options.outputSchemaMode,
+					restrictToolNames: options.restrictToolNames,
+					requireYieldTool: true,
+					contextFiles: options.contextFiles,
+					skills: options.skills,
+					promptTemplates: options.promptTemplates,
+					workspaceTree: options.workspaceTree,
+					rules: options.rules,
+					extensionRoots: extensionRoots ? () => extensionRoots : undefined,
+					preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
+					preloadedPreparedExtensions: restrictToolNames ? [] : options.preloadedPreparedExtensions,
+					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
+					systemPrompt: defaultPrompt => {
+						const ircRoster = ircEnabled
+							? collectIrcPeerRoster(AgentRegistry.global(), id, ircRootSessionFile)
+							: undefined;
+						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
+							agent: agent.systemPrompt,
+							context: options.context?.trim() ?? "",
+							planReference: options.planReference?.content ?? "",
+							planReferencePath: options.planReference?.path ?? "",
+							worktree: worktree ?? "",
+							outputSchema: normalizedOutputSchema,
+							outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
+							// Read the live item set through the registry instead of capturing
+							// the session: this callback outlives the turn via the lifecycle
+							// reviver, and a captured session would pin its whole graph past
+							// TTL park disposal. Parked revivals build while the registry
+							// session is null, so render the cleared set rather than
+							// resurrecting the launch-time pooled instructions.
+							workPoolYieldItems:
+								AgentRegistry.global().get(id)?.session?.getWorkPoolYieldItems?.() ??
+								(forRevive ? [] : (options.workPoolYieldItems ?? [])),
+							ircPeers: ircRoster?.peers ?? [],
+							ircParkedCount: ircRoster?.parkedCount ?? 0,
+							ircOmittedCount: ircRoster?.omittedCount ?? 0,
+							ircSelfId: ircEnabled ? id : "",
+							permissionBlock: formatPermissionScopeForPrompt(options.permissionScope),
+						});
+						return defaultPrompt.length === 0
+							? [subagentPrompt]
+							: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
+					},
+					sessionManager: sessionManagerForRun,
+					hasUI: false,
+					prewalk,
+					spawns: spawnsEnv,
+					taskDepth: childDepth,
+					// The whole spawn tree shares the root session's observability bus,
+					// so nested lifecycle/progress/event frames reach its surfaces
+					// without leaking into another root session's traffic.
+					subagentEventBus: options.subagentEventBus,
+					parentHindsightSessionState: options.parentHindsightSessionState,
+					parentMnemopiSessionState: options.parentMnemopiSessionState,
+					parentTaskPrefix: id,
+					parentAgentId: options.parentAgentId,
+					agentId: id,
+					agentDisplayName: agent.name,
+					agentName: agent.name,
+					expectedAgentRef,
+					enableLsp: lspEnabled,
+					enableIrc: options.enableIrc,
+					skipPythonPreflight,
+					enableMCP,
+					mcpManager,
+					customTools: sessionCustomTools.length > 0 ? sessionCustomTools : undefined,
+					localProtocolOptions: options.localProtocolOptions,
+					telemetry: subagentTelemetry,
+					permissionScope: options.permissionScope,
+					parentEvalSessionId: options.parentEvalSessionId,
+					onFirstChatDispatch: () => {
+						firstChatDispatchAt ??= performance.now();
+					},
 				};
 				bindBrowserAuditSessionOptions(sessionOptions, browserAuditCapability);
 				browserAuditCapability = undefined;
@@ -3657,13 +3680,17 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					? enabledSubagentTools.filter(name => name !== "write")
 					: enabledSubagentTools;
 
+			const persistedModelRole =
+				modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings);
 			session.sessionManager.appendSessionInit({
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
 				task,
 				tools: persistedSubagentTools,
 				agent: agent.name,
-				modelRole: modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings),
+				modelRole: persistedModelRole,
 				resolvedModel: progress.resolvedModel,
+				requestedPermissionProfiles: options.requestedPermissionProfiles,
+				effectivePermissionProfiles: options.effectivePermissionProfiles,
 				readOnly: isReadOnlyAgent(agent),
 				spawns: spawnsEnv,
 				readSummarize: agent.readSummarize,
@@ -3673,6 +3700,18 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				restrictToolNames: restrictToolNames || undefined,
 				enableMCP,
 			});
+			AgentRegistry.global().setHistory(
+				id,
+				{
+					agent: agent.name,
+					modelRole: persistedModelRole,
+					resolvedModel: progress.resolvedModel,
+					requestedPermissionProfiles: options.requestedPermissionProfiles,
+					effectivePermissionProfiles: options.effectivePermissionProfiles,
+					readOnly: isReadOnlyAgent(agent),
+				},
+				session.sessionManager.getSessionFile?.() ?? undefined,
+			);
 
 			abortSignal.addEventListener(
 				"abort",
@@ -3963,6 +4002,14 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		sessionFile: subtaskSessionFile,
 		startTime,
 	});
-	AgentRegistry.global().setHistory(id, { outputPath: result.outputPath });
+	AgentRegistry.global().setHistory(
+		id,
+		{
+			outputPath: result.outputPath,
+			resolvedModel: result.resolvedModel,
+			resolvedModelIsFallback: result.resolvedModelIsFallback,
+		},
+		subtaskSessionFile,
+	);
 	return result;
 }

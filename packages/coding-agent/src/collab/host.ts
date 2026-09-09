@@ -578,6 +578,11 @@ export class CollabHost {
 					hasSessionFile: !!ref.sessionFile,
 					createdAt: ref.createdAt,
 					lastActivity: ref.lastActivity,
+					modelRole: ref.history?.modelRole,
+					resolvedModel: ref.history?.resolvedModel,
+					resolvedModelIsFallback: ref.history?.resolvedModelIsFallback,
+					requestedPermissionProfiles: ref.history?.requestedPermissionProfiles,
+					effectivePermissionProfiles: ref.history?.effectivePermissionProfiles,
 				}))
 		);
 	}

@@ -2407,6 +2407,8 @@ export class SessionManager {
 		agent?: string;
 		modelRole?: string;
 		resolvedModel?: string;
+		requestedPermissionProfiles?: string[];
+		effectivePermissionProfiles?: string[];
 		readOnly?: boolean;
 		outputSchema?: unknown;
 		outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -2973,6 +2975,8 @@ export class SessionManager {
 			agent?: string;
 			modelRole?: string;
 			resolvedModel?: string;
+			requestedPermissionProfiles?: string[];
+			effectivePermissionProfiles?: string[];
 			readOnly?: boolean;
 			outputSchema?: unknown;
 			outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -2991,6 +2995,8 @@ export class SessionManager {
 			agent?: string;
 			modelRole?: string;
 			resolvedModel?: string;
+			requestedPermissionProfiles?: string[];
+			effectivePermissionProfiles?: string[];
 			readOnly?: boolean;
 			outputSchema?: unknown;
 			outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -3013,6 +3019,8 @@ export class SessionManager {
 					agent: entry.agent,
 					modelRole: entry.modelRole,
 					resolvedModel: entry.resolvedModel,
+					requestedPermissionProfiles: entry.requestedPermissionProfiles,
+					effectivePermissionProfiles: entry.effectivePermissionProfiles,
 					readOnly: entry.readOnly,
 					outputSchema: entry.outputSchema,
 					outputSchemaMode: entry.outputSchemaMode,

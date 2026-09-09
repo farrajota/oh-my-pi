@@ -172,4 +172,112 @@ describe("collab guest running-subagents badge", () => {
 			await guest.leave("test cleanup").catch(() => {});
 		}
 	});
+
+	it.each([true, false, undefined])(
+		"hydrates optional history metadata with fallback %s",
+		async resolvedModelIsFallback => {
+			const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+			const roomId = "metadata-room-1";
+			const roomKey = generateRoomKey();
+			const cryptoKey = await importRoomKey(roomKey);
+			const link = formatCollabLink("ws://localhost:8788", roomId, roomKey);
+			const hostSocket = new CollabSocket({
+				wsUrl: `ws://localhost:8788/r/${roomId}`,
+				role: "host",
+				key: cryptoKey,
+			});
+			const hostOpen = Promise.withResolvers<void>();
+			const metadataAgent: AgentSnapshot = {
+				id: "remote-metadata",
+				displayName: "Remote metadata",
+				kind: "sub",
+				parentId: "Main",
+				status: "parked",
+				hasSessionFile: true,
+				createdAt: 1000,
+				lastActivity: 2000,
+				modelRole: "taskpro",
+				resolvedModel: "anthropic/claude-sonnet-4-5",
+				...(resolvedModelIsFallback === undefined ? {} : { resolvedModelIsFallback }),
+				requestedPermissionProfiles: ["no-network", "focused-edit"],
+				effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+			};
+			hostSocket.onOpen = () => hostOpen.resolve();
+			hostSocket.onFrame = frame => {
+				if (frame.t === "hello") {
+					hostSocket.send({
+						t: "welcome",
+						proto: COLLAB_PROTO,
+						header: { type: "session", id: "remote-session", timestamp: "2026-06-26T00:00:00Z", cwd: "/tmp" },
+						state: makeState(),
+						agents: [metadataAgent],
+						entryCount: 0,
+					});
+				}
+			};
+			hostSocket.connect();
+			await hostOpen.promise;
+			const ctx = makeGuestContext([]);
+			const guest = new CollabGuestLink(ctx);
+			try {
+				await guest.join(link);
+				expect(guest.agentRegistry.get("remote-metadata")?.history).toStrictEqual({
+					modelRole: "taskpro",
+					resolvedModel: "anthropic/claude-sonnet-4-5",
+					...(resolvedModelIsFallback === undefined ? {} : { resolvedModelIsFallback }),
+					requestedPermissionProfiles: ["no-network", "focused-edit"],
+					effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+				});
+			} finally {
+				hostSocket.close();
+				writeSpy.mockRestore();
+				await guest.leave("test cleanup").catch(() => {});
+			}
+		},
+	);
+
+	it("hydrates legacy snapshots without inventing absent history metadata", async () => {
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const roomId = "legacy-metadata-room";
+		const roomKey = generateRoomKey();
+		const cryptoKey = await importRoomKey(roomKey);
+		const link = formatCollabLink("ws://localhost:8788", roomId, roomKey);
+		const hostSocket = new CollabSocket({ wsUrl: `ws://localhost:8788/r/${roomId}`, role: "host", key: cryptoKey });
+		const hostOpen = Promise.withResolvers<void>();
+		hostSocket.onOpen = () => hostOpen.resolve();
+		hostSocket.onFrame = frame => {
+			if (frame.t === "hello") {
+				hostSocket.send({
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: { type: "session", id: "legacy-session", timestamp: "2026-06-26T00:00:00Z", cwd: "/tmp" },
+					state: makeState(),
+					agents: [
+						{
+							id: "remote-legacy",
+							displayName: "Remote legacy",
+							kind: "sub",
+							parentId: "Main",
+							status: "parked",
+							hasSessionFile: true,
+							createdAt: 1000,
+							lastActivity: 2000,
+						},
+					],
+					entryCount: 0,
+				});
+			}
+		};
+		hostSocket.connect();
+		await hostOpen.promise;
+		const guest = new CollabGuestLink(makeGuestContext([]));
+		try {
+			await guest.join(link);
+			expect(guest.agentRegistry.get("remote-legacy")?.history).toBeUndefined();
+		} finally {
+			hostSocket.close();
+			writeSpy.mockRestore();
+			await guest.leave("test cleanup").catch(() => {});
+		}
+	});
 });

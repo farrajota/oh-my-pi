@@ -21,7 +21,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getConfigRootDir, logger } from "@oh-my-pi/pi-utils";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "../modes/components/agent-hub";
 import type { InteractiveModeContext } from "../modes/types";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, type AgentHistorySummary } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 import { shouldDisableReasoning, toReasoningEffort } from "../thinking";
@@ -624,8 +624,18 @@ export class CollabGuestLink {
 			}
 		}
 		for (const snap of agents) {
+			const history = Object.fromEntries(
+				Object.entries({
+					modelRole: snap.modelRole,
+					resolvedModel: snap.resolvedModel,
+					resolvedModelIsFallback: snap.resolvedModelIsFallback,
+					requestedPermissionProfiles: snap.requestedPermissionProfiles,
+					effectivePermissionProfiles: snap.effectivePermissionProfiles,
+				}).filter(([, value]) => value !== undefined),
+			) as AgentHistorySummary;
 			if (this.agentRegistry.get(snap.id)) {
 				this.agentRegistry.setStatus(snap.id, snap.status);
+				if (Object.keys(history).length > 0) this.agentRegistry.setHistory(snap.id, history);
 			} else {
 				this.agentRegistry.register({
 					id: snap.id,
@@ -634,6 +644,7 @@ export class CollabGuestLink {
 					parentId: snap.parentId,
 					session: null,
 					status: snap.status,
+					...(Object.keys(history).length > 0 ? { history } : {}),
 				});
 			}
 			// Refs are returned by reference: patch host timestamps directly so

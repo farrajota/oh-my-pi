@@ -57,6 +57,10 @@ export interface AgentHistorySummary {
 	agent?: string;
 	modelRole?: string;
 	resolvedModel?: string;
+	/** Exact permission profiles requested by the original invocation, in request order. */
+	requestedPermissionProfiles?: string[];
+	/** Effective inherited plus requested permission profiles, in composition order. */
+	effectivePermissionProfiles?: string[];
 	/** Whether the last resolved model was selected by retry fallback routing. */
 	resolvedModelIsFallback?: boolean;
 	metrics?: AgentMetricsSummary;

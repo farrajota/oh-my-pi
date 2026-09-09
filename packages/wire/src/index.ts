@@ -245,6 +245,11 @@ export interface AgentSnapshot {
 	hasSessionFile: boolean;
 	createdAt: number;
 	lastActivity: number;
+	modelRole?: string;
+	resolvedModel?: string;
+	resolvedModelIsFallback?: boolean;
+	requestedPermissionProfiles?: string[];
+	effectivePermissionProfiles?: string[];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

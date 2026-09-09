@@ -274,4 +274,39 @@ describe("TaskTool toolProfile execution", () => {
 
 		expect(lifecycleEvents).toEqual([{ status: "started" }, { status: "completed" }]);
 	});
+
+	test("forwards exact requested and composed effective permission profile order", async () => {
+		const agent = makeAgent();
+		const runSpy = vi.spyOn(executor, "runSubprocess").mockResolvedValue(makeResult(agent));
+		const taskTool = await makeTaskTool(
+			agent,
+			makeSession(
+				{ "task.permissions.mode": "enforce" },
+				{
+					getPermissionScope: () => ({
+						mode: "enforce",
+						toolsEnabled: true,
+						pathsEnabled: true,
+						actorId: "Main",
+						actorKind: "main",
+						profiles: ["read-only"],
+						denyTools: [],
+						allowPaths: [],
+						denyPaths: [],
+					}),
+				},
+			),
+		);
+
+		await taskTool.execute("tool-call", {
+			agent: "synthetic",
+			task: "read",
+			permissions: { profiles: ["no-network", "focused-edit"] },
+		});
+
+		expect(runSpy.mock.calls[0]?.[0]).toMatchObject({
+			requestedPermissionProfiles: ["no-network", "focused-edit"],
+			effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+		});
+	});
 });

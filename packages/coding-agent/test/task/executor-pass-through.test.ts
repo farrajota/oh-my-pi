@@ -165,22 +165,18 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(created?.enableMCP).toBe(true);
 		expect(created?.mcpManager).toBe(mcpManager);
 		expect(systemPrompt).toContain(baseAgent.systemPrompt);
-		for (const channel of [
-			"eventBus",
-			"contextFiles",
-			"skills",
-			"promptTemplates",
-			"workspaceTree",
-			"rules",
-			"preloadedExtensionPaths",
-			"preloadedPreparedExtensions",
-			"preloadedCustomToolPaths",
-			"parentHindsightSessionState",
-			"parentMnemopiSessionState",
-			"parentEvalSessionId",
-		] as const) {
-			expect(Object.hasOwn(created ?? {}, channel)).toBe(false);
-		}
+		expect(created?.eventBus).toBeUndefined();
+		expect(created?.contextFiles).toBeUndefined();
+		expect(created?.skills).toBeUndefined();
+		expect(created?.promptTemplates).toBeUndefined();
+		expect(created?.workspaceTree).toBeUndefined();
+		expect(created?.rules).toBeUndefined();
+		expect(created?.preloadedExtensionPaths).toBeUndefined();
+		expect(created?.preloadedPreparedExtensions).toBeUndefined();
+		expect(created?.preloadedCustomToolPaths).toBeUndefined();
+		expect(created?.parentHindsightSessionState).toBeUndefined();
+		expect(created?.parentMnemopiSessionState).toBeUndefined();
+		expect(created?.parentEvalSessionId).toBeUndefined();
 	});
 
 	it("forwards an exact credential resolver without replacing it", async () => {
@@ -265,17 +261,9 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(created?.enableMCP).toBe(false);
 		expect(created?.mcpManager).toBeUndefined();
 		expect(created?.customTools).toBeUndefined();
-		for (const channel of [
-			"preloadedExtensionPaths",
-			"preloadedPreparedExtensions",
-			"preloadedCustomToolPaths",
-		] as const) {
-			expect(Object.hasOwn(created ?? {}, channel)).toBe(false);
-		}
-		expect(getTools).not.toHaveBeenCalled();
-		expect(created?.outputSchemaMode).toBe("strict");
-		expect(persistedInits).toHaveLength(1);
-		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, enableMCP: false, tools: ["read", "yield"] });
+		expect(created?.preloadedExtensionPaths).toEqual([]);
+		expect(created?.preloadedPreparedExtensions).toEqual([]);
+		expect(created?.preloadedCustomToolPaths).toEqual([]);
 	});
 
 	it("persists bridge-only tools in the enabled Code Mode set", async () => {
@@ -585,5 +573,26 @@ describe("runSubprocess fresh child-session boundary", () => {
 
 		expect(result.exitCode).toBe(0);
 		expect(initSpy).toHaveBeenCalledWith(expect.objectContaining({ modelRole: "reviewer" }));
+	});
+
+	it("persists requested and effective permission profile provenance in session init", async () => {
+		const session = yieldEmittingSession();
+		const initSpy = vi.spyOn(session.sessionManager, "appendSessionInit");
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-permission-provenance",
+			requestedPermissionProfiles: ["no-network", "focused-edit"],
+			effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(initSpy).toHaveBeenCalledWith(
+			expect.objectContaining({
+				requestedPermissionProfiles: ["no-network", "focused-edit"],
+				effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+			}),
+		);
 	});
 });

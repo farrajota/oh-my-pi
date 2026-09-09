@@ -2210,6 +2210,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				modelOverride,
 				modelRole,
 				requestedModel,
+				requestedPermissionProfiles: params.permissions?.profiles,
+				effectivePermissionProfiles: permissionScope.profiles,
 				exactModelOverride,
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
