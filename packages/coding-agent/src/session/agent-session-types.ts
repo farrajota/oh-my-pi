@@ -1,3 +1,5 @@
+import type { AgentReservation } from "../registry/agent-registry";
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import type {
 	Agent,
 	AgentMessage,
@@ -39,6 +41,7 @@ import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
+import type { EffectiveSubagentPermissions } from "../task/permission-profiles";
 import type { SessionManager } from "./session-manager";
 
 /** Maximum time the interactive shutdown path waits for Mnemopi consolidation. */
@@ -259,7 +262,14 @@ export interface AgentSessionConfig {
 	ownedAsyncJobManager?: AsyncJobManager;
 	/** Async job manager visible to this session. */
 	asyncJobManager?: AsyncJobManager;
-	/** Registry identity used for IRC routing. */
+	/** Immutable effective permission scope for nested composition and revival checks. */
+	permissionScope?: EffectiveSubagentPermissions;
+	/** Canonical display summary restored from this session's durable journal, or built from the scope at startup. */
+	permissionSummary?: EffectivePermissionSummary;
+	/** Exact owner publisher installed by the SDK after each immutable summary replacement. */
+	onPermissionSummaryChanged?: (summary: EffectivePermissionSummary) => void;
+	/** Source-compatible assertion hint; direct construction rejects it and never claims registry authority. */
+	agentReservation?: AgentReservation;
 	agentId?: string;
 	/** Whether this is a top-level or subagent session. */
 	agentKind?: "main" | "sub";

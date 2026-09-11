@@ -15,10 +15,18 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 const baseAgent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
+
+function createAuthorityFixture() {
+	const agentRegistry = new AgentRegistry();
+	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+		sdkModule.createAgentSession({ ...options, agentRegistry });
+	return { agentRegistry, createAuthoritySession };
+}
 
 function assistantStopMessage(text: string, totalTokens = 0): AssistantMessage {
 	return {
@@ -199,12 +207,15 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 		});
 		mockCreateAgentSession(harness.session);
 
+		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
 			task: "do the work",
 			index: 0,
 			id: "quiescence-fresh-yield",
+			agentRegistry,
+			createAuthoritySession,
 		});
 
 		// Run did not terminate on the parked yield: the barrier noticed, the
@@ -228,12 +239,15 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 		});
 		mockCreateAgentSession(harness.session);
 
+		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
 			task: "do the work",
 			index: 0,
 			id: "quiescence-stale-refusal",
+			agentRegistry,
+			createAuthoritySession,
 		});
 
 		// task + notice + full reminder ladder (3).
@@ -254,12 +268,15 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 		});
 		mockCreateAgentSession(harness.session);
 
+		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
 			task: "do the work",
 			index: 0,
 			id: "quiescence-no-async",
+			agentRegistry,
+			createAuthoritySession,
 		});
 
 		expect(harness.prompts).toHaveLength(1);
@@ -284,12 +301,15 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 		};
 		mockCreateAgentSession(harness.session);
 
+		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const run = runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
 			task: "do the work",
 			index: 0,
 			id: "quiescence-no-second-idle",
+			agentRegistry,
+			createAuthoritySession,
 		});
 		const outcome = await Promise.race([
 			run.then(() => "completed" as const),
@@ -342,6 +362,7 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 		);
 		mockCreateAgentSession(harness.session);
 
+		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const run = runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -353,6 +374,8 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			onCleanupDeferred: completion => {
 				deferredCleanup = completion;
 			},
+			agentRegistry,
+			createAuthoritySession,
 		});
 		await abortStarted.promise;
 		// abortStarted synchronizes with the in-flight cleanup; a zero grace

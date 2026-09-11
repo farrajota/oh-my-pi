@@ -9,6 +9,8 @@
  * authoritative state.
  */
 
+import { ensureAgentLive, getAgentLifecycleManager } from "../../internal/agent-lifecycle-bridge";
+import { lookupAgentRef } from "../../internal/agent-registry-bridge";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID, type RegistryEvent } from "../../registry/agent-registry";
 import type { AgentSession } from "../../session/agent-session";
@@ -25,7 +27,7 @@ export class SessionFocusController {
 	constructor(
 		private ctx: InteractiveModeContext,
 		private registry: AgentRegistry = AgentRegistry.global(),
-		private lifecycle: () => AgentLifecycleManager = () => AgentLifecycleManager.global(),
+		private lifecycle: () => AgentLifecycleManager = () => getAgentLifecycleManager(this.registry),
 	) {}
 
 	get focusedAgentId(): string | undefined {
@@ -42,9 +44,9 @@ export class SessionFocusController {
 		if (this.ctx.collabGuest) throw new Error("Viewing agents is unavailable in a collab session.");
 		if (id === MAIN_AGENT_ID) return this.unfocus();
 		const generation = ++this.#focusGeneration;
-		const session = await this.lifecycle().ensureLive(id);
+		const session = await ensureAgentLive(this.lifecycle(), id);
 		if (generation !== this.#focusGeneration) return;
-		const ref = this.registry.get(id);
+		const ref = lookupAgentRef(this.registry, id);
 		if (!ref || ref.status === "parked" || ref.status === "aborted" || ref.session !== session) {
 			await this.unfocus();
 			return;

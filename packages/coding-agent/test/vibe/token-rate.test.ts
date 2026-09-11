@@ -10,12 +10,17 @@
  * 4. Skips workers whose AgentRegistry session is detached (parked/reviving),
  *    so a stale roster entry can't contribute a phantom zero.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry";
 import type { AgentSession } from "../../src/session/agent-session";
 import { aggregateVibeWorkerTokensPerSecond, VibeSessionRegistry } from "../../src/vibe/runtime";
 
 const OWNER = "test-owner";
+let registry: AgentRegistry;
+
+beforeEach(() => {
+	registry = new AgentRegistry();
+});
 
 /** Minimal fake AgentSession: just the messages + isStreaming the aggregator reads. */
 function fakeSession(messages: unknown[], isStreaming: boolean): AgentSession {
@@ -30,7 +35,7 @@ function assistantMessage(output: number, durationMs: number, timestamp = 1000) 
 function registerWorker(id: string, session: AgentSession | null, ownerId = OWNER) {
 	VibeSessionRegistry.global().registerRecordForTests({ id, ownerId });
 	if (session) {
-		AgentRegistry.global().register({
+		registry.register({
 			id,
 			displayName: id,
 			kind: "sub",
@@ -47,7 +52,7 @@ describe("aggregateVibeWorkerTokensPerSecond", () => {
 	});
 
 	it("returns null when the owner has no worker sessions", () => {
-		expect(aggregateVibeWorkerTokensPerSecond(OWNER)).toBeNull();
+		expect(aggregateVibeWorkerTokensPerSecond(registry, OWNER)).toBeNull();
 	});
 
 	it("sums tok/s across every live streaming worker", () => {
@@ -55,42 +60,42 @@ describe("aggregateVibeWorkerTokensPerSecond", () => {
 		registerWorker("w1", fakeSession([assistantMessage(100, 1000)], true));
 		// 50 tokens in 500ms → 100 tok/s.
 		registerWorker("w2", fakeSession([assistantMessage(50, 500)], true));
-		expect(aggregateVibeWorkerTokensPerSecond(OWNER)).toBe(200);
+		expect(aggregateVibeWorkerTokensPerSecond(registry, OWNER)).toBe(200);
 	});
 
 	it("returns null when workers exist but none have a live rate", () => {
 		// Not streaming, no duration → calculateTokensPerSecond returns null.
 		registerWorker("w1", fakeSession([assistantMessage(100, 0)], false));
-		expect(aggregateVibeWorkerTokensPerSecond(OWNER)).toBeNull();
+		expect(aggregateVibeWorkerTokensPerSecond(registry, OWNER)).toBeNull();
 	});
 
 	it("ignores idle workers whose last turn finished — a finalized duration must not contribute a stale rate", () => {
 		// Finalized message (duration set) but the worker is no longer
 		// streaming: its completed tok/s must not stick to the badge forever.
 		registerWorker("w1", fakeSession([assistantMessage(100, 1000)], false));
-		expect(aggregateVibeWorkerTokensPerSecond(OWNER)).toBeNull();
+		expect(aggregateVibeWorkerTokensPerSecond(registry, OWNER)).toBeNull();
 	});
 
 	it("streaming workers still count while an idle sibling is skipped", () => {
 		registerWorker("w1", fakeSession([assistantMessage(100, 1000)], true));
 		registerWorker("w2", fakeSession([assistantMessage(50, 500)], false));
-		expect(aggregateVibeWorkerTokensPerSecond(OWNER)).toBe(100);
+		expect(aggregateVibeWorkerTokensPerSecond(registry, OWNER)).toBe(100);
 	});
 
 	it("ignores workers whose AgentRegistry session is detached", () => {
 		registerWorker("w1", fakeSession([assistantMessage(100, 1000)], true));
 		// w2 is in the vibe roster but has no live AgentRegistry session.
 		registerWorker("w2", null);
-		expect(aggregateVibeWorkerTokensPerSecond(OWNER)).toBe(100);
+		expect(aggregateVibeWorkerTokensPerSecond(registry, OWNER)).toBe(100);
 	});
 
 	it("scopes to the requesting owner — other owners' workers don't count", () => {
 		registerWorker("w1", fakeSession([assistantMessage(100, 1000)], true), OWNER);
 		registerWorker("w2", fakeSession([assistantMessage(50, 500)], true), "other-owner");
-		expect(aggregateVibeWorkerTokensPerSecond(OWNER)).toBe(100);
+		expect(aggregateVibeWorkerTokensPerSecond(registry, OWNER)).toBe(100);
 	});
 
 	it("returns null for the main-agent owner id when no workers are registered", () => {
-		expect(aggregateVibeWorkerTokensPerSecond(MAIN_AGENT_ID)).toBeNull();
+		expect(aggregateVibeWorkerTokensPerSecond(registry, MAIN_AGENT_ID)).toBeNull();
 	});
 });

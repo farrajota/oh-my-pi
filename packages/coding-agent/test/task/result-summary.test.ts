@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { formatTaskResultSummary } from "@oh-my-pi/pi-coding-agent/task/result-summary";
 import type { SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 
 function settledResult(output: string): SingleResult {
 	return {
@@ -24,6 +25,7 @@ function settledResult(output: string): SingleResult {
 	};
 }
 
+const registry = new AgentRegistry();
 describe("formatTaskResultSummary", () => {
 	it("previews a pretty-printed structured yield past its opening brace", () => {
 		// A schema-bearing subagent's artifact is `JSON.stringify(data, null, 2)`:
@@ -34,6 +36,7 @@ describe("formatTaskResultSummary", () => {
 		const output = JSON.stringify({ summary: "Audit of 37 tools", report }, null, 2);
 		const summary = formatTaskResultSummary(settledResult(output), {
 			totalDurationMs: 1200,
+			agentRegistry: registry,
 		});
 
 		expect(summary).toContain('<preview full-output="agent://Scout">');
@@ -47,6 +50,7 @@ describe("formatTaskResultSummary", () => {
 		const lines = Array.from({ length: 400 }, (_, i) => `- item ${i} ${"x".repeat(20)}`);
 		const summary = formatTaskResultSummary(settledResult(lines.join("\n")), {
 			totalDurationMs: 5,
+			agentRegistry: registry,
 		});
 		const preview = /<preview[^>]*>\n([\s\S]*?)\n<\/preview>/.exec(summary)?.[1] ?? "";
 		expect(preview.endsWith("\n")).toBe(false);
@@ -56,6 +60,7 @@ describe("formatTaskResultSummary", () => {
 	it("inlines short output without an artifact pointer", () => {
 		const summary = formatTaskResultSummary(settledResult("done"), {
 			totalDurationMs: 5,
+			agentRegistry: registry,
 		});
 		expect(summary).toContain("<output>\ndone\n</output>");
 		expect(summary).not.toContain("<preview");

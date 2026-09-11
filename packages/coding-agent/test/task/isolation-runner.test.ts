@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import {
 	applyEligibleNestedPatches,
 	mergeIsolatedChanges,
@@ -35,6 +36,9 @@ function result(overrides: Partial<SingleResult> = {}): SingleResult {
 	};
 }
 
+const testRegistry = new AgentRegistry();
+const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+	sdkModule.createAgentSession({ ...options, agentRegistry: testRegistry });
 const tempRoots: string[] = [];
 
 async function git(repoRoot: string, ...args: string[]): Promise<string> {
@@ -140,6 +144,8 @@ describe("runIsolatedSubprocess", () => {
 				task: "Do work",
 				index: 0,
 				id: "PreserveBranchFailure",
+				agentRegistry: testRegistry,
+				createAuthoritySession,
 			},
 			context: { repoRoot, baseline },
 			preferredBackend: undefined,
@@ -226,6 +232,8 @@ describe("runIsolatedSubprocess", () => {
 				task: "Do work",
 				index: 0,
 				id: "RescueBranchCommits",
+				agentRegistry: testRegistry,
+				createAuthoritySession,
 			},
 			context: { repoRoot, baseline },
 			preferredBackend: undefined,
@@ -270,6 +278,8 @@ describe("runIsolatedSubprocess", () => {
 				task: "Do work",
 				index: 0,
 				id: "DeferredCleanup",
+				agentRegistry: testRegistry,
+				createAuthoritySession,
 			},
 			context: {
 				repoRoot: "/repo",
@@ -342,6 +352,8 @@ describe("runIsolatedSubprocess", () => {
 				task: "Do work",
 				index: 0,
 				id: "DeferredSuccess",
+				agentRegistry: testRegistry,
+				createAuthoritySession,
 			},
 			context: { repoRoot: "/repo", baseline },
 			preferredBackend: undefined,
@@ -408,6 +420,8 @@ describe("runIsolatedSubprocess", () => {
 					task: "Do work",
 					index: 0,
 					id: "UsageAccounting",
+					agentRegistry: testRegistry,
+					createAuthoritySession,
 				},
 				context: {
 					repoRoot: "/repo",

@@ -43,7 +43,7 @@ function modelChange(id: string, parentId: string, model: string, role: string, 
 }
 
 /** Head every transcript shares: a session that started on sonnet under the `task` role. */
-function transcriptHead(): string[] {
+function transcriptHead(permissionSummary?: unknown): string[] {
 	return [
 		JSON.stringify({ type: "session", id: "s0", parentId: null, timestamp: "2026-08-07T10:34:37.300Z" }),
 		modelChange("m1", "s0", "anthropic/claude-sonnet-5", "task", false),
@@ -57,6 +57,7 @@ function transcriptHead(): string[] {
 			task: "build the thing",
 			requestedPermissionProfiles: ["no-network", "focused-edit"],
 			effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+			permissionSummary,
 		}),
 	];
 }
@@ -253,5 +254,70 @@ describe("persisted agent model attribution", () => {
 		const history = registry.get("Routed")?.history;
 		expect(history?.resolvedModel).toBe("openai-codex/gpt-5.6-sol@vercel-gw");
 		expect(history?.resolvedModelIsFallback).toBe(true);
+	});
+
+	it("restores a bounded permission summary on parked history", async () => {
+		using tempDir = TempDir.createSync("@omp-attribution-permission-summary-");
+		const permissionSummary = {
+			mode: "enforce",
+			profiles: { items: Array.from({ length: 18 }, (_, index) => `profile-${index}`), omittedCount: 1 },
+			clauses: { items: [], omittedCount: 0 },
+			denyTools: { items: [], omittedCount: 0 },
+			denyPaths: { items: ["https://user:secret@example.test/private?token=hidden"], omittedCount: 0 },
+			guardrails: { noNetwork: true, secretsBlind: true },
+			intrinsicTools: { yield: true, reportToolIssue: false },
+			recentDenials: {
+				items: [
+					{
+						kind: "subagent_permission_denial",
+						code: "path-not-allowed",
+						tool: "read",
+						targets: { items: [{ kind: "path", display: "private\nfile" }], omittedCount: 0 },
+						matched: "subagent:path-allowlist",
+						reason: "blocked",
+					},
+				],
+				omittedCount: 0,
+			},
+		};
+		const updatedPermissionSummary = {
+			...permissionSummary,
+			recentDenials: {
+				items: [
+					{
+						kind: "subagent_permission_denial",
+						code: "guardrail",
+						tool: "read",
+						targets: { items: [{ kind: "network", display: "https://example.test/latest" }], omittedCount: 0 },
+						matched: "guardrail:no-network:read-url",
+						reason: "latest blocked",
+					},
+				],
+				omittedCount: 0,
+			},
+		};
+		const registry = await historyFor(tempDir.path(), "BoundedHistory", [
+			...transcriptHead(permissionSummary),
+			JSON.stringify({
+				type: "custom",
+				customType: "permission_summary_update",
+				id: "psu",
+				parentId: "si",
+				timestamp: "2026-08-07T10:34:39.000Z",
+				data: updatedPermissionSummary,
+			}),
+		]);
+
+		const ref = registry.get("BoundedHistory");
+		expect(ref?.status).toBe("parked");
+		expect(ref?.history?.permissionSummary?.profiles.items).toEqual(permissionSummary.profiles.items.slice(0, 16));
+		expect(ref?.history?.permissionSummary?.profiles.omittedCount).toBe(3);
+		expect(ref?.history?.permissionSummary?.denyPaths.items).toEqual(["https://example.test/private"]);
+		expect(ref?.history?.permissionSummary?.recentDenials.items[0]).toMatchObject({
+			code: "guardrail",
+			tool: "read",
+		});
+		expect(ref?.history?.requestedPermissionProfiles).toEqual(["no-network", "focused-edit"]);
+		expect(ref?.history?.effectivePermissionProfiles).toEqual(["read-only", "no-network", "focused-edit"]);
 	});
 });

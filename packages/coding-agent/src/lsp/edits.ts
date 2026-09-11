@@ -296,6 +296,11 @@ export type ExecutedWorkspaceChange =
 	| { kind: "rename"; oldUri: string; newUri: string }
 	| { kind: "delete"; uri: string };
 
+/** Optional authority callback run for every workspace mutation before any effect. */
+export interface WorkspaceEditAuthorization {
+	authorizePath: (filePath: string, mustExist: boolean) => Promise<void>;
+}
+
 /** What {@link applyWorkspaceEdit} did: human-readable summaries plus the ops that really ran. */
 export interface WorkspaceEditResult {
 	applied: string[];
@@ -317,6 +322,7 @@ export async function applyWorkspaceEdit(
 	edit: WorkspaceEdit,
 	cwd: string,
 	onExecuted?: (change: ExecutedWorkspaceChange) => void,
+	authorization?: WorkspaceEditAuthorization,
 ): Promise<WorkspaceEditResult> {
 	const applied: string[] = [];
 	const executed: ExecutedWorkspaceChange[] = [];
@@ -329,6 +335,16 @@ export async function applyWorkspaceEdit(
 		const ops = planDocumentChanges(edit.documentChanges);
 		for (const op of ops) {
 			if (op.kind === "text") sortAndValidateTextEdits(op.edits);
+		}
+		if (authorization) {
+			for (const op of ops) {
+				if (op.kind === "text") await authorization.authorizePath(uriToFile(op.uri), true);
+				else if (op.kind === "create") await authorization.authorizePath(uriToFile(op.uri), false);
+				else if (op.kind === "rename") {
+					await authorization.authorizePath(uriToFile(op.oldUri), true);
+					await authorization.authorizePath(uriToFile(op.newUri), false);
+				} else await authorization.authorizePath(uriToFile(op.uri), true);
+			}
 		}
 		for (const op of ops) {
 			if (op.kind === "text") {
@@ -437,6 +453,11 @@ export async function applyWorkspaceEdit(
 		const changes = edit.changes;
 		for (const uri in changes) {
 			sortAndValidateTextEdits(changes[uri]);
+		}
+		if (authorization) {
+			for (const uri in changes) {
+				if (changes[uri].length > 0) await authorization.authorizePath(uriToFile(uri), true);
+			}
 		}
 		for (const uri in changes) {
 			const textEdits = changes[uri];

@@ -57,7 +57,7 @@ import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { loadExtensions } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
-import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import type { ExtensionUIContext, LoadExtensionsResult } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import { discoverStartupLspServers } from "./lsp/servers";
@@ -78,7 +78,10 @@ import {
 import { ensureTheme, initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import { createWarpEventBridgeExtension } from "./modes/warp-events";
-import { AgentLifecycleManager } from "./registry/agent-lifecycle";
+import { getAgentLifecycleManager, setPersistedAgentReviverFactory } from "./internal/agent-lifecycle-bridge";
+import { createAgentRootSession } from "./internal/agent-registry-bridge";
+import { AgentRegistry } from "./registry/agent-registry";
+import { registryDurableStateForSession, type RegistryDurableStateStore } from "./registry/durable-state";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -402,7 +405,7 @@ async function loadTrustedSessionExtensions(
 	options: Pick<CreateAgentSessionOptions, "additionalExtensionPaths">,
 	cwd: string,
 	eventBus: EventBus,
-) {
+): Promise<LoadExtensionsResult> {
 	const paths = options.additionalExtensionPaths ?? [];
 	for (const trustedPath of paths) {
 		let stat: fsSync.Stats;
@@ -432,6 +435,14 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 	return async (cwd, factoryOptions) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
 		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
+		const sessionFile = nextSessionManager.getSessionFile();
+		// ACP sessions coexist in one host, so each persisted root gets its own
+		// recovered registry and carries it explicitly instead of replacing global state.
+		if (!sessionFile) {
+			throw new Error("ACP session persistence did not resolve a session file");
+		}
+		const durableState = registryDurableStateForSession(sessionFile);
+		const agentRegistry = new AgentRegistry({ durableState });
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
 		// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
 		// host can open `session/new` for any client-supplied workspace, so
@@ -458,6 +469,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			authStorage: args.authStorage,
 			modelRegistry: args.modelRegistry,
 			agentId,
+			agentRegistry,
 			// ACP defers the `ask` capability and reserve-policy confirmation until
 			// client capabilities are known, without enabling other UI-only behavior.
 			interactivePrompts: factoryOptions?.interactivePrompts,
@@ -1028,7 +1040,7 @@ export async function createSessionManager(
 	if (parsed.continue) {
 		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
 	}
-	// --resume without value is handled separately (needs picker UI)
+	if (parsed.resume === true) return undefined;
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
 		return SessionManager.create(cwd, parsed.sessionDir);
@@ -1044,8 +1056,7 @@ export async function createSessionManager(
 		}
 		return manager;
 	}
-	// Default case (new session) returns undefined, SDK will create one
-	return undefined;
+	return SessionManager.create(cwd);
 }
 
 /** Discover SYSTEM.md file if no CLI system prompt was provided */
@@ -1806,6 +1817,17 @@ export async function runRootCommand(
 			}
 		}
 
+		// Recover the canonical durable registry before installing any authority
+		// projection. Root creation, lifecycle management, and revival all retain
+		// these exact instances; `--no-session` intentionally installs a storeless
+		// unrestricted projection whose authority creator rejects restricted roots.
+		const sessionFile = sessionManager?.getSessionFile();
+		const durableState: RegistryDurableStateStore | undefined = sessionFile
+			? registryDurableStateForSession(sessionFile)
+			: undefined;
+		const agentRegistry = new AgentRegistry({ durableState });
+		AgentRegistry.installGlobal(agentRegistry);
+
 		if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource)) {
 			const pendingToolWarning = describePendingToolCalls(sessionManager.getBranch());
 			if (pendingToolWarning) {
@@ -1844,6 +1866,7 @@ export async function runRootCommand(
 		sessionOptions.modelRegistry = modelRegistry;
 		sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 		sessionOptions.settings = settingsInstance;
+		sessionOptions.agentRegistry = agentRegistry;
 
 		// OTEL: register global OTLP exporters when an endpoint is configured via
 		// env, then switch on the agent loop's telemetry hooks so traces, run-level
@@ -1867,9 +1890,12 @@ export async function runRootCommand(
 			}
 		}
 
-		const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 		const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
-			const result = await logger.time("createAgentSession", createAgentSessionImpl, options);
+			const registry = options.agentRegistry ?? agentRegistry;
+			const rootOptions = options.agentRegistry === registry ? options : { ...options, agentRegistry: registry };
+			const createRoot =
+				deps.createAgentSession ?? ((value: CreateAgentSessionOptions) => createAgentRootSession(registry, value));
+			const result = await logger.time("createAgentSession", createRoot, rootOptions);
 			// Kick off background model discovery only after createAgentSession finishes its parallel
 			// discovery arms; running these concurrently contends for the event loop and stretches
 			// every parallel arm by ~30ms.
@@ -1999,23 +2025,27 @@ export async function runRootCommand(
 			// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
 			// scan, collab mirror, resumed process) has a sessionFile but no in-memory
 			// reviver, so `ensureLive` (IRC sends, hub focus) would refuse it. Install a
-			// factory — bound to THIS top-level session — that rebuilds the subagent from
-			// its persisted JSONL (see persisted-revive.ts). Scoped to the non-ACP
-			// bootstrap: ACP keeps several concurrent top-level sessions and a single
-			// process-global factory must not be clobbered by the most recent one.
-			AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
-				createPersistedSubagentReviverFactory({
-					session,
-					authStorage,
-					modelRegistry,
-					settings: settingsInstance,
-					enableLsp: sessionOptions.enableLsp ?? true,
-					enableMCP: sessionOptions.enableMCP ?? true,
-					mcpManager,
-					subagentEventBus,
-				}),
-				Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
-			);
+			// factory bound to this top-level session's exact durable registry. Storeless
+			// `--no-session` roots stay an unrestricted projection and cannot revive or
+			// construct restricted agents.
+			if (durableState) {
+				setPersistedAgentReviverFactory(
+					getAgentLifecycleManager(agentRegistry),
+					createPersistedSubagentReviverFactory({
+						session,
+						authStorage,
+						modelRegistry,
+						settings: settingsInstance,
+						enableLsp: sessionOptions.enableLsp ?? true,
+						enableMCP: sessionOptions.enableMCP ?? true,
+						mcpManager,
+						subagentEventBus,
+						agentRegistry,
+						durableState,
+					}),
+					Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
+				);
+			}
 			if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
 				authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 			}

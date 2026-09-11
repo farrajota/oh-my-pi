@@ -7,11 +7,14 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text, visibleWidth } from "@oh-my-pi/pi-tui";
-import type { AsyncJob, AsyncJobManager, AsyncJobType } from "../../async";
+import type { AsyncJob, AsyncJobManager, AsyncJobType, AsyncJobResultObservation } from "../../async";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
+import { getAgentLifecycleManager, resolveToolSessionLifecycleAuthority } from "../../internal/agent-lifecycle-bridge";
+import type { HubAdmissionStateTransaction } from "../../internal/hub-admission";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
 import { terminateSubagent } from "../../registry/agent-control";
+import type { AgentRef } from "../../registry/agent-registry";
 import { renderStructuredJson } from "../../session/async-job-delivery";
 import type { StructuredSubagentOutput } from "../../task/types";
 import { parseConfiguredThinkingLevel } from "../../thinking";
@@ -26,12 +29,19 @@ import {
 	formatStatusIcon,
 	getPreviewLines,
 	isFeedModelBadgeEnabled,
-	PREVIEW_LIMITS,
 	replaceTabs,
 	type ToolUIColor,
 	type ToolUIStatus,
 } from "../render-utils";
-import type { AgentActivitySnapshot, CancelOutcome, CoordinationDetails, HubRenderArgs, JobSnapshot } from "./types";
+import { PREVIEW_LIMITS } from "../preview-limits";
+import {
+	boundCoordinationResult,
+	type AgentActivitySnapshot,
+	type CancelOutcome,
+	type CoordinationDetails,
+	type HubRenderArgs,
+	type JobSnapshot,
+} from "./types";
 
 const WAIT_DURATION_MS: Record<string, number> = {
 	"5s": 5_000,
@@ -40,6 +50,12 @@ const WAIT_DURATION_MS: Record<string, number> = {
 	"1m": 60_000,
 	"5m": 5 * 60_000,
 };
+
+export type HubJobScope = string;
+
+function resolveJobOwnerId(scope: HubJobScope): string {
+	return scope;
+}
 
 /**
  * A wait snapshot where every watched job is still running and nothing was
@@ -68,18 +84,13 @@ export function resolvePollWindow(
 	return { waitMs, smart };
 }
 
-/**
- * Resolve a list of job ids to job records visible to the calling agent.
- * Drops missing ids and ids owned by other agents, so cross-agent inspection
- * via the hub is impossible.
- */
-export function visibleJobs(manager: AsyncJobManager, ids: string[], ownerId: string | undefined): AsyncJob[] {
+export function visibleJobs(manager: AsyncJobManager, ids: string[], scope: HubJobScope): AsyncJob[] {
 	const out: AsyncJob[] = [];
+	const ownerId = resolveJobOwnerId(scope);
+	const filter = ownerId ? { ownerId } : undefined;
 	for (const id of ids) {
-		const job = manager.getJob(id);
-		if (!job) continue;
-		if (ownerId && job.ownerId !== ownerId) continue;
-		out.push(job);
+		const job = manager.getJob(id, filter);
+		if (job) out.push(job);
 	}
 	return out;
 }
@@ -103,13 +114,13 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 	const registry = session.agentRegistry;
 	if (!registry) return [];
 	const selfId = session.getAgentId?.() ?? undefined;
-	// Cover = the caller's RUNNING jobs only. A settled job still sitting in
-	// delivery retention must not hide its agent if that agent was re-woken
-	// (e.g. via a hub message) and is running again without a job.
+	if (!selfId) return [];
+	const rootId = registry.get(selfId)?.lineage?.rootId;
+	if (!rootId) return [];
 	const covered = new Set<string>();
 	const manager = session.asyncJobManager;
 	if (manager) {
-		for (const job of manager.getRunningJobs(selfId ? { ownerId: selfId } : undefined)) {
+		for (const job of manager.getRunningJobs({ ownerId: selfId })) {
 			covered.add(job.id);
 			if (job.agentId) covered.add(job.agentId);
 		}
@@ -117,7 +128,7 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 	const now = Date.now();
 	const out: AgentActivitySnapshot[] = [];
 	for (const ref of registry.list()) {
-		if (ref.kind !== "sub" || ref.status !== "running") continue;
+		if (ref.lineage?.rootId !== rootId || ref.kind !== "sub" || ref.status !== "running") continue;
 		if (ref.id === selfId || covered.has(ref.id)) continue;
 		out.push({
 			id: ref.id,
@@ -160,12 +171,20 @@ interface TrackedJobLike {
 	structured?: StructuredSubagentOutput;
 }
 
-export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobSnapshot[] {
+export function snapshotJobs(
+	session: ToolSession,
+	jobs: TrackedJobLike[],
+	observation?: AsyncJobResultObservation,
+): JobSnapshot[] {
 	const now = Date.now();
 	return jobs.map(j => {
 		const current = session.asyncJobManager?.getJob(j.id);
 		const latest = current ?? j;
-		const resultConsumed = session.asyncJobManager?.isJobResultConsumed(latest.id) === true;
+		// Progress and other metadata-only snapshots have no admission lease,
+		// so a newly settled body stays withheld until buildJobResult enlists it.
+		const resultWithheld =
+			latest.status !== "running" &&
+			(!observation || session.asyncJobManager?.ownsObservedJobResult(observation, latest.id) !== true);
 		let resolvedModel: string | undefined;
 		let resolvedModelIdentity: string | undefined;
 		let resolvedThinkingLevel: JobSnapshot["resolvedThinkingLevel"];
@@ -210,9 +229,9 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 			...(resolvedModelIdentity ? { resolvedModelIdentity } : {}),
 			...(resolvedThinkingLevel !== undefined ? { resolvedThinkingLevel } : {}),
 			...(advisor ? { advisor: true } : {}),
-			...(!resultConsumed && latest.resultText ? { resultText: latest.resultText } : {}),
-			...(!resultConsumed && latest.errorText ? { errorText: latest.errorText } : {}),
-			...(!resultConsumed && latest.structured
+			...(!resultWithheld && latest.resultText ? { resultText: latest.resultText } : {}),
+			...(!resultWithheld && latest.errorText ? { errorText: latest.errorText } : {}),
+			...(!resultWithheld && latest.structured
 				? { structured: latest.structured, agentUrlId: current?.agentId ?? latest.id }
 				: {}),
 		};
@@ -222,11 +241,14 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 export function buildJobResult(
 	session: ToolSession,
 	manager: AsyncJobManager,
+	scope: HubJobScope,
+	transaction: HubAdmissionStateTransaction,
 	op: "wait" | "cancel" | "jobs",
 	jobs: TrackedJobLike[],
 	cancelOutcomes: CancelOutcome[],
 	agents: AgentActivitySnapshot[] = [],
 ): AgentToolResult<CoordinationDetails> {
+	const ownerId = resolveJobOwnerId(scope);
 	// Deduplicate by id (cancelled jobs may also appear in the watched set).
 	const seen = new Set<string>();
 	const uniqueJobs = jobs.filter(j => {
@@ -234,10 +256,17 @@ export function buildJobResult(
 		seen.add(j.id);
 		return true;
 	});
-	const jobResults = snapshotJobs(session, uniqueJobs);
-	const alreadyConsumed = new Set(jobResults.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
-
-	manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
+	const observation = manager.observeJobResults(
+		transaction,
+		uniqueJobs.filter(job => job.status !== "running").map(job => job.id),
+		ownerId ? { ownerId } : undefined,
+	);
+	const jobResults = transaction.select(() => snapshotJobs(session, uniqueJobs, observation));
+	const alreadyConsumed = new Set(
+		jobResults
+			.filter(job => job.status !== "running" && !manager.ownsObservedJobResult(observation, job.id))
+			.map(job => job.id),
+	);
 
 	const completed = jobResults.filter(j => j.status !== "running");
 	const running = jobResults.filter(j => j.status === "running");
@@ -312,14 +341,12 @@ export function buildJobResult(
 		...(cancelOutcomes.length ? { cancelled: cancelOutcomes.map(({ id, status }) => ({ id, status })) } : {}),
 		...(agents.length ? { agents } : {}),
 	};
-	return {
+	const result = boundCoordinationResult({
 		content: [{ type: "text", text: lines.join("\n").trimEnd() }],
 		details,
-		// A wait where everything is still running carries no new information
-		// once a later wait exists — same predicate the TUI uses to displace
-		// stale waiting frames.
 		...(isWaitingPollDetails(details) ? { useless: true } : {}),
-	};
+	});
+	return result;
 }
 
 /** `wait` with explicit ids that matched nothing visible: correct the caller, surface live agents. */
@@ -343,14 +370,11 @@ export function noMatchingJobsResult(session: ToolSession, ids: string[]): Agent
 	if (agents.length > 0) {
 		lines.push("", ...describeAgents(agents));
 	}
-	return {
+	return boundCoordinationResult({
 		content: [{ type: "text", text: lines.join("\n") }],
 		details: { op: "wait", jobs: [], ...(agents.length ? { agents } : {}) },
-		// Nothing found is noise once consumed — the follow-up call has already
-		// corrected course. Running agents are real state the model may act on,
-		// so keep those results.
 		...(agents.length === 0 ? { useless: true } : {}),
-	};
+	});
 }
 
 /** Bare `wait` with no running jobs and nobody who could message: nothing to block on. */
@@ -360,37 +384,40 @@ export function nothingToWaitForResult(session: ToolSession): AgentToolResult<Co
 	if (agents.length > 0) {
 		lines.push("", ...describeAgents(agents));
 	}
-	return {
+	return boundCoordinationResult({
 		content: [{ type: "text", text: lines.join("\n") }],
 		details: { op: "wait", jobs: [], ...(agents.length ? { agents } : {}) },
 		...(agents.length === 0 ? { useless: true } : {}),
-	};
+	});
 }
 
 /** `cancel`: kill the named jobs; returns immediately with outcomes + snapshots. */
 export async function executeCancel(
 	session: ToolSession,
 	manager: AsyncJobManager,
-	ownerId: string | undefined,
+	scope: HubJobScope,
+	transaction: HubAdmissionStateTransaction,
 	ids: string[],
 ): Promise<AgentToolResult<CoordinationDetails>> {
+	const ownerId = resolveJobOwnerId(scope);
 	const ownerFilter = ownerId ? { ownerId } : undefined;
+	const registry = session.agentRegistry;
+	const selected = transaction.select(() =>
+		ids.map(id => ({
+			id,
+			existing: manager.getJob(id),
+			ref: registry?.get(id),
+		})),
+	);
+	transaction.markEffect();
 	const cancelOutcomes: CancelOutcome[] = [];
-	for (const id of ids) {
-		const existing = manager.getJob(id);
+	for (const { id, existing, ref } of selected) {
 		if (!existing || (ownerId && existing.ownerId !== ownerId)) {
-			// No job by this id (or it belongs to another agent): a budget-aborted
-			// keep-alive subagent lives on as a jobless registration long after its
-			// job row is reaped, so let cancel reach the agent registration too.
-			cancelOutcomes.push(await cancelAgentRegistration(session, ownerId, id));
+			cancelOutcomes.push(await cancelAgentRegistration(session, scope, id, ref));
 			continue;
 		}
 		if (existing.status !== "running") {
-			// The job row settled but may still be inside the retention window.
-			// The agent registration behind it (job id == agent id for task
-			// spawns) can outlive the row as an idle/parked zombie — try the
-			// registration kill before reporting the row as already done.
-			const regOutcome = await cancelAgentRegistration(session, ownerId, id);
+			const regOutcome = await cancelAgentRegistration(session, scope, id, ref);
 			cancelOutcomes.push(
 				regOutcome.status === "cancelled"
 					? regOutcome
@@ -402,6 +429,10 @@ export async function executeCancel(
 			);
 			continue;
 		}
+		if (manager.getJob(id, ownerFilter) !== existing) {
+			cancelOutcomes.push({ id, status: "not_found", message: `Background job not found: ${id}` });
+			continue;
+		}
 		const cancelled = manager.cancel(id, ownerFilter);
 		cancelOutcomes.push(
 			cancelled
@@ -409,33 +440,30 @@ export async function executeCancel(
 				: { id, status: "already_completed", message: `Background job ${id} is already completed.` },
 		);
 	}
-	return buildJobResult(session, manager, "cancel", visibleJobs(manager, ids, ownerId), cancelOutcomes);
+	const jobs = transaction.select(() => visibleJobs(manager, ids, scope));
+	return buildJobResult(session, manager, scope, transaction, "cancel", jobs, cancelOutcomes);
 }
 
-/**
- * Kill a non-job-backed agent registration named by `id`: abort any in-flight
- * turn, then release it from the lifecycle (dispose session + unregister). This
- * is the only kill path for a keep-alive subagent that was budget-aborted, went
- * `idle`/`parked`, and outlived its job row — otherwise it is unstoppable short
- * of a broker restart (issue #6315). Scoped to the caller's own descendants so
- * cross-agent kills stay impossible; a bare test/SDK caller (no owner id) may
- * target any sub. Never touches Main, the caller, or advisor transcripts.
- */
+/** Kill one exact preselected non-job-backed agent registration. */
 async function cancelAgentRegistration(
 	session: ToolSession,
-	ownerId: string | undefined,
+	scope: HubJobScope,
 	id: string,
+	ref: AgentRef | undefined,
 ): Promise<CancelOutcome> {
+	const ownerId = resolveJobOwnerId(scope);
 	const registry = session.agentRegistry;
-	const ref = registry?.get(id);
 	if (!registry || ref?.kind !== "sub") {
 		return { id, status: "not_found", message: `Background job not found: ${id}` };
 	}
+	const lifecycle = ownerId ? resolveToolSessionLifecycleAuthority(session) : getAgentLifecycleManager(registry);
+	if (!lifecycle) return { id, status: "not_found", message: `Background job not found: ${id}` };
 	const result = await terminateSubagent({
 		registry,
-		lifecycle: session.agentLifecycle?.(),
+		lifecycle,
 		targetId: id,
 		policy: ownerId ? { scope: "direct-child", ownerId } : { scope: "unrestricted" },
+		expectedRef: ref,
 	});
 	if (result.status === "cancelled") {
 		return { id, status: "cancelled", message: `Cancelled agent ${id} (killed session, dropped registration).` };
@@ -447,10 +475,15 @@ async function cancelAgentRegistration(
 export function executeJobsSnapshot(
 	session: ToolSession,
 	manager: AsyncJobManager,
-	ownerId: string | undefined,
+	scope: HubJobScope,
+	transaction: HubAdmissionStateTransaction,
 ): AgentToolResult<CoordinationDetails> {
-	const jobs = manager.getAllJobs(ownerId ? { ownerId } : undefined);
-	return buildJobResult(session, manager, "jobs", jobs, [], runningAgentsOutsideJobs(session));
+	const ownerId = resolveJobOwnerId(scope);
+	const snapshot = transaction.select(() => ({
+		jobs: manager.getAllJobs(ownerId ? { ownerId } : undefined),
+		agents: runningAgentsOutsideJobs(session),
+	}));
+	return buildJobResult(session, manager, scope, transaction, "jobs", snapshot.jobs, [], snapshot.agents);
 }
 
 // =============================================================================
@@ -468,7 +501,7 @@ function toJobRenderArgs(args: HubRenderArgs | undefined): JobRenderArgs | undef
 	if (!args) return undefined;
 	switch (args.op) {
 		case "wait":
-			return { poll: args.ids };
+			return { poll: args.ids ?? [] };
 		case "cancel":
 			return { cancel: args.ids ?? [] };
 		case "jobs":

@@ -7,7 +7,12 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
-import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type {
+	ExtensionActorIdentity,
+	ExtensionRunner,
+	RegisteredTool,
+	ToolDefinition,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { createBashTool } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -25,6 +30,23 @@ const bashResult = {
 	outputLines: 1,
 	outputBytes: 10,
 };
+
+const sessionActor: ExtensionActorIdentity = { id: "Main", kind: "main" };
+
+function createRegisteredBashTool(definition: ToolDefinition): RegisteredTool {
+	return { definition, extensionPath: "/test/extension.ts" };
+}
+
+function createExtensionRunnerDouble(overrides: Partial<ExtensionRunner> = {}): ExtensionRunner {
+	return {
+		getActor: () => sessionActor,
+		getPermissionScope: () => undefined,
+		hasHandlers: vi.fn(() => false),
+		emit: vi.fn().mockResolvedValue(undefined),
+		emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+		...overrides,
+	} as unknown as ExtensionRunner;
+}
 
 describe("AgentSession bash session ownership", () => {
 	let tempDir: TempDir;
@@ -77,12 +99,10 @@ describe("AgentSession bash session ownership", () => {
 	function createGatedBashRunner() {
 		const completion = Promise.withResolvers<{ result: typeof bashResult }>();
 		const emitUserBash = vi.fn(() => completion.promise);
-		const extensionRunner = {
+		const extensionRunner = createExtensionRunnerDouble({
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash"),
 			emitUserBash,
-			emit: vi.fn().mockResolvedValue(undefined),
-			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
-		} as unknown as ExtensionRunner;
+		});
 		return { completion, emitUserBash, extensionRunner };
 	}
 
@@ -133,12 +153,11 @@ describe("AgentSession bash session ownership", () => {
 			env: { ...spawn.env, OMP_USER_SHELL_ENV: "extension-value" },
 		}));
 		const definition = createBashTool(tempDir.path(), { spawnHook });
-		const extensionRunner = {
-			hasHandlers: vi.fn(() => false),
-			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
-			emit: vi.fn().mockResolvedValue(undefined),
-			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
-		} as unknown as ExtensionRunner;
+		const extensionRunner = createExtensionRunnerDouble({
+			getRegisteredTool: vi.fn((name: string) =>
+				name === "bash" ? createRegisteredBashTool(definition) : undefined,
+			),
+		});
 		createSession(undefined, extensionRunner);
 
 		const result = await session.executeBash('printf "%s" "$OMP_USER_SHELL_ENV"', undefined, {
@@ -178,12 +197,11 @@ describe("AgentSession bash session ownership", () => {
 				env: { ...spawn.env, OMP_USER_SHELL_MIRROR: "mirrored-value" },
 			}));
 			const definition = createBashTool(tempDir.path(), { spawnHook });
-			const extensionRunner = {
-				hasHandlers: vi.fn(() => false),
-				getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
-				emit: vi.fn().mockResolvedValue(undefined),
-				emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
-			} as unknown as ExtensionRunner;
+			const extensionRunner = createExtensionRunnerDouble({
+				getRegisteredTool: vi.fn((name: string) =>
+					name === "bash" ? createRegisteredBashTool(definition) : undefined,
+				),
+			});
 			createSession(undefined, extensionRunner);
 
 			const result = await session.executeBash('printf "%s" "$OMP_USER_SHELL_MIRROR"', undefined, {
@@ -221,12 +239,11 @@ describe("AgentSession bash session ownership", () => {
 			return context;
 		});
 		const definition = createBashTool(tempDir.path(), { spawnHook });
-		const extensionRunner = {
-			hasHandlers: vi.fn(() => false),
-			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
-			emit: vi.fn().mockResolvedValue(undefined),
-			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
-		} as unknown as ExtensionRunner;
+		const extensionRunner = createExtensionRunnerDouble({
+			getRegisteredTool: vi.fn((name: string) =>
+				name === "bash" ? createRegisteredBashTool(definition) : undefined,
+			),
+		});
 		createSession(undefined, extensionRunner);
 		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash").mockResolvedValue(bashResult);
 
@@ -245,19 +262,20 @@ describe("AgentSession bash session ownership", () => {
 		});
 		const definition = createBashTool(tempDir.path(), { spawnHook });
 		const emitUserBash = vi.fn().mockResolvedValue({ result: bashResult });
-		const extensionRunner = {
+		const extensionRunner = createExtensionRunnerDouble({
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash"),
 			emitUserBash,
-			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
-			emit: vi.fn().mockResolvedValue(undefined),
-			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
-		} as unknown as ExtensionRunner;
+			getRegisteredTool: vi.fn((name: string) =>
+				name === "bash" ? createRegisteredBashTool(definition) : undefined,
+			),
+		});
 		createSession(undefined, extensionRunner);
 
 		const result = await session.executeBash("replaced-command", undefined, { useUserShell: true });
 
 		expect(result).toEqual(bashResult);
 		expect(spawnHook).not.toHaveBeenCalled();
+		expect(emitUserBash).toHaveBeenCalledWith(expect.objectContaining({ actor: sessionActor }));
 	});
 
 	it("keeps a queued bash result on the branch discarded by an empty stop", async () => {

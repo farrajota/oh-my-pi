@@ -1,21 +1,36 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import {
+	installSessionOperationLedger,
+	markUnregisteredSessionOperationProjection,
+} from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { Shell } from "@oh-my-pi/pi-natives";
 
-afterEach(() => {
+const sessionManagers = new Set<SessionManager>();
+
+afterEach(async () => {
 	mock.restore();
+	await Promise.all([...sessionManagers].map(sessionManager => sessionManager.close()));
+	sessionManagers.clear();
 });
 
 function makeSession(asyncJobManager?: AsyncJobManager): ToolSession {
+	const sessionManager = SessionManager.inMemory("/tmp");
+	installSessionOperationLedger(sessionManager);
+	markUnregisteredSessionOperationProjection(sessionManager, false);
+	sessionManagers.add(sessionManager);
+
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		skills: [],
-		getSessionFile: () => null,
-		getSessionId: () => "bash-label-test",
+		getSessionFile: () => sessionManager.getSessionFile() ?? null,
+		getSessionId: () => sessionManager.getSessionId(),
 		getAgentId: () => "bash-label-owner",
+		sessionManager,
 		asyncJobManager,
 		settings: {
 			get(key: string) {

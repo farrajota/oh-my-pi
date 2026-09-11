@@ -1,4 +1,6 @@
 import type { BackgroundControlResult } from "../async/job-manager";
+import { releaseAgent } from "../internal/agent-lifecycle-bridge";
+import { lookupAgentRef, resolveAgentObservation, type InternalAgentRef } from "../internal/agent-registry-bridge";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
 import type { AgentLifecycleManager } from "./agent-lifecycle";
 import type { AgentRef, AgentRegistry } from "./agent-registry";
@@ -21,21 +23,21 @@ function unavailable(id: string, message: string): BackgroundControlResult {
 	return { id, status: "not_found", message };
 }
 
-function isDescendant(registry: AgentRegistry, ref: AgentRef, ownerId: string): boolean {
+function isDescendant(registry: AgentRegistry, ref: InternalAgentRef, ownerId: string): boolean {
 	const visited = new Set<string>([ref.id]);
 	let parentId = ref.parentId;
 	while (parentId) {
 		if (parentId === ownerId) return true;
 		if (visited.has(parentId)) return false;
 		visited.add(parentId);
-		const parent = registry.get(parentId);
+		const parent = lookupAgentRef(registry, parentId);
 		if (!parent) return false;
 		parentId = parent.parentId;
 	}
 	return false;
 }
 
-function isAuthorized(registry: AgentRegistry, ref: AgentRef, policy: AgentTerminationPolicy): boolean {
+function isAuthorized(registry: AgentRegistry, ref: InternalAgentRef, policy: AgentTerminationPolicy): boolean {
 	if (policy.scope === "unrestricted") return true;
 	if (ref.id === policy.ownerId) return false;
 	if (policy.scope === "direct-child") return ref.parentId === policy.ownerId;
@@ -49,10 +51,10 @@ function isAuthorized(registry: AgentRegistry, ref: AgentRef, policy: AgentTermi
  */
 export async function terminateSubagent(options: TerminateSubagentOptions): Promise<BackgroundControlResult> {
 	const { registry, lifecycle, targetId, policy, expectedRef } = options;
-	const ref = registry.get(targetId);
-	if (expectedRef !== undefined && ref !== expectedRef) {
-		return unavailable(targetId, `Subagent not found: ${targetId}`);
-	}
+	if (!expectedRef) return unavailable(targetId, `Subagent not found: ${targetId}`);
+	const ref = lookupAgentRef(registry, targetId);
+	const expected = ref === expectedRef ? ref : resolveAgentObservation(registry, expectedRef);
+	if (!expected || ref !== expected) return unavailable(targetId, `Subagent not found: ${targetId}`);
 	if (ref?.kind !== "sub" || ref.id === MAIN_AGENT_ID) {
 		return unavailable(targetId, `Subagent not found: ${targetId}`);
 	}
@@ -75,8 +77,9 @@ export async function terminateSubagent(options: TerminateSubagentOptions): Prom
 		}
 	}
 	try {
-		const released = await lifecycle.release(targetId, ref, { tombstone: true });
-		if (!released || registry.get(targetId) !== ref || registry.get(targetId)?.status !== "aborted") {
+		const released = await releaseAgent(lifecycle, targetId, ref, { tombstone: true });
+		const current = lookupAgentRef(registry, targetId);
+		if (!released || current !== ref || current.status !== "aborted") {
 			return {
 				id: targetId,
 				status: "already_completed",

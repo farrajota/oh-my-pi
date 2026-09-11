@@ -12,7 +12,8 @@ import type { ToolSession } from "../sdk";
 import type { SessionEntry } from "../session/session-entries";
 import { framedBlock, renderStatusLine, renderTreeList } from "../tui";
 import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
-import { formatErrorDetail, formatMoreItems, PREVIEW_LIMITS, pluralize, replaceTabs } from "./render-utils";
+import { formatErrorDetail, formatMoreItems, pluralize, replaceTabs } from "./render-utils";
+import { PREVIEW_LIMITS } from "./preview-limits";
 
 // =============================================================================
 // Types

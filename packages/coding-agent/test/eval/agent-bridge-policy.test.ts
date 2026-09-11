@@ -15,7 +15,19 @@ import { AgentProtocolHandler } from "../../src/internal-urls/agent-protocol";
 import { resetRegisteredArtifactDirsForTests } from "../../src/internal-urls/registry-helpers";
 import type { PlanModeState } from "../../src/plan-mode/state";
 import { AgentRegistry } from "../../src/registry/agent-registry";
+import {
+	getAgentLifecycleManager,
+	registerToolSessionLifecycleAuthority,
+	resetAgentLifecycleForTests,
+} from "../../src/internal/agent-lifecycle-bridge";
+import {
+	installSessionOperationLedger,
+	markUnregisteredSessionOperationProjection,
+} from "../../src/registry/operation-lease";
 import type { AgentSession } from "../../src/session/agent-session";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
+import { SessionManager } from "../../src/session/session-manager";
+import { ArtifactManager } from "../../src/session/artifacts";
 import * as taskDiscovery from "../../src/task/discovery";
 import type { ExecutorOptions } from "../../src/task/executor";
 import * as taskExecutor from "../../src/task/executor";
@@ -42,6 +54,12 @@ const reviewerAgent = {
 } satisfies AgentDefinition;
 
 const jobManagers = new Set<AsyncJobManager>();
+const authoritySessions = new Set<AgentSession>();
+async function disposeAuthoritySessions(): Promise<void> {
+	await Promise.all([...authoritySessions].map(session => session.dispose()));
+	authoritySessions.clear();
+	resetAgentLifecycleForTests();
+}
 
 function isEvalAgentResult(value: unknown): value is EvalAgentResult {
 	return (
@@ -83,7 +101,7 @@ interface SessionOptions {
 	outputSchema?: unknown;
 }
 
-function makeSession(options: SessionOptions = {}): ToolSession {
+async function makeSession(options: SessionOptions = {}): Promise<ToolSession> {
 	const settings =
 		options.settings ??
 		Settings.isolated({
@@ -94,11 +112,33 @@ function makeSession(options: SessionOptions = {}): ToolSession {
 	const artifactsDir = options.artifactsDir ?? null;
 	const asyncJobManager = new AsyncJobManager({});
 	jobManagers.add(asyncJobManager);
-	return {
+	const sessionManager = SessionManager.inMemory(options.cwd ?? process.cwd());
+	installSessionOperationLedger(sessionManager);
+	markUnregisteredSessionOperationProjection(sessionManager, false);
+	const registry = new AgentRegistry();
+	const root = await createAgentRootSession(registry, {
+		agentId: "Main",
+		agentDisplayName: "Main",
+		cwd: options.cwd ?? process.cwd(),
+		agentDir: options.cwd ?? process.cwd(),
+		settings,
+		disableExtensionDiscovery: true,
+		enableMCP: false,
+		enableLsp: false,
+		toolNames: [],
+		skipPythonPreflight: true,
+	});
+	const authorityBinding = bindInternalAgentAuthoritySession(registry, root.session);
+	if (!authorityBinding) throw new Error("Test fixture requires a live parent-bound authority session.");
+	authoritySessions.add(root.session);
+	const session = {
 		cwd: options.cwd ?? process.cwd(),
 		hasUI: false,
 		settings,
+		sessionManager,
 		asyncJobManager,
+		agentRegistry: registry,
+		createAuthoritySession: (options, reviveRef) => authorityBinding.create(options, reviveRef),
 		taskDepth: options.depth ?? 0,
 		enableLsp: options.enableLsp ?? true,
 		agentOutputManager: options.outputManager,
@@ -117,7 +157,9 @@ function makeSession(options: SessionOptions = {}): ToolSession {
 						planFilePath: path.join(options.cwd ?? process.cwd(), "plan.md"),
 					}) satisfies PlanModeState
 			: undefined,
-	};
+	} satisfies ToolSession;
+	registerToolSessionLifecycleAuthority(session, registry, root.session);
+	return session;
 }
 
 function mockAgents(agents: AgentDefinition[] = [taskAgent, reviewerAgent]): void {
@@ -162,14 +204,14 @@ function singleResult(options: ExecutorOptions, overrides: Partial<SingleResult>
 	};
 }
 
-function makeEvalSession(
+async function makeEvalSession(
 	tempDir: TempDir,
 	prefix: string,
 	settings?: Settings,
-): { session: ToolSession; sessionFile: string; sessionId: string } {
+): Promise<{ session: ToolSession; sessionFile: string; sessionId: string }> {
 	const sessionFile = path.join(tempDir.path(), "session.jsonl");
 	const artifactsDir = sessionFile.slice(0, -6);
-	const session = makeSession({
+	const session = await makeSession({
 		cwd: tempDir.path(),
 		sessionFile,
 		artifactsDir,
@@ -182,10 +224,10 @@ function makeEvalSession(
 describe("runEvalAgent", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		AgentRegistry.resetGlobalForTests();
 		resetRegisteredArtifactDirsForTests();
 		await Promise.all([...jobManagers].map(manager => manager.dispose()));
 		jobManagers.clear();
+		await disposeAuthoritySessions();
 	});
 
 	it("resolves the default task agent and agent overrides", async () => {
@@ -195,7 +237,7 @@ describe("runEvalAgent", () => {
 				output: options.agent.name,
 			}),
 		);
-		const session = makeSession();
+		const session = await makeSession();
 
 		const defaultResult = await runEvalAgentAndWait({ prompt: "hello" }, { session });
 		const overrideResult = await runEvalAgentAndWait({ prompt: "hello", agent: "reviewer" }, { session });
@@ -211,7 +253,7 @@ describe("runEvalAgent", () => {
 		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 
 		await expect(
-			runEvalAgentAndWait({ prompt: "hello", agent: "missing" }, { session: makeSession() }),
+			runEvalAgentAndWait({ prompt: "hello", agent: "missing" }, { session: await makeSession() }),
 		).rejects.toThrow('Unknown agent "missing"');
 	});
 
@@ -219,11 +261,14 @@ describe("runEvalAgent", () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 
-		await expect(runEvalAgentAndWait({ prompt: "hello" }, { session: makeSession({ spawns: "" }) })).rejects.toThrow(
-			"spawns disabled",
-		);
 		await expect(
-			runEvalAgentAndWait({ prompt: "hello", agent: "task" }, { session: makeSession({ spawns: "reviewer" }) }),
+			runEvalAgentAndWait({ prompt: "hello" }, { session: await makeSession({ spawns: "" }) }),
+		).rejects.toThrow("spawns disabled");
+		await expect(
+			runEvalAgentAndWait(
+				{ prompt: "hello", agent: "task" },
+				{ session: await makeSession({ spawns: "reviewer" }) },
+			),
 		).rejects.toThrow("Allowed: reviewer");
 		expect(runSpy).not.toHaveBeenCalled();
 	});
@@ -238,7 +283,7 @@ describe("runEvalAgent", () => {
 
 		const result = await runEvalAgentAndWait(
 			{ prompt: "hello" },
-			{ session: makeSession({ spawns: "reviewer,task" }) },
+			{ session: await makeSession({ spawns: "reviewer,task" }) },
 		);
 
 		expect(result.text).toBe("reviewer");
@@ -253,7 +298,7 @@ describe("runEvalAgent", () => {
 			runEvalAgentAndWait(
 				{ prompt: "hello" },
 				{
-					session: makeSession({
+					session: await makeSession({
 						settings: Settings.isolated({
 							"async.enabled": false,
 							"task.isolation.enabled": false,
@@ -267,7 +312,7 @@ describe("runEvalAgent", () => {
 		await runEvalAgentAndWait(
 			{ prompt: "hello" },
 			{
-				session: makeSession({
+				session: await makeSession({
 					depth: 3,
 					settings: Settings.isolated({
 						"async.enabled": false,
@@ -285,7 +330,7 @@ describe("runEvalAgent", () => {
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 
 		await expect(
-			runEvalAgentAndWait({ prompt: "hello" }, { session: makeSession({ planMode: true }) }),
+			runEvalAgentAndWait({ prompt: "hello" }, { session: await makeSession({ planMode: true }) }),
 		).resolves.toMatchObject({
 			text: "ok",
 		});
@@ -293,7 +338,7 @@ describe("runEvalAgent", () => {
 		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["read", "grep", "glob", "web_search", "ast_grep"]);
 		expect(runSpy.mock.calls[0]?.[0].agent.spawns).toBeUndefined();
 		await expect(
-			runEvalAgentAndWait({ prompt: "unsafe", isolated: true }, { session: makeSession({ planMode: true }) }),
+			runEvalAgentAndWait({ prompt: "unsafe", isolated: true }, { session: await makeSession({ planMode: true }) }),
 		).rejects.toThrow("isolation, apply, and merge controls are unavailable in plan mode");
 		expect(runSpy).toHaveBeenCalledTimes(1);
 	});
@@ -303,7 +348,7 @@ describe("runEvalAgent", () => {
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 		const abortController = new AbortController();
 		const schema = { type: "object", properties: { ok: { type: "boolean" } } };
-		const session = makeSession({
+		const session = await makeSession({
 			depth: 2,
 			activeModel: "p/current",
 			modelString: "p/fallback",
@@ -348,8 +393,8 @@ describe("runEvalAgent", () => {
 		// The schema strips unknown keys; a legacy `model` argument is silently
 		// discarded so resolution is identical to omitting it — the agent's own
 		// frontmatter model applies (issue #6438).
-		await runEvalAgentAndWait({ prompt: "work", model: "default" }, { session: makeSession() });
-		await runEvalAgentAndWait({ prompt: "work" }, { session: makeSession() });
+		await runEvalAgentAndWait({ prompt: "work", model: "default" }, { session: await makeSession() });
+		await runEvalAgentAndWait({ prompt: "work" }, { session: await makeSession() });
 
 		const withModel = runSpy.mock.calls[0]?.[0];
 		const withoutModel = runSpy.mock.calls[1]?.[0];
@@ -378,15 +423,15 @@ describe("runEvalAgent", () => {
 
 		const caller = await runEvalAgentAndWait(
 			{ prompt: "caller", schema: callerSchema, schemaMode: "strict" },
-			{ session: makeSession({ outputSchema: sessionSchema }) },
+			{ session: await makeSession({ outputSchema: sessionSchema }) },
 		);
 		const frontmatter = await runEvalAgentAndWait(
 			{ prompt: "agent", agent: "structured" },
-			{ session: makeSession({ outputSchema: sessionSchema }) },
+			{ session: await makeSession({ outputSchema: sessionSchema }) },
 		);
 		const inherited = await runEvalAgentAndWait(
 			{ prompt: "session" },
-			{ session: makeSession({ outputSchema: sessionSchema }) },
+			{ session: await makeSession({ outputSchema: sessionSchema }) },
 		);
 
 		expect(caller.data).toEqual({ source: "caller" });
@@ -404,7 +449,7 @@ describe("runEvalAgent", () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 		// makeSession() defaults to enableLsp: true and task.enableLsp: true.
-		const session = makeSession();
+		const session = await makeSession();
 
 		await runEvalAgentAndWait({ prompt: "hello" }, { session });
 
@@ -420,19 +465,24 @@ describe("runEvalAgent", () => {
 		mockAgents();
 		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
 			if (!options.artifactsDir) throw new Error("artifactsDir missing");
-			await fs.mkdir(options.artifactsDir, { recursive: true });
-			await fs.writeFile(path.join(options.artifactsDir, `${options.id}.md`), "recoverable output");
+			const manager = new ArtifactManager(options.artifactsDir);
+			await manager.publishAgentArtifacts(options.id, "recoverable output", undefined, {
+				provenance: "test-eval-agent-bridge",
+				scope: "in-memory-handle",
+			});
 			return singleResult(options, { output: "recoverable output" });
 		});
 
-		const result = await runEvalAgentAndWait({ prompt: "hello", handle: true }, { session: makeSession() });
+		const result = await runEvalAgentAndWait({ prompt: "hello", handle: true }, { session: await makeSession() });
 		const resource = await new AgentProtocolHandler().resolve(new URL(`agent://${result.details.id}`) as never);
 
 		expect(resource.content).toBe("recoverable output");
 	});
 
 	it("retains eval subagents for handle follow-up", async () => {
-		AgentRegistry.resetGlobalForTests();
+		const session = await makeSession();
+		const agentRegistry = session.agentRegistry;
+		if (!agentRegistry) throw new Error("Missing test registry");
 		mockAgents();
 		const order: string[] = [];
 		let disposed = false;
@@ -450,7 +500,7 @@ describe("runEvalAgent", () => {
 			},
 		} as unknown as AgentSession;
 		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
-			AgentRegistry.global().register({
+			agentRegistry.register({
 				id: options.id,
 				displayName: options.id,
 				kind: "sub",
@@ -465,20 +515,18 @@ describe("runEvalAgent", () => {
 				isolated: options.worktree !== undefined,
 				agentIdleTtlMs: 0,
 				reviveSession: null,
+				agentRegistry,
+				agentLifecycle: getAgentLifecycleManager(agentRegistry),
 			});
 			return singleResult(options);
 		});
 
-		await runEvalAgentAndWait({ prompt: "hello", label: "Cleanup" }, { session: makeSession() });
+		await runEvalAgentAndWait({ prompt: "hello", label: "Cleanup" }, { session });
 
 		expect(disposed).toBe(false);
 		expect(order).toEqual([]);
-		expect(AgentRegistry.global().get("Cleanup")?.status).toBe("idle");
-		expect(
-			AgentRegistry.global()
-				.listVisibleTo("Main")
-				.map(ref => ref.id),
-		).toContain("Cleanup");
+		expect(agentRegistry.get("Cleanup")?.status).toBe("idle");
+		expect(agentRegistry.listVisibleTo("Main").map(ref => ref.id)).toContain("Cleanup");
 	});
 
 	it("maps successful and failed subagent results", async () => {
@@ -500,12 +548,12 @@ describe("runEvalAgent", () => {
 			}),
 		);
 
-		const result = await runEvalAgentAndWait({ prompt: "hello" }, { session: makeSession() });
+		const result = await runEvalAgentAndWait({ prompt: "hello" }, { session: await makeSession() });
 		expect(result).toEqual({
 			text: "done",
 			details: { agent: "task", id: "0-EvalAgent", model: "p/model", structured: false },
 		});
-		await expect(runEvalAgentAndWait({ prompt: "fail" }, { session: makeSession() })).rejects.toThrow("boom");
+		await expect(runEvalAgentAndWait({ prompt: "fail" }, { session: await makeSession() })).rejects.toThrow("boom");
 	});
 
 	// Regression: a runtime-limit abort returns exitCode=1, stderr="", error=undefined,
@@ -545,16 +593,16 @@ describe("runEvalAgent", () => {
 			}),
 		);
 
-		await expect(runEvalAgentAndWait({ prompt: "slow" }, { session: makeSession() })).rejects.toThrow(
+		await expect(runEvalAgentAndWait({ prompt: "slow" }, { session: await makeSession() })).rejects.toThrow(
 			"Subagent runtime limit exceeded (task.maxRuntimeMs=900000)",
 		);
 		// Whitespace-only stderr/error must not mask abortReason either.
-		await expect(runEvalAgentAndWait({ prompt: "cancelled" }, { session: makeSession() })).rejects.toThrow(
+		await expect(runEvalAgentAndWait({ prompt: "cancelled" }, { session: await makeSession() })).rejects.toThrow(
 			"Cancelled by caller",
 		);
 		// Last resort: still produce a non-empty message even when nothing useful is set,
 		// so Python never falls back to `bridge call '__agent__' failed`.
-		await expect(runEvalAgentAndWait({ prompt: "blank" }, { session: makeSession() })).rejects.toThrow(
+		await expect(runEvalAgentAndWait({ prompt: "blank" }, { session: await makeSession() })).rejects.toThrow(
 			"agent() subagent 'task' failed.",
 		);
 	});
@@ -569,9 +617,12 @@ describe("agent() through eval runtimes", () => {
 	// these tests observe. Torn down in afterAll via disposeAllVmContexts().
 	const sharedJsSessionId = "agent-bridge-shared-js";
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		vi.useRealTimers();
+		await Promise.all([...jobManagers].map(manager => manager.dispose()));
+		jobManagers.clear();
+		await disposeAuthoritySessions();
 	});
 
 	afterAll(async () => {
@@ -581,7 +632,7 @@ describe("agent() through eval runtimes", () => {
 
 	it("exposes agent() in JavaScript and parses structured output", async () => {
 		using tempDir = TempDir.createSync("@omp-eval-agent-js-");
-		const { session, sessionFile } = makeEvalSession(tempDir, "js-agent");
+		const { session, sessionFile } = await makeEvalSession(tempDir, "js-agent");
 		mockAgents();
 		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options =>
 			singleResult(options, {
@@ -620,7 +671,7 @@ describe("agent() through eval runtimes", () => {
 
 	it("runs JavaScript agent handles concurrently and returns results in input order", async () => {
 		using tempDir = TempDir.createSync("@omp-eval-agent-js-handles-");
-		const { session, sessionFile } = makeEvalSession(tempDir, "js-agent-handles");
+		const { session, sessionFile } = await makeEvalSession(tempDir, "js-agent-handles");
 		mockAgents();
 		const overlap = spyOverlapBarrier(4);
 
@@ -636,7 +687,7 @@ describe("agent() through eval runtimes", () => {
 
 	it("propagates handle failures or returns them in place when requested", async () => {
 		using tempDir = TempDir.createSync("@omp-eval-agent-js-handle-errors-");
-		const { session, sessionFile } = makeEvalSession(tempDir, "js-agent-handle-errors");
+		const { session, sessionFile } = await makeEvalSession(tempDir, "js-agent-handle-errors");
 		mockAgents();
 		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
 			if (options.assignment === "bad") {
@@ -665,7 +716,7 @@ describe("agent() through eval runtimes", () => {
 
 	it("exposes agent() in the Python runtime", async () => {
 		using tempDir = TempDir.createSync("@omp-eval-agent-py-");
-		const { session, sessionFile, sessionId } = makeEvalSession(tempDir, "py-agent");
+		const { session, sessionFile, sessionId } = await makeEvalSession(tempDir, "py-agent");
 		mockAgents();
 		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options =>
 			singleResult(options, {
@@ -709,7 +760,7 @@ describe("agent() through eval runtimes", () => {
 
 	it("runs Python agent handles concurrently and returns results in input order", async () => {
 		using tempDir = TempDir.createSync("@omp-eval-agent-py-handles-");
-		const { session, sessionFile, sessionId } = makeEvalSession(tempDir, "py-agent-handles");
+		const { session, sessionFile, sessionId } = await makeEvalSession(tempDir, "py-agent-handles");
 		mockAgents();
 		const overlap = spyOverlapBarrier(4);
 
@@ -728,7 +779,7 @@ describe("agent() through eval runtimes", () => {
 
 	it("streams the latest enriched agent progress through onStatus before the cell finishes", async () => {
 		using tempDir = TempDir.createSync("@omp-eval-agent-progress-");
-		const { session, sessionFile } = makeEvalSession(tempDir, "js-agent-progress");
+		const { session, sessionFile } = await makeEvalSession(tempDir, "js-agent-progress");
 		mockAgents();
 		const releaseCompletion = Promise.withResolvers<void>();
 
@@ -828,7 +879,7 @@ describe("agent() through eval runtimes", () => {
 
 	it("pauses the idle watchdog while a quiet agent() runs past the budget", async () => {
 		using tempDir = TempDir.createSync("@omp-eval-agent-timeout-pause-");
-		const { session } = makeEvalSession(
+		const { session } = await makeEvalSession(
 			tempDir,
 			"js-agent-timeout-pause",
 			Settings.isolated({ "task.maxRuntimeMs": 1 }),
@@ -896,7 +947,7 @@ describe("agent() through eval runtimes", () => {
 
 	it("keeps timeout paused despite agent() progress snapshots", async () => {
 		using tempDir = TempDir.createSync("@omp-eval-agent-progress-timeout-pause-");
-		const { session } = makeEvalSession(tempDir, "js-agent-progress-timeout-pause");
+		const { session } = await makeEvalSession(tempDir, "js-agent-progress-timeout-pause");
 		mockAgents();
 
 		// Stream frequent progress snapshots (op:"agent") well past the budget.
@@ -980,7 +1031,7 @@ describe("agent() through eval runtimes", () => {
 		// Asserted as an ordering, not a duration: the agent call must finish
 		// before the cell settles. Killing early inverts the two.
 		using tempDir = TempDir.createSync("@omp-eval-agent-js-interrupt-");
-		const { session, sessionFile } = makeEvalSession(tempDir, "js-agent-interrupt");
+		const { session, sessionFile } = await makeEvalSession(tempDir, "js-agent-interrupt");
 		mockAgents();
 
 		const order: string[] = [];
@@ -1040,11 +1091,14 @@ describe("agent() through eval runtimes", () => {
 });
 
 describe("runEvalAgent isolation", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await Promise.all([...jobManagers].map(manager => manager.dispose()));
+		jobManagers.clear();
+		await disposeAuthoritySessions();
 	});
 
-	function isolatedSession(overrides: Partial<Parameters<typeof Settings.isolated>[0]> = {}): ToolSession {
+	function isolatedSession(overrides: Partial<Parameters<typeof Settings.isolated>[0]> = {}): Promise<ToolSession> {
 		return makeSession({
 			settings: Settings.isolated({
 				"async.enabled": false,
@@ -1072,7 +1126,7 @@ describe("runEvalAgent isolation", () => {
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 		const prepSpy = vi.spyOn(isolationRunner, "prepareIsolationContext");
 
-		const session = makeSession();
+		const session = await makeSession();
 
 		await expect(runEvalAgentAndWait({ prompt: "do work", isolated: true }, { session })).rejects.toThrow(
 			"task.isolation.enabled; it is currently false",
@@ -1098,7 +1152,7 @@ describe("runEvalAgent isolation", () => {
 		});
 
 		// Default (no isolated arg) — stays non-isolated even when settings allow it.
-		const defaultResult = await runEvalAgentAndWait({ prompt: "default" }, { session: isolatedSession() });
+		const defaultResult = await runEvalAgentAndWait({ prompt: "default" }, { session: await isolatedSession() });
 		expect(plainSpy).toHaveBeenCalledTimes(1);
 		expect(isolatedSpy).not.toHaveBeenCalled();
 		expect(defaultResult.details.isolated).toBeUndefined();
@@ -1106,7 +1160,10 @@ describe("runEvalAgent isolation", () => {
 		expect(mergeSpy).not.toHaveBeenCalled();
 
 		// Explicit isolated=true — opt-in turns it on and surfaces merge details.
-		const explicitOn = await runEvalAgentAndWait({ prompt: "on", isolated: true }, { session: isolatedSession() });
+		const explicitOn = await runEvalAgentAndWait(
+			{ prompt: "on", isolated: true },
+			{ session: await isolatedSession() },
+		);
 		expect(isolatedSpy).toHaveBeenCalledTimes(1);
 		expect(plainSpy).toHaveBeenCalledTimes(1);
 		expect(explicitOn.details.isolated).toBe(true);
@@ -1118,7 +1175,7 @@ describe("runEvalAgent isolation", () => {
 		const rmSpy = vi.spyOn(fs, "rm").mockResolvedValue(undefined);
 		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 
-		await runEvalAgentAndWait({ prompt: "plain handle", handle: true }, { session: makeSession() });
+		await runEvalAgentAndWait({ prompt: "plain handle", handle: true }, { session: await makeSession() });
 
 		const removedArtifactsDir = rmSpy.mock.calls.some(
 			([target]) => typeof target === "string" && target.includes("omp-eval-agent-"),
@@ -1143,7 +1200,7 @@ describe("runEvalAgent isolation", () => {
 		});
 
 		// Branch is the configured merge mode, but `merge: false` must demote to patch.
-		const session = isolatedSession({ "task.isolation.merge": "branch" });
+		const session = await isolatedSession({ "task.isolation.merge": "branch" });
 		const result = await runEvalAgentAndWait({ prompt: "migration", isolated: true, merge: false }, { session });
 
 		expect(isolatedSpy).toHaveBeenCalledTimes(1);
@@ -1177,7 +1234,7 @@ describe("runEvalAgent isolation", () => {
 		await runEvalAgentAndWait(
 			{ prompt: "migration", isolated: true },
 			{
-				session: isolatedSession(),
+				session: await isolatedSession(),
 				emitStatus: event => {
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP) ops.push(event.op);
 				},
@@ -1226,7 +1283,7 @@ describe("runEvalAgent isolation", () => {
 		await runEvalAgentAndWait(
 			{ prompt: "scout", isolated: true },
 			{
-				session: isolatedSession(),
+				session: await isolatedSession(),
 				emitStatus: event => {
 					if (event.op === EVAL_TIMEOUT_PAUSE_OP || event.op === EVAL_TIMEOUT_RESUME_OP) ops.push(event.op);
 				},
@@ -1268,7 +1325,7 @@ describe("runEvalAgent isolation", () => {
 					required: ["status"],
 				},
 			},
-			{ session: isolatedSession() },
+			{ session: await isolatedSession() },
 		);
 
 		expect(JSON.parse(result.text)).toEqual({ status: "ok" });
@@ -1304,7 +1361,7 @@ describe("runEvalAgent isolation", () => {
 						required: ["status"],
 					},
 				},
-				{ session: isolatedSession() },
+				{ session: await isolatedSession() },
 			),
 		).rejects.toThrow(/isolated apply failed.*Patch apply failed.*Captured patch preserved at \/artifacts\//s);
 	});
@@ -1321,7 +1378,7 @@ describe("runEvalAgent isolation", () => {
 		);
 		const mergeSpy = vi.spyOn(isolationRunner, "mergeIsolatedChanges");
 
-		const session = isolatedSession({ "task.isolation.merge": "branch" });
+		const session = await isolatedSession({ "task.isolation.merge": "branch" });
 		await expect(runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session })).rejects.toThrow(
 			/Merge failed.*garbage at end of loose object.*Captured patch preserved at \/artifacts\//s,
 		);
@@ -1344,7 +1401,7 @@ describe("runEvalAgent isolation", () => {
 			mergedBranchForNestedPatches: false,
 		});
 
-		const session = isolatedSession({ "task.isolation.merge": "branch" });
+		const session = await isolatedSession({ "task.isolation.merge": "branch" });
 		await expect(runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session })).rejects.toThrow(
 			/isolated apply failed.*Branch merge failed.*Captured branch preserved as omp\/task\//s,
 		);
@@ -1370,7 +1427,7 @@ describe("runEvalAgent isolation", () => {
 
 		let caught: Error | undefined;
 		try {
-			await runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session: isolatedSession() });
+			await runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session: await isolatedSession() });
 		} catch (err) {
 			caught = err as Error;
 		}
@@ -1416,7 +1473,7 @@ describe("runEvalAgent isolation", () => {
 						required: ["status"],
 					},
 				},
-				{ session: isolatedSession() },
+				{ session: await isolatedSession() },
 			),
 		).rejects.toThrow(
 			/nested patch apply failed.*Some nested repository patches failed to apply.*nested-0-sub_nested\.patch/s,
@@ -1436,7 +1493,7 @@ describe("runEvalAgent isolation", () => {
 
 		const result = await runEvalAgentAndWait(
 			{ prompt: "scout", isolated: true, apply: false },
-			{ session: isolatedSession() },
+			{ session: await isolatedSession() },
 		);
 
 		expect(mergeSpy).not.toHaveBeenCalled();
@@ -1458,7 +1515,7 @@ describe("runEvalAgent isolation", () => {
 		);
 		const mergeSpy = vi.spyOn(isolationRunner, "mergeIsolatedChanges");
 
-		const session = isolatedSession({ "task.isolation.merge": "branch" });
+		const session = await isolatedSession({ "task.isolation.merge": "branch" });
 		const result = await runEvalAgentAndWait({ prompt: "scout", isolated: true, apply: false }, { session });
 
 		expect(mergeSpy).not.toHaveBeenCalled();
@@ -1478,7 +1535,7 @@ describe("runEvalAgent isolation", () => {
 		);
 		const mergeSpy = vi.spyOn(isolationRunner, "mergeIsolatedChanges");
 
-		const session = isolatedSession({ "task.isolation.merge": "branch" });
+		const session = await isolatedSession({ "task.isolation.merge": "branch" });
 		const result = await runEvalAgentAndWait({ prompt: "scout", isolated: true, apply: false }, { session });
 
 		expect(mergeSpy).not.toHaveBeenCalled();
@@ -1499,7 +1556,7 @@ describe("runEvalAgent isolation", () => {
 
 		const result = await runEvalAgentAndWait(
 			{ prompt: "scout", isolated: true, apply: false },
-			{ session: isolatedSession() },
+			{ session: await isolatedSession() },
 		);
 
 		expect(result.details.patchPath).toMatch(/\.patch$/);
@@ -1523,7 +1580,7 @@ describe("runEvalAgent isolation", () => {
 			mergedBranchForNestedPatches: false,
 		});
 
-		await runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session: isolatedSession() });
+		await runEvalAgentAndWait({ prompt: "scout", isolated: true }, { session: await isolatedSession() });
 
 		const removedArtifactsDir = rmSpy.mock.calls.some(
 			([target]) => typeof target === "string" && target.includes("omp-eval-agent-"),

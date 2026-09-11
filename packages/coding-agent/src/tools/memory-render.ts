@@ -18,10 +18,10 @@ import {
 	createCachedComponent,
 	formatErrorMessage,
 	formatExpandHint,
-	PREVIEW_LIMITS,
 	replaceTabs,
 	type ToolUIStatus,
 } from "./render-utils";
+import { PREVIEW_LIMITS } from "./preview-limits";
 
 // Each stored memory renders as `<bullet> <content>`; the bullet glyph comes
 // from the active theme (`•` by default, a nerd-font dot under nerd themes).

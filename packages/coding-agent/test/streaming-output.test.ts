@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import {
 	enforceInlineByteCap,
 	formatHeadTruncationNotice,
@@ -307,6 +308,36 @@ describe("OutputSink", () => {
 		expect(dumped.artifactId).toBe("artifact-1");
 		expect(artifactText).toBe("abcdef");
 		expect(dumped.output).toBe("bcdef");
+	});
+
+	test("keeps manager-allocated streams invisible until dump closes and publishes them", async () => {
+		const dir = await createTempDir();
+		const manager = new ArtifactManager(dir);
+		const allocated = await manager.allocatePath("bash");
+		const sink = new OutputSink({
+			artifactPath: allocated.path,
+			artifactId: allocated.id,
+			spillThreshold: 5,
+		});
+
+		sink.push("abc");
+		sink.push("def");
+		expect(await manager.getPath(allocated.id)).toBeNull();
+		const dumped = await sink.dump();
+		const publishedPath = await manager.getPath(allocated.id);
+		expect(dumped.artifactId).toBe(allocated.id);
+		expect(publishedPath).not.toBeNull();
+		expect(await fs.readFile(publishedPath as string, "utf8")).toBe("abcdef");
+	});
+
+	test("does not publish a manager-allocated stream when disposal bypasses dump", async () => {
+		const dir = await createTempDir();
+		const manager = new ArtifactManager(dir);
+		const allocated = await manager.allocatePath("bash");
+		const sink = new OutputSink({ artifactPath: allocated.path, artifactId: allocated.id, spillThreshold: 1 });
+		sink.push("partial");
+		await sink.dispose();
+		expect(await manager.getPath(allocated.id)).toBeNull();
 	});
 
 	test("artifact file includes head-retained bytes when head retention is enabled", async () => {

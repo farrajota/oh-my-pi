@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AuthorizedFilesystemTarget, DurableOpenResource } from "../internal/session-path-scope";
 import type { ToolSession } from "../sdk";
 import { DEFAULT_MAX_LINES, truncateHead } from "../session/streaming-output";
 import { applyListLimit } from "./list-limit";
@@ -38,7 +39,29 @@ interface ResolvedSqliteReadPath {
 	sqliteSubPath: string;
 	queryString: string;
 	suffixResolution?: { from: string; to: string };
+	authorizedTargets?: readonly AuthorizedFilesystemTarget[];
 }
+async function authorizeSqlitePath(
+	session: ToolSession,
+	absolutePath: string,
+	requireDatabase: boolean,
+): Promise<{ absolutePath: string; targets?: readonly AuthorizedFilesystemTarget[] }> {
+	if (!session.pathScope) return { absolutePath };
+	const operation = session.pathScope.currentOperation();
+	const probes = await operation.preflight([
+		{ path: absolutePath, kind: "probe" },
+		{ path: `${absolutePath}-wal`, kind: "probe" },
+		{ path: `${absolutePath}-shm`, kind: "probe" },
+	]);
+	if (!requireDatabase) return { absolutePath: probes[0]!.canonicalTarget, targets: probes };
+	const finalCandidates = probes.map((target, index) => ({
+		path: target.canonicalTarget,
+		kind: index === 0 || target.existed ? ("read" as const) : ("probe" as const),
+	}));
+	const targets = await operation.preflight(finalCandidates);
+	return { absolutePath: targets[0]!.canonicalTarget, targets };
+}
+
 export async function resolveSqliteReadPath(
 	session: ToolSession,
 	readPath: string,
@@ -48,42 +71,38 @@ export async function resolveSqliteReadPath(
 	const candidates = parseSqlitePathCandidates(readPath);
 	for (const candidate of candidates) {
 		let absolutePath = resolveReadPath(candidate.sqlitePath, session.cwd);
-		let suffixResolution: { from: string; to: string } | undefined;
+		const initial = await authorizeSqlitePath(session, absolutePath, false);
+		absolutePath = initial.absolutePath;
 
 		try {
 			const stat = await Bun.file(absolutePath).stat();
-			if (stat.isDirectory()) continue;
-			if (!(await isSqliteFile(absolutePath))) continue;
-
+			if (stat.isDirectory() || !(await isSqliteFile(absolutePath))) continue;
+			const authorized = await authorizeSqlitePath(session, absolutePath, true);
 			return {
-				absolutePath,
+				absolutePath: authorized.absolutePath,
 				sqliteSubPath: candidate.subPath,
 				queryString: candidate.queryString,
-				suffixResolution,
+				authorizedTargets: authorized.targets,
 			};
 		} catch (error) {
 			if (!isNotFoundError(error) || isRemoteMountPath(absolutePath)) continue;
-
 			const suffixMatch = await findSuffixMatchCached(session, suffixCache, candidate.sqlitePath, signal);
 			if (!suffixMatch) continue;
 
 			try {
-				const retryStat = await Bun.file(suffixMatch.absolutePath).stat();
-				if (retryStat.isDirectory()) continue;
-				if (!(await isSqliteFile(suffixMatch.absolutePath))) continue;
-
-				absolutePath = suffixMatch.absolutePath;
-				suffixResolution = { from: candidate.sqlitePath, to: suffixMatch.displayPath };
+				const probe = await authorizeSqlitePath(session, suffixMatch.absolutePath, false);
+				const retryStat = await Bun.file(probe.absolutePath).stat();
+				if (retryStat.isDirectory() || !(await isSqliteFile(probe.absolutePath))) continue;
+				const authorized = await authorizeSqlitePath(session, probe.absolutePath, true);
 				return {
-					absolutePath,
+					absolutePath: authorized.absolutePath,
 					sqliteSubPath: candidate.subPath,
 					queryString: candidate.queryString,
-					suffixResolution,
+					suffixResolution: { from: candidate.sqlitePath, to: suffixMatch.displayPath },
+					authorizedTargets: authorized.targets,
 				};
 			} catch (retryError) {
-				if (!isNotFoundError(retryError)) {
-					throw retryError;
-				}
+				if (!isNotFoundError(retryError)) throw retryError;
 			}
 		}
 	}
@@ -91,6 +110,7 @@ export async function resolveSqliteReadPath(
 	return null;
 }
 export async function readSqlite(
+	session: ToolSession,
 	resolvedSqlitePath: ResolvedSqliteReadPath,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<ReadToolDetails>> {
@@ -107,8 +127,26 @@ export async function readSqlite(
 	};
 
 	let db: Database | null = null;
+	let durableResource: DurableOpenResource | undefined;
+	let result: AgentToolResult<ReadToolDetails> | undefined;
+	let operationError: unknown;
+	let operationFailed = false;
 	try {
+		if (session.pathScope && resolvedSqlitePath.authorizedTargets) {
+			const operation = session.pathScope.currentOperation();
+			for (const target of resolvedSqlitePath.authorizedTargets) await operation.verify(target);
+		}
+		if (session.pathScope && resolvedSqlitePath.authorizedTargets?.[0]) {
+			durableResource = session.pathScope
+				.currentOperation()
+				.beginOpenResource(resolvedSqlitePath.authorizedTargets[0], "sqlite");
+		}
 		db = await openSqliteReadConnection(resolvedSqlitePath.absolutePath);
+		durableResource?.effect();
+		if (session.pathScope && resolvedSqlitePath.authorizedTargets) {
+			const operation = session.pathScope.currentOperation();
+			for (const target of resolvedSqlitePath.authorizedTargets) await operation.verify(target);
+		}
 		throwIfAborted(signal);
 
 		switch (selector.kind) {
@@ -127,7 +165,8 @@ export async function readSqlite(
 				if (truncation.truncated) {
 					resultBuilder.truncation(truncation, { direction: "head" });
 				}
-				return resultBuilder.done();
+				result = resultBuilder.done();
+				break;
 			}
 			case "schema": {
 				const sampleRows = queryRows(db, selector.table, { limit: selector.sampleLimit, offset: 0 });
@@ -139,10 +178,11 @@ export async function readSqlite(
 					const remaining = sampleRows.totalCount - sampleRows.rows.length;
 					output += `\n[${remaining} more rows; append :${selector.table}?limit=20&offset=${sampleRows.rows.length} to the database path to continue]`;
 				}
-				return toolResult<ReadToolDetails>(details)
+				result = toolResult<ReadToolDetails>(details)
 					.text(prependSuffixResolutionNotice(output, resolvedSqlitePath.suffixResolution))
 					.sourcePath(resolvedSqlitePath.absolutePath)
 					.done();
+				break;
 			}
 			case "row": {
 				const lookup = resolveTableRowLookup(db, selector.table);
@@ -151,7 +191,7 @@ export async function readSqlite(
 						? getRowByKey(db, selector.table, lookup, selector.key)
 						: getRowByRowId(db, selector.table, selector.key);
 				if (!row) {
-					return toolResult<ReadToolDetails>(details)
+					result = toolResult<ReadToolDetails>(details)
 						.text(
 							prependSuffixResolutionNotice(
 								`No row found in table '${selector.table}' for key '${selector.key}'.`,
@@ -160,15 +200,17 @@ export async function readSqlite(
 						)
 						.sourcePath(resolvedSqlitePath.absolutePath)
 						.done();
+					break;
 				}
-				return toolResult<ReadToolDetails>(details)
+				result = toolResult<ReadToolDetails>(details)
 					.text(prependSuffixResolutionNotice(renderRow(row), resolvedSqlitePath.suffixResolution))
 					.sourcePath(resolvedSqlitePath.absolutePath)
 					.done();
+				break;
 			}
 			case "query": {
 				const page = queryRows(db, selector.table, selector);
-				return toolResult<ReadToolDetails>(details)
+				result = toolResult<ReadToolDetails>(details)
 					.text(
 						prependSuffixResolutionNotice(
 							renderTable(page.columns, page.rows, {
@@ -183,33 +225,49 @@ export async function readSqlite(
 					)
 					.sourcePath(resolvedSqlitePath.absolutePath)
 					.done();
+				break;
 			}
 			case "raw": {
-				const result = executeReadQuery(db, selector.sql);
-				let output = renderTable(result.columns, result.rows, {
-					totalCount: result.rows.length,
+				const queryResult = executeReadQuery(db, selector.sql);
+				let output = renderTable(queryResult.columns, queryResult.rows, {
+					totalCount: queryResult.rows.length,
 					offset: 0,
-					limit: result.rows.length || DEFAULT_MAX_LINES,
+					limit: queryResult.rows.length || DEFAULT_MAX_LINES,
 					table: "query",
 					dbPath: resolvedSqlitePath.absolutePath,
 				});
-				if (result.truncated) {
+				if (queryResult.truncated) {
 					output += `\n[Output capped at ${MAX_RAW_QUERY_ROWS} rows; add a LIMIT/OFFSET clause to the query to page through more]`;
 				}
-				return toolResult<ReadToolDetails>(details)
+				result = toolResult<ReadToolDetails>(details)
 					.text(prependSuffixResolutionNotice(output, resolvedSqlitePath.suffixResolution))
 					.sourcePath(resolvedSqlitePath.absolutePath)
 					.done();
+				break;
 			}
 		}
 
-		throw new ToolError("Unsupported SQLite selector");
+		if (result === undefined) throw new ToolError("Unsupported SQLite selector");
 	} catch (error) {
-		if (error instanceof ToolError) {
+		operationFailed = true;
+		operationError = error;
+	}
+
+	if (db) {
+		try {
+			db.close();
+			durableResource?.complete();
+		} catch (error) {
+			durableResource?.cancel();
 			throw error;
 		}
-		throw new ToolError(error instanceof Error ? error.message : String(error));
-	} finally {
-		db?.close();
+	} else {
+		durableResource?.cancel();
 	}
+	if (operationFailed) {
+		if (operationError instanceof ToolError) throw operationError;
+		throw new ToolError(operationError instanceof Error ? operationError.message : String(operationError));
+	}
+	if (result === undefined) throw new ToolError("Unsupported SQLite selector");
+	return result;
 }

@@ -14,13 +14,13 @@ import {
 	formatExpandHint,
 	formatMoreItems,
 	formatStatusIcon,
-	PREVIEW_LIMITS,
 	replaceTabs,
 	type ToolUIColor,
 	type ToolUIStatus,
 	TRUNCATE_LENGTHS,
 	truncateToWidth as truncateVisualWidth,
 } from "./render-utils";
+import { PREVIEW_LIMITS } from "./preview-limits";
 
 type GithubToolRenderArgs = {
 	op?: string;

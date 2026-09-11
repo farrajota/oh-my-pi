@@ -18,7 +18,8 @@ import {
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
-import type { StructuredSubagentSchemaMode } from "../task/types";
+import { normalizeEffectivePermissionSummary, type PermissionScopeSnapshot } from "../task/permission-profiles";
+import type { EffectivePermissionSummary, StructuredSubagentSchemaMode } from "../task/types";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
@@ -50,6 +51,7 @@ import {
 	type ServiceTierChangeEntry,
 	type SessionEntry,
 	type SessionHeader,
+	PERMISSION_SUMMARY_UPDATE_CUSTOM_TYPE,
 	type SessionInitEntry,
 	type SessionInitToolDefinition,
 	type SessionMessageEntry,
@@ -2399,6 +2401,36 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Latest valid durable permission summary replacement, falling back to the session-init baseline. */
+	getLatestPermissionSummary(): EffectivePermissionSummary | undefined {
+		for (let index = this.#entries.length - 1; index >= 0; index--) {
+			const entry = this.#entries[index];
+			if (
+				entry?.type !== "session_init" &&
+				!(entry?.type === "custom" && entry.customType === PERMISSION_SUMMARY_UPDATE_CUSTOM_TYPE)
+			)
+				continue;
+			const summary = normalizeEffectivePermissionSummary(
+				entry.type === "custom" ? entry.data : entry.permissionSummary,
+			);
+			if (summary) return summary;
+		}
+		return undefined;
+	}
+
+	appendPermissionSummaryUpdate(summary: EffectivePermissionSummary): string {
+		const permissionSummary = normalizeEffectivePermissionSummary(summary);
+		if (!permissionSummary) throw new TypeError("Permission summary update is invalid.");
+		const entry: CustomEntry<EffectivePermissionSummary> = {
+			type: "custom",
+			...this.#freshEntryFields(),
+			customType: PERMISSION_SUMMARY_UPDATE_CUSTOM_TYPE,
+			data: permissionSummary,
+		};
+		this.#recordEntry(entry);
+		return entry.id;
+	}
+
 	appendSessionInit(init: {
 		systemPrompt: string;
 		task: string;
@@ -2409,6 +2441,8 @@ export class SessionManager {
 		resolvedModel?: string;
 		requestedPermissionProfiles?: string[];
 		effectivePermissionProfiles?: string[];
+		permissionSnapshot?: PermissionScopeSnapshot;
+		permissionSummary?: EffectivePermissionSummary;
 		readOnly?: boolean;
 		outputSchema?: unknown;
 		outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -2418,7 +2452,13 @@ export class SessionManager {
 		readSummarize?: boolean;
 		advisor?: string;
 	}): string {
-		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
+		const permissionSummary = normalizeEffectivePermissionSummary(init.permissionSummary);
+		const entry: SessionInitEntry = {
+			type: "session_init",
+			...this.#freshEntryFields(),
+			...init,
+			permissionSummary,
+		};
 		this.#recordEntry(entry);
 		return entry.id;
 	}
@@ -2977,6 +3017,8 @@ export class SessionManager {
 			resolvedModel?: string;
 			requestedPermissionProfiles?: string[];
 			effectivePermissionProfiles?: string[];
+			permissionSnapshot?: PermissionScopeSnapshot;
+			permissionSummary?: EffectivePermissionSummary;
 			readOnly?: boolean;
 			outputSchema?: unknown;
 			outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -2997,6 +3039,8 @@ export class SessionManager {
 			resolvedModel?: string;
 			requestedPermissionProfiles?: string[];
 			effectivePermissionProfiles?: string[];
+			permissionSnapshot?: PermissionScopeSnapshot;
+			permissionSummary?: EffectivePermissionSummary;
 			readOnly?: boolean;
 			outputSchema?: unknown;
 			outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -3011,6 +3055,11 @@ export class SessionManager {
 				header ??= entry;
 				return;
 			}
+			if (entry.type === "custom" && entry.customType === PERMISSION_SUMMARY_UPDATE_CUSTOM_TYPE) {
+				const permissionSummary = normalizeEffectivePermissionSummary(entry.data);
+				if (permissionSummary && init) init = { ...init, permissionSummary };
+				return;
+			}
 			if (entry.type === "session_init") {
 				init = {
 					systemPrompt: entry.systemPrompt,
@@ -3021,6 +3070,8 @@ export class SessionManager {
 					resolvedModel: entry.resolvedModel,
 					requestedPermissionProfiles: entry.requestedPermissionProfiles,
 					effectivePermissionProfiles: entry.effectivePermissionProfiles,
+					permissionSnapshot: entry.permissionSnapshot,
+					permissionSummary: normalizeEffectivePermissionSummary(entry.permissionSummary),
 					readOnly: entry.readOnly,
 					outputSchema: entry.outputSchema,
 					outputSchemaMode: entry.outputSchemaMode,

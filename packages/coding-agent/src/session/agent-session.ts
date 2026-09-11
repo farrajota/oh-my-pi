@@ -161,7 +161,7 @@ import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
-import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
+import { getSessionLocalProtocolOptions, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
@@ -188,9 +188,10 @@ import rewindReportTemplate from "../prompts/system/rewind-report.md" with { typ
 import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import skillfulNoticePrompt from "../prompts/system/skillful-notice.md" with { type: "text" };
 import vibeModeActivePrompt from "../prompts/system/vibe-mode-active.md" with { type: "text" };
+import { getAgentLifecycleManager } from "../internal/agent-lifecycle-bridge";
 import { terminateSubagent as terminateRegisteredSubagent } from "../registry/agent-control";
-import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { AgentRegistry } from "../registry/agent-registry";
+import { installSessionOperationLedger } from "../registry/operation-lease";
 import videoAttachmentPrompt from "../prompts/system/video-attachment.md" with { type: "text" };
 import {
 	deobfuscateAssistantContent,
@@ -211,7 +212,6 @@ import {
 import { isLowSignalTitleInput } from "../tiny/text";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
 import type { ImageAttachmentEntry } from "../tools";
-import { resolveApproval } from "../tools/approval";
 import { type AskToolDetails, type AskToolInput, recoverAskQuestions } from "../tools/ask";
 import {
 	armIdleCloseForOwner,
@@ -234,6 +234,12 @@ import {
 import { supportsExternalThinking } from "../tools/think";
 import type { TodoPhase } from "../tools/todo";
 import { ToolError } from "../tools/tool-errors";
+import type { EffectivePermissionSummary, PermissionDenialDetails } from "@oh-my-pi/pi-wire";
+import {
+	appendPermissionDenialToSummary,
+	buildEffectivePermissionSummary,
+	normalizeEffectivePermissionSummary,
+} from "../task/permission-profiles";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import { parseCommandArgs } from "../utils/command-args";
 import type { EditMode } from "../utils/edit-mode";
@@ -268,7 +274,6 @@ import type {
 	SessionStats,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
-import { writeArtifact } from "./artifacts";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
 	ASYNC_PREVIEW_MAX_CHARS,
@@ -691,11 +696,15 @@ export class AgentSession {
 	#ircWakeTurnObserver:
 		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
 		| undefined;
-	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
+	readonly #permissionScope: AgentSessionConfig["permissionScope"];
+	#permissionSummary: EffectivePermissionSummary | undefined;
+	readonly #onPermissionSummaryChanged: AgentSessionConfig["onPermissionSummaryChanged"];
+	readonly #operationControl: { close(): Promise<void> };
 	#scoutAllowedBySpawnPolicy = true;
 	#providerSessionId: string | undefined;
+	/** Provider identity issued after a fresh/reset context; never persisted. */
 	#freshProviderSessionId: string | undefined;
 	#inheritedProviderPromptCacheKey: string | undefined;
 	#autolearnCaptureAbortController: AbortController | undefined;
@@ -1222,6 +1231,12 @@ export class AgentSession {
 	#codeModeState: { namespacesInfo?: unknown };
 
 	constructor(config: AgentSessionConfig) {
+		if (config.agentReservation !== undefined) {
+			throw new Error(
+				"Agent reservation hints are assertion-only and cannot register a directly constructed session.",
+			);
+		}
+		this.#operationControl = installSessionOperationLedger(config.sessionManager);
 		this.agent = config.agent;
 		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
@@ -1644,6 +1659,11 @@ export class AgentSession {
 		this.#loopGuards = new LoopGuards(streamGuardsHost);
 		this.#agentId = config.agentId;
 		this.#agentKind = config.agentKind ?? "main";
+		this.#permissionScope = config.permissionScope;
+		this.#permissionSummary =
+			normalizeEffectivePermissionSummary(config.permissionSummary) ??
+			(config.permissionScope ? buildEffectivePermissionSummary(config.permissionScope) : undefined);
+		this.#onPermissionSummaryChanged = config.onPermissionSummaryChanged;
 		this.#scoutAllowedBySpawnPolicy = config.scoutAllowedBySpawnPolicy ?? true;
 		this.#providerSessionId = config.providerSessionId;
 		this.#inheritedProviderPromptCacheKey =
@@ -2173,6 +2193,23 @@ export class AgentSession {
 			: { id, status: "not_found", message: "Background job is no longer available." };
 	}
 
+	getPermissionScope(): AgentSessionConfig["permissionScope"] {
+		return this.#permissionScope;
+	}
+
+	getPermissionSummary(): EffectivePermissionSummary | undefined {
+		return this.#permissionSummary;
+	}
+
+	recordPermissionDenial(details: PermissionDenialDetails): void {
+		const current = this.#permissionSummary;
+		if (!current) return;
+		const replacement = appendPermissionDenialToSummary(current, details);
+		this.sessionManager.appendPermissionSummaryUpdate(replacement);
+		this.#permissionSummary = replacement;
+		this.#onPermissionSummaryChanged?.(replacement);
+	}
+
 	terminateSubagent(id: string): Promise<BackgroundControlResult> {
 		const ownerId = this.#agentId;
 		if (!ownerId) {
@@ -2197,7 +2234,7 @@ export class AgentSession {
 		}
 		return terminateRegisteredSubagent({
 			registry,
-			lifecycle: AgentLifecycleManager.global(),
+			lifecycle: getAgentLifecycleManager(registry),
 			targetId: id,
 			expectedRef: ref ?? null,
 			policy: { scope: "descendant", ownerId },
@@ -2326,9 +2363,9 @@ export class AgentSession {
 		}
 		const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
 		try {
-			const { path: artifactPath, id: artifactId } = await this.sessionManager.allocateArtifactPath("async");
-			if (artifactPath && artifactId) {
-				await writeArtifact(artifactPath, result);
+			const artifactManager = this.sessionManager.getArtifactManager();
+			const artifactId = await artifactManager?.save(result, "async");
+			if (artifactId) {
 				return `${preview}\nFull output: artifact://${artifactId}`;
 			}
 		} catch (error) {
@@ -3714,7 +3751,7 @@ export class AgentSession {
 				try {
 					await scheduler.wait(delayMs, { signal });
 				} catch {
-					if (signal.aborted) await options?.onSkip?.("aborted");
+					await options?.onSkip?.("aborted");
 					return;
 				}
 			}
@@ -4033,15 +4070,6 @@ export class AgentSession {
 		if (!runner?.hasHandlers("tool_call")) return undefined;
 		const metadata = ctx.toolCall.providerMetadata;
 		const computer = metadata?.type === "computer" ? metadata : undefined;
-		// Parity with the wrapper's pre-emit short-circuit: an already-denied
-		// call never reaches extensions. Deny is mode-independent (tool decision
-		// or user policy), so resolving under the most permissive mode is exact;
-		// the wrapper still enforces the mode-accurate gate before execution.
-		const userPolicies = (this.settings.get("tools.approval") ?? {}) as Record<string, unknown>;
-		const approvalArgs = computer ? { actions: computer.actions } : ctx.args;
-		if (resolveApproval(ctx.tool, approvalArgs, "yolo", userPolicies).policy === "deny") {
-			return undefined;
-		}
 		const eventArgs = computer
 			? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
 			: ctx.args;
@@ -4079,10 +4107,12 @@ export class AgentSession {
 	}
 
 	#localProtocolOptions(): LocalProtocolOptions {
-		return {
-			getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-			getSessionId: () => this.sessionManager.getSessionId(),
-		};
+		return (
+			getSessionLocalProtocolOptions(this.sessionManager) ?? {
+				getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
+				getSessionId: () => this.sessionManager.getSessionId(),
+			}
+		);
 	}
 
 	#resetSessionStopContinuationState(): void {
@@ -4564,6 +4594,7 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		void this.#operationControl.close();
 		this.#modelDiscoveryAbortController.abort();
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
@@ -4623,6 +4654,14 @@ export class AgentSession {
 			if (AsyncJobManager.instance() === manager) {
 				AsyncJobManager.setInstance(undefined);
 			}
+		}
+	}
+
+	async #drainOwnedOperations(timeoutMs: number): Promise<void> {
+		try {
+			await withTimeout(this.#operationControl.close(), timeoutMs, "Timed out draining operations during dispose");
+		} catch (error) {
+			logger.warn("Operations still settling at dispose deadline", { error: String(error) });
 		}
 	}
 
@@ -4765,8 +4804,10 @@ export class AgentSession {
 			logger.warn("Session dispose: Sharpshooter release failed", { error: String(error) });
 		}
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
+		const disposeDrainTimeoutMs = options.drainTimeoutMs ?? POST_PROMPT_DRAIN_TIMEOUT_MS;
 		const results = await Promise.allSettled([
 			this.#disposeOwnedAsyncJobs(),
+			this.#drainOwnedOperations(disposeDrainTimeoutMs),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
@@ -6225,7 +6266,7 @@ export class AgentSession {
 			// A user turn owns the next decision; drop a queued forced choice from
 			// a reminder continuation this prompt just preempted.
 			this.#toolChoiceQueue.removeByLabel("plan-mode-decision");
-			this.#recovery.abortRetry();
+			this.#recovery.abortRetry("manual-input");
 		}
 
 		// If streaming, queue via steer()/followUp()/aside based on option
@@ -6953,7 +6994,7 @@ export class AgentSession {
 		// sendCustomMessage aside path (queueAside), which never touches this flag.
 		if (mode !== "aside") {
 			this.#advisors.autoResumeSuppressed = false;
-			this.#recovery.abortRetry();
+			this.#recovery.abortRetry("manual-input");
 		}
 		// The pre-dispatch re-check in prompt() arrives with normalization and the
 		// vision description already done — reuse them instead of paying a second

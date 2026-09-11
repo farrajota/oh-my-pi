@@ -4,10 +4,22 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import { ADVISOR_TRANSCRIPT_FILENAME, isAdvisorTranscriptName } from "../advisor/transcript-recorder";
 import { resolveExplicitModelRole } from "../config/model-resolver";
+import {
+	getAgentRefOwnershipToken,
+	type InternalAgentOwnershipToken,
+	type InternalAgentRef,
+	lookupAgentRef,
+	registerInternalAgent,
+	replaceInternalAgentIfAvailable,
+	setAgentHistory,
+	unregisterAgentRef,
+} from "../internal/agent-registry-bridge";
 import { assistantTurnProducedOutput } from "../session/messages";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "../session/session-entries";
 import { visitEntriesFromFileStream } from "../session/session-loader";
 import { loadBundledAgents } from "../task/agents";
+import { normalizeEffectivePermissionSummary } from "../task/permission-profiles";
+import { PERMISSION_SUMMARY_UPDATE_CUSTOM_TYPE } from "../session/session-entries";
 import { isReadOnlyAgent } from "../task/read-only-policy";
 import { persistedVibeChildIds } from "../vibe/lifecycle";
 import {
@@ -38,7 +50,7 @@ interface PersistedAgentMetadata {
 }
 
 interface PersistedTranscript {
-	id: string;
+	ref: InternalAgentRef;
 	sessionFile: string;
 	createdAt?: number;
 	lastActivity?: number;
@@ -159,6 +171,7 @@ async function readPersistedAgentHistory(
 	const assistantById = new Map<string, AssistantMetrics>();
 	const modelChangeById = new Map<string, { model: string; role?: string; resolvedModelIsFallback: boolean }>();
 	let sessionInitModelRole: string | undefined;
+	let permissionSummary: AgentHistorySummary["permissionSummary"];
 	let leafId: string | undefined;
 	let leafTimestamp: number | undefined;
 	try {
@@ -167,6 +180,11 @@ async function readPersistedAgentHistory(
 			entry => {
 				const record = recordOf(entry);
 				if (!record) return;
+				if (record.type === "session_init") {
+					permissionSummary = normalizeEffectivePermissionSummary(record.permissionSummary) ?? permissionSummary;
+				} else if (record.type === "custom" && record.customType === PERMISSION_SUMMARY_UPDATE_CUSTOM_TYPE) {
+					permissionSummary = normalizeEffectivePermissionSummary(record.data) ?? permissionSummary;
+				}
 				const id = typeof record.id === "string" ? record.id : undefined;
 				if (!id) return;
 				const parentId = typeof record.parentId === "string" ? record.parentId : undefined;
@@ -279,6 +297,7 @@ async function readPersistedAgentHistory(
 		...(metrics.requests > 0 ? { metrics } : {}),
 		...(resolvedModel ? { resolvedModel, resolvedModelIsFallback } : {}),
 		...(modelRole ? { modelRole } : {}),
+		...(permissionSummary ? { permissionSummary } : {}),
 	};
 }
 
@@ -354,6 +373,8 @@ async function readPersistedAgentMetadata(sessionFile: string): Promise<Persiste
 								(profile): profile is string => typeof profile === "string",
 							)
 						: history.effectivePermissionProfiles,
+					permissionSummary:
+						normalizeEffectivePermissionSummary(record.permissionSummary) ?? history.permissionSummary,
 					readOnly: typeof record.readOnly === "boolean" ? record.readOnly : inferred.readOnly,
 				};
 				return false;
@@ -425,22 +446,23 @@ const kPersistedRosterLatches = Symbol("persistedRosterLatches");
  */
 const kPersistedRosterScanTail = Symbol("persistedRosterScanTail");
 
+interface PersistedRosterOwnership {
+	id: string;
+	ref: InternalAgentRef;
+	sessionFile: string;
+	token: InternalAgentOwnershipToken;
+}
+
 interface PersistedRosterLatch {
 	/** Settles when the root's roster scan finishes (success or logged failure). */
 	pending: Promise<void>;
 	/** True once `pending` has settled; only settled latches are evictable. */
 	settled: boolean;
 	/**
-	 * Narrowest root-ownership token: every (id → sessionFile) pair this root's
-	 * scan restored as a parked ref — registered fresh, replaced from another
-	 * root, or confirmed already pointing at this root's own transcript. A
-	 * settled latch is reusable only while every recorded ref still matches
-	 * registry identity/session; a missing or re-targeted ref means another
-	 * root's scan (or a release) moved the id, so this root must be re-scanned.
-	 * Rebuilt per scan, the token stays bounded by the root's own transcript
-	 * tree — no reverse global map.
+	 * Exact refs restored by this root's scan, paired with the registry-owned
+	 * authority generation that owned each slot when it was observed.
 	 */
-	owned: Map<string, string>;
+	owned: Map<string, PersistedRosterOwnership>;
 }
 
 interface RegistryWithPersistedRosterLatches extends AgentRegistry {
@@ -448,17 +470,29 @@ interface RegistryWithPersistedRosterLatches extends AgentRegistry {
 	[kPersistedRosterScanTail]?: Promise<void>;
 }
 
-/**
- * A settled latch is reusable only while every parked ref its scan restored
- * still matches registry identity/session. A missing ref (released) or one
- * re-targeted at a different session file (superseded by another root's scan)
- * invalidates the latch, forcing a re-scan that restores this root's own
- * transcripts. Refs the scan did not restore are not this root's to police.
- */
-function latchOwnershipValid(registry: AgentRegistry, owned: Map<string, string>): boolean {
-	for (const [id, sessionFile] of owned) {
-		const ref = registry.get(id);
-		if (!ref || ref.sessionFile !== sessionFile) return false;
+function recordPersistedRosterOwnership(
+	registry: AgentRegistry,
+	owned: Map<string, PersistedRosterOwnership> | undefined,
+	id: string,
+	ref: InternalAgentRef,
+	sessionFile: string,
+): void {
+	if (!owned) return;
+	const token = getAgentRefOwnershipToken(registry, ref);
+	if (!token) throw new Error(`Agent "${id}" has no registry ownership token.`);
+	owned.set(id, { id, ref, sessionFile, token });
+}
+
+/** A settled latch is reusable only while every exact restored row is unchanged. */
+function latchOwnershipValid(registry: AgentRegistry, owned: Map<string, PersistedRosterOwnership>): boolean {
+	for (const ownership of owned.values()) {
+		const ref = lookupAgentRef(registry, ownership.id);
+		if (
+			ref !== ownership.ref ||
+			ref.sessionFile !== ownership.sessionFile ||
+			getAgentRefOwnershipToken(registry, ref) !== ownership.token
+		)
+			return false;
 	}
 	return true;
 }
@@ -626,7 +660,7 @@ export async function registerPersistedSubagents(
 		 * root-ownership token `ensurePersistedRoster` validates settled latches
 		 * against, bounded by this root's own transcript tree.
 		 */
-		owned?: Map<string, string>;
+		owned?: Map<string, PersistedRosterOwnership>;
 	} = {},
 ): Promise<void> {
 	if (!sessionFile?.endsWith(".jsonl")) return;
@@ -657,7 +691,7 @@ export async function registerPersistedSubagents(
 			if (!transcript) return;
 			const history = await readPersistedAgentHistory(transcript, shouldContinue);
 			if (!shouldContinue()) return;
-			registry.setHistory(transcript.id, history, transcript.sessionFile);
+			setAgentHistory(registry, transcript.ref, history);
 		}
 	});
 	await Promise.all(workers);
@@ -671,7 +705,7 @@ async function registerPersistedSubagentsFromDir(
 	transcripts: PersistedTranscript[],
 	shouldContinue: () => boolean,
 	rootSessionFile: string,
-	owned?: Map<string, string>,
+	owned?: Map<string, PersistedRosterOwnership>,
 ): Promise<void> {
 	if (!shouldContinue()) return;
 	let entries: fs.Dirent[];
@@ -704,7 +738,7 @@ async function registerPersistedSubagentsFromDir(
 				entry.name === ADVISOR_TRANSCRIPT_FILENAME ? "" : entry.name.slice("__advisor.".length, -".jsonl".length);
 			const advisorId = slug ? `${owner}/advisor:${slug}` : `${owner}/advisor`;
 			const displayName = slug ? `advisor:${slug}` : "advisor";
-			const existing = registry.get(advisorId);
+			const existing = lookupAgentRef(registry, advisorId);
 			// Never clobber a non-advisor ref that happens to share this id (a freak
 			// user task literally named `<owner>/advisor`): leave it, skip the advisor.
 			if (existing && existing.kind !== "advisor") continue;
@@ -712,8 +746,8 @@ async function registerPersistedSubagentsFromDir(
 				const metadata = await readPersistedAgentMetadata(sessionFile);
 				if (!shouldContinue()) return;
 				// The id is reused across `/new`; refresh it to the current session's file.
-				if (existing) registry.unregister(advisorId);
-				registry.register({
+				if (existing) unregisterAgentRef(registry, advisorId, existing);
+				const ref = registerInternalAgent(registry, {
 					id: advisorId,
 					displayName,
 					kind: "advisor",
@@ -726,17 +760,17 @@ async function registerPersistedSubagentsFromDir(
 					history: { ...metadata.history, readOnly: true },
 					status: "parked",
 				});
-				owned?.set(advisorId, sessionFile);
+				recordPersistedRosterOwnership(registry, owned, advisorId, ref, sessionFile);
 				transcripts.push({
-					id: advisorId,
+					ref,
 					sessionFile,
 					createdAt: metadata.createdAt,
 					lastActivity: metadata.lastActivity,
 				});
 			} else if (existing) {
-				owned?.set(advisorId, sessionFile);
+				recordPersistedRosterOwnership(registry, owned, advisorId, existing, sessionFile);
 				transcripts.push({
-					id: advisorId,
+					ref: existing,
 					sessionFile,
 					createdAt: existing.createdAt,
 					lastActivity: existing.lastActivity,
@@ -745,7 +779,8 @@ async function registerPersistedSubagentsFromDir(
 			continue;
 		}
 		const id = entry.name.slice(0, -6);
-		const existing = registry.get(id);
+		if (id === "" || id === "." || id === "..") continue;
+		const existing = lookupAgentRef(registry, id);
 		if (vibeOwnedIds.has(id) && existing?.sessionFile !== sessionFile) continue;
 		let tombstoned = false;
 		try {
@@ -767,9 +802,9 @@ async function registerPersistedSubagentsFromDir(
 			!sessionFileBelongsToRoot(existing.sessionFile, rootSessionFile);
 		if (existing && !replaceable) {
 			if (existing.sessionFile === sessionFile) {
-				owned?.set(id, sessionFile);
+				recordPersistedRosterOwnership(registry, owned, id, existing, sessionFile);
 				transcripts.push({
-					id,
+					ref: existing,
 					sessionFile,
 					createdAt: existing.createdAt,
 					lastActivity: existing.lastActivity,
@@ -782,14 +817,12 @@ async function registerPersistedSubagentsFromDir(
 			// Metadata reads yield. A spawn may claim the id while this scan is
 			// inspecting the file; never replace that live generation with a
 			// transcript-derived parked ref.
-			const current = registry.get(id);
-			const stillUnclaimed = expected === null && !current;
-			const stillReplaceable =
-				expected !== null && current === expected && current.status === "parked" && current.session === null;
-			// SessionManager.open writes title+session before createAgentSession
-			// claims the id. Parking that stub makes the spawn's expectedAgentRef:null
-			// CAS fail with "already owned by another session generation".
-			if ((stillUnclaimed || stillReplaceable) && !(metadata.incomplete && !tombstoned)) {
+			const current = lookupAgentRef(registry, id);
+			const unchanged = expected === null ? current === undefined : current === expected;
+			// SessionManager.open writes title+session before authority assembly.
+			// Treat an incomplete scan as a transient stub so it cannot displace the
+			// private reservation/claim sequence for the live session.
+			if (unchanged && !(metadata.incomplete && !tombstoned)) {
 				const input = {
 					id,
 					displayName: id,
@@ -803,15 +836,14 @@ async function registerPersistedSubagentsFromDir(
 					history: metadata.history,
 					status: tombstoned ? ("aborted" as const) : ("parked" as const),
 				};
-				const vacated = stillUnclaimed || (expected !== null && registry.unregister(id, expected));
-				if (vacated && registry.registerIfAvailable(input, null)) {
-					const ref = registry.get(id);
-					owned?.set(id, sessionFile);
+				const ref = replaceInternalAgentIfAvailable(registry, input, expected);
+				if (ref) {
+					recordPersistedRosterOwnership(registry, owned, id, ref, sessionFile);
 					transcripts.push({
-						id,
+						ref,
 						sessionFile,
-						createdAt: ref?.createdAt,
-						lastActivity: ref?.lastActivity,
+						createdAt: ref.createdAt,
+						lastActivity: ref.lastActivity,
 					});
 				}
 			}

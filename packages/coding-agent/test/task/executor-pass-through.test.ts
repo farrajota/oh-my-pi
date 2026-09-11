@@ -13,8 +13,9 @@ import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition, EffectivePermissionSummary } from "@oh-my-pi/pi-coding-agent/task/types";
 import { resolveTaskEffortLevel } from "@oh-my-pi/pi-coding-agent/thinking";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
@@ -39,6 +40,7 @@ function createMockSession(
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["read", "yield"],
+		getPermissionSummary: () => undefined,
 		getEnabledToolNames: () => ["read", "yield"],
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
@@ -85,6 +87,9 @@ const baseAgent: AgentDefinition = {
 	systemPrompt: "test",
 	source: "bundled",
 };
+const registry = new AgentRegistry();
+const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+	sdkModule.createAgentSession({ ...options, agentRegistry: registry });
 
 const baseOptions = {
 	cwd: "/tmp",
@@ -95,6 +100,8 @@ const baseOptions = {
 	settings: Settings.isolated(),
 	modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 	enableLsp: false,
+	createAuthoritySession,
+	agentRegistry: registry,
 };
 
 function createModelRegistry(model: Model, ...additionalModels: Model[]): ModelRegistry {
@@ -579,19 +586,34 @@ describe("runSubprocess fresh child-session boundary", () => {
 		const session = yieldEmittingSession();
 		const initSpy = vi.spyOn(session.sessionManager, "appendSessionInit");
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const permissionSummary: EffectivePermissionSummary = {
+			mode: "enforce",
+			profiles: { items: ["read-only", "no-network", "focused-edit"], omittedCount: 0 },
+			clauses: { items: [], omittedCount: 0 },
+			denyTools: { items: ["browser"], omittedCount: 0 },
+			denyPaths: { items: [], omittedCount: 0 },
+			guardrails: { noNetwork: true, secretsBlind: false },
+			intrinsicTools: { yield: true, reportToolIssue: false },
+			recentDenials: { items: [], omittedCount: 0 },
+		};
+		vi.spyOn(session, "getPermissionSummary").mockReturnValue(permissionSummary);
 
 		const result = await runSubprocess({
 			...baseOptions,
 			id: "subagent-permission-provenance",
 			requestedPermissionProfiles: ["no-network", "focused-edit"],
 			effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+			permissionSummary,
 		});
 
 		expect(result.exitCode).toBe(0);
+		expect(result.permissionSummary).toEqual(permissionSummary);
+		expect(result.output).not.toContain("permissionSummary");
 		expect(initSpy).toHaveBeenCalledWith(
 			expect.objectContaining({
 				requestedPermissionProfiles: ["no-network", "focused-edit"],
 				effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+				permissionSummary,
 			}),
 		);
 	});

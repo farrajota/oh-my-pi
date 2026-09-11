@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
 	type AgentMessage,
@@ -6,6 +9,14 @@ import {
 	type CommittableAsideMessage,
 } from "@oh-my-pi/pi-agent-core";
 import { type AsyncJob, AsyncJobManager, type AsyncJobType } from "@oh-my-pi/pi-coding-agent/async";
+import {
+	disposeAgentLifecycle,
+	getAgentLifecycleManager,
+	registerToolSessionLifecycleAuthority,
+} from "../src/internal/agent-lifecycle-bridge";
+import { createAgentRootSession, lookupAgentRef } from "../src/internal/agent-registry-bridge";
+import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { YieldQueue } from "@oh-my-pi/pi-coding-agent/session/yield-queue";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -52,21 +63,46 @@ function asyncDetails(message: AgentMessage): AsyncDetails {
 	return (message as CustomMessage<AsyncDetails>).details ?? { jobs: [] };
 }
 
-function createToolSession(asyncJobManager?: AsyncJobManager): ToolSession {
-	return {
-		cwd: process.cwd(),
+function createToolSession(
+	registry: AgentRegistry,
+	main: AgentSession,
+	asyncJobManager: AsyncJobManager,
+	cwd: string,
+): ToolSession {
+	const session = {
+		cwd,
 		hasUI: false,
 		settings: {
 			get: (key: string) => (key === "async.pollWaitDuration" ? "5s" : undefined),
 		},
-		getSessionFile: () => null,
+		getSessionFile: () => lookupAgentRef(registry, MAIN_AGENT_ID)?.sessionFile ?? null,
 		getSessionSpawns: () => null,
-		getAgentId: () => null,
+		getAgentId: () => MAIN_AGENT_ID,
+		isDisposed: () => main.isDisposed,
 		asyncJobManager,
+		sessionManager: main.sessionManager,
+		agentRegistry: registry,
 	} as unknown as ToolSession;
+	registerToolSessionLifecycleAuthority(session, registry, main);
+	return session;
 }
 
-function createHarness(initialStreaming: boolean) {
+const harnessCleanups = new Set<() => Promise<void>>();
+
+async function createHarness(initialStreaming: boolean) {
+	const directory = await mkdtemp(join(tmpdir(), "async-yield-queue-"));
+	const registry = new AgentRegistry();
+	const root = await createAgentRootSession(registry, {
+		agentId: MAIN_AGENT_ID,
+		agentDisplayName: "main",
+		cwd: directory,
+		agentDir: directory,
+		disableExtensionDiscovery: true,
+		enableMCP: false,
+		enableLsp: false,
+	});
+	const manager = new AsyncJobManager({ onJobComplete: () => {} });
+	const toolSession = createToolSession(registry, root.session, manager, directory);
 	let streaming = initialStreaming;
 	const followUps: AgentMessage[] = [];
 	const prompts: AgentMessage[][] = [];
@@ -87,20 +123,28 @@ function createHarness(initialStreaming: boolean) {
 		isStale: entry => manager.isDeliverySuppressed(entry.jobId),
 		build: buildAsyncMessage,
 	});
-	const manager = new AsyncJobManager({
-		onJobComplete: (jobId, result, job) => {
-			if (manager.isDeliverySuppressed(jobId)) return;
-			queue.enqueue<AsyncEntry>("async-result", {
-				jobId,
-				result,
-				job,
-				durationMs: job ? Math.max(0, Date.now() - job.startTime) : undefined,
-			});
-		},
+	const unregisterDeliverySink = manager.registerDeliverySink(MAIN_AGENT_ID, (jobId, result, job) => {
+		if (manager.isDeliverySuppressed(jobId)) return;
+		queue.enqueue<AsyncEntry>("async-result", {
+			jobId,
+			result,
+			job,
+			durationMs: job ? Math.max(0, Date.now() - job.startTime) : undefined,
+		});
 	});
 	AsyncJobManager.setInstance(manager);
+	const dispose = async () => {
+		harnessCleanups.delete(dispose);
+		unregisterDeliverySink();
+		await manager.dispose({ timeoutMs: 200 });
+		await root.session.dispose();
+		await disposeAgentLifecycle(getAgentLifecycleManager(registry));
+		await rm(directory, { recursive: true, force: true });
+	};
+	harnessCleanups.add(dispose);
 	return {
 		manager,
+		toolSession,
 		queue,
 		followUps,
 		prompts,
@@ -112,34 +156,42 @@ function createHarness(initialStreaming: boolean) {
 }
 
 afterEach(async () => {
-	const manager = AsyncJobManager.instance();
-	if (manager) {
-		await manager.dispose({ timeoutMs: 200 });
-	}
+	await Promise.all([...harnessCleanups].map(dispose => dispose()));
 	AsyncJobManager.resetForTests();
 });
 
 describe("async result yield queue delivery", () => {
-	test("job poll acknowledgement suppresses already staged completion", async () => {
-		const harness = createHarness(true);
-		const jobId = harness.manager.register("bash", "race job", async () => "inline result");
+	test("job poll cannot reclaim a completion already staged by auto-delivery", async () => {
+		const harness = await createHarness(true);
+		const jobId = harness.manager.register("bash", "race job", async () => "inline result", {
+			ownerId: MAIN_AGENT_ID,
+		});
 
 		await harness.manager.waitForAll();
 		expect(await harness.manager.drainDeliveries({ timeoutMs: 2_000 })).toBe(true);
 
-		const tool = new HubTool(createToolSession(harness.manager));
+		const tool = new HubTool(harness.toolSession);
 		const result = await tool.execute("tool-call", { op: "wait", ids: [jobId] });
 		expect((result.details as CoordinationDetails)?.jobs?.find(job => job.id === jobId)?.status).toBe("completed");
 
 		await harness.queue.flush("streaming");
 
-		expect(harness.followUps).toHaveLength(0);
+		expect(harness.followUps).toHaveLength(1);
+		const followUp = harness.followUps[0];
+		if (!followUp || followUp.role !== "custom" || followUp.customType !== "async-result") {
+			throw new Error("Expected an async-result follow-up");
+		}
+		expect(followUp.content).toBe("inline result");
 	});
 
 	test("multiple completions in one yield window become one follow-up", async () => {
-		const harness = createHarness(true);
-		const firstJobId = harness.manager.register("bash", "first", async () => "first result");
-		const secondJobId = harness.manager.register("task", "second", async () => "second result");
+		const harness = await createHarness(true);
+		const firstJobId = harness.manager.register("bash", "first", async () => "first result", {
+			ownerId: MAIN_AGENT_ID,
+		});
+		const secondJobId = harness.manager.register("task", "second", async () => "second result", {
+			ownerId: MAIN_AGENT_ID,
+		});
 
 		await harness.manager.waitForAll();
 		expect(await harness.manager.drainDeliveries({ timeoutMs: 2_000 })).toBe(true);
@@ -153,8 +205,10 @@ describe("async result yield queue delivery", () => {
 	});
 
 	test("idle completion prompts once after scheduled idle flush", async () => {
-		const harness = createHarness(false);
-		const jobId = harness.manager.register("bash", "idle job", async () => "idle result");
+		const harness = await createHarness(false);
+		const jobId = harness.manager.register("bash", "idle job", async () => "idle result", {
+			ownerId: MAIN_AGENT_ID,
+		});
 
 		await harness.manager.waitForAll();
 		expect(await harness.manager.drainDeliveries({ timeoutMs: 2_000 })).toBe(true);
@@ -168,8 +222,8 @@ describe("async result yield queue delivery", () => {
 		expect(asyncDetails(harness.prompts[0]![0]!).jobs.map(job => job.jobId)).toEqual([jobId]);
 	});
 
-	test("releases a canceled idle-flush latch for rescheduling", () => {
-		const harness = createHarness(false);
+	test("releases a canceled idle-flush latch for rescheduling", async () => {
+		const harness = await createHarness(false);
 		harness.queue.enqueue<AsyncEntry>("async-result", {
 			jobId: "idle-retry",
 			result: "retry",
@@ -185,7 +239,7 @@ describe("async result yield queue delivery", () => {
 	});
 
 	test("holds a streaming receipt until the aside enters live context", async () => {
-		const harness = createHarness(true);
+		const harness = await createHarness(true);
 		const receipt = harness.queue.enqueueWithReceipt<AsyncEntry>("async-result", {
 			jobId: "streaming-receipt",
 			result: "done",
@@ -207,7 +261,7 @@ describe("async result yield queue delivery", () => {
 	});
 
 	test("rejects a streaming receipt when the agent discards its aside", async () => {
-		const harness = createHarness(true);
+		const harness = await createHarness(true);
 		const receipt = harness.queue.enqueueWithReceipt<AsyncEntry>("async-result", {
 			jobId: "discarded-receipt",
 			result: "done",

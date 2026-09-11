@@ -6,10 +6,13 @@ import { type } from "@oh-my-pi/omptype";
 import { Settings } from "../../config/settings";
 import type { SettingPath } from "../../config/settings-schema";
 import type { PlanModeState } from "../../plan-mode/state";
+import { AgentRegistry } from "../../registry/agent-registry";
+import { createAgentSession } from "../../sdk";
 import type { ToolSession } from "../../tools";
 import { EventBus } from "../../utils/event-bus";
 import * as executor from "../executor";
 import { TaskTool } from "../index";
+import { freezePermissionScope } from "../permission-profiles";
 import { type AgentDefinition, getTaskSchema, type SingleResult, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../types";
 
 const temporaryRoots: string[] = [];
@@ -58,6 +61,7 @@ function makeSession(
 		"task.permissions.tools.enabled": true,
 		...settingsOverrides,
 	});
+	const agentRegistry = new AgentRegistry();
 	return {
 		cwd: process.cwd(),
 		hasUI: false,
@@ -71,6 +75,8 @@ function makeSession(
 		getEvalSessionId: () => "task-index-eval-test",
 		getActiveModelString: () => "p/active",
 		getModelString: () => "p/fallback",
+		agentRegistry,
+		createAuthoritySession: options => createAgentSession({ ...options, agentRegistry }),
 		...sessionOverrides,
 	} as ToolSession;
 }
@@ -232,6 +238,45 @@ describe("TaskTool toolProfile execution", () => {
 		expect(tools).not.toEqual(expect.arrayContaining(["edit", "write"]));
 	});
 
+	test("projects live descriptor tool instances while rejecting non-plain authority fields", async () => {
+		const agent = makeAgent();
+		const runSpy = vi.spyOn(executor, "runSubprocess").mockResolvedValue(makeResult(agent));
+		const descriptor = {
+			name: "read",
+			normalizedName: "read",
+			source: "builtin" as const,
+			origin: "test",
+			descriptorId: "builtin:test:read",
+			tool: new Map(),
+		};
+		const taskTool = await makeTaskTool(
+			agent,
+			makeSession(
+				{ "task.permissions.mode": "enforce" },
+				{
+					getActiveToolNames: () => ["read"],
+					toolExecutionAuthority: { getDescriptor: () => descriptor } as never,
+				},
+			),
+		);
+
+		await taskTool.execute("tool-call", {
+			agent: "synthetic",
+			task: "edit",
+			toolProfile: "edit",
+			permissions: { profiles: ["focused-edit", "no-network", "no-delegation"] },
+		});
+
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(runSpy.mock.calls[0]?.[0].permissionSnapshot?.scope.availableDescriptors).toBeUndefined();
+		expect(() =>
+			freezePermissionScope({
+				...runSpy.mock.calls[0]![0].permissionScope!,
+				tools: new Set(["read"]) as unknown as readonly string[],
+			}),
+		).toThrow("Permission snapshots may contain only plain objects and arrays.");
+	});
+
 	test("permissions do not widen toolProfile none", async () => {
 		const agent = makeAgent();
 		const runSpy = vi.spyOn(executor, "runSubprocess").mockResolvedValue(makeResult(agent));
@@ -281,10 +326,10 @@ describe("TaskTool toolProfile execution", () => {
 		const taskTool = await makeTaskTool(
 			agent,
 			makeSession(
-				{ "task.permissions.mode": "enforce" },
+				{ "task.permissions.mode": "suggest" },
 				{
 					getPermissionScope: () => ({
-						mode: "enforce",
+						mode: "suggest",
 						toolsEnabled: true,
 						pathsEnabled: true,
 						actorId: "Main",

@@ -31,13 +31,8 @@ import {
 	resolveToCwd,
 	toPathList,
 } from "./path-utils";
-import {
-	createCachedComponent,
-	formatCount,
-	formatEmptyMessage,
-	formatErrorMessage,
-	PREVIEW_LIMITS,
-} from "./render-utils";
+import { createCachedComponent, formatCount, formatEmptyMessage, formatErrorMessage } from "./render-utils";
+import { PREVIEW_LIMITS } from "./preview-limits";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -234,6 +229,10 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 						skills: this.session.skills,
 						rules: this.session.activeRules,
 						pathOnly: true,
+						callerMemory: {
+							backend: this.session.settings.get("memory.backend"),
+							getMnemopiSessionState: this.session.getMnemopiSessionState,
+						},
 					});
 					if (!resource.sourcePath) {
 						throw new ToolError(`Cannot find internal URL without a backing file: ${memoryGlob.baseUrl}`);
@@ -253,6 +252,10 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					localProtocolOptions: this.session.localProtocolOptions,
 					skills: this.session.skills,
 					rules: this.session.activeRules,
+					callerMemory: {
+						backend: this.session.settings.get("memory.backend"),
+						getMnemopiSessionState: this.session.getMnemopiSessionState,
+					},
 					pathOnly: true,
 				});
 				if (!resource.sourcePath) {
@@ -262,6 +265,16 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			}
 			if (normalizedPatterns.some(pattern => pattern.length === 0)) {
 				throw new ToolError("`path` must contain non-empty globs or paths");
+			}
+
+			if (this.session.pathScope) {
+				const operation = this.session.pathScope.currentOperation();
+				await operation.preflight(
+					normalizedPatterns.map(pattern => ({
+						path: resolveToCwd(parseFindPattern(pattern).basePath, this.session.cwd),
+						kind: "probe" as const,
+					})),
+				);
 			}
 
 			// Tolerate missing entries in a multi-path call: skip ones whose base
@@ -304,6 +317,11 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					throw new ToolError("Searching from root directory '/' is not allowed");
 				}
 			}
+			if (this.session.pathScope) {
+				await this.session.pathScope
+					.currentOperation()
+					.preflight(targets.map(target => ({ path: target.searchPath, kind: "search" as const })));
+			}
 
 			const requestedLimit = limit ?? DEFAULT_LIMIT;
 			if (!Number.isFinite(requestedLimit) || requestedLimit <= 0) {
@@ -321,6 +339,20 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 				return formatPathRelativeToCwd(absolutePath, this.session.cwd, {
 					trailingSlash: fileType === natives.FileType.Dir || hadTrailingSlash,
 				});
+			};
+			const authorizeMatches = async (entries: string[]): Promise<string[]> => {
+				if (!this.session.pathScope) return entries;
+				const allowed: string[] = [];
+				for (const entry of entries) {
+					try {
+						await this.session.pathScope.authorizePath("glob", path.resolve(this.session.cwd, entry), true);
+						allowed.push(entry);
+					} catch {
+						// A recursive scan may discover entries outside the session scope;
+						// prune the entry rather than leaking its name or metadata.
+					}
+				}
+				return allowed;
 			};
 
 			const missingPathsNote =
@@ -387,6 +419,43 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			// Collapsing multiple paths to a shared base would force the walker to
 			// traverse and stat every unrelated sibling under that ancestor; per-path
 			// roots keep each scan bounded to exactly what the user asked for.
+			if (this.session.pathScope) {
+				const operation = this.session.pathScope.currentOperation();
+				const constrainedResults: string[] = [];
+				for (const target of targets) {
+					const rootTarget = await operation.authorize(target.searchPath, "search");
+					const matcher = target.hasGlob ? new Bun.Glob(target.globPattern) : undefined;
+					const walked = await operation.walkAuthorized(rootTarget, {
+						signal: combinedSignal,
+						include: entry => {
+							if (!target.hasGlob) return entry.isFile && entry.path === rootTarget.canonicalTarget;
+							const relative = path.relative(target.searchPath, entry.path).replace(/\\/g, "/");
+							if (!relative || relative === ".") return false;
+							if (!includeHidden && relative.split("/").some(segment => segment.startsWith("."))) return false;
+							return Boolean(matcher?.match(relative) || matcher?.match(`${relative}/`));
+						},
+						descend: entry => {
+							const relative = path.relative(target.searchPath, entry.path).replace(/\\/g, "/");
+							if (!includeHidden && relative.split("/").some(segment => segment.startsWith("."))) return false;
+							if (
+								useGitignore &&
+								relative.split("/").some(segment => segment === ".git" || segment === "node_modules")
+							)
+								return false;
+							return true;
+						},
+					});
+					for (const entry of walked) {
+						if (!entry.isFile && !entry.isDirectory) continue;
+						const relative = formatPathRelativeToCwd(entry.path, this.session.cwd, {
+							trailingSlash: entry.isDirectory,
+						});
+						if (!constrainedResults.includes(relative)) constrainedResults.push(relative);
+					}
+				}
+				return buildResult(constrainedResults);
+			}
+
 			if (this.#customOps?.glob) {
 				const customOps = this.#customOps;
 				const perTarget = await Promise.all(
@@ -397,13 +466,13 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 						}
 						if (!target.hasGlob && customOps.stat) {
 							const stat = await customOps.stat(target.searchPath);
-							if (stat.isFile()) return [formatScopePath(target.searchPath)];
+							if (stat.isFile()) return authorizeMatches([formatScopePath(target.searchPath)]);
 						}
 						const results = await customOps.glob(target.globPattern, target.searchPath, {
 							ignore: ["**/node_modules/**", "**/.git/**"],
 							limit: effectiveLimit,
 						});
-						return results.map(matchPath => formatMatchPath(matchPath, target.searchPath));
+						return authorizeMatches(results.map(matchPath => formatMatchPath(matchPath, target.searchPath)));
 					}),
 				);
 				const seen = new Set<string>();
@@ -481,7 +550,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					if (streamed.has(relativePath)) return;
 					streamed.add(relativePath);
 					onUpdateMatches.push(relativePath);
-					onUpdateMtimes.push(match.mtime ?? 0);
+					if (this.session.pathScope) return;
 					emitUpdate();
 				};
 
@@ -489,6 +558,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			const runTarget = async (prepared: NativePreparedTarget): Promise<Array<{ path: string; mtime: number }>> => {
 				if (prepared.result) return prepared.result;
 				const { target } = prepared;
+				const out: Array<{ path: string; mtime: number }> = [];
 				try {
 					const result = await this.#nativeGlob(
 						{
@@ -511,13 +581,21 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 						makeOnMatch(target.searchPath),
 					);
 					throwIfAborted(signal);
-					const out: Array<{ path: string; mtime: number }> = [];
 					for (const match of result.matches) {
 						if (!match.path) continue;
-						out.push({
-							path: formatMatchPath(match.path, target.searchPath, match.fileType),
-							mtime: match.mtime ?? 0,
-						});
+						const formatted = formatMatchPath(match.path, target.searchPath, match.fileType);
+						if (this.session.pathScope) {
+							try {
+								await this.session.pathScope.authorizePath(
+									"glob",
+									path.resolve(this.session.cwd, formatted),
+									true,
+								);
+							} catch {
+								continue;
+							}
+						}
+						out.push({ path: formatted, mtime: match.mtime ?? 0 });
 					}
 					return out;
 				} catch (error) {

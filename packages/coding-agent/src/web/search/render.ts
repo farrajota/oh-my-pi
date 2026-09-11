@@ -15,10 +15,10 @@ import {
 	formatMoreItems,
 	formatStatusIcon,
 	getDomain,
-	PREVIEW_LIMITS,
 	replaceTabs,
 	truncateToWidth,
 } from "../../tools/render-utils";
+import { PREVIEW_LIMITS } from "../../tools/preview-limits";
 import { renderStatusLine, renderTreeList, urlHyperlink } from "../../tui";
 import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth } from "../../tui/output-block";
 import { getSearchProviderLabel } from "./provider";

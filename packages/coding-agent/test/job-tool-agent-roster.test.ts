@@ -6,41 +6,149 @@
  * QA report "job list returned no status output despite known running
  * background jobs and subagents".
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
-import { terminateSubagent } from "@oh-my-pi/pi-coding-agent/registry/agent-control";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import type { CreateAgentSessionResult } from "../src/sdk";
+import { terminateSubagent } from "../src/registry/agent-control";
+import {
+	adoptAgent,
+	disposeAgentLifecycle,
+	getAgentLifecycleManager,
+	lifecycleHasAgent,
+	releaseAgent,
+	registerToolSessionLifecycleAuthority,
+} from "../src/internal/agent-lifecycle-bridge";
+import {
+	bindInternalAgentAuthoritySession,
+	createAgentRootSession,
+	lookupAgentRef,
+	unregisterAgentRef,
+	setAgentStatus,
+} from "../src/internal/agent-registry-bridge";
 import { type CoordinationDetails, HubTool } from "../src/tools/hub";
 
-const managers: AsyncJobManager[] = [];
-
-function createManager(): AsyncJobManager {
-	const manager = new AsyncJobManager({ onJobComplete: () => {} });
-	managers.push(manager);
-	return manager;
+interface ManagerFixture {
+	readonly manager: AsyncJobManager;
+	readonly registry: AgentRegistry;
+	readonly root: CreateAgentSessionResult;
+	readonly dir: string;
 }
 
-function createToolSession(options: {
-	manager?: AsyncJobManager;
-	registry?: AgentRegistry;
-	agentId?: string;
-	lifecycle?: AgentLifecycleManager;
-}): ToolSession {
-	return {
-		cwd: process.cwd(),
+const managerFixtures: ManagerFixture[] = [];
+const lifecycles: AgentLifecycleManager[] = [];
+
+function createLifecycle(registry: AgentRegistry): AgentLifecycleManager {
+	const lifecycle = getAgentLifecycleManager(registry);
+	lifecycles.push(lifecycle);
+	return lifecycle;
+}
+
+async function createManager(registry = new AgentRegistry()): Promise<ManagerFixture> {
+	const dir = await mkdtemp(join(tmpdir(), "job-tool-agent-roster-"));
+	let root: CreateAgentSessionResult | undefined;
+	try {
+		root = await createAgentRootSession(registry, {
+			agentId: "Main",
+			agentDisplayName: "main",
+			cwd: dir,
+			agentDir: dir,
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableLsp: false,
+		});
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		managerFixtures.push({ manager, registry, root, dir });
+		return { manager, registry, root, dir };
+	} catch (error) {
+		await root?.session.dispose();
+		await rm(dir, { recursive: true, force: true });
+		throw error;
+	}
+}
+
+function createToolSession(options: { fixture: ManagerFixture; agentId?: string; authorized?: boolean }): ToolSession {
+	const { fixture } = options;
+	const toolSession = {
+		cwd: fixture.dir,
 		hasUI: false,
-		settings: {
-			get: (key: string) => (key === "async.pollWaitDuration" ? "5s" : undefined),
-		},
-		getSessionFile: () => null,
-		getSessionSpawns: () => null,
-		getAgentId: () => options.agentId ?? null,
-		asyncJobManager: options.manager,
-		agentRegistry: options.registry,
-		...(options.lifecycle ? { agentLifecycle: () => options.lifecycle } : {}),
-	} as unknown as ToolSession;
+		settings: Settings.isolated({ "async.pollWaitDuration": "5s" }),
+		getSessionFile: () => lookupAgentRef(fixture.registry, "Main")?.sessionFile ?? null,
+		getSessionSpawns: () => "*",
+		getAgentId: () => options.agentId ?? "Main",
+		isDisposed: () => fixture.root.session.isDisposed,
+		asyncJobManager: fixture.manager,
+		sessionManager: fixture.root.session.sessionManager,
+		agentRegistry: fixture.registry,
+	} satisfies ToolSession;
+	if (options.authorized !== false)
+		registerToolSessionLifecycleAuthority(toolSession, fixture.registry, fixture.root.session);
+	return toolSession;
+}
+
+async function createTrustedHubChild(id: string, status: "idle" | "running") {
+	const registry = new AgentRegistry();
+	const dir = await mkdtemp(join(tmpdir(), "job-tool-agent-roster-"));
+	let root: CreateAgentSessionResult | undefined;
+	let child: CreateAgentSessionResult | undefined;
+	try {
+		root = await createAgentRootSession(registry, {
+			agentId: "Main",
+			agentDisplayName: "main",
+			cwd: dir,
+			agentDir: dir,
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableLsp: false,
+		});
+		const authority = bindInternalAgentAuthoritySession(registry, root.session);
+		if (!authority) throw new Error("Expected root authority");
+		child = await authority.create({
+			agentId: id,
+			agentDisplayName: id,
+			cwd: dir,
+			agentDir: dir,
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableLsp: false,
+		});
+		if (status === "idle" && !setAgentStatus(registry, id, "idle", child.session)) {
+			throw new Error(`Failed to idle ${id}`);
+		}
+		const exact = lookupAgentRef(registry, id);
+		if (!exact) throw new Error(`Expected registered child ${id}`);
+		const lifecycle = getAgentLifecycleManager(registry);
+		adoptAgent(lifecycle, id, { idleTtlMs: 60_000 }, exact);
+		const hub = root.session.getToolByName("hub");
+		if (!hub) throw new Error("Expected root Hub tool");
+		const manager = root.session.asyncJobManager;
+		if (!manager) throw new Error("Expected root job manager");
+		const ownedRoot = root;
+		const ownedChild = child;
+		return {
+			registry,
+			lifecycle,
+			child: ownedChild,
+			hub,
+			manager,
+			async dispose() {
+				await ownedChild.session.dispose();
+				await ownedRoot.session.dispose();
+				await rm(dir, { recursive: true, force: true });
+			},
+		};
+	} catch (error) {
+		await child?.session.dispose();
+		await root?.session.dispose();
+		await rm(dir, { recursive: true, force: true });
+		throw error;
+	}
 }
 
 function registerRunningSub(registry: AgentRegistry, id: string, parentId = "Main"): void {
@@ -61,14 +169,20 @@ const runsUntilAborted = ({ signal }: { signal: AbortSignal }) =>
 	});
 
 afterEach(async () => {
-	for (const manager of managers.splice(0)) {
-		await manager.dispose({ timeoutMs: 200 });
+	for (const fixture of managerFixtures.splice(0).reverse()) {
+		await fixture.manager.dispose({ timeoutMs: 200 });
+		await fixture.root.session.dispose();
+		await rm(fixture.dir, { recursive: true, force: true });
+	}
+	for (const lifecycle of lifecycles.splice(0)) {
+		await disposeAgentLifecycle(lifecycle);
 	}
 });
 
 describe("hub jobs snapshot", () => {
 	test("empty jobs snapshot reports 'no jobs' instead of empty output", async () => {
-		const tool = new HubTool(createToolSession({ manager: createManager(), agentId: "Main" }));
+		const fixture = await createManager();
+		const tool = new HubTool(createToolSession({ fixture }));
 
 		const result = await tool.execute("call", { op: "jobs" });
 
@@ -77,7 +191,8 @@ describe("hub jobs snapshot", () => {
 	});
 
 	test("omits result bodies already auto-delivered to the owning agent", async () => {
-		const manager = createManager();
+		const fixture = await createManager();
+		const { manager } = fixture;
 		const deliveries: string[] = [];
 		manager.registerDeliverySink("Main", (_jobId, text) => {
 			deliveries.push(text);
@@ -88,7 +203,7 @@ describe("hub jobs snapshot", () => {
 		await manager.getJob(jobId)!.promise;
 		await manager.drainDeliveries({ timeoutMs: 200, filter: { ownerId: "Main" } });
 
-		const tool = new HubTool(createToolSession({ manager, agentId: "Main" }));
+		const tool = new HubTool(createToolSession({ fixture }));
 		const result = await tool.execute("call", { op: "jobs" });
 
 		expect(deliveries).toEqual(["already delivered eval body"]);
@@ -97,8 +212,9 @@ describe("hub jobs snapshot", () => {
 		expect((result.details as CoordinationDetails)?.jobs?.[0]?.resultText).toBeUndefined();
 	});
 
-	test("recovers a result while auto-delivery still awaits consumer injection", async () => {
-		const manager = createManager();
+	test("withholds a result while auto-delivery awaits consumer injection", async () => {
+		const fixture = await createManager();
+		const { manager } = fixture;
 		const deliveryStarted = Promise.withResolvers<void>();
 		const allowInjection = Promise.withResolvers<void>();
 		const injected: string[] = [];
@@ -113,25 +229,26 @@ describe("hub jobs snapshot", () => {
 		await manager.getJob(jobId)!.promise;
 		await deliveryStarted.promise;
 
-		const tool = new HubTool(createToolSession({ manager, agentId: "Main" }));
+		const tool = new HubTool(createToolSession({ fixture }));
 		const recovered = await tool.execute("recover", { op: "jobs" });
 		allowInjection.resolve();
 		await manager.drainDeliveries({ timeoutMs: 200, filter: { ownerId: "Main" } });
 
-		expect(resultText(recovered)).toContain("queued child report");
-		expect(resultText(recovered)).toContain("Delivery: not auto-delivered; recovered by this snapshot.");
-		expect(injected).toEqual([]);
+		expect(resultText(recovered)).not.toContain("queued child report");
+		expect(resultText(recovered)).toContain("Delivery: already delivered or recovered.");
+		expect(injected).toEqual(["queued child report"]);
 	});
 
 	test("returns an undelivered result body once for manual recovery", async () => {
-		const manager = createManager();
+		const fixture = await createManager();
+		const { manager } = fixture;
 		const jobId = manager.register("task", "orphaned child", async () => "recover this child report", {
 			ownerId: "Main",
 		});
 		await manager.getJob(jobId)!.promise;
 		await manager.drainDeliveries({ timeoutMs: 200, filter: { ownerId: "Main" } });
 
-		const tool = new HubTool(createToolSession({ manager, agentId: "Main" }));
+		const tool = new HubTool(createToolSession({ fixture }));
 		const recovered = await tool.execute("first", { op: "jobs" });
 		const consumed = await tool.execute("second", { op: "jobs" });
 
@@ -143,13 +260,13 @@ describe("hub jobs snapshot", () => {
 	});
 
 	test("list surfaces running subagents that have no backing job", async () => {
-		const registry = new AgentRegistry();
+		const fixture = await createManager();
+		const { registry } = fixture;
 		registerRunningSub(registry, "Worker");
 		registerRunningSub(registry, "Idler");
 		registry.setStatus("Idler", "idle");
 		registry.register({ id: "advisor", displayName: "advisor", kind: "advisor", session: null });
-		registry.register({ id: "Main", displayName: "Main", kind: "main", session: null });
-		const tool = new HubTool(createToolSession({ manager: createManager(), registry, agentId: "Main" }));
+		const tool = new HubTool(createToolSession({ fixture }));
 
 		const result = await tool.execute("call", { op: "jobs" });
 
@@ -161,8 +278,8 @@ describe("hub jobs snapshot", () => {
 	});
 
 	test("agents covered by the caller's running jobs are not double-listed", async () => {
-		const manager = createManager();
-		const registry = new AgentRegistry();
+		const fixture = await createManager();
+		const { manager, registry } = fixture;
 		// Task-style spawn: job id == agent id.
 		manager.register("task", "AgentA", runsUntilAborted, {
 			id: "AgentA",
@@ -179,7 +296,7 @@ describe("hub jobs snapshot", () => {
 		registerRunningSub(registry, "vibe-1");
 		// Woken via irc: running agent with no job at all.
 		registerRunningSub(registry, "Loner");
-		const tool = new HubTool(createToolSession({ manager, registry, agentId: "Main" }));
+		const tool = new HubTool(createToolSession({ fixture }));
 
 		const result = await tool.execute("call", { op: "jobs" });
 
@@ -190,13 +307,13 @@ describe("hub jobs snapshot", () => {
 	});
 
 	test("a settled job in retention does not hide its re-woken agent", async () => {
-		const manager = createManager();
-		const registry = new AgentRegistry();
+		const fixture = await createManager();
+		const { manager, registry } = fixture;
 		manager.register("task", "AgentB", async () => "done", { id: "AgentB", agentId: "AgentB", ownerId: "Main" });
 		await manager.waitForAll();
 		// The agent was re-woken (e.g. via irc) after its job completed.
 		registerRunningSub(registry, "AgentB");
-		const tool = new HubTool(createToolSession({ manager, registry, agentId: "Main" }));
+		const tool = new HubTool(createToolSession({ fixture }));
 
 		const result = await tool.execute("call", { op: "jobs" });
 
@@ -207,7 +324,8 @@ describe("hub jobs snapshot", () => {
 
 describe("hub wait with no matching jobs", () => {
 	test("bare wait with nothing running stays a useless no-op message", async () => {
-		const tool = new HubTool(createToolSession({ manager: createManager(), agentId: "Main" }));
+		const fixture = await createManager();
+		const tool = new HubTool(createToolSession({ fixture }));
 
 		const result = await tool.execute("call", { op: "wait" });
 
@@ -216,9 +334,10 @@ describe("hub wait with no matching jobs", () => {
 	});
 
 	test("bare wait reports running agents outside job control", async () => {
-		const registry = new AgentRegistry();
+		const fixture = await createManager();
+		const { registry } = fixture;
 		registerRunningSub(registry, "Worker");
-		const tool = new HubTool(createToolSession({ manager: createManager(), registry }));
+		const tool = new HubTool(createToolSession({ fixture }));
 
 		const result = await tool.execute("call", { op: "wait" });
 
@@ -230,9 +349,10 @@ describe("hub wait with no matching jobs", () => {
 	});
 
 	test("waiting on an agent id that has no job explains the agent's state", async () => {
-		const registry = new AgentRegistry();
+		const fixture = await createManager();
+		const { registry } = fixture;
 		registerRunningSub(registry, "Worker");
-		const tool = new HubTool(createToolSession({ manager: createManager(), registry, agentId: "Main" }));
+		const tool = new HubTool(createToolSession({ fixture }));
 
 		const result = await tool.execute("call", { op: "wait", ids: ["Worker"] });
 
@@ -260,57 +380,45 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 	}
 
 	test("cancel kills an owned idle agent that has no backing job", async () => {
-		const registry = new AgentRegistry();
-		const lifecycle = new AgentLifecycleManager(registry);
-		const fake = fakeSession();
-		registry.register({
-			id: "Zombie",
-			displayName: "Zombie",
-			kind: "sub",
-			parentId: "Main",
-			session: fake.session as never,
-			status: "idle",
-		});
-		lifecycle.adopt("Zombie", { idleTtlMs: 0 });
-		const tool = new HubTool(createToolSession({ manager: createManager(), registry, agentId: "Main", lifecycle }));
+		const fixture = await createTrustedHubChild("Zombie", "idle");
+		const disposeSpy = spyOn(fixture.child.session, "dispose");
+		try {
+			const result = await fixture.hub.execute("call", { op: "cancel", ids: ["Zombie"] });
 
-		const result = await tool.execute("call", { op: "cancel", ids: ["Zombie"] });
-
-		expect((result.details as CoordinationDetails)?.cancelled).toEqual([{ id: "Zombie", status: "cancelled" }]);
-		expect(resultText(result)).toContain("Cancelled agent Zombie");
-		const killed = registry.get("Zombie");
-		expect(killed?.status).toBe("aborted");
-		expect(killed?.session).toBeNull();
-		expect(lifecycle.has("Zombie")).toBe(false);
-		expect(fake.disposeCalls()).toBe(1);
-	});
+			expect((result.details as CoordinationDetails)?.cancelled).toEqual([{ id: "Zombie", status: "cancelled" }]);
+			expect(resultText(result)).toContain("Cancelled agent Zombie");
+			const killed = fixture.registry.get("Zombie");
+			expect(killed?.status).toBe("aborted");
+			expect(lookupAgentRef(fixture.registry, "Zombie")?.session).toBeNull();
+			expect(lifecycleHasAgent(fixture.lifecycle, "Zombie")).toBe(false);
+			expect(disposeSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			disposeSpy.mockRestore();
+			await fixture.dispose();
+		}
+	}, 15_000);
 
 	test("cancel aborts the in-flight turn of a running agent before releasing it", async () => {
-		const registry = new AgentRegistry();
-		const lifecycle = new AgentLifecycleManager(registry);
-		const fake = fakeSession();
-		registry.register({
-			id: "Runner",
-			displayName: "Runner",
-			kind: "sub",
-			parentId: "Main",
-			session: fake.session as never,
-			status: "running",
-		});
-		lifecycle.adopt("Runner", { idleTtlMs: 0 });
-		const tool = new HubTool(createToolSession({ manager: createManager(), registry, agentId: "Main", lifecycle }));
+		const fixture = await createTrustedHubChild("Runner", "running");
+		const abortSpy = spyOn(fixture.child.session, "abort");
+		const disposeSpy = spyOn(fixture.child.session, "dispose");
+		try {
+			const result = await fixture.hub.execute("call", { op: "cancel", ids: ["Runner"] });
 
-		const result = await tool.execute("call", { op: "cancel", ids: ["Runner"] });
-
-		expect((result.details as CoordinationDetails)?.cancelled).toEqual([{ id: "Runner", status: "cancelled" }]);
-		expect(fake.abortCalls()).toBe(1);
-		expect(fake.disposeCalls()).toBe(1);
-		expect(registry.get("Runner")?.status).toBe("aborted");
+			expect((result.details as CoordinationDetails)?.cancelled).toEqual([{ id: "Runner", status: "cancelled" }]);
+			expect(abortSpy).toHaveBeenCalledTimes(1);
+			expect(disposeSpy).toHaveBeenCalledTimes(1);
+			expect(fixture.registry.get("Runner")?.status).toBe("aborted");
+		} finally {
+			abortSpy.mockRestore();
+			disposeSpy.mockRestore();
+			await fixture.dispose();
+		}
 	});
 
 	test("cancel refuses an agent spawned by someone else", async () => {
-		const registry = new AgentRegistry();
-		const lifecycle = new AgentLifecycleManager(registry);
+		const fixture = await createManager();
+		const { registry } = fixture;
 		const fake = fakeSession();
 		registry.register({
 			id: "OtherKid",
@@ -320,7 +428,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 			session: fake.session as never,
 			status: "idle",
 		});
-		const tool = new HubTool(createToolSession({ manager: createManager(), registry, agentId: "Main", lifecycle }));
+		const tool = new HubTool(createToolSession({ fixture }));
 
 		const result = await tool.execute("call", { op: "cancel", ids: ["OtherKid"] });
 
@@ -329,10 +437,32 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 		expect(fake.disposeCalls()).toBe(0);
 	});
 
+	test("synthetic ToolSession cannot cancel a public legacy registration", async () => {
+		const fixture = await createManager();
+		const { registry } = fixture;
+		const fake = fakeSession();
+		registry.register({
+			id: "LegacyKid",
+			displayName: "LegacyKid",
+			kind: "sub",
+			parentId: "Main",
+			session: fake.session as never,
+			status: "idle",
+		});
+		const tool = new HubTool(createToolSession({ fixture, authorized: false }));
+
+		const result = await tool.execute("call", { op: "cancel", ids: ["LegacyKid"] });
+
+		expect(result.isError).toBe(true);
+		expect(resultText(result)).toBe("Hub coordination authority is unavailable for this session.");
+		expect(registry.get("LegacyKid")?.status).toBe("idle");
+		expect(fake.abortCalls()).toBe(0);
+		expect(fake.disposeCalls()).toBe(0);
+	});
+
 	test("cancel of a truly unknown id still reports not_found", async () => {
-		const registry = new AgentRegistry();
-		const lifecycle = new AgentLifecycleManager(registry);
-		const tool = new HubTool(createToolSession({ manager: createManager(), registry, agentId: "Main", lifecycle }));
+		const fixture = await createManager();
+		const tool = new HubTool(createToolSession({ fixture }));
 
 		const result = await tool.execute("call", { op: "cancel", ids: ["Ghost"] });
 
@@ -340,40 +470,34 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 		expect(resultText(result)).toContain("Background job not found: Ghost");
 	});
 	test("cancel kills the registration even while the settled job row is still retained", async () => {
-		const registry = new AgentRegistry();
-		const lifecycle = new AgentLifecycleManager(registry);
-		const fake = fakeSession();
-		const manager = createManager();
-		// Job id == agent id for task spawns; the settled row survives ~5 min
-		// after the budget abort while the keep-alive registration lives on.
-		manager.register("task", "Zombie", async () => "done", { id: "Zombie", agentId: "Zombie", ownerId: "Main" });
-		await manager.waitForAll();
-		registry.register({
-			id: "Zombie",
-			displayName: "Zombie",
-			kind: "sub",
-			parentId: "Main",
-			session: fake.session as never,
-			status: "idle",
-		});
-		lifecycle.adopt("Zombie", { idleTtlMs: 0 });
-		const tool = new HubTool(createToolSession({ manager, registry, agentId: "Main", lifecycle }));
+		const fixture = await createTrustedHubChild("Zombie", "idle");
+		const disposeSpy = spyOn(fixture.child.session, "dispose");
+		try {
+			fixture.manager.register("task", "Zombie", async () => "done", {
+				id: "Zombie",
+				agentId: "Zombie",
+				ownerId: "Main",
+			});
+			await fixture.manager.waitForAll();
 
-		const result = await tool.execute("call", { op: "cancel", ids: ["Zombie"] });
+			const result = await fixture.hub.execute("call", { op: "cancel", ids: ["Zombie"] });
 
-		expect((result.details as CoordinationDetails)?.cancelled).toEqual([{ id: "Zombie", status: "cancelled" }]);
-		expect(registry.get("Zombie")?.status).toBe("aborted");
-		expect(lifecycle.has("Zombie")).toBe(false);
-		expect(fake.disposeCalls()).toBe(1);
+			expect((result.details as CoordinationDetails)?.cancelled).toEqual([{ id: "Zombie", status: "cancelled" }]);
+			expect(fixture.registry.get("Zombie")?.status).toBe("aborted");
+			expect(lifecycleHasAgent(fixture.lifecycle, "Zombie")).toBe(false);
+			expect(disposeSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			disposeSpy.mockRestore();
+			await fixture.dispose();
+		}
 	});
 
 	test("cancel of a settled job with no lingering registration stays already_completed", async () => {
-		const registry = new AgentRegistry();
-		const lifecycle = new AgentLifecycleManager(registry);
-		const manager = createManager();
+		const fixture = await createManager();
+		const { manager } = fixture;
 		manager.register("task", "DoneJob", async () => "done", { id: "DoneJob", agentId: "DoneJob", ownerId: "Main" });
 		await manager.waitForAll();
-		const tool = new HubTool(createToolSession({ manager, registry, agentId: "Main", lifecycle }));
+		const tool = new HubTool(createToolSession({ fixture }));
 
 		const result = await tool.execute("call", { op: "cancel", ids: ["DoneJob"] });
 
@@ -385,7 +509,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 
 	test("descendant scope terminates nested children while direct-child scope fails closed", async () => {
 		const registry = new AgentRegistry();
-		const lifecycle = new AgentLifecycleManager(registry);
+		const lifecycle = createLifecycle(registry);
 		registry.register({
 			id: "Child",
 			displayName: "Child",
@@ -403,13 +527,15 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 			session: grandchild.session as never,
 			status: "idle",
 		});
-		lifecycle.adopt("Grandchild", { idleTtlMs: 0 });
+		const exact = lookupAgentRef(registry, "Grandchild")!;
+		adoptAgent(lifecycle, "Grandchild", { idleTtlMs: 0 }, exact);
 
 		await expect(
 			terminateSubagent({
 				registry,
 				lifecycle,
 				targetId: "Grandchild",
+				expectedRef: exact,
 				policy: { scope: "direct-child", ownerId: "Main" },
 			}),
 		).resolves.toMatchObject({ status: "not_found" });
@@ -418,6 +544,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 				registry,
 				lifecycle,
 				targetId: "Grandchild",
+				expectedRef: exact,
 				policy: { scope: "descendant", ownerId: "Main" },
 			}),
 		).resolves.toMatchObject({ status: "cancelled" });
@@ -427,7 +554,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 
 	test("a stale termination cannot kill a replacement generation", async () => {
 		const registry = new AgentRegistry();
-		const lifecycle = new AgentLifecycleManager(registry);
+		const lifecycle = createLifecycle(registry);
 		let replacement: AgentRef | undefined;
 		const stale = fakeSession(() => {
 			replacement = registry.register({
@@ -447,24 +574,32 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 			session: stale.session as never,
 			status: "running",
 		});
-		lifecycle.adopt("Runner", { idleTtlMs: 0 });
+		const exact = lookupAgentRef(registry, "Runner")!;
+		adoptAgent(lifecycle, "Runner", { idleTtlMs: 0 }, exact);
 
 		await expect(
 			terminateSubagent({
 				registry,
 				lifecycle,
 				targetId: "Runner",
+				expectedRef: exact,
 				policy: { scope: "direct-child", ownerId: "Main" },
 			}),
 		).resolves.toMatchObject({ status: "already_completed" });
-		expect(registry.get("Runner")).toBe(replacement);
-		expect(replacement?.status).toBe("idle");
+		if (!replacement) throw new Error("Expected replacement generation");
+		expect(registry.get("Runner")).toMatchObject({
+			id: replacement.id,
+			lineage: replacement.lineage,
+			status: "idle",
+		});
+		expect(lookupAgentRef(registry, "Runner")?.session).toBeNull();
+		expect(replacement.status).toBe("idle");
 	});
 
 	test("rejects a replacement that appeared after caller authorization", async () => {
 		const registry = new AgentRegistry();
-		const lifecycle = new AgentLifecycleManager(registry);
-		const authorized = registry.register({
+		const lifecycle = createLifecycle(registry);
+		registry.register({
 			id: "Runner",
 			displayName: "Authorized",
 			kind: "sub",
@@ -472,7 +607,9 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 			session: null,
 			status: "idle",
 		});
-		expect(registry.unregister("Runner", authorized)).toBe(true);
+		const authorized = lookupAgentRef(registry, "Runner")!;
+		if (!unregisterAgentRef(registry, "Runner", authorized))
+			throw new Error("Failed to retire authorized generation");
 		const replacement = registry.register({
 			id: "Runner",
 			displayName: "Replacement",
@@ -491,35 +628,72 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 				policy: { scope: "direct-child", ownerId: "Main" },
 			}),
 		).resolves.toMatchObject({ status: "not_found" });
-		expect(registry.get("Runner")).toBe(replacement);
+		expect(registry.get("Runner")).toMatchObject({
+			id: replacement.id,
+			lineage: replacement.lineage,
+			status: "idle",
+		});
+		expect(lookupAgentRef(registry, "Runner")?.session).toBeNull();
 		expect(replacement.status).toBe("idle");
 	});
-	test("blocks same-id replacement while tombstone publication is pending", () => {
+	test("blocks same-id replacement until manager-owned termination finishes", async () => {
 		const registry = new AgentRegistry();
-		const current = registry.register({
+		const lifecycle = createLifecycle(registry);
+		const disposeStarted = Promise.withResolvers<void>();
+		const finishDispose = Promise.withResolvers<void>();
+		const fake = fakeSession();
+		fake.session.dispose = async () => {
+			disposeStarted.resolve();
+			await finishDispose.promise;
+		};
+		registry.register({
 			id: "Runner",
 			displayName: "Runner",
 			kind: "sub",
 			parentId: "Main",
-			session: null,
+			session: fake.session as never,
 			status: "idle",
 		});
-
-		expect(registry.beginTermination("Runner", current)).toBe(true);
-		expect(() =>
-			registry.register({
-				id: "Runner",
-				displayName: "Replacement",
-				kind: "sub",
-				parentId: "Main",
-				session: null,
-				status: "idle",
-			}),
-		).toThrow('Agent "Runner" is being terminated.');
-		expect(registry.get("Runner")).toBe(current);
-		registry.endTermination("Runner", current);
-		expect(
-			registry.register({ id: "Runner", displayName: "Replacement", kind: "sub", parentId: "Main", session: null }),
-		).not.toBe(current);
+		const current = lookupAgentRef(registry, "Runner")!;
+		adoptAgent(lifecycle, "Runner", { idleTtlMs: 0 }, current);
+		const termination = terminateSubagent({
+			registry,
+			lifecycle,
+			targetId: "Runner",
+			expectedRef: current,
+			policy: { scope: "direct-child", ownerId: "Main" },
+		});
+		try {
+			await disposeStarted.promise;
+			expect(() =>
+				registry.register({
+					id: "Runner",
+					displayName: "Replacement",
+					kind: "sub",
+					parentId: "Main",
+					session: null,
+				}),
+			).toThrow('Agent "Runner" is being terminated.');
+			expect(registry.get("Runner")).toMatchObject({ id: current.id, lineage: current.lineage, status: "aborted" });
+			expect(lookupAgentRef(registry, "Runner")?.session).toBeNull();
+			expect(current.status).toBe("aborted");
+			finishDispose.resolve();
+			await termination;
+			// Releasing the completed tombstone removes it through the same lifecycle owner.
+			expect(await releaseAgent(lifecycle, "Runner", current)).toBe(true);
+			expect(
+				registry.register({
+					id: "Runner",
+					displayName: "Replacement",
+					kind: "sub",
+					parentId: "Main",
+					session: null,
+				}),
+			).not.toBe(current);
+		} finally {
+			finishDispose.resolve();
+			await termination;
+			await disposeAgentLifecycle(lifecycle);
+		}
 	});
 });

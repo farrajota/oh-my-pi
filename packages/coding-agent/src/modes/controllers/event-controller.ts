@@ -2116,6 +2116,7 @@ export class EventController {
 			this.ctx.statusContainer.disposeChildren();
 		}
 		await this.ctx.flushPendingModelSwitch();
+		if (source !== this.ctx.viewSession) return;
 		this.#sealAbandonedForegroundTools();
 		this.#approvalAttentionToolCallIds.clear();
 		this.#readToolCallArgs.clear();

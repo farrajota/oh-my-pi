@@ -18,6 +18,7 @@ import { getDefault, type Settings } from "../config/settings";
 import { formatGroupedDiagnosticMessages } from "../lsp/utils";
 import type { Theme } from "../modes/theme/theme";
 import { type OutputSummary, type TruncationResult, truncateMiddle, truncateTail } from "../session/streaming-output";
+import { runArtifactOperation } from "../registry/operation-lease";
 import { formatBytes, wrapBrackets } from "./render-utils";
 import { renderError } from "./tool-errors";
 
@@ -726,6 +727,7 @@ async function spillLargeResultToArtifact(
 	result: AgentToolResult,
 	toolName: string,
 	context: AgentToolContext | undefined,
+	operationId: string,
 ): Promise<AgentToolResult> {
 	const sessionManager = context?.sessionManager;
 	if (!sessionManager) return result;
@@ -759,7 +761,6 @@ async function spillLargeResultToArtifact(
 	const totalBytes = Buffer.byteLength(fullText, "utf-8");
 	if (totalBytes <= threshold) return result;
 
-	// Save the full output as an artifact so the elided bytes stay recoverable.
 	// In a persistent session this hits `Bun.write`, which can throw (disk full,
 	// permissions). The spill wraps arbitrary tools (built-in, MCP, extension,
 	// RPC-host); a save failure must never convert a successful call into an
@@ -768,7 +769,12 @@ async function spillLargeResultToArtifact(
 	// attach the `artifact://` recovery link when the save actually succeeded.
 	let artifactId: string | undefined;
 	try {
-		artifactId = await sessionManager.saveArtifact(fullText, toolName);
+		artifactId = await runArtifactOperation(
+			context?.sessionManager,
+			`artifact:${operationId}`,
+			() => sessionManager.saveArtifact(fullText, toolName),
+			context?.toolCall?.steeringSignal,
+		);
 	} catch (error) {
 		logger.warn("Failed to spill large tool result to artifact", {
 			tool: toolName,
@@ -910,7 +916,7 @@ async function wrappedExecute(
 		let result = await originalExecute.call(this, toolCallId, params, signal, onUpdate, context, preparedExecution);
 
 		// Spill large results to artifact, truncate to tail
-		result = await spillLargeResultToArtifact(result, this.name, context);
+		result = await spillLargeResultToArtifact(result, this.name, context, toolCallId);
 
 		// Append notices from meta
 		const meta: OutputMeta | undefined = result.details?.meta;

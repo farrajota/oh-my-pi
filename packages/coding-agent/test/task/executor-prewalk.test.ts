@@ -11,8 +11,11 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import {
+	installSessionOperationLedger,
+	markUnregisteredSessionOperationProjection,
+} from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -23,6 +26,7 @@ import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 function yieldEmittingSession(
@@ -34,9 +38,15 @@ function yieldEmittingSession(
 		onBeforeSwitch?: () => void;
 		onAfterSwitch?: () => void;
 	},
+	sessionManagerOverride?: AgentSession["sessionManager"],
 ): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	let activeTools = initialTools;
+	const sessionManager = sessionManagerOverride ?? { appendSessionInit: () => {} };
+	if (!sessionManagerOverride) {
+		installSessionOperationLedger(sessionManager);
+		markUnregisteredSessionOperationProjection(sessionManager, false);
+	}
 	// `servingModel` mirrors the real session: attribution names the model that
 	// produced output, so a prewalk hand-off moves it along with `model`.
 	const serving = (
@@ -51,7 +61,8 @@ function yieldEmittingSession(
 		model: modelSwitch?.from,
 		servingModel: serving(modelSwitch?.from),
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		sessionManager,
+		getPermissionSummary: () => undefined,
 		getActiveToolNames: () => activeTools,
 		getEnabledToolNames: () => activeTools,
 		getAllToolNames: () => activeTools,
@@ -128,8 +139,11 @@ const baseAgent: AgentDefinition = {
 describe("runSubprocess per-agent prewalk", () => {
 	const primary = modelOrThrow("claude-sonnet-4-5");
 	const target = modelOrThrow("claude-sonnet-4-6");
+	const registry = new AgentRegistry();
 
 	function baseOptions(id: string, settings: Settings) {
+		const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+			sdkModule.createAgentSession({ ...options, agentRegistry: registry });
 		return {
 			cwd: "/tmp",
 			task: "do work",
@@ -138,17 +152,19 @@ describe("runSubprocess per-agent prewalk", () => {
 			settings,
 			modelRegistry: createModelRegistry([primary, target]),
 			enableLsp: false,
+			agentRegistry: registry,
+			createAuthoritySession,
 		};
 	}
 
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 	});
 
 	afterEach(() => {
 		vi.restoreAllMocks();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 	});
 
@@ -222,7 +238,7 @@ describe("runSubprocess per-agent prewalk", () => {
 		expect(progressModels.at(-1)).toBe(`${target.provider}/${target.id}`);
 	});
 
-	it("keeps registry history synchronized with an authoritative fallback model through detach", async () => {
+	it("keeps authoritative fallback history synchronized before terminal cleanup", async () => {
 		const id = "subagent-serving-model-history";
 		const requestedPermissionProfiles = ["focused-edit", "no-network"];
 		const effectivePermissionProfiles = ["focused-edit", "no-network"];
@@ -234,7 +250,7 @@ describe("runSubprocess per-agent prewalk", () => {
 			effectivePermissionProfiles?: string[];
 		}> = [];
 		const snapshotHistory = () => {
-			const history = AgentRegistry.global().get(id)?.history;
+			const history = registry.get(id)?.history;
 			historySnapshots.push({
 				modelRole: history?.modelRole,
 				resolvedModel: history?.resolvedModel,
@@ -243,23 +259,21 @@ describe("runSubprocess per-agent prewalk", () => {
 				effectivePermissionProfiles: history?.effectivePermissionProfiles,
 			});
 		};
-		const session = yieldEmittingSession(["read", "yield"], {
-			from: primary,
-			to: target,
-			toIsFallback: true,
-			onBeforeSwitch: snapshotHistory,
-			onAfterSwitch: snapshotHistory,
-		});
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
-			AgentRegistry.global().register({
-				id,
-				displayName: "task",
-				kind: "sub",
-				parentId: "Main",
-				session,
-				status: "running",
-			});
-			return createSessionResult(session);
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options?.sessionManager) throw new Error("Expected executor-owned session manager");
+			return createSessionResult(
+				yieldEmittingSession(
+					["read", "yield"],
+					{
+						from: primary,
+						to: target,
+						toIsFallback: true,
+						onBeforeSwitch: snapshotHistory,
+						onAfterSwitch: snapshotHistory,
+					},
+					options.sessionManager,
+				),
+			);
 		});
 
 		const result = await runSubprocess({
@@ -291,17 +305,7 @@ describe("runSubprocess per-agent prewalk", () => {
 			resolvedModel: `${target.provider}/${target.id}`,
 			resolvedModelIsFallback: true,
 		});
-		expect(AgentRegistry.global().get(id)).toMatchObject({
-			status: "parked",
-			session: null,
-			history: {
-				modelRole: "reviewer",
-				resolvedModel: `${target.provider}/${target.id}`,
-				resolvedModelIsFallback: true,
-				requestedPermissionProfiles,
-				effectivePermissionProfiles,
-			},
-		});
+		expect(registry.get(id)).toBeUndefined();
 	});
 
 	it("resolves prewalk: true through the smol role default target", async () => {
@@ -460,20 +464,24 @@ describe("task tool plan-mode prewalk guard", () => {
 
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 	});
 
 	afterEach(() => {
 		vi.restoreAllMocks();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 	});
 
 	function toolSession(planMode: boolean): ToolSession {
+		const sessionManager = {};
+		installSessionOperationLedger(sessionManager);
+		markUnregisteredSessionOperationProjection(sessionManager, false);
 		return {
 			cwd: "/tmp",
 			hasUI: false,
 			settings: Settings.isolated({ "task.isolation.enabled": false }),
+			sessionManager,
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
 			getPlanModeState: () => (planMode ? { enabled: true, planFilePath: "local://PLAN.md" } : undefined),

@@ -683,6 +683,53 @@ describe("MemoryProtocolHandler — mnemopi bridge (issue #4443)", () => {
 		});
 	});
 
+	it("uses an unregistered caller projection without exposing a registered peer's bank", async () => {
+		await withMnemopiSession(async ({ state, dbDir }) => {
+			const directDbDir = TempDir.createSync("memory-protocol-mnemopi-direct-");
+			let directState: MnemopiSessionState | undefined;
+			try {
+				const directSession = {
+					sessionId: "direct-mnemopi",
+					sessionManager: {
+						getEntries: () => [],
+						getCwd: () => dbDir.path(),
+						getArtifactsDir: () => null,
+						getSessionId: () => "direct-mnemopi",
+					},
+					emitNotice: () => {},
+					settings: Settings.isolated({ "memory.backend": "mnemopi" }),
+				} as unknown as AgentSession;
+				directState = new MnemopiSessionState({
+					sessionId: "direct-mnemopi",
+					config: { ...state.config, dbPath: directDbDir.join("mnemopi.db"), bank: "direct-bank" },
+					session: directSession,
+				});
+				const directId = directState.rememberInScope("direct caller row");
+				const peerId = state.rememberInScope("registered peer row");
+				if (!directId || !peerId) throw new Error("Expected both session banks to store a memory id");
+
+				const context = {
+					cwd: dbDir.path(),
+					sessionId: "direct-mnemopi",
+					callerMemory: {
+						backend: "mnemopi",
+						getMnemopiSessionState: () => directState,
+					},
+				};
+				const router = InternalUrlRouter.instance();
+				await expect(router.resolve(`memory://${directId}`, context)).resolves.toMatchObject({
+					content: expect.stringContaining("direct caller row"),
+				});
+				await expect(router.resolve(`memory://${peerId}`, context)).rejects.toThrow(
+					/not found in the calling session's scoped bank/,
+				);
+			} finally {
+				await directState?.dispose({ consolidate: false });
+				await directDbDir.remove();
+			}
+		});
+	});
+
 	it("binds memory://<id> to the calling session's own bank", async () => {
 		await withMnemopiSession(async ({ state, dbDir }) => {
 			const peerDbDir = TempDir.createSync("memory-protocol-mnemopi-peer-");

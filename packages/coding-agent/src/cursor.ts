@@ -29,7 +29,9 @@ import {
 } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { cursorMcpPrefersReplaceEdit, normalizeCursorReplaceArgs } from "./cursor-bridge-tools";
+import type { FilesystemOperation, SessionPathScope } from "./internal/session-path-scope";
 import type { MCPResourceReadResult } from "./mcp/types";
+import { runBoundFilesystemOperation } from "./registry/operation-lease";
 import type { ApprovalMode } from "./tools/approval";
 import { resolveApproval } from "./tools/approval";
 import { confineToWorkspace, resolveToCwd } from "./tools/path-utils";
@@ -57,6 +59,37 @@ export interface CursorMcpResourceAdapter {
 		name: string,
 	): Promise<{ resources: { uri: string; name?: string; description?: string; mimeType?: string }[] } | undefined>;
 	readServerResource(name: string, uri: string): Promise<MCPResourceReadResult | undefined>;
+}
+
+/** Exact operation broker used only by Cursor frames that bypass registry tools. */
+export interface CursorFilesystemOperationHandler {
+	run<T>(
+		toolName: "delete" | "write",
+		operationId: string,
+		run: (operation: FilesystemOperation, signal: AbortSignal) => Promise<T>,
+	): Promise<T>;
+}
+
+/**
+ * Bind Cursor's direct delete/download frames to both the session operation
+ * ledger and its operation-local path scope. Missing ledgers fail closed.
+ */
+export function createCursorFilesystemOperationHandler(
+	pathScope: SessionPathScope,
+	sessionManager: object | undefined,
+): CursorFilesystemOperationHandler {
+	return Object.freeze({
+		run<T>(
+			toolName: "delete" | "write",
+			operationId: string,
+			run: (operation: FilesystemOperation, signal: AbortSignal) => Promise<T>,
+		): Promise<T> {
+			const boundId = `${toolName}:${operationId}`;
+			return runBoundFilesystemOperation(sessionManager, boundId, signal =>
+				pathScope.withOperationLease(boundId, operation => run(operation, signal)),
+			);
+		},
+	});
 }
 
 interface CursorExecBridgeOptions {
@@ -136,6 +169,8 @@ interface CursorExecBridgeOptions {
 	 * which is indistinguishable from a server that advertises nothing.
 	 */
 	mcpResources?: CursorMcpResourceAdapter;
+	/** Operation-local authority for the two Cursor frames that mutate files directly. */
+	filesystemOperation?: CursorFilesystemOperationHandler;
 }
 
 /**
@@ -328,11 +363,6 @@ async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, 
 		return createToolResultMessage(toolCallId, toolName, result, true);
 	}
 
-	// Unlike every other frame, this one mutates the filesystem directly instead
-	// of running a registry tool, so no approval wrapper sits in front of it.
-	// `allowDirectFileMutation` answers "was a mutating tool granted", which is a
-	// different question from "does the user's policy allow this call" — without
-	// this, a configured `deny` or an `always-ask` session still lost the file.
 	const refusal = refuseByWritePolicy(options, toolName, pathArg);
 	if (refusal) {
 		return createToolResultMessage(toolCallId, toolName, buildToolErrorResult(refusal), true);
@@ -345,21 +375,28 @@ async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, 
 	let result: AgentToolResult<unknown>;
 
 	try {
-		let fileStat: fs.Stats | undefined;
-		try {
-			fileStat = fs.statSync(absolutePath);
-		} catch {
-			throw new Error(`File not found: ${pathArg}`);
-		}
-		if (!fileStat.isFile()) {
-			throw new Error(`Path is not a file: ${pathArg}`);
+		let size = 0n;
+		if (options.filesystemOperation) {
+			await options.filesystemOperation.run(toolName, toolCallId, async operation => {
+				const target = await operation.authorize(absolutePath, "delete");
+				if (!target.isFile) throw new Error(`Path is not a file: ${pathArg}`);
+				size = target.size;
+				await operation.deleteFile(target);
+			});
+		} else {
+			let fileStat: fs.Stats | undefined;
+			try {
+				fileStat = fs.statSync(absolutePath);
+			} catch {
+				throw new Error(`File not found: ${pathArg}`);
+			}
+			if (!fileStat.isFile()) throw new Error(`Path is not a file: ${pathArg}`);
+			size = BigInt(fileStat.size);
+			fs.rmSync(absolutePath);
 		}
 
-		fs.rmSync(absolutePath);
-
-		const sizeText = fileStat.size ? ` (${fileStat.size} bytes)` : "";
-		const message = `Deleted ${pathArg}${sizeText}`;
-		result = { content: [{ type: "text", text: message }], details: {} };
+		const sizeText = size > 0n ? ` (${size} bytes)` : "";
+		result = { content: [{ type: "text", text: `Deleted ${pathArg}${sizeText}` }], details: {} };
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		result = buildToolErrorResult(message);
@@ -823,7 +860,14 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			const cwd = this.options.getCwd?.() ?? this.options.cwd;
 			const absolutePath = confineToWorkspace(downloadPath, cwd);
 			if (!absolutePath) throw new Error(`Refusing to download outside the workspace: ${downloadPath}`);
-			await writeWithoutFollowingLinks(absolutePath, payload);
+			if (this.options.filesystemOperation) {
+				await this.options.filesystemOperation.run("write", randomUUID(), async operation => {
+					const target = await operation.authorize(absolutePath, "write");
+					await operation.writeFile(target, payload);
+				});
+			} else {
+				await writeWithoutFollowingLinks(absolutePath, payload);
+			}
 			// The path echoed back is the one the frame asked for; the model
 			// addresses it the same relative way.
 			return { uri, mimeType: texts.length > 0 ? textMimeType : blobMimeType, downloadPath };

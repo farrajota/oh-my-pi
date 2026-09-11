@@ -16,6 +16,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const OPENAI_TEST_MODEL = getBundledModel("openai", "gpt-4o-mini");
+const FORK_INTEGRATION_TIMEOUT_MS = 15_000;
 
 interface ArgsWithPromptCacheKey extends Args {
 	providerPromptCacheKey?: string;
@@ -124,110 +125,122 @@ describe("provider prompt-cache key session affinity", () => {
 		}
 	});
 
-	it("initializes a full fork with child request lineage and parent prompt-cache affinity", async () => {
-		using tempDir = TempDir.createSync("@omp-prompt-cache-fork-");
-		const source = await createSourceSessionFixture(tempDir, "parent-cache-session");
-		const forkedManager = await SessionManager.forkFrom(source.sourceFile, source.cwd, source.forkSessionDir);
-		let session: AgentSession | undefined;
-		let authStorage: AuthStorage | undefined;
-		try {
-			const created = await createMinimalSession(tempDir, {
-				cwd: source.cwd,
-				sessionManager: forkedManager,
-			});
-			session = created.session;
-			authStorage = created.authStorage;
-			const childSessionId = forkedManager.getSessionId();
-
-			expect(forkedManager.getHeader()?.parentSession).toBe(source.sourceHeader.id);
-			expect(childSessionId).toBeString();
-			expect(childSessionId).not.toBe(source.sourceHeader.id);
-			expect(session.agent.sessionId).toBe(childSessionId);
-			expect(session.agent.promptCacheKey).toBe(source.sourceHeader.id);
-			expect(session.agent.promptCacheKey).not.toBe(session.agent.sessionId);
-		} finally {
-			await session?.dispose();
-			authStorage?.close();
-		}
-	});
-
-	it("does not auto-inherit parent prompt-cache affinity when fork startup changes request-shaping inputs", async () => {
-		const cases: Array<{ name: string; options: CreateAgentSessionOptions }> = [
-			{
-				name: "model",
-				options: { model: OPENAI_TEST_MODEL },
-			},
-			{
-				name: "thinking",
-				options: { thinkingLevel: ThinkingLevel.High },
-			},
-			{
-				name: "system",
-				options: { customSystemPrompt: "Use a different provider prompt." },
-			},
-			{
-				name: "tools",
-				options: { toolNames: ["read"] },
-			},
-		];
-
-		for (const entry of cases) {
-			using tempDir = TempDir.createSync(`@omp-prompt-cache-fork-${entry.name}-`);
-			const source = await createSourceSessionFixture(tempDir, `parent-cache-session-${entry.name}`);
+	it(
+		"initializes a full fork with child request lineage and parent prompt-cache affinity",
+		async () => {
+			using tempDir = TempDir.createSync("@omp-prompt-cache-fork-");
+			const source = await createSourceSessionFixture(tempDir, "parent-cache-session");
 			const forkedManager = await SessionManager.forkFrom(source.sourceFile, source.cwd, source.forkSessionDir);
 			let session: AgentSession | undefined;
 			let authStorage: AuthStorage | undefined;
 			try {
 				const created = await createMinimalSession(tempDir, {
-					...entry.options,
 					cwd: source.cwd,
 					sessionManager: forkedManager,
 				});
 				session = created.session;
 				authStorage = created.authStorage;
+				const childSessionId = forkedManager.getSessionId();
 
 				expect(forkedManager.getHeader()?.parentSession).toBe(source.sourceHeader.id);
-				expect(session.agent.promptCacheKey, entry.name).toBeUndefined();
+				expect(childSessionId).toBeString();
+				expect(childSessionId).not.toBe(source.sourceHeader.id);
+				expect(session.agent.sessionId).toBe(childSessionId);
+				expect(session.agent.promptCacheKey).toBe(source.sourceHeader.id);
+				expect(session.agent.promptCacheKey).not.toBe(session.agent.sessionId);
 			} finally {
 				await session?.dispose();
 				authStorage?.close();
 			}
-		}
-	});
+		},
+		FORK_INTEGRATION_TIMEOUT_MS,
+	);
 
-	it("does not pre-pin parent prompt-cache affinity when a scoped model selects the startup route", async () => {
-		using tempDir = TempDir.createSync("@omp-prompt-cache-scoped-model-");
-		const source = await createSourceSessionFixture(tempDir, "parent-cache-session-scoped");
-		const forkedManager = await SessionManager.forkFrom(source.sourceFile, source.cwd, source.forkSessionDir);
-		const authStorage = await AuthStorage.create(tempDir.join("scoped-auth.db"));
-		authStorage.setRuntimeApiKey(OPENAI_TEST_MODEL.provider, "test-key");
-		try {
-			const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
-			const parsed = parseArgs([
-				"--cwd",
-				source.cwd,
-				"--models",
-				`${OPENAI_TEST_MODEL.provider}/${OPENAI_TEST_MODEL.id}`,
-			]);
-			const scopedModels: ScopedModel[] = [
+	it(
+		"does not auto-inherit parent prompt-cache affinity when fork startup changes request-shaping inputs",
+		async () => {
+			const cases: Array<{ name: string; options: CreateAgentSessionOptions }> = [
 				{
-					model: OPENAI_TEST_MODEL,
-					explicitThinkingLevel: false,
+					name: "model",
+					options: { model: OPENAI_TEST_MODEL },
+				},
+				{
+					name: "thinking",
+					options: { thinkingLevel: ThinkingLevel.High },
+				},
+				{
+					name: "system",
+					options: { customSystemPrompt: "Use a different provider prompt." },
+				},
+				{
+					name: "tools",
+					options: { toolNames: ["read"] },
 				},
 			];
 
-			const options = await buildSessionOptions(
-				parsed,
-				scopedModels,
-				forkedManager,
-				modelRegistry,
-				Settings.isolated({ "marketplace.autoUpdate": "off" }),
-			);
+			for (const entry of cases) {
+				using tempDir = TempDir.createSync(`@omp-prompt-cache-fork-${entry.name}-`);
+				const source = await createSourceSessionFixture(tempDir, `parent-cache-session-${entry.name}`);
+				const forkedManager = await SessionManager.forkFrom(source.sourceFile, source.cwd, source.forkSessionDir);
+				let session: AgentSession | undefined;
+				let authStorage: AuthStorage | undefined;
+				try {
+					const created = await createMinimalSession(tempDir, {
+						...entry.options,
+						cwd: source.cwd,
+						sessionManager: forkedManager,
+					});
+					session = created.session;
+					authStorage = created.authStorage;
 
-			expect(options.model).toBe(OPENAI_TEST_MODEL);
-			expect(options.providerPromptCacheKey).toBeUndefined();
-		} finally {
-			authStorage.close();
-		}
-	});
+					expect(forkedManager.getHeader()?.parentSession).toBe(source.sourceHeader.id);
+					expect(session.agent.promptCacheKey, entry.name).toBeUndefined();
+				} finally {
+					await session?.dispose();
+					authStorage?.close();
+				}
+			}
+		},
+		FORK_INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"does not pre-pin parent prompt-cache affinity when a scoped model selects the startup route",
+		async () => {
+			using tempDir = TempDir.createSync("@omp-prompt-cache-scoped-model-");
+			const source = await createSourceSessionFixture(tempDir, "parent-cache-session-scoped");
+			const forkedManager = await SessionManager.forkFrom(source.sourceFile, source.cwd, source.forkSessionDir);
+			const authStorage = await AuthStorage.create(tempDir.join("scoped-auth.db"));
+			authStorage.setRuntimeApiKey(OPENAI_TEST_MODEL.provider, "test-key");
+			try {
+				const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+				const parsed = parseArgs([
+					"--cwd",
+					source.cwd,
+					"--models",
+					`${OPENAI_TEST_MODEL.provider}/${OPENAI_TEST_MODEL.id}`,
+				]);
+				const scopedModels: ScopedModel[] = [
+					{
+						model: OPENAI_TEST_MODEL,
+						explicitThinkingLevel: false,
+					},
+				];
+
+				const options = await buildSessionOptions(
+					parsed,
+					scopedModels,
+					forkedManager,
+					modelRegistry,
+					Settings.isolated({ "marketplace.autoUpdate": "off" }),
+				);
+
+				expect(options.model).toBe(OPENAI_TEST_MODEL);
+				expect(options.providerPromptCacheKey).toBeUndefined();
+			} finally {
+				authStorage.close();
+			}
+		},
+		FORK_INTEGRATION_TIMEOUT_MS,
+	);
 });

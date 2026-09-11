@@ -2,16 +2,53 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
+import type {
+	AuthorizedFilesystemTarget,
+	FilesystemOperation,
+	FilesystemOperationKind,
+	SessionPathScope,
+} from "../internal/session-path-scope";
+import { listAgentRefs } from "../internal/agent-registry-bridge";
 import { AgentRegistry } from "../registry/agent-registry";
+import {
+	canonicalDurableSha256,
+	durableBackingSha256,
+	type DurableLocalBackingExpectation,
+	type DurableLocalState,
+} from "../registry/durable-state";
 import { isMarkdownPath } from "../utils/lang-from-path";
-import { buildDirectoryResource } from "./filesystem-resource";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
-import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
+import type {
+	InternalResource,
+	InternalUrl,
+	ProtocolHandler,
+	ResolveContext,
+	UrlCompletion,
+	WriteContext,
+} from "./types";
 
 export interface LocalProtocolOptions {
 	getArtifactsDir?: () => string | null;
 	getSessionId?: () => string | null;
+	/** Exact calling session's operation-local filesystem authority. */
+	getPathScope?: () => SessionPathScope | undefined;
+	/** Session-owned single-head W4 journal. The callback returns metadata authority only, never a backing path. */
+	getDurableLocalState?: () => DurableLocalState | undefined;
+	/** Caller-owned lookup that validates recovered bytes without exposing or persisting a backing path. */
+	validateDurableLocalBacking?: (expectation: DurableLocalBackingExpectation) => boolean | Promise<boolean>;
+}
+
+const sessionLocalProtocolOptions = new WeakMap<object, LocalProtocolOptions>();
+
+/** Bind the exact options snapshot owned by one session manager. */
+export function bindSessionLocalProtocolOptions(sessionManager: object, options: LocalProtocolOptions): void {
+	sessionLocalProtocolOptions.set(sessionManager, options);
+}
+
+/** Recover the exact local:// options owned by one session manager. */
+export function getSessionLocalProtocolOptions(sessionManager: object): LocalProtocolOptions | undefined {
+	return sessionLocalProtocolOptions.get(sessionManager);
 }
 
 function parseLocalUrl(input: string): InternalUrl {
@@ -29,6 +66,7 @@ function toLocalValidationError(error: unknown): Error {
 	return new Error(message.replace("skill://", "local://"));
 }
 const WINDOWS_LOCAL_ROOT_MAX_CHARS = 180;
+const LOCAL_WRITE_NOTE = "local:// resources are writable files in the active session.";
 
 function safeSessionId(options: LocalProtocolOptions): string {
 	const raw = options.getSessionId?.() ?? "session";
@@ -41,6 +79,28 @@ function shortLocalRoot(options: LocalProtocolOptions): string {
 	// so `SessionManager.moveTo()` and the resume-after-move flow keep finding
 	// the same `local://` directory the session wrote pre-move.
 	return path.join(os.tmpdir(), "omp-local", safeSessionId(options));
+}
+
+function assertLocalRootCurrent(options: LocalProtocolOptions, expectedRoot: string): void {
+	const currentRoot = path.resolve(resolveLocalRoot(options));
+	if (currentRoot === expectedRoot) return;
+	throw new Error("local:// root changed during the operation");
+}
+
+function currentLocalOperation(options: LocalProtocolOptions): FilesystemOperation | undefined {
+	return options.getPathScope?.()?.currentOperation();
+}
+
+async function authorizeLocalTarget(
+	operation: FilesystemOperation,
+	targetPath: string,
+	kind: FilesystemOperationKind,
+	localRoot: string,
+): Promise<AuthorizedFilesystemTarget> {
+	const target = await operation.authorizeLocal(targetPath, kind);
+	ensureWithinRoot(target.canonicalTarget, localRoot);
+	ensureWithinRoot(target.canonicalParent, localRoot);
+	return target;
 }
 
 function getContentType(filePath: string): InternalResource["contentType"] {
@@ -143,7 +203,42 @@ function isUtf8Text(bytes: Uint8Array): boolean {
 async function buildFileResource(
 	url: InternalUrl,
 	resolved: Extract<ResolvedLocalTarget, { kind: "file" }>,
+	options?: LocalProtocolOptions,
 ): Promise<InternalResource> {
+	const operation = options ? currentLocalOperation(options) : undefined;
+	if (operation && resolved.authorizedTarget) {
+		const handle = await operation.openRead(resolved.authorizedTarget, "local");
+		try {
+			if (BINARY_FILE_EXTENSIONS.has(path.extname(resolved.path).toLowerCase())) {
+				return buildNonTextLocalResource(
+					url,
+					resolved.path,
+					resolved.size,
+					"extension is a known binary/container type",
+				);
+			}
+			const sniffLength = Math.min(resolved.size, LOCAL_TEXT_SNIFF_BYTES);
+			const sniffBytes = new Uint8Array(sniffLength);
+			const { bytesRead } = await handle.read(sniffBytes, 0, sniffLength, 0);
+			if (!isUtf8Text(sniffBytes.subarray(0, bytesRead))) {
+				return buildNonTextLocalResource(url, resolved.path, resolved.size, "content is not valid UTF-8 text");
+			}
+			if (resolved.size > LOCAL_TEXT_RESOURCE_MAX_BYTES) {
+				return buildLargeLocalTextResource(url, resolved.path, resolved.size);
+			}
+			const content = await handle.readFile({ encoding: "utf8" });
+			return {
+				url: url.href,
+				content,
+				contentType: getContentType(resolved.path),
+				size: Buffer.byteLength(content, "utf-8"),
+				sourcePath: resolved.path,
+				notes: [LOCAL_WRITE_NOTE],
+			};
+		} finally {
+			await handle.close();
+		}
+	}
 	if (BINARY_FILE_EXTENSIONS.has(path.extname(resolved.path).toLowerCase())) {
 		return buildNonTextLocalResource(url, resolved.path, resolved.size, "extension is a known binary/container type");
 	}
@@ -151,9 +246,8 @@ async function buildFileResource(
 	if (!isUtf8Text(sniffBytes)) {
 		return buildNonTextLocalResource(url, resolved.path, resolved.size, "content is not valid UTF-8 text");
 	}
-	if (resolved.size > LOCAL_TEXT_RESOURCE_MAX_BYTES) {
+	if (resolved.size > LOCAL_TEXT_RESOURCE_MAX_BYTES)
 		return buildLargeLocalTextResource(url, resolved.path, resolved.size);
-	}
 	const content = await Bun.file(resolved.path).text();
 	return {
 		url: url.href,
@@ -164,34 +258,49 @@ async function buildFileResource(
 		notes: [LOCAL_WRITE_NOTE],
 	};
 }
-
-async function listFilesRecursively(rootPath: string): Promise<string[]> {
+async function listFilesRecursively(rootPath: string, options?: LocalProtocolOptions): Promise<string[]> {
 	const pending = [""];
 	const files: string[] = [];
+	const operation = options ? currentLocalOperation(options) : undefined;
+	const expectedRoot = options ? path.resolve(resolveLocalRoot(options)) : undefined;
 
 	while (pending.length > 0) {
 		const relativeDir = pending.pop();
 		if (relativeDir === undefined) continue;
 		const absoluteDir = path.join(rootPath, relativeDir);
-		const entries = await fs.readdir(absoluteDir, { withFileTypes: true });
+		const directoryTarget = operation ? await operation.authorize(absoluteDir, "list") : undefined;
+		const directoryHandle = directoryTarget ? await operation!.openRead(directoryTarget, "local") : undefined;
+		try {
+			const entries = await fs.readdir(absoluteDir, { withFileTypes: true });
+			if (options && expectedRoot) assertLocalRootCurrent(options, expectedRoot);
 
-		for (const entry of entries) {
-			const entryPath = path.join(relativeDir, entry.name);
-			if (entry.isDirectory()) {
-				pending.push(entryPath);
-				continue;
+			for (const entry of entries) {
+				const entryPath = path.join(relativeDir, entry.name);
+				const absoluteEntry = path.join(rootPath, entryPath);
+				if (operation) {
+					try {
+						await operation.authorize(absoluteEntry, entry.isDirectory() ? "list" : "search");
+					} catch {
+						continue;
+					}
+				}
+				if (entry.isDirectory()) pending.push(entryPath);
+				else if (entry.isFile()) files.push(entryPath.replaceAll(path.sep, "/"));
 			}
-			if (entry.isFile()) {
-				files.push(entryPath.replaceAll(path.sep, "/"));
-			}
+		} finally {
+			await directoryHandle?.close();
 		}
 	}
 
 	return files.sort((a, b) => a.localeCompare(b));
 }
 
-async function buildListing(url: InternalUrl, localRoot: string): Promise<InternalResource> {
-	const files = await listFilesRecursively(localRoot);
+async function buildListing(
+	url: InternalUrl,
+	localRoot: string,
+	options?: LocalProtocolOptions,
+): Promise<InternalResource> {
+	const files = await listFilesRecursively(localRoot, options);
 	const listing = files.length === 0 ? "(empty)" : files.map(file => `- [${file}](local://${file})`).join("\n");
 	const content =
 		`# Local\n\n` +
@@ -315,82 +424,78 @@ export function resolveLocalUrlToPath(
 }
 
 /**
- * On-disk roots the eval helpers (`read`/`write`) substitute for
- * internal-URL schemes so e.g. `write("local://x.md")` lands where a later
- * `read local://x.md` resolves — instead of a literal `local:/` directory under
- * the cwd (a stdlib `pathlib.Path`/`path.resolve` collapses `local://` to
- * `local:/`). Keyed by scheme without the `://`. Currently only `local`, but the
- * shape is a map so additional file-backed schemes can be added without
- * re-plumbing the worker boundary.
+ * On-disk roots the eval helpers substitute for internal-URL schemes. These
+ * roots are addressing hints only; restricted host operations still resolve
+ * each local:// entry through the operation-local handler below.
  */
 export function buildEvalUrlRoots(options: LocalProtocolOptions): Record<string, string> {
 	return { local: resolveLocalRoot(options) };
 }
 
-const LOCAL_WRITE_NOTE = "Use write path local://<file> to persist large intermediate artifacts across turns.";
-
 type ResolvedLocalTarget =
-	| { kind: "listing"; root: string }
-	| { kind: "directory"; path: string }
-	| { kind: "file"; path: string; size: number };
+	| { kind: "listing"; root: string; authorizedTarget?: AuthorizedFilesystemTarget }
+	| { kind: "directory"; path: string; authorizedTarget?: AuthorizedFilesystemTarget }
+	| { kind: "file"; path: string; size: number; authorizedTarget?: AuthorizedFilesystemTarget };
 
-/**
- * Resolve a local:// URL to its on-disk target with realpath + containment
- * checks on the root, parent, and target so symlinks cannot escape the session
- * local root. Does NOT read or decode file contents — callers decide how to
- * consume the resolved path. Shared by {@link LocalProtocolHandler.resolve} and
- * {@link resolveLocalUrlToFile}.
- */
 async function resolveLocalTarget(url: InternalUrl, opts: LocalProtocolOptions): Promise<ResolvedLocalTarget> {
 	const localRoot = path.resolve(resolveLocalRoot(opts));
+	const operation = currentLocalOperation(opts);
+	if (operation) await operation.authorizeLocal(localRoot, "probe");
 	await fs.mkdir(localRoot, { recursive: true });
+	assertLocalRootCurrent(opts, localRoot);
 
 	let resolvedRoot: string;
 	try {
 		resolvedRoot = await fs.realpath(localRoot);
 	} catch (error) {
-		if (isEnoent(error)) {
-			throw new Error("Unable to initialize local:// root");
-		}
+		if (isEnoent(error)) throw new Error("Unable to initialize local:// root");
 		throw error;
 	}
+	assertLocalRootCurrent(opts, localRoot);
 
 	const relativePath = extractRelativePath(url);
 	const targetPath = relativePath ? path.resolve(resolvedRoot, relativePath) : resolvedRoot;
 	ensureWithinRoot(targetPath, resolvedRoot);
 
 	if (targetPath === resolvedRoot) {
-		return { kind: "listing", root: resolvedRoot };
+		const authorizedTarget = operation
+			? await authorizeLocalTarget(operation, resolvedRoot, "list", resolvedRoot)
+			: undefined;
+		return { kind: "listing", root: resolvedRoot, authorizedTarget };
 	}
 
-	const parentDir = path.dirname(targetPath);
+	const probe = operation ? await authorizeLocalTarget(operation, targetPath, "probe", resolvedRoot) : undefined;
+	const canonicalTarget = probe?.canonicalTarget ?? targetPath;
+	const parentDir = path.dirname(canonicalTarget);
 	try {
 		const realParent = await fs.realpath(parentDir);
 		ensureWithinRoot(realParent, resolvedRoot);
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
+	assertLocalRootCurrent(opts, localRoot);
 
 	let realTargetPath: string;
 	try {
-		realTargetPath = await fs.realpath(targetPath);
+		realTargetPath = await fs.realpath(canonicalTarget);
 	} catch (error) {
-		if (isEnoent(error)) {
-			throw new Error(`Local file not found: ${url.href}`);
-		}
+		if (isEnoent(error)) throw new Error(`Local file not found: ${url.href}`);
 		throw error;
 	}
-
 	ensureWithinRoot(realTargetPath, resolvedRoot);
-
-	const stat = await fs.stat(realTargetPath);
+	const authorizedTarget = operation
+		? await authorizeLocalTarget(operation, realTargetPath, "read", resolvedRoot)
+		: undefined;
+	const stat = await fs.stat(authorizedTarget?.canonicalTarget ?? realTargetPath);
+	assertLocalRootCurrent(opts, localRoot);
 	if (stat.isDirectory()) {
-		return { kind: "directory", path: realTargetPath };
+		const directoryTarget = operation
+			? await authorizeLocalTarget(operation, realTargetPath, "list", resolvedRoot)
+			: authorizedTarget;
+		return { kind: "directory", path: realTargetPath, authorizedTarget: directoryTarget };
 	}
-	if (!stat.isFile()) {
-		throw new Error(`local:// URL must resolve to a file or directory: ${url.href}`);
-	}
-	return { kind: "file", path: realTargetPath, size: stat.size };
+	if (!stat.isFile()) throw new Error(`local:// URL must resolve to a file or directory: ${url.href}`);
+	return { kind: "file", path: realTargetPath, size: stat.size, authorizedTarget };
 }
 
 /**
@@ -465,20 +570,25 @@ export class LocalProtocolHandler implements ProtocolHandler {
 	 *    SHOULD thread it through `context` so this branch is never taken in
 	 *    multi-session setups.
 	 */
-	static resolveOptions(context?: ResolveContext): LocalProtocolOptions | undefined {
+	static resolveOptions(context?: ResolveContext | WriteContext): LocalProtocolOptions | undefined {
 		const fromContext = context?.localProtocolOptions;
 		if (fromContext) return fromContext;
+		// A supplied caller context is an authority-bearing invocation. Missing
+		// caller options must fail closed; stale process-global state is never a
+		// valid substitute. Contextless display/hyperlink resolution retains the
+		// legacy ambient fallback as a distinct non-authority branch.
+		if (context) return undefined;
 		const override = LocalProtocolHandler.#override;
 		if (override) return override;
-		const main = AgentRegistry.global()
-			.list()
-			.find(ref => ref.kind === "main");
+		const main = listAgentRefs(AgentRegistry.global()).find(ref => ref.kind === "main");
 		const sessionManager = main?.session?.sessionManager;
 		if (!sessionManager) return undefined;
-		return {
-			getArtifactsDir: () => sessionManager.getArtifactsDir(),
-			getSessionId: () => sessionManager.getSessionId(),
-		};
+		return (
+			getSessionLocalProtocolOptions(sessionManager) ?? {
+				getArtifactsDir: () => sessionManager.getArtifactsDir(),
+				getSessionId: () => sessionManager.getSessionId(),
+			}
+		);
 	}
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
@@ -500,13 +610,59 @@ export class LocalProtocolHandler implements ProtocolHandler {
 			};
 		}
 		if (resolved.kind === "listing") {
-			return buildListing(url, resolved.root);
+			return buildListing(url, resolved.root, opts);
 		}
 		if (resolved.kind === "directory") {
-			return buildDirectoryResource(url.href, resolved.path, [LOCAL_WRITE_NOTE]);
+			return buildListing(url, resolved.path, opts);
 		}
 
-		return buildFileResource(url, resolved);
+		return buildFileResource(url, resolved, opts);
+	}
+
+	async write(url: InternalUrl, content: string, context?: WriteContext): Promise<void> {
+		const opts = LocalProtocolHandler.resolveOptions(context);
+		if (!opts) throw new Error("No session - local:// unavailable");
+		const localRoot = path.resolve(resolveLocalRoot(opts));
+		const targetPath = resolveLocalUrlToPath(url, opts);
+		if (targetPath === localRoot) throw new Error("local:// root is not a writable file");
+		ensureWithinRoot(targetPath, localRoot);
+		const effect = async () => {
+			await fs.mkdir(path.dirname(targetPath), { recursive: true });
+			assertLocalRootCurrent(opts, localRoot);
+			const resolvedRoot = await fs.realpath(localRoot);
+			const operation = currentLocalOperation(opts);
+			if (!operation) {
+				await fs.writeFile(targetPath, content, "utf8");
+				return;
+			}
+			const exists = await fs.lstat(targetPath).then(
+				() => true,
+				error => {
+					if (isEnoent(error)) return false;
+					throw error;
+				},
+			);
+			const target = await authorizeLocalTarget(operation, targetPath, exists ? "write" : "create", resolvedRoot);
+			await operation.writeFile(target, content, "local");
+			await operation.verifyPostWrite(target);
+		};
+		const durable = opts.getDurableLocalState?.();
+		if (!durable) {
+			await effect();
+			return;
+		}
+		const entryId = canonicalDurableSha256({ localId: safeSessionId(opts), url: url.href });
+		await durable.ensureRecoveredBacking(async expectation => {
+			if (opts.validateDurableLocalBacking) return await opts.validateDurableLocalBacking(expectation);
+			if (expectation.entryId !== entryId) return false;
+			try {
+				return durableBackingSha256(await fs.readFile(targetPath)) === expectation.entryHash;
+			} catch {
+				return false;
+			}
+		});
+		const expectedHeadHash = durable.current()?.headHash ?? "0".repeat(64);
+		await durable.publishWithEffect(entryId, durableBackingSha256(content), expectedHeadHash, effect);
 	}
 
 	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {
@@ -514,7 +670,7 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		if (!opts) return [];
 		const localRoot = path.resolve(resolveLocalRoot(opts));
 		try {
-			const files = await listFilesRecursively(localRoot);
+			const files = await listFilesRecursively(localRoot, opts);
 			return files.map(value => ({ value }));
 		} catch (err) {
 			if (isEnoent(err)) return [];

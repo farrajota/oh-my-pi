@@ -49,12 +49,12 @@ import { formatPathRelativeToCwd, resolveToCwd } from "./path-utils";
 import {
 	formatExpandHint,
 	formatStatusIcon,
-	PREVIEW_LIMITS,
 	replaceTabs,
 	shortenPath,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
 } from "./render-utils";
+import { PREVIEW_LIMITS } from "./preview-limits";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";

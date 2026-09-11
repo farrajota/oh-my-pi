@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -6,14 +6,22 @@ import { AgentProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/ag
 import { HistoryProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/history-protocol";
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import {
+	adoptAgent,
+	getAgentLifecycleManager,
+	resetAgentLifecycleForTests,
+	setPersistedAgentReviverFactory,
+} from "../../src/internal/agent-lifecycle-bridge";
+import { lookupAgentRef } from "../../src/internal/agent-registry-bridge";
+import * as registryBridge from "../../src/internal/agent-registry-bridge";
 import { AgentRegistry, getAgentTombstonePath, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ensurePersistedRoster, registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { collectIrcPeerRoster } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
+import { type CoordinationDetails, HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
 import {
 	DEFAULT_HUB_LIST_LIMIT,
 	executeList,
@@ -21,6 +29,7 @@ import {
 	MAX_HUB_LIST_LIMIT,
 } from "@oh-my-pi/pi-coding-agent/tools/hub/messaging";
 import { prompt, TempDir } from "@oh-my-pi/pi-utils";
+import { createHubAuthorityFixture } from "./hub-fixtures";
 
 function sessionHeader(id: string): string {
 	return JSON.stringify({
@@ -925,7 +934,7 @@ describe("hub list", () => {
 
 	it("send still revives a known parked id omitted from the default list", async () => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		IrcBus.resetGlobalForTests();
 		try {
 			const registry = AgentRegistry.global();
@@ -945,10 +954,17 @@ describe("hub list", () => {
 					return "woken";
 				},
 			} as unknown as AgentSession;
-			AgentLifecycleManager.global().adopt("Sleeper", {
-				idleTtlMs: 0,
-				revive: async () => revived,
-			});
+			const sleeperRef = lookupAgentRef(registry, "Sleeper");
+			if (!sleeperRef) throw new Error("Expected exact Sleeper ref");
+			adoptAgent(
+				getAgentLifecycleManager(registry),
+				"Sleeper",
+				{
+					idleTtlMs: 0,
+					revive: async () => revived,
+				},
+				sleeperRef,
+			);
 
 			const listed = await executeList(registry, MAIN_AGENT_ID);
 			expect(listed.details?.peers?.map(peer => peer.id)).not.toContain("Sleeper");
@@ -963,149 +979,56 @@ describe("hub list", () => {
 			expect(registry.get("Sleeper")?.status).not.toBe("parked");
 		} finally {
 			AgentRegistry.resetGlobalForTests();
-			AgentLifecycleManager.resetGlobalForTests();
+			resetAgentLifecycleForTests();
 			IrcBus.resetGlobalForTests();
 		}
 	});
 });
 
 describe("hub list session authority", () => {
-	it("uses HubTool getSessionFile when Main's registry ref still points at the old root", async () => {
-		using tempDir = TempDir.createSync("@omp-hub-stale-main-");
-		const firstSession = path.join(tempDir.path(), "first.jsonl");
-		const secondSession = path.join(tempDir.path(), "second.jsonl");
-		await Bun.write(firstSession, `${sessionHeader("first")}\n`);
-		await Bun.write(secondSession, `${sessionHeader("second")}\n`);
-		await writeParkedTranscript(path.join(tempDir.path(), "first", "FirstWorker.jsonl"), "first-worker", "first");
-		await writeParkedTranscript(path.join(tempDir.path(), "second", "SecondWorker.jsonl"), "second-worker", "second");
-
+	it("rejects caller-supplied registry and session-file hints without bound authority", async () => {
 		const registry = new AgentRegistry();
 		registry.register({
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
 			session: null,
-			sessionFile: firstSession,
 			status: "running",
 		});
-		const tool = new HubTool(makeToolSession(registry, MAIN_AGENT_ID, secondSession));
-		const listed = await tool.execute("list-switch", { op: "list", status: "parked" });
-		if (!listed.details || !("peers" in listed.details)) throw new Error("Expected list details");
-		expect(listed.details.peers?.map(peer => peer.id)).toEqual(["SecondWorker"]);
-		expect(listText(listed)).not.toContain("FirstWorker");
-		expect(registry.get(MAIN_AGENT_ID)?.sessionFile).toBe(firstSession);
+		registry.register({ id: "Peer", displayName: "peer", kind: "sub", session: null, status: "idle" });
+		const tool = new HubTool(makeToolSession(registry, MAIN_AGENT_ID, "/tmp/forged-root.jsonl"));
+		const listed = await tool.execute("list-unbound", { op: "list", status: "parked" });
+		expect(listed.isError).toBe(true);
+		expect(listText(listed)).toContain("unavailable");
 	});
 
-	it("replaces a detached old-root parked sub so send and history target the current file", async () => {
-		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
-		IrcBus.resetGlobalForTests();
+	it("does not use a caller-supplied agent id to address peers", async () => {
+		const registry = new AgentRegistry();
+		registry.register({
+			id: MAIN_AGENT_ID,
+			displayName: MAIN_AGENT_ID,
+			kind: "main",
+			session: null,
+			status: "running",
+		});
+		registry.register({ id: "Peer", displayName: "peer", kind: "sub", session: null, status: "idle" });
+		const tool = new HubTool(makeToolSession(registry, MAIN_AGENT_ID));
+		const sent = await tool.execute("send-unbound", { op: "send", to: "Peer", message: "forged" });
+		expect(sent.isError).toBe(true);
+		expect(listText(sent)).toContain("unavailable");
+	});
+
+	it("lists peers through a registry-attested tool session", async () => {
+		const registry = new AgentRegistry();
+		const fixture = await createHubAuthorityFixture(registry, MAIN_AGENT_ID);
 		try {
-			using tempDir = TempDir.createSync("@omp-hub-replace-current-");
-			const firstSession = path.join(tempDir.path(), "first.jsonl");
-			const secondSession = path.join(tempDir.path(), "second.jsonl");
-			const oldWorker = path.join(tempDir.path(), "first", "Worker.jsonl");
-			const newWorker = path.join(tempDir.path(), "second", "Worker.jsonl");
-			await Bun.write(firstSession, `${sessionHeader("first")}\n`);
-			await Bun.write(secondSession, `${sessionHeader("second")}\n`);
-			await Bun.write(
-				oldWorker,
-				`${[
-					sessionHeader("old-worker"),
-					JSON.stringify({
-						type: "session_init",
-						id: "si-old",
-						parentId: null,
-						timestamp: "2026-08-13T17:14:49.000Z",
-						systemPrompt: "review",
-						task: "old-secret-task-body",
-						tools: ["read"],
-					}),
-					JSON.stringify({
-						type: "message",
-						id: "old-user",
-						parentId: null,
-						timestamp: "2026-08-13T17:14:50.000Z",
-						message: { role: "user", content: "old-secret-user-line", timestamp: 1 },
-					}),
-				].join("\n")}\n`,
-			);
-			await Bun.write(
-				newWorker,
-				`${[
-					sessionHeader("worker"),
-					JSON.stringify({
-						type: "session_init",
-						id: "si-new",
-						parentId: null,
-						timestamp: "2026-08-13T17:14:49.000Z",
-						systemPrompt: "review",
-						task: "new-current-task-body",
-						tools: ["read"],
-					}),
-					JSON.stringify({
-						type: "message",
-						id: "new-user",
-						parentId: null,
-						timestamp: "2026-08-13T17:14:50.000Z",
-						message: { role: "user", content: "new-current-user-line", timestamp: 1 },
-					}),
-				].join("\n")}\n`,
-			);
-
-			const registry = AgentRegistry.global();
-			registry.register({
-				id: MAIN_AGENT_ID,
-				displayName: MAIN_AGENT_ID,
-				kind: "main",
-				session: null,
-				sessionFile: firstSession,
-				status: "running",
-			});
-			registry.register({
-				id: "Worker",
-				displayName: "task",
-				kind: "sub",
-				session: null,
-				sessionFile: oldWorker,
-				status: "parked",
-				activity: "old-secret-task-body",
-			});
-
-			const tool = new HubTool(makeToolSession(registry, MAIN_AGENT_ID, secondSession));
-			const listed = await tool.execute("list-replace", { op: "list", status: "parked" });
-			if (!listed.details || !("peers" in listed.details)) throw new Error("Expected list details");
-			expect(registry.get("Worker")?.sessionFile).toBe(newWorker);
-			expect(listed.details.peers?.map(peer => peer.id)).toEqual(["Worker"]);
-
-			const history = await new HistoryProtocolHandler().resolve(parseInternalUrl("history://Worker"));
-			expect(history.sourcePath).toBe(newWorker);
-			expect(history.content).toContain("new-current-user-line");
-			expect(history.content).not.toContain("old-secret-user-line");
-
-			const delivered: string[] = [];
-			const revived = {
-				isStreaming: false,
-				deliverIrcMessage: async (msg: { body: string }) => {
-					delivered.push(msg.body);
-					return "woken";
-				},
-			} as unknown as AgentSession;
-			AgentLifecycleManager.global().adopt("Worker", {
-				idleTtlMs: 0,
-				revive: async () => revived,
-			});
-			const sent = await executeSend(
-				{ registry, senderId: MAIN_AGENT_ID, settings: Settings.isolated() },
-				{ to: "Worker", message: "wake current" },
-			);
-			expect(sent.isError).toBeFalsy();
-			expect(sent.details?.receipts).toEqual([{ to: "Worker", outcome: "revived" }]);
-			expect(delivered).toEqual(["wake current"]);
+			await fixture.createChild("Peer");
+			const tool = new HubTool(fixture.createToolSession(MAIN_AGENT_ID));
+			const listed = await tool.execute("list-bound", { op: "list" });
+			expect(listed.isError).toBeFalsy();
+			expect((listed.details as CoordinationDetails | undefined)?.peers?.map(peer => peer.id)).toEqual(["Peer"]);
 		} finally {
-			AgentRegistry.resetGlobalForTests();
-			AgentLifecycleManager.resetGlobalForTests();
-			IrcBus.resetGlobalForTests();
+			await fixture.dispose();
 		}
 	});
 
@@ -1200,7 +1123,7 @@ describe("hub list session authority", () => {
 
 		await executeList(registry, MAIN_AGENT_ID, { status: "parked" }, currentSession);
 		expect(registry.get("LiveTwin")?.status).toBe("running");
-		expect(registry.get("LiveTwin")?.session).toBe(liveSession);
+		expect(lookupAgentRef(registry, "LiveTwin")?.session).toBe(liveSession);
 		expect(registry.get("LiveTwin")?.sessionFile).toBe(oldLive);
 		expect(registry.get("IdleTwin")?.status).toBe("idle");
 		expect(registry.get("IdleTwin")?.sessionFile).toBe(oldIdle);
@@ -1245,7 +1168,7 @@ describe("hub list session authority", () => {
 			sessionFile: oldIncomplete,
 			status: "parked",
 		});
-		const parkedRace = registry.register({
+		registry.register({
 			id: "RaceTwin",
 			displayName: "task",
 			kind: "sub",
@@ -1253,15 +1176,13 @@ describe("hub list session authority", () => {
 			sessionFile: oldRace,
 			status: "parked",
 		});
-		const originalGet = registry.get.bind(registry);
+		const replaceInternal = registryBridge.replaceInternalAgentIfAvailable;
 		let injectClaim = true;
-		registry.get = id => {
-			const current = originalGet(id);
-			if (id === "RaceTwin" && injectClaim && current === parkedRace) {
-				injectClaim = false;
-				queueMicrotask(() => {
-					registry.unregister("RaceTwin", parkedRace);
-					registry.register({
+		const replace = spyOn(registryBridge, "replaceInternalAgentIfAvailable").mockImplementation(
+			(target, input, expected) => {
+				if (input.id === "RaceTwin" && injectClaim) {
+					injectClaim = false;
+					target.register({
 						id: "RaceTwin",
 						displayName: "task",
 						kind: "sub",
@@ -1269,16 +1190,23 @@ describe("hub list session authority", () => {
 						sessionFile: newRace,
 						status: "running",
 					});
-				});
-			}
-			return current;
-		};
-
-		await executeList(registry, MAIN_AGENT_ID, { status: "parked" }, currentSession);
-		expect(originalGet("IncompleteTwin")).toBe(incomplete);
-		expect(originalGet("IncompleteTwin")?.sessionFile).toBe(oldIncomplete);
-		expect(originalGet("RaceTwin")?.status).toBe("running");
-		expect(originalGet("RaceTwin")?.session).toBe(liveSession);
+				}
+				return replaceInternal(target, input, expected);
+			},
+		);
+		try {
+			await executeList(registry, MAIN_AGENT_ID, { status: "parked" }, currentSession);
+		} finally {
+			replace.mockRestore();
+		}
+		expect(registry.get("IncompleteTwin")).toMatchObject({
+			id: incomplete.id,
+			lineage: incomplete.lineage,
+			status: "parked",
+		});
+		expect(registry.get("IncompleteTwin")?.sessionFile).toBe(oldIncomplete);
+		expect(registry.get("RaceTwin")?.status).toBe("running");
+		expect(lookupAgentRef(registry, "RaceTwin")?.session).toBe(liveSession);
 	});
 
 	it("keeps ensurePersistedRoster metadata-only and hydrates on a later explicit register", async () => {
@@ -1387,7 +1315,7 @@ describe("child system prompt roster", () => {
 
 		const text = await renderIrcPeerRoster("Child");
 		expect(text).toContain("LiveWorker");
-		expect(text).toContain("editing auth.ts");
+		expect(text).not.toContain("editing auth.ts");
 		expect(text).toContain("IdleReviewer");
 		expect(text).toContain("1 parked peer(s) omitted");
 		expect(text).toContain('status:"parked"');
@@ -1476,12 +1404,12 @@ describe("child system prompt roster", () => {
 describe("hub direct addressing refreshes the caller root without a prior list", () => {
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		IrcBus.resetGlobalForTests();
 	});
 	afterEach(() => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		IrcBus.resetGlobalForTests();
 	});
 
@@ -1540,7 +1468,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 		} as unknown as AgentSession;
 	}
 
-	it("direct send, history://, and agent:// target the caller root's parked Worker without a prior list (A→B→A)", async () => {
+	it("direct send, history://, and agent:// target each caller root's parked Worker without a prior list", async () => {
 		using tempDir = TempDir.createSync("@omp-hub-direct-root-");
 		const dir = tempDir.path();
 		const rootA = path.join(dir, "a", "main.jsonl");
@@ -1553,120 +1481,104 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 		await Bun.write(rootB, `${sessionHeader("b")}\n`);
 		await writeTranscriptWithLine(childA, "worker", "A");
 		await writeTranscriptWithLine(childB, "worker", "B");
-		await Bun.write(artifactA, "A OUTPUT");
-		await Bun.write(artifactB, "B OUTPUT");
+		await new ArtifactManager(path.dirname(artifactA)).publishAgentArtifacts("Worker", "A OUTPUT");
+		await new ArtifactManager(path.dirname(artifactB)).publishAgentArtifacts("Worker", "B OUTPUT");
 
-		const registry = AgentRegistry.global();
+		const registryA = new AgentRegistry();
+		const registryB = new AgentRegistry();
+		const busA = new IrcBus(registryA);
+		const busB = new IrcBus(registryB);
+		registryA.register({
+			id: MAIN_AGENT_ID,
+			displayName: MAIN_AGENT_ID,
+			kind: "main",
+			session: null,
+			sessionFile: rootA,
+			status: "running",
+		});
+		registryB.register({
+			id: MAIN_AGENT_ID,
+			displayName: MAIN_AGENT_ID,
+			kind: "main",
+			session: null,
+			sessionFile: rootB,
+			status: "running",
+		});
 		const readdirs: string[] = [];
 		spyOnReaddirs(readdirs);
 		try {
-			// B's scan runs first and restores the shared id: the process-global
-			// Worker ref points at B's transcript (and B's artifacts dir wins the
-			// agent:// scan before A's session is even registered).
-			await ensurePersistedRoster(registry, rootB);
-			expect(registry.get("Worker")?.sessionFile).toBe(childB);
+			await ensurePersistedRoster(registryB, rootB);
+			expect(registryB.get("Worker")?.sessionFile).toBe(childB);
 			expect(countReaddirs(readdirs, scanDir(rootB))).toBe(1);
-			registry.register({
-				id: MAIN_AGENT_ID,
-				displayName: MAIN_AGENT_ID,
-				kind: "main",
-				session: null,
-				sessionFile: rootA,
-				status: "running",
-			});
 
-			// history://Worker without a list refreshes A's root and reads A's
-			// transcript — the stale B ref is replaced before the lookup.
 			const history = await new HistoryProtocolHandler().resolve(parseInternalUrl("history://Worker"), {
 				sessionFile: rootA,
+				agentRegistry: registryA,
 			});
 			expect(history.sourcePath).toBe(childA);
 			expect(history.content).toContain("secret-A-line");
 			expect(history.content).not.toContain("secret-B-line");
-			expect(registry.get("Worker")?.sessionFile).toBe(childA);
+			expect(registryA.get("Worker")?.sessionFile).toBe(childA);
 			expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
 
-			// agent://Worker resolves A's output artifact through the same refresh.
-			// Its own readdir goes through the `node:fs/promises` binding, which
-			// the roster-scan spy does not intercept: the roster count stays put,
-			// proving the refresh did not re-scan A's tree.
 			const artifact = await new AgentProtocolHandler().resolve(parseInternalUrl("agent://Worker"), {
 				sessionFile: rootA,
+				agentRegistry: registryA,
 			});
 			expect(artifact.content).toBe("A OUTPUT");
 			expect(artifact.sourcePath).toBe(artifactA);
 			expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
 
-			// A direct send without a prior list revives A's parked Worker: the
-			// refreshed ref is what the cold revive (persisted-subagent factory)
-			// and the bus delivery are bound to.
-			let delivered: string[] = [];
-			AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
-				async () => async () => fakeRevivedSession(delivered),
+			const deliveredA: string[] = [];
+			setPersistedAgentReviverFactory(
+				getAgentLifecycleManager(registryA),
+				async () => async () => fakeRevivedSession(deliveredA),
 				0,
 			);
-			const sent = await executeSend(
-				{ registry, senderId: MAIN_AGENT_ID, settings: Settings.isolated(), sessionFileHint: rootA },
+			const sentA = await executeSend(
+				{
+					registry: registryA,
+					senderId: MAIN_AGENT_ID,
+					settings: Settings.isolated(),
+					sessionFileHint: rootA,
+					bus: busA,
+				},
 				{ to: "Worker", message: "wake A" },
 			);
-			expect(sent.isError).toBeFalsy();
-			expect(sent.details?.receipts).toEqual([{ to: "Worker", outcome: "revived" }]);
-			expect(delivered).toEqual(["wake A"]);
-			expect(registry.get("Worker")?.sessionFile).toBe(childA);
-			expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
+			expect(sentA.isError).toBeFalsy();
+			expect(sentA.details?.receipts).toEqual([{ to: "Worker", outcome: "revived" }]);
+			expect(deliveredA).toEqual(["wake A"]);
 
-			// A repeated direct send stays on the settled latch — no re-scan.
-			const again = await executeSend(
-				{ registry, senderId: MAIN_AGENT_ID, settings: Settings.isolated(), sessionFileHint: rootA },
-				{ to: "Worker", message: "wake A again" },
-			);
-			expect(again.isError).toBeFalsy();
-			expect(again.details?.receipts?.[0]?.to).toBe("Worker");
-			expect(delivered).toEqual(["wake A", "wake A again"]);
-			expect(registry.get("Worker")?.sessionFile).toBe(childA);
-			expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
-
-			// A's revived Worker parks again (session detached, ref retained) —
-			// the state a real idle-TTL park leaves behind.
-			registry.unregister("Worker");
-			registry.register({
-				id: "Worker",
-				displayName: "task",
-				kind: "sub",
-				session: null,
-				sessionFile: childA,
-				status: "parked",
-			});
-
-			// history://Worker from B refreshes B's superseded root and reads B's
-			// transcript while the ref is still parked.
 			const historyB = await new HistoryProtocolHandler().resolve(parseInternalUrl("history://Worker"), {
 				sessionFile: rootB,
+				agentRegistry: registryB,
 			});
 			expect(historyB.sourcePath).toBe(childB);
 			expect(historyB.content).toContain("secret-B-line");
 			expect(historyB.content).not.toContain("secret-A-line");
-			// B's latch was superseded by A's re-scan; the history refresh re-scans
-			// B exactly once.
-			expect(countReaddirs(readdirs, scanDir(rootB))).toBe(2);
-			expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
+			expect(countReaddirs(readdirs, scanDir(rootB))).toBe(1);
 
-			// Reversed: B's direct send (settled latch — no re-scan) revives B's
-			// Worker.
 			const deliveredB: string[] = [];
-			delivered = deliveredB;
+			setPersistedAgentReviverFactory(
+				getAgentLifecycleManager(registryB),
+				async () => async () => fakeRevivedSession(deliveredB),
+				0,
+			);
 			const sentB = await executeSend(
-				{ registry, senderId: MAIN_AGENT_ID, settings: Settings.isolated(), sessionFileHint: rootB },
+				{
+					registry: registryB,
+					senderId: MAIN_AGENT_ID,
+					settings: Settings.isolated(),
+					sessionFileHint: rootB,
+					bus: busB,
+				},
 				{ to: "Worker", message: "wake B" },
 			);
 			expect(sentB.isError).toBeFalsy();
 			expect(sentB.details?.receipts).toEqual([{ to: "Worker", outcome: "revived" }]);
 			expect(deliveredB).toEqual(["wake B"]);
-			expect(registry.get("Worker")?.sessionFile).toBe(childB);
-			expect(countReaddirs(readdirs, scanDir(rootB))).toBe(2);
-			expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
 		} finally {
-			spyOn(fs.promises, "readdir").mockRestore();
+			vi.restoreAllMocks();
 		}
 	}, 15_000);
 
@@ -1678,7 +1590,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 		await Bun.write(rootA, `${sessionHeader("a")}\n`);
 		await writeTranscriptWithLine(childA, "worker", "A");
 
-		const registry = AgentRegistry.global();
+		const registry = new AgentRegistry();
 		const delivered: string[] = [];
 		const liveSession = {
 			isStreaming: false,
@@ -1708,23 +1620,30 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 		// The refresh scans A's tree and finds the same-id transcript, but the
 		// live session must never be displaced by the disk-derived parked ref.
 		const sent = await executeSend(
-			{ registry, senderId: MAIN_AGENT_ID, settings: Settings.isolated(), sessionFileHint: rootA },
+			{
+				registry,
+				senderId: MAIN_AGENT_ID,
+				settings: Settings.isolated(),
+				sessionFileHint: rootA,
+				bus: new IrcBus(registry),
+			},
 			{ to: "Worker", message: "live ping" },
 		);
 		expect(sent.isError).toBeFalsy();
 		expect(sent.details?.receipts).toEqual([{ to: "Worker", outcome: "woken" }]);
 		expect(delivered).toEqual(["live ping"]);
 		expect(registry.get("Worker")?.status).toBe("running");
-		expect(registry.get("Worker")?.session).toBe(liveSession);
+		expect(lookupAgentRef(registry, "Worker")?.session).toBe(liveSession);
 		expect(registry.get("Worker")?.sessionFile).toBe(childA);
 
 		const history = await new HistoryProtocolHandler().resolve(parseInternalUrl("history://Worker"), {
 			sessionFile: rootA,
+			agentRegistry: registry,
 		});
 		expect(history.notes?.join("\n")).toContain("live session");
 		expect(history.content).toContain("live-worker-line");
 		expect(registry.get("Worker")?.status).toBe("running");
-		expect(registry.get("Worker")?.session).toBe(liveSession);
+		expect(lookupAgentRef(registry, "Worker")?.session).toBe(liveSession);
 	});
 
 	it("stays graceful when the caller root or target id is unavailable", async () => {
@@ -1734,7 +1653,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 		const childB = path.join(dir, "b", "main", "Worker.jsonl");
 		await Bun.write(rootB, `${sessionHeader("b")}\n`);
 		await writeTranscriptWithLine(childB, "worker", "B");
-		const registry = AgentRegistry.global();
+		const registry = new AgentRegistry();
 		registry.register({
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
@@ -1754,21 +1673,28 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 		// The caller session file points at a root that does not exist on disk.
 		const missingRoot = path.join(dir, "missing", "main.jsonl");
 
-		// history:// with an unavailable caller root keeps the in-memory ref.
-		const history = await new HistoryProtocolHandler().resolve(parseInternalUrl("history://Worker"), {
-			sessionFile: missingRoot,
-		});
-		expect(history.sourcePath).toBe(childB);
-		expect(history.content).toContain("secret-B-line");
+		await expect(
+			new HistoryProtocolHandler().resolve(parseInternalUrl("history://Worker"), {
+				sessionFile: missingRoot,
+				agentRegistry: registry,
+			}),
+		).rejects.toThrow("Unknown agent: Worker");
 
 		// A send with an unresolvable caller root still delivers (in-memory refs).
 		const delivered: string[] = [];
-		AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
+		setPersistedAgentReviverFactory(
+			getAgentLifecycleManager(registry),
 			async () => async () => fakeRevivedSession(delivered),
 			0,
 		);
 		const sent = await executeSend(
-			{ registry, senderId: MAIN_AGENT_ID, settings: Settings.isolated(), sessionFileHint: missingRoot },
+			{
+				registry,
+				senderId: MAIN_AGENT_ID,
+				settings: Settings.isolated(),
+				sessionFileHint: missingRoot,
+				bus: new IrcBus(registry),
+			},
 			{ to: "Worker", message: "wake in-memory" },
 		);
 		expect(sent.isError).toBeFalsy();
@@ -1778,7 +1704,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 		// Unknown ids still fail with the same guided error, and sends to them
 		// still produce a failed receipt — never a throw.
 		const error = await new HistoryProtocolHandler()
-			.resolve(parseInternalUrl("history://Nope"), { sessionFile: missingRoot })
+			.resolve(parseInternalUrl("history://Nope"), { sessionFile: missingRoot, agentRegistry: registry })
 			.then(
 				() => null,
 				err => err as Error,
@@ -1786,7 +1712,13 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 		expect(error).toBeInstanceOf(Error);
 		expect(error?.message).toContain("Unknown agent: Nope");
 		const unknown = await executeSend(
-			{ registry, senderId: MAIN_AGENT_ID, settings: Settings.isolated(), sessionFileHint: missingRoot },
+			{
+				registry,
+				senderId: MAIN_AGENT_ID,
+				settings: Settings.isolated(),
+				sessionFileHint: missingRoot,
+				bus: new IrcBus(registry),
+			},
 			{ to: "Nope", message: "hello?" },
 		);
 		expect(unknown.isError).toBeTruthy();

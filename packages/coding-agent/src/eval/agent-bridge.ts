@@ -1,3 +1,4 @@
+import { runJobOperation } from "../registry/operation-lease";
 /**
  * Host-side handler for the eval `agent()` helper.
  */
@@ -207,39 +208,45 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 		manager.register(
 			"task",
 			id,
-			async ({ signal, reportProgress, markRunning }) => {
-				markRunning();
-				let latestProgress: AgentProgress | undefined;
-				try {
-					const execution = await runStructuredSubagent({
-						session: options.session,
-						invocationKind: "eval",
-						assignment: parsed.prompt,
-						...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
-						...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
-						...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
-						identity: { id, label: parsed.label },
-						...(isolation ? { isolation } : {}),
-						...(customTools ? { customTools } : {}),
-						retainArtifacts: true,
-						keepAlive: true,
-						signal,
-						onProgress: progress => {
-							latestProgress = progress;
-							void reportProgress(`Running agent ${progress.id}...`, { progress: [progress] });
-						},
-					});
-					const result = await buildEvalAgentResult(execution);
-					await reportProgress(result.text, {
-						progress: latestProgress ? [latestProgress] : [],
-						evalResult: result,
-					});
-					return result.text;
-				} catch (error) {
-					if (error instanceof StructuredSubagentError) throw new ToolError(error.message);
-					throw error;
-				}
-			},
+			async ({ signal, reportProgress, markRunning }) =>
+				runJobOperation(
+					options.session.sessionManager,
+					`job:${id}`,
+					async () => {
+						markRunning();
+						let latestProgress: AgentProgress | undefined;
+						try {
+							const execution = await runStructuredSubagent({
+								session: options.session,
+								invocationKind: "eval",
+								assignment: parsed.prompt,
+								...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
+								...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
+								...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
+								identity: { id, label: parsed.label },
+								...(isolation ? { isolation } : {}),
+								...(customTools ? { customTools } : {}),
+								retainArtifacts: true,
+								keepAlive: true,
+								signal,
+								onProgress: progress => {
+									latestProgress = progress;
+									void reportProgress(`Running agent ${progress.id}...`, { progress: [progress] });
+								},
+							});
+							const result = await buildEvalAgentResult(execution);
+							await reportProgress(result.text, {
+								progress: latestProgress ? [latestProgress] : [],
+								evalResult: result,
+							});
+							return result.text;
+						} catch (error) {
+							if (error instanceof StructuredSubagentError) throw new ToolError(error.message);
+							throw error;
+						}
+					},
+					signal,
+				),
 			{ id, agentId: id, ownerId },
 		);
 		return { id, agent: policy.agentName };

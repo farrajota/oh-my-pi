@@ -19,11 +19,19 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 const baseAgent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
+
+function createAuthorityFixture() {
+	const agentRegistry = new AgentRegistry();
+	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+		sdkModule.createAgentSession({ ...options, agentRegistry });
+	return { agentRegistry, createAuthoritySession };
+}
 
 function assistantStop(text: string): AssistantMessage {
 	return {
@@ -124,6 +132,7 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 		} as CreateAgentSessionResult);
 
 		let deferredCleanup: Promise<void> | undefined;
+		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -135,6 +144,8 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 			onCleanupDeferred: completion => {
 				deferredCleanup = completion;
 			},
+			agentRegistry,
+			createAuthoritySession,
 		});
 
 		// The deferred teardown must not overwrite the successful yield.
@@ -166,6 +177,7 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 		} as CreateAgentSessionResult);
 
 		let deferredCleanup: Promise<void> | undefined;
+		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -178,6 +190,8 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 			onCleanupDeferred: completion => {
 				deferredCleanup = completion;
 			},
+			agentRegistry,
+			createAuthoritySession,
 		});
 
 		expect(result.aborted).toBe(true);

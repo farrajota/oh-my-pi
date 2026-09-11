@@ -20,6 +20,7 @@ import {
 	readArchiveEntries,
 	writeArchive,
 } from "@oh-my-pi/pi-utils/ar";
+import type { AuthorizedFilesystemTarget } from "../internal/session-path-scope";
 import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -617,15 +618,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			archiveSubPath: normalizeArchiveWriteSubPath(fallbackCandidate.subPath),
 			exists: false,
 		};
-
 		for (const candidate of candidates) {
-			const absolutePath = resolvePlanPath(this.session, candidate.archivePath);
+			let absolutePath = resolvePlanPath(this.session, candidate.archivePath);
+			if (this.session.pathScope) {
+				absolutePath = (await this.session.pathScope.currentOperation().authorize(absolutePath, "probe"))
+					.canonicalTarget;
+			}
 			try {
 				const stat = await Bun.file(absolutePath).stat();
-				if (stat.isDirectory()) {
-					continue;
-				}
-
+				if (stat.isDirectory()) continue;
 				return {
 					absolutePath,
 					archivePath: candidate.archivePath,
@@ -633,10 +634,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					exists: true,
 				};
 			} catch (error) {
-				if (!isArchivePathNotFound(error)) {
-					throw error;
-				}
+				if (!isArchivePathNotFound(error)) throw error;
 			}
+		}
+		if (this.session.pathScope) {
+			fallback.absolutePath = (
+				await this.session.pathScope.currentOperation().authorize(fallback.absolutePath, "probe")
+			).canonicalTarget;
 		}
 
 		return fallback;
@@ -646,34 +650,70 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		content: string,
 		resolvedArchivePath: ResolvedArchiveWritePath,
 	): Promise<AgentToolResult<WriteToolDetails>> {
-		// Resolve symlinks before the tmp+rename swap: renaming over a symlink
-		// replaces the link itself with a regular file instead of writing
-		// through to its target.
-		const finalPath = resolvedArchivePath.exists
-			? await fs.realpath(resolvedArchivePath.absolutePath).catch(() => resolvedArchivePath.absolutePath)
-			: resolvedArchivePath.absolutePath;
-		// A realpath swap can land on a name without an archive extension; a
-		// whole-archive rewrite then defaults to an uncompressed tar.
+		// The resolver has already canonicalized and authorized the container candidate;
+		// do not resolve the ordinary path again after admission.
+		const finalPath = resolvedArchivePath.absolutePath;
+		// A canonical target can lack an archive extension; a whole-archive
+		// rewrite then defaults to an uncompressed tar.
 		const inferredFormat = archiveFormatFromPath(finalPath);
 		const format = inferredFormat ?? "tar";
 		if (!isWritableArchiveFormat(format)) {
 			throw new ToolError(`Writing entries inside ${format} archives is not supported (read-only format).`);
 		}
 		// Rewrites are whole-archive: write to a temp file and rename so a
-		// crash/disk-full mid-write can't destroy the original archive.
+		// crash/disk-full mid-write cannot destroy the original archive.
 		const tmpPath = `${finalPath}.tmp-${process.pid}`;
+		const operation = this.session.pathScope?.currentOperation();
+		const authorizedTargets = operation
+			? await operation.preflight([
+					{ path: finalPath, kind: resolvedArchivePath.exists ? "write" : "create" },
+					{ path: tmpPath, kind: "create" },
+					...(resolvedArchivePath.exists ? [{ path: finalPath, kind: "read" as const }] : []),
+				])
+			: [];
+		const authorizedArchiveTarget = authorizedTargets[0];
+		const authorizedTempTarget = authorizedTargets[1];
+		const authorizedReadTarget = authorizedTargets[2];
 
 		const parentDir = path.dirname(resolvedArchivePath.absolutePath);
-		if (parentDir && parentDir !== ".") {
+		if (!this.session.pathScope && parentDir && parentDir !== ".") {
 			await fs.mkdir(parentDir, { recursive: true });
 		}
 
 		const entries = new Map<string, ArchiveMemberContent>();
 		if (resolvedArchivePath.exists) {
 			try {
-				const existing = await readArchiveEntries({ path: finalPath, format });
-				for (const [entryPath, data] of existing) {
-					entries.set(entryPath, data);
+				if (operation && authorizedReadTarget) {
+					const handle = await operation.openRead(authorizedReadTarget);
+					try {
+						const size = Number(authorizedReadTarget.size);
+						if (!Number.isSafeInteger(size)) throw new ToolError("Archive is too large to read safely");
+						const source = {
+							size,
+							async read(start: number, end: number): Promise<Uint8Array> {
+								if (
+									!Number.isSafeInteger(start) ||
+									!Number.isSafeInteger(end) ||
+									start < 0 ||
+									end < start ||
+									end > size
+								) {
+									throw new ToolError("Invalid archive range");
+								}
+								const bytes = Buffer.allocUnsafe(end - start);
+								const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, start);
+								if (bytesRead !== bytes.byteLength) throw new ToolError("Invalid archive: truncated data");
+								return bytes;
+							},
+						};
+						const existing = await readArchiveEntries({ source, format, path: finalPath });
+						for (const [entryPath, data] of existing) entries.set(entryPath, data);
+					} finally {
+						await handle.close();
+					}
+				} else {
+					const existing = await readArchiveEntries({ path: finalPath, format });
+					for (const [entryPath, data] of existing) entries.set(entryPath, data);
 				}
 			} catch (error) {
 				throw new ToolError(error instanceof Error ? error.message : String(error));
@@ -687,8 +727,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		entries.set(resolvedArchivePath.archiveSubPath, content);
 
 		try {
-			await writeArchive(tmpPath, format, entries);
-			await fs.rename(tmpPath, finalPath);
+			if (operation && authorizedArchiveTarget && authorizedTempTarget) {
+				await operation.replaceFile(authorizedArchiveTarget, authorizedTempTarget, authorizedPath =>
+					writeArchive(authorizedPath, format, entries),
+				);
+			} else {
+				await writeArchive(tmpPath, format, entries);
+				await fs.rename(tmpPath, finalPath);
+			}
 		} catch (error) {
 			await fs.rm(tmpPath, { force: true }).catch(() => {});
 			throw new ToolError(error instanceof Error ? error.message : String(error));
@@ -723,7 +769,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		let sawExistingNonSqlite = false;
 		for (const candidate of candidates) {
 			const target = parseSqliteWriteTarget(candidate.subPath, candidate.queryString);
-			const absolutePath = resolvePlanPath(this.session, candidate.sqlitePath);
+			let absolutePath = resolvePlanPath(this.session, candidate.sqlitePath);
+			if (this.session.pathScope) {
+				absolutePath = (await this.session.pathScope.currentOperation().authorize(absolutePath, "probe"))
+					.canonicalTarget;
+			}
 			try {
 				const stat = await Bun.file(absolutePath).stat();
 				if (stat.isDirectory()) {
@@ -761,12 +811,32 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		resolvedSqlitePath: ResolvedSqliteWritePath,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		let db: Database | null = null;
+		let authorizedTargets: readonly AuthorizedFilesystemTarget[] = [];
 		try {
 			if (!resolvedSqlitePath.exists) {
 				throw new ToolError(`SQLite database '${displayPath}' not found`);
 			}
 
+			if (this.session.pathScope) {
+				const operation = this.session.pathScope.currentOperation();
+				const probes = await operation.preflight([
+					{ path: resolvedSqlitePath.absolutePath, kind: "probe" },
+					{ path: `${resolvedSqlitePath.absolutePath}-wal`, kind: "probe" },
+					{ path: `${resolvedSqlitePath.absolutePath}-shm`, kind: "probe" },
+				]);
+				authorizedTargets = await operation.preflight(
+					probes
+						.filter((target, index) => index === 0 || target.existed)
+						.map(target => ({ path: target.canonicalTarget, kind: "write" as const })),
+				);
+				for (const target of authorizedTargets) await operation.verify(target);
+				resolvedSqlitePath.absolutePath = authorizedTargets[0]!.canonicalTarget;
+			}
 			db = new Database(resolvedSqlitePath.absolutePath, { create: false, strict: true });
+			if (this.session.pathScope) {
+				const operation = this.session.pathScope.currentOperation();
+				for (const target of authorizedTargets) await operation.verify(target);
+			}
 			db.run("PRAGMA busy_timeout = 3000");
 
 			const trimmedContent = content.trim();
@@ -815,6 +885,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}
 			}
 
+			if (this.session.pathScope) {
+				const operation = this.session.pathScope.currentOperation();
+				for (const target of authorizedTargets) await operation.verify(target);
+			}
 			invalidateFsScanAfterWrite(resolvedSqlitePath.absolutePath);
 			return toolResult<WriteToolDetails>({ resolvedPath: resolvedSqlitePath.absolutePath })
 				.text(resultText)
@@ -1155,6 +1229,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					await internalRouter.write(path, cleanContent, {
 						cwd: this.session.cwd,
 						signal,
+						localProtocolOptions: this.session.localProtocolOptions,
 						xd: {
 							write: async (name, deviceContent) => {
 								if (name === REPORT_ISSUE_DEVICE_NAME) {
@@ -1284,7 +1359,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			await assertNotReadSelectorMisfire(path, cleanContent, this.session.cwd);
 			enforcePlanModeWrite(this.session, path, { op: "create" });
-			const absolutePath = resolvePlanPath(this.session, path);
+			let absolutePath = resolvePlanPath(this.session, path);
+			const authorizedTarget = this.session.pathScope
+				? await this.session.pathScope.currentOperation().authorize(absolutePath, "write")
+				: undefined;
+			if (authorizedTarget) {
+				absolutePath = authorizedTarget.canonicalTarget;
+				await this.session.pathScope!.currentOperation().verify(authorizedTarget);
+			}
 			const batchRequest = getLspBatchRequest(context?.toolCall);
 
 			// Check if file exists and is auto-generated before overwriting
@@ -1297,6 +1379,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			// Try ACP bridge first for editor-visible filesystem paths. Internal
 			// artifacts such as local:// plans are owned by OMP, not the editor.
+			if (authorizedTarget) await this.session.pathScope!.currentOperation().verify(authorizedTarget);
 			const bridgeWrite = await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent, signal);
 			if (bridgeWrite) {
 				// `write` always replaces the whole file, so (unlike hashline's
@@ -1304,6 +1387,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				// executable-bit check on the verified post-write content —
 				// use it so a drifted write (e.g. client format-on-save) still
 				// hands back a tag that matches what's actually on disk.
+				if (authorizedTarget) await this.session.pathScope!.currentOperation().verifyPostWrite(authorizedTarget);
 				const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, bridgeWrite.text);
 				const header = maybeWriteSnapshotHeader(this.session, absolutePath, bridgeWrite.text);
 				const writeLine = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
@@ -1320,6 +1404,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				};
 			}
 
+			if (authorizedTarget) await this.session.pathScope!.currentOperation().verify(authorizedTarget);
 			const diagnostics = await this.#writethrough(
 				absolutePath,
 				cleanContent,
@@ -1328,6 +1413,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				batchRequest,
 				dst => this.#deferredDiagnostics?.begin(dst),
 			);
+			if (authorizedTarget) await this.session.pathScope!.currentOperation().verifyPostWrite(authorizedTarget);
 			invalidateFsScanAfterWrite(absolutePath);
 			if (!this.#deferredDiagnostics || batchRequest?.flush === false) {
 				this.session.bumpFileMutationVersion?.(absolutePath);

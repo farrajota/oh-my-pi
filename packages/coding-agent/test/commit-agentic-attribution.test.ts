@@ -6,6 +6,8 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
+import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
 describe("commit agent prompt attribution", () => {
 	afterEach(() => {
@@ -15,14 +17,23 @@ describe("commit agent prompt attribution", () => {
 	it("marks generated commit prompts and reminders as agent-attributed", async () => {
 		const prompts: Array<{ text: string; options?: PromptOptions }> = [];
 		const session = {
+			sessionManager: undefined as unknown as SessionManager,
 			prompt: async (text: string, options?: PromptOptions) => {
 				prompts.push({ text, options });
 			},
 			subscribe: () => () => {},
-			dispose: async () => {},
+			dispose: async () => {
+				await session.sessionManager.close();
+			},
 		};
 
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as unknown as CreateAgentSessionResult);
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			const sessionManager = options?.sessionManager;
+			if (!sessionManager) throw new Error("Expected commit agent session manager");
+			session.sessionManager = sessionManager;
+			installSessionOperationLedger(sessionManager);
+			return { session } as unknown as CreateAgentSessionResult;
+		});
 		vi.spyOn(toolsModule, "createCommitTools").mockReturnValue([]);
 
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -50,14 +61,22 @@ describe("commit agent prompt attribution", () => {
 	it("runs completion before session disposal", async () => {
 		const events: string[] = [];
 		const session = {
+			sessionManager: undefined as unknown as SessionManager,
 			prompt: async () => {},
 			subscribe: () => () => {},
 			dispose: async () => {
 				events.push("dispose");
+				await session.sessionManager.close();
 			},
 		};
 
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as unknown as CreateAgentSessionResult);
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			const sessionManager = options?.sessionManager;
+			if (!sessionManager) throw new Error("Expected commit agent session manager");
+			session.sessionManager = sessionManager;
+			installSessionOperationLedger(sessionManager);
+			return { session } as unknown as CreateAgentSessionResult;
+		});
 		vi.spyOn(toolsModule, "createCommitTools").mockImplementation(options => {
 			options.state.proposal = {
 				analysis: {

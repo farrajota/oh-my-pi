@@ -2,8 +2,10 @@ import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { Settings } from "../../src/config/settings";
 import { getThemeByName, setThemeInstance, type Theme } from "../../src/modes/theme/theme";
 import { renderResult } from "../../src/task/render";
+import { formatTaskResultSummary } from "../../src/task/result-summary";
 import { taskToolRenderer } from "../../src/task/renderer";
-import type { AgentProgress, SingleResult, TaskToolDetails } from "../../src/task/types";
+import type { AgentProgress, EffectivePermissionSummary, SingleResult, TaskToolDetails } from "../../src/task/types";
+import { AgentRegistry } from "../../src/registry/agent-registry";
 
 const strip = (lines: readonly string[]): string =>
 	lines
@@ -12,6 +14,51 @@ const strip = (lines: readonly string[]): string =>
 		.replace(/\x1b\[[0-9;]*m/g, "");
 
 const originalRowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+const summaryRegistry = new AgentRegistry();
+const PERMISSION_SUMMARY: EffectivePermissionSummary = {
+	mode: "enforce",
+	profiles: { items: ["focused-edit", "no-network"], omittedCount: 2 },
+	clauses: {
+		items: [
+			{
+				tools: { items: ["read", "edit"], omittedCount: 1 },
+				allowPathSets: {
+					items: [
+						{ items: ["src/**", "test/**"], omittedCount: 1 },
+						{ items: ["docs/**"], omittedCount: 0 },
+					],
+					omittedCount: 1,
+				},
+			},
+		],
+		omittedCount: 2,
+	},
+	denyTools: { items: ["bash"], omittedCount: 1 },
+	denyPaths: { items: ["**/.env"], omittedCount: 2 },
+	guardrails: { noNetwork: true, secretsBlind: false },
+	intrinsicTools: { yield: true, reportToolIssue: true },
+	recentDenials: {
+		items: [
+			{
+				kind: "subagent_permission_denial",
+				code: "tool-deny",
+				tool: "bash",
+				targets: { items: [{ kind: "process", display: "shell command" }], omittedCount: 1 },
+				matched: "bash",
+				reason: "denied by fixture",
+			},
+			{
+				kind: "subagent_permission_denial",
+				code: "path-not-allowed",
+				tool: "read",
+				targets: { items: [{ kind: "path", display: "private file" }], omittedCount: 0 },
+				matched: "src/private.ts",
+				reason: "outside allowed paths",
+			},
+		],
+		omittedCount: 3,
+	},
+};
 
 function setViewportRows(rows: number): void {
 	Object.defineProperty(process.stdout, "rows", { configurable: true, value: rows });
@@ -191,6 +238,37 @@ describe("task live progress rendering", () => {
 		expect(text).toContain("rawprompt");
 		expect(text).not.toContain("\x1b[2K");
 		expect(text).not.toContain("\r");
+	});
+	it("renders the same bounded permission facts for progress, results, and the task-result envelope", () => {
+		const progressText = renderProgressText(
+			{ ...makeProgress([]), permissionSummary: PERMISSION_SUMMARY },
+			false,
+			uiTheme,
+		);
+		const result = makeSingleResult(0, { output: "unchanged agent payload", permissionSummary: PERMISSION_SUMMARY });
+		const resultText = renderResultText(
+			{ projectAgentsDir: null, results: [result], totalDurationMs: 1 },
+			false,
+			uiTheme,
+		);
+		const envelope = formatTaskResultSummary(result, { totalDurationMs: 1, agentRegistry: summaryRegistry });
+		for (const fact of [
+			"Permissions: mode enforce",
+			"Profiles: focused-edit, no-network (+2 omitted)",
+			"Clause 1: tools read, edit (+1 omitted)",
+			"Clauses omitted: 2",
+			"Deny paths: **/.env (+2 omitted)",
+			"Guardrails: no-network on; secrets-blind off",
+			"Intrinsic tools: yield on; report-tool-issue on",
+			"Recent denial codes: tool-deny, path-not-allowed (+3 omitted)",
+		]) {
+			expect(progressText).toContain(fact);
+			expect(resultText).toContain(fact);
+			expect(envelope).toContain(fact);
+		}
+		expect(envelope).toContain("<output>\nunchanged agent payload\n</output>");
+		expect(envelope).not.toContain("denied by fixture");
+		expect(envelope).not.toContain("private file");
 	});
 	it("sanitizes control sequences from finalized subagent results", () => {
 		const output = JSON.stringify({ "\x1b[2Kkey": "safe value" });

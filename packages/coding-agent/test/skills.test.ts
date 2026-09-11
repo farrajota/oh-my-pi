@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -165,18 +165,34 @@ describe("skills", () => {
 
 	describe("loadSkills with options", () => {
 		let customDirectorySkills: LoadSkillsResult;
+		let customSkillAgentDir: string;
 
 		beforeAll(async () => {
+			customSkillAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-custom-skills-agent-"));
+			const managedSkillDir = path.join(customSkillAgentDir, "managed-skills", "ambient-managed-skill");
+			await fs.mkdir(managedSkillDir, { recursive: true });
+			await fs.writeFile(
+				path.join(managedSkillDir, "SKILL.md"),
+				["---", "description: Must not leak into custom-only loads", "---", "", "# ambient-managed-skill"].join(
+					"\n",
+				),
+			);
 			customDirectorySkills = await loadSkills({
 				...DISABLE_ALL_BUILTIN_SKILLS,
+				agentDir: customSkillAgentDir,
 				customDirectories: [fixturesDir],
 			});
+		});
+
+		afterAll(async () => {
+			await removeWithRetries(customSkillAgentDir);
 		});
 		it("should load from customDirectories only when built-ins disabled", async () => {
 			const { skills } = customDirectorySkills;
 			expect(skills.length).toBeGreaterThan(0);
 			// Custom directory skills have source "custom:user"
 			expect(skills.every(s => s.source.startsWith("custom"))).toBe(true);
+			expect(skills.some(s => s.name === "ambient-managed-skill")).toBe(false);
 		});
 
 		it("should return customDirectory skills sorted by name (case-insensitive)", async () => {

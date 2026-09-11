@@ -79,6 +79,7 @@ const TOP_LEVEL_INTERNAL_URL_PREFIXES = [
 	"rule://",
 	"security://",
 	"local://",
+	"memory://",
 	"mcp://",
 	"ssh://",
 	"vault://",

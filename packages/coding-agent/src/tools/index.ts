@@ -21,14 +21,15 @@ import {
 	clearBrowserAuditToolSession,
 	createRegisteredBrowserAuditTool,
 } from "../internal/browser-audit-authority";
+import type { SessionPathScope } from "../internal/session-path-scope";
 import type { LocalProtocolOptions } from "../internal-urls";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { LspTool } from "../lsp";
 import type { MCPManager } from "../mcp";
 import type { MnemopiSessionState } from "../mnemopi/state";
 import type { PlanModeState } from "../plan-mode/state";
-import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import type { AgentRegistry } from "../registry/agent-registry";
+import type { AgentRef, AgentRegistry } from "../registry/agent-registry";
+import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../sdk";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CustomMessage } from "../session/messages";
@@ -37,7 +38,7 @@ import type { SessionManager } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
-import type { EffectiveSubagentPermissions } from "../task/permission-profiles";
+import type { EffectiveSubagentPermissions, ToolExecutionAuthority } from "../task/permission-profiles";
 import { canSpawnAtDepth, type StructuredSubagentSchemaMode } from "../task/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { EventBus } from "../utils/event-bus";
@@ -306,6 +307,8 @@ export interface ToolSession {
 	setActiveToolNames?: (names: Iterable<string>) => void;
 	/** Canonical map containing every registered tool exactly once. */
 	toolRegistry?: Map<string, Tool>;
+	/** Exact post-precedence registry authority used by enforce-mode wrappers. */
+	toolExecutionAuthority?: ToolExecutionAuthority;
 	/** `xd://` presentation state backed by {@link toolRegistry}. */
 	xdev?: XdevState;
 	/**
@@ -322,10 +325,14 @@ export interface ToolSession {
 	 * remains restricted until the activation commits.
 	 */
 	pendingFullWriteDescription?: boolean;
+	/** Session-bound filesystem authority; present only for registered sessions. */
+	pathScope?: SessionPathScope;
 	/** Agent registry for IRC routing across live sessions. */
 	agentRegistry?: AgentRegistry;
-	/** Idle→parked→revive lifecycle owner; lets the hub kill a non-job-backed agent registration. Default: AgentLifecycleManager.global(). */
-	agentLifecycle?: () => AgentLifecycleManager;
+	createAuthoritySession?: (
+		options: CreateAgentSessionOptions & { agentId: string },
+		reviveRef?: AgentRef,
+	) => Promise<CreateAgentSessionResult>;
 	/** Get artifacts directory for artifact:// URLs */
 	getArtifactsDir?: () => string | null;
 	/** Get the ArtifactManager backing this session (shared across parent + subagents). */
@@ -657,9 +664,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 				((session.taskDepth ?? 0) === 0 || requestedTools !== undefined)
 			);
 		if (name === "hub") {
-			return (
-				!restrictToolNames && session.enableIrc !== false && isIrcEnabled(session.settings, session.taskDepth ?? 0)
-			);
+			return session.enableIrc !== false && isIrcEnabled(session.settings, session.taskDepth ?? 0);
 		}
 		if (name === "retain" || name === "recall" || name === "reflect") {
 			return ["hindsight", "mnemopi"].includes(session.settings.get("memory.backend") ?? "");

@@ -7,10 +7,12 @@ import type { PythonKernel as PythonKernelInstance } from "@oh-my-pi/pi-coding-a
 import * as pythonKernel from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession, type ExtensionFactory, type WorkspaceTree } from "@oh-my-pi/pi-coding-agent/sdk";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createAgentRootSession } from "../src/internal/agent-registry-bridge";
+import * as operationLease from "../src/registry/operation-lease";
 import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
-
 const OK_EXECUTION = { status: "ok", cancelled: false, timedOut: false, stdinRequested: false } as const;
 
 class FakeKernel {
@@ -250,14 +252,21 @@ describe("AgentSession python cleanup", () => {
 		const { tempDir, cwd } = createTempProject();
 		tempDirs.push(tempDir);
 		const unrelatedKernel = createMockKernel();
+		const attemptedKernel = createMockKernel();
 		const unrelatedCwd = tempDir.join("unrelated-after");
 		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		const startSpy = vi
 			.spyOn(pythonKernel.PythonKernel, "start")
-			.mockResolvedValueOnce(unrelatedKernel as unknown as PythonKernelInstance);
-		const throwingRegistry = new AgentRegistry();
-		vi.spyOn(throwingRegistry, "register").mockImplementation(() => {
-			throw new Error("Agent registry failed");
+			.mockResolvedValueOnce(unrelatedKernel as unknown as PythonKernelInstance)
+			.mockResolvedValueOnce(attemptedKernel as unknown as PythonKernelInstance);
+		const registry = new AgentRegistry();
+		const initializeCodeMode = AgentSession.prototype.initializeCodeMode;
+		vi.spyOn(AgentSession.prototype, "initializeCodeMode").mockImplementation(async function (this: AgentSession) {
+			await initializeCodeMode.call(this);
+			await this.executePython("print('attempted after')");
+		});
+		vi.spyOn(operationLease, "markUnregisteredSessionOperationProjection").mockImplementation(() => {
+			throw new Error("Session operation projection failed");
 		});
 
 		await pythonExecutor.executePython("print('unrelated after')", {
@@ -268,7 +277,7 @@ describe("AgentSession python cleanup", () => {
 		});
 
 		await expect(
-			createAgentSession({
+			createAgentRootSession(registry, {
 				cwd,
 				agentDir: createAgentDir(),
 				sessionManager: SessionManager.inMemory(cwd),
@@ -284,12 +293,13 @@ describe("AgentSession python cleanup", () => {
 				enableLsp: false,
 				toolNames: ["eval"],
 				workspaceTree: emptyWorkspaceTree(cwd),
-				agentRegistry: throwingRegistry,
 			}),
-		).rejects.toThrow("Agent registry failed");
+		).rejects.toThrow("Session operation projection failed");
 
-		expect(startSpy).toHaveBeenCalledTimes(1);
+		expect(startSpy).toHaveBeenCalledTimes(2);
+		expect(attemptedKernel.shutdown).toHaveBeenCalledTimes(1);
 		expect(unrelatedKernel.shutdown).not.toHaveBeenCalled();
+		expect(registry.get("Main")).toBeUndefined();
 
 		const replacementKernel = createMockKernel();
 		startSpy.mockResolvedValueOnce(replacementKernel as unknown as PythonKernelInstance);
@@ -299,7 +309,7 @@ describe("AgentSession python cleanup", () => {
 			kernelMode: "session",
 			kernelOwnerId: "fresh-owner-after",
 		});
-		expect(startSpy).toHaveBeenCalledTimes(2);
+		expect(startSpy).toHaveBeenCalledTimes(3);
 		expect(replacementKernel.execute).toHaveBeenCalledTimes(1);
 		expect(replacementKernel.execute).toHaveBeenCalledTimes(1);
 
@@ -310,7 +320,7 @@ describe("AgentSession python cleanup", () => {
 			kernelOwnerId: "other-owner",
 		});
 
-		expect(startSpy).toHaveBeenCalledTimes(2);
+		expect(startSpy).toHaveBeenCalledTimes(3);
 		expect(unrelatedKernel.execute).toHaveBeenCalledTimes(2);
 	});
 

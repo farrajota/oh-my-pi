@@ -1,9 +1,11 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import { AgentRegistry, type AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { formatResultOutputFallback } from "@oh-my-pi/pi-coding-agent/task";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -80,6 +82,7 @@ function createFakeSession(config: FakeSessionConfig = {}): FakeSessionHandle {
 		...createSessionDefaults(),
 		state: { messages: [] } as never,
 		agent: { state: { systemPrompt: ["test"] } } as never,
+		getPermissionSummary: () => undefined,
 		extensionRunner: undefined as never,
 		sessionManager: { appendSessionInit: () => {} } as never,
 		getActiveToolNames: () => ["read", "yield"],
@@ -116,13 +119,17 @@ function createFakeSession(config: FakeSessionConfig = {}): FakeSessionHandle {
 	};
 }
 
-function mockCreateAgentSession(session: AgentSession) {
-	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
+function sessionCreationResult(session: AgentSession) {
+	return {
 		session,
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),
-	} satisfies CreateAgentSessionResult);
+	} satisfies CreateAgentSessionResult;
+}
+
+function mockCreateAgentSession(session: AgentSession) {
+	pendingSessionCreations.push(sessionCreationResult(session));
 }
 
 const baseAgent: AgentDefinition = {
@@ -131,7 +138,10 @@ const baseAgent: AgentDefinition = {
 	systemPrompt: "test",
 	source: "bundled",
 };
-
+let registry: AgentRegistry;
+let createAuthoritySession: AgentAuthoritySessionBinding["create"];
+let rootSession: AgentSession | undefined;
+const pendingSessionCreations: CreateAgentSessionResult[] = [];
 const baseOptions = {
 	cwd: "/tmp",
 	agent: baseAgent,
@@ -143,7 +153,24 @@ const baseOptions = {
 };
 
 describe("runSubprocess request guards", () => {
-	afterEach(() => {
+	beforeEach(async () => {
+		registry = new AgentRegistry();
+		rootSession = createFakeSession().session;
+		pendingSessionCreations.push(sessionCreationResult(rootSession));
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+			const created = pendingSessionCreations.shift();
+			if (!created) throw new Error("Unexpected authority session creation.");
+			return created;
+		});
+		await createAgentRootSession(registry, { agentId: "Main", agentDisplayName: "main" });
+		const authority = bindInternalAgentAuthoritySession(registry, rootSession);
+		if (!authority) throw new Error("Expected a manager-owned root authority fixture.");
+		createAuthoritySession = authority.create;
+	});
+
+	afterEach(async () => {
+		await rootSession?.dispose();
+		rootSession = undefined;
 		vi.restoreAllMocks();
 	});
 
@@ -159,7 +186,13 @@ describe("runSubprocess request guards", () => {
 		});
 		mockCreateAgentSession(handle.session);
 
-		const result = await runSubprocess({ ...baseOptions, id: "subagent-requests", settings });
+		const result = await runSubprocess({
+			...baseOptions,
+			agentRegistry: registry,
+			createAuthoritySession,
+			id: "subagent-requests",
+			settings,
+		});
 
 		expect(result.aborted).toBe(false);
 		expect(result.requests).toBe(3);
@@ -187,7 +220,13 @@ describe("runSubprocess request guards", () => {
 		});
 		mockCreateAgentSession(handle.session);
 
-		const result = await runSubprocess({ ...baseOptions, id: "subagent-steer", settings });
+		const result = await runSubprocess({
+			...baseOptions,
+			agentRegistry: registry,
+			createAuthoritySession,
+			id: "subagent-steer",
+			settings,
+		});
 
 		expect(result.requests).toBe(5);
 		expect(result.aborted).toBe(false);
@@ -216,7 +255,13 @@ describe("runSubprocess request guards", () => {
 		});
 		mockCreateAgentSession(handle.session);
 
-		const result = await runSubprocess({ ...baseOptions, id: "subagent-steer-default", settings });
+		const result = await runSubprocess({
+			...baseOptions,
+			agentRegistry: registry,
+			createAuthoritySession,
+			id: "subagent-steer-default",
+			settings,
+		});
 
 		expect(result.requests).toBe(5);
 		expect(result.aborted).toBe(false);
@@ -242,7 +287,13 @@ describe("runSubprocess request guards", () => {
 		});
 		mockCreateAgentSession(handle.session);
 
-		const result = await runSubprocess({ ...baseOptions, id: "subagent-hard-stop-notice-disabled", settings });
+		const result = await runSubprocess({
+			...baseOptions,
+			agentRegistry: registry,
+			createAuthoritySession,
+			id: "subagent-hard-stop-notice-disabled",
+			settings,
+		});
 
 		expect(result.aborted).toBe(true);
 		expect(result.exitCode).toBe(1);
@@ -269,7 +320,13 @@ describe("runSubprocess request guards", () => {
 		});
 		mockCreateAgentSession(handle.session);
 
-		const result = await runSubprocess({ ...baseOptions, id: "subagent-hard-stop", settings });
+		const result = await runSubprocess({
+			...baseOptions,
+			agentRegistry: registry,
+			createAuthoritySession,
+			id: "subagent-hard-stop",
+			settings,
+		});
 
 		expect(result.aborted).toBe(true);
 		expect(result.exitCode).toBe(1);
@@ -295,7 +352,13 @@ describe("runSubprocess request guards", () => {
 		});
 		mockCreateAgentSession(handle.session);
 
-		const result = await runSubprocess({ ...baseOptions, id: "subagent-salvage", settings });
+		const result = await runSubprocess({
+			...baseOptions,
+			agentRegistry: registry,
+			createAuthoritySession,
+			id: "subagent-salvage",
+			settings,
+		});
 
 		expect(result.aborted).toBe(true);
 		expect(result.requests).toBe(1);
@@ -320,7 +383,13 @@ describe("runSubprocess request guards", () => {
 		});
 		mockCreateAgentSession(handle.session);
 
-		const result = await runSubprocess({ ...baseOptions, id: "subagent-salvage-clip", settings });
+		const result = await runSubprocess({
+			...baseOptions,
+			agentRegistry: registry,
+			createAuthoritySession,
+			id: "subagent-salvage-clip",
+			settings,
+		});
 
 		expect(result.aborted).toBe(true);
 		expect(result.output).toContain("start-marker");

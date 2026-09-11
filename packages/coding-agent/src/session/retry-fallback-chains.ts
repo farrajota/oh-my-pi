@@ -416,31 +416,33 @@ function getRetryFallbackEffectiveChain(
 					context.modelLookup,
 				)
 			: undefined);
-	const seen = new Set<string>();
+	const seenModelIdentities = new Set<string>();
 	const chain: RetryFallbackSelector[] = [];
 	if (isRetryFallbackWildcardKey(chainKey)) {
 		// A wildcard key has no fixed primary: the active model is the
 		// primary, followed by the configured provider-level fallbacks.
 		if (parsedCurrent) {
 			chain.push(parsedCurrent);
-			seen.add(parsedCurrent.raw);
+			seenModelIdentities.add(formatRetryFallbackBaseSelector(parsedCurrent));
 		}
 	} else {
 		const primarySelector = getRetryFallbackPrimarySelector(context, chainKey);
 		if (primarySelector) {
 			chain.push(primarySelector);
-			seen.add(primarySelector.raw);
+			seenModelIdentities.add(formatRetryFallbackBaseSelector(primarySelector));
 		} else if ((chainKey === "default" || allowMissingPrimary) && parsedCurrent) {
 			chain.push(parsedCurrent);
-			seen.add(parsedCurrent.raw);
+			seenModelIdentities.add(formatRetryFallbackBaseSelector(parsedCurrent));
 		} else if (!allowMissingPrimary) {
 			return [];
 		}
 	}
 	for (const selector of context.chains[chainKey] ?? []) {
 		const parsed = parseRetryFallbackChainEntry(context, selector, parsedCurrent);
-		if (!parsed || seen.has(parsed.raw)) continue;
-		seen.add(parsed.raw);
+		if (!parsed) continue;
+		const identity = formatRetryFallbackBaseSelector(parsed);
+		if (seenModelIdentities.has(identity)) continue;
+		seenModelIdentities.add(identity);
 		chain.push(parsed);
 	}
 	return chain;

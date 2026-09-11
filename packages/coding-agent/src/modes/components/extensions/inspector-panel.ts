@@ -8,7 +8,8 @@
 import * as os from "node:os";
 import { type Component, visibleWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui";
 import { theme } from "../../../modes/theme/theme";
-import { expandKeyHint, PREVIEW_LIMITS, replaceTabs, shortenPath } from "../../../tools/render-utils";
+import { expandKeyHint, replaceTabs, shortenPath } from "../../../tools/render-utils";
+import { PREVIEW_LIMITS } from "../../../tools/preview-limits";
 import {
 	sanitizeDisplayField,
 	sanitizeDisplayLine,

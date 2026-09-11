@@ -21,13 +21,13 @@ import {
 	getLspBatchRequest,
 	invalidateRenderedStringCache,
 	type LspBatchRequest,
-	PREVIEW_LIMITS,
 	previewWindowRows,
 	type RenderedStringCache,
 	replaceTabs,
 	shortenPath,
 	truncateDiffByHunk,
 } from "../tools/render-utils";
+import { PREVIEW_LIMITS } from "../tools/preview-limits";
 import type { ToolActivityContext, ToolActivitySummary } from "../tools/renderers";
 import {
 	fileHyperlink,

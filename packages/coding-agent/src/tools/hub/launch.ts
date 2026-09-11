@@ -20,11 +20,9 @@ import { resolveToCwd } from "../path-utils";
 import {
 	capPreviewLines,
 	createCachedComponent,
-	DEFAULT_TERMINAL_PREVIEW_LINES,
 	formatDuration,
 	formatExpandHint,
 	formatMoreItems,
-	PREVIEW_LIMITS,
 	pluralize,
 	previewLine,
 	replaceTabs,
@@ -32,6 +30,7 @@ import {
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
 } from "../render-utils";
+import { DEFAULT_TERMINAL_PREVIEW_LINES, PREVIEW_LIMITS } from "../preview-limits";
 import { styleTerminalRow } from "../terminal-output";
 import { ToolError } from "../tool-errors";
 

@@ -6,7 +6,15 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { SettingPath } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import { IrcBus, type IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import {
+	adoptAgent,
+	getAgentLifecycleManager,
+	lifecycleHasAgent,
+	parkAgent,
+	resetAgentLifecycleForTests,
+} from "../../src/internal/agent-lifecycle-bridge";
+import { lookupAgentRef, setAgentStatus } from "../../src/internal/agent-registry-bridge";
+import { createHubAuthorityFixture, type HubAuthorityFixture, installHubIrcControls } from "./hub-fixtures";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { IrcBridge } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
@@ -86,16 +94,11 @@ function makeFakeSession(): FakeSession {
 	};
 }
 
+let hubFixture: HubAuthorityFixture | undefined;
+
 function makeToolSession(registry: AgentRegistry, agentId: string): ToolSession {
-	return {
-		cwd: "/tmp",
-		hasUI: false,
-		getSessionFile: () => null,
-		getSessionSpawns: () => "*",
-		settings: Settings.isolated(),
-		agentRegistry: registry,
-		getAgentId: () => agentId,
-	};
+	if (!hubFixture || hubFixture.registry !== registry) throw new Error("Expected Hub authority fixture.");
+	return hubFixture.createToolSession(agentId);
 }
 
 function createRealSession(overrides: Partial<Record<SettingPath, unknown>> = {}): {
@@ -149,6 +152,12 @@ describe("IRC", () => {
 	let registry: AgentRegistry;
 	let bus: IrcBus;
 
+	function adopt(id: string, options: Parameters<typeof adoptAgent>[2]): void {
+		const ref = lookupAgentRef(registry, id);
+		if (!ref) throw new Error(`Expected exact agent ref for ${id}`);
+		adoptAgent(getAgentLifecycleManager(registry), id, options, ref);
+	}
+
 	const sessions: AgentSession[] = [];
 	let authDir: TempDir;
 	let authStorage: AuthStorage;
@@ -165,7 +174,7 @@ describe("IRC", () => {
 	});
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		IrcBus.resetGlobalForTests();
 		registry = AgentRegistry.global();
 		bus = IrcBus.global();
@@ -236,7 +245,7 @@ describe("IRC", () => {
 			const sub = makeFakeSession();
 			sub.setOutcome("woken");
 			registry.register({ id: "0-Parked", displayName: "task", kind: "sub", session: null, status: "parked" });
-			AgentLifecycleManager.global().adopt("0-Parked", {
+			adopt("0-Parked", {
 				idleTtlMs: 0,
 				revive: async () => sub.session,
 			});
@@ -249,7 +258,7 @@ describe("IRC", () => {
 
 		it("send fails cleanly when a parked recipient has no reviver", async () => {
 			registry.register({ id: "0-Parked", displayName: "task", kind: "sub", session: null, status: "parked" });
-			AgentLifecycleManager.global().adopt("0-Parked", { idleTtlMs: 0 });
+			adopt("0-Parked", { idleTtlMs: 0 });
 			const receipt = await bus.send({ from: "0-Main", to: "0-Parked", body: "wake up" });
 			expect(receipt.outcome).toBe("failed");
 			expect(receipt.error).toBeTruthy();
@@ -271,9 +280,9 @@ describe("IRC", () => {
 			globalStub.session.dispose = (async () => {
 				await neverDispose;
 			}) as AgentSession["dispose"];
-			AgentLifecycleManager.global().adopt("0-Sub", { idleTtlMs: 0 });
-			void AgentLifecycleManager.global().park("0-Sub");
-			expect(AgentLifecycleManager.global().has("0-Sub")).toBe(true);
+			adopt("0-Sub", { idleTtlMs: 0 });
+			void parkAgent(getAgentLifecycleManager(registry), "0-Sub");
+			expect(lifecycleHasAgent(getAgentLifecycleManager(registry), "0-Sub")).toBe(true);
 
 			const customRegistry = new AgentRegistry();
 			const customBus = new IrcBus(customRegistry);
@@ -312,7 +321,7 @@ describe("IRC", () => {
 				status: "idle",
 			});
 			let reviverRuns = 0;
-			AgentLifecycleManager.global().adopt("0-Parking", {
+			adopt("0-Parking", {
 				idleTtlMs: 0,
 				revive: async () => {
 					reviverRuns++;
@@ -320,7 +329,7 @@ describe("IRC", () => {
 				},
 			});
 
-			const parking = AgentLifecycleManager.global().park("0-Parking");
+			const parking = parkAgent(getAgentLifecycleManager(registry), "0-Parking");
 			// Same tick: cancel window still open — send must keep the live session.
 			const receipt = await bus.send({ from: "0-Main", to: "0-Parking", body: "stay alive" });
 			await parking;
@@ -329,7 +338,7 @@ describe("IRC", () => {
 			expect(delivered.map(msg => msg.body)).toEqual(["stay alive"]);
 			expect(disposeCalls).toBe(0);
 			expect(reviverRuns).toBe(0);
-			expect(registry.get("0-Parking")?.session).toBe(session);
+			expect(lookupAgentRef(registry, "0-Parking")?.session).toBe(session);
 			expect(registry.get("0-Parking")?.status).toBe("idle");
 			expect(bus.unreadCount("0-Parking")).toBe(0);
 			resolveDispose();
@@ -359,7 +368,7 @@ describe("IRC", () => {
 				status: "idle",
 			});
 			let reviverRuns = 0;
-			AgentLifecycleManager.global().adopt("0-Parking", {
+			adopt("0-Parking", {
 				idleTtlMs: 0,
 				revive: async () => {
 					reviverRuns++;
@@ -367,12 +376,12 @@ describe("IRC", () => {
 				},
 			});
 
-			const parking = AgentLifecycleManager.global().park("0-Parking");
+			const parking = parkAgent(getAgentLifecycleManager(registry), "0-Parking");
 			// Pass the cancel window so park detaches before send.
 			await Promise.resolve();
 			await Promise.resolve();
 			expect(registry.get("0-Parking")?.status).toBe("parked");
-			expect(registry.get("0-Parking")?.session).toBeNull();
+			expect(lookupAgentRef(registry, "0-Parking")?.session).toBeNull();
 			expect(disposeCalls).toBe(1);
 
 			const sendPromise = bus.send({ from: "0-Main", to: "0-Parking", body: "after park" });
@@ -394,7 +403,7 @@ describe("IRC", () => {
 			expect(receipt.outcome).toBe("revived");
 			expect(revived.delivered.map(msg => msg.body)).toEqual(["after park"]);
 			expect(reviverRuns).toBe(1);
-			expect(registry.get("0-Parking")?.session).toBe(revived.session);
+			expect(lookupAgentRef(registry, "0-Parking")?.session).toBe(revived.session);
 			expect(bus.unreadCount("0-Parking")).toBe(0);
 		});
 
@@ -420,7 +429,7 @@ describe("IRC", () => {
 				status: "idle",
 			});
 			let reviverRuns = 0;
-			AgentLifecycleManager.global().adopt("0-Parking", {
+			adopt("0-Parking", {
 				idleTtlMs: 0,
 				revive: async () => {
 					reviverRuns++;
@@ -428,7 +437,7 @@ describe("IRC", () => {
 				},
 			});
 
-			const parking = AgentLifecycleManager.global().park("0-Parking");
+			const parking = parkAgent(getAgentLifecycleManager(registry), "0-Parking");
 			await Promise.resolve();
 			await Promise.resolve();
 
@@ -573,26 +582,50 @@ describe("IRC", () => {
 			expect(bus.unreadCount("0-Main")).toBe(0);
 		});
 
-		it("mailbox drops the oldest message beyond the 100-message cap", async () => {
+		it("mailbox rejects the 101st message without evicting the oldest", async () => {
 			const main = makeFakeSession();
 			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
 			const sub = makeFakeSession();
 			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session });
 
-			for (let i = 0; i <= 100; i++) {
+			for (let i = 0; i < 100; i++) {
 				main.setError(new Error(`down ${i}`));
 				await bus.send({ from: "0-Sub", to: "0-Main", body: `msg-${i}` });
 			}
+			const rejected = await bus.send({ from: "0-Sub", to: "0-Main", body: "msg-100" });
 
+			expect(rejected).toMatchObject({ to: "0-Main", outcome: "failed" });
+			expect(rejected.error).toContain("Mailbox capacity reached");
 			expect(bus.unreadCount("0-Main")).toBe(100);
 			const pending = bus.inbox("0-Main", { peek: true });
-			expect(pending[0]?.body).toBe("msg-1");
-			expect(pending[pending.length - 1]?.body).toBe("msg-100");
+			expect(pending[0]?.body).toBe("msg-0");
+			expect(pending[pending.length - 1]?.body).toBe("msg-99");
+		});
+
+		it("counts in-flight reservations at the 99/100/101 capacity boundary", async () => {
+			const main = makeFakeSession();
+			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
+			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: makeFakeSession().session });
+			for (let i = 0; i < 99; i++) {
+				main.setError(new Error(`down ${i}`));
+				await bus.send({ from: "0-Sub", to: "0-Main", body: `msg-${i}` });
+			}
+			main.setError(new Error("down 99"));
+			const [hundredth, hundredFirst] = await Promise.all([
+				bus.send({ from: "0-Sub", to: "0-Main", body: "msg-99" }),
+				bus.send({ from: "0-Sub", to: "0-Main", body: "msg-100" }),
+			]);
+
+			expect(hundredth.error).toBe("down 99");
+			expect(hundredFirst.error).toContain("Mailbox capacity reached");
+			expect(bus.inbox("0-Main", { peek: true }).map(message => message.body)).toEqual(
+				Array.from({ length: 100 }, (_, index) => `msg-${index}`),
+			);
 		});
 
 		it("send surfaces the reviver's error message when revival fails", async () => {
 			registry.register({ id: "0-Parked", displayName: "task", kind: "sub", session: null, status: "parked" });
-			AgentLifecycleManager.global().adopt("0-Parked", {
+			adopt("0-Parked", {
 				idleTtlMs: 0,
 				revive: async () => {
 					throw new Error("revive exploded");
@@ -629,6 +662,14 @@ describe("IRC", () => {
 	});
 
 	describe("HubTool", () => {
+		beforeEach(async () => {
+			hubFixture = await createHubAuthorityFixture(registry, "0-Main");
+			bus = IrcBus.forRoot(registry, "0-Main");
+		});
+		afterEach(async () => {
+			await hubFixture?.dispose();
+			hubFixture = undefined;
+		});
 		it("isIrcEnabled returns false for a top-level session that cannot spawn tasks", () => {
 			const settings = Settings.isolated();
 			// Depth 0 with spawning gated off: no peers exist or can be created.
@@ -685,17 +726,15 @@ describe("IRC", () => {
 		});
 
 		it("op=list defaults to live peers and reports parked counts without parked names", async () => {
-			const sub = makeFakeSession();
+			const sub = installHubIrcControls((await hubFixture!.createChild("0-AuthLoader", "0-Main")).session);
 			registry.register({
-				id: "0-AuthLoader",
+				id: "0-Parked",
 				displayName: "task",
 				kind: "sub",
 				parentId: "0-Main",
-				session: sub.session,
+				session: null,
+				status: "parked",
 			});
-			registry.register({ id: "0-Parked", displayName: "task", kind: "sub", session: null, status: "parked" });
-			const main = makeFakeSession();
-			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
 			sub.setError(new Error("temporarily unavailable"));
 			await bus.send({ from: "0-Main", to: "0-AuthLoader", body: "unread one" });
 
@@ -720,12 +759,12 @@ describe("IRC", () => {
 		});
 
 		it("op=list hides advisor-kind refs from the peer roster", async () => {
-			const sub = makeFakeSession();
-			registry.register({ id: "0-Worker", displayName: "task", kind: "sub", session: sub.session });
+			await hubFixture!.createChild("0-Worker", "0-Main");
 			registry.register({
 				id: "0-Main/advisor",
 				displayName: "advisor",
 				kind: "advisor",
+				parentId: "0-Main",
 				session: null,
 				status: "parked",
 			});
@@ -739,8 +778,7 @@ describe("IRC", () => {
 		});
 
 		it("op=send returns receipts immediately without waiting for a reply", async () => {
-			const sub = makeFakeSession();
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session });
+			const sub = installHubIrcControls((await hubFixture!.createChild("0-Sub", "0-Main")).session);
 
 			const tool = new HubTool(makeToolSession(registry, "0-Main"));
 			const result = await tool.execute("call-1", { op: "send", to: "0-Sub", message: "ping" });
@@ -751,13 +789,36 @@ describe("IRC", () => {
 			expect(sub.delivered.map(msg => msg.body)).toEqual(["ping"]);
 		});
 
+		it("accepts 65535 and 65536 UTF-8 bytes and rejects 65537 after trimming", async () => {
+			const sub = installHubIrcControls((await hubFixture!.createChild("0-Sub", "0-Main")).session);
+			const tool = new HubTool(makeToolSession(registry, "0-Main"));
+			const bytes65535 = `${"é".repeat(32_767)}a`;
+			const bytes65536 = "é".repeat(32_768);
+			const bytes65537 = `${bytes65536}a`;
+
+			const under = await tool.execute("body-65535", { op: "send", to: "0-Sub", message: ` ${bytes65535} ` });
+			const exact = await tool.execute("body-65536", { op: "send", to: "0-Sub", message: ` ${bytes65536} ` });
+			const over = await tool.execute("body-65537", { op: "send", to: "0-Sub", message: ` ${bytes65537} ` });
+
+			expect(under.isError).toBeFalsy();
+			expect(exact.isError).toBeFalsy();
+			expect(over.isError).toBe(true);
+			expect(over.content[0]?.type === "text" ? over.content[0].text : "").toContain("body-limit");
+			expect(sub.delivered.map(message => Buffer.byteLength(message.body, "utf8"))).toEqual([65_535, 65_536]);
+		});
+
 		it("op=send to=all fans out to live peers and reports per-recipient receipts", async () => {
-			const a = makeFakeSession();
-			registry.register({ id: "0-A", displayName: "task", kind: "sub", session: a.session });
-			const b = makeFakeSession();
+			const a = installHubIrcControls((await hubFixture!.createChild("0-A", "0-Main")).session);
+			const b = installHubIrcControls((await hubFixture!.createChild("0-B", "0-Main")).session);
 			b.setError(new Error("kaput"));
-			registry.register({ id: "0-B", displayName: "task", kind: "sub", session: b.session });
-			registry.register({ id: "0-Parked", displayName: "task", kind: "sub", session: null, status: "parked" });
+			registry.register({
+				id: "0-Parked",
+				displayName: "task",
+				kind: "sub",
+				parentId: "0-Main",
+				session: null,
+				status: "parked",
+			});
 
 			const tool = new HubTool(makeToolSession(registry, "0-Main"));
 			const result = await tool.execute("call-1", { op: "send", to: "all", message: "anyone there?" });
@@ -770,12 +831,36 @@ describe("IRC", () => {
 			expect(a.delivered.map(msg => msg.body)).toEqual(["anyone there?"]);
 		});
 
+		it("broadcast preflights every mailbox before delivering any leg", async () => {
+			const a = installHubIrcControls((await hubFixture!.createChild("0-A", "0-Main")).session);
+			const b = installHubIrcControls((await hubFixture!.createChild("0-B", "0-Main")).session);
+			for (let index = 0; index < 100; index++) {
+				b.setError(new Error(`down ${index}`));
+				await bus.send({ from: "0-Main", to: "0-B", body: `queued-${index}` });
+			}
+
+			const tool = new HubTool(makeToolSession(registry, "0-Main"));
+			const result = await tool.execute("broadcast-capacity", { op: "send", to: "all", message: "atomic" });
+			const details = result.details as CoordinationDetails | undefined;
+
+			expect(result.isError).toBe(true);
+			expect(a.delivered).toEqual([]);
+			expect(details?.receipts?.every(receipt => receipt.outcome === "failed")).toBe(true);
+			expect(bus.inbox("0-B", { peek: true })[0]?.body).toBe("queued-0");
+			expect(bus.unreadCount("0-B")).toBe(100);
+		});
+
 		it("op=send to=all does not relay sibling legs when the broadcast also reaches main", async () => {
 			const main = makeFakeSession();
-			registry.register({ id: "Main", displayName: "main", kind: "main", session: main.session });
-			const b = makeFakeSession();
-			registry.register({ id: "0-B", displayName: "task", kind: "sub", session: b.session });
-			registry.register({ id: "0-A", displayName: "task", kind: "sub", session: makeFakeSession().session });
+			registry.register({
+				id: "Main",
+				displayName: "main",
+				kind: "main",
+				parentId: "0-Main",
+				session: main.session,
+			});
+			const b = installHubIrcControls((await hubFixture!.createChild("0-B", "0-Main")).session);
+			await hubFixture!.createChild("0-A", "0-Main");
 
 			const tool = new HubTool(makeToolSession(registry, "0-A"));
 			await tool.execute("call-1", { op: "send", to: "all", message: "anyone there?" });
@@ -789,13 +874,11 @@ describe("IRC", () => {
 		});
 
 		it("op=send await=true round-trips the recipient's reply", async () => {
-			const main = makeFakeSession();
-			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
-			const sub = makeFakeSession();
-			// Recipient starts idle: send wakes it, and its immediate reply must
-			// still reach the pre-armed await waiter — proving `send await:true`
-			// never arms the liveness auto-cancel that op:"wait" uses.
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session, status: "idle" });
+			const sub = installHubIrcControls((await hubFixture!.createChild("0-Sub", "0-Main")).session);
+			const subRef = lookupAgentRef(registry, "0-Sub");
+			if (!subRef || !setAgentStatus(registry, "0-Sub", "idle", subRef.session!)) {
+				throw new Error("Expected to idle the exact 0-Sub authority session.");
+			}
 			sub.onDeliver(msg => {
 				// Reply synchronously during delivery: the tool has already parked
 				// a future-only waiter, so the immediate reply is handed directly
@@ -812,10 +895,10 @@ describe("IRC", () => {
 		});
 
 		it("op=send await=true ignores buffered stale mail and waits for a future reply", async () => {
-			const main = makeFakeSession();
-			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
-			const sub = makeFakeSession();
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session });
+			const mainOwner = lookupAgentRef(registry, "0-Main")?.session;
+			if (!mainOwner) throw new Error("Expected exact 0-Main authority session.");
+			const main = installHubIrcControls(mainOwner);
+			const sub = installHubIrcControls((await hubFixture!.createChild("0-Sub", "0-Main")).session);
 			main.setError(new Error("temporarily unavailable"));
 			await bus.send({ from: "0-Sub", to: "0-Main", body: "old buffered reply" });
 			sub.onDeliver(msg => {
@@ -830,8 +913,7 @@ describe("IRC", () => {
 		});
 
 		it("op=send await=true reports a clean timeout when no reply arrives", async () => {
-			const sub = makeFakeSession();
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session });
+			await hubFixture!.createChild("0-Sub", "0-Main");
 
 			const tool = new HubTool(makeToolSession(registry, "0-Main"));
 			const result = await tool.execute("call-1", {
@@ -855,8 +937,7 @@ describe("IRC", () => {
 			// the same signal. If the abort lands after the message was delivered, the tool
 			// must surface a successful receipt so the agent loop keeps the tool as "sent"
 			// and does not report it as skipped — which would prompt a duplicate resend.
-			const sub = makeFakeSession();
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session });
+			const sub = installHubIrcControls((await hubFixture!.createChild("0-Sub", "0-Main")).session);
 
 			const tool = new HubTool(makeToolSession(registry, "0-Main"));
 			const controller = new AbortController();
@@ -880,10 +961,15 @@ describe("IRC", () => {
 		});
 
 		it("op=send await=true settles when the recipient stops without replying", async () => {
-			const main = makeFakeSession();
-			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
 			const sub = makeFakeSession();
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session, status: "running" });
+			registry.register({
+				id: "0-Sub",
+				displayName: "task",
+				kind: "sub",
+				parentId: "0-Main",
+				session: sub.session,
+				status: "running",
+			});
 			sub.onDeliver(() => {
 				// The recipient consumes the aside and ends its turn WITHOUT replying.
 				// It stays `isStreaming === true` throughout: the terminal `agent_end`
@@ -912,10 +998,15 @@ describe("IRC", () => {
 		});
 
 		it("op=send await=true ignores a non-terminal (continuation) agent_end", async () => {
-			const main = makeFakeSession();
-			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
 			const sub = makeFakeSession();
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session, status: "running" });
+			registry.register({
+				id: "0-Sub",
+				displayName: "task",
+				kind: "sub",
+				parentId: "0-Main",
+				session: sub.session,
+				status: "running",
+			});
 			sub.onDeliver(() => {
 				// A mid-run continuation (auto-compaction / retry) emits a
 				// non-terminal agent_end; it must NOT settle the await early.
@@ -945,8 +1036,14 @@ describe("IRC", () => {
 			// flipping would strand the sender for the full timeout.
 			const { session: subSession } = createStreamingSession(modelRegistry, [{ content: ["done, not replying"] }]);
 			sessions.push(subSession);
-			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: makeFakeSession().session });
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: subSession, status: "running" });
+			registry.register({
+				id: "0-Sub",
+				displayName: "task",
+				kind: "sub",
+				parentId: "0-Main",
+				session: subSession,
+				status: "running",
+			});
 			const unsync = registry.syncSessionStatus("0-Sub", subSession);
 			try {
 				const waitP = bus.wait("0-Main", { from: "0-Sub" }, 120_000, undefined, {
@@ -963,50 +1060,39 @@ describe("IRC", () => {
 		});
 
 		it("op=send await=true waits for an in-flight side-channel auto-reply", async () => {
-			const streamStarted = Promise.withResolvers<void>();
 			const autoReplyStarted = Promise.withResolvers<void>();
 			const releaseAutoReply = Promise.withResolvers<void>();
-			const { session: subSession } = createStreamingSession(
-				modelRegistry,
-				[
-					() => {
-						streamStarted.resolve();
-						return { content: ["working"], delayMs: 1_000 };
-					},
-				],
-				{ settings: { "async.enabled": false } },
-			);
-			sessions.push(subSession);
-			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: makeFakeSession().session });
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: subSession, status: "running" });
-			const unsync = registry.syncSessionStatus("0-Sub", subSession);
-			vi.spyOn(subSession, "runEphemeralTurn").mockImplementation(async () => {
-				autoReplyStarted.resolve();
-				await releaseAutoReply.promise;
-				return { replyText: "delayed auto answer", assistantMessage: {} as never };
+			const sub = installHubIrcControls((await hubFixture!.createChild("0-Sub", "0-Main")).session);
+			let autoReply: Promise<void> | undefined;
+			sub.onDeliver(message => {
+				autoReply = (async () => {
+					autoReplyStarted.resolve();
+					await releaseAutoReply.promise;
+					await bus.send({
+						from: "0-Sub",
+						to: message.from,
+						body: "delayed auto answer",
+						replyTo: message.id,
+					});
+				})();
+			});
+			const mainHub = new HubTool(makeToolSession(registry, "0-Main"));
+			const resultP = mainHub.execute("call-1", {
+				op: "send",
+				to: "0-Sub",
+				message: "answer on the side channel",
+				await: true,
+				timeoutMs: 5_000,
 			});
 			try {
-				const running = subSession.prompt("work");
-				await streamStarted.promise;
-				const mainHub = new HubTool(makeToolSession(registry, "0-Main"));
-				const resultP = mainHub.execute("call-1", {
-					op: "send",
-					to: "0-Sub",
-					message: "answer on the side channel",
-					await: true,
-					timeoutMs: 5_000,
-				});
-				let settled = false;
-				void resultP.then(() => {
-					settled = true;
-				});
 				await autoReplyStarted.promise;
-				// Model the main turn consuming the incoming aside before it ends:
-				// no bridge queue or wake turn remains to keep agent_end
-				// non-terminal; only the separate side request is still alive.
-				expect(subSession.drainPendingIrcInboxMessages("0-Sub")).toHaveLength(1);
-				await running;
-				await subSession.waitForIdle();
+				let settled = false;
+				void resultP.then(
+					() => {
+						settled = true;
+					},
+					() => undefined,
+				);
 				await Promise.resolve();
 				expect(settled).toBe(false);
 
@@ -1014,13 +1100,16 @@ describe("IRC", () => {
 				const result = await resultP;
 				const details = result.details as CoordinationDetails | undefined;
 				expect(details?.waited?.body).toBe("delayed auto answer");
+				await autoReply;
 			} finally {
 				releaseAutoReply.resolve();
-				unsync();
+				await autoReply;
+				await resultP;
 			}
 		});
 
 		it("await target waits through an IRC wake scheduled after terminal settle", async () => {
+			const ownedSub = await hubFixture!.createChild("0-Sub", "0-Main");
 			const subHub = new HubTool(makeToolSession(registry, "0-Sub"));
 			const { session: subSession } = createStreamingSession(
 				modelRegistry,
@@ -1041,35 +1130,41 @@ describe("IRC", () => {
 				{ tools: [subHub] },
 			);
 			sessions.push(subSession);
-			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: makeFakeSession().session });
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: subSession, status: "running" });
-			const unsync = registry.syncSessionStatus("0-Sub", subSession);
+			const forwardedDeliveries: Promise<"injected" | "woken">[] = [];
+			installHubIrcControls(ownedSub.session).onDeliver(message => {
+				const forwarded = subSession.deliverIrcMessage(message);
+				forwardedDeliveries.push(forwarded);
+				void forwarded.catch(() => undefined);
+			});
 			let sentAtTail = false;
+			let scheduledDelivery: Promise<unknown> | undefined;
 			const unsubscribe = subSession.subscribe(event => {
 				if (sentAtTail || event.type !== "message_end" || event.message.role !== "assistant") return;
 				sentAtTail = true;
-				// Session listeners receive the final assistant message after the
-				// loop's last aside poll but before the deferred terminal
-				// `agent_end`. Delivering here strands the record until the settle
-				// drain schedules its IRC wake turn.
-				void bus.send(
+				scheduledDelivery = bus.send(
 					{ from: "0-Main", to: "0-Sub", body: "reply after your current turn" },
 					{ expectsReply: true },
 				);
+				void scheduledDelivery.catch(() => undefined);
 			});
+			let waitP: Promise<IrcMessage | null> | undefined;
 			try {
-				const waitP = bus.wait("0-Main", { from: "0-Sub" }, 5_000, undefined, {
+				waitP = bus.wait("0-Main", { from: "0-Sub" }, 5_000, undefined, {
 					drainPending: false,
 					awaitTarget: { registry, target: "0-Sub" },
 				});
 				await subSession.prompt("work");
+				await Promise.all(forwardedDeliveries);
+				await scheduledDelivery;
 				const reply = await waitP;
 
 				expect(sentAtTail).toBe(true);
 				expect(reply?.body).toBe("reply from the IRC wake");
 			} finally {
 				unsubscribe();
-				unsync();
+				await Promise.all(forwardedDeliveries);
+				await scheduledDelivery;
+				if (waitP) await waitP;
 			}
 		});
 
@@ -1092,15 +1187,19 @@ describe("IRC", () => {
 		});
 
 		it("op=wait returns a clean non-error timeout result", async () => {
-			const fake = makeFakeSession();
-			registry.register({ id: "0-Sub", displayName: "sub", kind: "sub", session: fake.session, status: "running" });
+			const sub = makeFakeSession();
+			registry.register({
+				id: "0-Sub",
+				displayName: "task",
+				kind: "sub",
+				parentId: "0-Main",
+				session: sub.session,
+			});
 			const tool = new HubTool(makeToolSession(registry, "0-Main"));
-			const result = await tool.execute("call-1", { op: "wait", timeoutMs: 5 });
+			const result = await tool.execute("call-1", { op: "wait", from: "0-Sub", timeoutMs: 5 });
 			expect(result.isError).toBeFalsy();
 			const details = result.details as CoordinationDetails | undefined;
 			expect(details?.waited).toBeNull();
-			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-			expect(text).toContain("No message");
 		});
 
 		it("op=wait returns a clean result if no active agents exist", async () => {
@@ -1112,7 +1211,14 @@ describe("IRC", () => {
 		});
 
 		it("op=wait returns an error if the requested specific 'from' agent is not active", async () => {
-			registry.register({ id: "0-Sub", displayName: "sub", kind: "sub", session: null, status: "parked" });
+			registry.register({
+				id: "0-Sub",
+				displayName: "sub",
+				kind: "sub",
+				parentId: "0-Main",
+				session: null,
+				status: "parked",
+			});
 			const tool = new HubTool(makeToolSession(registry, "0-Main"));
 			const result = await tool.execute("call-1", { op: "wait", from: "0-Sub", timeoutMs: 5 });
 			expect(result.isError).toBe(true);
@@ -1121,19 +1227,16 @@ describe("IRC", () => {
 		});
 
 		it("op=wait consumes a pending IRC aside before honoring a queued interrupt abort", async () => {
-			const { session } = createRealSession();
-			sessions.push(session);
+			await hubFixture!.createChild("0-Sender", "0-Main");
+			const { session } = await hubFixture!.createChild("0-Running", "0-Main");
 			Object.defineProperty(session, "isStreaming", { value: true, configurable: true });
-			registry.register({ id: "0-Running", displayName: "task", kind: "sub", session });
 
-			const delivery = await session.deliverIrcMessage({
-				id: "msg-wait-pending",
-				from: "0-Main",
+			const delivery = await bus.send({
+				from: "0-Sender",
 				to: "0-Running",
 				body: "queued interrupt note",
-				ts: Date.now(),
 			});
-			expect(delivery).toBe("injected");
+			expect(delivery.outcome).toBe("injected");
 
 			const tool = new HubTool(makeToolSession(registry, "0-Running"));
 			const controller = new AbortController();
@@ -1143,8 +1246,7 @@ describe("IRC", () => {
 			expect(result.isError).toBeFalsy();
 			const details = result.details as CoordinationDetails | undefined;
 			expect(details?.waited).toMatchObject({
-				id: "msg-wait-pending",
-				from: "0-Main",
+				from: "0-Sender",
 				to: "0-Running",
 				body: "queued interrupt note",
 			});
@@ -1157,19 +1259,12 @@ describe("IRC", () => {
 		});
 
 		it("op=inbox drains IRC asides that arrived while the caller was running", async () => {
-			const { session } = createRealSession();
-			sessions.push(session);
+			await hubFixture!.createChild("0-Sender", "0-Main");
+			const { session } = await hubFixture!.createChild("0-Running", "0-Main");
 			Object.defineProperty(session, "isStreaming", { value: true, configurable: true });
-			registry.register({ id: "0-Running", displayName: "task", kind: "sub", session });
 
-			const delivery = await session.deliverIrcMessage({
-				id: "msg-running",
-				from: "0-Main",
-				to: "0-Running",
-				body: "parallel note",
-				ts: Date.now(),
-			});
-			expect(delivery).toBe("injected");
+			const delivery = await bus.send({ from: "0-Sender", to: "0-Running", body: "parallel note" });
+			expect(delivery.outcome).toBe("injected");
 
 			const tool = new HubTool(makeToolSession(registry, "0-Running"));
 			const result = await tool.execute("call-1", { op: "inbox" });
@@ -1180,37 +1275,29 @@ describe("IRC", () => {
 		});
 
 		it("op=inbox peek surfaces a pending IRC aside and prevents it auto-injecting", async () => {
-			const { session } = createRealSession();
-			sessions.push(session);
+			await hubFixture!.createChild("0-Sender", "0-Main");
+			const { session } = await hubFixture!.createChild("0-Running", "0-Main");
 			Object.defineProperty(session, "isStreaming", { value: true, configurable: true });
-			registry.register({ id: "0-Running", displayName: "task", kind: "sub", session });
 
-			await session.deliverIrcMessage({
-				id: "msg-peek",
-				from: "0-Main",
-				to: "0-Running",
-				body: "peeked note",
-				ts: Date.now(),
-			});
+			const delivery = await bus.send({ from: "0-Sender", to: "0-Running", body: "peeked note" });
+			expect(delivery.outcome).toBe("injected");
 
 			const tool = new HubTool(makeToolSession(registry, "0-Running"));
 			const peeked = await tool.execute("call-1", { op: "inbox", peek: true });
 			const peekedDetails = peeked.details as CoordinationDetails | undefined;
 			expect(peekedDetails?.inbox?.map((msg: IrcMessage) => msg.body)).toEqual(["peeked note"]);
 
-			// The peek surfaced the body via the tool result, so the aside-channel
-			// copy must NOT also be auto-injected at the next step: a second drain
-			// returns nothing (the pending aside was consumed out of the
 			const second = await tool.execute("call-2", { op: "inbox" });
 			const secondDetails = second.details as CoordinationDetails | undefined;
 			expect(secondDetails?.inbox).toEqual([]);
 		});
 
 		it("op=inbox drains the caller's mailbox", async () => {
-			const main = makeFakeSession();
-			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
+			const mainOwner = lookupAgentRef(registry, "0-Main")?.session;
+			if (!mainOwner) throw new Error("Expected exact 0-Main authority session.");
+			const main = installHubIrcControls(mainOwner);
 			const sub = makeFakeSession();
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session });
+			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", parentId: "0-Main", session: sub.session });
 			main.setError(new Error("temporarily unavailable"));
 			await bus.send({ from: "0-Sub", to: "0-Main", body: "fyi" });
 

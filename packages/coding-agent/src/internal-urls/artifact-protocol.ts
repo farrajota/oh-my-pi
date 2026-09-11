@@ -9,10 +9,8 @@
  *
  * Pagination is handled by the read tool via offset/limit parameters.
  */
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { isEnoent } from "@oh-my-pi/pi-utils";
-import { artifactsDirsFromRegistry } from "./registry-helpers";
+import { artifactsDirsForContext, isBoundResourceContext } from "./registry-helpers";
+import { ArtifactManager } from "../session/artifacts";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
 const MAX_INLINE_ARTIFACT_BYTES = 8 * 1024 * 1024;
@@ -39,62 +37,24 @@ function parseArtifactId(url: InternalUrl): string {
 export async function resolveArtifactFile(url: InternalUrl, context?: ResolveContext): Promise<ResolvedArtifactFile> {
 	const id = parseArtifactId(url);
 
-	// Artifact ids are per-session counters; in multi-session hosts the same
-	// id exists in several dirs. Pin resolution to the calling session's
-	// artifacts dir first so `artifact://3` means *this* session's #3.
-	const dirs = artifactsDirsFromRegistry();
-	const pinnedDir = context?.localProtocolOptions?.getArtifactsDir?.() ?? null;
-	if (pinnedDir) {
-		const pinnedIndex = dirs.indexOf(pinnedDir);
-		if (pinnedIndex >= 0) dirs.splice(pinnedIndex, 1);
-		dirs.unshift(pinnedDir);
+	const dirs = artifactsDirsForContext(context);
+	if (isBoundResourceContext(context) && dirs.length === 0) {
+		throw new Error("No caller-owned artifacts available");
 	}
+	if (dirs.length === 0) throw new Error("No session - artifacts unavailable");
 
-	if (dirs.length === 0) {
-		throw new Error("No session - artifacts unavailable");
-	}
-
-	let foundPath: string | undefined;
-	let anyDirExists = false;
-	const availableIds = new Set<string>();
-
+	let foundPath: string | null = null;
 	for (const dir of dirs) {
-		let files: string[];
-		try {
-			files = await fs.readdir(dir);
-			anyDirExists = true;
-		} catch (err) {
-			if (isEnoent(err)) continue;
-			throw err;
-		}
-		const match = files.find(f => f.startsWith(`${id}.`));
-		if (match) {
-			foundPath = path.join(dir, match);
-			break;
-		}
-		for (const f of files) {
-			const m = f.match(/^(\d+)\./);
-			if (m) availableIds.add(m[1]);
-		}
+		const manager = new ArtifactManager(dir);
+		foundPath = await manager.getPath(id);
+		if (foundPath) break;
 	}
 
-	if (!anyDirExists) {
-		throw new Error("No artifacts directory found");
-	}
-
-	if (!foundPath) {
-		const sorted = [...availableIds].sort((a, b) => Number(a) - Number(b));
-		const availableStr = sorted.length > 0 ? sorted.join(", ") : "none";
-		throw new Error(`Artifact ${id} not found. Available: ${availableStr}`);
-	}
+	if (!foundPath) throw new Error(`Artifact ${id} not found`);
 
 	const stat = await Bun.file(foundPath).stat();
-	if (stat.isDirectory()) {
-		throw new Error(`Artifact ${id} resolved to a directory, not a file`);
-	}
 	return { id, path: foundPath, size: stat.size };
 }
-
 export class ArtifactProtocolHandler implements ProtocolHandler {
 	readonly scheme = "artifact";
 	readonly immutable = true;
@@ -117,7 +77,7 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 
 		if (artifact.size > MAX_INLINE_ARTIFACT_BYTES) {
 			throw new Error(
-				`Artifact ${artifact.id} is ${artifact.size} bytes; full internal resolution is blocked. Use read selectors such as artifact://${artifact.id}:1-3000 or artifact://${artifact.id}:raw:1-3000, and use the artifact file path for search/copy workflows: ${artifact.path}`,
+				`Artifact ${artifact.id} is ${artifact.size} bytes; full internal resolution is blocked. Use read selectors such as artifact://${artifact.id}:1-3000 or artifact://${artifact.id}:raw:1-3000.`,
 			);
 		}
 
@@ -131,21 +91,17 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 		};
 	}
 
-	async complete(): Promise<UrlCompletion[]> {
+	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {
 		const ids = new Set<string>();
-		for (const dir of artifactsDirsFromRegistry()) {
-			let files: string[];
-			try {
-				files = await fs.readdir(dir);
-			} catch (err) {
-				if (isEnoent(err)) continue;
-				throw err;
-			}
-			for (const f of files) {
-				const m = f.match(/^(\d+)\./);
-				if (m) ids.add(m[1]!);
+		for (const dir of artifactsDirsForContext(context)) {
+			const manager = new ArtifactManager(dir);
+			for (const file of await manager.listFiles()) {
+				const id = file.match(/^(\d+)\./)?.[1];
+				if (id) ids.add(id);
 			}
 		}
-		return [...ids].sort((a, b) => Number(a) - Number(b)).map(value => ({ value }));
+		return [...ids]
+			.sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0))
+			.map(value => ({ value }));
 	}
 }

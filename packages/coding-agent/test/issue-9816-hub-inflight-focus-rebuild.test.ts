@@ -11,15 +11,15 @@
  * focus blackout is authoritative in the rebuilt transcript; a later event is
  * delivered through the newly installed subscription.
  */
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { disposeAgentLifecycle, getAgentLifecycleManager } from "../src/internal/agent-lifecycle-bridge";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { SessionFocusController } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
@@ -258,6 +258,8 @@ function makeSession(
 	};
 }
 
+const fixtureCleanups = new Set<() => Promise<void>>();
+
 function createFixture(main = makeSession([danglingHubWait], true)) {
 	const worker = makeSession([], false);
 	const registry = new AgentRegistry();
@@ -269,7 +271,7 @@ function createFixture(main = makeSession([danglingHubWait], true)) {
 		session: worker.session,
 		status: "running",
 	});
-	const lifecycle = new AgentLifecycleManager(registry);
+	const lifecycle = getAgentLifecycleManager(registry);
 	const ctx = createInteractiveModeContext({
 		session: main.session,
 		initialChatRendered: false,
@@ -299,8 +301,17 @@ function createFixture(main = makeSession([danglingHubWait], true)) {
 		get: () => focus.target ?? main.session,
 	});
 	ctx.unsubscribe = main.session.subscribe(event => eventController.handleEvent(event));
-	return { ctx, focus, main };
+	const dispose = async () => {
+		fixtureCleanups.delete(dispose);
+		await disposeAgentLifecycle(lifecycle);
+	};
+	fixtureCleanups.add(dispose);
+	return { ctx, focus, main, dispose };
 }
+
+afterEach(async () => {
+	await Promise.all([...fixtureCleanups].map(dispose => dispose()));
+});
 
 beforeAll(async () => {
 	resetSettingsForTest();

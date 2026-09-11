@@ -21,8 +21,9 @@ import type {
 	AgentEvent as WireAgentEvent,
 	SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
+import { ensureAgentLive, getAgentLifecycleManager, releaseAgent } from "../internal/agent-lifecycle-bridge";
+import { lookupAgentRef } from "../internal/agent-registry-bridge";
 import type { InteractiveModeContext } from "../modes/types";
-import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
@@ -583,6 +584,7 @@ export class CollabHost {
 					resolvedModelIsFallback: ref.history?.resolvedModelIsFallback,
 					requestedPermissionProfiles: ref.history?.requestedPermissionProfiles,
 					effectivePermissionProfiles: ref.history?.effectivePermissionProfiles,
+					permissionSummary: ref.history?.permissionSummary,
 				}))
 		);
 	}
@@ -618,26 +620,25 @@ export class CollabHost {
 					return;
 				}
 				// Mirrors the hub's #submitChatMessage: revive if parked, steer if mid-turn.
-				AgentLifecycleManager.global()
-					.ensureLive(agentId)
+				ensureAgentLive(getAgentLifecycleManager(), agentId)
 					.then(session => session.prompt(trimmed, { streamingBehavior: "steer" }))
 					.catch(fail);
 				break;
 			}
 			case "kill": {
 				const kill = async () => {
-					const ref = AgentRegistry.global().get(agentId);
+					const ref = lookupAgentRef(AgentRegistry.global(), agentId);
 					if (!ref) return;
 					if (ref.status === "running" && ref.session) {
 						await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
 					}
-					await AgentLifecycleManager.global().release(agentId, ref, { tombstone: true });
+					await releaseAgent(getAgentLifecycleManager(), agentId, ref, { tombstone: true });
 				};
 				kill().catch(fail);
 				break;
 			}
 			case "revive":
-				AgentLifecycleManager.global().ensureLive(agentId).catch(fail);
+				ensureAgentLive(getAgentLifecycleManager(), agentId).catch(fail);
 				break;
 		}
 	}

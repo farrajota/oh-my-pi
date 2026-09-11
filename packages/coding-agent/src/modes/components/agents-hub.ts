@@ -42,7 +42,8 @@ import {
 import type { Settings } from "../../config/settings";
 import agentCreationArchitectPrompt from "../../prompts/system/agent-creation-architect.md" with { type: "text" };
 import agentCreationUserPrompt from "../../prompts/system/agent-creation-user.md" with { type: "text" };
-import { createAgentSession } from "../../sdk";
+import { createAgentRootSession } from "../../internal/agent-registry-bridge";
+import { AgentRegistry } from "../../registry/agent-registry";
 import { refreshAgentDiscovery } from "../../task";
 import { discoverAgents } from "../../task/discovery";
 import { resolveAgentPrewalkDefault } from "../../task/prewalk";
@@ -763,7 +764,7 @@ export class AgentsHubComponent implements Component {
 		}
 		const systemPrompt = prompt.render(agentCreationArchitectPrompt, {});
 		const userPrompt = prompt.render(agentCreationUserPrompt, { request: description });
-		const { session } = await createAgentSession({
+		const { session } = await createAgentRootSession(new AgentRegistry(), {
 			cwd: this.#cwd,
 			authStorage: modelRegistry.authStorage,
 			modelRegistry,

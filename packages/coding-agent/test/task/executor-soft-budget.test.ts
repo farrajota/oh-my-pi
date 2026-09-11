@@ -6,7 +6,12 @@ import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibili
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import {
+	getAgentLifecycleManager,
+	lifecycleHasAgent,
+	parkAgent,
+	resetAgentLifecycleForTests,
+} from "../../src/internal/agent-lifecycle-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -172,22 +177,26 @@ const baseAgent: AgentDefinition = {
 
 describe("runSubprocess soft request budget", () => {
 	let tempDir: TempDir;
-
+	let lifecycle: ReturnType<typeof getAgentLifecycleManager>;
+	let registry: AgentRegistry;
 	beforeEach(() => {
+		registry = new AgentRegistry();
+		lifecycle = getAgentLifecycleManager(registry);
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
 		AsyncJobManager.resetForTests();
 		tempDir = TempDir.createSync("@pi-soft-budget-");
 	});
 	afterEach(() => {
 		vi.restoreAllMocks();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		AsyncJobManager.resetForTests();
 		tempDir[Symbol.dispose]();
 	});
 
 	function baseOptions(id: string, subagentEventBus?: EventBus) {
+		const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+			sdkModule.createAgentSession({ ...options, agentRegistry: registry });
 		return {
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -199,11 +208,13 @@ describe("runSubprocess soft request budget", () => {
 			enableLsp: false,
 			artifactsDir: tempDir.path(),
 			subagentEventBus,
+			agentRegistry: registry,
+			createAuthoritySession,
 		};
 	}
 
 	function registerRunning(id: string, session: AgentSession, sessionFile: string | null = null) {
-		AgentRegistry.global().register({
+		registry.register({
 			id,
 			displayName: id,
 			kind: "sub",
@@ -272,8 +283,8 @@ describe("runSubprocess soft request budget", () => {
 		expect(result.abortReason).toBeUndefined();
 		expect(JSON.parse(result.output)).toEqual({ report: "partial findings" });
 		// The agent stays a live, adopted peer.
-		expect(AgentRegistry.global().get(id)?.status).toBe("idle");
-		expect(AgentLifecycleManager.global().has(id)).toBe(true);
+		expect(registry.get(id)?.status).toBe("idle");
+		expect(lifecycleHasAgent(lifecycle, id)).toBe(true);
 		expect(handle.disposeCalls()).toBe(0);
 	});
 
@@ -331,8 +342,8 @@ describe("runSubprocess soft request budget", () => {
 		expect(result.abortReason).toMatch(/Soft request budget exceeded/);
 		expect(result.advisor).toBe(true);
 		// Resumable stop, not a terminal kill: the ref stays adopted and live.
-		expect(AgentRegistry.global().get(id)?.status).toBe("idle");
-		expect(AgentLifecycleManager.global().has(id)).toBe(true);
+		expect(registry.get(id)?.status).toBe("idle");
+		expect(lifecycleHasAgent(lifecycle, id)).toBe(true);
 		expect(handle.disposeCalls()).toBe(0);
 
 		const expectRpcTurn = (advised: boolean): void => {
@@ -361,8 +372,8 @@ describe("runSubprocess soft request budget", () => {
 		await idleTerminal;
 		expectRpcTurn(true);
 
-		await AgentLifecycleManager.global().park(id);
-		expect(AgentRegistry.global().get(id)?.status).toBe("parked");
+		await parkAgent(lifecycle, id);
+		expect(registry.get(id)?.status).toBe("parked");
 		frames.length = 0;
 		// Parking can rebuild an unadvised session; don't retain the prior turn's marker.
 		advisorActive.mockReturnValue(false);
@@ -426,7 +437,7 @@ describe("runSubprocess soft request budget", () => {
 		const result = await runSubprocess({ ...baseOptions(id), signal: controller.signal });
 
 		expect(result.aborted).toBe(true);
-		expect(AgentRegistry.global().get(id)).toBeUndefined();
+		expect(registry.get(id)).toBeUndefined();
 		expect(handle.disposeCalls()).toBeGreaterThanOrEqual(1);
 		expect(await Bun.file(`${workerSessionFile}.tombstone`).exists()).toBe(false);
 		const restored = new AgentRegistry();
@@ -483,7 +494,7 @@ describe("runSubprocess soft request budget", () => {
 		AsyncJobManager.setInstance(undefined);
 
 		expect(await Bun.file(`${workerSessionFile}.tombstone`).exists()).toBe(false);
-		expect(AgentRegistry.global().get(id)).toBeUndefined();
+		expect(registry.get(id)).toBeUndefined();
 		const restoredRegistry = new AgentRegistry();
 		await registerPersistedSubagents(restoredRegistry, rootSessionFile);
 		expect(restoredRegistry.get(id)?.status).toBe("parked");
@@ -601,7 +612,7 @@ describe("runSubprocess soft request budget", () => {
 		const result = await runSubprocess({ ...baseOptions(id), signal: controller.signal });
 
 		expect(result.aborted).toBe(true);
-		expect(AgentRegistry.global().get(id)?.status).toBe("aborted");
+		expect(registry.get(id)?.status).toBe("aborted");
 		expect(handle.disposeCalls()).toBeGreaterThanOrEqual(1);
 
 		const receipt = await new IrcBus().send({ from: "Main", to: id, body: "resume" });

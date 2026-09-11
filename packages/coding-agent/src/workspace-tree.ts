@@ -36,6 +36,8 @@ export interface BuildDirectoryTreeOptions {
 	rootLimit?: number | null;
 	/** Hard rendered line cap. `null` disables. Default: `null`. */
 	lineCap?: number | null;
+	/** Optional admission check applied to every native entry before rendering. */
+	entryFilter?: (absolutePath: string) => Promise<boolean>;
 }
 
 export interface BuildWorkspaceTreeOptions {
@@ -69,6 +71,10 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 	} catch {
 		return emptyTree(rootPath);
 	}
+
+	// Authorization is deliberately outside the native-scan catch: an admission
+	// failure (including abort) must reject rather than return a partial listing.
+	entries = await filterDirectoryEntries(rootPath, entries, options.entryFilter);
 
 	return assembleTree(rootPath, entries, {
 		perDirLimit,
@@ -146,6 +152,43 @@ interface AssembleOptions {
 	 *   the system-prompt workspace tree). See {@link makeAgeFormatter}.
 	 */
 	ageMode: "relative" | "absolute";
+}
+
+interface FilteredEntry {
+	entry: GlobMatch;
+	relativePath: string;
+	authorized: boolean;
+}
+
+async function filterDirectoryEntries(
+	rootPath: string,
+	entries: readonly GlobMatch[],
+	entryFilter: BuildDirectoryTreeOptions["entryFilter"],
+): Promise<readonly GlobMatch[]> {
+	if (!entryFilter) return entries;
+
+	const decisions: FilteredEntry[] = [];
+	for (const entry of entries) {
+		const absolutePath = path.resolve(rootPath, entry.path);
+		const relativePath = path.relative(rootPath, absolutePath).split(path.sep).join("/");
+		const authorized = await entryFilter(absolutePath);
+		decisions.push({ entry, relativePath, authorized });
+	}
+
+	const deniedEntries = new Set(
+		decisions.filter(decision => !decision.authorized).map(decision => decision.relativePath),
+	);
+	return decisions
+		.filter(decision => {
+			if (!decision.authorized) return false;
+			let parentPath = path.posix.dirname(decision.relativePath);
+			while (parentPath !== ".") {
+				if (deniedEntries.has(parentPath)) return false;
+				parentPath = path.posix.dirname(parentPath);
+			}
+			return true;
+		})
+		.map(decision => decision.entry);
 }
 
 function assembleTree(rootPath: string, entries: readonly GlobMatch[], opts: AssembleOptions): DirectoryTree {

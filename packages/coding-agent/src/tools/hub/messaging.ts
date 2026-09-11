@@ -14,7 +14,15 @@ import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { formatAge, formatDuration } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
-import { IrcAwaitTargetStopped, IrcBus, type IrcDeliveryReceipt, type IrcMessage } from "../../irc/bus";
+import { lookupAgentRef } from "../../internal/agent-registry-bridge";
+import type { HubAdmissionStateTransaction } from "../../internal/hub-admission";
+import {
+	IrcAwaitTargetStopped,
+	IrcBus,
+	IrcDeliveryAdmissionError,
+	type IrcDeliveryReceipt,
+	type IrcMessage,
+} from "../../irc/bus";
 import type { Theme } from "../../modes/theme/theme";
 import { type AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../../registry/persisted-agents";
@@ -25,17 +33,20 @@ import {
 	formatBadge,
 	formatErrorDetail,
 	getPreviewLines,
-	PREVIEW_LIMITS,
 	replaceTabs,
 	type ToolUIColor,
 } from "../render-utils";
+import { PREVIEW_LIMITS } from "../preview-limits";
 import {
+	boundCoordinationResult,
+	boundIrcMessage,
 	type CoordinationDetails,
 	DEFAULT_HUB_LIST_LIMIT,
 	type HubListStatus,
 	type HubRenderArgs,
 	type HubRosterCounts,
 	hubErrorResult,
+	MAX_HUB_BODY_BYTES,
 	MAX_HUB_LIST_LIMIT,
 } from "./types";
 
@@ -65,18 +76,22 @@ function selectListRefs(
 	senderId: string,
 	status: HubListStatus | undefined,
 	rootSessionFile: string | undefined,
+	rootId?: string,
 ) {
+	const inRoot = (ref: { lineage?: { rootId: string } }): boolean =>
+		rootId === undefined || ref.lineage?.rootId === rootId;
 	if (status === "parked") {
 		return registry
 			.list()
 			.filter(
 				ref =>
+					inRoot(ref) &&
 					isAddressablePeer(ref, senderId) &&
 					ref.status === "parked" &&
 					isCurrentSessionRosterRef(ref, rootSessionFile),
 			);
 	}
-	const live = registry.listVisibleTo(senderId);
+	const live = registry.listVisibleTo(senderId).filter(inRoot);
 	return status ? live.filter(ref => ref.status === status) : live;
 }
 
@@ -134,19 +149,27 @@ export function resolveMessageTimeoutMs(settings: Settings, explicit?: number): 
 }
 
 /** Session-buffered inbox drain used before parking a bus waiter. */
-export function drainPendingInbox(registry: AgentRegistry, senderId: string, from?: string): IrcMessage | undefined {
-	const session = registry.get(senderId)?.session;
-	return typeof session?.drainPendingIrcInboxMessages === "function"
-		? session.drainPendingIrcInboxMessages(senderId, { from, limit: 1 })[0]
-		: undefined;
+export function drainPendingInbox(
+	registry: AgentRegistry,
+	senderId: string,
+	from?: string,
+	transaction?: HubAdmissionStateTransaction,
+): IrcMessage | undefined {
+	const select = (): IrcMessage | undefined => {
+		const session = lookupAgentRef(registry, senderId)?.session;
+		return typeof session?.drainPendingIrcInboxMessages === "function"
+			? session.drainPendingIrcInboxMessages(senderId, { from, limit: 1 })[0]
+			: undefined;
+	};
+	return transaction ? transaction.select(select) : select();
 }
 
-/** `wait` result carrying a consumed message. */
 export function messageResult(senderId: string, waited: IrcMessage): AgentToolResult<CoordinationDetails> {
-	return {
-		content: [{ type: "text", text: formatIncoming(waited) }],
-		details: { op: "wait", from: senderId, waited },
-	};
+	const bounded = boundIrcMessage(waited);
+	return boundCoordinationResult({
+		content: [{ type: "text", text: formatIncoming(bounded) }],
+		details: { op: "wait", from: senderId, waited: bounded },
+	});
 }
 
 /**
@@ -159,16 +182,27 @@ export async function executeList(
 	senderId: string,
 	params: HubListParams = {},
 	sessionFileHint?: string | null,
+	bus: IrcBus = IrcBus.global(),
+	rootId?: string,
+	transaction?: HubAdmissionStateTransaction,
 ): Promise<AgentToolResult<CoordinationDetails>> {
+	transaction?.assertActive();
 	const rootSessionFile = await ensurePersistedRoster(
 		registry,
 		sessionFileHint ?? registry.get(senderId)?.sessionFile,
 	);
-	const refs = registry
-		.list()
-		.filter(ref => isAddressablePeer(ref, senderId) && isCurrentSessionRosterRef(ref, rootSessionFile));
-
-	const selected = selectListRefs(registry, senderId, params.status, rootSessionFile);
+	const snapshot = () => ({
+		refs: registry
+			.list()
+			.filter(
+				ref =>
+					(rootId === undefined || ref.lineage?.rootId === rootId) &&
+					isAddressablePeer(ref, senderId) &&
+					isCurrentSessionRosterRef(ref, rootSessionFile),
+			),
+		selected: selectListRefs(registry, senderId, params.status, rootSessionFile, rootId),
+	});
+	const { refs, selected } = transaction ? transaction.select(snapshot) : snapshot();
 	selected.sort(
 		(a, b) =>
 			(LIST_STATUS_ORDER[a.status] ?? 9) - (LIST_STATUS_ORDER[b.status] ?? 9) || b.lastActivity - a.lastActivity,
@@ -181,18 +215,18 @@ export async function executeList(
 		shown: shownRefs.length,
 		truncated,
 	};
-
-	const bus = IrcBus.global();
-	const peers = shownRefs.map(ref => ({
-		id: ref.id,
-		displayName: ref.displayName,
-		kind: ref.kind,
-		status: ref.status,
-		parentId: ref.parentId,
-		unread: bus.unreadCount(ref.id),
-		lastActivity: ref.lastActivity,
-		activity: ref.activity,
-	}));
+	const buildPeers = () =>
+		shownRefs.map(ref => ({
+			id: ref.id,
+			displayName: ref.displayName,
+			kind: ref.kind,
+			status: ref.status,
+			parentId: ref.parentId,
+			unread: bus.unreadCount(ref.id),
+			lastActivity: ref.lastActivity,
+			activity: ref.activity,
+		}));
+	const peers = transaction ? transaction.select(buildPeers) : buildPeers();
 	const lines = [formatRosterSummary(counts, params.status ? `${params.status} peers` : "actionable peers")];
 	for (const peer of peers) {
 		const extras = [
@@ -211,10 +245,10 @@ export async function executeList(
 				: 'Parked agents remain queryable with status="parked" and are revived automatically when you message them.',
 		);
 	}
-	return {
+	return boundCoordinationResult({
 		content: [{ type: "text", text: lines.join("\n") }],
 		details: { op: "list", from: senderId, peers, counts },
-	};
+	});
 }
 
 export interface HubSendParams {
@@ -226,18 +260,34 @@ export interface HubSendParams {
 }
 
 export async function executeSend(
-	deps: { registry: AgentRegistry; senderId: string; settings: Settings; sessionFileHint?: string | null },
+	deps: {
+		registry: AgentRegistry;
+		senderId: string;
+		settings: Settings;
+		sessionFileHint?: string | null;
+		bus?: IrcBus;
+		rootId?: string;
+	},
 	params: HubSendParams,
 	signal?: AbortSignal,
+	transaction?: HubAdmissionStateTransaction,
 ): Promise<AgentToolResult<CoordinationDetails>> {
-	const { registry, senderId, settings, sessionFileHint } = deps;
+	transaction?.assertActive();
+	const { registry, senderId, settings, sessionFileHint, rootId } = deps;
 	const to = params.to?.trim();
+	const replyTo = params.replyTo?.trim() || undefined;
 	const message = params.message?.trim();
 	if (!to) {
 		return hubErrorResult('`to` is required for op="send".', { op: "send", from: senderId });
 	}
 	if (!message) {
 		return hubErrorResult('`message` is required for op="send".', { op: "send", from: senderId });
+	}
+	if (Buffer.byteLength(message, "utf8") > MAX_HUB_BODY_BYTES) {
+		return hubErrorResult(`body-limit: message exceeds ${MAX_HUB_BODY_BYTES} UTF-8 bytes.`, {
+			op: "send",
+			from: senderId,
+		});
 	}
 	if (to === senderId) {
 		return hubErrorResult("Cannot send a message to yourself.", { op: "send", from: senderId, to });
@@ -262,17 +312,18 @@ export async function executeSend(
 		await ensurePersistedRoster(registry, sessionFileHint);
 	}
 
-	const bus = IrcBus.global();
-	let waited: IrcMessage | null | undefined;
+	const bus = deps.bus ?? IrcBus.global();
 	const timeoutMs = params.await ? resolveMessageTimeoutMs(settings, params.timeoutMs) : undefined;
 	const awaitAbort = params.await ? new AbortController() : undefined;
 	const awaitCancelled = new Error("IRC await cancelled");
 	let removeAwaitAbortListener: (() => void) | undefined;
+	let waited: IrcMessage | null | undefined;
 	const waiting = params.await
 		? bus
 				.wait(senderId, { from: to }, timeoutMs ?? DEFAULT_IRC_TIMEOUT_MS, awaitAbort?.signal, {
 					drainPending: false,
 					awaitTarget: { registry, target: to },
+					...(transaction ? { transaction } : {}),
 				})
 				.then(
 					message => ({ message, error: null as Error | null }),
@@ -295,25 +346,43 @@ export async function executeSend(
 	}
 
 	try {
-		// Broadcasts fan out to live peers only (running | idle); reviving every
-		// parked agent on a broadcast would be a stampede. Direct sends go
-		// through the bus unfiltered so parked recipients are revived.
-		const targets = isBroadcast ? registry.listVisibleTo(senderId).map(ref => ref.id) : [to];
-		// A broadcast that also reaches the main agent delivers the body to it
-		// directly (its own incoming card); relaying the sibling legs to the
-		// main UI would then show the same body once per other recipient.
+		// Broadcast target selection and every delivery leg are admitted before
+		// any recipient can observe the invocation.
+		const selectTargets = (): string[] =>
+			isBroadcast
+				? registry
+						.listVisibleTo(senderId)
+						.filter(ref => rootId === undefined || ref.lineage?.rootId === rootId)
+						.map(ref => ref.id)
+				: [to];
+		const targets = transaction ? transaction.select(selectTargets) : selectTargets();
 		const suppressRelay = isBroadcast && targets.includes(MAIN_AGENT_ID);
-		const receipts = await Promise.all(
-			targets.map(target =>
-				bus.send(
-					{ from: senderId, to: target, body: message, replyTo: params.replyTo },
-					// Awaited sends mark the sender as blocked on an answer so a
-					// busy recipient that cannot reach a step boundary (async
-					// disabled) auto-replies instead of stranding the sender.
-					{ expectsReply: params.await || undefined, suppressRelay: suppressRelay || undefined },
+		let receipts: IrcDeliveryReceipt[];
+		if (transaction) {
+			try {
+				const batch = bus.admitDeliveryBatch(
+					transaction,
+					targets.map(target => ({ from: senderId, to: target, body: message, replyTo })),
+				);
+				receipts = await bus.deliverBatch(transaction, batch, {
+					expectsReply: params.await || undefined,
+					suppressRelay: suppressRelay || undefined,
+				});
+			} catch (error) {
+				if (!(error instanceof IrcDeliveryAdmissionError)) throw error;
+				const reason = error.receipts[0]?.error ?? error.message;
+				receipts = targets.map(target => ({ to: target, outcome: "failed", error: reason }));
+			}
+		} else {
+			receipts = await Promise.all(
+				targets.map(target =>
+					bus.send(
+						{ from: senderId, to: target, body: message, replyTo },
+						{ expectsReply: params.await || undefined, suppressRelay: suppressRelay || undefined },
+					),
 				),
-			),
-		);
+			);
+		}
 
 		const lines: string[] = [];
 		const delivered = receipts.filter(receipt => receipt.outcome !== "failed");
@@ -376,17 +445,17 @@ export async function executeSend(
 			}
 		}
 
-		return {
+		return boundCoordinationResult({
 			content: [{ type: "text", text: lines.join("\n") }],
 			details: {
 				op: "send",
 				from: senderId,
 				to,
 				receipts,
-				...(waited !== undefined ? { waited } : {}),
+				...(waited !== undefined ? { waited: waited ? boundIrcMessage(waited) : null } : {}),
 			},
 			isError: delivered.length === 0 && targets.length > 0,
-		};
+		});
 	} finally {
 		awaitAbort?.abort(awaitCancelled);
 		removeAwaitAbortListener?.();
@@ -395,16 +464,19 @@ export async function executeSend(
 
 /** Pure message wait: no jobs in play, block on the bus with peer liveness. */
 export async function executeMessageWait(
-	deps: { registry: AgentRegistry; senderId: string; settings: Settings },
+	deps: { registry: AgentRegistry; senderId: string; settings: Settings; bus?: IrcBus; rootId?: string },
 	params: { from?: string; timeoutMs?: number },
 	signal?: AbortSignal,
+	transaction?: HubAdmissionStateTransaction,
 ): Promise<AgentToolResult<CoordinationDetails>> {
+	transaction?.assertActive();
 	const { registry, senderId, settings } = deps;
 	const from = params.from?.trim() || undefined;
 	const timeoutMs = resolveMessageTimeoutMs(settings, params.timeoutMs);
 	try {
-		const waited = await IrcBus.global().wait(senderId, { from }, timeoutMs, signal, {
+		const waited = await (deps.bus ?? IrcBus.global()).wait(senderId, { from }, timeoutMs, signal, {
 			liveness: { registry, senderId },
+			...(transaction ? { transaction } : {}),
 		});
 		if (!waited) {
 			const filterNote = from ? ` from ${from}` : "";
@@ -428,26 +500,32 @@ export function executeInbox(
 	registry: AgentRegistry,
 	senderId: string,
 	peek?: boolean,
+	bus: IrcBus = IrcBus.global(),
+	transaction?: HubAdmissionStateTransaction,
 ): AgentToolResult<CoordinationDetails> {
-	const busMessages = IrcBus.global().inbox(senderId, { peek });
-	const session = registry.get(senderId)?.session;
-	const pendingMessages =
-		typeof session?.drainPendingIrcInboxMessages === "function" ? session.drainPendingIrcInboxMessages(senderId) : [];
+	transaction?.assertActive();
+	const busMessages = bus.inbox(senderId, { peek }, transaction);
+	const selectPending = (): IrcMessage[] => {
+		const session = lookupAgentRef(registry, senderId)?.session;
+		return typeof session?.drainPendingIrcInboxMessages === "function"
+			? session.drainPendingIrcInboxMessages(senderId)
+			: [];
+	};
+	const pendingMessages = transaction ? transaction.select(selectPending) : selectPending();
 	const messages = [...busMessages, ...pendingMessages].sort((a, b) => a.ts - b.ts);
 	if (messages.length === 0) {
-		return {
+		return boundCoordinationResult({
 			content: [{ type: "text", text: "Inbox empty." }],
 			details: { op: "inbox", from: senderId, inbox: [] },
-			// An empty inbox drain carries no information once consumed.
 			useless: true,
-		};
+		});
 	}
 	const header = peek ? `${messages.length} unread message(s):` : `${messages.length} message(s):`;
-	const lines = [header, ...messages.map(msg => `- ${formatIncoming(msg)}`)];
-	return {
-		content: [{ type: "text", text: lines.join("\n") }],
-		details: { op: "inbox", from: senderId, inbox: messages },
-	};
+	const boundedMessages = messages.map(boundIrcMessage);
+	return boundCoordinationResult({
+		content: [{ type: "text", text: [header, ...boundedMessages.map(msg => `- ${formatIncoming(msg)}`)].join("\n") }],
+		details: { op: "inbox", from: senderId, inbox: boundedMessages },
+	});
 }
 
 // =============================================================================

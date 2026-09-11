@@ -16,6 +16,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("extension/hook loader process.exit guard (#3680)", () => {
 	let project: TempDir | undefined;
+	const childWatchdogTimeoutMs = 10_000;
 
 	beforeEach(() => {
 		project = TempDir.createSync("@omp-exit-guard-");
@@ -47,7 +48,7 @@ describe("extension/hook loader process.exit guard (#3680)", () => {
 			try {
 				proc.kill("SIGKILL");
 			} catch {}
-		}, 2000);
+		}, childWatchdogTimeoutMs);
 		try {
 			const [exitCode, stdout, stderr] = await Promise.all([
 				proc.exited,

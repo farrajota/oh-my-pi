@@ -9,6 +9,7 @@ import * as sdk from "../../sdk";
 import type { AgentSession } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
 import { EventBus } from "../../utils/event-bus";
+import { AgentRegistry } from "../../registry/agent-registry";
 import { createMCPProxyTools, runSubprocess } from "../executor";
 import * as taskLabel from "../label";
 import type { AgentDefinition } from "../types";
@@ -52,6 +53,8 @@ function fakeSession(): AgentSession {
 		subscribe: () => () => {},
 		setIrcWakeTurnObserver: () => {},
 		prompt: async () => {},
+		prepareForHeadlessAdvisorDrain: () => {},
+		waitForAdvisorCatchup: async () => true,
 		waitForIdle: async () => {},
 		getLastAssistantMessage: () => ({ stopReason: "error", errorMessage: "test stop" }),
 		dispose: async () => {},
@@ -69,6 +72,13 @@ function fakeModelRegistry(): ModelRegistry {
 	} as unknown as ModelRegistry;
 }
 
+function createAuthorityFixture() {
+	const agentRegistry = new AgentRegistry();
+	const createAuthoritySession = (options: Parameters<typeof sdk.createAgentSession>[0]) =>
+		sdk.createAgentSession({ ...options, agentRegistry });
+	return { agentRegistry, createAuthoritySession };
+}
+
 async function runWithAgentTools(
 	agentTools: string[] | undefined,
 	settings = Settings.isolated({ "task.agentIdleTtlMs": 0 }),
@@ -83,6 +93,7 @@ async function runWithAgentTools(
 	});
 
 	try {
+		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		await runSubprocess({
 			cwd: process.cwd(),
 			agent: fakeAgent(agentTools),
@@ -92,6 +103,8 @@ async function runWithAgentTools(
 			id: "ExecutorTest",
 			settings,
 			modelRegistry: fakeModelRegistry(),
+			agentRegistry,
+			createAuthoritySession,
 		});
 	} finally {
 		createSpy.mockRestore();
@@ -123,12 +136,12 @@ describe("createMCPProxyTools", () => {
 });
 
 describe("runSubprocess explicit agent tools", () => {
-	test("forwards explicit empty agent tools to child session creation with IRC coordination only", async () => {
-		expect(await runWithAgentTools([])).toEqual(["irc"]);
+	test("forwards explicit empty agent tools with legacy IRC and native Hub coordination", async () => {
+		expect(await runWithAgentTools([])).toEqual(["irc", "hub"]);
 	});
 
 	test("forwards narrow explicit agent tools without treating them as defaults", async () => {
-		expect(await runWithAgentTools(["read"])).toEqual(["read", "irc"]);
+		expect(await runWithAgentTools(["read"])).toEqual(["read", "irc", "hub"]);
 	});
 });
 
@@ -145,6 +158,7 @@ describe("runSubprocess subagent event bus propagation", () => {
 		});
 
 		try {
+			const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 			await runSubprocess({
 				cwd: process.cwd(),
 				agent: fakeAgent([]),
@@ -155,6 +169,8 @@ describe("runSubprocess subagent event bus propagation", () => {
 				settings: Settings.isolated({ "task.agentIdleTtlMs": 0, "task.generateLabels": false }),
 				modelRegistry: fakeModelRegistry(),
 				subagentEventBus,
+				agentRegistry,
+				createAuthoritySession,
 			});
 			expect(capturedOptions?.subagentEventBus).toBe(subagentEventBus);
 			expect(Object.hasOwn(capturedOptions ?? {}, "eventBus")).toBe(false);

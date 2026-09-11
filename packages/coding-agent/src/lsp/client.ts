@@ -1,9 +1,10 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as path from "node:path";
 import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
 import { MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { getConfig } from "./config";
-import { applyWorkspaceEdit, type ExecutedWorkspaceChange } from "./edits";
+import { applyWorkspaceEdit, type ExecutedWorkspaceChange, type WorkspaceEditAuthorization } from "./edits";
 import { getLspmuxCommand, isLspmuxSupported } from "./lspmux";
 import { connectSharedLspTransport } from "./mux/daemon";
 import type {
@@ -46,15 +47,24 @@ let idleTimeoutMs: number | null = null;
 let idleCheckInterval: NodeJS.Timeout | null = null;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
 
-// Broker-shared server mode (one language server per project shared by every
-// omp instance through the LSP mux daemon). Off by default so embedders and
-// tests that drive getOrCreateClient directly never touch the daemon broker;
-// the SDK turns it on from the `lsp.shared` setting at session creation.
-let sharedLspEnabled = false;
+export interface LspSessionPolicy {
+	readonly shared: boolean;
+}
 
-/** Enable or disable attaching to broker-shared language servers. */
-export function setSharedLspEnabled(enabled: boolean): void {
-	sharedLspEnabled = enabled;
+const lspSessionPolicy = new AsyncLocalStorage<LspSessionPolicy>();
+
+// Legacy default for direct library consumers that do not enter a session
+// policy. SDK sessions always install an AsyncLocalStorage policy, so changing
+// this value cannot alter an already-running or concurrent session.
+
+/** Compatibility entry point for direct non-session consumers; SDK sessions use {@link withLspSessionPolicy}. */
+export function setSharedLspEnabled(_enabled: boolean): void {
+	void _enabled;
+}
+
+/** Run LSP discovery, warmup, and tool work under one immutable session policy. */
+export function withLspSessionPolicy<T>(policy: LspSessionPolicy, run: () => T): T {
+	return lspSessionPolicy.run(Object.freeze({ ...policy }), run);
 }
 
 /**
@@ -650,11 +660,12 @@ export async function applyWorkspaceEditWithLsp(
 	edit: WorkspaceEdit,
 	cwd: string,
 	signal?: AbortSignal,
+	authorization?: WorkspaceEditAuthorization,
 ): Promise<string[]> {
 	const executed: ExecutedWorkspaceChange[] = [];
 	let applied: string[];
 	try {
-		({ applied } = await applyWorkspaceEdit(edit, cwd, change => executed.push(change)));
+		({ applied } = await applyWorkspaceEdit(edit, cwd, change => executed.push(change), authorization));
 	} catch (err) {
 		// Best-effort: overlays for the mutated prefix must not stay stale, but
 		// reconciliation problems must not mask the original apply failure.
@@ -997,6 +1008,7 @@ export async function getOrCreateClient(
 	initTimeoutMs?: number,
 	signal?: AbortSignal,
 ): Promise<LspClient> {
+	const sessionPolicy = lspSessionPolicy.getStore();
 	const key = clientKey(config, cwd);
 	// Check if client already exists
 	const existingClient = clients.get(key);
@@ -1062,7 +1074,7 @@ export async function getOrCreateClient(
 		// already multiplexing this command. Any shared-path failure falls back
 		// to a private spawn so LSP never regresses on broker trouble.
 		let proc: LspTransport | null = null;
-		if (sharedLspEnabled && command === baseCommand) {
+		if (sessionPolicy?.shared === true && command === baseCommand) {
 			proc = await connectSharedLspTransport({ command, args, cwd, env, signal });
 		}
 		proc ??= ptree.spawn([command, ...args], {

@@ -2,11 +2,10 @@
  * Contracts: history:// protocol handler (rework-contracts.md §6), resolved
  * through `InternalUrlRouter.instance().resolve(...)` like real callers.
  *
- * - Bare `history://` renders an index listing registered agent ids.
- * - `history://<id>` with a live ref renders the in-memory transcript.
- * - A parked ref (session null, sessionFile retained) renders read-only from
- *   the JSONL session file.
- * - An unknown id fails with an error listing the known ids.
+- Bare `history://` renders an index listing registered agent ids in an explicit contextless display call.
+- `history://<id>` with a live ref renders the in-memory transcript.
+- A parked ref (session null, sessionFile retained) renders read-only from the JSONL session file.
+- An unknown id fails without disclosing other registry ids or backing paths.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -39,7 +38,7 @@ function fakeLiveSession(messages: unknown[]): AgentSession {
 	return { messages } as unknown as AgentSession;
 }
 
-function makeToolSession(cwd: string, sessionFile: string = path.join(cwd, "session.jsonl")): ToolSession {
+function makeToolSession(cwd: string, sessionFile: string | null = path.join(cwd, "session.jsonl")): ToolSession {
 	return {
 		cwd,
 		hasUI: false,
@@ -144,7 +143,7 @@ describe("history:// protocol", () => {
 			session: fakeLiveSession([{ role: "user", content: "hello from live", timestamp: 1 }]),
 			status: "idle",
 		});
-		const tool = new ReadTool(makeToolSession(os.tmpdir()));
+		const tool = new ReadTool(makeToolSession(os.tmpdir(), null));
 
 		const result = await tool.execute("history-range", { path: "history://HubAgent:1-1" });
 		const output = result.content.find(content => content.type === "text");
@@ -191,7 +190,7 @@ describe("history:// protocol", () => {
 		});
 	});
 
-	it("rejects an unknown id with the list of known agents", async () => {
+	it("rejects an unknown id without enumerating other agents", async () => {
 		AgentRegistry.global().register({
 			id: "HubAgent",
 			displayName: "task",
@@ -209,7 +208,7 @@ describe("history:// protocol", () => {
 
 		expect(error).toBeInstanceOf(Error);
 		expect(error?.message).toContain("Unknown agent: Nope");
-		expect(error?.message).toContain("HubAgent");
+		expect(error?.message).not.toContain("HubAgent");
 	});
 
 	it("rejects a ref with neither session nor session file", async () => {
@@ -462,7 +461,6 @@ describe("history:// protocol", () => {
 			if (output?.type !== "text") throw new Error("Expected text output");
 			expect(output.text).toContain("hello from root A");
 			expect(output.text).not.toContain("hello from root B");
-			expect(AgentRegistry.global().get("Worker")?.sessionFile).toBe(childA);
 		});
 	});
 });

@@ -3,7 +3,15 @@ import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import subagentSystemPrompt from "../../src/prompts/system/subagent-system-prompt.md" with { type: "text" };
 import { AgentRegistry } from "../../src/registry/agent-registry";
-import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
+import {
+	registerToolSessionLifecycleAuthority,
+	resetAgentLifecycleForTests,
+} from "../../src/internal/agent-lifecycle-bridge";
+import {
+	bindInternalAgentAuthoritySession,
+	createAgentRootSession,
+	lookupAgentRef,
+} from "../../src/internal/agent-registry-bridge";
 import type { AgentSession } from "../../src/session/agent-session";
 import { HubTool } from "../../src/tools/hub";
 import type { CustomMessage } from "../../src/session/messages";
@@ -37,14 +45,34 @@ const POLICY = {
 } satisfies EffectiveSubagentPolicy;
 
 const managers = new Set<AsyncJobManager>();
+const authoritySessions = new Set<AgentSession>();
+let activeRegistry: AgentRegistry | undefined;
 
-function makeSession(
+async function makeSession(
 	cards: CustomMessage[] = [],
 	concurrency = 2,
 	freshAgents = false,
 	deliveries?: Array<{ id: string; text: string }>,
-): ToolSession {
+): Promise<ToolSession> {
 	const manager = new AsyncJobManager({ retentionMs: 0 });
+	const registry = new AgentRegistry();
+	const root = await createAgentRootSession(registry, {
+		agentId: "Main",
+		agentDisplayName: "Main",
+		cwd: "/tmp",
+		agentDir: "/tmp",
+		settings: Settings.isolated({ "async.enabled": false }),
+		disableExtensionDiscovery: true,
+		enableMCP: false,
+		enableLsp: false,
+		toolNames: [],
+		skipPythonPreflight: true,
+	});
+	const authorityBinding = bindInternalAgentAuthoritySession(registry, root.session);
+	if (!authorityBinding) throw new Error("Test fixture requires a live parent-bound authority session.");
+	authoritySessions.add(root.session);
+	activeRegistry = registry;
+	root.session.emitIrcRelayObservation = (card: CustomMessage) => cards.push(card);
 	if (deliveries) {
 		manager.registerDeliverySink("Main", (id, text) => {
 			deliveries.push({ id, text });
@@ -60,18 +88,14 @@ function makeSession(
 			"eval.workpool.freshAgents": freshAgents,
 		}),
 		asyncJobManager: manager,
+		agentRegistry: registry,
+		createAuthoritySession: (options, reviveRef) => authorityBinding.create(options, reviveRef),
 		getAgentId: () => "Main",
-		getSessionFile: () => null,
+		getSessionFile: () => root.session.sessionManager.getSessionFile() ?? null,
 		getSessionSpawns: () => "*",
 		getArtifactsDir: () => null,
 	} satisfies ToolSession;
-	AgentRegistry.global().register({
-		id: "Main",
-		displayName: "Main",
-		kind: "main",
-		status: "idle",
-		session: { emitIrcRelayObservation: (card: CustomMessage) => cards.push(card) } as unknown as AgentSession,
-	});
+	registerToolSessionLifecycleAuthority(session, registry, root.session);
 	return session;
 }
 
@@ -104,7 +128,8 @@ function execution(id: string, output?: string): StructuredSubagentResult {
 }
 
 function markIdle(id: string): void {
-	AgentRegistry.global().register({
+	if (!activeRegistry) throw new Error("Missing active test registry");
+	activeRegistry.register({
 		id,
 		displayName: id,
 		kind: "sub",
@@ -140,11 +165,11 @@ async function finishPool(session: ToolSession, workpool: WorkPool): Promise<voi
 afterEach(async () => {
 	for (const manager of managers) await manager.dispose();
 	managers.clear();
+	await Promise.all([...authoritySessions].map(session => session.dispose()));
+	authoritySessions.clear();
+	activeRegistry = undefined;
 	vi.restoreAllMocks();
-	AgentRegistry.resetGlobalForTests();
-	// The global lifecycle binds its registry at construction; drop it with the
-	// registry so release() in later tests manages the current instance.
-	AgentLifecycleManager.resetGlobalForTests();
+	resetAgentLifecycleForTests();
 	WorkPoolRegistry.resetForTests();
 });
 
@@ -159,9 +184,10 @@ describe("WorkPool dispatch", () => {
 		expect(rendered).toContain("{ key: <1-based number>, data: <outcome> }");
 		expect(rendered).not.toContain("Your terminal `yield` MUST use exactly this shape");
 	});
+
 	it("spawns while there is room, then queues round-robin, and dispatches to an idle agent", async () => {
 		const cards: CustomMessage[] = [];
-		const session = makeSession(cards);
+		const session = await makeSession(cards);
 		const gates = new Map<string, PromiseWithResolvers<void>>();
 		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
 			const id = request.identity?.id ?? "missing";
@@ -194,7 +220,7 @@ describe("WorkPool dispatch", () => {
 	});
 
 	it("hands a queued batch to a follow-up turn after the first turn settles", async () => {
-		const session = makeSession([], 1);
+		const session = await makeSession([], 1);
 		const first = Promise.withResolvers<void>();
 		const follow = Promise.withResolvers<void>();
 		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
@@ -221,16 +247,16 @@ describe("WorkPool dispatch", () => {
 		follow.resolve();
 		await finishPool(session, workpool);
 	});
+
 	it("tombstones the worker session when clearing the yield contract fails", async () => {
-		const session = makeSession([], 1);
+		const session = await makeSession([], 1);
+		const registry = session.agentRegistry;
+		if (!registry) throw new Error("Missing test registry");
 		let workerId = "";
 		let disposed = false;
 		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
 			workerId = request.identity?.id ?? "missing";
-			// Retained worker whose prompt rebuild throws after the runtime
-			// contract already flipped: pool-local drop alone would leave it
-			// messageable with a stale keyed declaration.
-			AgentRegistry.global().register({
+			registry.register({
 				id: workerId,
 				displayName: workerId,
 				kind: "sub",
@@ -249,18 +275,15 @@ describe("WorkPool dispatch", () => {
 		const workpool = pool(session, "poison");
 		workpool.push(["one"]);
 		await finishPool(session, workpool);
-		// The successful turn result survives the cleanup failure, but the
-		// poisoned worker is gone locally and left terminal in the registry: a
-		// later persisted-agent scan must not resurrect it as parked.
 		expect(workpool.batches[0]?.status).toBe("completed");
 		expect(workpool.agents.length).toBe(0);
 		expect(disposed).toBe(true);
-		expect(AgentRegistry.global().get(workerId)?.status).toBe("aborted");
-		expect(AgentRegistry.global().get(workerId)?.session).toBeNull();
+		expect(registry.get(workerId)?.status).toBe("aborted");
+		expect(lookupAgentRef(registry, workerId)?.session).toBeNull();
 	});
 
 	it("requeues a dead agent's queued items onto another worker", async () => {
-		const session = makeSession([], 2);
+		const session = await makeSession([], 2);
 		const gates = new Map<string, PromiseWithResolvers<void>>();
 		let firstId = "";
 		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
@@ -289,7 +312,7 @@ describe("WorkPool dispatch", () => {
 	});
 
 	it("uses the pool name as the aggregate job id and label", async () => {
-		const session = makeSession([], 1);
+		const session = await makeSession([], 1);
 		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
 			const id = request.identity?.id ?? "missing";
 			markIdle(id);
@@ -315,7 +338,7 @@ describe("WorkPool dispatch", () => {
 	it("auto-delivers one aggregate completion under the pool id", async () => {
 		const deliveries: Array<{ id: string; text: string }> = [];
 		const cards: CustomMessage[] = [];
-		const session = makeSession(cards, 1, false, deliveries);
+		const session = await makeSession(cards, 1, false, deliveries);
 		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
 			const id = request.identity?.id ?? "missing";
 			markIdle(id);
@@ -333,7 +356,7 @@ describe("WorkPool dispatch", () => {
 	});
 
 	it("sends new work to the least context-loaded idle agent", async () => {
-		const session = makeSession([], 3);
+		const session = await makeSession([], 3);
 		const gates = new Map<string, PromiseWithResolvers<void>>();
 		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
 			const id = request.identity?.id ?? "missing";
@@ -378,7 +401,7 @@ describe("WorkPool dispatch", () => {
 	});
 
 	it("spawns a fresh agent per item when eval.workpool.freshAgents is enabled", async () => {
-		const session = makeSession([], 1, true);
+		const session = await makeSession([], 1, true);
 		const gates: Array<PromiseWithResolvers<void>> = [];
 		const runSpy = vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
 			const gate = Promise.withResolvers<void>();
@@ -405,7 +428,7 @@ describe("WorkPool dispatch", () => {
 	});
 
 	it("close drops queued items but lets the in-flight turn finish", async () => {
-		const session = makeSession([], 1);
+		const session = await makeSession([], 1);
 		const first = Promise.withResolvers<void>();
 		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
 			await first.promise;

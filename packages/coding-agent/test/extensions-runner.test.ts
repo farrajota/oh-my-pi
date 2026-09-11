@@ -29,6 +29,10 @@ import type {
 	ProviderModelConfig,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
+import {
+	installSessionOperationLedger,
+	markUnregisteredSessionOperationProjection,
+} from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
@@ -62,6 +66,8 @@ describe("ExtensionRunner", () => {
 		extensionsDir = path.join(getProjectAgentDir(tempDir.path()), "extensions");
 		fs.mkdirSync(extensionsDir, { recursive: true });
 		sessionManager = SessionManager.inMemory();
+		installSessionOperationLedger(sessionManager);
+		markUnregisteredSessionOperationProjection(sessionManager, false);
 	});
 
 	afterEach(() => {
@@ -100,6 +106,8 @@ describe("ExtensionRunner", () => {
 		fs.mkdirSync(dirA, { recursive: true });
 		fs.mkdirSync(dirB, { recursive: true });
 		const movableSessionManager = SessionManager.inMemory(dirA);
+		installSessionOperationLedger(movableSessionManager);
+		markUnregisteredSessionOperationProjection(movableSessionManager, false);
 
 		const result = await loadTestExtensions();
 		const runner = new ExtensionRunner(result.extensions, result.runtime, dirA, movableSessionManager, modelRegistry);
@@ -4106,6 +4114,100 @@ describe("ExtensionRunner", () => {
 			);
 			// A fresh chain at depth 0 is unaffected by another chain's depth.
 			await expect(runner.invokeNativeTool("bash", { command: "echo hi" }, { depth: 0 })).resolves.toBeDefined();
+		});
+	});
+
+	describe("restricted tool admission", () => {
+		const restrictedScope = {
+			mode: "enforce" as const,
+			toolsEnabled: true,
+			pathsEnabled: true,
+			actorId: "RestrictedExtensionTest",
+			actorKind: "sub" as const,
+			profiles: ["no-network"],
+			tools: ["bash"],
+			denyTools: [],
+			allowPaths: [],
+			denyPaths: [],
+			guardrails: { noNetwork: true, secretsBlind: false },
+			restrictedState: "restricted" as const,
+		};
+
+		const createRestrictedRunner = (extensions: Extension[] = []): ExtensionRunner =>
+			new ExtensionRunner(
+				extensions,
+				new ExtensionRuntime(),
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				undefined,
+				undefined,
+				{ permissionScope: restrictedScope },
+			);
+
+		it("does not expose denied input to tool_call handlers", async () => {
+			let handlerCalls = 0;
+			const extensionPath = path.join(extensionsDir, "restricted-tool-call.ts");
+			const extension: Extension = {
+				path: extensionPath,
+				resolvedPath: extensionPath,
+				handlers: new Map([
+					[
+						"tool_call",
+						[
+							async () => {
+								handlerCalls++;
+							},
+						],
+					],
+				]),
+				tools: new Map(),
+				assistantThinkingRenderers: [],
+				fileWriteFallbackHandlers: [],
+				fileDeleteFallbackHandlers: [],
+				messageRenderers: new Map(),
+				workingMessageSuffixes: new Map(),
+				composerShapes: new Map(),
+				commands: new Map(),
+				flags: new Map(),
+				shortcuts: new Map(),
+			};
+			const runner = createRestrictedRunner([extension]);
+
+			const result = await runner.emitToolCall({
+				type: "tool_call",
+				toolName: "bash",
+				toolCallId: "restricted-handler-input",
+				input: { command: "curl https://example.com/private" },
+			});
+
+			expect(result).toEqual(expect.objectContaining({ block: true }));
+			expect(handlerCalls).toBe(0);
+		});
+
+		it("re-enters wrapped authorization for same-name native delegation", async () => {
+			let nativeCalls = 0;
+			const runner = createRestrictedRunner();
+			const native: AgentTool = {
+				name: "bash",
+				label: "Bash",
+				description: "native bash",
+				parameters: Type.Object({ command: Type.String() }),
+				execute: async () => {
+					nativeCalls++;
+					return { content: [{ type: "text", text: "native ran" }], details: {} };
+				},
+			};
+			const wrapped = new ExtensionToolWrapper(native, runner);
+			runner.setNativeToolResolver(name =>
+				name === native.name ? { tool: wrapped, makeContext: () => ({}) as never } : undefined,
+			);
+
+			await expect(runner.invokeNativeTool("bash", { command: "curl https://example.com/private" })).rejects.toThrow(
+				/no-network guardrail/,
+			);
+			expect(nativeCalls).toBe(0);
 		});
 	});
 

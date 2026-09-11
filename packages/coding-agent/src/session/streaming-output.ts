@@ -1,5 +1,6 @@
 import type { AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { formatBytes, materializeString, sanitizeText } from "@oh-my-pi/pi-utils";
+import { publishAllocatedArtifact } from "./artifacts";
 import { sanitizeWithOptionalSixelPassthrough } from "../utils/sixel";
 
 // =============================================================================
@@ -796,6 +797,7 @@ export class OutputSink {
 	#file?: {
 		path: string;
 		artifactId?: string;
+		published: boolean;
 		sink: Bun.FileSink;
 	};
 
@@ -1153,7 +1155,7 @@ export class OutputSink {
 		if (!this.#artifactPath || this.#fileReady) return;
 		try {
 			const sink = Bun.file(this.#artifactPath).writer();
-			this.#file = { path: this.#artifactPath, artifactId: this.#artifactId, sink };
+			this.#file = { path: this.#artifactPath, artifactId: this.#artifactId, published: false, sink };
 			this.#fileReady = true;
 
 			// Head-retained bytes precede the rolling tail buffer in the capture.
@@ -1311,9 +1313,7 @@ export class OutputSink {
 		// Flush any chunk still held back by the throttle so the live preview
 		// ends with the complete stream.
 		this.#flushPendingChunk();
-		const totalLines = this.#sawData ? this.#totalLines + 1 : 0;
-
-		await this.#finalizeFile();
+		await this.#finalizeFile(true);
 
 		// Compose the visible output. With head retention, splice head + marker
 		// + tail when content was elided. Otherwise return the rolling buffer.
@@ -1326,6 +1326,7 @@ export class OutputSink {
 		// Bytes that survived the column cap. Middle elision operates on these,
 		// so column-dropped bytes don't inflate the "elided from middle" count.
 		const effectiveTotalBytes = Math.max(0, this.#totalBytes - this.#columnDroppedBytes);
+		const totalLines = this.#totalLines + (this.#sawData ? 1 : 0);
 
 		let body: string;
 		let outputBytes: number;
@@ -1373,19 +1374,17 @@ export class OutputSink {
 			columnDroppedBytes: this.#columnDroppedBytes > 0 ? this.#columnDroppedBytes : undefined,
 			columnTruncatedLines: this.#columnTruncatedLines > 0 ? this.#columnTruncatedLines : undefined,
 			columnMax: this.#columnTruncatedLines > 0 ? this.#maxColumns : undefined,
-			artifactId: this.#file?.artifactId,
+			artifactId: this.#file?.published ? this.#file.artifactId : undefined,
 		};
 	}
 
 	/**
-	 * Flush any capped artifact tail and close the spill file descriptor,
-	 * awaiting an in-flight sink creation so a descriptor opened by a late
-	 * chunk is still released. Idempotent via {@link #finalized}: the artifact
-	 * is finalized exactly once whether the caller reached {@link dump} or
-	 * bailed through {@link dispose}. `#file` is left set so {@link dump} can
-	 * still read `artifactId` for its summary.
+	 * Flush any capped tail and close the spill descriptor. A normal dump
+	 * publishes the completed manager reservation; dispose-only error and abort
+	 * paths close without publishing, so partial streams stay invisible.
+	 * Idempotent via {@link #finalized}.
 	 */
-	async #finalizeFile(): Promise<void> {
+	async #finalizeFile(publish: boolean): Promise<void> {
 		if (this.#finalized) return;
 		this.#finalized = true;
 		if (this.#fileCreation) {
@@ -1394,14 +1393,16 @@ export class OutputSink {
 		const file = this.#file;
 		if (!file) return;
 		// The tail/notice replay writes to the sink and can throw (e.g. a disk
-		// write error). Closing the descriptor MUST still happen — otherwise the
-		// fd leaks and the replay error masks the original tool error that put us
-		// on this path. Both failures are swallowed so dispose() never throws.
+		// write error). Only a fully closed stream may advance the manager's
+		// publication marker; failures leave the reservation invisible.
 		try {
 			this.#flushArtifactTailIfCapped();
+			await file.sink.end();
+			if (publish) {
+				await publishAllocatedArtifact(file.path);
+				file.published = true;
+			}
 		} catch {
-			/* ignore */
-		} finally {
 			try {
 				await file.sink.end();
 			} catch {
@@ -1411,15 +1412,12 @@ export class OutputSink {
 	}
 
 	/**
-	 * Release the artifact spill descriptor on an exit path that skips
-	 * {@link dump} — a thrown error or abort. Idempotent and safe in a
-	 * `finally`: if {@link dump} already ran this is a no-op, otherwise it
-	 * flushes the capped tail and closes the sink so the descriptor is not
-	 * leaked until a later unrelated read hits `EMFILE` (issue #6463).
+	 * Release the spill descriptor on an exit path that skips {@link dump}.
+	 * The staged bytes are deliberately not published.
 	 */
 	async dispose(): Promise<void> {
 		this.#clearPendingChunkTimer();
-		await this.#finalizeFile();
+		await this.#finalizeFile(false);
 	}
 }
 

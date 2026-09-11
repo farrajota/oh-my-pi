@@ -1,3 +1,4 @@
+import { runJobOperation } from "../registry/operation-lease";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, ToolExample } from "@oh-my-pi/pi-ai";
@@ -484,42 +485,41 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const jobId = autoBgManager.register(
 			"eval",
 			label,
-			async ({ jobId, signal: runSignal, reportProgress }) => {
-				try {
-					const result = await run(runSignal, (text, details) => {
-						latestText = text;
-						latestDetails = details;
-						void reportProgress(text, { async: { state: "running", jobId, type: "eval" } });
-						if (forwardUpdates) emitToolUpdate?.(text, details);
-					});
-					const finalText = result.content.find(block => block.type === "text")?.text ?? "";
-					latestText = finalText;
-					latestDetails = result.details;
-					// Hand the full result (images included) to the foreground waiter
-					// before deciding the job's terminal state.
-					completion.resolve({ kind: "completed", result });
-					if (result.isError === true) {
-						// A failed, cancelled, or timed-out cell is a completed execution
-						// that errored. Re-enter the failure path so the job manager
-						// records it as failed and delivers the error text.
-						throw new ToolError(finalText || "Eval cell failed");
-					}
-					await reportProgress(finalText, {
-						...result.details,
-						async: { state: "completed", jobId, type: "eval" },
-					});
-					return finalText;
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					latestText = message;
-					completion.resolve({ kind: "failed", error });
-					await reportProgress(message, {
-						...latestDetails,
-						async: { state: "failed", jobId, type: "eval" },
-					});
-					throw error;
-				}
-			},
+			async ({ jobId, signal: runSignal, reportProgress }) =>
+				runJobOperation(
+					session.sessionManager,
+					`job:${jobId}`,
+					async () => {
+						try {
+							const result = await run(runSignal, (text, details) => {
+								latestText = text;
+								latestDetails = details;
+								void reportProgress(text, { async: { state: "running", jobId, type: "eval" } });
+								if (forwardUpdates) emitToolUpdate?.(text, details);
+							});
+							const finalText = result.content.find(block => block.type === "text")?.text ?? "";
+							latestText = finalText;
+							latestDetails = result.details;
+							completion.resolve({ kind: "completed", result });
+							if (result.isError === true) throw new ToolError(finalText || "Eval cell failed");
+							await reportProgress(finalText, {
+								...result.details,
+								async: { state: "completed", jobId, type: "eval" },
+							});
+							return finalText;
+						} catch (error) {
+							const message = error instanceof Error ? error.message : String(error);
+							latestText = message;
+							completion.resolve({ kind: "failed", error });
+							await reportProgress(message, {
+								...latestDetails,
+								async: { state: "failed", jobId, type: "eval" },
+							});
+							throw error;
+						}
+					},
+					runSignal,
+				),
 			{ ownerId: session.getAgentId?.() ?? undefined },
 		);
 

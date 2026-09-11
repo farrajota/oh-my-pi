@@ -13,20 +13,6 @@ export function looksLikeSqlite(bytes: Uint8Array): boolean {
 	}
 	return true;
 }
-function isSqliteCantOpen(error: unknown): boolean {
-	if (!(error instanceof Error) || error.name !== "SQLiteError" || !("code" in error)) return false;
-	return typeof error.code === "string" && error.code.startsWith("SQLITE_CANTOPEN");
-}
-
-async function requiresWalSidecarInitialization(filePath: string): Promise<boolean> {
-	const formatVersions = await Bun.file(filePath).slice(18, 20).bytes();
-	if (formatVersions[0] !== 2 && formatVersions[1] !== 2) return false;
-	const [walExists, shmExists] = await Promise.all([
-		Bun.file(`${filePath}-wal`).exists(),
-		Bun.file(`${filePath}-shm`).exists(),
-	]);
-	return !walExists || !shmExists;
-}
 
 function configureSqliteReadConnection(db: Database): Database {
 	try {
@@ -40,21 +26,9 @@ function configureSqliteReadConnection(db: Database): Database {
 	}
 }
 
-/**
- * Opens the query-only connection used by read tools, retrying read-write mode solely to initialize missing WAL sidecars.
- */
+/** Open the read tool's SQLite connection without any read-write fallback. */
 export async function openSqliteReadConnection(filePath: string): Promise<Database> {
-	if (await requiresWalSidecarInitialization(filePath)) {
-		return configureSqliteReadConnection(new Database(filePath, { readwrite: true, create: false, strict: true }));
-	}
-	try {
-		return configureSqliteReadConnection(new Database(filePath, { readonly: true, strict: true }));
-	} catch (error) {
-		if (!isSqliteCantOpen(error)) {
-			throw error;
-		}
-	}
-	return configureSqliteReadConnection(new Database(filePath, { readwrite: true, create: false, strict: true }));
+	return configureSqliteReadConnection(new Database(filePath, { readonly: true, create: false, strict: true }));
 }
 const SQLITE_PATH_PATTERN = /\.(?:sqlite3?|db3?)(?=(?::|\?|$))/gi;
 const DEFAULT_QUERY_LIMIT = 20;
@@ -760,10 +734,78 @@ export function getRowByRowId(db: Database, table: string, key: string): Record<
 		.get(binding);
 }
 
+function assertReadOnlySql(sql: string): void {
+	let normalized = "";
+	let quote: "'" | '"' | "`" | "]" | undefined;
+	for (let index = 0; index < sql.length; index++) {
+		const char = sql[index]!;
+		if (quote) {
+			if (quote === "]" ? char === "]" : char === quote) {
+				if (quote !== "]" && sql[index + 1] === quote) index++;
+				else quote = undefined;
+			}
+			normalized += " ";
+			continue;
+		}
+		if (char === "'" || char === '"' || char === "`") {
+			quote = char;
+			normalized += " ";
+			continue;
+		}
+		if (char === "[") {
+			quote = "]";
+			normalized += " ";
+			continue;
+		}
+		if (char === ";") throw new ToolError("SQLite raw queries must contain exactly one read-only statement");
+		if (char === "-" && sql[index + 1] === "-") {
+			while (index < sql.length && sql[index] !== "\n") index++;
+			normalized += " ";
+			continue;
+		}
+		if (char === "/" && sql[index + 1] === "*") {
+			const end = sql.indexOf("*/", index + 2);
+			if (end === -1) throw new ToolError("SQLite raw query contains an unterminated comment");
+			index = end + 1;
+			normalized += " ";
+			continue;
+		}
+		normalized += char;
+	}
+	const keywords = normalized.toUpperCase().match(/[A-Z_]+/g) ?? [];
+	const forbidden = new Set([
+		"INSERT",
+		"UPDATE",
+		"DELETE",
+		"REPLACE",
+		"CREATE",
+		"DROP",
+		"ALTER",
+		"VACUUM",
+		"REINDEX",
+		"ANALYZE",
+		"ATTACH",
+		"DETACH",
+		"PRAGMA",
+		"BEGIN",
+		"COMMIT",
+		"ROLLBACK",
+		"SAVEPOINT",
+		"RELEASE",
+	]);
+	if (keywords.some(keyword => forbidden.has(keyword))) {
+		throw new ToolError("SQLite raw queries are readonly; only SELECT/WITH/EXPLAIN statements are allowed");
+	}
+	if (!keywords.some(keyword => keyword === "SELECT")) {
+		throw new ToolError("SQLite raw queries must contain a SELECT statement");
+	}
+}
+
 export function executeReadQuery(
 	db: Database,
 	sql: string,
 ): { columns: string[]; rows: Record<string, unknown>[]; truncated: boolean } {
+	assertReadOnlySql(sql);
 	const statement = db.prepare<SqliteRow, []>(sql);
 	if (statement.paramsCount > 0) {
 		throw new ToolError("SQLite raw queries do not support bound parameters");

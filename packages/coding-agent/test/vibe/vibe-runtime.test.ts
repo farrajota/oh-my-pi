@@ -23,7 +23,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import * as lifecycleBridge from "../../src/internal/agent-lifecycle-bridge";
+import { lookupAgentRef } from "../../src/internal/agent-registry-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import {
@@ -259,6 +260,7 @@ function createFakeWorkerSession(options: { streaming?: boolean; onDispose?: () 
 	const fake = {
 		isStreaming: options.streaming ?? false,
 		model: undefined,
+		isAdvisorActive: () => false,
 		subscribe(listener: (event: unknown) => void): () => void {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
@@ -347,6 +349,11 @@ describe("vibe session registry", () => {
 	const persistedManagers: SessionManager[] = [];
 	const tempRoots: string[] = [];
 
+	function exactAgent(id: string) {
+		const ref = lookupAgentRef(AgentRegistry.global(), id);
+		if (!ref) throw new Error(`Expected exact agent ref for ${id}`);
+		return ref;
+	}
 	async function createPersistedParent(storage?: SessionStorage): Promise<SessionManager> {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-vibe-resume-"));
 		tempRoots.push(root);
@@ -399,41 +406,50 @@ describe("vibe session registry", () => {
 				status: "running",
 			});
 			AgentRegistry.global().setStatus(options.id, "idle");
-			AgentLifecycleManager.global().adopt(options.id, {
-				idleTtlMs: 0,
-				revive: async () => worker.session,
-			});
+			lifecycleBridge.adoptAgent(
+				lifecycleBridge.getAgentLifecycleManager(),
+				options.id,
+				{
+					idleTtlMs: 0,
+					revive: async () => worker.session,
+				},
+				exactAgent(options.id),
+			);
 			return makeResult(options.id, { output: "Persisted first turn." });
 		});
 	}
 
 	function installPersistedReviver(capture: { sessionFile?: string; prompts?: string[] }): void {
-		AgentLifecycleManager.global().setPersistedSubagentReviverFactory(async ref => {
-			if (!ref.sessionFile) return undefined;
-			const persisted = await SessionManager.peekSessionInit(ref.sessionFile);
-			if (!persisted?.init) return undefined;
-			const worker = createFakeWorkerSession();
-			worker.prompts.push(persisted.init.task);
-			worker.setScript({
-				events: yieldTurnEvents({ report: RESTORED_VIBE_RESPONSE }),
-				responseText: RESTORED_VIBE_RESPONSE,
-			});
-			capture.sessionFile = ref.sessionFile;
-			capture.prompts = worker.prompts;
-			return async () => worker.session;
-		}, 0);
+		lifecycleBridge.setPersistedAgentReviverFactory(
+			lifecycleBridge.getAgentLifecycleManager(),
+			async ref => {
+				if (!ref.sessionFile) return undefined;
+				const persisted = await SessionManager.peekSessionInit(ref.sessionFile);
+				if (!persisted?.init) return undefined;
+				const worker = createFakeWorkerSession();
+				worker.prompts.push(persisted.init.task);
+				worker.setScript({
+					events: yieldTurnEvents({ report: RESTORED_VIBE_RESPONSE }),
+					responseText: RESTORED_VIBE_RESPONSE,
+				});
+				capture.sessionFile = ref.sessionFile;
+				capture.prompts = worker.prompts;
+				return async () => worker.session;
+			},
+			0,
+		);
 	}
 
 	async function simulateProcessBoundary(): Promise<void> {
-		await AgentLifecycleManager.global().dispose();
+		await lifecycleBridge.disposeAgentLifecycle(lifecycleBridge.getAgentLifecycleManager());
 		VibeSessionRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		lifecycleBridge.resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 	}
 
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		lifecycleBridge.resetAgentLifecycleForTests();
 		VibeSessionRegistry.resetGlobalForTests();
 	});
 
@@ -449,7 +465,7 @@ describe("vibe session registry", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 		VibeSessionRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		lifecycleBridge.resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 	});
 
@@ -1087,7 +1103,11 @@ describe("vibe session registry", () => {
 			prompt: INITIAL_VIBE_TASK,
 		});
 		await jobs.getJob(spawned.jobId)!.promise;
-		await AgentLifecycleManager.global().release("exact-ref");
+		await lifecycleBridge.releaseAgent(
+			lifecycleBridge.getAgentLifecycleManager(),
+			"exact-ref",
+			exactAgent("exact-ref"),
+		);
 		const mismatchedFile = path.join(parentSessionFile.slice(0, -6), "another-parent.jsonl");
 		AgentRegistry.global().register({
 			id: "exact-ref",
@@ -1201,6 +1221,8 @@ describe("vibe session registry", () => {
 		await registry.spawn(sessionA, { cli: "fast", name: "reused", prompt: INITIAL_VIBE_TASK });
 		await pollUntil(() => workerA !== undefined);
 		const oldRef = AgentRegistry.global().get("reused");
+		const owningRegistry = AgentRegistry.global();
+		const owningLifecycle = lifecycleBridge.getAgentLifecycleManager(owningRegistry);
 		if (!oldRef) throw new Error("Expected parent A worker ref");
 		expect(await registry.suspendScope(registry.ownerScope(sessionA), jobsA)).toBe(1);
 
@@ -1218,9 +1240,15 @@ describe("vibe session registry", () => {
 			isolated: false,
 			agentIdleTtlMs: 0,
 			reviveSession: null,
+			agentRegistry: owningRegistry,
+			agentLifecycle: owningLifecycle,
 		});
-		await AgentLifecycleManager.global().release("reused", oldRef);
-		expect(AgentRegistry.global().get("reused")).toBe(replacement);
+		await lifecycleBridge.releaseAgent(owningLifecycle, "reused", oldRef);
+		expect(AgentRegistry.global().get("reused")).toMatchObject({
+			id: replacement!.id,
+			lineage: replacement!.lineage,
+			status: "idle",
+		});
 		expect(registry.screens(sessionB)[0]).toMatchObject({ id: "reused", state: "idle" });
 	});
 
@@ -1352,7 +1380,11 @@ describe("vibe session registry", () => {
 		expect(await registry.rehydrate(session)).toBe(1);
 		expect(registry.screens(session)[0]?.lastActivity).toBe("blocked by an agent id collision");
 		expect(await registry.killAll(session)).toBe(1);
-		expect(AgentRegistry.global().get("collision")).toBe(otherRef);
+		expect(AgentRegistry.global().get("collision")).toMatchObject({
+			id: otherRef.id,
+			lineage: otherRef.lineage,
+			status: otherRef.status,
+		});
 		expect(otherWorker.isDisposed()).toBe(false);
 		expect(
 			parentManager.getEntries().some(entry => {
@@ -1369,7 +1401,8 @@ describe("vibe session registry", () => {
 		persistedManagers.push(reopened);
 		const resumedSession = createSession({ manager: createManager(), sessionManager: reopened });
 		expect(await VibeSessionRegistry.global().rehydrate(resumedSession)).toBe(0);
-		expect(AgentRegistry.global().get("collision")).toMatchObject({ status: "aborted", session: null });
+		expect(AgentRegistry.global().get("collision")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "collision")?.session).toBeNull();
 	});
 
 	it("rejects a spawn queued behind mode exit and leaves no live or untombstoned worker", async () => {
@@ -1475,8 +1508,16 @@ describe("vibe session registry", () => {
 		const reloadedRegistry = VibeSessionRegistry.global();
 		expect(await reloadedRegistry.rehydrate(session)).toBe(2);
 		expect(reloadedRegistry.listIds(session)).toEqual(["retry-exit-one", "retry-exit-two"]);
-		expect(AgentRegistry.global().get("retry-exit-one")).toBe(firstRef);
-		expect(AgentRegistry.global().get("retry-exit-two")).toBe(secondRef);
+		expect(AgentRegistry.global().get("retry-exit-one")).toMatchObject({
+			id: firstRef.id,
+			lineage: firstRef.lineage,
+			status: firstRef.status,
+		});
+		expect(AgentRegistry.global().get("retry-exit-two")).toMatchObject({
+			id: secondRef.id,
+			lineage: secondRef.lineage,
+			status: secondRef.status,
+		});
 
 		expect(await reloadedRegistry.killAll(session)).toBe(2);
 		expect(reloadedRegistry.listIds(session)).toEqual([]);
@@ -1491,8 +1532,10 @@ describe("vibe session registry", () => {
 		const resumedSession = createSession({ manager: createManager(), sessionManager: reopened });
 		expect(reopened.buildSessionContext().mode).toBe("none");
 		expect(await VibeSessionRegistry.global().rehydrate(resumedSession)).toBe(0);
-		expect(AgentRegistry.global().get("retry-exit-one")).toMatchObject({ status: "aborted", session: null });
-		expect(AgentRegistry.global().get("retry-exit-two")).toMatchObject({ status: "aborted", session: null });
+		expect(AgentRegistry.global().get("retry-exit-one")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "retry-exit-one")?.session).toBeNull();
+		expect(AgentRegistry.global().get("retry-exit-two")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "retry-exit-two")?.session).toBeNull();
 	});
 
 	it("fail-closes workers when mode-exit rollback durability is indeterminate", async () => {
@@ -1525,7 +1568,8 @@ describe("vibe session registry", () => {
 
 		expect(failure).toBeInstanceOf(SessionPersistenceIndeterminateError);
 		expect(registry.listIds(session)).toEqual([]);
-		expect(AgentRegistry.global().get("indeterminate-exit")).toMatchObject({ status: "aborted", session: null });
+		expect(AgentRegistry.global().get("indeterminate-exit")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "indeterminate-exit")?.session).toBeNull();
 		expect(parentManager.buildSessionContext().mode).toBe("vibe");
 		const durableText = await fs.readFile(parentSessionFile, "utf8");
 		expect(durableText).toContain('"reason":"mode-exit"');
@@ -1552,9 +1596,9 @@ describe("vibe session registry", () => {
 			prompt: INITIAL_VIBE_TASK,
 		});
 		await jobs.getJob(spawned.jobId)!.promise;
-		const liveRef = AgentRegistry.global().get("explicit-io-failure");
-		if (!liveRef?.session) throw new Error("Expected a live worker ref");
-		const dispose = vi.spyOn(liveRef.session, "dispose");
+		const liveSession = lookupAgentRef(AgentRegistry.global(), "explicit-io-failure")?.session;
+		if (!liveSession) throw new Error("Expected a live worker ref");
+		const dispose = vi.spyOn(liveSession, "dispose");
 		await parentManager.flush();
 		const beforeSize = (await fs.stat(parentSessionFile)).size;
 		storage.failNextAppendWithPrefix(Object.assign(new Error("explicit tombstone ENOSPC"), { code: "ENOSPC" }), 23);
@@ -1564,7 +1608,8 @@ describe("vibe session registry", () => {
 		expect(dispose).toHaveBeenCalled();
 		expect(storage.failedWriterClosed).toBe(true);
 		expect(registry.listIds(session)).toEqual([]);
-		expect(AgentRegistry.global().get("explicit-io-failure")).toMatchObject({ status: "aborted", session: null });
+		expect(AgentRegistry.global().get("explicit-io-failure")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "explicit-io-failure")?.session).toBeNull();
 		await parentManager.flush();
 		expect((await fs.stat(parentSessionFile)).size).toBeGreaterThan(beforeSize);
 		const repairedLines = (await fs.readFile(parentSessionFile, "utf8")).trimEnd().split("\n");
@@ -1583,7 +1628,8 @@ describe("vibe session registry", () => {
 		persistedManagers.push(reopened);
 		const resumedSession = createSession({ manager: createManager(), sessionManager: reopened });
 		expect(await VibeSessionRegistry.global().rehydrate(resumedSession)).toBe(0);
-		expect(AgentRegistry.global().get("explicit-io-failure")).toMatchObject({ status: "aborted", session: null });
+		expect(AgentRegistry.global().get("explicit-io-failure")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "explicit-io-failure")?.session).toBeNull();
 	});
 
 	it("serializes explicit kill ahead of a failing mode exit so rollback cannot erase it", async () => {
@@ -1612,15 +1658,16 @@ describe("vibe session registry", () => {
 		const releaseExplicitFlush = Promise.withResolvers<void>();
 		const explicitTeardownStarted = Promise.withResolvers<void>();
 		const releaseExplicitTeardown = Promise.withResolvers<void>();
-		const lifecycle = AgentLifecycleManager.global();
-		const originalRelease = lifecycle.release.bind(lifecycle);
-		const releaseSpy = vi.spyOn(lifecycle, "release").mockImplementation(async (id, expected) => {
-			if (id === "overlap-explicit") {
-				explicitTeardownStarted.resolve();
-				await releaseExplicitTeardown.promise;
-			}
-			return originalRelease(id, expected);
-		});
+		const originalRelease = lifecycleBridge.releaseAgent;
+		const releaseSpy = vi
+			.spyOn(lifecycleBridge, "releaseAgent")
+			.mockImplementation(async (manager, id, expected, options) => {
+				if (id === "overlap-explicit") {
+					explicitTeardownStarted.resolve();
+					await releaseExplicitTeardown.promise;
+				}
+				return originalRelease(manager, id, expected, options);
+			});
 		let flushCalls = 0;
 		const flush = vi.spyOn(parentManager, "flush").mockImplementation(async () => {
 			flushCalls++;
@@ -1650,7 +1697,8 @@ describe("vibe session registry", () => {
 		expect(String(exitError)).toContain("overlapping mode exit failed");
 		expect(flushCalls).toBe(2);
 		expect(parentManager.buildSessionContext().mode).toBe("vibe");
-		expect(AgentRegistry.global().get("overlap-explicit")).toMatchObject({ status: "aborted", session: null });
+		expect(AgentRegistry.global().get("overlap-explicit")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "overlap-explicit")?.session).toBeNull();
 		expect(AgentRegistry.global().get("overlap-survivor")?.status).toBe("idle");
 
 		flush.mockRestore();
@@ -1661,8 +1709,10 @@ describe("vibe session registry", () => {
 		persistedManagers.push(reopened);
 		const resumedSession = createSession({ manager: createManager(), sessionManager: reopened });
 		expect(await VibeSessionRegistry.global().rehydrate(resumedSession)).toBe(1);
-		expect(AgentRegistry.global().get("overlap-explicit")).toMatchObject({ status: "aborted", session: null });
-		expect(AgentRegistry.global().get("overlap-survivor")).toMatchObject({ status: "parked", session: null });
+		expect(AgentRegistry.global().get("overlap-explicit")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "overlap-explicit")?.session).toBeNull();
+		expect(AgentRegistry.global().get("overlap-survivor")).toMatchObject({ status: "parked" });
+		expect(lookupAgentRef(AgentRegistry.global(), "overlap-survivor")?.session).toBeNull();
 	});
 
 	it("serializes overlapping mode exits so a later success cannot be revoked by an earlier failure", async () => {
@@ -1708,7 +1758,8 @@ describe("vibe session registry", () => {
 		expect(flushCalls).toBe(2);
 		expect(parentManager.buildSessionContext().mode).toBe("none");
 		expect(registry.listIds(session)).toEqual([]);
-		expect(AgentRegistry.global().get("overlap-mode-exit")).toMatchObject({ status: "aborted", session: null });
+		expect(AgentRegistry.global().get("overlap-mode-exit")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "overlap-mode-exit")?.session).toBeNull();
 		expect(await registry.killAll(session)).toBe(0);
 		expect(flushCalls).toBe(2);
 
@@ -1719,7 +1770,8 @@ describe("vibe session registry", () => {
 		persistedManagers.push(reopened);
 		const resumedSession = createSession({ manager: createManager(), sessionManager: reopened });
 		expect(await VibeSessionRegistry.global().rehydrate(resumedSession)).toBe(0);
-		expect(AgentRegistry.global().get("overlap-mode-exit")).toMatchObject({ status: "aborted", session: null });
+		expect(AgentRegistry.global().get("overlap-mode-exit")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "overlap-mode-exit")?.session).toBeNull();
 	});
 
 	it("persists mode none when re-exiting a rewound pre-exit vibe branch", async () => {
@@ -1835,16 +1887,18 @@ describe("vibe session registry", () => {
 		expect(resumedRegistry.listIds(resumedSession)).toEqual([]);
 		const explicitRef = AgentRegistry.global().get("explicitly-killed");
 		const modeExitRef = AgentRegistry.global().get("mode-exited");
-		expect(explicitRef).toMatchObject({ status: "aborted", session: null });
-		expect(modeExitRef).toMatchObject({ status: "aborted", session: null });
+		expect(explicitRef).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "explicitly-killed")?.session).toBeNull();
+		expect(modeExitRef).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "mode-exited")?.session).toBeNull();
 		if (!explicitRef?.sessionFile || !modeExitRef?.sessionFile) {
 			throw new Error("Tombstoned workers must retain readable transcript references");
 		}
 		expect((await SessionManager.peekSessionInit(explicitRef.sessionFile))?.init?.task).toBe(INITIAL_VIBE_TASK);
 		expect((await SessionManager.peekSessionInit(modeExitRef.sessionFile))?.init?.task).toBe(INITIAL_VIBE_TASK);
-		await expect(AgentLifecycleManager.global().ensureLive("explicitly-killed")).rejects.toThrow(
-			"aborted and cannot be revived",
-		);
+		await expect(
+			lifecycleBridge.ensureAgentLive(lifecycleBridge.getAgentLifecycleManager(), "explicitly-killed"),
+		).rejects.toThrow("aborted and cannot be revived");
 		await expect(
 			resumedRegistry.send(resumedSession, { session: "explicitly-killed", message: FOLLOW_UP_VIBE_TASK }),
 		).rejects.toThrow('Unknown vibe session "explicitly-killed"');
@@ -1854,8 +1908,10 @@ describe("vibe session registry", () => {
 	});
 
 	it("runSubagentFollowUpTurn continues the same live session and finalizes trace + yield response", async () => {
+		const registry = new AgentRegistry();
+		const lifecycle = lifecycleBridge.getAgentLifecycleManager(registry);
 		const fake = createFakeWorkerSession();
-		AgentRegistry.global().register({
+		registry.register({
 			id: "Worker",
 			displayName: "Worker",
 			kind: "sub",
@@ -1872,6 +1928,8 @@ describe("vibe session registry", () => {
 			agent,
 			message: "do the first thing",
 			onProgress: progress => progressSnapshots.push({ ...progress, recentTools: progress.recentTools.slice() }),
+			agentRegistry: registry,
+			agentLifecycle: lifecycle,
 		});
 		expect(first.exitCode).toBe(0);
 		expect(first.output).toContain("did the first thing");
@@ -1879,7 +1937,13 @@ describe("vibe session registry", () => {
 
 		// Second turn lands on the SAME session instance — prior context retained.
 		fake.setScript({ events: yieldTurnEvents({ report: "built on prior work" }), responseText: "second summary" });
-		const second = await executorModule.runSubagentFollowUpTurn({ id: "Worker", agent, message: "now extend it" });
+		const second = await executorModule.runSubagentFollowUpTurn({
+			id: "Worker",
+			agent,
+			message: "now extend it",
+			agentRegistry: registry,
+			agentLifecycle: lifecycle,
+		});
 		expect(second.exitCode).toBe(0);
 		expect(second.output).toContain("built on prior work");
 		expect(fake.prompts).toEqual(["do the first thing", "now extend it"]);
@@ -2066,7 +2130,10 @@ describe("vibe session registry", () => {
 
 		expect((await registry.kill(session, "persisted-kill")).cancelledTurn).toBe(true);
 		const terminal = AgentRegistry.global().get("persisted-kill");
-		expect(terminal).toMatchObject({ status: "aborted", session: null });
+		const owningRegistry = AgentRegistry.global();
+		const owningLifecycle = lifecycleBridge.getAgentLifecycleManager(owningRegistry);
+		expect(terminal).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "persisted-kill")?.session).toBeNull();
 
 		await executorModule.finalizeSubagentLifecycle({
 			id: "persisted-kill",
@@ -2076,10 +2143,18 @@ describe("vibe session registry", () => {
 			isolated: false,
 			agentIdleTtlMs: 0,
 			reviveSession: null,
+			agentRegistry: owningRegistry,
+			agentLifecycle: owningLifecycle,
 		});
-		expect(AgentRegistry.global().get("persisted-kill")).toBe(terminal);
-		expect(AgentRegistry.global().get("persisted-kill")).toMatchObject({ status: "aborted", session: null });
-		await expect(AgentLifecycleManager.global().ensureLive("persisted-kill")).rejects.toThrow("cannot be revived");
+		expect(AgentRegistry.global().get("persisted-kill")).toMatchObject({
+			id: terminal!.id,
+			lineage: terminal!.lineage,
+		});
+		expect(AgentRegistry.global().get("persisted-kill")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "persisted-kill")?.session).toBeNull();
+		await expect(lifecycleBridge.ensureAgentLive(owningLifecycle, "persisted-kill")).rejects.toThrow(
+			"cannot be revived",
+		);
 	});
 
 	it("does not terminalize a same-path replacement installed while the killed worker disposes", async () => {
@@ -2136,8 +2211,13 @@ describe("vibe session registry", () => {
 
 		expect((await registry.kill(session, "same-path-replacement")).cancelledTurn).toBe(true);
 		expect(replacement).toBeDefined();
-		expect(AgentRegistry.global().get("same-path-replacement")).toBe(replacement);
-		expect(replacement).toMatchObject({ status: "idle", session: replacementWorker!.session });
+		expect(AgentRegistry.global().get("same-path-replacement")).toMatchObject({
+			id: replacement!.id,
+			lineage: replacement!.lineage,
+			status: "idle",
+		});
+		expect(replacement).toMatchObject({ status: "idle" });
+		expect(lookupAgentRef(AgentRegistry.global(), "same-path-replacement")?.session).toBe(replacementWorker!.session);
 		expect(replacementWorker!.isDisposed()).toBe(false);
 	});
 
@@ -2190,7 +2270,8 @@ describe("vibe session registry", () => {
 		await workerStarted.promise;
 
 		expect((await registry.kill(session, "pre-init-kill")).cancelledTurn).toBe(true);
-		expect(AgentRegistry.global().get("pre-init-kill")).toMatchObject({ status: "aborted", session: null });
+		expect(AgentRegistry.global().get("pre-init-kill")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "pre-init-kill")?.session).toBeNull();
 		expect(
 			parentManager.getEntries().some(entry => {
 				if (entry.type !== "custom" || typeof entry.data !== "object" || entry.data === null) return false;
@@ -2205,7 +2286,8 @@ describe("vibe session registry", () => {
 		persistedManagers.push(reopened);
 		const resumedSession = createSession({ manager: createManager(), sessionManager: reopened });
 		expect(await VibeSessionRegistry.global().rehydrate(resumedSession)).toBe(0);
-		expect(AgentRegistry.global().get("pre-init-kill")).toMatchObject({ status: "aborted", session: null });
+		expect(AgentRegistry.global().get("pre-init-kill")).toMatchObject({ status: "aborted" });
+		expect(lookupAgentRef(AgentRegistry.global(), "pre-init-kill")?.session).toBeNull();
 	});
 
 	it("killAll terminates every session for the owner (mode-exit path)", async () => {

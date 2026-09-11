@@ -28,17 +28,31 @@ import type { Component } from "@oh-my-pi/pi-tui";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { IrcBus } from "../../irc/bus";
+import {
+	beginHubAdmission,
+	type HubAdmissionLifecycle,
+	type HubAdmissionStateTransaction,
+} from "../../internal/hub-admission";
+import type { DurableHubStore } from "../../internal/hub-durable-state";
+
+import {
+	isHubSessionAuthorityLive,
+	resolveHubAuthorityDurableStore,
+	resolveHubSessionAccess,
+	type HubSessionAccess,
+} from "../../internal/hub-authority";
 import type { Theme } from "../../modes/theme/theme";
 import hubDescription from "../../prompts/tools/hub.md" with { type: "text" };
 import type { AgentRegistry } from "../../registry/agent-registry";
-import type { ToolSession } from "..";
 import type { ToolActivitySummary } from "../renderers";
+import type { ToolSession } from "..";
 import {
 	buildJobResult,
 	executeCancel,
 	executeJobsSnapshot,
 	jobsRenderCall,
 	jobsRenderResult,
+	type HubJobScope,
 	noMatchingJobsResult,
 	nothingToWaitForResult,
 	resolvePollWindow,
@@ -65,7 +79,9 @@ import {
 	normalizeIrcTimeoutMs,
 } from "./messaging";
 import {
+	admitCoordinationResult,
 	DEFAULT_HUB_LIST_LIMIT,
+	type CoordinationDetails,
 	type HubDetails,
 	type HubRenderArgs,
 	hubErrorResult,
@@ -127,16 +143,60 @@ const hubSchema = type({
 });
 
 type HubParams = typeof hubSchema.infer;
+const PROGRESS_INTERVAL_MS = 500;
 
 interface MessagingDeps {
 	registry: AgentRegistry;
 	senderId: string;
 	settings: ToolSession["settings"];
-	/** Caller session file: direct sends refresh this root's persisted roster before resolving the target. */
 	sessionFileHint?: string | null;
+	bus: IrcBus;
+	rootId?: string;
 }
 
-const PROGRESS_INTERVAL_MS = 500;
+interface DurableRecoveryBatch {
+	readonly nextCursor?: number;
+}
+
+interface DurableRecoveryAttempt {
+	readonly journalPath: string;
+	complete: boolean;
+	error?: unknown;
+}
+
+const recoveryByJobManager = new WeakMap<object, DurableRecoveryAttempt>();
+const recoveryByBus = new WeakMap<object, DurableRecoveryAttempt>();
+
+function recoverDurableStateOnce(
+	target: object,
+	store: DurableHubStore,
+	recoveryByTarget: WeakMap<object, DurableRecoveryAttempt>,
+	recover: (cursor: number) => DurableRecoveryBatch,
+): void {
+	const prior = recoveryByTarget.get(target);
+	if (prior) {
+		if (prior.journalPath !== store.journalPath) throw new Error("Durable recovery target changed journals.");
+		if (prior.complete) return;
+		if (prior.error !== undefined) throw prior.error;
+		throw new Error("Durable recovery is already in progress.");
+	}
+	const attempt: DurableRecoveryAttempt = { journalPath: store.journalPath, complete: false };
+	recoveryByTarget.set(target, attempt);
+	try {
+		let cursor = 0;
+		for (;;) {
+			const recovered = recover(cursor);
+			if (recovered.nextCursor === undefined) break;
+			cursor = recovered.nextCursor;
+		}
+		attempt.complete = true;
+	} catch (error) {
+		attempt.error = error;
+		throw error;
+	}
+}
+
+type ActiveHubSessionAccess = Extract<HubSessionAccess, { kind: "authority" }>;
 
 /** Mutating process ops require exec approval; messaging, jobs, and inspection are read-only. */
 function hubApproval(params: unknown): ToolApprovalDecision {
@@ -161,6 +221,23 @@ function hubApproval(params: unknown): ToolApprovalDecision {
 		default:
 			// start / stop / restart and anything unrecognized.
 			return "exec";
+	}
+}
+
+function coordinationFingerprint(params: HubParams): string {
+	switch (params.op) {
+		case "send":
+			return JSON.stringify([params.op, params.to, params.message, params.replyTo, params.await, params.timeoutMs]);
+		case "wait":
+			return JSON.stringify([params.op, params.from, params.ids, params.timeoutMs]);
+		case "inbox":
+			return JSON.stringify([params.op, params.peek]);
+		case "list":
+			return JSON.stringify([params.op, params.status, params.limit]);
+		case "cancel":
+			return JSON.stringify([params.op, params.ids]);
+		default:
+			return JSON.stringify([params.op]);
 	}
 }
 
@@ -249,92 +326,181 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 	];
 
 	constructor(private readonly session: ToolSession) {
+		const access = resolveHubSessionAccess(session);
+		const durableStore = access.kind === "authority" ? resolveHubAuthorityDurableStore(access.authority) : undefined;
+		if (access.kind === "authority" && durableStore) {
+			const manager = session.asyncJobManager;
+			if (manager) {
+				manager.attachDurableStore(durableStore);
+				recoverDurableStateOnce(manager, durableStore, recoveryByJobManager, cursor =>
+					manager.recoverDurableState(cursor, 100),
+				);
+			}
+			const bus = access.authority.bus;
+			bus.attachDurableStore(durableStore);
+			recoverDurableStateOnce(bus, durableStore, recoveryByBus, cursor => bus.recoverDurableState(cursor, 100));
+		}
 		this.description = prompt.render(hubDescription);
 	}
 
-	/** Messaging deps when this session can address peers; null otherwise. */
-	#messaging(): MessagingDeps | null {
-		const registry = this.session.agentRegistry;
-		const senderId = this.session.getAgentId?.() ?? null;
-		if (!registry || !senderId) return null;
+	#coordinationAccess(): HubSessionAccess {
+		const access = resolveHubSessionAccess(this.session);
+		if (access.kind === "authority" && !isHubSessionAuthorityLive(access.authority, this.session)) {
+			return { kind: "invalid" };
+		}
+		return access;
+	}
+
+	#messaging(access: HubSessionAccess | undefined): MessagingDeps | null {
+		if (access?.kind !== "authority") return null;
+		const authority = access.authority;
 		return {
-			registry,
-			senderId,
+			registry: authority.registry,
+			senderId: authority.actorId,
 			settings: this.session.settings,
 			sessionFileHint: this.session.getSessionFile?.() ?? null,
+			bus: authority.bus,
+			rootId: authority.rootId,
 		};
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		params: HubParams,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<HubDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<HubDetails>> {
-		switch (params.op) {
-			case "list": {
-				const messaging = this.#messaging();
-				if (!messaging) return hubErrorResult("Peer messaging is unavailable in this session.", { op: "list" });
-				return executeList(
-					messaging.registry,
-					messaging.senderId,
-					{
-						status: params.status,
-						limit: params.limit,
-					},
-					this.session.getSessionFile(),
-				);
+		const coordinationOp =
+			params.op === "list" ||
+			params.op === "inbox" ||
+			params.op === "jobs" ||
+			params.op === "cancel" ||
+			(params.op === "send" && !params.name?.trim()) ||
+			(params.op === "wait" && !params.name?.trim());
+		const access = coordinationOp ? this.#coordinationAccess() : undefined;
+		let admission: HubAdmissionLifecycle | undefined;
+		if (access?.kind === "authority") {
+			try {
+				admission = beginHubAdmission(access.authority, this.session, toolCallId, coordinationFingerprint(params));
+			} catch (error) {
+				return hubErrorResult(error instanceof Error ? error.message : String(error), { op: params.op });
 			}
-			case "send": {
-				const toPeer = params.to?.trim();
-				const toProcess = params.name?.trim();
-				if (toPeer && toProcess) {
-					return hubErrorResult('`to` (peer) and `name` (process) are mutually exclusive for op="send".', {
-						op: "send",
-					});
-				}
-				if (toProcess) return this.#launch(params, "send", signal);
-				const messaging = this.#messaging();
-				if (!messaging) return hubErrorResult("Peer messaging is unavailable in this session.", { op: "send" });
-				return executeSend(messaging, params, signal);
-			}
-			case "inbox": {
-				const messaging = this.#messaging();
-				if (!messaging) return hubErrorResult("Peer messaging is unavailable in this session.", { op: "inbox" });
-				return executeInbox(messaging.registry, messaging.senderId, params.peek);
-			}
-			case "wait":
-				if (params.name?.trim()) return this.#launch(params, "wait", signal);
-				return this.#executeWait(params, signal, onUpdate);
-			case "cancel": {
-				const manager = this.session.asyncJobManager;
-				if (!manager) return this.#asyncDisabled("cancel");
-				if (!params.ids?.length) {
-					return hubErrorResult('`ids` is required for op="cancel".', { op: "cancel", jobs: [] });
-				}
-				return await executeCancel(this.session, manager, this.#ownerId(), params.ids);
-			}
-			case "jobs": {
-				const manager = this.session.asyncJobManager;
-				if (!manager) return this.#asyncDisabled("jobs");
-				return executeJobsSnapshot(this.session, manager, this.#ownerId());
-			}
-			case "start":
-			case "ps":
-			case "logs":
-			case "stop":
-			case "restart":
-			case "describe":
-				return this.#launch(params, params.op === "ps" ? "list" : params.op, signal);
-			default:
-				return hubErrorResult("Unknown hub op.", { op: params.op });
 		}
-	}
-
-	/** Job visibility scope: everything the calling agent owns (tests/SDK without an agent id see all). */
-	#ownerId(): string | undefined {
-		return this.session.getAgentId?.() ?? undefined;
+		let settlementStarted = false;
+		try {
+			const result = await (async (): Promise<AgentToolResult<HubDetails>> => {
+				if (access?.kind === "invalid") {
+					return hubErrorResult("Hub coordination authority is unavailable for this session.", { op: params.op });
+				}
+				switch (params.op) {
+					case "list": {
+						const messaging = this.#messaging(access);
+						if (!messaging)
+							return hubErrorResult("Peer messaging is unavailable in this session.", { op: "list" });
+						return executeList(
+							messaging.registry,
+							messaging.senderId,
+							{ status: params.status, limit: params.limit },
+							messaging.sessionFileHint,
+							messaging.bus,
+							messaging.rootId,
+							admission!.admissionTransaction,
+						);
+					}
+					case "send": {
+						const toPeer = params.to?.trim();
+						const toProcess = params.name?.trim();
+						if (toPeer && toProcess) {
+							return hubErrorResult('`to` (peer) and `name` (process) are mutually exclusive for op="send".', {
+								op: "send",
+							});
+						}
+						if (toProcess) return this.#launch(params, "send", signal);
+						const messaging = this.#messaging(access);
+						if (!messaging)
+							return hubErrorResult("Peer messaging is unavailable in this session.", { op: "send" });
+						return executeSend(messaging, params, signal, admission!.admissionTransaction);
+					}
+					case "inbox": {
+						const messaging = this.#messaging(access);
+						if (!messaging)
+							return hubErrorResult("Peer messaging is unavailable in this session.", { op: "inbox" });
+						return executeInbox(
+							messaging.registry,
+							messaging.senderId,
+							params.peek,
+							messaging.bus,
+							admission!.admissionTransaction,
+						);
+					}
+					case "wait":
+						if (params.name?.trim()) return this.#launch(params, "wait", signal);
+						if (access?.kind !== "authority") {
+							return hubErrorResult("Hub coordination authority is unavailable for this session.", {
+								op: "wait",
+							});
+						}
+						return this.#executeWait(params, access, admission!.admissionTransaction, signal, onUpdate);
+					case "cancel": {
+						if (access?.kind !== "authority") {
+							return hubErrorResult("Hub coordination authority is unavailable for this session.", {
+								op: "cancel",
+								jobs: [],
+							});
+						}
+						const manager = this.session.asyncJobManager;
+						if (!manager) return this.#asyncDisabled("cancel");
+						if (!params.ids?.length) {
+							return hubErrorResult('`ids` is required for op="cancel".', { op: "cancel", jobs: [] });
+						}
+						return executeCancel(
+							this.session,
+							manager,
+							access.authority.actorId,
+							admission!.admissionTransaction,
+							params.ids,
+						);
+					}
+					case "jobs": {
+						if (access?.kind !== "authority") {
+							return hubErrorResult("Hub coordination authority is unavailable for this session.", {
+								op: "jobs",
+								jobs: [],
+							});
+						}
+						const manager = this.session.asyncJobManager;
+						if (!manager) return this.#asyncDisabled("jobs");
+						return executeJobsSnapshot(
+							this.session,
+							manager,
+							access.authority.actorId,
+							admission!.admissionTransaction,
+						);
+					}
+					case "start":
+					case "ps":
+					case "logs":
+					case "stop":
+					case "restart":
+					case "describe":
+						return this.#launch(params, params.op === "ps" ? "list" : params.op, signal);
+					default:
+						return hubErrorResult("Unknown hub op.", { op: params.op });
+				}
+			})();
+			const admittedResult = admission
+				? admitCoordinationResult(admission.admissionTransaction, result as AgentToolResult<CoordinationDetails>)
+				: result;
+			if (admission) {
+				settlementStarted = true;
+				admission.transaction.commit();
+			}
+			return admittedResult;
+		} catch (error) {
+			if (admission && !settlementStarted) admission.transaction.abandon();
+			throw error;
+		}
 	}
 
 	#asyncDisabled(op: "cancel" | "jobs"): AgentToolResult<HubDetails> {
@@ -366,66 +532,74 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 	 */
 	async #executeWait(
 		params: HubParams,
+		access: ActiveHubSessionAccess,
+		transaction: HubAdmissionStateTransaction,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<HubDetails>,
 	): Promise<AgentToolResult<HubDetails>> {
-		const messaging = this.#messaging();
+		const messaging = this.#messaging(access);
 		const manager = this.session.asyncJobManager;
-		const ownerId = this.#ownerId();
+		const scope: HubJobScope = access.authority.actorId;
+		const ownerId = scope;
 		const from = params.from?.trim() || undefined;
 
 		// A message already buffered on the session satisfies the wait first.
 		if (messaging) {
-			const pending = drainPendingInbox(messaging.registry, messaging.senderId, from);
+			const pending = drainPendingInbox(messaging.registry, messaging.senderId, from, transaction);
 			if (pending) return messageResult(messaging.senderId, pending);
 		}
 
-		// Resolve which jobs to watch:
-		// - explicit `ids` → exactly those (owner-scoped; missing ids corrected);
-		// - omitted → every running job the caller owns.
 		const ids = params.ids;
-		const jobsToWatch = manager
-			? ids?.length
-				? visibleJobs(manager, ids, ownerId)
-				: manager.getRunningJobs(ownerId ? { ownerId } : undefined)
-			: [];
+		const jobsToWatch = transaction.select(() =>
+			manager
+				? ids?.length
+					? visibleJobs(manager, ids, scope)
+					: manager.getRunningJobs(ownerId ? { ownerId } : undefined)
+				: [],
+		);
 		if (manager && ids?.length && jobsToWatch.length === 0) {
-			return noMatchingJobsResult(this.session, ids);
+			return transaction.select(() => noMatchingJobsResult(this.session, ids));
 		}
 		const runningJobs = jobsToWatch.filter(j => j.status === "running");
 		if (manager && jobsToWatch.length > 0 && runningJobs.length === 0) {
 			// Every explicitly watched job already settled — immediate snapshot.
-			return buildJobResult(this.session, manager, "wait", jobsToWatch, []);
+			return buildJobResult(this.session, manager, scope, transaction, "wait", jobsToWatch, []);
 		}
 
 		if (!manager || runningJobs.length === 0) {
 			// No job legs: pure message wait — or nothing to block on at all.
-			if (!messaging) return nothingToWaitForResult(this.session);
+			if (!messaging) return transaction.select(() => nothingToWaitForResult(this.session));
 			// The bus mailbox is a separate store from the session-pending buffer
 			// drained above, and only `executeMessageWait` below ever reads it. A
 			// peer that sends and then stops running leaves its message queued
 			// there, so without this take the liveness gate would answer "nothing
 			// to wait for" while `hub inbox` hands back the very message being
 			// waited on. Single atomic take: the rest of the backlog stays queued.
-			const queued = IrcBus.global().take(messaging.senderId, from);
+			const queued = messaging.bus.take(messaging.senderId, from, transaction);
 			if (queued) return messageResult(messaging.senderId, queued);
 			if (!from) {
 				// A bare wait can only be satisfied by a running peer eventually
 				// sending something; with none, return the snapshot immediately
 				// instead of blocking a full message-timeout window.
-				const hasRunningPeer = messaging.registry
-					.listVisibleTo(messaging.senderId)
-					.some(ref => messaging.registry.isRunning(ref));
-				if (!hasRunningPeer) return nothingToWaitForResult(this.session);
+				const hasRunningPeer = transaction.select(() =>
+					messaging.registry
+						.listVisibleTo(messaging.senderId)
+						.some(
+							ref =>
+								(messaging.rootId === undefined || ref.lineage?.rootId === messaging.rootId) &&
+								messaging.registry.isRunning(ref),
+						),
+				);
+				if (!hasRunningPeer) return transaction.select(() => nothingToWaitForResult(this.session));
 			}
-			return executeMessageWait(messaging, { from, timeoutMs: params.timeoutMs }, signal);
+			return executeMessageWait(messaging, { from, timeoutMs: params.timeoutMs }, signal, transaction);
 		}
 
 		// Wait window: explicit timeout wins (0 = no window); otherwise the
 		// `async.pollWaitDuration` fixed value or smart ladder. The ladder
 		// starts at the floor and climbs as the agent waits in a tight loop,
 		// then resets once it steps away (see AsyncJobManager.nextPollWaitMs).
-		const window = resolvePollWindow(this.session, manager, ownerId);
+		const window = transaction.select(() => resolvePollWindow(this.session, manager, ownerId));
 		const windowMs = params.timeoutMs !== undefined ? normalizeIrcTimeoutMs(params.timeoutMs) : window.waitMs;
 		const usedSmartWindow = window.smart && params.timeoutMs === undefined;
 
@@ -438,16 +612,13 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		let removeBusAbortListener: (() => void) | undefined;
 		const busLeg =
 			messaging && busAbort
-				? IrcBus.global()
-						.wait(messaging.senderId, { from }, 0, busAbort.signal)
-						.then(
-							message => ({ message, error: null as Error | null }),
-							error => ({
-								message: null,
-								error:
-									error === busCancelled ? null : error instanceof Error ? error : new Error(String(error)),
-							}),
-						)
+				? messaging.bus.wait(messaging.senderId, { from }, 0, busAbort.signal, { transaction }).then(
+						message => ({ message, error: null as Error | null }),
+						error => ({
+							message: null,
+							error: error === busCancelled ? null : error instanceof Error ? error : new Error(String(error)),
+						}),
+					)
 				: undefined;
 		if (busLeg) racePromises.push(busLeg);
 		if (busAbort && signal) {
@@ -467,14 +638,45 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		if (timeoutHandle) racePromises.push(timeoutPromise);
 
 		const watchedJobIds = runningJobs.map(job => job.id);
-		manager.watchJobs(watchedJobIds);
+		const durableWaiterId = crypto.randomUUID();
+		const durableDeadlineAt = windowMs > 0 ? Date.now() + windowMs : null;
+		const durableWait = (state: "waiting" | "committed" | "abandoned"): void =>
+			transaction.recordWait(durableWaiterId, {
+				state,
+				mode: messaging ? "jobs-and-mailbox" : "jobs",
+				windowMs,
+				deadlineAt: durableDeadlineAt,
+				waiterId: durableWaiterId,
+				jobIds: watchedJobIds.slice(0, 100),
+			});
+		transaction.enlist({
+			hold: () => {
+				durableWait("waiting");
+				manager.watchJobs(watchedJobIds);
+			},
+			commit: () => {
+				manager.unwatchJobs(watchedJobIds);
+				durableWait("committed");
+			},
+			rollback: () => {
+				manager.unwatchJobs(watchedJobIds);
+				durableWait("abandoned");
+			},
+			abandon: () => {
+				manager.unwatchJobs(watchedJobIds);
+				durableWait("abandoned");
+			},
+		});
 
 		const emitProgress = () => {
 			if (!onUpdate) return;
-			onUpdate({
+			const progressJobs = transaction.select(() => snapshotJobs(this.session, jobsToWatch));
+			const progress = admitCoordinationResult(transaction, {
 				content: [{ type: "text", text: "" }],
-				details: { op: "wait", jobs: snapshotJobs(this.session, jobsToWatch) },
+				details: { op: "wait", jobs: progressJobs },
 			});
+			transaction.markEffect();
+			onUpdate(progress);
 		};
 		const progressTimer = onUpdate ? setInterval(emitProgress, PROGRESS_INTERVAL_MS) : undefined;
 		emitProgress();
@@ -494,15 +696,13 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 				await Promise.race(racePromises);
 			}
 		} finally {
-			manager.unwatchJobs(watchedJobIds);
-			if (timeoutHandle) clearTimeout(timeoutHandle);
-			if (progressTimer) clearInterval(progressTimer);
+			clearTimeout(timeoutHandle);
+			clearInterval(progressTimer);
 			busAbort?.abort(busCancelled);
 			removeBusAbortListener?.();
 			if (usedSmartWindow) {
-				// Reset the idle-gap clock: escalate if the agent waits again soon,
-				// drop back to the floor once it goes quiet for a while.
-				manager.recordPollWaitEnd(ownerId);
+				// Reset the idle-gap clock inside the same admitted observation.
+				transaction.select(() => manager.recordPollWaitEnd(ownerId));
 			}
 		}
 
@@ -514,7 +714,7 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 			if (settled.message) return messageResult(messaging.senderId, settled.message);
 		}
 
-		return buildJobResult(this.session, manager, "wait", jobsToWatch, []);
+		return buildJobResult(this.session, manager, scope, transaction, "wait", jobsToWatch, []);
 	}
 }
 

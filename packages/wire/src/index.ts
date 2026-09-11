@@ -235,6 +235,67 @@ export interface SessionState {
 	isAborting?: boolean;
 }
 
+/** Stable-order bounded display list. `omittedCount` reports source items excluded by validation or caps. */
+export interface BoundedList<T> {
+	readonly items: readonly T[];
+	readonly omittedCount: number;
+}
+
+/** Sanitized display-only target involved in a permission denial. */
+export interface PermissionTargetSummary {
+	readonly kind: "path" | "uri" | "network" | "process" | "opaque";
+	/** At most 512 UTF-8 bytes after sanitization. */
+	readonly display: string;
+}
+
+/** Bounded, display-only permission denial. It is never an authority input. */
+export interface PermissionDenialDetails {
+	readonly kind: "subagent_permission_denial";
+	readonly code:
+		| "tool-deny"
+		| "tool-not-allowed"
+		| "path-deny"
+		| "path-not-allowed"
+		| "guardrail"
+		| "artifact-root";
+	/** At most 128 UTF-8 bytes after sanitization. */
+	readonly tool: string;
+	/** At most 16 targets. */
+	readonly targets: BoundedList<PermissionTargetSummary>;
+	/** At most 512 UTF-8 bytes after sanitization. */
+	readonly matched: string;
+	/** At most 4096 UTF-8 bytes after sanitization. */
+	readonly reason: string;
+}
+
+/** Sanitized bounded permission metadata for display and transport only. */
+export interface EffectivePermissionSummary {
+	readonly mode: "off" | "suggest" | "enforce";
+	/** At most 16 items, each at most 128 UTF-8 bytes. */
+	readonly profiles: BoundedList<string>;
+	/** At most 32 clauses. */
+	readonly clauses: BoundedList<{
+		/** At most 32 items, each at most 128 UTF-8 bytes. */
+		readonly tools: BoundedList<string>;
+		/** At most 16 sets of 16 patterns, each pattern at most 512 UTF-8 bytes. */
+		readonly allowPathSets: BoundedList<BoundedList<string>>;
+	}>;
+	/** At most 32 items, each at most 128 UTF-8 bytes. */
+	readonly denyTools: BoundedList<string>;
+	/** At most 32 items, each at most 512 UTF-8 bytes. */
+	readonly denyPaths: BoundedList<string>;
+	readonly guardrails: {
+		readonly noNetwork: boolean;
+		readonly secretsBlind: boolean;
+	};
+	readonly intrinsicTools: {
+		readonly yield: true;
+		readonly reportToolIssue: boolean;
+	};
+	/** At most 64 items. */
+	readonly recentDenials: BoundedList<PermissionDenialDetails>;
+}
+
 export interface AgentSnapshot {
 	id: string;
 	displayName: string;
@@ -250,6 +311,7 @@ export interface AgentSnapshot {
 	resolvedModelIsFallback?: boolean;
 	requestedPermissionProfiles?: string[];
 	effectivePermissionProfiles?: string[];
+	permissionSummary?: EffectivePermissionSummary;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

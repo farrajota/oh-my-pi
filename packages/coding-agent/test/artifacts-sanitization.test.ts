@@ -19,38 +19,51 @@ describe("ArtifactManager tool-type sanitization", () => {
 		}
 	});
 
-	// External tool names (MCP servers, extensions, RPC hosts) are arbitrary; the
-	// artifact filename is `${id}.${toolType}.log`. Path separators or traversal
-	// in the name must never let the file escape the artifacts directory.
-	it("never lets a path-hostile tool name escape the artifacts directory", async () => {
+	it("confines published artifacts for path-hostile tool names", async () => {
 		const dir = freshDir();
 		const mgr = new ArtifactManager(dir);
-		for (const hostile of ["../../etc/passwd", "mcp__srv/peek", "a\\b\\c", "..", "./escape", "tool name"]) {
-			const { path: filePath } = await mgr.allocatePath(hostile);
-			expect(path.dirname(filePath)).toBe(dir);
-			expect(path.basename(filePath)).toMatch(/^\d+\.[A-Za-z0-9_-]+\.log$/);
+		const cases = [
+			["../../etc/passwd", "etc_passwd"],
+			["mcp__srv/peek", "mcp__srv_peek"],
+			["a\\b\\c", "a_b_c"],
+			["..", "tool"],
+			["./escape", "escape"],
+			["tool name", "tool_name"],
+		] as const;
+		for (const [index, [hostile, suffix]] of cases.entries()) {
+			const content = `content-${index}`;
+			const id = await mgr.save(content, hostile);
+			const filePath = await mgr.getPath(id);
+			expect(filePath).not.toBeNull();
+			expect(path.dirname(filePath as string)).toBe(dir);
+			expect(path.basename(filePath as string)).toBe(`${id}.${suffix}.log`);
+			expect(await Bun.file(filePath as string).text()).toBe(content);
+			expect(await mgr.listFiles()).toContain(`${id}.${suffix}.log`);
 		}
 	});
 
-	it("caps very long tool names so the filename stays within filesystem limits", async () => {
+	it("caps the published logical tool suffix within filesystem limits", async () => {
 		const mgr = new ArtifactManager(freshDir());
-		const { path: filePath } = await mgr.allocatePath("x".repeat(500));
+		const id = await mgr.save("content", "x".repeat(500));
+		const filePath = await mgr.getPath(id);
+		expect(filePath).not.toBeNull();
 		const segment = path
-			.basename(filePath)
-			.replace(/^\d+\./, "")
+			.basename(filePath as string)
+			.replace(new RegExp(`^${id}\\.`), "")
 			.replace(/\.log$/, "");
 		expect(segment.length).toBeLessThanOrEqual(64);
 	});
 
-	it("falls back to a stable segment when nothing survives sanitization", async () => {
+	it("publishes a stable fallback suffix when sanitization removes everything", async () => {
 		const mgr = new ArtifactManager(freshDir());
-		const { path: filePath } = await mgr.allocatePath("/../");
-		expect(path.basename(filePath)).toMatch(/^\d+\.tool\.log$/);
+		const id = await mgr.save("content", "/../");
+		const filePath = await mgr.getPath(id);
+		expect(filePath).not.toBeNull();
+		expect(path.basename(filePath as string)).toBe(`${id}.tool.log`);
+		expect(await mgr.listFiles()).toEqual([`${id}.tool.log`]);
 	});
 
-	// Recovery is keyed on the numeric id, so sanitizing the type segment must not
-	// break round-tripping the full content back through getPath.
-	it("round-trips full content through save/getPath despite a hostile name", async () => {
+	it("round-trips full content through governed publication despite a hostile name", async () => {
 		const dir = freshDir();
 		const mgr = new ArtifactManager(dir);
 		const id = await mgr.save("FULL-ORIGINAL-CONTENT", "mcp__srv/peek_topic");

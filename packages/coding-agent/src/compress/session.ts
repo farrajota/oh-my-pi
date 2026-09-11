@@ -9,8 +9,12 @@ import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../config/model-registry";
 import { formatModelString, resolveCliModel } from "../config/model-resolver";
 import { Settings } from "../config/settings";
-import { createAgentSession, discoverAuthStorage } from "../sdk";
+import { createAgentRootSession } from "../internal/agent-registry-bridge";
+import { AgentRegistry } from "../registry/agent-registry";
+import { registryDurableStateForSession } from "../registry/durable-state";
+import { discoverAuthStorage } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
+import { SessionManager } from "../session/session-manager";
 import systemPrompt from "./prompts/system.md" with { type: "text" };
 import type { CompressProtocol } from "./protocol";
 
@@ -38,11 +42,16 @@ export async function createCompressSession(options: {
 	if (resolved && (resolved.error || !resolved.model)) {
 		throw new Error(resolved.error ?? `Model "${options.model}" not found`);
 	}
-	const { session } = await createAgentSession({
+	const sessionManager = SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, settings.getAgentDir()));
+	const sessionFile = sessionManager.getSessionFile();
+	if (!sessionFile) throw new Error("Compress restricted startup requires a persisted session file.");
+	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
+	const { session } = await createAgentRootSession(registry, {
 		cwd,
 		settings,
 		authStorage,
 		modelRegistry,
+		sessionManager,
 		...(resolved?.model ? { model: resolved.model } : {}),
 		customTools: [options.protocol.rewriteTool(), options.protocol.approveTool()],
 		toolNames: ["rewrite", "approve"],

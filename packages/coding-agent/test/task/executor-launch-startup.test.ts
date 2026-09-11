@@ -6,10 +6,18 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createSessionDefaults } from "../helpers/session-defaults";
+
+function createAuthorityFixture() {
+	const agentRegistry = new AgentRegistry();
+	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+		sdkModule.createAgentSession({ ...options, agentRegistry });
+	return { agentRegistry, createAuthoritySession };
+}
 
 const authStorages: AuthStorage[] = [];
 const tempDirs: TempDir[] = [];
@@ -77,6 +85,7 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 		return result;
 	});
 
+	const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 	const run = runSubprocess({
 		cwd: tempDir.path(),
 		artifactsDir: tempDir.path(),
@@ -87,6 +96,8 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 		authStorage,
 		enableLsp: false,
 		enableIrc: false,
+		agentRegistry,
+		createAuthoritySession,
 	});
 	await openStarted.promise;
 

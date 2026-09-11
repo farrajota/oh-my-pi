@@ -1,7 +1,9 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import type { HubAdmissionStateTransaction } from "../internal/hub-admission";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "../session/streaming-output";
 import type { StructuredSubagentOutput } from "../task/types";
+import { DurableHubStore, type HubDurableRecord } from "../internal/hub-durable-state";
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -30,6 +32,7 @@ const DEFAULT_MAX_RUNNING_JOBS = 15;
 const TERMINAL_HISTORY_BUCKET_LIMIT = 15;
 /** Abort reason used only when the owning session shuts down the entire manager. */
 export const ASYNC_JOB_MANAGER_SHUTDOWN_REASON = Symbol("AsyncJobManager shutdown");
+const DURABLE_JOB_RESULT_BYTES = 48 * 1024;
 
 /**
  * Adaptive ("smart") `hub` poll-wait ladder (ms). A tight poll loop climbs
@@ -218,6 +221,9 @@ export interface AsyncJobManagerOptions {
 	 * a real-time wait.
 	 */
 	retainedArtifactsCleanupMaxWaitMs?: number;
+	/** Records-only append journal. Startup recovery is explicit via recoverDurableState(). */
+	durableJournalPath?: string;
+	durableStore?: DurableHubStore;
 }
 
 interface AsyncJobDelivery {
@@ -246,6 +252,14 @@ export interface AsyncJobDeliveryState {
 	pendingJobIds: string[];
 }
 
+declare const asyncJobResultObservationBrand: unique symbol;
+
+/** Opaque read-only view of results held by one Hub admission transaction. */
+export interface AsyncJobResultObservation {
+	readonly [asyncJobResultObservationBrand]: never;
+	readonly jobIds: readonly string[];
+}
+
 export interface AsyncJobReapResult {
 	settled: boolean;
 	pendingJobIds: string[];
@@ -261,6 +275,40 @@ export interface AsyncJobRegisterOptions {
 	onProgress?: (text: string, details?: AsyncJobDetails) => void | Promise<void>;
 	/** Register the job in queued state; see {@link AsyncJob.queued}. */
 	queued?: boolean;
+}
+
+export interface AsyncJobRecoveryBatch {
+	readonly processed: number;
+	readonly restoredJobIds: readonly string[];
+	readonly quarantinedJobIds: readonly string[];
+	readonly nextCursor?: number;
+}
+
+interface DurableJobPayload {
+	readonly event: "registered" | "terminal";
+	readonly type: AsyncJobType;
+	readonly status: AsyncJob["status"];
+	readonly label: string;
+	readonly startTime: number;
+	readonly endTime?: number;
+	readonly ownerId?: string;
+	readonly agentId?: string;
+	readonly queued: boolean;
+	readonly output?: {
+		readonly source: "result" | "error";
+		readonly text: string;
+		readonly byteCount: number;
+		readonly sha256: string;
+		readonly truncated: boolean;
+	};
+}
+
+interface DurableRecoveryState {
+	readonly jobs: Map<string, HubDurableRecord>;
+	readonly deliveries: Map<string, HubDurableRecord>;
+	readonly consumed: Set<string>;
+	readonly quarantined: Set<string>;
+	readonly pins: Map<string, HubDurableRecord>;
 }
 
 /**
@@ -301,7 +349,11 @@ export class AsyncJobManager {
 	readonly #suppressedDeliveries = new Set<string>();
 	readonly #watchedJobs = new Set<string>();
 	readonly #consumedJobResults = new Set<string>();
+	readonly #resultPins = new Map<string, Set<string>>();
+
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
+	readonly #resultObservationOwnership = new WeakMap<object, (jobId: string) => boolean>();
+	readonly #pendingResultObservations = new Set<string>();
 	readonly #pollEscalation = new Map<string | undefined, PollEscalationState>();
 	readonly #deliverySinks = new Map<string, AsyncJobDeliverySink>();
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
@@ -309,6 +361,10 @@ export class AsyncJobManager {
 	readonly #retentionMs: number;
 	readonly #retainedArtifactsCleanupGraceMs: number;
 	readonly #retainedArtifactsCleanupMaxWaitMs: number;
+	#durableStore: DurableHubStore | undefined;
+	readonly #jobIncarnations = new Map<string, string>();
+	#durableRecovery: DurableRecoveryState | undefined;
+
 	#deliveryLoop: Promise<void> | undefined;
 	#deliveryQueueChanged = Promise.withResolvers<void>();
 	#disposed = false;
@@ -338,6 +394,17 @@ export class AsyncJobManager {
 			0,
 			Math.floor(options.retainedArtifactsCleanupMaxWaitMs ?? RETAINED_ARTIFACTS_CLEANUP_MAX_WAIT_MS),
 		);
+		this.#durableStore =
+			options.durableStore ??
+			(options.durableJournalPath ? new DurableHubStore(options.durableJournalPath) : undefined);
+	}
+
+	/** Attach one journal before registration/recovery; changing journals fails closed. */
+	attachDurableStore(store: DurableHubStore): void {
+		if (this.#durableStore && this.#durableStore.journalPath !== store.journalPath) {
+			throw new Error("Async job manager already has a different durable store.");
+		}
+		this.#durableStore ??= store;
 	}
 
 	/** True when the running-job count has reached the configured cap. */
@@ -378,7 +445,9 @@ export class AsyncJobManager {
 			);
 		}
 
-		const id = this.#resolveJobId(options?.id);
+		const incarnationId = crypto.randomUUID();
+		const id = this.#resolveJobId(options?.id, incarnationId);
+		this.#jobIncarnations.set(id, incarnationId);
 		this.#suppressedDeliveries.delete(id);
 		this.#consumedJobResults.delete(id);
 		const abortController = new AbortController();
@@ -396,6 +465,8 @@ export class AsyncJobManager {
 			agentId: options?.agentId,
 			queued: options?.queued === true,
 		};
+		this.#jobs.set(id, job);
+		this.#persistJob(job, "registered");
 
 		const reportProgress = async (text: string, details?: AsyncJobDetails): Promise<void> => {
 			const latest = truncateTail(text, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
@@ -419,7 +490,10 @@ export class AsyncJobManager {
 					signal: abortController.signal,
 					reportProgress,
 					markRunning: () => {
-						if (job.status === "running") job.queued = false;
+						if (job.status === "running" && job.queued) {
+							job.queued = false;
+							this.#persistJob(job, "registered");
+						}
 					},
 				});
 				const text = typeof outcome === "string" ? outcome : outcome.text;
@@ -427,12 +501,14 @@ export class AsyncJobManager {
 				if (structured) job.structured = structured;
 				if (job.status === "cancelled") {
 					job.resultText = text;
+					this.#persistJob(job, "terminal");
 					this.#recordTerminalHistory(job);
 					return;
 				}
 				job.status = "completed";
 				job.endTime = Date.now();
 				job.resultText = text;
+				this.#persistJob(job, "terminal");
 				this.#recordTerminalHistory(job);
 				this.#enqueueDelivery(id, text);
 				this.#scheduleEviction(id);
@@ -440,6 +516,7 @@ export class AsyncJobManager {
 				if (error instanceof AsyncJobError && error.structured) job.structured = error.structured;
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
+					this.#persistJob(job, "terminal");
 					this.#recordTerminalHistory(job);
 					return;
 				}
@@ -447,13 +524,13 @@ export class AsyncJobManager {
 				job.status = "failed";
 				job.endTime = Date.now();
 				job.errorText = errorText;
+				this.#persistJob(job, "terminal");
 				this.#recordTerminalHistory(job);
 				this.#enqueueDelivery(id, errorText);
 				this.#scheduleEviction(id);
 			}
 		})();
 
-		this.#jobs.set(id, job);
 		return id;
 	}
 
@@ -469,6 +546,8 @@ export class AsyncJobManager {
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
 		job.endTime = Date.now();
+		this.#persistJob(job, "terminal");
+		this.#persistEvent("cancel", job.id, { state: "committed", terminalStatus: "cancelled" });
 		this.#recordTerminalHistory(job);
 		job.abortController.abort();
 		this.#scheduleEviction(id);
@@ -494,6 +573,9 @@ export class AsyncJobManager {
 				text: job.latestText ?? "",
 				truncated: job.latestTextTruncated ?? false,
 			};
+		}
+		if (this.#consumedJobResults.has(id)) {
+			return { id, status: job.status, source: "none", text: "", truncated: false };
 		}
 
 		const sourceText =
@@ -587,6 +669,35 @@ export class AsyncJobManager {
 		};
 	}
 
+	/** Hold retained result resources until this exact terminal result is published. */
+	pinJobResult(jobId: string, pinId: string): boolean {
+		const job = this.#jobs.get(jobId);
+		const normalized = pinId.trim();
+		if (!job || job.status === "running" || !normalized) return false;
+		let pins = this.#resultPins.get(jobId);
+		if (!pins) {
+			pins = new Set();
+			this.#resultPins.set(jobId, pins);
+		}
+		if (pins.has(normalized)) return true;
+		pins.add(normalized);
+		this.#persistEvent("pin", jobId, { state: "held", pinId: normalized.slice(0, 256) });
+		return true;
+	}
+
+	/** Release is refused until delivery/foreground consumption committed. */
+	releaseJobResultPin(jobId: string, pinId: string): boolean {
+		if (!this.#consumedJobResults.has(jobId)) return false;
+		const pins = this.#resultPins.get(jobId);
+		if (!pins?.delete(pinId.trim())) return false;
+		this.#persistEvent("pin", jobId, { state: "released", pinId: pinId.trim().slice(0, 256) });
+		if (pins.size === 0) {
+			this.#resultPins.delete(jobId);
+			this.#scheduleEviction(jobId);
+		}
+		return true;
+	}
+
 	hasPendingDeliveries(filter?: AsyncJobFilter): boolean {
 		return this.getDeliveryState(filter).queued > 0;
 	}
@@ -655,12 +766,93 @@ export class AsyncJobManager {
 		return before - this.#deliveries.length;
 	}
 
-	/**
-	 * Mark settled job results as recovered by a foreground snapshot.
-	 *
-	 * Suppresses queued delivery and marks retained bodies as consumed so later
-	 * snapshots report execution state without replaying the same result.
-	 */
+	/** Atomically reserve unseen settled results for one exact Hub admission attempt. */
+	observeJobResults(
+		transaction: HubAdmissionStateTransaction,
+		jobIds: string[],
+		filter?: AsyncJobFilter,
+	): AsyncJobResultObservation {
+		const candidates = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
+		const held = new Set<string>();
+		let observedJobIds: readonly string[] = Object.freeze([]);
+		let state: "fresh" | "holding" | "held" | "finished" = "fresh";
+		const releaseHeld = (consume: boolean): void => {
+			if (state === "finished") return;
+			state = "finished";
+			for (const id of held) this.#pendingResultObservations.delete(id);
+			if (consume) {
+				for (const id of held) this.#consumeJobResult(id, false);
+				this.acknowledgeDeliveries([...held]);
+			} else {
+				this.resumeDeliveries([...held]);
+			}
+		};
+		const observation = Object.freeze({
+			get jobIds(): readonly string[] {
+				return observedJobIds;
+			},
+		}) as AsyncJobResultObservation;
+		this.#resultObservationOwnership.set(observation as object, jobId => state === "held" && held.has(jobId));
+		transaction.enlist({
+			hold: () => {
+				if (state !== "fresh") throw new Error("Async job result observation is not fresh.");
+				state = "holding";
+				try {
+					for (const id of candidates) {
+						const job = this.getJob(id, filter);
+						if (
+							!job ||
+							job.status === "running" ||
+							this.#consumedJobResults.has(id) ||
+							this.#pendingResultObservations.has(id) ||
+							this.#inFlightDeliveries.some(delivery => delivery.jobId === id)
+						)
+							continue;
+						if (job.resultText === undefined && job.errorText === undefined) continue;
+						this.#pendingResultObservations.add(id);
+						this.#suppressedDeliveries.add(id);
+						held.add(id);
+					}
+					observedJobIds = Object.freeze([...held]);
+					state = "held";
+				} catch (error) {
+					for (const id of held) this.#pendingResultObservations.delete(id);
+					this.resumeDeliveries([...held]);
+					held.clear();
+					state = "fresh";
+					throw error;
+				}
+			},
+			prepare: () => {
+				if (state !== "held") throw new Error("Async job result observation is not held.");
+				const mutations: Array<{
+					kind: "consumption" | "delivery";
+					entityId: string;
+					incarnationId: string;
+					payload: Readonly<Record<string, unknown>>;
+				}> = [];
+				for (const id of held) {
+					const incarnationId = this.#jobIncarnations.get(id);
+					if (!incarnationId) continue;
+					mutations.push({ kind: "consumption", entityId: id, incarnationId, payload: { state: "committed" } });
+					mutations.push({ kind: "delivery", entityId: id, incarnationId, payload: { state: "suppressed" } });
+				}
+				return mutations;
+			},
+			apply: () => releaseHeld(true),
+			commit: () => releaseHeld(true),
+			rollback: () => releaseHeld(false),
+			abandon: () => releaseHeld(false),
+		});
+		return observation;
+	}
+
+	/** Validate exact manager membership before an observed result can be projected. */
+	ownsObservedJobResult(observation: AsyncJobResultObservation, jobId: string): boolean {
+		return this.#resultObservationOwnership.get(observation as object)?.(jobId) === true;
+	}
+
+	/** Consume settled results immediately; retained for non-Hub callers. */
 	consumeJobResults(jobIds: string[]): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		this.acknowledgeDeliveries(uniqueJobIds);
@@ -714,6 +906,8 @@ export class AsyncJobManager {
 		for (const job of this.getRunningJobs(filter)) {
 			job.status = "cancelled";
 			job.endTime = Date.now();
+			this.#persistJob(job, "terminal");
+			this.#persistEvent("cancel", job.id, { state: "committed", terminalStatus: "cancelled" });
 			this.#recordTerminalHistory(job);
 			job.abortController.abort(reason);
 			this.#scheduleEviction(job.id);
@@ -732,12 +926,167 @@ export class AsyncJobManager {
 	 */
 	evictCompletedJobs(filter?: AsyncJobFilter): number {
 		let evicted = 0;
+
 		for (const job of this.#filterJobs(this.#jobs.values(), filter)) {
 			if (job.status !== "completed" && job.status !== "failed") continue;
 			this.acknowledgeDeliveries([job.id]);
 			if (this.#evictJob(job.id)) evicted += 1;
 		}
 		return evicted;
+	}
+	/**
+	 * Replay at most 100 custody records. No recovered capability, observer, or
+	 * running body is recreated; only exact terminal incarnations are exposed.
+	 */
+	recoverDurableState(cursor = 0, limit = 100): AsyncJobRecoveryBatch {
+		if (!this.#durableStore) return { processed: 0, restoredJobIds: [], quarantinedJobIds: [] };
+		const batch = this.#durableStore.recover(cursor, limit);
+		this.#durableRecovery ??= {
+			jobs: new Map(),
+			deliveries: new Map(),
+			consumed: new Set(),
+			pins: new Map(),
+			quarantined: new Set(),
+		};
+		const recovery = this.#durableRecovery;
+		for (const invalid of batch.quarantined) recovery.quarantined.add(`journal:${invalid.cursor}`);
+		for (const record of batch.records) {
+			const exactId = `${record.entityId}\u0000${record.incarnationId}`;
+			if (record.kind === "job") {
+				const prior = recovery.jobs.get(record.entityId);
+				if (prior && prior.incarnationId !== record.incarnationId) {
+					recovery.jobs.delete(record.entityId);
+					recovery.quarantined.add(record.entityId);
+					continue;
+				}
+				if (!recovery.quarantined.has(record.entityId)) recovery.jobs.set(record.entityId, record);
+			} else if (record.kind === "delivery") {
+				recovery.deliveries.set(exactId, record);
+			} else if (record.kind === "consumption" && record.payload.state === "committed") {
+				recovery.consumed.add(exactId);
+			} else if (record.kind === "pin" && typeof record.payload.pinId === "string") {
+				recovery.pins.set(`${exactId}\u0000${record.payload.pinId}`, record);
+			}
+		}
+		if (batch.nextCursor !== undefined) {
+			return {
+				processed: batch.records.length + batch.quarantined.length,
+				restoredJobIds: [],
+				quarantinedJobIds: [...recovery.quarantined],
+				nextCursor: batch.nextCursor,
+			};
+		}
+
+		const restoredJobIds: string[] = [];
+		for (const [id, record] of recovery.jobs) {
+			if (recovery.quarantined.has(id) || this.#jobs.has(id)) {
+				recovery.quarantined.add(id);
+				continue;
+			}
+			const payload = record.payload as unknown as DurableJobPayload;
+			if (
+				payload.event !== "terminal" ||
+				!(["completed", "failed", "cancelled"] as string[]).includes(payload.status) ||
+				typeof payload.label !== "string" ||
+				typeof payload.startTime !== "number"
+			) {
+				recovery.quarantined.add(id);
+				this.#durableStore.append("job", id, record.incarnationId, {
+					...record.payload,
+					event: "quarantined",
+					reason: "non-terminal-or-invalid-snapshot",
+				});
+				continue;
+			}
+			const output = payload.output;
+			if (
+				output &&
+				(Buffer.byteLength(output.text) !== output.byteCount ||
+					new Bun.CryptoHasher("sha256").update(output.text).digest("hex") !== output.sha256)
+			) {
+				recovery.quarantined.add(id);
+				this.#durableStore.append("job", id, record.incarnationId, {
+					...record.payload,
+					event: "quarantined",
+					reason: "output-integrity-failed",
+				});
+				continue;
+			}
+			const job: AsyncJob = {
+				id,
+				type: payload.type,
+				status: payload.status,
+				startTime: payload.startTime,
+				endTime: payload.endTime,
+				label: payload.label,
+				abortController: new AbortController(),
+				promise: Promise.resolve(),
+				ownerId: payload.ownerId,
+				agentId: payload.agentId,
+				queued: false,
+				...(output?.source === "result" ? { resultText: output.text } : {}),
+				...(output?.source === "error" ? { errorText: output.text } : {}),
+			};
+			this.#jobs.set(id, job);
+			this.#jobIncarnations.set(id, record.incarnationId);
+			this.#recordTerminalHistory(job);
+			const exactId = `${id}\u0000${record.incarnationId}`;
+			const delivery = recovery.deliveries.get(exactId);
+			for (const pinRecord of recovery.pins.values()) {
+				if (
+					pinRecord.entityId === id &&
+					pinRecord.incarnationId === record.incarnationId &&
+					pinRecord.payload.state === "held" &&
+					typeof pinRecord.payload.pinId === "string"
+				) {
+					let pins = this.#resultPins.get(id);
+					if (!pins) {
+						pins = new Set();
+						this.#resultPins.set(id, pins);
+					}
+					pins.add(pinRecord.payload.pinId);
+				}
+			}
+			if (recovery.consumed.has(exactId) || delivery?.payload.state === "delivered") {
+				this.#consumedJobResults.add(id);
+			} else if (delivery?.payload.state === "queued" && output) {
+				this.#queueDelivery({
+					jobId: id,
+					text: output.text,
+					attempt: typeof delivery.payload.attempt === "number" ? delivery.payload.attempt : 0,
+					nextAttemptAt:
+						typeof delivery.payload.nextAttemptAt === "number" ? delivery.payload.nextAttemptAt : Date.now(),
+					ownerId: payload.ownerId,
+					jobSnapshot: {
+						type: job.type,
+						status: job.status,
+						startTime: job.startTime,
+						label: job.label,
+						agentId: job.agentId,
+					},
+				});
+			} else if (delivery && (delivery.payload.state === "delivering" || delivery.payload.state === "quarantined")) {
+				recovery.quarantined.add(id);
+				if (delivery.payload.state === "delivering") {
+					this.#durableStore.append("delivery", id, record.incarnationId, {
+						...delivery.payload,
+						state: "quarantined",
+						reason: "ambiguous-delivery-effect",
+					});
+				}
+				this.#jobs.delete(id);
+				continue;
+			}
+			this.#scheduleEviction(id);
+			restoredJobIds.push(id);
+		}
+		this.#durableRecovery = undefined;
+		if (this.#deliveries.length > 0) this.#ensureDeliveryLoop();
+		return {
+			processed: batch.records.length + batch.quarantined.length,
+			restoredJobIds,
+			quarantinedJobIds: [...recovery.quarantined],
+		};
 	}
 
 	async waitForAll(): Promise<void> {
@@ -903,6 +1252,8 @@ export class AsyncJobManager {
 		this.#suppressedDeliveries.clear();
 		this.#watchedJobs.clear();
 		this.#consumedJobResults.clear();
+		this.#resultPins.clear();
+		this.#pendingResultObservations.clear();
 		this.#pollEscalation.clear();
 		this.#deliverySinks.clear();
 		return jobsSettled && drained;
@@ -939,37 +1290,85 @@ export class AsyncJobManager {
 		}
 		return false;
 	}
-	#consumeJobResult(jobId: string): boolean {
+	#persistEvent(
+		kind: "job" | "delivery" | "consumption" | "cancel" | "pin" | "result",
+		jobId: string,
+		payload: Readonly<Record<string, unknown>>,
+	): void {
+		const incarnationId = this.#jobIncarnations.get(jobId);
+		if (!this.#durableStore || !incarnationId) return;
+		this.#durableStore.append(kind, jobId, incarnationId, payload);
+	}
+
+	#persistJob(job: AsyncJob, event: DurableJobPayload["event"]): void {
+		if (!this.#durableStore) return;
+		const source =
+			job.resultText !== undefined
+				? { source: "result" as const, text: job.resultText }
+				: job.errorText !== undefined
+					? { source: "error" as const, text: job.errorText }
+					: undefined;
+		let output: DurableJobPayload["output"];
+		if (source) {
+			const bounded = truncateTail(source.text, { maxBytes: DURABLE_JOB_RESULT_BYTES, maxLines: DEFAULT_MAX_LINES });
+			output = {
+				source: source.source,
+				text: bounded.content,
+				byteCount: Buffer.byteLength(bounded.content),
+				sha256: new Bun.CryptoHasher("sha256").update(bounded.content).digest("hex"),
+				truncated: bounded.truncated === true,
+			};
+		}
+		const payload: DurableJobPayload = {
+			event,
+			type: job.type,
+			status: job.status,
+			label: truncateTail(job.label, { maxBytes: 4096, maxLines: 32 }).content,
+			startTime: job.startTime,
+			endTime: job.endTime,
+			ownerId: job.ownerId,
+			agentId: job.agentId,
+			queued: job.status === "running" && job.queued === true,
+			output,
+		};
+		this.#persistEvent("job", job.id, payload as unknown as Readonly<Record<string, unknown>>);
+		if (event === "terminal" && output) {
+			this.#persistEvent("result", job.id, {
+				state: "assembled",
+				source: output.source,
+				byteCount: output.byteCount,
+				sha256: output.sha256,
+				truncated: output.truncated,
+			});
+		}
+	}
+
+	#consumeJobResult(jobId: string, persist = true): boolean {
 		const job = this.#jobs.get(jobId);
 		if (!job || job.status === "running" || this.#consumedJobResults.has(jobId)) return false;
 		if (job.resultText === undefined && job.errorText === undefined) return false;
 		this.#consumedJobResults.add(jobId);
+		if (persist) this.#persistEvent("consumption", jobId, { state: "committed" });
 		return true;
 	}
 
-	#resolveJobId(preferredId?: string): string {
-		preferredId = preferredId?.trim();
-		if (!preferredId) {
-			let candidate = 1;
-			while (true) {
-				const id = `bg_${candidate}`;
-				if (!this.#hasJobId(id)) {
-					return id;
-				}
-				candidate += 1;
+	#resolveJobId(preferredId: string | undefined, incarnationId: string): string {
+		const preferred = preferredId?.trim();
+		const reserve = (candidate: string): boolean => {
+			if (this.#hasJobId(candidate)) return false;
+			return this.#durableStore?.reserve("job", candidate, incarnationId) ?? true;
+		};
+		if (preferred && reserve(preferred)) return preferred;
+		if (preferred) {
+			for (let suffix = 2; ; suffix++) {
+				const candidate = `${preferred}-${suffix}`;
+				if (reserve(candidate)) return candidate;
 			}
 		}
-
-		const base = preferredId.trim();
-		if (!this.#hasJobId(base)) return base;
-
-		let suffix = 2;
-		let candidate = `${base}-${suffix}`;
-		while (this.#hasJobId(candidate)) {
-			suffix += 1;
-			candidate = `${base}-${suffix}`;
+		for (;;) {
+			const candidate = `bg_${crypto.randomUUID().replaceAll("-", "")}`;
+			if (reserve(candidate)) return candidate;
 		}
-		return candidate;
 	}
 
 	/**
@@ -1068,6 +1467,7 @@ export class AsyncJobManager {
 	#evictJob(jobId: string): boolean {
 		clearTimeout(this.#evictionTimers.get(jobId));
 		this.#evictionTimers.delete(jobId);
+		if ((this.#resultPins.get(jobId)?.size ?? 0) > 0) return false;
 		this.#suppressedDeliveries.delete(jobId);
 		this.#watchedJobs.delete(jobId);
 		this.#consumedJobResults.delete(jobId);
@@ -1178,6 +1578,7 @@ export class AsyncJobManager {
 					}
 				: undefined,
 		});
+		this.#persistEvent("delivery", jobId, { state: "queued", attempt: 0, nextAttemptAt: Date.now() });
 		this.#ensureDeliveryLoop();
 	}
 
@@ -1247,11 +1648,17 @@ export class AsyncJobManager {
 				jobId: delivery.jobId,
 				ownerId: delivery.ownerId,
 			});
+			this.#persistEvent("delivery", delivery.jobId, { state: "abandoned", reason: "no-live-sink" });
 			delivery.promise = Promise.resolve();
 			return delivery.promise;
 		}
 		const promise = (async () => {
 			this.#inFlightDeliveries.push(delivery);
+			this.#persistEvent("delivery", delivery.jobId, {
+				state: "delivering",
+				attempt: delivery.attempt,
+				nextAttemptAt: delivery.nextAttemptAt,
+			});
 			try {
 				await sink(
 					delivery.jobId,
@@ -1259,19 +1666,33 @@ export class AsyncJobManager {
 					this.#jobs.get(delivery.jobId) ?? this.#reconstructEvictedJob(delivery),
 				);
 				this.#consumeJobResult(delivery.jobId);
+				this.#persistEvent("delivery", delivery.jobId, { state: "delivered", attempt: delivery.attempt });
 			} catch (error) {
 				delivery.attempt += 1;
 				delivery.lastError = error instanceof Error ? error.message : String(error);
-				delivery.nextAttemptAt = Date.now() + this.#getRetryDelay(delivery.attempt);
-				if (!this.isDeliverySuppressed(delivery.jobId) && this.#jobs.has(delivery.jobId)) {
-					this.#queueDelivery(delivery);
+				if (this.#durableStore) {
+					this.#persistEvent("delivery", delivery.jobId, {
+						state: "quarantined",
+						attempt: delivery.attempt,
+						reason: "ambiguous-delivery-effect",
+					});
+					logger.warn("Async job completion delivery quarantined after an ambiguous effect", {
+						jobId: delivery.jobId,
+						attempt: delivery.attempt,
+						error: delivery.lastError,
+					});
+				} else {
+					delivery.nextAttemptAt = Date.now() + this.#getRetryDelay(delivery.attempt);
+					if (!this.isDeliverySuppressed(delivery.jobId) && this.#jobs.has(delivery.jobId)) {
+						this.#queueDelivery(delivery);
+					}
+					logger.warn("Async job completion delivery failed", {
+						jobId: delivery.jobId,
+						attempt: delivery.attempt,
+						nextRetryAt: delivery.nextAttemptAt,
+						error: delivery.lastError,
+					});
 				}
-				logger.warn("Async job completion delivery failed", {
-					jobId: delivery.jobId,
-					attempt: delivery.attempt,
-					nextRetryAt: delivery.nextAttemptAt,
-					error: delivery.lastError,
-				});
 			} finally {
 				const index = this.#inFlightDeliveries.indexOf(delivery);
 				if (index !== -1) this.#inFlightDeliveries.splice(index, 1);

@@ -155,6 +155,50 @@ describe("buildWorkspaceTree", () => {
 		expect(tree.rendered).toContain("… 1 more");
 	});
 
+	it("filters denied descendants and symlink entries before caps and rendering", async () => {
+		const cwd = await makeTempDir();
+		const deniedDir = path.join(cwd, "denied-dir");
+		await fs.mkdir(deniedDir);
+		await Bun.write(path.join(deniedDir, "secret.txt"), "secret");
+		await fs.symlink(deniedDir, path.join(cwd, "denied-link"));
+		for (let i = 0; i < 14; i += 1) {
+			await Bun.write(path.join(cwd, `entry-${String(i).padStart(2, "0")}.txt`), String(i));
+		}
+
+		const tree = await buildDirectoryTree(cwd, {
+			maxDepth: 2,
+			perDirLimit: 12,
+			rootLimit: null,
+			entryFilter: async absolutePath => {
+				const name = path.basename(absolutePath);
+				return (
+					name !== "denied-dir" && name !== "denied-link" && name !== "entry-00.txt" && name !== "entry-01.txt"
+				);
+			},
+		});
+
+		expect(tree.rendered).not.toContain("denied-dir");
+		expect(tree.rendered).not.toContain("denied-link");
+		expect(tree.rendered).not.toContain("secret.txt");
+		expect(tree.rendered).not.toContain("entry-00.txt");
+		expect(tree.rendered).not.toContain("entry-01.txt");
+		expect(tree.truncated).toBe(false);
+		expect(tree.totalLines).toBe(13);
+	});
+
+	it("rejects without returning a partial directory listing when filtering aborts", async () => {
+		const cwd = await makeTempDir();
+		await Bun.write(path.join(cwd, "visible.txt"), "visible");
+
+		await expect(
+			buildDirectoryTree(cwd, {
+				entryFilter: async () => {
+					throw new Error("entry admission aborted");
+				},
+			}),
+		).rejects.toThrow("entry admission aborted");
+	});
+
 	it("returns AGENTS.md files at directory depths one through four", async () => {
 		const cwd = await makeTempDir();
 

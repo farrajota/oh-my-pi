@@ -153,16 +153,22 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		extensionRoots,
 	} = options;
 
+	const includeManagedSkills =
+		enableCodexUser ||
+		enableClaudeUser ||
+		enableClaudeProject ||
+		enablePiUser ||
+		enablePiProject ||
+		enableAgentsUser ||
+		enableAgentsProject;
+
 	// Early return if skills are disabled
 	if (!enabled) {
 		return { skills: [], warnings: [] };
 	}
 	function isSourceEnabled(source: SourceMeta): boolean {
 		const { provider, level } = source;
-		// Managed skills (auto-learn) are OMP-native and discovered unconditionally
-		// — third-party CLI toggles must never silently hide them (cf. #2401). The
-		// master `enabled` flag above still gates them.
-		if (provider === MANAGED_SKILLS_PROVIDER_ID) return true;
+		if (provider === MANAGED_SKILLS_PROVIDER_ID) return includeManagedSkills;
 		if (provider === "codex" && level === "user") return enableCodexUser || isUserSourceEnabled("codex");
 		if (provider === "claude" && level === "user") return enableClaudeUser || isUserSourceEnabled("claude");
 		if (provider === "claude" && level === "project") return enableClaudeProject;
@@ -352,6 +358,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	const managedCandidates = result.all.filter(
 		capSkill =>
 			capSkill._source.provider === MANAGED_SKILLS_PROVIDER_ID &&
+			isSourceEnabled(capSkill._source) &&
 			isValidManagedSkillName(capSkill.name) &&
 			!disabledSkillNames.has(capSkill.name) &&
 			!matchesIgnorePatterns(capSkill.name) &&

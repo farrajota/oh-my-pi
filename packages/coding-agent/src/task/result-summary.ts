@@ -7,9 +7,12 @@
  */
 import { prompt } from "@oh-my-pi/pi-utils";
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
-import { AgentRegistry } from "../registry/agent-registry";
+import type { AgentRegistry } from "../registry/agent-registry";
 import { formatBytes, formatDuration } from "../tools/render-utils";
 import type { SingleResult } from "./types";
+import { formatEffectivePermissionSummaryLines } from "./permission-profiles";
+
+export { formatEffectivePermissionSummaryLines } from "./permission-profiles";
 
 /** Inline preview budget before the envelope points at `agent://<id>` instead. */
 const FULL_OUTPUT_THRESHOLD = 5000;
@@ -40,7 +43,7 @@ function previewHead(output: string): string {
 /** Render the `<task-result>` envelope for a settled run. */
 export function formatTaskResultSummary(
 	result: SingleResult,
-	options: { totalDurationMs: number; mergeSummary?: string },
+	options: { totalDurationMs: number; mergeSummary?: string; agentRegistry: AgentRegistry },
 ): string {
 	const status = result.aborted
 		? "cancelled"
@@ -55,9 +58,9 @@ export function formatTaskResultSummary(
 	const preview = truncated ? previewHead(output) : output;
 	// A stopped-but-adopted agent (soft-budget stop) stays messageable; tell
 	// the parent so it can resume via irc instead of redoing the work.
-	const refStatus = AgentRegistry.global().get(result.id)?.status;
+	const refStatus = options.agentRegistry.get(result.id)?.status;
 	const resumable = result.aborted && (refStatus === "idle" || refStatus === "parked");
-	return prompt.render(taskSummaryTemplate, {
+	const rendered = prompt.render(taskSummaryTemplate, {
 		agentName: result.agent,
 		id: result.id,
 		status,
@@ -74,4 +77,10 @@ export function formatTaskResultSummary(
 			: undefined,
 		mergeSummary: options.mergeSummary ?? "",
 	});
+	if (!result.permissionSummary) return rendered;
+	const permissionBlock = formatEffectivePermissionSummaryLines(result.permissionSummary).join("\n");
+	return rendered.replace(
+		"\n</task-result>",
+		`\n<permission-summary>\n${permissionBlock}\n</permission-summary>\n</task-result>`,
+	);
 }

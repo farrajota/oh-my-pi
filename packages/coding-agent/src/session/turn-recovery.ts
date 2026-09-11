@@ -201,6 +201,7 @@ export interface TurnRecoveryHost {
 		delayMs?: number;
 		generation?: number;
 		shouldContinue?: () => boolean;
+		onSkip?: () => void;
 		onError?: (error: unknown) => void;
 	}): void;
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
@@ -256,6 +257,15 @@ type UsageLimitOutcome = {
 	reportResetAtMs: number | undefined;
 };
 
+type RepeatedRetryState = {
+	startedAtMs: number;
+	deadlineMs: number;
+	timeoutMs: number;
+	round: number;
+	resetAware: boolean;
+	lastError: string;
+};
+
 /** Owns terminal-stop recovery, automatic retries, and fallback routing. */
 export class TurnRecovery {
 	readonly #host: TurnRecoveryHost;
@@ -267,6 +277,9 @@ export class TurnRecovery {
 	#usageReserveApprovedSelector: string | undefined;
 	#pendingRetryErrors: PendingRetryError[] = [];
 	#usageLimitOutcomes = new WeakMap<AssistantMessage, Promise<UsageLimitOutcome>>();
+	#repeatedRetry: RepeatedRetryState | undefined;
+	#repeatedRetryAbortReason: "cancelled" | "manual-input" | undefined;
+	#repeatedRetryProbeProviderMaxAttempts: number | undefined;
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
 	#malformedFunctionCallRetryCount = 0;
@@ -446,6 +459,11 @@ export class TurnRecovery {
 				role: this.#activeRetryFallback.role,
 			});
 		}
+		const repeatedRetry = this.#repeatedRetry;
+		if (repeatedRetry) {
+			await this.#finishRepeatedRetry(repeatedRetry, "success", undefined, message);
+			return;
+		}
 		if (this.#retryAttempt === 0) {
 			return;
 		}
@@ -466,7 +484,13 @@ export class TurnRecovery {
 
 	/** Closes a failed retry saga when no compaction continuation took ownership. */
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
-		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
+		if (message.stopReason !== "error") return;
+		const repeatedRetry = this.#repeatedRetry;
+		if (repeatedRetry) {
+			await this.#finishRepeatedRetry(repeatedRetry, "not-recoverable", message.errorMessage);
+			return;
+		}
+		if (this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
 		this.#retryAttempt = 0;
 		await this.#host.emitSessionEvent({
@@ -477,7 +501,6 @@ export class TurnRecovery {
 		});
 		this.#clearPendingRetryErrors();
 	}
-
 	/** Persists an otherwise skipped terminal empty error turn. */
 	persistTerminalEmptyErrorTurn(message: AssistantMessage): Promise<void> {
 		return this.#persistTerminalEmptyErrorTurn(message);
@@ -2088,6 +2111,235 @@ export class TurnRecovery {
 		return extractRetryHint(undefined, errorMessage);
 	}
 
+	#isRepeatedRetryEligible(id: number, errorMessage: string): boolean {
+		if (this.#host.settings.get("retry.repeated.enabled") !== true) return false;
+		if (/\busage_not_included\b/i.test(errorMessage)) return false;
+		return (
+			(AIError.is(id, AIError.Flag.UsageLimit) && AIError.retriable(id)) ||
+			/\b(?:session|weekly|daily|subscription|usage)\s+limit\b|\bquota\b.*\breset/i.test(errorMessage) ||
+			/\ball credentials\b.*\bcooling down\b|\btype=model_cooldown\b/i.test(errorMessage)
+		);
+	}
+
+	#repeatedRetryWait(
+		errorMessage: string,
+		outcome: UsageLimitOutcome | undefined,
+	): {
+		delayMs: number;
+		resetAware: boolean;
+	} {
+		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
+		const durationMatch =
+			/\b(?:try again|retry|resets?)\s+in\s+(\d+(?:\.\d+)?)\s*(seconds?|minutes?|hours?|days?)\b/i.exec(
+				errorMessage,
+			);
+		const durationMs =
+			durationMatch === null
+				? undefined
+				: Number(durationMatch[1]) *
+					({ second: 1_000, minute: 60_000, hour: 3_600_000, day: 86_400_000 }[
+						durationMatch[2].replace(/s$/i, "").toLowerCase()
+					] ?? 0);
+		const resetAtMatch = /\breset(?:s)?\s+at\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\b/i.exec(
+			errorMessage,
+		);
+		const resetAtMs = resetAtMatch === null ? undefined : Math.max(0, Date.parse(resetAtMatch[1]) - Date.now());
+		const reportResetMs =
+			outcome?.reportResetAtMs === undefined ? undefined : Math.max(0, outcome.reportResetAtMs - Date.now());
+		const resetDelayMs = Math.max(parsedRetryAfterMs ?? 0, durationMs ?? 0, resetAtMs ?? 0, reportResetMs ?? 0);
+		return resetDelayMs > 0
+			? { delayMs: resetDelayMs, resetAware: true }
+			: { delayMs: this.#host.settings.get("retry.repeated.timerMs"), resetAware: false };
+	}
+
+	async #beginRepeatedRetry(
+		message: AssistantMessage,
+		id: number,
+		reason: "max-retries" | "max-delay",
+		preserveFailedTurn: boolean,
+		outcome: UsageLimitOutcome | undefined,
+	): Promise<boolean> {
+		if (!this.#isRepeatedRetryEligible(id, message.errorMessage || "")) return false;
+		const now = Date.now();
+		const timeoutMs = this.#host.settings.get("retry.repeated.timeoutMs");
+		const { delayMs: requestedDelayMs, resetAware } = this.#repeatedRetryWait(
+			message.errorMessage || "Unknown error",
+			outcome,
+		);
+		const state: RepeatedRetryState = {
+			startedAtMs: now,
+			deadlineMs: now + timeoutMs,
+			timeoutMs,
+			round: 1,
+			resetAware,
+			lastError: message.errorMessage || "Unknown error",
+		};
+		const delayMs = Math.min(requestedDelayMs, Math.max(0, state.deadlineMs - now));
+		await this.#recordPendingRetryError(message, id, {
+			switchedCredential: false,
+			switchedModel: false,
+			delayMs,
+		});
+		this.#repeatedRetry = state;
+		await this.#host.emitSessionEvent({
+			type: "auto_retry_start",
+			mode: "repeated",
+			attempt: this.#retryAttempt,
+			maxAttempts: this.#retryAttempt,
+			delayMs,
+			errorMessage: state.lastError,
+			errorId: message.errorId,
+			round: state.round,
+			deadlineMs: state.deadlineMs,
+			timeoutMs: state.timeoutMs,
+			reason,
+			resetAware,
+		});
+		if (!preserveFailedTurn) {
+			this.removeAssistantMessageFromActiveContext(message, "auto-retry");
+		}
+		this.#scheduleRepeatedRetryWait(state, delayMs);
+		return true;
+	}
+
+	async #continueRepeatedRetry(
+		state: RepeatedRetryState,
+		message: AssistantMessage,
+		id: number,
+		outcome: UsageLimitOutcome | undefined,
+		preserveFailedTurn: boolean,
+	): Promise<void> {
+		this.#restoreRepeatedRetryProbeProviderMaxAttempts();
+		const { delayMs: requestedDelayMs, resetAware } = this.#repeatedRetryWait(
+			message.errorMessage || "Unknown error",
+			outcome,
+		);
+		const delayMs = Math.min(requestedDelayMs, Math.max(0, state.deadlineMs - Date.now()));
+		state.round++;
+		state.resetAware = resetAware;
+		state.lastError = message.errorMessage || "Unknown error";
+		await this.#recordPendingRetryError(message, id, {
+			switchedCredential: false,
+			switchedModel: false,
+			delayMs,
+		});
+		await this.#host.emitSessionEvent({
+			type: "auto_retry_start",
+			mode: "repeated",
+			attempt: this.#retryAttempt,
+			maxAttempts: this.#retryAttempt,
+			delayMs,
+			errorMessage: state.lastError,
+			errorId: message.errorId,
+			round: state.round,
+			deadlineMs: state.deadlineMs,
+			timeoutMs: state.timeoutMs,
+			reason: "max-retries",
+			resetAware,
+		});
+		if (!preserveFailedTurn) {
+			this.removeAssistantMessageFromActiveContext(message, "auto-retry");
+		}
+		this.#scheduleRepeatedRetryWait(state, delayMs);
+	}
+
+	#scheduleRepeatedRetryWait(state: RepeatedRetryState, delayMs: number): void {
+		const controller = new AbortController();
+		this.#retryAbortController?.abort();
+		this.#retryAbortController = controller;
+		void (async () => {
+			try {
+				await scheduler.wait(delayMs, { signal: controller.signal });
+			} catch {
+				if (this.#repeatedRetry === state && this.#retryAbortController === controller) {
+					await this.#finishRepeatedRetry(state, this.#repeatedRetryAbortReason ?? "cancelled");
+				}
+				return;
+			}
+			if (this.#repeatedRetry !== state || this.#retryAbortController !== controller) return;
+			this.#retryAbortController = undefined;
+			if (Date.now() >= state.deadlineMs) {
+				await this.#finishRepeatedRetry(state, "timeout", state.lastError);
+				return;
+			}
+			this.#scheduleRepeatedRetryProbe(state);
+		})();
+	}
+
+	#scheduleRepeatedRetryProbe(state: RepeatedRetryState): void {
+		this.#host.scheduleAgentContinue({
+			source: "repeated-retry",
+			delayMs: 1,
+			generation: this.#host.promptGeneration(),
+			shouldContinue: () => {
+				if (this.#repeatedRetry !== state) return false;
+				if (Date.now() >= state.deadlineMs) {
+					void this.#finishRepeatedRetry(state, "timeout", state.lastError);
+					return false;
+				}
+				this.#repeatedRetryProbeProviderMaxAttempts = this.#host.agent.providerMaxAttempts;
+				this.#host.agent.providerMaxAttempts = 1;
+				return true;
+			},
+			onSkip: () => {
+				this.#restoreRepeatedRetryProbeProviderMaxAttempts();
+				if (this.#repeatedRetry === state) {
+					void this.#finishRepeatedRetry(state, "cancelled");
+				}
+			},
+			onError: error => {
+				void this.#finishRepeatedRetry(
+					state,
+					"not-recoverable",
+					`Repeated probe continuation failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			},
+		});
+	}
+
+	#restoreRepeatedRetryProbeProviderMaxAttempts(): void {
+		if (this.#repeatedRetryProbeProviderMaxAttempts === undefined) return;
+		this.#host.agent.providerMaxAttempts = this.#repeatedRetryProbeProviderMaxAttempts;
+		this.#repeatedRetryProbeProviderMaxAttempts = undefined;
+	}
+
+	async #finishRepeatedRetry(
+		state: RepeatedRetryState,
+		reason: "success" | "cancelled" | "timeout" | "manual-input" | "not-recoverable",
+		finalError?: string,
+		supersedingMessage?: AssistantMessage,
+	): Promise<void> {
+		if (this.#repeatedRetry !== state) return;
+		this.#repeatedRetry = undefined;
+		this.#repeatedRetryAbortReason = undefined;
+		this.#retryAbortController = undefined;
+		this.#restoreRepeatedRetryProbeProviderMaxAttempts();
+		const terminalAtMs = Date.now();
+		const recoveredErrors =
+			supersedingMessage === undefined
+				? undefined
+				: await this.#markPendingRetryErrors({ status: "recovered", supersedingMessage });
+		await this.#host.emitSessionEvent({
+			type: "auto_retry_end",
+			mode: "repeated",
+			success: reason === "success",
+			attempt: this.#retryAttempt,
+			finalError,
+			recoveredErrors,
+			reason,
+			resetAware: state.resetAware,
+			round: state.round,
+			startedAtMs: state.startedAtMs,
+			terminalAtMs,
+			durationMs: terminalAtMs - state.startedAtMs,
+			deadlineMs: state.deadlineMs,
+			timeoutMs: state.timeoutMs,
+		});
+		this.#clearPendingRetryErrors();
+		this.#retryAttempt = 0;
+		this.resolveRetry();
+	}
+
 	/**
 	 * Handle retryable errors with exponential backoff, credential rotation, and
 	 * model-fallback chains. Also entered for NON-retryable errors when a switch
@@ -2105,6 +2357,24 @@ export class TurnRecovery {
 			preserveFailedTurn?: boolean;
 		},
 	): Promise<boolean> {
+		const repeatedRetry = this.#repeatedRetry;
+		if (repeatedRetry) {
+			const repeatedRetryId = this.#classifyRetryMessage(message);
+			if (!this.#isRepeatedRetryEligible(repeatedRetryId, message.errorMessage || "")) {
+				await this.#finishRepeatedRetry(repeatedRetry, "not-recoverable", message.errorMessage);
+				return false;
+			}
+			const repeatedRetryPreserveFailedTurn =
+				options?.preserveFailedTurn === true || this.#unexecutedToolCallsReplaySafe(message);
+			await this.#continueRepeatedRetry(
+				repeatedRetry,
+				message,
+				repeatedRetryId,
+				await this.#usageLimitOutcomes.get(message),
+				repeatedRetryPreserveFailedTurn,
+			);
+			return true;
+		}
 		const retrySettings = this.#host.settings.getGroup("retry");
 		// The Fireworks Fast→base degrade is an intrinsic model-selection safety net,
 		// not a retry loop, so it runs even when the user disabled retries: it switches
@@ -2331,6 +2601,11 @@ export class TurnRecovery {
 
 		if (retryBudgetExhausted) {
 			if (!switchedModel && !switchedCredential) {
+				if (
+					await this.#beginRepeatedRetry(message, id, "max-retries", preserveFailedTurn, recordedUsageLimitOutcome)
+				) {
+					return true;
+				}
 				const attempt = this.#retryAttempt - 1;
 				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
 				await this.persistTerminalEmptyErrorTurn(message);
@@ -2426,6 +2701,9 @@ export class TurnRecovery {
 			effectiveUsageLimitWaitMs !== undefined &&
 			delayMs <= effectiveUsageLimitWaitMs;
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel && !waitForUsageReset) {
+			if (await this.#beginRepeatedRetry(message, id, "max-delay", preserveFailedTurn, recordedUsageLimitOutcome)) {
+				return true;
+			}
 			await this.persistTerminalEmptyErrorTurn(message);
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;
@@ -2593,9 +2871,15 @@ export class TurnRecovery {
 	/**
 	 * Cancel in-progress retry.
 	 */
-	abortRetry(): void {
+	abortRetry(reason: "cancelled" | "manual-input" = "cancelled"): void {
+		const repeatedRetry = this.#repeatedRetry;
+		if (repeatedRetry) {
+			this.#repeatedRetryAbortReason = reason;
+			this.#retryAbortController?.abort();
+			void this.#finishRepeatedRetry(repeatedRetry, reason);
+			return;
+		}
 		this.#retryAbortController?.abort();
-		// Note: _retryAttempt is reset in the catch block of _autoRetry
 		this.resolveRetry();
 	}
 

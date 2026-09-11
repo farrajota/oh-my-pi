@@ -21,6 +21,7 @@
  *   `gh`.
  */
 import type { Settings } from "../config/settings";
+import { listAgentRefs } from "../internal/agent-registry-bridge";
 import { AgentRegistry } from "../registry/agent-registry";
 import {
 	formatRepoRef,
@@ -247,7 +248,7 @@ function parseUrl(url: InternalUrl, scheme: Scheme): Parsed {
  */
 function resolveCwd(context: ResolveContext | undefined): string {
 	if (context?.cwd) return context.cwd;
-	for (const ref of AgentRegistry.global().list()) {
+	for (const ref of listAgentRefs(AgentRegistry.global())) {
 		const cwd = ref.session?.sessionManager?.getCwd();
 		if (cwd) return cwd;
 	}

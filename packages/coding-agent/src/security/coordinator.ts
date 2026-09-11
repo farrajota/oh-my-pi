@@ -12,7 +12,9 @@ import securityReviewerPrompt from "../prompts/agents/security-reviewer.md" with
 import securityCoordinatorPrompt from "../prompts/security/scan-coordinator.md" with { type: "text" };
 import securityRequestPrompt from "../prompts/security/scan-request.md" with { type: "text" };
 import securityPublishDescription from "../prompts/tools/security-publish.md" with { type: "text" };
-import { createAgentSession } from "../sdk";
+import { createAgentRootSession } from "../internal/agent-registry-bridge";
+import { AgentRegistry } from "../registry/agent-registry";
+import { registryDurableStateForSession } from "../registry/durable-state";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
@@ -238,7 +240,10 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 		...scanSettings.get("task.agentPrewalk"),
 		"security-reviewer": "off",
 	});
-	const { session } = await createAgentSession({
+	const sessionFile = input.sessionManager.getSessionFile();
+	if (!sessionFile) throw new Error("Security restricted startup requires a persisted session file.");
+	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
+	const { session } = await createAgentRootSession(registry, {
 		cwd: input.executionRoot,
 		authStorage: input.host.authStorage,
 		modelRegistry: input.host.modelRegistry,

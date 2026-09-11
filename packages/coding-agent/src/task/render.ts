@@ -38,6 +38,7 @@ import {
 } from "../tools/review";
 import { framedBlock, outputBlockContentWidth, renderStatusLine } from "../tui";
 import { repairDoubleEncodedJsonString } from "./repair-args";
+import { formatEffectivePermissionSummaryLines } from "./permission-profiles";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails, YieldItem } from "./types";
 import { assembleYieldResult } from "./yield-assembly";
@@ -100,6 +101,7 @@ function appendAgentStats(
 		contextWindow?: number;
 		cost: number;
 		resolvedModel?: string;
+		resolvedModelIdentity?: string;
 		requestedModel?: string;
 		showResolvedModelBadge?: boolean;
 	},
@@ -125,8 +127,9 @@ function appendAgentStats(
 	if (opts.requestedModel) {
 		line += `${theme.sep.dot}${theme.fg("dim", `requested ${truncateToWidth(replaceTabs(opts.requestedModel), 30)}`)}`;
 	}
-	if (opts.resolvedModel && opts.showResolvedModelBadge) {
-		line += `${theme.sep.dot}${theme.fg("dim", truncateToWidth(replaceTabs(opts.resolvedModel), 30))}`;
+	const displayModel = opts.resolvedModelIdentity ?? opts.resolvedModel;
+	if (displayModel && opts.showResolvedModelBadge) {
+		line += `${theme.sep.dot}${theme.fg("dim", truncateToWidth(replaceTabs(displayModel), 30))}`;
 	}
 	return line;
 }
@@ -733,6 +736,17 @@ function appendPermissionLines(
 	const permissionLines = renderPermissionLines(permissions);
 	for (const line of permissionLines) lines.push(`  ${theme.fg("dim", line)}`);
 }
+function appendEffectivePermissionSummary(
+	lines: string[],
+	summary: AgentProgress["permissionSummary"] | SingleResult["permissionSummary"],
+	prefix: string,
+	theme: Theme,
+): void {
+	if (!summary) return;
+	for (const line of formatEffectivePermissionSummaryLines(summary)) {
+		lines.push(`${prefix}${theme.fg("dim", line)}`);
+	}
+}
 
 /**
  * First line of a streamed `task` brief, trimmed — a row's secondary text.
@@ -1069,6 +1083,7 @@ function renderAgentProgress(
 	}
 
 	lines.push(...renderTaskSection(progress.assignment ?? progress.task, continuePrefix, expanded, theme));
+	appendEffectivePermissionSummary(lines, progress.permissionSummary, continuePrefix, theme);
 
 	// Current tool (if running) or most recent completed tool
 	if (progress.status === "running") {
@@ -1407,6 +1422,7 @@ function renderAgentResult(
 			cost: result.usage?.cost.total ?? 0,
 			requestedModel: result.requestedModel,
 			resolvedModel: result.resolvedModel,
+			resolvedModelIdentity: result.resolvedModelIdentity,
 			showResolvedModelBadge: showBadge,
 		},
 		theme,
@@ -1423,6 +1439,7 @@ function renderAgentResult(
 	}
 
 	lines.push(...renderTaskSection(result.assignment ?? result.task, continuePrefix, expanded, theme));
+	appendEffectivePermissionSummary(lines, result.permissionSummary, continuePrefix, theme);
 
 	if (aborted && result.abortReason) {
 		lines.push(

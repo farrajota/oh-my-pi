@@ -5,10 +5,10 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
-import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
@@ -93,6 +93,8 @@ function createSession(
 		planMode?: PlanModeState;
 		sessionFile?: string | null;
 		taskEnableLsp?: boolean;
+		agentRegistry?: AgentRegistry;
+		createAuthoritySession?: ToolSession["createAuthoritySession"];
 	} = {},
 ): ToolSession {
 	const modelRegistry = {
@@ -114,6 +116,8 @@ function createSession(
 		getSessionFile: () => options.sessionFile ?? null,
 		getSessionSpawns: () => "*",
 		modelRegistry,
+		agentRegistry: options.agentRegistry,
+		createAuthoritySession: options.createAuthoritySession,
 		getPlanModeState: () => options.planMode,
 	} as unknown as ToolSession;
 }
@@ -125,18 +129,26 @@ function mockAgents(agent: AgentDefinition): void {
 	});
 }
 
-function mockCreateAgentSession(): { getOptions: () => CreateAgentSessionOptions | undefined } {
+function mockCreateAuthoritySession(): {
+	agentRegistry: AgentRegistry;
+	createAuthoritySession: NonNullable<ToolSession["createAuthoritySession"]>;
+	getOptions: () => CreateAgentSessionOptions | undefined;
+} {
 	let capturedOptions: CreateAgentSessionOptions | undefined;
-	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
-		capturedOptions = options;
-		return {
-			session: createYieldingSession(),
-			extensionsResult: {} as unknown as LoadExtensionsResult,
-			setToolUIContext: () => {},
-			eventBus: new EventBus(),
-		} satisfies CreateAgentSessionResult;
-	});
-	return { getOptions: () => capturedOptions };
+	const agentRegistry = new AgentRegistry();
+	return {
+		agentRegistry,
+		createAuthoritySession: async options => {
+			capturedOptions = options;
+			return {
+				session: createYieldingSession(),
+				extensionsResult: {} as unknown as LoadExtensionsResult,
+				setToolUIContext: () => {},
+				eventBus: new EventBus(),
+			} satisfies CreateAgentSessionResult;
+		},
+		getOptions: () => capturedOptions,
+	};
 }
 
 function mockIsolation(): void {
@@ -178,12 +190,17 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["lsp"],
 		});
-		const { getOptions } = mockCreateAgentSession();
+		const creator = mockCreateAuthoritySession();
 
-		const tool = await TaskTool.create(createSession());
+		const tool = await TaskTool.create(
+			createSession({
+				agentRegistry: creator.agentRegistry,
+				createAuthoritySession: creator.createAuthoritySession,
+			}),
+		);
 		await tool.execute("tool-call", TEST_TASK);
 
-		expect(getOptions()?.enableLsp).toBe(false);
+		expect(creator.getOptions()?.enableLsp).toBe(false);
 	});
 
 	it("enables subagent LSP when task.enableLsp is set", async () => {
@@ -194,13 +211,19 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["lsp"],
 		});
-		const { getOptions } = mockCreateAgentSession();
+		const creator = mockCreateAuthoritySession();
 
-		const tool = await TaskTool.create(createSession({ taskEnableLsp: true }));
+		const tool = await TaskTool.create(
+			createSession({
+				agentRegistry: creator.agentRegistry,
+				taskEnableLsp: true,
+				createAuthoritySession: creator.createAuthoritySession,
+			}),
+		);
 		await tool.execute("tool-call", TEST_TASK);
 
-		expect(getOptions()?.enableLsp).toBe(true);
-		expect(getOptions()?.toolNames).toContain("lsp");
+		expect(creator.getOptions()?.enableLsp).toBe(true);
+		expect(creator.getOptions()?.toolNames).toContain("lsp");
 	});
 
 	it("keeps subagent LSP disabled when the parent session disables LSP", async () => {
@@ -211,12 +234,19 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["lsp"],
 		});
-		const { getOptions } = mockCreateAgentSession();
+		const creator = mockCreateAuthoritySession();
 
-		const tool = await TaskTool.create(createSession({ parentEnableLsp: false, taskEnableLsp: true }));
+		const tool = await TaskTool.create(
+			createSession({
+				parentEnableLsp: false,
+				taskEnableLsp: true,
+				agentRegistry: creator.agentRegistry,
+				createAuthoritySession: creator.createAuthoritySession,
+			}),
+		);
 		await tool.execute("tool-call", TEST_TASK);
 
-		expect(getOptions()?.enableLsp).toBe(false);
+		expect(creator.getOptions()?.enableLsp).toBe(false);
 	});
 
 	it("disables LSP for isolated subagents by default", async () => {
@@ -228,13 +258,19 @@ describe("subagent LSP availability", () => {
 			tools: ["lsp"],
 		});
 		mockIsolation();
-		const { getOptions } = mockCreateAgentSession();
+		const creator = mockCreateAuthoritySession();
 
-		const tool = await TaskTool.create(createSession({ isolationEnabled: true }));
+		const tool = await TaskTool.create(
+			createSession({
+				agentRegistry: creator.agentRegistry,
+				isolationEnabled: true,
+				createAuthoritySession: creator.createAuthoritySession,
+			}),
+		);
 		await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
 
-		expect(getOptions()?.cwd).toBe("/tmp/isolated-subagent");
-		expect(getOptions()?.enableLsp).toBe(false);
+		expect(creator.getOptions()?.cwd).toBe("/tmp/isolated-subagent");
+		expect(creator.getOptions()?.enableLsp).toBe(false);
 	});
 
 	it("opens isolated persisted subagent sessions with the worktree cwd", async () => {
@@ -246,15 +282,22 @@ describe("subagent LSP availability", () => {
 			tools: ["write"],
 		});
 		mockIsolation();
-		const { getOptions } = mockCreateAgentSession();
+		const creator = mockCreateAuthoritySession();
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolated-session-cwd-"));
 		try {
 			const parentSessionFile = path.join(tempDir, "parent.jsonl");
-			const tool = await TaskTool.create(createSession({ isolationEnabled: true, sessionFile: parentSessionFile }));
+			const tool = await TaskTool.create(
+				createSession({
+					isolationEnabled: true,
+					sessionFile: parentSessionFile,
+					agentRegistry: creator.agentRegistry,
+					createAuthoritySession: creator.createAuthoritySession,
+				}),
+			);
 			await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
 
-			const sessionManager = getOptions()?.sessionManager as { getCwd?: () => string } | undefined;
-			expect(getOptions()?.cwd).toBe("/tmp/isolated-subagent");
+			const sessionManager = creator.getOptions()?.sessionManager as { getCwd?: () => string } | undefined;
+			expect(creator.getOptions()?.cwd).toBe("/tmp/isolated-subagent");
 			expect(sessionManager?.getCwd?.()).toBe("/tmp/isolated-subagent");
 		} finally {
 			await removeWithRetries(tempDir);
@@ -269,13 +312,20 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["bash", "ast_grep", "memory_edit", "retain", "todo"],
 		});
-		const { getOptions } = mockCreateAgentSession();
+		const creator = mockCreateAuthoritySession();
 		const planMode = { enabled: true, planFilePath: "local://PLAN.md" };
 
-		const tool = await TaskTool.create(createSession({ planMode, taskEnableLsp: true }));
+		const tool = await TaskTool.create(
+			createSession({
+				agentRegistry: creator.agentRegistry,
+				planMode,
+				taskEnableLsp: true,
+				createAuthoritySession: creator.createAuthoritySession,
+			}),
+		);
 		await tool.execute("tool-call", TEST_TASK);
 
-		const options = getOptions();
+		const options = creator.getOptions();
 		expect(options?.enableLsp).toBe(false);
 		expect(options?.enableIrc).toBe(false);
 		expect(options?.restrictToolNames).toBe(true);

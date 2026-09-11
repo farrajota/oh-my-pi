@@ -25,6 +25,7 @@ import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess } from "./executor";
+import { composeEffectivePermissions, freezePermissionScope } from "./permission-profiles";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -415,6 +416,22 @@ function buildExecutorOptions(
 	};
 	const restrictToolNames = policy.planMode || session.restrictToolNames === true;
 	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
+	const inheritedPermissions = session.getPermissionScope?.();
+	const composedPermissions = inheritedPermissions
+		? composeEffectivePermissions({
+				mode: inheritedPermissions.mode,
+				toolsEnabled: inheritedPermissions.toolsEnabled,
+				pathsEnabled: inheritedPermissions.pathsEnabled,
+				actorId: id,
+				actorKind: "sub",
+				parentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
+				inherited: inheritedPermissions,
+				profiles: {},
+			})
+		: undefined;
+	if (composedPermissions && !composedPermissions.ok)
+		throw new StructuredSubagentError("preflight", composedPermissions.error);
+	const permissionSnapshot = composedPermissions?.ok ? freezePermissionScope(composedPermissions.value) : undefined;
 	return {
 		cwd: session.cwd,
 		additionalDirectories: session.additionalDirectories,
@@ -429,6 +446,8 @@ function buildExecutorOptions(
 		parentToolCallId: request.parentToolCallId,
 		detached: request.detached,
 		id,
+		agentRegistry: session.agentRegistry!,
+		createAuthoritySession: session.createAuthoritySession!,
 		taskDepth: session.taskDepth ?? 0,
 		invokedAt: request.invokedAt,
 		acquiredAt: request.acquiredAt,
@@ -472,6 +491,8 @@ function buildExecutorOptions(
 		autoloadSkillNames: policy.agent.autoloadSkills,
 		parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
 		parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
+		permissionScope: permissionSnapshot?.scope,
+		permissionSnapshot,
 	};
 }
 
@@ -572,6 +593,15 @@ function attachStructuredOutputMetadata(result: SingleResult, schema: Structured
  * lease or child dispatch; callers keep responsibility for their result text.
  */
 export async function runStructuredSubagent(request: StructuredSubagentRequest): Promise<StructuredSubagentResult> {
+	if (!request.session.agentRegistry) {
+		throw new StructuredSubagentError("preflight", "Authority subagent execution requires an owning agent registry.");
+	}
+	if (!request.session.createAuthoritySession) {
+		throw new StructuredSubagentError(
+			"preflight",
+			"Authority subagent creation requires a live parent-bound session creator.",
+		);
+	}
 	const policy = await resolveEffectiveSubagentPolicy(request);
 	const lease = await leaseArtifacts(request.session, request.invocationKind);
 	let changesApplied: boolean | null = null;

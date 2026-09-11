@@ -36,11 +36,15 @@ import {
 import type { KeyId } from "../../config/keybindings";
 import type { Settings } from "../../config/settings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
+import { ensureAgentLive, getAgentLifecycleManager } from "../../internal/agent-lifecycle-bridge";
+import { lookupAgentRef } from "../../internal/agent-registry-bridge";
+import type { AgentSession } from "../../session/agent-session";
 import { IrcBus } from "../../irc/bus";
 import { terminateSubagent } from "../../registry/agent-control";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, type AgentStatus, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { registerPersistedSubagents } from "../../registry/persisted-agents";
+import { formatEffectivePermissionSummaryLines } from "../../task/permission-profiles";
 import { shortenPath, truncateToWidth } from "../../tools/render-utils";
 import { formatLocalDateTimeWithOffset } from "../../utils/local-date";
 import type { ObservableSession, SessionObserverRegistry } from "../session-observer-registry";
@@ -51,6 +55,7 @@ import {
 	type AggregateMetrics,
 	aggregateMetrics,
 	progressMetrics,
+	projectedPermissionSummary,
 	projectAgentTree,
 	STATUS_ORDER,
 } from "./agent-hub-projection";
@@ -102,6 +107,10 @@ const AGE_TICK_MS = 5_000;
 const DATA_CHANGE_RENDER_COALESCE_MS = 100;
 /** Double-tap window for the table's left-left "close hub" gesture. */
 const LEFT_TAP_WINDOW_MS = 500;
+
+function agentGenerationKey(ref: AgentRef): string {
+	return `${ref.id}\0${ref.createdAt}`;
+}
 
 function activityGlyph(row: AgentActivityRow): string {
 	if (row.status === "error") return theme.fg("error", theme.status.error);
@@ -225,7 +234,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	/** Stable roster order captured on first refresh: keyboard navigation must
 	 *  not jump as agents heartbeat. Existing agent generations keep their rank
 	 *  while the hub is open; newly appearing generations append at the end. */
-	#rowOrder: Map<AgentRef, number> | undefined;
+	#rowOrder: Map<string, number> | undefined;
 	#nextRowOrder = 0;
 	#hoveredRow: number | null = null;
 	/** Per-render screen-line to agent-row map, shared by click and hover routing. */
@@ -291,9 +300,8 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		this.#observers = deps.observers;
 		this.#settings = deps.settings;
 		this.#irc = deps.irc ?? IrcBus.global();
-		// Lazy: the lifecycle global self-constructs against the global
-		// registry, so only touch it when revive/kill actually needs it.
-		this.#lifecycle = () => deps.lifecycle ?? AgentLifecycleManager.global();
+		// Lazy: avoid constructing lifecycle state until revive/kill needs it.
+		this.#lifecycle = () => deps.lifecycle ?? getAgentLifecycleManager(this.#registry);
 		this.#onDone = deps.onDone;
 		this.#requestRender = deps.requestRender;
 		this.#hubKeys = deps.hubKeys;
@@ -335,13 +343,14 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 					.finally(() => {
 						// Clear the loading flag first so this refresh captures the
 						// full status/recency ranking rather than a partial roster.
+						const completedPersistedScan = this.#loadingPersistedSubagents;
 						this.#loadingPersistedSubagents = false;
-						if (!this.#disposed) {
-							this.#refreshRows();
+						if (!this.#disposed && completedPersistedScan) {
+							this.#refreshRows(true);
 							this.#requestRender();
 						}
 					});
-		this.#refreshRows();
+		this.#refreshRows(true);
 	}
 
 	/**
@@ -503,11 +512,11 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	}
 
 	#onDataChange(): void {
-		this.#refreshRows();
+		this.#refreshRows(true);
 		this.#requestRender();
 	}
 
-	#refreshRows(): void {
+	#refreshRows(captureInitialOrder = false): void {
 		const selectedId = this.#rows[this.#selectedRow]?.id;
 		const refs = this.#registry.list().filter(ref => ref.id !== MAIN_AGENT_ID);
 		this.#observedById = new Map();
@@ -527,19 +536,23 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 					b.lastActivity - a.lastActivity ||
 					a.id.localeCompare(b.id),
 			);
-			if (!this.#loadingPersistedSubagents && ordered.length > 0) {
+			if (captureInitialOrder && !this.#loadingPersistedSubagents && ordered.length > 0) {
 				this.#rowOrder = new Map();
-				for (const ref of ordered) this.#rowOrder.set(ref, this.#nextRowOrder++);
+				for (const ref of ordered) this.#rowOrder.set(agentGenerationKey(ref), this.#nextRowOrder++);
 			}
 		} else {
-			for (const rankedRef of rowOrder.keys()) {
-				if (!refs.includes(rankedRef)) rowOrder.delete(rankedRef);
+			const currentGenerationKeys = new Set(refs.map(agentGenerationKey));
+			for (const generationKey of rowOrder.keys()) {
+				if (!currentGenerationKeys.has(generationKey)) rowOrder.delete(generationKey);
 			}
 			ordered = refs.sort(
-				(a, b) => (rowOrder.get(a) ?? Number.MAX_SAFE_INTEGER) - (rowOrder.get(b) ?? Number.MAX_SAFE_INTEGER),
+				(a, b) =>
+					(rowOrder.get(agentGenerationKey(a)) ?? Number.MAX_SAFE_INTEGER) -
+					(rowOrder.get(agentGenerationKey(b)) ?? Number.MAX_SAFE_INTEGER),
 			);
 			for (const ref of ordered) {
-				if (!rowOrder.has(ref)) rowOrder.set(ref, this.#nextRowOrder++);
+				const generationKey = agentGenerationKey(ref);
+				if (!rowOrder.has(generationKey)) rowOrder.set(generationKey, this.#nextRowOrder++);
 			}
 		}
 		const query = this.#agentFilter.trim();
@@ -665,12 +678,9 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		return session ? this.#sessionMetrics.get(session)?.metrics : undefined;
 	}
 
-	#fallbackStatsSession(
-		ref: AgentRef,
-		observed: ObservableSession | undefined,
-	): NonNullable<AgentRef["session"]> | undefined {
+	#fallbackStatsSession(ref: AgentRef, observed: ObservableSession | undefined): AgentSession | undefined {
 		if (observed?.progress) return undefined;
-		const session = ref.session;
+		const session = lookupAgentRef(this.#registry, ref.id)?.session;
 		return session && typeof session.getSessionStats === "function" ? session : undefined;
 	}
 
@@ -1061,9 +1071,16 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const modelDetails: string[] = [];
 		const modelRole = progress?.modelRole ?? ref.history?.modelRole;
 		if (modelRole && this.#settings) modelDetails.push(formatRoleBadge(modelRole, this.#settings));
-		const badge = modelBadge(ref, observed);
+		const badge = modelBadge(ref, observed, lookupAgentRef(this.#registry, ref.id)?.session ?? undefined);
 		if (badge) modelDetails.push(badge);
 		if (modelDetails.length > 0) add(modelDetails.join(theme.sep.dot));
+		const permissionSummary = projectedPermissionSummary(ref, observed);
+		if (permissionSummary) {
+			section("Permissions");
+			for (const permissionLine of formatEffectivePermissionSummaryLines(permissionSummary)) {
+				for (const wrapped of wrapTextWithAnsi(sanitizeLine(permissionLine), Math.max(1, width))) add(wrapped);
+			}
+		}
 
 		const task = observed?.description ?? progress?.task ?? ref.activity;
 		if (task) {
@@ -1176,7 +1193,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		if (modelRole && this.#settings) {
 			meta.push(formatRoleBadge(modelRole, this.#settings));
 		}
-		const badge = modelBadge(ref, observed);
+		const badge = modelBadge(ref, observed, lookupAgentRef(this.#registry, ref.id)?.session ?? undefined);
 		if (badge) meta.push(badge);
 		const right = meta.join(theme.sep.dot);
 
@@ -1508,12 +1525,10 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			return;
 		}
 		// Fire-and-forget; failures surface as an inline notice
-		this.#lifecycle()
-			.ensureLive(ref.id)
-			.catch((error: unknown) => {
-				this.#notice = error instanceof Error ? error.message : String(error);
-				this.#requestRender();
-			});
+		ensureAgentLive(this.#lifecycle(), ref.id).catch((error: unknown) => {
+			this.#notice = error instanceof Error ? error.message : String(error);
+			this.#requestRender();
+		});
 		this.#requestRender();
 	}
 

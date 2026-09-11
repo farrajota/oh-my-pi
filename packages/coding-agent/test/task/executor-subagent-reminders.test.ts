@@ -6,9 +6,10 @@ import type { ExtensionActions, LoadExtensionsResult } from "@oh-my-pi/pi-coding
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { getAgentLifecycleManager } from "../../src/internal/agent-lifecycle-bridge";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import {
 	finalizeSubprocessOutput,
 	runSubagentFollowUpTurn,
@@ -109,6 +110,10 @@ describe("runSubprocess yield reminders", () => {
 		systemPrompt: "test",
 		source: "bundled",
 	};
+	const registry = new AgentRegistry();
+	const lifecycle = getAgentLifecycleManager(registry);
+	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+		sdkModule.createAgentSession({ ...options, agentRegistry: registry });
 
 	const baseOptions = {
 		cwd: "/tmp",
@@ -119,8 +124,11 @@ describe("runSubprocess yield reminders", () => {
 		settings: Settings.isolated(),
 		modelRegistry: {
 			refresh: async () => {},
-		} as unknown as import("@oh-my-pi/pi-coding-agent/config/model-registry").ModelRegistry,
+		} as unknown as ModelRegistry,
 		enableLsp: false,
+		agentRegistry: registry,
+		agentLifecycle: lifecycle,
+		createAuthoritySession,
 	};
 
 	it("waits for session_start extension user messages before prompting the subagent", async () => {
@@ -284,7 +292,7 @@ describe("runSubprocess yield reminders", () => {
 				});
 			}
 		};
-		AgentRegistry.global().register({
+		registry.register({
 			id: "subagent-race",
 			displayName: "subagent-race",
 			kind: "sub",
@@ -298,7 +306,7 @@ describe("runSubprocess yield reminders", () => {
 			expect(result.output).toContain('"batch": true');
 			expect(result.output).not.toContain("intruder");
 		} finally {
-			AgentRegistry.global().unregister("subagent-race");
+			registry.unregister("subagent-race");
 		}
 	});
 	it("waits out a running turn before installing the pooled contract", async () => {
@@ -329,7 +337,7 @@ describe("runSubprocess yield reminders", () => {
 			calls.push("waitForIdle");
 			streaming = false;
 		};
-		AgentRegistry.global().register({
+		registry.register({
 			id: "subagent-prewait",
 			displayName: "subagent-prewait",
 			kind: "sub",
@@ -348,7 +356,7 @@ describe("runSubprocess yield reminders", () => {
 			expect(result.exitCode).toBe(0);
 			expect(result.output).toContain('"batch": true');
 		} finally {
-			AgentRegistry.global().unregister("subagent-prewait");
+			registry.unregister("subagent-prewait");
 		}
 	});
 	it("fails the follow-up instead of installing under a wedged turn", async () => {
@@ -366,7 +374,7 @@ describe("runSubprocess yield reminders", () => {
 		mutable.waitForIdle = async () => {
 			calls.push("waitForIdle");
 		};
-		AgentRegistry.global().register({
+		registry.register({
 			id: "subagent-wedged",
 			displayName: "subagent-wedged",
 			kind: "sub",
@@ -382,7 +390,7 @@ describe("runSubprocess yield reminders", () => {
 			expect(calls).toEqual(["waitForIdle", "waitForIdle", "waitForIdle"]);
 			expect(calls).not.toContain("setYield");
 		} finally {
-			AgentRegistry.global().unregister("subagent-wedged");
+			registry.unregister("subagent-wedged");
 		}
 	});
 	it("drives the reacquired session when parking replaces the worker mid-install", async () => {
@@ -416,10 +424,7 @@ describe("runSubprocess yield reminders", () => {
 		// The idle TTL fires during the install rebuild: the follow-up must drive
 		// the revived replacement (reinstalling its empty contract) instead of
 		// the detached corpse.
-		const ensureLive = vi
-			.spyOn(AgentLifecycleManager.global(), "ensureLive")
-			.mockResolvedValueOnce(stale)
-			.mockResolvedValue(revived);
+		const ensureLive = vi.spyOn(lifecycle, "ensureLive").mockResolvedValueOnce(stale).mockResolvedValue(revived);
 		try {
 			const result = await runSubagentFollowUpTurn({ ...baseOptions, id: "subagent-revive", message: "batch work" });
 			expect(ensureLive).toHaveBeenCalledTimes(3);
@@ -427,7 +432,7 @@ describe("runSubprocess yield reminders", () => {
 			expect(result.exitCode).toBe(0);
 			expect(result.output).toContain('"revived": true');
 		} finally {
-			AgentRegistry.global().unregister("subagent-revive");
+			registry.unregister("subagent-revive");
 		}
 	});
 	it("fails fast when parking replaces the worker on every install", async () => {
@@ -446,7 +451,7 @@ describe("runSubprocess yield reminders", () => {
 		// A park slipping into every rebuild window replaces the worker each
 		// round trip: fail after three instead of chasing replacements forever.
 		const ensureLive = vi
-			.spyOn(AgentLifecycleManager.global(), "ensureLive")
+			.spyOn(lifecycle, "ensureLive")
 			.mockResolvedValueOnce(sessions[0]!)
 			.mockResolvedValueOnce(sessions[1]!)
 			.mockResolvedValueOnce(sessions[2]!)
@@ -457,7 +462,7 @@ describe("runSubprocess yield reminders", () => {
 			).rejects.toThrow("was replaced during every install attempt");
 			expect(ensureLive).toHaveBeenCalledTimes(4);
 		} finally {
-			AgentRegistry.global().unregister("subagent-churn");
+			registry.unregister("subagent-churn");
 		}
 	});
 	it("waits out a wake running on the replacement worker before reinstalling", async () => {
@@ -499,7 +504,7 @@ describe("runSubprocess yield reminders", () => {
 		// Parking swaps the worker mid-install while an IRC delivery revives the
 		// replacement straight into an ordinary wake: the follow-up must wait out
 		// that wake before installing the keyed contract, not reject its yield.
-		vi.spyOn(AgentLifecycleManager.global(), "ensureLive").mockResolvedValueOnce(stale).mockResolvedValue(revived);
+		vi.spyOn(lifecycle, "ensureLive").mockResolvedValueOnce(stale).mockResolvedValue(revived);
 		try {
 			const result = await runSubagentFollowUpTurn({
 				...baseOptions,
@@ -510,9 +515,65 @@ describe("runSubprocess yield reminders", () => {
 			expect(result.exitCode).toBe(0);
 			expect(result.output).toContain('"revived": true');
 		} finally {
-			AgentRegistry.global().unregister("subagent-revive-wake");
+			registry.unregister("subagent-revive-wake");
 		}
 	});
+	it("fails before session creation when authority creator is missing", async () => {
+		const createSessionSpy = vi.spyOn(sdkModule, "createAgentSession");
+		await expect(runSubprocess({ ...baseOptions, createAuthoritySession: undefined as never })).rejects.toThrow(
+			"parent-bound session creator",
+		);
+		expect(createSessionSpy).not.toHaveBeenCalled();
+	});
+
+	it("fails before setup when the owning registry is missing", async () => {
+		const createSessionSpy = vi.spyOn(sdkModule, "createAgentSession");
+		await expect(runSubprocess({ ...baseOptions, agentRegistry: undefined as never })).rejects.toThrow(
+			"agent registry",
+		);
+		expect(createSessionSpy).not.toHaveBeenCalled();
+	});
+
+	it("drives the session from the exact followup registry", async () => {
+		const firstSession = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "cross-root-first",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { root: 1 } },
+				},
+				isError: false,
+			});
+		});
+		const secondSession = createMockSession(() => {});
+		const firstRegistry = new AgentRegistry();
+		const secondRegistry = new AgentRegistry();
+		firstRegistry.register({
+			id: "cross-root",
+			displayName: "cross-root",
+			kind: "sub",
+			status: "idle",
+			session: firstSession,
+		});
+		secondRegistry.register({
+			id: "cross-root",
+			displayName: "cross-root",
+			kind: "sub",
+			status: "idle",
+			session: secondSession,
+		});
+		const result = await runSubagentFollowUpTurn({
+			...baseOptions,
+			id: "cross-root",
+			message: "continue in root one",
+			agentRegistry: firstRegistry,
+			agentLifecycle: getAgentLifecycleManager(firstRegistry),
+		});
+		expect(result.output).toContain('"root": 1');
+	});
+
 	it("sends reminder prompt when subagent stops without yield", async () => {
 		const prompts: string[] = [];
 		const promptOptions: Array<PromptOptions | undefined> = [];
@@ -1079,6 +1140,9 @@ describe("runSubprocess telemetry propagation", () => {
 		source: "bundled",
 	};
 
+	const registry = new AgentRegistry();
+	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+		sdkModule.createAgentSession({ ...options, agentRegistry: registry });
 	const baseOptions = {
 		cwd: "/tmp",
 		agent: baseAgent,
@@ -1090,6 +1154,8 @@ describe("runSubprocess telemetry propagation", () => {
 			refresh: async () => {},
 		} as unknown as import("@oh-my-pi/pi-coding-agent/config/model-registry").ModelRegistry,
 		enableLsp: false,
+		agentRegistry: registry,
+		createAuthoritySession,
 	};
 
 	function buildSession() {

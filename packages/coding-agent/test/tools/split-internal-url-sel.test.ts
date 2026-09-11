@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { pathTargetsSsh, peelWriteUrlSelector, splitInternalUrlSel } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
+import {
+	isInternalUrlPath,
+	pathTargetsSsh,
+	peelWriteUrlSelector,
+	splitInternalUrlSel,
+} from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 
 describe("splitInternalUrlSel", () => {
 	it("returns the input unchanged when there is no selector tail", () => {
@@ -137,6 +142,15 @@ describe("splitInternalUrlSel", () => {
 
 	it("still peels authority-trailing selectors for non-ssh schemes (artifact://5:1-50)", () => {
 		expect(splitInternalUrlSel("artifact://5:1-50")).toEqual({ path: "artifact://5", sel: "1-50" });
+	});
+});
+
+describe("isInternalUrlPath", () => {
+	it("recognizes memory URLs without admitting scheme lookalikes", () => {
+		expect(isInternalUrlPath("memory://root?q=needle")).toBe(true);
+		expect(isInternalUrlPath("memory:/x")).toBe(false);
+		expect(isInternalUrlPath("memoryx://root")).toBe(false);
+		expect(isInternalUrlPath("custom://root")).toBe(false);
 	});
 });
 

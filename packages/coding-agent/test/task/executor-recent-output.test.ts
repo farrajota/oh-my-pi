@@ -21,11 +21,19 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, AgentProgress } from "@oh-my-pi/pi-coding-agent/task/types";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 const TAIL_BYTES = 8 * 1024;
+
+function createAuthorityFixture() {
+	const agentRegistry = new AgentRegistry();
+	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+		sdkModule.createAgentSession({ ...options, agentRegistry });
+	return { agentRegistry, createAuthoritySession };
+}
 
 /**
  * Reference model: the pre-optimization algorithm, recomputed eagerly from the
@@ -241,6 +249,7 @@ async function runScenario(ops: Op[], options?: { abortAfterOps?: boolean }): Pr
 
 	vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as CreateAgentSessionResult);
 
+	const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 	const result = await runSubprocess({
 		cwd: "/tmp",
 		agent,
@@ -256,6 +265,8 @@ async function runScenario(ops: Op[], options?: { abortAfterOps?: boolean }): Pr
 			observations.push({ got: [...progress.recentOutput], want: ref.expected() });
 			immutability.push({ live: progress.recentOutput, copy: [...progress.recentOutput] });
 		},
+		agentRegistry,
+		createAuthoritySession,
 	});
 
 	return { observations, immutability, exitCode: result.exitCode, finalWant: ref.expected() };

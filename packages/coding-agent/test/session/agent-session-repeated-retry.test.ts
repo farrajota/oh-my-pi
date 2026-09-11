@@ -291,6 +291,7 @@ async function createHarness(
 async function disposeHarness(harness: Harness | undefined): Promise<void> {
 	if (!harness) return;
 	harness.session.abortRetry();
+	await harness.session.dispose();
 	harness.authStorage.close();
 	if (fs.existsSync(harness.tempDir)) {
 		removeSyncWithRetries(harness.tempDir);

@@ -24,6 +24,7 @@ import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry, type AgentHistorySummary } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
+import { normalizeEffectivePermissionSummary } from "../task/permission-profiles";
 import { shouldDisableReasoning, toReasoningEffort } from "../thinking";
 import { emitSubagentFrame } from "../utils/event-bus";
 import { setSessionTerminalTitle } from "../utils/title-generator";
@@ -624,6 +625,7 @@ export class CollabGuestLink {
 			}
 		}
 		for (const snap of agents) {
+			const permissionSummary = normalizeEffectivePermissionSummary(snap.permissionSummary);
 			const history = Object.fromEntries(
 				Object.entries({
 					modelRole: snap.modelRole,
@@ -631,11 +633,22 @@ export class CollabGuestLink {
 					resolvedModelIsFallback: snap.resolvedModelIsFallback,
 					requestedPermissionProfiles: snap.requestedPermissionProfiles,
 					effectivePermissionProfiles: snap.effectivePermissionProfiles,
+					permissionSummary,
 				}).filter(([, value]) => value !== undefined),
 			) as AgentHistorySummary;
-			if (this.agentRegistry.get(snap.id)) {
-				this.agentRegistry.setStatus(snap.id, snap.status);
-				if (Object.keys(history).length > 0) this.agentRegistry.setHistory(snap.id, history);
+			// Guest snapshots are legacy replica rows (`session: null`), never local
+			// authority. Every public mutation is bound to the exact frozen
+			// observation so a copied, replaced, or authority-owned collision is
+			// rejected without partially applying host metadata.
+			const observation = this.agentRegistry.get(snap.id);
+			if (observation) {
+				this.agentRegistry.setStatus(snap.id, snap.status, observation);
+				if (Object.keys(history).length > 0) this.agentRegistry.setHistoryExact(snap.id, observation, history);
+				this.agentRegistry.updateAgentMetadata(snap.id, observation, {
+					displayName: snap.displayName,
+					createdAt: snap.createdAt,
+					lastActivity: snap.lastActivity,
+				});
 			} else {
 				this.agentRegistry.register({
 					id: snap.id,
@@ -644,16 +657,10 @@ export class CollabGuestLink {
 					parentId: snap.parentId,
 					session: null,
 					status: snap.status,
+					createdAt: snap.createdAt,
+					lastActivity: snap.lastActivity,
 					...(Object.keys(history).length > 0 ? { history } : {}),
 				});
-			}
-			// Refs are returned by reference: patch host timestamps directly so
-			// hub age/activity columns reflect the host, not local registration.
-			const ref = this.agentRegistry.get(snap.id);
-			if (ref) {
-				ref.createdAt = snap.createdAt;
-				ref.lastActivity = snap.lastActivity;
-				ref.displayName = snap.displayName;
 			}
 			this.#agentHasTranscript.set(snap.id, snap.hasSessionFile);
 		}

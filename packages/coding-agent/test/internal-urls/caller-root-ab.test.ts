@@ -2,20 +2,16 @@
  * A/B caller-root resolution contracts for the internal URL tools.
  *
  * Two top-level roots (A and B) both contain a same-named parked `Worker`
- * (transcript + `.md` output). The process-global registry's single `Main`
- * ref belongs to B, and B's roster scan ran first, so every global-first
- * lookup points at B. When a session rooted in A resolves `history://Worker`
- * or `agent://Worker` through the tool paths — grep, find, and bash URL
- * expansion — the caller's own root must win:
+ * (transcript + manager-published output). Bound callers provide the exact
+ * registry/session root, so each lookup sees only its own root:
  *
- * - `history://Worker` serves A's transcript (roster refresh per caller root),
- * - `agent://Worker` scans A's canonical artifact directory first,
- * - repeated caller resolutions reuse the settled roster latch (no re-scans),
- * - a caller root with no artifacts falls back gracefully to the global scan,
- * - no caller session file keeps the pre-existing global behavior.
+ * - `history://Worker` serves the caller's transcript,
+ * - `agent://Worker` serves the caller's published logical head,
+ * - bare indexes/completion do not enumerate another root,
+ * - a caller root with no resource fails closed,
+ * - no caller session keeps the explicit contextless global display behavior.
  */
-import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
-import * as fs from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -25,10 +21,13 @@ import { resetRegisteredArtifactDirsForTests } from "@oh-my-pi/pi-coding-agent/i
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ensurePersistedRoster } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { expandInternalUrls } from "@oh-my-pi/pi-coding-agent/tools/bash-skill-urls";
 import { GlobTool } from "@oh-my-pi/pi-coding-agent/tools/glob";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
+import { HistoryProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/history-protocol";
+import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 
 function sessionHeader(id: string): string {
 	return JSON.stringify({
@@ -66,31 +65,14 @@ async function writeTranscriptWithLine(sessionFile: string, id: string, secret: 
 	);
 }
 
-/** Directory a roster scan reads for a root (`<sessionFile>` minus `.jsonl`). */
-function scanDir(sessionFile: string): string {
-	return sessionFile.slice(0, -".jsonl".length);
-}
-
-function countReaddirs(readdirs: string[], dir: string): number {
-	return readdirs.filter(target => target === dir).length;
-}
-
-/** Spy on `fs.promises.readdir` (the binding the roster scan uses), recording each scanned directory. */
-function spyOnReaddirs(readdirs: string[]): void {
-	const realReaddir = fs.promises.readdir;
-	spyOn(fs.promises, "readdir").mockImplementation((async (target: fs.PathLike) => {
-		readdirs.push(String(target));
-		return realReaddir(target, { withFileTypes: true });
-	}) as unknown as typeof fs.promises.readdir);
-}
-
-function makeSession(cwd: string, sessionFile: string | null = null): ToolSession {
+function makeSession(cwd: string, sessionFile: string | null = null, agentRegistry?: AgentRegistry): ToolSession {
 	return {
 		cwd,
 		hasUI: false,
 		getSessionFile: () => sessionFile,
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated({ "grep.contextBefore": 0, "grep.contextAfter": 0 }),
+		...(agentRegistry ? { agentRegistry } : {}),
 	};
 }
 
@@ -107,20 +89,20 @@ function getResultText(result: { content: Array<{ type: string; text?: string }>
  */
 async function setupAbRoots(
 	dir: string,
-): Promise<{ rootA: string; rootB: string; childA: string; childB: string; artifactA: string; artifactB: string }> {
+): Promise<{ rootA: string; rootB: string; artifactA: string; artifactB: string }> {
 	const rootA = path.join(dir, "a", "main.jsonl");
 	const rootB = path.join(dir, "b", "main.jsonl");
-	const childA = path.join(dir, "a", "main", "Worker.jsonl");
-	const childB = path.join(dir, "b", "main", "Worker.jsonl");
 	const artifactA = path.join(dir, "a", "main", "Worker.md");
 	const artifactB = path.join(dir, "b", "main", "Worker.md");
 	await Bun.write(rootA, `${sessionHeader("a")}\n`);
 	await Bun.write(rootB, `${sessionHeader("b")}\n`);
-	await writeTranscriptWithLine(childA, "worker", "A");
-	await writeTranscriptWithLine(childB, "worker", "B");
-	await Bun.write(artifactA, "A OUTPUT");
-	await Bun.write(artifactB, "B OUTPUT");
-	return { rootA, rootB, childA, childB, artifactA, artifactB };
+	await writeTranscriptWithLine(path.join(dir, "a", "main", "Worker.jsonl"), "worker", "A");
+	await writeTranscriptWithLine(path.join(dir, "b", "main", "Worker.jsonl"), "worker", "B");
+	await Promise.all([
+		new ArtifactManager(path.dirname(artifactA)).publishAgentArtifacts("Worker", "A OUTPUT"),
+		new ArtifactManager(path.dirname(artifactB)).publishAgentArtifacts("Worker", "B OUTPUT"),
+	]);
+	return { rootA, rootB, artifactA, artifactB };
 }
 
 /** Install the A/B trap: B's roster scan ran first AND the global Main ref is B. */
@@ -138,11 +120,8 @@ async function installGlobalMainB(registry: AgentRegistry, rootB: string): Promi
 
 describe("internal URL tools resolve against the caller root (A/B same ids)", () => {
 	let dir: string;
-	let readdirs: string[];
 	let rootA: string;
 	let rootB: string;
-	let childA: string;
-	let childB: string;
 	let artifactA: string;
 	let artifactB: string;
 
@@ -151,9 +130,7 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 		InternalUrlRouter.resetForTests();
 		resetRegisteredArtifactDirsForTests();
 		dir = path.join(await fsp.mkdtemp(path.join(os.tmpdir(), "caller-root-ab-")));
-		({ rootA, rootB, childA, childB, artifactA, artifactB } = await setupAbRoots(dir));
-		readdirs = [];
-		spyOnReaddirs(readdirs);
+		({ rootA, rootB, artifactA, artifactB } = await setupAbRoots(dir));
 	});
 
 	afterEach(async () => {
@@ -167,31 +144,41 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 	it("grep history://Worker serves the caller root's transcript when the global Main is the other root", async () => {
 		const registry = AgentRegistry.global();
 		await installGlobalMainB(registry, rootB);
-		expect(registry.get("Worker")?.sessionFile).toBe(childB);
 
-		const tool = new GrepTool(makeSession(dir, rootA));
+		const tool = new GrepTool(makeSession(dir, rootA, registry));
 		const result = await tool.execute("grep-history-a", { pattern: "secret-A-line", path: "history://Worker" });
 		const text = getResultText(result);
 		expect(text).toContain("secret-A-line");
 		expect(text).not.toContain("secret-B-line");
-		expect(registry.get("Worker")?.sessionFile).toBe(childA);
 
-		// A settled roster latch: the second resolution reuses it — no re-scan.
 		const again = await tool.execute("grep-history-a-again", { pattern: "secret-A-line", path: "history://Worker" });
 		expect(getResultText(again)).toContain("secret-A-line");
-		// agent:// from the same caller shares the settled latch too.
 		const agent = await tool.execute("grep-agent-a", { pattern: "A OUTPUT", path: "agent://Worker" });
 		expect(getResultText(agent)).toContain("A OUTPUT");
-		expect(getResultText(agent)).not.toContain("B OUTPUT");
-		expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
-		expect(countReaddirs(readdirs, scanDir(rootB))).toBe(1);
+	});
+
+	it("scopes bare history index and completion to the caller root", async () => {
+		const registry = AgentRegistry.global();
+		await installGlobalMainB(registry, rootB);
+		await Bun.write(path.join(dir, "a", "main", "OnlyA.jsonl"), sessionHeader("only-a"));
+		await Bun.write(path.join(dir, "b", "main", "OnlyB.jsonl"), sessionHeader("only-b"));
+		const context = { agentRegistry: registry, sessionFile: rootA };
+		const handler = new HistoryProtocolHandler();
+		const index = await handler.resolve(parseInternalUrl("history://"), context);
+		const completions = await handler.complete(undefined, context);
+		expect(index.content).toContain("OnlyA");
+		expect(index.content).not.toContain("OnlyB");
+		expect(completions.map(entry => entry.value)).toContain("OnlyA");
+		expect(completions.map(entry => entry.value)).not.toContain("OnlyB");
+		const agentCompletions = (await InternalUrlRouter.instance().complete("agent", "", context)) ?? [];
+		expect(agentCompletions.map(entry => entry.value)).not.toContain("Worker");
 	});
 
 	it("grep agent://Worker serves the caller root's output artifact when the global Main is the other root", async () => {
 		const registry = AgentRegistry.global();
 		await installGlobalMainB(registry, rootB);
 
-		const tool = new GrepTool(makeSession(dir, rootA));
+		const tool = new GrepTool(makeSession(dir, rootA, registry));
 		const result = await tool.execute("grep-agent-a", { pattern: "A OUTPUT", path: "agent://Worker" });
 		expect(getResultText(result)).toContain("A OUTPUT");
 		expect(getResultText(result)).not.toContain("B OUTPUT");
@@ -201,7 +188,7 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 		const registry = AgentRegistry.global();
 		await installGlobalMainB(registry, rootB);
 
-		const tool = new GlobTool(makeSession(dir, rootA));
+		const tool = new GlobTool(makeSession(dir, rootA, registry));
 		const result = await tool.execute("find-history-a", { path: "history://Worker" });
 		const text = getResultText(result);
 		expect(text).toContain("# a/main/");
@@ -212,12 +199,12 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 	it("bash agent:// expansion resolves the caller root's output path when the global Main is the other root", async () => {
 		const registry = AgentRegistry.global();
 		await installGlobalMainB(registry, rootB);
-
 		const expanded = await expandInternalUrls("cat agent://Worker", {
 			skills: [],
 			internalRouter: InternalUrlRouter.instance(),
 			cwd: dir,
 			sessionFile: rootA,
+			agentRegistry: registry,
 		});
 		expect(expanded).toContain(artifactA);
 		expect(expanded).not.toContain(artifactB);
@@ -238,41 +225,33 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 		await installGlobalMainB(registry, rootB);
 
 		// Caller A: A's refs replace B's and A's output wins.
-		const toolA = new GrepTool(makeSession(dir, rootA));
+		const toolA = new GrepTool(makeSession(dir, rootA, registry));
 		const aHistory = await toolA.execute("grep-history-a", { pattern: "secret-A-line", path: "history://Worker" });
 		expect(getResultText(aHistory)).toContain("secret-A-line");
 		expect(getResultText(aHistory)).not.toContain("secret-B-line");
 		const aAgent = await toolA.execute("grep-agent-a", { pattern: "A OUTPUT", path: "agent://Worker" });
 		expect(getResultText(aAgent)).toContain("A OUTPUT");
 
-		// Caller B: A's re-scan superseded B's latch, so B re-scans exactly
-		// once and B's transcript + output win again.
-		const toolB = new GrepTool(makeSession(dir, rootB));
+		const toolB = new GrepTool(makeSession(dir, rootB, registry));
 		const bHistory = await toolB.execute("grep-history-b", { pattern: "secret-B-line", path: "history://Worker" });
 		expect(getResultText(bHistory)).toContain("secret-B-line");
 		expect(getResultText(bHistory)).not.toContain("secret-A-line");
-		expect(registry.get("Worker")?.sessionFile).toBe(childB);
 		const bAgent = await toolB.execute("grep-agent-b", { pattern: "B OUTPUT", path: "agent://Worker" });
 		expect(getResultText(bAgent)).toContain("B OUTPUT");
 		expect(getResultText(bAgent)).not.toContain("A OUTPUT");
-
-		expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
-		expect(countReaddirs(readdirs, scanDir(rootB))).toBe(2);
 	});
-
-	it("a caller root with no artifacts falls back gracefully to the global registry", async () => {
+	it("fails closed when a caller root has no matching registry or disk resource", async () => {
 		const registry = AgentRegistry.global();
 		await installGlobalMainB(registry, rootB);
 
-		// Caller C's session file points at a root whose artifacts dir was
-		// never created: nothing caller-specific exists, so resolution must
-		// not crash and keeps serving the global best effort (B's refs).
 		const rootC = path.join(dir, "c", "main.jsonl");
-		const tool = new GrepTool(makeSession(dir, rootC));
-		const history = await tool.execute("grep-history-c", { pattern: "secret-B-line", path: "history://Worker" });
-		expect(getResultText(history)).toContain("secret-B-line");
-		const agent = await tool.execute("grep-agent-c", { pattern: "B OUTPUT", path: "agent://Worker" });
-		expect(getResultText(agent)).toContain("B OUTPUT");
+		const tool = new GrepTool(makeSession(dir, rootC, registry));
+		await expect(
+			tool.execute("grep-history-c", { pattern: "secret-B-line", path: "history://Worker" }),
+		).rejects.toThrow("Unknown agent: Worker");
+		await expect(tool.execute("grep-agent-c", { pattern: "B OUTPUT", path: "agent://Worker" })).rejects.toThrow(
+			"No artifacts directory found",
+		);
 	});
 
 	it("agent://Worker/<field> pairs the sidecar with the SAME root as the matched Worker.md", async () => {
@@ -281,9 +260,15 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 
 		// Root A has no sidecar; root B has one with a different payload. A's
 		// caller must never answer with B's sidecar.
-		await fsp.writeFile(path.join(dir, "a", "main", "Worker.md"), JSON.stringify({ count: 1 }));
-		await fsp.writeFile(path.join(dir, "b", "main", "Worker.md"), JSON.stringify({ count: 2 }));
-		await fsp.writeFile(path.join(dir, "b", "main", "Worker.json"), JSON.stringify({ count: 2 }));
+		await new ArtifactManager(path.join(dir, "a", "main")).publishAgentArtifacts(
+			"Worker",
+			JSON.stringify({ count: 1 }),
+		);
+		await new ArtifactManager(path.join(dir, "b", "main")).publishAgentArtifacts(
+			"Worker",
+			JSON.stringify({ count: 2 }),
+			JSON.stringify({ count: 2 }),
+		);
 
 		const router = InternalUrlRouter.instance();
 		const resource = await router.resolve("agent://Worker/count", { sessionFile: rootA });

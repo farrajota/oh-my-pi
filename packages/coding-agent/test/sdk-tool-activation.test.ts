@@ -390,6 +390,10 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getToolByName("think")).toBeUndefined();
 			expect(session.getActiveToolNames()).not.toContain("think");
 
+			await session.setThinkToolEnabled(true);
+			expect(session.getToolByName("think")).toBeUndefined();
+			expect(session.getActiveToolNames()).not.toContain("think");
+
 			settings.set("externalThinking", true);
 			await session.setThinkToolEnabled(true);
 
@@ -400,6 +404,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			settings.set("externalThinking", false);
 			await session.setThinkToolEnabled(false);
 			expect(session.getActiveToolNames()).not.toContain("think");
+			expect(session.getToolByName("think")).toBeDefined();
 		} finally {
 			await session.dispose();
 		}
@@ -2195,9 +2200,12 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			});
 		};
 
+		const restrictedSettings = configuredSettings();
+		restrictedSettings.set("externalThinking", true);
+
 		const { session: restricted } = await createAgentSession({
 			...baseOptions(restrictedDir),
-			settings: configuredSettings(),
+			settings: restrictedSettings,
 			extensions: [toolActivationExtension, restrictedLateExtension],
 			customTools: [sdkCustomTool],
 			toolNames: ["read", "lsp", "hub"],
@@ -2214,6 +2222,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 				reportSendError: vi.fn(),
 				reportRuntimeError: vi.fn(),
 			});
+			await restricted.setThinkToolEnabled(true);
 			expect(restricted.getAllToolNames()).toEqual(["read", "lsp", "yield"]);
 			expect(restricted.getActiveToolNames()).toEqual(["read", "lsp", "yield"]);
 			for (const name of [
@@ -2229,6 +2238,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 				"sdk_custom_tool",
 				"restricted_late_extension_tool",
 				"hub",
+				"think",
 			]) {
 				expect(restricted.getToolByName(name)).toBeUndefined();
 			}

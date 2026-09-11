@@ -3,6 +3,7 @@ import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -13,6 +14,50 @@ import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memor
 // Embedders on the previous InteractiveMode constructor signature wire only a
 // session `eventBus`; the host must fall back to it so depth-1 subagent
 // frames keep reaching collaboration guests.
+const PERMISSION_SUMMARY: EffectivePermissionSummary = {
+	mode: "enforce",
+	profiles: { items: ["focused-edit", "no-network"], omittedCount: 2 },
+	clauses: {
+		items: [
+			{
+				tools: { items: ["read", "edit"], omittedCount: 1 },
+				allowPathSets: {
+					items: [
+						{ items: ["src/**", "test/**"], omittedCount: 1 },
+						{ items: ["docs/**"], omittedCount: 0 },
+					],
+					omittedCount: 1,
+				},
+			},
+		],
+		omittedCount: 2,
+	},
+	denyTools: { items: ["bash"], omittedCount: 1 },
+	denyPaths: { items: ["**/.env"], omittedCount: 2 },
+	guardrails: { noNetwork: true, secretsBlind: false },
+	intrinsicTools: { yield: true, reportToolIssue: true },
+	recentDenials: {
+		items: [
+			{
+				kind: "subagent_permission_denial",
+				code: "tool-deny",
+				tool: "bash",
+				targets: { items: [{ kind: "process", display: "shell command" }], omittedCount: 1 },
+				matched: "bash",
+				reason: "denied by fixture",
+			},
+			{
+				kind: "subagent_permission_denial",
+				code: "path-not-allowed",
+				tool: "read",
+				targets: { items: [{ kind: "path", display: "private file" }], omittedCount: 0 },
+				matched: "src/private.ts",
+				reason: "outside allowed paths",
+			},
+		],
+		omittedCount: 3,
+	},
+};
 
 function makeHostContext(eventBus: EventBus): InteractiveModeContext {
 	return {
@@ -125,6 +170,7 @@ describe("collab host bus fallback", () => {
 				resolvedModelIsFallback: false,
 				requestedPermissionProfiles: ["no-network", "focused-edit"],
 				effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+				permissionSummary: PERMISSION_SUMMARY,
 			},
 		});
 		registry.setHistory("MetadataWorker", {
@@ -176,6 +222,7 @@ describe("collab host bus fallback", () => {
 				requestedPermissionProfiles: ["no-network", "focused-edit"],
 				effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
 			});
+			expect(metadata?.permissionSummary).toEqual(PERMISSION_SUMMARY);
 			expect(agents.find(agent => agent.id === "NonFallbackWorker")).toMatchObject({
 				resolvedModel: "anthropic/claude-sonnet-4-5",
 				resolvedModelIsFallback: false,

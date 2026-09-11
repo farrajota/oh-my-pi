@@ -4,13 +4,18 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import backgroundTanDispatchPrompt from "../../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import tanContextSwitchPrompt from "../../prompts/system/tan-context-switch.md" with { type: "text" };
-import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
-import * as sdk from "../../sdk";
+import {
+	bindInternalAgentAuthoritySession,
+	detachAgentSession,
+	setAgentStatus,
+} from "../../internal/agent-registry-bridge";
+import { AgentRegistry } from "../../registry/agent-registry";
 import type { AgentSession } from "../../session/agent-session";
 import { BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE } from "../../session/messages";
 import { SessionManager } from "../../session/session-manager";
 import { createMCPProxyTools, createSubagentSettings } from "../../task/executor";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
+import { runJobOperation } from "../../registry/operation-lease";
 import type { InteractiveModeContext } from "../types";
 
 const TAN_LABEL_PREVIEW_LENGTH = 80;
@@ -88,7 +93,6 @@ export class TanCommandController {
 		// providers rather than pruning the shared registry from an empty set.
 		const parentExtensionPaths = session.extensionPaths;
 		const parentExtensionRoots = session.effectiveExtensionRoots;
-		const ownerId = session.getAgentId() ?? MAIN_AGENT_ID;
 		const mcpManager = this.ctx.mcpManager;
 		const cwd = this.ctx.sessionManager.getCwd();
 		const parentArtifactsDir = this.ctx.sessionManager.getArtifactsDir();
@@ -112,6 +116,8 @@ export class TanCommandController {
 		const customTools = mcpManager ? createMCPProxyTools(mcpManager) : undefined;
 		const enableLsp = this.ctx.settings.get("task.enableLsp") !== false;
 		const agentRegistry = AgentRegistry.global();
+		const authorityBinding = bindInternalAgentAuthoritySession(agentRegistry, session);
+		if (!authorityBinding) throw new Error("Invalid live parent session authority.");
 		const cloneId = `Tan-${Snowflake.next()}`;
 		const cloneFile = path.join(sessionDir, `${cloneId}.jsonl`);
 		const label = `/tan ${previewWork(trimmedWork)}`;
@@ -131,112 +137,114 @@ export class TanCommandController {
 				resetInheritedCost: true,
 			});
 
-			jobId = manager.register(
-				"task",
-				label,
-				async ({ signal }) => {
-					if (signal.aborted) throw new Error("Aborted before execution");
-
-					let clone: AgentSession | undefined;
-					try {
-						const created = await sdk.createAgentSession({
-							cwd,
-							sessionManager: cloneManager,
-							model,
-							thinkingLevel,
-							systemPrompt,
-							toolNames,
-							providerSessionId: `${parentSessionId}:tan:${Snowflake.next()}`,
-							providerPromptCacheKey: parentPromptCacheKey,
-							modelRegistry,
-							authStorage: modelRegistry.authStorage,
-							settings,
-							hasUI: false,
-							enableMCP: false,
-							customTools,
-							enableLsp,
-							agentId: cloneId,
-							agentDisplayName: "tan",
-							parentTaskPrefix: cloneId,
-							parentAgentId: ownerId,
-							agentRegistry,
-							disableExtensionDiscovery: true,
-							// `[]` is truthy and would make the child pick bindPreparedExtensions([])
-							// over a populated path fallback, so collapse an empty list to undefined.
-							preloadedPreparedExtensions: parentPreparedExtensions?.length
-								? parentPreparedExtensions
-								: undefined,
-							preloadedExtensionPaths: parentExtensionPaths?.length ? [...parentExtensionPaths] : undefined,
-							extensionRoots: () => parentExtensionRoots,
-							localProtocolOptions,
-						});
-						clone = created.session;
-						clone.sessionManager?.appendSessionInit?.({
-							systemPrompt: clone.systemPrompt ? clone.systemPrompt.join("\n\n") : systemPrompt.join("\n\n"),
-							task: trimmedWork,
-							tools: clone.getEnabledToolNames(),
-						});
-						const abortClone = () => {
-							void clone?.abort();
-						};
-						signal.addEventListener("abort", abortClone, { once: true });
-						// The fork inherits the parent's todo list via session entries;
-						// its reminders would drag the tan back onto the parent's task.
-						// Clear runtime state and persist an empty edit so reloads agree.
-						clone.setTodoPhases([]);
-						cloneManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: [] });
-						const injectContextSwitch = () => {
-							clone?.agent.appendMessage({
-								role: "developer",
-								content: tanContextSwitchPrompt,
-								attribution: "agent",
-								timestamp: Date.now(),
-							});
-						};
-						// Compaction summarizes the fork notice away with the rest of the
-						// history, after which the clone re-adopts the parent's task as its
-						// own (the summary blends both). Re-inject after every successful
-						// compaction so the fork boundary survives summarization.
-						const unsubscribeCompaction = clone.subscribe(event => {
-							if (event.type === "auto_compaction_end" && event.result && !event.aborted) {
-								injectContextSwitch();
-							}
-						});
+			jobId = manager.register("task", label, async ({ signal, jobId: registeredJobId }) =>
+				runJobOperation(
+					session.sessionManager,
+					`job:${registeredJobId}`,
+					async () => {
+						if (signal.aborted) throw new Error("Aborted before execution");
+						let clone: AgentSession | undefined;
 						try {
-							if (signal.aborted) {
-								abortClone();
-								throw new Error("Aborted before execution");
+							const created = await authorityBinding.create({
+								cwd,
+								sessionManager: cloneManager,
+								model,
+								thinkingLevel,
+								systemPrompt,
+								toolNames,
+								providerSessionId: `${parentSessionId}:tan:${Snowflake.next()}`,
+								providerPromptCacheKey: parentPromptCacheKey,
+								modelRegistry,
+								authStorage: modelRegistry.authStorage,
+								settings,
+								hasUI: false,
+								enableMCP: false,
+								customTools,
+								enableLsp,
+								agentId: cloneId,
+								agentDisplayName: "tan",
+								parentTaskPrefix: cloneId,
+								disableExtensionDiscovery: true,
+								// `[]` is truthy and would make the child pick bindPreparedExtensions([])
+								// over a populated path fallback, so collapse an empty list to undefined.
+								preloadedPreparedExtensions: parentPreparedExtensions?.length
+									? parentPreparedExtensions
+									: undefined,
+								preloadedExtensionPaths: parentExtensionPaths?.length ? [...parentExtensionPaths] : undefined,
+								extensionRoots: () => parentExtensionRoots,
+								localProtocolOptions,
+							});
+							const activeClone = created.session;
+							clone = activeClone;
+							activeClone.sessionManager?.appendSessionInit?.({
+								systemPrompt: activeClone.systemPrompt
+									? activeClone.systemPrompt.join("\n\n")
+									: systemPrompt.join("\n\n"),
+								task: trimmedWork,
+								tools: activeClone.getEnabledToolNames(),
+							});
+							const abortClone = () => {
+								void activeClone.abort();
+							};
+							signal.addEventListener("abort", abortClone, { once: true });
+							// The fork inherits the parent's todo list via session entries;
+							// its reminders would drag the tan back onto the parent's task.
+							// Clear runtime state and persist an empty edit so reloads agree.
+							activeClone.setTodoPhases([]);
+							cloneManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: [] });
+							const injectContextSwitch = () => {
+								activeClone.agent.appendMessage({
+									role: "developer",
+									content: tanContextSwitchPrompt,
+									attribution: "agent",
+									timestamp: Date.now(),
+								});
+							};
+							// Compaction summarizes the fork notice away with the rest of the
+							// history, after which the clone re-adopts the parent's task as its
+							// own (the summary blends both). Re-inject after every successful
+							// compaction so the fork boundary survives summarization.
+							const unsubscribeCompaction = activeClone.subscribe(event => {
+								if (event.type === "auto_compaction_end" && event.result && !event.aborted) {
+									injectContextSwitch();
+								}
+							});
+							try {
+								if (signal.aborted) {
+									abortClone();
+									throw new Error("Aborted before execution");
+								}
+								// Inject a context-switch developer message so the clone knows
+								// it is a tangential fork — its parent owns the prior conversation;
+								// this agent must focus exclusively on the user's request.
+								injectContextSwitch();
+								await activeClone.prompt(trimmedWork, { attribution: "user" });
+								await activeClone.waitForIdle();
+								return extractAssistantText(activeClone.getLastAssistantMessage()) || "(no output)";
+							} finally {
+								unsubscribeCompaction();
+								signal.removeEventListener("abort", abortClone);
 							}
-							// Inject a context-switch developer message so the clone knows
-							// it is a tangential fork — its parent owns the prior conversation;
-							// this agent must focus exclusively on the user's request.
-							injectContextSwitch();
-							await clone.prompt(trimmedWork, { attribution: "user" });
-							await clone.waitForIdle();
-							return extractAssistantText(clone.getLastAssistantMessage()) || "(no output)";
 						} finally {
-							unsubscribeCompaction();
-							signal.removeEventListener("abort", abortClone);
-						}
-					} finally {
-						// Keep the finished tan in the Agent Hub instead of unregistering it:
-						// flip the ref to parked BEFORE dispose so the sdk dispose wrapper
-						// skips its unregister, then null the disposed session so the hub
-						// treats it as a transcript-only parked agent. An aborted tan is
-						// terminal — let dispose unregister it.
-						if (clone) {
-							if (signal.aborted) {
-								agentRegistry.setStatus(cloneId, "aborted");
-								await clone.dispose();
-							} else {
-								agentRegistry.setStatus(cloneId, "parked");
-								await clone.dispose();
-								agentRegistry.detachSession(cloneId);
+							// Keep the finished tan in the Agent Hub instead of unregistering it:
+							// flip the ref to parked BEFORE dispose so the sdk dispose wrapper
+							// skips its unregister, then null the disposed session so the hub
+							// treats it as a transcript-only parked agent. An aborted tan is
+							// terminal — let dispose unregister it.
+							if (clone) {
+								if (signal.aborted) {
+									setAgentStatus(agentRegistry, cloneId, "aborted", clone);
+									await clone.dispose();
+								} else {
+									setAgentStatus(agentRegistry, cloneId, "parked", clone);
+									await clone.dispose();
+									detachAgentSession(agentRegistry, cloneId, clone);
+								}
 							}
 						}
-					}
-				},
-				{ ownerId, agentId: cloneId },
+					},
+					signal,
+				),
 			);
 		} catch (error) {
 			if (cloneFile) await removeCloneSession(cloneFile);

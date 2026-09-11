@@ -8,9 +8,12 @@ import typesDescriptionPrompt from "../../commit/prompts/types-description.md" w
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
 import { getMarkdownTheme } from "../../modes/theme/theme";
-import { createAgentSession } from "../../sdk";
+import { createAgentRootSession } from "../../internal/agent-registry-bridge";
+import { AgentRegistry } from "../../registry/agent-registry";
+import { registryDurableStateForSession } from "../../registry/durable-state";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
+import { SessionManager } from "../../session/session-manager";
 import agentUserPrompt from "./prompts/session-user.md" with { type: "text" };
 import agentSystemPrompt from "./prompts/system.md" with { type: "text" };
 import type { CommitAgentState } from "./state";
@@ -55,11 +58,19 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		enableAnalyzeFiles: true,
 	});
 
-	const { session } = await createAgentSession({
+	const sessionManager = SessionManager.create(
+		input.cwd,
+		SessionManager.getDefaultSessionDir(input.cwd, input.settings.getAgentDir()),
+	);
+	const sessionFile = sessionManager.getSessionFile();
+	if (!sessionFile) throw new Error("Commit agent restricted startup requires a persisted session file.");
+	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
+	const { session } = await createAgentRootSession(registry, {
 		cwd: input.cwd,
 		authStorage: input.authStorage,
 		modelRegistry: input.modelRegistry,
 		settings: input.settings,
+		sessionManager,
 		model: input.model,
 		thinkingLevel: input.thinkingLevel,
 		systemPrompt: [systemPrompt],

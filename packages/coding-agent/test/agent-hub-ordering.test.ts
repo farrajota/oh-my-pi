@@ -15,12 +15,57 @@ import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import { AgentActivityIndex, type AgentActivityRow } from "../src/activity";
 
 interface GeometryStub {
 	setRows(n: number): void;
 	restore(): void;
 }
+const PERMISSION_SUMMARY: EffectivePermissionSummary = {
+	mode: "enforce",
+	profiles: { items: ["focused-edit", "no-network"], omittedCount: 2 },
+	clauses: {
+		items: [
+			{
+				tools: { items: ["read", "edit"], omittedCount: 1 },
+				allowPathSets: {
+					items: [
+						{ items: ["src/**", "test/**"], omittedCount: 1 },
+						{ items: ["docs/**"], omittedCount: 0 },
+					],
+					omittedCount: 1,
+				},
+			},
+		],
+		omittedCount: 2,
+	},
+	denyTools: { items: ["bash"], omittedCount: 1 },
+	denyPaths: { items: ["**/.env"], omittedCount: 2 },
+	guardrails: { noNetwork: true, secretsBlind: false },
+	intrinsicTools: { yield: true, reportToolIssue: true },
+	recentDenials: {
+		items: [
+			{
+				kind: "subagent_permission_denial",
+				code: "tool-deny",
+				tool: "bash",
+				targets: { items: [], omittedCount: 1 },
+				matched: "bash",
+				reason: "hidden reason",
+			},
+			{
+				kind: "subagent_permission_denial",
+				code: "path-not-allowed",
+				tool: "read",
+				targets: { items: [{ kind: "path", display: "private file" }], omittedCount: 0 },
+				matched: "src/private.ts",
+				reason: "hidden path",
+			},
+		],
+		omittedCount: 3,
+	},
+};
 
 function stubStdoutGeometry(cols: number): GeometryStub {
 	const rowsDesc = Object.getOwnPropertyDescriptor(process.stdout, "rows");
@@ -714,6 +759,71 @@ describe("Agent hub row ordering", () => {
 			expect(rendered).toContain("Patch /tmp/Reviewer.patch");
 			hub.handleInput("\x1b[6~");
 			expect(Bun.stripANSI(hub.render(140).join("\n"))).toContain("Worktree branch omp/task/Reviewer");
+		} finally {
+			hub.dispose();
+		}
+	});
+	it("renders canonical permission facts from history and authoritative progress in the inspector", () => {
+		geometry = stubStdoutGeometry(160);
+		geometry.setRows(48);
+		const agents = new AgentRegistry();
+		agents.register({
+			id: "HistoryPermissions",
+			displayName: "History Permissions",
+			kind: "sub",
+			session: null,
+			status: "idle",
+			lastActivity: 2_000,
+			history: { permissionSummary: PERMISSION_SUMMARY },
+		});
+		agents.register({
+			id: "ProgressPermissions",
+			displayName: "Progress Permissions",
+			kind: "sub",
+			session: null,
+			status: "idle",
+			lastActivity: 1_000,
+			history: { permissionSummary: { ...PERMISSION_SUMMARY, mode: "off" } },
+		});
+		const observers = new SessionObserverRegistry();
+		vi.spyOn(observers, "getSessions").mockReturnValue([
+			{
+				id: "ProgressPermissions",
+				kind: "subagent",
+				label: "Progress Permissions",
+				status: "active",
+				lastUpdate: Date.now(),
+				progress: {
+					id: "ProgressPermissions",
+					index: 0,
+					agent: "task",
+					agentSource: "bundled",
+					status: "running",
+					task: "inspect permissions",
+					recentTools: [],
+					recentOutput: [],
+					toolCount: 0,
+					requests: 0,
+					tokens: 0,
+					cost: 0,
+					durationMs: 1,
+					permissionSummary: { ...PERMISSION_SUMMARY, mode: "suggest" },
+				} as never,
+			},
+		]);
+		const hub = makeHub(agents, { observers });
+
+		try {
+			const historyDetail = Bun.stripANSI(hub.render(160).join("\n"));
+			expect(historyDetail).toContain("Permissions: mode enforce");
+			expect(historyDetail).toContain("Profiles: focused-edit, no-network (+2 omitted)");
+			expect(historyDetail).toContain("Clauses omitted: 2");
+			expect(historyDetail).toContain("Recent denial codes: tool-deny, path-not-allowed (+3 omitted)");
+			expect(historyDetail).not.toContain("hidden reason");
+			hub.handleInput("\x1b[B");
+			const progressDetail = Bun.stripANSI(hub.render(160).join("\n"));
+			expect(progressDetail).toContain("Permissions: mode suggest");
+			expect(progressDetail).not.toContain("Permissions: mode off");
 		} finally {
 			hub.dispose();
 		}

@@ -33,7 +33,7 @@ it("agent:// resolves a depth-2 subagent's .md output while its session is live 
 
 	const grandchildId = "CodexDeepDive.GraphStore";
 	const grandchildSessionFile = path.join(midOwnArtifactsDir, `${grandchildId}.jsonl`);
-	await fs.writeFile(path.join(midOwnArtifactsDir, `${grandchildId}.md`), "full report content");
+	await new ArtifactManager(midOwnArtifactsDir).publishAgentArtifacts(grandchildId, "full report content");
 
 	const fakeSession = {
 		sessionManager: { getArtifactsDir: () => sharedArtifactManager.dir },
@@ -79,9 +79,9 @@ it("agent:// slash form resolves a nested subagent child (hierarchy separator)",
 	const parentSessionFile = path.join(rootArtifactsDir, "Parent.jsonl");
 	const parentOwnDir = parentSessionFile.slice(0, -6);
 	await fs.mkdir(parentOwnDir, { recursive: true });
-	await fs.writeFile(path.join(parentOwnDir, "Parent.Child.md"), "child capsule");
+	await new ArtifactManager(parentOwnDir).publishAgentArtifacts("Parent.Child", "child capsule");
 	// Parent output may be in the root dir; the nested child must still win.
-	await fs.writeFile(path.join(rootArtifactsDir, "Parent.md"), JSON.stringify({ Child: "wrong base output" }));
+	await sharedArtifactManager.publishAgentArtifacts("Parent", JSON.stringify({ Child: "wrong base output" }));
 
 	const fakeSession = {
 		sessionManager: { getArtifactsDir: () => sharedArtifactManager.dir },
@@ -119,7 +119,7 @@ it("agent:// path form falls back to JSON extraction when no nested output match
 	const rootArtifactsDir = rootSessionFile.slice(0, -6);
 	await fs.mkdir(rootArtifactsDir, { recursive: true });
 	const sharedArtifactManager = new ArtifactManager(rootArtifactsDir);
-	await fs.writeFile(path.join(rootArtifactsDir, "Worker.md"), JSON.stringify({ result: { ok: true } }));
+	await sharedArtifactManager.publishAgentArtifacts("Worker", JSON.stringify({ result: { ok: true } }));
 
 	const fakeSession = {
 		sessionManager: { getArtifactsDir: () => sharedArtifactManager.dir },
@@ -147,8 +147,11 @@ it("agent:// path extraction prefers the <id>.json sidecar over the markdown bod
 	await fs.mkdir(rootArtifactsDir, { recursive: true });
 	const sharedArtifactManager = new ArtifactManager(rootArtifactsDir);
 	// Non-JSON body proves the fallback path could not have produced the answer.
-	await fs.writeFile(path.join(rootArtifactsDir, "Worker.md"), "schema_violation summary text");
-	await fs.writeFile(path.join(rootArtifactsDir, "Worker.json"), JSON.stringify({ summary: "ok", count: 7 }));
+	await sharedArtifactManager.publishAgentArtifacts(
+		"Worker",
+		"schema_violation summary text",
+		JSON.stringify({ summary: "ok", count: 7 }),
+	);
 
 	const fakeSession = {
 		sessionManager: { getArtifactsDir: () => sharedArtifactManager.dir },
@@ -176,4 +179,109 @@ it("agent:// path extraction prefers the <id>.json sidecar over the markdown bod
 	// A corrupt sidecar falls back to <id>.md instead of surfacing its own parse error.
 	await fs.writeFile(path.join(rootArtifactsDir, "Worker.json"), "{not json");
 	await expect(handler.resolve(new URL("agent://Worker/count") as never)).rejects.toThrow(/Worker is not valid JSON/);
+});
+
+it("agent:// keeps raw and tampered aliases invisible without changing lookup errors", async () => {
+	const handler = new AgentProtocolHandler();
+	await expect(handler.resolve(new URL("agent://Missing") as never)).rejects.toThrow(
+		"No session - agent outputs unavailable",
+	);
+
+	const root = tempDir.path();
+	const missingSessionFile = path.join(root, "missing-artifacts.jsonl");
+	AgentRegistry.global().register({
+		id: "Main",
+		displayName: "main",
+		kind: "main",
+		session: null,
+		sessionFile: missingSessionFile,
+	});
+	await expect(handler.resolve(new URL("agent://Missing") as never)).rejects.toThrow("No artifacts directory found");
+
+	AgentRegistry.resetGlobalForTests();
+	const sessionFile = path.join(root, "marker-gated.jsonl");
+	const artifactsDir = sessionFile.slice(0, -6);
+	await fs.mkdir(artifactsDir, { recursive: true });
+	await fs.writeFile(path.join(artifactsDir, "RawOnly.md"), "unpublished raw payload");
+	const manager = new ArtifactManager(artifactsDir);
+	const tampered = await manager.publishAgentArtifacts("Tampered", "trusted payload");
+	await fs.writeFile(tampered.outputPath, "tampered payload");
+	const fakeSession = {
+		sessionManager: { getArtifactsDir: () => manager.dir },
+	} as unknown as AgentSession;
+	AgentRegistry.global().register({
+		id: "Main",
+		displayName: "main",
+		kind: "main",
+		session: fakeSession,
+		sessionFile,
+	});
+
+	await expect(handler.resolve(new URL("agent://RawOnly") as never)).rejects.toThrow("Not found: RawOnly");
+	await expect(handler.resolve(new URL("agent://Tampered") as never)).rejects.toThrow("Not found: Tampered");
+});
+
+it("agent:// extraction uses only the current output generation's sidecar in the preferred root", async () => {
+	const root = tempDir.path();
+	const rootASessionFile = path.join(root, "generation-a.jsonl");
+	const rootBSessionFile = path.join(root, "generation-b.jsonl");
+	await Promise.all([fs.writeFile(rootASessionFile, ""), fs.writeFile(rootBSessionFile, "")]);
+	const managerA = new ArtifactManager(rootASessionFile.slice(0, -6));
+	const managerB = new ArtifactManager(rootBSessionFile.slice(0, -6));
+	await managerA.publishAgentArtifacts("Worker", "old summary", JSON.stringify({ count: 1 }));
+	await managerA.publishAgentArtifacts("Worker", JSON.stringify({ count: 3 }));
+	// Neither a stale raw sidecar in the preferred root nor a current foreign
+	// sidecar in a later root may be paired with A's current output generation.
+	await fs.writeFile(path.join(managerA.dir, "Worker.json"), JSON.stringify({ count: 1 }));
+	await managerB.publishAgentArtifacts("Worker", "foreign summary", JSON.stringify({ count: 2 }));
+
+	const fakeSessionB = {
+		sessionManager: { getArtifactsDir: () => managerB.dir },
+	} as unknown as AgentSession;
+	AgentRegistry.global().register({
+		id: "Main",
+		displayName: "main",
+		kind: "main",
+		session: fakeSessionB,
+		sessionFile: rootBSessionFile,
+	});
+
+	const resource = await new AgentProtocolHandler().resolve(new URL("agent://Worker/count") as never, {
+		sessionFile: rootASessionFile,
+	});
+	expect(JSON.parse(resource.content)).toBe(3);
+	expect(resource.sourcePath).toBe(path.join(managerA.dir, "Worker.md"));
+});
+
+it("agent:// completion is registry-bounded and independent of raw filenames", async () => {
+	const root = tempDir.path();
+	const sessionFile = path.join(root, "completion.jsonl");
+	const artifactsDir = sessionFile.slice(0, -6);
+	const manager = new ArtifactManager(artifactsDir);
+	await manager.publishAgentArtifacts("Published", "published output");
+	await manager.publishAgentArtifacts("Parent.Child", "nested output");
+	const tampered = await manager.publishAgentArtifacts("Tampered", "trusted output");
+	await fs.writeFile(tampered.outputPath, "tampered output");
+	await fs.writeFile(path.join(artifactsDir, "FilenameOnly.md"), "raw output");
+
+	const fakeSession = {
+		sessionManager: { getArtifactsDir: () => manager.dir },
+	} as unknown as AgentSession;
+	for (const id of ["Main", "Published", "Parent.Child", "Tampered", "RegisteredWithoutOutput"]) {
+		AgentRegistry.global().register({
+			id,
+			displayName: id,
+			kind: id === "Main" ? "main" : "sub",
+			...(id === "Main" ? {} : { parentId: "Main" }),
+			session: fakeSession,
+			sessionFile: id === "Main" ? sessionFile : path.join(artifactsDir, `${id}.jsonl`),
+		});
+	}
+
+	await expect(new AgentProtocolHandler().complete()).resolves.toEqual([
+		{ value: "Parent.Child" },
+		{ value: "Published" },
+		{ value: "RegisteredWithoutOutput" },
+		{ value: "Tampered" },
+	]);
 });

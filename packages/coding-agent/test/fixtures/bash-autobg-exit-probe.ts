@@ -7,6 +7,11 @@
  * process must exit promptly. The parent test measures wall-clock exit time.
  */
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import {
+	installSessionOperationLedger,
+	markUnregisteredSessionOperationProjection,
+} from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 
@@ -16,13 +21,18 @@ const THRESHOLD_MS = 30_000;
 // unref'd regardless, so the only ref'd timer under test is the race threshold.
 const manager = new AsyncJobManager({ retentionMs: 0 });
 
+const sessionManager = SessionManager.inMemory("/tmp");
+const operationLedger = installSessionOperationLedger(sessionManager);
+markUnregisteredSessionOperationProjection(sessionManager, false);
+
 const session = {
 	cwd: "/tmp",
 	hasUI: false,
 	skills: [],
-	getSessionFile: () => null,
-	getSessionId: () => "autobg-probe",
-	getAgentId: () => null,
+	getSessionFile: () => sessionManager.getSessionFile() ?? null,
+	getSessionId: () => sessionManager.getSessionId(),
+	getAgentId: () => "autobg-probe-owner",
+	sessionManager,
 	asyncJobManager: manager,
 	settings: {
 		get(key: string) {
@@ -39,6 +49,7 @@ const session = {
 
 const tool = new BashTool(session);
 const result = await tool.execute("autobg-probe-call", { command: "printf hi" });
+await operationLedger.close();
 const text = result.content.find(c => c.type === "text")?.text ?? "";
 // First line only: the completed-result text carries a dynamic "Wall time" footer.
 const firstLine = text.split("\n", 1)[0]?.trim() ?? "";

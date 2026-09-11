@@ -1457,7 +1457,9 @@ export class SessionTools {
 	 * @returns false when enabling was requested but this session cannot build the tool.
 	 */
 	setThinkToolEnabled(enabled: boolean): Promise<boolean> {
-		return this.#setThinkToolActive(enabled && supportsExternalThinking(this.#host.model()));
+		return this.#setThinkToolActive(
+			enabled && this.#host.settings.get("externalThinking") && supportsExternalThinking(this.#host.model()),
+		);
 	}
 
 	/** Reconciles the external scratchpad after the active model changes. */

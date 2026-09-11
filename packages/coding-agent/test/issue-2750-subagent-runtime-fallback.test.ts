@@ -7,9 +7,19 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ServingModel } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { runSubprocess, type RunSubprocessOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, AgentProgress } from "@oh-my-pi/pi-coding-agent/task/types";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createSessionDefaults } from "./helpers/session-defaults";
+
+function runWithAuthority(options: Omit<RunSubprocessOptions, "agentRegistry" | "createAuthoritySession">) {
+	const agentRegistry = new AgentRegistry();
+	return runSubprocess({
+		...options,
+		agentRegistry,
+		createAuthoritySession: createOptions => sdkModule.createAgentSession({ ...createOptions, agentRegistry }),
+	});
+}
 
 function model(provider: string, id: string): Model<Api> {
 	return buildModel({
@@ -54,6 +64,7 @@ function createYieldingSession(
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
+		getPermissionSummary: () => undefined,
 		subscribe: (listener: (event: { type: string; [key: string]: unknown }) => void) => {
 			listeners.push(listener);
 			return () => {};
@@ -102,6 +113,7 @@ describe("subagent runtime model resolution", () => {
 	]) {
 		it(`keeps literal suffix attribution distinct from thinking (${collide ? "colliding selector" : (level ?? "unset")})`, async () => {
 			const literal = model("custom", "coding-router:max");
+			const base = model("custom", "coding-router");
 			const snapshots: AgentProgress[] = [];
 			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 				if (!options?.model) throw new Error("Expected resolved model");
@@ -118,7 +130,7 @@ describe("subagent runtime model resolution", () => {
 				const session = createYieldingSession("none", async () => {
 					if (collide) {
 						// Same concatenated selector, different identity and reasoning.
-						activeModel = model("custom", "coding-router");
+						activeModel = base;
 						activeLevel = ThinkingLevel.Max;
 					}
 					await recovery.onAssistantSettledSuccessfully({
@@ -126,6 +138,12 @@ describe("subagent runtime model resolution", () => {
 						content: [{ type: "text", text: "literal model produced this answer" }],
 						stopReason: "stop",
 					} as AssistantMessage);
+					if (collide) {
+						expect(recovery.servingModel).toMatchObject({
+							modelIdentity: "custom/coding-router",
+							thinkingLevel: ThinkingLevel.Max,
+						});
+					}
 					// A newly armed model must not steal the settled answer's identity.
 					activeModel = model("custom", "unserved-candidate");
 				});
@@ -136,7 +154,7 @@ describe("subagent runtime model resolution", () => {
 			});
 			const settings = Settings.isolated({});
 			settings.setModelRole("default", "custom/coding-router:max");
-			const result = await runSubprocess({
+			const result = await runWithAuthority({
 				cwd: "/tmp",
 				agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
 				task: "work",
@@ -146,7 +164,7 @@ describe("subagent runtime model resolution", () => {
 				settings,
 				modelRegistry: {
 					refresh: async () => {},
-					getAvailable: () => [literal],
+					getAvailable: () => [literal, base],
 					getApiKey: async () => "test-key",
 				} as never,
 				onProgress: progress => snapshots.push({ ...progress }),
@@ -180,7 +198,7 @@ describe("subagent runtime model resolution", () => {
 			},
 		});
 		settings.setModelRole("default", "primary/bad-runtime-model");
-		const result = await runSubprocess({
+		const result = await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -238,7 +256,7 @@ describe("subagent runtime model resolution", () => {
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
 		const settings = Settings.isolated({});
 		settings.setModelRole("default", "primary/bad-runtime-model");
-		const result = await runSubprocess({
+		const result = await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -276,7 +294,7 @@ describe("subagent runtime model resolution", () => {
 			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
 		});
 
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
 			task: "work",
@@ -320,7 +338,7 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -369,7 +387,7 @@ describe("subagent runtime model resolution", () => {
 			source: "bundled",
 			model: ["@smol"],
 		};
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -416,7 +434,7 @@ describe("subagent runtime model resolution", () => {
 			source: "bundled",
 			model: ["@task"],
 		};
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -459,7 +477,7 @@ describe("subagent runtime model resolution", () => {
 			source: "bundled",
 			model: ["@smol"],
 		};
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -499,7 +517,7 @@ describe("subagent runtime model resolution", () => {
 		});
 		settings.setModelRole("default", "openai-codex/gpt-5.6-sol");
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -532,7 +550,7 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -564,7 +582,7 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -596,7 +614,7 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -626,7 +644,7 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",
@@ -663,7 +681,7 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent,
 			task: "work",

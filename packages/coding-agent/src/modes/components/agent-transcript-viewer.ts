@@ -19,6 +19,7 @@ import { type Component, Editor, matchesKey, routeSgrMouseInput, ScrollView, typ
 import { formatDuration, formatNumber, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
+import { ensureAgentLive } from "../../internal/agent-lifecycle-bridge";
 import type { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import type { AgentRegistry, AgentStatus } from "../../registry/agent-registry";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
@@ -36,7 +37,7 @@ export interface AgentTranscriptViewerDeps {
 	agentId: string;
 	/** Persisted entry to reveal on first paint when opened from an activity row. */
 	initialEntryId?: string;
-	registry: AgentRegistry;
+	registry: Pick<AgentRegistry, "get">;
 	/** Collab guest: read transcript from the host instead of a local file. */
 	remote?: AgentHubRemote;
 	/** Progress/cost snapshot source for the stats line. */
@@ -68,12 +69,19 @@ export type ReadOnlyAgentTranscriptViewerDeps = Omit<AgentTranscriptViewerDeps, 
 
 export function createReadOnlyAgentTranscriptViewer(deps: ReadOnlyAgentTranscriptViewerDeps): AgentTranscriptViewer {
 	const expectedRef = deps.registry.get(deps.agentId);
-	const pinnedRegistry = {
+	const pinnedRegistry: Pick<AgentRegistry, "get"> = {
 		get: (id: string) => {
 			if (id !== deps.agentId || !expectedRef) return undefined;
-			return deps.registry.get(id) === expectedRef ? expectedRef : undefined;
+			const current = deps.registry.get(id);
+			if (!current || !current.lineage || !expectedRef.lineage) return undefined;
+			return current.id === expectedRef.id &&
+				current.lineage.rootId === expectedRef.lineage.rootId &&
+				current.lineage.parentId === expectedRef.lineage.parentId &&
+				current.lineage.generation === expectedRef.lineage.generation
+				? current
+				: undefined;
 		},
-	} as AgentRegistry;
+	};
 	const { remote: _remote, lifecycle: _lifecycle, ...safeDeps } = deps as AgentTranscriptViewerDeps;
 	return new AgentTranscriptViewer({ ...safeDeps, registry: pinnedRegistry, remote: undefined, lifecycle: undefined });
 }
@@ -560,7 +568,7 @@ export class AgentTranscriptViewer implements Component {
 		void (async () => {
 			try {
 				// Revives a parked agent; returns the live session for running/idle.
-				const session = await lifecycle().ensureLive(id);
+				const session = await ensureAgentLive(lifecycle(), id);
 				// Steers a mid-turn agent; sends a normal prompt to an idle one.
 				await session.prompt(trimmed, { streamingBehavior: "steer" });
 			} catch (error) {

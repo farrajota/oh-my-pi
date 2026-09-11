@@ -26,6 +26,7 @@ import { InternalUrlRouter, resolveLocalUrlToFile, resolveLocalUrlToPath } from 
 import { type ResolvedArtifactFile, resolveArtifactFile } from "../internal-urls/artifact-protocol";
 import { parseInternalUrl } from "../internal-urls/parse";
 import type { InternalUrl } from "../internal-urls/types";
+import type { AuthorizedFilesystemTarget, FilesystemOperation } from "../internal/session-path-scope";
 import readDescription from "../prompts/tools/read.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import {
@@ -190,11 +191,23 @@ interface BufferedFileText {
  * on the bytes first: a file that decodes to mojibake is refused, and building
  * three string views of it before finding that out would be pure waste.
  */
-async function readWholeFile(absolutePath: string): Promise<Buffer | undefined> {
+async function readWholeFile(
+	absolutePath: string,
+	operation?: FilesystemOperation,
+	target?: AuthorizedFilesystemTarget,
+): Promise<Buffer | undefined> {
+	let handle: fs.FileHandle | undefined;
 	try {
+		if (operation && target) {
+			handle = await operation.openRead(target);
+			return await handle.readFile();
+		}
 		return await fs.readFile(absolutePath);
-	} catch {
+	} catch (error) {
+		if (operation && target) throw error;
 		return undefined;
+	} finally {
+		await handle?.close();
 	}
 }
 
@@ -1408,7 +1421,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 			const sqlitePath = await resolveSqliteReadPath(this.session, readPath, suffixCache, signal);
 			if (sqlitePath) {
-				return readSqlite(sqlitePath, signal);
+				return readSqlite(this.session, sqlitePath, signal);
 			}
 
 			const pdfCandidate = literalSplit.sel === undefined ? splitPdfImageReadPath(readPath) : null;
@@ -1430,7 +1443,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				? { kind: "none" as const }
 				: parseSel(localTarget.sel);
 
+		let authorizedTarget: AuthorizedFilesystemTarget | undefined;
 		let absolutePath = resolveReadPath(localReadPath, this.session.cwd);
+		if (this.session.pathScope) {
+			const operation = this.session.pathScope.currentOperation();
+			const probe = await operation.authorize(absolutePath, "probe");
+			absolutePath = probe.canonicalTarget;
+			if (probe.existed) absolutePath = (await operation.authorize(absolutePath, "read")).canonicalTarget;
+		}
 		let suffixResolution: { from: string; to: string } | undefined;
 
 		let isDirectory = false;
@@ -1455,6 +1475,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const suffixMatch = await findSuffixMatchCached(this.session, suffixCache, localReadPath, signal);
 					if (suffixMatch) {
 						try {
+							if (this.session.pathScope) {
+								const target = await this.session.pathScope
+									.currentOperation()
+									.authorize(suffixMatch.absolutePath, "read");
+								suffixMatch.absolutePath = target.canonicalTarget;
+							}
 							const retryStat = await Bun.file(suffixMatch.absolutePath).stat();
 							absolutePath = suffixMatch.absolutePath;
 							fileSize = retryStat.size;
@@ -1472,8 +1498,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const approvedPlanPath = this.#approvedPlanAlias(absolutePath);
 					if (approvedPlanPath) {
 						try {
-							const approvedPlanStat = await Bun.file(approvedPlanPath).stat();
-							absolutePath = approvedPlanPath;
+							if (this.session.pathScope) {
+								const target = await this.session.pathScope
+									.currentOperation()
+									.authorize(approvedPlanPath, "read");
+								absolutePath = target.canonicalTarget;
+							}
+							const approvedPlanStat = await Bun.file(absolutePath).stat();
 							fileSize = approvedPlanStat.size;
 							isDirectory = approvedPlanStat.isDirectory();
 							recoveredApprovedPlan = true;
@@ -1492,6 +1523,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			} else {
 				throw error;
 			}
+		}
+		if (this.session.pathScope) {
+			authorizedTarget = await this.session.pathScope.currentOperation().authorize(absolutePath, "read");
+			absolutePath = authorizedTarget.canonicalTarget;
 		}
 
 		if (isDirectory) {
@@ -1629,7 +1664,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			// the rendered window, bracket context and the snapshot hash all want
 			// the same bytes; past the snapshot cap nothing wants the whole file,
 			// so the streaming reader keeps that case cheap.
-			const wholeFileBytes = fileSize <= SNAPSHOT_MAX_BYTES ? await readWholeFile(absolutePath) : undefined;
+			const wholeFileBytes =
+				fileSize <= SNAPSHOT_MAX_BYTES
+					? await readWholeFile(absolutePath, this.session.pathScope?.currentOperation(), authorizedTarget)
+					: undefined;
 
 			// Binary sniff before any UTF-8 text materialization. A binary file
 			// (font, object, archive, packed blob) decodes to NUL/control bytes and
@@ -2454,6 +2492,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			localProtocolOptions: this.session.localProtocolOptions,
 			skills: this.session.skills,
 			rules: this.session.activeRules,
+			callerMemory: {
+				backend: this.session.settings.get("memory.backend"),
+				getMnemopiSessionState: this.session.getMnemopiSessionState,
+			},
 			xd: {
 				read: async name => {
 					if (name === REPORT_ISSUE_DEVICE_NAME) return reportIssueDeviceUsage();
@@ -2546,6 +2588,15 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				// `lineCap` truncates the rendered tree itself; selectors slice the full
 				// rendering below instead so `:N-M` and `:-N` see the same listing.
 				lineCap: null,
+				entryFilter: async entryPath => {
+					if (!this.session.pathScope) return true;
+					try {
+						await this.session.pathScope.authorizePath("read", entryPath, true);
+						return true;
+					} catch {
+						return false;
+					}
+				},
 			});
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);

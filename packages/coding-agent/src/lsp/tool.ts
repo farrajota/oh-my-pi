@@ -30,6 +30,8 @@ import {
 	sendRequest,
 	shutdownStaleClients,
 	waitForProjectLoaded,
+	withLspSessionPolicy,
+	type LspSessionPolicy,
 } from "./client";
 import { getLinterClient } from "./clients";
 import { configCache, getConfig, getServersForFile } from "./config";
@@ -188,7 +190,11 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 	readonly parameters = lspSchema;
 	readonly strict = true;
 
+	private readonly lspPolicy: LspSessionPolicy;
+
 	constructor(private readonly session: ToolSession) {
+		const sessionPolicy = session as ToolSession & { lspShared?: boolean };
+		this.lspPolicy = { shared: sessionPolicy.lspShared === true };
 		this.description = prompt.render(lspDescription);
 	}
 
@@ -197,6 +203,18 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 	}
 
 	async execute(
+		_toolCallId: string,
+		params: LspParams,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<LspToolDetails>,
+		context?: AgentToolContext,
+	): Promise<AgentToolResult<LspToolDetails>> {
+		return withLspSessionPolicy(this.lspPolicy, () =>
+			this.executeWithPolicy(_toolCallId, params, signal, onUpdate, context),
+		);
+	}
+
+	private async executeWithPolicy(
 		_toolCallId: string,
 		params: LspParams,
 		signal?: AbortSignal,
@@ -553,6 +571,14 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					content: [{ type: "text", text: "Error: no files to rename" }],
 					details: { action, success: false, request: params },
 				};
+			}
+			if (this.session.pathScope) {
+				await this.session.pathScope.authorizePath("lsp", source, true);
+				await this.session.pathScope.authorizePath("lsp", dest, false);
+				for (const pair of pairs) {
+					await this.session.pathScope.authorizePath("lsp", uriToFile(pair.oldUri), true);
+					await this.session.pathScope.authorizePath("lsp", uriToFile(pair.newUri), false);
+				}
 			}
 
 			const lspParams = { files: pairs };
@@ -1393,7 +1419,19 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						const appliedAction = await applyCodeAction(selectedAction, {
 							resolveCodeAction: async actionItem =>
 								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
-							applyWorkspaceEdit: async edit => applyWorkspaceEditWithLsp(edit, this.session.cwd, signal),
+							applyWorkspaceEdit: async edit =>
+								applyWorkspaceEditWithLsp(
+									edit,
+									this.session.cwd,
+									signal,
+									this.session.pathScope
+										? {
+												authorizePath: async (filePath, mustExist) => {
+													await this.session.pathScope!.authorizePath("lsp", filePath, mustExist);
+												},
+											}
+										: undefined,
+								),
 							executeCommand: async commandItem => {
 								await sendRequest(
 									client,
@@ -1489,7 +1527,18 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					} else {
 						const shouldApply = apply !== false;
 						if (shouldApply) {
-							const applied = await applyWorkspaceEditWithLsp(result, this.session.cwd, signal);
+							const applied = await applyWorkspaceEditWithLsp(
+								result,
+								this.session.cwd,
+								signal,
+								this.session.pathScope
+									? {
+											authorizePath: async (filePath, mustExist) => {
+												await this.session.pathScope!.authorizePath("lsp", filePath, mustExist);
+											},
+										}
+									: undefined,
+							);
 							output = `Applied rename:\n${applied.map(a => `  ${a}`).join("\n")}`;
 						} else {
 							const preview = formatWorkspaceEdit(result, this.session.cwd);

@@ -2,6 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { PermissionDenialDetails } from "@oh-my-pi/pi-wire";
 import type {
 	AgentMessage,
 	AgentTool,
@@ -21,10 +22,12 @@ import type {
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Settings, withActiveSettings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
+import { evaluateRestrictedToolGuardrails } from "../../internal/restricted-startup-policy";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { SessionManager } from "../../session/session-manager";
-import type { EffectiveSubagentPermissions } from "../../task/permission-profiles";
+import { evaluateSubagentPermission, type EffectiveSubagentPermissions } from "../../task/permission-profiles";
+import type { SessionPathScope } from "../../internal/session-path-scope";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { ManagedTimers } from "./managed-timers";
@@ -441,6 +444,13 @@ interface ToolRegistrationScope {
 	closed: boolean;
 }
 
+function toRecord(value: unknown): Record<string, unknown> {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+	const record: Record<string, unknown> = {};
+	for (const [key, entry] of Object.entries(value)) record[key] = entry;
+	return record;
+}
+
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
@@ -469,6 +479,9 @@ export class ExtensionRunner {
 	private readonly sessionScope?: {
 		actor?: ExtensionActorIdentity;
 		permissionScope?: EffectiveSubagentPermissions;
+		pathScope?: SessionPathScope;
+		recordPermissionDenial?: (details: PermissionDenialDetails) => void;
+		lspShared?: boolean;
 	};
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
@@ -560,15 +573,13 @@ export class ExtensionRunner {
 	}
 
 	/**
-	 * Resolves a tool NAME to its native built-in implementation (the pre-extension-override,
-	 * unwrapped tool) plus a factory for the `AgentToolContext` that native tool expects, or
-	 * undefined when no native built-in of that name exists. Set by the SDK; backs same-tool
-	 * `invokeTool`. The context factory is the same one the agent loop uses for tool execution, so a
-	 * delegated native call sees the ordinary session tool context (ui, cwd, snapshot state, etc.).
+	 * Resolves a tool name to the SDK-owned, fully wrapped native built-in used by
+	 * same-name `invokeTool` delegation. Delegation must traverse the same exact
+	 * authorization, path, approval, and operation-lease gates as a model call.
 	 */
 	#nativeToolResolver?: (name: string) => { tool: AgentTool; makeContext: () => AgentToolContext } | undefined;
 
-	/** Wires the native-tool resolver used by {@link invokeNativeTool}. */
+	/** Wires the wrapped native-tool resolver used by {@link invokeNativeTool}. */
 	setNativeToolResolver(
 		resolve: (name: string) => { tool: AgentTool; makeContext: () => AgentToolContext } | undefined,
 	): void {
@@ -581,12 +592,9 @@ export class ExtensionRunner {
 	}
 
 	/**
-	 * Run the native built-in of `name` with `params` and return its result — the delegation target
-	 * of a same-tool `ctx.invokeTool`. Calls the unwrapped native `execute` directly with the loop's
-	 * ordinary tool context, so it inherits the caller's already-granted approval (the caller is the
-	 * same tool) rather than re-running the gate. `depth` guards a wrapper that recurses into itself;
-	 * it is per call chain (threaded from the caller), not session-global, so concurrent independent
-	 * delegations do not interfere.
+	 * Run the fully wrapped native built-in of `name`. `depth` guards an
+	 * extension implementation that recursively delegates to itself; it is per
+	 * call chain so concurrent independent delegations do not interfere.
 	 */
 	async invokeNativeTool<TDetails = unknown>(
 		name: string,
@@ -613,9 +621,9 @@ export class ExtensionRunner {
 		const toolCallId = `invoke-${name}-${Date.now().toString(36)}-${depth}`;
 		return (await resolved.tool.execute(
 			toolCallId,
-			params as never,
+			params,
 			options?.signal,
-			options?.onUpdate as never,
+			options?.onUpdate,
 			options?.callerContext ?? resolved.makeContext(),
 		)) as AgentToolResult<TDetails>;
 	}
@@ -634,6 +642,9 @@ export class ExtensionRunner {
 			| {
 					actor?: ExtensionActorIdentity;
 					permissionScope?: EffectiveSubagentPermissions;
+					pathScope?: SessionPathScope;
+					recordPermissionDenial?: (details: PermissionDenialDetails) => void;
+					lspShared?: boolean;
 			  }
 			| ((options?: AsyncJobSnapshotOptions) => AsyncJobSnapshot | null),
 		getAsyncJobSnapshot?: (options?: AsyncJobSnapshotOptions) => AsyncJobSnapshot | null,
@@ -942,6 +953,18 @@ export class ExtensionRunner {
 
 	getPermissionScope(): EffectiveSubagentPermissions | undefined {
 		return this.sessionScope?.permissionScope;
+	}
+
+	recordPermissionDenial(details: PermissionDenialDetails): void {
+		this.sessionScope?.recordPermissionDenial?.(details);
+	}
+
+	getPathScope(): SessionPathScope | undefined {
+		return this.sessionScope?.pathScope;
+	}
+
+	isSharedLspEnabled(): boolean {
+		return this.sessionScope?.lspShared === true;
 	}
 
 	getCwd(): string {
@@ -1565,6 +1588,25 @@ export class ExtensionRunner {
 	 * silent consent to run the tool.
 	 */
 	async emitToolCall(event: ToolCallEvent, signal?: AbortSignal): Promise<ToolCallEventResult | undefined> {
+		const permissionDecision = evaluateSubagentPermission({
+			scope: this.getPermissionScope(),
+			toolName: event.toolName,
+			toolInput: toRecord(event.input),
+			cwd: this.cwd,
+		});
+		if (permissionDecision.action === "deny") {
+			this.recordPermissionDenial(permissionDecision.details);
+			return { block: true, reason: permissionDecision.reason };
+		}
+		const guardrailDecision = evaluateRestrictedToolGuardrails({
+			scope: this.getPermissionScope(),
+			toolName: event.toolName,
+			toolInput: toRecord(event.input),
+		});
+		if (guardrailDecision.action === "deny") {
+			this.recordPermissionDenial(guardrailDecision.details);
+			return { block: true, reason: guardrailDecision.reason };
+		}
 		const ctx = this.createContext();
 		const timeoutMs = normalizeHandlerTimeout(
 			this.settings?.get("extensionHandlers.toolCallTimeoutMs") ?? extensionHandlerTimeoutMs,

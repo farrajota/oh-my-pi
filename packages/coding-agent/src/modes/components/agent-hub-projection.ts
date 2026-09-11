@@ -1,3 +1,5 @@
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
+import type { AgentSession } from "../../session/agent-session";
 import type { AgentMetricsSummary, AgentRef, AgentStatus } from "../../registry/agent-registry";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { ObservableSession } from "../session-observer-registry";
@@ -59,13 +61,20 @@ export function progressMetrics(observed: ObservableSession | undefined): AgentM
 				: undefined,
 	};
 }
+/** Exact task progress is authoritative; persisted/remote history is the fallback. */
+export function projectedPermissionSummary(
+	ref: AgentRef,
+	observed: ObservableSession | undefined,
+): EffectivePermissionSummary | undefined {
+	return observed?.progress?.permissionSummary ?? ref.history?.permissionSummary;
+}
 
 /**
  * Read direct assistant usage from a live session. SessionStats also includes
  * usage embedded in completed `task` tool results, so using it for a parent
  * row would double-count child rows in the aggregate.
  */
-function readSessionMetrics(session: NonNullable<AgentRef["session"]>): AgentMetrics | undefined {
+function readSessionMetrics(session: AgentSession): AgentMetrics | undefined {
 	try {
 		const stats = session.getSessionStats();
 		const messages = session.agent?.state?.messages;
@@ -114,10 +123,7 @@ export function aggregateMetrics(args: {
 	rows: readonly AgentRef[];
 	observedById: ReadonlyMap<string, ObservableSession>;
 	metricsFor: (ref: AgentRef, observed: ObservableSession | undefined) => AgentMetrics | undefined;
-	fallbackStatsSession: (
-		ref: AgentRef,
-		observed: ObservableSession | undefined,
-	) => NonNullable<AgentRef["session"]> | undefined;
+	fallbackStatsSession: (ref: AgentRef, observed: ObservableSession | undefined) => AgentSession | undefined;
 	sessionMetrics: WeakMap<object, { metrics: AgentMetrics | undefined }>;
 	refreshFallback: boolean;
 }): { metrics: AggregateMetrics; hasFallbackLiveSessions: boolean } {
@@ -132,7 +138,7 @@ export function aggregateMetrics(args: {
 		activeDurationAgents: 0,
 	};
 	let hasFallbackLiveSessions = false;
-	const countedFallbackSessions = new Set<NonNullable<AgentRef["session"]>>();
+	const countedFallbackSessions = new Set<AgentSession>();
 	for (const ref of args.rows) {
 		const observed = args.observedById.get(ref.id);
 		const fallbackSession = args.fallbackStatsSession(ref, observed);

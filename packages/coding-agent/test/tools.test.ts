@@ -9,6 +9,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
+import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
@@ -21,6 +22,11 @@ import { openArchive, readArchiveEntries } from "@oh-my-pi/pi-utils/ar";
 import { GlobTool } from "../src/tools/glob";
 import { DEFAULT_FILE_LIMIT, GrepTool, MULTI_FILE_PER_FILE_MATCHES } from "../src/tools/grep";
 import { HubTool } from "../src/tools/hub";
+import { createAgentRootSession } from "../src/internal/agent-registry-bridge";
+import { registerToolSessionLifecycleAuthority } from "../src/internal/agent-lifecycle-bridge";
+import { getSessionLocalProtocolOptions } from "../src/internal-urls/local-protocol";
+import { AgentRegistry } from "../src/registry/agent-registry";
+import { runLocalOperation } from "../src/registry/operation-lease";
 
 // Helper to extract text from content blocks
 function getTextOutput(result: any): string {
@@ -536,6 +542,79 @@ function createTestToolContext(toolNames: string[]): AgentToolContext {
 	} as AgentToolContext;
 }
 
+function createAuthorityModelRegistry() {
+	return {
+		authStorage: {
+			onCredentialDisabled: () => () => {},
+		},
+		hydrateCredentialScopedModelCaches: async () => {},
+		hasConfiguredAuth: () => true,
+		getAvailable: () => [],
+		getAvailableForProviders: () => [],
+		syncExtensionSources: () => {},
+		clearSourceRegistrations: () => {},
+		registerProvider: () => {},
+		refreshRuntimeProviders: async () => {},
+		refreshSelectedModelMetadata: async <T>(model: T) => model,
+		find: () => undefined,
+		getApiKey: async () => undefined,
+	};
+}
+
+async function createAuthorityToolFixture(
+	cwd: string,
+	settings: Settings,
+	asyncJobManager?: AsyncJobManager,
+): Promise<{
+	toolSession: ToolSession;
+	sessionManager: SessionManager;
+	dispose(): Promise<void>;
+}> {
+	const sessionManager = SessionManager.create(cwd, path.join(cwd, "authority-sessions"));
+	await sessionManager.ensureOnDisk();
+	const registry = new AgentRegistry();
+	const { session: owner } = await createAgentRootSession(registry, {
+		cwd,
+		agentId: "Main",
+		agentDisplayName: "main",
+		sessionManager,
+		settings,
+		model: createMockModel({ id: "authority-fixture" }),
+		modelRegistry: createAuthorityModelRegistry() as never,
+		disableExtensionDiscovery: true,
+		enableMCP: false,
+		enableLsp: false,
+		skills: [],
+		rules: [],
+		contextFiles: [],
+		promptTemplates: [],
+		slashCommands: [],
+	});
+	const localProtocolOptions = getSessionLocalProtocolOptions(sessionManager);
+	if (!localProtocolOptions) {
+		await owner.dispose();
+		throw new Error("Expected registered session local protocol options");
+	}
+	const toolSession = createTestToolSession(cwd, settings, {
+		getSessionFile: () => sessionManager.getSessionFile() ?? null,
+		getSessionId: () => sessionManager.getSessionId(),
+		getArtifactsDir: () => sessionManager.getArtifactsDir(),
+		getArtifactManager: () => sessionManager.getArtifactManager(),
+		allocateOutputArtifact: toolType => sessionManager.allocateArtifactPath(toolType),
+		sessionManager,
+		agentRegistry: registry,
+		getAgentId: () => "Main",
+		localProtocolOptions,
+		asyncJobManager,
+	});
+	registerToolSessionLifecycleAuthority(toolSession, registry, owner);
+	return {
+		toolSession,
+		sessionManager,
+		dispose: () => owner.dispose(),
+	};
+}
+
 describe("Coding Agent Tools", () => {
 	let testDir: string;
 	let session: ToolSession;
@@ -954,8 +1033,10 @@ describe("Coding Agent Tools", () => {
 
 		it("reports the artifact byte budget that truncated a ranged read", async () => {
 			const artifactsDir = path.join(testDir, "artifact-limit-session");
-			fs.mkdirSync(artifactsDir, { recursive: true });
-			fs.writeFileSync(path.join(artifactsDir, "7.mcp.log"), `skip\n{\n${"x".repeat(60 * 1024)}\ntail`);
+			const artifactId = await new ArtifactManager(artifactsDir).save(
+				`skip\n{\n${"x".repeat(60 * 1024)}\ntail`,
+				"mcp",
+			);
 			const artifactSession = createTestToolSession(testDir, Settings.isolated(), {
 				localProtocolOptions: {
 					getArtifactsDir: () => artifactsDir,
@@ -965,12 +1046,12 @@ describe("Coding Agent Tools", () => {
 			const artifactReadTool = wrapToolWithMetaNotice(new ReadTool(artifactSession));
 
 			const result = await artifactReadTool.execute("test-call-artifact-byte-limit", {
-				path: "artifact://7:3-4",
+				path: `artifact://${artifactId}:3-4`,
 			});
 			const output = getTextOutput(result);
 			expect(output).toContain("[Showing lines 2-2 of 4 (50.0KB limit)]");
 			expect(output).toContain("Line 3 is 60.0KB");
-			expect(output).toContain("artifact://7:raw:3-3");
+			expect(output).toContain(`artifact://${artifactId}:raw:3-3`);
 			expect(output).not.toContain("Use :3 to continue");
 		});
 
@@ -985,21 +1066,15 @@ describe("Coding Agent Tools", () => {
 				"tools.artifactHeadBytes": 1,
 			});
 			const defaultLimit = spillSettings.get("read.defaultLimit");
-			const spillManager = SessionManager.create(testDir, path.join(testDir, "spill-sessions"));
-			await spillManager.ensureOnDisk();
-			const spillSession = createTestToolSession(testDir, spillSettings, {
-				getSessionFile: () => spillManager.getSessionFile() ?? null,
-				getArtifactsDir: () => spillManager.getArtifactsDir(),
-				localProtocolOptions: {
-					getArtifactsDir: () => spillManager.getArtifactsDir(),
-					getSessionId: () => spillManager.getSessionId(),
-				},
-			});
+			const authority = await createAuthorityToolFixture(testDir, spillSettings);
+			const spillManager = authority.sessionManager;
+			const spillSession = authority.toolSession;
 			const spillReadTool = wrapToolWithMetaNotice(new ReadTool(spillSession));
 			const context = {
 				...createTestToolContext(["read"]),
 				settings: spillSettings,
 				sessionManager: spillManager,
+				localProtocolOptions: spillSession.localProtocolOptions,
 			};
 
 			try {
@@ -1030,7 +1105,7 @@ describe("Coding Agent Tools", () => {
 				expect(getTextOutput(artifactResult)).toContain(line);
 				expect(saveArtifact).not.toHaveBeenCalled();
 			} finally {
-				await spillManager.close();
+				await authority.dispose();
 			}
 		});
 
@@ -1046,12 +1121,13 @@ describe("Coding Agent Tools", () => {
 				"tools.artifactTailLines": 10,
 				"tools.artifactHeadBytes": 64,
 			});
-			const spillManager = SessionManager.create(testDir, path.join(testDir, "mcp-spill-sessions"));
-			await spillManager.ensureOnDisk();
+			const authority = await createAuthorityToolFixture(testDir, spillSettings);
+			const spillManager = authority.sessionManager;
 			const context = {
 				...createTestToolContext(["mcp__server__tool"]),
 				settings: spillSettings,
 				sessionManager: spillManager,
+				localProtocolOptions: authority.toolSession.localProtocolOptions,
 			};
 
 			const payload = "SEARCH RESULT LINE\n".repeat(4000);
@@ -1107,7 +1183,7 @@ describe("Coding Agent Tools", () => {
 				);
 				expect(await Bun.file(artifactPath).text()).toBe(payload);
 			} finally {
-				await spillManager.close();
+				await authority.dispose();
 			}
 		});
 
@@ -1122,12 +1198,12 @@ describe("Coding Agent Tools", () => {
 				"tools.artifactTailLines": 10,
 				"tools.artifactHeadBytes": 64,
 			});
-			const spillManager = SessionManager.create(testDir, path.join(testDir, "sdk-spill-sessions"));
-			await spillManager.ensureOnDisk();
+			const authority = await createAuthorityToolFixture(testDir, spillSettings);
 			const context = {
 				...createTestToolContext(["custom_sdk_tool"]),
 				settings: spillSettings,
-				sessionManager: spillManager,
+				sessionManager: authority.sessionManager,
+				localProtocolOptions: authority.toolSession.localProtocolOptions,
 			};
 
 			const payload = "SDK OUTPUT LINE\n".repeat(4000);
@@ -1156,7 +1232,7 @@ describe("Coding Agent Tools", () => {
 				// The tool's own rawContent is left untouched.
 				expect(result.details?.rawContent).toEqual(rawContent);
 			} finally {
-				await spillManager.close();
+				await authority.dispose();
 			}
 		});
 
@@ -1882,15 +1958,32 @@ describe("Coding Agent Tools", () => {
 		it("should write to a new local:// path under the session local root", async () => {
 			const localPath = "local://handoffs/new-output.json";
 			const content = '{"ok":true}\n';
-			const expectedPath = path.join(testDir, "session", "local", "handoffs", "new-output.json");
-
-			const result = await writeTool.execute("test-call-4-local", { path: localPath, content });
-
-			expect(getTextOutput(result)).toContain(
-				`Successfully wrote ${content.length} bytes to session/local/handoffs/new-output.json`,
+			const authority = await createAuthorityToolFixture(testDir, Settings.isolated());
+			const expectedPath = path.join(
+				authority.sessionManager.getArtifactsDir()!,
+				"local",
+				"handoffs",
+				"new-output.json",
 			);
-			expect(fs.existsSync(expectedPath)).toBe(true);
-			expect(fs.readFileSync(expectedPath, "utf-8")).toBe(content);
+			const authorityWriteTool = wrapToolWithMetaNotice(new WriteTool(authority.toolSession));
+			const pathScope = authority.toolSession.localProtocolOptions?.getPathScope?.();
+			if (!pathScope) {
+				throw new Error("Expected registered session path scope");
+			}
+
+			try {
+				const result = await runLocalOperation(authority.sessionManager, "test-call-4-local", () =>
+					pathScope.withOperationLease("test-call-4-local", () =>
+						authorityWriteTool.execute("test-call-4-local", { path: localPath, content }),
+					),
+				);
+
+				expect(getTextOutput(result)).toContain(`Successfully wrote ${content.length} bytes to ${localPath}`);
+				expect(fs.existsSync(expectedPath)).toBe(true);
+				expect(fs.readFileSync(expectedPath, "utf-8")).toBe(content);
+			} finally {
+				await authority.dispose();
+			}
 		});
 
 		it("should reject oversized tar rewrites before reading the archive bytes", async () => {
@@ -2361,21 +2454,15 @@ function b() {
 					deliveries.push(text);
 				},
 			});
-			const autoBackgroundBashTool = wrapToolWithMetaNotice(
-				new BashTool(
-					createTestToolSession(
-						testDir,
-						Settings.isolated({
-							"bash.autoBackground.enabled": true,
-							"bash.autoBackground.thresholdMs": 2_000,
-						}),
-						{
-							getSessionId: () => "test-session",
-							asyncJobManager,
-						},
-					),
-				),
-			);
+			const settings = Settings.isolated({
+				"bash.autoBackground.enabled": true,
+				"bash.autoBackground.thresholdMs": 2_000,
+			});
+			const authority = await createAuthorityToolFixture(testDir, settings, asyncJobManager);
+			asyncJobManager.registerDeliverySink("Main", async (_jobId, text) => {
+				deliveries.push(text);
+			});
+			const autoBackgroundBashTool = wrapToolWithMetaNotice(new BashTool(authority.toolSession));
 
 			const result = await autoBackgroundBashTool.execute("test-call-9-auto-inline", { command: "echo short" });
 
@@ -2385,6 +2472,7 @@ function b() {
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toEqual([]);
 			await asyncJobManager.dispose();
+			await authority.dispose();
 		});
 
 		it("should auto-background at the threshold even with a longer timeout", async () => {
@@ -2395,21 +2483,15 @@ function b() {
 					deliveries.push({ jobId, text });
 				},
 			});
-			const autoBackgroundBashTool = wrapToolWithMetaNotice(
-				new BashTool(
-					createTestToolSession(
-						testDir,
-						Settings.isolated({
-							"bash.autoBackground.enabled": true,
-							"bash.autoBackground.thresholdMs": 10,
-						}),
-						{
-							getSessionId: () => "test-session",
-							asyncJobManager,
-						},
-					),
-				),
-			);
+			const settings = Settings.isolated({
+				"bash.autoBackground.enabled": true,
+				"bash.autoBackground.thresholdMs": 10,
+			});
+			const authority = await createAuthorityToolFixture(testDir, settings, asyncJobManager);
+			asyncJobManager.registerDeliverySink("Main", async (jobId, text) => {
+				deliveries.push({ jobId, text });
+			});
+			const autoBackgroundBashTool = wrapToolWithMetaNotice(new BashTool(authority.toolSession));
 
 			const result = await autoBackgroundBashTool.execute(
 				"test-call-9-auto-running",
@@ -2442,26 +2524,18 @@ function b() {
 			expect(deliveries[0]?.text).toContain("done");
 			expect(updates).toEqual(updatesAtBackground);
 			await asyncJobManager.dispose();
+			await authority.dispose();
 		});
 
 		it("backgrounds a running command when the steering signal fires mid-wait", async () => {
 			const asyncJobManager = new AsyncJobManager({});
-			const autoBackgroundBashTool = wrapToolWithMetaNotice(
-				new BashTool(
-					createTestToolSession(
-						testDir,
-						Settings.isolated({
-							"bash.autoBackground.enabled": true,
-							// High threshold: only the steering signal can background this.
-							"bash.autoBackground.thresholdMs": 60_000,
-						}),
-						{
-							getSessionId: () => "test-session",
-							asyncJobManager,
-						},
-					),
-				),
-			);
+			const settings = Settings.isolated({
+				"bash.autoBackground.enabled": true,
+				"bash.autoBackground.thresholdMs": 60_000,
+			});
+			const authority = await createAuthorityToolFixture(testDir, settings, asyncJobManager);
+			asyncJobManager.registerDeliverySink("Main", async () => {});
+			const autoBackgroundBashTool = wrapToolWithMetaNotice(new BashTool(authority.toolSession));
 
 			const steering = new AbortController();
 			steering.abort();
@@ -2495,6 +2569,7 @@ function b() {
 			await job?.promise;
 			expect(asyncJobManager.getJob(jobId)?.status).toBe("completed");
 			await asyncJobManager.dispose();
+			await authority.dispose();
 		});
 
 		it("should background instead of timing out when auto-background wait exceeds the effective timeout", async () => {
@@ -2504,21 +2579,15 @@ function b() {
 					deliveries.push({ jobId, text });
 				},
 			});
-			const autoBackgroundBashTool = wrapToolWithMetaNotice(
-				new BashTool(
-					createTestToolSession(
-						testDir,
-						Settings.isolated({
-							"bash.autoBackground.enabled": true,
-							"bash.autoBackground.thresholdMs": 60_000,
-						}),
-						{
-							getSessionId: () => "test-session",
-							asyncJobManager,
-						},
-					),
-				),
-			);
+			const settings = Settings.isolated({
+				"bash.autoBackground.enabled": true,
+				"bash.autoBackground.thresholdMs": 60_000,
+			});
+			const authority = await createAuthorityToolFixture(testDir, settings, asyncJobManager);
+			asyncJobManager.registerDeliverySink("Main", async (jobId, text) => {
+				deliveries.push({ jobId, text });
+			});
+			const autoBackgroundBashTool = wrapToolWithMetaNotice(new BashTool(authority.toolSession));
 			// Drive the effective timeout via the production clamp seam so the
 			// backgrounded job hits its timeout in ~0.1s instead of a real
 			// wall-clock second. The auto-background-on-timeout decision path is
@@ -2547,6 +2616,7 @@ function b() {
 			expect(deliveries[0]?.jobId).toBe(jobId);
 			expect(deliveries[0]?.text).toContain("Command timed out after");
 			await asyncJobManager.dispose();
+			await authority.dispose();
 		});
 
 		it("should surface clamped timeout in results", async () => {
@@ -2642,12 +2712,15 @@ function b() {
 			const manager = new AsyncJobManager({
 				onJobComplete: async () => {},
 			});
-			const session = createTestToolSession(testDir, Settings.isolated({ "bash.autoBackground.enabled": true }), {
-				asyncJobManager: manager,
-			});
-			const jobTool = new HubTool(session);
+			const authority = await createAuthorityToolFixture(
+				testDir,
+				Settings.isolated({ "bash.autoBackground.enabled": true }),
+				manager,
+			);
+			manager.registerDeliverySink("Main", async () => {});
+			const jobTool = new HubTool(authority.toolSession);
 
-			const jobId = manager.register("bash", "test job", async () => "success");
+			const jobId = manager.register("bash", "test job", async () => "success", { ownerId: "Main" });
 
 			// Job is running, call poll
 			const resultPromise = jobTool.execute("test-call-poll-1", { op: "wait", ids: [jobId] });
@@ -2661,18 +2734,23 @@ function b() {
 
 			// If it correctly acknowledged, the delivery is suppressed.
 			expect(manager.hasPendingDeliveries()).toBe(false);
+			await manager.dispose();
+			await authority.dispose();
 		});
 
 		it("flags still-waiting polls and all-running snapshots as contextually useless", async () => {
 			const manager = new AsyncJobManager({
 				onJobComplete: async () => {},
 			});
-			const session = createTestToolSession(testDir, Settings.isolated({ "bash.autoBackground.enabled": true }), {
-				asyncJobManager: manager,
-			});
-			const jobTool = new HubTool(session);
+			const authority = await createAuthorityToolFixture(
+				testDir,
+				Settings.isolated({ "bash.autoBackground.enabled": true }),
+				manager,
+			);
+			manager.registerDeliverySink("Main", async () => {});
+			const jobTool = new HubTool(authority.toolSession);
 			const gate = Promise.withResolvers<string>();
-			const jobId = manager.register("bash", "long job", () => gate.promise);
+			const jobId = manager.register("bash", "long job", () => gate.promise, { ownerId: "Main" });
 
 			// Poll cut short while the job is still running: a pure "still
 			// waiting" snapshot carries no information once consumed.
@@ -2701,6 +2779,8 @@ function b() {
 			const missing = await jobTool.execute("test-call-useless-missing", { op: "wait", ids: ["no-such-job"] });
 			expect(getTextOutput(missing)).toContain("No matching jobs found");
 			expect(missing.useless).toBe(true);
+			await manager.dispose();
+			await authority.dispose();
 		});
 	});
 

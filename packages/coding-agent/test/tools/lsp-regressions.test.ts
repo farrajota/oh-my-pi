@@ -23,6 +23,7 @@ import {
 	applyTextEditsToString,
 	applyWorkspaceEdit,
 	type ExecutedWorkspaceChange,
+	type WorkspaceEditAuthorization,
 	sortAndValidateTextEdits,
 } from "@oh-my-pi/pi-coding-agent/lsp/edits";
 import { renderCall, renderResult } from "@oh-my-pi/pi-coding-agent/lsp/render";
@@ -425,6 +426,32 @@ describe("lsp regressions", () => {
 			expect(differentInit).not.toBe(baseClient);
 			expect(differentSettings).not.toBe(baseClient);
 			expect(differentLanguage).not.toBe(baseClient);
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("reuses one client when concurrent sessions use opposite shared-LSP policies", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-session-policy-");
+		try {
+			const server = installHandshakeLsp();
+			const config: ServerConfig = {
+				command: "fake-lsp",
+				args: ["--session-policy"],
+				fileTypes: [".ts"],
+				rootMarkers: [],
+			};
+			const privateClientPromise = lspClient.withLspSessionPolicy({ shared: false }, () =>
+				lspClient.getOrCreateClient(config, tempDir.path(), 1_000),
+			);
+			const sharedClientPromise = lspClient.withLspSessionPolicy({ shared: true }, () =>
+				lspClient.getOrCreateClient(config, tempDir.path(), 1_000),
+			);
+			const [privateClient, sharedClient] = await Promise.all([privateClientPromise, sharedClientPromise]);
+			expect(privateClient).toBe(sharedClient);
+			expect(privateClient.proc).toBe(sharedClient.proc);
+			expect(server.spawnCount).toBe(1);
 		} finally {
 			await lspClient.shutdownAll();
 			tempDir.removeSync();
@@ -3315,6 +3342,44 @@ describe("lsp regressions", () => {
 			expect(applied[1]).toContain("Renamed");
 			expect(applied[1]).toContain("src");
 			expect(applied[1]).toContain("src2");
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
+	it("preflights every workspace edit target before applying any mutation", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-edit-auth-");
+		try {
+			const firstPath = path.join(tempDir.path(), "first.ts");
+			const secondPath = path.join(tempDir.path(), "second.ts");
+			await Bun.write(firstPath, "const first = 1;\n");
+			await Bun.write(secondPath, "const second = 2;\n");
+			const workspaceEdit: WorkspaceEdit = {
+				changes: {
+					[fileToUri(firstPath)]: [
+						{
+							range: { start: { line: 0, character: 14 }, end: { line: 0, character: 15 } },
+							newText: "3",
+						},
+					],
+					[fileToUri(secondPath)]: [
+						{
+							range: { start: { line: 0, character: 15 }, end: { line: 0, character: 16 } },
+							newText: "4",
+						},
+					],
+				},
+			};
+			const authorization: WorkspaceEditAuthorization = {
+				authorizePath: async filePath => {
+					if (filePath === secondPath) throw new Error("denied target");
+				},
+			};
+			await expect(applyWorkspaceEdit(workspaceEdit, tempDir.path(), undefined, authorization)).rejects.toThrow(
+				"denied target",
+			);
+			expect(await Bun.file(firstPath).text()).toBe("const first = 1;\n");
+			expect(await Bun.file(secondPath).text()).toBe("const second = 2;\n");
 		} finally {
 			tempDir.removeSync();
 		}

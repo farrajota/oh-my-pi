@@ -1,9 +1,8 @@
 /**
- * Regression coverage for the `<id>.json` structured-output sidecar
- * lifecycle: a replacement write failure must not leave a stale sidecar from
- * an earlier turn answering `agent://<id>/<field>` with superseded data, and
- * a schema-invalid yield with parsed data must still get a sidecar so its
- * full payload stays recoverable via `agent://<id>` (PR #10625 review).
+ * Regression coverage for transactional task-result generations. Output and
+ * optional structured sidecar advance one CAS head, failed competing updates
+ * disclose neither member, and schema-invalid parsed data remains recoverable
+ * without changing the public SingleResult payload.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -11,14 +10,21 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
-import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
+import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
-import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
+
+function createAuthorityFixture() {
+	const agentRegistry = new AgentRegistry();
+	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+		sdkModule.createAgentSession({ ...options, agentRegistry });
+	return { agentRegistry, createAuthoritySession };
+}
 
 function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent) => void }) => void): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
@@ -63,15 +69,6 @@ function yieldEmittingSession(data: unknown): AgentSession {
 	});
 }
 
-function createSessionResult(session: AgentSession): CreateAgentSessionResult {
-	return {
-		session,
-		extensionsResult: { extensions: [], errors: [], runtime: {} as unknown } as unknown as LoadExtensionsResult,
-		setToolUIContext: () => {},
-		eventBus: new EventBus(),
-	};
-}
-
 const baseAgent: AgentDefinition = {
 	name: "task",
 	description: "test",
@@ -88,22 +85,15 @@ describe("structured output sidecar lifecycle", () => {
 		artifactsDir = undefined;
 	});
 
-	it("drops a stale sidecar instead of leaving it behind when the replacement write fails", async () => {
-		artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sidecar-test-"));
+	it("keeps the prior generation authoritative when a competing head advance loses CAS", async () => {
 		const id = "SidecarProbe";
-		const sidecarPath = path.join(artifactsDir, `${id}.json`);
-		await fs.writeFile(sidecarPath, JSON.stringify({ summary: "stale from an earlier turn" }));
+		artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sidecar-test-"));
+		const manager = new ArtifactManager(artifactsDir);
+		await manager.publishAgentArtifacts(id, "old output", JSON.stringify({ summary: "prior generation" }));
 
 		const session = yieldEmittingSession({ ok: true });
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		const originalWrite = Bun.write.bind(Bun);
-		vi.spyOn(Bun, "write").mockImplementation(((dest: unknown, ...rest: unknown[]) => {
-			if (typeof dest === "string" && dest.includes(`${id}.json.tmp-`)) {
-				return Promise.reject(new Error("simulated disk failure"));
-			}
-			return (originalWrite as (...args: unknown[]) => unknown)(dest, ...rest);
-		}) as typeof Bun.write);
+		const authority = createAuthorityFixture();
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as CreateAgentSessionResult);
 
 		const result = await runSubprocess({
 			cwd: "/tmp",
@@ -113,18 +103,21 @@ describe("structured output sidecar lifecycle", () => {
 			id,
 			settings: Settings.isolated(),
 			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+			createAuthoritySession: authority.createAuthoritySession,
 			enableLsp: false,
+			agentRegistry: authority.agentRegistry,
 			artifactsDir,
+			parentArtifactManager: manager,
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
 		});
 
 		expect(result.exitCode).toBe(0);
 		expect(result.structuredOutput).toMatchObject({ status: "valid", data: { ok: true } });
-		// The <id>.md artifact republished successfully...
-		expect(result.outputPath).toBe(path.join(artifactsDir, `${id}.md`));
-		// ...but the sidecar write failed, so the stale sidecar must not survive
-		// to keep answering agent://<id>/<field> with the superseded payload.
-		await expect(fs.stat(sidecarPath)).rejects.toThrow();
+		expect(result.outputPath).toBeUndefined();
+		const outputPath = await manager.getNamedPath("agent-output", id);
+		const sidecarPath = await manager.getNamedPath("agent-sidecar", id);
+		expect(await fs.readFile(outputPath as string, "utf8")).toBe("old output");
+		expect(JSON.parse(await fs.readFile(sidecarPath as string, "utf8"))).toEqual({ summary: "prior generation" });
 	});
 
 	it("removes a stale sidecar instead of leaving it when the serialized data is undefined", async () => {
@@ -135,11 +128,13 @@ describe("structured output sidecar lifecycle", () => {
 		// from an earlier turn behind (PR #10625 review).
 		artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sidecar-test-"));
 		const id = "UndefinedDataProbe";
+		const manager = new ArtifactManager(artifactsDir);
 		const sidecarPath = path.join(artifactsDir, `${id}.json`);
 		await fs.writeFile(sidecarPath, JSON.stringify({ summary: "stale from an earlier turn" }));
 
 		const session = yieldEmittingSession({ ok: true });
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const authority = createAuthorityFixture();
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as CreateAgentSessionResult);
 
 		const originalStringify = JSON.stringify.bind(JSON);
 		vi.spyOn(JSON, "stringify").mockImplementation(((value: unknown, ...rest: unknown[]) => {
@@ -166,12 +161,17 @@ describe("structured output sidecar lifecycle", () => {
 			id,
 			settings: Settings.isolated(),
 			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+			createAuthoritySession: authority.createAuthoritySession,
+			agentRegistry: authority.agentRegistry,
 			enableLsp: false,
 			artifactsDir,
+			parentArtifactManager: manager,
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
 		});
 
 		expect(result.structuredOutput?.data).toEqual({ ok: true });
+		expect(result.outputPath).toBe(path.join(artifactsDir, `${id}.md`));
+		expect(await manager.getNamedPath("agent-sidecar", id)).toBeNull();
 		await expect(fs.stat(sidecarPath)).rejects.toThrow();
 	});
 
@@ -181,11 +181,13 @@ describe("structured output sidecar lifecycle", () => {
 		// recovery path beyond the truncated inline preview.
 		artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sidecar-test-"));
 		const id = "InvalidSidecarProbe";
+		const manager = new ArtifactManager(artifactsDir);
 
 		// `ok` is a string, not a boolean — violates the schema below, but the
 		// data still parses and must be preserved.
 		const session = yieldEmittingSession({ ok: "not-a-boolean" });
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const authority = createAuthorityFixture();
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as CreateAgentSessionResult);
 
 		const result = await runSubprocess({
 			cwd: "/tmp",
@@ -193,17 +195,21 @@ describe("structured output sidecar lifecycle", () => {
 			task: "do work",
 			index: 0,
 			id,
+			createAuthoritySession: authority.createAuthoritySession,
+			agentRegistry: authority.agentRegistry,
 			settings: Settings.isolated(),
 			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 			enableLsp: false,
 			artifactsDir,
+			parentArtifactManager: manager,
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
 		});
 
 		expect(result.structuredOutput?.status).toBe("invalid");
-		const sidecarPath = path.join(artifactsDir, `${id}.json`);
-		await expect(fs.stat(sidecarPath)).resolves.toBeDefined();
-		const sidecar = JSON.parse(await fs.readFile(sidecarPath, "utf-8"));
+		expect(result.outputPath).toBe(path.join(artifactsDir, `${id}.md`));
+		const sidecarPath = await manager.getNamedPath("agent-sidecar", id);
+		expect(sidecarPath).toBe(path.join(artifactsDir, `${id}.json`));
+		const sidecar = JSON.parse(await fs.readFile(sidecarPath as string, "utf-8"));
 		expect(sidecar).toEqual({ ok: "not-a-boolean" });
 	});
 });

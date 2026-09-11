@@ -1,6 +1,4 @@
-/**
- * Tool wrappers for extensions.
- */
+/** Tool wrappers for extensions. */
 import type {
 	AgentTool,
 	AgentToolContext,
@@ -10,23 +8,129 @@ import type {
 	ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
+import type { PermissionDenialDetails } from "@oh-my-pi/pi-wire";
 import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
-import type { Settings } from "../../config/settings";
-import type { Theme } from "../../modes/theme/theme";
-import { evaluateSubagentPermission } from "../../task/permission-profiles";
 import {
+	truncateForPrompt,
 	type ApprovalMode,
 	denyError,
 	formatApprovalPrompt,
 	resolveApproval,
-	truncateForPrompt,
 } from "../../tools/approval";
-import { defaultLoadModeForToolName } from "../../tools/essential-tools";
-import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
+import {
+	runArtifactOperation,
+	runExtensionOperation,
+	runFilesystemOperation,
+	runLocalOperation,
+	runMcpOperation,
+	runEvalOperation,
+	runSessionOperation,
+} from "../../registry/operation-lease";
+import { rewriteAuthorizedInput, type SessionPathScope } from "../../internal/session-path-scope";
+import { evaluateRestrictedToolGuardrails } from "../../internal/restricted-startup-policy";
+import { defaultLoadModeForToolName } from "../../tools/essential-tools";
+import { withFileMutationSession } from "../../tools/file-write-fallback";
+import {
+	evaluateSubagentPermission,
+	type EffectiveSubagentPermissions,
+	type EffectiveToolDescriptor,
+	type ToolExecutionAuthority,
+} from "../../task/permission-profiles";
+import type { Theme } from "../../modes/theme/theme";
+import { withLspSessionPolicy } from "../../lsp/client";
 import type { ExtensionRunner } from "./runner";
-import type { RegisteredTool, ToolCallEventResult } from "./types";
+import type { RegisteredTool, ToolCallEventResult, ToolResultEventResult } from "./types";
+type ClassFixedOperationRunner = typeof runMcpOperation;
+
+let descriptorSequence = 0;
+type PreparationRecord = {
+	descriptor: EffectiveToolDescriptor;
+	toolCallId: string;
+	input: object;
+	inner: AgentToolPreparedExecution | undefined;
+	consumed: boolean;
+	disposed: boolean;
+};
+
+/** Session-local authority for exact descriptor-bound, one-use preparations. */
+export class EffectiveToolRegistry implements ToolExecutionAuthority {
+	readonly #descriptors = new Map<string, EffectiveToolDescriptor>();
+	readonly #preparations = new WeakMap<object, PreparationRecord>();
+
+	registerDescriptor(descriptor: EffectiveToolDescriptor): void {
+		const normalizedName = descriptor.normalizedName || descriptor.name.trim().toLowerCase();
+		const frozen = Object.freeze({
+			...descriptor,
+			normalizedName,
+			descriptorId: descriptor.descriptorId || `descriptor:${++descriptorSequence}`,
+		});
+		this.#descriptors.set(normalizedName, frozen);
+	}
+
+	getDescriptor(name: string): EffectiveToolDescriptor | undefined {
+		return this.#descriptors.get(name.trim().toLowerCase());
+	}
+
+	prepare(name: string, toolCallId: string, input: object, inner: AgentToolPreparedExecution | undefined) {
+		const descriptor = this.getDescriptor(name);
+		if (!descriptor) throw new Error(`Tool "${name}" is not registry-authorized.`);
+		const record: PreparationRecord = { descriptor, toolCallId, input, inner, consumed: false, disposed: false };
+		const handle = {
+			metadata: Object.freeze({
+				descriptorId: descriptor.descriptorId,
+				origin: descriptor.origin,
+				tool: descriptor.normalizedName,
+			}),
+			consume: <T>(owner: object, expectedToolCallId: string): T => {
+				if (record.consumed) throw new Error("Registry execution preparation was already consumed.");
+				if (record.disposed) throw new Error("Registry execution preparation is stale.");
+				if (this.#descriptors.get(descriptor.normalizedName) !== descriptor)
+					throw new Error("Registry execution preparation is stale after tool registry refresh.");
+				if (descriptor.tool !== owner)
+					throw new Error("Registry execution preparation targets a different tool object.");
+				if (expectedToolCallId !== toolCallId)
+					throw new Error("Registry execution preparation targets a different tool call.");
+				record.consumed = true;
+				return (inner ? inner.consume<T>(owner, expectedToolCallId) : undefined) as T;
+			},
+			dispose: async () => {
+				if (record.disposed) return;
+				record.disposed = true;
+				if (!record.consumed) await inner?.dispose();
+			},
+		} satisfies AgentToolPreparedExecution;
+		this.#preparations.set(handle, record);
+		return handle;
+	}
+
+	validatePrepared(prepared: AgentToolPreparedExecution, name: string, toolCallId: string, input: object): void {
+		const record = this.#preparations.get(prepared);
+		const descriptor = this.getDescriptor(name);
+		if (!record || !descriptor || record.descriptor !== descriptor)
+			throw new Error("Registry execution preparation is missing or stale.");
+		if (record.toolCallId !== toolCallId)
+			throw new Error("Registry execution preparation targets a different tool call.");
+		if (record.input !== input) throw new Error("Registry execution preparation targets different final input.");
+		if (record.consumed) throw new Error("Registry execution preparation was already consumed.");
+		if (record.disposed) throw new Error("Registry execution preparation is stale.");
+	}
+}
+function operationRunnerForTool(tool: AgentTool, params: unknown): ClassFixedOperationRunner | undefined {
+	if (tool.name === "hub") return undefined;
+	const candidate = tool as AgentTool & { mcpServerName?: string };
+	if (candidate.mcpServerName !== undefined) return runMcpOperation;
+	if (tool.name === "eval") return runEvalOperation;
+	if (tool.name === "task") return runSessionOperation;
+	if (["read", "write", "edit", "grep", "glob", "ast_edit", "ast_grep", "lsp", "bash"].includes(tool.name)) {
+		const values = JSON.stringify(params);
+		if (values.includes("artifact://")) return runArtifactOperation;
+		if (values.includes("local://")) return runLocalOperation;
+		return runFilesystemOperation;
+	}
+	return runExtensionOperation;
+}
 
 /**
  * Adapts a RegisteredTool into an AgentTool.
@@ -130,7 +234,41 @@ function toolEventArgs(params: unknown, context: AgentToolContext | undefined): 
 			pendingSafetyChecks: metadata.pendingSafetyChecks,
 		};
 	}
-	return params as Record<string, unknown>;
+	return recordParams(params);
+}
+function recordParams(value: unknown): Record<string, unknown> {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+	const record: Record<string, unknown> = {};
+	for (const [key, entry] of Object.entries(value)) record[key] = entry;
+	return record;
+}
+
+type OptionalRunnerCapabilities = {
+	hasHandlers?: (eventType: string) => boolean;
+	consumeToolCallEmitted?: (toolCallId: string, toolName: string) => boolean;
+	emitToolCall?: (event: unknown, signal?: AbortSignal) => Promise<unknown>;
+	emitToolResult?: (event: unknown) => Promise<unknown>;
+	emit?: ExtensionRunner["emit"];
+	getPermissionScope?: () => EffectiveSubagentPermissions | undefined;
+	getToolExecutionAuthority?: () => ToolExecutionAuthority | undefined;
+	getPathScope?: () => SessionPathScope | undefined;
+	getCwd?: () => string;
+	recordPermissionDenial?: (details: PermissionDenialDetails) => void;
+	runScoped?: <T>(fn: () => T) => T;
+	isSharedLspEnabled?: () => boolean;
+	sessionId?: string;
+};
+function optionalRunnerCapabilities(runner: ExtensionRunner): OptionalRunnerCapabilities {
+	return runner as unknown as OptionalRunnerCapabilities;
+}
+
+function hasRunnerHandlers(runner: ExtensionRunner, eventType: string): boolean {
+	const method = optionalRunnerCapabilities(runner).hasHandlers;
+	return typeof method === "function" && method.call(runner, eventType);
+}
+
+function hasRunnerEmitter(runner: ExtensionRunner): boolean {
+	return typeof optionalRunnerCapabilities(runner).emit === "function";
 }
 
 function approvalData(value: string): string {
@@ -179,6 +317,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		return target.restartForModeChange();
 	}
 
+	/** Exact underlying executor used for registry descriptor identity. */
+	get executionTarget(): AgentTool<TParameters, TDetails> {
+		return this.tool;
+	}
 	async execute(
 		toolCallId: string,
 		params: Static<TParameters>,
@@ -187,43 +329,53 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		context?: AgentToolContext,
 		preparedExecution?: AgentToolPreparedExecution,
 	): Promise<AgentToolResult<TDetails, TParameters>> {
-		const permissionDecision = evaluateSubagentPermission({
-			scope: this.runner.getPermissionScope?.(),
-			toolName: this.tool.name,
-			toolInput: params as Record<string, unknown>,
-			cwd: this.runner.getCwd?.() ?? process.cwd(),
-		});
-		if (permissionDecision.action === "deny") throw new Error(permissionDecision.reason);
-
 		// The agent loop emits `tool_call` at arg-prep time (session
 		// `beforeToolCall` wiring) so a handler revision lands before concurrency
 		// scheduling and `tool_execution_start`. Consume the marker
 		// unconditionally so it cannot go stale; emit here only for dispatches
 		// the loop never saw — nested xd:// device dispatches and direct
 		// (non-loop) execution such as Cursor exec handlers.
-		const loopEmittedToolCall = this.runner.consumeToolCallEmitted(toolCallId, this.tool.name);
-		// Resolve approval settings up front. A `deny` on the original input short-circuits before the
-		// runner is touched — an already-denied tool never emits `tool_call` — while the full gate below
-		// re-resolves against the (possibly revised) input so a handler cannot rewrite into a denied or
-		// newly prompt-gated command and have it run unapproved.
-		const cliAutoApprove = context?.autoApprove === true;
-		const settings: Settings | undefined = context?.settings;
-		const configuredMode = (settings?.get("tools.approvalMode") ?? "yolo") as ApprovalMode;
-		const approvalMode: ApprovalMode = cliAutoApprove ? "yolo" : configuredMode;
-		const userPolicies = (settings?.get("tools.approval") ?? {}) as Record<string, unknown>;
-		const preResolved = resolveApproval(this.tool, approvalArgs(params, context), approvalMode, userPolicies);
-		if (preResolved.policy === "deny") {
-			throw denyError(preResolved, this.tool.name);
-		}
+		const runner = optionalRunnerCapabilities(this.runner);
+		const loopEmittedToolCall = runner.consumeToolCallEmitted?.call(this.runner, toolCallId, this.tool.name) ?? false;
+		const assertAuthorized = (candidate: Static<TParameters>): void => {
+			const scope = runner.getPermissionScope?.call(this.runner);
+			if (scope === undefined) return;
+			const toolInput = recordParams(candidate);
+			const permissionDecision = evaluateSubagentPermission({
+				scope,
+				toolName: this.tool.name,
+				toolInput,
+				cwd: runner.getCwd?.call(this.runner) ?? "",
+			});
+			if (permissionDecision.action === "deny") {
+				runner.recordPermissionDenial?.call(this.runner, permissionDecision.details);
+				throw new Error(permissionDecision.reason);
+			}
+			const guardrailDecision = evaluateRestrictedToolGuardrails({
+				scope,
+				toolName: this.tool.name,
+				toolInput,
+			});
+			if (guardrailDecision.action === "deny") {
+				runner.recordPermissionDenial?.call(this.runner, guardrailDecision.details);
+				throw new Error(guardrailDecision.reason);
+			}
+		};
+		assertAuthorized(params);
 
 		// 1. Emit tool_call event first - extensions can block execution or revise the input the tool
 		// runs with. Doing this BEFORE the approval gate means approval (below) resolves against the
 		// input that actually executes, closing the "approve one thing, run another" gap: the prompt
 		// text, policy resolution, and provider safety checks all see `effectiveParams`.
 		let effectiveParams = params;
-		if (!loopEmittedToolCall && this.runner.hasHandlers("tool_call")) {
+		if (
+			!loopEmittedToolCall &&
+			hasRunnerHandlers(this.runner, "tool_call") &&
+			typeof runner.emitToolCall === "function"
+		) {
 			try {
-				const callResult = (await this.runner.emitToolCall(
+				const callResult = (await runner.emitToolCall.call(
+					this.runner,
 					{
 						type: "tool_call",
 						toolName: this.tool.name,
@@ -240,10 +392,6 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					const reason = callResult.reason || "Tool execution was blocked by an extension";
 					throw new Error(reason);
 				}
-				// A non-blocking handler may replace the execution input. The returned object is the raw
-				// input passed to `execute` (handler-owned; not re-normalized). Skipped for `computer`
-				// tool calls, whose event input is a synthetic {actions,pendingSafetyChecks} view
-				// (see toolEventArgs) rather than the real execution params.
 				if (callResult?.input !== undefined && context?.toolCall?.providerMetadata?.type !== "computer") {
 					effectiveParams = callResult.input as typeof params;
 				}
@@ -254,14 +402,53 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
-		// Native tools may freeze exact one-use execution state after every input revision,
-		// before approval. A handle supplied by an outer wrapper is already prepared and
-		// remains owned by that wrapper; otherwise this wrapper owns its handle.
+		assertAuthorized(effectiveParams);
+		const pathScope = runner.getPathScope?.call(this.runner);
+		const pathInput = recordParams(effectiveParams);
+		if (pathScope && Object.keys(pathInput).length > 0) {
+			const replacements = await pathScope.authorizeInput(this.tool.name, pathInput);
+			effectiveParams = rewriteAuthorizedInput(pathInput, replacements) as typeof effectiveParams;
+		}
+		const settings = context?.settings;
+		const approvalMode: ApprovalMode =
+			context?.autoApprove === true ? "yolo" : (settings?.get("tools.approvalMode") ?? "yolo");
+		const userPolicies = (settings?.get("tools.approval") ?? {}) as Record<string, unknown>;
+		const scope = runner.getPermissionScope?.call(this.runner);
+		const enforcePreparation = scope?.mode === "enforce";
+		const authority = runner.getToolExecutionAuthority?.call(this.runner);
 		const ownsPreparation = preparedExecution === undefined;
 		const executionKey = ownsPreparation ? Object.freeze({}) : undefined;
 		let effectivePreparedExecution = preparedExecution;
 		try {
-			if (effectivePreparedExecution === undefined) {
+			if (enforcePreparation) {
+				if (!authority) throw new Error(`Tool "${this.tool.name}" has no registry execution authority.`);
+				if (effectivePreparedExecution !== undefined) {
+					authority.validatePrepared(
+						effectivePreparedExecution,
+						this.tool.name,
+						toolCallId,
+						effectiveParams as object,
+					);
+				} else {
+					const innerPreparation = await this.tool.prepareExecution?.(
+						toolCallId,
+						effectiveParams,
+						signal,
+						context,
+						executionKey!,
+					);
+					effectivePreparedExecution = authority.prepare(
+						this.tool.name,
+						toolCallId,
+						effectiveParams as object,
+						innerPreparation,
+					);
+					if (innerPreparation === undefined) {
+						effectivePreparedExecution.consume(this.tool, toolCallId);
+						effectivePreparedExecution = undefined;
+					}
+				}
+			} else if (effectivePreparedExecution === undefined) {
 				effectivePreparedExecution = await this.tool.prepareExecution?.(
 					toolCallId,
 					effectiveParams,
@@ -307,10 +494,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				}
 
 				const hasApprovalHandlers =
-					this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
+					hasRunnerEmitter(this.runner) &&
+					(hasRunnerHandlers(this.runner, "tool_approval_requested") ||
+						hasRunnerHandlers(this.runner, "tool_approval_resolved"));
 				const sessionId = context?.sessionManager?.getSessionId() ?? "";
 				if (hasApprovalHandlers) {
-					await this.runner.emit({
+					await runner.emit?.call(this.runner, {
 						type: "tool_approval_requested",
 						sessionId,
 						toolName: this.tool.name,
@@ -322,7 +511,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 				const emitApprovalResolved = async (approved: boolean, reason?: string) => {
 					if (!hasApprovalHandlers) return;
-					await this.runner.emit({
+					await runner.emit?.call(this.runner, {
 						type: "tool_approval_resolved",
 						sessionId,
 						toolName: this.tool.name,
@@ -332,8 +521,6 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					});
 				};
 
-				// Provider safety checks fail closed without an interactive prompt. Unlike
-				// ordinary tier approval, no setting or yolo mode may bypass this gate.
 				if (!this.runner.hasUI()) {
 					const reason = "no interactive UI available";
 					await emitApprovalResolved(false, reason);
@@ -380,17 +567,42 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			let executionError: Error | undefined;
 
 			try {
-				// A denied file write or delete inside this tool can be brokered to an
-				// extension handler, and that registry is PROCESS-WIDE — so the session is
-				// named here, the one place where every tool's execution and the runner
-				// that owns the handlers are both in scope (`sdk.ts` wraps the whole tool
-				// registry with this class whenever a runner exists). Enter both the active
-				// Settings scope and the file-mutation fallback scope for every execution.
-				result = await this.runner.runScoped(() =>
-					withFileMutationSession(this.runner.sessionId, () =>
-						this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context, effectivePreparedExecution),
-					),
-				);
+				const executeTool = (executionSignal?: AbortSignal) => {
+					const runTool = () =>
+						this.tool.execute(
+							toolCallId,
+							effectiveParams,
+							executionSignal ?? signal,
+							onUpdate,
+							context,
+							effectivePreparedExecution,
+						);
+					const sessionId = runner.sessionId;
+					const runWithMutation =
+						typeof sessionId === "string" && sessionId.length > 0
+							? () => withFileMutationSession(sessionId, runTool)
+							: runTool;
+					const runScoped = runner.runScoped ? () => runner.runScoped!(runWithMutation) : runWithMutation;
+					return withLspSessionPolicy(
+						{ shared: runner.isSharedLspEnabled?.call(this.runner) === true },
+						runScoped,
+					);
+				};
+				const operationRunner = context?.sessionManager
+					? operationRunnerForTool(this.tool, effectiveParams)
+					: undefined;
+				const leasedExecuteTool = pathScope
+					? (executionSignal?: AbortSignal) =>
+							pathScope.withOperationLease(`${this.tool.name}:${toolCallId}`, () => executeTool(executionSignal))
+					: executeTool;
+				result = operationRunner
+					? await operationRunner(
+							context?.sessionManager,
+							`${this.tool.name}:${toolCallId}`,
+							leasedExecuteTool,
+							signal,
+						)
+					: await leasedExecuteTool(signal);
 			} catch (err) {
 				executionError = err instanceof Error ? err : new Error(String(err));
 				result = {
@@ -399,9 +611,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				};
 			}
 
-			// Emit tool_result event - extensions can modify the result and error status
-			if (this.runner.hasHandlers("tool_result")) {
-				const resultResult = await this.runner.emitToolResult({
+			// Emit tool_result event - extensions can modify the result and error status.
+			if (hasRunnerHandlers(this.runner, "tool_result") && typeof runner.emitToolResult === "function") {
+				const resultResult = (await runner.emitToolResult.call(this.runner, {
 					type: "tool_result",
 					toolName: this.tool.name,
 					toolCallId,
@@ -412,24 +624,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					content: result.content,
 					details: result.details,
 					isError: !!executionError,
-				});
+				})) as ToolResultEventResult | undefined;
 
 				if (resultResult) {
 					const modifiedContent: (TextContent | ImageContent)[] = resultResult.content ?? result.content;
 					const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
-
-					// Effective error state: an explicit handler override wins; otherwise the
-					// original execution outcome stands. This lets a handler rewrite a failed
-					// call's model-visible content/details while keeping it an error, flip a
-					// failure to success, or flag a success as an error.
 					const effectiveError = resultResult.isError ?? !!executionError;
-
-					// Return the (possibly modified) result carrying the error flag rather than
-					// rethrowing the original exception. The agent loop honors
-					// `AgentToolResult.isError` and surfaces it as a tool error on the wire (see
-					// `coerceToolResult` in agent-loop), so replacement failure content reaches
-					// the model while the call remains an error — the original exception text is
-					// no longer forced through, which previously discarded the replacement.
 					return {
 						content: modifiedContent,
 						details: modifiedDetails,

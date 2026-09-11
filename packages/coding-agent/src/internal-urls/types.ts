@@ -9,6 +9,7 @@ import type { Rule } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type { LocalProtocolOptions } from "./local-protocol";
+import type { MnemopiSessionState } from "../mnemopi/state";
 
 /**
  * Raw resource payload returned by protocol handlers. The `immutable` flag is
@@ -81,6 +82,17 @@ export interface InternalUrl extends URL {
 }
 
 /**
+ * Immutable memory identity projected by the caller's live tool session.
+ * This deliberately exposes only the selected backend and a read-only state
+ * provider: internal URL handlers must not receive the caller's session or
+ * its mutable memory banks.
+ */
+export interface CallerMemoryProjection {
+	readonly backend: string | undefined;
+	readonly getMnemopiSessionState?: () => MnemopiSessionState | undefined;
+}
+
+/**
  * Caller-supplied context that the router threads into protocol handlers.
  *
  * Read tool calls `InternalUrlRouter.resolve(url, { cwd, settings, signal })`
@@ -111,6 +123,12 @@ export interface ResolveContext {
 	agentRegistry?: AgentRegistry;
 	/** Settings of the calling session (used by `issue://`/`pr://` for cache TTLs). */
 	settings?: unknown;
+	/**
+	 * Exact memory identity of the tool session issuing this request. This takes
+	 * precedence over registry inference so direct SDK sessions remain scoped
+	 * without being registered as actor authority.
+	 */
+	callerMemory?: CallerMemoryProjection;
 	/** Caller's abort signal. */
 	signal?: AbortSignal;
 	/**

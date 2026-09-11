@@ -21,7 +21,9 @@
 import * as path from "node:path";
 import type * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { setAgentHistory } from "../internal/agent-registry-bridge";
 import { AgentRegistry } from "../registry/agent-registry";
+import type { AgentSession } from "../session/agent-session";
 import type { ToolSession } from "../tools";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import { trackLateCleanup } from "../utils/late-cleanup";
@@ -45,12 +47,18 @@ import {
 
 type IsoBackendKind = natives.IsoBackendKind;
 
-function rememberAgentArtifacts(result: SingleResult): SingleResult {
-	AgentRegistry.global().setHistory(result.id, {
-		outputPath: result.outputPath,
-		patchPath: result.patchPath,
-		branchName: result.branchName,
-	});
+function rememberAgentArtifacts(
+	result: SingleResult,
+	registry: AgentRegistry,
+	historyAuthority: AgentSession | undefined,
+): SingleResult {
+	if (historyAuthority) {
+		setAgentHistory(registry, historyAuthority, {
+			outputPath: result.outputPath,
+			patchPath: result.patchPath,
+			branchName: result.branchName,
+		});
+	}
 	return result;
 }
 
@@ -192,6 +200,8 @@ async function writeIsolationPatch(
 export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<SingleResult> {
 	let handle: IsolationHandle | undefined;
 	let deferredCleanup: Promise<void> | undefined;
+	let historyAuthority: AgentSession | undefined;
+	const agentRegistry = opts.baseOptions.agentRegistry;
 	try {
 		const taskBaseline = structuredClone(opts.context.baseline);
 		handle = await ensureIsolation(opts.context.repoRoot, opts.agentId, opts.preferredBackend);
@@ -202,6 +212,10 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			onCleanupDeferred: completion => {
 				deferredCleanup = completion;
 				opts.baseOptions.onCleanupDeferred?.(completion);
+			},
+			onHistoryAuthorityClaimed: session => {
+				historyAuthority = session;
+				opts.baseOptions.onHistoryAuthorityClaimed?.(session);
 			},
 		});
 		opts.onSubprocessResult?.(result);
@@ -220,12 +234,16 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					opts.description,
 					opts.buildCommitMessage?.(),
 				);
-				return rememberAgentArtifacts({
-					...result,
-					branchName: commitResult?.branchName,
-					branchBaseSha: commitResult?.baseSha,
-					nestedPatches: commitResult?.nestedPatches,
-				});
+				return rememberAgentArtifacts(
+					{
+						...result,
+						branchName: commitResult?.branchName,
+						branchBaseSha: commitResult?.baseSha,
+						nestedPatches: commitResult?.nestedPatches,
+					},
+					agentRegistry,
+					historyAuthority,
+				);
 			} catch (mergeErr) {
 				// Agent succeeded but the branch commit failed. `commitToBranch`
 				// is not atomic: the clean-baseline path fetches the agent's
@@ -251,37 +269,50 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 						opts.artifactsDir,
 						opts.agentId,
 					);
-					return rememberAgentArtifacts({
-						...result,
-						patchPath: patchResult.patchPath,
-						nestedPatches: patchResult.nestedPatches,
-						error: `Merge failed: ${msg}.${rescueNote}`,
-					});
+					return rememberAgentArtifacts(
+						{
+							...result,
+							patchPath: patchResult.patchPath,
+							nestedPatches: patchResult.nestedPatches,
+							error: `Merge failed: ${msg}.${rescueNote}`,
+						},
+						agentRegistry,
+						historyAuthority,
+					);
 				} catch (patchErr) {
 					const patchMsg = patchErr instanceof Error ? patchErr.message : String(patchErr);
-					return rememberAgentArtifacts({
-						...result,
-						error: `Merge failed: ${msg}; patch capture failed: ${patchMsg}.${rescueNote}`,
-					});
+					return rememberAgentArtifacts(
+						{ ...result, error: `Merge failed: ${msg}; patch capture failed: ${patchMsg}.${rescueNote}` },
+						agentRegistry,
+						historyAuthority,
+					);
 				}
 			}
 		}
 		if (result.exitCode === 0) {
 			try {
 				const patchResult = await writeIsolationPatch(isolationDir, taskBaseline, opts.artifactsDir, opts.agentId);
-				return rememberAgentArtifacts({
-					...result,
-					patchPath: patchResult.patchPath,
-					nestedPatches: patchResult.nestedPatches,
-				});
+				return rememberAgentArtifacts(
+					{
+						...result,
+						patchPath: patchResult.patchPath,
+						nestedPatches: patchResult.nestedPatches,
+					},
+					agentRegistry,
+					historyAuthority,
+				);
 			} catch (patchErr) {
 				const msg = patchErr instanceof Error ? patchErr.message : String(patchErr);
-				return rememberAgentArtifacts({ ...result, error: `Patch capture failed: ${msg}` });
+				return rememberAgentArtifacts(
+					{ ...result, error: `Patch capture failed: ${msg}` },
+					agentRegistry,
+					historyAuthority,
+				);
 			}
 		}
-		return rememberAgentArtifacts(result);
+		return rememberAgentArtifacts(result, agentRegistry, historyAuthority);
 	} catch (err) {
-		return rememberAgentArtifacts(opts.buildFailureResult(err));
+		return rememberAgentArtifacts(opts.buildFailureResult(err), agentRegistry, historyAuthority);
 	} finally {
 		if (handle) {
 			const isolationHandle = handle;

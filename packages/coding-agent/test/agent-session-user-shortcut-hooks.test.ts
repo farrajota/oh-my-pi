@@ -73,6 +73,8 @@ describe("AgentSession user shortcut hooks", () => {
 		};
 		const emitUserBash = vi.fn().mockResolvedValue({ result: replacement });
 		const extensionRunner = {
+			getActor: () => undefined,
+			getPermissionScope: () => undefined,
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash"),
 			emitUserBash,
 		} as unknown as ExtensionRunner;
@@ -86,6 +88,8 @@ describe("AgentSession user shortcut hooks", () => {
 			command: "echo hello",
 			excludeFromContext: true,
 			cwd: expect.any(String),
+			actor: undefined,
+			permissionScope: undefined,
 		});
 		expect(executeBashSpy).not.toHaveBeenCalled();
 		expect(result).toEqual(replacement);
@@ -112,6 +116,8 @@ describe("AgentSession user shortcut hooks", () => {
 		};
 		const emitUserPython = vi.fn().mockResolvedValue({ result: replacement });
 		const extensionRunner = {
+			getActor: () => undefined,
+			getPermissionScope: () => undefined,
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_python"),
 			emitUserPython,
 		} as unknown as ExtensionRunner;
@@ -125,6 +131,8 @@ describe("AgentSession user shortcut hooks", () => {
 			code: "print('hi')",
 			excludeFromContext: true,
 			cwd: expect.any(String),
+			actor: undefined,
+			permissionScope: undefined,
 		});
 		expect(executePythonSpy).not.toHaveBeenCalled();
 		expect(result).toEqual(replacement);
@@ -138,6 +146,8 @@ describe("AgentSession user shortcut hooks", () => {
 
 	it("falls back to normal execution when hook does not return a replacement", async () => {
 		const extensionRunner = {
+			getActor: () => undefined,
+			getPermissionScope: () => undefined,
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash" || eventType === "user_python"),
 			emitUserBash: vi.fn().mockResolvedValue({}),
 			emitUserPython: vi.fn().mockResolvedValue(undefined),

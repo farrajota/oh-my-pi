@@ -4,7 +4,6 @@
  * Runs each subagent on the main thread and forwards AgentEvents for progress tracking.
  */
 
-import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
@@ -42,18 +41,34 @@ import { initializeExtensions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
+import {
+	adoptAgent,
+	ensureAgentLive,
+	getAgentLifecycleManager,
+	lifecycleManagesRegistry,
+	releaseAgent,
+} from "../internal/agent-lifecycle-bridge";
+import {
+	detachAgentSession,
+	lookupAgentRef,
+	setAgentHistory,
+	setAgentStatus,
+	syncAgentSessionStatus,
+	unregisterAgentRef,
+} from "../internal/agent-registry-bridge";
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
-import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
+import { type CreateAgentSessionOptions, discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-session";
-import { type ArtifactManager, writeArtifact } from "../session/artifacts";
+import { ArtifactManager } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
 import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
+import { resolveAgentPrewalkDefault } from "./prewalk";
 import { resolveEvalBackends } from "../tools/eval-backends";
 
 import { normalizeToolNames } from "../tools/builtin-names";
@@ -68,8 +83,13 @@ import { trackLateCleanup } from "../utils/late-cleanup";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
-import { type EffectiveSubagentPermissions, formatPermissionScopeForPrompt } from "./permission-profiles";
-import { resolveAgentPrewalkDefault } from "./prewalk";
+import {
+	type EffectiveSubagentPermissions,
+	formatPermissionScopeForPrompt,
+	type PermissionScopeSnapshot,
+	permissionScopeDrifted,
+	normalizePermissionToolName,
+} from "./permission-profiles";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
@@ -77,6 +97,7 @@ import type { WorkPoolYieldItem } from "./workpool-yield";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	type EffectivePermissionSummary,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	type SingleResult,
@@ -413,6 +434,7 @@ export interface RunSubprocessOptions {
 	description?: string;
 	index: number;
 	id: string;
+	agentRegistry: AgentRegistry;
 	parentToolCallId?: string;
 	/**
 	 * Spawn runs as a detached background job (parent turn not blocked on it).
@@ -429,7 +451,9 @@ export interface RunSubprocessOptions {
 	/** Exact permission profiles requested by the original invocation, in request order. */
 	requestedPermissionProfiles?: string[];
 	/** Effective inherited plus requested permission profiles, in composition order. */
-	effectivePermissionProfiles?: string[];
+	effectivePermissionProfiles?: readonly string[];
+	/** Bounded display-only permission metadata. Never use it for authorization. */
+	permissionSummary?: EffectivePermissionSummary;
 	/** A caller-selected task model must not fall back to another model. */
 	exactModelOverride?: boolean;
 	/**
@@ -455,6 +479,13 @@ export interface RunSubprocessOptions {
 	taskDepth?: number;
 	/** Effective least-privilege scope resolved for this spawn. */
 	permissionScope?: EffectiveSubagentPermissions;
+	/** Exact frozen permission value/hash persisted and checked across launch and revival. */
+	permissionSnapshot?: PermissionScopeSnapshot;
+	/** Exact live-parent-bound authority creator supplied by the owning ToolSession. */
+	createAuthoritySession: (
+		options: CreateAgentSessionOptions & { agentId: string },
+		reviveRef?: AgentRef,
+	) => Promise<{ session: AgentSession }>;
 	/**
 	 * Override the `task.maxRuntimeMs` wall-clock cap for this run. When provided
 	 * it wins over the settings value; `0` disables the per-subagent wall-clock
@@ -546,6 +577,8 @@ export interface RunSubprocessOptions {
 	keepAlive?: boolean;
 	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
 	onCleanupDeferred?: (completion: Promise<void>) => void;
+	/** Internal exact-authority capture for post-run work that may outlive this executor. */
+	onHistoryAuthorityClaimed?: (session: AgentSession) => void;
 	/** Internal cleanup grace override for deterministic lifecycle tests. */
 	cleanupGraceMs?: number;
 }
@@ -1006,12 +1039,15 @@ interface RunMonitorArgs {
 	modelRole?: string;
 	/** Raw request-local model selector, retained for task progress rendering. */
 	requestedModel?: string;
+	permissionSummary?: EffectivePermissionSummary;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	detached?: boolean;
 	sessionFile?: string;
+	ircBus?: IrcBus;
+	agentRegistry: AgentRegistry;
 	/** Soft assistant-request budget; 0 disables the guard. */
 	softRequestBudget: number;
 	/** Whether crossing the soft budget injects a wrap-up steering notice. */
@@ -1112,6 +1148,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		task,
 		assignment,
 		description: args.description,
+		permissionSummary: args.permissionSummary,
 		lastIntent: undefined,
 		recentTools: [],
 		recentOutput: [],
@@ -1144,7 +1181,6 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let yieldInvalidatedByAsync = false;
 	let yieldTurnStopRequested = false;
 	let yieldTurnStopPromise: Promise<void> | null = null;
-
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
 	const accumulatedUsage: Usage = {
 		input: 0,
@@ -1343,7 +1379,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		onProgress?.({ ...progress });
 		const activityGist =
 			progress.lastIntent ?? (progress.currentTool ? `running ${progress.currentTool}` : undefined);
-		if (activityGist) AgentRegistry.global().setActivity(id, activityGist);
+		if (activityGist) args.agentRegistry.setActivity(id, activityGist);
 		const progressPayload = {
 			index,
 			agent: agent.name,
@@ -1801,20 +1837,24 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			progress.resolvedModelIdentity = serving.modelIdentity;
 			progress.resolvedThinkingLevel = serving.thinkingLevel;
 			progress.resolvedModelIsFallback = isFallback;
-			AgentRegistry.global().setHistory(
-				id,
-				{
-					resolvedModel: serving.selector,
-					resolvedModelIsFallback: isFallback,
-				},
-				session.sessionManager.getSessionFile?.() ?? args.sessionFile ?? undefined,
-			);
+			setAgentHistory(args.agentRegistry, session, {
+				resolvedModel: serving.selector,
+				resolvedModelIsFallback: isFallback,
+			});
 			scheduleProgress(true);
 		};
+		const publishPermissionSummary = (): void => {
+			const permissionSummary = session.getPermissionSummary();
+			if (permissionSummary === progress.permissionSummary) return;
+			progress.permissionSummary = permissionSummary;
+			scheduleProgress(true);
+		};
+		publishPermissionSummary();
 		return session.subscribe(event => {
 			emitSubagentEvent(event);
 			publishAdvisorState(session);
 			publishServingModel();
+			publishPermissionSummary();
 			if (event.type === "auto_retry_start") {
 				progress.retryState = {
 					attempt: event.attempt,
@@ -2266,14 +2306,15 @@ interface FinalizeRunArgs {
 	outputSchemaSource?: StructuredSubagentSchemaSource;
 	signal?: AbortSignal;
 	artifactsDir?: string;
+	artifactManager?: ArtifactManager;
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	detached?: boolean;
 	/**
 	 * This finalize is a revival/wake or explicit follow-up turn, not the initial
-	 * run. Such turns only (re)write `<id>.md` when they produce a real `yield`
-	 * result, so a conversational hub wake (which never yields) cannot clobber the
-	 * completed run's artifact with a missing-yield warning body (issue #9518).
+	 * run. Such turns only publish a fresh `<id>.md` generation when they produce
+	 * a real `yield`, so a conversational hub wake cannot replace the completed
+	 * result with a missing-yield warning body (issue #9518).
 	 */
 	followUpTurn?: boolean;
 	sessionFile?: string;
@@ -2282,9 +2323,8 @@ interface FinalizeRunArgs {
 
 /**
  * Turn a settled run into a {@link SingleResult}: resolve the yield payload via
- * {@link finalizeSubprocessOutput}, salvage cancelled-run output, write the
- * `<id>.md` output artifact, flush final progress, and emit the lifecycle end
- * event.
+ * {@link finalizeSubprocessOutput}, salvage cancelled-run output, publish the
+ * `<id>.md` output generation, flush final progress, and emit lifecycle end.
  */
 async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	const { monitor, done, index, id, agent, task, assignment, signal, modelOverride, modelRole, requestedModel } = args;
@@ -2337,76 +2377,45 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		maxLines: MAX_OUTPUT_LINES,
 	});
 
-	// Write output artifact (input and jsonl already written in real-time).
-	// Compute output metadata for agent:// URL integration.
-	//
-	// A revival/follow-up turn only (re)writes <id>.md when it produced a real
-	// yield result. A subagent revived to answer a hub message never yields, so
-	// writing here would overwrite the completed run's authoritative artifact with
-	// a missing-yield warning body (issue #9518). The initial run is unaffected
-	// (followUpTurn is unset), preserving the documented missing-yield artifact.
+	// Publish output and structured sidecar as one marker-gated generation.
+	// A revival/follow-up turn only advances the head when it produced a real
+	// yield, so a conversational hub wake cannot replace the completed result.
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
 	let outputPath: string | undefined;
-	if (args.artifactsDir && (!args.followUpTurn || hasYield)) {
-		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
+	const artifactManager =
+		args.artifactManager ?? (args.artifactsDir ? new ArtifactManager(args.artifactsDir) : undefined);
+	if (artifactManager && (!args.followUpTurn || hasYield)) {
+		let sidecarContent: string | undefined;
+		const structured = finalized.structuredOutput;
+		if (structured && Object.hasOwn(structured, "data")) {
+			try {
+				const serialized = JSON.stringify(structured.data, null, 2);
+				if (serialized !== undefined) sidecarContent = `${serialized}\n`;
+			} catch (error) {
+				logger.warn("Failed to serialize subagent structured output sidecar", {
+					agentId: id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		try {
-			await writeArtifact(candidatePath, rawOutput);
-			outputPath = candidatePath;
+			const expectedGenerationId = await artifactManager.getAgentArtifactGeneration(id);
+			const publication = await artifactManager.publishAgentArtifacts(id, rawOutput, sidecarContent, {
+				provenance: "task-executor",
+				scope: args.sessionFile ?? "ephemeral-task",
+				metadata: { hasStructuredSidecar: sidecarContent !== undefined },
+				expectedGenerationId,
+			});
+			outputPath = publication.outputPath;
 			outputMeta = {
 				lineCount: rawOutput.split("\n").length,
 				charCount: rawOutput.length,
 			};
 		} catch (error) {
-			logger.warn("Failed to persist subagent output artifact", {
+			logger.warn("Failed to publish subagent output artifact", {
 				agentId: id,
-				path: candidatePath,
 				error: error instanceof Error ? error.message : String(error),
 			});
-		}
-		const structured = finalized.structuredOutput;
-		const sidecarPath = path.join(args.artifactsDir, `${id}.json`);
-		if (outputPath && structured && Object.hasOwn(structured, "data")) {
-			try {
-				const serialized = JSON.stringify(structured.data, null, 2);
-				// `structured.data === undefined` (an own "data" key holding
-				// `undefined`) makes JSON.stringify return `undefined` too —
-				// neither a write nor a removal, which would leave a stale
-				// sidecar from an earlier turn answering agent://<id>/<field>
-				// with superseded data (PR #10625 review).
-				if (serialized !== undefined) await writeArtifact(sidecarPath, `${serialized}\n`);
-				else await fs.rm(sidecarPath, { force: true });
-			} catch (error) {
-				logger.warn("Failed to persist subagent structured output sidecar", {
-					agentId: id,
-					path: sidecarPath,
-					error: error instanceof Error ? error.message : String(error),
-				});
-				// A stale sidecar from an earlier turn must not outlive this
-				// turn's <id>.md just because the replacement write failed —
-				// agent://<id>/<field> would keep answering with superseded data.
-				try {
-					await fs.rm(sidecarPath, { force: true });
-				} catch (rmError) {
-					logger.warn("Failed to drop stale subagent structured output sidecar", {
-						agentId: id,
-						path: sidecarPath,
-						error: rmError instanceof Error ? rmError.message : String(rmError),
-					});
-				}
-			}
-		} else if (outputPath) {
-			// This turn republished <id>.md; a stale sidecar from an earlier
-			// turn would keep answering agent://<id>/<field> with the
-			// superseded payload, so it must not outlive its <id>.md.
-			try {
-				await fs.rm(sidecarPath, { force: true });
-			} catch (error) {
-				logger.warn("Failed to drop stale subagent structured output sidecar", {
-					agentId: id,
-					path: sidecarPath,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
 		}
 	}
 
@@ -2457,6 +2466,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		task,
 		assignment,
 		description: progress.description,
+		permissionSummary: progress.permissionSummary,
 		lastIntent: progress.lastIntent,
 		exitCode,
 		output: truncatedOutput,
@@ -2497,6 +2507,11 @@ export interface IrcWakeTurnMonitorOptions {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	permissionSummary?: EffectivePermissionSummary;
+	/** Registry owning this kept-alive subagent. */
+	agentRegistry: AgentRegistry;
+	/** Exact IRC bus bound to the owning registry. */
+	ircBus: IrcBus;
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	/** Fallback session file when the registry ref carries none. */
@@ -2546,15 +2561,20 @@ async function relayWakeTurnOutput(args: {
 	yielded: boolean;
 	result: SingleResult;
 	turnText: string;
+	agentRegistry: AgentRegistry;
+	ircBus: IrcBus;
 }): Promise<void> {
-	const bus = IrcBus.global();
+	const bus = args.ircBus;
 	const pending = wakeSources(args.records, args.id).filter(
 		source => !bus.sentSince(args.id, source.from, args.turnStartTime),
 	);
 	if (pending.length === 0) return;
 	const body =
 		args.yielded && args.result.outputPath
-			? formatTaskResultSummary(args.result, { totalDurationMs: args.result.durationMs })
+			? formatTaskResultSummary(args.result, {
+					totalDurationMs: args.result.durationMs,
+					agentRegistry: args.agentRegistry,
+				})
 			: args.turnText.trim();
 	if (!body) return;
 	for (const source of pending) {
@@ -2618,7 +2638,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		const turnStartTime = Date.now();
 		const relay = Promise.withResolvers<void>();
 		session.trackIrcReply(relay.promise);
-		const sessionFile = AgentRegistry.global().get(id)?.sessionFile ?? options.sessionFile ?? undefined;
+		const sessionFile = options.agentRegistry.get(id)?.sessionFile ?? options.sessionFile ?? undefined;
 		const turnMonitor = createSubagentRunMonitor({
 			index,
 			id,
@@ -2627,6 +2647,9 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			description: options.description,
 			modelOverride: options.modelOverride,
 			modelRole: options.modelRole,
+			permissionSummary: options.permissionSummary,
+			agentRegistry: options.agentRegistry,
+			ircBus: options.ircBus,
 			subagentEventBus: options.subagentEventBus,
 			parentToolCallId: options.parentToolCallId,
 			detached: true,
@@ -2681,6 +2704,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 						abortReason: aborted ? turnMonitor.resolveAbortReasonText() : undefined,
 						durationMs: Date.now() - turnStartTime,
 					},
+					artifactManager: session.sessionManager.getArtifactManager() ?? undefined,
 					index,
 					id,
 					agent,
@@ -2699,7 +2723,16 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					startTime: turnStartTime,
 				});
 				if (!aborted && !error) {
-					await relayWakeTurnOutput({ id, records, turnStartTime, yielded, result, turnText });
+					await relayWakeTurnOutput({
+						id,
+						records,
+						turnStartTime,
+						yielded,
+						result,
+						turnText,
+						agentRegistry: options.agentRegistry,
+						ircBus: options.ircBus,
+					});
 				}
 			} catch (finalizeError) {
 				logger.warn("IRC subagent turn finalization failed", {
@@ -2724,17 +2757,20 @@ export async function finalizeSubagentLifecycle(args: {
 	id: string;
 	session: AgentSession;
 	aborted: boolean;
-	/** Which watchdog (if any) requested the abort; decides revivability. */
 	abortKind?: AbortReason;
 	keepAlive: boolean;
 	isolated: boolean;
 	agentIdleTtlMs: number;
-	reviveSession: AgentReviver | null;
+	reviveSession?: AgentReviver | null;
 	cleanupDeadlineAt?: number;
+	agentRegistry: AgentRegistry;
 	onCleanupDeferred?: (completion: Promise<void>) => void;
+	agentLifecycle: AgentLifecycleManager;
 }): Promise<void> {
-	const registry = AgentRegistry.global();
-	const ref = registry.get(args.id);
+	const registry = args.agentRegistry;
+	const ref = lookupAgentRef(registry, args.id);
+	const lifecycle = args.agentLifecycle;
+	const managesAgentRegistry = lifecycleManagesRegistry(lifecycle, registry);
 	const ownsRef = Boolean(ref && ref.session === args.session);
 	const cleanupDeadlineAt = args.cleanupDeadlineAt ?? Date.now() + 5000;
 	const disposeSession = async (): Promise<void> => {
@@ -2767,36 +2803,39 @@ export async function finalizeSubagentLifecycle(args: {
 	// Manager shutdown also preserves the transcript, but disposes and unregisters
 	// the process-local session. Caller signals, wall-clock timeouts, and internal
 	// terminations are genuine kills and stay terminal.
-	const resumableAbort =
-		args.abortKind === "budget" && args.keepAlive && !args.isolated && args.reviveSession !== null;
+	const resumableAbort = args.abortKind === "budget" && args.keepAlive && !args.isolated && args.reviveSession != null;
 	if (args.aborted && !resumableAbort) {
 		if (ref && ownsRef) {
 			if (args.abortKind === "shutdown") {
 				try {
-					await AgentLifecycleManager.global().release(args.id, ref);
+					if (managesAgentRegistry) await releaseAgent(lifecycle, args.id, ref);
+					else {
+						await disposeSession();
+						unregisterAgentRef(registry, args.id, args.session);
+					}
 				} catch (error) {
 					logger.warn("runSubagent: failed to release session during manager shutdown", {
 						id: args.id,
 						error: String(error),
 					});
 					await disposeSession();
-					registry.unregister(args.id, ref);
+					unregisterAgentRef(registry, args.id, args.session);
 				}
 			} else {
-				// Route hard kills through the lifecycle owner so the terminal
-				// decision is durable and a restart cannot rediscover the transcript
-				// as a revivable parked agent.
 				try {
-					await AgentLifecycleManager.global().release(args.id, ref, { tombstone: true });
+					if (managesAgentRegistry) await releaseAgent(lifecycle, args.id, ref, { tombstone: true });
+					else {
+						setAgentStatus(registry, args.id, "aborted", args.session);
+						detachAgentSession(registry, args.id, args.session);
+						await disposeSession();
+					}
 				} catch (error) {
 					logger.warn("runSubagent: failed to persist kill tombstone", { id: args.id, error: String(error) });
-					registry.setStatus(args.id, "aborted", ref);
-					registry.detachSession(args.id, ref);
+					setAgentStatus(registry, args.id, "aborted", args.session);
+					detachAgentSession(registry, args.id, args.session);
 					await disposeSession();
 				}
 			}
-		} else {
-			await disposeSession();
 		}
 		return;
 	}
@@ -2804,7 +2843,7 @@ export async function finalizeSubagentLifecycle(args: {
 	if (!args.keepAlive) {
 		// One-shot helper: dispose and unregister. No IRC, no revival.
 		await disposeSession();
-		if (ref && ownsRef) registry.unregister(args.id, ref);
+		if (ref && ownsRef) unregisterAgentRef(registry, args.id, args.session);
 		return;
 	}
 
@@ -2814,26 +2853,29 @@ export async function finalizeSubagentLifecycle(args: {
 		// transcript stays reachable (history://), but ensureLive will throw.
 		// Status must flip to "parked" before dispose so the sdk dispose
 		// wrapper skips unregister.
-		if (ref && ownsRef) registry.setStatus(args.id, "parked", ref);
+		if (ref && ownsRef) setAgentStatus(registry, args.id, "parked", args.session);
 		await disposeSession();
-		if (ref && ownsRef) registry.detachSession(args.id, ref);
+		if (ref && ownsRef) detachAgentSession(registry, args.id, args.session);
 		return;
 	}
 
 	// Keep-alive: finished and failed subagents both stay interrogable.
 	// The lifecycle manager owns idle-TTL parking + revival from here on.
-	if (!ref || !ownsRef || !registry.setStatus(args.id, "idle", ref)) {
+	if (!ref || !ownsRef || !setAgentStatus(registry, args.id, "idle", args.session)) {
 		await disposeSession();
 		return;
 	}
-	AgentLifecycleManager.global().adopt(
-		args.id,
-		{
-			idleTtlMs: args.agentIdleTtlMs,
-			revive: args.reviveSession ?? undefined,
-		},
-		ref,
-	);
+	if (managesAgentRegistry) {
+		adoptAgent(
+			lifecycle,
+			args.id,
+			{
+				idleTtlMs: args.agentIdleTtlMs,
+				revive: args.reviveSession ?? undefined,
+			},
+			ref,
+		);
+	}
 }
 
 /** Options for {@link runSubagentFollowUpTurn}. */
@@ -2848,6 +2890,7 @@ export interface FollowUpTurnOptions {
 	description?: string;
 	/** Explicit pre-expansion model role alias retained from the original run. */
 	modelRole?: string;
+	permissionSummary?: EffectivePermissionSummary;
 	/** Structured-output state retained from the original invocation. */
 	outputSchema?: unknown;
 	outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -2855,11 +2898,15 @@ export interface FollowUpTurnOptions {
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	subagentEventBus?: EventBus;
+	/** Registry owning the continued subagent. */
+	agentRegistry: AgentRegistry;
+	/** Lifecycle manager bound to {@link agentRegistry}. */
+	agentLifecycle: AgentLifecycleManager;
 	parentToolCallId?: string;
 	/**
-	 * When set, a turn that produces a `yield` result (re)writes `<artifactsDir>/<id>.md`
-	 * so `agent://<id>` tracks the latest completion. A yield-less turn (e.g. a hub
-	 * wake answering a message) leaves the existing artifact intact (issue #9518).
+	 * When set, a turn that produces a `yield` result publishes a fresh
+	 * `<artifactsDir>/<id>.md` generation so `agent://<id>` tracks the latest
+	 * completion. A yield-less hub wake leaves the existing head intact.
 	 */
 	artifactsDir?: string;
 	/** Wall-clock cap in ms for this turn; 0 disables. */
@@ -2883,7 +2930,8 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	const { id, agent, message, signal } = options;
 	const index = options.index ?? 0;
 	const startTime = Date.now();
-	let session = await AgentLifecycleManager.global().ensureLive(id);
+	const { agentRegistry: registry, agentLifecycle: lifecycle } = options;
+	let session = await ensureAgentLive(lifecycle, id);
 	// Acquire turn ownership before mutating the shared yield contract: installing
 	// pooled items under a running ordinary wake would reject its in-flight tool
 	// calls. The check-to-install section below has no await, so once idle is
@@ -2916,7 +2964,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	// already be streaming a wake, so ownership is reacquired every round.
 	for (let acquireAttempts = 0; ; acquireAttempts++) {
 		await session.setWorkPoolYieldItems(options.workPoolYieldItems ?? []);
-		const live = await AgentLifecycleManager.global().ensureLive(id);
+		const live = await ensureAgentLive(lifecycle, id);
 		if (live === session) break;
 		if (acquireAttempts >= 2) {
 			throw new Error(
@@ -2926,16 +2974,19 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		session = live;
 		await acquireOwnership();
 	}
-	const ref = AgentRegistry.global().get(id);
+	const ref = registry.get(id);
 	const sessionFile = ref?.sessionFile ?? undefined;
+	const permissionSummary = options.permissionSummary ?? ref?.history?.permissionSummary;
 
 	const monitor = createSubagentRunMonitor({
 		index,
 		id,
 		agent,
 		task: message,
+		agentRegistry: registry,
 		description: options.description,
 		modelRole: options.modelRole,
+		permissionSummary,
 		signal,
 		onProgress: options.onProgress,
 		subagentEventBus: options.subagentEventBus,
@@ -3010,6 +3061,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		outputSchemaSource: options.outputSchemaSource,
 		signal,
 		artifactsDir: options.artifactsDir,
+		artifactManager: session.sessionManager.getArtifactManager() ?? undefined,
 		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: true,
@@ -3041,10 +3093,26 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		signal,
 		onProgress,
 	} = options;
+	if (!options.agentRegistry) throw new Error("Authority subagent execution requires an owning agent registry.");
+	if (!options.createAuthoritySession)
+		throw new Error("Authority subagent creation requires a live parent-bound session creator.");
 	const extensionRoots = snapshotEffectiveExtensionRoots(options.extensionRoots);
 	const cleanupGraceMs = options.cleanupGraceMs ?? TASK_ABORT_CLEANUP_GRACE_MS;
 	let browserAuditCapability: BrowserAuditToolCapability | undefined = takeBrowserAuditRunCapability(options.agent);
 	const startTime = Date.now();
+	const agentRegistry = options.agentRegistry;
+	const createSubagentSession = options.createAuthoritySession;
+	const agentLifecycle = getAgentLifecycleManager(agentRegistry);
+	if (options.permissionScope && !options.permissionSnapshot) {
+		throw new Error("Authority subagent creation requires a frozen permission snapshot.");
+	}
+	if (
+		options.permissionScope &&
+		options.permissionSnapshot &&
+		permissionScopeDrifted(options.permissionSnapshot, options.permissionScope)
+	) {
+		throw new Error("Subagent permission scope changed after reservation.");
+	}
 	// loop dispatches a chat request to the provider — the launch-complete boundary.
 	let firstChatDispatchAt: number | undefined;
 
@@ -3068,6 +3136,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			requests: 0,
 			modelRole,
 			requestedModel,
+			permissionSummary: options.permissionSummary,
 			error: "Cancelled before start",
 			aborted: true,
 			abortReason: "Cancelled before start",
@@ -3133,8 +3202,9 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 	if (atMaxDepth && toolNames?.includes("task")) {
 		toolNames = toolNames.filter(name => name !== "task");
 	}
-	const ircDenied = options.permissionScope?.denyTools.some(tool => tool.toLowerCase() === "irc") ?? false;
-	// Ordinary agents retain IRC collaboration when enabled. Restricted benchmark
+	const ircDenied =
+		options.permissionScope?.denyTools.some(tool => normalizePermissionToolName(tool).toLowerCase() === "hub") ??
+		false;
 	// sessions must not widen their explicit host tool list.
 	if (toolNames && ircEnabled && !options.restrictToolNames && !toolNames.includes("irc") && !ircDenied) {
 		toolNames = [...toolNames, "irc"];
@@ -3179,12 +3249,14 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		settings,
 		modelRole,
 		requestedModel,
+		permissionSummary: options.permissionSummary,
 		signal,
 		onProgress,
 		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: options.detached,
 		sessionFile: subtaskSessionFile,
+		agentRegistry,
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
@@ -3192,7 +3264,12 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
 	let reviveSession: AgentReviver | null = null;
+	let historyAuthority: AgentSession | undefined;
 	const installIrcWakeTurnMonitor = (target: AgentSession): void => {
+		const ref = lookupAgentRef(agentRegistry, id);
+		if (!ref) return;
+		const rootId = ref.lineage?.rootId;
+		if (!rootId) throw new Error(`Cannot install IRC wake monitor for "${id}" without a lineage root.`);
 		attachIrcWakeTurnMonitor(target, {
 			id,
 			index,
@@ -3200,6 +3277,9 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			description: options.description,
 			modelOverride,
 			modelRole,
+			permissionSummary: options.permissionSummary,
+			agentRegistry,
+			ircBus: IrcBus.forRoot(agentRegistry, rootId),
 			subagentEventBus: options.subagentEventBus,
 			parentToolCallId: options.parentToolCallId,
 			sessionFile: subtaskSessionFile,
@@ -3464,16 +3544,10 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			// of the original run (same agent id, tools, model, system prompt,
 			// artifacts dir) — only the SessionManager differs.
 			const buildSubagentSessionOptions = (
-				sessionManagerForRun: SessionManager,
-				expectedAgentRef: CreateAgentSessionOptions["expectedAgentRef"],
-				// Parked workers always revive with an empty runtime yield set; a
-				// pooled follow-up reinstalls its items explicitly before turning.
-				// Without this, the registry lookup below misses (session === null
-				// while the replacement builds) and the revived prompt resurrects
-				// the launch-time pooled instructions against an ordinary runtime.
+				sessionManager: SessionManager,
 				forRevive = false,
-			): CreateAgentSessionOptions => {
-				const sessionOptions: CreateAgentSessionOptions = {
+			): CreateAgentSessionOptions & { agentId: string } => {
+				const sessionOptions: CreateAgentSessionOptions & { agentId: string } = {
 					cwd: worktree ?? cwd,
 					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
 					agentDir: subagentSettings.getAgentDir(),
@@ -3507,7 +3581,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 					systemPrompt: defaultPrompt => {
 						const ircRoster = ircEnabled
-							? collectIrcPeerRoster(AgentRegistry.global(), id, ircRootSessionFile)
+							? collectIrcPeerRoster(agentRegistry, id, ircRootSessionFile)
 							: undefined;
 						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
 							agent: agent.systemPrompt,
@@ -3524,7 +3598,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 							// session is null, so render the cleared set rather than
 							// resurrecting the launch-time pooled instructions.
 							workPoolYieldItems:
-								AgentRegistry.global().get(id)?.session?.getWorkPoolYieldItems?.() ??
+								lookupAgentRef(agentRegistry, id)?.session?.getWorkPoolYieldItems?.() ??
 								(forRevive ? [] : (options.workPoolYieldItems ?? [])),
 							ircPeers: ircRoster?.peers ?? [],
 							ircParkedCount: ircRoster?.parkedCount ?? 0,
@@ -3536,7 +3610,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 							? [subagentPrompt]
 							: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
 					},
-					sessionManager: sessionManagerForRun,
+					sessionManager,
 					hasUI: false,
 					prewalk,
 					spawns: spawnsEnv,
@@ -3552,7 +3626,6 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					agentId: id,
 					agentDisplayName: agent.name,
 					agentName: agent.name,
-					expectedAgentRef,
 					enableLsp: lspEnabled,
 					enableIrc: options.enableIrc,
 					skipPythonPreflight,
@@ -3561,7 +3634,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					customTools: sessionCustomTools.length > 0 ? sessionCustomTools : undefined,
 					localProtocolOptions: options.localProtocolOptions,
 					telemetry: subagentTelemetry,
-					permissionScope: options.permissionScope,
+					permissionScope: options.permissionSnapshot?.scope ?? options.permissionScope,
 					parentEvalSessionId: options.parentEvalSessionId,
 					onFirstChatDispatch: () => {
 						firstChatDispatchAt ??= performance.now();
@@ -3579,15 +3652,15 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			sessionOpenedAt = performance.now();
 			if (ircEnabled) {
 				ircRootSessionFile = await ensurePersistedRoster(
-					AgentRegistry.global(),
+					agentRegistry,
 					sessionManager.getSessionFile() ??
 						sessionFile ??
-						AgentRegistry.global().get(id)?.sessionFile ??
-						AgentRegistry.global().get(MAIN_AGENT_ID)?.sessionFile,
+						agentRegistry.get(id)?.sessionFile ??
+						agentRegistry.get(MAIN_AGENT_ID)?.sessionFile,
 				);
 			}
 
-			const sessionPromise = createAgentSession(buildSubagentSessionOptions(sessionManager, null));
+			const sessionPromise = createSubagentSession(buildSubagentSessionOptions(sessionManager));
 			let session: AgentSession;
 			try {
 				({ session } = await awaitAbortable(sessionPromise));
@@ -3598,12 +3671,14 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				void sessionPromise.then(created => created.session.dispose()).catch(() => {});
 				throw err;
 			}
+			historyAuthority = session;
+			options.onHistoryAuthorityClaimed?.(session);
 			sessionCreatedAt = performance.now();
 
 			monitor.setActiveSession(session);
 			// Run-state notifications precede deferrable wire-level `agent_end`,
 			// so adopted keep-alive lifecycle cannot get stuck during prompt unwind.
-			AgentRegistry.global().syncSessionStatus(id, session);
+			syncAgentSessionStatus(agentRegistry, id, session);
 			if (sessionFile !== null && worktree === undefined) {
 				// Lifecycle reviver: park closed the JSONL writer, so reopening takes
 				// the single-writer lock cleanly and restores the full message history
@@ -3613,20 +3688,19 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 						suppressBreadcrumb: true,
 					});
-					if (options.parentArtifactManager) {
-						reopened.adoptArtifactManager(options.parentArtifactManager);
-					}
+					if (options.parentArtifactManager) reopened.adoptArtifactManager(options.parentArtifactManager);
 					if (ircEnabled) {
 						ircRootSessionFile = await ensurePersistedRoster(
-							AgentRegistry.global(),
+							agentRegistry,
 							reopened.getSessionFile() ??
 								sessionFile ??
-								AgentRegistry.global().get(id)?.sessionFile ??
-								AgentRegistry.global().get(MAIN_AGENT_ID)?.sessionFile,
+								agentRegistry.get(id)?.sessionFile ??
+								agentRegistry.get(MAIN_AGENT_ID)?.sessionFile,
 						);
 					}
-					const { session: revived } = await createAgentSession(
-						buildSubagentSessionOptions(reopened, expectedAgentRef, true),
+					const { session: revived } = await createSubagentSession(
+						buildSubagentSessionOptions(reopened, true),
+						expectedAgentRef,
 					);
 					// Re-run the executor's extension wiring on the rebuilt session.
 					// Skipping it leaves the runner pre-init, so a `tool_call` handler
@@ -3638,7 +3712,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 						reportRuntimeError: err =>
 							logger.error("Extension error", { path: err.extensionPath, error: err.error }),
 					});
-					AgentRegistry.global().syncSessionStatus(id, revived);
+					syncAgentSessionStatus(agentRegistry, id, revived);
 					installIrcWakeTurnMonitor(revived);
 					return revived;
 				};
@@ -3682,6 +3756,8 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 
 			const persistedModelRole =
 				modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings);
+			const permissionSummary = session.getPermissionSummary() ?? options.permissionSummary;
+			progress.permissionSummary = permissionSummary;
 			session.sessionManager.appendSessionInit({
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
 				task,
@@ -3689,8 +3765,14 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				agent: agent.name,
 				modelRole: persistedModelRole,
 				resolvedModel: progress.resolvedModel,
-				requestedPermissionProfiles: options.requestedPermissionProfiles,
-				effectivePermissionProfiles: options.effectivePermissionProfiles,
+				requestedPermissionProfiles: options.requestedPermissionProfiles
+					? [...options.requestedPermissionProfiles]
+					: undefined,
+				effectivePermissionProfiles: options.effectivePermissionProfiles
+					? [...options.effectivePermissionProfiles]
+					: undefined,
+				permissionSummary,
+				permissionSnapshot: options.permissionSnapshot,
 				readOnly: isReadOnlyAgent(agent),
 				spawns: spawnsEnv,
 				readSummarize: agent.readSummarize,
@@ -3700,18 +3782,22 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				restrictToolNames: restrictToolNames || undefined,
 				enableMCP,
 			});
-			AgentRegistry.global().setHistory(
-				id,
-				{
+			if (historyAuthority) {
+				setAgentHistory(agentRegistry, historyAuthority, {
 					agent: agent.name,
 					modelRole: persistedModelRole,
 					resolvedModel: progress.resolvedModel,
-					requestedPermissionProfiles: options.requestedPermissionProfiles,
-					effectivePermissionProfiles: options.effectivePermissionProfiles,
+					requestedPermissionProfiles: options.requestedPermissionProfiles
+						? [...options.requestedPermissionProfiles]
+						: undefined,
+					effectivePermissionProfiles: options.effectivePermissionProfiles
+						? [...options.effectivePermissionProfiles]
+						: undefined,
+					permissionSummary,
+					permissionSnapshot: options.permissionSnapshot,
 					readOnly: isReadOnlyAgent(agent),
-				},
-				session.sessionManager.getSessionFile?.() ?? undefined,
-			);
+				});
+			}
 
 			abortSignal.addEventListener(
 				"abort",
@@ -3901,12 +3987,13 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					id,
 					session,
 					aborted,
-					abortKind: monitor.abortKind(),
 					keepAlive: options.keepAlive !== false,
 					isolated: worktree !== undefined,
 					agentIdleTtlMs,
 					reviveSession,
+					agentRegistry,
 					cleanupDeadlineAt,
+					agentLifecycle,
 					onCleanupDeferred: completion => {
 						deferredSessionShutdown = completion;
 						deferCleanup(completion);
@@ -3983,6 +4070,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 	const result = await finalizeRunResult({
 		monitor,
 		done,
+		artifactManager: options.parentArtifactManager,
 		index,
 		id,
 		agent,
@@ -4002,14 +4090,13 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		sessionFile: subtaskSessionFile,
 		startTime,
 	});
-	AgentRegistry.global().setHistory(
-		id,
-		{
+	if (historyAuthority) {
+		setAgentHistory(agentRegistry, historyAuthority, {
 			outputPath: result.outputPath,
 			resolvedModel: result.resolvedModel,
 			resolvedModelIsFallback: result.resolvedModelIsFallback,
-		},
-		subtaskSessionFile,
-	);
+			permissionSummary: result.permissionSummary,
+		});
+	}
 	return result;
 }

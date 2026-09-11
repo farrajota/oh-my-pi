@@ -81,7 +81,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		systemPrompt: "test",
 		source: "bundled",
 	};
-
+	let registry = new AgentRegistry();
+	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+		sdkModule.createAgentSession({ ...options, agentRegistry: registry });
 	const baseOptions = {
 		cwd: "/tmp",
 		agent: baseAgent,
@@ -90,6 +92,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		id: "subagent-walltime",
 		modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 		enableLsp: false,
+		agentRegistry: registry,
+		createAuthoritySession,
 	};
 
 	it("aborts a stalled subagent and surfaces a runtime-limit reason", async () => {
@@ -197,8 +201,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 	});
 
 	it("a cancelled late initializer cannot replace a newer same-id worker", async () => {
-		AgentRegistry.resetGlobalForTests();
-		const registry = AgentRegistry.global();
+		registry = new AgentRegistry();
 		const creationGate = Promise.withResolvers<void>();
 		const creationStarted = Promise.withResolvers<CreateAgentSessionOptions>();
 		const lateDisposed = Promise.withResolvers<void>();
@@ -206,21 +209,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			...createSessionDefaults(),
 			dispose: async () => lateDisposed.resolve(),
 		} as unknown as AgentSession;
-		let lateInstall = registry.get("late-generation");
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
 			creationStarted.resolve(options);
 			await creationGate.promise;
-			lateInstall = registry.registerIfAvailable(
-				{
-					id: "late-generation",
-					displayName: "late A",
-					kind: "sub",
-					parentId: "Main",
-					session: null,
-					status: "running",
-				},
-				options.expectedAgentRef ?? null,
-			);
 			return {
 				session: lateSession,
 				extensionsResult: {} as unknown as LoadExtensionsResult,
@@ -236,7 +227,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			signal: abortController.signal,
 		});
 		const creationOptions = await creationStarted.promise;
-		expect(creationOptions.expectedAgentRef).toBeNull();
+		expect(creationOptions.expectedAgentRef).toBeUndefined();
 		abortController.abort();
 		const cancelled = await run;
 		expect(cancelled.aborted).toBe(true);
@@ -253,9 +244,96 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		creationGate.resolve();
 		await lateDisposed.promise;
 
-		expect(lateInstall).toBeUndefined();
-		expect(registry.get("late-generation")).toBe(replacement);
-		expect(replacement).toMatchObject({ status: "idle", session: replacementSession });
+		expect(registry.get("late-generation")).toMatchObject({
+			id: replacement.id,
+			lineage: replacement.lineage,
+			status: "idle",
+		});
+		expect(replacement.status).toBe("idle");
+	});
+
+	it("does not let a delayed run write history after its exact ref is rebound to a revived session", async () => {
+		registry = new AgentRegistry();
+		const setupPaused = Promise.withResolvers<void>();
+		const releaseSetup = Promise.withResolvers<void>();
+		let childSessionManager!: AgentSession["sessionManager"];
+		const session = {
+			...createSessionDefaults(),
+			state: { messages: [] } as never,
+			agent: { state: { systemPrompt: ["test"] } } as never,
+			extensionRunner: undefined as never,
+			get sessionManager() {
+				return childSessionManager;
+			},
+			getActiveToolNames: () => ["read", "yield"],
+			getEnabledToolNames: () => ["read", "yield"],
+			setWorkPoolYieldItems: async () => {
+				setupPaused.resolve();
+				await releaseSetup.promise;
+			},
+			subscribe: (listener: (event: AgentSessionEvent) => void) => {
+				queueMicrotask(() => {
+					listener({
+						type: "tool_execution_end",
+						toolCallId: "tool-generation-fence",
+						toolName: "yield",
+						result: {
+							content: [{ type: "text", text: "Result submitted." }],
+							details: { status: "success", data: { ok: true } },
+						},
+						isError: false,
+					} as AgentSessionEvent);
+				});
+				return () => {};
+			},
+			prompt: async () => true,
+		} as unknown as AgentSession;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
+			childSessionManager = options.sessionManager!;
+			registry.register({
+				id: "history-generation",
+				displayName: "original",
+				kind: "sub",
+				parentId: "Main",
+				session,
+				sessionFile: options.sessionManager?.getSessionFile() ?? null,
+				status: "running",
+			});
+			return {
+				session,
+				extensionsResult: {} as unknown as LoadExtensionsResult,
+				setToolUIContext: () => {},
+				eventBus: new EventBus(),
+			} satisfies CreateAgentSessionResult;
+		});
+
+		const run = runSubprocess({
+			...baseOptions,
+			id: "history-generation",
+			settings: Settings.isolated({ "task.maxRuntimeMs": 0 }),
+			workPoolYieldItems: [],
+		});
+		await setupPaused.promise;
+		const original = registry.get("history-generation");
+		if (!original) throw new Error("Expected original history generation");
+		const replacementSession = createSessionDefaults() as unknown as AgentSession;
+		expect(registry.attachSession("history-generation", replacementSession, null, original)).toBe(true);
+		expect(registry.setHistory("history-generation", { resolvedModel: "replacement/model" })).toBe(true);
+		const replacement = registry.get("history-generation");
+		if (!replacement) throw new Error("Expected rebound history generation");
+		const metadataEvents: unknown[] = [];
+		registry.onChange(event => {
+			if (event.type === "metadata_changed") metadataEvents.push(event);
+		});
+
+		releaseSetup.resolve();
+		await run;
+
+		expect(registry.get("history-generation")).toMatchObject({
+			lineage: replacement.lineage,
+			history: { resolvedModel: "replacement/model" },
+		});
+		expect(metadataEvents).toEqual([]);
 	});
 
 	it("a late successful yield does not flip a timed-out run to success", async () => {

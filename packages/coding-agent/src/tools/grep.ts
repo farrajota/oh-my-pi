@@ -72,9 +72,9 @@ import {
 	formatEmptyMessage,
 	formatErrorMessage,
 	formatMoreItems,
-	PREVIEW_LIMITS,
 	replaceTabs,
 } from "./render-utils";
+import { PREVIEW_LIMITS } from "./preview-limits";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -783,6 +783,7 @@ async function resolveInternalSearchInputs(opts: {
 	sessionFile?: string;
 	sessionId?: string;
 	agentRegistry?: ResolveContext["agentRegistry"];
+	callerMemory?: ResolveContext["callerMemory"];
 }): Promise<InternalSearchInputResolution> {
 	const internalRouter = InternalUrlRouter.instance();
 	const paths = opts.resolvedPaths.slice();
@@ -801,6 +802,7 @@ async function resolveInternalSearchInputs(opts: {
 		localProtocolOptions: opts.localProtocolOptions,
 		skills: opts.skills,
 		rules: opts.rules,
+		callerMemory: opts.callerMemory,
 		skipDirectoryListing: true,
 		// Try path-only first so large artifacts (and any other handler that
 		// separates path from content) resolve without materializing bytes.
@@ -1015,6 +1017,10 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					sessionFile: this.session.getSessionFile() ?? undefined,
 					sessionId: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
 					agentRegistry: this.session.agentRegistry,
+					callerMemory: {
+						backend: this.session.settings.get("memory.backend"),
+						getMnemopiSessionState: this.session.getMnemopiSessionState,
+					},
 				});
 				const searchablePaths = internalResolution.paths;
 				const { virtualResources, virtualPathSet, virtualInputIndexes } = internalResolution;
@@ -1160,7 +1166,13 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					? Math.ceil(INTERNAL_TOTAL_CAP / (perFileMatchCap + 1)) * nativeMaxCountPerFile
 					: INTERNAL_TOTAL_CAP;
 
-				// Run grep
+				if (this.session.pathScope && searchablePaths.length > 0) {
+					const roots = exactFilePaths ?? multiTargets?.map(target => target.basePath) ?? [searchPath];
+					await this.session.pathScope
+						.currentOperation()
+						.preflight(roots.map(root => ({ path: root, kind: "search" as const })));
+				}
+
 				let result: GrepResult = {
 					matches: [],
 					totalMatches: 0,
@@ -1168,9 +1180,58 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					filesSearched: 0,
 					limitReached: false,
 				};
+				const constrainedSearch = Boolean(this.session.pathScope && searchablePaths.length > 0);
+				if (constrainedSearch) {
+					const operation = this.session.pathScope!.currentOperation();
+					const manifest: VirtualSearchResource[] = [];
+					const targets = exactFilePaths
+						? exactFilePaths.map(basePath => ({ basePath, glob: undefined as string | undefined }))
+						: (multiTargets ?? [{ basePath: searchPath, glob: globFilter }]);
+					for (const target of targets) {
+						const rootTarget = await operation.authorize(target.basePath, "search");
+						const matcher = target.glob ? new Bun.Glob(target.glob) : undefined;
+						const walked = await operation.walkAuthorized(rootTarget, {
+							signal,
+							readFiles: true,
+							include: entry => {
+								if (!entry.isFile) return false;
+								if (!matcher) return entry.path === rootTarget.canonicalTarget;
+								const relative = path.relative(target.basePath, entry.path).replace(/\\/g, "/");
+								if (!relative || relative === ".") return false;
+								return Boolean(matcher.match(relative));
+							},
+							descend: entry => {
+								if (!entry.isDirectory) return false;
+								const relative = path.relative(target.basePath, entry.path).replace(/\\/g, "/");
+								return !(
+									useGitignore &&
+									relative.split("/").some(segment => segment === ".git" || segment === "node_modules")
+								);
+							},
+						});
+						for (const entry of walked) {
+							if (entry.isFile && entry.content !== undefined) {
+								manifest.push({ path: entry.path, content: entry.content });
+							}
+						}
+					}
+					result = await searchVirtualResources(
+						manifest,
+						normalizedPattern,
+						ignoreCase,
+						effectiveMultiline,
+						normalizedContextBefore,
+						normalizedContextAfter,
+						nativeMaxCount,
+						signal,
+					);
+				}
+
+				// Run native grep only for unrestricted scopes. Constrained scopes above
+				// supply an exact manifest of content read from authorized handles.
 				let skippedOversizedCount = 0;
 				try {
-					if (searchablePaths.length > 0) {
+					if (!constrainedSearch && searchablePaths.length > 0) {
 						if (exactFilePaths || multiTargets) {
 							const matches: GrepMatch[] = [];
 							const seenMatchKeys = new Set<string>();
@@ -1210,6 +1271,13 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 								filesSearched += targetResult.filesSearched;
 								for (const match of targetResult.matches) {
 									const absolute = path.resolve(target.basePath, match.path);
+									if (this.session.pathScope) {
+										try {
+											await this.session.pathScope.authorizePath("grep", absolute, true);
+										} catch {
+											continue;
+										}
+									}
 									// Overlapping targets (a directory plus a file nested
 									// inside it) surface the same physical line twice;
 									// keep the first occurrence.
@@ -1253,6 +1321,25 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 							);
 							skippedOversizedCount = result.skippedOversized ?? 0;
 						}
+					}
+					if (this.session.pathScope && result.matches.length > 0) {
+						const allowedMatches: GrepMatch[] = [];
+						for (const match of result.matches) {
+							const absolute = path.resolve(searchPath, match.path);
+							try {
+								await this.session.pathScope.authorizePath("grep", absolute, true);
+								allowedMatches.push(match);
+							} catch {
+								// Do not leak unauthorized file names or matched content.
+							}
+						}
+						result = {
+							...result,
+							matches: allowedMatches,
+							totalMatches: allowedMatches.length,
+							filesWithMatches: new Set(allowedMatches.map(match => match.path)).size,
+							filesSearched: new Set(allowedMatches.map(match => match.path)).size,
+						};
 					}
 				} catch (err) {
 					if (err instanceof Error && /^regex(?: parse)? error/i.test(err.message)) {

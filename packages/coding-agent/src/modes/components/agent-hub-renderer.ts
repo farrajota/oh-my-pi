@@ -3,6 +3,7 @@ import { Ellipsis, padding, visibleWidth } from "@oh-my-pi/pi-tui";
 import { formatDuration, formatNumber, sanitizeText } from "@oh-my-pi/pi-utils";
 import { getRoleInfo } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
+import type { AgentSession } from "../../session/agent-session";
 import { type AgentRef, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { parseThinkingLevel } from "../../thinking";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
@@ -102,10 +103,14 @@ function formatResolvedModelBadge(resolved: string, preserveProvider = false, fa
  * the session merely points at: an armed fallback that has not served yet stays
  * attributed to whichever model last actually spoke.
  */
-export function modelBadge(ref: AgentRef, observed: ObservableSession | undefined): string | undefined {
+export function modelBadge(
+	ref: AgentRef,
+	observed: ObservableSession | undefined,
+	session?: AgentSession,
+): string | undefined {
 	const progress = observed?.progress;
-	const liveThinkingLevel = ref.session?.thinkingLevel;
-	const serving = ref.session?.servingModel;
+	const liveThinkingLevel = session?.thinkingLevel;
+	const serving = session?.servingModel;
 	const fallbackSelector =
 		(serving?.isFallback ? serving.selector : undefined) ??
 		(progress?.resolvedModelIsFallback ? progress.resolvedModel : undefined) ??
@@ -115,7 +120,7 @@ export function modelBadge(ref: AgentRef, observed: ObservableSession | undefine
 	}
 	const resolvedModel = progress?.resolvedModel ?? ref.history?.resolvedModel ?? serving?.selector;
 	if (resolvedModel) return formatResolvedModelBadge(resolvedModel, false, liveThinkingLevel);
-	const model = ref.session?.model;
+	const model = session?.model;
 	if (!model) return undefined;
 	const level = model.thinking ? liveThinkingLevel : undefined;
 	return formatModelBadge(model.id, level);

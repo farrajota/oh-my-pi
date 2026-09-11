@@ -7,7 +7,8 @@ import type {
 	TextContent,
 	Usage,
 } from "@oh-my-pi/pi-ai";
-import type { StructuredSubagentSchemaMode } from "../task/types";
+import type { PermissionScopeSnapshot } from "../task/permission-profiles";
+import type { EffectivePermissionSummary, StructuredSubagentSchemaMode } from "../task/types";
 import type { CompactionMethod } from "./compaction-methods";
 
 export const CURRENT_SESSION_VERSION = 3;
@@ -163,6 +164,9 @@ export interface ResetBoundaryEntry extends SessionEntryBase {
 	type: "reset_boundary";
 }
 
+/** Host-owned custom metadata key for durable permission summary replacements. */
+export const PERMISSION_SUMMARY_UPDATE_CUSTOM_TYPE = "permission_summary_update";
+
 /**
  * Custom entry for extensions to store extension-specific data in the session.
  * Use customType to identify your extension's entries.
@@ -256,6 +260,10 @@ export interface SessionInitEntry extends SessionEntryBase {
 	requestedPermissionProfiles?: string[];
 	/** Effective inherited plus requested permission profiles, in composition order. */
 	effectivePermissionProfiles?: string[];
+	/** Complete frozen permission scope and canonical content hash for faithful revival. */
+	permissionSnapshot?: PermissionScopeSnapshot;
+	/** Sanitized bounded display metadata; never used to reconstruct authority. */
+	permissionSummary?: EffectivePermissionSummary;
 	/** Whether the agent definition is read-only, allowing an exact zero-LoC attribution. */
 	readOnly?: boolean;
 	/** Output schema if structured output was requested. */

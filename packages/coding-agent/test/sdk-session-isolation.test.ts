@@ -8,13 +8,21 @@ import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import * as lifecycleBridge from "../src/internal/agent-lifecycle-bridge";
+import {
+	bindInternalAgentAuthoritySession,
+	createAgentRootSession,
+	lookupAgentRef,
+} from "../src/internal/agent-registry-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as secrets from "@oh-my-pi/pi-coding-agent/secrets";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
+import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { getSessionsDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { getActiveProfile, getConfigRootDir, setProfile } from "@oh-my-pi/pi-utils/dirs";
@@ -193,7 +201,7 @@ describe("createAgentSession session storage isolation", () => {
 		}
 	});
 
-	it("does not replace a newer registry generation when creation expected the id to be absent", async () => {
+	it("rejects public expected-ref authority hints without replacing the registry generation", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-generation-cas-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const cwd = path.join(tempDir, "project");
@@ -207,6 +215,7 @@ describe("createAgentSession session storage isolation", () => {
 			session: null,
 			status: "idle",
 		});
+		const replacementGeneration = replacement.lineage?.generation;
 
 		await expect(
 			createAgentSession({
@@ -221,17 +230,19 @@ describe("createAgentSession session storage isolation", () => {
 				slashCommands: [],
 				enableMCP: false,
 				enableLsp: false,
-				agentRegistry: registry,
 				agentId: "shared-worker",
-				agentDisplayName: "late A",
-				parentTaskPrefix: "shared-worker",
-				parentAgentId: "Main",
-				taskDepth: 1,
 				expectedAgentRef: null,
 			}),
-		).rejects.toThrow("already owned by another session generation");
-		expect(registry.get("shared-worker")).toBe(replacement);
-		expect(replacement).toMatchObject({ status: "idle", session: null });
+		).rejects.toThrow("assertion-only");
+		const observedReplacement = registry.get("shared-worker");
+		if (!observedReplacement) throw new Error("Expected replacement generation");
+		expect(observedReplacement).toMatchObject({
+			id: replacement.id,
+			lineage: replacement.lineage,
+			status: "idle",
+		});
+		expect(observedReplacement.lineage?.generation).toBe(replacementGeneration);
+		expect(lookupAgentRef(registry, "shared-worker")?.session).toBeNull();
 	});
 
 	it("reclaims an unrevivable parked generation before a fresh same-id spawn", async () => {
@@ -239,9 +250,9 @@ describe("createAgentSession session storage isolation", () => {
 		tempDirs.push(tempDir);
 		const cwd = path.join(tempDir, "project");
 		fs.mkdirSync(cwd, { recursive: true });
-		AgentLifecycleManager.resetGlobalForTests();
+		lifecycleBridge.resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
-		const lifecycle = AgentLifecycleManager.global();
+		const lifecycle = lifecycleBridge.getAgentLifecycleManager();
 		const registry = AgentRegistry.global();
 		const corpse = registry.register({
 			id: "reused-worker",
@@ -255,7 +266,8 @@ describe("createAgentSession session storage isolation", () => {
 
 		let session: AgentSession | undefined;
 		try {
-			({ session } = await createAgentSession({
+			expect(await lifecycleBridge.reclaimDeadAgent(lifecycle, "reused-worker", corpse)).toBe(true);
+			({ session } = await createAgentRootSession(registry, {
 				cwd,
 				agentDir: path.join(tempDir, "agent"),
 				modelRegistry: sharedModelRegistry,
@@ -267,22 +279,17 @@ describe("createAgentSession session storage isolation", () => {
 				slashCommands: [],
 				enableMCP: false,
 				enableLsp: false,
-				agentRegistry: registry,
 				agentId: "reused-worker",
 				agentDisplayName: "fresh generation",
-				parentTaskPrefix: "reused-worker",
-				parentAgentId: "Main",
-				taskDepth: 1,
-				expectedAgentRef: null,
 			}));
 			const replacement = registry.get("reused-worker");
 			expect(replacement).toBeDefined();
 			expect(replacement).not.toBe(corpse);
-			expect(replacement?.session).toBe(session);
+			expect(lookupAgentRef(registry, "reused-worker")?.session).toBe(session);
 		} finally {
 			await session?.dispose();
-			await lifecycle.dispose();
-			AgentLifecycleManager.resetGlobalForTests();
+			await lifecycleBridge.disposeAgentLifecycle(lifecycle);
+			lifecycleBridge.resetAgentLifecycleForTests();
 			AgentRegistry.resetGlobalForTests();
 		}
 	});
@@ -297,18 +304,9 @@ describe("createAgentSession session storage isolation", () => {
 		const sessionFile = sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected persisted worker session file");
 		const registry = new AgentRegistry();
-		const parked = registry.register({
-			id: "revived-worker",
-			displayName: "revived worker",
-			kind: "sub",
-			parentId: "Main",
-			session: null,
-			sessionFile,
-			status: "parked",
-		});
-
-		const { session } = await createAgentSession({
+		const parent = await createAgentRootSession(registry, {
 			cwd,
+			agentDir: path.join(tempDir, "agent"),
 			modelRegistry: sharedModelRegistry,
 			settings: Settings.isolated(),
 			disableExtensionDiscovery: true,
@@ -318,22 +316,193 @@ describe("createAgentSession session storage isolation", () => {
 			slashCommands: [],
 			enableMCP: false,
 			enableLsp: false,
-			sessionManager,
-			agentRegistry: registry,
-			agentId: "revived-worker",
-			agentDisplayName: "revived worker",
-			parentTaskPrefix: "revived-worker",
-			parentAgentId: "Main",
-			taskDepth: 1,
-			expectedAgentRef: parked,
+			agentId: "Main",
 		});
+		const parked = registry.register({
+			id: "revived-worker",
+			displayName: "revived worker",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			sessionFile,
+			status: "parked",
+		});
+		const parkedGeneration = parked.lineage?.generation;
+
+		const authority = bindInternalAgentAuthoritySession(registry, parent.session);
+		if (!authority) throw new Error("Invalid live parent authority");
+		const { session } = await authority.create(
+			{
+				cwd,
+				modelRegistry: sharedModelRegistry,
+				settings: Settings.isolated(),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				sessionManager,
+				agentRegistry: registry,
+				agentId: "revived-worker",
+				agentDisplayName: "revived worker",
+				parentTaskPrefix: "revived-worker",
+				parentAgentId: "Main",
+				taskDepth: 1,
+			},
+			parked,
+		);
 		try {
-			expect(registry.get("revived-worker")).toBe(parked);
-			expect(parked).toMatchObject({ status: "running", session, sessionFile });
+			const revived = registry.get("revived-worker");
+			if (!revived) throw new Error("Expected revived worker generation");
+			expect(revived).toMatchObject({
+				id: parked.id,
+				lineage: parked.lineage,
+				sessionFile,
+				status: "running",
+			});
+			expect(lookupAgentRef(registry, revived.id)?.session).toBe(session);
+			expect(revived.lineage?.generation).toBe(parkedGeneration);
 		} finally {
 			await session.dispose();
+			await parent.session.dispose();
 		}
 		expect(registry.get("revived-worker")).toBeUndefined();
+	});
+
+	it("lets real root and child Task creators build nested authority sessions without exposing a binder", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-nested-authority-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		const registry = new AgentRegistry();
+		const taskAgent: AgentDefinition = {
+			name: "task",
+			description: "General-purpose task agent",
+			systemPrompt: "Do the assigned work.",
+			source: "bundled",
+		};
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+		const commonOptions = {
+			cwd,
+			agentDir: path.join(tempDir, "agent"),
+			modelRegistry: sharedModelRegistry,
+			settings: Settings.isolated({ "async.enabled": false }),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			toolNames: ["task"],
+			enableMCP: false,
+			enableLsp: false,
+		};
+		const root = await createAgentRootSession(registry, { ...commonOptions, agentId: "Main" });
+		const createdIds: string[] = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			const creator = options.createAuthoritySession;
+			if (!creator) throw new Error("Expected internal authority creator on real ToolSession");
+			const id = options.id;
+			await creator({
+				...commonOptions,
+				agentId: id,
+				agentDisplayName: id,
+				parentAgentId: options.parentAgentId,
+				parentTaskPrefix: id,
+				taskDepth: options.taskDepth,
+			});
+			createdIds.push(id);
+			return {
+				index: options.index ?? 0,
+				id,
+				agent: "task",
+				agentSource: "bundled",
+				task: options.task,
+				exitCode: 0,
+				output: `created ${id}`,
+				stderr: "",
+				truncated: false,
+				durationMs: 1,
+				tokens: 0,
+				requests: 0,
+			} satisfies SingleResult;
+		});
+		try {
+			const rootTask = root.session.agent.state.tools.find(tool => tool.name === "task");
+			if (!rootTask) throw new Error("Expected root Task tool");
+			await rootTask.execute("root-child", {
+				agent: "task",
+				name: "Child",
+				task: "Create the child.",
+			} as TaskParams);
+			const childSession = lookupAgentRef(registry, "Child")?.session;
+			if (!childSession) throw new Error("Expected live child session");
+			const childTask = childSession.agent.state.tools.find(tool => tool.name === "task");
+			if (!childTask) throw new Error("Expected child Task tool");
+			await childTask.execute("child-nested", {
+				agent: "task",
+				name: "Nested",
+				task: "Create the nested child.",
+			} as TaskParams);
+			expect(createdIds).toEqual(["Child", "Child.Nested"]);
+			expect(registry.get("Child")?.lineage).toMatchObject({ rootId: "Main", parentId: "Main" });
+			expect(registry.get("Child.Nested")?.lineage).toMatchObject({ rootId: "Main", parentId: "Child" });
+		} finally {
+			await root.session.dispose();
+		}
+	});
+
+	it("memoizes SDK disposal and never lets a stale dispose resolve a later global lifecycle", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-dispose-owner-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: path.join(tempDir, "agent"),
+			modelRegistry: sharedModelRegistry,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			toolNames: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		const firstDispose = session.dispose();
+		const repeatedDispose = session.dispose();
+		expect(repeatedDispose).toBe(firstDispose);
+		await firstDispose;
+
+		lifecycleBridge.resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
+		const laterRegistry = AgentRegistry.global();
+		const laterLifecycle = lifecycleBridge.getAgentLifecycleManager(laterRegistry);
+		const laterSession = { dispose: vi.fn(async () => {}) } as unknown as AgentSession;
+		const laterRef = laterRegistry.register({
+			id: "LaterWorker",
+			displayName: "Later worker",
+			kind: "sub",
+			parentId: "Main",
+			session: laterSession,
+			status: "idle",
+		});
+		const laterAuthority = lookupAgentRef(laterRegistry, laterRef.id)!;
+		lifecycleBridge.adoptAgent(laterLifecycle, laterRef.id, { idleTtlMs: 0 }, laterAuthority);
+		expect(lifecycleBridge.lifecycleHasAgent(laterLifecycle, laterRef.id, laterAuthority)).toBe(true);
+		try {
+			const staleDispose = session.dispose();
+			expect(staleDispose).toBe(firstDispose);
+			await staleDispose;
+			expect(lifecycleBridge.lifecycleHasAgent(laterLifecycle, laterRef.id, laterAuthority)).toBe(true);
+		} finally {
+			await lifecycleBridge.disposeAgentLifecycle(laterLifecycle);
+			lifecycleBridge.resetAgentLifecycleForTests();
+			AgentRegistry.resetGlobalForTests();
+		}
 	});
 
 	it("suspends the exact Vibe owner scope before global lifecycle teardown", async () => {
@@ -357,7 +526,7 @@ describe("createAgentSession session storage isolation", () => {
 		});
 		const vibeRegistry = VibeSessionRegistry.global();
 		const suspend = vi.spyOn(vibeRegistry, "suspendScope");
-		const lifecycleDispose = vi.spyOn(AgentLifecycleManager.global(), "dispose");
+		const lifecycleDispose = vi.spyOn(lifecycleBridge, "disposeAgentLifecycle");
 		const parentSessionId = session.sessionManager.getSessionId();
 		const parentSessionFile = session.sessionManager.getSessionFile();
 		if (!parentSessionFile) throw new Error("Expected persisted parent session file");
@@ -365,7 +534,7 @@ describe("createAgentSession session storage isolation", () => {
 		await session.dispose();
 
 		expect(suspend).toHaveBeenCalledWith(
-			{ ownerId: "Main", parentSessionId, parentSessionFile },
+			{ ownerId: "Main", parentSessionId, parentSessionFile, agentRegistry: AgentRegistry.global() },
 			session.asyncJobManager,
 		);
 		expect(suspend.mock.invocationCallOrder[0]).toBeLessThan(lifecycleDispose.mock.invocationCallOrder[0]);

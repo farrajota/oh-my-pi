@@ -8,6 +8,11 @@ import {
 	resolveLocalRoot,
 	resolveLocalUrlToPath,
 } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import {
+	DurableLocalState,
+	DurableStateUnavailableError,
+	RegistryDurableStateStore,
+} from "@oh-my-pi/pi-coding-agent/registry/durable-state";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -214,6 +219,49 @@ describe("LocalProtocolHandler", () => {
 					},
 				}),
 			).rejects.toThrow("Local file not found: local://PLAN.md");
+		});
+	});
+
+	it("fails closed when a bound caller omits local protocol options", async () => {
+		await withTempDir(async tempDir => {
+			const staleArtifactsDir = path.join(tempDir, "stale-artifacts");
+			await fs.mkdir(path.join(staleArtifactsDir, "local"), { recursive: true });
+			await Bun.write(path.join(staleArtifactsDir, "local", "PLAN.md"), "stale");
+			LocalProtocolHandler.setOverride({ getArtifactsDir: () => staleArtifactsDir, getSessionId: () => "stale" });
+			await expect(InternalUrlRouter.instance().resolve("local://PLAN.md", { cwd: tempDir })).rejects.toThrow(
+				"No session - local:// unavailable",
+			);
+		});
+	});
+
+	it("quarantines a recovered local head when caller-validated backing bytes changed", async () => {
+		await withTempDir(async tempDir => {
+			const artifactsDir = path.join(tempDir, "artifacts");
+			const journalPath = path.join(tempDir, "authority.jsonl");
+			const firstStore = new RegistryDurableStateStore(journalPath);
+			const firstLocalState = new DurableLocalState(firstStore, "restart-session");
+			const router = InternalUrlRouter.instance();
+			const firstOptions = {
+				getArtifactsDir: () => artifactsDir,
+				getSessionId: () => "restart-session",
+				getDurableLocalState: () => firstLocalState,
+			};
+			await router.write("local://PLAN.md", "# durable", { localProtocolOptions: firstOptions });
+
+			const localPath = resolveLocalUrlToPath("local://PLAN.md", firstOptions);
+			await fs.writeFile(localPath, "# tampered", "utf8");
+			const restartedStore = new RegistryDurableStateStore(journalPath);
+			const restartedLocalState = new DurableLocalState(restartedStore, "restart-session");
+			await expect(
+				router.write("local://PLAN.md", "# replacement", {
+					localProtocolOptions: {
+						getArtifactsDir: () => artifactsDir,
+						getSessionId: () => "restart-session",
+						getDurableLocalState: () => restartedLocalState,
+					},
+				}),
+			).rejects.toBeInstanceOf(DurableStateUnavailableError);
+			expect(restartedStore.available).toBe(false);
 		});
 	});
 });

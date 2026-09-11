@@ -14,7 +14,7 @@ import { webSearchToolRenderer } from "../web/search/render";
 import { askToolRenderer } from "./ask";
 import { astEditToolRenderer } from "./ast-edit";
 import { astGrepToolRenderer } from "./ast-grep";
-import { bashToolRenderer } from "./bash";
+import { bashToolRenderer } from "./bash-renderer";
 import { debugToolRenderer } from "./debug";
 import { evalToolRenderer } from "./eval-render";
 import { githubToolRenderer } from "./gh-renderer";

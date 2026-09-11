@@ -6,10 +6,97 @@
 
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AsyncJobType } from "../../async";
+import type { HubAdmissionStateTransaction } from "../../internal/hub-admission";
 import type { IrcDeliveryReceipt, IrcMessage } from "../../irc/bus";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "../../session/streaming-output";
 import type { StructuredSubagentOutput } from "../../task/types";
 import type { ConfiguredThinkingLevel } from "../../thinking";
 import type { LaunchParams, LaunchToolDetails } from "./launch";
+
+export const MAX_HUB_BODY_BYTES = 64 * 1024;
+export const MAX_HUB_DETAIL_BYTES = DEFAULT_MAX_BYTES;
+export const MAX_HUB_DETAIL_ROWS = 100;
+
+function boundedText(value: string, maxBytes = MAX_HUB_DETAIL_BYTES): string {
+	return truncateTail(value, { maxBytes, maxLines: DEFAULT_MAX_LINES }).content;
+}
+
+function sanitizePublicValue(value: unknown, seen: WeakSet<object>, budget: { remaining: number }, depth = 0): unknown {
+	if (budget.remaining <= 0) return "[details truncated]";
+	if (typeof value === "string") {
+		const text = boundedText(value, Math.min(MAX_HUB_DETAIL_BYTES, budget.remaining));
+		budget.remaining -= Buffer.byteLength(text, "utf8");
+		return text;
+	}
+	if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+	if (typeof value === "bigint") return `[unsupported bigint: ${value.toString()}]`;
+	if (typeof value === "function" || typeof value === "symbol" || typeof value === "undefined")
+		return `[unsupported ${typeof value}]`;
+	if (depth >= 8 || seen.has(value)) return depth >= 8 ? "[details depth limit]" : "[Circular]";
+	seen.add(value);
+	try {
+		if (Array.isArray(value)) {
+			return value.slice(0, MAX_HUB_DETAIL_ROWS).map(item => sanitizePublicValue(item, seen, budget, depth + 1));
+		}
+		const out: Record<string, unknown> = {};
+		for (const [key, raw] of Object.entries(value).slice(0, MAX_HUB_DETAIL_ROWS)) {
+			const item = sanitizePublicValue(raw, seen, budget, depth + 1);
+			out[key] =
+				/(?:id|label|activity|model|parent)/i.test(key) && typeof item === "string" ? boundedText(item, 256) : item;
+		}
+		return out;
+	} finally {
+		seen.delete(value);
+	}
+}
+
+export function boundIrcMessage(message: IrcMessage): IrcMessage {
+	return {
+		...message,
+		id: boundedText(message.id, 256),
+		from: boundedText(message.from, 256),
+		to: boundedText(message.to, 256),
+		body: boundedText(message.body, MAX_HUB_BODY_BYTES),
+		...(message.replyTo ? { replyTo: boundedText(message.replyTo, 256) } : {}),
+	};
+}
+
+export function boundCoordinationDetails(details: CoordinationDetails): CoordinationDetails {
+	const budget = { remaining: MAX_HUB_DETAIL_BYTES };
+	const value = sanitizePublicValue(details, new WeakSet<object>(), budget);
+	if (
+		typeof value === "object" &&
+		value !== null &&
+		!Array.isArray(value) &&
+		Buffer.byteLength(JSON.stringify(value), "utf8") <= MAX_HUB_DETAIL_BYTES
+	) {
+		return { ...value, op: details.op };
+	}
+	return {
+		op: details.op,
+		...(details.from ? { from: boundedText(details.from, 256) } : {}),
+		...(details.to ? { to: boundedText(details.to, 256) } : {}),
+	};
+}
+
+export function boundCoordinationResult<T extends AgentToolResult<CoordinationDetails>>(result: T): T {
+	const content = result.content.map(part =>
+		part.type === "text" && typeof part.text === "string" ? { ...part, text: boundedText(part.text) } : part,
+	);
+	return {
+		...result,
+		content,
+		details: result.details ? boundCoordinationDetails(result.details) : result.details,
+	};
+}
+
+/** Bound public Hub output while the exact invocation transaction is active. */
+export function admitCoordinationResult<T extends AgentToolResult<CoordinationDetails>>(
+	transaction: HubAdmissionStateTransaction,
+	result: T,
+): T {
+	return transaction.select(() => boundCoordinationResult(result));
+}
 
 /**
  * Hub operations: messaging (`send`/`wait`/`inbox`/`list`), jobs
@@ -149,8 +236,8 @@ export type HubRenderArgs = {
 
 export function hubErrorResult(text: string, details: CoordinationDetails): AgentToolResult<HubDetails> {
 	return {
-		content: [{ type: "text", text }],
-		details,
+		content: [{ type: "text", text: boundedText(text) }],
+		details: boundCoordinationDetails(details),
 		isError: true,
 	};
 }

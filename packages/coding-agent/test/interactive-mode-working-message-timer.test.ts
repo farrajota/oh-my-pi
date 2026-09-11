@@ -38,7 +38,10 @@ let harnesses: Harness[] = [];
 function makeSession(
 	sessionManager: SessionManager,
 	sessionFile: string,
-	extensionRunner?: { renderWorkingMessageSuffix(message: string, context: WorkingMessageSuffixContext): string },
+	extensionRunner?: {
+		renderWorkingMessageSuffix(message: string, context: WorkingMessageSuffixContext): string;
+		setToolApprovalPreviewWaiter(waiter: (toolCallId: string) => Promise<void>): () => void;
+	},
 ): MutableSession {
 	return {
 		sessionManager,
@@ -70,6 +73,7 @@ async function createHarness(): Promise<Harness> {
 	const contexts: WorkingMessageSuffixContext[] = [];
 	const runnerCalls: string[] = [];
 	const hostRunner = {
+		setToolApprovalPreviewWaiter: () => () => {},
 		getRegisteredCommands: () => [],
 		renderWorkingMessageSuffix(message: string, context: WorkingMessageSuffixContext): string {
 			runnerCalls.push(`host:${message}`);
@@ -79,12 +83,14 @@ async function createHarness(): Promise<Harness> {
 	};
 	const main = makeSession(sessionManager, "main.jsonl", hostRunner);
 	const parent = makeSession(sessionManager, "parent.jsonl", {
+		setToolApprovalPreviewWaiter: () => () => {},
 		renderWorkingMessageSuffix: () => {
 			runnerCalls.push("parent");
 			return " parent";
 		},
 	});
 	const child = makeSession(sessionManager, "child.jsonl", {
+		setToolApprovalPreviewWaiter: () => () => {},
 		renderWorkingMessageSuffix: () => {
 			runnerCalls.push("child");
 			return " child";
@@ -244,6 +250,6 @@ describe("InteractiveMode per-session working-message timers", () => {
 		h.timers.beginWorkingMessageRun(h.child, 1_000);
 		h.setViewSession(h.child);
 		renderSuffix(h);
-		expect(h.runnerCalls).toEqual(["host:Working… ⟦esc⟧"]);
+		expect(h.runnerCalls).toEqual(["host:Working…"]);
 	});
 });

@@ -1,11 +1,18 @@
 import { type BaseType, type } from "@oh-my-pi/omptype";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { ConfiguredThinkingLevel, TaskEffort } from "../thinking";
 import type { TaskPermissionRequest } from "./permission-profiles";
 import type { TaskToolProfileName } from "./tool-profiles";
 import type { NestedRepoPatch } from "./worktree";
+export type {
+	BoundedList,
+	EffectivePermissionSummary,
+	PermissionDenialDetails,
+	PermissionTargetSummary,
+} from "@oh-my-pi/pi-wire";
 
 /** Source of an agent definition */
 export type AgentSource = "bundled" | "user" | "project";
@@ -516,6 +523,8 @@ export interface AgentProgress {
 	assignment?: string;
 	description?: string;
 	lastIntent?: string;
+	/** Bounded display-only effective permission metadata. Never use it for authorization. */
+	permissionSummary?: EffectivePermissionSummary;
 	currentTool?: string;
 	currentToolArgs?: string;
 	currentToolStartMs?: number;
@@ -618,6 +627,8 @@ export interface SingleResult {
 	task: string;
 	assignment?: string;
 	description?: string;
+	/** Bounded display-only effective permission metadata. Never use it for authorization. */
+	permissionSummary?: EffectivePermissionSummary;
 	lastIntent?: string;
 	exitCode: number;
 	output: string;

@@ -19,7 +19,7 @@ import type {
 	MCPServerConfig,
 	MCPServerConnection,
 } from "../../../mcp/types";
-import { PREVIEW_LIMITS } from "../../../tools/render-utils";
+import { PREVIEW_LIMITS } from "../../../tools/preview-limits";
 import {
 	sanitizeDisplayField,
 	sanitizeDisplayLine,

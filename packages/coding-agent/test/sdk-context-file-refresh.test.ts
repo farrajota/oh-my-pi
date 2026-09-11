@@ -31,7 +31,7 @@ async function createContextSession(
 	const sessionManager = SessionManager.inMemory(cwd);
 	const { session } = await createAgentSession({
 		cwd,
-		agentDir: cwd,
+		agentDir: path.join(cwd, "agent-home"),
 		modelRegistry,
 		sessionManager,
 		settings,

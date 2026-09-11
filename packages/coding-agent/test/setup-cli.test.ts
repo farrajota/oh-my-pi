@@ -6,6 +6,8 @@ import { checkPythonSetup } from "../src/cli/setup-cli";
 
 const cliEntry = path.join(import.meta.dir, "..", "src", "cli.ts");
 
+const concurrentColdStartTimeoutMs = 15_000;
+
 interface CliProcessResult {
 	exitCode: number;
 	output: string;
@@ -79,6 +81,7 @@ describe("omp setup python", () => {
 				usingManagedEnv: false,
 			});
 		},
+		concurrentColdStartTimeoutMs,
 	);
 	it.skipIf(process.platform === "win32")("prefers the project venv over the PATH interpreter", async () => {
 		projectDir = TempDir.createSync("@omp-setup-python-");
@@ -130,13 +133,17 @@ describe("omp setup without a component", () => {
 	// stdout and exit 0, silently succeeding a machine-readable check and breaking
 	// scripted `--json` health checks. It must now fail loudly on stderr.
 	for (const flags of [["--check"], ["--json"]]) {
-		it(`fails on stderr with a non-zero exit for ${["setup", ...flags].join(" ")}`, async () => {
-			projectDir = TempDir.createSync("@omp-setup-noarg-");
-			const result = await runSetup(projectDir.path(), ...flags);
+		it(
+			`fails on stderr with a non-zero exit for ${["setup", ...flags].join(" ")}`,
+			async () => {
+				projectDir = TempDir.createSync("@omp-setup-noarg-");
+				const result = await runSetup(projectDir.path(), ...flags);
 
-			expect(result.exitCode).not.toBe(0);
-			expect(result.output).toBe("");
-			expect(result.error).toContain("requires a COMPONENT");
-		});
+				expect(result.exitCode).not.toBe(0);
+				expect(result.output).toBe("");
+				expect(result.error).toContain("requires a COMPONENT");
+			},
+			concurrentColdStartTimeoutMs,
+		);
 	}
 });

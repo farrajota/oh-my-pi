@@ -28,6 +28,7 @@ import type {
 import type { ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { $env, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "..";
+import { BUILTIN_TOOLS } from "../tools";
 import { type EffectiveExtensionRoots, snapshotEffectiveExtensionRoots } from "../capability/types";
 import type { Settings } from "../config/settings";
 import {
@@ -53,6 +54,7 @@ import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	type EffectivePermissionSummary,
 	canSpawnAtDepth,
 	getTaskSchema,
 	oneLineLabel,
@@ -65,11 +67,10 @@ import {
 // Import review tools for side effects (registers subagent tool handlers)
 import "../tools/review";
 import { AsyncJobError, type AsyncJobManager } from "../async";
-import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import { parseAgent } from "./agents";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
-import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
+import { createEvalCustomTools, describeEvalTools, evalToolsEnabled, listEvalTools } from "./eval-tools";
 import { type ExecutorOptions, runSubprocess } from "./executor";
 import {
 	applyEligibleNestedPatches,
@@ -83,10 +84,16 @@ import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import {
-	composeEffectivePermissions,
+	buildEffectivePermissionSummary,
+	preflightPermissionGuardrails,
 	type EffectiveSubagentPermissions,
+	freezePermissionScope,
+	isScopeNoBroader,
 	loadPermissionProfiles,
+	type PermissionCapability,
 	type PermissionProfileSummary,
+	type PermissionScopeSnapshot,
+	permissionScopeDrifted,
 	type SubagentPermissionMode,
 } from "./permission-profiles";
 import { renderResult, renderCall as renderTaskCall } from "./render";
@@ -98,6 +105,29 @@ import {
 } from "./structured-subagent";
 import { applyTaskToolProfile } from "./tool-profiles";
 import { type IsoBackendKind, parseIsolationBackend } from "./worktree";
+
+/** Snapshot every route that can be inherited into a child before permission composition. */
+async function collectLivePermissionCapabilities(
+	session: ToolSession,
+	signal: AbortSignal | undefined,
+): Promise<readonly PermissionCapability[]> {
+	const byName = new Map<string, PermissionCapability>();
+	for (const name of session.getActiveToolNames?.() ?? []) {
+		const descriptor = session.toolExecutionAuthority?.getDescriptor(name);
+		const tool = session.getToolByName?.(name) as { mcpServerName?: unknown } | undefined;
+		const source: PermissionCapability["source"] =
+			descriptor?.source ??
+			(typeof tool?.mcpServerName === "string" ? "mcp" : Object.hasOwn(BUILTIN_TOOLS, name) ? "builtin" : "opaque");
+		byName.set(name.toLowerCase(), { name, source, ...(descriptor ? { descriptor } : {}) });
+	}
+	for (const descriptor of await listEvalTools(session, signal)) {
+		byName.set(descriptor.name.toLowerCase(), { name: descriptor.name, source: "eval" });
+	}
+	for (const intrinsic of ["yield", "report_tool_issue"] as const) {
+		byName.set(intrinsic, { name: intrinsic, source: "builtin", intrinsic: true });
+	}
+	return [...byName.values()];
+}
 
 function renderSubagentUserPrompt(assignment: string): string {
 	return prompt.render(subagentUserPromptTemplate, {
@@ -692,6 +722,8 @@ interface PreparedSpawnReservation {
 	effectiveAgent: AgentDefinition;
 	permissionAgent: AgentDefinition;
 	permissionScope: EffectiveSubagentPermissions;
+	permissionSummary: EffectivePermissionSummary;
+	permissionSnapshot: PermissionScopeSnapshot;
 	settings: Settings;
 	sharedContext?: string;
 	isIsolated: boolean;
@@ -1105,6 +1137,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const parentServiceTier = this.session.getServiceTierByFamily
 			? structuredClone(this.session.getServiceTierByFamily() ?? null)
 			: undefined;
+		const parentId = this.session.getAgentId?.() ?? MAIN_AGENT_ID;
 		const params = repairTaskParams(rawParams as TaskParams);
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		const batchEnabled = preparedSettings.get("task.batch");
@@ -1128,8 +1161,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		);
 		const loadedPermissionProfiles = await loadPermissionProfiles(this.session.cwd);
 		const inheritedPermissions = this.session.getPermissionScope?.();
+		const liveCapabilities = await collectLivePermissionCapabilities(this.session, signal);
 		const activeToolNames = this.session.getActiveToolNames?.();
-		const parentId = this.session.getAgentId?.() ?? MAIN_AGENT_ID;
 		const localProtocolOptions: LocalProtocolOptions = this.session.localProtocolOptions ?? {
 			getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
 			getSessionId: this.session.getSessionId ?? (() => null),
@@ -1162,7 +1195,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						`Plan mode cannot spawn agent "${profiledAgent.name}" because its tool profile does not permit planning tools.`,
 					);
 				}
-				const composedPermissions = composeEffectivePermissions({
+				const composedPermissions = preflightPermissionGuardrails({
 					mode: permissionMode,
 					toolsEnabled: permissionToolsEnabled,
 					pathsEnabled: permissionPathsEnabled,
@@ -1172,9 +1205,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					request: spawnParams.permissions,
 					inherited: inheritedPermissions,
 					profiles: loadedPermissionProfiles.profiles,
+					capabilities: liveCapabilities,
+					profileIdentities: loadedPermissionProfiles.profileIdentities,
 				});
 				if (!composedPermissions.ok) throw new StructuredSubagentError("preflight", composedPermissions.error);
 				const permissionScope = composedPermissions.value;
+				const permissionSummary = buildEffectivePermissionSummary(permissionScope);
+				const permissionSnapshot = freezePermissionScope(permissionScope);
 				let permissionAgent = profiledAgent;
 				if (permissionScope.mode === "enforce" && permissionScope.toolsEnabled) {
 					const deniedTools = new Set(permissionScope.denyTools.map(tool => tool.toLowerCase()));
@@ -1216,6 +1253,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					permissionAgent,
 					settings: preparedSettings,
 					permissionScope,
+					permissionSummary,
+					permissionSnapshot,
 					sharedContext: batchEnabled ? params.context?.trim() || undefined : undefined,
 					isIsolated: policy.isIsolated,
 					mergeMode: policy.mergeMode,
@@ -1331,6 +1370,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		_context?: AgentToolContext,
 		preparedExecution?: AgentToolPreparedExecution,
 	): Promise<AgentToolResult<TaskToolDetails>> {
+		if (this.session.getPermissionScope?.()?.mode === "enforce") {
+			const authority = this.session.toolExecutionAuthority;
+			if (!authority || preparedExecution === undefined)
+				return createTaskModeError("Task execution requires a registry-minted prepared execution.");
+			try {
+				authority.validatePrepared(preparedExecution, this.name, toolCallId, rawParams as object);
+			} catch (error) {
+				return createTaskModeError(
+					`Task execution failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 		let localPreparation: AgentToolPreparedExecution | undefined;
 		let prepared: PreparedTaskState;
 		try {
@@ -1709,10 +1760,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			options;
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
 			if (aborted) {
-				const ref = AgentRegistry.global().get(agentId);
-				const transcript = (await hasResolvableTranscript(agentId))
-					? `transcript at history://${agentId}`
-					: "transcript unavailable";
+				const ref = this.session.agentRegistry?.get(agentId);
+				const transcript = ref?.sessionFile ? `transcript at history://${agentId}` : "transcript unavailable";
 				if (ref?.status === "idle" || ref?.status === "parked") {
 					const followUp = ircEnabled ? "message it via `hub` to resume; " : "";
 					return `\n\n${agentId} was stopped but is still resumable — ${followUp}${transcript}`;
@@ -1872,7 +1921,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const statusText = `Background task ${agentId} failed.`;
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
 					const message = error instanceof Error ? error.message : String(error);
-					const hint = AgentRegistry.global().get(agentId) ? await buildFollowUpHint(false) : "";
+					const hint = this.session.agentRegistry?.get(agentId) ? await buildFollowUpHint(false) : "";
 					throw new TaskJobError(`${message}${hint}`);
 				} finally {
 					releasePermit();
@@ -2100,6 +2149,23 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const permissionAgent = preparedReservation.permissionAgent;
 		const preparedSettings = preparedReservation.settings;
 		const permissionScope = preparedReservation.permissionScope;
+		const permissionSummary = preparedReservation.permissionSummary;
+		const permissionSnapshot = preparedReservation.permissionSnapshot;
+		if (permissionScopeDrifted(permissionSnapshot, permissionScope)) {
+			throw new StructuredSubagentError("preflight", "Prepared subagent permission scope changed before launch.");
+		}
+		const currentInheritedPermissions = this.session.getPermissionScope?.();
+		const inheritedScopeRequired = permissionScope.clauses?.some(clause => clause.source === "inherited") === true;
+		if (
+			(inheritedScopeRequired && currentInheritedPermissions === undefined) ||
+			(currentInheritedPermissions !== undefined &&
+				!isScopeNoBroader(currentInheritedPermissions, permissionSnapshot.scope))
+		) {
+			throw new StructuredSubagentError(
+				"preflight",
+				"Prepared subagent permission scope is missing or broader than the live parent scope.",
+			);
+		}
 		const sharedContext = preparedReservation.sharedContext;
 		const assignment = (params.task ?? "").trim();
 		const isIsolated = preparedReservation.isIsolated;
@@ -2125,6 +2191,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const browserAudit = preparedReservation.browserAudit;
 		const auditConstrained = browserAudit !== undefined;
 		const localProtocolOptions = preparedReservation.localProtocolOptions;
+		const agentRegistry = this.session.agentRegistry;
+		const createAuthoritySession = this.session.createAuthoritySession;
+		if (!agentRegistry || !createAuthoritySession) {
+			throw new StructuredSubagentError(
+				"preflight",
+				"Task execution requires a parent-bound agent registry and session creator.",
+			);
+		}
 
 		// Derive artifacts directory
 		const sessionFile = this.session.getSessionFile();
@@ -2151,6 +2225,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				status: "pending",
 				task: renderSubagentUserPrompt(assignment),
 				assignment,
+				permissionSummary,
 				recentTools: [],
 				recentOutput: [],
 				toolCount: 0,
@@ -2191,6 +2266,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				additionalDirectories: this.session.additionalDirectories,
 				getApiKey: this.session.getApiKey,
 				id: agentId,
+				agentRegistry,
+				createAuthoritySession,
 				agent: permissionAgent,
 				thinkingLevel: permissionAgent.thinkingLevel,
 				task: renderSubagentUserPrompt(assignment),
@@ -2211,7 +2288,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				modelRole,
 				requestedModel,
 				requestedPermissionProfiles: params.permissions?.profiles,
-				effectivePermissionProfiles: permissionScope.profiles,
+				effectivePermissionProfiles: [...permissionScope.profiles],
+				permissionSummary,
 				exactModelOverride,
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
@@ -2245,6 +2323,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				autoloadSkillNames: agent.autoloadSkills,
 				parentAgentId: this.session.getAgentId?.() ?? MAIN_AGENT_ID,
 				permissionScope,
+				permissionSnapshot,
 				parentServiceTier,
 			} satisfies ExecutorOptions;
 			bindBrowserAuditRunOptions(sharedRunOptions.agent, browserAudit);
@@ -2349,7 +2428,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		totalDurationMs: number,
 		mergeSummary: string,
 	): AgentToolResult<TaskToolDetails> {
-		const summary = formatTaskResultSummary(result, { totalDurationMs, mergeSummary });
+		const summary = formatTaskResultSummary(result, {
+			totalDurationMs,
+			mergeSummary,
+			agentRegistry: this.session.agentRegistry!,
+		});
 
 		return {
 			content: [{ type: "text", text: summary }],

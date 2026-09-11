@@ -23,8 +23,14 @@ import { resolveAgentModelSelection } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
-import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { getAgentLifecycleManager, lifecycleHasAgent, releaseAgent } from "../internal/agent-lifecycle-bridge";
+import {
+	lookupAgentRef,
+	registerInternalAgent,
+	unregisterAgentRef,
+	type InternalAgentRef,
+} from "../internal/agent-registry-bridge";
+import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { getBundledAgent } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
@@ -83,6 +89,7 @@ export interface VibeOwnerScope {
 	ownerId: string;
 	parentSessionId: string;
 	parentSessionFile: string | null;
+	agentRegistry: AgentRegistry;
 }
 
 export interface VibeParentSession {
@@ -103,6 +110,7 @@ export interface VibeParentSession {
 	settings: ToolSession["settings"];
 	getActiveModelString?: () => string | undefined;
 	getModelString?: () => string | undefined;
+	agentRegistry?: AgentRegistry;
 }
 
 interface VibeRestoreCandidate {
@@ -373,6 +381,7 @@ export class VibeSessionRegistry {
 			ownerId: session.getAgentId?.() ?? MAIN_AGENT_ID,
 			parentSessionId,
 			parentSessionFile: parentSessionFile ? path.resolve(parentSessionFile) : null,
+			agentRegistry: this.#registry(session),
 		};
 	}
 
@@ -540,6 +549,11 @@ export class VibeSessionRegistry {
 		return manager;
 	}
 
+	#registry(session: { agentRegistry?: AgentRegistry }): AgentRegistry {
+		if (!session.agentRegistry) throw new ToolError("Vibe sessions require an owning agent registry.");
+		return session.agentRegistry;
+	}
+
 	#record(scope: VibeOwnerScope, id: string): VibeRecord {
 		const record = this.#records.get(scopeKey(scope, id.trim()));
 		if (!record || !matchesScope(record, scope)) {
@@ -551,8 +565,8 @@ export class VibeSessionRegistry {
 		return record;
 	}
 
-	#registeredAgent(record: VibeRecord): AgentRef | undefined {
-		const ref = AgentRegistry.global().get(record.id);
+	#registeredAgent(record: VibeRecord, registry: AgentRegistry): InternalAgentRef | undefined {
+		const ref = lookupAgentRef(registry, record.id);
 		if (ref?.kind !== "sub" || ref.parentId !== record.ownerId) return undefined;
 		if (record.childSessionFile && ref.sessionFile !== record.childSessionFile) return undefined;
 		return ref;
@@ -619,19 +633,6 @@ export class VibeSessionRegistry {
 		}));
 	}
 
-	#persistedIds(session: VibeParentSession, scope: VibeOwnerScope): Set<string> {
-		const ids = new Set<string>();
-		for (const entry of session.sessionManager?.getEntries() ?? []) {
-			if (entry.type !== "custom" || entry.customType !== VIBE_LIFECYCLE_CUSTOM_TYPE) continue;
-			const event = parseLifecycleEvent(entry.data);
-			if (event?.ownerId === scope.ownerId && event.parentSessionId === scope.parentSessionId) ids.add(event.id);
-		}
-		for (const record of this.#records.values()) {
-			if (matchesScope(record, scope)) ids.add(record.id);
-		}
-		return ids;
-	}
-
 	async #resolvePersistedChild(
 		parentSessionFile: string,
 		spawn: VibeSpawnLifecycleEvent,
@@ -653,8 +654,13 @@ export class VibeSessionRegistry {
 		}
 	}
 
-	#trackAgentRelease(id: string, ref: AgentRef, action: "detach" | "release"): TrackedVibeTeardown {
-		return trackVibeTeardown(AgentLifecycleManager.global().release(id, ref), error => {
+	#trackAgentRelease(
+		id: string,
+		ref: InternalAgentRef,
+		action: "detach" | "release",
+		registry: AgentRegistry,
+	): TrackedVibeTeardown {
+		return trackVibeTeardown(releaseAgent(getAgentLifecycleManager(registry), id, ref), error => {
 			logger.warn(`vibe: failed to ${action} worker session`, {
 				id,
 				error: error instanceof Error ? error.message : String(error),
@@ -662,23 +668,29 @@ export class VibeSessionRegistry {
 		});
 	}
 
-	#finishAgentRelease(id: string, ref: AgentRef, task: TrackedVibeTeardown, action: "detach" | "release"): void {
+	#finishAgentRelease(
+		id: string,
+		ref: InternalAgentRef,
+		task: TrackedVibeTeardown,
+		action: "detach" | "release",
+		registry: AgentRegistry,
+	): void {
 		if (task.status() === "settled") return;
 		if (task.status() === "pending") {
 			logger.warn(`vibe: timed out waiting to ${action} worker session; detaching registry ref`, { id });
 		}
-		AgentRegistry.global().unregister(id, ref);
+		unregisterAgentRef(registry, id, ref);
 	}
-
 	async #releaseRefWithinDeadline(
 		id: string,
-		ref: AgentRef,
+		ref: InternalAgentRef,
 		deadline: number,
 		action: "detach" | "release",
+		registry: AgentRegistry,
 	): Promise<void> {
-		const task = this.#trackAgentRelease(id, ref, action);
+		const task = this.#trackAgentRelease(id, ref, action, registry);
 		await waitForVibeTeardown([task], deadline);
-		this.#finishAgentRelease(id, ref, task, action);
+		this.#finishAgentRelease(id, ref, task, action, registry);
 	}
 
 	#trackJobSettlement(record: VibeRecord, job: AsyncJob): TrackedVibeTeardown {
@@ -690,16 +702,15 @@ export class VibeSessionRegistry {
 			});
 		});
 	}
-
 	async #markTerminalRef(
 		id: string,
 		ownerId: string,
 		childSessionFile: string,
-		expected?: AgentRef | null,
+		registry: AgentRegistry,
+		expected?: InternalAgentRef | null,
 		teardownDeadline?: number,
 	): Promise<void> {
-		const registry = AgentRegistry.global();
-		const existing = registry.get(id);
+		const existing = lookupAgentRef(registry, id);
 		if (expected !== undefined && existing !== undefined && existing !== expected) return;
 		if (
 			existing &&
@@ -708,18 +719,17 @@ export class VibeSessionRegistry {
 			return;
 		}
 		if (existing?.status === "aborted" && !existing.session) return;
-		if (existing && !registry.setStatus(id, "aborted", existing)) return;
 		if (existing && teardownDeadline !== undefined) {
-			await this.#releaseRefWithinDeadline(id, existing, teardownDeadline, "release");
-		} else if (existing && AgentLifecycleManager.global().has(id, existing)) {
-			await AgentLifecycleManager.global().release(id, existing);
+			await this.#releaseRefWithinDeadline(id, existing, teardownDeadline, "release", registry);
+		} else if (existing && lifecycleHasAgent(getAgentLifecycleManager(registry), id, existing)) {
+			await releaseAgent(getAgentLifecycleManager(registry), id, existing);
 		} else if (existing?.session) {
 			await existing.session.dispose();
 		}
-		const current = registry.get(id);
+		const current = lookupAgentRef(registry, id);
 		if (current && current !== existing) return;
-		if (current) registry.unregister(id, current);
-		registry.register({
+		if (current) unregisterAgentRef(registry, id, current);
+		registerInternalAgent(registry, {
 			id,
 			displayName: id,
 			kind: "sub",
@@ -785,7 +795,7 @@ export class VibeSessionRegistry {
 			if (!spawn) continue;
 			const childSessionFile = await this.#resolvePersistedChild(sessionFile, spawn, { requireAgentMatch: false });
 			if (!childSessionFile) continue;
-			await this.#markTerminalRef(id, scope.ownerId, childSessionFile);
+			await this.#markTerminalRef(id, scope.ownerId, childSessionFile, scope.agentRegistry);
 			this.#records.delete(scopeKey(scope, id));
 		}
 
@@ -797,7 +807,7 @@ export class VibeSessionRegistry {
 			if (!childSessionFile) continue;
 			const key = scopeKey(scope, spawn.id);
 			if (this.#records.has(key)) continue;
-			const existing = AgentRegistry.global().get(spawn.id);
+			const existing = lookupAgentRef(scope.agentRegistry, spawn.id);
 			const existingIsResumable =
 				existing?.kind === "sub" &&
 				existing.parentId === scope.ownerId &&
@@ -806,7 +816,7 @@ export class VibeSessionRegistry {
 			const blockedByCollision = Boolean(existing && !existingIsResumable);
 			const { agent, modelOverride, modelRole } = this.#resolveWorker(session, spawn.cli);
 			if (!existing) {
-				AgentRegistry.global().register({
+				registerInternalAgent(scope.agentRegistry, {
 					id: spawn.id,
 					displayName: spawn.id,
 					kind: "sub",
@@ -859,13 +869,16 @@ export class VibeSessionRegistry {
 		if (this.#terminatedScopes.has(scopeKey(scope, ""))) {
 			throw new ToolError("Vibe mode has exited; enter Vibe mode again before spawning a worker.");
 		}
+		this.#registry(session);
+		if (!session.createAuthoritySession)
+			throw new ToolError("Vibe sessions require a live parent-bound session creator.");
 		const manager = this.#manager(session);
 		const { agent, modelOverride, modelRole } = this.#resolveWorker(session, args.cli);
 		if (!session.agentOutputManager) {
 			session.agentOutputManager = new AgentOutputManager(session.getArtifactsDir ?? (() => null));
 		}
-		const reservedIds = this.#persistedIds(session, scope);
-		for (const ref of AgentRegistry.global().list()) reservedIds.add(ref.id);
+		const reservedIds = new Set<string>();
+		for (const ref of scope.agentRegistry.list()) reservedIds.add(ref.id);
 		await session.agentOutputManager.reserve(reservedIds);
 		const requestedName = args.name?.replace(/[^A-Za-z0-9_-]+/g, "").slice(0, 48);
 		const id = await session.agentOutputManager.allocate(requestedName || generateTaskName());
@@ -944,9 +957,8 @@ export class VibeSessionRegistry {
 			throw new ToolError(`Vibe session "${record.id}" is dead. Spawn a new one with vibe_spawn.`);
 		}
 		const message = args.message.trim();
-		if (!message) throw new ToolError("Message must not be empty.");
-		const registered = this.#registeredAgent(record);
-		if (AgentRegistry.global().get(record.id) && !registered) {
+		const registered = this.#registeredAgent(record, scope.agentRegistry);
+		if (lookupAgentRef(scope.agentRegistry, record.id) && !registered) {
 			throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
 		}
 
@@ -1065,11 +1077,15 @@ export class VibeSessionRegistry {
 	/** Detach one parent's process-local workers without tombstoning their persisted conversations. */
 	async suspendScope(scope: VibeOwnerScope, manager?: AsyncJobManager): Promise<number> {
 		const records = [...this.#records.values()].filter(record => matchesScope(record, scope));
-		const teardown = records.map(record => ({
-			record,
-			ref: this.#registeredAgent(record),
-			job: record.turn && manager ? manager.getJob(record.turn.jobId) : undefined,
-		}));
+		const teardown = records.map(record => {
+			const job = record.turn && manager ? manager.getJob(record.turn.jobId) : undefined;
+			return {
+				record,
+				ref: this.#registeredAgent(record, scope.agentRegistry),
+				job,
+				jobTask: job ? this.#trackJobSettlement(record, job) : undefined,
+			};
+		});
 		for (const { record } of teardown) {
 			record.suspended = true;
 			record.queue.length = 0;
@@ -1082,15 +1098,21 @@ export class VibeSessionRegistry {
 		const deadline = Date.now() + this.#teardownGraceMs;
 		const cleanup = teardown.map(entry => ({
 			...entry,
-			releaseTask: entry.ref ? this.#trackAgentRelease(entry.record.id, entry.ref, "detach") : undefined,
-			jobTask: entry.job ? this.#trackJobSettlement(entry.record, entry.job) : undefined,
+			releaseTask: entry.ref
+				? this.#trackAgentRelease(entry.record.id, entry.ref, "detach", scope.agentRegistry)
+				: undefined,
 		}));
 		await waitForVibeTeardown(
-			cleanup.flatMap(entry => [entry.releaseTask, entry.jobTask].filter(task => task !== undefined)),
+			cleanup.flatMap(entry => {
+				const tasks: TrackedVibeTeardown[] = [];
+				if (entry.releaseTask) tasks.push(entry.releaseTask);
+				if (entry.jobTask) tasks.push(entry.jobTask);
+				return tasks;
+			}),
 			deadline,
 		);
 		for (const { record, ref, releaseTask, job, jobTask } of cleanup) {
-			if (ref && releaseTask) this.#finishAgentRelease(record.id, ref, releaseTask, "detach");
+			if (ref && releaseTask) this.#finishAgentRelease(record.id, ref, releaseTask, "detach", scope.agentRegistry);
 			if (job && jobTask?.status() === "pending") {
 				logger.warn("vibe: timed out waiting for cancelled worker turn; cleanup continues in the background", {
 					id: record.id,
@@ -1099,9 +1121,9 @@ export class VibeSessionRegistry {
 				this.#continueSuspendedCleanup(scope, record, jobTask);
 			}
 			if (this.#records.has(scopeKey(scope, record.id))) continue;
-			const lateRef = this.#registeredAgent(record);
+			const lateRef = this.#registeredAgent(record, scope.agentRegistry);
 			if (lateRef && lateRef !== ref) {
-				await this.#releaseRefWithinDeadline(record.id, lateRef, deadline, "detach");
+				await this.#releaseRefWithinDeadline(record.id, lateRef, deadline, "detach", scope.agentRegistry);
 			}
 		}
 		return records.length;
@@ -1111,9 +1133,15 @@ export class VibeSessionRegistry {
 		void jobTask.promise
 			.then(async () => {
 				if (this.#records.has(scopeKey(scope, record.id))) return;
-				const lateRef = this.#registeredAgent(record);
+				const lateRef = this.#registeredAgent(record, scope.agentRegistry);
 				if (!lateRef) return;
-				await this.#releaseRefWithinDeadline(record.id, lateRef, Date.now() + this.#teardownGraceMs, "detach");
+				await this.#releaseRefWithinDeadline(
+					record.id,
+					lateRef,
+					Date.now() + this.#teardownGraceMs,
+					"detach",
+					scope.agentRegistry,
+				);
 			})
 			.catch(error => {
 				logger.warn("vibe: failed to finish suspended worker cleanup", {
@@ -1192,7 +1220,8 @@ export class VibeSessionRegistry {
 		persistTerminal = true,
 		teardownDeadline?: number,
 	): Promise<VibeKillOutcome> {
-		const registered = this.#registeredAgent(record);
+		const registry = this.#registry(session);
+		const registered = this.#registeredAgent(record, registry);
 		const settlingJobs = new Set<AsyncJob>();
 		if (record.turn && manager) {
 			const job = manager.getJob(record.turn.jobId);
@@ -1228,13 +1257,13 @@ export class VibeSessionRegistry {
 		record.lastActivityAt = Date.now();
 		record.lastActivity = "killed";
 		const deadline = teardownDeadline ?? Date.now() + this.#teardownGraceMs;
-		const releaseTask = registered ? this.#trackAgentRelease(record.id, registered, "release") : undefined;
+		const releaseTask = registered ? this.#trackAgentRelease(record.id, registered, "release", registry) : undefined;
 		const jobCleanup = [...settlingJobs].map(job => ({ job, task: this.#trackJobSettlement(record, job) }));
 		await waitForVibeTeardown(
 			[releaseTask, ...jobCleanup.map(entry => entry.task)].filter(task => task !== undefined),
 			deadline,
 		);
-		if (registered && releaseTask) this.#finishAgentRelease(record.id, registered, releaseTask, "release");
+		if (registered && releaseTask) this.#finishAgentRelease(record.id, registered, releaseTask, "release", registry);
 		const pendingJobs = jobCleanup.filter(entry => entry.task.status() === "pending");
 		for (const { job } of pendingJobs) {
 			logger.warn("vibe: timed out waiting for cancelled worker turn; cleanup continues in the background", {
@@ -1242,13 +1271,14 @@ export class VibeSessionRegistry {
 				jobId: job.id,
 			});
 		}
-		const terminalRef = registered ?? this.#registeredAgent(record) ?? null;
-		await this.#markTerminalRecord(record, terminalRef, deadline);
+		const terminalRef = registered ?? this.#registeredAgent(record, registry) ?? null;
+		await this.#markTerminalRecord(record, terminalRef, deadline, registry);
 		if (pendingJobs.length > 0) {
 			this.#continueKilledCleanup(
 				record,
 				pendingJobs.map(entry => entry.task),
 				registered,
+				registry,
 			);
 		}
 		if (persistenceError) {
@@ -1280,14 +1310,22 @@ export class VibeSessionRegistry {
 
 	async #markTerminalRecord(
 		record: VibeRecord,
-		expected: AgentRef | null | undefined,
+		expected: InternalAgentRef | null | undefined,
 		teardownDeadline: number,
+		registry: AgentRegistry,
 	): Promise<void> {
 		if (!record.childSessionFile) return;
 		try {
 			const persisted = await SessionManager.peekSessionInit(record.childSessionFile);
 			if (persisted?.init) {
-				await this.#markTerminalRef(record.id, record.ownerId, record.childSessionFile, expected, teardownDeadline);
+				await this.#markTerminalRef(
+					record.id,
+					record.ownerId,
+					record.childSessionFile,
+					registry,
+					expected,
+					teardownDeadline,
+				);
 			}
 		} catch (error) {
 			logger.warn("vibe: failed to retain terminal worker transcript", {
@@ -1300,10 +1338,11 @@ export class VibeSessionRegistry {
 	#continueKilledCleanup(
 		record: VibeRecord,
 		jobTasks: readonly TrackedVibeTeardown[],
-		expected: AgentRef | undefined,
+		expected: InternalAgentRef | undefined,
+		registry: AgentRegistry,
 	): void {
 		void Promise.allSettled(jobTasks.map(task => task.promise))
-			.then(() => this.#markTerminalRecord(record, expected, Date.now() + this.#teardownGraceMs))
+			.then(() => this.#markTerminalRecord(record, expected, Date.now() + this.#teardownGraceMs, registry))
 			.catch(error => {
 				logger.warn("vibe: failed to finish killed worker cleanup", {
 					id: record.id,
@@ -1320,6 +1359,9 @@ export class VibeSessionRegistry {
 		signal: AbortSignal,
 		onProgress: (progress: AgentProgress) => void,
 	): Promise<ExecutorOptions> {
+		const registry = this.#registry(session);
+		if (!session.createAuthoritySession)
+			throw new ToolError("Vibe sessions require a live parent-bound session creator.");
 		const sessionFile = session.getSessionFile();
 		const sessionArtifactsDir = sessionFile ? sessionFile.slice(0, -6) : null;
 		const artifactsDir = sessionArtifactsDir ?? path.join(os.tmpdir(), `omp-vibe-${Snowflake.next()}`);
@@ -1336,9 +1378,10 @@ export class VibeSessionRegistry {
 			agent: record.agent,
 			task: message,
 			assignment: message,
-			description: `vibe ${record.cli} session`,
-			index: 0,
 			id: record.id,
+			agentRegistry: registry,
+			createAuthoritySession: session.createAuthoritySession,
+			index: 0,
 			taskDepth: session.taskDepth ?? 0,
 			detached: true,
 			modelOverride: record.modelOverride,
@@ -1430,9 +1473,11 @@ export class VibeSessionRegistry {
 								signal,
 								onProgress,
 								subagentEventBus: session.subagentEventBus,
+								agentRegistry: this.#registry(session),
+								agentLifecycle: getAgentLifecycleManager(this.#registry(session)),
 								artifactsDir: session.getSessionFile()?.slice(0, -6),
 							});
-					return await this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result);
+					return this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result);
 				} catch (error) {
 					if (error instanceof VibeTurnError) throw error;
 					await this.#finishTurn(session, manager, record, ownJobId);
@@ -1465,9 +1510,6 @@ export class VibeSessionRegistry {
 			record.state = "dead";
 			return;
 		}
-		// Only an idle/parked ref with this parent's exact child file is resumable.
-		const registered = this.#registeredAgent(record);
-		record.state = registered && (registered.status === "idle" || registered.status === "parked") ? "idle" : "dead";
 		if (record.state === "dead") {
 			record.terminalPersisted = await this.#appendTombstone(session, record, "unrecoverable");
 			return;
@@ -1577,19 +1619,14 @@ export class VibeSessionRegistry {
  * their own rate unchanged). The director is often idle while workers stream,
  * so without this aggregation the status-line tok/s badge would show a stale
  * value while parallel work is actively generating tokens.
- *
- * Reads each worker's last assistant message via {@link calculateTokensPerSecond}
- * — the same leaf calculator the main status line uses — so worker rates are
- * computed identically to the main session's rate.
  */
-export function aggregateVibeWorkerTokensPerSecond(ownerId: string): number | null {
+export function aggregateVibeWorkerTokensPerSecond(registry: AgentRegistry, ownerId: string): number | null {
 	const ids = VibeSessionRegistry.global().listIdsByOwner(ownerId);
 	if (ids.length === 0) return null;
 	let total = 0;
 	let any = false;
-	const registry = AgentRegistry.global();
 	for (const id of ids) {
-		const workerSession = registry.get(id)?.session;
+		const workerSession = lookupAgentRef(registry, id)?.session;
 		if (!workerSession?.isStreaming) continue;
 		const rate = calculateTokensPerSecond(workerSession.state.messages, true);
 		if (rate !== null) {

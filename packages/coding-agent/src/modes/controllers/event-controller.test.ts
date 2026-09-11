@@ -30,8 +30,29 @@ function source(streaming = false, activeRunStartedAt: number | undefined = 1_00
 	return {
 		activeRunStartedAt,
 		isStreaming: streaming,
-		agent: { state: { isStreaming: streaming } },
+		agent: { state: { isStreaming: streaming }, tokenizer: { countMessage: () => 0 } },
 	} as unknown as AgentSession;
+}
+
+type StreamingComponentDouble = {
+	isTranscriptBlockFinalized(): boolean;
+	setLinkTargets(): void;
+	updateContent(): void;
+	markTranscriptBlockFinalized(): void;
+	setCompletionFooter(): void;
+};
+
+function createStreamingComponent() {
+	let transcriptBlockFinalized = false;
+	return {
+		isTranscriptBlockFinalized: () => transcriptBlockFinalized,
+		setLinkTargets() {},
+		updateContent() {},
+		markTranscriptBlockFinalized: () => {
+			transcriptBlockFinalized = true;
+		},
+		setCompletionFooter() {},
+	};
 }
 
 function createContext(viewSession = source()) {
@@ -66,6 +87,7 @@ function createContext(viewSession = source()) {
 			terminal: { setProgress: (active: boolean) => calls.terminalProgress.push(active) },
 		},
 		settings: { get: () => false },
+		noteDisplayableThinkingContent: () => false,
 		effectiveHideThinkingBlock: false,
 		hideThinkingBlock: false,
 		proseOnlyThinking: true,
@@ -104,9 +126,13 @@ function createContext(viewSession = source()) {
 		streamingMessage: undefined,
 		pendingTools: new Map(),
 		chatContainer: { children: [], removeChild: () => calls.removeChild++ },
+		transcriptMessageComponents: new Map(),
 		flushPendingModelSwitch: async () => {
 			calls.flushModelSwitch++;
 		},
+		flushPendingCommandOutput() {},
+		syncRetryHintRow() {},
+		editor: { getText: () => "" },
 		viewSession,
 		session: viewSession,
 	};
@@ -147,20 +173,12 @@ describe("EventController source-aware working-message lifecycle", () => {
 		} as AgentMessage;
 		const completionContext = ctx as unknown as {
 			streamingMessage: AgentMessage;
-			streamingComponent: {
-				updateContent(): void;
-				markTranscriptBlockFinalized(): void;
-				setCompletionFooter(): void;
-			};
+			streamingComponent: StreamingComponentDouble;
 			noteDisplayableThinkingContent(): boolean;
 		};
 		completionContext.noteDisplayableThinkingContent = () => false;
 		completionContext.streamingMessage = completed;
-		completionContext.streamingComponent = {
-			updateContent() {},
-			markTranscriptBlockFinalized() {},
-			setCompletionFooter() {},
-		};
+		completionContext.streamingComponent = createStreamingComponent();
 		await controller.handleEvent(main, { type: "message_end", message: completed } as AgentSessionEvent);
 		expect(calls.elapsedLookups).toEqual([main]);
 	});
@@ -171,6 +189,14 @@ describe("EventController source-aware working-message lifecycle", () => {
 		const controller = new EventController(ctx) as unknown as SourceAwareController;
 
 		await controller.handleEvent(endedIdle, { type: "agent_start" });
+		const completed = {
+			...assistantMessage(0),
+			stopReason: "stop",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+		} as AgentMessage;
+		const mismatchContext = ctx as unknown as { streamingComponent: StreamingComponentDouble };
+		mismatchContext.streamingComponent = createStreamingComponent();
+		await controller.handleEvent(endedIdle, { type: "message_end", message: completed } as AgentSessionEvent);
 		await controller.handleEvent(endedIdle, {
 			type: "agent_end",
 			messages: [assistantMessage(1)],

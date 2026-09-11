@@ -151,6 +151,9 @@ export const BUILTIN_COMPOSER_SHAPES = [
 export const COMPOSER_SHAPE_VALUES = BUILTIN_COMPOSER_SHAPES.map(shape => shape.value);
 
 export type ContextLineMode = "off" | "percentage" | "annotated" | "embedded";
+/** Task permission modes are a stable settings contract; keep wire names unchanged. */
+export const TASK_PERMISSION_MODE_VALUES = ["off", "suggest", "enforce"] as const;
+export type TaskPermissionMode = (typeof TASK_PERMISSION_MODE_VALUES)[number];
 export const CONTEXT_LINE_MODE_VALUES = ["off", "percentage", "annotated", "embedded"] as const;
 
 export type SettingTab =
@@ -5194,10 +5197,9 @@ export const SETTINGS_SCHEMA = {
 				"Allow subagents spawned via the task tool to use the lsp tool. Off by default to keep subagents cheap; enable when LSP-aware delegation is worth the extra tokens.",
 		},
 	},
-
 	"task.permissions.mode": {
 		type: "enum",
-		values: ["off", "suggest", "enforce"] as const,
+		values: TASK_PERMISSION_MODE_VALUES,
 		default: "off",
 		ui: {
 			tab: "tasks",

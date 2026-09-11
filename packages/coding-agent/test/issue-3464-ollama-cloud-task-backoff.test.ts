@@ -83,7 +83,9 @@ describe("issue #3464: ollama-cloud task backoff", () => {
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 1,
-			"retry.fallbackChains": { default: [`${fallback.provider}/${fallback.id}`] },
+			"retry.fallbackChains": {
+				default: [`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			},
 		});
 		settings.setModelRole("task", `${primary.provider}/${primary.id}`);
 

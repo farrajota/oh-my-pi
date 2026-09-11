@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync } from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
@@ -11,15 +11,46 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import type {
 	AsyncJobOutputSnapshot,
 	BackgroundControlResult,
+	ExtensionContextActions,
 	ExtensionRuntime,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { disposeAgentLifecycle, getAgentLifecycleManager } from "../src/internal/agent-lifecycle-bridge";
+import { terminateSubagent as terminateRegisteredSubagent } from "../src/registry/agent-control";
+import type { AgentLifecycleManager } from "../src/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+
+const lifecycles: AgentLifecycleManager[] = [];
+
+function createLifecycle(registry: AgentRegistry): AgentLifecycleManager {
+	const lifecycle = getAgentLifecycleManager(registry);
+	lifecycles.push(lifecycle);
+	return lifecycle;
+}
+
+afterEach(async () => {
+	for (const lifecycle of lifecycles.splice(0).reverse()) {
+		await disposeAgentLifecycle(lifecycle);
+	}
+});
+
+function initializeRunner(runner: ExtensionRunner, contextActions: Partial<ExtensionContextActions>): void {
+	runner.initialize({} as never, {
+		getModel: () => undefined,
+		isIdle: () => true,
+		abort: () => {},
+		hasPendingMessages: () => false,
+		shutdown: () => {},
+		getContextUsage: () => undefined,
+		compact: async () => {},
+		getSystemPrompt: () => [],
+		...contextActions,
+	});
+}
 
 function createRunner(getAsyncJobSnapshot?: () => AsyncJobSnapshot | null): ExtensionRunner {
 	const runtime = {
@@ -78,15 +109,7 @@ describe("ExtensionRunner async job context", () => {
 			status: "cancelled",
 			message: "Background job cancelled.",
 		};
-		runner.initialize({} as never, {
-			getModel: () => undefined,
-			isIdle: () => true,
-			abort: () => {},
-			hasPendingMessages: () => false,
-			shutdown: () => {},
-			getContextUsage: () => undefined,
-			compact: async () => {},
-			getSystemPrompt: () => [],
+		initializeRunner(runner, {
 			getAsyncJobOutput: id => (id === "bg-1" ? output : null),
 			cancelAsyncJob: async id => (id === "bg-1" ? cancelled : { id, status: "not_found", message: "missing" }),
 		});
@@ -123,9 +146,8 @@ describe("ExtensionRunner async job context", () => {
 		mkdirSync(ownerRoot, { recursive: true });
 		mkdirSync(priorRoot, { recursive: true });
 
-		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
-		const registry = AgentRegistry.global();
+		const registry = new AgentRegistry();
+		const lifecycle = createLifecycle(registry);
 		const prior = registry.register({
 			id: "same-owner-prior-child",
 			displayName: "Prior child",
@@ -145,15 +167,39 @@ describe("ExtensionRunner async job context", () => {
 			sessionFile: path.join(ownerRoot, "same-owner-current-child.jsonl"),
 		});
 
+		const runner = createRunner();
+		initializeRunner(runner, {
+			terminateSubagent: targetId => {
+				const expectedRef = registry.get(targetId);
+				const candidate = expectedRef?.sessionFile ? path.resolve(expectedRef.sessionFile) : undefined;
+				const relative = candidate ? path.relative(ownerRoot, candidate) : undefined;
+				if (!relative || path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
+					return Promise.resolve({
+						id: targetId,
+						status: "not_found",
+						message: `Subagent not found: ${targetId}`,
+					});
+				}
+				return terminateRegisteredSubagent({
+					registry,
+					lifecycle,
+					targetId,
+					expectedRef: expectedRef ?? null,
+					policy: { scope: "descendant", ownerId: "Owner" },
+				});
+			},
+		});
+		const context = runner.createContext();
+
+		expect(prior.lineage?.generation).not.toBe(current.lineage?.generation);
 		try {
-			await expect(session.terminateSubagent(prior.id)).resolves.toMatchObject({
+			await expect(context.terminateSubagent(prior.id)).resolves.toMatchObject({
 				id: prior.id,
 				status: "not_found",
 			});
-			expect(registry.get(prior.id)).toBe(prior);
-			expect(registry.get(prior.id)?.status).toBe("parked");
+			expect(registry.get(prior.id)).toMatchObject({ id: prior.id, status: "parked" });
 
-			await expect(session.terminateSubagent(current.id)).resolves.toMatchObject({
+			await expect(context.terminateSubagent(current.id)).resolves.toMatchObject({
 				id: current.id,
 				status: "cancelled",
 			});
@@ -161,8 +207,6 @@ describe("ExtensionRunner async job context", () => {
 		} finally {
 			await session.dispose();
 			authStorage.close();
-			AgentLifecycleManager.resetGlobalForTests();
-			AgentRegistry.resetGlobalForTests();
 		}
 	});
 });

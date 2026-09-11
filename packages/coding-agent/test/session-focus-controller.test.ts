@@ -1,6 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { SessionFocusController } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { disposeAgentLifecycle, getAgentLifecycleManager } from "../src/internal/agent-lifecycle-bridge";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -54,6 +55,7 @@ function makeSessionStub(
 interface Harness {
 	controller: SessionFocusController;
 	registry: AgentRegistry;
+	lifecycle: AgentLifecycleManager;
 	main: SessionStub;
 	handledEvents: Array<{ source: AgentSession; event: AgentSessionEvent }>;
 	rehydrated: AgentSession[];
@@ -121,13 +123,15 @@ function makeHarness(
 		collabGuest: undefined,
 	} as unknown as InteractiveModeContext;
 	const registry = new AgentRegistry();
-	const lifecycle = ensureLive
-		? ({ ensureLive } as unknown as AgentLifecycleManager)
-		: new AgentLifecycleManager(registry);
-	const controller = new SessionFocusController(ctx, registry, () => lifecycle);
+	const lifecycle = getAgentLifecycleManager(registry);
+	const controller = new SessionFocusController(ctx, registry, () =>
+		ensureLive ? ({ ensureLive } as unknown as AgentLifecycleManager) : lifecycle,
+	);
+	lifecycles.push(lifecycle);
 	return {
 		controller,
 		registry,
+		lifecycle,
 		main,
 		handledEvents,
 		rehydrated,
@@ -149,6 +153,12 @@ function registerSub(registry: AgentRegistry, id: string, session: AgentSession,
 async function flushAsync(): Promise<void> {
 	for (let i = 0; i < 5; i++) await Promise.resolve();
 }
+
+const lifecycles: AgentLifecycleManager[] = [];
+
+afterEach(async () => {
+	for (const lifecycle of lifecycles.splice(0).reverse()) await disposeAgentLifecycle(lifecycle);
+});
 
 describe("SessionFocusController", () => {
 	it("rehydrates a streaming attach rather than synthesizing agent_start", async () => {

@@ -3,6 +3,12 @@ import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { runEvalWorkpool } from "../../src/eval/workpool-bridge";
 import { AgentRegistry } from "../../src/registry/agent-registry";
+import {
+	registerToolSessionLifecycleAuthority,
+	resetAgentLifecycleForTests,
+} from "../../src/internal/agent-lifecycle-bridge";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
+import type { AgentSession } from "../../src/session/agent-session";
 import * as discovery from "../../src/task/discovery";
 import type { AgentDefinition } from "../../src/task/types";
 import { WorkPoolRegistry } from "../../src/task/workpool";
@@ -16,38 +22,63 @@ const SCOUT: AgentDefinition = {
 };
 
 const managers = new Set<AsyncJobManager>();
+const authoritySessions = new Set<AgentSession>();
 
-function makeSession(): ToolSession {
+async function makeSession(): Promise<ToolSession> {
 	const manager = new AsyncJobManager({ retentionMs: 0 });
+	const registry = new AgentRegistry();
+	const settings = Settings.isolated({
+		"async.enabled": false,
+		"task.maxConcurrency": 2,
+		"task.maxRecursionDepth": 2,
+		"task.isolation.enabled": false,
+		"task.enableLsp": false,
+	});
+	const root = await createAgentRootSession(registry, {
+		agentId: "Main",
+		agentDisplayName: "Main",
+		cwd: "/tmp",
+		agentDir: "/tmp",
+		settings,
+		disableExtensionDiscovery: true,
+		enableMCP: false,
+		enableLsp: false,
+		toolNames: [],
+		skipPythonPreflight: true,
+	});
+	const authorityBinding = bindInternalAgentAuthoritySession(registry, root.session);
+	if (!authorityBinding) throw new Error("Test fixture requires a live parent-bound authority session.");
+	authoritySessions.add(root.session);
 	managers.add(manager);
-	return {
+	const session = {
 		cwd: "/tmp",
 		hasUI: false,
-		settings: Settings.isolated({
-			"task.maxConcurrency": 2,
-			"task.maxRecursionDepth": 2,
-			"task.isolation.enabled": false,
-			"task.enableLsp": false,
-		}),
+		settings,
 		asyncJobManager: manager,
+		agentRegistry: registry,
+		createAuthoritySession: (options, reviveRef) => authorityBinding.create(options, reviveRef),
 		getAgentId: () => "Main",
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		getArtifactsDir: () => null,
-	};
+	} satisfies ToolSession;
+	registerToolSessionLifecycleAuthority(session, registry, root.session);
+	return session;
 }
 
 afterEach(async () => {
 	for (const manager of managers) await manager.dispose();
 	managers.clear();
+	await Promise.all([...authoritySessions].map(session => session.dispose()));
+	authoritySessions.clear();
 	vi.restoreAllMocks();
-	AgentRegistry.resetGlobalForTests();
+	resetAgentLifecycleForTests();
 	WorkPoolRegistry.resetForTests();
 });
 
 describe("runEvalWorkpool", () => {
 	it("validates operation arguments", async () => {
-		const session = makeSession();
+		const session = await makeSession();
 		await expect(runEvalWorkpool(null, { session })).rejects.toThrow("arguments must be an object");
 		await expect(runEvalWorkpool({}, { session })).rejects.toThrow("requires an op");
 		await expect(runEvalWorkpool({ op: "create", agent: 4 }, { session })).rejects.toThrow(
@@ -59,7 +90,7 @@ describe("runEvalWorkpool", () => {
 	});
 
 	it("rejects unknown pool names", async () => {
-		const session = makeSession();
+		const session = await makeSession();
 		await expect(runEvalWorkpool({ op: "status", name: "missing" }, { session })).rejects.toThrow(
 			'unknown workpool "missing"',
 		);
@@ -67,7 +98,7 @@ describe("runEvalWorkpool", () => {
 
 	it("creates unique default names and validates push and peek arguments", async () => {
 		vi.spyOn(discovery, "discoverAgents").mockResolvedValue({ agents: [SCOUT], projectAgentsDir: null });
-		const session = makeSession();
+		const session = await makeSession();
 		const events: Array<Record<string, unknown>> = [];
 		const first = await runEvalWorkpool(
 			{ op: "create", agent: "scout" },

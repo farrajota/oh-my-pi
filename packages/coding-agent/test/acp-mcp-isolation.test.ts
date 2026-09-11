@@ -15,9 +15,12 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { createAcpSessionFactory } from "@oh-my-pi/pi-coding-agent/main";
+import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
@@ -69,6 +72,44 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			expect(result.session).toBe(fakeSession);
 			expect(captured).toHaveLength(1);
 			expect(captured[0].enableMCP).toBe(false);
+		} finally {
+			await tempDir.remove();
+		}
+	});
+
+	it("creates each persisted ACP session with its canonical durable registry before creation", async () => {
+		const tempDir = TempDir.createSync("@pi-acp-durable-registry-");
+		try {
+			const settings = Settings.isolated({});
+			const fakeSession = {} as AgentSession;
+			let capturedOptions: CreateAgentSessionOptions | undefined;
+			let capturedRegistry: CreateAgentSessionOptions["agentRegistry"];
+			const factory = createAcpSessionFactory({
+				baseOptions: {} as CreateAgentSessionOptions,
+				settings,
+				sessionDir: tempDir.join("sessions"),
+				authStorage,
+				modelRegistry,
+				parsedArgs: {},
+				rawArgs: [],
+				createSession: async options => {
+					capturedOptions = options;
+					capturedRegistry = options.agentRegistry;
+					return {
+						session: fakeSession,
+						extensionsResult: { extensions: [], errors: [], runtime: new ExtensionRuntime() },
+						setToolUIContext: () => {},
+						eventBus: new EventBus(),
+					} satisfies CreateAgentSessionResult;
+				},
+			});
+
+			await factory(tempDir.path());
+
+			const sessionFile = capturedOptions?.sessionManager?.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persisted ACP session file");
+			expect(capturedOptions?.agentRegistry).toBe(capturedRegistry);
+			expect(capturedRegistry?.getDurableStateStore()).toBe(registryDurableStateForSession(sessionFile));
 		} finally {
 			await tempDir.remove();
 		}

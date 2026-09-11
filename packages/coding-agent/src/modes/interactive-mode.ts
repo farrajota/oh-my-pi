@@ -1069,7 +1069,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// workers stream, so without this the tok/s badge would show a stale
 		// value while parallel work is actively generating tokens.
 		this.statusLine.setVibeWorkerTokenRateProvider(() =>
-			aggregateVibeWorkerTokensPerSecond(this.session.getAgentId() ?? MAIN_AGENT_ID),
+			aggregateVibeWorkerTokensPerSecond(
+				getRunningSubagentBadgeRegistry(this.collabGuest),
+				this.session.getAgentId() ?? MAIN_AGENT_ID,
+			),
 		);
 
 		this.hideToolActivity = settings.get("display.hideToolActivity");
@@ -2944,6 +2947,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			// the primary fallback in resolveAgentModelPatterns, so the `good` worker's
 			// pi/task inheritance tracks the reopened session's model.
 			getActiveModelString: () => (this.session.model ? formatModelString(this.session.model) : undefined),
+			agentRegistry: getRunningSubagentBadgeRegistry(this.collabGuest),
 		};
 	}
 

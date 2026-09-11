@@ -2,8 +2,11 @@ import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import workpoolBatchTemplate from "../prompts/tools/workpool-batch.md" with { type: "text" };
 import workpoolTurnResultTemplate from "../prompts/tools/workpool-turn-result.md" with { type: "text" };
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
-import { AgentLifecycleManager } from "../registry/agent-lifecycle";
+import { getAgentLifecycleManager, releaseAgent } from "../internal/agent-lifecycle-bridge";
+import { lookupAgentRef } from "../internal/agent-registry-bridge";
+import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { AgentRegistry } from "../registry/agent-registry";
+import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { CustomMessage } from "../session/messages";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
@@ -109,6 +112,8 @@ export class WorkPool {
 	readonly context?: string;
 	readonly customTools: CustomTool[];
 	readonly freshAgents: boolean;
+	readonly agentRegistry: AgentRegistry;
+	readonly agentLifecycle: AgentLifecycleManager;
 	readonly agents: WorkPoolAgent[] = [];
 	readonly items: WorkPoolItem[] = [];
 	readonly batches: WorkPoolBatch[] = [];
@@ -124,6 +129,7 @@ export class WorkPool {
 	readonly #freshQueue: WorkPoolItem[] = [];
 
 	constructor(session: ToolSession, options: WorkPoolCreateOptions) {
+		if (!session.agentRegistry) throw new ToolError("workpool() requires an owning agent registry");
 		this.name = options.name;
 		this.ownerId = session.getAgentId?.() ?? MAIN_AGENT_ID;
 		this.session = session;
@@ -131,6 +137,8 @@ export class WorkPool {
 		this.context = options.context;
 		this.customTools = options.customTools ?? [];
 		this.freshAgents = session.settings.get("eval.workpool.freshAgents");
+		this.agentRegistry = session.agentRegistry;
+		this.agentLifecycle = getAgentLifecycleManager(this.agentRegistry);
 		if (!session.asyncJobManager) {
 			throw new ToolError("workpool() needs the session's async job manager; unavailable here");
 		}
@@ -404,6 +412,8 @@ export class WorkPool {
 							signal,
 							onProgress,
 							subagentEventBus: this.session.subagentEventBus,
+							agentRegistry: this.agentRegistry,
+							agentLifecycle: this.agentLifecycle,
 							artifactsDir: this.session.getSessionFile()?.slice(0, -6),
 							maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
 						});
@@ -434,7 +444,7 @@ export class WorkPool {
 		for (const item of batch.items) item.status = batch.status;
 		agent.turns++;
 		agent.jobId = undefined;
-		const ref = AgentRegistry.global().get(agent.id);
+		const ref = lookupAgentRef(this.agentRegistry, agent.id);
 		// Retained idle workers can wake through IRC, so clear the runtime schema and cached inline declaration together.
 		// A refresh failure must not strand the pool in #waitForDrain(): items are
 		// already terminal, so keep the turn result, drop the worker instead of
@@ -460,7 +470,7 @@ export class WorkPool {
 			// declaration and an empty runtime set.
 			if (ref) {
 				try {
-					await AgentLifecycleManager.global().release(agent.id, ref, { tombstone: true });
+					await releaseAgent(this.agentLifecycle, agent.id, ref, { tombstone: true });
 				} catch (releaseError) {
 					logger.warn("workpool: failed to release worker after yield clear failure", {
 						pool: this.name,
@@ -603,7 +613,7 @@ export class WorkPool {
 			timestamp,
 		};
 		try {
-			AgentRegistry.global().get(this.ownerId)?.session?.emitIrcRelayObservation(record);
+			lookupAgentRef(this.agentRegistry, this.ownerId)?.session?.emitIrcRelayObservation(record);
 		} catch (error) {
 			logger.debug("workpool: card emission failed", {
 				pool: this.name,

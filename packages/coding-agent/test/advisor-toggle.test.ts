@@ -272,24 +272,31 @@ describe("AgentSession advisor toggle", () => {
 		expect(session.getAdvisorAgent()?.state.messages).toEqual([historyMessage]);
 	});
 
-	it("explicit enable overrides default-off setting for the session only", () => {
+	it("explicit enable overrides default-off setting for the session only", async () => {
 		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		session.settings.override("advisor.enabled", false);
+		const customSessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		const customSession = new AgentSession({
 			agent: session.agent,
-			sessionManager,
+			sessionManager: customSessionManager,
 			settings: session.settings,
 			modelRegistry,
 			advisorTools: [],
 		});
-		expect(customSession.isAdvisorEnabled()).toBe(false);
+		try {
+			expect(session.isAdvisorEnabled()).toBe(false);
+			expect(customSession.isAdvisorEnabled()).toBe(false);
 
-		const active = customSession.setAdvisorEnabled(true);
+			const active = customSession.setAdvisorEnabled(true);
 
-		expect(active).toBe(true);
-		expect(customSession.isAdvisorActive()).toBe(true);
-		expect(customSession.isAdvisorEnabled()).toBe(true);
-		expect(customSession.settings.get("advisor.enabled")).toBe(false);
+			expect(active).toBe(true);
+			expect(customSession.isAdvisorActive()).toBe(true);
+			expect(customSession.isAdvisorEnabled()).toBe(true);
+			expect(session.isAdvisorEnabled()).toBe(false);
+			expect(customSession.settings.get("advisor.enabled")).toBe(false);
+		} finally {
+			await customSession.dispose();
+		}
 	});
 
 	it("toggle disables the advisor and runtime", () => {
@@ -346,9 +353,10 @@ describe("AgentSession advisor toggle", () => {
 		const { promise: refreshSettled, resolve: settleRefresh } = Promise.withResolvers<void>();
 		vi.spyOn(modelRegistry, "awaitBackgroundRefresh").mockImplementation(() => refreshSettled);
 
+		const raceSessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		const raceSession = new AgentSession({
 			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
-			sessionManager,
+			sessionManager: raceSessionManager,
 			settings,
 			modelRegistry,
 			advisorTools: [],
@@ -382,43 +390,49 @@ describe("AgentSession advisor toggle", () => {
 		sharedSettings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		expect(sharedSettings.get("advisor.enabled")).toBe(false);
 
+		const sessionAManager = SessionManager.create(tempDir.path(), tempDir.path());
 		const sessionA = new AgentSession({
 			agent: session.agent,
-			sessionManager,
+			sessionManager: sessionAManager,
 			settings: sharedSettings,
 			modelRegistry,
 			advisorTools: [],
 		});
+		const sessionBManager = SessionManager.create(tempDir.path(), tempDir.path());
 		const sessionB = new AgentSession({
 			agent: session.agent,
-			sessionManager,
+			sessionManager: sessionBManager,
 			settings: sharedSettings,
 			modelRegistry,
 			advisorTools: [],
 		});
 
-		expect(sessionA.isAdvisorEnabled()).toBe(false);
-		expect(sessionB.isAdvisorEnabled()).toBe(false);
+		try {
+			expect(sessionA.isAdvisorEnabled()).toBe(false);
+			expect(sessionB.isAdvisorEnabled()).toBe(false);
 
-		const activeA = sessionA.setAdvisorEnabled(true);
-		expect(activeA).toBe(true);
-		expect(sessionA.isAdvisorEnabled()).toBe(true);
-		expect(sessionA.isAdvisorActive()).toBe(true);
+			const activeA = sessionA.setAdvisorEnabled(true);
+			expect(activeA).toBe(true);
+			expect(sessionA.isAdvisorEnabled()).toBe(true);
+			expect(sessionA.isAdvisorActive()).toBe(true);
 
-		expect(sessionB.isAdvisorEnabled()).toBe(false);
-		expect(sessionB.isAdvisorActive()).toBe(false);
-		expect(sessionB.formatAdvisorStatus()).toBe("Advisor is disabled.");
+			expect(sessionB.isAdvisorEnabled()).toBe(false);
+			expect(sessionB.isAdvisorActive()).toBe(false);
+			expect(sessionB.formatAdvisorStatus()).toBe("Advisor is disabled.");
 
-		const activeB = sessionB.toggleAdvisorEnabled();
-		expect(activeB).toBe(true);
-		expect(sessionB.isAdvisorEnabled()).toBe(true);
+			const activeB = sessionB.toggleAdvisorEnabled();
+			expect(activeB).toBe(true);
+			expect(sessionB.isAdvisorEnabled()).toBe(true);
 
-		sessionA.setAdvisorEnabled(false);
-		expect(sessionA.isAdvisorEnabled()).toBe(false);
-		expect(sessionA.isAdvisorActive()).toBe(false);
+			sessionA.setAdvisorEnabled(false);
+			expect(sessionA.isAdvisorEnabled()).toBe(false);
+			expect(sessionA.isAdvisorActive()).toBe(false);
 
-		expect(sessionB.isAdvisorEnabled()).toBe(true);
-		expect(sessionB.isAdvisorActive()).toBe(true);
+			expect(sessionB.isAdvisorEnabled()).toBe(true);
+			expect(sessionB.isAdvisorActive()).toBe(true);
+		} finally {
+			await Promise.all([sessionA.dispose(), sessionB.dispose()]);
+		}
 	});
 
 	it("exposes provider sessionId on live advisor stats", () => {

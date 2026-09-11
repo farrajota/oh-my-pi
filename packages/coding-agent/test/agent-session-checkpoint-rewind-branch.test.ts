@@ -96,12 +96,17 @@ const activeHarnesses: Harness[] = [];
 afterEach(async () => {
 	while (activeHarnesses.length > 0) {
 		const harness = activeHarnesses.pop();
-		for (const extraSession of harness?.extraSessions ?? []) {
-			await extraSession.dispose();
+		if (!harness) continue;
+		try {
+			const disposals = await Promise.allSettled(
+				[...harness.extraSessions, harness.session].map(session => session.dispose()),
+			);
+			const failedDisposal = disposals.find(disposal => disposal.status === "rejected");
+			if (failedDisposal?.status === "rejected") throw failedDisposal.reason;
+		} finally {
+			harness.authStorage.close();
+			harness.tempDir.removeSync();
 		}
-		await harness?.session.dispose();
-		harness?.authStorage.close();
-		harness?.tempDir.removeSync();
 	}
 });
 
@@ -145,7 +150,7 @@ async function createHarness(
 		resolveFallbackTool: options?.resolveFallbackTool,
 	});
 
-	const sessionManager = SessionManager.inMemory(tempDir.path());
+	const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 	let extensionRunner: ExtensionRunner | undefined;
 	if (options?.onAgentEnd) {
 		const runtime = new ExtensionRuntime();
@@ -172,6 +177,13 @@ async function createHarness(
 	const harness = { session, authStorage, tempDir, extraSessions: [] };
 	activeHarnesses.push(harness);
 	return { ...harness, mock };
+}
+
+async function resumeHarnessSessionManager(harness: Harness): Promise<SessionManager> {
+	const sessionFile = harness.session.sessionManager.getSessionFile();
+	if (!sessionFile) throw new Error("Expected persisted session file");
+	await harness.session.dispose();
+	return SessionManager.open(sessionFile, path.dirname(sessionFile), undefined, { suppressBreadcrumb: true });
 }
 
 function messageText(message: Message): string {
@@ -583,6 +595,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		]);
 
 		await harness.session.prompt("investigate with a checkpoint");
+		const resumedManager = await resumeHarnessSessionManager(harness);
 
 		const reloadedMock = createMockModel({ responses: [] });
 		const reloadedSettings = Settings.isolated({
@@ -600,14 +613,14 @@ describe("AgentSession checkpoint rewind branch context", () => {
 				model: reloadedMock,
 				systemPrompt: ["Test"],
 				tools: reloadedTools,
-				messages: harness.session.sessionManager.buildSessionContext().messages,
+				messages: resumedManager.buildSessionContext().messages,
 			},
 			convertToLlm,
 			streamFn: reloadedMock.stream,
 		});
 		const reloadedSession = new AgentSession({
 			agent: reloadedAgent,
-			sessionManager: harness.session.sessionManager,
+			sessionManager: resumedManager,
 			settings: reloadedSettings,
 			modelRegistry: new ModelRegistry(
 				harness.authStorage,
@@ -731,6 +744,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		);
 		if (!checkpointEntry) throw new Error("Expected checkpoint tool result entry");
 		harness.session.sessionManager.branch(checkpointEntry.id);
+		const resumedManager = await resumeHarnessSessionManager(harness);
 
 		const reloadedMock = createMockModel({ responses: [] });
 		const reloadedSettings = Settings.isolated({
@@ -748,14 +762,14 @@ describe("AgentSession checkpoint rewind branch context", () => {
 				model: reloadedMock,
 				systemPrompt: ["Test"],
 				tools: reloadedTools,
-				messages: harness.session.sessionManager.buildSessionContext().messages,
+				messages: resumedManager.buildSessionContext().messages,
 			},
 			convertToLlm,
 			streamFn: reloadedMock.stream,
 		});
 		const reloadedSession = new AgentSession({
 			agent: reloadedAgent,
-			sessionManager: harness.session.sessionManager,
+			sessionManager: resumedManager,
 			settings: reloadedSettings,
 			modelRegistry: new ModelRegistry(
 				harness.authStorage,
@@ -865,6 +879,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		});
 		if (!checkpointEntry) throw new Error("Expected xdev checkpoint tool result entry");
 		harness.session.sessionManager.branch(checkpointEntry.id);
+		const resumedManager = await resumeHarnessSessionManager(harness);
 
 		const reloadedMock = createMockModel({ responses: [] });
 		const reloadedSettings = Settings.isolated({
@@ -882,14 +897,14 @@ describe("AgentSession checkpoint rewind branch context", () => {
 				model: reloadedMock,
 				systemPrompt: ["Test"],
 				tools: reloadedTools,
-				messages: harness.session.sessionManager.buildSessionContext().messages,
+				messages: resumedManager.buildSessionContext().messages,
 			},
 			convertToLlm,
 			streamFn: reloadedMock.stream,
 		});
 		const reloadedSession = new AgentSession({
 			agent: reloadedAgent,
-			sessionManager: harness.session.sessionManager,
+			sessionManager: resumedManager,
 			settings: reloadedSettings,
 			modelRegistry: new ModelRegistry(
 				harness.authStorage,

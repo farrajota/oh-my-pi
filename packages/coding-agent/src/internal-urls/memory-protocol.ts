@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
+import { listAgentRefs } from "../internal/agent-registry-bridge";
 import { getMemoryRoot } from "../memories";
 import { getMnemopiSessionState, type MnemopiScopedMemoryHit, type MnemopiSessionState } from "../mnemopi/state";
 import { AgentRegistry } from "../registry/agent-registry";
@@ -32,7 +33,7 @@ const HINDSIGHT_UNADDRESSABLE =
 export function memoryRootsFromRegistry(): string[] {
 	const agentDir = getAgentDir();
 	const roots: string[] = [];
-	for (const ref of AgentRegistry.global().list()) {
+	for (const ref of listAgentRefs(AgentRegistry.global())) {
 		const sm = ref.session?.sessionManager;
 		if (!sm) continue;
 		const root = getMemoryRoot(agentDir, sm.getCwd());
@@ -227,7 +228,7 @@ async function tryResolveInRoot(url: InternalUrl, memoryRoot: string): Promise<I
 function mnemopiSessionStatesFromRegistry(): MnemopiSessionState[] {
 	const seen = new Set<unknown>();
 	const states: MnemopiSessionState[] = [];
-	for (const ref of AgentRegistry.global().list()) {
+	for (const ref of listAgentRefs(AgentRegistry.global())) {
 		const session = ref.session;
 		if (!session) continue;
 		const state = getMnemopiSessionState(session);
@@ -263,6 +264,7 @@ function memoryBackendFromContext(context?: ResolveContext): string | undefined 
 interface MemoryCallerBinding {
 	readonly session: AgentSession | undefined;
 	readonly backend: string | undefined;
+	readonly mnemopiState: MnemopiSessionState | undefined;
 	readonly legacy: boolean;
 }
 
@@ -272,7 +274,7 @@ interface MemoryCallerBinding {
  * sits in it, so two sessions in one worktree never impersonate each other.
  */
 function findCallerSession(context: ResolveContext): AgentSession | undefined {
-	const refs = (context.agentRegistry ?? AgentRegistry.global()).list();
+	const refs = listAgentRefs(context.agentRegistry ?? AgentRegistry.global());
 	if (context.sessionFile !== undefined) {
 		const byFile = refs.find(ref => ref.session?.sessionFile === context.sessionFile)?.session;
 		if (byFile) return byFile;
@@ -290,27 +292,52 @@ function findCallerSession(context: ResolveContext): AgentSession | undefined {
 }
 
 function resolveMemoryCaller(context?: ResolveContext): MemoryCallerBinding {
-	if (!context) return { session: undefined, backend: undefined, legacy: true };
+	if (!context) return { session: undefined, backend: undefined, mnemopiState: undefined, legacy: true };
+	if (context.callerMemory) {
+		// A live tool session supplied its own immutable identity. Do not turn that
+		// capability back into registry authority; `cwd` still pins file-backed root.
+		return {
+			session: undefined,
+			backend: context.callerMemory.backend,
+			mnemopiState: canonicalMnemopiState(context.callerMemory.getMnemopiSessionState?.()),
+			legacy: false,
+		};
+	}
 	const session = findCallerSession(context);
 	// The caller's own session owns the backend decision: not every tool threads
 	// its settings blob, and a same-cwd peer's backend is not an answer.
-	if (session) return { session, backend: session.settings.get("memory.backend"), legacy: false };
+	if (session) {
+		return {
+			session,
+			backend: session.settings.get("memory.backend"),
+			mnemopiState: callerMnemopiState(session),
+			legacy: false,
+		};
+	}
 	if (context.sessionFile !== undefined || context.sessionId !== undefined) {
 		// The named caller is gone; a surviving peer may not answer for it.
-		return { session: undefined, backend: "off", legacy: false };
+		return { session: undefined, backend: "off", mnemopiState: undefined, legacy: false };
 	}
 	// A cwd that names no single live session still scopes the file-backed root,
 	// but it identifies no bank: peer memory ids stay unreachable.
-	return { session: undefined, backend: memoryBackendFromContext(context), legacy: context.cwd === undefined };
+	return {
+		session: undefined,
+		backend: memoryBackendFromContext(context),
+		mnemopiState: undefined,
+		legacy: context.cwd === undefined,
+	};
 }
 
 /**
  * Canonical mnemopi state of one session. Subagents alias their parent's
  * state, so the alias is resolved to the state that owns the banks.
  */
-function callerMnemopiState(session: AgentSession): MnemopiSessionState | undefined {
-	const state = getMnemopiSessionState(session);
+function canonicalMnemopiState(state: MnemopiSessionState | undefined): MnemopiSessionState | undefined {
 	return state?.aliasOf ?? state;
+}
+
+function callerMnemopiState(session: AgentSession): MnemopiSessionState | undefined {
+	return canonicalMnemopiState(getMnemopiSessionState(session));
 }
 
 function unknownNamespaceError(namespace: string): Error {
@@ -395,7 +422,7 @@ export class MemoryProtocolHandler implements ProtocolHandler {
 			if (!caller.legacy) {
 				if (backend === "hindsight") throw new Error(HINDSIGHT_UNADDRESSABLE);
 				if (backend === "mnemopi") {
-					const hit = caller.session ? callerMnemopiState(caller.session)?.getScopedMemory(namespace) : undefined;
+					const hit = caller.mnemopiState?.getScopedMemory(namespace);
 					if (hit) return renderMnemopiMemory(url, hit);
 					throw new Error(
 						`Mnemopi memory ${namespace} not found in the calling session's scoped bank. Use \`recall\` to list available ids.`,
@@ -408,9 +435,7 @@ export class MemoryProtocolHandler implements ProtocolHandler {
 			const hindsightActive =
 				backend === "hindsight" ||
 				(mnemopiStates.length === 0 &&
-					AgentRegistry.global()
-						.list()
-						.some(ref => ref.session?.getHindsightSessionState?.()));
+					listAgentRefs(AgentRegistry.global()).some(ref => ref.session?.getHindsightSessionState?.()));
 			if (hindsightActive) {
 				throw new Error(HINDSIGHT_UNADDRESSABLE);
 			}
@@ -462,9 +487,7 @@ export class MemoryProtocolHandler implements ProtocolHandler {
 		}
 		const mnemopiAvailable = caller.legacy
 			? mnemopiSessionStatesFromRegistry().length > 0
-			: caller.backend === "mnemopi" &&
-				caller.session !== undefined &&
-				callerMnemopiState(caller.session) !== undefined;
+			: caller.backend === "mnemopi" && caller.mnemopiState !== undefined;
 		if (mnemopiAvailable) {
 			completions.push({
 				value: "<memory-id>",

@@ -33,8 +33,8 @@ import {
 	formatErrorMessage,
 	formatParseErrors,
 	formatParseErrorsCountLabel,
-	PREVIEW_LIMITS,
 } from "./render-utils";
+import { PREVIEW_LIMITS } from "./preview-limits";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -244,8 +244,15 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
+			if (this.session.pathScope) {
+				const roots = multiTargets?.map(target => target.basePath) ?? [resolvedSearchPath];
+				await this.session.pathScope
+					.currentOperation()
+					.preflight(roots.map(root => ({ path: root, kind: "search" as const })));
+			}
+
 			const DEFAULT_AST_LIMIT = 50;
-			const result = multiTargets
+			let result = multiTargets
 				? await runMultiTargetAstGrep(multiTargets, {
 						patterns,
 						lang: params.lang,
@@ -263,6 +270,31 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 						includeMeta: true,
 						signal,
 					});
+
+			if (this.session.pathScope) {
+				const operation = this.session.pathScope.currentOperation();
+				const authorizedMatches: AstFindMatch[] = [];
+				for (const match of result.matches) {
+					const absolutePath = path.isAbsolute(match.path)
+						? match.path
+						: path.resolve(resolvedSearchPath, match.path);
+					try {
+						await operation.authorize(absolutePath, "search");
+						authorizedMatches.push(match);
+					} catch {
+						// Unauthorized children must not contribute names, content, counts, or parse diagnostics.
+					}
+				}
+				const authorizedFiles = new Set(authorizedMatches.map(match => match.path));
+				result = {
+					...result,
+					matches: authorizedMatches,
+					totalMatches: authorizedMatches.length,
+					filesWithMatches: authorizedFiles.size,
+					filesSearched: authorizedFiles.size,
+					parseErrors: undefined,
+				};
+			}
 
 			const normalizedParseErrors = (result.parseErrors ?? []).map(error => {
 				const parseError = error.match(/^.+: (.+: parse error \(syntax tree contains error nodes\))$/);

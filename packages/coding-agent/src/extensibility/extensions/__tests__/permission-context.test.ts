@@ -2,10 +2,11 @@ import { describe, expect, test, vi } from "bun:test";
 import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import { type } from "arktype";
+import { SessionPathScope } from "../../../internal/session-path-scope";
 import type { EffectiveSubagentPermissions } from "../../../task/permission-profiles";
 import { ExtensionRunner } from "../runner";
 import type { Extension, ExtensionRuntime } from "../types";
-import { ExtensionToolWrapper } from "../wrapper";
+import { EffectiveToolRegistry, ExtensionToolWrapper } from "../wrapper";
 
 const cwd = "/workspace/project";
 const paramsSchema = type({
@@ -64,7 +65,7 @@ function scope(overrides: Partial<EffectiveSubagentPermissions> = {}): Effective
 	};
 }
 
-function fakeTool(name: string, execute = vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] }))) {
+function fakeTool(name: string, execute: unknown = vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] }))) {
 	return {
 		name,
 		description: `${name} test tool`,
@@ -137,6 +138,98 @@ describe("extension permission context", () => {
 			wrapped.execute("call-2", { path: "blocked/secret.txt" }, undefined, undefined, autoApprovedContext),
 		).rejects.toThrow("BLOCKED: Subagent permission profile denied path");
 
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	test("execute preserves opaque Hub peer identifiers with an active path scope", async () => {
+		const permissionScope = scope({ tools: ["hub"] });
+		const pathScope = new SessionPathScope({
+			actorId: () => permissionScope.actorId,
+			sessionId: () => "session-1",
+			cwd: () => cwd,
+			permissionScope: () => permissionScope,
+		});
+		const execute = vi.fn(async (_toolCallId: string, _params: unknown) => ({
+			content: [{ type: "text", text: "ok" }],
+		}));
+		const tool = fakeTool("hub", execute);
+		const toolRegistry = new EffectiveToolRegistry();
+		toolRegistry.registerDescriptor({
+			name: "hub",
+			normalizedName: "hub",
+			source: "builtin",
+			origin: "builtin",
+			descriptorId: "permission-context-hub",
+			tool,
+		});
+		const subject = runner([], { permissionScope, pathScope });
+		(subject as unknown as { getToolExecutionAuthority: () => EffectiveToolRegistry }).getToolExecutionAuthority =
+			() => toolRegistry;
+		const wrapped = new ExtensionToolWrapper(tool, subject);
+
+		await wrapped.execute(
+			"call-hub-peer-ids",
+			{ op: "send", to: "SmokeWorker", from: "Main", message: "smoke" },
+			undefined,
+			undefined,
+			autoApprovedContext,
+		);
+
+		expect(execute.mock.calls[0]?.[1]).toEqual({
+			op: "send",
+			to: "SmokeWorker",
+			from: "Main",
+			message: "smoke",
+		});
+	});
+
+	test("records one structured denial after an extension rewrites the input", async () => {
+		const recorded = vi.fn();
+		const rewrite = vi.fn(async () => ({ input: { path: "blocked/revised.txt" } }));
+		const execute = vi.fn(async () => ({ content: [{ type: "text", text: "should not run" }] }));
+		const subject = runner([extension(new Map([["tool_call", [rewrite]]]) as Extension["handlers"])], {
+			permissionScope: scope({ tools: ["read"], allowPaths: ["allowed/**"] }),
+			recordPermissionDenial: recorded,
+		});
+		const wrapped = new ExtensionToolWrapper(fakeTool("read", execute), subject);
+
+		await expect(
+			wrapped.execute("call-rewrite", { path: "allowed/original.txt" }, undefined, undefined, autoApprovedContext),
+		).rejects.toThrow("does not allow path");
+
+		expect(recorded).toHaveBeenCalledTimes(1);
+		expect(recorded.mock.calls[0]?.[0]).toMatchObject({
+			kind: "subagent_permission_denial",
+			code: "path-not-allowed",
+			tool: "read",
+			matched: "subagent:path-allowlist",
+		});
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	test("records guardrail denials with the guardrail code", async () => {
+		const recorded = vi.fn();
+		const execute = vi.fn(async () => ({ content: [{ type: "text", text: "should not run" }] }));
+		const wrapped = new ExtensionToolWrapper(
+			fakeTool("read", execute),
+			runner([], {
+				permissionScope: scope({ tools: ["read"], guardrails: { noNetwork: true, secretsBlind: false } }),
+				recordPermissionDenial: recorded,
+			}),
+		);
+
+		await expect(
+			wrapped.execute(
+				"call-guardrail",
+				{ path: "https://example.test/data" },
+				undefined,
+				undefined,
+				autoApprovedContext,
+			),
+		).rejects.toThrow("no-network guardrail");
+
+		expect(recorded).toHaveBeenCalledTimes(1);
+		expect(recorded.mock.calls[0]?.[0]).toMatchObject({ code: "guardrail", tool: "read" });
 		expect(execute).not.toHaveBeenCalled();
 	});
 

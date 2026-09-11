@@ -84,6 +84,94 @@ describe("SessionManager.peekSessionInit", () => {
 		expect(peek?.init?.effectivePermissionProfiles).toEqual(["read-only", "no-network", "focused-edit"]);
 	});
 
+	it("bounds and freezes hostile persisted permission summaries", async () => {
+		const cwd = makeTempDir("@pi-peek-permission-summary-");
+		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file path");
+		const hostileSummary = {
+			mode: "enforce",
+			profiles: { items: Array.from({ length: 20 }, (_, index) => `profile-${index}`), omittedCount: 2 },
+			clauses: { items: [], omittedCount: 0 },
+			denyTools: { items: Array.from({ length: 40 }, (_, index) => `tool-${index}`), omittedCount: 0 },
+			denyPaths: { items: ["https://user:secret@example.test/root?token=hidden"], omittedCount: 0 },
+			guardrails: { noNetwork: true, secretsBlind: true },
+			intrinsicTools: { yield: true, reportToolIssue: false },
+			recentDenials: {
+				items: Array.from({ length: 70 }, (_, index) => ({
+					kind: "subagent_permission_denial",
+					code: "tool-deny",
+					tool: `tool-${index}`,
+					targets: { items: [], omittedCount: 0 },
+					matched: "subagent:tool-deny",
+					reason: "blocked",
+				})),
+				omittedCount: 4,
+			},
+		};
+		manager.appendSessionInit({
+			systemPrompt: "summary",
+			task: "task",
+			tools: ["read"],
+			permissionSummary: hostileSummary as never,
+		});
+		manager.appendMessage(assistantMessage("flush"));
+
+		const summary = (await SessionManager.peekSessionInit(sessionFile))?.init?.permissionSummary;
+		expect(summary?.profiles.items).toEqual(hostileSummary.profiles.items.slice(0, 16));
+		expect(summary?.profiles.omittedCount).toBe(6);
+		expect(summary?.denyTools.items).toHaveLength(32);
+		expect(summary?.denyTools.omittedCount).toBe(8);
+		expect(summary?.denyPaths.items).toEqual(["https://example.test/root"]);
+		expect(summary?.recentDenials.items).toHaveLength(64);
+		expect(summary?.recentDenials.omittedCount).toBe(10);
+		expect(Object.isFrozen(summary?.recentDenials.items[0]?.targets.items)).toBe(true);
+	});
+
+	it("restores the latest valid permission summary update after session init", async () => {
+		const cwd = makeTempDir("@pi-peek-permission-update-");
+		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file path");
+		const baseline = {
+			mode: "enforce",
+			profiles: { items: ["focused-edit"], omittedCount: 0 },
+			clauses: { items: [], omittedCount: 0 },
+			denyTools: { items: [], omittedCount: 0 },
+			denyPaths: { items: [], omittedCount: 0 },
+			guardrails: { noNetwork: false, secretsBlind: false },
+			intrinsicTools: { yield: true, reportToolIssue: false },
+			recentDenials: { items: [], omittedCount: 0 },
+		};
+		manager.appendSessionInit({
+			systemPrompt: "summary",
+			task: "task",
+			tools: ["read"],
+			permissionSummary: baseline as never,
+		});
+		manager.appendPermissionSummaryUpdate({
+			...baseline,
+			recentDenials: {
+				items: [
+					{
+						kind: "subagent_permission_denial",
+						code: "tool-deny",
+						tool: "write",
+						targets: { items: [], omittedCount: 0 },
+						matched: "subagent:tool-deny:write",
+						reason: "blocked",
+					},
+				],
+				omittedCount: 0,
+			},
+		} as never);
+		manager.appendMessage(assistantMessage("flush"));
+
+		const summary = (await SessionManager.peekSessionInit(sessionFile))?.init?.permissionSummary;
+		expect(summary?.recentDenials.items[0]?.code).toBe("tool-deny");
+		expect(Object.isFrozen(summary?.recentDenials.items)).toBe(true);
+	});
+
 	it("streams large file-backed sessions without a full read", async () => {
 		const cwd = makeTempDir("@pi-peek-stream-");
 		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));

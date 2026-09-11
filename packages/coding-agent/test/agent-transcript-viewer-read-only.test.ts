@@ -1,12 +1,18 @@
-import { afterEach, beforeAll, describe, expect, test, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "bun:test";
 import * as path from "node:path";
 import { createReadOnlyAgentTranscriptViewer, type ReadOnlyAgentTranscriptViewerDeps } from "@oh-my-pi/pi-coding-agent";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("createReadOnlyAgentTranscriptViewer", () => {
-	beforeAll(() => initTheme());
+	beforeAll(async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true, cwd: "/workspace" });
+		await initTheme();
+	});
+	afterAll(() => resetSettingsForTest());
 	afterEach(() => vi.useRealTimers());
 
 	test("opens the exact agent transcript without send capability", () => {
