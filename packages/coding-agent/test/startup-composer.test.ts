@@ -32,7 +32,12 @@ import { createTestSession } from "./utilities";
 class CountingTerminal extends VirtualTerminal {
 	starts = 0;
 	stops = 0;
-	override start(onInput: (data: string) => void, onResize: () => void): void {
+	override start(
+		onInput: (data: string) => void,
+		onResize: () => void,
+		_onDisconnect?: () => void,
+		_options?: { deferInput?: boolean },
+	): void {
 		this.starts += 1;
 		super.start(onInput, onResize);
 	}
@@ -44,7 +49,12 @@ class CountingTerminal extends VirtualTerminal {
 }
 
 class ThrowingStartTerminal extends CountingTerminal {
-	override start(): void {
+	override start(
+		_onInput: (data: string) => void,
+		_onResize: () => void,
+		_onDisconnect?: () => void,
+		_options?: { deferInput?: boolean },
+	): void {
 		this.starts += 1;
 		throw new Error("terminal start failed");
 	}
@@ -126,7 +136,7 @@ describe("outer startup collaboration gate", () => {
 		const abort = vi.spyOn(testSession.session, "abort").mockImplementation(async () => {
 			outcome.resolve("abort");
 		});
-		const ensureLive = vi.spyOn(AgentLifecycleManager.global(), "ensureLive").mockImplementation(async () => {
+		const ensureLive = vi.spyOn(AgentLifecycleManager.prototype, "ensureLive").mockImplementation(async () => {
 			outcome.resolve("agent");
 			return testSession.session;
 		});

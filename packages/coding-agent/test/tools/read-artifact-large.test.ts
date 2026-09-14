@@ -51,6 +51,7 @@ describe("read tool large artifact handling", () => {
 	let artifactDir: string;
 	let artifactManager: ArtifactManager;
 	let artifactId: string;
+	let artifactFilename: string;
 	let unregisterArtifactsDir: (() => void) | undefined;
 	let tool: ReadTool;
 
@@ -59,6 +60,9 @@ describe("read tool large artifact handling", () => {
 		artifactDir = path.join(testDir, "session");
 		artifactManager = new ArtifactManager(artifactDir);
 		artifactId = await artifactManager.save(largeArtifactText(), "mcp");
+		const artifactPath = await artifactManager.getPath(artifactId);
+		if (!artifactPath) throw new Error("expected the test artifact to be published");
+		artifactFilename = path.basename(artifactPath);
 		resetRegisteredArtifactDirsForTests();
 		unregisterArtifactsDir = registerArtifactsDir(artifactDir);
 		tool = new ReadTool(makeSession(testDir, artifactManager));
@@ -75,11 +79,11 @@ describe("read tool large artifact handling", () => {
 		const output = getTextOutput(result);
 
 		expect(output).toContain(`Unbounded raw read blocked for artifact://${artifactId}`);
-		expect(output).toContain(`artifact://${artifactId}:raw:1-3000`);
+		expect(output).toContain(`Use artifact://${artifactId}:raw:1-3000 for bounded verbatim chunks`);
 		// The notice must name the artifact file so it can be searched or copied.
 		// Only the directory prefix varies by host (a Windows temp dir sits under
 		// `%USERPROFILE%` and is displayed shortened), so match the path tail.
-		expect(output).toMatch(/session[/\\]0\.mcp\.log/);
+		expect(output).toContain(artifactFilename);
 		expect(output).not.toContain("line-001");
 	});
 
@@ -206,7 +210,7 @@ describe("read tool large artifact handling", () => {
 			// as `~`-relative (with `/` separators) and must NOT leak the absolute
 			// artifact path. Assert the exact displayed path rather than recomputing
 			// it with the production shortener.
-			expect(output).toContain("~/session/0.mcp.log");
+			expect(output).toContain(`~/session/${artifactFilename}`);
 			expect(output).not.toContain(artifactDir);
 		} finally {
 			homeSpy.mockRestore();

@@ -213,7 +213,7 @@ describe("collab guest running-subagents badge", () => {
 			};
 			hostSocket.connect();
 			await hostOpen.promise;
-			const ctx = makeGuestContext([]);
+			const ctx = makeGuestContext();
 			const guest = new CollabGuestLink(ctx);
 			try {
 				await guest.join(link);
@@ -223,6 +223,7 @@ describe("collab guest running-subagents badge", () => {
 					...(resolvedModelIsFallback === undefined ? {} : { resolvedModelIsFallback }),
 					requestedPermissionProfiles: ["no-network", "focused-edit"],
 					effectivePermissionProfiles: ["read-only", "no-network", "focused-edit"],
+					permissionSummary: undefined,
 				});
 			} finally {
 				hostSocket.close();
@@ -266,7 +267,7 @@ describe("collab guest running-subagents badge", () => {
 		};
 		hostSocket.connect();
 		await hostOpen.promise;
-		const guest = new CollabGuestLink(makeGuestContext([]));
+		const guest = new CollabGuestLink(makeGuestContext());
 		try {
 			await guest.join(link);
 			expect(guest.agentRegistry.get("remote-legacy")?.history).toBeUndefined();

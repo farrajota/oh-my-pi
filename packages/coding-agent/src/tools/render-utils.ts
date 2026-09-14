@@ -22,7 +22,8 @@ import { formatDimensionNote, type ResizedImage } from "../utils/image-resize";
 
 export { Ellipsis } from "@oh-my-pi/pi-natives";
 export { replaceTabs, truncateToWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui";
-export { DEFAULT_TERMINAL_PREVIEW_LINES, PREVIEW_LIMITS } from "./preview-limits";
+import { DEFAULT_TERMINAL_PREVIEW_LINES, PREVIEW_LIMITS } from "./preview-limits";
+export { DEFAULT_TERMINAL_PREVIEW_LINES, PREVIEW_LIMITS };
 
 /**
  * Normalize stray carriage returns in model-authored display text. Some models

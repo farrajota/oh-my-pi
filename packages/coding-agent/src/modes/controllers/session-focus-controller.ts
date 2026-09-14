@@ -68,6 +68,7 @@ export class SessionFocusController {
 		if (this.ctx.collabGuest) throw new Error("Viewing agents is unavailable in a collab session.");
 		if (id === MAIN_AGENT_ID) return this.unfocus();
 		const request = ++this.#focusRequestSeq;
+		const wasRegistered = lookupAgentRef(this.registry, id) !== undefined;
 		let session: AgentSession;
 		try {
 			session = await ensureAgentLive(this.lifecycle(), id);
@@ -77,7 +78,10 @@ export class SessionFocusController {
 		}
 		if (request !== this.#focusRequestSeq) return;
 		const ref = lookupAgentRef(this.registry, id);
-		if (!ref || ref.status === "parked" || ref.status === "aborted" || ref.session !== session) {
+		if (
+			(wasRegistered && !ref) ||
+			(ref && (ref.status === "parked" || ref.status === "aborted" || ref.session !== session))
+		) {
 			await this.unfocus();
 			return;
 		}
@@ -210,12 +214,12 @@ export class SessionFocusController {
 				if (event.type === "message_end" && event.message.role === "assistant") assistantStreamSynced = false;
 				await this.ctx.eventController.handleEvent(target, event);
 			});
+			this.ctx.statusLine.setSession(target, this.#focusedAgentId);
 
 			await target.settleInFlightMessagePersistence();
 			if (generation !== this.#attachGeneration) return false;
-			this.ctx.statusLine.setSession(target, this.#focusedAgentId);
 			// Reset run bookkeeping before replay populates pending tool handles.
-			if (target.isStreaming) await this.ctx.eventController.handleEvent(target, { type: "agent_start" });
+			if (target.isStreaming) await this.ctx.eventController.rehydrateActiveRun(target);
 			else setTerminalTitleState("idle");
 			if (generation !== this.#attachGeneration) return false;
 			await this.ctx.renderInitialMessages({ clearTerminalHistory: true });

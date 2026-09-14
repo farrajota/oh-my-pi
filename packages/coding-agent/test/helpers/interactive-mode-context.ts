@@ -102,7 +102,6 @@ export function createSessionStub(
 		messages: [],
 		model: undefined,
 		activeRunStartedAt: 0,
-		agent: { tokenizer: { countMessage: () => 0 } },
 		sessionFile: undefined,
 		skills: [],
 		ttsrManager: undefined,
@@ -113,6 +112,7 @@ export function createSessionStub(
 		hasBuiltInTool: () => true,
 		getLastAssistantMessage: () => undefined,
 		agent: {
+			tokenizer: { countMessage: () => 0 },
 			state: { streamMessage: null },
 			getPendingToolResults: () => [],
 			metadataForProvider: () => undefined,

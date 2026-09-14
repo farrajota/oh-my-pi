@@ -905,8 +905,9 @@ export async function postProcessToolResult(
 	result: AgentToolResult,
 	toolName: string,
 	context?: AgentToolContext,
+	operationId: string = toolName,
 ): Promise<AgentToolResult> {
-	const processed = await spillLargeResultToArtifact(result, toolName, context);
+	const processed = await spillLargeResultToArtifact(result, toolName, context, operationId);
 	const meta: OutputMeta | undefined = processed.details?.meta;
 	return meta ? { ...processed, content: appendOutputNotice(processed.content, meta) } : processed;
 }

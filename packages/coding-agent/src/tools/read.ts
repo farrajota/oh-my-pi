@@ -985,7 +985,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				}
 			}
 			appendRepeatReadHint(this.session, staged?.path ?? (context.args as ReadParams).path, result);
-			return await postProcessToolResult(result, this.name, this.session as unknown as AgentToolContext);
+			return await postProcessToolResult(result, this.name, this.session as unknown as AgentToolContext, context.toolCall.id);
 		} finally {
 			this.#speculativeReads.delete(context.toolCall.id);
 		}

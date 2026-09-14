@@ -15,8 +15,8 @@
  */
 import * as fs from "node:fs";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
-import { type Component, Editor, matchesKey, routeSgrMouseInput, ScrollView, type TUI } from "@oh-my-pi/pi-tui";
-import { formatDuration, formatNumber, logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { type Component, Editor, matchesKey, routeSgrMouseInput, ScrollView, truncateToWidth, type TUI } from "@oh-my-pi/pi-tui";
+import { formatDuration, formatNumber, logger } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import { ensureAgentLive } from "../../internal/agent-lifecycle-bridge";
@@ -32,6 +32,7 @@ import { ChatTranscriptBuilder } from "./chat-transcript-builder";
 import { DynamicBorder } from "./dynamic-border";
 import { sanitizeErrorLine } from "./error-block";
 import { formatContextUsage } from "./status-line/context-thresholds";
+import { sanitizeDisplayLine as sanitizeMetadata } from "./extensions/display-text";
 
 export interface AgentTranscriptViewerDeps {
 	agentId: string;

@@ -26,6 +26,7 @@ function makeSessionStub(
 	opts: { activeRunStartedAt?: number; isStreaming?: boolean; sessionFile?: string } = {},
 ): SessionStub {
 	let listener: ((event: AgentSessionEvent) => Promise<void> | void) | undefined;
+	let lastListener: ((event: AgentSessionEvent) => Promise<void> | void) | undefined;
 	let unsubscribeCalls = 0;
 	let queue: { steering: string[]; followUp: string[] } = { steering: [], followUp: [] };
 	const stub = {
@@ -35,6 +36,7 @@ function makeSessionStub(
 		agent: { state: { streamMessage: null } },
 		subscribe(fn: (event: AgentSessionEvent) => Promise<void> | void) {
 			listener = fn;
+			lastListener = fn;
 			return () => {
 				if (listener === fn) listener = undefined;
 				unsubscribeCalls++;
@@ -47,8 +49,8 @@ function makeSessionStub(
 	return {
 		session: stub as unknown as AgentSession,
 		emit: async event => {
-			if (!listener) throw new Error("no listener captured: subscribe() was never called");
-			await listener(event);
+			if (!lastListener) throw new Error("no listener captured: subscribe() was never called");
+			await lastListener(event);
 		},
 		unsubscribeCalls: () => unsubscribeCalls,
 		setStreaming: streaming => {
@@ -67,8 +69,9 @@ function makeSessionStub(
 }
 
 interface Harness {
-	controller: SessionFocusController;
+	ctx: InteractiveModeContext;
 	registry: AgentRegistry;
+	controller: SessionFocusController;
 	lifecycle: AgentLifecycleManager;
 	main: SessionStub;
 	handledEvents: Array<{ source: AgentSession; event: AgentSessionEvent }>;
@@ -156,6 +159,7 @@ function makeHarness(
 	const uiHelpers = new UiHelpers(ctx);
 	lifecycles.push(lifecycle);
 	return {
+		ctx,
 		controller,
 		registry,
 		lifecycle,
@@ -763,12 +767,12 @@ describe("SessionFocusController", () => {
 		await expect(h.controller.focusAgent("Worker")).rejects.toThrow("replay failed");
 		expect(h.controller.focusedAgentId).toBeUndefined();
 		expect(h.pendingMessagesContainer.render(80).join("\n")).toContain("main input after recovery");
-		const mainEvent = {
+		const mainEvent: AgentSessionEvent = {
 			type: "message_start",
 			message: { role: "user", content: "MAIN_AFTER_FAILURE", timestamp: 1 },
 		};
 		await h.main.emit(mainEvent);
-		expect(h.handledEvents).toContainEqual(mainEvent);
+		expect(h.handledEvents).toContainEqual({ source: h.main.session, event: mainEvent });
 		await h.controller.focusAgent("Worker");
 		expect(h.pendingMessagesContainer.render(80).join("\n")).toContain("worker input after retry");
 		expect(h.controller.target).toBe(worker.session);
@@ -818,12 +822,12 @@ describe("SessionFocusController", () => {
 		const failure = await h.controller.focusAgent("Worker").catch((error: unknown) => error);
 		if (!(failure instanceof AggregateError)) throw new Error("Expected both attachment errors");
 		expect(failure.errors).toEqual([workerFailure, mainFailure]);
-		const mainEvent = {
+		const mainEvent: AgentSessionEvent = {
 			type: "message_start",
 			message: { role: "user", content: "MAIN_AFTER_DOUBLE_FAILURE", timestamp: 1 },
 		};
 		await h.main.emit(mainEvent);
-		expect(h.handledEvents).toContainEqual(mainEvent);
+		expect(h.handledEvents).toContainEqual({ source: h.main.session, event: mainEvent });
 		expect(h.controller.focusedAgentId).toBeUndefined();
 	});
 
@@ -863,7 +867,6 @@ describe("pickRecentFocusableAgentId", () => {
 			displayName: id,
 			kind: "sub",
 			status: "running",
-			session: null,
 			sessionFile: `${id}.jsonl`,
 			createdAt: 1000,
 			lastActivity: 1000,

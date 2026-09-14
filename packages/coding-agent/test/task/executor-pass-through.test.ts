@@ -88,7 +88,7 @@ const baseAgent: AgentDefinition = {
 	source: "bundled",
 };
 const registry = new AgentRegistry();
-const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+const createAuthoritySession = (options: CreateAgentSessionOptions & { agentId: string }) =>
 	sdkModule.createAgentSession({ ...options, agentRegistry: registry });
 
 const baseOptions = {
@@ -529,7 +529,9 @@ describe("runSubprocess fresh child-session boundary", () => {
 			modelOverride: `${overrideModel.provider}/${overrideModel.id}`,
 			requestedModel,
 			exactModelOverride: true,
-			modelRegistry: createModelRegistry(overrideModel, metadataModel),
+			modelRegistry: createModelRegistry(overrideModel, async model =>
+				model.provider === overrideModel.provider && model.id === overrideModel.id ? "test-key" : undefined,
+			),
 		});
 
 		expect(result.exitCode).toBe(0);
