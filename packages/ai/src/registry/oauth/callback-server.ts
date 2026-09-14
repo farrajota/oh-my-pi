@@ -328,7 +328,7 @@ export abstract class OAuthCallbackFlow {
 					);
 				}
 			}
-			server?.stop();
+			await server?.stop(this.ctrl.signal?.aborted === true);
 		}
 	}
 
@@ -508,9 +508,9 @@ export abstract class OAuthCallbackFlow {
 				get port() {
 					return primary.port;
 				},
-				stop: (closeActiveConnections?: boolean) => {
-					void companion.stop(closeActiveConnections);
-					return primary.stop(closeActiveConnections);
+				stop: async (closeActiveConnections?: boolean) => {
+					await companion.stop(closeActiveConnections);
+					await primary.stop(closeActiveConnections);
 				},
 			};
 		}

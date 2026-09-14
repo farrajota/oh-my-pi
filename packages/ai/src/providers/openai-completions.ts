@@ -1519,13 +1519,15 @@ const streamOpenAICompletionsOnce = (
 };
 
 /**
- * Retries benign empty completions and transient provider failures only before
- * assistant output commits the attempt.
+ * Retries benign empty completions and transient pre-output stream failures.
+ * HTTP failures are already retried within `postOpenAIStream`, so replaying
+ * their finalized status here would exceed the configured request budget.
  */
 export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (model, context, options) =>
 	withReplaySafeStreamRetry(model, context, options, streamOpenAICompletionsOnce, {
 		retryEmptyCompletion: true,
 		retryProviderErrors: true,
+		retryProviderHttpErrors: false,
 		maxProviderErrorRetries: 1,
 	});
 
