@@ -249,11 +249,14 @@ export async function discoverCustomToolPaths(
 	};
 
 	// Discover tools via the capability system under the supplied session scope.
+	// Capability providers also expose metadata and scripts. Filter before deduplication
+	// so those entries cannot shadow executable modules with the same name.
 	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, {
 		cwd,
 		agentDir: options.agentDir,
 		disabledExtensions: options.disabledExtensions,
 		extensionRoots: options.extensionRoots,
+		filter: tool => /\.(ts|js|mjs|cjs)$/.test(tool.path) && !tool.path.endsWith(".d.ts"),
 	});
 	for (const tool of discoveredTools.items) {
 		addPath(tool.path, {

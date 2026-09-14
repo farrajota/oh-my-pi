@@ -13,6 +13,7 @@
 		"auth/baseten.kdl",
 		"auth/bedrock-mantle.kdl",
 		"auth/cerebras.kdl",
+		"auth/charm-hyper.kdl",
 		"auth/cline-pass.kdl",
 		"auth/cloudflare-ai-gateway.kdl",
 		"auth/commandcode.kdl",
@@ -114,6 +115,7 @@
 		"providers/baseten.kdl",
 		"providers/bedrock-mantle.kdl",
 		"providers/cerebras.kdl",
+		"providers/charm-hyper.kdl",
 		"providers/cline-pass.kdl",
 		"providers/cloudflare-ai-gateway.kdl",
 		"providers/commandcode.kdl",
@@ -3925,6 +3927,28 @@
 				}
 			},
 			{
+				"source": "classes/anthropic.kdl:181",
+				"class": "anthropic",
+				"providers": [
+					"anthropic"
+				],
+				"family": "fable",
+				"revision": [
+					{
+						"op": "=",
+						"revision": "5.1.0"
+					}
+				],
+				"catalog": {
+					"costPatch": {
+						"input": 10,
+						"output": 50,
+						"cacheRead": 0.25,
+						"cacheWrite": 12.5
+					}
+				}
+			},
+			{
 				"source": "classes/anthropic.kdl:165",
 				"class": "anthropic",
 				"providers": [
@@ -3945,7 +3969,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:177",
+				"source": "classes/anthropic.kdl:194",
 				"class": "anthropic",
 				"providers": [
 					"anthropic"
@@ -3965,7 +3989,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:195",
+				"source": "classes/anthropic.kdl:212",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -3988,7 +4012,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:200",
+				"source": "classes/anthropic.kdl:217",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4008,7 +4032,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:206",
+				"source": "classes/anthropic.kdl:223",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4037,7 +4061,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:220",
+				"source": "classes/anthropic.kdl:237",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4061,7 +4085,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:226",
+				"source": "classes/anthropic.kdl:243",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4081,7 +4105,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:235",
+				"source": "classes/anthropic.kdl:252",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4106,7 +4130,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:241",
+				"source": "classes/anthropic.kdl:258",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4125,7 +4149,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:246",
+				"source": "classes/anthropic.kdl:263",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4148,7 +4172,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:251",
+				"source": "classes/anthropic.kdl:268",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4168,7 +4192,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:257",
+				"source": "classes/anthropic.kdl:274",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4187,7 +4211,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:262",
+				"source": "classes/anthropic.kdl:279",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4207,7 +4231,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:270",
+				"source": "classes/anthropic.kdl:287",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4226,7 +4250,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:275",
+				"source": "classes/anthropic.kdl:292",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4246,7 +4270,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:283",
+				"source": "classes/anthropic.kdl:300",
 				"class": "anthropic",
 				"providers": [
 					"amazon-bedrock"
@@ -4266,7 +4290,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:293",
+				"source": "classes/anthropic.kdl:310",
 				"class": "anthropic",
 				"family": "haiku",
 				"revision": [
@@ -4280,7 +4304,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:299",
+				"source": "classes/anthropic.kdl:316",
 				"class": "anthropic",
 				"providers": [
 					"google-antigravity",
@@ -4292,7 +4316,7 @@
 				}
 			},
 			{
-				"source": "classes/anthropic.kdl:303",
+				"source": "classes/anthropic.kdl:320",
 				"class": "anthropic",
 				"providers": [
 					"google-antigravity"
@@ -4631,7 +4655,21 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:76",
+				"source": "classes/deepseek.kdl:84",
+				"class": "deepseek",
+				"models": [
+					{
+						"kind": "glob",
+						"value": "*v4.1-flash*"
+					}
+				],
+				"priority": 10,
+				"wire": {
+					"stripImageInput": false
+				}
+			},
+			{
+				"source": "classes/deepseek.kdl:87",
 				"class": "deepseek",
 				"providers": [
 					"ollama-cloud",
@@ -5988,9 +6026,10 @@
 				}
 			},
 			{
-				"source": "classes/minimax.kdl:32",
+				"source": "classes/minimax.kdl:34",
 				"class": "minimax",
 				"providers": [
+					"charm-hyper",
 					"minimax",
 					"minimax-cn",
 					"minimax-code",
@@ -6000,6 +6039,10 @@
 					{
 						"kind": "exact",
 						"value": "MiniMax-M3"
+					},
+					{
+						"kind": "exact",
+						"value": "minimax-m3"
 					}
 				],
 				"catalog": {
@@ -6010,7 +6053,7 @@
 				}
 			},
 			{
-				"source": "classes/minimax.kdl:39",
+				"source": "classes/minimax.kdl:41",
 				"class": "minimax",
 				"providers": [
 					"alibaba-coding-plan",
@@ -6023,7 +6066,7 @@
 				}
 			},
 			{
-				"source": "classes/minimax.kdl:44",
+				"source": "classes/minimax.kdl:46",
 				"class": "minimax",
 				"providers": [
 					"amazon-bedrock",
@@ -6040,7 +6083,7 @@
 				}
 			},
 			{
-				"source": "classes/minimax.kdl:48",
+				"source": "classes/minimax.kdl:50",
 				"class": "minimax",
 				"providers": [
 					"kilo",
@@ -6058,7 +6101,7 @@
 				}
 			},
 			{
-				"source": "classes/minimax.kdl:54",
+				"source": "classes/minimax.kdl:56",
 				"class": "minimax",
 				"providers": [
 					"minimax",
@@ -6075,7 +6118,7 @@
 				}
 			},
 			{
-				"source": "classes/minimax.kdl:62",
+				"source": "classes/minimax.kdl:64",
 				"class": "minimax",
 				"providers": [
 					"minimax",
@@ -6097,7 +6140,7 @@
 				}
 			},
 			{
-				"source": "classes/minimax.kdl:52",
+				"source": "classes/minimax.kdl:54",
 				"class": "minimax",
 				"providers": [
 					"minimax",
@@ -6109,7 +6152,7 @@
 				}
 			},
 			{
-				"source": "classes/minimax.kdl:72",
+				"source": "classes/minimax.kdl:74",
 				"class": "minimax",
 				"providers": [
 					"minimax-code",
@@ -6121,7 +6164,7 @@
 				}
 			},
 			{
-				"source": "classes/minimax.kdl:76",
+				"source": "classes/minimax.kdl:78",
 				"class": "minimax",
 				"providers": [
 					"minimax-code",
@@ -7585,6 +7628,55 @@
 					"supportsStrictMode": true,
 					"supportsUsageInStreaming": false,
 					"toolStrictMode": "all_strict"
+				},
+				"thinking": {
+					"mode": "effort"
+				}
+			},
+			{
+				"source": "providers/charm-hyper.kdl:72",
+				"providers": [
+					"charm-hyper"
+				],
+				"models": [
+					{
+						"kind": "exact",
+						"value": "glm-5.1"
+					}
+				],
+				"catalog": {
+					"limitsPatch": {
+						"maxTokens": 20275
+					}
+				}
+			},
+			{
+				"source": "providers/charm-hyper.kdl:77",
+				"providers": [
+					"charm-hyper"
+				],
+				"models": [
+					{
+						"kind": "exact",
+						"value": "minimax-m2.7"
+					}
+				],
+				"catalog": {
+					"limitsPatch": {
+						"maxTokens": 26214
+					}
+				}
+			},
+			{
+				"source": "providers/charm-hyper.kdl:9",
+				"providers": [
+					"charm-hyper"
+				],
+				"wire": {
+					"supportsDeveloperRole": false,
+					"supportsStore": false,
+					"maxTokensField": "max_tokens",
+					"reasoningContentField": "reasoning_content"
 				},
 				"thinking": {
 					"mode": "effort"
@@ -9761,11 +9853,15 @@
 				}
 			},
 			{
-				"source": "providers/deepseek.kdl:85",
+				"source": "providers/deepseek.kdl:89",
 				"providers": [
 					"deepseek"
 				],
 				"models": [
+					{
+						"kind": "exact",
+						"value": "deepseek-flash"
+					},
 					{
 						"kind": "exact",
 						"value": "deepseek-v4-flash"
@@ -9780,7 +9876,16 @@
 					"reasoningContentField": "reasoning_content",
 					"requiresAssistantContentForToolCalls": true,
 					"requiresReasoningContentForToolCalls": true,
+					"allowsSyntheticReasoningContentForToolCalls": false,
 					"supportsToolChoice": false
+				},
+				"thinking": {
+					"upgradeNeutral": true,
+					"efforts": [
+						"low",
+						"high",
+						"max"
+					]
 				}
 			},
 			{
@@ -13132,7 +13237,19 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:49",
+				"source": "providers/opencode-go.kdl:55",
+				"class": "meta",
+				"providers": [
+					"opencode-go"
+				],
+				"family": "muse-spark",
+				"wire": {
+					"includeEncryptedReasoning": false,
+					"filterReasoningHistory": true
+				}
+			},
+			{
+				"source": "providers/opencode-go.kdl:61",
 				"class": "mimo",
 				"providers": [
 					"opencode-go"
@@ -13143,7 +13260,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:48",
+				"source": "providers/opencode-go.kdl:60",
 				"class": "mimo",
 				"providers": [
 					"opencode-go"
@@ -13153,7 +13270,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:56",
+				"source": "providers/opencode-go.kdl:68",
 				"class": "qwen",
 				"providers": [
 					"opencode-go"
@@ -13179,7 +13296,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:60",
+				"source": "providers/opencode-go.kdl:72",
 				"class": "qwen",
 				"providers": [
 					"opencode-go"
@@ -13205,7 +13322,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:66",
+				"source": "providers/opencode-go.kdl:78",
 				"providers": [
 					"opencode-go"
 				],
@@ -13230,7 +13347,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:71",
+				"source": "providers/opencode-go.kdl:83",
 				"providers": [
 					"opencode-go"
 				],
@@ -13250,7 +13367,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:76",
+				"source": "providers/opencode-go.kdl:88",
 				"providers": [
 					"opencode-go"
 				],
@@ -13272,7 +13389,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:81",
+				"source": "providers/opencode-go.kdl:93",
 				"providers": [
 					"opencode-go"
 				],
@@ -13293,7 +13410,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:85",
+				"source": "providers/opencode-go.kdl:97",
 				"providers": [
 					"opencode-go"
 				],
@@ -13320,7 +13437,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:89",
+				"source": "providers/opencode-go.kdl:101",
 				"providers": [
 					"opencode-go"
 				],
@@ -13342,7 +13459,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:94",
+				"source": "providers/opencode-go.kdl:106",
 				"providers": [
 					"opencode-go"
 				],
@@ -13357,7 +13474,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-go.kdl:98",
+				"source": "providers/opencode-go.kdl:110",
 				"providers": [
 					"opencode-go"
 				],
@@ -13449,7 +13566,19 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:30",
+				"source": "providers/opencode-zen.kdl:36",
+				"class": "meta",
+				"providers": [
+					"opencode-zen"
+				],
+				"family": "muse-spark",
+				"wire": {
+					"includeEncryptedReasoning": false,
+					"filterReasoningHistory": true
+				}
+			},
+			{
+				"source": "providers/opencode-zen.kdl:42",
 				"class": "mimo",
 				"providers": [
 					"opencode-zen"
@@ -13460,7 +13589,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:35",
+				"source": "providers/opencode-zen.kdl:47",
 				"class": "minimax",
 				"providers": [
 					"opencode-zen"
@@ -13471,7 +13600,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:40",
+				"source": "providers/opencode-zen.kdl:52",
 				"class": "openai",
 				"providers": [
 					"opencode-zen"
@@ -13491,7 +13620,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:44",
+				"source": "providers/opencode-zen.kdl:56",
 				"class": "unknown",
 				"providers": [
 					"opencode-zen"
@@ -13501,7 +13630,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:48",
+				"source": "providers/opencode-zen.kdl:60",
 				"class": "xai",
 				"providers": [
 					"opencode-zen"
@@ -13512,7 +13641,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:53",
+				"source": "providers/opencode-zen.kdl:65",
 				"providers": [
 					"opencode-zen"
 				],
@@ -13534,7 +13663,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:58",
+				"source": "providers/opencode-zen.kdl:70",
 				"providers": [
 					"opencode-zen"
 				],
@@ -13552,7 +13681,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:62",
+				"source": "providers/opencode-zen.kdl:74",
 				"providers": [
 					"opencode-zen"
 				],
@@ -13609,7 +13738,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:67",
+				"source": "providers/opencode-zen.kdl:79",
 				"providers": [
 					"opencode-zen"
 				],
@@ -13630,7 +13759,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:71",
+				"source": "providers/opencode-zen.kdl:83",
 				"providers": [
 					"opencode-zen"
 				],
@@ -13654,7 +13783,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:75",
+				"source": "providers/opencode-zen.kdl:87",
 				"providers": [
 					"opencode-zen"
 				],
@@ -13672,7 +13801,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:79",
+				"source": "providers/opencode-zen.kdl:91",
 				"providers": [
 					"opencode-zen"
 				],
@@ -13695,7 +13824,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:84",
+				"source": "providers/opencode-zen.kdl:96",
 				"providers": [
 					"opencode-zen"
 				],
@@ -13719,7 +13848,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:89",
+				"source": "providers/opencode-zen.kdl:101",
 				"providers": [
 					"opencode-zen"
 				],
@@ -13739,7 +13868,7 @@
 				}
 			},
 			{
-				"source": "providers/opencode-zen.kdl:99",
+				"source": "providers/opencode-zen.kdl:111",
 				"providers": [
 					"opencode-zen"
 				],
@@ -13774,22 +13903,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:5",
-				"providers": [
-					"openrouter"
-				],
-				"models": [
-					{
-						"kind": "exact",
-						"value": "deepseek/deepseek-v4.1-flash"
-					}
-				],
-				"wire": {
-					"stripImageInput": false
-				}
-			},
-			{
-				"source": "providers/openrouter.kdl:14",
+				"source": "providers/openrouter.kdl:10",
 				"class": "anthropic",
 				"providers": [
 					"openrouter"
@@ -13799,7 +13913,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:21",
+				"source": "providers/openrouter.kdl:17",
 				"class": "minimax",
 				"providers": [
 					"openrouter"
@@ -13815,7 +13929,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:26",
+				"source": "providers/openrouter.kdl:22",
 				"class": "openai",
 				"providers": [
 					"openrouter"
@@ -13831,7 +13945,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:31",
+				"source": "providers/openrouter.kdl:27",
 				"class": "stepfun",
 				"providers": [
 					"openrouter"
@@ -13847,7 +13961,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:35",
+				"source": "providers/openrouter.kdl:31",
 				"class": "unknown",
 				"providers": [
 					"openrouter"
@@ -13862,7 +13976,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:39",
+				"source": "providers/openrouter.kdl:35",
 				"providers": [
 					"openrouter"
 				],
@@ -13889,7 +14003,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:44",
+				"source": "providers/openrouter.kdl:40",
 				"providers": [
 					"openrouter"
 				],
@@ -13910,7 +14024,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:48",
+				"source": "providers/openrouter.kdl:44",
 				"providers": [
 					"openrouter"
 				],
@@ -13928,7 +14042,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:52",
+				"source": "providers/openrouter.kdl:48",
 				"providers": [
 					"openrouter"
 				],
@@ -13953,7 +14067,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:57",
+				"source": "providers/openrouter.kdl:53",
 				"providers": [
 					"openrouter"
 				],
@@ -13968,7 +14082,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:61",
+				"source": "providers/openrouter.kdl:57",
 				"providers": [
 					"openrouter"
 				],
@@ -14036,7 +14150,7 @@
 				}
 			},
 			{
-				"source": "providers/openrouter.kdl:67",
+				"source": "providers/openrouter.kdl:63",
 				"providers": [
 					"openrouter"
 				],
@@ -16409,7 +16523,8 @@
 								"muse-spark-"
 							],
 							"exact": [
-								"muse-spark-1.3-contributor-free"
+								"muse-spark-1.3-contributor-free",
+								"gpt-6-astra"
 							]
 						}
 					},
@@ -18325,6 +18440,30 @@
 				}
 			},
 			{
+				"id": "charm-hyper",
+				"apiKeyFormat": "bearer",
+				"name": "Charm Hyper",
+				"env": {
+					"vars": [
+						"CHARM_HYPER_API_KEY",
+						"HYPER_API_KEY"
+					]
+				},
+				"login": {
+					"kind": "api-key",
+					"authUrl": "https://hyper.charm.land/",
+					"instructions": "Create or copy an API key from the Charm Hyper dashboard",
+					"prompt": "Paste your Charm Hyper API key",
+					"placeholder": "sk-hyper-...",
+					"normalize": "strip-bearer",
+					"validate": {
+						"kind": "models-endpoint",
+						"label": "Charm Hyper",
+						"url": "https://hyper.charm.land/v1/credits"
+					}
+				}
+			},
+			{
 				"id": "deepseek",
 				"apiKeyFormat": "bearer",
 				"name": "DeepSeek",
@@ -18996,7 +19135,10 @@
 				"name": "Amazon Bedrock",
 				"env": {
 					"hook": "aws-bedrock"
-				}
+				},
+				"nativeAuthApis": [
+					"bedrock-converse-stream"
+				]
 			},
 			{
 				"id": "azure",
@@ -19010,7 +19152,10 @@
 				"env": {
 					"hook": "aws-bedrock-mantle"
 				},
-				"allowsMissingApiKey": true
+				"allowsMissingApiKey": true,
+				"nativeAuthApis": [
+					"openai-responses"
+				]
 			},
 			{
 				"id": "google",

@@ -13,14 +13,17 @@ import type { ToolSession } from "../sdk";
 import { enforceInlineByteCap } from "../session/streaming-output";
 import { truncateForPrompt } from "./approval";
 import { resolveCmuxKind } from "./browser/cmux/rpc";
+import { resolveSpawnArgs } from "./browser/attach";
 import {
 	acquireBrowser,
+	browserKey,
 	type BrowserHandle,
 	type BrowserKind,
 	type BrowserKindTag,
 	holdBrowser,
 	releaseBrowser,
 } from "./browser/registry";
+import { ensureChromiumExecutable } from "./browser/launch";
 import { resolveRelayKind } from "./browser/relay/kind";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import {
@@ -88,6 +91,7 @@ const browserSchema = type({
 	"kill?": type("boolean").describe("also kill spawned-app browsers"),
 	"persist?": type("boolean").describe("keep tab live across turn settle and idle close"),
 });
+
 
 /** Create the enabled-only browser host prelude for one tool session. */
 export function createBrowserPrelude(session: ToolSession): EvalPreludeDefinition {
@@ -171,7 +175,7 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 	}
 	if (app?.path) {
 		const exe = resolveToCwd(app.path, session.cwd);
-		return { kind: "spawned", path: exe };
+		return { kind: "spawned", path: exe, args: resolveSpawnArgs(exe, app.args, session.cwd) };
 	}
 	const relayUrl = session.settings.get("browser.relayUrl") as string | undefined;
 	// Explicit app.relay wins over every setting; PI_BROWSER_RELAY stays the
@@ -590,7 +594,7 @@ function describeKind(kind: BrowserKind): string {
 function sameBrowserKind(a: BrowserKind, b: BrowserKind): boolean {
 	if (a.kind !== b.kind) return false;
 	if (a.kind === "headless" && b.kind === "headless") return a.headless === b.headless;
-	if (a.kind === "spawned" && b.kind === "spawned") return a.path === b.path;
+	if (a.kind === "spawned" && b.kind === "spawned") return a.path === b.path && JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? []);
 	if (a.kind === "connected" && b.kind === "connected") return a.cdpUrl === b.cdpUrl;
 	if (a.kind === "relay" && b.kind === "relay") return a.cdpUrl === b.cdpUrl;
 	if (a.kind === "cmux" && b.kind === "cmux") return a.socketPath === b.socketPath;

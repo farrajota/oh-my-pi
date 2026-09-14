@@ -11,6 +11,7 @@ import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { snapshotEffectiveExtensionRoots } from "../capability/types";
 import { resolveAgentModelSelection, resolveModelOverride } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
+import { type ServiceTierInheritSettingValue, validateAgentServiceTierOverrides } from "../config/service-tier";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
@@ -148,6 +149,8 @@ export interface EffectiveSubagentPolicy {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	/** Exact-name `task.agentServiceTierOverrides` entry for this agent, applied after model resolution. */
+	serviceTierOverride?: ServiceTierInheritSettingValue;
 	parentActiveModelPattern?: string;
 	schema: StructuredSubagentSchemaResolution;
 	planMode: boolean;
@@ -310,6 +313,12 @@ export async function resolveEffectiveSubagentPolicy(
 		}
 	}
 	const agentModelOverrides = settings.get("task.agentModelOverrides");
+	const agentServiceTierOverrides = validateAgentServiceTierOverrides(
+		settings.get("task.agentServiceTierOverrides"),
+	);
+	const serviceTierOverride = Object.hasOwn(agentServiceTierOverrides, agentName)
+		? agentServiceTierOverrides[agentName]
+		: undefined;
 	const parentActiveModelPattern = request.session.getActiveModelString?.();
 	const modelResolution = {
 		requestModel: request.model,
@@ -352,6 +361,7 @@ export async function resolveEffectiveSubagentPolicy(
 		effectiveAgent,
 		modelOverride,
 		modelRole,
+		serviceTierOverride,
 		parentActiveModelPattern,
 		schema,
 		planMode,
@@ -458,6 +468,7 @@ function buildExecutorOptions(
 		modelRole: policy.modelRole,
 		requestedModel,
 		exactModelOverride,
+		serviceTierOverride: policy.serviceTierOverride,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
