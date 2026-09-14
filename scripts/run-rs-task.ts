@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import * as os from "node:os";
 import * as path from "node:path";
 import { $ } from "bun";
 
@@ -149,16 +150,29 @@ function isOneOf<T extends string>(value: string, values: readonly T[]): value i
 }
 
 async function resolveCargoBinary(): Promise<string> {
-	// On macOS runners, Homebrew's `rustup-init` binary is on PATH before the
-	// rustup proxies in `$CARGO_HOME/bin`, and invoking it as `cargo` falls
-	// through to its installer mode ("unexpected argument 'nextest' found").
-	// Ask rustup directly for the cargo binary in the active toolchain.
-	const result = await $`rustup which cargo`.cwd(repoRoot).quiet().nothrow();
-	if (result.exitCode === 0) {
-		const resolved = result.stdout.toString().trim();
-		if (resolved !== "") return resolved;
+	const pathSep = path.delimiter;
+	const cargoHomes = [...new Set([Bun.env.CARGO_HOME, path.join(os.homedir(), ".cargo")].filter(Boolean))] as string[];
+	const conventionalBinDirs = [
+		...cargoHomes.map(cargoHome => path.join(cargoHome, "bin")),
+		path.join(repoRoot, ".cargo", "bin"),
+		...(process.platform === "win32" ? [] : ["/usr/local/cargo/bin"]),
+	];
+	const currentPath = process.env.PATH ?? process.env.Path ?? "";
+	const searchPath = [...new Set([...conventionalBinDirs, ...currentPath.split(pathSep).filter(Boolean)])].join(
+		pathSep,
+	);
+	const rustup = Bun.which("rustup", { cwd: repoRoot, PATH: searchPath });
+	if (rustup) {
+		const result = await $`${rustup} which cargo`.cwd(repoRoot).quiet().nothrow();
+		if (result.exitCode === 0) {
+			const resolved = result.stdout.toString().trim();
+			if (resolved !== "") return resolved;
+		}
 	}
-	return "cargo";
+
+	const cargo = Bun.which("cargo", { cwd: repoRoot, PATH: searchPath });
+	if (cargo) return cargo;
+	throw new Error(`Cargo executable not found on PATH or conventional locations: ${conventionalBinDirs.join(", ")}`);
 }
 
 async function runCommand(command: readonly string[]): Promise<number> {

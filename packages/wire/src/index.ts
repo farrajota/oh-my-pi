@@ -251,13 +251,7 @@ export interface PermissionTargetSummary {
 /** Bounded, display-only permission denial. It is never an authority input. */
 export interface PermissionDenialDetails {
 	readonly kind: "subagent_permission_denial";
-	readonly code:
-		| "tool-deny"
-		| "tool-not-allowed"
-		| "path-deny"
-		| "path-not-allowed"
-		| "guardrail"
-		| "artifact-root";
+	readonly code: "tool-deny" | "tool-not-allowed" | "path-deny" | "path-not-allowed" | "guardrail" | "artifact-root";
 	/** At most 128 UTF-8 bytes after sanitization. */
 	readonly tool: string;
 	/** At most 16 targets. */

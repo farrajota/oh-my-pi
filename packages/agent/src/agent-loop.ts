@@ -2627,25 +2627,6 @@ async function executeToolCalls(
 		stream.push({ type: "message_end", message: toolResultMessage });
 	};
 
-	const emitValidationError = (record: (typeof records)[number], validationError: unknown): void => {
-		emitToolResult(
-			record,
-			{
-				content: [
-					{
-						type: "text" as const,
-						text: validationError instanceof Error ? validationError.message : String(validationError),
-					},
-				],
-				details: {
-					isError: true,
-					error: validationError instanceof Error ? validationError.message : String(validationError),
-				},
-			},
-			true,
-		);
-	};
-
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
 		// A pending interrupt preempts not-yet-started *interruptible* waits so
 		// the message injects promptly instead of sitting out a `hub wait`.
