@@ -6,6 +6,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 			"pi",
 			"omp_version",
 			"docker_container",
+			"vim",
 			"model",
 			"mode",
 			"collab",
@@ -25,7 +26,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 	},
 
 	minimal: {
-		leftSegments: ["path", "git"],
+		leftSegments: ["vim", "path", "git"],
 		rightSegments: ["session_name", "mode", "context_pct"],
 		separator: "slash",
 		segmentOptions: {
@@ -35,7 +36,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 	},
 
 	compact: {
-		leftSegments: ["model", "mode", "git", "pr"],
+		leftSegments: ["vim", "model", "mode", "git", "pr"],
 		rightSegments: ["session_name", "cost", "context_pct"],
 		separator: "powerline-thin",
 		segmentOptions: {
@@ -45,7 +46,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 	},
 
 	full: {
-		leftSegments: ["pi", "hostname", "model", "mode", "path", "git", "pr", "subagents"],
+		leftSegments: ["pi", "vim", "hostname", "model", "mode", "path", "git", "pr", "subagents"],
 		rightSegments: [
 			"session_name",
 			"cache_hit",
@@ -69,7 +70,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 
 	nerd: {
 		// Full preset with all Nerd Font icons
-		leftSegments: ["pi", "hostname", "model", "mode", "path", "git", "pr", "session", "subagents"],
+		leftSegments: ["pi", "vim", "hostname", "model", "mode", "path", "git", "pr", "session", "subagents"],
 		rightSegments: [
 			"session_name",
 			"token_in",
@@ -94,7 +95,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 
 	ascii: {
 		// No Nerd Font dependencies
-		leftSegments: ["model", "mode", "path", "git", "pr"],
+		leftSegments: ["vim", "model", "mode", "path", "git", "pr"],
 		rightSegments: ["session_name", "token_total", "cost", "context_pct"],
 		separator: "ascii",
 		segmentOptions: {
@@ -106,7 +107,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 
 	custom: {
 		// User-defined - these are just defaults that get overridden
-		leftSegments: ["model", "mode", "path", "git", "pr"],
+		leftSegments: ["vim", "model", "mode", "path", "git", "pr"],
 		rightSegments: ["session_name", "token_total", "cost", "context_pct"],
 		separator: "powerline-thin",
 		segmentOptions: {},

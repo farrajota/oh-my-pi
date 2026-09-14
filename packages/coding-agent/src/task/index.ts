@@ -43,6 +43,7 @@ import { loadOverallPlanReference, type OverallPlanReference } from "../plan-mod
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
+import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { type: "text" };
 import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { canonicalBytes } from "../tools/browser-audit";
@@ -78,6 +79,7 @@ import {
 	makeIsolationCommitMessage,
 	mergeIsolatedChanges,
 	prepareIsolationContext,
+	renderIsolationSummary,
 	runIsolatedSubprocess,
 } from "./isolation-runner";
 import { generateTaskName } from "./name-generator";
@@ -727,6 +729,7 @@ interface PreparedSpawnReservation {
 	settings: Settings;
 	sharedContext?: string;
 	isIsolated: boolean;
+	applyChanges: boolean;
 	mergeMode: "patch" | "branch";
 	preferredIsolationBackend: IsoBackendKind | undefined;
 	isolationContext: IsolationContext | null;
@@ -1257,6 +1260,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					permissionSnapshot,
 					sharedContext: batchEnabled ? params.context?.trim() || undefined : undefined,
 					isIsolated: policy.isIsolated,
+					applyChanges: policy.applyChanges,
 					mergeMode: policy.mergeMode,
 					preferredIsolationBackend,
 					isolationContext,
@@ -1759,17 +1763,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const { manager, toolCallId, spawnParams, agentId, progress, ircEnabled, buildDetails, onUpdate, onSettled } =
 			options;
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
-			if (aborted) {
-				const ref = this.session.agentRegistry?.get(agentId);
-				const transcript = ref?.sessionFile ? `transcript at history://${agentId}` : "transcript unavailable";
-				if (ref?.status === "idle" || ref?.status === "parked") {
-					const followUp = ircEnabled ? "message it via `hub` to resume; " : "";
-					return `\n\n${agentId} was stopped but is still resumable — ${followUp}${transcript}`;
-				}
-				return `\n\n${agentId} was aborted — ${transcript}`;
-			}
-			const followUp = ircEnabled ? "message it via `hub` to follow up; " : "";
-			return `\n\n${agentId} is now idle — ${followUp}transcript at history://${agentId}`;
+			const isolated = spawnParams.isolated === true;
+			const ref = aborted ? this.session.agentRegistry?.get(agentId) : undefined;
+			return `\n\n${prompt.render(taskFollowUpTemplate, {
+				agentId,
+				aborted,
+				isolated,
+				ircEnabled,
+				resumable: !isolated && (ref?.status === "idle" || ref?.status === "parked"),
+				transcriptAvailable: aborted ? ref?.sessionFile !== undefined : true,
+			})}`;
 		};
 		return manager.register(
 			"task",
@@ -1873,8 +1876,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 					const singleResult = result.details?.results[0];
 					// A missing result means the sync path failed at the tool level
-					// (results: []) — treat it as a failure, not success.
-					const resultFailed = !singleResult || (singleResult.aborted ?? false) || singleResult.exitCode !== 0;
+					// (results: []) — treat it as a failure, not success. A runner
+					// error on a zero exit (changes captured but not landed, or a
+					// retained workspace) is a failure too: the work needs manual
+					// recovery, which a "completed" job would hide. Mirrors the sync
+					// path's status derivation.
+					const resultFailed =
+						!singleResult ||
+						(singleResult.aborted ?? false) ||
+						singleResult.exitCode !== 0 ||
+						singleResult.error !== undefined;
 					progress.status = singleResult?.aborted ? "aborted" : resultFailed ? "failed" : "completed";
 					progress.durationMs = singleResult?.durationMs ?? Math.max(0, Date.now() - startedAt);
 					progress.tokens = singleResult?.tokens ?? 0;
@@ -2169,6 +2180,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const sharedContext = preparedReservation.sharedContext;
 		const assignment = (params.task ?? "").trim();
 		const isIsolated = preparedReservation.isIsolated;
+		const applyChanges = preparedReservation.applyChanges;
 		const mergeMode = preparedReservation.mergeMode;
 		const preferredIsolationBackend = preparedReservation.preferredIsolationBackend;
 		const isolationContext = preparedReservation.isolationContext;
@@ -2376,28 +2388,42 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			let mergeSummary = "";
 			let changesApplied: boolean | null = null;
 			let mergedBranchForNestedPatches = false;
-			if (isIsolated && repoRoot) {
+			if (isIsolated && repoRoot && applyChanges && result.exitCode === 0 && !result.error && !result.aborted) {
 				const outcome = await mergeIsolatedChanges({ result, repoRoot, mergeMode });
 				mergeSummary = outcome.summary;
 				changesApplied = outcome.changesApplied;
 				mergedBranchForNestedPatches = outcome.mergedBranchForNestedPatches;
-			}
-
-			// Apply nested repo patches (separate from parent git).
-			if (isIsolated && repoRoot) {
-				mergeSummary += await applyEligibleNestedPatches({
-					result,
-					repoRoot,
-					mergeMode,
-					changesApplied,
-					mergedBranchForNestedPatches,
-					commitMessage: buildCommitMessageFn(),
+				if (outcome.changesApplied !== false) {
+					mergeSummary += await applyEligibleNestedPatches({
+						result,
+						repoRoot,
+						mergeMode,
+						changesApplied,
+						mergedBranchForNestedPatches,
+						commitMessage: buildCommitMessageFn(),
+					});
+				}
+			} else if (isIsolated && repoRoot && result.error) {
+				mergeSummary = renderIsolationSummary({
+					kind: "capture-error",
+					error: result.error,
+					branchName: result.branchName,
+					rootPatchPath: result.hasRootChanges === false ? undefined : result.patchPath,
+					nestedPatchPaths: result.nestedPatchPaths ?? [],
+				});
+			} else if (isIsolated && repoRoot && !applyChanges) {
+				mergeSummary = renderIsolationSummary({
+					kind: "captured",
+					branchName: result.branchName,
+					rootPatchPath: result.hasRootChanges === false ? undefined : result.patchPath,
+					nestedCount: result.nestedPatchPaths?.length ?? result.nestedPatches?.length ?? 0,
+					nestedPatchPaths: result.nestedPatchPaths ?? [],
 				});
 			}
 
 			// Cleanup temp directory if used
 			const shouldCleanupTempArtifacts =
-				tempArtifactsDir && (!isIsolated || changesApplied === true || changesApplied === null);
+				tempArtifactsDir && (!isIsolated || (applyChanges && (changesApplied === true || changesApplied === null)));
 			if (tempArtifactsDir && onArtifactsRetained) {
 				const retainedArtifactsDir = tempArtifactsDir;
 				onArtifactsRetained(() => fs.rm(retainedArtifactsDir, { recursive: true, force: true }));

@@ -144,6 +144,7 @@ export class SessionFocusController {
 		// own todos rather than overwriting them with the main session's list.
 		await this.ctx.reloadTodos(target);
 		if (generation !== this.#focusGeneration) return;
+		this.ctx.updatePendingMessagesDisplay();
 		if (target.isStreaming) {
 			await this.ctx.eventController.rehydrateActiveRun(target);
 			if (generation !== this.#focusGeneration) return;

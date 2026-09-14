@@ -267,7 +267,8 @@ export type StatusLineSegmentId =
 	| "cache_hit"
 	| "session_name"
 	| "usage"
-	| "collab";
+	| "collab"
+	| "vim";
 
 /** Submenu choice metadata. */
 export type SubmenuOption<V extends string = string> = {
@@ -2072,6 +2073,36 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tui.vimMode": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			group: "Input",
+			label: "Vim Editing Mode",
+			description:
+				"Modal prompt editing. Escape leaves Insert mode; Normal mode has hjkl, 0, $, ^, w, b, e, gg, G, counts, x/D/C, dd/yy, p and u; operators take motions or text objects (diw, ca(, dap); v/V start a Visual selection that y copies and d deletes",
+		},
+	},
+
+	"tui.vimModeDisplay": {
+		type: "enum",
+		values: ["text", "icon", "none"] as const,
+		default: "text",
+		ui: {
+			tab: "interaction",
+			group: "Input",
+			label: "Vim Mode Indicator",
+			description: "How the current Vim mode appears in the status line",
+			condition: "vimModeEnabled",
+			options: [
+				{ value: "text", label: "Text", description: "Full mode name — NORMAL, INSERT, VISUAL, V-LINE" },
+				{ value: "icon", label: "Icon", description: "Single compact glyph per mode" },
+				{ value: "none", label: "Hidden", description: "Do not show the mode in the status line" },
+			],
+		},
+	},
+
 	"loop.mode": {
 		type: "enum",
 		values: ["prompt", "compact", "reset"] as const,
@@ -2097,7 +2128,37 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"loop.conditionTimeoutMs": {
+		type: "number",
+		default: 30_000,
+		ui: {
+			tab: "interaction",
+			group: "Input",
+			label: "Loop Condition Timeout (ms)",
+			description:
+				"Max wait for a `/loop --while` / `--until` condition command before treating it as broken and stopping the loop. Set to 0 to wait indefinitely",
+			options: [
+				{ value: "0", label: "Unlimited" },
+				{ value: "10000", label: "10 seconds" },
+				{ value: "30000", label: "30 seconds" },
+				{ value: "120000", label: "2 minutes" },
+			],
+		},
+	},
+
 	// Input and startup
+	"composer.recallClearedDrafts": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			group: "Input",
+			label: "Recall Cleared Drafts",
+			description:
+				"Keep drafts cleared with Ctrl+C in local Up/Down history until exit; disabling affects future clears",
+		},
+	},
+
 	doubleEscapeAction: {
 		type: "enum",
 		values: ["rewind", "tree", "none"] as const,
@@ -2632,6 +2693,17 @@ export const SETTINGS_SCHEMA = {
 			group: "Compaction",
 			label: "Auto-Compact",
 			description: "Automatically compact context when it gets too large",
+		},
+	},
+	"compaction.experimentalContextManagement": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "context",
+			group: "Compaction",
+			label: "Notes-backed context windows (experimental)",
+			description:
+				"Keep persistent notes and searchable raw history across context windows. Restart to update available tools.",
 		},
 	},
 
@@ -4927,6 +4999,31 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"plan.autosave": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Modes",
+			label: "Autosave Plans",
+			description: "Automatically save approved plans to disk when plan mode completes",
+			condition: "planModeEnabled",
+		},
+	},
+
+	"plan.autosaveDir": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tasks",
+			group: "Modes",
+			label: "Autosave Directory",
+			description:
+				"Directory for autosaved plans. Supports ~, absolute, and cwd-relative paths. Empty uses <project>/.omp/plans/.",
+			condition: "planAutosaveEnabled",
+		},
+	},
+
 	"goal.enabled": {
 		type: "boolean",
 		default: true,
@@ -5908,7 +6005,7 @@ export const SETTINGS_SCHEMA = {
 					value: "auto",
 					label: "Auto",
 					description:
-						"Provider default — Anthropic uses 5m entries kept warm by idle keep-alive refreshes; PI_CACHE_RETENTION still applies",
+						"Provider default — Anthropic OAuth subscriber sessions default to 1h, API keys use 5m kept warm by idle keep-alive refreshes; PI_CACHE_RETENTION still applies",
 				},
 				{
 					value: "short",
@@ -6354,6 +6451,7 @@ export type Personality = SettingValue<"personality">;
 
 export interface CompactionSettings {
 	enabled: boolean;
+	experimentalContextManagement?: boolean;
 	methodOrder: CompactionMethod[];
 	thresholdPercent: number;
 	thresholdTokens: number;

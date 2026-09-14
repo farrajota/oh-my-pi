@@ -16,11 +16,14 @@ import * as fs from "node:fs/promises";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import type { AgentDefinition, AgentProgress, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { snapshotJobs } from "@oh-my-pi/pi-coding-agent/tools/hub/jobs";
@@ -32,15 +35,38 @@ const taskAgent: AgentDefinition = {
 	source: "bundled",
 };
 
-function createSession(options: {
+const authoritySessions: AgentSession[] = [];
+
+async function createSession(options: {
 	manager?: AsyncJobManager;
 	settings?: Record<string, unknown>;
 	overrides?: Partial<ToolSession>;
-}): ToolSession {
+}): Promise<ToolSession> {
+	const settings = Settings.isolated(options.settings ?? {});
+	const registry = new AgentRegistry();
+	const root = await createAgentRootSession(registry, {
+		agentId: "Main",
+		agentDisplayName: "Main",
+		cwd: "/tmp",
+		agentDir: "/tmp",
+		settings,
+		disableExtensionDiscovery: true,
+		enableMCP: false,
+		enableLsp: false,
+		toolNames: [],
+		skipPythonPreflight: true,
+	});
+	const authority = bindInternalAgentAuthoritySession(registry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	authoritySessions.push(root.session);
+	const createAuthoritySession: NonNullable<ToolSession["createAuthoritySession"]> = (createOptions, reviveRef) =>
+		authority.create(createOptions, reviveRef);
 	return {
 		cwd: "/tmp",
 		hasUI: false,
-		settings: Settings.isolated(options.settings ?? {}),
+		settings,
+		agentRegistry: registry,
+		createAuthoritySession,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		asyncJobManager: options.manager,
@@ -106,15 +132,16 @@ describe("task spawn routing", () => {
 
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const session of authoritySessions.splice(0)) await session.dispose();
 		for (const manager of managers.splice(0)) {
 			await manager.dispose({ timeoutMs: 1000 });
 		}
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 	});
 
@@ -131,7 +158,7 @@ describe("task spawn routing", () => {
 
 		const manager = createManager();
 		const tool = await TaskTool.create(
-			createSession({ manager, settings: { "task.agentModelOverrides": { task: "openai/gpt-4.1-mini" } } }),
+			await createSession({ manager, settings: { "task.agentModelOverrides": { task: "openai/gpt-4.1-mini" } } }),
 		);
 
 		const result = await tool.execute("tc-spawn", {
@@ -177,7 +204,7 @@ describe("task spawn routing", () => {
 			configuredLevel: "project" as const,
 		};
 		const tool = await TaskTool.create(
-			createSession({
+			await createSession({
 				settings: { "async.enabled": false },
 				overrides: {
 					additionalDirectories: ["/task/shared-worktree"],
@@ -202,6 +229,76 @@ describe("task spawn routing", () => {
 		extensionRoots.explicit.push("/late/task-extension");
 		expect(captured?.extensionRoots?.explicit).toEqual(["/task/explicit"]);
 	});
+	for (const { label, runnerOverrides, expectRetained } of [
+		{
+			label: "tells the parent an isolated agent cannot be messaged instead of calling it idle",
+			runnerOverrides: {},
+			expectRetained: false,
+		},
+		{
+			// The runner keeps the workspace when captured changes could not be
+			// written; the follow-up hint must not contradict that recovery path,
+			// and a run that needs manual recovery must not be reported as a
+			// completed job.
+			label: "does not claim the worktree is gone when the runner retained it",
+			runnerOverrides: {
+				patchPath: undefined,
+				error: "Patch capture failed: EACCES. Isolation workspace retained at /wt/sandboxed/m — recover the changes from it; `omp worktree clear` reclaims it once this session has exited.",
+			},
+			expectRetained: true,
+		},
+	]) {
+		it(label, async () => {
+			vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+				agents: [{ ...taskAgent, model: ["anthropic/claude-sonnet-4"] }],
+				projectAgentsDir: null,
+			});
+			const repoRoot = process.cwd();
+			vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
+				repoRoot,
+				baseline: {
+					root: { repoRoot, headCommit: "HEAD", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
+					nested: [],
+				},
+			});
+			vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts => ({
+				...makeResult(opts.agentId),
+				isolated: true,
+				patchPath: `${opts.artifactsDir}/${opts.agentId}.patch`,
+				...runnerOverrides,
+			}));
+
+			const manager = createManager();
+			const tool = await TaskTool.create(
+				await createSession({
+					manager,
+					settings: { "task.isolation.enabled": true, "task.isolation.apply": false },
+				}),
+			);
+
+			const result = await tool.execute("tc-isolated", {
+				agent: "task",
+				name: "Sandboxed",
+				task: "Do the thing.",
+				isolated: true,
+			} as TaskParams);
+			const job = manager.getJob(result.details?.async?.jobId ?? "");
+			await job!.promise;
+
+			const delivered = `${job!.resultText ?? ""}${job!.errorText ?? ""}`;
+			expect(delivered).toContain("Sandboxed ran isolated and cannot be resumed or messaged");
+			expect(delivered).toContain("history://Sandboxed");
+			expect(delivered).not.toContain("is now idle");
+			expect(delivered).not.toContain("message it via");
+			expect(delivered).not.toContain("removed");
+			if (expectRetained) {
+				expect(job!.status).toBe("failed");
+				expect(delivered).toContain("Isolation workspace retained at /wt/sandboxed/m");
+			} else {
+				expect(job!.status).toBe("completed");
+			}
+		});
+	}
 
 	for (const { label, liveAdvisor, settledAdvisor, expectedAdvisor } of [
 		{
@@ -262,7 +359,7 @@ describe("task spawn routing", () => {
 			});
 
 			const manager = createManager();
-			const session = createSession({ manager });
+			const session = await createSession({ manager });
 			const tool = await TaskTool.create(session);
 			const result = await tool.execute("tc-advisor", {
 				agent: "task",
@@ -326,7 +423,7 @@ describe("task spawn routing", () => {
 			return makeResult(options.id ?? "?");
 		});
 		const manager = createManager();
-		const session = createSession({ manager });
+		const session = await createSession({ manager });
 		const tool = await TaskTool.create(session);
 		const result = await tool.execute("tc-metadata", { agent: "task", name: "Metadata", task: "work" } as TaskParams);
 		const job = manager.getJob(result.details!.async!.jobId)!;
@@ -401,7 +498,7 @@ describe("task spawn routing", () => {
 				});
 			});
 			const manager = createManager();
-			const tool = await TaskTool.create(createSession({ manager }));
+			const tool = await TaskTool.create(await createSession({ manager }));
 			const result = await tool.execute("tc-fallback", {
 				agent: "task",
 				name: "Fallback",
@@ -438,7 +535,7 @@ describe("task spawn routing", () => {
 		});
 
 		const manager = createManager();
-		const tool = await TaskTool.create(createSession({ manager }));
+		const tool = await TaskTool.create(await createSession({ manager }));
 
 		const result = await tool.execute("tc-retain", {
 			agent: "task",
@@ -493,7 +590,7 @@ describe("task spawn routing", () => {
 			retainedArtifactsCleanupGraceMs: 0,
 		});
 		managers.push(manager);
-		const tool = await TaskTool.create(createSession({ manager }));
+		const tool = await TaskTool.create(await createSession({ manager }));
 
 		const result = await tool.execute("tc-evict", {
 			agent: "task",
@@ -545,7 +642,7 @@ describe("task spawn routing", () => {
 			{ id: "Foo" },
 		);
 
-		const tool = await TaskTool.create(createSession({ manager }));
+		const tool = await TaskTool.create(await createSession({ manager }));
 		const result = await tool.execute("tc-collide", {
 			agent: "task",
 			name: "Foo",
@@ -583,7 +680,7 @@ describe("task spawn routing", () => {
 		});
 
 		const manager = createManager();
-		const tool = await TaskTool.create(createSession({ manager, settings: { "task.maxConcurrency": 1 } }));
+		const tool = await TaskTool.create(await createSession({ manager, settings: { "task.maxConcurrency": 1 } }));
 
 		const first = await tool.execute("tc-1", { agent: "task", name: "First", task: "Work A." } as TaskParams);
 		const second = await tool.execute("tc-2", { agent: "task", name: "Second", task: "Work B." } as TaskParams);
@@ -625,7 +722,7 @@ describe("task spawn routing", () => {
 		});
 
 		const manager = createManager();
-		const tool = await TaskTool.create(createSession({ manager, settings: { "task.maxConcurrency": 1 } }));
+		const tool = await TaskTool.create(await createSession({ manager, settings: { "task.maxConcurrency": 1 } }));
 
 		const first = await tool.execute("tc-1", { agent: "task", name: "First", task: "Work A." } as TaskParams);
 		const second = await tool.execute("tc-2", { agent: "task", name: "Second", task: "Work B." } as TaskParams);
@@ -668,7 +765,7 @@ describe("task spawn routing", () => {
 		});
 
 		const manager = createManager();
-		const tool = await TaskTool.create(createSession({ manager, settings: { "task.maxConcurrency": 1 } }));
+		const tool = await TaskTool.create(await createSession({ manager, settings: { "task.maxConcurrency": 1 } }));
 
 		// A holds the only permit, gated inside the executor.
 		const first = await tool.execute("tc-1", { agent: "task", name: "First", task: "Work A." } as TaskParams);
@@ -737,7 +834,7 @@ describe("task spawn routing", () => {
 
 			const manager = createManager();
 			const tool = await TaskTool.create(
-				createSession({ manager, settings: { "task.maxConcurrency": maxConcurrency } }),
+				await createSession({ manager, settings: { "task.maxConcurrency": maxConcurrency } }),
 			);
 
 			const first = await tool.execute("tc-1", { agent: "task", name: "First", task: "Work A." } as TaskParams);
@@ -775,14 +872,7 @@ describe("task spawn routing", () => {
 
 		const manager = createManager();
 		const settings = Settings.isolated({ "task.maxConcurrency": 4 });
-		const tool = await TaskTool.create({
-			cwd: "/tmp",
-			hasUI: false,
-			settings,
-			getSessionFile: () => null,
-			getSessionSpawns: () => "*",
-			asyncJobManager: manager,
-		} as unknown as ToolSession);
+		const tool = await TaskTool.create(await createSession({ manager, overrides: { settings } }));
 
 		// Prime the semaphore at the initial high cap.
 		const first = await tool.execute("tc-1", { agent: "task", name: "First", task: "Work A." } as TaskParams);
@@ -826,14 +916,7 @@ describe("task spawn routing", () => {
 
 		const manager = createManager();
 		const settings = Settings.isolated({ "task.maxConcurrency": 4 });
-		const tool = await TaskTool.create({
-			cwd: "/tmp",
-			hasUI: false,
-			settings,
-			getSessionFile: () => null,
-			getSessionSpawns: () => "*",
-			asyncJobManager: manager,
-		} as unknown as ToolSession);
+		const tool = await TaskTool.create(await createSession({ manager, overrides: { settings } }));
 
 		const jobs: AsyncJob[] = [];
 		for (const id of ["First", "Second", "Third", "Fourth", "Fifth"]) {

@@ -1,12 +1,16 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { checkPythonSetup } from "../src/cli/setup-cli";
+import { Settings } from "../src/config/settings";
+import { restoreEnvValue } from "./helpers/settings-test-state";
 
 const cliEntry = path.join(import.meta.dir, "..", "src", "cli.ts");
 
 const concurrentColdStartTimeoutMs = 15_000;
+// Activated venv/conda environments legitimately outrank the project `.venv`.
+const ACTIVE_PYTHON_ENV_VARS = ["VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV"] as const;
 
 interface CliProcessResult {
 	exitCode: number;
@@ -53,10 +57,32 @@ async function runSetup(cwd: string, ...setupArgs: string[]): Promise<CliProcess
 	return { exitCode, output: stdout, error: stderr };
 }
 
+/**
+ * Hide any activated Python environment from the in-process probe for the
+ * duration of a test. The resolver reads the live env (`resolveVenvPath`) and
+ * the process-wide cached shell env (`Settings#getShellConfig().env`), so both
+ * are covered. Returns the restore function; the spy is undone by
+ * `vi.restoreAllMocks()` in `afterEach`.
+ */
+function hideActivePythonEnv(): () => void {
+	const previous = new Map<string, string | undefined>(ACTIVE_PYTHON_ENV_VARS.map(name => [name, process.env[name]]));
+	for (const name of ACTIVE_PYTHON_ENV_VARS) delete process.env[name];
+	vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+		shell: "/bin/sh",
+		args: ["-c"],
+		env: { PATH: Bun.env.PATH ?? "", HOME: Bun.env.HOME ?? "" },
+		prefix: undefined,
+	});
+	return () => {
+		for (const [name, value] of previous) restoreEnvValue(name, value);
+	};
+}
+
 describe("omp setup python", () => {
 	let projectDir: TempDir | undefined;
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		await projectDir?.remove();
 		projectDir = undefined;
 	});
@@ -90,13 +116,18 @@ describe("omp setup python", () => {
 		await Bun.write(interpreter, "#!/bin/sh\nexit 0\n");
 		await fs.chmod(interpreter, 0o755);
 
-		const result = await checkPythonSetup(cwd);
+		const restoreEnv = hideActivePythonEnv();
+		try {
+			const result = await checkPythonSetup(cwd);
 
-		expect(result).toMatchObject({
-			available: true,
-			pythonPath: interpreter,
-			usingManagedEnv: false,
-		});
+			expect(result).toMatchObject({
+				available: true,
+				pythonPath: interpreter,
+				usingManagedEnv: false,
+			});
+		} finally {
+			restoreEnv();
+		}
 	});
 	it.skipIf(process.platform === "win32")("does not let the global probe bypass skip setup validation", async () => {
 		projectDir = TempDir.createSync("@omp-setup-python-");

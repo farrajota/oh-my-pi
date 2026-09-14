@@ -66,6 +66,7 @@ function createMockSession(
 		extensionRunner: undefined,
 		sessionManager: {
 			appendSessionInit: () => {},
+			getArtifactManager: () => undefined,
 		},
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],

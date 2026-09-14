@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { AgentRegistry } from "../../src/registry/agent-registry";
 import { AsyncJobManager } from "../../src/async/job-manager";
 import type { ToolSession } from "../../src/tools";
 import { VibeWaitTool } from "../../src/tools/vibe";
@@ -47,6 +48,7 @@ beforeEach(() => {
 		getSessionId: () => "test-parent-session",
 		getSessionFile: () => null,
 		asyncJobManager: manager,
+		agentRegistry: new AgentRegistry(),
 	} as unknown as ToolSession;
 });
 

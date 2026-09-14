@@ -107,6 +107,8 @@ export interface AgentHistorySummary {
 	patchPath?: string;
 	/** Isolated branch identity, when branch-mode capture succeeded. */
 	branchName?: string;
+	/** Captured nested-repo patches (`<id>.nested-<n>-<path>.patch`), one per nested repository the agent changed. */
+	nestedPatchPaths?: string[];
 }
 function cloneAndFreezeAuthorityInput<T>(value: T, active = new WeakSet<object>()): T {
 	if (value === null || typeof value !== "object") return value;

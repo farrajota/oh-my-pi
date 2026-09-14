@@ -11,6 +11,8 @@ export function createSessionDefaults() {
 		abort: async () => {},
 		dispose: async () => {},
 		setIrcWakeTurnObserver: () => {},
+		setWorkPoolYieldItems: async () => {},
+		getPermissionSummary: () => undefined,
 		isAdvisorActive: () => false,
 		subscribeRunState: () => () => {},
 	} satisfies Partial<AgentSession>;

@@ -107,8 +107,6 @@ async function createRef(sessionFile: string, options: FixtureOptions = {}): Pro
 		const { session } = await authorityBinding.create({
 			cwd: peek.cwd,
 			agentDir: subagentSettings.getAgentDir(),
-			authStorage: {} as never,
-			modelRegistry: { authStorage: {} } as ModelRegistry,
 			...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
 			modelPatternAuthFallback: init.resolvedModel,
 			sessionManager: reopened,
@@ -202,6 +200,11 @@ function createRevivedSession(
 	};
 }
 
+function fakeAuthAndRegistry(): { authStorage: never; modelRegistry: ModelRegistry } {
+	const authStorage = {} as never;
+	return { authStorage, modelRegistry: { authStorage } as unknown as ModelRegistry };
+}
+
 async function createPersistedSession(
 	cwd: string,
 	restrictToolNames?: boolean,
@@ -212,6 +215,7 @@ async function createPersistedSession(
 		readOnly?: boolean;
 		agent?: string;
 		enableMCP?: boolean;
+		isolated?: boolean;
 		permissionProfile?: string;
 		omitPermissionProvenance?: boolean;
 		omitPermissionSnapshot?: boolean;
@@ -264,6 +268,7 @@ async function createPersistedSession(
 		readOnly: contract?.readOnly,
 		agent: contract?.agent,
 		enableMCP: contract?.enableMCP,
+		isolated: contract?.isolated,
 		...persistedPermissions,
 	});
 	manager.appendMessage({
@@ -297,8 +302,7 @@ function createFactory(cwd: string, subagentEventBus?: EventBus, options: Fixtur
 		}
 		return createPersistedSubagentReviverFactory({
 			session: parentSession,
-			authStorage: {} as never,
-			modelRegistry: { authStorage: {} } as ModelRegistry,
+			...fakeAuthAndRegistry(),
 			settings: Settings.isolated(),
 			enableLsp: true,
 			enableMCP: options.enableMCP ?? true,
@@ -338,13 +342,13 @@ describe("persisted subagent revival", () => {
 		await initialRootManager.ensureOnDisk();
 		const initialRootFile = initialRootManager.getSessionFile();
 		if (!initialRootFile) throw new Error("Expected persisted root fixture");
-		const { session: initialRoot } = await createAgentRootSession(fixtureRegistry, {
+		await createAgentRootSession(fixtureRegistry, {
 			agentId: MAIN_AGENT_ID,
 			sessionManager: initialRootManager,
 		});
 		const initialRef = await createRef(childSessionFile);
 		await disposeAgentLifecycle(getAgentLifecycleManager(fixtureRegistry));
-		await initialRoot.dispose();
+		// Simulate process restart without retiring the durable Main actor.
 		await initialRootManager.close();
 
 		AgentRegistry.resetGlobalForTests();
@@ -371,8 +375,7 @@ describe("persisted subagent revival", () => {
 			getAgentLifecycleManager(registry),
 			createPersistedSubagentReviverFactory({
 				session: root,
-				authStorage: {} as never,
-				modelRegistry: { authStorage: {} } as ModelRegistry,
+				...fakeAuthAndRegistry(),
 				settings: Settings.isolated(),
 				enableLsp: true,
 				enableMCP: true,
@@ -414,8 +417,7 @@ describe("persisted subagent revival", () => {
 			const { session } = await authorityBinding.create({
 				cwd: peek.cwd,
 				agentDir: Settings.isolated().getAgentDir(),
-				authStorage: {} as never,
-				modelRegistry: { authStorage: {} } as ModelRegistry,
+				...fakeAuthAndRegistry(),
 				model: { provider: "pi", id: "smol" } as never,
 				thinkingLevel: "high" as never,
 				thinkingLevelCeiling: "high" as never,
@@ -718,6 +720,21 @@ describe("persisted subagent revival", () => {
 		expect(Object.hasOwn(capturedOptions ?? {}, "mcpManager")).toBe(false);
 		expect(capturedOptions?.customTools).toBeUndefined();
 		expect(getTools).not.toHaveBeenCalled();
+	});
+
+	it("leaves isolated sessions transcript-only even when the workspace still exists", async () => {
+		// Isolated runs are never resumable: the worktree is merged + cleaned,
+		// and the parent is told messaging is impossible. A retained workspace
+		// (capture/persist failure) still passes the cwd probe, so the stamped
+		// contract — not directory existence — must gate revival. Otherwise a
+		// restart + Hub message revives the agent in the parent cwd, outside
+		// isolation.
+		const cwd = makeTempDir("@pi-isolated-revive-");
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, { isolated: true });
+
+		const ref = await createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		expect(reviver).toBeUndefined();
 	});
 
 	it("restores the persisted agent definition name on cold revival so agent-scoped rules keep matching", async () => {

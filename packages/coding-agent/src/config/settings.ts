@@ -23,6 +23,7 @@ import {
 	getAgentDir,
 	getLastChangelogVersionPath,
 	getProjectDir,
+	getProjectAgentDir,
 	isEnoent,
 	logger,
 	MAIN_CONFIG_FILENAMES,
@@ -489,6 +490,8 @@ export class Settings {
 	#configOverlay: RawSettings = {};
 	/** Project settings file that most recently supplied shellPath. */
 	#projectShellPathSource: string | undefined;
+	/** Capability warnings already surfaced for the current project scope; reloads stay quiet. */
+	#projectSettingsWarningsSeen = new Set<string>();
 	/** Explicit config overlay that most recently supplied shellPath. */
 	#overlayShellPathSource: string | undefined;
 	/** Runtime overrides (not persisted) */
@@ -1818,10 +1821,27 @@ export class Settings {
 	}
 
 	async #readProjectSettings(quarantineInvalid: boolean): Promise<ProjectSettingsReadResult> {
+		// Resolve once: capability discovery, fs-cache invalidation, and the
+		// warning prefix below must all derive from the same absolute scope so
+		// relative cwds (e.g. ".") produce absolute provider paths that match.
+		const discoveryCwd = path.resolve(this.#cwd);
+		const projectConfigDir = getProjectAgentDir(this.#cwd);
+		const projectConfigPath = path.join(projectConfigDir, "config.yml");
+		invalidateCapabilityFsCache(projectConfigPath);
+		invalidateCapabilityFsCache(path.join(projectConfigDir, "settings.json"));
+		invalidateCapabilityFsCache(path.join(discoveryCwd, ".claude", "settings.json"));
 		let shellPathSource: string | undefined;
 		let merged: RawSettings = {};
 		try {
-			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd, agentDir: this.#agentDir });
+			const result = await loadCapability(settingsCapability.id, { cwd: discoveryCwd, agentDir: this.#agentDir });
+			// Surface only project-root warnings here; global warnings belong to the user layer.
+			const cwdRoot = discoveryCwd.endsWith(path.sep) ? discoveryCwd : discoveryCwd + path.sep;
+			const projectWarnings = (result.warnings ?? []).filter(warning => warning.includes(cwdRoot));
+			for (const warning of projectWarnings) {
+				if (this.#projectSettingsWarningsSeen.has(warning)) continue;
+				logger.warn(`Settings: ${warning}`);
+			}
+			this.#projectSettingsWarningsSeen = new Set(projectWarnings);
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level === "project") {
 					merged = this.#deepMerge(merged, dropSettingsGroupShadows(item.data as RawSettings, item.path));
@@ -1833,7 +1853,6 @@ export class Settings {
 			// Capability discovery is best-effort; the native project config below
 			// remains authoritative for its model-role layer and must not be hidden.
 		}
-		const projectConfigPath = path.join(this.#cwd, ".omp", "config.yml");
 		const nativeProject = quarantineInvalid
 			? await this.#loadYaml(projectConfigPath)
 			: (this.#unwrapYamlLoadResult(projectConfigPath, await this.#loadYamlIfPresent(projectConfigPath, false)) ??
@@ -2913,7 +2932,7 @@ export class Settings {
 	async #saveProjectNow(): Promise<void> {
 		if (this.#savesCancelled || !this.#persist || this.#modifiedProjectModelRoles.size === 0) return;
 
-		const projectConfigPath = path.join(this.#cwd, ".omp", "config.yml");
+		const projectConfigPath = path.join(getProjectAgentDir(this.#cwd), "config.yml");
 		const modifiedModelRoles = [...this.#modifiedProjectModelRoles];
 		this.#modifiedProjectModelRoles.clear();
 

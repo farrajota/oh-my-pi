@@ -3781,6 +3781,8 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: restrictToolNames || undefined,
 				enableMCP,
+				// Isolated runs are never revivable after their worktree lifecycle ends.
+				isolated: worktree !== undefined || undefined,
 			});
 			if (historyAuthority) {
 				setAgentHistory(agentRegistry, historyAuthority, {

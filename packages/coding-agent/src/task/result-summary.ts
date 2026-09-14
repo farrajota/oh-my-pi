@@ -57,9 +57,10 @@ export function formatTaskResultSummary(
 	const truncated = outputCharCount > FULL_OUTPUT_THRESHOLD && result.outputPath !== undefined;
 	const preview = truncated ? previewHead(output) : output;
 	// A stopped-but-adopted agent (soft-budget stop) stays messageable; tell
-	// the parent so it can resume via irc instead of redoing the work.
+	// the parent so it can resume via irc instead of redoing the work. Isolated
+	// runs are parked without a reviver, so they must not read as resumable.
 	const refStatus = options.agentRegistry.get(result.id)?.status;
-	const resumable = result.aborted && (refStatus === "idle" || refStatus === "parked");
+	const resumable = result.aborted && !result.isolated && (refStatus === "idle" || refStatus === "parked");
 	const rendered = prompt.render(taskSummaryTemplate, {
 		agentName: result.agent,
 		id: result.id,

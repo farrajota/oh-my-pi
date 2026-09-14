@@ -5,8 +5,10 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
+import { StatusLineTestComponents } from "./helpers/status-line";
 
 let settingsState: SettingsTestState | undefined;
+const statusLines = new StatusLineTestComponents();
 
 beforeEach(async () => {
 	settingsState = beginSettingsTest();
@@ -15,6 +17,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+	statusLines.dispose();
 	restoreSettingsTestState(settingsState);
 	settingsState = undefined;
 });
@@ -69,7 +72,7 @@ function makeComponent(running: AsyncJobSnapshotItem[]): StatusLineComponent {
 		},
 		getContextUsage: () => undefined,
 	} as unknown as ConstructorParameters<typeof StatusLineComponent>[0];
-	const component = new StatusLineComponent(session);
+	const component = statusLines.track(new StatusLineComponent(session));
 	component.updateSettings({
 		preset: "custom",
 		leftSegments: [],

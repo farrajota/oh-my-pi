@@ -1,10 +1,13 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { Container } from "@oh-my-pi/pi-tui";
 import { SessionFocusController } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { disposeAgentLifecycle, getAgentLifecycleManager } from "../src/internal/agent-lifecycle-bridge";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
+import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
 interface SessionStub {
 	session: AgentSession;
@@ -13,6 +16,7 @@ interface SessionStub {
 	setStreaming(streaming: boolean): void;
 	setActiveRunStartedAt(startedAt: number | undefined): void;
 	setSessionFile(sessionFile: string | undefined): void;
+	setQueue(queue: { steering?: string[]; followUp?: string[] }): void;
 }
 
 function makeSessionStub(
@@ -20,6 +24,7 @@ function makeSessionStub(
 ): SessionStub {
 	let listener: ((event: AgentSessionEvent) => Promise<void> | void) | undefined;
 	let unsubscribeCalls = 0;
+	let queue: { steering: string[]; followUp: string[] } = { steering: [], followUp: [] };
 	const stub = {
 		activeRunStartedAt: opts.activeRunStartedAt,
 		isStreaming: opts.isStreaming ?? false,
@@ -32,6 +37,7 @@ function makeSessionStub(
 		},
 		async settleInFlightMessagePersistence() {},
 		activeToolExecutionUpdates: () => [],
+		getQueuedMessages: () => queue,
 	};
 	return {
 		session: stub as unknown as AgentSession,
@@ -49,6 +55,9 @@ function makeSessionStub(
 		setSessionFile: sessionFile => {
 			stub.sessionFile = sessionFile;
 		},
+		setQueue: next => {
+			queue = { steering: next.steering ?? [], followUp: next.followUp ?? [] };
+		},
 	};
 }
 
@@ -61,6 +70,7 @@ interface Harness {
 	rehydrated: AgentSession[];
 	setSessionCalls: Array<[AgentSession, string | undefined]>;
 	reloadTodoSessions: AgentSession[];
+	pendingMessagesContainer: Container;
 	counts: {
 		clearTransientSessionUi(): number;
 		resetTranscriptAnchors(): number;
@@ -81,12 +91,19 @@ function makeHarness(
 	const rehydrated: AgentSession[] = [];
 	const setSessionCalls: Array<[AgentSession, string | undefined]> = [];
 	const reloadTodoSessions: AgentSession[] = [];
+	const pendingMessagesContainer = new Container();
 	let clearTransientSessionUi = 0;
 	let resetTranscriptAnchors = 0;
 	let renderInitialMessages = 0;
 	let mainUnsubscribe = 0;
 	const ctx = {
 		session: main.session,
+		get viewSession() {
+			return controller.target ?? main.session;
+		},
+		pendingMessagesContainer,
+		compactionQueuedMessages: [],
+		keybindings: { getDisplayString: () => "Alt+Up" },
 		unsubscribe: () => {
 			mainUnsubscribe++;
 		},
@@ -109,6 +126,8 @@ function makeHarness(
 		},
 		clearTransientSessionUi: () => {
 			clearTransientSessionUi++;
+			// Mirror interactive-mode.ts: focus teardown disposes the pending block.
+			pendingMessagesContainer.disposeChildren();
 		},
 		renderInitialMessages: async () => {
 			renderInitialMessages++;
@@ -117,8 +136,9 @@ function makeHarness(
 		reloadTodos: async (source?: AgentSession) => {
 			reloadTodoSessions.push(source ?? main.session);
 		},
+		updatePendingMessagesDisplay: () => uiHelpers.updatePendingMessagesDisplay(),
 		updateEditorBorderColor() {},
-		ui: { requestRender() {} },
+		ui: { requestRender() {}, requestComponentRender() {} },
 		showStatus() {},
 		collabGuest: undefined,
 	} as unknown as InteractiveModeContext;
@@ -127,6 +147,7 @@ function makeHarness(
 	const controller = new SessionFocusController(ctx, registry, () =>
 		ensureLive ? ({ ensureLive } as unknown as AgentLifecycleManager) : lifecycle,
 	);
+	const uiHelpers = new UiHelpers(ctx);
 	lifecycles.push(lifecycle);
 	return {
 		controller,
@@ -137,6 +158,7 @@ function makeHarness(
 		rehydrated,
 		setSessionCalls,
 		reloadTodoSessions,
+		pendingMessagesContainer,
 		counts: {
 			clearTransientSessionUi: () => clearTransientSessionUi,
 			resetTranscriptAnchors: () => resetTranscriptAnchors,
@@ -161,6 +183,10 @@ afterEach(async () => {
 });
 
 describe("SessionFocusController", () => {
+	beforeAll(async () => {
+		await initTheme(false);
+	});
+
 	it("rehydrates a streaming attach rather than synthesizing agent_start", async () => {
 		const h = makeHarness();
 		const worker = makeSessionStub({ isStreaming: true, activeRunStartedAt: 1_000, sessionFile: "worker.jsonl" });
@@ -204,6 +230,29 @@ describe("SessionFocusController", () => {
 		expect(h.controller.focusedAgentId).toBeUndefined();
 		expect(h.setSessionCalls.at(-1)).toEqual([h.main.session, undefined]);
 		expect(h.reloadTodoSessions).toEqual([worker.session, h.main.session]);
+	});
+
+	it("re-renders the pending steering block against the attached session's real queue on both focus directions (#11379)", async () => {
+		// clearTransientSessionUi() disposes pendingMessagesContainer on every attach.
+		// The queue survives, but nothing repainted it, so returning from a focused
+		// agent left the steering block permanently blank. #attach() must rebuild the
+		// real container from viewSession's queue in both directions: the subagent's
+		// own queue on focus, main's queue on unfocus.
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		h.main.setQueue({ steering: ["main steer alpha"] });
+		worker.setQueue({ steering: ["worker steer beta"] });
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+
+		const rendered = () => h.pendingMessagesContainer.render(80).join("\n");
+
+		await h.controller.focusAgent("Worker");
+		expect(rendered()).toContain("worker steer beta");
+		expect(rendered()).not.toContain("main steer alpha");
+
+		await h.controller.unfocus();
+		expect(rendered()).toContain("main steer alpha");
+		expect(rendered()).not.toContain("worker steer beta");
 	});
 
 	it("does not let a superseded focus attachment restore the worker todo HUD after unfocusing", async () => {
