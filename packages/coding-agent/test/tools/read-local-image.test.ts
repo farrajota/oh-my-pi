@@ -54,6 +54,10 @@ function makeSession(testDir: string, textOnlyModel = false): ToolSession {
 		hasUI: false,
 		getSessionFile: () => sessionFile,
 		getArtifactsDir: () => artifactsDir,
+		localProtocolOptions: {
+			getArtifactsDir: () => path.join(testDir, "artifacts"),
+			getSessionId: () => "session-local-image",
+		},
 		getSessionSpawns: () => null,
 		getModelString: () => `${model.provider}/${model.id}`,
 		getActiveModelString: () => `${model.provider}/${model.id}`,
