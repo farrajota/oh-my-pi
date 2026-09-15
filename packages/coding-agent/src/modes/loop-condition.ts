@@ -15,11 +15,11 @@
  * work, which is the failure mode this whole feature exists to avoid.
  */
 
+import { truncateToWidth } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
-import type { BashResult } from "../exec/bash-executor";
-import { executeBash } from "../exec/bash-executor";
-import { TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
-import { sanitizeStatusText } from "./shared";
+import { executeBash, type BashResult } from "../exec/bash-executor";
+import { PREVIEW_LIMITS } from "../tools/preview-limits";
+import { sanitizeStatusText } from "./sanitize-status-text";
 
 /** A `/loop --while` / `/loop --until` continue-condition. */
 export interface LoopConditionConfig {
@@ -56,15 +56,10 @@ export interface LoopConditionOptions {
  */
 const LOOP_CONDITION_SESSION_KEY = "loop-condition";
 
-/** Width budget for command text echoed back into a one-line status message. */
-const COMMAND_PREVIEW_WIDTH = TRUNCATE_LENGTHS.TITLE;
-
-/** Width budget for a broken condition's output echoed into the status message. */
-const OUTPUT_PREVIEW_WIDTH = TRUNCATE_LENGTHS.TITLE;
 
 /** Sanitize + bound user command text for single-line status display. */
 function quoteCommand(command: string): string {
-	return `\`${truncateToWidth(sanitizeStatusText(command), COMMAND_PREVIEW_WIDTH)}\``;
+	return `\`${truncateToWidth(sanitizeStatusText(command), PREVIEW_LIMITS.TITLE_WIDTH)}\``;
 }
 
 /** First meaningful line of a failed condition's output, bounded for display. */
@@ -74,7 +69,7 @@ function previewOutput(output: string): string {
 		.map(entry => entry.trim())
 		.find(entry => entry.length > 0);
 	if (!line) return "";
-	return truncateToWidth(sanitizeStatusText(line), OUTPUT_PREVIEW_WIDTH);
+	return truncateToWidth(sanitizeStatusText(line), PREVIEW_LIMITS.TITLE_WIDTH);
 }
 
 function formatTimeout(timeoutMs: number): string {
@@ -118,7 +113,7 @@ export async function evaluateLoopCondition(
 		logger.error("loop condition failed to start", { command: condition.command, error: String(error) });
 		return {
 			kind: "error",
-			message: `Loop condition ${quoteCommand(condition.command)} could not run: ${truncateToWidth(sanitizeStatusText(String(error)), OUTPUT_PREVIEW_WIDTH)}. Loop mode disabled.`,
+			message: `Loop condition ${quoteCommand(condition.command)} could not run: ${truncateToWidth(sanitizeStatusText(String(error)), PREVIEW_LIMITS.TITLE_WIDTH)}. Loop mode disabled.`,
 		};
 	}
 

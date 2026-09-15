@@ -3,6 +3,7 @@ export const DEFAULT_TERMINAL_PREVIEW_LINES = 10;
 
 /** Preview limits shared by tool renderers without importing the TUI utility graph. */
 export const PREVIEW_LIMITS = {
+	TITLE_WIDTH: 60,
 	COLLAPSED_LINES: 3,
 	EXPANDED_LINES: 12,
 	COLLAPSED_ITEMS: 8,

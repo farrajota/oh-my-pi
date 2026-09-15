@@ -137,7 +137,7 @@ export function formatFeedModelBadge(
 /** Truncation lengths for different content types */
 export const TRUNCATE_LENGTHS = {
 	/** Short titles, labels */
-	TITLE: 60,
+	TITLE: PREVIEW_LIMITS.TITLE_WIDTH,
 	/** Medium-length content (messages, previews) */
 	CONTENT: 80,
 	/** Longer content (code, explanations) */

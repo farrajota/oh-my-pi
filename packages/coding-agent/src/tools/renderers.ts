@@ -100,8 +100,13 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	bash: bashToolRenderer as ToolRenderer,
 	debug: debugToolRenderer as ToolRenderer,
 	eval: evalToolRenderer as ToolRenderer,
-	edit: editToolRenderer as ToolRenderer,
-	apply_patch: editToolRenderer as ToolRenderer,
+	// Lazy getters: edit renderer dependencies close a cycle back through the tool registry.
+	get edit(): ToolRenderer {
+		return editToolRenderer as ToolRenderer;
+	},
+	get apply_patch(): ToolRenderer {
+		return editToolRenderer as ToolRenderer;
+	},
 	glob: globToolRenderer as ToolRenderer,
 	grep: grepToolRenderer as ToolRenderer,
 	lsp: lspToolRenderer as ToolRenderer,
