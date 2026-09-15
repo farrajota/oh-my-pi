@@ -85,7 +85,10 @@ describe("EventController plan-approval dispatch", () => {
 		// agent_start / message_start / tool events / the coalesced message_update
 		// flush, so its dispatch proves the gate is open mid-execution.
 		await dispatch({ type: "turn_start" } as AgentSessionEvent);
-		expect(handleEventSpy).toHaveBeenCalledWith(expect.objectContaining({ type: "turn_start" }));
+		expect(handleEventSpy.mock.calls.at(-1)).toEqual([
+			ctx.session,
+			expect.objectContaining({ type: "turn_start" }),
+		]);
 
 		executionTurn.resolve();
 		await executionTurn.promise;
