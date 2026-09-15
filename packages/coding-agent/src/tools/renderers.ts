@@ -107,9 +107,13 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	get apply_patch(): ToolRenderer {
 		return editToolRenderer as ToolRenderer;
 	},
-	glob: globToolRenderer as ToolRenderer,
+	get glob(): ToolRenderer {
+		return globToolRenderer as ToolRenderer;
+	},
 	grep: grepToolRenderer as ToolRenderer,
-	lsp: lspToolRenderer as ToolRenderer,
+	get lsp(): ToolRenderer {
+		return lspToolRenderer as ToolRenderer;
+	},
 	// Lazy getter: `hubToolRenderer` lives in a module whose deps (messaging →
 	// persisted-agents → vibe/runtime → task/executor → sdk) close an import
 	// cycle back here, so reading it at init order-dependently hits its
@@ -124,7 +128,9 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	// through the `resolve` entry. Both devices carry the same ResolveDetails.
 	resolve: resolveRenderer as ToolRenderer,
 	reject: resolveRenderer as ToolRenderer,
-	retain: retainToolRenderer as ToolRenderer,
+	get retain(): ToolRenderer {
+		return retainToolRenderer as ToolRenderer;
+	},
 	recall: recallToolRenderer as ToolRenderer,
 	reflect: reflectToolRenderer as ToolRenderer,
 	// Lazy getter: `taskToolRenderer` lives in a module that closes an import
@@ -138,13 +144,17 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	todo: todoToolRenderer as ToolRenderer,
 	github: githubToolRenderer as ToolRenderer,
 	goal: goalToolRenderer as ToolRenderer,
-	web_search: webSearchToolRenderer as ToolRenderer,
+	get web_search(): ToolRenderer {
+		return webSearchToolRenderer as ToolRenderer;
+	},
 	vibe_spawn: createVibeToolRenderer("spawn") as ToolRenderer,
 	vibe_send: createVibeToolRenderer("send") as ToolRenderer,
 	vibe_wait: createVibeToolRenderer("wait") as ToolRenderer,
 	vibe_kill: createVibeToolRenderer("kill") as ToolRenderer,
 	vibe_list: createVibeToolRenderer("list") as ToolRenderer,
-	write: writeToolRenderer as ToolRenderer,
+	get write(): ToolRenderer {
+		return writeToolRenderer as ToolRenderer;
+	},
 };
 
 // Wire the xd:// render delegation. Injected (instead of the xdev module

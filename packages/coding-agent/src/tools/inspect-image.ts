@@ -27,9 +27,9 @@ import {
 	loadImageAttachmentInput,
 	loadImageInput,
 	loadSvgImageInput,
-	MAX_IMAGE_INPUT_BYTES,
 	webpExclusionForModel,
 } from "../utils/image-loading";
+import { MAX_IMAGE_INPUT_BYTES } from "../utils/image-limits";
 import type { ToolSession } from "./index";
 import { splitPathAndSelPreferringLiteral } from "./path-utils";
 import { ToolError } from "./tool-errors";

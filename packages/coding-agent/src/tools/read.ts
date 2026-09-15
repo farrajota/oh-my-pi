@@ -51,9 +51,9 @@ import {
 	InvalidImageDataError,
 	loadImageInput,
 	loadSvgImageInput,
-	MAX_IMAGE_INPUT_BYTES,
 	webpExclusionForModel,
 } from "../utils/image-loading";
+import { MAX_IMAGE_INPUT_BYTES } from "../utils/image-limits";
 import { askImageQuestion, resolveImageQuestionModel } from "../utils/image-question";
 import { CONVERTIBLE_EXTENSIONS, convertFileWithMarkit } from "../utils/markit";
 import { isSampleProfilePath, renderSampleProfile } from "../utils/sample-profile";

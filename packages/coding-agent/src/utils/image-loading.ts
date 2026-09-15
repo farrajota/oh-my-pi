@@ -13,8 +13,9 @@ import {
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { resolveReadPath } from "../tools/path-utils";
 import { formatDimensionNote, type ImageResizeOptions, resizeImage } from "./image-resize";
+import { MAX_IMAGE_INPUT_BYTES } from "./image-limits";
 
-export const MAX_IMAGE_INPUT_BYTES = 20 * 1024 * 1024;
+export { MAX_IMAGE_INPUT_BYTES } from "./image-limits";
 export const SUPPORTED_INPUT_IMAGE_MIME_TYPES = SUPPORTED_IMAGE_MIME_TYPES;
 /** Largest edge rasterized from SVG before it enters the image pipeline. */
 const SVG_IMAGE_MAX_EDGE_PX = 2048;
