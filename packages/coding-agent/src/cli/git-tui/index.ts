@@ -500,16 +500,17 @@ class GitTuiComponent implements Component {
 	#stageCurrentFile(): void {
 		const file = this.#currentFile;
 		if (!file) return;
-		const selection = { files: [file], label: file.path };
-		if (file.area === "unstaged") void this.#runAction({ type: "stage", selection });
-		else if (file.area === "staged") void this.#runAction({ type: "unstage", selection });
+		if (file.area === "unstaged")
+			void this.#runAction({ type: "stage", selection: { files: [file], label: file.path, area: file.area } });
+		else if (file.area === "staged")
+			void this.#runAction({ type: "unstage", selection: { files: [file], label: file.path, area: file.area } });
 	}
 
 	/** `delete` in the diff pane: discard every change of the shown file. */
 	#discardCurrentFile(): void {
 		const file = this.#currentFile;
 		if (!file || file.area === "commit") return;
-		void this.#runAction({ type: "discard", selection: { files: [file], label: file.path } });
+		void this.#runAction({ type: "discard", selection: { files: [file], label: file.path, area: file.area } });
 	}
 
 	#setMode(mode: ViewMode): void {

@@ -101,8 +101,9 @@ describe("git tui sidebar staging", () => {
 			expect(action).toEqual({
 				type: "stage",
 				selection: {
-					files: [expect.objectContaining({ path: "a/one.txt", area: "unstaged" })],
+					files: [{ path: "a/one.txt", kind: "untracked", area: "unstaged" }],
 					label: "a/one.txt",
+					area: "unstaged",
 				},
 			});
 			await model.stage(action?.type === "stage" ? action.selection?.files : undefined);
@@ -123,8 +124,12 @@ describe("git tui sidebar staging", () => {
 			expect(actions.at(-1)).toEqual({
 				type: "stage",
 				selection: {
-					files: [expect.objectContaining({ path: "a/one.txt" }), expect.objectContaining({ path: "a/two.txt" })],
+					files: [
+						{ path: "a/one.txt", kind: "untracked", area: "unstaged" },
+						{ path: "a/two.txt", kind: "untracked", area: "unstaged" },
+					],
 					label: "a/",
+					area: "unstaged",
 				},
 			});
 			await harness.applyLastAction();
@@ -158,10 +163,11 @@ describe("git tui sidebar staging", () => {
 				type: "unstage",
 				selection: {
 					files: [
-						expect.objectContaining({ path: "a/one.txt", area: "staged" }),
-						expect.objectContaining({ path: "a/two.txt", area: "staged" }),
+						{ path: "a/one.txt", kind: "added", area: "staged" },
+						{ path: "a/two.txt", kind: "added", area: "staged" },
 					],
 					label: "a/",
+					area: "staged",
 				},
 			});
 			await harness.applyLastAction();
@@ -188,10 +194,11 @@ describe("git tui sidebar staging", () => {
 				type: "stage",
 				selection: {
 					files: [
-						expect.objectContaining({ path: "a/tracked.txt" }),
-						expect.objectContaining({ path: "a/new.txt" }),
+						{ path: "a/tracked.txt", kind: "modified", area: "unstaged" },
+						{ path: "a/new.txt", kind: "untracked", area: "unstaged" },
 					],
 					label: "a/",
+					area: "unstaged",
 				},
 			});
 			await harness.applyLastAction();

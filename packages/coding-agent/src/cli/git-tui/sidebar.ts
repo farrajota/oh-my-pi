@@ -26,13 +26,15 @@ import { type AvatarLoader, identiconLines } from "./avatar";
 import { pill, selectionBgAnsi, softPill, tintChip, withBg } from "./colors";
 import type { ChangedFile, GitModel } from "./state";
 
+type SidebarSelection = { files: ChangedFile[]; label: string; area: "unstaged" | "staged" };
+
 /** Actions the sidebar raises to the root component. */
 export type SidebarAction =
 	/** `selection` omitted → whole tree; `label` names the target for the status line. */
-	| { type: "stage"; selection?: { files: ChangedFile[]; label: string } }
-	| { type: "unstage"; selection?: { files: ChangedFile[]; label: string } }
+	| { type: "stage"; selection?: SidebarSelection }
+	| { type: "unstage"; selection?: SidebarSelection }
 	/** `delete`: throw away the row's changes (a dir batches every file underneath). */
-	| { type: "discard"; selection: { files: ChangedFile[]; label: string } }
+	| { type: "discard"; selection: SidebarSelection }
 	| { type: "generate" }
 	/** Wand pill: AI-filter the unstaged tree against a natural-language prompt. */
 	| { type: "stage-ai"; prompt: string }
@@ -516,7 +518,7 @@ export class Sidebar {
 	}
 
 	/** Files under a file/dir row plus a status-line label; null outside the unstaged/staged sections. */
-	#selectionFor(target: FileTarget): { files: ChangedFile[]; label: string; area: "unstaged" | "staged" } | null {
+	#selectionFor(target: FileTarget): SidebarSelection | null {
 		if (target.kind === "file") {
 			const area = target.file.area;
 			if (area !== "unstaged" && area !== "staged") return null;
