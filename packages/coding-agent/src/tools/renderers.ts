@@ -94,7 +94,9 @@ export type ToolRenderer = {
 };
 
 export const toolRenderers: Record<string, ToolRenderer> = {
-	ask: askToolRenderer as ToolRenderer,
+	get ask(): ToolRenderer {
+		return askToolRenderer as ToolRenderer;
+	},
 	ast_grep: astGrepToolRenderer as ToolRenderer,
 	ast_edit: astEditToolRenderer as ToolRenderer,
 	bash: bashToolRenderer as ToolRenderer,
