@@ -143,7 +143,9 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 		return taskToolRenderer as ToolRenderer;
 	},
 	think: thinkToolRenderer as ToolRenderer,
-	todo: todoToolRenderer as ToolRenderer,
+	get todo(): ToolRenderer {
+		return todoToolRenderer as ToolRenderer;
+	},
 	github: githubToolRenderer as ToolRenderer,
 	get goal(): ToolRenderer {
 		return goalToolRenderer as ToolRenderer;
