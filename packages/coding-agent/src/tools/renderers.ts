@@ -145,7 +145,9 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	think: thinkToolRenderer as ToolRenderer,
 	todo: todoToolRenderer as ToolRenderer,
 	github: githubToolRenderer as ToolRenderer,
-	goal: goalToolRenderer as ToolRenderer,
+	get goal(): ToolRenderer {
+		return goalToolRenderer as ToolRenderer;
+	},
 	get web_search(): ToolRenderer {
 		return webSearchToolRenderer as ToolRenderer;
 	},
