@@ -330,8 +330,8 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	}
 	if (tools !== undefined) tools = normalizeToolNames(tools);
 
-	// Subagents with non-empty explicit tool lists always need yield
-	if (tools !== undefined && tools.length > 0 && !tools.includes("yield")) {
+	// Explicit tool lists always need yield; an empty list intentionally denies every other tool.
+	if (tools !== undefined && !tools.includes("yield")) {
 		tools = [...tools, "yield"];
 	}
 
