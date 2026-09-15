@@ -131,6 +131,11 @@ function formatRetryFallbackBaseSelector(selector: RetryFallbackSelector): strin
 	return `${selector.provider}/${selector.id}`;
 }
 
+/** Identity used to deduplicate exact model-and-thinking fallback entries. */
+function formatRetryFallbackIdentity(selector: RetryFallbackSelector): string {
+	return formatModelSelectorValue(formatRetryFallbackBaseSelector(selector), selector.thinkingLevel);
+}
+
 /** Whether a provider is registered or configured for discovery. */
 export function isKnownProvider(modelRegistry: ModelRegistry, provider: string): boolean {
 	return modelRegistry.hasProvider(provider);
@@ -416,23 +421,23 @@ function getRetryFallbackEffectiveChain(
 					context.modelLookup,
 				)
 			: undefined);
-	const seenModelIdentities = new Set<string>();
+	const seenSelectors = new Set<string>();
 	const chain: RetryFallbackSelector[] = [];
 	if (isRetryFallbackWildcardKey(chainKey)) {
 		// A wildcard key has no fixed primary: the active model is the
 		// primary, followed by the configured provider-level fallbacks.
 		if (parsedCurrent) {
 			chain.push(parsedCurrent);
-			seenModelIdentities.add(formatRetryFallbackBaseSelector(parsedCurrent));
+			seenSelectors.add(formatRetryFallbackIdentity(parsedCurrent));
 		}
 	} else {
 		const primarySelector = getRetryFallbackPrimarySelector(context, chainKey);
 		if (primarySelector) {
 			chain.push(primarySelector);
-			seenModelIdentities.add(formatRetryFallbackBaseSelector(primarySelector));
+			seenSelectors.add(formatRetryFallbackIdentity(primarySelector));
 		} else if ((chainKey === "default" || allowMissingPrimary) && parsedCurrent) {
 			chain.push(parsedCurrent);
-			seenModelIdentities.add(formatRetryFallbackBaseSelector(parsedCurrent));
+			seenSelectors.add(formatRetryFallbackIdentity(parsedCurrent));
 		} else if (!allowMissingPrimary) {
 			return [];
 		}
@@ -440,9 +445,9 @@ function getRetryFallbackEffectiveChain(
 	for (const selector of context.chains[chainKey] ?? []) {
 		const parsed = parseRetryFallbackChainEntry(context, selector, parsedCurrent);
 		if (!parsed) continue;
-		const identity = formatRetryFallbackBaseSelector(parsed);
-		if (seenModelIdentities.has(identity)) continue;
-		seenModelIdentities.add(identity);
+		const identity = formatRetryFallbackIdentity(parsed);
+		if (seenSelectors.has(identity)) continue;
+		seenSelectors.add(identity);
 		chain.push(parsed);
 	}
 	return chain;
