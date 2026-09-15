@@ -7,8 +7,9 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { TanCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/tan-command-controller";
+import { createAgentRootSession, lookupAgentRef } from "../../../src/internal/agent-registry-bridge";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -23,6 +24,7 @@ interface CapturedJobRunContext {
 type CapturedJobRun = (ctx: CapturedJobRunContext) => Promise<string>;
 
 const model = { provider: "anthropic", id: "claude-sonnet-4-5" } as Model;
+const rootSessions: Array<{ dispose: () => Promise<void> }> = [];
 
 function assistantText(text: string): AssistantMessage {
 	return {
@@ -49,8 +51,11 @@ interface TanSessionEvent {
 	result?: unknown;
 	aborted?: boolean;
 }
+interface TanCloneStub {
+	clone: object;
+	attachSessionManager(sessionManager: CreateAgentSessionOptions["sessionManager"]): void;
+}
 
-/** Minimal tan clone session stub covering the surface `TanCommandController` drives. */
 function createCloneStub(overrides?: {
 	prompt?: () => Promise<void>;
 	abort?: () => void;
@@ -60,10 +65,11 @@ function createCloneStub(overrides?: {
 	enabledToolNames?: string[];
 }) {
 	const appendMessage = vi.fn();
+	const dispose = vi.fn(async () => {});
 	let listener: ((event: TanSessionEvent) => void) | undefined;
 	const clone = {
 		agent: { appendMessage },
-		sessionManager: overrides?.sessionManager,
+		sessionManager: undefined as CreateAgentSessionOptions["sessionManager"],
 		setTodoPhases: vi.fn(),
 		getActiveToolNames: vi.fn(() => overrides?.activeToolNames ?? ["read", "bash"]),
 		getEnabledToolNames: vi.fn(() => overrides?.enabledToolNames ?? overrides?.activeToolNames ?? ["read", "bash"]),
@@ -77,18 +83,39 @@ function createCloneStub(overrides?: {
 		waitForIdle: vi.fn(async () => {}),
 		getLastAssistantMessage: vi.fn(() => assistantText(overrides?.lastAssistantText ?? "done")),
 		abort: vi.fn(overrides?.abort ?? (() => {})),
-		dispose: vi.fn(async () => {}),
+		dispose,
 	};
 	return {
 		clone,
+		dispose,
 		appendMessage,
+		attachSessionManager(sessionManager: CreateAgentSessionOptions["sessionManager"]) {
+			if (!sessionManager) throw new Error("Tan test session requires a session manager");
+			const fixtureSessionManager = Object.assign(
+				{ getSessionFile: sessionManager.getSessionFile.bind(sessionManager) },
+				overrides?.sessionManager,
+			);
+			clone.sessionManager = fixtureSessionManager as CreateAgentSessionOptions["sessionManager"];
+		},
 		get compactionListener() {
 			return listener;
 		},
 	};
 }
 
-function createContext(overrides?: {
+function mockTanSessionCreation(
+	stub: TanCloneStub,
+	onCreate?: (options: CreateAgentSessionOptions) => void,
+) {
+	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		if (!options) throw new Error("Tan test session requires create options");
+		onCreate?.(options);
+		stub.attachSessionManager(options.sessionManager);
+		return { session: stub.clone } as unknown as CreateAgentSessionResult;
+	});
+}
+
+async function createContext(overrides?: {
 	isStreaming?: boolean;
 	model?: Model;
 	agentId?: string;
@@ -146,6 +173,7 @@ function createContext(overrides?: {
 		ensureOnDisk: vi.fn(async () => {}),
 		flush: vi.fn(async () => {}),
 	} as unknown as InteractiveModeContext["sessionManager"];
+	Object.assign(session, { sessionManager, dispose: vi.fn(async () => {}) });
 	const cloneManager = {
 		getSessionFile: vi.fn(() => cloneFile),
 		appendCustomEntry: vi.fn(),
@@ -159,6 +187,15 @@ function createContext(overrides?: {
 		showError: vi.fn(),
 		rebuildChatFromMessages: vi.fn(),
 	} as unknown as InteractiveModeContext;
+	const rootCreate = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValueOnce({
+		session,
+	} as unknown as CreateAgentSessionResult);
+	try {
+		await createAgentRootSession(AgentRegistry.global(), { agentId: overrides?.agentId ?? MAIN_AGENT_ID, sessionManager });
+	} finally {
+		rootCreate.mockRestore();
+	}
+	rootSessions.push(session);
 	return {
 		tempDir,
 		parentFile,
@@ -180,12 +217,14 @@ function createContext(overrides?: {
 }
 
 describe("TanCommandController", () => {
-	afterEach(() => {
+	afterEach(async () => {
+		for (const root of rootSessions.splice(0)) await root.dispose();
+		AgentRegistry.resetGlobalForTests();
 		vi.restoreAllMocks();
 	});
 
 	it("rejects empty work before forking", async () => {
-		const harness = createContext();
+		const harness = await createContext();
 		const forkSpy = vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
 		const controller = new TanCommandController(harness.ctx);
 
@@ -196,7 +235,7 @@ describe("TanCommandController", () => {
 	});
 
 	it("dispatches without disturbing an in-flight turn while streaming", async () => {
-		const harness = createContext({ isStreaming: true });
+		const harness = await createContext({ isStreaming: true });
 		const forkSpy = vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
 		const controller = new TanCommandController(harness.ctx);
 
@@ -215,8 +254,13 @@ describe("TanCommandController", () => {
 	});
 
 	it("forks with breadcrumb suppression, registers under Main, and dispatches after receiving the job id", async () => {
-		const harness = createContext();
+		const harness = await createContext();
 		const forkSpy = vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
+		const stub = createCloneStub();
+		let creationOptions: CreateAgentSessionOptions | undefined;
+		mockTanSessionCreation(stub, options => {
+			creationOptions = options;
+		});
 		const controller = new TanCommandController(harness.ctx);
 
 		await controller.start("write the release note");
@@ -233,11 +277,22 @@ describe("TanCommandController", () => {
 				resetInheritedCost: true,
 			},
 		);
-		expect(harness.register).toHaveBeenCalledWith("task", "/tan write the release note", expect.any(Function), {
-			ownerId: MAIN_AGENT_ID,
-			agentId: expect.stringMatching(/^Tan-/) as unknown as string,
-		});
-		expect(harness.capturedOptions?.ownerId).toBe(MAIN_AGENT_ID);
+		expect(harness.register).toHaveBeenCalledWith("task", "/tan write the release note", expect.any(Function));
+		expect(harness.capturedOptions).toBeUndefined();
+		const run = harness.capturedRun;
+		if (!run) throw new Error("run function was not captured");
+		await run({ jobId: "job-123", signal: new AbortController().signal, reportProgress: async () => {} });
+		const agentId = creationOptions?.agentId;
+		if (!agentId) throw new Error("Tan child agent id was not passed to session creation");
+		expect(AgentRegistry.global().get(agentId)).toEqual(
+			expect.objectContaining({
+				id: agentId,
+				parentId: MAIN_AGENT_ID,
+				kind: "sub",
+				sessionFile: harness.cloneFile,
+				status: "parked",
+			}),
+		);
 		expect(harness.sequence).toEqual(["register", "sendCustomMessage"]);
 		expect(harness.ctx.session.sendCustomMessage).toHaveBeenCalledWith(
 			expect.objectContaining({
@@ -255,13 +310,12 @@ describe("TanCommandController", () => {
 	});
 
 	it("keeps the dispatching session's local:// root after the interactive session switches", async () => {
-		const harness = createContext();
+		const harness = await createContext();
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
-		const { clone } = createCloneStub({ lastAssistantText: "done" });
+		const stub = createCloneStub({ lastAssistantText: "done" });
 		let capturedOptions: CreateAgentSessionOptions | undefined;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		mockTanSessionCreation(stub, options => {
 			capturedOptions = options;
-			return { session: clone } as unknown as CreateAgentSessionResult;
 		});
 		const controller = new TanCommandController(harness.ctx);
 
@@ -297,13 +351,12 @@ describe("TanCommandController", () => {
 			configuredLevel: "user",
 		};
 		const extensionPaths = ["/ext/provider.ts"];
-		const harness = createContext({ preparedExtensions, effectiveExtensionRoots, extensionPaths });
+		const harness = await createContext({ preparedExtensions, effectiveExtensionRoots, extensionPaths });
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
-		const { clone } = createCloneStub({ lastAssistantText: "done" });
+		const stub = createCloneStub({ lastAssistantText: "done" });
 		let capturedOptions: CreateAgentSessionOptions | undefined;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		mockTanSessionCreation(stub, options => {
 			capturedOptions = options;
-			return { session: clone } as unknown as CreateAgentSessionResult;
 		});
 		const controller = new TanCommandController(harness.ctx);
 
@@ -312,10 +365,10 @@ describe("TanCommandController", () => {
 		if (!capturedRun) throw new Error("run function was not captured");
 		await capturedRun({ jobId: "job-123", signal: new AbortController().signal, reportProgress: async () => {} });
 
-		expect(capturedOptions?.preloadedPreparedExtensions).toBe(preparedExtensions);
+		expect(capturedOptions?.preloadedPreparedExtensions).toEqual(preparedExtensions);
 		// Path-list fallback is forwarded (fresh copy) for parent builds without prepared factories.
 		expect(capturedOptions?.preloadedExtensionPaths).toEqual(extensionPaths);
-		expect(capturedOptions?.extensionRoots?.()).toBe(effectiveExtensionRoots);
+		expect(capturedOptions?.extensionRoots?.()).toEqual(effectiveExtensionRoots);
 		expect(capturedOptions?.disableExtensionDiscovery).toBe(true);
 	});
 
@@ -330,13 +383,12 @@ describe("TanCommandController", () => {
 			configuredLevel: "user",
 		};
 		const extensionPaths = ["/ext/provider.ts"];
-		const harness = createContext({ preparedExtensions: [], effectiveExtensionRoots, extensionPaths });
+		const harness = await createContext({ preparedExtensions: [], effectiveExtensionRoots, extensionPaths });
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
-		const { clone } = createCloneStub({ lastAssistantText: "done" });
+		const stub = createCloneStub({ lastAssistantText: "done" });
 		let capturedOptions: CreateAgentSessionOptions | undefined;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		mockTanSessionCreation(stub, options => {
 			capturedOptions = options;
-			return { session: clone } as unknown as CreateAgentSessionResult;
 		});
 		const controller = new TanCommandController(harness.ctx);
 
@@ -350,11 +402,11 @@ describe("TanCommandController", () => {
 	});
 
 	it("aborts the cloned agent when the background job signal aborts", async () => {
-		const harness = createContext({ agentId: MAIN_AGENT_ID });
+		const harness = await createContext({ agentId: MAIN_AGENT_ID });
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
 		const promptStarted = Promise.withResolvers<void>();
 		const abortObserved = Promise.withResolvers<void>();
-		const { clone } = createCloneStub({
+		const stub = createCloneStub({
 			prompt: async () => {
 				promptStarted.resolve();
 				await abortObserved.promise;
@@ -364,9 +416,8 @@ describe("TanCommandController", () => {
 			},
 			lastAssistantText: "finished",
 		});
-		const createAgentSessionSpy = vi
-			.spyOn(sdkModule, "createAgentSession")
-			.mockResolvedValue({ session: clone } as unknown as CreateAgentSessionResult);
+		const { clone } = stub;
+		const createAgentSessionSpy = mockTanSessionCreation(stub);
 		const controller = new TanCommandController(harness.ctx);
 		await controller.start("follow the tangent");
 		const capturedRun = harness.capturedRun;
@@ -381,11 +432,10 @@ describe("TanCommandController", () => {
 		});
 		await promptStarted.promise;
 		abortController.abort();
-		const result = await resultPromise;
+		await expect(resultPromise).rejects.toThrow(/^Operation job cancelled:/);
 
-		expect(result).toBe("finished");
 		expect(clone.abort).toHaveBeenCalled();
-		expect(clone.dispose).toHaveBeenCalled();
+		expect(stub.dispose).toHaveBeenCalled();
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]).toEqual(
 			expect.objectContaining({
 				providerPromptCacheKey: "parent-session",
@@ -396,12 +446,11 @@ describe("TanCommandController", () => {
 	});
 
 	it("parents the tan clone to the spawning agent, not to the clone itself", async () => {
-		const harness = createContext({ agentId: "FocusedParent" });
+		const harness = await createContext({ agentId: "FocusedParent" });
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
-		const { clone } = createCloneStub();
-		const createAgentSessionSpy = vi
-			.spyOn(sdkModule, "createAgentSession")
-			.mockResolvedValue({ session: clone } as unknown as CreateAgentSessionResult);
+		const stub = createCloneStub();
+		const { clone } = stub;
+		const createAgentSessionSpy = mockTanSessionCreation(stub);
 		const controller = new TanCommandController(harness.ctx);
 		await controller.start("follow the tangent");
 		const capturedRun = harness.capturedRun;
@@ -409,10 +458,8 @@ describe("TanCommandController", () => {
 		await capturedRun({ jobId: "job-1", signal: new AbortController().signal, reportProgress: async () => {} });
 
 		const opts = createAgentSessionSpy.mock.calls[0]?.[0];
-		// The clone's registry parent is the spawning (focused) agent. Its own
-		// `Tan-<id>` artifact prefix must never double as the parent link, or the
-		// hub would render the tan parented to itself.
-		expect(opts?.parentAgentId).toBe("FocusedParent");
+		const child = opts?.agentId ? AgentRegistry.global().get(opts.agentId) : undefined;
+		expect(child?.parentId).toBe("FocusedParent");
 		expect(opts?.parentTaskPrefix).toMatch(/^Tan-/);
 		expect(opts?.parentTaskPrefix).not.toBe("FocusedParent");
 	});
@@ -420,12 +467,11 @@ describe("TanCommandController", () => {
 	it("pins the parent's effective cache key when the parent itself carries a pinned promptCacheKey", async () => {
 		// A parent that is itself a fork/tan caches under `agent.promptCacheKey`,
 		// not its own session id — the clone must read that exact shard.
-		const harness = createContext({ parentPromptCacheKey: "grandparent-cache-key" });
+		const harness = await createContext({ parentPromptCacheKey: "grandparent-cache-key" });
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
-		const { clone } = createCloneStub();
-		const createAgentSessionSpy = vi
-			.spyOn(sdkModule, "createAgentSession")
-			.mockResolvedValue({ session: clone } as unknown as CreateAgentSessionResult);
+		const stub = createCloneStub();
+		const { clone } = stub;
+		const createAgentSessionSpy = mockTanSessionCreation(stub);
 		const controller = new TanCommandController(harness.ctx);
 
 		await controller.start("follow the tangent");
@@ -439,17 +485,23 @@ describe("TanCommandController", () => {
 	});
 
 	it("parks the finished tan in the registry so it stays visible in the Agent Hub", async () => {
-		const harness = createContext();
+		const harness = await createContext();
+		const registry = AgentRegistry.global();
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
 		const appendSessionInit = vi.fn();
-		const { clone } = createCloneStub({ sessionManager: { appendSessionInit } });
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
-			session: clone,
-		} as unknown as CreateAgentSessionResult);
-		const registry = AgentRegistry.global();
-		const setStatus = vi.spyOn(registry, "setStatus");
-		const detachSession = vi.spyOn(registry, "detachSession");
-		const unregister = vi.spyOn(registry, "unregister");
+		const stub = createCloneStub({ sessionManager: { appendSessionInit } });
+		const { clone } = stub;
+		let childId: string | undefined;
+		let childBeforeDispose: AgentRef | undefined;
+		let childSessionBeforeDispose: unknown;
+		mockTanSessionCreation(stub, options => {
+			childId = options.agentId;
+		});
+		stub.dispose.mockImplementation(async () => {
+			if (!childId) throw new Error("Tan child id was not passed to session creation");
+			childBeforeDispose = registry.get(childId);
+			childSessionBeforeDispose = lookupAgentRef(registry, childId)?.session;
+		});
 		const controller = new TanCommandController(harness.ctx);
 
 		await controller.start("park me");
@@ -467,27 +519,37 @@ describe("TanCommandController", () => {
 			task: "park me",
 			tools: ["read", "bash"],
 		});
-		// Parked (not unregistered) before dispose, then the disposed session is nulled
-		// out — the hub keeps the ref and reads its transcript from the session file.
-		expect(setStatus).toHaveBeenCalledWith(expect.stringMatching(/^Tan-/), "parked");
-		expect(detachSession).toHaveBeenCalledWith(expect.stringMatching(/^Tan-/));
-		expect(clone.dispose).toHaveBeenCalled();
-		expect(unregister).not.toHaveBeenCalled();
+		if (!childId) throw new Error("Tan child id was not passed to session creation");
+		expect(childBeforeDispose).toEqual(
+			expect.objectContaining({
+				id: childId,
+				parentId: MAIN_AGENT_ID,
+				kind: "sub",
+				status: "parked",
+				sessionFile: harness.cloneFile,
+			}),
+		);
+		expect(childSessionBeforeDispose).toBe(clone);
+		const childAfterDispose = registry.get(childId);
+		expect(childAfterDispose).toEqual(
+			expect.objectContaining({ id: childId, status: "parked", sessionFile: harness.cloneFile }),
+		);
+		expect(lookupAgentRef(registry, childId)?.session).toBeNull();
+		expect(stub.dispose).toHaveBeenCalledTimes(1);
 	});
 
 	it("copies and persists the full enabled tool set", async () => {
 		const enabledToolNames = ["eval", "read", "bash"];
-		const harness = createContext({ activeToolNames: ["eval"], enabledToolNames });
+		const harness = await createContext({ activeToolNames: ["eval"], enabledToolNames });
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
 		const appendSessionInit = vi.fn();
-		const { clone } = createCloneStub({
+		const stub = createCloneStub({
 			sessionManager: { appendSessionInit },
 			activeToolNames: ["eval"],
 			enabledToolNames,
 		});
-		const createAgentSessionSpy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
-			session: clone,
-		} as unknown as CreateAgentSessionResult);
+		const { clone } = stub;
+		const createAgentSessionSpy = mockTanSessionCreation(stub);
 		const controller = new TanCommandController(harness.ctx);
 
 		await controller.start("preserve bridge tools");
@@ -500,7 +562,7 @@ describe("TanCommandController", () => {
 	});
 
 	it("isolates the fork: clears inherited todos, injects the fork notice, and re-injects after compaction", async () => {
-		const harness = createContext();
+		const harness = await createContext();
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
 		const compacted = Promise.withResolvers<void>();
 		const stub = createCloneStub({
@@ -511,9 +573,7 @@ describe("TanCommandController", () => {
 				compacted.resolve();
 			},
 		});
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
-			session: stub.clone,
-		} as unknown as CreateAgentSessionResult);
+		mockTanSessionCreation(stub);
 		const controller = new TanCommandController(harness.ctx);
 
 		await controller.start("follow the tangent");
