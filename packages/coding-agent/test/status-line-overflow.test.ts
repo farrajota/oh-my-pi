@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { StatusLineSegmentId } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
+import { getSeparator } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/separators";
 import type { SegmentContext } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/segments";
 import { renderSegment } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/segments";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
@@ -456,60 +457,68 @@ describe("overflow: path shrinks before git is dropped", () => {
 	});
 });
 
-describe("overflow: path survives before model", () => {
-	it("drops the model segment before the cwd path when both cannot fit", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-statusline-overflow-"));
-		const cwd = path.join(root, "cwdxyz");
+describe("overflow gap budgeting by layout", () => {
+	it("keeps mode and path within the box gauge boundary", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-statusline-box-boundary-"));
+		const cwd = path.join(root, "controlled-path-boundary");
 		fs.mkdirSync(cwd);
 		setProjectDir(cwd);
 
-		const modelName = `MODEL_SHOULD_DROP_${"x".repeat(24)}`;
-		const session = createStatusLineSession("overflow test", modelName);
+		const session = createStatusLineSession("boundary test");
 		const component = statusLines.track(new StatusLineComponent(session));
-		const pathOptions = {
-			abbreviate: false,
-			maxLength: 32,
-			stripWorkPrefix: false,
-		};
 		component.updateSettings({
 			preset: "custom",
-			leftSegments: ["pi", "model", "path"],
+			leftSegments: ["mode", "path"],
 			rightSegments: [],
 			separator: "none",
 			sessionAccent: false,
 			transparent: true,
 			segmentOptions: {
-				model: { showThinkingLevel: false },
-				path: pathOptions,
+				path: { abbreviate: false, maxLength: 80, stripWorkPrefix: false },
 			},
 		});
+		component.setPlanModeStatus({ enabled: true, paused: false });
 
-		const ctx = {
-			...createCtx({ pathMaxLength: pathOptions.maxLength }),
-			session,
-			options: {
-				model: { showThinkingLevel: false },
-				path: pathOptions,
+		const groupOnly = component.getTopBorder(0);
+		const budget = groupOnly.width;
+		const rendered = component.getTopBorder(budget);
+		const text = stripAnsi(rendered.content);
+
+		expect(rendered.width).toBeLessThanOrEqual(budget);
+		expect(text).toContain("Plan");
+		expect(text).toContain("controlled-path-boundary");
+		expect(component.getTopBorder(1).width).toBeLessThanOrEqual(1);
+	});
+
+	it("fits a one-sided plain group without a phantom gap", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-statusline-plain-boundary-"));
+		const cwd = path.join(root, "controlled-plain-path");
+		fs.mkdirSync(cwd);
+		setProjectDir(cwd);
+
+		const session = createStatusLineSession("plain boundary test");
+		const component = statusLines.track(new StatusLineComponent(session));
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["mode", "path"],
+			rightSegments: [],
+			separator: "none",
+			sessionAccent: false,
+			transparent: true,
+			segmentOptions: {
+				path: { abbreviate: false, maxLength: 80, stripWorkPrefix: false },
 			},
-		} as SegmentContext;
-		const pi = renderSegment("pi", ctx).content;
-		const model = renderSegment("model", ctx).content;
-		const minPath = renderSegment("path", {
-			...ctx,
-			options: { ...ctx.options, path: { ...pathOptions, maxLength: 4 } },
-		}).content;
-		const separatorWidth = visibleWidth(theme.sep.space);
-		const groupWidth = (parts: string[]) =>
-			parts.reduce((sum, part) => sum + visibleWidth(part), 0) +
-			Math.max(0, parts.length - 1) * (separatorWidth + 2) +
-			2;
-		const width = groupWidth([pi, model]) + 1;
+		});
+		component.setPlanModeStatus({ enabled: true, paused: false });
 
-		expect(groupWidth([pi, model, minPath])).toBeGreaterThan(width);
-		expect(groupWidth([pi, minPath])).toBeLessThanOrEqual(width);
+		const groupOnly = component.renderBottomBar(0, "left");
+		const budget = visibleWidth(groupOnly);
+		const rendered = component.renderBottomBar(budget, "left");
+		const text = stripAnsi(rendered);
 
-		const rendered = stripAnsi(component.getTopBorder(width).content);
-		expect(rendered).toContain("xyz");
-		expect(rendered).not.toContain("MODEL_SHOULD_DROP");
+		expect(visibleWidth(rendered)).toBeLessThanOrEqual(budget);
+		expect(text).toContain("Plan");
+		expect(text).toContain("controlled-plain-path");
+		expect(rendered).toBe(groupOnly);
 	});
 });

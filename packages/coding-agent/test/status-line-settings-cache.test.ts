@@ -190,6 +190,28 @@ describe("StatusLineComponent effective settings cache", () => {
 		expect(component.getEffectiveSettingsForTest()).toBe(effective);
 	});
 
+	it("keeps active mode and path within the status width budget", () => {
+		const component = makeComponent({
+			preset: "custom",
+			leftSegments: ["mode", "path"],
+			rightSegments: [],
+			separator: "slash",
+			sessionAccent: false,
+			segmentOptions: { path: { abbreviate: false, maxLength: 120, stripWorkPrefix: false } },
+		});
+		component.setPlanModeStatus({ enabled: true, paused: false });
+
+		const wide = component.getTopBorder(100);
+		const widePlain = stripVTControlCharacters(wide.content);
+		expect(widePlain).toContain("Plan");
+		expect(widePlain).toContain(path.basename(projectDir));
+		expect(visibleWidth(widePlain)).toBeLessThanOrEqual(100);
+		expect(visibleWidth(wide.content)).toBeLessThanOrEqual(100);
+
+		const narrow = component.getTopBorder(1);
+		expect(visibleWidth(narrow.content)).toBeLessThanOrEqual(1);
+	});
+
 	it("renders arbitrary extension statuses in deterministic segment order", () => {
 		const component = makeComponent({
 			preset: "custom",

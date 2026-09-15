@@ -2145,7 +2145,10 @@ export class StatusLineComponent implements Component {
 				: embeddedContextGaugeMinWidth(ctx.contextPercent ?? 0, ctx.contextWindow)
 			: 0;
 		const minimumGapWidth = (): number => {
-			if (!embeddedContextWidth) return left.length > 0 && right.length > 0 ? 1 : 0;
+			const hasLeft = left.length > 0;
+			const hasRight = right.length > 0;
+			if (plain) return hasLeft && hasRight ? 1 : 0;
+			if (!embeddedContextWidth) return hasLeft || hasRight ? 1 : 0;
 			// If the labels cannot coexist with the last surviving segment, fall
 			// back to the original one-cell gauge instead of dropping the entire
 			// status line. At this width the labels cannot render either way.
@@ -2211,10 +2214,10 @@ export class StatusLineComponent implements Component {
 				}
 			}
 			const leftOverflowDropIndex = (): number => {
-				// Preserve the current working directory as long as possible. The
-				// previous right-to-left pop could collapse a normal-width bar to
-				// just the model segment, hiding the path before less-critical left
-				// segments such as model/mode/collab were removed.
+				for (let i = leftSegIds.length - 1; i >= 0; i--) {
+					const segment = leftSegIds[i];
+					if (segment !== "path" && segment !== "mode") return i;
+				}
 				for (let i = leftSegIds.length - 1; i >= 0; i--) {
 					if (leftSegIds[i] !== "path") return i;
 				}
