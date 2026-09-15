@@ -1,4 +1,12 @@
-import { type Component, Container, Markdown, Text } from "@oh-my-pi/pi-tui";
+import {
+	padding,
+	sliceWithWidth,
+	type Component,
+	Container,
+	Markdown,
+	Text,
+	visibleWidth,
+} from "@oh-my-pi/pi-tui";
 import { formatBytes } from "@oh-my-pi/pi-utils";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 import { attachmentSgr, collapseImageMarkers, renderPlaceholders } from "../composer-attachments";
@@ -38,6 +46,8 @@ export class UserMessageComponent extends Container {
 	// never mutates the container's cached array.
 	#zoneSource: readonly string[] | undefined;
 	#zoneLines: string[] | undefined;
+	#zoneReaction: string | undefined;
+	#reaction: string | undefined;
 
 	constructor(text: string, synthetic = false, imageLinks?: readonly (string | undefined)[], timestamp?: number) {
 		super();
@@ -82,18 +92,34 @@ export class UserMessageComponent extends Container {
 		}
 	}
 
+	setReaction(reaction: string): void {
+		if (this.#reaction === reaction) return;
+		this.#reaction = reaction;
+		this.invalidate();
+	}
+
 	override render(width: number): readonly string[] {
 		const lines = super.render(width);
 		if (lines.length === 0) {
 			return lines;
 		}
-		if (this.#zoneSource === lines && this.#zoneLines !== undefined) {
+		if (this.#zoneSource === lines && this.#zoneLines !== undefined && this.#zoneReaction === this.#reaction) {
 			return this.#zoneLines;
 		}
-		const wrapped = lines.slice();
+		const rendered = lines.slice();
+		if (this.#reaction !== undefined) {
+			const rawBadge = theme.fgOnBg("userMessageText", "userMessageBg", `${this.#reaction} `);
+			const badge = visibleWidth(rawBadge) > width ? sliceWithWidth(rawBadge, 0, width, true).text : rawBadge;
+			const badgeWidth = visibleWidth(badge);
+			const prefixWidth = Math.max(0, width - badgeWidth);
+			const prefix = sliceWithWidth(lines[0]!, 0, prefixWidth, true).text;
+			rendered[0] = prefix + padding(prefixWidth - visibleWidth(prefix)) + badge;
+		}
+		const wrapped = rendered;
 		wrapped[0] = OSC133_ZONE_START + wrapped[0];
 		wrapped[wrapped.length - 1] = wrapped[wrapped.length - 1] + OSC133_ZONE_CLOSE;
 		this.#zoneSource = lines;
+		this.#zoneReaction = this.#reaction;
 		this.#zoneLines = wrapped;
 		return wrapped;
 	}
