@@ -23,7 +23,6 @@ import { computeNonMessageTokens } from "@oh-my-pi/pi-coding-agent/modes/utils/c
 import { mnemopiBackend } from "@oh-my-pi/pi-coding-agent/mnemopi/backend";
 import type { Tool, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ContextNotesTool, NewContextTool } from "@oh-my-pi/pi-coding-agent/tools/context-notes";
-import { BUILTIN_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/builtin-names";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
@@ -33,6 +32,10 @@ const authStorage = createInMemoryAuthStorage();
 authStorage.setRuntimeApiKey("anthropic", "test-key");
 authStorage.setRuntimeApiKey("openai-codex", "test-key");
 const modelRegistry = new ModelRegistry(authStorage);
+
+function getBuiltInToolNames(tools: Iterable<Tool>): Set<string> {
+	return new Set([...tools].map(tool => tool.name));
+}
 
 afterAll(() => {
 	authStorage.close();
@@ -121,7 +124,7 @@ describe("experimental context management", () => {
 			settings,
 			modelRegistry,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
-			builtInToolNames: BUILTIN_TOOL_NAMES,
+			builtInToolNames: getBuiltInToolNames(tools),
 		});
 		await session.setActiveToolsByName(tools.map(tool => tool.name));
 		return { session, manager, mock };
@@ -246,7 +249,7 @@ describe("experimental context management", () => {
 			settings,
 			modelRegistry,
 			toolRegistry,
-			builtInToolNames: BUILTIN_TOOL_NAMES,
+			builtInToolNames: getBuiltInToolNames(tools),
 		});
 
 		await session.compact();
@@ -353,7 +356,7 @@ describe("experimental context management", () => {
 			settings,
 			modelRegistry,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
-			builtInToolNames: BUILTIN_TOOL_NAMES,
+			builtInToolNames: getBuiltInToolNames(tools),
 		});
 
 		await session.prompt("save the notebook and roll over");
@@ -440,7 +443,7 @@ describe("experimental context management", () => {
 			settings,
 			modelRegistry,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
-			builtInToolNames: BUILTIN_TOOL_NAMES,
+			builtInToolNames: getBuiltInToolNames(tools),
 		});
 		return { rolloverSession, manager, agent, providerCalls: () => providerCalls };
 	}
@@ -518,7 +521,7 @@ describe("experimental context management", () => {
 			settings,
 			modelRegistry,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
-			builtInToolNames: BUILTIN_TOOL_NAMES,
+			builtInToolNames: getBuiltInToolNames(tools),
 		});
 		await session.compact();
 		const messages = session.agent.state.messages;
@@ -559,7 +562,7 @@ describe("experimental context management", () => {
 			settings,
 			modelRegistry,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
-			builtInToolNames: BUILTIN_TOOL_NAMES,
+			builtInToolNames: getBuiltInToolNames(tools),
 		});
 		const notebookText = `Durable notebook:\n${"- task state entry line. ".repeat(64)}`;
 		await contextNotes.execute("save-notebook", { text: notebookText });
@@ -601,7 +604,7 @@ describe("experimental context management", () => {
 				settings,
 				modelRegistry,
 				toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
-				builtInToolNames: BUILTIN_TOOL_NAMES,
+				builtInToolNames: getBuiltInToolNames(tools),
 			});
 			await session.compact();
 			expect(recallSpy).not.toHaveBeenCalled();
@@ -653,7 +656,7 @@ describe("experimental context management", () => {
 				settings,
 				modelRegistry,
 				toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
-				builtInToolNames: BUILTIN_TOOL_NAMES,
+				builtInToolNames: getBuiltInToolNames(tools),
 				extensionRunner,
 			});
 			const compacted = session.compact();

@@ -8,16 +8,36 @@ import {
 } from "@oh-my-pi/pi-coding-agent/eval/agent-bridge";
 import { runEvalWait } from "@oh-my-pi/pi-coding-agent/eval/handle-bridge";
 import type { LocalProtocolOptions } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
+import {
+	disposeAgentLifecycle,
+	getAgentLifecycleManager,
+	registerToolSessionLifecycleAuthority,
+	resetAgentLifecycleForTests,
+} from "../../src/internal/agent-lifecycle-bridge";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import {
+	installSessionOperationLedger,
+	markUnregisteredSessionOperationProjection,
+} from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import * as taskDiscovery from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as taskExecutor from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition, SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import type { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
+
+interface SessionOperationLedgerControl {
+	close(): Promise<void>;
+}
 
 const jobManagers = new Set<AsyncJobManager>();
+const operationLedgers = new Set<SessionOperationLedgerControl>();
+const lifecycleManagers = new Set<AgentLifecycleManager>();
 
 function isEvalAgentResult(value: unknown): value is EvalAgentResult {
 	return (
@@ -32,11 +52,8 @@ function isEvalAgentResult(value: unknown): value is EvalAgentResult {
 }
 
 async function runEvalAgentAndWait(args: unknown, options: EvalAgentBridgeOptions): Promise<EvalAgentResult> {
-	let manager = options.session.asyncJobManager;
-	if (!manager) {
-		manager = new AsyncJobManager({});
-		Object.assign(options.session, { asyncJobManager: manager });
-	}
+	const manager = options.session.asyncJobManager;
+	if (!manager) throw new Error("Eval fixture requires a session async job manager");
 	jobManagers.add(manager);
 	const handle = await runEvalAgent(args, options);
 	const waited = await runEvalWait({ items: [{ kind: "agent", id: handle.id }] }, options);
@@ -48,6 +65,55 @@ async function runEvalAgentAndWait(args: unknown, options: EvalAgentBridgeOption
 	const result = manager.getJob(handle.id)?.latestDetails?.evalResult;
 	if (!isEvalAgentResult(result)) throw new Error(`Agent handle ${handle.id} returned no eval result`);
 	return result;
+}
+
+const authoritySessions = new Set<AgentSession>();
+
+async function createFixtureSession(options: {
+	sessionManager?: SessionManager;
+	settings?: Settings;
+	asyncJobManager?: AsyncJobManager;
+} = {}): Promise<ToolSession> {
+	const settings = options.settings ?? Settings.isolated({ "task.isolation.enabled": false });
+	const sessionManager = options.sessionManager ?? SessionManager.inMemory("/tmp");
+	const operationLedger = installSessionOperationLedger(sessionManager);
+	operationLedgers.add(operationLedger);
+	markUnregisteredSessionOperationProjection(sessionManager, false);
+	const asyncJobManager = options.asyncJobManager ?? new AsyncJobManager({});
+	jobManagers.add(asyncJobManager);
+	const registry = new AgentRegistry();
+	const lifecycleManager = getAgentLifecycleManager(registry);
+	lifecycleManagers.add(lifecycleManager);
+	const root = await createAgentRootSession(registry, {
+		agentId: "Main",
+		agentDisplayName: "Main",
+		cwd: "/tmp",
+		agentDir: "/tmp",
+		settings,
+		disableExtensionDiscovery: true,
+		enableMCP: false,
+		enableLsp: false,
+		toolNames: [],
+		skipPythonPreflight: true,
+	});
+	authoritySessions.add(root.session);
+	const authorityBinding = bindInternalAgentAuthoritySession(registry, root.session);
+	if (!authorityBinding) throw new Error("Eval fixture requires a live parent-bound authority session.");
+	const session = {
+		cwd: "/tmp",
+		hasUI: false,
+		settings,
+		sessionManager,
+		asyncJobManager,
+		agentRegistry: registry,
+		createAuthoritySession: (childOptions, reviveRef) => authorityBinding.create(childOptions, reviveRef),
+		getSessionSpawns: () => "*",
+		getSessionFile: () => null,
+		getSessionId: () => "test-session",
+		getAgentId: () => "Main",
+	} satisfies ToolSession;
+	registerToolSessionLifecycleAuthority(session, registry, root.session);
+	return session;
 }
 
 function createResult(overrides: Partial<SingleResult> = {}): SingleResult {
@@ -79,15 +145,13 @@ function createUsage(output: number) {
 	};
 }
 
-function createBudgetSession(sessionManager: SessionManager): ToolSession {
-	return {
-		cwd: "/tmp",
-		settings: Settings.isolated(),
-		getSessionSpawns: () => "*",
-		getSessionFile: () => null,
+async function createBudgetSession(sessionManager: SessionManager, settings?: Settings): Promise<ToolSession> {
+	const session = await createFixtureSession({ sessionManager, settings });
+	Object.assign(session, {
 		getTurnBudget: () => sessionManager.getTurnBudget(),
 		recordEvalSubagentUsage: (output: number) => sessionManager.recordEvalSubagentOutput(output),
-	} as unknown as ToolSession;
+	});
+	return session;
 }
 
 describe("runEvalAgent", () => {
@@ -95,6 +159,13 @@ describe("runEvalAgent", () => {
 		vi.restoreAllMocks();
 		await Promise.all([...jobManagers].map(manager => manager.dispose()));
 		jobManagers.clear();
+		await Promise.all([...lifecycleManagers].map(manager => disposeAgentLifecycle(manager)));
+		lifecycleManagers.clear();
+		await Promise.all([...authoritySessions].map(session => session.dispose()));
+		authoritySessions.clear();
+		await Promise.all([...operationLedgers].map(ledger => ledger.close()));
+		operationLedgers.clear();
+		resetAgentLifecycleForTests();
 	});
 
 	it("forwards session-scoped MCP and local protocol options", async () => {
@@ -112,15 +183,12 @@ describe("runEvalAgent", () => {
 			getArtifactsDir: () => "/tmp/parent-artifacts",
 			getSessionId: () => "parent-session",
 		};
-		const session = {
-			cwd: "/tmp",
-			settings: Settings.isolated(),
-			getSessionSpawns: () => "*",
-			getSessionFile: () => null,
+		const session = await createFixtureSession();
+		Object.assign(session, {
 			mcpManager,
 			localProtocolOptions,
 			getAgentId: () => "BridgeParent",
-		} as unknown as ToolSession;
+		});
 
 		await runEvalAgentAndWait({ prompt: "do work", agent: "task" }, { session });
 
@@ -147,12 +215,7 @@ describe("runEvalAgent", () => {
 		};
 		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
 		vi.spyOn(taskExecutor, "runSubprocess").mockResolvedValue(createResult({ output: "not JSON", structuredOutput }));
-		const session = {
-			cwd: "/tmp",
-			settings: Settings.isolated(),
-			getSessionSpawns: () => "*",
-			getSessionFile: () => null,
-		} as unknown as ToolSession;
+		const session = await createFixtureSession();
 
 		const result = await runEvalAgentAndWait({ prompt: "do work", agent: "task", schemaMode: "strict" }, { session });
 
@@ -172,7 +235,7 @@ describe("runEvalAgent", () => {
 		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
 		vi.spyOn(taskExecutor, "runSubprocess").mockResolvedValue(createResult({ usage: createUsage(1_234) }));
 
-		await runEvalAgentAndWait({ prompt: "do work", agent: "task" }, { session: createBudgetSession(sessionManager) });
+		await runEvalAgentAndWait({ prompt: "do work", agent: "task" }, { session: await createBudgetSession(sessionManager) });
 
 		expect(sessionManager.getTurnBudget()).toEqual({
 			total: 100_000,
@@ -201,7 +264,7 @@ describe("runEvalAgent", () => {
 		);
 
 		await expect(
-			runEvalAgentAndWait({ prompt: "do work", agent: "task" }, { session: createBudgetSession(sessionManager) }),
+			runEvalAgentAndWait({ prompt: "do work", agent: "task" }, { session: await createBudgetSession(sessionManager) }),
 		).rejects.toThrow("agent failed");
 
 		expect(sessionManager.getTurnBudget().spent).toBe(2_345);
@@ -216,8 +279,10 @@ describe("runEvalAgent", () => {
 		};
 		const sessionManager = SessionManager.inMemory();
 		sessionManager.beginTurnBudget(100_000, true);
-		const session = createBudgetSession(sessionManager);
-		session.settings.set("task.isolation.enabled", true);
+		const session = await createBudgetSession(
+			sessionManager,
+			Settings.isolated({ "task.isolation.enabled": true }),
+		);
 		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
 		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
 			repoRoot: "/tmp",
@@ -253,13 +318,8 @@ describe("runEvalAgent", () => {
 			source: "bundled",
 		};
 		const recordEvalSubagentUsage = vi.fn();
-		const session = {
-			cwd: "/tmp",
-			settings: Settings.isolated(),
-			getSessionSpawns: () => "*",
-			getSessionFile: () => null,
-			recordEvalSubagentUsage,
-		} as unknown as ToolSession;
+		const session = await createFixtureSession();
+		Object.assign(session, { recordEvalSubagentUsage });
 		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
 		vi.spyOn(taskExecutor, "runSubprocess").mockResolvedValue(createResult({ usage: createUsage(3_456) }));
 
