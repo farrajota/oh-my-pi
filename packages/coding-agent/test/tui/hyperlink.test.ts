@@ -8,6 +8,7 @@ import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-ag
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { getMarkdownTheme, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import {
 	applyHyperlinkSetting,
 	fileHyperlink,
@@ -405,9 +406,11 @@ describe("resource links in chat markdown", () => {
 
 	it("expands labeled, reference, and table links to real local and artifact files", async () => {
 		const localFile = path.join(tempDir, "local", "reviewed findings#.json");
-		const artifactFile = path.join(tempDir, "42.txt");
+		const artifactManager = new ArtifactManager(tempDir);
+		const artifactId = await artifactManager.save("artifact output", "test");
+		const artifactFile = await artifactManager.getPath(artifactId);
+		if (!artifactFile) throw new Error(`Published artifact ${artifactId} was not found`);
 		await Bun.write(localFile, '{"reviewed":true}');
-		await Bun.write(artifactFile, "artifact output");
 		const href = "local://reviewed%20findings%23.json";
 		const text = [
 			`[Reviewed findings](${href})`,
@@ -416,7 +419,7 @@ describe("resource links in chat markdown", () => {
 			"| --- |",
 			"| [Artifact][output] |",
 			"",
-			"[output]: artifact://42",
+			`[output]: artifact://${artifactId}`,
 		].join("\n");
 		const targets = await resolveMarkdownLinkTargets([text], {
 			localProtocolOptions: { getArtifactsDir: () => tempDir },
@@ -432,7 +435,7 @@ describe("resource links in chat markdown", () => {
 		expect(output).toContain(`\x1b]8;;${artifactUri}\x07`);
 		const visible = stripVTControlCharacters(output);
 		expect(visible).toContain(`Reviewed findings (${href})`);
-		expect(visible).toContain("Artifact (artifact://42)");
+		expect(visible).toContain(`Artifact (artifact://${artifactId})`);
 		expect(visible).not.toContain("file://");
 	});
 
