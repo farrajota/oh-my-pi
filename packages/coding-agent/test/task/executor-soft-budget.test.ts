@@ -176,6 +176,7 @@ function registerAuthorityChild(
 	session: AgentSession,
 	sessionFile: string | null = null,
 ) {
+	if (!options) throw new Error("Expected createAgentSession options");
 	const agentRegistry = options.agentRegistry;
 	if (!agentRegistry) throw new Error("Expected runSubprocess authority to provide an agent registry");
 	const ref = agentRegistry.register({
@@ -191,6 +192,7 @@ function registerAuthorityChild(
 
 function mockCreateAgentSession(id: string, session: AgentSession, sessionFile: string | null = null) {
 	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		if (!options) throw new Error("Expected createAgentSession options");
 		const existing = options.agentRegistry ? lookupAgentRef(options.agentRegistry, id) : undefined;
 		if (existing?.status !== "parked") registerAuthorityChild(options, id, session, sessionFile);
 		return {

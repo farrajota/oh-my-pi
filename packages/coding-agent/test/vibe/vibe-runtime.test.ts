@@ -24,8 +24,8 @@ import * as path from "node:path";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as lifecycleBridge from "../../src/internal/agent-lifecycle-bridge";
-import { lookupAgentRef } from "../../src/internal/agent-registry-bridge";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { lookupAgentRef, type InternalAgentRef } from "../../src/internal/agent-registry-bridge";
+import { AgentRegistry, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import {
 	SessionManager,
@@ -120,8 +120,8 @@ class SwitchGatedSessionStorage extends FaultInjectingSessionStorage {
 	#readGate:
 		| {
 				filePath: string;
-				started: ReturnType<typeof Promise.withResolvers<void>>;
-				release: ReturnType<typeof Promise.withResolvers<void>>;
+				started: PromiseWithResolvers<void>;
+				release: PromiseWithResolvers<void>;
 		  }
 		| undefined;
 
@@ -187,7 +187,7 @@ function createSession(options: TestSessionOptions = {}): ToolSession {
 			(options.overrides as (Partial<ToolSession> & { operationLedger?: unknown }) | undefined)?.operationLedger ??
 			new Map<string, unknown>(),
 		createAuthoritySession: () => session,
-	} as ToolSession;
+	} as unknown as ToolSession;
 	return session;
 }
 
@@ -230,31 +230,30 @@ function makeResult(id: string, overrides: Partial<SingleResult> = {}): SingleRe
 		...overrides,
 	};
 }
-interface WorkerAuthority {
-	session: AgentSession | null;
-}
+type WorkerAuthority = InternalAgentRef;
 
-type WorkerExecutionOptions = Pick<ExecutorOptions, "id" | "operationLedger"> & {
+interface WorkerExecutionOptions {
+	id: string;
 	agentRegistry?: AgentRegistry;
 	authority?: WorkerAuthority;
-};
+}
 
 async function settleWorker(options: WorkerExecutionOptions, result: SingleResult): Promise<SingleResult> {
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const aborted = result.aborted === true;
 	const authority = aborted ? (options.authority ?? lookupAgentRef(agentRegistry, options.id)) : lookupAgentRef(agentRegistry, options.id);
-	if (!authority?.session) return result;
+	const session = authority?.session;
+	if (!session) return result;
 	await executorModule.finalizeSubagentLifecycle({
 		id: options.id,
-		session: authority.session,
+		session,
 		aborted,
 		keepAlive: true,
 		isolated: false,
 		agentIdleTtlMs: 0,
-		reviveSession: aborted ? null : async () => authority.session,
+		reviveSession: aborted ? null : async () => session,
 		agentRegistry,
 		agentLifecycle: lifecycleBridge.getAgentLifecycleManager(agentRegistry),
-		operationLedger: options.operationLedger,
 	});
 	return result;
 }
@@ -287,7 +286,16 @@ async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<vo
  * reports a final assistant message — enough surface for the executor's run
  * monitor + driveSessionToYield.
  */
-function createFakeWorkerSession(options: { streaming?: boolean; onDispose?: () => void | Promise<void> } = {}) {
+interface FakeWorkerSession {
+	session: AgentSession;
+	prompts: string[];
+	steers: string[];
+	isDisposed(): boolean;
+	setStreaming(value: boolean): void;
+	setScript(next: { events: unknown[]; responseText: string }): void;
+}
+
+function createFakeWorkerSession(options: { streaming?: boolean; onDispose?: () => void | Promise<void> } = {}): FakeWorkerSession {
 	const listeners = new Set<(event: unknown) => void>();
 	const prompts: string[] = [];
 	const steers: string[] = [];
@@ -392,7 +400,7 @@ describe("vibe session registry", () => {
 	const persistedManagers: SessionManager[] = [];
 	const tempRoots: string[] = [];
 
-	function exactAgent(id: string) {
+	function exactAgent(id: string): WorkerAuthority {
 		const ref = lookupAgentRef(AgentRegistry.global(), id);
 		if (!ref) throw new Error(`Expected exact agent ref for ${id}`);
 		return ref;
@@ -1209,7 +1217,7 @@ describe("vibe session registry", () => {
 		parentB.appendModeChange("vibe");
 		const parentAFile = parentA.getSessionFile();
 		if (!parentAFile) throw new Error("Persisted parent A session file was not created");
-		let workerA: ReturnType<typeof createFakeWorkerSession> | undefined;
+		let workerA: FakeWorkerSession | undefined;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			const artifactsDir = options.artifactsDir;
 			if (!artifactsDir) throw new Error("Persisted vibe test requires an artifacts directory");
@@ -1221,7 +1229,7 @@ describe("vibe session registry", () => {
 			});
 			const worker = createFakeWorkerSession();
 			if (options.sessionFile === parentAFile) workerA = worker;
-			const authority = AgentRegistry.global().register({
+			AgentRegistry.global().register({
 				id: options.id,
 				displayName: options.id,
 				kind: "sub",
@@ -1230,6 +1238,8 @@ describe("vibe session registry", () => {
 				sessionFile: childSessionFile,
 				status: "running",
 			});
+			const authority = lookupAgentRef(AgentRegistry.global(), options.id);
+			if (!authority) throw new Error(`Expected authority for ${options.id}`);
 			if (options.sessionFile === parentAFile) {
 				const signal = options.signal;
 				if (!signal) throw new Error("Persisted blocked worker requires a cancellation signal");
@@ -1248,7 +1258,7 @@ describe("vibe session registry", () => {
 		const registry = VibeSessionRegistry.global();
 		await registry.spawn(sessionA, { cli: "fast", name: "reused", prompt: INITIAL_VIBE_TASK });
 		await pollUntil(() => workerA !== undefined);
-		const oldRef = AgentRegistry.global().get("reused");
+		const oldRef = lookupAgentRef(AgentRegistry.global(), "reused");
 		const owningRegistry = AgentRegistry.global();
 		const owningLifecycle = lifecycleBridge.getAgentLifecycleManager(owningRegistry);
 		if (!oldRef) throw new Error("Expected parent A worker ref");
@@ -2122,7 +2132,7 @@ describe("vibe session registry", () => {
 	});
 
 	it("keeps a persisted in-flight kill terminal when the old executor finalizes late", async () => {
-		let worker: ReturnType<typeof createFakeWorkerSession> | undefined;
+		let worker: FakeWorkerSession | undefined;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			const artifactsDir = options.artifactsDir;
 			if (!artifactsDir) throw new Error("Persisted vibe test requires an artifacts directory");
@@ -2188,9 +2198,9 @@ describe("vibe session registry", () => {
 	});
 
 	it("does not terminalize a same-path replacement installed while the killed worker disposes", async () => {
-		let worker: ReturnType<typeof createFakeWorkerSession> | undefined;
-		let replacement: ReturnType<AgentRegistry["register"]> | undefined;
-		let replacementWorker: ReturnType<typeof createFakeWorkerSession> | undefined;
+		let worker: FakeWorkerSession | undefined;
+		let replacement: AgentRef | undefined;
+		let replacementWorker: FakeWorkerSession | undefined;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			const artifactsDir = options.artifactsDir;
 			if (!artifactsDir) throw new Error("Persisted vibe test requires an artifacts directory");
@@ -2214,7 +2224,7 @@ describe("vibe session registry", () => {
 					});
 				},
 			});
-			const authority = AgentRegistry.global().register({
+			AgentRegistry.global().register({
 				id: options.id,
 				displayName: options.id,
 				kind: "sub",
@@ -2223,6 +2233,8 @@ describe("vibe session registry", () => {
 				sessionFile: childSessionFile,
 				status: "running",
 			});
+			const authority = lookupAgentRef(AgentRegistry.global(), options.id);
+			if (!authority) throw new Error(`Expected authority for ${options.id}`);
 			const signal = options.signal;
 			if (!signal) throw new Error("Persisted blocked worker requires a cancellation signal");
 			await new Promise<void>(resolve => {
