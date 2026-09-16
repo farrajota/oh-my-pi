@@ -307,11 +307,14 @@ describe("runSubprocess per-agent prewalk", () => {
 					configurable: true,
 					value: async () => {
 						snapshotHistory();
-						result.session.model = target;
-						result.session.servingModel = {
-							selector: `${target.provider}/${target.id}`,
-							isFallback: true,
-						};
+						Object.defineProperties(result.session, {
+							model: { configurable: true, writable: true, value: target },
+							servingModel: {
+								configurable: true,
+								writable: true,
+								value: { selector: `${target.provider}/${target.id}`, isFallback: true },
+							},
+						});
 						for (const listener of listeners) {
 							listener({ type: "notice", level: "info", message: "Prewalk switched", source: "prewalk" });
 						}
