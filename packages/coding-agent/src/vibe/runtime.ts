@@ -1527,7 +1527,10 @@ export class VibeSessionRegistry {
 			record.state = "dead";
 			return;
 		}
-		if (record.queue.length === 0) return;
+		if (record.queue.length === 0) {
+			record.state = "idle";
+			return;
+		}
 		const nextMessage = record.queue.splice(0, record.queue.length).join("\n\n");
 		try {
 			this.#registerTurnJob(session, manager, record, nextMessage, { first: false });

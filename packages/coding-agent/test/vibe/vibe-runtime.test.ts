@@ -162,24 +162,33 @@ interface TestSessionOptions {
 	sessionManager?: SessionManager;
 	ownerId?: string;
 	parentSessionId?: string;
+	agentRegistry?: AgentRegistry;
 	overrides?: Partial<ToolSession>;
 }
 
 function createSession(options: TestSessionOptions = {}): ToolSession {
 	const sessionManager = options.sessionManager;
-	return {
+	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
+	const parentSessionId = options.parentSessionId ?? sessionManager?.getSessionId() ?? "vibe-test-parent";
+	const session = {
 		cwd: sessionManager?.getCwd() ?? "/tmp",
 		hasUI: false,
 		settings: Settings.isolated({}),
 		getSessionFile: () => sessionManager?.getSessionFile() ?? null,
-		getSessionId: () => options.parentSessionId ?? sessionManager?.getSessionId() ?? "vibe-test-parent",
+		getSessionId: () => parentSessionId,
 		getAgentId: () => options.ownerId ?? "Main",
 		getArtifactsDir: () => sessionManager?.getArtifactsDir() ?? null,
 		getSessionSpawns: () => "*",
 		sessionManager,
 		asyncJobManager: options.manager,
 		...options.overrides,
-	};
+		agentRegistry,
+		operationLedger:
+			(options.overrides as (Partial<ToolSession> & { operationLedger?: unknown }) | undefined)?.operationLedger ??
+			new Map<string, unknown>(),
+		createAuthoritySession: () => session,
+	} as ToolSession;
+	return session;
 }
 
 interface PersistWorkerOptions {
@@ -221,6 +230,34 @@ function makeResult(id: string, overrides: Partial<SingleResult> = {}): SingleRe
 		...overrides,
 	};
 }
+interface WorkerAuthority {
+	session: AgentSession | null;
+}
+
+type WorkerExecutionOptions = Pick<ExecutorOptions, "id" | "operationLedger"> & {
+	agentRegistry?: AgentRegistry;
+	authority?: WorkerAuthority;
+};
+
+async function settleWorker(options: WorkerExecutionOptions, result: SingleResult): Promise<SingleResult> {
+	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
+	const aborted = result.aborted === true;
+	const authority = aborted ? (options.authority ?? lookupAgentRef(agentRegistry, options.id)) : lookupAgentRef(agentRegistry, options.id);
+	if (!authority?.session) return result;
+	await executorModule.finalizeSubagentLifecycle({
+		id: options.id,
+		session: authority.session,
+		aborted,
+		keepAlive: true,
+		isolated: false,
+		agentIdleTtlMs: 0,
+		reviveSession: aborted ? null : async () => authority.session,
+		agentRegistry,
+		agentLifecycle: lifecycleBridge.getAgentLifecycleManager(agentRegistry),
+		operationLedger: options.operationLedger,
+	});
+	return result;
+}
 
 interface Deferred {
 	promise: Promise<void>;
@@ -261,6 +298,11 @@ function createFakeWorkerSession(options: { streaming?: boolean; onDispose?: () 
 		isStreaming: options.streaming ?? false,
 		model: undefined,
 		isAdvisorActive: () => false,
+		async prepareForHeadlessAdvisorDrain(): Promise<void> {},
+		async waitForAdvisorCatchup(): Promise<void> {},
+		sessionManager: {
+			getArtifactManager: () => undefined,
+		},
 		subscribe(listener: (event: unknown) => void): () => void {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
@@ -288,6 +330,7 @@ function createFakeWorkerSession(options: { streaming?: boolean; onDispose?: () 
 		getLastAssistantMessage() {
 			return lastAssistant;
 		},
+		getPermissionSummary: () => undefined,
 		setWorkPoolYieldItems: (_items: unknown[]) => {},
 		async abort(): Promise<void> {},
 		async dispose(): Promise<void> {
@@ -405,17 +448,7 @@ describe("vibe session registry", () => {
 				sessionFile: childSessionFile,
 				status: "running",
 			});
-			AgentRegistry.global().setStatus(options.id, "idle");
-			lifecycleBridge.adoptAgent(
-				lifecycleBridge.getAgentLifecycleManager(),
-				options.id,
-				{
-					idleTtlMs: 0,
-					revive: async () => worker.session,
-				},
-				exactAgent(options.id),
-			);
-			return makeResult(options.id, { output: "Persisted first turn." });
+			return settleWorker(options, makeResult(options.id, { output: "Persisted first turn." }));
 		});
 	}
 
@@ -492,8 +525,7 @@ describe("vibe session registry", () => {
 				}),
 			);
 			await gate.promise;
-			AgentRegistry.global().setStatus(options.id, "idle");
-			return makeResult(options.id, { output: "Implemented the widget.", requests: 3 });
+			return settleWorker(options, makeResult(options.id, { output: "Implemented the widget.", requests: 3 }));
 		});
 
 		const manager = createManager();
@@ -538,8 +570,7 @@ describe("vibe session registry", () => {
 				session: createFakeWorkerSession().session,
 				status: "running",
 			});
-			AgentRegistry.global().setStatus(options.id, "idle");
-			return makeResult(options.id, { output: "Fresh worker ready." });
+			return settleWorker(options, makeResult(options.id, { output: "Fresh worker ready." }));
 		});
 		const extensionRoots = {
 			explicit: ["/vibe/explicit"],
@@ -650,13 +681,12 @@ describe("vibe session registry", () => {
 				status: "running",
 			});
 			await gate.promise;
-			AgentRegistry.global().setStatus(options.id, "idle");
-			return makeResult(options.id);
+			return settleWorker(options, makeResult(options.id));
 		});
 		const followUps: Array<{ id: string; message: string }> = [];
 		vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockImplementation(async options => {
 			followUps.push({ id: options.id, message: options.message });
-			return makeResult(options.id, { output: "queued work done" });
+			return settleWorker(options, makeResult(options.id, { output: "queued work done" }));
 		});
 
 		const manager = createManager();
@@ -695,8 +725,7 @@ describe("vibe session registry", () => {
 				status: "running",
 			});
 			await gate.promise;
-			AgentRegistry.global().setStatus(options.id, "idle");
-			return makeResult(options.id);
+			return settleWorker(options, makeResult(options.id));
 		});
 		const followUps: Array<{ id: string; message: string }> = [];
 		vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockImplementation(async options => {
@@ -707,7 +736,7 @@ describe("vibe session registry", () => {
 					recentTools: [{ tool: "edit", args: "src/foo.ts", endMs: 1 }],
 				}),
 			);
-			return makeResult(options.id, { output: "Renamed everything." });
+			return settleWorker(options, makeResult(options.id, { output: "Renamed everything." }));
 		});
 
 		const manager = createManager();
@@ -863,7 +892,7 @@ describe("vibe session registry", () => {
 				if (signal.aborted) resolve();
 				else signal.addEventListener("abort", () => resolve(), { once: true });
 			});
-			return makeResult(options.id, { output: "Interrupted by disposal.", aborted: true });
+			return settleWorker(options, makeResult(options.id, { output: "Interrupted by disposal.", aborted: true }));
 		});
 		const parentManager = await createPersistedParent();
 		parentManager.appendModeChange("vibe");
@@ -928,7 +957,7 @@ describe("vibe session registry", () => {
 			});
 			started.resolve();
 			await gate.promise;
-			return makeResult(options.id);
+			return settleWorker(options, makeResult(options.id));
 		});
 
 		const manager = createManager();
@@ -1192,7 +1221,7 @@ describe("vibe session registry", () => {
 			});
 			const worker = createFakeWorkerSession();
 			if (options.sessionFile === parentAFile) workerA = worker;
-			AgentRegistry.global().register({
+			const authority = AgentRegistry.global().register({
 				id: options.id,
 				displayName: options.id,
 				kind: "sub",
@@ -1208,10 +1237,9 @@ describe("vibe session registry", () => {
 					if (signal.aborted) resolve();
 					else signal.addEventListener("abort", () => resolve(), { once: true });
 				});
-				return makeResult(options.id, { output: "Parent A suspended.", aborted: true });
+				return settleWorker({ ...options, authority }, makeResult(options.id, { output: "Parent A suspended.", aborted: true }));
 			}
-			AgentRegistry.global().setStatus(options.id, "idle");
-			return makeResult(options.id, { output: "Parent B finished." });
+			return settleWorker({ ...options, authority }, makeResult(options.id, { output: "Parent B finished." }));
 		});
 		const jobsA = createManager();
 		const jobsB = createManager();
@@ -1316,7 +1344,12 @@ describe("vibe session registry", () => {
 		if (!parentSessionFile) throw new Error("Persisted parent session file was not created");
 		const artifactsDir = parentSessionFile.slice(0, -6);
 		await fs.mkdir(artifactsDir, { recursive: true });
-		await fs.writeFile(path.join(artifactsDir, "orphan.jsonl"), "orphaned transcript");
+		await persistWorkerSession({
+			cwd: parentManager.getCwd(),
+			artifactsDir,
+			id: "orphan",
+			task: INITIAL_VIBE_TASK,
+		});
 		const firstJobs = createManager();
 		const firstSession = createSession({ manager: firstJobs, sessionManager: parentManager });
 		const registry = VibeSessionRegistry.global();
@@ -1335,7 +1368,6 @@ describe("vibe session registry", () => {
 		});
 		await firstJobs.getJob(metadataOnly.jobId)!.promise;
 		await registry.kill(firstSession, metadataOnly.id);
-		await fs.rm(path.join(artifactsDir, "metadata-only.jsonl"), { force: true });
 		await simulateProcessBoundary();
 
 		const resumedJobs = createManager();
@@ -1964,8 +1996,7 @@ describe("vibe session registry", () => {
 			const gate = deferred();
 			gates.set(options.id, gate);
 			await gate.promise;
-			AgentRegistry.global().setStatus(options.id, "idle");
-			return makeResult(options.id, { output: `${options.id} finished.` });
+			return settleWorker(options, makeResult(options.id, { output: `${options.id} finished.` }));
 		});
 
 		const manager = createManager();
@@ -2003,13 +2034,12 @@ describe("vibe session registry", () => {
 				status: "running",
 			});
 			await firstGate.promise;
-			AgentRegistry.global().setStatus(options.id, "idle");
-			return makeResult(options.id, { output: "First turn done." });
+			return settleWorker(options, makeResult(options.id, { output: "First turn done." }));
 		});
 		const followUpGate = deferred();
 		vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockImplementation(async options => {
 			await followUpGate.promise;
-			return makeResult(options.id, { output: "Follow-up done." });
+			return settleWorker(options, makeResult(options.id, { output: "Follow-up done." }));
 		});
 
 		const manager = createManager();
@@ -2055,7 +2085,7 @@ describe("vibe session registry", () => {
 			});
 			started.resolve();
 			await gate.promise;
-			return makeResult(options.id);
+			return settleWorker(options, makeResult(options.id));
 		});
 
 		const manager = createManager();
@@ -2118,7 +2148,7 @@ describe("vibe session registry", () => {
 				if (signal.aborted) resolve();
 				else signal.addEventListener("abort", () => resolve(), { once: true });
 			});
-			return makeResult(options.id, { output: "Killed during work.", aborted: true });
+			return settleWorker(options, makeResult(options.id, { output: "Killed during work.", aborted: true }));
 		});
 		const parentManager = await createPersistedParent();
 		parentManager.appendModeChange("vibe");
@@ -2184,7 +2214,7 @@ describe("vibe session registry", () => {
 					});
 				},
 			});
-			AgentRegistry.global().register({
+			const authority = AgentRegistry.global().register({
 				id: options.id,
 				displayName: options.id,
 				kind: "sub",
@@ -2199,7 +2229,7 @@ describe("vibe session registry", () => {
 				if (signal.aborted) resolve();
 				else signal.addEventListener("abort", () => resolve(), { once: true });
 			});
-			return makeResult(options.id, { output: "Old worker killed.", aborted: true });
+			return settleWorker({ ...options, authority }, makeResult(options.id, { output: "Old worker killed.", aborted: true }));
 		});
 		const parentManager = await createPersistedParent();
 		parentManager.appendModeChange("vibe");
@@ -2253,9 +2283,9 @@ describe("vibe session registry", () => {
 				parentId: options.parentAgentId ?? "Main",
 				session: createFakeWorkerSession().session,
 				sessionFile: childSessionFile,
-				status: "idle",
+				status: "running",
 			});
-			return makeResult(options.id, { output: "Killed before initialization.", aborted: true });
+			return settleWorker(options, makeResult(options.id, { output: "Killed before initialization.", aborted: true }));
 		});
 		const parentManager = await createPersistedParent();
 		parentManager.appendModeChange("vibe");
@@ -2304,7 +2334,7 @@ describe("vibe session registry", () => {
 			const gate = deferred();
 			gates.set(options.id, gate);
 			await gate.promise;
-			return makeResult(options.id);
+			return settleWorker(options, makeResult(options.id));
 		});
 
 		const manager = createManager();
