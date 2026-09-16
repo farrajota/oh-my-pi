@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
@@ -21,12 +21,19 @@ function createSession(options: {
 	settings?: Record<string, unknown>;
 	spawns?: string | boolean;
 }): ToolSession {
+	const parentId = "parent";
+	const agentRegistry = new AgentRegistry();
+	const operationLedger = new Map();
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		settings: Settings.isolated({ "async.enabled": true, ...options.settings }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => options.spawns ?? "*",
+		getAgentId: () => parentId,
+		agentRegistry,
+		createAuthoritySession: () => ({ agentRegistry, operationLedger, parentId }),
+		operationLedger,
 		asyncJobManager: options.manager,
 	} as unknown as ToolSession;
 }
@@ -63,13 +70,13 @@ describe("task async preflight", () => {
 
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 1_000 });
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 	});
 

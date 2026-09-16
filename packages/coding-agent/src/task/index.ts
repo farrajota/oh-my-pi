@@ -214,6 +214,10 @@ export function formatResultOutputFallback(result: Pick<SingleResult, "output" |
 function formatListForDetails(values: string[] | undefined): string | undefined {
 	return values && values.length > 0 ? values.join(", ") : undefined;
 }
+function formatTaskFailure(item: TaskItem, index: number, message: string, phase = "failed"): string {
+	const label = item.name?.trim() || `#${index + 1}`;
+	return `Task ${label} ${phase}: ${message}`;
+}
 
 function appendPermissionDetails(lines: string[], permissions: TaskParams["permissions"] | undefined): void {
 	if (!permissions) return;
@@ -1157,11 +1161,24 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const spawnItems = resolveSpawnItems(params);
 		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
 		const resolvedAgents = normalizedSpawnParams.map(spawn => spawn.agent ?? defaultAgent);
-		const preflights = await Promise.all(
+		const preflightResults = await Promise.allSettled(
 			normalizedSpawnParams.map(spawn =>
 				this.#resolveSpawnPreflight(spawn, preparedSettings, batchEnabled, taskDepth),
 			),
 		);
+		const preflights: EffectiveSubagentPolicy[] = [];
+		const preflightFailures: string[] = [];
+		for (const [index, result] of preflightResults.entries()) {
+			if (result.status === "rejected") {
+				const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+				preflightFailures.push(formatTaskFailure(spawnItems[index]!, index, message, "failed preflight"));
+			} else {
+				preflights.push(result.value);
+			}
+		}
+		if (preflightFailures.length > 0) {
+			throw new StructuredSubagentError("preflight", preflightFailures.join("\n"));
+		}
 		const loadedPermissionProfiles = await loadPermissionProfiles(this.session.cwd);
 		const inheritedPermissions = this.session.getPermissionScope?.();
 		const liveCapabilities = await collectLivePermissionCapabilities(this.session, signal);
@@ -2094,7 +2111,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				content: [
 					{
 						type: "text",
-						text: `Task ${item.name?.trim() || `#${spawns[position].index + 1}`} failed: ${message}`,
+						text: formatTaskFailure(item, position, message),
 					},
 				],
 				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },

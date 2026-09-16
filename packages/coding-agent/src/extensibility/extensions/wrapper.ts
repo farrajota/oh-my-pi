@@ -368,6 +368,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// input that actually executes, closing the "approve one thing, run another" gap: the prompt
 		// text, policy resolution, and provider safety checks all see `effectiveParams`.
 		let effectiveParams = params;
+		let executableInputChanged = false;
 		if (
 			!loopEmittedToolCall &&
 			hasRunnerHandlers(this.runner, "tool_call") &&
@@ -393,6 +394,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					throw new Error(reason);
 				}
 				if (callResult?.input !== undefined && context?.toolCall?.providerMetadata?.type !== "computer") {
+					executableInputChanged = true;
 					effectiveParams = callResult.input as typeof params;
 				}
 			} catch (err) {
@@ -407,6 +409,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const pathInput = recordParams(effectiveParams);
 		if (pathScope && Object.keys(pathInput).length > 0) {
 			const replacements = await pathScope.authorizeInput(this.tool.name, pathInput);
+			if (Object.keys(replacements).length > 0) executableInputChanged = true;
 			effectiveParams = rewriteAuthorizedInput(pathInput, replacements) as typeof effectiveParams;
 		}
 		const settings = context?.settings;
@@ -477,7 +480,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// stronger: yolo, per-tool allow, and xdev approval never acknowledge
 			// them on the user's behalf.
 			const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
-			const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
+			const xdevBypass = context?.xdevApproved === true && !executableInputChanged;
 			const approvalCheck = {
 				required:
 					pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),

@@ -20,7 +20,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
@@ -44,13 +44,19 @@ const scoutAgent: AgentDefinition = {
 };
 
 function createSession(options: { manager?: AsyncJobManager; settings?: Record<string, unknown> } = {}): ToolSession {
+	const parentId = "parent";
+	const agentRegistry = new AgentRegistry();
+	const operationLedger = new Map();
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		settings: Settings.isolated(options.settings ?? { "async.enabled": true, "task.batch": true }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		getAgentId: () => null,
+		getAgentId: () => parentId,
+		agentRegistry,
+		createAuthoritySession: () => ({ agentRegistry, operationLedger, parentId }),
+		operationLedger,
 		asyncJobManager: options.manager,
 	} as unknown as ToolSession;
 }
@@ -97,7 +103,7 @@ describe("task per-item blocking split", () => {
 
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 	});
 
 	afterEach(async () => {
@@ -105,7 +111,7 @@ describe("task per-item blocking split", () => {
 		for (const manager of managers.splice(0)) {
 			await manager.dispose({ timeoutMs: 1000 });
 		}
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 	});
 
