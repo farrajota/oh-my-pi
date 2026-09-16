@@ -6,12 +6,13 @@
  * target identical to the starting model).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import type { Model } from "@oh-my-pi/pi-ai";
+import { AuthStorage, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import {
 	installSessionOperationLedger,
 	markUnregisteredSessionOperationProjection,
@@ -128,6 +129,24 @@ function createModelRegistry(models: Model[]): ModelRegistry {
 		hasConfiguredAuth: () => true,
 	} as unknown as ModelRegistry;
 }
+async function createAuthorityFixture(settings = Settings.isolated()) {
+	const agentRegistry = new AgentRegistry();
+	const root = await createAgentRootSession(agentRegistry, {
+		agentId: "Main",
+		agentDisplayName: "Main",
+		cwd: "/tmp",
+		agentDir: "/tmp",
+		settings,
+		disableExtensionDiscovery: true,
+		enableMCP: false,
+		enableLsp: false,
+		toolNames: [],
+		skipPythonPreflight: true,
+	});
+	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	return { agentRegistry, createAuthoritySession: authority.create };
+}
 
 const baseAgent: AgentDefinition = {
 	name: "task",
@@ -135,6 +154,7 @@ const baseAgent: AgentDefinition = {
 	systemPrompt: "test",
 	source: "bundled",
 };
+const authorityAuthStorages: AuthStorage[] = [];
 
 describe("runSubprocess per-agent prewalk", () => {
 	const primary = modelOrThrow("claude-sonnet-4-5");
@@ -144,13 +164,14 @@ describe("runSubprocess per-agent prewalk", () => {
 	function baseOptions(id: string, settings: Settings) {
 		const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
 			sdkModule.createAgentSession({ ...options, agentRegistry: registry });
+		const modelRegistry = createModelRegistry([primary, target]);
 		return {
 			cwd: "/tmp",
 			task: "do work",
 			index: 0,
 			id,
 			settings,
-			modelRegistry: createModelRegistry([primary, target]),
+			modelRegistry,
 			enableLsp: false,
 			agentRegistry: registry,
 			createAuthoritySession,
@@ -162,10 +183,11 @@ describe("runSubprocess per-agent prewalk", () => {
 		resetAgentLifecycleForTests();
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
+		for (const authStorage of authorityAuthStorages.splice(0)) await authStorage.close();
 	});
 
 	it("resolves a frontmatter prewalk pattern to a target for the spawned session", async () => {
@@ -249,8 +271,13 @@ describe("runSubprocess per-agent prewalk", () => {
 			requestedPermissionProfiles?: string[];
 			effectivePermissionProfiles?: string[];
 		}> = [];
+		const authority = await createAuthorityFixture();
+		const authStorage = await AuthStorage.create(":memory:");
+		authorityAuthStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
 		const snapshotHistory = () => {
-			const history = registry.get(id)?.history;
+			const history = authority.agentRegistry.get(id)?.history;
 			historySnapshots.push({
 				modelRole: history?.modelRole,
 				resolvedModel: history?.resolvedModel,
@@ -259,25 +286,63 @@ describe("runSubprocess per-agent prewalk", () => {
 				effectivePermissionProfiles: history?.effectivePermissionProfiles,
 			});
 		};
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			if (!options?.sessionManager) throw new Error("Expected executor-owned session manager");
-			return createSessionResult(
-				yieldEmittingSession(
-					["read", "yield"],
-					{
-						from: primary,
-						to: target,
-						toIsFallback: true,
-						onBeforeSwitch: snapshotHistory,
-						onAfterSwitch: snapshotHistory,
+		const createAuthoritySession: NonNullable<ToolSession["createAuthoritySession"]> = async (options, reviveRef) => {
+			const result = await authority.createAuthoritySession(options, reviveRef);
+			const listeners: Array<(event: AgentSessionEvent) => void> = [];
+			Object.defineProperties(result.session, {
+				model: { configurable: true, writable: true, value: primary },
+				servingModel: {
+					configurable: true,
+					writable: true,
+					value: { selector: `${primary.provider}/${primary.id}`, isFallback: false },
+				},
+				subscribe: {
+					configurable: true,
+					value: (listener: (event: AgentSessionEvent) => void) => {
+						listeners.push(listener);
+						return () => listeners.splice(listeners.indexOf(listener), 1);
 					},
-					options.sessionManager,
-				),
-			);
-		});
+				},
+				prompt: {
+					configurable: true,
+					value: async () => {
+						snapshotHistory();
+						result.session.model = target;
+						result.session.servingModel = {
+							selector: `${target.provider}/${target.id}`,
+							isFallback: true,
+						};
+						for (const listener of listeners) {
+							listener({ type: "notice", level: "info", message: "Prewalk switched", source: "prewalk" });
+						}
+						snapshotHistory();
+						for (const listener of listeners) {
+							listener({
+								type: "tool_execution_end",
+								toolCallId: "tool-prewalk",
+								toolName: "yield",
+								result: {
+									content: [{ type: "text", text: "Result submitted." }],
+									details: { status: "success", data: { ok: true } },
+								},
+								isError: false,
+							});
+						}
+					},
+				},
+			});
+			result.session.getActiveToolNames = () => ["read", "yield"];
+			result.session.getEnabledToolNames = () => ["read", "yield"];
+			result.session.getAllToolNames = () => ["read", "yield"];
+			return result;
+		};
 
 		const result = await runSubprocess({
 			...baseOptions(id, Settings.isolated()),
+			agentRegistry: authority.agentRegistry,
+			createAuthoritySession,
+			authStorage,
+			modelRegistry,
 			agent: { ...baseAgent, model: [`${primary.provider}/${primary.id}`] },
 			modelRole: "reviewer",
 			requestedPermissionProfiles,
@@ -305,7 +370,16 @@ describe("runSubprocess per-agent prewalk", () => {
 			resolvedModel: `${target.provider}/${target.id}`,
 			resolvedModelIsFallback: true,
 		});
-		expect(registry.get(id)).toBeUndefined();
+		expect(authority.agentRegistry.get(id)).toMatchObject({
+			status: "parked",
+			history: {
+				modelRole: "reviewer",
+				resolvedModel: `${target.provider}/${target.id}`,
+				resolvedModelIsFallback: true,
+				requestedPermissionProfiles,
+				effectivePermissionProfiles,
+			},
+		});
 	});
 
 	it("resolves prewalk: true through the smol role default target", async () => {
@@ -461,10 +535,14 @@ describe("task tool plan-mode prewalk guard", () => {
 		source: "bundled",
 		prewalk: true,
 	};
-
-	beforeEach(() => {
+	let registry: AgentRegistry;
+	let createAuthoritySession: NonNullable<ToolSession["createAuthoritySession"]>;
+	beforeEach(async () => {
 		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		const authority = await createAuthorityFixture();
+		registry = authority.agentRegistry;
+		createAuthoritySession = authority.createAuthoritySession;
 	});
 
 	afterEach(() => {
@@ -481,6 +559,10 @@ describe("task tool plan-mode prewalk guard", () => {
 			cwd: "/tmp",
 			hasUI: false,
 			settings: Settings.isolated({ "task.isolation.enabled": false }),
+			modelRegistry: createModelRegistry([]),
+			authStorage: {},
+			agentRegistry: registry,
+			createAuthoritySession,
 			sessionManager,
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
