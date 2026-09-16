@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { buildSpecializationAdvisory, TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
@@ -58,12 +58,12 @@ describe("task tool advisory gating via suppressSpawnAdvisory", () => {
 
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 	});
 
 	afterEach(() => {
 		vi.restoreAllMocks();
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 	});
 

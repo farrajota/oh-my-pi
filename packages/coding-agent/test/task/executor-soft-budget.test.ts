@@ -12,12 +12,21 @@ import {
 	parkAgent,
 	resetAgentLifecycleForTests,
 } from "../../src/internal/agent-lifecycle-bridge";
+import {
+	bindInternalAgentAuthoritySession,
+	createAgentRootSession,
+	lookupAgentRef,
+} from "../../src/internal/agent-registry-bridge";
+import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
+import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { resolveSoftRequestBudget, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
@@ -73,13 +82,16 @@ function createMockSession(
 		for (const listener of [...listeners]) listener(event);
 	};
 
+	const sessionManager = SessionManager.inMemory("/tmp");
+	installSessionOperationLedger(sessionManager);
+
 	const session: Partial<AgentSession> = {
 		...createSessionDefaults(),
 		state: { messages: [] } as never,
 		agent: { state: { systemPrompt: ["test"] } } as never,
 		model: { api: "anthropic-messages" } as never,
 		extensionRunner: undefined as never,
-		sessionManager: { appendSessionInit: () => {} } as never,
+		sessionManager,
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
@@ -158,13 +170,36 @@ function createMockSession(
 	};
 }
 
-function mockCreateAgentSession(session: AgentSession) {
-	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
+function registerAuthorityChild(
+	options: Parameters<typeof sdkModule.createAgentSession>[0],
+	id: string,
+	session: AgentSession,
+	sessionFile: string | null = null,
+) {
+	const agentRegistry = options.agentRegistry;
+	if (!agentRegistry) throw new Error("Expected runSubprocess authority to provide an agent registry");
+	const ref = agentRegistry.register({
+		id,
+		displayName: id,
+		kind: "sub",
 		session,
-		extensionsResult: {} as unknown as LoadExtensionsResult,
-		setToolUIContext: () => {},
-		eventBus: new EventBus(),
-	} satisfies CreateAgentSessionResult);
+		sessionFile,
+		status: "running",
+	});
+	return { ref, lifecycle: getAgentLifecycleManager(agentRegistry) };
+}
+
+function mockCreateAgentSession(id: string, session: AgentSession, sessionFile: string | null = null) {
+	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		const existing = options.agentRegistry ? lookupAgentRef(options.agentRegistry, id) : undefined;
+		if (existing?.status !== "parked") registerAuthorityChild(options, id, session, sessionFile);
+		return {
+			session,
+			extensionsResult: {} as unknown as LoadExtensionsResult,
+			setToolUIContext: () => {},
+			eventBus: new EventBus(),
+		} satisfies CreateAgentSessionResult;
+	});
 }
 // Use a bundled scout so these runSubprocess tests exercise the built-in
 // ceiling together with a lower task.softRequestBudget setting.
@@ -177,14 +212,21 @@ const baseAgent: AgentDefinition = {
 
 describe("runSubprocess soft request budget", () => {
 	let tempDir: TempDir;
-	let lifecycle: ReturnType<typeof getAgentLifecycleManager>;
 	let registry: AgentRegistry;
-	beforeEach(() => {
-		registry = new AgentRegistry();
-		lifecycle = getAgentLifecycleManager(registry);
+	let lifecycle: AgentLifecycleManager;
+	beforeEach(async () => {
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
-		AsyncJobManager.resetForTests();
 		tempDir = TempDir.createSync("@pi-soft-budget-");
+		const rootSessionFile = `${tempDir.path()}/main.jsonl`;
+		await Bun.write(rootSessionFile, "");
+		registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
+		AgentRegistry.installGlobal(registry);
+		const { session: rootSession } = await createAgentRootSession(registry, { agentId: "Main" });
+		if (!bindInternalAgentAuthoritySession(registry, rootSession)) {
+			throw new Error("Expected bound Main authority fixture");
+		}
+		lifecycle = getAgentLifecycleManager(registry);
 	});
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -213,16 +255,6 @@ describe("runSubprocess soft request budget", () => {
 		};
 	}
 
-	function registerRunning(id: string, session: AgentSession, sessionFile: string | null = null) {
-		registry.register({
-			id,
-			displayName: id,
-			kind: "sub",
-			session,
-			sessionFile,
-			status: "running",
-		});
-	}
 
 	it("a budget stop drives one forced final yield and finishes as a normal completion", async () => {
 		const id = "BudgetScout";
@@ -264,8 +296,7 @@ describe("runSubprocess soft request budget", () => {
 				isError: false,
 			} as AgentSessionEvent);
 		});
-		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
+		mockCreateAgentSession(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id));
 
@@ -330,8 +361,7 @@ describe("runSubprocess soft request budget", () => {
 			}
 		});
 		const advisorActive = vi.spyOn(handle.session, "isAdvisorActive");
-		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
+		mockCreateAgentSession(id, handle.session);
 
 		const result = await runSubprocess({
 			...baseOptions(id, eventBus),
@@ -431,8 +461,7 @@ describe("runSubprocess soft request budget", () => {
 				}
 			},
 		);
-		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session, workerSessionFile);
+		mockCreateAgentSession(id, handle.session, workerSessionFile);
 
 		const result = await runSubprocess({ ...baseOptions(id), signal: controller.signal });
 
@@ -475,8 +504,7 @@ describe("runSubprocess soft request budget", () => {
 			},
 			() => promptStopped.resolve(),
 		);
-		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session, workerSessionFile);
+		mockCreateAgentSession(id, handle.session, workerSessionFile);
 		const manager = new AsyncJobManager({ maxRunningJobs: 1 });
 		AsyncJobManager.setInstance(manager);
 		manager.register(
@@ -537,6 +565,7 @@ describe("runSubprocess soft request budget", () => {
 		let capturedOptions: { subagentEventBus?: EventBus } | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
+			registerAuthorityChild(options, id, handle.session);
 			return {
 				session: handle.session,
 				extensionsResult: {} as unknown as LoadExtensionsResult,
@@ -544,7 +573,6 @@ describe("runSubprocess soft request budget", () => {
 				eventBus: new EventBus(),
 			} satisfies CreateAgentSessionResult;
 		});
-		registerRunning(id, handle.session);
 
 		const terminal = waitForTerminal();
 		await runSubprocess(baseOptions(id, treeBus));
@@ -580,7 +608,8 @@ describe("runSubprocess soft request budget", () => {
 			pushMessage(message);
 			emit({ type: "message_end", message } as unknown as AgentSessionEvent);
 		});
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			registerAuthorityChild(options, id, handle.session);
 			return {
 				session: handle.session,
 				extensionsResult: {} as unknown as LoadExtensionsResult,
@@ -588,7 +617,6 @@ describe("runSubprocess soft request budget", () => {
 				eventBus: new EventBus(),
 			} satisfies CreateAgentSessionResult;
 		});
-		registerRunning(id, handle.session);
 
 		await runSubprocess(baseOptions(id, sharedBus));
 		await terminal.promise;
@@ -606,8 +634,7 @@ describe("runSubprocess soft request budget", () => {
 			emit({ type: "message_end", message } as unknown as AgentSessionEvent);
 			controller.abort();
 		});
-		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
+		mockCreateAgentSession(id, handle.session);
 
 		const result = await runSubprocess({ ...baseOptions(id), signal: controller.signal });
 

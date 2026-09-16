@@ -28,16 +28,17 @@ function createAuthorityFixture() {
 
 function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent) => void }) => void): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
+	const messages: unknown[] = [];
 	const emit = (event: AgentSessionEvent) => {
 		for (const listener of listeners) listener(event);
 	};
-	const session = {
+	const session: Partial<AgentSession> = {
 		...createSessionDefaults(),
-		state: { messages: [] },
-		agent: { state: { systemPrompt: ["test"] } },
-		model: undefined,
-		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		state: { messages: [] } as never,
+		agent: { state: { systemPrompt: ["test"] } } as never,
+		model: { api: "anthropic-messages" } as never,
+		extensionRunner: undefined as never,
+		sessionManager: { appendSessionInit: () => {} } as never,
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
@@ -49,9 +50,16 @@ function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent)
 		},
 		prompt: async (_text: string, _options?: PromptOptions) => {
 			onPrompt({ emit });
+			return true;
 		},
+		getLastAssistantMessage: () => messages.at(-1) as never,
+		sendUserMessage: async () => {},
+		setIrcWakeTurnObserver: () => {},
+		trackIrcReply: () => {},
+		abort: async () => {},
+		dispose: async () => {},
 	};
-	return session as unknown as AgentSession;
+	return session as AgentSession;
 }
 
 function yieldEmittingSession(data: unknown): AgentSession {
@@ -90,6 +98,15 @@ describe("structured output sidecar lifecycle", () => {
 		artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sidecar-test-"));
 		const manager = new ArtifactManager(artifactsDir);
 		await manager.publishAgentArtifacts(id, "old output", JSON.stringify({ summary: "prior generation" }));
+		const publishAgentArtifacts = manager.publishAgentArtifacts.bind(manager);
+		let advanceHeadBeforeChildPublication = true;
+		vi.spyOn(manager, "publishAgentArtifacts").mockImplementation(async (...args) => {
+			if (advanceHeadBeforeChildPublication) {
+				advanceHeadBeforeChildPublication = false;
+				await publishAgentArtifacts(id, "old output", JSON.stringify({ summary: "prior generation" }));
+			}
+			return publishAgentArtifacts(...args);
+		});
 
 		const session = yieldEmittingSession({ ok: true });
 		const authority = createAuthorityFixture();

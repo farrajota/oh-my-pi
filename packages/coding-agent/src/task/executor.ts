@@ -4025,6 +4025,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					id,
 					session,
 					aborted,
+					abortKind: monitor.abortKind(),
 					keepAlive: options.keepAlive !== false,
 					isolated: worktree !== undefined,
 					agentIdleTtlMs,
