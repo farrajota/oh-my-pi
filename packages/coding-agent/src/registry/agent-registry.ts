@@ -41,6 +41,7 @@ import {
 	type DurableRegistryRecoverySnapshot,
 	type DurableTransitionRecord,
 	durableRootHeadHash,
+	registryDurableStateForSession,
 	RegistryDurableStateStore,
 } from "./durable-state";
 import { type EffectivePermissionSummary, oneLineLabel } from "../task/types";
@@ -322,6 +323,11 @@ export class AgentRegistry {
 		AgentRegistry.#global = registry;
 	}
 
+	/** Create a private registry whose durable authority ledger follows one session transcript. */
+	static isolatedForSession(sessionFile: string): AgentRegistry {
+		return new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
+	}
+
 	/** Reset the global registry. Test-only. */
 	static resetGlobalForTests(): void {
 		AgentRegistry.#global = new AgentRegistry();
@@ -396,6 +402,20 @@ export class AgentRegistry {
 	/** Exact journal used by this registry; never included in public agent observations. */
 	getDurableStateStore(): RegistryDurableStateStore | undefined {
 		return this.#durableState;
+	}
+
+	/**
+	 * Create the first authority-owning root session in this private registry.
+	 *
+	 * Public SDK sessions intentionally cannot self-register by passing assertion
+	 * hints to `createAgentSession`. Embedders that need a task-capable isolated
+	 * session must instead create a fresh registry and claim its empty root here.
+	 * Existing registries are rejected so this capability cannot replace a live
+	 * process root or bypass its generation ownership.
+	 */
+	async createIsolatedRootSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+		if (this.#refs.size > 0) throw new Error("Isolated root creation requires an empty agent registry.");
+		return this.#createRootSession(options);
 	}
 
 	#nextGeneration = 1;

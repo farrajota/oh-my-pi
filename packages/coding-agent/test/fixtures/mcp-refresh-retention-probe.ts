@@ -67,9 +67,16 @@ const sessionTools = new SessionTools(host, {
 });
 const connection = { name: "alpha" } as MCPServerConnection;
 
-for (let refresh = 0; refresh < REFRESH_COUNT; refresh++) {
-	await sessionTools.refreshMCPTools(MCPTool.fromTools(connection, definitions));
+async function exerciseRefreshes(): Promise<void> {
+	for (let refresh = 0; refresh < REFRESH_COUNT; refresh++) {
+		await sessionTools.refreshMCPTools(MCPTool.fromTools(connection, definitions));
+	}
 }
+
+// Let the async refresh frame unwind before forcing collection. Keeping the
+// last call expression on the module's top-level-await frame makes JSC's
+// conservative stack scan retain one obsolete generation owned by the probe.
+await exerciseRefreshes();
 
 Bun.gc(true);
 const heap = JSON.parse(Bun.generateHeapSnapshot("v8")) as V8HeapSnapshot;

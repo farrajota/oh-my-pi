@@ -299,17 +299,18 @@ describe("pickElectronTarget", () => {
 			const ownedName = `owned-${crypto.randomUUID()}`;
 			try {
 				await waitForCdp(`http://127.0.0.1:${port}`, 15_000);
+				const attachExe = Process.fromPid(child.pid)?.args()[0] ?? exe;
 				await invoke({
 					action: "open",
 					name: borrowedName,
 					url: "data:text/html,<title>Borrowed</title>",
-					app: { path: exe, args: [...flags, "--user-data-dir", borrowedProfile] },
+					app: { path: attachExe, args: [...flags, "--user-data-dir", borrowedProfile] },
 				});
 				await invoke({
 					action: "open",
 					name: ownedName,
 					url: "data:text/html,<title>Owned</title>",
-					app: { path: exe, args: [...flags, "--user-data-dir", path.join(root, "owned")] },
+					app: { path: attachExe, args: [...flags, "--user-data-dir", path.join(root, "owned")] },
 				});
 				const title = await invoke({ action: "run", name: borrowedName, code: "return await tab.title();" });
 				expect(title.details).toMatchObject({ value: "Borrowed" });

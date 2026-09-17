@@ -315,6 +315,7 @@ async function buildListing(
 		contentType: "text/markdown",
 		size: Buffer.byteLength(content, "utf-8"),
 		sourcePath: localRoot,
+		immutable: true,
 	};
 }
 

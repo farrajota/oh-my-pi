@@ -105,7 +105,7 @@ function makeStubTab(overrides: Record<string, unknown> = {}): { tab: TabSession
 	};
 	const tab = {
 		name: "stub-tab",
-		browser: { browser: { targets: () => [target] } },
+		browser: { kind: { kind: "headless", headless: true }, browser: { targets: () => [target] } },
 		targetId: "stub-target-1",
 		backend: "worker",
 		state: "alive",

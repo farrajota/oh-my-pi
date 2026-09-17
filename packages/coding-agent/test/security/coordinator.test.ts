@@ -134,6 +134,7 @@ describe("native security coordinator", () => {
 				content: [
 					{
 						type: "toolCall",
+						id: "publish-1",
 						name: "security_publish",
 						arguments: {
 							findings: [

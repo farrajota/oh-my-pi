@@ -2,17 +2,28 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import * as evalIndex from "@oh-my-pi/pi-coding-agent/eval";
+import * as evalIndex from "../../src/eval";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	installSessionOperationLedger,
+	markUnregisteredSessionOperationProjection,
+} from "../../src/registry/operation-lease";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 
+const operationLedgers: Array<{ close(): Promise<void> }> = [];
+
 function makeSession(settings: Settings, asyncJobManager: AsyncJobManager): ToolSession {
+	const sessionManager = SessionManager.inMemory();
+	const operationLedger = installSessionOperationLedger(sessionManager);
+	markUnregisteredSessionOperationProjection(sessionManager, false);
+	operationLedgers.push(operationLedger);
 	return {
 		cwd: "/tmp/eval-test",
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
+		sessionManager,
 		settings,
 		asyncJobManager,
 	};
@@ -83,8 +94,9 @@ function steeringContext(steeringSignal: AbortSignal): AgentToolContext {
  * the queued message can inject while the kernel keeps working.
  */
 describe("EvalTool auto-background", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await Promise.all(operationLedgers.splice(0).map(ledger => ledger.close()));
 	});
 
 	it("keeps fast cells inline and suppresses their job delivery", async () => {

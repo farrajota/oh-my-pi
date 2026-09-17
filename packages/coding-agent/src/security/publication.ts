@@ -1,4 +1,5 @@
 import { type } from "@oh-my-pi/omptype";
+import * as path from "node:path";
 import type { ToolDefinition } from "../extensibility/extensions";
 import securityPublishDescription from "../prompts/tools/security-publish.md" with { type: "text" };
 import type {
@@ -96,8 +97,14 @@ export interface SecurityPublicationOptions {
 	onPublished?: (bundle: SecurityScanBundle) => void | Promise<void>;
 }
 
-function normalizePublishedPath(input: string): string {
-	const normalized = input.replaceAll("\\", "/").replace(/^\.\//, "");
+function normalizePublishedPath(input: string, repositoryRoot: string): string {
+	let candidate = input;
+	if (path.isAbsolute(input)) {
+		candidate = path.relative(repositoryRoot, input);
+	} else if (path.win32.isAbsolute(input)) {
+		candidate = path.win32.relative(repositoryRoot, input);
+	}
+	const normalized = candidate.replaceAll("\\", "/").replace(/^\.\//, "");
 	const segments = normalized.split("/");
 	if (
 		!normalized ||
@@ -114,7 +121,7 @@ function toLocation(
 	input: SecurityPublishParams["findings"][number]["locations"][number],
 	plan: SecurityScanPlan,
 ): SecurityLocation {
-	const normalizedPath = normalizePublishedPath(input.path);
+	const normalizedPath = normalizePublishedPath(input.path, plan.repositoryRoot);
 	if (!pathMatchesSecurityScope(normalizedPath, plan.target.includePaths, plan.target.excludePaths)) {
 		throw new Error(`Security finding path is outside the immutable scan scope: ${input.path}`);
 	}

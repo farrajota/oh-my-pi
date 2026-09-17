@@ -14,6 +14,21 @@ const HANG = [bun, "-e", "await Bun.sleep(60_000)"];
 const IGNORE_TERM = [bun, "-e", 'process.on("SIGTERM", () => {}); await Bun.sleep(60_000)'];
 const baseEnv = (): Record<string, string | undefined> => ({ ...process.env });
 
+async function processIsRunning(pid: number): Promise<boolean> {
+	try {
+		process.kill(pid, 0);
+	} catch {
+		return false;
+	}
+	if (process.platform !== "linux") return true;
+	try {
+		const stat = await Bun.file(`/proc/${pid}/stat`).text();
+		return stat.slice(stat.lastIndexOf(")") + 2).split(" ", 1)[0] !== "Z";
+	} catch {
+		return false;
+	}
+}
+
 describe("runBoundedProbe", () => {
 	test("a hung probe is bounded by its timeout instead of hanging (regression: #9466)", async () => {
 		const start = Date.now();
@@ -50,15 +65,10 @@ describe("runBoundedProbe", () => {
 			expect(result).toEqual({ exitCode: null, timedOut: true, aborted: false });
 			grandchildPid = Number(await Bun.file(pidFile).text());
 			const deadline = Date.now() + 2_000;
-			while (Date.now() < deadline) {
-				try {
-					process.kill(grandchildPid, 0);
-					await Bun.sleep(25);
-				} catch {
-					break;
-				}
+			while (Date.now() < deadline && (await processIsRunning(grandchildPid))) {
+				await Bun.sleep(25);
 			}
-			expect(() => process.kill(grandchildPid!, 0)).toThrow();
+			expect(await processIsRunning(grandchildPid)).toBe(false);
 		} finally {
 			if (grandchildPid !== undefined) {
 				try {

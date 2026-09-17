@@ -21,7 +21,7 @@ import { Effort, type ServiceTierByFamily } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
@@ -70,18 +70,24 @@ function createSession(
 		spawns?: string;
 	} = {},
 ): ToolSession {
+	const parentId = options.agentId ?? "parent";
+	const agentRegistry = new AgentRegistry();
+	const operationLedger = new Map();
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		settings: Settings.isolated(options.settings ?? {}),
 		getSessionFile: () => null,
 		getSessionSpawns: () => options.spawns ?? "*",
-		getAgentId: () => options.agentId ?? null,
+		getAgentId: () => parentId,
+		agentRegistry,
+		createAuthoritySession: () => ({ agentRegistry, operationLedger, parentId }),
+		operationLedger,
 		asyncJobManager: options.manager,
 		getServiceTierByFamily: () => options.serviceTier,
 		taskDepth: options.taskDepth,
 		getPlanModeState: options.planMode ? () => ({ enabled: true }) : undefined,
-	} as ToolSession;
+	} as unknown as ToolSession;
 }
 
 function getSchemaProperties(tool: TaskTool): Record<string, unknown> {
@@ -542,8 +548,8 @@ describe("task.batch spawning", () => {
 	}
 
 	beforeEach(() => {
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
-		AgentLifecycleManager.resetGlobalForTests();
 	});
 
 	afterEach(async () => {
@@ -551,7 +557,7 @@ describe("task.batch spawning", () => {
 		for (const manager of managers.splice(0)) {
 			await manager.dispose({ timeoutMs: 1000 });
 		}
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 	});
 	it("spawns one background job per task item and forwards independent models and schemas with shared context", async () => {

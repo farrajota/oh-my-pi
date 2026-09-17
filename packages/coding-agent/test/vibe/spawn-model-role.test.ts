@@ -20,17 +20,19 @@ import type { VibeCli } from "@oh-my-pi/pi-coding-agent/vibe/lifecycle";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 
 function makeParentSession(settings: Settings): ToolSession {
-	return {
+	const session = {
 		cwd: "/tmp",
 		settings,
 		asyncJobManager: new AsyncJobManager({ onJobComplete: () => {} }),
 		getSessionId: () => "parent-session",
-		// No session file: spawn skips lifecycle persistence and stays in-memory.
 		getSessionFile: () => null,
 		getArtifactsDir: () => null,
 		taskDepth: 0,
 		enableLsp: false,
+		agentRegistry: AgentRegistry.global(),
+		createAuthoritySession: () => session,
 	} as unknown as ToolSession;
+	return session;
 }
 
 /** Spawn one worker and capture the ExecutorOptions the vibe path hands the executor. */

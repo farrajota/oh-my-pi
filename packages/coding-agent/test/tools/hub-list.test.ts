@@ -933,8 +933,8 @@ describe("hub list", () => {
 	});
 
 	it("send still revives a known parked id omitted from the default list", async () => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 		IrcBus.resetGlobalForTests();
 		try {
 			const registry = AgentRegistry.global();
@@ -1403,13 +1403,13 @@ describe("child system prompt roster", () => {
 });
 describe("hub direct addressing refreshes the caller root without a prior list", () => {
 	beforeEach(() => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 		IrcBus.resetGlobalForTests();
 	});
 	afterEach(() => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 		IrcBus.resetGlobalForTests();
 	});
 

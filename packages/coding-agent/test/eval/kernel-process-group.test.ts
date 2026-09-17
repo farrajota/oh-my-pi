@@ -26,6 +26,21 @@ function processGroupExists(pid: number): boolean {
 	}
 }
 
+async function processIsRunning(pid: number): Promise<boolean> {
+	try {
+		process.kill(pid, 0);
+	} catch {
+		return false;
+	}
+	if (process.platform !== "linux") return true;
+	try {
+		const stat = await Bun.file(`/proc/${pid}/stat`).text();
+		return stat.slice(stat.lastIndexOf(")") + 2).split(" ", 1)[0] !== "Z";
+	} catch {
+		return false;
+	}
+}
+
 describe("isSignalableProcessGroup", () => {
 	test("rejects the degenerate kill(2) group targets", () => {
 		// `-0` would signal omp's own process group and `-1` would signal every
@@ -104,7 +119,7 @@ describe("BaseKernel shutdown", () => {
 		"kills TERM-resistant descendants after a %s leader exit",
 		async exitMode => {
 			const pidFile = `/tmp/omp-kernel-process-group-${process.pid}-${Date.now()}`;
-			const child = `sh -c 'trap "" TERM; echo ready > "$1"; exec sleep 30' sh '${pidFile}' &`;
+			const child = `sh -c 'trap "" TERM; echo $$ > "$1"; exec sleep 30' sh '${pidFile}' &`;
 			const command =
 				exitMode === "graceful"
 					? `${child} read request; [ "$request" = exit ]`
@@ -126,6 +141,7 @@ describe("BaseKernel shutdown", () => {
 						throw new Error("timed out waiting for the kernel descendant");
 					}),
 				]);
+				const descendantPid = Number(await Bun.file(pidFile).text());
 
 				const kernel = new TestKernel();
 				kernel.setProcess(proc);
@@ -134,10 +150,10 @@ describe("BaseKernel shutdown", () => {
 
 				await Promise.race([
 					(async () => {
-						while (processGroupExists(proc.pid)) await Bun.sleep(10);
+						while (await processIsRunning(descendantPid)) await Bun.sleep(10);
 					})(),
 					Bun.sleep(1_000).then(() => {
-						throw new Error("kernel process group survived shutdown");
+						throw new Error("kernel descendant survived shutdown");
 					}),
 				]);
 			} finally {

@@ -10,6 +10,7 @@
 
 - Fixed interactive prompt submission and resumed sessions crashing with `TypeError` when a custom editor was active after the upstream merge dropped `pendingImages` and `pendingImageLinks` initialization.
 - Fixed extension async-job snapshots so callers can exclude agent-backed rows by authoritative `agentId` metadata without changing unified delivery or `/jobs` behavior, and retained independent bounded agent/non-agent terminal histories so filtering before `recentLimit` cannot starve background Bash completions.
+- Fixed full-suite order-dependent failures across built-in tool and renderer initialization, MCP refresh retention, browser lifecycle handling, internal URL authority, and isolated session state.
 
 ## [17.0.1] - 2026-07-16
 ### Breaking Changes

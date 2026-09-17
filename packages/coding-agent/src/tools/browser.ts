@@ -16,14 +16,12 @@ import { resolveCmuxKind } from "./browser/cmux/rpc";
 import { resolveSpawnArgs } from "./browser/attach";
 import {
 	acquireBrowser,
-	browserKey,
 	type BrowserHandle,
 	type BrowserKind,
 	type BrowserKindTag,
 	holdBrowser,
 	releaseBrowser,
 } from "./browser/registry";
-import { ensureChromiumExecutable } from "./browser/launch";
 import { resolveRelayKind } from "./browser/relay/kind";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import {
@@ -91,7 +89,6 @@ const browserSchema = type({
 	"kill?": type("boolean").describe("also kill spawned-app browsers"),
 	"persist?": type("boolean").describe("keep tab live across turn settle and idle close"),
 });
-
 
 /** Create the enabled-only browser host prelude for one tool session. */
 export function createBrowserPrelude(session: ToolSession): EvalPreludeDefinition {
@@ -165,6 +162,7 @@ export interface BrowserToolDetails {
 	observation?: Observation;
 	screenshots?: ScreenshotResult[];
 	result?: string;
+	value?: unknown;
 	meta?: OutputMeta;
 }
 
@@ -485,6 +483,17 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
+		if (params.action === "run") {
+			const hasCode = typeof params.code === "string" && params.code.trim().length > 0;
+			const hasFunction = typeof params.fn === "string" && params.fn.trim().length > 0;
+			if (hasCode === hasFunction) {
+				throw new ToolError(
+					hasCode
+						? "Action 'run' requires exactly one of 'code' or 'fn'."
+						: "Missing required parameter 'code' or 'fn' for action 'run'.",
+				);
+			}
+		}
 		const code =
 			params.action === "call"
 				? renderTabCall(params.chain ?? [])
@@ -514,6 +523,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		});
 
 		if (screenshots.length) details.screenshots = screenshots;
+		details.value = returnValue;
 
 		const content = [...displays];
 		if (returnValue !== undefined) {
@@ -594,7 +604,8 @@ function describeKind(kind: BrowserKind): string {
 function sameBrowserKind(a: BrowserKind, b: BrowserKind): boolean {
 	if (a.kind !== b.kind) return false;
 	if (a.kind === "headless" && b.kind === "headless") return a.headless === b.headless;
-	if (a.kind === "spawned" && b.kind === "spawned") return a.path === b.path && JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? []);
+	if (a.kind === "spawned" && b.kind === "spawned")
+		return a.path === b.path && JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? []);
 	if (a.kind === "connected" && b.kind === "connected") return a.cdpUrl === b.cdpUrl;
 	if (a.kind === "relay" && b.kind === "relay") return a.cdpUrl === b.cdpUrl;
 	if (a.kind === "cmux" && b.kind === "cmux") return a.socketPath === b.socketPath;

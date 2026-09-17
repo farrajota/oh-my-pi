@@ -572,10 +572,14 @@ export class SessionTools {
 			return this.#toolRegistryMutationScope.run(true, mutation);
 		});
 		const operation = untilAborted(signal, serialized);
-		this.#toolRegistryMutationTail = serialized.then(
+		const tail = serialized.then(
 			() => undefined,
 			() => undefined,
 		);
+		this.#toolRegistryMutationTail = tail;
+		void tail.then(() => {
+			if (this.#toolRegistryMutationTail === tail) this.#toolRegistryMutationTail = Promise.resolve();
+		});
 		return operation;
 	}
 

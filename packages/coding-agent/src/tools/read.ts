@@ -53,7 +53,7 @@ import {
 	loadSvgImageInput,
 	webpExclusionForModel,
 } from "../utils/image-loading";
-import { MAX_IMAGE_INPUT_BYTES } from "../utils/image-limits";
+import { getMaxImageInputBytes } from "../utils/image-limits";
 import { askImageQuestion, resolveImageQuestionModel } from "../utils/image-question";
 import { CONVERTIBLE_EXTENSIONS, convertFileWithMarkit } from "../utils/markit";
 import { isSampleProfilePath, renderSampleProfile } from "../utils/sample-profile";
@@ -639,7 +639,7 @@ function splitImageQuestionTarget(readPath: string): { path: string; question?: 
 }
 
 // Maximum image file size (20MB) - larger images will be rejected to prevent OOM during serialization
-const MAX_IMAGE_SIZE = MAX_IMAGE_INPUT_BYTES;
+const MAX_IMAGE_SIZE = getMaxImageInputBytes();
 
 const readSchema = type({
 	path: type("string").describe(
@@ -985,7 +985,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				}
 			}
 			appendRepeatReadHint(this.session, staged?.path ?? (context.args as ReadParams).path, result);
-			return await postProcessToolResult(result, this.name, this.session as unknown as AgentToolContext, context.toolCall.id);
+			return await postProcessToolResult(
+				result,
+				this.name,
+				this.session as unknown as AgentToolContext,
+				context.toolCall.id,
+			);
 		} finally {
 			this.#speculativeReads.delete(context.toolCall.id);
 		}

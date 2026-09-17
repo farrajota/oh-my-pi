@@ -34,13 +34,13 @@ describe("browser prelude", () => {
 			/browser received invalid arguments/,
 		);
 		await expect(prelude.invoke({ action: "run", name: "x" }, context)).rejects.toThrow(
-			"Action 'run' requires exactly one of 'code' or 'fn'.",
+			"Missing required parameter 'code' or 'fn' for action 'run'.",
 		);
 		await expect(
 			prelude.invoke({ action: "run", name: "x", code: "return 1", fn: "() => 1" }, context),
 		).rejects.toThrow("Action 'run' requires exactly one of 'code' or 'fn'.");
 		await expect(prelude.invoke({ action: "run", name: "x", code: "   " }, context)).rejects.toThrow(
-			"Action 'run' requires exactly one of 'code' or 'fn'.",
+			"Missing required parameter 'code' or 'fn' for action 'run'.",
 		);
 		await expect(prelude.invoke({ action: "call", name: "x", chain: [] }, context)).rejects.toThrow(
 			"Action 'call' requires a non-empty 'chain'.",

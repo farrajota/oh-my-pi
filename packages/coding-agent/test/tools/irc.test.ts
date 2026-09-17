@@ -173,8 +173,8 @@ describe("IRC", () => {
 		authDir.removeSync();
 	});
 	beforeEach(() => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 		IrcBus.resetGlobalForTests();
 		registry = AgentRegistry.global();
 		bus = IrcBus.global();

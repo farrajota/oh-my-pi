@@ -29,7 +29,7 @@ import {
 	loadSvgImageInput,
 	webpExclusionForModel,
 } from "../utils/image-loading";
-import { MAX_IMAGE_INPUT_BYTES } from "../utils/image-limits";
+import { getMaxImageInputBytes } from "../utils/image-limits";
 import type { ToolSession } from "./index";
 import { splitPathAndSelPreferringLiteral } from "./path-utils";
 import { ToolError } from "./tool-errors";
@@ -88,7 +88,7 @@ async function loadAttachmentReferenceInput(options: {
 		label: attachment.label,
 		uri: attachment.uri,
 		autoResize: options.autoResize,
-		maxBytes: MAX_IMAGE_INPUT_BYTES,
+		maxBytes: getMaxImageInputBytes(),
 		excludeWebP: options.excludeWebP,
 	});
 }
@@ -226,7 +226,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 					path: imageTarget.path,
 					cwd: this.session.cwd,
 					autoResize,
-					maxBytes: MAX_IMAGE_INPUT_BYTES,
+					maxBytes: getMaxImageInputBytes(),
 					excludeWebP,
 				});
 			} else {
@@ -234,7 +234,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 					path: params.path,
 					cwd: this.session.cwd,
 					autoResize,
-					maxBytes: MAX_IMAGE_INPUT_BYTES,
+					maxBytes: getMaxImageInputBytes(),
 					excludeWebP,
 				});
 			}

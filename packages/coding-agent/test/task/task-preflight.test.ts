@@ -69,8 +69,8 @@ describe("task async preflight", () => {
 	const managers: AsyncJobManager[] = [];
 
 	beforeEach(() => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 	});
 
 	afterEach(async () => {

@@ -226,6 +226,7 @@ function makeSession(
 				return { streamMessage: liveMessage };
 			},
 			getPendingToolResults: () => bufferedResults,
+			tokenizer: { countMessage: () => 2 },
 		},
 		subscribe(next: (event: AgentSessionEvent) => Promise<void> | void) {
 			listener = next;

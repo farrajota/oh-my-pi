@@ -2066,6 +2066,17 @@ mod tests {
 	}
 
 	#[cfg(unix)]
+	async fn wait_for_process_ready(path: &std::path::Path) {
+		time::timeout(Duration::from_secs(2), async {
+			while !path.exists() {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("child did not signal readiness");
+	}
+
+	#[cfg(unix)]
 	fn test_executable(name: &str) -> std::path::PathBuf {
 		use std::os::unix::fs::PermissionsExt as _;
 
@@ -2111,6 +2122,9 @@ mod tests {
 		let Ok(duration_ms) = std::env::var("PI_SHELL_PROCESS_TEST_SLEEP_MS") else {
 			return;
 		};
+		if let Some(path) = std::env::var_os("PI_SHELL_PROCESS_TEST_READY_PATH") {
+			fs::write(path, b"ready").expect("write process test readiness marker");
+		}
 		let duration_ms = duration_ms
 			.parse()
 			.expect("valid process test sleep duration");
@@ -2359,12 +2373,14 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn pidwait_returns_after_the_matching_process_exits() {
-		let (_dir, command, name) = process_test_command("opw");
+		let (dir, command, name) = process_test_command("opw");
+		let ready_path = dir.path().join("ready");
 		let mut child = process_test_child(&command, Duration::from_millis(250))
+			.env("PI_SHELL_PROCESS_TEST_READY_PATH", &ready_path)
 			.spawn()
 			.expect("waited process");
 		let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
-		wait_for_process_name(pid, &name).await;
+		wait_for_process_ready(&ready_path).await;
 
 		let (result, output) = execute_captured(format!("pidwait -x -p {pid} {name}")).await;
 		let status = child.try_wait().expect("waited child status");

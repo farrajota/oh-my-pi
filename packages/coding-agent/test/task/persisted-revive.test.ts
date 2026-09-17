@@ -895,8 +895,8 @@ describe("persisted subagent revival", () => {
 	});
 
 	it("installs an IRC wake monitor that emits cold-revive lifecycle frames on the shared bus", async () => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 		const cwd = makeTempDir("@pi-revive-frames-");
 		const sessionFile = await createPersistedSession(cwd);
 		MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);
@@ -948,8 +948,8 @@ describe("persisted subagent revival", () => {
 	});
 
 	it("preserves the completed output artifact when a revived subagent answers a hub message without yielding", async () => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 		const cwd = makeTempDir("@pi-revive-artifact-");
 		const sessionFile = await createPersistedSession(cwd);
 		MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);

@@ -57,8 +57,8 @@ describe("task tool advisory gating via suppressSpawnAdvisory", () => {
 	};
 
 	beforeEach(() => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 	});
 
 	afterEach(() => {

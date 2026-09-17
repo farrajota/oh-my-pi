@@ -102,8 +102,8 @@ describe("task per-item blocking split", () => {
 	}
 
 	beforeEach(() => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 	});
 
 	afterEach(async () => {

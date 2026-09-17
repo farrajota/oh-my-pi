@@ -24,11 +24,12 @@ const APPROVAL_RE = /requires approval but no interactive UI available/;
 
 describe("ssh:// tools are exec-gated through the production approval wrapper", () => {
 	let tempDir: string;
+	let cwd: string;
 	let session: AgentSession;
 
 	beforeAll(async () => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-ssh-approval-${Snowflake.next()}-`));
-		const cwd = path.join(tempDir, "cwd");
+		cwd = path.join(tempDir, "cwd");
 		fs.mkdirSync(cwd, { recursive: true });
 		fs.writeFileSync(path.join(cwd, "local.txt"), "hello-local\n");
 		const sessionManager = SessionManager.create(cwd, path.join(tempDir, "sessions"));
@@ -82,7 +83,13 @@ describe("ssh:// tools are exec-gated through the production approval wrapper", 
 				ctx("always-ask"),
 			),
 		).rejects.toThrow(APPROVAL_RE);
-		const ok = await tool("read").execute("r-local", { path: "local.txt" }, undefined, undefined, ctx("always-ask"));
+		const ok = await tool("read").execute(
+			"r-local",
+			{ path: path.join(cwd, "local.txt") },
+			undefined,
+			undefined,
+			ctx("always-ask"),
+		);
 		expect(JSON.stringify(ok.content)).toContain("hello-local");
 	});
 
@@ -91,7 +98,7 @@ describe("ssh:// tools are exec-gated through the production approval wrapper", 
 		await expect(
 			tool("grep").execute(
 				"s-ssh",
-				{ pattern: "x", paths: "local.txt,ssh://localhost/etc/hosts" },
+				{ pattern: "x", path: "local.txt;ssh://localhost/etc/hosts" },
 				undefined,
 				undefined,
 				ctx("always-ask"),

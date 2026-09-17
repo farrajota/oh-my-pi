@@ -205,7 +205,7 @@ function parseChangelogContent(content: string): ChangelogEntry[] {
 		});
 	}
 
-	return entries;
+	return entries.sort((a, b) => b.major - a.major || b.minor - a.minor || b.patch - a.patch);
 }
 
 async function parseStartupChangelog(

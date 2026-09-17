@@ -58,8 +58,8 @@ describe("AgentLifecycleManager", () => {
 	let lifecycle: AgentLifecycleManager;
 
 	beforeEach(() => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 		registry = AgentRegistry.global();
 		lifecycle = getAgentLifecycleManager();
 	});

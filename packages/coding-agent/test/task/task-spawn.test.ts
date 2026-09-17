@@ -131,8 +131,8 @@ describe("task spawn routing", () => {
 	}
 
 	beforeEach(() => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 	});
 
 	afterEach(async () => {

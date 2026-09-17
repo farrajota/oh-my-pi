@@ -179,8 +179,8 @@ describe("runSubprocess per-agent prewalk", () => {
 	}
 
 	beforeEach(() => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 	});
 
 	afterEach(async () => {
@@ -541,8 +541,8 @@ describe("task tool plan-mode prewalk guard", () => {
 	let registry: AgentRegistry;
 	let createAuthoritySession: NonNullable<ToolSession["createAuthoritySession"]>;
 	beforeEach(async () => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 		const authority = await createAuthorityFixture();
 		registry = authority.agentRegistry;
 		createAuthoritySession = authority.createAuthoritySession;

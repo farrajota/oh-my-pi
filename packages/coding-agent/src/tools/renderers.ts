@@ -133,8 +133,12 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	get retain(): ToolRenderer {
 		return retainToolRenderer as ToolRenderer;
 	},
-	recall: recallToolRenderer as ToolRenderer,
-	reflect: reflectToolRenderer as ToolRenderer,
+	get recall(): ToolRenderer {
+		return recallToolRenderer as ToolRenderer;
+	},
+	get reflect(): ToolRenderer {
+		return reflectToolRenderer as ToolRenderer;
+	},
 	// Lazy getter: `taskToolRenderer` lives in a module that closes an import
 	// cycle back here (task/renderer → task/render → … → tools/renderers), so
 	// reading it at init order-dependently hits its temporal dead zone. Deferring

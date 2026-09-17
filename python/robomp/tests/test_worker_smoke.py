@@ -78,6 +78,8 @@ def test_triage_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("GITHUB_TOKEN", "")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ROBOMP_BOT_LOGIN", "robomp-bot")
+    monkeypatch.setenv("ROBOMP_GIT_AUTHOR_NAME", "robomp-test")
+    monkeypatch.setenv("ROBOMP_GIT_AUTHOR_EMAIL", "robomp-test@example.invalid")
     monkeypatch.setenv("ROBOMP_REPO_ALLOWLIST", "octo/widget")
     monkeypatch.setenv("ROBOMP_WORKSPACE_ROOT", str(tmp_path / "workspaces"))
     monkeypatch.setenv("ROBOMP_SQLITE_PATH", str(tmp_path / "robomp.sqlite"))

@@ -241,7 +241,9 @@ interface WorkerExecutionOptions {
 async function settleWorker(options: WorkerExecutionOptions, result: SingleResult): Promise<SingleResult> {
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const aborted = result.aborted === true;
-	const authority = aborted ? (options.authority ?? lookupAgentRef(agentRegistry, options.id)) : lookupAgentRef(agentRegistry, options.id);
+	const authority = aborted
+		? (options.authority ?? lookupAgentRef(agentRegistry, options.id))
+		: lookupAgentRef(agentRegistry, options.id);
 	const session = authority?.session;
 	if (!session) return result;
 	await executorModule.finalizeSubagentLifecycle({
@@ -295,7 +297,9 @@ interface FakeWorkerSession {
 	setScript(next: { events: unknown[]; responseText: string }): void;
 }
 
-function createFakeWorkerSession(options: { streaming?: boolean; onDispose?: () => void | Promise<void> } = {}): FakeWorkerSession {
+function createFakeWorkerSession(
+	options: { streaming?: boolean; onDispose?: () => void | Promise<void> } = {},
+): FakeWorkerSession {
 	const listeners = new Set<(event: unknown) => void>();
 	const prompts: string[] = [];
 	const steers: string[] = [];
@@ -489,8 +493,8 @@ describe("vibe session registry", () => {
 	}
 
 	beforeEach(() => {
-		AgentRegistry.resetGlobalForTests();
 		lifecycleBridge.resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 		VibeSessionRegistry.resetGlobalForTests();
 	});
 
@@ -1247,7 +1251,10 @@ describe("vibe session registry", () => {
 					if (signal.aborted) resolve();
 					else signal.addEventListener("abort", () => resolve(), { once: true });
 				});
-				return settleWorker({ ...options, authority }, makeResult(options.id, { output: "Parent A suspended.", aborted: true }));
+				return settleWorker(
+					{ ...options, authority },
+					makeResult(options.id, { output: "Parent A suspended.", aborted: true }),
+				);
 			}
 			return settleWorker({ ...options, authority }, makeResult(options.id, { output: "Parent B finished." }));
 		});
@@ -2241,7 +2248,10 @@ describe("vibe session registry", () => {
 				if (signal.aborted) resolve();
 				else signal.addEventListener("abort", () => resolve(), { once: true });
 			});
-			return settleWorker({ ...options, authority }, makeResult(options.id, { output: "Old worker killed.", aborted: true }));
+			return settleWorker(
+				{ ...options, authority },
+				makeResult(options.id, { output: "Old worker killed.", aborted: true }),
+			);
 		});
 		const parentManager = await createPersistedParent();
 		parentManager.appendModeChange("vibe");
@@ -2297,7 +2307,10 @@ describe("vibe session registry", () => {
 				sessionFile: childSessionFile,
 				status: "running",
 			});
-			return settleWorker(options, makeResult(options.id, { output: "Killed before initialization.", aborted: true }));
+			return settleWorker(
+				options,
+				makeResult(options.id, { output: "Killed before initialization.", aborted: true }),
+			);
 		});
 		const parentManager = await createPersistedParent();
 		parentManager.appendModeChange("vibe");

@@ -355,7 +355,9 @@ describe("browser facade Chromium helper E2E", () => {
 				expect(
 					await runInContext("__e2eTab.run('display(\"worker display text\"); return { value: 3 };')", context),
 				).toEqual({ value: 3 });
-				expect(displayed).toContain("worker display text");
+				expect(displayed.some(value => typeof value === "string" && value.includes("worker display text"))).toBe(
+					true,
+				);
 
 				const observation = await runInContext("__e2eTab.observe()", context);
 				expect(field(observation, "elements")).toBeArray();

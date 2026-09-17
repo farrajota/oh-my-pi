@@ -16,6 +16,7 @@ import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { lookupAgentRef } from "../../src/internal/agent-registry-bridge";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 // In-memory transport: FakeWebSocket + InMemoryRelay (see ./helpers/in-memory-relay)
@@ -359,13 +360,14 @@ describe("collab read-only links", () => {
 		});
 		const killed = Promise.withResolvers<void>();
 		const unsubscribe = registry.onChange(event => {
-			if (event.ref === ref && event.type === "status_changed" && event.ref.status === "aborted") killed.resolve();
+			if (event.ref.id === id && event.type === "status_changed" && event.ref.status === "aborted") killed.resolve();
 		});
 		try {
 			guest.socket.send({ t: "agent-cmd", cmd: "kill", agentId: id });
 			await killed.promise;
 			expect(aborts).toBe(1);
-			expect(registry.get(id)).toMatchObject({ status: "aborted", session: null });
+			expect(registry.get(id)).toMatchObject({ status: "aborted" });
+			expect(lookupAgentRef(registry, id)?.session).toBeNull();
 		} finally {
 			unsubscribe();
 			registry.unregister(id, ref);

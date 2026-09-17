@@ -13,8 +13,8 @@ const agentDir = path.join(work, "agent");
 const extensionPath = path.join(work, "probe.mjs");
 const resultPath = path.join(work, "result.json");
 
-// A local OpenAI-compatible fixture exercises the native task's resolved model
-// without credentials or network services. Yield completes the real child turn.
+// A local OpenAI-compatible fixture supplies the model registry entries used to
+// verify task model resolution through authority-owned root sessions.
 const requestedModels: string[] = [];
 const server = Bun.serve({
 	hostname: "127.0.0.1",
@@ -81,7 +81,7 @@ export default function (api) {
 	registerFixtureProvider(api);
 	api.registerCommand("settings-session-smoke", {
 		handler: async (_args, ctx) => {
-			const { createAgentSession, Settings, AgentRegistry, SessionManager, ModelRegistry } = api.pi;
+			const { Settings, AgentRegistry, SessionManager, ModelRegistry } = api.pi;
 			const sessions = [];
 			const entered = [Promise.withResolvers(), Promise.withResolvers()];
 			const disposedA = Promise.withResolvers();
@@ -99,11 +99,14 @@ export default function (api) {
 							"modelRoles": { default: "fixture/fallback", tiny: "fixture/fallback" },
 						},
 					});
-					const { session } = await createAgentSession({
+					const sessionManager = SessionManager.create(fixture.cwd, fixture.work + "/sessions-" + name);
+					const sessionFile = sessionManager.getSessionFile();
+					assert(sessionFile, "Persisted fixture session did not allocate a transcript");
+					const agentRegistry = AgentRegistry.isolatedForSession(sessionFile);
+					const { session } = await agentRegistry.createIsolatedRootSession({
 						cwd: fixture.cwd, agentDir: fixture.agentDir, settings,
-						agentRegistry: new AgentRegistry(),
 						modelRegistry: new ModelRegistry(ctx.modelRegistry.authStorage, fixture.agentDir + "/models.yml"),
-						sessionManager: SessionManager.inMemory(fixture.cwd),
+						sessionManager,
 						// Merge mode lets runtime settings supply roots. Empty preloaded
 						// paths prevent this driver extension from loading recursively.
 						preloadedExtensionPaths: [], preloadedCustomToolPaths: [],
@@ -125,8 +128,13 @@ export default function (api) {
 									const task = session.getToolByName("task");
 									assert(task, "Native task tool is unavailable");
 									const sibling = name === "a" ? "only-b" : "only-a";
-									const rejected = await task.execute("reject-" + name, { agent: sibling, task: "Fixture check" });
-									const errorText = rejected.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+									let errorText = "";
+									try {
+										await task.execute("reject-" + name, { agent: sibling, task: "Fixture check" });
+										assert.fail("Unknown sibling agent unexpectedly passed preflight");
+									} catch (error) {
+										errorText = String(error instanceof Error ? error.message : error);
+									}
 									assert(errorText.includes('Unknown agent "' + sibling + '"'), errorText);
 									const available = errorText.split("Available: ")[1]?.split(", ") ?? [];
 									assert(available.includes("only-" + name), errorText);

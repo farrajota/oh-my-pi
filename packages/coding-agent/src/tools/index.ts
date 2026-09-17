@@ -51,6 +51,7 @@ import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
+import type { ConflictHistory } from "./conflict-detect";
 import { ContextNotesTool, NewContextTool } from "./context-notes";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
@@ -437,7 +438,7 @@ export interface ToolSession {
 	 *  `read`. Each entry gets a stable id N referenced by `write conflict://N`
 	 *  to splice the recorded region with replacement content. Lazily initialized
 	 *  by `getConflictHistory`. */
-	conflictHistory?: import("./conflict-detect").ConflictHistory;
+	conflictHistory?: ConflictHistory;
 
 	/** Per-session ledger of post-edit LSP diagnostics already surfaced to the
 	 *  model for each file. Lazily initialized by `getDiagnosticsLedger`. */
@@ -483,7 +484,7 @@ export const BUILTIN_TOOLS: Readonly<Record<BuiltinToolName, ToolFactory>> = Obj
 	ask: s => AskTool.createIf(s),
 	debug: DebugTool.createIf,
 	eval: s => new EvalTool(s),
-	github: GithubTool.createIf,
+	github: s => GithubTool.createIf(s),
 	glob: s => new GlobTool(s, { rootPathAlias: true }),
 	grep: s => new GrepTool(s),
 	lsp: s => LspTool.createIf(s),

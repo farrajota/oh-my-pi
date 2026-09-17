@@ -481,8 +481,8 @@ describe("W2 registry capabilities", () => {
 	});
 
 	it("memoizes registry-owned disposal and never lets a stale dispose resolve a later lifecycle", async () => {
-		AgentRegistry.resetGlobalForTests();
 		resetAgentLifecycleForTests();
+		AgentRegistry.resetGlobalForTests();
 		const registry = AgentRegistry.global();
 		const backing = fakeSession("/root-dispose-owner.jsonl");
 		const createSession = vi

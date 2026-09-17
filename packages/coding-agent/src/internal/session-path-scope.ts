@@ -7,7 +7,7 @@ import { getActiveOperationDurability, getActiveOperationLease } from "../regist
 import { durableTargetHash, type DurableResourceClass, type DurableResourceRecord } from "../registry/durable-state";
 import type { EffectiveSubagentPermissions } from "../task/permission-profiles";
 import { evaluateSubagentPermission } from "../task/permission-profiles";
-import { isInternalUrlPath, resolveSyscallTarget } from "../tools/path-utils";
+import { expandDelimitedPathEntries, isInternalUrlPath, resolveSyscallTarget } from "../tools/path-utils";
 export interface SessionPathScopeOptions {
 	readonly actorId: () => string | null | undefined;
 	readonly sessionId: () => string | null | undefined;
@@ -756,17 +756,21 @@ export class SessionPathScope {
 	/** Compatibility admission precheck. Executable authority is minted only inside withOperationLease. */
 	async authorizeInput(toolName: string, input: Record<string, unknown>): Promise<ReadonlyMap<string, string>> {
 		this.#refreshIdentity();
-		if (toolName === "hub") return new Map();
+		if (toolName === "hub" || toolName === "security_publish") return new Map();
 		const replacements = new Map<string, string>();
 		for (const rawPath of pathValues(input)) {
-			if (!rawPath || isNonFilesystemPath(rawPath)) {
-				replacements.set(rawPath, rawPath);
-				continue;
+			const expandedPaths =
+				toolName === "grep" ? await expandDelimitedPathEntries([rawPath], this.#options.cwd()) : [rawPath];
+			for (const expandedPath of expandedPaths) {
+				if (!expandedPath || isNonFilesystemPath(expandedPath)) continue;
+				const requestedPath = path.isAbsolute(expandedPath)
+					? expandedPath
+					: path.resolve(this.#options.cwd(), expandedPath);
+				const canonical = await resolveSyscallTarget(requestedPath, toolName !== "delete");
+				if (canonical === null) throw new Error(`Filesystem authority could not resolve path '${expandedPath}'.`);
+				this.assertPermission(toolName, canonical);
+				if (expandedPaths.length === 1 && canonical !== rawPath) replacements.set(rawPath, canonical);
 			}
-			const canonical = await resolveSyscallTarget(rawPath, toolName !== "delete");
-			if (canonical === null) throw new Error(`Filesystem authority could not resolve path '${rawPath}'.`);
-			this.assertPermission(toolName, canonical);
-			replacements.set(rawPath, canonical);
 		}
 		return replacements;
 	}
@@ -790,14 +794,26 @@ export class SessionPathScope {
 	}
 }
 
-/** Apply canonical path substitutions returned by SessionPathScope.authorizeInput. */
+/** Apply canonical path substitutions, preserving the original graph when nothing changes. */
 export function rewriteAuthorizedInput<T>(input: T, replacements: ReadonlyMap<string, string>): T {
+	if (replacements.size === 0) return input;
 	if (typeof input === "string") return (replacements.get(input) ?? input) as T;
-	if (Array.isArray(input)) return input.map(value => rewriteAuthorizedInput(value, replacements)) as T;
+	if (Array.isArray(input)) {
+		let changed = false;
+		const output = input.map(value => {
+			const rewritten = rewriteAuthorizedInput(value, replacements);
+			if (rewritten !== value) changed = true;
+			return rewritten;
+		});
+		return (changed ? output : input) as T;
+	}
 	if (!input || typeof input !== "object") return input;
+	let changed = false;
 	const output: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
-		output[key] = rewriteAuthorizedInput(value, replacements);
+		const rewritten = rewriteAuthorizedInput(value, replacements);
+		if (rewritten !== value) changed = true;
+		output[key] = rewritten;
 	}
-	return output as T;
+	return (changed ? output : input) as T;
 }

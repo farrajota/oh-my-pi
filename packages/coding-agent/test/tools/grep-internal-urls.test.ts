@@ -15,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import * as sshFileTransfer from "@oh-my-pi/pi-coding-agent/ssh/file-transfer";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
@@ -106,9 +107,14 @@ describe("GrepTool internal URL resolution", () => {
 			hasUI: false,
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
+			localProtocolOptions: { getArtifactsDir: () => artifactsDir, getSessionId: () => "session" },
 			settings: Settings.isolated({ "grep.contextBefore": 0, "grep.contextAfter": 0 }),
 			...overrides,
 		};
+	}
+
+	async function saveArtifact(content: string): Promise<string> {
+		return new ArtifactManager(artifactsDir).save(content, "bash");
 	}
 
 	async function registerSkillDirectory(): Promise<string> {
@@ -235,14 +241,14 @@ describe("GrepTool internal URL resolution", () => {
 
 	it("resolves artifact:// URL to backing file and greps it", async () => {
 		const content = "line one\nfound the needle here\nline three\n";
-		await Bun.write(path.join(artifactsDir, "5.bash.log"), content);
+		const artifactId = await saveArtifact(content);
 
 		const session = createSession();
 		const tool = new GrepTool(session);
 
 		const result = await tool.execute("test-call", {
 			pattern: "needle",
-			path: "artifact://5",
+			path: `artifact://${artifactId}`,
 		});
 
 		const text = getResultText(result);
@@ -251,14 +257,14 @@ describe("GrepTool internal URL resolution", () => {
 
 	it("greps artifact:// with regex pattern", async () => {
 		const content = "ERROR: connection refused\nWARN: timeout\nERROR: disk full\nINFO: ok\n";
-		await Bun.write(path.join(artifactsDir, "3.python.log"), content);
+		const artifactId = await saveArtifact(content);
 
 		const session = createSession();
 		const tool = new GrepTool(session);
 
 		const result = await tool.execute("test-call", {
 			pattern: "ERROR.*",
-			path: "artifact://3",
+			path: `artifact://${artifactId}`,
 		});
 
 		const text = getResultText(result);
@@ -425,14 +431,14 @@ describe("GrepTool internal URL resolution", () => {
 
 	it("suppresses hashline anchors when searching immutable artifact:// sources", async () => {
 		const content = "alpha line\nbeta needle line\ngamma line\n";
-		await Bun.write(path.join(artifactsDir, "9.bash.log"), content);
+		const artifactId = await saveArtifact(content);
 
 		const session = createSession({ hasEditTool: true });
 		const tool = new GrepTool(session);
 
 		const result = await tool.execute("test-call", {
 			pattern: "needle",
-			path: "artifact://9",
+			path: `artifact://${artifactId}`,
 		});
 
 		const text = getResultText(result);
@@ -535,7 +541,7 @@ describe("GrepTool internal URL resolution", () => {
 
 	it("keeps hashlines on mutable files when mixed with immutable artifact:// inputs", async () => {
 		const content = "alpha line\nbeta needle line\ngamma line\n";
-		await Bun.write(path.join(artifactsDir, "11.bash.log"), content);
+		const artifactId = await saveArtifact(content);
 		await Bun.write(path.join(tmpDir, "mixed.txt"), "mixed needle line\n");
 
 		const session = createSession({ hasEditTool: true });
@@ -543,7 +549,7 @@ describe("GrepTool internal URL resolution", () => {
 
 		const result = await tool.execute("test-call", {
 			pattern: "needle",
-			path: JSON.stringify(["artifact://11", "mixed.txt"]),
+			path: JSON.stringify([`artifact://${artifactId}`, "mixed.txt"]),
 		});
 
 		const text = getResultText(result);

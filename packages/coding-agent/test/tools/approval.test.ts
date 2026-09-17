@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { AgentTool, ToolApproval } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolContext, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { LSP_READONLY_ACTIONS } from "@oh-my-pi/pi-coding-agent/lsp";
 import {
 	type ApprovalMode,
@@ -14,6 +14,68 @@ import { DEBUG_READONLY_ACTIONS } from "@oh-my-pi/pi-coding-agent/tools/debug";
 import { Settings } from "../../src/config/settings";
 import { EditTool } from "../../src/edit";
 import type { ToolSession } from "../../src/tools";
+import type { ExtensionRunner } from "../../src/extensibility/extensions/runner";
+import { ExtensionToolWrapper } from "../../src/extensibility/extensions/wrapper";
+
+function wrappedPathApprovalCase(replacements: ReadonlyMap<string, string>, extensionInput?: Record<string, unknown>) {
+	const executed: unknown[] = [];
+	const innerTool = {
+		name: "write",
+		label: "write",
+		description: "test write",
+		parameters: {} as AgentTool["parameters"],
+		approval: "write" as const,
+		execute: async (_toolCallId: string, input: unknown) => {
+			executed.push(input);
+			return { content: [{ type: "text", text: "ok" }] };
+		},
+	};
+	const runner = {
+		hasHandlers: (eventType: string) => eventType === "tool_call",
+		emitToolCall: async () => (extensionInput === undefined ? undefined : { input: extensionInput }),
+		getPathScope: () => ({
+			authorizeInput: async () => replacements,
+			withOperationLease: async (_label: string, run: () => Promise<unknown>) => run(),
+		}),
+		getUIContext: () => undefined,
+		hasUI: () => false,
+	};
+	return {
+		tool: new ExtensionToolWrapper(innerTool as unknown as AgentTool, runner as unknown as ExtensionRunner),
+		executed,
+	};
+}
+
+function xdevApprovalContext(): AgentToolContext {
+	return {
+		settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+		xdevApproved: true,
+	} as AgentToolContext;
+}
+
+describe("path authorization preserves approval semantics", () => {
+	it("keeps an extension mutation marked after canonical path rewriting", async () => {
+		const { tool } = wrappedPathApprovalCase(new Map([["relative.txt", "/canonical/relative.txt"]]), {
+			path: "relative.txt",
+		});
+		await expect(
+			tool.execute("extension-change", { path: "original.txt" }, undefined, undefined, xdevApprovalContext()),
+		).rejects.toThrow(/requires approval but no interactive UI available/);
+	});
+
+	it("does not prompt for an unchanged input when path authorization has no replacements", async () => {
+		const input = { path: "relative.txt" };
+		const { tool, executed } = wrappedPathApprovalCase(new Map<string, string>());
+		await tool.execute("no-op-rewrite", input, undefined, undefined, xdevApprovalContext());
+		expect(executed).toEqual([input]);
+	});
+
+	it("executes the canonical path when authorization replaces a path", async () => {
+		const { tool, executed } = wrappedPathApprovalCase(new Map([["relative.txt", "/canonical/relative.txt"]]));
+		await tool.execute("canonical-rewrite", { path: "relative.txt" }, undefined, undefined, xdevApprovalContext());
+		expect(executed).toEqual([{ path: "/canonical/relative.txt" }]);
+	});
+});
 
 type ApprovalTool = Pick<AgentTool, "name" | "approval" | "formatApprovalDetails">;
 
@@ -238,9 +300,9 @@ describe("MCP fallback and prompt formatting", () => {
 		]);
 	});
 
-	it("keeps an all-internal sloppy payload at read tier", () => {
+	it("keeps all writable local targets at write tier", () => {
 		const input = `${sloppySection("local://notes")}\n${sloppySection("local://scratch")}`;
-		expect(sloppyEditTool().approval?.({ input })).toBe("read");
+		expect(sloppyEditTool().approval?.({ input })).toBe("write");
 	});
 
 	it("keeps a writable internal sloppy target at write tier", () => {

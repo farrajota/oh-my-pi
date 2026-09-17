@@ -1,7 +1,8 @@
 import { deflateSync, inflateSync } from "node:zlib";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { decodeSixelToPng } from "@oh-my-pi/pi-natives";
-import { MAX_IMAGE_INPUT_BYTES, convertImageToPng } from "./image-loading";
+import { convertImageToPng } from "./image-loading";
+import { getMaxImageInputBytes } from "./image-limits";
 
 const ESC = "\x1b";
 const KITTY_CHUNK_BYTES = 3072;
@@ -9,6 +10,7 @@ const MAX_IMAGE_COUNT = 32;
 const MAX_IMAGE_PIXELS = 4 * 1024 * 1024;
 const MAX_IMAGE_EDGE = 8192;
 const MAX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024;
+const MAX_IMAGE_INPUT_BYTES = getMaxImageInputBytes();
 const MAX_BASE64_CHARS = Math.ceil(MAX_IMAGE_INPUT_BYTES / 3) * 4;
 const MAX_FRAME_CHARS = MAX_BASE64_CHARS + 4096;
 const MAX_FRAME_PARTS = 8192;
