@@ -104,6 +104,10 @@ export const shareHelp = {
 	description: "Share a saved session via an encrypted link (same as /share)",
 } satisfies CommandMetadata;
 
+export const sessionHelp = {
+	description: "Inspect or repair saved session authority (repair is dry-run by default)",
+} satisfies CommandMetadata;
+
 export const setupHelp = {
 	description: "Run onboarding setup or install dependencies for optional features",
 } satisfies CommandMetadata;

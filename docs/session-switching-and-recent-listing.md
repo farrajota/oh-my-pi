@@ -216,6 +216,12 @@ So visible conversation/todo state is rebuilt from the new session file.
 - `session_before_switch`/`session_switch` hooks are emitted.
 - UI chat/todos are refreshed.
 - Interactive mode reconciliation runs through the registered session-switch reconciler.
+### Bound live sessions and authority repair
+
+An already bound live session cannot switch to or import any different session in-process, regardless of the target's authority health; the guard does not inspect that target. It runs before UI preparation, transcript import, or session mutation. The UI stays open with the current transcript and authority unchanged and displays the appropriate command for a fresh-process resume or import (`omp --resume '<path>'` for a session target).
+
+Same-session reload remains supported, including rebuilding the current session when replay changes. SDK sessions that are unbound from durable session authority retain their existing unbound compatibility behavior; they are not forced through this bound-client refusal path. Startup is separate: when it opens a session whose durable authority is unavailable or quarantined, it fails with the repair diagnosis and exits. Use the documented `omp session repair <session-id-or-path>` dry-run/apply flow only for that actual authority-recovery case, then start the reported fresh-process command after a successful repair.
+
 
 ## Failure and edge-case behavior
 

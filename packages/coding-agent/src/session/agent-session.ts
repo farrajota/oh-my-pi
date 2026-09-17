@@ -192,6 +192,7 @@ import { getAgentLifecycleManager } from "../internal/agent-lifecycle-bridge";
 import { terminateSubagent as terminateRegisteredSubagent } from "../registry/agent-control";
 import { AgentRegistry } from "../registry/agent-registry";
 import { installSessionOperationLedger } from "../registry/operation-lease";
+import { assertSessionSwitchPreflight } from "./session-switch-preflight";
 import videoAttachmentPrompt from "../prompts/system/video-attachment.md" with { type: "text" };
 import {
 	deobfuscateAssistantContent,
@@ -9219,11 +9220,12 @@ export class AgentSession {
 			preserveLocalCwd?: boolean;
 		},
 	): Promise<boolean> {
-		using _transition = this.#beginSessionTransition();
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 			: true;
+		assertSessionSwitchPreflight(this.sessionManager, { kind: "session", path: sessionPath });
+		using _transition = this.#beginSessionTransition();
 		// Emit session_before_switch event (can be cancelled)
 		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({

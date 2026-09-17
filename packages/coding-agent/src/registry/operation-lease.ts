@@ -432,6 +432,14 @@ export function bindSessionOperationAuthority(manager: object, authority: BoundS
 	operationRegistries.set(manager, registry);
 }
 
+/** Returns true whenever this manager retains installed bound actor ownership, including stale or closed bindings. */
+export function hasBoundSessionOperationAuthority(manager: object): boolean {
+	const registry = operationRegistries.get(manager);
+	const state = sessionOperationLedgerStates.get(manager);
+	if (!registry || !state || state.current !== registry) return false;
+	return operationAuthorities.get(registry)?.kind === "bound";
+}
+
 function registryFor(manager: object | undefined): OperationLeaseRegistry | undefined {
 	return manager === undefined ? undefined : operationRegistries.get(manager);
 }

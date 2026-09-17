@@ -15,6 +15,7 @@ import {
 	saveWatchdogConfigFile,
 } from "../../advisor";
 import { reset as resetCapabilities } from "../../capability";
+import { assertSessionSwitchPreflight } from "../../session/session-switch-preflight";
 import { showGitOverlay } from "../../cli/git-tui";
 import {
 	formatModelSelectorValue,
@@ -1790,6 +1791,11 @@ export class SelectorController {
 			const foreignByPath = new Map(foreignSessions.map(session => [session.path, session]));
 			sessions = foreignSessions.map(foreignSessionInfoToSessionInfo);
 			onSelectSession = async session => {
+				assertSessionSwitchPreflight(this.ctx.sessionManager, {
+					kind: "foreign-import",
+					source,
+					sourceName,
+				});
 				try {
 					await this.ctx.settings.flush();
 				} catch (error) {
@@ -1933,12 +1939,14 @@ export class SelectorController {
 		this.ctx.ui.requestRender(true, { clearScrollback: true });
 		return true;
 	}
-
 	async handleResumeSession(sessionPath: string, options?: { settingsFlushed?: boolean }): Promise<boolean> {
+		try {
+			assertSessionSwitchPreflight(this.ctx.sessionManager, { kind: "session", path: sessionPath });
+		} catch (error) {
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
+			return false;
+		}
 		const previousCwd = this.ctx.sessionManager.getCwd();
-		// Flush pending settings writes before switching sessions so a save
-		// failure leaves the session, process project dir, and Settings in the
-		// source scope.
 		if (!options?.settingsFlushed) {
 			try {
 				await this.ctx.settings.flush();

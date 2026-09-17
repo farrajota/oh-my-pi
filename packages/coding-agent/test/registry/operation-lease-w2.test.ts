@@ -275,4 +275,31 @@ describe("W2 non-Hub operation ownership", () => {
 			auth.close();
 		}
 	});
+	it("continues to report installed bound authority after its generation becomes stale or the ledger closes", async () => {
+		const manager = {};
+		const control = operationLease.installSessionOperationLedger(manager);
+		let valid = true;
+		const authority = operationLease.issueBoundSessionOperationAuthority(
+			{
+				capability: {},
+				actorId: "Worker",
+				rootId: "Main",
+				generation: 2,
+				sessionFile: null,
+				validate: () => valid,
+			},
+			manager,
+		);
+		try {
+			expect(operationLease.hasBoundSessionOperationAuthority(manager)).toBe(false);
+			operationLease.bindSessionOperationAuthority(manager, authority);
+			expect(operationLease.hasBoundSessionOperationAuthority(manager)).toBe(true);
+			valid = false;
+			expect(operationLease.hasBoundSessionOperationAuthority(manager)).toBe(true);
+			await control.close();
+			expect(operationLease.hasBoundSessionOperationAuthority(manager)).toBe(true);
+		} finally {
+			await control.close();
+		}
+	});
 });

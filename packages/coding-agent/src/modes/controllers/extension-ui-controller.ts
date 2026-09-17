@@ -33,6 +33,7 @@ import { HookSelectorComponent, type HookSelectorSlider } from "../../modes/comp
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "../../modes/types";
 import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { assertSessionSwitchPreflight } from "../../session/session-switch-preflight";
 import { disambiguateDisplayLabels, sanitizeCarriageReturns } from "../../tools/render-utils";
 import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 
@@ -297,6 +298,7 @@ export class ExtensionUiController {
 			},
 			compact: async instructionsOrOptions => this.#handleInteractiveCompact(instructionsOrOptions),
 			switchSession: async sessionPath => {
+				assertSessionSwitchPreflight(this.ctx.sessionManager, { kind: "session", path: sessionPath });
 				await this.ctx.prepareSessionSwitch();
 				this.clearHookWidgets();
 				const result = await this.ctx.session.switchSession(sessionPath);
@@ -534,6 +536,7 @@ export class ExtensionUiController {
 			},
 			compact: async instructionsOrOptions => this.#handleInteractiveCompact(instructionsOrOptions),
 			switchSession: async sessionPath => {
+				assertSessionSwitchPreflight(this.ctx.sessionManager, { kind: "session", path: sessionPath });
 				await this.ctx.prepareSessionSwitch();
 				this.clearHookWidgets();
 				const result = await this.ctx.session.switchSession(sessionPath);

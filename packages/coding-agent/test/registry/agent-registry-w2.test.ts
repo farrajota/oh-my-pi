@@ -594,4 +594,70 @@ describe("W2 registry capabilities", () => {
 		}
 		expect(Object.isFrozen(snapshot.scope.allowPathGroups?.[0])).toBe(true);
 	});
+
+	it("retires a parent and all transitive descendants before stale authority can create", async () => {
+		const root = realSession();
+		const child = realSession();
+		const grandchild = realSession();
+		const createSession = vi
+			.spyOn(sdk, "createAgentSession")
+			.mockResolvedValueOnce({ session: root.session } as sdk.CreateAgentSessionResult)
+			.mockResolvedValueOnce({ session: child.session } as sdk.CreateAgentSessionResult)
+			.mockResolvedValueOnce({ session: grandchild.session } as sdk.CreateAgentSessionResult);
+		try {
+			const registry = new AgentRegistry();
+			await createAgentRootSession(registry, { agentId: "Main" });
+			const childResult = await authority(registry, root.session).create({ agentId: "Child" });
+			await authority(registry, childResult.session).create({ agentId: "Grandchild" });
+			const staleChildAuthority = authority(registry, childResult.session);
+			await root.session.dispose();
+			expect(registry.get("Main")).toBeUndefined();
+			expect(registry.get("Child")).toBeUndefined();
+			expect(registry.get("Grandchild")).toBeUndefined();
+			await expect(staleChildAuthority.create({ agentId: "Late" })).rejects.toThrow(/authority|parent|disposed/i);
+		} finally {
+			createSession.mockRestore();
+			await root.session.dispose();
+			await child.session.dispose();
+			await grandchild.session.dispose();
+			root.auth.close();
+			child.auth.close();
+			grandchild.auth.close();
+		}
+	});
+	it("revokes descendant authority when a parent is tombstoned", async () => {
+		const root = realSession();
+		const child = realSession();
+		const grandchild = realSession();
+		const createSession = vi
+			.spyOn(sdk, "createAgentSession")
+			.mockResolvedValueOnce({ session: root.session } as sdk.CreateAgentSessionResult)
+			.mockResolvedValueOnce({ session: child.session } as sdk.CreateAgentSessionResult)
+			.mockResolvedValueOnce({ session: grandchild.session } as sdk.CreateAgentSessionResult);
+		const registry = new AgentRegistry();
+		const lifecycle = createAgentLifecycleManager(registry);
+		try {
+			await createAgentRootSession(registry, { agentId: "Main" });
+			const childResult = await authority(registry, root.session).create({ agentId: "Child" });
+			await authority(registry, childResult.session).create({ agentId: "Grandchild" });
+			const staleChildAuthority = authority(registry, childResult.session);
+			const main = registry.get("Main");
+			if (!main) throw new Error("Expected registered root authority.");
+
+			expect(await releaseAgent(lifecycle, "Main", main, { tombstone: true })).toBe(true);
+			expect(registry.get("Main")?.status).toBe("aborted");
+			expect(registry.get("Child")).toBeUndefined();
+			expect(registry.get("Grandchild")).toBeUndefined();
+			await expect(staleChildAuthority.create({ agentId: "Late" })).rejects.toThrow(/authority|parent|disposed/i);
+		} finally {
+			createSession.mockRestore();
+			await disposeAgentLifecycle(lifecycle);
+			await root.session.dispose();
+			await child.session.dispose();
+			await grandchild.session.dispose();
+			root.auth.close();
+			child.auth.close();
+			grandchild.auth.close();
+		}
+	});
 });

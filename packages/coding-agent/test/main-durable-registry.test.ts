@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fsSync from "node:fs";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import * as durableState from "@oh-my-pi/pi-coding-agent/registry/durable-state";
 import {
+	registryDurableJournalPath,
 	registryDurableStateForSession,
 	type RegistryDurableStateStore,
 } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
@@ -81,5 +86,59 @@ describe("Main durable registry startup", () => {
 		expect(options.sessionManager?.getSessionFile()).toBeUndefined();
 		expect(options.agentRegistry).toBe(installedRegistry);
 		expect(installedRegistry.getDurableStateStore()).toBeUndefined();
+	});
+});
+
+describe("Main durable resume remediation", () => {
+	it("prints repair and fresh-process guidance for a quarantined resume journal", async () => {
+		using tempDir = TempDir.createSync("@omp-main-resume-remediation-");
+		const previousAgentDir = getAgentDir();
+		const agentDir = await fs.mkdtemp(path.join(tempDir.path(), "agent dir 'quoted' "));
+		setAgentDir(agentDir);
+		const authStorage = await AuthStorage.create(":memory:");
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		const parsed = parseArgs(["--print", "hello"]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		const createDurableStore = durableState.registryDurableStateForSession;
+		const durableSpy = vi.spyOn(durableState, "registryDurableStateForSession").mockImplementation(sessionFile => {
+			const journalPath = registryDurableJournalPath(sessionFile);
+			fsSync.mkdirSync(path.dirname(journalPath), { recursive: true });
+			fsSync.writeFileSync(`${journalPath}.quarantine`, "authority journal is quarantined\n");
+			return createDurableStore(sessionFile);
+		});
+		const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+			throw new Error(`EXIT:${code ?? 0}`);
+		}) as never);
+		const stderr: string[] = [];
+		const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+			stderr.push(String(chunk));
+			return true;
+		}) as typeof process.stderr.write);
+
+		try {
+			await expect(
+				runRootCommand(parsed, ["--print", "hello"], {
+					discoverAuthStorage: async () => authStorage,
+					settings,
+				}),
+			).rejects.toThrow("EXIT:1");
+		} finally {
+			stderrSpy.mockRestore();
+			exit.mockRestore();
+			durableSpy.mockRestore();
+			authStorage.close();
+			setAgentDir(previousAgentDir);
+		}
+
+		expect(stderr.join("")).toContain("omp session repair");
+		expect(stderr.join("")).toContain("--apply");
+		expect(stderr.join("")).toContain("fresh process");
+		expect(stderr.join("")).toContain("omp session repair '");
+		expect(stderr.join("")).toContain("'\\''");
+		expect(AgentRegistry.global()).toBe(priorRegistry);
 	});
 });

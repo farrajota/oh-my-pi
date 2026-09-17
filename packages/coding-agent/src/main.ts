@@ -81,7 +81,11 @@ import { createWarpEventBridgeExtension } from "./modes/warp-events";
 import { getAgentLifecycleManager, setPersistedAgentReviverFactory } from "./internal/agent-lifecycle-bridge";
 import { createAgentRootSession } from "./internal/agent-registry-bridge";
 import { AgentRegistry } from "./registry/agent-registry";
-import { registryDurableStateForSession, type RegistryDurableStateStore } from "./registry/durable-state";
+import {
+	DurableStateUnavailableError,
+	registryDurableStateForSession,
+	type RegistryDurableStateStore,
+} from "./registry/durable-state";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -112,6 +116,7 @@ import type { LspStartupServerInfo } from "./tools";
 import { sanitizeDisplayWarnings } from "./tools/render-utils";
 import { getChangelogPath, resolveStartupChangelogForDisplay, type StartupChangelogSelection } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
+import { repairSessionCommand } from "./utils/resume-command";
 
 type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<number>;
@@ -1846,10 +1851,24 @@ export async function runRootCommand(
 		// these exact instances; `--no-session` intentionally installs a storeless
 		// unrestricted projection whose authority creator rejects restricted roots.
 		const sessionFile = sessionManager?.getSessionFile();
-		const durableState: RegistryDurableStateStore | undefined = sessionFile
-			? registryDurableStateForSession(sessionFile)
-			: undefined;
-		const agentRegistry = new AgentRegistry({ durableState });
+		let durableState: RegistryDurableStateStore | undefined;
+		let agentRegistry: AgentRegistry;
+		try {
+			durableState = sessionFile ? registryDurableStateForSession(sessionFile) : undefined;
+			agentRegistry = new AgentRegistry({ durableState });
+		} catch (error) {
+			if (!(error instanceof DurableStateUnavailableError)) throw error;
+			stopPendingStartupComposer();
+			stopStartupWatchdog();
+			stopThemeWatcher();
+			const target = sessionFile ?? "the current session";
+			const reason = error instanceof Error ? error.message : String(error);
+			process.stderr.write(
+				`Unable to resume ${target}: ${reason}\nRun ${repairSessionCommand(target)} first (dry-run), review the diagnosis, stop the owning client, then add --apply only if it is explicitly repairable. Start a fresh process after repair.\n`,
+			);
+			process.exit(1);
+			return;
+		}
 		AgentRegistry.installGlobal(agentRegistry);
 
 		if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource)) {

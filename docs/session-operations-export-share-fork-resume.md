@@ -30,6 +30,7 @@ This document describes operator-visible behavior for session export, sharing, c
 | `--resume <id\|path>`                   | CLI startup                  | Yes after session creation                    | Opens existing session; a missing recorded cwd may be re-rooted into the current directory | None                                                                                |
 | `/restart`                              | Interactive slash command    | Yes (process relaunches)                      | Relaunches omp with the original launch flags and resumes the current session in place     | None                                                                                |
 | `--continue`                            | CLI startup                  | Yes after session creation                    | Opens terminal breadcrumb or most-recent session; creates new one if none exists           | None                                                                                |
+| `omp session repair <session-id-or-path> [--apply]` | CLI command | Dry-run is read-only; `--apply` appends authority closure records only | No transcript switch or provider mutation; apply requires the owning client to be stopped | Status, retained backup directory, and fresh-process resume command |
 
 ## Export and dump
 
@@ -271,6 +272,34 @@ Startup `--fork` is resolved before normal session creation:
 Use `--prompt-cache-key <key>` to pin the provider prompt-cache identity explicitly and independently from both the OMP session id and `--provider-session-id`. `--provider-session-id` continues to control provider session/routing headers and sticky credential selection; `--prompt-cache-key` controls the OpenAI Responses `prompt_cache_key` payload where supported.
 
 ## Resume and continue
+
+## Session authority repair
+
+`omp session repair <session-id-or-path>` is a provider-independent inspection and repair command for the durable authority sidecar associated with a saved session. The command accepts a session id or a path to a `.jsonl` file; use a quoted path placeholder when the path contains spaces.
+
+```sh
+omp session repair '/path/to/session.jsonl'
+```
+
+Repair is a **dry-run by default**. It reads and validates the complete authority journal, including its hash/history chain, root identity, actor generations, parent lineage, and permission snapshots. A dry-run never changes the journal or its quarantine marker and reports either `clean` or an explicitly `repairable` diagnosis. It refuses unexplained quarantine markers, hash/history corruption, cycles, root or lineage conflicts, scope drift, and other states that cannot be proven safe.
+
+Any actor records that repair appends are limited to verified legacy descendants of terminal ancestors (`retired` or `aborted`). A recognized quarantine marker may also be resolved when whole-history validation proves that no affected actor closure remains. The repair set is closed leaf-first: each affected descendant is retired before its terminal parent is relied on. This is authority recovery, not transcript repair; the session `.jsonl` and its conversation history are preserved.
+
+After reviewing a repairable dry-run, stop the client that owns the session before applying:
+
+```sh
+omp session repair '/path/to/session.jsonl' --apply
+```
+
+`--apply` takes the journal and, when present, quarantine-marker locks; rechecks the source bytes, metadata, journal head, and affected lineage; writes the exact pre-repair journal and marker bytes to a retained `.authority-repair-*` backup directory; and appends terminal closure records to the journal. A source change, lock conflict, or failed verification aborts safely rather than overwriting a competing source. The active quarantine marker is resolved only as part of a successful apply; do not manually delete the journal, marker, or backup.
+
+After a successful apply, start a **fresh process** with the reported command instead of trying to hot-reload the repaired authority:
+
+```sh
+omp --resume '/path/to/session.jsonl'
+```
+
+Do not use this command to deploy, repair live provider data, revive old actor authority, or alter unrelated session behavior.
 
 ## Interactive `/resume [value]`
 

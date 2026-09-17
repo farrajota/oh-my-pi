@@ -16,7 +16,7 @@ import {
 } from "../../src/internal/agent-lifecycle-bridge";
 import { lookupAgentRef } from "../../src/internal/agent-registry-bridge";
 import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -754,6 +754,52 @@ describe("AgentLifecycleManager", () => {
 		const restoredRegistry = new AgentRegistry();
 		await registerPersistedSubagents(restoredRegistry, rootSessionFile);
 		expect(restoredRegistry.get(workerId)?.status).toBe("aborted");
+	});
+	it("tombstone release retires transitive descendants before publishing the parent abort", async () => {
+		const parent = makeSessionStub();
+		const child = makeSessionStub();
+		const grandchild = makeSessionStub();
+		for (const stub of [parent, child, grandchild]) {
+			Object.assign(stub.session, { beginDispose: () => {}, isDisposed: false });
+		}
+		const parentRef = registry.register({
+			id: MAIN_AGENT_ID,
+			displayName: "main",
+			kind: "main",
+			session: parent.session,
+			status: "running",
+		});
+		registry.register({
+			id: "Child",
+			displayName: "child",
+			kind: "sub",
+			parentId: MAIN_AGENT_ID,
+			session: child.session,
+			status: "running",
+		});
+		registry.register({
+			id: "Grandchild",
+			displayName: "grandchild",
+			kind: "sub",
+			parentId: "Child",
+			session: grandchild.session,
+			status: "running",
+		});
+		let descendantsAtParentAbort: readonly (AgentRef | undefined)[] | undefined;
+		const unsubscribe = registry.onChange(event => {
+			if (event.type === "status_changed" && event.ref.id === MAIN_AGENT_ID && event.ref.status === "aborted")
+				descendantsAtParentAbort = [registry.get("Child"), registry.get("Grandchild")];
+		});
+
+		expect(await releaseAgent(lifecycle, MAIN_AGENT_ID, parentRef, { tombstone: true })).toBe(true);
+		unsubscribe();
+		expect(descendantsAtParentAbort).toEqual([undefined, undefined]);
+		expect(registry.get(MAIN_AGENT_ID)?.status).toBe("aborted");
+		expect(registry.get("Child")).toBeUndefined();
+		expect(registry.get("Grandchild")).toBeUndefined();
+		expect(parent.disposeCalls()).toBe(1);
+		expect(child.disposeCalls()).toBe(1);
+		expect(grandchild.disposeCalls()).toBe(1);
 	});
 
 	it("publishes an aborted status only after the session is detached", async () => {

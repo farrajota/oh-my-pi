@@ -1629,6 +1629,7 @@ export class AgentRegistry {
 				: ref.session !== expectedSession || !this.#matchesInternalExpected(ref, expectedSession))
 		)
 			return false;
+		this.#retireDescendants(ref);
 		this.#persistDurableActorState(ref, "aborted");
 		this.#terminating.set(ref.id, ref);
 		ref.session = null;
@@ -1644,12 +1645,54 @@ export class AgentRegistry {
 		return ref === expectedRef && !this.#terminating.has(ref.id) && this.#removeExactRef(ref);
 	}
 
-	#removeExactRef(ref: RegistryAgentRef): boolean {
+	#retireRef(ref: RegistryAgentRef): boolean {
 		if (this.#refs.get(ref.id) !== ref) return false;
 		this.#persistDurableActorState(ref, "retired");
 		this.#refs.delete(ref.id);
+		const session = ref.session;
 		this.#emit({ type: "removed", ref });
+		if (session && !session.isDisposed) {
+			try {
+				session.beginDispose();
+				void session.dispose().catch(error =>
+					logger.warn("AgentRegistry descendant retirement failed", {
+						id: ref.id,
+						error: error instanceof Error ? error.message : String(error),
+					}),
+				);
+			} catch (error) {
+				logger.warn("AgentRegistry descendant retirement failed", {
+					id: ref.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		return true;
+	}
+
+	#retireDescendants(ref: RegistryAgentRef): void {
+		const descendants = [...this.#refs.values()]
+			.filter(candidate => candidate !== ref && candidate.lineage?.rootId === ref.lineage?.rootId)
+			.map(candidate => {
+				let cursor: RegistryAgentRef | undefined = candidate;
+				let depth = 0;
+				const seen = new Set<string>();
+				while (cursor?.parentId !== undefined && !seen.has(cursor.id)) {
+					seen.add(cursor.id);
+					if (cursor.parentId === ref.id) return { ref: candidate, depth: depth + 1 };
+					cursor = this.#refs.get(cursor.parentId);
+					depth++;
+				}
+				return undefined;
+			})
+			.filter((entry): entry is { ref: RegistryAgentRef; depth: number } => entry !== undefined)
+			.sort((left, right) => right.depth - left.depth);
+		for (const descendant of descendants) this.#retireRef(descendant.ref);
+	}
+	#removeExactRef(ref: RegistryAgentRef): boolean {
+		if (this.#refs.get(ref.id) !== ref) return false;
+		this.#retireDescendants(ref);
+		return this.#retireRef(ref);
 	}
 
 	#unregisterInternal(id: string, expected: RegistryAgentRef | AgentSession): boolean {
