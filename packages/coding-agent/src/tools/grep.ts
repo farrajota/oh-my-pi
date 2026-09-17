@@ -1,6 +1,7 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { Worker as ThreadWorker } from "node:worker_threads";
 import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
@@ -121,6 +122,24 @@ const NATIVE_GREP_MAX_FILE_BYTES = 4 * 1024 * 1024;
  * aborted or runaway search (huge tree, network mount) keeps burning CPU on
  * the native thread pool after the JS promise is abandoned. */
 const SEARCH_GREP_TIMEOUT_MS = 30_000;
+const CONSTRAINED_BATCH_MAX_FILES = 64;
+const CONSTRAINED_BATCH_MAX_BYTES = 4 * 1024 * 1024;
+
+function searchDeadlineError(): ToolError {
+	return new ToolError(
+		`Grep timed out after ${SEARCH_GREP_TIMEOUT_MS / 1000}s; narrow paths or pattern, or scope with \`glob\` first`,
+	);
+}
+
+function checkSearchDeadline(deadline: number, signal?: AbortSignal): void {
+	if (signal?.aborted) throw new Error("Search traversal aborted.");
+	if (Date.now() >= deadline) throw searchDeadlineError();
+}
+
+function remainingSearchTime(deadline: number, signal?: AbortSignal): number {
+	checkSearchDeadline(deadline, signal);
+	return Math.max(1, deadline - Date.now());
+}
 
 /**
  * Parsed `paths` entry — a path (possibly archive-shaped) plus an optional
@@ -406,67 +425,102 @@ function lineRangeFetchCap(pathSpecs: readonly GrepPathSpec[], perFileKeep: numb
 	return Math.min(cap, NATIVE_GREP_MAX_FILE_BYTES);
 }
 
-/** Binary search for the index of the line containing byte `offset`. */
-function findLineIndex(starts: readonly number[], offset: number): number {
-	if (starts.length === 0) return -1;
-	let low = 0;
-	let high = starts.length - 1;
-	while (low <= high) {
-		const mid = Math.floor((low + high) / 2);
-		if (starts[mid] <= offset) {
-			low = mid + 1;
-		} else {
-			high = mid - 1;
-		}
-	}
-	return Math.max(0, high);
-}
-
 /**
- * JS-`RegExp` fallback returning matched line indexes for a virtual resource too
- * large for native grep (>`NATIVE_GREP_MAX_FILE_BYTES`, which native grep silently
- * skips). Mirrors the native probe's output (sorted, deduped indexes) so
- * `buildVirtualMatches` rebuilds context/ranges identically; only the regex dialect
- * differs for these oversized inputs (the pre-RE2-parity behavior).
+ * Isolate the JS-RegExp fallback used for resources larger than native grep's
+ * file window. The worker is terminated at the invocation's remaining absolute
+ * deadline, so a pathological expression cannot block the agent event loop.
  */
-function jsMatchedLineIndexes(
+async function jsMatchedLineIndexes(
 	content: string,
-	lines: readonly string[],
 	pattern: string,
 	ignoreCase: boolean,
 	multiline: boolean,
-): number[] {
-	const flags = `${ignoreCase ? "i" : ""}${multiline ? "gm" : ""}`;
-	let regex: RegExp;
-	try {
-		regex = new RegExp(pattern, flags);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new ToolError(`Invalid regex: ${message.replace(/^Invalid regular expression:\s*/i, "")}`);
-	}
-	if (!multiline) {
-		const out: number[] = [];
-		for (let i = 0; i < lines.length; i++) {
-			regex.lastIndex = 0;
-			if (regex.test(lines[i] ?? "")) out.push(i);
+	maxCount: number,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<number[]> {
+	const timeoutMs = remainingSearchTime(deadline, signal);
+	const workerSource = String.raw`
+		const { parentPort, workerData } = require("node:worker_threads");
+		try {
+			const { content, pattern, ignoreCase, multiline, maxCount } = workerData;
+			const regex = new RegExp(pattern, (ignoreCase ? "i" : "") + (multiline ? "gm" : ""));
+			const indexes = [];
+			if (!multiline) {
+				const lines = content.split("\n");
+				if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+				for (let index = 0; index < lines.length && indexes.length < maxCount; index++) {
+					regex.lastIndex = 0;
+					if (regex.test(lines[index].endsWith("\r") ? lines[index].slice(0, -1) : lines[index])) indexes.push(index);
+				}
+			} else {
+				const starts = [];
+				let offset = 0;
+				const rawLines = content.split("\n");
+				if (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") rawLines.pop();
+				for (const line of rawLines) {
+					starts.push(offset);
+					offset += line.length + 1;
+				}
+				const seen = new Set();
+				let match = regex.exec(content);
+				while (match !== null && indexes.length < maxCount) {
+					let low = 0;
+					let high = starts.length - 1;
+					while (low <= high) {
+						const mid = Math.floor((low + high) / 2);
+						if (starts[mid] <= match.index) low = mid + 1;
+						else high = mid - 1;
+					}
+					if (high >= 0 && !seen.has(high)) {
+						seen.add(high);
+						indexes.push(high);
+					}
+					if (match[0].length === 0) regex.lastIndex++;
+					match = regex.exec(content);
+				}
+			}
+			parentPort.postMessage({ indexes });
+		} catch (error) {
+			parentPort.postMessage({ error: error instanceof Error ? error.message : String(error) });
 		}
-		return out;
-	}
-	const { starts } = indexSearchLines(content);
-	const seen = new Set<number>();
-	const out: number[] = [];
-	let match = regex.exec(content);
-	while (match !== null) {
-		const lineIndex = findLineIndex(starts, match.index);
-		if (lineIndex >= 0 && !seen.has(lineIndex)) {
-			seen.add(lineIndex);
-			out.push(lineIndex);
-		}
-		if (match[0].length === 0) regex.lastIndex++;
-		match = regex.exec(content);
-	}
-	out.sort((a, b) => a - b);
-	return out;
+	`;
+	return await new Promise<number[]>((resolve, reject) => {
+		const worker = new ThreadWorker(workerSource, {
+			eval: true,
+			workerData: { content, pattern, ignoreCase, multiline, maxCount },
+		});
+		let settled = false;
+		const cleanup = (): void => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			void worker.terminate();
+		};
+		const fail = (error: Error): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(error);
+		};
+		const onAbort = (): void => fail(new Error("Search traversal aborted."));
+		const timer = setTimeout(() => fail(searchDeadlineError()), timeoutMs);
+		timer.unref?.();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		worker.once("message", (message: { indexes?: number[]; error?: string }) => {
+			if (settled) return;
+			if (message.error !== undefined) {
+				fail(new ToolError(`Invalid regex: ${message.error.replace(/^Invalid regular expression:\s*/i, "")}`));
+				return;
+			}
+			settled = true;
+			cleanup();
+			resolve(message.indexes ?? []);
+		});
+		worker.once("error", fail);
+		worker.once("exit", code => {
+			if (!settled && code !== 0) fail(new Error(`Regex worker exited with code ${code}.`));
+		});
+	});
 }
 
 /**
@@ -482,8 +536,11 @@ async function nativeChunkedLineIndexes(
 	content: string,
 	pattern: string,
 	ignoreCase: boolean,
+	maxCountPerFile: number,
+	deadline: number,
 	signal: AbortSignal | undefined,
 ): Promise<number[]> {
+	checkSearchDeadline(deadline, signal);
 	const rawLines = content.split("\n");
 	if (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") rawLines.pop();
 	const indexes: number[] = [];
@@ -491,10 +548,13 @@ async function nativeChunkedLineIndexes(
 	let chunkBytes = 0;
 	let chunkLines: string[] = [];
 	let chunkSeq = 0;
-	const flush = async (): Promise<void> => {
-		if (chunkLines.length === 0) return;
+	const flush = async (): Promise<boolean> => {
+		if (chunkLines.length === 0) return indexes.length >= maxCountPerFile;
+		checkSearchDeadline(deadline, signal);
 		const scratch = path.resolve(dir, `${resourceIdx}-chunk-${chunkSeq++}`);
 		await writeFile(scratch, chunkLines.join("\n"));
+		checkSearchDeadline(deadline, signal);
+		const remaining = maxCountPerFile - indexes.length;
 		const probe = await grep(
 			{
 				pattern,
@@ -503,41 +563,48 @@ async function nativeChunkedLineIndexes(
 				multiline: false,
 				hidden: true,
 				gitignore: false,
-				maxCount: chunkLines.length,
+				maxCount: Math.max(remaining, 1),
+				maxCountPerFile: Math.max(remaining, 1),
 				contextBefore: 0,
 				contextAfter: 0,
 				maxColumns: DEFAULT_MAX_COLUMN,
 				mode: GrepOutputMode.Content,
 				signal,
-				timeoutMs: SEARCH_GREP_TIMEOUT_MS,
+				timeoutMs: remainingSearchTime(deadline, signal),
 			},
 			undefined,
 		);
-		for (const match of probe.matches) indexes.push(chunkStart + match.lineNumber - 1);
+		checkSearchDeadline(deadline, signal);
+		for (const match of probe.matches) {
+			indexes.push(chunkStart + match.lineNumber - 1);
+			if (indexes.length >= maxCountPerFile) break;
+		}
 		chunkLines = [];
 		chunkBytes = 0;
+		return indexes.length >= maxCountPerFile;
 	};
-	let lineRegex: RegExp | undefined;
 	for (let i = 0; i < rawLines.length; i++) {
+		checkSearchDeadline(deadline, signal);
 		const line = rawLines[i];
 		const lineBytes = Buffer.byteLength(line, "utf8") + 1;
 		if (lineBytes > NATIVE_GREP_MAX_FILE_BYTES) {
-			await flush();
-			if (!lineRegex) {
-				try {
-					lineRegex = new RegExp(pattern, ignoreCase ? "i" : "");
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					throw new ToolError(`Invalid regex: ${message.replace(/^Invalid regular expression:\s*/i, "")}`);
-				}
-			}
-			lineRegex.lastIndex = 0;
-			if (lineRegex.test(line)) indexes.push(i);
+			if (await flush()) return indexes;
+			const lineMatches = await jsMatchedLineIndexes(
+				line,
+				pattern,
+				ignoreCase,
+				false,
+				maxCountPerFile - indexes.length,
+				deadline,
+				signal,
+			);
+			if (lineMatches.length > 0) indexes.push(i);
+			if (indexes.length >= maxCountPerFile) return indexes;
 			chunkStart = i + 1;
 			continue;
 		}
 		if (chunkLines.length > 0 && chunkBytes + lineBytes > NATIVE_GREP_MAX_FILE_BYTES) {
-			await flush();
+			if (await flush()) return indexes;
 			chunkStart = i;
 		}
 		if (chunkLines.length === 0) chunkStart = i;
@@ -545,7 +612,6 @@ async function nativeChunkedLineIndexes(
 		chunkBytes += lineBytes;
 	}
 	await flush();
-	indexes.sort((a, b) => a - b);
 	return indexes;
 }
 
@@ -612,10 +678,13 @@ function buildVirtualMatches(
 	contextBefore: number,
 	contextAfter: number,
 	maxCount: number,
+	deadline: number,
+	signal?: AbortSignal,
 ): GrepMatch[] {
 	const matches: GrepMatch[] = [];
 	let lastEmittedLine = 0;
 	for (let i = 0; i < matchedIndexes.length && matches.length < maxCount; i++) {
+		checkSearchDeadline(deadline, signal);
 		const lineIndex = matchedIndexes[i];
 		const nextMatchLine = i + 1 < matchedIndexes.length ? matchedIndexes[i + 1] + 1 : Number.POSITIVE_INFINITY;
 		const match = makeVirtualMatch(
@@ -642,44 +711,63 @@ async function searchVirtualResources(
 	contextBefore: number,
 	contextAfter: number,
 	maxCount: number,
+	maxCountPerFile: number,
+	deadline: number,
 	signal?: AbortSignal,
+	batchOrdinaryResources = false,
 ): Promise<GrepResult> {
 	if (resources.length === 0) {
 		return { matches: [], totalMatches: 0, filesWithMatches: 0, filesSearched: 0, limitReached: false };
 	}
+	checkSearchDeadline(deadline, signal);
 	const matches: GrepMatch[] = [];
 	const filesWithMatches = new Set<string>();
+	const linesByResource: string[][] = [];
+	for (const resource of resources) {
+		checkSearchDeadline(deadline, signal);
+		linesByResource.push(multiline ? indexSearchLines(resource.content).lines : splitSearchLines(resource.content));
+	}
+	const matchedIndexesByResource = resources.map(() => [] as number[]);
 	let totalMatches = 0;
 	let limitReached = false;
-	// Detect matched line numbers with native grep (RE2) — the SAME matcher local
-	// search uses — so a pattern valid for local grep but not JS `RegExp` (`(?i)x`,
-	// `[[:digit:]]`) behaves identically on virtual/remote resources. The JS helpers
-	// below then rebuild the exact forward-only, range-trimmed context windows the
-	// virtual-search contract requires.
+	checkSearchDeadline(deadline, signal);
 	const dir = await mkdtemp(path.join(tmpdir(), "omp-search-virtual-"));
 	try {
+		const batchDir = path.resolve(dir, "batch");
+		const batchedIndexes: number[] = [];
+		let batchDirectoryCreated = false;
 		for (let idx = 0; idx < resources.length; idx++) {
+			checkSearchDeadline(deadline, signal);
 			const resource = resources[idx];
-			const remaining = Math.max(maxCount - matches.length, 0);
-			if (remaining === 0) {
-				limitReached = true;
-				break;
-			}
-			const lines = multiline ? indexSearchLines(resource.content).lines : splitSearchLines(resource.content);
-			let matchedIndexes: number[];
+			const lines = linesByResource[idx];
 			if (Buffer.byteLength(resource.content, "utf8") > NATIVE_GREP_MAX_FILE_BYTES) {
-				// Native grep skips files above its 4 MiB cap. Search oversized content in
-				// line-boundary chunks so line-mode keeps RE2 parity; multiline can't be chunked
-				// without missing matches that span a chunk boundary, so it falls back to JS
-				// (dialect-as-JS only for these oversized multiline inputs).
-				matchedIndexes = (
+				matchedIndexesByResource[idx] = (
 					multiline
-						? jsMatchedLineIndexes(resource.content, lines, pattern, ignoreCase, true)
-						: await nativeChunkedLineIndexes(dir, idx, resource.content, pattern, ignoreCase, signal)
+						? await jsMatchedLineIndexes(
+								resource.content,
+								pattern,
+								ignoreCase,
+								true,
+								maxCountPerFile,
+								deadline,
+								signal,
+							)
+						: await nativeChunkedLineIndexes(
+								dir,
+								idx,
+								resource.content,
+								pattern,
+								ignoreCase,
+								maxCountPerFile,
+								deadline,
+								signal,
+							)
 				).filter(lineIndex => lineAllowed(lineIndex + 1, resource.ranges));
-			} else {
+			} else if (resource.ranges || !batchOrdinaryResources) {
+				checkSearchDeadline(deadline, signal);
 				const scratch = path.resolve(dir, `${idx}`);
 				await writeFile(scratch, resource.content);
+				checkSearchDeadline(deadline, signal);
 				const probe = await grep(
 					{
 						pattern,
@@ -688,36 +776,96 @@ async function searchVirtualResources(
 						multiline,
 						hidden: true,
 						gitignore: false,
-						// A ranged selector must see every match so the range filter below never
-						// drops in-range hits that fall after the cap; matches can't exceed the
-						// line count. Unranged search keeps the overall result cap.
 						maxCount: resource.ranges ? Math.max(lines.length, 1) : INTERNAL_TOTAL_CAP,
+						maxCountPerFile,
 						contextBefore: 0,
 						contextAfter: 0,
 						maxColumns: DEFAULT_MAX_COLUMN,
 						mode: GrepOutputMode.Content,
 						signal,
-						timeoutMs: SEARCH_GREP_TIMEOUT_MS,
+						timeoutMs: remainingSearchTime(deadline, signal),
 					},
 					undefined,
 				);
-				matchedIndexes = [...new Set(probe.matches.map(match => match.lineNumber - 1))]
+				checkSearchDeadline(deadline, signal);
+				matchedIndexesByResource[idx] = [...new Set(probe.matches.map(match => match.lineNumber - 1))]
 					.filter(lineIndex => lineAllowed(lineIndex + 1, resource.ranges))
 					.sort((a, b) => a - b);
+				limitReached ||= Boolean(probe.limitReached);
+			} else {
+				batchedIndexes.push(idx);
+				if (!batchDirectoryCreated) {
+					checkSearchDeadline(deadline, signal);
+					await mkdir(batchDir);
+					batchDirectoryCreated = true;
+				}
+				checkSearchDeadline(deadline, signal);
+				await writeFile(path.resolve(batchDir, `${idx}`), resource.content);
 			}
+		}
+		if (batchedIndexes.length > 0) {
+			checkSearchDeadline(deadline, signal);
+			const probe = await grep(
+				{
+					pattern,
+					path: batchDir,
+					ignoreCase,
+					multiline,
+					hidden: true,
+					gitignore: false,
+					maxCount: Math.max(maxCount, 1),
+					maxCountPerFile,
+					contextBefore: 0,
+					contextAfter: 0,
+					maxColumns: DEFAULT_MAX_COLUMN,
+					mode: GrepOutputMode.Content,
+					signal,
+					timeoutMs: remainingSearchTime(deadline, signal),
+				},
+				undefined,
+			);
+			checkSearchDeadline(deadline, signal);
+			const batchedIndexSet = new Set(batchedIndexes);
+			for (const match of probe.matches) {
+				checkSearchDeadline(deadline, signal);
+				const relative = path.relative(batchDir, path.resolve(batchDir, match.path));
+				const index = Number(relative);
+				if (Number.isInteger(index) && batchedIndexSet.has(index)) {
+					matchedIndexesByResource[index].push(match.lineNumber - 1);
+				}
+			}
+			for (const index of batchedIndexes) {
+				checkSearchDeadline(deadline, signal);
+				matchedIndexesByResource[index] = [...new Set(matchedIndexesByResource[index])].sort((a, b) => a - b);
+			}
+			limitReached ||= Boolean(probe.limitReached);
+		}
+		for (let idx = 0; idx < resources.length; idx++) {
+			checkSearchDeadline(deadline, signal);
+			const remaining = Math.max(maxCount - matches.length, 0);
+			if (remaining === 0) {
+				limitReached = true;
+				break;
+			}
+			const matchedIndexes = matchedIndexesByResource[idx];
 			const resourceMatches = buildVirtualMatches(
-				resource,
-				lines,
+				resources[idx],
+				linesByResource[idx],
 				matchedIndexes,
 				contextBefore,
 				contextAfter,
-				remaining,
+				Math.min(remaining, maxCountPerFile),
+				deadline,
+				signal,
 			);
-			if (matchedIndexes.length > 0) filesWithMatches.add(resource.path);
+			if (matchedIndexes.length > 0) filesWithMatches.add(resources[idx].path);
 			totalMatches += matchedIndexes.length;
-			limitReached = limitReached || matchedIndexes.length > resourceMatches.length;
+			limitReached ||= matchedIndexes.length > resourceMatches.length;
 			matches.push(...resourceMatches);
 		}
+	} catch (error) {
+		if (error instanceof Error && error.message.includes("Aborted: Timeout")) throw searchDeadlineError();
+		throw error;
 	} finally {
 		await rm(dir, { recursive: true, force: true }).catch(() => {});
 	}
@@ -974,6 +1122,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 		const { pattern, path: rawPath, case: caseSensitive, gitignore, skip } = params;
 
 		return untilAborted(signal, async () => {
+			const searchDeadline = Date.now() + SEARCH_GREP_TIMEOUT_MS;
 			// Preserve the pattern verbatim — leading/trailing whitespace is
 			// meaningful in regexes (indentation anchors, trailing-space matches).
 			if (!pattern.trim()) {
@@ -1192,52 +1341,126 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const constrainedSearch = Boolean(this.session.pathScope && searchablePaths.length > 0);
 				if (constrainedSearch) {
 					const operation = this.session.pathScope!.currentOperation();
-					const manifest: VirtualSearchResource[] = [];
 					const targets = exactFilePaths
 						? exactFilePaths.map(basePath => ({ basePath, glob: undefined as string | undefined }))
 						: (multiTargets ?? [{ basePath: searchPath, glob: globFilter }]);
+					const filesWithMatches = new Set<string>();
+					const searchedFiles = new Set<string>();
+					const seenMatchKeys = new Set<string>();
+					const seenResourcePaths = new Set<string>();
+					const streamedResult: GrepResult = {
+						matches: [],
+						totalMatches: 0,
+						filesWithMatches: 0,
+						filesSearched: 0,
+						limitReached: false,
+					};
+					let stopTraversal = false;
+					let batch: VirtualSearchResource[] = [];
+					let batchBytes = 0;
+					const flushBatch = async (): Promise<void> => {
+						if (batch.length === 0 || stopTraversal) return;
+						checkSearchDeadline(searchDeadline, signal);
+						const remaining = nativeMaxCount - streamedResult.matches.length;
+						if (remaining <= 0) {
+							stopTraversal = true;
+							streamedResult.limitReached = true;
+							return;
+						}
+						const resourceResult = await searchVirtualResources(
+							batch,
+							normalizedPattern,
+							ignoreCase,
+							effectiveMultiline,
+							normalizedContextBefore,
+							normalizedContextAfter,
+							remaining,
+							nativeMaxCountPerFile,
+							searchDeadline,
+							signal,
+							true,
+						);
+						checkSearchDeadline(searchDeadline, signal);
+						for (const resource of batch) searchedFiles.add(path.resolve(resource.path));
+						const uniqueMatches = resourceResult.matches.filter(match => {
+							const matchKey = `${path.resolve(match.path)}\0${match.lineNumber}`;
+							if (seenMatchKeys.has(matchKey)) return false;
+							seenMatchKeys.add(matchKey);
+							return true;
+						});
+						streamedResult.matches.push(...uniqueMatches);
+						streamedResult.totalMatches += uniqueMatches.length;
+						streamedResult.filesSearched = searchedFiles.size;
+						streamedResult.limitReached ||= resourceResult.limitReached;
+						for (const match of uniqueMatches) filesWithMatches.add(match.path);
+						batch = [];
+						batchBytes = 0;
+						if (streamedResult.matches.length >= nativeMaxCount) {
+							stopTraversal = true;
+							streamedResult.limitReached = true;
+						}
+					};
 					for (const target of targets) {
+						checkSearchDeadline(searchDeadline, signal);
+						if (stopTraversal) break;
 						const rootTarget = await operation.authorize(target.basePath, "search");
 						const matcher = target.glob ? new Bun.Glob(target.glob) : undefined;
-						const walked = await operation.walkAuthorized(rootTarget, {
+						await operation.walkAuthorized(rootTarget, {
 							signal,
+							deadline: searchDeadline,
+							gitignore: useGitignore,
 							readFiles: true,
 							include: entry => {
-								if (!entry.isFile) return false;
-								if (!matcher) return entry.path === rootTarget.canonicalTarget;
+								if (!entry.isFile || seenResourcePaths.has(path.resolve(entry.path))) return false;
+								if (!matcher) return rootTarget.isFile ? entry.path === rootTarget.canonicalTarget : true;
 								const relative = path.relative(target.basePath, entry.path).replace(/\\/g, "/");
 								if (!relative || relative === ".") return false;
 								return Boolean(matcher.match(relative));
 							},
 							descend: entry => {
-								if (!entry.isDirectory) return false;
+								if (stopTraversal || !entry.isDirectory) return false;
 								const relative = path.relative(target.basePath, entry.path).replace(/\\/g, "/");
 								return !(
 									useGitignore &&
 									relative.split("/").some(segment => segment === ".git" || segment === "node_modules")
 								);
 							},
+							visit: async entry => {
+								if (stopTraversal || !entry.isFile || entry.content === undefined) return;
+								checkSearchDeadline(searchDeadline, signal);
+								const resourcePath = path.resolve(entry.path);
+								if (seenResourcePaths.has(resourcePath)) return;
+								seenResourcePaths.add(resourcePath);
+								const contentBytes = Buffer.byteLength(entry.content, "utf8");
+								if (
+									batch.length > 0 &&
+									(batch.length >= CONSTRAINED_BATCH_MAX_FILES ||
+										batchBytes + contentBytes > CONSTRAINED_BATCH_MAX_BYTES)
+								) {
+									await flushBatch();
+								}
+								if (stopTraversal) return;
+								batch.push({
+									path: entry.path,
+									content: entry.content,
+									ranges: rangesByAbsPath.get(path.resolve(entry.path)),
+								});
+								batchBytes += contentBytes;
+								if (batch.length >= CONSTRAINED_BATCH_MAX_FILES || batchBytes >= CONSTRAINED_BATCH_MAX_BYTES) {
+									await flushBatch();
+								}
+							},
+							stop: () => stopTraversal,
 						});
-						for (const entry of walked) {
-							if (entry.isFile && entry.content !== undefined) {
-								manifest.push({ path: entry.path, content: entry.content });
-							}
-						}
+						await flushBatch();
 					}
-					result = await searchVirtualResources(
-						manifest,
-						normalizedPattern,
-						ignoreCase,
-						effectiveMultiline,
-						normalizedContextBefore,
-						normalizedContextAfter,
-						nativeMaxCount,
-						signal,
-					);
+					await flushBatch();
+					streamedResult.filesWithMatches = filesWithMatches.size;
+					result = streamedResult;
 				}
 
 				// Run native grep only for unrestricted scopes. Constrained scopes above
-				// supply an exact manifest of content read from authorized handles.
+				// search content from exact handles authorized during incremental traversal.
 				let skippedOversizedCount = 0;
 				try {
 					if (!constrainedSearch && searchablePaths.length > 0) {
@@ -1254,6 +1477,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 									}))
 								: (multiTargets ?? []);
 							for (const target of targets) {
+								checkSearchDeadline(searchDeadline, signal);
 								const targetResult = await grep(
 									{
 										pattern: normalizedPattern,
@@ -1270,10 +1494,11 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 										mode: effectiveOutputMode,
 										maxCountPerFile: nativeMaxCountPerFile,
 										signal,
-										timeoutMs: SEARCH_GREP_TIMEOUT_MS,
+										timeoutMs: remainingSearchTime(searchDeadline, signal),
 									},
 									undefined,
 								);
+								checkSearchDeadline(searchDeadline, signal);
 								skippedOversizedCount += targetResult.skippedOversized ?? 0;
 								limitReached = limitReached || Boolean(targetResult.limitReached);
 								totalMatches += targetResult.totalMatches;
@@ -1324,7 +1549,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 									mode: effectiveOutputMode,
 									maxCountPerFile: nativeMaxCountPerFile,
 									signal,
-									timeoutMs: SEARCH_GREP_TIMEOUT_MS,
+									timeoutMs: remainingSearchTime(searchDeadline, signal),
 								},
 								undefined,
 							);
@@ -1355,9 +1580,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						throw new ToolError(err.message.replace(/^regex(?: parse)? error:?\s*/i, "Invalid regex: "));
 					}
 					if (err instanceof Error && err.message.includes("Aborted: Timeout")) {
-						throw new ToolError(
-							`Grep timed out after ${SEARCH_GREP_TIMEOUT_MS / 1000}s; narrow paths or pattern, or scope with \`glob\` first`,
-						);
+						throw searchDeadlineError();
 					}
 					throw err;
 				}
@@ -1371,6 +1594,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						normalizedContextBefore,
 						normalizedContextAfter,
 						INTERNAL_TOTAL_CAP,
+						nativeMaxCountPerFile,
+						searchDeadline,
 						signal,
 					);
 				} catch (err) {
@@ -1502,6 +1727,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				// this note the caller might miss that matches beyond the window
 				// (or "no matches") reflect partial coverage, not the whole file.
 				const oversizedNote = await (async (): Promise<string | undefined> => {
+					if (constrainedSearch) return undefined;
 					const explicitFileTargets: string[] = [];
 					if (exactFilePaths) {
 						explicitFileTargets.push(...exactFilePaths);

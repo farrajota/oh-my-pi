@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { FileLock } from "@oh-my-pi/pi-natives";
 import { AgentRegistry } from "../../src/registry/agent-registry";
 import {
 	canonicalDurableSha256,
@@ -106,6 +108,127 @@ describe("W4 durable registry state", () => {
 		expect(first.sequence).toBe(1);
 	});
 
+	it("rejects lock contention before reading or writing the journal", async () => {
+		const { journal, store } = await createStore();
+		const lock = FileLock.tryAcquire(journal);
+		expect(lock.acquired).toBe(true);
+		const readFileSync = vi.spyOn(syncFs, "readFileSync");
+		try {
+			expect(() => store.append({ kind: "gate", at: 1, rootId: "Main", generation: 1, phase: "open" })).toThrow(
+				DurableStateConflictError,
+			);
+			expect(readFileSync.mock.calls.filter(([filePath]) => String(filePath) === journal)).toHaveLength(0);
+			expect(syncFs.existsSync(journal)).toBe(false);
+		} finally {
+			readFileSync.mockRestore();
+			lock.release();
+		}
+		const appended = store.append({ kind: "gate", at: 2, rootId: "Main", generation: 1, phase: "open" });
+		expect(appended.sequence).toBe(1);
+	});
+
+	it("never writes through a file raced into an absent journal path", async () => {
+		const { journal, store } = await createStore();
+		const replacement = "replacement must remain unchanged\n";
+		const originalOpenSync = syncFs.openSync;
+		let injected = false;
+		const openSync = vi.spyOn(syncFs, "openSync").mockImplementation(((filePath, flags, mode) => {
+			if (!injected && String(filePath) === journal) {
+				injected = true;
+				syncFs.writeFileSync(journal, replacement, { mode: 0o600 });
+			}
+			return originalOpenSync(filePath, flags, mode);
+		}) as typeof syncFs.openSync);
+		try {
+			expect(() => store.append({ kind: "gate", at: 1, rootId: "Main", generation: 1, phase: "open" })).toThrow(
+				DurableStateConflictError,
+			);
+			expect(syncFs.readFileSync(journal, "utf8")).toBe(replacement);
+		} finally {
+			openSync.mockRestore();
+		}
+	});
+
+	it("rejects an existing journal replacement before writing", async () => {
+		const { directory, journal, store } = await createStore();
+		store.append({ kind: "gate", at: 1, rootId: "Main", generation: 1, phase: "open" });
+		const replacement = "replacement must remain unchanged\n";
+		const displaced = path.join(directory, "registry.displaced.jsonl");
+		const originalOpenSync = syncFs.openSync;
+		let injected = false;
+		const openSync = vi.spyOn(syncFs, "openSync").mockImplementation(((filePath, flags, mode) => {
+			if (!injected && String(filePath) === journal) {
+				injected = true;
+				syncFs.renameSync(journal, displaced);
+				syncFs.writeFileSync(journal, replacement, { mode: 0o600 });
+			}
+			return originalOpenSync(filePath, flags, mode);
+		}) as typeof syncFs.openSync);
+		try {
+			expect(() => store.append({ kind: "gate", at: 2, rootId: "Main", generation: 1, phase: "quiescing" })).toThrow(
+				DurableStateConflictError,
+			);
+			expect(syncFs.readFileSync(journal, "utf8")).toBe(replacement);
+		} finally {
+			openSync.mockRestore();
+		}
+	});
+
+	it("rejects an in-place same-size journal mutation before writing", async () => {
+		const { journal, store } = await createStore();
+		store.append({ kind: "gate", at: 1, rootId: "Main", generation: 1, phase: "open" });
+		const original = syncFs.readFileSync(journal, "utf8");
+		const mutated = original.replace('"rootId":"Main"', '"rootId":"Evil"');
+		expect(Buffer.byteLength(mutated)).toBe(Buffer.byteLength(original));
+		const inode = syncFs.statSync(journal).ino;
+		const originalOpenSync = syncFs.openSync;
+		let injected = false;
+		const openSync = vi.spyOn(syncFs, "openSync").mockImplementation(((filePath, flags, mode) => {
+			if (!injected && String(filePath) === journal) {
+				injected = true;
+				syncFs.writeFileSync(journal, mutated, { mode: 0o600 });
+				expect(syncFs.statSync(journal).ino).toBe(inode);
+			}
+			return originalOpenSync(filePath, flags, mode);
+		}) as typeof syncFs.openSync);
+		try {
+			expect(() => store.append({ kind: "gate", at: 2, rootId: "Main", generation: 1, phase: "quiescing" })).toThrow(
+				DurableStateConflictError,
+			);
+			expect(injected).toBe(true);
+			expect(syncFs.readFileSync(journal, "utf8")).toBe(mutated);
+		} finally {
+			openSync.mockRestore();
+		}
+	});
+
+	it.skipIf(process.platform === "win32")("never follows a symlink raced into an existing journal path", async () => {
+		const { directory, journal, store } = await createStore();
+		store.append({ kind: "gate", at: 1, rootId: "Main", generation: 1, phase: "open" });
+		const original = syncFs.readFileSync(journal, "utf8");
+		const displaced = path.join(directory, "registry.symlink-target.jsonl");
+		const originalOpenSync = syncFs.openSync;
+		let injected = false;
+		const openSync = vi.spyOn(syncFs, "openSync").mockImplementation(((filePath, flags, mode) => {
+			if (!injected && String(filePath) === journal) {
+				injected = true;
+				syncFs.renameSync(journal, displaced);
+				syncFs.symlinkSync(displaced, journal);
+			}
+			return originalOpenSync(filePath, flags, mode);
+		}) as typeof syncFs.openSync);
+		try {
+			expect(() => store.append({ kind: "gate", at: 2, rootId: "Main", generation: 1, phase: "quiescing" })).toThrow(
+				DurableStateConflictError,
+			);
+			expect(injected).toBe(true);
+			expect(syncFs.lstatSync(journal).isSymbolicLink()).toBe(true);
+			expect(syncFs.readFileSync(displaced, "utf8")).toBe(original);
+		} finally {
+			openSync.mockRestore();
+		}
+	});
+
 	it("rejects explicitly undefined optional fields in malformed durable records", async () => {
 		const { store } = await createStore();
 		expect(() =>
@@ -121,6 +244,41 @@ describe("W4 durable registry state", () => {
 				phase: "reserved",
 			} as never),
 		).toThrow("Durable state field 'parentId' is undefined.");
+	});
+
+	it("caches same-store journal validation and observes external appends", async () => {
+		const { journal, store } = await createStore();
+		appendActiveRoot(store);
+
+		const readFileSync = vi.spyOn(syncFs, "readFileSync");
+		try {
+			for (let index = 8; index <= 40; index++) {
+				store.append({ kind: "gate", at: index, rootId: "Main", generation: 1, phase: "open" });
+			}
+
+			const sameStoreJournalReads = readFileSync.mock.calls.filter(
+				([filePath]) => String(filePath) === journal,
+			).length;
+			expect(sameStoreJournalReads).toBeLessThanOrEqual(1);
+
+			const otherStore = new RegistryDurableStateStore(journal);
+			otherStore.append({ kind: "gate", at: 41, rootId: "Main", generation: 1, phase: "quiescing" });
+			const readsBeforeExternalObservation = readFileSync.mock.calls.filter(
+				([filePath]) => String(filePath) === journal,
+			).length;
+			const observed = store.readBatch(null).records;
+			const readsAfterExternalObservation = readFileSync.mock.calls.filter(
+				([filePath]) => String(filePath) === journal,
+			).length;
+			expect(readsAfterExternalObservation).toBeGreaterThan(readsBeforeExternalObservation);
+			expect(
+				observed.some(
+					entry => entry.record.kind === "gate" && entry.record.at === 41 && entry.record.phase === "quiescing",
+				),
+			).toBe(true);
+		} finally {
+			readFileSync.mockRestore();
+		}
 	});
 
 	it("quarantines tampered journal content and remains unavailable after another restart", async () => {
