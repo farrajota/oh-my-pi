@@ -605,6 +605,7 @@ async function createAuthorityToolFixture(
 		agentRegistry: registry,
 		getAgentId: () => "Main",
 		localProtocolOptions,
+		pathScope: localProtocolOptions.getPathScope?.(),
 		asyncJobManager,
 	});
 	registerToolSessionLifecycleAuthority(toolSession, registry, owner);
@@ -613,6 +614,17 @@ async function createAuthorityToolFixture(
 		sessionManager,
 		dispose: () => owner.dispose(),
 	};
+}
+
+async function runAuthorityOperation<T>(
+	authority: { toolSession: ToolSession; sessionManager: SessionManager },
+	operationId: string,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const pathScope = authority.toolSession.pathScope ?? authority.toolSession.localProtocolOptions?.getPathScope?.();
+	if (!pathScope) throw new Error("Expected registered session path scope");
+	authority.toolSession.pathScope = pathScope;
+	return runLocalOperation(authority.sessionManager, operationId, () => pathScope.withOperationLease(operationId, fn));
 }
 
 describe("Coding Agent Tools", () => {
@@ -654,17 +666,13 @@ describe("Coding Agent Tools", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
-
-		// Clean up test directory
-		removeSyncWithRetries(testDir);
-
-		// Restore original edit variant
 		if (originalEditVariant === undefined) {
 			delete Bun.env.PI_EDIT_VARIANT;
 		} else {
 			Bun.env.PI_EDIT_VARIANT = originalEditVariant;
 		}
 		AsyncJobManager.resetForTests();
+		removeSyncWithRetries(testDir);
 	});
 
 	describe("read tool", () => {
@@ -1078,12 +1086,8 @@ describe("Coding Agent Tools", () => {
 			};
 
 			try {
-				const result = await spillReadTool.execute(
-					"test-call-read-spill",
-					{ path: testFile },
-					undefined,
-					undefined,
-					context,
+				const result = await runAuthorityOperation(authority, "test-call-read-spill", () =>
+					spillReadTool.execute("test-call-read-spill", { path: testFile }, undefined, undefined, context),
 				);
 				const truncation = result.details?.meta?.truncation;
 				const output = getTextOutput(result);
@@ -1095,12 +1099,14 @@ describe("Coding Agent Tools", () => {
 				expect(output).toContain(`Use :${defaultLimit + 1} to continue`);
 
 				const saveArtifact = vi.spyOn(spillManager, "saveArtifact");
-				const artifactResult = await spillReadTool.execute(
-					"test-call-read-spilled-artifact",
-					{ path: `artifact://${truncation?.artifactId}` },
-					undefined,
-					undefined,
-					context,
+				const artifactResult = await runAuthorityOperation(authority, "test-call-read-spilled-artifact", () =>
+					spillReadTool.execute(
+						"test-call-read-spilled-artifact",
+						{ path: `artifact://${truncation?.artifactId}` },
+						undefined,
+						undefined,
+						context,
+					),
 				);
 				expect(getTextOutput(artifactResult)).toContain(line);
 				expect(saveArtifact).not.toHaveBeenCalled();
@@ -2980,6 +2986,165 @@ function b() {
 			expect(result.details?.matchCount).toBe(10);
 		});
 
+		it("flushes a pending root before opening the next ordered root", async () => {
+			const settings = Settings.isolated({ "grep.contextBefore": 0, "grep.contextAfter": 0 });
+			const authority = await createAuthorityToolFixture(testDir, settings);
+			const authoritySearchTool = wrapToolWithMetaNotice(new GrepTool(authority.toolSession));
+			const scopeDir = path.join(testDir, "grep-budget-stop");
+			const earlyDir = path.join(scopeDir, "early");
+			const sentinelDir = path.join(scopeDir, "sentinels");
+			fs.mkdirSync(earlyDir, { recursive: true });
+			fs.mkdirSync(sentinelDir, { recursive: true });
+			const earlyFileCount = DEFAULT_FILE_LIMIT * 10;
+			const earlyContent = Array.from(
+				{ length: MULTI_FILE_PER_FILE_MATCHES + 20 },
+				(_, index) => `needle early ${index + 1}`,
+			).join("\n");
+			for (let index = 0; index < earlyFileCount; index++) {
+				fs.writeFileSync(path.join(earlyDir, `early-${String(index).padStart(3, "0")}.txt`), earlyContent);
+			}
+			const sentinelPaths = ["sentinel-a.txt", "sentinel-b.txt"].map(name => path.join(sentinelDir, name));
+			for (const sentinelPath of sentinelPaths) {
+				fs.writeFileSync(sentinelPath, `needle ${path.basename(sentinelPath)} must not be opened`);
+			}
+			const openedPaths: string[] = [];
+			const originalOpen = fs.promises.open;
+			const open = vi.spyOn(fs.promises, "open").mockImplementation(((filePath, flags, mode) => {
+				openedPaths.push(path.resolve(String(filePath)));
+				return originalOpen(filePath, flags, mode);
+			}) as typeof fs.promises.open);
+
+			const context = {
+				...createTestToolContext(["grep"]),
+				settings,
+				sessionManager: authority.sessionManager,
+				localProtocolOptions: authority.toolSession.localProtocolOptions,
+			};
+			try {
+				const result = await runAuthorityOperation(authority, "test-call-grep-budget-stop", () =>
+					authoritySearchTool.execute(
+						"test-call-grep-budget-stop",
+						{ pattern: "needle", path: `${earlyDir};${sentinelDir}` },
+						undefined,
+						undefined,
+						context,
+					),
+				);
+				const output = getTextOutput(result);
+				expect(output).toContain("early 1");
+				expect(output).not.toContain("sentinel-a.txt");
+				expect(output).not.toContain("sentinel-b.txt");
+				expect(result.details?.matchCount).toBeGreaterThan(0);
+				expect(openedPaths).not.toContain(path.resolve(sentinelDir));
+				for (const sentinelPath of sentinelPaths) {
+					expect(openedPaths).not.toContain(path.resolve(sentinelPath));
+				}
+			} finally {
+				open.mockRestore();
+				await authority.dispose();
+			}
+		});
+
+		it("deduplicates a nested file repeated by overlapping constrained roots", async () => {
+			const settings = Settings.isolated({ "grep.contextBefore": 0, "grep.contextAfter": 0 });
+			const authority = await createAuthorityToolFixture(testDir, settings);
+			const authoritySearchTool = wrapToolWithMetaNotice(
+				new GrepTool(authority.toolSession, { totalMatchLimit: 2 }),
+			);
+			const scenarioDir = path.join(testDir, "grep-overlapping-roots");
+			const nestedFile = path.join(scenarioDir, "nested.txt");
+			const secondFile = path.join(testDir, "grep-overlap-second.txt");
+			fs.mkdirSync(scenarioDir, { recursive: true });
+			fs.writeFileSync(nestedFile, "needle overlap A\n");
+			fs.writeFileSync(secondFile, "needle overlap B\n");
+			let nestedFileReads = 0;
+			const originalOpen = fs.promises.open;
+			const open = vi.spyOn(fs.promises, "open").mockImplementation((async (filePath, flags, mode) => {
+				const handle = await originalOpen(filePath, flags, mode);
+				if (path.resolve(String(filePath)) === path.resolve(nestedFile)) {
+					const originalReadFile = handle.readFile.bind(handle);
+					handle.readFile = ((options?: Parameters<typeof handle.readFile>[0]) => {
+						nestedFileReads++;
+						return options === undefined ? originalReadFile() : originalReadFile(options);
+					}) as typeof handle.readFile;
+				}
+				return handle;
+			}) as typeof fs.promises.open);
+			const context = {
+				...createTestToolContext(["grep"]),
+				settings,
+				sessionManager: authority.sessionManager,
+				localProtocolOptions: authority.toolSession.localProtocolOptions,
+			};
+			try {
+				const result = await runAuthorityOperation(authority, "test-call-grep-overlap", () =>
+					authoritySearchTool.execute(
+						"test-call-grep-overlap",
+						{ pattern: "needle", path: `${nestedFile};${scenarioDir};${secondFile}` },
+						undefined,
+						undefined,
+						context,
+					),
+				);
+				const output = getTextOutput(result);
+				expect(output.match(/overlap A/g)).toHaveLength(1);
+				expect(output.match(/overlap B/g)).toHaveLength(1);
+				expect(result.details?.matchCount).toBe(2);
+				expect(result.details?.fileCount).toBe(2);
+				expect(result.details?.truncated).toBe(false);
+				expect(nestedFileReads).toBe(1);
+			} finally {
+				open.mockRestore();
+				await authority.dispose();
+			}
+		});
+
+		it("does not let overlapping roots consume the constrained match budget", async () => {
+			const settings = Settings.isolated({ "grep.contextBefore": 0, "grep.contextAfter": 0 });
+			const authority = await createAuthorityToolFixture(testDir, settings);
+			const authoritySearchTool = wrapToolWithMetaNotice(new GrepTool(authority.toolSession));
+			const parentDir = path.join(testDir, "grep-overlap-budget-parent");
+			const hotDir = path.join(parentDir, "hot");
+			const finalFile = path.join(testDir, "grep-overlap-budget-final.txt");
+			fs.mkdirSync(hotDir, { recursive: true });
+			const hotFileCount = 97;
+			const hotContent = Array.from(
+				{ length: MULTI_FILE_PER_FILE_MATCHES },
+				(_, index) => `needle duplicate budget ${index}`,
+			).join("\n");
+			for (let index = 0; index < hotFileCount; index++) {
+				fs.writeFileSync(path.join(hotDir, `hot-${String(index).padStart(2, "0")}.txt`), hotContent);
+			}
+			fs.writeFileSync(finalFile, "needle unique after overlap\n");
+			const context = {
+				...createTestToolContext(["grep"]),
+				settings,
+				sessionManager: authority.sessionManager,
+				localProtocolOptions: authority.toolSession.localProtocolOptions,
+			};
+			try {
+				const result = await runAuthorityOperation(authority, "test-call-grep-overlap-budget", () =>
+					authoritySearchTool.execute(
+						"test-call-grep-overlap-budget",
+						{
+							pattern: "needle",
+							path: `${parentDir};${hotDir};${finalFile}`,
+							skip: hotFileCount,
+						},
+						undefined,
+						undefined,
+						context,
+					),
+				);
+				expect(getTextOutput(result)).toContain("unique after overlap");
+				expect(result.details?.matchCount).toBe(1);
+				expect(result.details?.fileCount).toBe(1);
+				expect(result.details?.truncated).toBe(false);
+			} finally {
+				await authority.dispose();
+			}
+		});
+
 		it("should not repeat file headings for multiple matches per file", async () => {
 			fs.writeFileSync(path.join(testDir, "alpha.txt"), "needle a1\nneedle a2\nneedle a3");
 			fs.writeFileSync(path.join(testDir, "beta.txt"), "needle b1\nneedle b2\nneedle b3");
@@ -3019,24 +3184,70 @@ function b() {
 			expect(output).toContain("## models.json");
 			expect(result.details?.fileCount).toBeGreaterThanOrEqual(2);
 		});
-
-		it("should respect .gitignore by default", async () => {
+		it("should apply constrained nested gitignore rules before content and descent", async () => {
 			const scenarioDir = path.join(testDir, "grep-gitignore-default");
-			fs.mkdirSync(path.join(scenarioDir, ".git"), { recursive: true });
-			fs.writeFileSync(path.join(scenarioDir, ".gitignore"), "ignored.txt\n");
-			fs.writeFileSync(path.join(scenarioDir, "ignored.txt"), "needle ignored\n");
-			fs.writeFileSync(path.join(scenarioDir, "kept.txt"), "needle kept\n");
+			const ignoredDir = path.join(scenarioDir, "ignored-dir");
+			const nestedDir = path.join(scenarioDir, "nested");
+			const subDir = path.join(scenarioDir, "sub");
+			fs.mkdirSync(ignoredDir, { recursive: true });
+			fs.mkdirSync(nestedDir, { recursive: true });
+			fs.mkdirSync(subDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(scenarioDir, ".gitignore"),
+				"/anchored.txt\nignored-dir/\n*.tmp\n!keep.tmp\nignored\\ \ntrimmed-ignore   \n",
+			);
+			fs.writeFileSync(path.join(nestedDir, ".gitignore"), "nested-ignore.txt\n!nested-keep.txt\n");
+			fs.writeFileSync(path.join(scenarioDir, "anchored.txt"), "needle root anchored ignored\n");
+			fs.writeFileSync(path.join(subDir, "anchored.txt"), "needle nested anchored kept\n");
+			fs.writeFileSync(path.join(ignoredDir, "sentinel.txt"), "needle ignored descendant\n");
+			fs.writeFileSync(path.join(scenarioDir, "drop.tmp"), "needle glob ignored\n");
+			fs.writeFileSync(path.join(scenarioDir, "keep.tmp"), "needle negation kept\n");
+			fs.writeFileSync(path.join(nestedDir, "nested-ignore.txt"), "needle nested ignored\n");
+			fs.writeFileSync(path.join(nestedDir, "nested-keep.txt"), "needle nested kept\n");
+			fs.writeFileSync(path.join(scenarioDir, "ignored "), "needle escaped trailing space ignored\n");
+			fs.writeFileSync(path.join(scenarioDir, "trimmed-ignore"), "needle unescaped trailing spaces ignored\n");
+			const openedPaths: string[] = [];
+			const originalOpen = fs.promises.open;
+			const open = vi.spyOn(fs.promises, "open").mockImplementation(((filePath, flags, mode) => {
+				openedPaths.push(path.resolve(String(filePath)));
+				return originalOpen(filePath, flags, mode);
+			}) as typeof fs.promises.open);
 
-			const result = await searchTool.execute("test-call-15-gitignore-default", {
-				pattern: "needle",
-				path: scenarioDir,
-			});
-
-			const output = getTextOutput(result);
-			expect(output).toContain("kept.txt");
-			expect(output).not.toContain("ignored.txt");
-			expect(result.details?.fileCount).toBe(1);
-			expect(result.details?.matchCount).toBe(1);
+			const settings = Settings.isolated({ "grep.contextBefore": 0, "grep.contextAfter": 0 });
+			const authority = await createAuthorityToolFixture(testDir, settings);
+			const authoritySearchTool = wrapToolWithMetaNotice(new GrepTool(authority.toolSession));
+			const context = {
+				...createTestToolContext(["grep"]),
+				settings,
+				sessionManager: authority.sessionManager,
+				localProtocolOptions: authority.toolSession.localProtocolOptions,
+			};
+			try {
+				const result = await runAuthorityOperation(authority, "test-call-gitignore-authority", () =>
+					authoritySearchTool.execute(
+						"test-call-gitignore-authority",
+						{ pattern: "needle", path: scenarioDir },
+						undefined,
+						undefined,
+						context,
+					),
+				);
+				const output = getTextOutput(result);
+				expect(output).toContain("nested anchored kept");
+				expect(output).toContain("keep.tmp");
+				expect(output).toContain("nested-keep.txt");
+				expect(output).not.toContain("root anchored ignored");
+				expect(output).not.toContain("ignored descendant");
+				expect(output).not.toContain("glob ignored");
+				expect(output).not.toContain("nested ignored");
+				expect(output).not.toContain("escaped trailing space ignored");
+				expect(output).not.toContain("unescaped trailing spaces ignored");
+				expect(result.details?.fileCount).toBe(3);
+				expect(openedPaths).not.toContain(path.resolve(ignoredDir, "sentinel.txt"));
+			} finally {
+				open.mockRestore();
+				await authority.dispose();
+			}
 		});
 
 		it("should include ignored files when gitignore is false", async () => {
@@ -3101,25 +3312,76 @@ function b() {
 			expect(output).toContain(`Showing files 1-${DEFAULT_FILE_LIMIT} of ${totalFiles}`);
 			expect(output).toContain(`Use skip=${DEFAULT_FILE_LIMIT}`);
 		});
-
-		it("should cap matches per file in multi-file scopes", async () => {
-			const concDir = path.join(testDir, "concentration-dir");
-			fs.mkdirSync(concDir, { recursive: true });
+		it("should cap a constrained oversized hot file without starving a later file", async () => {
+			const hotDir = path.join(testDir, "concentration-hot");
+			const coolDir = path.join(testDir, "concentration-cool");
+			fs.mkdirSync(hotDir, { recursive: true });
+			fs.mkdirSync(coolDir, { recursive: true });
 			const hotMatches = MULTI_FILE_PER_FILE_MATCHES + 30;
 			fs.writeFileSync(
-				path.join(concDir, "hot.txt"),
-				Array.from({ length: hotMatches }, (_, i) => `needle ${i + 1}`).join("\n"),
+				path.join(hotDir, "hot.txt"),
+				`${Array.from({ length: hotMatches }, (_, i) => `needle ${i + 1}`).join("\n")}\n${"x".repeat(4 * 1024 * 1024)}`,
 			);
-			fs.writeFileSync(path.join(concDir, "cool.txt"), "needle cool");
+			fs.writeFileSync(path.join(coolDir, "cool.txt"), "needle cool");
 
-			const result = await searchTool.execute("test-call-14-per-file-cap", {
-				pattern: "needle",
-				path: concDir,
-			});
+			const settings = Settings.isolated({ "grep.contextBefore": 0, "grep.contextAfter": 0 });
+			const authority = await createAuthorityToolFixture(testDir, settings);
+			const authoritySearchTool = wrapToolWithMetaNotice(new GrepTool(authority.toolSession));
+			const context = {
+				...createTestToolContext(["grep"]),
+				settings,
+				sessionManager: authority.sessionManager,
+				localProtocolOptions: authority.toolSession.localProtocolOptions,
+			};
+			try {
+				const result = await runAuthorityOperation(authority, "test-call-per-file-cap", () =>
+					authoritySearchTool.execute(
+						"test-call-per-file-cap",
+						{ pattern: "needle", path: `${hotDir};${coolDir}` },
+						undefined,
+						undefined,
+						context,
+					),
+				);
+				const hotCount = result.details?.fileMatches?.find(entry => entry.path.endsWith("hot.txt"))?.count ?? 0;
+				const coolCount = result.details?.fileMatches?.find(entry => entry.path.endsWith("cool.txt"))?.count ?? 0;
+				expect(hotCount).toBe(MULTI_FILE_PER_FILE_MATCHES);
+				expect(coolCount).toBe(1);
+				expect(getTextOutput(result)).toContain("cool.txt");
+				expect(result.details?.perFileLimitReached).toBe(MULTI_FILE_PER_FILE_MATCHES);
+			} finally {
+				await authority.dispose();
+			}
+		});
 
-			const hotCount = result.details?.fileMatches?.find(entry => entry.path.endsWith("hot.txt"))?.count ?? 0;
-			expect(hotCount).toBe(MULTI_FILE_PER_FILE_MATCHES);
-			expect(result.details?.perFileLimitReached).toBe(MULTI_FILE_PER_FILE_MATCHES);
+		it("should search constrained content beyond the native file window", async () => {
+			const oversized = path.join(testDir, "oversized-after-window.txt");
+			fs.writeFileSync(oversized, `${"x".repeat(4 * 1024 * 1024 + 1024)}\nneedle after native window\n`);
+			const settings = Settings.isolated({ "grep.contextBefore": 0, "grep.contextAfter": 0 });
+			const authority = await createAuthorityToolFixture(testDir, settings);
+			const authoritySearchTool = wrapToolWithMetaNotice(new GrepTool(authority.toolSession));
+			const context = {
+				...createTestToolContext(["grep"]),
+				settings,
+				sessionManager: authority.sessionManager,
+				localProtocolOptions: authority.toolSession.localProtocolOptions,
+			};
+			try {
+				const result = await runAuthorityOperation(authority, "test-call-oversized-window", () =>
+					authoritySearchTool.execute(
+						"test-call-oversized-window",
+						{ pattern: "needle", path: oversized },
+						undefined,
+						undefined,
+						context,
+					),
+				);
+				const output = getTextOutput(result);
+				expect(output).toContain("needle after native window");
+				expect(output).not.toContain("first 4 MiB");
+			} finally {
+				await authority.dispose();
+			}
 		});
 
 		it("should let a single-file scope exceed the multi-file per-file cap", async () => {

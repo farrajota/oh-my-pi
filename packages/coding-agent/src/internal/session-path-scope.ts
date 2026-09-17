@@ -84,9 +84,13 @@ export interface AuthorizedSearchEntry {
 
 export interface AuthorizedSearchWalkOptions {
 	readonly signal?: AbortSignal;
+	readonly deadline?: number;
+	readonly gitignore?: boolean;
 	readonly readFiles?: boolean;
 	readonly include?: (entry: Omit<AuthorizedSearchEntry, "content">) => boolean;
 	readonly descend?: (entry: Omit<AuthorizedSearchEntry, "content">) => boolean;
+	readonly visit?: (entry: AuthorizedSearchEntry) => void | Promise<void>;
+	readonly stop?: () => boolean;
 }
 
 const PATH_KEYS = new Set([
@@ -125,6 +129,117 @@ function identityOf(stat: fs.BigIntStats): FilesystemIdentity {
 
 function sameIdentity(left: FilesystemIdentity, right: FilesystemIdentity): boolean {
 	return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
+}
+
+interface GitignoreRule {
+	readonly basePath: string;
+	readonly negated: boolean;
+	readonly directoryOnly: boolean;
+	readonly exact: RegExp;
+}
+
+function escapeRegex(value: string): string {
+	return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
+function gitignoreGlobSource(pattern: string): string {
+	let source = "";
+	for (let index = 0; index < pattern.length; index++) {
+		const character = pattern[index];
+		if (character === "\\" && index + 1 < pattern.length) {
+			source += escapeRegex(pattern[++index]);
+			continue;
+		}
+		if (character === "*") {
+			if (pattern[index + 1] === "*") {
+				while (pattern[index + 1] === "*") index++;
+				if (pattern[index + 1] === "/") {
+					index++;
+					source += "(?:.*/)?";
+				} else {
+					source += ".*";
+				}
+			} else {
+				source += "[^/]*";
+			}
+			continue;
+		}
+		if (character === "?") {
+			source += "[^/]";
+			continue;
+		}
+		if (character === "[") {
+			const end = pattern.indexOf("]", index + 1);
+			if (end !== -1) {
+				let content = pattern.slice(index + 1, end);
+				let negated = false;
+				if (content.startsWith("!")) {
+					negated = true;
+					content = content.slice(1);
+				}
+				if (content.startsWith("^")) content = `\\${content}`;
+				source += `[${negated ? "^" : ""}${content.replace(/\\/g, "\\\\")}]`;
+				index = end;
+				continue;
+			}
+		}
+		source += character === "/" ? "/" : escapeRegex(character);
+	}
+	return source;
+}
+
+function trimUnescapedTrailingSpaces(pattern: string): string {
+	let end = pattern.length;
+	while (end > 0 && pattern[end - 1] === " ") {
+		let backslashes = 0;
+		for (let index = end - 2; index >= 0 && pattern[index] === "\\"; index--) backslashes++;
+		if (backslashes % 2 === 1) break;
+		end--;
+	}
+	return pattern.slice(0, end);
+}
+
+function parseGitignore(content: string, basePath: string): GitignoreRule[] {
+	const rules: GitignoreRule[] = [];
+	for (const rawLine of content.split("\n")) {
+		let pattern = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		pattern = trimUnescapedTrailingSpaces(pattern);
+		if (!pattern.trim() || pattern.startsWith("#")) continue;
+		let negated = false;
+		if (pattern.startsWith("\\#") || pattern.startsWith("\\!")) {
+			pattern = pattern.slice(1);
+		} else if (pattern.startsWith("!")) {
+			negated = true;
+			pattern = pattern.slice(1);
+		}
+		if (!pattern) continue;
+		const directoryOnly = pattern.endsWith("/");
+		if (directoryOnly) pattern = pattern.slice(0, -1);
+		const anchored = pattern.startsWith("/");
+		if (anchored) pattern = pattern.slice(1);
+		if (!pattern) continue;
+		const source = gitignoreGlobSource(pattern);
+		const prefix = anchored || pattern.includes("/") ? "^" : "(?:^|/)";
+		rules.push({
+			basePath,
+			negated,
+			directoryOnly,
+			exact: new RegExp(`${prefix}${source}$`),
+		});
+	}
+	return rules;
+}
+
+function isGitignored(entryPath: string, isDirectory: boolean, rules: readonly GitignoreRule[]): boolean {
+	let ignored = false;
+	for (const rule of rules) {
+		const relative = path.relative(rule.basePath, entryPath).replace(/\\/g, "/");
+		if (!relative || relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)) continue;
+		if (rule.exact.test(relative) && (!rule.directoryOnly || isDirectory)) {
+			ignored = !rule.negated;
+		}
+	}
+	return ignored;
 }
 
 async function lstatIdentity(filePath: string): Promise<FilesystemIdentity | undefined> {
@@ -208,12 +323,25 @@ export class FilesystemOperation {
 		const entries: AuthorizedSearchEntry[] = [];
 		const include = options.include ?? (() => true);
 		const descend = options.descend ?? (() => true);
-		const visit = async (target: AuthorizedFilesystemTarget): Promise<void> => {
+		const checkActive = (): void => {
 			this.assertActive();
 			if (options.signal?.aborted) throw new Error("Search traversal aborted.");
+			if (options.deadline !== undefined && Date.now() >= options.deadline) {
+				throw new Error("Search traversal timed out; narrow paths or pattern.");
+			}
+		};
+		const visit = async (
+			target: AuthorizedFilesystemTarget,
+			rules: readonly GitignoreRule[],
+			applyRules: boolean,
+		): Promise<void> => {
+			if (options.stop?.()) return;
+			checkActive();
 			const handle = await this.openRead(target);
 			try {
+				checkActive();
 				const stat = await handle.stat({ bigint: true });
+				checkActive();
 				const base: Omit<AuthorizedSearchEntry, "content"> = Object.freeze({
 					path: target.canonicalTarget,
 					isFile: stat.isFile(),
@@ -221,31 +349,81 @@ export class FilesystemOperation {
 					size: stat.size,
 					mtimeMs: Number(stat.mtimeMs),
 				});
-				const selected = include(base);
+				const ignored =
+					options.gitignore === true && applyRules && isGitignored(base.path, base.isDirectory, rules);
+				const selected = !ignored && include(base);
 				if (selected && base.isFile) {
+					checkActive();
 					const content = options.readFiles ? await handle.readFile({ encoding: "utf8" }) : undefined;
-					entries.push(content === undefined ? base : Object.freeze({ ...base, content }));
+					checkActive();
+					const entry = content === undefined ? base : Object.freeze({ ...base, content });
+					if (options.visit) await options.visit(entry);
+					else entries.push(entry);
 				} else if (selected) {
-					entries.push(base);
+					if (options.visit) await options.visit(base);
+					else entries.push(base);
 				}
-				if (!base.isDirectory || !descend(base)) return;
+				checkActive();
+				if (ignored || !base.isDirectory || !descend(base)) return;
 				if (process.platform !== "linux") {
 					throw new Error("Exact filesystem traversal requires Linux /proc/self/fd support.");
 				}
-				const directory = await fs.promises.opendir(`/proc/self/fd/${handle.fd}`);
+				checkActive();
+				const directoryPath = `/proc/self/fd/${handle.fd}`;
+				let childRules = rules;
+				let ignoreTarget: AuthorizedFilesystemTarget | undefined;
+				if (options.gitignore === true) {
+					const ruleDirectory = await fs.promises.opendir(directoryPath);
+					try {
+						for (;;) {
+							if (options.stop?.()) return;
+							checkActive();
+							const child = await ruleDirectory.read();
+							if (child === null) break;
+							if (child.name !== ".gitignore") continue;
+							try {
+								ignoreTarget = await this.authorize(path.join(target.canonicalTarget, child.name), "search");
+							} catch {
+								break;
+							}
+							checkActive();
+							const ignoreHandle = await this.openRead(ignoreTarget);
+							try {
+								checkActive();
+								const ignoreStat = await ignoreHandle.stat({ bigint: true });
+								if (ignoreStat.isFile()) {
+									checkActive();
+									const ignoreContent = await ignoreHandle.readFile({ encoding: "utf8" });
+									checkActive();
+									childRules = [...rules, ...parseGitignore(ignoreContent, target.canonicalTarget)];
+								}
+							} finally {
+								await ignoreHandle.close();
+							}
+							break;
+						}
+					} finally {
+						await ruleDirectory.close();
+					}
+				}
+
+				const directory = await fs.promises.opendir(directoryPath);
 				try {
 					for (;;) {
+						if (options.stop?.()) return;
+						checkActive();
 						const child = await directory.read();
 						if (child === null) break;
-						if (options.signal?.aborted) throw new Error("Search traversal aborted.");
 						const childPath = path.join(target.canonicalTarget, child.name);
-						let authorized: AuthorizedFilesystemTarget;
-						try {
-							authorized = await this.authorize(childPath, "search");
-						} catch {
-							continue;
+						let authorized = child.name === ".gitignore" ? ignoreTarget : undefined;
+						if (!authorized) {
+							try {
+								authorized = await this.authorize(childPath, "search");
+							} catch {
+								continue;
+							}
 						}
-						await visit(authorized);
+						await visit(authorized, childRules, true);
 					}
 				} finally {
 					await directory.close();
@@ -254,7 +432,7 @@ export class FilesystemOperation {
 				await handle.close();
 			}
 		};
-		await visit(root);
+		await visit(root, [], false);
 		return Object.freeze(entries);
 	}
 

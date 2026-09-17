@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { FileLock } from "@oh-my-pi/pi-natives";
 
 export const DURABLE_STATE_VERSION = 1 as const;
 export const DURABLE_RECOVERY_BATCH_LIMIT = 100;
 const GENESIS_HASH = "0".repeat(64);
 export const REGISTRY_DURABLE_JOURNAL_SUFFIX = ".authority-v1.jsonl";
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const O_NOFOLLOW = "O_NOFOLLOW" in fs.constants ? fs.constants.O_NOFOLLOW : 0;
 
 export type DurablePhase = "intent" | "effect" | "committed";
 export type DurableTerminalPhase = "completed" | "failed" | "abandoned" | "cancelled";
@@ -472,6 +474,58 @@ function journalHash(input: Omit<DurableJournalRecord, "hash">): string {
 	return canonicalDurableSha256(input);
 }
 
+interface DurableJournalMetadata {
+	readonly dev: bigint;
+	readonly ino: bigint;
+	readonly mode: bigint;
+	readonly size: bigint;
+	readonly mtimeNs: bigint;
+	readonly ctimeNs: bigint;
+}
+
+interface ValidatedJournal {
+	readonly records: DurableJournalRecord[];
+	readonly metadata: DurableJournalMetadata | undefined;
+}
+
+function journalMetadataFromStat(stat: fs.BigIntStats): DurableJournalMetadata {
+	return Object.freeze({
+		dev: stat.dev,
+		ino: stat.ino,
+		mode: stat.mode,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		ctimeNs: stat.ctimeNs,
+	});
+}
+
+function journalMetadata(journalPath: string): DurableJournalMetadata | undefined {
+	try {
+		return journalMetadataFromStat(fs.statSync(journalPath, { bigint: true }));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+function sameJournalIdentity(left: DurableJournalMetadata, right: DurableJournalMetadata): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
+}
+
+function sameJournalMetadata(
+	left: DurableJournalMetadata | undefined,
+	right: DurableJournalMetadata | undefined,
+): boolean {
+	return (
+		left?.dev === right?.dev &&
+		left?.ino === right?.ino &&
+		left?.mode === right?.mode &&
+		left?.size === right?.size &&
+		left?.mtimeNs === right?.mtimeNs &&
+		left?.ctimeNs === right?.ctimeNs
+	);
+}
+
 function readJournalFile(journalPath: string): DurableJournalRecord[] {
 	let text: string;
 	try {
@@ -537,11 +591,12 @@ export class RegistryDurableStateStore {
 	readonly #journalPath: string;
 	readonly #quarantinePath: string;
 	#unavailableReason: string | undefined;
+	#validatedJournal: ValidatedJournal | undefined;
 
 	constructor(journalPath: string) {
 		if (!path.isAbsolute(journalPath)) throw new Error("Durable journal path must be absolute.");
-		this.#journalPath = journalPath;
-		this.#quarantinePath = `${journalPath}.quarantine`;
+		this.#journalPath = path.resolve(journalPath);
+		this.#quarantinePath = `${this.#journalPath}.quarantine`;
 		try {
 			this.#unavailableReason =
 				fs.readFileSync(this.#quarantinePath, "utf8").trim() || "Durable state is quarantined.";
@@ -565,32 +620,81 @@ export class RegistryDurableStateStore {
 	append(record: DurableRegistryRecord, expectedHead?: DurableRecoveryCursor | null): DurableJournalRecord {
 		if (!this.available) throw new DurableStateUnavailableError(this.#unavailableReason);
 		validateRecord(record);
-		const records = this.#readValidated();
-		const head = currentCursor(records);
-		if (
-			expectedHead !== undefined &&
-			(head?.sequence !== expectedHead?.sequence || head?.hash !== expectedHead?.hash)
-		) {
-			throw new DurableStateConflictError();
-		}
-		const previousHash = head?.hash ?? GENESIS_HASH;
-		const base = {
-			version: DURABLE_STATE_VERSION,
-			sequence: (head?.sequence ?? 0) + 1,
-			previousHash,
-			contentHash: canonicalDurableSha256(record),
-			record: Object.freeze({ ...record }) as DurableRegistryRecord,
-		};
-		const entry: DurableJournalRecord = Object.freeze({ ...base, hash: journalHash(base) });
 		fs.mkdirSync(path.dirname(this.#journalPath), { recursive: true });
-		const handle = fs.openSync(this.#journalPath, "a", 0o600);
+		const lock = FileLock.tryAcquire(this.#journalPath);
+		if (!lock.acquired) throw new DurableStateConflictError();
 		try {
-			fs.writeSync(handle, `${JSON.stringify(entry)}\n`);
-			fs.fsyncSync(handle);
+			const records = this.#readValidated();
+			const head = currentCursor(records);
+			if (
+				expectedHead !== undefined &&
+				(head?.sequence !== expectedHead?.sequence || head?.hash !== expectedHead?.hash)
+			) {
+				throw new DurableStateConflictError();
+			}
+			const previousHash = head?.hash ?? GENESIS_HASH;
+			const base = {
+				version: DURABLE_STATE_VERSION,
+				sequence: (head?.sequence ?? 0) + 1,
+				previousHash,
+				contentHash: canonicalDurableSha256(record),
+				record: Object.freeze({ ...record }) as DurableRegistryRecord,
+			};
+			const entry: DurableJournalRecord = Object.freeze({ ...base, hash: journalHash(base) });
+			const encoded = Buffer.from(`${JSON.stringify(entry)}\n`);
+			const validated = this.#validatedJournal;
+			const expectedMetadata = validated?.records === records ? validated.metadata : undefined;
+			let handle: number;
+			try {
+				const flags =
+					fs.constants.O_WRONLY |
+					fs.constants.O_APPEND |
+					O_NOFOLLOW |
+					(expectedMetadata === undefined ? fs.constants.O_CREAT | fs.constants.O_EXCL : 0);
+				handle = fs.openSync(this.#journalPath, flags, 0o600);
+			} catch (error) {
+				if (["EEXIST", "ELOOP"].includes((error as NodeJS.ErrnoException).code ?? ""))
+					throw new DurableStateConflictError();
+				throw error;
+			}
+			let afterWrite: DurableJournalMetadata;
+			try {
+				const beforeWrite = journalMetadataFromStat(fs.fstatSync(handle, { bigint: true }));
+				const journalChanged =
+					expectedMetadata === undefined
+						? beforeWrite.size !== 0n
+						: !sameJournalMetadata(beforeWrite, expectedMetadata);
+				if (journalChanged) {
+					this.#validatedJournal = undefined;
+					throw new DurableStateConflictError();
+				}
+				let offset = 0;
+				while (offset < encoded.byteLength) {
+					const written = fs.writeSync(handle, encoded, offset, encoded.byteLength - offset);
+					if (written <= 0) throw new Error("Durable journal append made no progress.");
+					offset += written;
+				}
+				fs.fsyncSync(handle);
+				afterWrite = journalMetadataFromStat(fs.fstatSync(handle, { bigint: true }));
+				const current = journalMetadata(this.#journalPath);
+				if (
+					!sameJournalIdentity(beforeWrite, afterWrite) ||
+					afterWrite.size !== beforeWrite.size + BigInt(encoded.byteLength) ||
+					current === undefined ||
+					!sameJournalMetadata(afterWrite, current)
+				) {
+					this.#validatedJournal = undefined;
+					throw new DurableStateConflictError();
+				}
+			} finally {
+				fs.closeSync(handle);
+			}
+			records.push(entry);
+			this.#validatedJournal = Object.freeze({ records, metadata: afterWrite });
+			return entry;
 		} finally {
-			fs.closeSync(handle);
+			lock.release();
 		}
-		return entry;
 	}
 
 	readBatch(cursor: DurableRecoveryCursor | null = null): DurableRecoveryBatch {
@@ -670,13 +774,26 @@ export class RegistryDurableStateStore {
 	#readValidated(): DurableJournalRecord[] {
 		if (!this.available) throw new DurableStateUnavailableError(this.#unavailableReason);
 		try {
-			return readJournalFile(this.#journalPath);
+			const current = journalMetadata(this.#journalPath);
+			if (this.#validatedJournal && sameJournalMetadata(this.#validatedJournal.metadata, current)) {
+				return this.#validatedJournal.records;
+			}
+			for (;;) {
+				const before = journalMetadata(this.#journalPath);
+				const records = readJournalFile(this.#journalPath);
+				const after = journalMetadata(this.#journalPath);
+				if (!sameJournalMetadata(before, after)) continue;
+				this.#validatedJournal = Object.freeze({ records, metadata: after });
+				return records;
+			}
 		} catch (error) {
+			this.#validatedJournal = undefined;
 			return this.#quarantine(error instanceof Error ? error.message : String(error));
 		}
 	}
 
 	#quarantine(reason: string): never {
+		this.#validatedJournal = undefined;
 		this.#unavailableReason = reason;
 		fs.mkdirSync(path.dirname(this.#quarantinePath), { recursive: true });
 		try {
