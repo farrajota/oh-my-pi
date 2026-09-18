@@ -24,6 +24,7 @@ import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry, type AgentHistorySummary } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
+import { assertSessionSwitchPreflight } from "../session/session-switch-preflight";
 import { normalizeEffectivePermissionSummary } from "../task/permission-profiles";
 import { shouldDisableReasoning, toReasoningEffort } from "../thinking";
 import { emitSubagentFrame } from "../utils/event-bus";
@@ -39,6 +40,16 @@ import {
 	parseCollabLink,
 } from "./protocol";
 import { CollabSocket } from "./relay-client";
+
+function collabReplicaPath(roomId: string): string {
+	return path.join(getConfigRootDir(), "collab", `${roomId}.jsonl`);
+}
+
+export function assertCollabJoinPreflight(ctx: InteractiveModeContext, link: string): void {
+	const parsed = parseCollabLink(link);
+	if ("error" in parsed) throw new Error(parsed.error);
+	assertSessionSwitchPreflight(ctx.sessionManager, { kind: "session", path: collabReplicaPath(parsed.roomId) });
+}
 
 /** Commands a guest may run locally; everything else is host-only. */
 export const COLLAB_GUEST_ALLOWED_COMMANDS: Record<string, true> = {
@@ -261,6 +272,8 @@ export class CollabGuestLink {
 		const parsed = parseCollabLink(link);
 		if ("error" in parsed) throw new Error(parsed.error);
 		if (this.#ctx.collabGuest || this.#left) throw new Error("Already in a collab session (/leave first)");
+		const replicaPath = collabReplicaPath(parsed.roomId);
+		assertSessionSwitchPreflight(this.#ctx.sessionManager, { kind: "session", path: replicaPath });
 		this.#roomId = parsed.roomId;
 		this.#writeToken = parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined;
 		this.#returnSessionFile = this.#ctx.sessionManager.getSessionFile() ?? null;
@@ -447,10 +460,12 @@ export class CollabGuestLink {
 		this.#pendingSnapshot = null;
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
-		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}.jsonl`);
+		const replicaPath = collabReplicaPath(this.#roomId);
+		assertSessionSwitchPreflight(this.#ctx.sessionManager, { kind: "session", path: replicaPath });
 		const lines = [pending.header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
 		await Bun.write(replicaPath, `${lines}\n`);
 		if (this.#left) return;
+		assertSessionSwitchPreflight(this.#ctx.sessionManager, { kind: "session", path: replicaPath });
 
 		// Resume through AgentSession without adopting the host's cwd.
 		const switched = await this.#ctx.session.switchSession(replicaPath, { preserveLocalCwd: true });
@@ -808,6 +823,12 @@ export class CollabGuestLink {
 	}
 
 	async #resumeLocalSession(): Promise<void> {
+		if (this.#returnSessionFile) {
+			assertSessionSwitchPreflight(this.#ctx.sessionManager, {
+				kind: "session",
+				path: this.#returnSessionFile,
+			});
+		}
 		this.#ctx.statusLine.setCollabStatus(null);
 		this.#flushPendingTranscripts();
 		this.#clearAgentMirror();

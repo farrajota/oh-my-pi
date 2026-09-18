@@ -1,6 +1,6 @@
 import { Spacer } from "@oh-my-pi/pi-tui";
 import { APP_NAME, formatAge } from "@oh-my-pi/pi-utils";
-import { CollabGuestLink } from "../collab/guest";
+import { assertCollabJoinPreflight, CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
 import { type CollabHostSnapshot, listCollabHosts } from "../collab/registry";
 import type { SettingPath, SettingValue } from "../config/settings";
@@ -417,9 +417,9 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			const ctx = runtime.ctx;
-			ctx.editor.setText("");
 			const link = command.args.trim();
 			if (!link) {
+				ctx.editor.setText("");
 				ctx.showError("Usage: /join <link>");
 				return;
 			}
@@ -428,6 +428,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 				return;
 			}
 			try {
+				assertCollabJoinPreflight(ctx, link);
 				// Stop stale/ending ownership and cancel pending starts, not a live room.
 				if (!ctx.collabController.host) await ctx.collabController.stop("joining another session");
 				// Recheck after teardown: a concurrent manual start may have won.
@@ -435,6 +436,8 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 					ctx.showError("Stop hosting first (/collab stop)");
 					return;
 				}
+				assertCollabJoinPreflight(ctx, link);
+				ctx.editor.setText("");
 				await new CollabGuestLink(ctx).join(link);
 			} catch (err) {
 				ctx.showError(`Failed to join collab session: ${errorMessage(err)}`);
