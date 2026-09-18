@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "omp://skill-cutover/validation-receipt.schema.json",
+  "title": "Skill cutover validation receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "set_id", "operation", "phase", "desired_digest", "checked_members", "receipt_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "set_id": {"type": "string", "pattern": "^ds-[0-9a-f]{64}$"},
+    "operation": {"enum": ["cutover-v1", "baseline-v1"]},
+    "phase": {"enum": ["post-validation-passed", "post-validation-failed", "rollback-validation-passed"]},
+    "desired_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "checked_members": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^member-[0-9a-f]{20}$"}},
+    "child_set_id": {"type": "string", "pattern": "^ds-[0-9a-f]{64}$"},
+    "baseline_source_root": {"type": "string", "minLength": 1},
+    "baseline_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

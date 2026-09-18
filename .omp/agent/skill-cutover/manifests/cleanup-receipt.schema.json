@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "omp://skill-cutover/cleanup-receipt.schema.json",
+  "title": "Skill cutover cleanup receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "set_id", "operation", "terminal_phase", "removed_workspaces", "retained_records", "receipt_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "set_id": {"type": "string", "pattern": "^ds-[0-9a-f]{64}$"},
+    "operation": {"enum": ["cutover-v1", "baseline-v1"]},
+    "terminal_phase": {"enum": ["cleanup-complete", "rollback-cleanup-complete", "cleanup-failed"]},
+    "intended_terminal_phase": {"enum": ["cleanup-complete", "rollback-cleanup-complete"]},
+    "removed_workspaces": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "retained_records": {"const": true},
+    "receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "error": {"type": "string", "minLength": 1}
+  }
+}
