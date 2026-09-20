@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentLifecycleManager, resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { RETAINED_BACKEND_FILE } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
@@ -14,7 +16,7 @@ import {
 	retainIsolationWorkspace,
 	runIsolatedSubprocess,
 } from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
-import type { SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -81,6 +83,7 @@ async function seedFooRepo(finalContent: string): Promise<{ repoRoot: string; pa
 describe("runIsolatedSubprocess", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		await Promise.all(tempRoots.splice(0).map(tempRoot => fs.rm(tempRoot, { force: true, recursive: true })));
 	});
@@ -380,6 +383,174 @@ describe("runIsolatedSubprocess", () => {
 		expect(captureSpy).toHaveBeenCalledWith("/repo/isolated", baseline);
 		await Promise.resolve();
 		await Promise.resolve();
+		expect(cleanupSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("captures an isolated patch before cleanup for a kept-alive child", async () => {
+		const isolationDir = "/repo/isolated";
+		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-retained-"));
+		tempRoots.push(artifactsDir);
+		const rootPatch = "diff --git a/task.txt b/task.txt\n+captured\n";
+		const baseline = {
+			root: {
+				repoRoot: "/repo",
+				headCommit: "base",
+				staged: "",
+				unstaged: "",
+				untracked: [],
+				untrackedPatch: "",
+			},
+			nested: [],
+		};
+		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
+			mergedDir: isolationDir,
+			backend: natives.IsoBackendKind.Rcopy,
+			fellBack: false,
+			fallbackReason: null,
+		});
+		const liveSession = {
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
+			dispose: async () => {},
+		} as unknown as AgentSession;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			options.agentRegistry.register({
+				id: options.id,
+				displayName: options.id,
+				kind: "sub",
+				session: liveSession,
+				sessionFile: "/tmp/RetainedIsolation.jsonl",
+				status: "running",
+			});
+			await executorModule.finalizeSubagentLifecycle({
+				id: options.id,
+				session: liveSession,
+				aborted: false,
+				keepAlive: true,
+				isolated: true,
+				agentIdleTtlMs: 0,
+				reviveSession: async () => liveSession,
+				agentRegistry: options.agentRegistry,
+				agentLifecycle: getAgentLifecycleManager(options.agentRegistry),
+			});
+			return result({ id: options.id, exitCode: 0 });
+		});
+		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch,
+			nestedPatches: [],
+		});
+		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+
+		const outcome = await runIsolatedSubprocess({
+			baseOptions: {
+				cwd: "/repo",
+				agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
+				task: "Do work",
+				index: 0,
+				id: "RetainedIsolation",
+				agentRegistry: testRegistry,
+				createAuthoritySession,
+			},
+			context: { repoRoot: "/repo", baseline },
+			preferredBackend: undefined,
+			agentId: "RetainedIsolation",
+			mergeMode: "patch",
+			artifactsDir,
+			buildFailureResult: error => result({ exitCode: 1, error: String(error) }),
+		});
+
+		const patchPath = path.join(artifactsDir, "RetainedIsolation.patch");
+		expect(outcome.exitCode).toBe(0);
+		expect(await Bun.file(patchPath).text()).toBe(rootPatch);
+		expect(testRegistry.get("RetainedIsolation")?.status).toBe("parked");
+		expect(captureSpy).toHaveBeenCalledTimes(1);
+		expect(cleanupSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("captures a one-shot isolated patch before cleanup", async () => {
+		const isolationDir = "/repo/isolated";
+		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-oneshot-"));
+		tempRoots.push(artifactsDir);
+		const rootPatch = "diff --git a/task.txt b/task.txt\n+captured\n";
+		const baseline = {
+			root: {
+				repoRoot: "/repo",
+				headCommit: "base",
+				staged: "",
+				unstaged: "",
+				untracked: [],
+				untrackedPatch: "",
+			},
+			nested: [],
+		};
+		const order: string[] = [];
+		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
+			mergedDir: isolationDir,
+			backend: natives.IsoBackendKind.Rcopy,
+			fellBack: false,
+			fallbackReason: null,
+		});
+		const oneShotSession = {
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
+			dispose: async () => {},
+		} as unknown as AgentSession;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			options.agentRegistry.register({
+				id: options.id,
+				displayName: options.id,
+				kind: "sub",
+				session: oneShotSession,
+				sessionFile: "/tmp/OneShotIsolation.jsonl",
+				status: "running",
+			});
+			await executorModule.finalizeSubagentLifecycle({
+				id: options.id,
+				session: oneShotSession,
+				aborted: false,
+				keepAlive: false,
+				isolated: true,
+				agentIdleTtlMs: 0,
+				reviveSession: null,
+				agentRegistry: options.agentRegistry,
+				agentLifecycle: getAgentLifecycleManager(options.agentRegistry),
+			});
+			return result({ id: options.id, exitCode: 0 });
+		});
+		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockImplementation(async () => {
+			order.push("capture");
+			return { rootPatch, nestedPatches: [] };
+		});
+		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockImplementation(async () => {
+			order.push("cleanup");
+		});
+
+		const outcome = await runIsolatedSubprocess({
+			baseOptions: {
+				cwd: "/repo",
+				agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
+				task: "Do work",
+				index: 0,
+				id: "OneShotIsolation",
+				keepAlive: false,
+				agentRegistry: testRegistry,
+				createAuthoritySession,
+			},
+			context: { repoRoot: "/repo", baseline },
+			preferredBackend: undefined,
+			agentId: "OneShotIsolation",
+			mergeMode: "patch",
+			artifactsDir,
+			buildFailureResult: error => result({ exitCode: 1, error: String(error) }),
+		});
+
+		const patchPath = path.join(artifactsDir, "OneShotIsolation.patch");
+		expect(outcome.exitCode).toBe(0);
+		expect(outcome.error).toBeUndefined();
+		expect(outcome.patchPath).toBe(patchPath);
+		expect(await Bun.file(patchPath).text()).toBe(rootPatch);
+		expect(order).toEqual(["capture", "cleanup"]);
+		expect(captureSpy).toHaveBeenCalledTimes(1);
 		expect(cleanupSpy).toHaveBeenCalledTimes(1);
 	});
 

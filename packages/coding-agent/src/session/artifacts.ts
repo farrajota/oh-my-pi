@@ -4,6 +4,7 @@
  * Artifacts are stored in a directory alongside the session file,
  * accessible via artifact:// URLs.
  */
+import { setArtifactPublisher } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { replaceFileAtomically } from "../utils/atomic-file";
@@ -39,6 +40,8 @@ export async function publishAllocatedArtifact(artifactPath: string): Promise<vo
 		pendingManagedWrites.delete(resolvedPath);
 	}
 }
+
+setArtifactPublisher(publishAllocatedArtifact);
 
 /**
  * Persist an artifact only after the filesystem confirms the complete payload

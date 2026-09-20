@@ -34,7 +34,11 @@ const bashResult = {
 const sessionActor: ExtensionActorIdentity = { id: "Main", kind: "main" };
 
 function createRegisteredBashTool(definition: ToolDefinition): RegisteredTool {
-	return { definition, extensionPath: "/test/extension.ts" };
+	return {
+		definition,
+		extensionPath: "/test/extension.ts",
+		sourceInfo: { path: "/test/extension.ts", source: "extension", scope: "temporary", origin: "top-level" },
+	};
 }
 
 function createExtensionRunnerDouble(overrides: Partial<ExtensionRunner> = {}): ExtensionRunner {

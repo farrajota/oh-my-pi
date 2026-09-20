@@ -7,7 +7,7 @@ import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import typesDescriptionPrompt from "../../commit/prompts/types-description.md" with { type: "text" };
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
-import { getMarkdownTheme } from "../../modes/theme/theme";
+import { getMarkdownTheme } from "@oh-my-pi/pi-tui/theme";
 import { createAgentRootSession } from "../../internal/agent-registry-bridge";
 import { AgentRegistry } from "../../registry/agent-registry";
 import { registryDurableStateForSession } from "../../registry/durable-state";

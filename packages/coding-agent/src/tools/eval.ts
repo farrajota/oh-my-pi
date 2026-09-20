@@ -27,22 +27,23 @@ import { runWithEvalShadowCell } from "../eval/speculation/runtime-context";
 import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import evalCodeModeDescription from "../prompts/tools/eval-code-mode.md" with { type: "text" };
-import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
+import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { sessionDelegationBias } from "../task/prompt-policy";
+import { canSpawnAtDepth } from "../task/types";
 import { resolveSpawnPolicy } from "../task/spawn-policy";
 import { webpExclusionForModel } from "../utils/image-loading";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import { type EvalBackendsAllowance, resolveEvalBackends } from "./eval-backends";
-import { generateCodeModeDeclarations } from "./eval-format/code-mode-declarations";
-import { upsertStatusEvent } from "./eval-render";
+import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
+import { upsertStatusEvent } from "@oh-my-pi/pi-tui/tools/eval";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "./output-meta";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 
-export { EVAL_DEFAULT_PREVIEW_LINES, evalToolRenderer } from "./eval-render";
+export { EVAL_DEFAULT_PREVIEW_LINES, evalToolRenderer } from "@oh-my-pi/pi-tui/tools/eval";
 
 /** Language tokens the eval tool accepts, in stable display order. */
 export type EvalLanguageToken = "py" | "js";
@@ -130,21 +131,38 @@ export type EvalToolResult = {
 };
 
 export type EvalProxyExecutor = (params: EvalToolParams, signal?: AbortSignal) => Promise<EvalToolResult>;
-
 /** Cap per `display()` value sent back to the model. */
 const MAX_DISPLAY_TEXT_BYTES = 8000;
 
-function formatDisplayJsonForText(value: unknown): string {
-	let text: string;
+function formatDisplayJson(value: unknown): string {
 	try {
-		text = JSON.stringify(value, null, 2) ?? String(value);
+		return JSON.stringify(value, null, 2) ?? String(value);
 	} catch {
-		text = String(value);
+		return String(value);
 	}
-	if (text.length > MAX_DISPLAY_TEXT_BYTES) {
-		text = `${text.slice(0, MAX_DISPLAY_TEXT_BYTES)}\n[…${text.length - MAX_DISPLAY_TEXT_BYTES}ch elided…]`;
+}
+
+function formatDisplayJsonForText(value: unknown): string {
+	let text = formatDisplayJson(value);
+	const bytes = Buffer.byteLength(text, "utf-8");
+	if (bytes > MAX_DISPLAY_TEXT_BYTES) {
+		let end = Math.min(text.length, MAX_DISPLAY_TEXT_BYTES);
+		while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf-8") > MAX_DISPLAY_TEXT_BYTES) end--;
+		const prefix = text.slice(0, end);
+		text = `${prefix}\n[…${text.length - end}ch elided…]`;
 	}
 	return text;
+}
+
+function formatDisplayOutputsForArtifact(outputs: EvalDisplayOutput[]): string {
+	const chunks: string[] = [];
+	let displayIndex = 0;
+	for (const output of outputs) {
+		if (output.type !== "json") continue;
+		displayIndex++;
+		chunks.push(`display[${displayIndex}]:\n${formatDisplayJson(output.data)}`);
+	}
+	return chunks.join("\n\n");
 }
 
 /**
@@ -289,6 +307,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		} else {
 			const backends = resolveEvalBackends(this.session);
 			const sessionSpawns = this.session.getSessionSpawns?.() ?? "*";
+			const taskDepth = this.session.taskDepth ?? 0;
+			const maxRecursionDepth = this.session.settings.get("task.maxRecursionDepth") ?? 2;
+			const spawnPolicy = canSpawnAtDepth(maxRecursionDepth, taskDepth) ? sessionSpawns : false;
 			const preludeDocumentation = getEnabledEvalPreludes(this.session.getEvalPreludes?.() ?? [])
 				.map(definition => definition.documentation.trim())
 				.filter(Boolean)
@@ -296,7 +317,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			base = getEvalToolDescription({
 				py: backends.python,
 				js: backends.js,
-				spawns: sessionSpawns,
+				spawns: spawnPolicy,
 				autoBackgroundEnabled: this.session.settings.get("eval.autoBackground.enabled"),
 				evalTools: this.session.settings.get("eval.tools.enabled"),
 				eagerDelegation: sessionDelegationBias(this.session) === "eager",
@@ -704,6 +725,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			// double-counting against the aggregate `tailBuffer`; on completion the
 			// authoritative `cellResult.output` (below) overwrites this live tail.
 			let activeLiveCell: { result: EvalCellResult; buf: TailBuffer } | undefined;
+			let suppressArtifactOnly = false;
 
 			const appendTail = (text: string) => {
 				tailBuffer.append(text);
@@ -747,6 +769,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				headBytes: resolveOutputSinkHeadBytes(session.settings),
 				maxColumns: resolveOutputMaxColumns(session.settings),
 				onChunk: chunk => {
+					if (suppressArtifactOnly) return;
 					appendTail(chunk);
 					if (activeLiveCell) {
 						activeLiveCell.buf.append(chunk);
@@ -871,6 +894,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				const stdoutTrimmed = result.output.trim();
 				const imageText = cellImageNotes.join("\n");
 				const displayText = formatDisplayOutputsForText(cellDisplayOutputs);
+				const fullDisplayText = formatDisplayOutputsForArtifact(cellDisplayOutputs);
+				if (fullDisplayText) {
+					suppressArtifactOnly = true;
+					outputSink.push(fullDisplayText);
+					suppressArtifactOnly = false;
+				}
 				const visibleDisplayText =
 					displayText && imageText ? `${displayText}\n\n${imageText}` : displayText || imageText;
 				const cellOutput =
@@ -900,7 +929,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						language: languages[0],
 						languages,
 						cells: cellResults,
-						jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
+						jsonOutputs: summaryForMeta.artifactId ? undefined : jsonOutputs.length > 0 ? jsonOutputs : undefined,
 						statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 						isError: true,
 					};
@@ -926,7 +955,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						language: languages[0],
 						languages,
 						cells: cellResults,
-						jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
+						jsonOutputs: summaryForMeta.artifactId ? undefined : jsonOutputs.length > 0 ? jsonOutputs : undefined,
 						statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 						isError: true,
 					};
@@ -956,7 +985,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				language: languages[0],
 				languages,
 				cells: cellResults,
-				jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
+				jsonOutputs: summaryForMeta.artifactId ? undefined : jsonOutputs.length > 0 ? jsonOutputs : undefined,
 				statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 			};
 			if (notice) details.notice = notice;
@@ -993,12 +1022,15 @@ async function summarizeFinal(
 	const missingBytes = Math.max(0, rawSummary.totalBytes - rawSummary.outputBytes);
 	return {
 		output: combinedOutput,
-		truncated: rawSummary.truncated,
+		truncated: rawSummary.truncated || (rawSummary.columnDroppedBytes ?? 0) > 0,
 		totalLines: outputLines + missingLines,
 		totalBytes: outputBytes + missingBytes,
 		outputLines,
 		outputBytes,
+		elidedBytes: rawSummary.elidedBytes,
+		elidedLines: rawSummary.elidedLines,
 		artifactId: rawSummary.artifactId,
+		artifactError: rawSummary.artifactError,
 		columnDroppedBytes: rawSummary.columnDroppedBytes,
 		columnTruncatedLines: rawSummary.columnTruncatedLines,
 		columnMax: rawSummary.columnMax,

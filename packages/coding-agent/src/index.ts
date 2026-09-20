@@ -8,7 +8,7 @@ export { z } from "@oh-my-pi/omptype/zod";
 export { Container, Markdown, Spacer, Text } from "@oh-my-pi/pi-tui";
 // Logging
 export { getAgentDir, logger, VERSION } from "@oh-my-pi/pi-utils";
-export * from "./config/keybindings";
+export * from "@oh-my-pi/pi-tui/app-keybindings";
 export * from "./config/model-registry";
 // Prompt templates
 export type * from "./config/prompt-templates";
@@ -17,12 +17,30 @@ export type { RetrySettings, SkillsSettings } from "./config/settings";
 export { Settings, settings } from "./config/settings";
 // Custom commands
 export type * from "./extensibility/custom-commands/types";
-export type * from "./extensibility/custom-tools";
 // Custom tools
 export * from "./extensibility/custom-tools";
-export type * from "./extensibility/extensions";
 // Extension types and utilities
-export * from "./extensibility/extensions";
+export {
+	bindPreparedExtensions,
+	discoverAndLoadExtensions,
+	discoverExtensionPaths,
+	ExtensionRuntimeNotInitializedError,
+	extensionToolSourceInfo,
+	loadExtensionFromFactory,
+	loadExtensions,
+	EXTENSION_HANDLER_TIMEOUT_MS,
+	SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS,
+	emitSessionShutdownEvent,
+	ExtensionRunner,
+	testSetExtensionHandlerTimeoutMs,
+	testSetSessionShutdownHandlerTimeoutMs,
+	EffectiveToolRegistry,
+	RegisteredToolAdapter,
+	wrapRegisteredTool,
+	wrapRegisteredTools,
+	ExtensionToolWrapper,
+} from "./extensibility/extensions";
+export { ExtensionRuntime } from "./extensibility/extensions/loader";
 // Hook system types (legacy re-export)
 // Skills
 export * from "./extensibility/skills";
@@ -35,9 +53,10 @@ export * from "./main";
 export * from "./modes";
 export * from "./modes/components";
 // Theme utilities for custom tools
-export * from "./modes/theme/theme";
+export * from "@oh-my-pi/pi-tui/theme";
 // SDK for programmatic usage
 export * from "./sdk";
+export type { ContextUsage } from "./extensibility/extensions/types";
 export * from "./session/agent-session";
 // Auth and model registry
 export * from "./session/auth-storage";
@@ -55,6 +74,22 @@ export * from "./session/session-storage";
 export * from "./session/sql-session-storage";
 export * from "./task/executor";
 export type * from "./task/types";
+export type {
+	AgentSource,
+	StructuredSubagentSchemaMode,
+	StructuredSubagentSchemaSource,
+	StructuredSubagentValidationStatus,
+	StructuredSubagentOutput,
+	TaskItem,
+	TaskParams,
+	ReviewFinding,
+	ReviewSummary,
+	ReviewData,
+	YieldItem,
+	AgentProgress,
+	SingleResult,
+	TaskToolDetails,
+} from "@oh-my-pi/pi-tui/tools/task";
 // Tools (detail types and utilities)
 export * from "./tools";
 export * from "./utils/github";

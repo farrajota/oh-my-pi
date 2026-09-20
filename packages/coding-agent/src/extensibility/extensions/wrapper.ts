@@ -38,7 +38,7 @@ import {
 	type EffectiveToolDescriptor,
 	type ToolExecutionAuthority,
 } from "../../task/permission-profiles";
-import type { Theme } from "../../modes/theme/theme";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { withLspSessionPolicy } from "../../lsp/client";
 import type { ExtensionRunner } from "./runner";
 import type { RegisteredTool, ToolCallEventResult, ToolResultEventResult } from "./types";
@@ -629,7 +629,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					),
 					content: result.content,
 					details: result.details,
-					isError: !!executionError,
+					isError: !!executionError || result.isError === true,
 				})) as ToolResultEventResult | undefined;
 
 				if (resultResult) {

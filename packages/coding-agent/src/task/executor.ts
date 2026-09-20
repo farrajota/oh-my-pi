@@ -72,8 +72,8 @@ import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
-import { truncateTail } from "../session/streaming-output";
-import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
+import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { resolveEvalBackends } from "../tools/eval-backends";
 
@@ -84,6 +84,7 @@ import { DEFAULT_HUB_LIST_LIMIT } from "../tools/hub/types";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { ToolAbortError } from "../tools/tool-errors";
+import { resetYieldTurnState } from "../tools/yield";
 import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { buildNamedToolChoice } from "../utils/tool-choice";
@@ -252,10 +253,9 @@ function resolveSubagentInheritedRetryFallbackChain(
 	modelRegistry: ModelRegistry,
 	role: string | undefined,
 ): string[] | undefined {
-	const configuredChains = settings.get("retry.fallbackChains");
-	// An explicitly emptied role chain means "no fallbacks", not "inherit
-	// default" — mirrors expandDefaultRetryFallbackChains.
-	const fallbackChain = (role !== undefined ? configuredChains?.[role] : undefined) ?? configuredChains?.default;
+	const fallbackChain =
+		(role !== undefined ? settings.get("retry.fallbackChains")[role] : undefined) ??
+		settings.get("retry.fallbackChains").default;
 	if (
 		!Array.isArray(fallbackChain) ||
 		fallbackChain.length === 0 ||
@@ -424,6 +424,8 @@ export interface RunSubprocessOptions {
 	additionalDirectories?: string[];
 	/** Exact provider credential resolver inherited from the parent session. */
 	getApiKey?: CreateAgentSessionOptions["getApiKey"];
+	/** Parent session identity whose credential affinity is inherited by this run. */
+	credentialSourceSessionId?: string;
 	worktree?: string;
 	agent: AgentDefinition;
 	task: string;
@@ -1086,6 +1088,8 @@ interface SubagentRunMonitor {
 	readonly accumulatedUsage: Usage;
 	hasUsage(): boolean;
 	yieldCalled(): boolean;
+	/** Epoch ms when the current run's terminal yield was accepted. */
+	yieldAcceptedAt(): number | undefined;
 	runtimeLimitExceeded(): boolean;
 	/** True once the soft-budget stop fired: the free-running turn was aborted and the run is being driven to a forced final yield. */
 	budgetStopRequested(): boolean;
@@ -1195,6 +1199,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const abortSignal = abortController.signal;
 	let activeSession: AgentSession | null = null;
 	let yieldCalled = false;
+	let yieldAcceptedAt: number | undefined;
 	let yieldCallPending = false;
 	let yieldInvalidatedByAsync = false;
 	let yieldTurnStopRequested = false;
@@ -1522,7 +1527,10 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			const incremental = Array.isArray(item?.type) && item.type.length > 0;
 			yieldCalled = !incremental || item?.complete === true || item?.status === "aborted";
 			yieldCallPending = false;
-			if (yieldCalled) yieldInvalidatedByAsync = false;
+			if (yieldCalled) {
+				yieldInvalidatedByAsync = false;
+				yieldAcceptedAt = Date.now();
+			}
 		}
 	};
 
@@ -1544,6 +1552,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				// the settled classification.
 				if (yieldCalled && !abortSignal.aborted && isAsyncResultInjection(event.message)) {
 					yieldCalled = false;
+					yieldAcceptedAt = undefined;
 					yieldInvalidatedByAsync = true;
 				}
 				break;
@@ -1754,7 +1763,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 								// never take down event processing (which escalates to terminate).
 								const notice = buildBudgetNotice(progress.requests, softRequestBudget);
 								void Promise.resolve()
-									.then(() => steerSession.sendUserMessage(notice, { deliverAs: "steer" }))
+									.then(() => steerSession.sendUserMessage(notice, { deliverAs: "steer", attribution: "agent" }))
 									.catch(err => {
 										logger.warn("Subagent budget steer failed", {
 											error: err instanceof Error ? err.message : String(err),
@@ -1957,6 +1966,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		yieldCalled: () => yieldCalled,
 		runtimeLimitExceeded: () => runtimeLimitExceeded,
 		terminalError: () => terminalError,
+		yieldAcceptedAt: () => yieldAcceptedAt,
 		hasExplicitAbortReason: () =>
 			abortReason === "signal" ||
 			abortReason === "shutdown" ||
@@ -2579,12 +2589,13 @@ async function relayWakeTurnOutput(args: {
 	yielded: boolean;
 	result: SingleResult;
 	turnText: string;
+	force: boolean;
 	agentRegistry: AgentRegistry;
 	ircBus: IrcBus;
 }): Promise<void> {
 	const bus = args.ircBus;
 	const pending = wakeSources(args.records, args.id).filter(
-		source => !bus.sentSince(args.id, source.from, args.turnStartTime),
+		source => args.force || !bus.sentSince(args.id, source.from, args.turnStartTime),
 	);
 	if (pending.length === 0) return;
 	const body =
@@ -2637,6 +2648,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 	const index = options.index ?? 0;
 	const maxRuntimeMs = options.maxRuntimeMs ?? 0;
 	session.setIrcWakeTurnObserver(records => {
+		resetYieldTurnState(session.getToolByName("yield"));
 		const ircTask =
 			records
 				.map(record => {
@@ -2698,6 +2710,9 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			if (activeSession) turnMonitor.captureSalvage(activeSession);
 			const lastAssistant = session.getLastAssistantMessage();
 			const yielded = turnMonitor.yieldCalled();
+			if (yielded) {
+				options.agentRegistry.markResultAccepted(id, session, turnMonitor.yieldAcceptedAt());
+			}
 			const runtimeLimitExceeded = turnMonitor.runtimeLimitExceeded();
 			const aborted = runtimeLimitExceeded || (lastAssistant?.stopReason === "aborted" && !yielded);
 			const error =
@@ -2705,7 +2720,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					? attributeSubagentError(lastAssistant.errorMessage, lastAssistant)
 					: turnError !== undefined && !yielded
 						? turnError instanceof Error
-							? turnError.stack || turnError.message
+							? turnError.message
 							: String(turnError)
 						: undefined;
 			turnMonitor.finish();
@@ -2740,18 +2755,27 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					sessionFile,
 					startTime: turnStartTime,
 				});
-				if (!aborted && !error) {
-					await relayWakeTurnOutput({
-						id,
-						records,
-						turnStartTime,
-						yielded,
-						result,
-						turnText,
-						agentRegistry: options.agentRegistry,
-						ircBus: options.ircBus,
-					});
-				}
+				const hadEarlierMessage = wakeSources(records, id).some(source =>
+					options.ircBus.sentSince(id, source.from, turnStartTime),
+				);
+				const relayText = error
+					? `${error}${hadEarlierMessage ? "\n\nThe agent sent a progress update earlier in this turn before failing." : ""}\n\nFull transcript: history://${id}`
+					: aborted
+						? `Wake turn cancelled. Full transcript: history://${id}`
+						: turnText.trim()
+							? turnText
+							: `Wake turn completed with no output. Full transcript: history://${id}`;
+				await relayWakeTurnOutput({
+					id,
+					records,
+					turnStartTime,
+					yielded,
+					result,
+					turnText: relayText,
+					force: Boolean(error) || aborted || !turnText.trim(),
+					agentRegistry: options.agentRegistry,
+					ircBus: options.ircBus,
+				});
 			} catch (finalizeError) {
 				logger.warn("IRC subagent turn finalization failed", {
 					id,
@@ -3054,6 +3078,9 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 			await session.setWorkPoolYieldItems(options.workPoolYieldItems ?? []);
 			attemptUnsubscribe = monitor.attach(session);
 		});
+		if (monitor.yieldCalled()) {
+			registry.markResultAccepted(id, session, monitor.yieldAcceptedAt());
+		}
 	} finally {
 		try {
 			await untilAborted(AbortSignal.timeout(5000), () => monitor.waitForActiveSessionAbort());
@@ -3208,28 +3235,30 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 	const softRequestBudgetNotice = settings.get("task.softRequestBudgetNotice") ?? false;
 	const parentDepth = options.taskDepth ?? 0;
 	const childDepth = parentDepth + 1;
-	const atMaxDepth = maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
-	const ircEnabled = options.enableIrc !== false && isIrcEnabled(subagentSettings, childDepth);
 
-	// Add tools if specified
+	const atMaxDepth = options.taskDepth !== undefined && maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
+	const ircEnabled = options.enableIrc !== false && isIrcEnabled(subagentSettings, childDepth);
 	let toolNames: string[] | undefined;
 	if (agent.tools !== undefined) {
 		toolNames = agent.tools;
 	}
+	if (toolNames && !atMaxDepth && agent.spawns !== undefined && !toolNames.includes("task")) {
+		toolNames = [...toolNames, "task"];
+	}
 
-	if (atMaxDepth && toolNames?.includes("task")) {
+	if (atMaxDepth && agent.spawns === undefined && toolNames?.includes("task")) {
 		toolNames = toolNames.filter(name => name !== "task");
 	}
 	const ircDenied =
 		options.permissionScope?.denyTools.some(tool => normalizePermissionToolName(tool).toLowerCase() === "hub") ??
 		false;
+	const canInjectHub = !isReadOnlyAgent(agent) || agent.spawns !== undefined;
 	// sessions must not widen their explicit host tool list.
-	if (toolNames && ircEnabled && !options.restrictToolNames && !toolNames.includes("irc") && !ircDenied) {
+	const peerPromptEnabled = canInjectHub && ircEnabled;
+	if (toolNames && options.enableIrc === true && ircEnabled && !options.restrictToolNames && !isReadOnlyAgent(agent) && !toolNames.includes("irc") && !ircDenied) {
 		toolNames = [...toolNames, "irc"];
 	}
-	// Ordinary agents retain the host's always-on collaboration capability.
-	// Restricted sessions must not widen their explicit host tool list with hub.
-	if (toolNames && !options.restrictToolNames && !toolNames.includes("hub")) {
+	if (toolNames && !options.restrictToolNames && canInjectHub && !toolNames.includes("hub")) {
 		toolNames = [...toolNames, "hub"];
 	}
 	if (toolNames?.includes("exec")) {
@@ -3488,6 +3517,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				? SessionManager.open(sessionFile, undefined, undefined, {
 						initialCwd: effectiveCwd,
 						suppressBreadcrumb: true,
+						parentSession: options.sessionFile ?? undefined,
 					})
 				: Promise.resolve(SessionManager.inMemory(effectiveCwd));
 			// Setup below can fail before this promise's consumption boundary.
@@ -3585,6 +3615,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
 					agentDir: subagentSettings.getAgentDir(),
 					authStorage,
+					credentialSourceSessionId: options.credentialSourceSessionId,
 					modelRegistry,
 					getApiKey: options.getApiKey,
 					settings: subagentSettings,
@@ -3616,7 +3647,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					preloadedPreparedExtensions: restrictToolNames ? [] : options.preloadedPreparedExtensions,
 					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 					systemPrompt: defaultPrompt => {
-						const ircRoster = ircEnabled
+						const ircRoster = peerPromptEnabled
 							? collectIrcPeerRoster(agentRegistry, id, ircRootSessionFile)
 							: undefined;
 						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
@@ -3639,7 +3670,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 							ircPeers: ircRoster?.peers ?? [],
 							ircParkedCount: ircRoster?.parkedCount ?? 0,
 							ircOmittedCount: ircRoster?.omittedCount ?? 0,
-							ircSelfId: ircEnabled ? id : "",
+								ircSelfId: peerPromptEnabled ? id : "",
 							permissionBlock: formatPermissionScopeForPrompt(options.permissionScope),
 						});
 						return defaultPrompt.length === 0
@@ -3724,6 +3755,13 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 						suppressBreadcrumb: true,
 					});
+					const hasMessageHistory = reopened.getEntries().some(
+						entry => entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"),
+					);
+					if (!hasMessageHistory) {
+						await reopened.close();
+						throw new Error(`Cannot revive subagent "${id}": no message history`);
+					}
 					if (options.parentArtifactManager) reopened.adoptArtifactManager(options.parentArtifactManager);
 					if (ircEnabled) {
 						ircRootSessionFile = await ensurePersistedRoster(
@@ -3925,7 +3963,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				for (const name of options.autoloadSkillNames) {
 					const skill = session.skills.find(candidate => candidate.name === name);
 					if (!skill) continue;
-					const { message } = await buildSkillPromptMessage(skill, "", "autoload");
+					const { message } = await buildSkillPromptMessage(skill, { args: "" }, "autoload");
 					await session.sendCustomMessage(
 						{
 							customType: SKILL_PROMPT_MESSAGE_TYPE,
@@ -3944,6 +3982,9 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			error = outcome.error;
 			aborted = outcome.aborted;
 			abortReasonText = outcome.abortReasonText;
+			if (monitor.yieldCalled()) {
+				agentRegistry.markResultAccepted(id, session, monitor.yieldAcceptedAt());
+			}
 		} catch (err) {
 			exitCode = 1;
 			if (!abortSignal.aborted) {

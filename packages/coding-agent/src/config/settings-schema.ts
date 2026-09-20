@@ -1,6 +1,6 @@
 import { ADVISOR_DEFAULT_BUDGET_PER_UPDATE } from "../advisor/emission-guard";
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
-import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
+import { DEFAULT_SHARE_URL, DEFAULT_STREAM_URL } from "@oh-my-pi/pi-wire";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
 import {
 	type BlobDestinationId,
@@ -16,7 +16,7 @@ import {
 } from "../session/compaction-methods";
 import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS, STT_MODEL_VALUES } from "../stt/models";
 import { STT_SUBMIT_TRIGGER_OPTIONS, STT_SUBMIT_TRIGGER_VALUES } from "../stt/submit-trigger";
-import { AUTO_THINKING, getConfiguredThinkingLevelMetadata, getThinkingLevelMetadata } from "../thinking";
+import { AUTO_THINKING, getConfiguredThinkingLevelMetadata, getThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
 import {
 	TINY_MODEL_DEVICE_DEFAULT,
 	TINY_MODEL_DEVICE_SETTING_OPTIONS,
@@ -54,6 +54,7 @@ import {
 	SEARCH_PROVIDER_CHOICES,
 	type SearchProviderId,
 } from "../web/search/types";
+export type { SearchProviderId } from "../web/search/types";
 import {
 	SERVICE_TIER_ANTHROPIC_OPTIONS,
 	SERVICE_TIER_ANTHROPIC_VALUES,
@@ -2630,6 +2631,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"stream.serverUrl": {
+		type: "string",
+		default: DEFAULT_STREAM_URL,
+		ui: {
+			tab: "interaction",
+			group: "Stream",
+			label: "Stream Server",
+			description: "Live stream server base used by omp stream",
+		},
+	},
+
 	"share.store": {
 		type: "enum",
 		values: ["blob", "gist"] as const,
@@ -3857,7 +3869,7 @@ export const SETTINGS_SCHEMA = {
 
 	"edit.enforceSeenLines": {
 		type: "boolean",
-		default: false,
+	default: true,
 		ui: {
 			tab: "files",
 			group: "Editing",
@@ -5680,6 +5692,22 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"providers.judgmentProvider": {
+		type: "enum",
+		values: ["auto", "typesafe", "llm"] as const,
+		default: "auto",
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Judgment Provider",
+			description: "Backend for typed judgment calls",
+			options: [
+				{ value: "auto", label: "Auto", description: "Use TypeSafe when credentials are available" },
+				{ value: "typesafe", label: "TypeSafe" },
+				{ value: "llm", label: "LLM" },
+			],
+		},
+	},
 	// Provider selection
 	"providers.ollama-cloud.maxConcurrency": {
 		type: "number",
@@ -6471,7 +6499,8 @@ export type SettingValue<P extends SettingPath> = Schema[P] extends { type: "boo
 
 /** Get the default value for a setting path */
 export function getDefault<P extends SettingPath>(path: P): SettingValue<P> {
-	return SETTINGS_SCHEMA[path].default as SettingValue<P>;
+	const value = SETTINGS_SCHEMA[path].default;
+	return (value !== null && typeof value === "object" ? structuredClone(value) : value) as SettingValue<P>;
 }
 
 /** Check if a path has UI metadata (should appear in settings panel) */

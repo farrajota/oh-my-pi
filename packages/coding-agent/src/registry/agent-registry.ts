@@ -84,8 +84,18 @@ export interface AgentMetricsSummary {
 	contextTokens?: number;
 	contextWindow?: number;
 }
+/** Run lifecycle milestones scoped to the current turn. */
+export interface AgentRunLifecycle {
+	/** When the run produced its final response. */
+	responseAt?: number;
+	/** When the run's final result was accepted by its driver. */
+	acceptedAt?: number;
+	/** When the ref last left `running` for a terminal status. */
+	terminalAt?: number;
+}
 
-/** Historical identity and telemetry that remain available after the live session is disposed. */
+
+/** Historical identity and telemetry that remain available after the live observer is gone. */
 export interface AgentHistorySummary {
 	agent?: string;
 	modelRole?: string;
@@ -255,8 +265,10 @@ export interface AgentRef {
 	lastActivity: number;
 	/** Short gist of what the agent is currently doing (latest intent or tool), for the work-aware roster. Display-only. */
 	activity?: string;
-	/** Persisted identity and telemetry restored after the live observer is gone. */
+	/** Persisted identity and telemetry restored after the live session is disposed. */
 	history?: AgentHistorySummary;
+	/** Run lifecycle milestones for the current turn. */
+	lifecycle?: AgentRunLifecycle;
 	/** Opaque lineage slot assigned by the registry generation. */
 	readonly lineage?: { readonly rootId: string; readonly parentId?: string; readonly generation: number };
 }
@@ -285,6 +297,8 @@ export interface RegisterInput {
 	createdAt?: number;
 	lastActivity?: number;
 	history?: AgentHistorySummary;
+	/** Run lifecycle milestones restored from persisted history, when known. */
+	lifecycle?: AgentRunLifecycle;
 }
 
 export interface AgentMetadataUpdate {
@@ -637,7 +651,7 @@ export class AgentRegistry {
 		const requestedOptions: CreateAgentSessionOptions = options.settings
 			? { ...options, settings: options.settings.snapshot() }
 			: options;
-		const { getApiKey, mcpManager, ...authorityOptions } = requestedOptions;
+		const { getApiKey, mcpManager, credentialSourceSessionId, ...authorityOptions } = requestedOptions;
 		const frozenAuthorityData = cloneAndFreezeAuthorityInput({
 			...authorityOptions,
 			agentId: reservation.id,
@@ -652,6 +666,7 @@ export class AgentRegistry {
 		const creationOptions = Object.freeze({
 			...frozenAuthorityData,
 			...(getApiKey === undefined ? {} : { getApiKey }),
+			...(credentialSourceSessionId === undefined ? {} : { credentialSourceSessionId }),
 			...(mcpManager === undefined ? {} : { mcpManager }),
 		}) satisfies CreateAgentSessionOptions;
 		if (deriveRestrictedStartupPolicy(creationOptions).restricted && !this.#durableState) {
@@ -1400,6 +1415,7 @@ export class AgentRegistry {
 			lastActivity: input.lastActivity ?? now,
 			activity: input.activity,
 			history: inputHistory ? { ...inputHistory, permissionSummary } : undefined,
+			lifecycle: input.lifecycle,
 			lineage,
 		};
 		if (recoveredActor && recoveredLineage) this.#durableActorRecords.set(ref, recoveredActor);
@@ -1505,12 +1521,45 @@ export class AgentRegistry {
 			return status === "aborted" || this.#rejectStatusUpdate(ref.id, status, "aborted-is-terminal");
 		}
 		if (ref.status === status) return true;
+		const leftRunning = ref.status === "running";
 		this.#persistDurableActorState(ref, status === "aborted" ? "aborted" : "active");
 		ref.status = status;
 		if (status !== "running") ref.activity = undefined;
 		ref.lastActivity = Date.now();
+		if (status === "running") {
+			ref.lifecycle = undefined;
+		} else if (leftRunning) {
+			ref.lifecycle = { ...ref.lifecycle, terminalAt: ref.lastActivity };
+		}
 		this.#emit({ type: "status_changed", ref });
 		return true;
+	}
+
+	/** Record final-result acceptance and expose accepted runs missed by status mirroring. */
+	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.status === "aborted") return false;
+		const matches =
+			expected === undefined ||
+			this.#matchesPublicExpected(ref, expected) ||
+			this.#matchesInternalExpected(ref, expected as RegistryAgentRef | AgentSession);
+		if (!matches) return false;
+		const now = Date.now();
+		ref.lifecycle = {
+			...ref.lifecycle,
+			responseAt: responseAt ?? now,
+			acceptedAt: now,
+		};
+		if (ref.status === "running" && ref.session?.isStreaming !== true) this.#setStatus(ref, "idle");
+		else this.#emit({ type: "metadata_changed", ref });
+		return true;
+	}
+
+	/** Accepted final results whose ref still claims running without an active turn. */
+	staleAcceptedRuns(): AgentRef[] {
+		return this.list().filter(
+			ref => ref.status === "running" && ref.lifecycle?.acceptedAt !== undefined && !this.isRunning(ref),
+		);
 	}
 
 	#setStatusInternal(id: string, status: AgentStatus, expected: RegistryAgentRef | AgentSession): boolean {

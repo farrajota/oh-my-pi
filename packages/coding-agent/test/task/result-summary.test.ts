@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { formatTaskResultSummary } from "@oh-my-pi/pi-coding-agent/task/result-summary";
+
 import type { SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 

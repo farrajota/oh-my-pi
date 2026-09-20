@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 
 import { getProjectDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import type { OutputArtifactError } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { ToolSession } from "../../tools";
 import {
 	buildManagedKernelEnv,
@@ -146,6 +147,7 @@ export interface PythonResult {
 	truncated: boolean;
 	/** Artifact ID if full output was saved to artifact storage */
 	artifactId?: string;
+	artifactError?: OutputArtifactError;
 	/** Total number of lines in the output stream */
 	totalLines: number;
 	/** Total number of bytes in the output stream */
@@ -587,8 +589,6 @@ export async function executePython(code: string, options?: PythonExecutorOption
 				),
 			);
 		}
-		await ensureKernelAvailable(cwd, executionOptions);
-		await ensureToolBridge(executionOptions);
 
 		const kernelMode = executionOptions.kernelMode ?? "session";
 		if (kernelMode === "per-call") {

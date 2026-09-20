@@ -8,9 +8,9 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AsyncJobType } from "../../async";
 import type { HubAdmissionStateTransaction } from "../../internal/hub-admission";
 import type { IrcDeliveryReceipt, IrcMessage } from "../../irc/bus";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "../../session/streaming-output";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { StructuredSubagentOutput } from "../../task/types";
-import type { ConfiguredThinkingLevel } from "../../thinking";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { LaunchParams, LaunchToolDetails } from "./launch";
 
 export const MAX_HUB_BODY_BYTES = 64 * 1024;
@@ -198,6 +198,8 @@ export interface AgentActivitySnapshot {
 	 * wiring up or a stale registration that `hub cancel <id>` clears (#8634).
 	 */
 	live: boolean;
+	/** Acceptance time when a final result was accepted but the ref stayed running. */
+	acceptedAt?: number;
 }
 
 /** Result details for messaging and job ops; fields are disjoint per op. */

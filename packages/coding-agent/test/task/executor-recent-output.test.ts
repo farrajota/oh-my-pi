@@ -23,6 +23,7 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+
 import type { AgentDefinition, AgentProgress } from "@oh-my-pi/pi-coding-agent/task/types";
 import { createSessionDefaults } from "../helpers/session-defaults";
 

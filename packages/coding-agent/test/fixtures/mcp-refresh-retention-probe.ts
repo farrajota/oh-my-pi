@@ -67,18 +67,25 @@ const sessionTools = new SessionTools(host, {
 });
 const connection = { name: "alpha" } as MCPServerConnection;
 
-async function exerciseRefreshes(): Promise<void> {
+
+// The refresh loop lives in its own frame so the arrays it materialises
+// (wrapper lists, dedupe sets, promise plumbing) are not left in this module's
+// register slots when the collector scans the stack conservatively.
+async function refreshRepeatedly(): Promise<void> {
 	for (let refresh = 0; refresh < REFRESH_COUNT; refresh++) {
 		await sessionTools.refreshMCPTools(MCPTool.fromTools(connection, definitions));
 	}
 }
+await refreshRepeatedly();
 
-// Let the async refresh frame unwind before forcing collection. Keeping the
-// last call expression on the module's top-level-await frame makes JSC's
-// conservative stack scan retain one obsolete generation owned by the probe.
-await exerciseRefreshes();
 
-Bun.gc(true);
+// Collect from a fresh event-loop turn, twice: each turn re-enters the native
+// stack at a different depth, so a stale pointer that one scan happened to
+// pin is not reachable from the next.
+for (let pass = 0; pass < 2; pass++) {
+	await Bun.sleep(0);
+	Bun.gc(true);
+}
 const heap = JSON.parse(Bun.generateHeapSnapshot("v8")) as V8HeapSnapshot;
 const { node_fields: nodeFields, node_types: nodeTypes } = heap.snapshot.meta;
 const typeOffset = nodeFields.indexOf("type");

@@ -31,16 +31,22 @@ import { couldBecomeXdUrl, parseXdUrl } from "../internal-urls/xd-protocol";
 import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
-import { createHighlightStream, getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
+import { createHighlightStream, getLanguageFromPath, highlightCode, type Theme } from "@oh-my-pi/pi-tui/theme";
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import writeDeviceOnlyDescription from "../prompts/tools/write-device-only.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
-import { fileHyperlink, framedBlock, renderStatusLine } from "../tui";
+import { fileHyperlink, renderStatusLine } from "@oh-my-pi/pi-tui/render";
+import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
-import { routeWriteThroughBridge } from "./acp-bridge";
+import { routeWriteThroughBridge, shouldRouteWriteThroughBridge } from "./acp-bridge";
 import { resolveToolTier, truncateForPrompt } from "./approval";
 import { assertEditableFile } from "./auto-generated-guard";
-import { formatHashlineHeader, stripHashlinePrefixes } from "./hashline-format";
+import {
+	formatHashlineHeader,
+	isReadTruncationNotice,
+	splitAddressableFileLines,
+	stripHashlinePrefixes,
+} from "@oh-my-pi/pi-tui/tools/hashline-format";
 import {
 	type ConflictEntry,
 	conflictRegionPresent,
@@ -66,6 +72,8 @@ import {
 	targetsLocalSandbox,
 	unwrapHashlineHeaderPath,
 } from "./plan-mode-guard";
+import { decodeUtf8Text } from "./read-format";
+import { routeReadThroughBridge } from "./read-summary";
 import {
 	cachedRenderedString,
 	createRenderedStringCache,
@@ -75,14 +83,14 @@ import {
 	formatExpandHint,
 	formatMoreItems,
 	formatStatusIcon,
-	getLspBatchRequest,
-	type RenderedStringCache,
 	replaceTabs,
 	shortenPath,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
-} from "./render-utils";
-import type { ToolActivityContext, ToolActivitySummary } from "./renderers";
+	type RenderedStringCache,
+} from "@oh-my-pi/pi-tui/render";
+import type { ToolActivityContext, ToolActivitySummary } from "@oh-my-pi/pi-tui/tools";
+import { getLspBatchRequest } from "../lsp/batch";
 import { dispatchReportIssueDevice, REPORT_ISSUE_DEVICE_NAME, renderReportIssueDeviceCall } from "./report-tool-issue";
 import { dispatchResolutionDevice, isResolutionDeviceName, renderResolutionDeviceCall } from "./resolve";
 import {
@@ -363,6 +371,71 @@ function stripWriteContent(session: ToolSession, content: string): { text: strin
 		return { text: content, stripped: false };
 	}
 	return stripWriteContentWithPotentialLooseHeader(content.split("\n"));
+}
+function endsWithReadTruncationNotice(content: string): boolean {
+	const lines = splitAddressableFileLines(normalizeToLF(content));
+	const noticeIndex = lines.findLastIndex(line => line.trim().length > 0);
+	return noticeIndex !== -1 && isReadTruncationNotice(lines[noticeIndex]!);
+}
+
+function readProjectionPayloadLength(content: string): number | undefined {
+	const lines = splitAddressableFileLines(normalizeToLF(content));
+	const noticeIndex = lines.findLastIndex(line => line.trim().length > 0);
+	if (noticeIndex === -1 || !isReadTruncationNotice(lines[noticeIndex]!)) return undefined;
+	let end = noticeIndex;
+	while (end > 0 && lines[end - 1]!.trim().length === 0) end--;
+	return lines.slice(0, end).join("\n").length;
+}
+
+function assertNotShorterReadProjection(
+	displayPath: string,
+	rawContent: string,
+	currentContent: string | undefined,
+	writeContent: string = rawContent,
+): void {
+	const rawPayloadLength = readProjectionPayloadLength(rawContent);
+	if (rawPayloadLength === undefined || currentContent === undefined) return;
+	const payloadLength = writeContent === rawContent ? rawPayloadLength : normalizeToLF(writeContent).length;
+	if (payloadLength >= normalizeToLF(currentContent).length) return;
+	throw new ToolError(
+		`Refusing to overwrite '${displayPath}' with an incomplete read projection: the content ends with an omp read truncation notice and covers less than the current source, so it would discard unseen content. Re-read the omitted ranges and write the complete file, or use edit for a partial change.`,
+	);
+}
+
+async function readCurrentWriteSource(
+	session: ToolSession,
+	requestedPath: string,
+	absolutePath: string,
+): Promise<string | undefined> {
+	const readDisk = async (): Promise<string | undefined> => {
+		try {
+			return await Bun.file(absolutePath).text();
+		} catch (error) {
+			if (isEnoent(error)) return undefined;
+			throw error;
+		}
+	};
+	if (!shouldRouteWriteThroughBridge(session, requestedPath, absolutePath)) return readDisk();
+	const bridgeRead = routeReadThroughBridge(session, absolutePath);
+	if (!bridgeRead) return readDisk();
+	try {
+		return await bridgeRead;
+	} catch {
+		return readDisk();
+	}
+}
+
+async function assertNotTruncatedFileReadProjection(
+	session: ToolSession,
+	requestedPath: string,
+	absolutePath: string,
+	displayPath: string,
+	rawContent: string,
+	writeContent: string,
+): Promise<void> {
+	if (!endsWithReadTruncationNotice(rawContent)) return;
+	const currentContent = await readCurrentWriteSource(session, requestedPath, absolutePath);
+	assertNotShorterReadProjection(displayPath, rawContent, currentContent, writeContent);
 }
 
 /**
@@ -649,6 +722,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 	async #writeArchiveEntry(
 		content: string,
+		rawContent: string,
 		resolvedArchivePath: ResolvedArchiveWritePath,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		// The resolver has already canonicalized and authorized the container candidate;
@@ -724,6 +798,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const sel = readSelectorForEmptyWrite(writeTarget, content);
 		if (sel !== undefined && !entries.has(resolvedArchivePath.archiveSubPath)) {
 			throwReadSelectorMisfire(writeTarget, sel);
+		}
+		const existingTarget = entries.get(resolvedArchivePath.archiveSubPath);
+		if (existingTarget !== undefined && endsWithReadTruncationNotice(rawContent)) {
+			const existingBytes = existingTarget instanceof Blob ? new Uint8Array(await existingTarget.arrayBuffer()) : existingTarget;
+			const existingText = typeof existingBytes === "string" ? existingBytes : decodeUtf8Text(existingBytes);
+			assertNotShorterReadProjection(writeTarget, rawContent, existingText ?? undefined, content);
 		}
 		entries.set(resolvedArchivePath.archiveSubPath, content);
 
@@ -1220,6 +1300,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
 				const handler = internalRouter.getHandler(scheme);
 				if (handler?.write) {
+					if (scheme !== "xd" && endsWithReadTruncationNotice(content)) {
+						const currentResource = await internalRouter.resolve(path, {
+							cwd: this.session.cwd,
+							settings: this.session.settings,
+							signal,
+							localProtocolOptions: this.session.localProtocolOptions,
+						});
+						assertNotShorterReadProjection(path, content, currentResource.content, cleanContent);
+					}
 					// Handler-owned writes mutate user data outside the local
 					// sandbox. xd:// dispatches retain each wrapped tool's tier.
 					if (scheme !== "xd") {
@@ -1327,7 +1416,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					}`,
 					resolvedArchivePath.absolutePath,
 				);
-				const archiveResult = await this.#writeArchiveEntry(cleanContent, resolvedArchivePath);
+				const archiveResult = await this.#writeArchiveEntry(cleanContent, content, resolvedArchivePath);
 				if (stripped) {
 					const firstText = archiveResult.content.find(
 						(block): block is { type: "text"; text: string } =>
@@ -1374,6 +1463,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (await fs.exists(absolutePath)) {
 				await assertEditableFile(absolutePath, path, this.session.settings);
 			}
+			await assertNotTruncatedFileReadProjection(
+				this.session,
+				path,
+				absolutePath,
+				formatPathRelativeToCwd(absolutePath, this.session.cwd),
+				content,
+				cleanContent,
+			);
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 			emitWriteProgress(onUpdate, cleanContent, displayPath, absolutePath);
@@ -1787,7 +1884,7 @@ export const writeToolRenderer = {
 		// back to the normalizing stringify.
 		const content = typeof args.content === "string" ? args.content : normalizeDisplayText(args.content);
 		const streamingCache = createRenderedStringCache();
-		return framedBlock(uiTheme, width => {
+		return framedToolCard(uiTheme, () => {
 			const body = content
 				? formatStreamingContent(
 						content,
@@ -1796,10 +1893,6 @@ export const writeToolRenderer = {
 						uiTheme,
 						options?.spinnerFrame,
 						streamingCache,
-						// `options` is the ToolExecutionComponent's persistent
-						// render-state object — a stable identity across reveal ticks
-						// that keys the incremental preview state. `argsComplete`
-						// flushes the trailing line through the highlighter once.
 						options,
 						options?.argsComplete,
 					)
@@ -1808,10 +1901,9 @@ export const writeToolRenderer = {
 			while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
 			return {
 				header,
-				sections: bodyLines.length > 0 ? [{ lines: bodyLines }] : [],
-				state: "pending",
+				sections: bodyLines.length > 0 ? [{ content: bodyLines }] : [],
+				phase: "pending",
 				borderColor: "borderMuted",
-				width,
 			};
 		});
 	},
@@ -1849,15 +1941,13 @@ export const writeToolRenderer = {
 				{ icon: "error", title: "Write", description: `${langIcon} ${pathDisplay}` },
 				uiTheme,
 			);
-			return framedBlock(uiTheme, width => ({
+			return framedToolCard(uiTheme, () => ({
 				header,
-				sections: [{ lines: formatErrorDetail(errorText, uiTheme).split("\n") }],
-				state: "error",
+				sections: [{ content: formatErrorDetail(errorText, uiTheme).split("\n") }],
+				phase: "error",
 				borderColor: "error",
-				width,
 			}));
 		}
-
 		const isPartial = options.isPartial === true;
 		const progressText = result.content?.find(c => c.type === "text")?.text ?? "";
 		const lineCount = countLines(fileContent);
@@ -1879,7 +1969,7 @@ export const writeToolRenderer = {
 		const diagnostics = result.details?.diagnostics;
 
 		const previewCache = createRenderedStringCache();
-		return framedBlock(uiTheme, width => {
+		return framedToolCard(uiTheme, () => {
 			const { expanded } = options;
 			let body = renderContentPreview(fileContent, expanded, lang, uiTheme, previewCache);
 			if (isPartial && progressText) {
@@ -1904,10 +1994,9 @@ export const writeToolRenderer = {
 			while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
 			return {
 				header,
-				sections: bodyLines.length > 0 ? [{ lines: bodyLines }] : [],
-				state: isPartial ? "pending" : "success",
+				sections: bodyLines.length > 0 ? [{ content: bodyLines }] : [],
+				phase: isPartial ? "pending" : "success",
 				borderColor: "borderMuted",
-				width,
 			};
 		});
 	},

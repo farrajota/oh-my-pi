@@ -3,7 +3,7 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import type { AgentSessionEvent } from "../session/agent-session";
-import type { ConfiguredThinkingLevel, TaskEffort } from "../thinking";
+import type { ConfiguredThinkingLevel, TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { TaskPermissionRequest } from "./permission-profiles";
 import type { TaskToolProfileName } from "./tool-profiles";
 import type { NestedRepoPatch } from "./worktree";

@@ -21,15 +21,14 @@ import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { collectIrcPeerRoster } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { type CoordinationDetails, HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
-import {
-	DEFAULT_HUB_LIST_LIMIT,
-	executeList,
-	executeSend,
-	MAX_HUB_LIST_LIMIT,
-} from "@oh-my-pi/pi-coding-agent/tools/hub/messaging";
-import { prompt, TempDir } from "@oh-my-pi/pi-utils";
+
+import type { CoordinationDetails } from "@oh-my-pi/pi-tui/tools/hub";
+import { HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
+import { executeList, executeSend } from "@oh-my-pi/pi-coding-agent/tools/hub/messaging";
+import { DEFAULT_HUB_LIST_LIMIT, MAX_HUB_LIST_LIMIT } from "@oh-my-pi/pi-tui/tools/hub";
+import { prompt, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { createHubAuthorityFixture } from "./hub-fixtures";
+
 
 function sessionHeader(id: string): string {
 	return JSON.stringify({
@@ -1467,6 +1466,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 			},
 		} as unknown as AgentSession;
 	}
+
 
 	it("direct send, history://, and agent:// target each caller root's parked Worker without a prior list", async () => {
 		using tempDir = TempDir.createSync("@omp-hub-direct-root-");

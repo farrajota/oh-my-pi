@@ -1,5 +1,6 @@
 import { type CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { registerToolSessionLifecycleAuthority } from "../../src/internal/agent-lifecycle-bridge";
 import {
 	bindInternalAgentAuthoritySession,
@@ -13,6 +14,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 export interface HubAuthorityFixture {
 	readonly registry: AgentRegistry;
+	readonly bus: IrcBus;
 	createChild(id: string, parentId?: string): Promise<CreateAgentSessionResult>;
 	createToolSession(id: string): ToolSession;
 	dispose(): Promise<void>;
@@ -33,9 +35,11 @@ export async function createHubAuthorityFixture(registry: AgentRegistry, rootId:
 		agentId: rootId,
 		agentDisplayName: rootId,
 	});
+	const bus = IrcBus.forRoot(registry, rootId);
 	const owned = new Map<string, CreateAgentSessionResult>([[rootId, root]]);
 	return {
 		registry,
+		bus,
 		async createChild(id: string, parentId = rootId): Promise<CreateAgentSessionResult> {
 			const existing = owned.get(id);
 			if (existing) return existing;

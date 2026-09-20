@@ -2,6 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+
+import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
 
@@ -10,8 +12,15 @@ function makeDirectSession(manager: AsyncJobManager): ToolSession {
 	registry.register({ id: "Main", displayName: "main", kind: "main", session: null, status: "running" });
 	return {
 		cwd: process.cwd(),
-		settings: { get: () => undefined },
+
+		settings: {
+			get(key: string): unknown {
+				if (key === "irc.timeoutMs") return 120_000;
+				return undefined;
+			},
+		},
 		agentRegistry: registry,
+
 		asyncJobManager: manager,
 		getAgentId: () => "Main",
 		isDisposed: () => false,

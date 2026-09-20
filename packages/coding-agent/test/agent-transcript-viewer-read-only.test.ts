@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "bun:
 import * as path from "node:path";
 import { createReadOnlyAgentTranscriptViewer, type ReadOnlyAgentTranscriptViewerDeps } from "@oh-my-pi/pi-coding-agent";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TempDir } from "@oh-my-pi/pi-utils";
 

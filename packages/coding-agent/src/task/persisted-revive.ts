@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { logger } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
@@ -22,15 +23,18 @@ import type { RegistryDurableStateStore } from "../registry/durable-state";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
+import type { SessionInitEntry } from "../session/session-entries";
 import type { EventBus } from "../utils/event-bus";
 import { IrcBus } from "../irc/bus";
 import { attachIrcWakeTurnMonitor, createMCPProxyTools, createSubagentSettings } from "./executor";
+import type { EffectivePermissionSummary } from "./types";
 import type { AgentDefinition } from "./types";
 import {
 	buildEffectivePermissionSummary,
 	freezePermissionScope,
 	isScopeNoBroader,
 	loadPermissionProfiles,
+	type PermissionScopeSnapshot,
 } from "./permission-profiles";
 
 /**
@@ -56,6 +60,95 @@ export interface PersistedSubagentReviveContext {
 	subagentEventBus?: EventBus;
 	/** Optional W4 authority journal; configured cold revival requires an exact validated actor/root snapshot. */
 	durableState?: RegistryDurableStateStore;
+}
+
+type PersistedRevivalInit = Pick<
+	SessionInitEntry,
+	| "systemPrompt"
+	| "task"
+	| "tools"
+	| "agent"
+	| "modelRole"
+	| "resolvedModel"
+	| "requestedPermissionProfiles"
+	| "effectivePermissionProfiles"
+	| "permissionSnapshot"
+	| "permissionSummary"
+	| "readOnly"
+	| "outputSchema"
+	| "outputSchemaMode"
+	| "restrictToolNames"
+	| "enableMCP"
+	| "spawns"
+	| "readSummarize"
+	| "advisor"
+	| "isolated"
+>;
+
+async function validatePersistedRevivalContract(
+	init: PersistedRevivalInit,
+	cwd: string,
+	ref: { id: string; parentId?: string; lineage?: { rootId: string; generation: number } },
+	durableState: RegistryDurableStateStore | undefined,
+): Promise<
+	| {
+			init: PersistedRevivalInit;
+			permissionSnapshot: PermissionScopeSnapshot;
+			permissionSummary: EffectivePermissionSummary;
+		}
+	| undefined
+> {
+	const persistedSnapshot = init.permissionSnapshot;
+	if (!persistedSnapshot) return undefined;
+	const permissionSnapshot = freezePermissionScope(persistedSnapshot.scope);
+	if (permissionSnapshot.canonicalSha256 !== persistedSnapshot.canonicalSha256) return undefined;
+	const permissionSummary = buildEffectivePermissionSummary(
+		permissionSnapshot.scope,
+		init.permissionSummary?.recentDenials ?? [],
+	);
+	if (
+		permissionSnapshot.scope.actorId !== ref.id ||
+		permissionSnapshot.scope.actorKind !== "sub" ||
+		permissionSnapshot.scope.parentId !== ref.parentId
+	)
+		return undefined;
+	const provenance = permissionSnapshot.scope.provenance;
+	if (
+		!provenance ||
+		provenance.profileNames.length !== permissionSnapshot.scope.profiles.length ||
+		provenance.profileNames.some((name, index) => name !== permissionSnapshot.scope.profiles[index]) ||
+		(init.effectivePermissionProfiles !== undefined &&
+			(init.effectivePermissionProfiles.length !== permissionSnapshot.scope.profiles.length ||
+				permissionSnapshot.scope.profiles.some(
+					(name, index) => init.effectivePermissionProfiles?.[index] !== name,
+				))) ||
+		provenance.profiles.length !== permissionSnapshot.scope.profiles.length
+	)
+		return undefined;
+	if (provenance.profiles.length) {
+		const currentProfiles = await loadPermissionProfiles(cwd);
+		if (currentProfiles.errors.length > 0) return undefined;
+		for (const identity of provenance.profiles) {
+			const current = currentProfiles.profileIdentities[identity.name];
+			if (!current || current.source !== identity.source || current.canonicalSha256 !== identity.canonicalSha256)
+				return undefined;
+		}
+	}
+	if (durableState) {
+		const lineage = ref.lineage;
+		if (
+			!lineage ||
+			!durableState.validateRevival({
+				actorId: ref.id,
+				parentId: ref.parentId,
+				rootId: lineage.rootId,
+				generation: lineage.generation,
+				scopeHash: permissionSnapshot.canonicalSha256,
+			})
+		)
+			return undefined;
+	}
+	return { init, permissionSnapshot, permissionSummary };
 }
 
 /**
@@ -230,6 +323,68 @@ export function createPersistedSubagentReviverFactory(
 				// the single-writer lock cleanly and restores the full message history.
 				const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 					suppressBreadcrumb: true,
+					throwIfMissing: true,
+				});
+				await fs.stat(sessionFile);
+				const currentPeek = await SessionManager.peekSessionInit(sessionFile);
+				if (!currentPeek?.init)
+					throw new Error("Persisted subagent transcript has no persisted session contract.");
+				await fs.stat(currentPeek.cwd);
+				const hasMessageHistory = reopened.getEntries().some(entry => entry.type === "message");
+				if (!hasMessageHistory) throw new Error("Persisted subagent transcript has no message history.");
+				if (currentPeek.init.isolated) throw new Error("Persisted isolated subagent cannot be revived.");
+				const currentContract = await validatePersistedRevivalContract(
+					currentPeek.init,
+					currentPeek.cwd,
+					ref,
+					durableState,
+				);
+				if (!currentContract) throw new Error("Persisted subagent transcript contract is invalid.");
+				const {
+					init,
+					permissionSnapshot,
+					permissionSummary,
+				} = currentContract;
+				const currentParentScope = parentSession.getPermissionScope?.();
+				const currentInheritedScopeRequired =
+					permissionSnapshot.scope.clauses?.some(clause => clause.source === "inherited") === true;
+				if (
+					(currentInheritedScopeRequired && currentParentScope === undefined) ||
+					(currentParentScope !== undefined && !isScopeNoBroader(currentParentScope, permissionSnapshot.scope))
+				)
+					throw new Error("Persisted subagent parent authority changed before revival.");
+				const subagentSettings = createSubagentSettings(
+					ctx.settings,
+					{
+						...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
+						...(init.advisor
+							? {
+									"advisor.enabled": true,
+									...(init.advisor !== "on"
+										? { modelRoles: { ...ctx.settings.getModelRoles(), advisor: init.advisor } }
+										: undefined),
+								}
+							: undefined),
+					},
+					undefined,
+					{ cwd: currentPeek.cwd, agentDir: ctx.settings.getAgentDir() },
+				);
+				const persistedModelPattern =
+					init.modelRole && init.modelRole !== "default"
+						? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]
+						: init.resolvedModel;
+				const revivedToolNames =
+					init.readOnly === true && init.tools.includes("write")
+						? init.tools.filter(name => name !== "write")
+						: init.tools;
+				const restrictToolNames = init.restrictToolNames === true;
+				const startupPolicy = deriveRestrictedStartupPolicy({
+					permissionScope: permissionSnapshot.scope,
+					restrictToolNames,
+					allowRestrictedExtensions: true,
+					toolNames: revivedToolNames,
+					enableLsp: ctx.enableLsp,
+					enableMCP: (init.enableMCP ?? true) && ctx.enableMCP,
 				});
 				const artifactManager = ctx.session.sessionManager.getArtifactManager();
 				if (artifactManager) reopened.adoptArtifactManager(artifactManager);
@@ -238,16 +393,20 @@ export function createPersistedSubagentReviverFactory(
 				const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
 				const { session } = await authorityBinding.create(
 					{
-						cwd: peek.cwd,
+						cwd: currentPeek.cwd,
 						agentDir: subagentSettings.getAgentDir(),
-						authStorage: ctx.authStorage,
 						// Revived agents join the root session tree, so their observability
 						// frames ride the same bus the RPC/collab surfaces subscribed to.
 						subagentEventBus: ctx.subagentEventBus,
+						authStorage: ctx.authStorage,
 						modelRegistry: ctx.modelRegistry,
 						...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
 						modelPatternAuthFallback: init.resolvedModel,
 						settings: subagentSettings,
+						extensionRoots: () => ctx.session.effectiveExtensionRoots,
+						...(ctx.session.preparedExtensions?.length
+							? { preloadedPreparedExtensions: ctx.session.preparedExtensions }
+							: undefined),
 						sessionManager: reopened,
 						localProtocolOptions: getSessionLocalProtocolOptions(parentSession.sessionManager),
 						agentId: ref.id,
@@ -276,6 +435,7 @@ export function createPersistedSubagentReviverFactory(
 						outputSchema: init.outputSchema,
 						outputSchemaMode: init.outputSchemaMode,
 						restrictToolNames,
+						allowRestrictedExtensions: startupPolicy.allowExtensions,
 						permissionScope: permissionSnapshot?.scope,
 						requireYieldTool: true,
 						systemPrompt: () => [init.systemPrompt],
@@ -335,13 +495,13 @@ export function createPersistedSubagentReviverFactory(
 					id: ref.id,
 					agent: wakeAgent,
 					permissionSummary,
+					artifactsDir: path.dirname(sessionFile),
 					agentRegistry: registry,
 					ircBus: IrcBus.forRoot(registry, rootId),
 					subagentEventBus: ctx.subagentEventBus,
 					sessionFile,
 					outputSchema: init.outputSchema,
 					outputSchemaMode: init.outputSchemaMode,
-					artifactsDir: ctx.session.sessionFile?.slice(0, -6),
 				});
 				return session;
 			} catch (error) {

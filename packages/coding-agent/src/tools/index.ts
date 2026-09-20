@@ -39,7 +39,7 @@ import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
 import type { EffectiveSubagentPermissions, ToolExecutionAuthority } from "../task/permission-profiles";
-import { canSpawnAtDepth, type StructuredSubagentSchemaMode } from "../task/types";
+import { canSpawnAtDepth, type AgentDefinition, type StructuredSubagentSchemaMode } from "../task/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { EventBus } from "../utils/event-bus";
 import { WebSearchTool } from "../web/search";
@@ -80,7 +80,7 @@ import { YieldTool } from "./yield";
 export * from "../edit";
 export * from "../goals";
 export * from "../lsp";
-export * from "../session/streaming-output";
+export * from "@oh-my-pi/pi-tui/tools/streaming-output";
 export * from "../task";
 export * from "../web/search";
 export * from "./ask";
@@ -119,7 +119,18 @@ export * from "./memory-retain";
 export * from "./read";
 export * from "./report-tool-issue";
 export * from "./resolve";
-export * from "./review";
+export {
+	getPriorityInfo,
+	isFindingPriority,
+	parseFindingDetails,
+	PRIORITY_LABELS,
+} from "@oh-my-pi/pi-tui/tools/task";
+export type {
+	FindingDetails,
+	FindingPriority,
+	FindingPriorityInfo,
+	SubmitReviewDetails,
+} from "@oh-my-pi/pi-tui/tools/task";
 export * from "./security-scan";
 export * from "./think";
 export * from "./todo";
@@ -193,6 +204,7 @@ export interface ToolSession {
 	fetch?: FetchImpl;
 	/** Provider credential resolver preserved for explicitly constructed child sessions. */
 	getApiKey?: AgentOptions["getApiKey"];
+	providerSessionId?: string;
 	/** Skip subprocess-kernel availability checks and warmup */
 	skipPythonPreflight?: boolean;
 	/** Context files materialized for this session; fresh children rediscover their own. */
@@ -344,6 +356,8 @@ export interface ToolSession {
 	allocateOutputArtifact?: (toolType: string) => Promise<{ id?: string; path?: string }>;
 	/** Get session spawns */
 	getSessionSpawns: () => string | null;
+	getSessionAgents?: () => readonly AgentDefinition[];
+	getLastAssistantText?: () => string | undefined;
 	/** Get resolved model string if explicitly set for this session */
 	getModelString?: () => string | undefined;
 	/** Get the current session model string, regardless of how it was chosen */
@@ -399,6 +413,8 @@ export interface ToolSession {
 	getTodoPhases?: () => TodoPhase[];
 	/** Replace cached todo phases for this session. */
 	setTodoPhases?: (phases: TodoPhase[]) => void;
+	/** Persist bridged todo mutations to the session branch. */
+	persistTodoPhases?: (phases: TodoPhase[]) => void;
 	/** Active workpool items whose incremental yields complete the current turn. */
 	getWorkPoolYieldItems?: () => readonly WorkPoolYieldItem[];
 	/** Replace the active workpool item contract and refresh its provider-facing prompt. */

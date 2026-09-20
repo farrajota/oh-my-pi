@@ -11,14 +11,13 @@ import type { AsyncJob, AsyncJobManager, AsyncJobType, AsyncJobResultObservation
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { getAgentLifecycleManager, resolveToolSessionLifecycleAuthority } from "../../internal/agent-lifecycle-bridge";
 import type { HubAdmissionStateTransaction } from "../../internal/hub-admission";
-import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
-import type { Theme } from "../../modes/theme/theme";
+import { shimmerEnabled, shimmerText, type Theme } from "@oh-my-pi/pi-tui/theme";
 import { terminateSubagent } from "../../registry/agent-control";
 import type { AgentRef } from "../../registry/agent-registry";
 import { renderStructuredJson } from "../../session/async-job-delivery";
 import type { StructuredSubagentOutput } from "../../task/types";
-import { parseConfiguredThinkingLevel } from "../../thinking";
-import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
+import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "@oh-my-pi/pi-tui/render";
 import type { ToolSession } from "..";
 import {
 	FEED_MODEL_BADGE_WIDTH,
@@ -32,7 +31,7 @@ import {
 	replaceTabs,
 	type ToolUIColor,
 	type ToolUIStatus,
-} from "../render-utils";
+} from "@oh-my-pi/pi-tui/render";
 import { PREVIEW_LIMITS } from "../preview-limits";
 import {
 	boundCoordinationResult,
@@ -116,7 +115,6 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 	const selfId = session.getAgentId?.() ?? undefined;
 	if (!selfId) return [];
 	const rootId = registry.get(selfId)?.lineage?.rootId;
-	if (!rootId) return [];
 	const covered = new Set<string>();
 	const manager = session.asyncJobManager;
 	if (manager) {
@@ -126,16 +124,19 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 		}
 	}
 	const now = Date.now();
+	const staleAccepted = new Set(registry.staleAcceptedRuns().map(ref => ref.id));
 	const out: AgentActivitySnapshot[] = [];
 	for (const ref of registry.list()) {
-		if (ref.lineage?.rootId !== rootId || ref.kind !== "sub" || ref.status !== "running") continue;
+		if ((rootId ? ref.lineage?.rootId !== rootId : ref.parentId !== selfId) || ref.kind !== "sub" || ref.status !== "running") continue;
 		if (ref.id === selfId || covered.has(ref.id)) continue;
+		const acceptedAt = staleAccepted.has(ref.id) ? ref.lifecycle?.acceptedAt : undefined;
 		out.push({
 			id: ref.id,
 			...(ref.parentId ? { parentId: ref.parentId } : {}),
 			...(ref.activity ? { activity: ref.activity } : {}),
 			ageMs: Math.max(0, now - ref.createdAt),
 			live: registry.isRunning(ref),
+			...(acceptedAt !== undefined ? { acceptedAt } : {}),
 		});
 	}
 	return out;
@@ -147,7 +148,11 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 	for (const agent of agents) {
 		const parent = agent.parentId ? ` (spawned by \`${agent.parentId}\`)` : "";
 		const activity = agent.activity ? ` — ${agent.activity}` : "";
-		const stale = agent.live ? "" : " — no turn in flight (stale registration?)";
+		const stale = agent.live
+			? ""
+			: agent.acceptedAt !== undefined
+				? ` — final result accepted ${formatDuration(Math.max(0, Date.now() - agent.acceptedAt))} ago but still running; clear it with \`hub\` cancel`
+				: " — no turn in flight (stale registration?)";
 		lines.push(`- \`${agent.id}\`${parent} — up ${formatDuration(agent.ageMs)}${activity}${stale}`);
 	}
 	lines.push("", "These agents have no job entry; message them via `hub` send, transcripts at `history://<id>`.");

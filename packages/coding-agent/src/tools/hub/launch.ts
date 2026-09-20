@@ -13,8 +13,9 @@ import type { RenderResultOptions } from "../../extensibility/custom-tools/types
 import { type DaemonBrokerClient, DaemonBrokerRejectedError, daemonClientForProject } from "../../launch/client";
 import type { DaemonOperation, DaemonRpcResult, DaemonSnapshot, DaemonSpec, DaemonState } from "../../launch/protocol";
 import { renderTerminalOutputIsolated } from "../../launch/terminal-output-worker-client";
-import type { Theme, ThemeColor } from "../../modes/theme/theme";
-import { framedBlock, outputBlockContentWidth, renderStatusLine } from "../../tui";
+import type { Theme, ThemeColor } from "@oh-my-pi/pi-tui/theme";
+import { outputBlockContentWidth, renderStatusLine } from "@oh-my-pi/pi-tui/render";
+import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
 import type { ToolSession } from "..";
 import { resolveToCwd } from "../path-utils";
 import {
@@ -29,9 +30,9 @@ import {
 	shortenPath,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
-} from "../render-utils";
+} from "@oh-my-pi/pi-tui/render";
 import { DEFAULT_TERMINAL_PREVIEW_LINES, PREVIEW_LIMITS } from "../preview-limits";
-import { styleTerminalRow } from "../terminal-output";
+import { styleTerminalRow } from "@oh-my-pi/pi-tui/tools/terminal-output";
 import { ToolError } from "../tool-errors";
 
 interface CompletionRegistration {
@@ -654,22 +655,20 @@ export function launchRenderResult(
 	);
 
 	if (op === "logs") {
-		return framedBlock(theme, width => {
-			const innerWidth = outputBlockContentWidth(width);
-			const rows = body.map(line => truncateToWidth(line, innerWidth));
+		return framedToolCard(theme, ({ contentWidth }) => {
+			const rows = body.map(line => truncateToWidth(line, contentWidth));
 			return {
 				header,
-				state: options.isPartial ? "pending" : failed ? "error" : "success",
+				phase: options.isPartial ? "pending" : failed ? "error" : "success",
 				sections: [
 					{
 						label: theme.fg("toolTitle", "Output"),
-						lines: capPreviewLines(rows, theme, {
+						content: capPreviewLines(rows, theme, {
 							expanded: options.expanded,
 							max: DEFAULT_TERMINAL_PREVIEW_LINES,
 						}),
 					},
 				],
-				width,
 			};
 		});
 	}

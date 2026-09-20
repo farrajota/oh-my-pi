@@ -1,9 +1,10 @@
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import type { Theme } from "../modes/theme/theme";
-import { framedBlock, renderStatusLine } from "../tui";
-import { formatErrorDetail, formatExpandHint, replaceTabs, shortenPath, truncateToWidth } from "./render-utils";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import { renderStatusLine } from "@oh-my-pi/pi-tui/render";
+import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
+import { formatErrorDetail, formatExpandHint, replaceTabs, shortenPath, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 
 interface InspectImageRenderArgs {
 	path?: string;
@@ -70,19 +71,17 @@ export const inspectImageToolRenderer = {
 
 		const question = typeof args?.question === "string" ? args.question.trim() : "";
 		const outputText = result.content.find(content => content.type === "text")?.text?.trimEnd() ?? "";
-
 		if (result.isError) {
-			return framedBlock(uiTheme, width => {
+			return framedToolCard(uiTheme, () => {
 				const bodyLines: string[] = [];
 				if (question) bodyLines.push(questionLine(question, uiTheme));
 				bodyLines.push(formatErrorDetail(outputText || "inspection failed", uiTheme));
 				return {
 					header,
-					sections: [{ lines: bodyLines }],
-					state: "error",
+					sections: [{ content: bodyLines }],
+					phase: "error",
 					borderColor: "error",
 					applyBg: false,
-					width,
 				};
 			});
 		}
@@ -96,7 +95,7 @@ export const inspectImageToolRenderer = {
 			return new Text(metaLine ? `${header}\n${metaLine}` : header, 0, 0);
 		}
 
-		return framedBlock(uiTheme, width => {
+		return framedToolCard(uiTheme, () => {
 			const bodyLines: string[] = [];
 			if (question) {
 				bodyLines.push(questionLine(question, uiTheme));
@@ -117,11 +116,10 @@ export const inspectImageToolRenderer = {
 			return {
 				header,
 				headerMeta: metaLine || undefined,
-				sections: [{ lines: bodyLines }],
-				state: "success",
+				sections: [{ content: bodyLines }],
+				phase: "success",
 				borderColor: "borderMuted",
 				applyBg: false,
-				width,
 			};
 		});
 	},

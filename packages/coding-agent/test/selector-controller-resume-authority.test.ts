@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as foreignSessionImport from "@oh-my-pi/pi-coding-agent/session/foreign-session-import";
 import type { ForeignSessionInfo } from "@oh-my-pi/pi-coding-agent/session/foreign-session-store";
 import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
-import * as SessionSelector from "@oh-my-pi/pi-coding-agent/modes/components/session-selector";
+import * as SessionSelector from "@oh-my-pi/pi-tui/overlays/session-selector";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import * as operationLease from "@oh-my-pi/pi-coding-agent/registry/operation-lease";

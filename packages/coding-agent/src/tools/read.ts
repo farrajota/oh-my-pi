@@ -35,6 +35,7 @@ import type { AuthorizedFilesystemTarget, FilesystemOperation } from "../interna
 import { getExperimentalContextSession } from "./context-notes";
 import readDescription from "../prompts/tools/read.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
+import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -42,7 +43,7 @@ import {
 	truncateHead,
 	truncateHeadBytes,
 	truncateLine,
-} from "../session/streaming-output";
+} from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { buildLineEntriesWithBlockContext, lineEntriesToPlainText } from "../utils/block-context";
 import { isCpuProfilePath, renderCpuProfile } from "../utils/cpuprofile";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
@@ -70,7 +71,7 @@ import {
 	scanFileForConflicts,
 } from "./conflict-detect";
 import { executeReadUrl, fetchReadUrl, parseReadUrlTarget } from "./fetch";
-import { postProcessToolResult, type OutputMeta, resolveOutputMaxColumns } from "./output-meta";
+import { postProcessToolResult, resolveOutputMaxColumns } from "./output-meta";
 import {
 	expandPath,
 	formatPathRelativeToCwd,
@@ -106,6 +107,7 @@ import {
 	RANGE_TRAILING_CONTEXT_LINES,
 	READ_CHUNK_SIZE,
 	readHashlineHeaderContext,
+	toReadTruncationStats,
 } from "./read-format";
 import {
 	findSuffixMatchCached,
@@ -137,7 +139,7 @@ import {
 	resolveTailSelector,
 	selToOffsetLimit,
 } from "./read-selector";
-import { splitAddressableFileLines } from "./hashline-format";
+import { splitAddressableFileLines } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import { readSqlite, resolveSqliteReadPath } from "./read-sqlite";
 import {
 	getReadTextFileBridge,
@@ -147,14 +149,15 @@ import {
 	trySummarize,
 } from "./read-summary";
 import { parseSqlitePathCandidates } from "./sqlite-reader";
-import { formatBytes, shortenPath } from "./render-utils";
+import { formatBytes, shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { REPORT_ISSUE_DEVICE_NAME, reportIssueDeviceUsage } from "./report-tool-issue";
 import { isResolutionDeviceName, resolutionDeviceUsage } from "./resolve";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { xdevDocs, xdevListing } from "./xdev";
 
-export { readToolRenderer } from "./read-renderer";
+export { readToolRenderer } from "@oh-my-pi/pi-tui/tools/read";
+export type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 
 /** Largest profile (`*.sample.txt`, `*.cpuprofile`) converted to a bottleneck summary; bigger files read as plain text. */
 const MAX_PROFILE_SUMMARY_BYTES = 32 * 1024 * 1024;
@@ -627,7 +630,7 @@ const IMAGE_ATTACHMENT_URI_REGEX = /^attachment:\/\/[1-9]\d*$/;
 const IMAGE_QUESTION_SELECTOR_ERROR =
 	"The ?q= selector only supports images (raster files, .svg:img, attachment://N, local:// images, PDF page screenshots).";
 
-function splitImageQuestionTarget(readPath: string): { path: string; question?: string } {
+export function splitImageQuestionTarget(readPath: string): { path: string; question?: string } {
 	const supportsQuestion =
 		!readPath.includes("://") || readPath.startsWith("attachment://") || readPath.startsWith("local://");
 	if (!supportsQuestion || parseSqlitePathCandidates(readPath).length > 0) return { path: readPath };
@@ -642,47 +645,23 @@ function splitImageQuestionTarget(readPath: string): { path: string; question?: 
 const MAX_IMAGE_SIZE = getMaxImageInputBytes();
 
 const readSchema = type({
-	path: type("string").describe(
-		"Local path, internal URI (e.g. memory://, skill://), or URL. Inline selectors are supported.",
-	),
+	path: type("string").describe("Local path, internal URI (e.g. memory://, skill://), or URL. Inline selectors are supported."),
 });
 
 const readSchemaWithoutMemory = type({
 	path: type("string").describe("Local path, internal URI (e.g. skill://), or URL. Inline selectors are supported."),
 });
 
+const readSchemaWithoutSkills = type({
+	path: type("string").describe("Local path, internal URI, or URL. Inline selectors are supported."),
+});
+
+const readSchemaWithoutMemoryAndSkills = type({
+	path: type("string").describe("Local path, internal URI, or URL. Inline selectors are supported."),
+});
+
 export type ReadToolInput = typeof readSchema.infer;
 
-export interface ReadToolDetails {
-	kind?: "file" | "url";
-	truncation?: TruncationResult;
-	isDirectory?: boolean;
-	resolvedPath?: string;
-	suffixResolution?: { from: string; to: string };
-	url?: string;
-	finalUrl?: string;
-	contentType?: string;
-	method?: string;
-	notes?: string[];
-	meta?: OutputMeta;
-	/** Full on-disk byte size recorded before applying a file range. */
-	fileSize?: number;
-	/** Full source line count when the read reached EOF and the count is exact. */
-	totalLines?: number;
-	/** Raw text + start line for user-visible TUI rendering, set when content is text-like.
-	 * Mirrors the same lines the model receives but without hashline/line-number prefixes,
-	 * so the TUI can render the file content with its own gutter without re-parsing the formatted text. */
-	displayContent?: {
-		text: string;
-		startLine: number;
-		lineNumbers?: Array<number | null>;
-	};
-	summary?: { lines: number; elidedSpans: number; elidedLines: number };
-	/** Number of unresolved git conflicts surfaced by this read (TUI uses for inline `⚠ N` badge). */
-	conflictCount?: number;
-	/** Paths recovered from a delimited read argument; used only by the TUI to render one call as multiple read rows. */
-	displayReadTargets?: string[];
-}
 type ReadParams = ReadToolInput;
 
 /** Identical reads tolerated before the loop hint is appended. */
@@ -835,6 +814,7 @@ async function assessLocalReadSpeculation(
  */
 export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	readonly name = "read";
+	readonly readsSkillUris = true;
 	readonly approval = (args: unknown): ToolTier => {
 		let readPath = "";
 		if (args && typeof args === "object" && "path" in args) readPath = String(args.path ?? "");
@@ -846,10 +826,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	readonly label = "Read";
 	readonly loadMode = "essential";
 	description: string;
-	get parameters(): typeof readSchema {
-		return this.session.settings.get("memory.backend") === "off" ? readSchemaWithoutMemory : readSchema;
+	get parameters() {
+		const hasSkills = (this.session.skills?.length ?? 0) > 0;
+		if (this.session.settings.get("memory.backend") === "off") {
+			return hasSkills ? readSchemaWithoutMemory : readSchemaWithoutMemoryAndSkills;
+		}
+		return hasSkills ? readSchema : readSchemaWithoutSkills;
 	}
-	readonly strict = true;
 
 	readonly speculation = {
 		finalized: {
@@ -2283,17 +2266,21 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								firstLineBytes,
 							)}, exceeds ${formatBytes(maxBytesForRead)} limit. Unable to display a valid UTF-8 snippet.]`;
 						}
-						details = { truncation };
-						sourcePath = renderAbsolutePath;
-						truncationInfo = {
-							result: truncation,
-							options: {
-								direction: "head",
-								startLine: startLineDisplay,
-								totalFileLines: reachedEof ? totalFileLines : undefined,
-							},
-						};
-					} else if (truncation.truncated) {
+						if (reachedEof) {
+							details = { truncation: toReadTruncationStats(truncation) };
+							sourcePath = renderAbsolutePath;
+							truncationInfo = {
+								result: truncation,
+								options: {
+									direction: "head",
+									startLine: startLineDisplay,
+									totalFileLines,
+								},
+							};
+						} else {
+							outputText += "\n\n[File not scanned to EOF]";
+						}
+					} else if (truncation.truncated && reachedEof) {
 						outputText = formatBracketAwareText() ?? formatText(truncation.content, startLineDisplay);
 						if (omittedSelectedLine) {
 							const lineNumber = omittedSelectedLine.index + 1;
@@ -2303,7 +2290,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								`:raw:${lineNumber}-${lineNumber}`,
 							)}`;
 						}
-						details = { truncation };
+						details = { truncation: toReadTruncationStats(truncation) };
 						sourcePath = renderAbsolutePath;
 						truncationInfo = {
 							result: truncation,
@@ -2657,40 +2644,45 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					: `[Line ${startLineDisplay} is ${formatBytes(
 							firstLineBytes,
 						)}, exceeds ${formatBytes(maxBytesForRead)} limit. Unable to display a valid UTF-8 snippet.]`;
-			truncationInfo = {
-				result: truncation,
-				options: {
-					direction: "head",
-					startLine: startLineDisplay,
-					totalFileLines: reachedEof ? totalFileLines : undefined,
-				},
-			};
-		} else {
-			outputText = formatText(truncation.content, startLineDisplay);
-			if (truncation.truncated) {
-				if (omittedSelectedLine) {
-					const lineNumber = omittedSelectedLine.index + 1;
-					outputText += `\n\n${formatOmittedRequestedLineNotice(
-						omittedSelectedLine,
-						maxBytesForRead,
-						`${artifactUrl}:raw:${lineNumber}-${lineNumber}`,
-					)}`;
-				}
+			if (reachedEof) {
 				truncationInfo = {
 					result: truncation,
 					options: {
 						direction: "head",
 						startLine: startLineDisplay,
-						totalFileLines: reachedEof ? totalFileLines : undefined,
-						nextOffset: omittedSelectedLine ? null : undefined,
+						totalFileLines,
 					},
 				};
-			} else if (startLine + collectedLines.length < totalFileLines || !reachedEof) {
-				const nextOffset = startLine + collectedLines.length + 1;
-				outputText += reachedEof
-					? `\n\n[${totalFileLines - (startLine + collectedLines.length)} more lines in artifact. Use ${artifactUrl}:${nextOffset} to continue]`
-					: `\n\n[More lines in artifact (${formatBytes(artifact.size)} total; not scanned to EOF). Use ${artifactUrl}:${nextOffset} to continue]`;
+			} else {
+				outputText += "\n\n[File not scanned to EOF]";
 			}
+		} else if (truncation.truncated && reachedEof) {
+			outputText = formatText(truncation.content, startLineDisplay);
+			if (omittedSelectedLine) {
+				const lineNumber = omittedSelectedLine.index + 1;
+				outputText += `\n\n${formatOmittedRequestedLineNotice(
+					omittedSelectedLine,
+					maxBytesForRead,
+					`${artifactUrl}:raw:${lineNumber}-${lineNumber}`,
+				)}`;
+			}
+			truncationInfo = {
+				result: truncation,
+				options: {
+					direction: "head",
+					startLine: startLineDisplay,
+					totalFileLines,
+					nextOffset: omittedSelectedLine ? null : undefined,
+				},
+			};
+		} else if (startLine + collectedLines.length < totalFileLines || !reachedEof) {
+			outputText = formatText(truncation.content, startLineDisplay);
+			const nextOffset = startLine + collectedLines.length + 1;
+			outputText += reachedEof
+				? `\n\n[${totalFileLines - (startLine + collectedLines.length)} more lines in artifact. Use ${artifactUrl}:${nextOffset} to continue]`
+				: `\n\n[More lines in artifact (${formatBytes(artifact.size)} total; not scanned to EOF). Use ${artifactUrl}:${nextOffset} to continue]`;
+		} else {
+			outputText = formatText(truncation.content, startLineDisplay);
 		}
 
 		if (!rawSelector && artifact.size > MAX_ARTIFACT_RAW_INLINE_BYTES) {
@@ -2698,7 +2690,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 		if (reachedEof) details.totalLines = totalFileLines;
 		if (displayContent) details.displayContent = displayContent;
-		if (truncationInfo) details.truncation = truncationInfo.result;
+		if (truncationInfo) details.truncation = toReadTruncationStats(truncationInfo.result);
 		const resultBuilder = toolResult<ReadToolDetails>(details)
 			.text(outputText)
 			.sourcePath(artifact.path)
@@ -2916,20 +2908,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				text += `\n\n[${remaining} more lines in listing. Use :${end + 1} to continue]`;
 			}
 			resultBuilder.text(text);
-			if (tree.truncated) {
-				resultBuilder.limits({ resultLimit: 1 });
-			}
 			return resultBuilder.done();
 		}
 
 		const truncation = truncateHead(output, { maxLines: Number.MAX_SAFE_INTEGER });
 		const resultBuilder = toolResult(details).text(truncation.content).sourcePath(tree.rootPath);
-		if (tree.truncated) {
-			resultBuilder.limits({ resultLimit: 1 });
-		}
 		if (truncation.truncated) {
 			resultBuilder.truncation(truncation, { direction: "head" });
-			details.truncation = truncation;
+			details.truncation = toReadTruncationStats(truncation);
 		}
 
 		return resultBuilder.done();

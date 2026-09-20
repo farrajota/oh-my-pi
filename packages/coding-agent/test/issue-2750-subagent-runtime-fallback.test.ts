@@ -7,9 +7,12 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ServingModel } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
+
 import { runSubprocess, type RunSubprocessOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition, AgentProgress } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+
 import { createSessionDefaults } from "./helpers/session-defaults";
 
 function runWithAuthority(options: Omit<RunSubprocessOptions, "agentRegistry" | "createAuthoritySession">) {

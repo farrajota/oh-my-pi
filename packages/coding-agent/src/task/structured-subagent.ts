@@ -20,7 +20,7 @@ import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" wit
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import isolationRecoveryHintTemplate from "../prompts/tools/isolation-recovery-hint.md" with { type: "text" };
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
-import type { TaskEffort } from "../thinking";
+import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
 import { buildOutputValidator } from "../tools/output-schema-validator";
@@ -283,9 +283,14 @@ export async function resolveEffectiveSubagentPolicy(
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
 
-	const discovery =
+	const discovered =
 		request.discovery ??
 		(await discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.()));
+	const sessionAgents = request.session.getSessionAgents?.() ?? [];
+	const knownNames = new Set(discovered.agents.map(candidate => candidate.name));
+	const discovery = sessionAgents.length
+		? { ...discovered, agents: [...discovered.agents, ...sessionAgents.filter(candidate => !knownNames.has(candidate.name))] }
+		: discovered;
 	const agent = getAgent(discovery.agents, agentName);
 	if (!agent) {
 		const available = discovery.agents.map(candidate => candidate.name).join(", ") || "none";
@@ -449,6 +454,7 @@ function buildExecutorOptions(
 		cwd: session.cwd,
 		additionalDirectories: session.additionalDirectories,
 		getApiKey: session.getApiKey,
+		credentialSourceSessionId: session.providerSessionId ?? session.getSessionId?.() ?? undefined,
 		agent: policy.effectiveAgent,
 		task: renderSubagentPrompt(request.assignment),
 		assignment: request.assignment.trim(),
