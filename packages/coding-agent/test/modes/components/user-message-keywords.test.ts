@@ -3,13 +3,15 @@ import * as path from "node:path";
 import * as url from "node:url";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ChatTranscriptBuilder } from "@oh-my-pi/pi-coding-agent/modes/components/chat-transcript-builder";
-import { CustomEditor } from "@oh-my-pi/pi-coding-agent/modes/components/custom-editor";
-import { formatUsageTimestamp } from "@oh-my-pi/pi-coding-agent/modes/components/usage-row";
-import { UserMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/user-message";
-import { chipLabel } from "@oh-my-pi/pi-coding-agent/modes/composer-attachments";
-import { imageReferenceHyperlink } from "@oh-my-pi/pi-coding-agent/modes/image-references";
-import { getEditorTheme, initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+
+import { ChatTranscriptBuilder } from "@oh-my-pi/pi-tui/chat/chat-transcript-builder";
+import { formatUsageTimestamp } from "@oh-my-pi/pi-tui/overlays/usage-row";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { UserMessageComponent } from "@oh-my-pi/pi-tui/chat/user-message";
+import { chipLabel, modelChipStyle, modelMentionChipLabel } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
+import { imageReferenceHyperlink } from "@oh-my-pi/pi-tui/prompt/image-references";
+import { getEditorTheme, initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import { Container } from "@oh-my-pi/pi-tui";
@@ -94,10 +96,11 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 		expect(raw).toContain("\x1b[1m");
 	});
 
+
 	it("preserves image hyperlinks when timestamp is the trailing constructor argument", () => {
 		const imagePath = path.resolve("/tmp/omp-image.png");
 		const imageUri = url.pathToFileURL(path.resolve(imagePath)).href;
-		const raw = new UserMessageComponent("please inspect [Image #1]", false, [imagePath], ISSUED_AT)
+        const raw = new UserMessageComponent("please inspect [Image #1]", { imageLinks: [imagePath], timestamp: ISSUED_AT })
 			.render(80)
 			.join("\n");
 		expect(Bun.stripANSI(raw)).toContain(chipLabel("image", 1));
@@ -109,7 +112,7 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 	it("renders a video marker as a video chip linked to its source", () => {
 		const videoPath = path.resolve("/tmp/omp-video.mp4");
 		const videoUri = url.pathToFileURL(videoPath).href;
-		const raw = new UserMessageComponent("please inspect [Video #1, 960x480]", false, [videoPath])
+		const raw = new UserMessageComponent("please inspect [Video #1, 960x480]", { imageLinks: [videoPath] })
 			.render(80)
 			.join("\n");
 		expect(Bun.stripANSI(raw)).toContain(chipLabel("video", 1));
@@ -147,7 +150,6 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 		};
 		const helpers = new UiHelpers({
 			chatContainer,
-			getUserMessageText: () => "please inspect [Image #1]",
 			sessionManager: sessionManagerMock,
 			viewSession: { sessionManager: sessionManagerMock },
 			transcriptMessageComponents: new WeakMap(),
@@ -201,25 +203,25 @@ describe("UserMessageComponent issued timestamp footer", () => {
 	it("exports the local timestamp formatter and renders a valid timestamp as a dim footer", () => {
 		expect(formatUsageTimestamp(ISSUED_AT)).toBe(ISSUED_AT_LABEL);
 
-		const raw = new UserMessageComponent("please inspect this", false, undefined, ISSUED_AT).render(80).join("\n");
+        const raw = new UserMessageComponent("please inspect this", { timestamp: ISSUED_AT }).render(80).join("\n");
 		expect(Bun.stripANSI(raw)).toContain(ISSUED_AT_LABEL);
 		expect(raw).toContain(theme.fg("dim", ISSUED_AT_LABEL));
 	});
 
 	it("omits the footer for synthetic messages", () => {
-		const raw = new UserMessageComponent("synthetic context", true, undefined, ISSUED_AT).render(80).join("\n");
+        const raw = new UserMessageComponent("synthetic context", { synthetic: true, timestamp: ISSUED_AT }).render(80).join("\n");
 		expect(Bun.stripANSI(raw)).not.toContain(ISSUED_AT_LABEL);
 	});
 
 	it("omits the footer for missing and invalid timestamps", () => {
 		for (const timestamp of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-			const raw = new UserMessageComponent("prompt body", false, undefined, timestamp).render(80).join("\n");
+            const raw = new UserMessageComponent("prompt body", { timestamp }).render(80).join("\n");
 			expect(Bun.stripANSI(raw)).not.toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
 		}
 	});
 
 	it("keeps the footer below fenced Markdown rather than extending the code block", () => {
-		const raw = new UserMessageComponent("```ts\nconst emittedAt = 1;\n```", false, undefined, ISSUED_AT)
+        const raw = new UserMessageComponent("```ts\nconst emittedAt = 1;\n```", { timestamp: ISSUED_AT })
 			.render(80)
 			.join("\n");
 		const lines = Bun.stripANSI(raw).split("\n");

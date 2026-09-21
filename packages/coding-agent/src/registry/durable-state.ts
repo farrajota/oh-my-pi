@@ -810,6 +810,399 @@ export function registryDurableJournalPath(sessionFile: string): string {
 	return `${path.resolve(sessionFile)}${REGISTRY_DURABLE_JOURNAL_SUFFIX}`;
 }
 
+export interface SessionAuthorityRepairResult {
+	readonly status: "clean" | "repairable" | "repaired";
+	readonly journalPath: string;
+	readonly affectedActorIds: readonly string[];
+	readonly originalHead: DurableRecoveryCursor | null;
+	readonly backupDirectory?: string;
+}
+
+interface RepairFileSnapshot {
+	readonly bytes: Buffer;
+	readonly text: string;
+	readonly metadata: DurableJournalMetadata;
+}
+
+interface RepairSourceIdentity {
+	readonly journalBytes: Buffer | undefined;
+	readonly journalText: string;
+	readonly journalMetadata: DurableJournalMetadata | undefined;
+	readonly markerBytes: Buffer | undefined;
+	readonly markerText: string | undefined;
+	readonly markerMetadata: DurableJournalMetadata | undefined;
+}
+
+interface RepairVerification {
+	readonly actors: ReadonlyMap<string, DurableActorRecord>;
+	readonly affectedActorIds: readonly string[];
+}
+
+interface RepairActorGeneration {
+	readonly record: DurableActorRecord;
+	readonly parentKey?: string;
+}
+
+const REPAIRABLE_QUARANTINE_REASON = "Actor references a missing or invalid parent.";
+
+function readRepairFile(filePath: string): RepairFileSnapshot | undefined {
+	try {
+		const stat = fs.lstatSync(filePath, { bigint: true });
+		if (!stat.isFile()) throw new Error(`Durable repair source is not a regular file: ${filePath}`);
+		const metadata = journalMetadataFromStat(stat);
+		const bytes = fs.readFileSync(filePath);
+		const after = journalMetadata(filePath);
+		if (!sameJournalMetadata(metadata, after)) throw new DurableStateConflictError();
+		return { bytes, text: bytes.toString("utf8"), metadata };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+function readRepairSource(journalPath: string): RepairSourceIdentity {
+	const journal = readRepairFile(journalPath);
+	const marker = readRepairFile(`${journalPath}.quarantine`);
+	return {
+		journalBytes: journal?.bytes,
+		journalText: journal?.text ?? "",
+		journalMetadata: journal?.metadata,
+		markerBytes: marker?.bytes,
+		markerText: marker?.text,
+		markerMetadata: marker?.metadata,
+	};
+}
+
+function repairJournalEntry(
+	record: DurableRegistryRecord,
+	sequence: number,
+	previousHash: string,
+): DurableJournalRecord {
+	validateRecord(record);
+	const base = {
+		version: DURABLE_STATE_VERSION,
+		sequence,
+		previousHash,
+		contentHash: canonicalDurableSha256(record),
+		record: Object.freeze({ ...record }) as DurableRegistryRecord,
+	};
+	return Object.freeze({ ...base, hash: journalHash(base) });
+}
+
+function verifyRepairLineage(records: readonly DurableJournalRecord[]): RepairVerification {
+	const state = createMutableRecoveryState();
+	const rootsByGeneration = new Map<string, DurableRootRecord>();
+	const actorsByGeneration = new Map<string, RepairActorGeneration>();
+	const actorSequences = new Map<string, number>();
+	const actorKey = (actorId: string, generation: number): string => `${actorId}\0${generation}`;
+	const rootKey = (rootId: string, generation: number): string => `${rootId}\0${generation}`;
+	for (const entry of records) {
+		const record = entry.record;
+		if (record.kind === "actor") {
+			const key = actorKey(record.actorId, record.generation);
+			const previous = actorsByGeneration.get(key);
+			const parentAtAppend = record.parentId === undefined ? undefined : state.actors.get(record.parentId);
+			applyRecord(state, record);
+			const root = rootsByGeneration.get(rootKey(record.rootId, record.rootGeneration));
+			if (!root || root.headHash !== record.rootHeadHash)
+				throw new Error("Actor references a missing or mismatched root head.");
+			let parentKey = previous?.parentKey;
+			if (!previous && record.parentId !== undefined) {
+				if (record.parentId === record.actorId) throw new Error("Actor parent graph contains a cycle.");
+				if (!parentAtAppend) throw new Error("Actor references a missing parent or cyclic lineage.");
+				parentKey = actorKey(parentAtAppend.actorId, parentAtAppend.generation);
+				if (!actorsByGeneration.has(parentKey))
+					throw new Error("Actor references a missing parent or cyclic lineage.");
+			}
+			actorsByGeneration.set(key, {
+				record,
+				...(parentKey === undefined ? {} : { parentKey }),
+			});
+			actorSequences.set(record.actorId, entry.sequence);
+			continue;
+		}
+		applyRecord(state, record);
+		if (record.kind === "root") rootsByGeneration.set(rootKey(record.rootId, record.generation), record);
+	}
+	for (const root of rootsByGeneration.values()) {
+		const actor = actorsByGeneration.get(actorKey(root.rootId, root.generation))?.record;
+		if (
+			!actor ||
+			actor.rootId !== root.rootId ||
+			actor.rootGeneration !== root.generation ||
+			actor.parentId !== undefined ||
+			root.headHash !==
+				durableRootHeadHash({
+					rootId: root.rootId,
+					generation: root.generation,
+					actorId: root.rootId,
+					startupHash: actor.startupHash,
+					provenanceHash: actor.provenanceHash,
+				})
+		)
+			throw new Error("Root head does not match its root actor identity.");
+	}
+	const terminal = (actor: DurableActorRecord): boolean => actor.state === "retired" || actor.state === "aborted";
+	const lineage = (generation: RepairActorGeneration): { depth: number; terminalAncestor: boolean } => {
+		const actor = generation.record;
+		const seen = new Set<string>();
+		let current = generation;
+		let depth = 0;
+		let terminalAncestor = false;
+		while (current.parentKey !== undefined) {
+			const currentKey = actorKey(current.record.actorId, current.record.generation);
+			if (seen.has(currentKey)) throw new Error("Actor parent graph contains a cycle.");
+			seen.add(currentKey);
+			const parent = actorsByGeneration.get(current.parentKey);
+			if (
+				!parent ||
+				parent.record.rootId !== actor.rootId ||
+				parent.record.rootGeneration !== actor.rootGeneration ||
+				parent.record.rootHeadHash !== actor.rootHeadHash
+			)
+				throw new Error("Actor references a missing or invalid parent.");
+			if (current.record.parentScopeHash !== undefined && current.record.parentScopeHash !== parent.record.scopeHash)
+				throw new Error("Actor parent permission snapshot drifted.");
+			depth++;
+			if (terminal(parent.record)) terminalAncestor = true;
+			current = parent;
+		}
+		if (
+			current.record.actorId !== actor.rootId ||
+			current.record.rootId !== actor.rootId ||
+			current.record.generation !== actor.rootGeneration ||
+			current.record.rootHeadHash !== actor.rootHeadHash
+		)
+			throw new Error("Actor root lineage is invalid.");
+		return { depth, terminalAncestor };
+	};
+	for (const generation of actorsByGeneration.values()) lineage(generation);
+	const affected = new Set<string>();
+	const depths = new Map<string, number>();
+	for (const actor of state.actors.values()) {
+		const generation = actorsByGeneration.get(actorKey(actor.actorId, actor.generation));
+		if (!generation) throw new Error("Actor historical generation is missing.");
+		const root = rootsByGeneration.get(rootKey(actor.rootId, actor.rootGeneration));
+		if (!root || root.headHash !== actor.rootHeadHash)
+			throw new Error("Actor references a missing or mismatched root head.");
+		const currentRoot = state.roots.get(actor.rootId);
+		if (
+			!terminal(actor) &&
+			(!currentRoot ||
+				currentRoot.state !== "active" ||
+				currentRoot.generation !== actor.rootGeneration ||
+				currentRoot.headHash !== actor.rootHeadHash)
+		)
+			throw new Error("Actor references a missing or mismatched root head.");
+		const actorLineage = lineage(generation);
+		depths.set(actor.actorId, actorLineage.depth);
+		if (!terminal(actor) && actorLineage.terminalAncestor) affected.add(actor.actorId);
+	}
+	const affectedActorIds = [...affected].sort((left, right) => {
+		const depthDelta = (depths.get(right) ?? 0) - (depths.get(left) ?? 0);
+		return depthDelta || (actorSequences.get(right) ?? 0) - (actorSequences.get(left) ?? 0);
+	});
+	return Object.freeze({
+		actors: state.actors,
+		affectedActorIds: Object.freeze(affectedActorIds),
+	});
+}
+
+function sameRepairBytes(left: Buffer | undefined, right: Buffer | undefined): boolean {
+	return left === undefined ? right === undefined : right !== undefined && left.equals(right);
+}
+
+function assertRepairSourceUnchanged(journalPath: string, source: RepairSourceIdentity): void {
+	const current = readRepairSource(journalPath);
+	if (
+		!sameRepairBytes(current.journalBytes, source.journalBytes) ||
+		!sameJournalMetadata(current.journalMetadata, source.journalMetadata) ||
+		!sameRepairBytes(current.markerBytes, source.markerBytes) ||
+		!sameJournalMetadata(current.markerMetadata, source.markerMetadata)
+	)
+		throw new DurableStateConflictError("Durable repair source changed during publication.");
+}
+
+function fsyncFile(filePath: string): void {
+	const handle = fs.openSync(filePath, fs.constants.O_RDONLY | O_NOFOLLOW);
+	try {
+		fs.fsyncSync(handle);
+	} finally {
+		fs.closeSync(handle);
+	}
+}
+
+function writeRepairBackup(filePath: string, bytes: Uint8Array): void {
+	fs.writeFileSync(filePath, bytes, { mode: 0o600, flag: "wx" });
+	fsyncFile(filePath);
+}
+
+function fsyncDirectory(directory: string): void {
+	const handle = fs.openSync(directory, fs.constants.O_RDONLY);
+	try {
+		fs.fsyncSync(handle);
+	} finally {
+		fs.closeSync(handle);
+	}
+}
+
+/** Restores quarantine without overwriting a competing pathname occupant. */
+function restoreRepairMarker(markerPath: string, capturedPath: string | undefined, backupPath: string): void {
+	if (capturedPath !== undefined) {
+		try {
+			fs.linkSync(capturedPath, markerPath);
+			fs.unlinkSync(capturedPath);
+			fsyncDirectory(path.dirname(markerPath));
+			fsyncDirectory(path.dirname(capturedPath));
+			return;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "EEXIST") return;
+			if (code !== "ENOENT") throw error;
+		}
+	}
+	try {
+		fs.linkSync(backupPath, markerPath);
+		fsyncDirectory(path.dirname(markerPath));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
+		throw error;
+	}
+}
+
+/** Atomically moves the pathname into private evidence, then proves it is the exact marker verified before publication. */
+function captureVerifiedRepairMarker(markerPath: string, capturedPath: string, source: RepairSourceIdentity): void {
+	try {
+		fs.renameSync(markerPath, capturedPath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT")
+			throw new DurableStateConflictError("Durable repair quarantine marker disappeared during publication.");
+		throw error;
+	}
+	const captured = readRepairFile(capturedPath);
+	if (
+		!captured ||
+		!source.markerMetadata ||
+		!sameJournalIdentity(captured.metadata, source.markerMetadata) ||
+		captured.metadata.size !== source.markerMetadata.size ||
+		!sameRepairBytes(captured.bytes, source.markerBytes)
+	)
+		throw new DurableStateConflictError("Durable repair quarantine marker changed during publication.");
+	if (readRepairFile(markerPath) !== undefined)
+		throw new DurableStateConflictError("Durable repair quarantine marker changed during publication.");
+}
+
+/** Diagnose or explicitly repair a session authority journal without normal recovery side effects. */
+export async function repairSessionAuthority(
+	sessionFile: string,
+	options: { apply?: boolean } = {},
+): Promise<SessionAuthorityRepairResult> {
+	const journalPath = registryDurableJournalPath(sessionFile);
+	const source = readRepairSource(journalPath);
+	const markerReason = source.markerText?.trim();
+	if (markerReason !== undefined && markerReason !== REPAIRABLE_QUARANTINE_REASON)
+		throw new Error("Durable repair refuses an unexplained quarantine marker.");
+	let records: readonly DurableJournalRecord[];
+	try {
+		records = readJournalFile(journalPath);
+	} catch (error) {
+		throw new Error(`Durable repair verification failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	const verification = verifyRepairLineage(records);
+	const repairable = verification.affectedActorIds.length > 0 || markerReason !== undefined;
+	const originalHead = currentCursor(records);
+	if (!options.apply || !repairable) {
+		return Object.freeze({
+			status: repairable ? "repairable" : "clean",
+			journalPath,
+			affectedActorIds: verification.affectedActorIds,
+			originalHead,
+		});
+	}
+	const lock = FileLock.tryAcquire(journalPath);
+	if (!lock.acquired) throw new DurableStateConflictError("Durable repair could not acquire the journal lock.");
+	const markerPath = `${journalPath}.quarantine`;
+	const markerLock = source.markerText === undefined ? undefined : FileLock.tryAcquire(markerPath);
+	if (markerLock && !markerLock.acquired) {
+		lock.release();
+		throw new DurableStateConflictError("Durable repair could not acquire the quarantine marker lock.");
+	}
+	let backupDirectory: string | undefined;
+	let backupMarkerPath: string | undefined;
+	let capturedMarkerPath: string | undefined;
+	let journalPublished = false;
+	let markerResolved = source.markerText === undefined;
+	try {
+		assertRepairSourceUnchanged(journalPath, source);
+		const lockedRecords = readJournalFile(journalPath);
+		const lockedVerification = verifyRepairLineage(lockedRecords);
+		const lockedHead = currentCursor(lockedRecords);
+		if (
+			lockedHead?.sequence !== originalHead?.sequence ||
+			lockedHead?.hash !== originalHead?.hash ||
+			lockedVerification.affectedActorIds.join("\0") !== verification.affectedActorIds.join("\0")
+		)
+			throw new DurableStateConflictError("Durable repair lineage changed before publication.");
+		backupDirectory = fs.mkdtempSync(path.join(path.dirname(journalPath), ".authority-repair-"));
+		if (source.journalBytes !== undefined)
+			writeRepairBackup(path.join(backupDirectory, path.basename(journalPath)), source.journalBytes);
+		if (source.markerBytes !== undefined) {
+			backupMarkerPath = path.join(backupDirectory, path.basename(markerPath));
+			writeRepairBackup(backupMarkerPath, source.markerBytes);
+		}
+		fsyncDirectory(backupDirectory);
+		fsyncDirectory(path.dirname(journalPath));
+		const appended: DurableJournalRecord[] = [];
+		let previousHash = lockedHead?.hash ?? GENESIS_HASH;
+		let sequence = (lockedHead?.sequence ?? 0) + 1;
+		for (const actorId of lockedVerification.affectedActorIds) {
+			const actor = lockedVerification.actors.get(actorId);
+			if (!actor) throw new Error("Durable repair candidate disappeared during staging.");
+			const terminalRecord = Object.freeze({ ...actor, at: Date.now(), state: "retired" as const });
+			const entry = repairJournalEntry(terminalRecord, sequence++, previousHash);
+			appended.push(entry);
+			previousHash = entry.hash;
+		}
+		const stagedRecords = Object.freeze([...lockedRecords, ...appended]);
+		if (verifyRepairLineage(stagedRecords).affectedActorIds.length > 0)
+			throw new Error("Durable repair did not close every terminal-parent descendant.");
+		const stagedText = `${source.journalText}${appended.map(entry => `${JSON.stringify(entry)}\n`).join("")}`;
+		const stagedPath = path.join(backupDirectory, ".staged-authority.jsonl");
+		fs.writeFileSync(stagedPath, stagedText, { mode: 0o600, flag: "wx" });
+		fsyncFile(stagedPath);
+		new RegistryDurableStateStore(stagedPath).snapshot();
+		assertRepairSourceUnchanged(journalPath, source);
+		fs.renameSync(stagedPath, journalPath);
+		journalPublished = true;
+		fsyncDirectory(path.dirname(journalPath));
+		if (source.markerText !== undefined) {
+			capturedMarkerPath = path.join(backupDirectory, ".captured-quarantine-marker");
+			captureVerifiedRepairMarker(markerPath, capturedMarkerPath, source);
+			fsyncFile(capturedMarkerPath);
+			fsyncDirectory(backupDirectory);
+		}
+		if (readRepairFile(markerPath) !== undefined)
+			throw new DurableStateConflictError("Durable repair quarantine marker changed during publication.");
+		fsyncDirectory(path.dirname(journalPath));
+		markerResolved = true;
+		return Object.freeze({
+			status: "repaired",
+			journalPath,
+			affectedActorIds: verification.affectedActorIds,
+			originalHead,
+			backupDirectory,
+		});
+	} finally {
+		try {
+			if (journalPublished && !markerResolved && backupMarkerPath)
+				restoreRepairMarker(markerPath, capturedMarkerPath, backupMarkerPath);
+		} finally {
+			markerLock?.release();
+			lock.release();
+		}
+	}
+}
+
 const registryDurableStoresByPath = new Map<string, RegistryDurableStateStore>();
 
 /** Process-local singleton for one session authority journal. */
@@ -939,157 +1332,145 @@ interface MutableDurableRecoveryState {
 	localEntries: Map<string, DurableLocalEntryRecord>;
 }
 
+function createMutableRecoveryState(): MutableDurableRecoveryState {
+	return {
+		head: null,
+		roots: new Map<string, DurableRootRecord>(),
+		actors: new Map<string, DurableActorRecord>(),
+		constructions: new Map<string, DurableConstructionRecord>(),
+		gates: new Map<string, DurableGateRecord>(),
+		operations: new Map<string, DurableOperationRecord>(),
+		transitions: new Map<string, DurableTransitionRecord>(),
+		resources: new Map<string, DurableResourceRecord>(),
+		localHeads: new Map<string, DurableLocalHeadRecord>(),
+		localEntries: new Map<string, DurableLocalEntryRecord>(),
+	};
+}
+
+function applyRecord(state: MutableDurableRecoveryState, record: DurableRegistryRecord): void {
+	switch (record.kind) {
+		case "root": {
+			const previous = state.roots.get(record.rootId);
+			if (previous && record.generation < previous.generation && previous.state !== "invalidated")
+				throw new Error("Root generation regressed.");
+			if (previous && record.generation === previous.generation && previous.headHash !== record.headHash)
+				throw new Error("Root generation has multiple head hashes.");
+			state.roots.set(record.rootId, record);
+			return;
+		}
+		case "actor": {
+			const previous = state.actors.get(record.actorId);
+			if (previous && record.generation < previous.generation) throw new Error("Actor generation regressed.");
+			if (
+				previous &&
+				record.generation === previous.generation &&
+				(previous.rootId !== record.rootId ||
+					previous.parentId !== record.parentId ||
+					previous.rootGeneration !== record.rootGeneration ||
+					previous.rootHeadHash !== record.rootHeadHash ||
+					previous.startupHash !== record.startupHash ||
+					previous.provenanceHash !== record.provenanceHash ||
+					previous.scopeHash !== record.scopeHash ||
+					previous.parentScopeHash !== record.parentScopeHash)
+			)
+				throw new Error("Actor immutable identity changed.");
+			state.actors.set(record.actorId, record);
+			return;
+		}
+		case "construction": {
+			const key = constructionKey(record);
+			const previous = state.constructions.get(key);
+			if (
+				previous &&
+				(previous.startupHash !== record.startupHash ||
+					previous.provenanceHash !== record.provenanceHash ||
+					previous.parentId !== record.parentId ||
+					previous.scopeHash !== record.scopeHash ||
+					previous.parentScopeHash !== record.parentScopeHash)
+			)
+				throw new Error("Construction identity changed.");
+			assertProgress(previous?.phase, record.phase, CONSTRUCTION_ORDER, ["activated", "abandoned"], "Construction");
+			state.constructions.set(key, record);
+			return;
+		}
+		case "gate": {
+			const previous = state.gates.get(record.rootId);
+			if (previous && record.generation < previous.generation) throw new Error("Gate generation regressed.");
+			state.gates.set(record.rootId, record);
+			return;
+		}
+		case "operation": {
+			const key = operationKey(record);
+			operationProgress(state.operations.get(key), record);
+			state.operations.set(key, record);
+			return;
+		}
+		case "transition": {
+			const key = transitionKey(record);
+			const previous = state.transitions.get(key);
+			if (
+				previous &&
+				(previous.sourceGeneration !== record.sourceGeneration ||
+					previous.destinationGeneration !== record.destinationGeneration ||
+					previous.sourceHeadHash !== record.sourceHeadHash ||
+					previous.destinationHeadHash !== record.destinationHeadHash)
+			)
+				throw new Error("Root transition identity changed.");
+			assertProgress(previous?.phase, record.phase, TRANSITION_ORDER, ["retired", "recovered"], "Root transition");
+			state.transitions.set(key, record);
+			return;
+		}
+		case "resource": {
+			const key = resourceKey(record);
+			resourceProgress(state.resources.get(key), record);
+			state.resources.set(key, record);
+			return;
+		}
+		case "local-entry": {
+			const key = localEntryKey(record);
+			const previous = state.localEntries.get(key);
+			if (
+				previous &&
+				(previous.expectedHeadHash !== record.expectedHeadHash ||
+					previous.entryHash !== record.entryHash ||
+					previous.headHash !== record.headHash)
+			)
+				throw new Error("Local entry identity changed.");
+			assertProgress(
+				previous?.phase,
+				record.phase,
+				["intent", "effect", "committed"],
+				["committed", "conflict", "cancelled"],
+				"Local entry",
+			);
+			state.localEntries.set(key, record);
+			return;
+		}
+		case "local-head": {
+			const previous = state.localHeads.get(record.localId);
+			if (!previous) {
+				if (record.version !== 1 || record.previousHeadHash !== GENESIS_HASH)
+					throw new Error("Local journal does not begin at the genesis head.");
+			} else if (record.version !== previous.version + 1 || record.previousHeadHash !== previous.headHash) {
+				throw new Error("Local journal head compare-and-swap mismatch.");
+			}
+			state.localHeads.set(record.localId, record);
+			return;
+		}
+	}
+}
+
 function applyRecords(store: RegistryDurableStateStore): MutableDurableRecoveryState {
-	const roots = new Map<string, DurableRootRecord>();
-	const actors = new Map<string, DurableActorRecord>();
-	const constructions = new Map<string, DurableConstructionRecord>();
-	const gates = new Map<string, DurableGateRecord>();
-	const operations = new Map<string, DurableOperationRecord>();
-	const transitions = new Map<string, DurableTransitionRecord>();
-	const resources = new Map<string, DurableResourceRecord>();
-	const localHeads = new Map<string, DurableLocalHeadRecord>();
-	const localEntries = new Map<string, DurableLocalEntryRecord>();
+	const state = createMutableRecoveryState();
 	let cursor: DurableRecoveryCursor | null = null;
 	while (true) {
 		const batch = store.readBatch(cursor);
-		for (const entry of batch.records) {
-			const record = entry.record;
-			switch (record.kind) {
-				case "root": {
-					const previous = roots.get(record.rootId);
-					if (previous && record.generation < previous.generation && previous.state !== "invalidated")
-						throw new Error("Root generation regressed.");
-					if (previous && record.generation === previous.generation && previous.headHash !== record.headHash)
-						throw new Error("Root generation has multiple head hashes.");
-					roots.set(record.rootId, record);
-					break;
-				}
-				case "actor": {
-					const previous = actors.get(record.actorId);
-					if (previous && record.generation < previous.generation) throw new Error("Actor generation regressed.");
-					if (
-						previous &&
-						record.generation === previous.generation &&
-						(previous.rootId !== record.rootId ||
-							previous.parentId !== record.parentId ||
-							previous.startupHash !== record.startupHash ||
-							previous.provenanceHash !== record.provenanceHash ||
-							previous.scopeHash !== record.scopeHash ||
-							previous.parentScopeHash !== record.parentScopeHash)
-					)
-						throw new Error("Actor immutable identity changed.");
-					actors.set(record.actorId, record);
-					break;
-				}
-				case "construction": {
-					const key = constructionKey(record);
-					const previous = constructions.get(key);
-					if (
-						previous &&
-						(previous.startupHash !== record.startupHash ||
-							previous.provenanceHash !== record.provenanceHash ||
-							previous.parentId !== record.parentId ||
-							previous.scopeHash !== record.scopeHash ||
-							previous.parentScopeHash !== record.parentScopeHash)
-					)
-						throw new Error("Construction identity changed.");
-					assertProgress(
-						previous?.phase,
-						record.phase,
-						CONSTRUCTION_ORDER,
-						["activated", "abandoned"],
-						"Construction",
-					);
-					constructions.set(key, record);
-					break;
-				}
-				case "gate": {
-					const previous = gates.get(record.rootId);
-					if (previous && record.generation < previous.generation) throw new Error("Gate generation regressed.");
-					gates.set(record.rootId, record);
-					break;
-				}
-				case "operation": {
-					const key = operationKey(record);
-					operationProgress(operations.get(key), record);
-					operations.set(key, record);
-					break;
-				}
-				case "transition": {
-					const key = transitionKey(record);
-					const previous = transitions.get(key);
-					if (
-						previous &&
-						(previous.sourceGeneration !== record.sourceGeneration ||
-							previous.destinationGeneration !== record.destinationGeneration ||
-							previous.sourceHeadHash !== record.sourceHeadHash ||
-							previous.destinationHeadHash !== record.destinationHeadHash)
-					)
-						throw new Error("Root transition identity changed.");
-					assertProgress(
-						previous?.phase,
-						record.phase,
-						TRANSITION_ORDER,
-						["retired", "recovered"],
-						"Root transition",
-					);
-					transitions.set(key, record);
-					break;
-				}
-				case "resource": {
-					const key = resourceKey(record);
-					resourceProgress(resources.get(key), record);
-					resources.set(key, record);
-					break;
-				}
-				case "local-entry": {
-					const key = localEntryKey(record);
-					const previous = localEntries.get(key);
-					if (
-						previous &&
-						(previous.expectedHeadHash !== record.expectedHeadHash ||
-							previous.entryHash !== record.entryHash ||
-							previous.headHash !== record.headHash)
-					)
-						throw new Error("Local entry identity changed.");
-					assertProgress(
-						previous?.phase,
-						record.phase,
-						["intent", "effect", "committed"],
-						["committed", "conflict", "cancelled"],
-						"Local entry",
-					);
-					localEntries.set(key, record);
-					break;
-				}
-				case "local-head": {
-					const previous = localHeads.get(record.localId);
-					if (!previous) {
-						if (record.version !== 1 || record.previousHeadHash !== GENESIS_HASH)
-							throw new Error("Local journal does not begin at the genesis head.");
-					} else if (record.version !== previous.version + 1 || record.previousHeadHash !== previous.headHash) {
-						throw new Error("Local journal head compare-and-swap mismatch.");
-					}
-					localHeads.set(record.localId, record);
-					break;
-				}
-			}
-		}
+		for (const entry of batch.records) applyRecord(state, entry.record);
 		cursor = batch.cursor;
 		if (batch.done) break;
 	}
-	return {
-		head: cursor,
-		roots,
-		actors,
-		constructions,
-		gates,
-		operations,
-		transitions,
-		resources,
-		localHeads,
-		localEntries,
-	};
+	state.head = cursor;
+	return state;
 }
 
 function validateSnapshot(state: MutableDurableRecoveryState): void {

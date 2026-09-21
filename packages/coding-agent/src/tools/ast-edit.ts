@@ -8,25 +8,19 @@ import { replaceTabs, Text } from "@oh-my-pi/pi-tui";
 import { $envpos, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
-import { formatHashlineHeader } from "./hashline-format";
+import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import type { Theme } from "../modes/theme/theme";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
-import {
-	Ellipsis,
-	fileHyperlink,
-	framedBlock,
-	outputBlockContentWidth,
-	renderStatusLine,
-	truncateToWidth,
-} from "../tui";
+import { Ellipsis, fileHyperlink, renderStatusLine, truncateToWidth } from "@oh-my-pi/pi-tui/render";
+import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { AuthorizedFilesystemTarget } from "../internal/session-path-scope";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import { parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
-import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "./grouped-file-output";
+import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import type { OutputMeta } from "./output-meta";
 import { isInternalUrlPath, resolveToolSearchScope } from "./path-utils";
 import {
@@ -38,7 +32,7 @@ import {
 	formatMoreItems,
 	formatParseErrors,
 	formatParseErrorsCountLabel,
-} from "./render-utils";
+} from "@oh-my-pi/pi-tui/render/render-utils";
 import { PREVIEW_LIMITS } from "./preview-limits";
 import { PREVIEW_PENDING_NOTICE, queueResolveHandler } from "./resolve";
 import { ToolError } from "./tool-errors";
@@ -695,12 +689,11 @@ export const astEditToolRenderer = {
 		if (result.isError) {
 			const errorText = result.content?.find(c => c.type === "text")?.text || "Unknown error";
 			const header = renderStatusLine({ icon: "error", title: "AST Edit" }, uiTheme);
-			return framedBlock(uiTheme, width => ({
+			return framedToolCard(uiTheme, () => ({
 				header,
-				sections: [{ lines: formatErrorDetail(errorText, uiTheme).split("\n") }],
-				state: "error",
+				sections: [{ content: formatErrorDetail(errorText, uiTheme).split("\n") }],
+				phase: "error",
 				borderColor: "error",
-				width,
 			}));
 		}
 
@@ -721,15 +714,13 @@ export const astEditToolRenderer = {
 			const bodyLines: string[] = [];
 			appendParseErrorsBulletList(bodyLines, details?.parseErrors, uiTheme, details?.parseErrorsTotal);
 			if (bodyLines.length === 0) return new Text(header, 0, 0);
-			return framedBlock(uiTheme, width => ({
+			return framedToolCard(uiTheme, () => ({
 				header,
-				sections: [{ lines: bodyLines }],
-				state: "warning",
+				sections: [{ content: bodyLines }],
+				phase: "warning",
 				borderColor: "borderMuted",
-				width,
 			}));
 		}
-
 		const summaryParts = [formatCount("replacement", totalReplacements), formatCount("file", filesTouched)];
 		const meta = [...summaryParts];
 		if (details?.scopePath) meta.push(`in ${details.scopePath}`);
@@ -782,17 +773,15 @@ export const astEditToolRenderer = {
 				uiTheme.fg("warning", formatParseErrorsCountLabel(details.parseErrors, details.parseErrorsTotal)),
 			);
 		}
-		return framedBlock(uiTheme, width => {
+		return framedToolCard(uiTheme, ({ contentWidth }) => {
 			const changeLines = buildChangeBody(changeGroups, Boolean(options.expanded), COLLAPSED_CHANGE_LIMIT, uiTheme);
-			const innerWidth = outputBlockContentWidth(width);
-			const bodyLines = [...changeLines, ...extraLines].map(l => truncateToWidth(l, innerWidth, Ellipsis.Omit));
+			const bodyLines = [...changeLines, ...extraLines].map(l => truncateToWidth(l, contentWidth, Ellipsis.Omit));
 			while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
 			return {
 				header,
-				sections: bodyLines.length > 0 ? [{ lines: bodyLines }] : [],
-				state: options.isPartial ? "pending" : "success",
+				sections: bodyLines.length > 0 ? [{ content: bodyLines }] : [],
+				phase: options.isPartial ? "pending" : "success",
 				borderColor: "borderMuted",
-				width,
 			};
 		});
 	},

@@ -16,6 +16,7 @@
  */
 
 import { type } from "@oh-my-pi/omptype";
+import { POLL_WAIT_LADDER_MS } from "../../async/job-manager";
 import type {
 	AgentTool,
 	AgentToolContext,
@@ -41,15 +42,16 @@ import {
 	resolveHubSessionAccess,
 	type HubSessionAccess,
 } from "../../internal/hub-authority";
-import type { Theme } from "../../modes/theme/theme";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import hubDescription from "../../prompts/tools/hub.md" with { type: "text" };
 import type { AgentRegistry } from "../../registry/agent-registry";
-import type { ToolActivitySummary } from "../renderers";
+import type { ToolActivitySummary } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { ToolSession } from "..";
 import {
 	buildJobResult,
 	executeCancel,
 	executeJobsSnapshot,
+	isWaitingPollDetails,
 	jobsRenderCall,
 	jobsRenderResult,
 	type HubJobScope,
@@ -494,7 +496,12 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 				: result;
 			if (admission) {
 				settlementStarted = true;
-				admission.transaction.commit();
+				const retryableWait =
+					params.op === "wait" &&
+					!onUpdate &&
+					isWaitingPollDetails((admittedResult as AgentToolResult<CoordinationDetails>).details);
+				if (retryableWait) admission.transaction.rollback();
+				else admission.transaction.commit();
 			}
 			return admittedResult;
 		} catch (error) {
@@ -577,22 +584,34 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 			// waited on. Single atomic take: the rest of the backlog stays queued.
 			const queued = messaging.bus.take(messaging.senderId, from, transaction);
 			if (queued) return messageResult(messaging.senderId, queued);
-			if (!from) {
-				// A bare wait can only be satisfied by a running peer eventually
-				// sending something; with none, return the snapshot immediately
-				// instead of blocking a full message-timeout window.
-				const hasRunningPeer = transaction.select(() =>
-					messaging.registry
-						.listVisibleTo(messaging.senderId)
-						.some(
-							ref =>
-								(messaging.rootId === undefined || ref.lineage?.rootId === messaging.rootId) &&
-								messaging.registry.isRunning(ref),
-						),
-				);
-				if (!hasRunningPeer) return transaction.select(() => nothingToWaitForResult(this.session));
+			const runningPeers = transaction.select(() =>
+				messaging.registry.listVisibleTo(messaging.senderId).filter(ref => messaging.registry.isRunning(ref)),
+			);
+			const inScopeRunning = runningPeers.some(
+				ref =>
+					(messaging.rootId === undefined || ref.lineage?.rootId === messaging.rootId) &&
+					(!from || ref.id === from),
+			);
+			const legacyRunning = runningPeers.some(
+				ref =>
+					(ref.lineage === undefined || ref.lineage.rootId === ref.id) &&
+					(!from || ref.id === from),
+			);
+			if (!from && !inScopeRunning && !legacyRunning) {
+				return transaction.select(() => nothingToWaitForResult(this.session));
 			}
-			return executeMessageWait(messaging, { from, timeoutMs: params.timeoutMs }, signal, transaction);
+			const waitMs =
+				params.timeoutMs !== undefined
+					? normalizeIrcTimeoutMs(params.timeoutMs)
+					: manager
+						? transaction.select(() => resolvePollWindow(this.session, manager, ownerId)).waitMs
+						: POLL_WAIT_LADDER_MS[0];
+			return executeMessageWait(
+				{ ...messaging, liveness: inScopeRunning || !legacyRunning },
+				{ from, timeoutMs: waitMs },
+				signal,
+				transaction,
+			);
 		}
 
 		// Wait window: explicit timeout wins (0 = no window); otherwise the

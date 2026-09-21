@@ -4,7 +4,7 @@ import type { Effort } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
 import type { AutoRetryEndEvent, AutoRetryStartEvent } from "../extensibility/shared-events";
 import type { Goal, GoalModeState } from "../goals/state";
-import type { ConfiguredThinkingLevel } from "../thinking";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { TodoItem } from "../tools/todo";
 import type { CustomMessage } from "./messages";
 

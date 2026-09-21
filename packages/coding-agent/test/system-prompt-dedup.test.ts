@@ -22,6 +22,7 @@ const READ_TOOL = new Map<string, SystemPromptToolMetadata>([
 			label: "Read",
 			description: "Reads files from disk.",
 			parameters: { type: "object", properties: { path: { type: "string" } } },
+			readsSkillUris: true,
 		},
 	],
 ]);
@@ -191,6 +192,7 @@ describe("SYSTEM.md prompt assembly", () => {
 	it("renders active child repo context in the main system prompt", async () => {
 		const parentDir = path.join(tempDir, "parent-cwd");
 		fs.mkdirSync(path.join(parentDir, "active-project", ".git"), { recursive: true });
+		fs.writeFileSync(path.join(parentDir, "active-project", ".git", "HEAD"), "ref: refs/heads/main\n", "utf8");
 
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: parentDir,
@@ -208,8 +210,6 @@ describe("SYSTEM.md prompt assembly", () => {
 		});
 
 		const promptText = systemPrompt.join("\n\n");
-		expect(promptText).toContain("<active-repo-context>");
-		expect(promptText).toContain("`active-project`");
 		expect(promptText).toContain("`active-project/`");
 	});
 

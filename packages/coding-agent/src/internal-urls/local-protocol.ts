@@ -16,7 +16,7 @@ import {
 	type DurableLocalBackingExpectation,
 	type DurableLocalState,
 } from "../registry/durable-state";
-import { isMarkdownPath } from "../utils/lang-from-path";
+import { isMarkdownPath } from "@oh-my-pi/pi-tui/lang-from-path";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
 import type {

@@ -16,7 +16,7 @@ import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/p
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, EffectivePermissionSummary } from "@oh-my-pi/pi-coding-agent/task/types";
-import { resolveTaskEffortLevel } from "@oh-my-pi/pi-coding-agent/thinking";
+import { resolveTaskEffortLevel } from "@oh-my-pi/pi-tui/thinking";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
@@ -226,6 +226,46 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(spy.mock.calls[1]?.[0]?.toolNames).toBeUndefined();
 	});
 
+	it("does not inject hub into read-only subagents", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const readOnlyResult = await runSubprocess({
+			...baseOptions,
+			id: "read-only-child",
+			agent: { ...baseAgent, tools: ["read", "grep", "glob"] },
+		});
+		const writableResult = await runSubprocess({
+			...baseOptions,
+			id: "writable-child",
+			agent: { ...baseAgent, tools: ["read", "write"] },
+		});
+		const spawningResult = await runSubprocess({
+			...baseOptions,
+			id: "spawning-child",
+			agent: { ...baseAgent, tools: ["read"], spawns: ["scout"] },
+		});
+
+		expect(readOnlyResult.exitCode).toBe(0);
+		expect(writableResult.exitCode).toBe(0);
+		expect(spawningResult.exitCode).toBe(0);
+		expect(spy.mock.calls[0]?.[0]?.toolNames).toEqual(["read", "grep", "glob"]);
+		expect(spy.mock.calls[1]?.[0]?.toolNames).toEqual(["read", "write", "hub"]);
+		expect(spy.mock.calls[2]?.[0]?.toolNames).toEqual(["read", "task", "hub"]);
+
+		const promptText = (index: number): string => {
+			const prompt = spy.mock.calls[index]?.[0]?.systemPrompt;
+			const resolved = typeof prompt === "function" ? prompt(["default"]) : prompt;
+			return Array.isArray(resolved) ? resolved.join("\n") : (resolved ?? "");
+		};
+		const readOnlyPrompt = promptText(0);
+		const writablePrompt = promptText(1);
+		const spawningPrompt = promptText(2);
+		expect(readOnlyPrompt.includes("# Peers")).toBe(false);
+		expect(writablePrompt.includes("# Peers")).toBe(true);
+		expect(spawningPrompt.includes("# Peers")).toBe(true);
+	});
+
 	it("records the spawning agent as parentAgentId, distinct from the child's own id and prefix", async () => {
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
@@ -246,7 +286,8 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(forwarded?.parentTaskPrefix).toBe("ChildAgent");
 	});
 
-	it("keeps a restricted child free of MCP capabilities and discovery preloads", async () => {
+
+	it("removes MCP and fresh discovery sources for a restricted child", async () => {
 		const session = yieldEmittingSession();
 		const persistedInits: Array<{ restrictToolNames?: boolean; tools: string[] }> = [];
 		vi.spyOn(session.sessionManager, "appendSessionInit").mockImplementation(init => {
@@ -267,6 +308,7 @@ describe("runSubprocess fresh child-session boundary", () => {
 		});
 
 		expect(result.exitCode).toBe(0);
+
 		const created = spy.mock.calls[0]?.[0];
 		expect(created?.restrictToolNames).toBe(true);
 		expect(created?.enableMCP).toBe(false);
@@ -275,6 +317,11 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(created?.preloadedExtensionPaths).toEqual([]);
 		expect(created?.preloadedPreparedExtensions).toEqual([]);
 		expect(created?.preloadedCustomToolPaths).toEqual([]);
+		expect(getTools).not.toHaveBeenCalled();
+		expect(created?.outputSchemaMode).toBe("strict");
+		expect(persistedInits).toHaveLength(1);
+		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, tools: ["read", "yield"] });
+
 	});
 
 	it("persists bridge-only tools in the enabled Code Mode set", async () => {

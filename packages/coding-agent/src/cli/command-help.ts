@@ -104,6 +104,10 @@ export const shareHelp = {
 	description: "Share a saved session via an encrypted link (same as /share)",
 } satisfies CommandMetadata;
 
+export const sessionHelp = {
+	description: "Inspect or repair saved session authority (repair is dry-run by default)",
+} satisfies CommandMetadata;
+
 export const setupHelp = {
 	description: "Run onboarding setup or install dependencies for optional features",
 } satisfies CommandMetadata;
@@ -113,6 +117,10 @@ export const shellHelp = { description: "Interactive shell console" } satisfies 
 export const sshHelp = { description: "Manage SSH host configurations" } satisfies CommandMetadata;
 
 export const statsHelp = { description: "View usage statistics" } satisfies CommandMetadata;
+
+export const streamHelp = {
+	description: "Broadcast local omp session screens and chat to your public live channel",
+} satisfies CommandMetadata;
 
 export const tinyModelsHelp = {
 	description: "Download tiny local models (session titles + memory)",

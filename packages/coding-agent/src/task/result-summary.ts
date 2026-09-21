@@ -8,7 +8,7 @@
 import { prompt } from "@oh-my-pi/pi-utils";
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { AgentRegistry } from "../registry/agent-registry";
-import { formatBytes, formatDuration } from "../tools/render-utils";
+import { formatBytes, formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { SingleResult } from "./types";
 import { formatEffectivePermissionSummaryLines } from "./permission-profiles";
 

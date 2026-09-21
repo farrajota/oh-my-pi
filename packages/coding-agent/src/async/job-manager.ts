@@ -1,7 +1,7 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { HubAdmissionStateTransaction } from "../internal/hub-admission";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "../session/streaming-output";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { StructuredSubagentOutput } from "../task/types";
 import { DurableHubStore, type HubDurableRecord } from "../internal/hub-durable-state";
 
@@ -9,6 +9,7 @@ const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
 const DELIVERY_RETRY_JITTER_MS = 200;
 const DEFAULT_RETENTION_MS = 5 * 60 * 1000;
+const DEFAULT_CONSUMED_RESULT_EVICTION_MS = 30 * 1000;
 /**
  * Extra delay after an `async-result` delivery settles (its `ASIDE_MESSAGE_COMMIT`
  * hook fires, resolving `enqueueWithReceipt()`) before retained artifacts are
@@ -41,7 +42,7 @@ const DURABLE_JOB_RESULT_BYTES = 48 * 1024;
  * top rung is the longest a smart poll will ever block. Only used when
  * `async.pollWaitDuration` is set to `smart`; fixed durations wait verbatim.
  */
-const POLL_WAIT_LADDER_MS = [5_000, 10_000, 30_000, 60_000, 300_000] as const;
+export const POLL_WAIT_LADDER_MS = [5_000, 10_000, 30_000, 60_000, 300_000] as const;
 /**
  * Going at least this long between poll calls means the agent stepped out of
  * the poll loop to do real work — the next poll drops back to the ladder floor.
@@ -206,6 +207,8 @@ export interface AsyncJobManagerOptions {
 	onJobComplete?: AsyncJobDeliverySink;
 	maxRunningJobs?: number;
 	retentionMs?: number;
+	/** Delay after a settled result is consumed before its row is evicted. */
+	consumedResultEvictionMs?: number;
 	/**
 	 * Delay after a job's `async-result` delivery settles before its retained
 	 * artifacts are removed (see {@link RETAINED_ARTIFACTS_CLEANUP_GRACE_MS}).
@@ -359,6 +362,7 @@ export class AsyncJobManager {
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
 	readonly #retentionMs: number;
+	readonly #consumedResultEvictionMs: number;
 	readonly #retainedArtifactsCleanupGraceMs: number;
 	readonly #retainedArtifactsCleanupMaxWaitMs: number;
 	#durableStore: DurableHubStore | undefined;
@@ -386,6 +390,11 @@ export class AsyncJobManager {
 		this.#onJobComplete = options.onJobComplete;
 		this.#maxRunningJobs = Math.max(1, Math.floor(options.maxRunningJobs ?? DEFAULT_MAX_RUNNING_JOBS));
 		this.#retentionMs = Math.max(0, Math.floor(options.retentionMs ?? DEFAULT_RETENTION_MS));
+		this.#consumedResultEvictionMs = Math.max(
+			0,
+			Math.floor(options.consumedResultEvictionMs ?? options.retentionMs ?? DEFAULT_CONSUMED_RESULT_EVICTION_MS),
+		);
+
 		this.#retainedArtifactsCleanupGraceMs = Math.max(
 			0,
 			Math.floor(options.retainedArtifactsCleanupGraceMs ?? RETAINED_ARTIFACTS_CLEANUP_GRACE_MS),
@@ -503,6 +512,7 @@ export class AsyncJobManager {
 					job.resultText = text;
 					this.#persistJob(job, "terminal");
 					this.#recordTerminalHistory(job);
+					this.#scheduleEviction(id);
 					return;
 				}
 				job.status = "completed";
@@ -518,6 +528,7 @@ export class AsyncJobManager {
 					job.errorText = error instanceof Error ? error.message : String(error);
 					this.#persistJob(job, "terminal");
 					this.#recordTerminalHistory(job);
+					this.#scheduleEviction(id);
 					return;
 				}
 				const errorText = error instanceof Error ? error.message : String(error);
@@ -550,7 +561,6 @@ export class AsyncJobManager {
 		this.#persistEvent("cancel", job.id, { state: "committed", terminalStatus: "cancelled" });
 		this.#recordTerminalHistory(job);
 		job.abortController.abort();
-		this.#scheduleEviction(id);
 		return true;
 	}
 
@@ -693,7 +703,7 @@ export class AsyncJobManager {
 		this.#persistEvent("pin", jobId, { state: "released", pinId: pinId.trim().slice(0, 256) });
 		if (pins.size === 0) {
 			this.#resultPins.delete(jobId);
-			this.#scheduleEviction(jobId);
+			this.#scheduleConsumedResultEviction(jobId);
 		}
 		return true;
 	}
@@ -910,7 +920,6 @@ export class AsyncJobManager {
 			this.#persistEvent("cancel", job.id, { state: "committed", terminalStatus: "cancelled" });
 			this.#recordTerminalHistory(job);
 			job.abortController.abort(reason);
-			this.#scheduleEviction(job.id);
 		}
 	}
 
@@ -1077,7 +1086,7 @@ export class AsyncJobManager {
 				this.#jobs.delete(id);
 				continue;
 			}
-			this.#scheduleEviction(id);
+			this.#scheduleEviction(id, this.#consumedJobResults.has(id) ? this.#consumedResultEvictionMs : this.#retentionMs);
 			restoredJobIds.push(id);
 		}
 		this.#durableRecovery = undefined;
@@ -1349,6 +1358,7 @@ export class AsyncJobManager {
 		if (job.resultText === undefined && job.errorText === undefined) return false;
 		this.#consumedJobResults.add(jobId);
 		if (persist) this.#persistEvent("consumption", jobId, { state: "committed" });
+		this.#scheduleConsumedResultEviction(jobId);
 		return true;
 	}
 
@@ -1464,6 +1474,16 @@ export class AsyncJobManager {
 		}
 	}
 
+	#scheduleConsumedResultEviction(jobId: string): void {
+		if (this.#disposed) return;
+		if (
+			this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId) ||
+			this.#deliveries.some(delivery => delivery.jobId === jobId)
+		)
+			return;
+		this.#scheduleEviction(jobId, this.#consumedResultEvictionMs);
+	}
+
 	#evictJob(jobId: string): boolean {
 		clearTimeout(this.#evictionTimers.get(jobId));
 		this.#evictionTimers.delete(jobId);
@@ -1476,19 +1496,16 @@ export class AsyncJobManager {
 		return this.#jobs.delete(jobId);
 	}
 
-	#scheduleEviction(jobId: string): void {
+	#scheduleEviction(jobId: string, delayMs = this.#retentionMs): void {
 		if (this.#disposed) return;
-		if (this.#retentionMs <= 0) {
+		if (delayMs <= 0) {
 			this.#evictJob(jobId);
 			return;
 		}
-		const existing = this.#evictionTimers.get(jobId);
-		if (existing) {
-			clearTimeout(existing);
-		}
+		clearTimeout(this.#evictionTimers.get(jobId));
 		const timer = setTimeout(() => {
 			this.#evictJob(jobId);
-		}, this.#retentionMs);
+		}, delayMs);
 		timer.unref();
 		this.#evictionTimers.set(jobId, timer);
 	}
@@ -1696,6 +1713,7 @@ export class AsyncJobManager {
 			} finally {
 				const index = this.#inFlightDeliveries.indexOf(delivery);
 				if (index !== -1) this.#inFlightDeliveries.splice(index, 1);
+				if (this.#consumedJobResults.has(delivery.jobId)) this.#scheduleConsumedResultEviction(delivery.jobId);
 				if (this.#deliveries.length > 0) this.#ensureDeliveryLoop();
 			}
 		})();

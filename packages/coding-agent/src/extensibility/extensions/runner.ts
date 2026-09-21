@@ -11,6 +11,12 @@ import type {
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
 import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMetadata } from "@oh-my-pi/pi-ai";
+import {
+	clearContextHistoryIndex,
+	getContextHistoryIndex,
+	markPerCallContextMessage,
+	setContextHistoryIndex,
+} from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import type {
@@ -24,7 +30,7 @@ import { type Settings, withActiveSettings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import { evaluateRestrictedToolGuardrails } from "../../internal/restricted-startup-policy";
 import type { MemoryRuntimeContext } from "../../memory-backend";
-import { type Theme, theme } from "../../modes/theme/theme";
+import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { SessionManager } from "../../session/session-manager";
 import { evaluateSubagentPermission, type EffectiveSubagentPermissions } from "../../task/permission-profiles";
 import type { SessionPathScope } from "../../internal/session-path-scope";
@@ -1516,10 +1522,7 @@ export class ExtensionRunner {
 
 				if (event.type === "session_stop" && handlerResult) {
 					result = handlerResult as SessionStopEventResult;
-					const hasContinuationContext =
-						(typeof result.additionalContext === "string" && result.additionalContext.length > 0) ||
-						(typeof result.reason === "string" && result.reason.length > 0);
-					if ((result.continue === true || result.decision === "block") && hasContinuationContext) {
+					if (result.decision === "block") {
 						return result as RunnerEmitResult<TEvent>;
 					}
 				}
@@ -1771,10 +1774,14 @@ export class ExtensionRunner {
 		try {
 			currentMessages = structuredClone(messages);
 		} catch {
-			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
+			// Messages may contain non-cloneable objects (e.g., in ToolResultMessage.details
 			// or ProviderPayload). Fall back to a shallow array clone — extensions should
 			// return new message arrays rather than mutating in place.
 			currentMessages = [...messages];
+		}
+		for (let index = 0; index < currentMessages.length; index++) {
+			const message = currentMessages[index];
+			if (message) setContextHistoryIndex(message, index);
 		}
 
 		for (const ext of this.extensions) {
@@ -1793,10 +1800,14 @@ export class ExtensionRunner {
 
 				if (handlerResult && (handlerResult as ContextEventResult).messages) {
 					currentMessages = (handlerResult as ContextEventResult).messages!;
+					for (const message of currentMessages) {
+						if (getContextHistoryIndex(message) === undefined) markPerCallContextMessage(message);
+					}
 				}
 			}
 		}
 
+		for (const message of currentMessages) clearContextHistoryIndex(message);
 		return currentMessages;
 	}
 

@@ -15,6 +15,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+
 import type { CreateAgentSessionResult } from "../src/sdk";
 import { terminateSubagent } from "../src/registry/agent-control";
 import {
@@ -78,6 +79,7 @@ function createToolSession(options: { fixture: ManagerFixture; agentId?: string;
 	const toolSession = {
 		cwd: fixture.dir,
 		hasUI: false,
+
 		settings: Settings.isolated({ "async.pollWaitDuration": "5s" }),
 		getSessionFile: () => lookupAgentRef(fixture.registry, "Main")?.sessionFile ?? null,
 		getSessionSpawns: () => "*",

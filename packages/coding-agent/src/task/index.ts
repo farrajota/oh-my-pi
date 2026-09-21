@@ -38,13 +38,13 @@ import {
 	takeBrowserAuditTaskAuthority,
 } from "../internal/browser-audit-authority";
 import type { LocalProtocolOptions } from "../internal-urls";
-import type { Theme } from "../modes/theme/theme";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { loadOverallPlanReference, type OverallPlanReference } from "../plan-mode/plan-handoff";
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
 import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { type: "text" };
-import { TASK_EFFORTS, type TaskEffort } from "../thinking";
+import { TASK_EFFORTS, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { canonicalBytes } from "../tools/browser-audit";
 
@@ -65,8 +65,6 @@ import {
 	type TaskToolDetails,
 	type TaskToolSchemaInstance,
 } from "./types";
-// Import review tools for side effects (registers subagent tool handlers)
-import "../tools/review";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import { parseAgent } from "./agents";
@@ -98,8 +96,8 @@ import {
 	permissionScopeDrifted,
 	type SubagentPermissionMode,
 } from "./permission-profiles";
-import { renderResult, renderCall as renderTaskCall } from "./render";
-import { repairTaskParams } from "./repair-args";
+import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/tools/task";
+import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
 import {
 	type EffectiveSubagentPolicy,
 	resolveEffectiveSubagentPolicy,
@@ -2294,6 +2292,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				cwd: this.session.cwd,
 				additionalDirectories: this.session.additionalDirectories,
 				getApiKey: this.session.getApiKey,
+				credentialSourceSessionId: this.session.providerSessionId ?? this.session.getSessionId?.() ?? undefined,
 				id: agentId,
 				agentRegistry,
 				createAuthoritySession,

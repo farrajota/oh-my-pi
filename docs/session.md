@@ -57,6 +57,21 @@ Terminal breadcrumb files are written under:
 ```
 
 Breadcrumb content is original cwd and session file path, plus an optional third line `fresh`. A fresh breadcrumb preserves a `/new` boundary whose lazily-created JSONL file does not exist yet, preventing `continueRecent()` from reopening the previous session. Writes are synchronous, ordered, and best-effort.
+## Durable authority sidecar and offline repair
+
+When a persistent session owns registry authority, its session file has a provider-independent durable sidecar:
+
+```text
+<session>.jsonl.authority-v1.jsonl
+<session>.jsonl.authority-v1.jsonl.quarantine
+```
+
+The journal is hash-linked and records actor/root identity, generation, parent lineage, and permission snapshots. Recovery validates the complete journal and history, not only its last record. A quarantine marker keeps the authority unavailable until the state is proven safe; an unexplained marker or any hash, root, cycle, lineage, or permission conflict is refused rather than repaired.
+
+`omp session repair <session-id-or-path>` is read-only by default. Any actor records it appends are limited to a verified legacy-descendant closure: non-terminal actors whose lineage contains a terminal (`retired` or `aborted`) ancestor. A recognized marker may also be resolved when whole-history validation proves that no affected actor closure remains. Apply rechecks the journal and marker under locks, preserves the exact source bytes in a retained `.authority-repair-*` backup directory, and appends terminal records to the existing journal. Closure is leaf-first, so descendant authority is retired before a removed or tombstoned parent is relied on. The journal remains append-only; transcript entries, session history, and provider data are not rewritten by this operation.
+
+Do not delete the journal, quarantine marker, or retained backup to force recovery. Stop the owning client before `--apply`, and start a fresh process after a successful repair so the repaired authority is reconstructed from disk.
+
 
 ## File Format
 
@@ -524,6 +539,14 @@ Implementations and adapters:
 - `IndexedSessionStorage`: shared local index plus ordered remote publication used by Redis/SQL-backed storage
 
 `SessionStorageWriter` exposes `append`, optional `appendSync`, `flush`, optional `flushSync`, `isOpen`, `close`, and `getError`.
+
+### Manual storage maintenance
+
+`omp gc` previews maintenance by default; `--apply` is required to sweep unreferenced blobs, archive eligible cold sessions, or checkpoint database WALs. Storage maintenance is separate from model-context compaction.
+
+Journal payload I/O is streamed during blob-reference scans, archive history/stats reconciliation, gzip creation, and rollback. Active `.jsonl`, recoverable `.jsonl.*.bak`, and archived `.jsonl.gz` records all participate in reference discovery, including references in malformed JSON text. Compressed scans drain and validate the complete stream before their results can authorize deletion. Archives retain the original JSONL bytes when decompressed, and artifact trees keep their existing layout.
+
+Streaming avoids materializing a whole journal; it does not make GC constant-memory. A single long record, reference sets, and history/stats identity collections still consume memory. Original files and temporary compressed output also coexist during archive publication.
 
 ## Session Discovery Utilities
 

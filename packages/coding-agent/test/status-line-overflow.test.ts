@@ -3,13 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { StatusLineSegmentId } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
-import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import { getSeparator } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/separators";
-import type { SegmentContext } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/segments";
-import { renderSegment } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/segments";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { getSessionAccentAnsi, getSessionAccentHex } from "@oh-my-pi/pi-coding-agent/utils/session-color";
+
+import type { StatusLineSegmentId } from "@oh-my-pi/pi-tui/status-line/schema";
+import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
+import type { SegmentContext } from "@oh-my-pi/pi-tui/status-line/segments";
+import { renderSegment } from "@oh-my-pi/pi-tui/status-line/segments";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import { getSessionAccentAnsi, getSessionAccentHex } from "@oh-my-pi/pi-tui/theme/session-color";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
 import { StatusLineTestComponents } from "./helpers/status-line";
@@ -63,6 +64,7 @@ function createCtx(overrides?: {
 		vibeMode: null,
 		vim: null,
 		collab: null,
+		stream: null,
 		usageStats: {
 			input: 0,
 			output: 0,
@@ -142,7 +144,9 @@ function stripAnsi(value: string): string {
 
 describe("status line session accent", () => {
 	function buildComponent(sessionAccent: boolean) {
-		const component = statusLines.track(new StatusLineComponent(createStatusLineSession("Named session")));
+		const component = statusLines.track(
+			new StatusLineComponent(createStatusLineSession("Named session"), statusLineHost),
+		);
 		component.updateSettings({
 			preset: "custom",
 			leftSegments: ["pi"],
@@ -211,7 +215,7 @@ describe("session_name preview-title fallback", () => {
 	});
 
 	it("right-aligns the stand-in title through the box border pipeline", () => {
-		const component = statusLines.track(new StatusLineComponent(createStatusLineSession("")));
+		const component = statusLines.track(new StatusLineComponent(createStatusLineSession(""), statusLineHost));
 		component.updateSettings({
 			preset: "custom",
 			leftSegments: ["pi"],
@@ -230,7 +234,9 @@ describe("session_name preview-title fallback", () => {
 
 describe("status line focused-agent dimming", () => {
 	it("keeps powerline end caps at full intensity while text stays dimmed", () => {
-		const component = statusLines.track(new StatusLineComponent(createStatusLineSession("Focused session")));
+		const component = statusLines.track(
+			new StatusLineComponent(createStatusLineSession("Focused session"), statusLineHost),
+		);
 		component.updateSettings({
 			preset: "custom",
 			leftSegments: ["pi"],
@@ -464,8 +470,9 @@ describe("overflow gap budgeting by layout", () => {
 		fs.mkdirSync(cwd);
 		setProjectDir(cwd);
 
+
 		const session = createStatusLineSession("boundary test");
-		const component = statusLines.track(new StatusLineComponent(session));
+		const component = statusLines.track(new StatusLineComponent(session, statusLineHost));
 		component.updateSettings({
 			preset: "custom",
 			leftSegments: ["mode", "path"],
@@ -497,7 +504,7 @@ describe("overflow gap budgeting by layout", () => {
 		setProjectDir(cwd);
 
 		const session = createStatusLineSession("plain boundary test");
-		const component = statusLines.track(new StatusLineComponent(session));
+		const component = statusLines.track(new StatusLineComponent(session, statusLineHost));
 		component.updateSettings({
 			preset: "custom",
 			leftSegments: ["mode", "path"],

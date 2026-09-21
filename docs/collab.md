@@ -28,6 +28,12 @@ Running `/collab` or `/collab view` starts or displays the active hosting sessio
 
 The guest's previous session is restored on `/leave` (or when the host stops).
 
+Joining uses the same session-switch policy as `/resume`. When the current session has bound operation authority, joining a different replica is refused before clearing the editor, cancelling a pending local host start, claiming guest ownership, or writing the replica. Authority is checked again when the delayed snapshot arrives, so a refusal at that boundary preserves any existing replica bytes. Unbound joins and bound reloads of the same replica remain allowed.
+
+The public `/join` handler also rechecks authority after awaited host teardown, before clearing the editor. If authority becomes bound during teardown, the draft is preserved and no guest is claimed. Teardown already admitted while the session was unbound is not rolled back; these preflight checks do not make the whole transition atomic.
+
+If authority prevents returning to the previous local session on `/leave`, restoration fails without first clearing the guest status or transcript UI; guest ownership remains held and automatic hosting stays blocked. These checks preserve the existing resume restriction; they do not implement seamless cross-session authority transfer or change `/new`, `/fork`, branching, or session moves.
+
 ### Commands
 
 | Command           | Effect                                                                              |

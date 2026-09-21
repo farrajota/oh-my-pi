@@ -1,22 +1,22 @@
 import { Spacer } from "@oh-my-pi/pi-tui";
 import { APP_NAME, formatAge } from "@oh-my-pi/pi-utils";
-import { CollabGuestLink } from "../collab/guest";
+import { assertCollabJoinPreflight, CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
 import { type CollabHostSnapshot, listCollabHosts } from "../collab/registry";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
 import { parseExportArgs } from "../export/html/args";
 import { shareSession } from "../export/share";
-import { theme } from "../modes/theme/theme";
+import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../modes/types";
-import { sanitizeDisplayLine } from "../modes/components/extensions/display-text";
-import { extractLastCodeBlock, extractLastCommand, extractLastLink } from "../modes/utils/copy-targets";
+import { sanitizeDisplayLine } from "@oh-my-pi/pi-tui/overlays/extensions/display-text";
+import { extractLastCodeBlock, extractLastCommand, extractLastLink } from "@oh-my-pi/pi-tui/overlays/copy-targets";
 import { restartBrowserForModeChange } from "../tools/browser";
-import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
+import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 import { openPath } from "../utils/open";
 import { copyToClipboard } from "../utils/clipboard";
 import { refreshStatusLine } from "./builtin-modes";
-import { CollabQrCodeComponent, collabBrowserLink } from "./helpers/collab-qrcode";
+import { CollabQrCodeComponent, collabBrowserLink } from "@oh-my-pi/pi-tui/chrome/collab-qrcode";
 import { commandConsumed, errorMessage, parseSubcommand, usage } from "./helpers/parse";
 import type { SlashCommandSpec } from "./types";
 
@@ -417,9 +417,9 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			const ctx = runtime.ctx;
-			ctx.editor.setText("");
 			const link = command.args.trim();
 			if (!link) {
+				ctx.editor.setText("");
 				ctx.showError("Usage: /join <link>");
 				return;
 			}
@@ -428,6 +428,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 				return;
 			}
 			try {
+				assertCollabJoinPreflight(ctx, link);
 				// Stop stale/ending ownership and cancel pending starts, not a live room.
 				if (!ctx.collabController.host) await ctx.collabController.stop("joining another session");
 				// Recheck after teardown: a concurrent manual start may have won.
@@ -435,6 +436,8 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 					ctx.showError("Stop hosting first (/collab stop)");
 					return;
 				}
+				assertCollabJoinPreflight(ctx, link);
+				ctx.editor.setText("");
 				await new CollabGuestLink(ctx).join(link);
 			} catch (err) {
 				ctx.showError(`Failed to join collab session: ${errorMessage(err)}`);

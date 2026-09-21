@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import { initTheme } from "../theme/theme";
-import { AssistantMessageComponent } from "./assistant-message";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 
 function stripAnsi(lines: readonly string[]): string {
 	return lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");

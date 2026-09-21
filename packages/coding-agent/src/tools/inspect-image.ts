@@ -20,7 +20,7 @@ import {
 } from "../config/model-resolver";
 import inspectImageDescription from "../prompts/tools/inspect-image.md" with { type: "text" };
 import inspectImageSystemPromptTemplate from "../prompts/tools/inspect-image-system.md" with { type: "text" };
-import { concreteThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
+import { concreteThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import {
 	ImageInputTooLargeError,
 	type LoadedImageInput,

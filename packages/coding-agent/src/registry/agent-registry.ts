@@ -84,8 +84,18 @@ export interface AgentMetricsSummary {
 	contextTokens?: number;
 	contextWindow?: number;
 }
+/** Run lifecycle milestones scoped to the current turn. */
+export interface AgentRunLifecycle {
+	/** When the run produced its final response. */
+	responseAt?: number;
+	/** When the run's final result was accepted by its driver. */
+	acceptedAt?: number;
+	/** When the ref last left `running` for a terminal status. */
+	terminalAt?: number;
+}
 
-/** Historical identity and telemetry that remain available after the live session is disposed. */
+
+/** Historical identity and telemetry that remain available after the live observer is gone. */
 export interface AgentHistorySummary {
 	agent?: string;
 	modelRole?: string;
@@ -255,8 +265,10 @@ export interface AgentRef {
 	lastActivity: number;
 	/** Short gist of what the agent is currently doing (latest intent or tool), for the work-aware roster. Display-only. */
 	activity?: string;
-	/** Persisted identity and telemetry restored after the live observer is gone. */
+	/** Persisted identity and telemetry restored after the live session is disposed. */
 	history?: AgentHistorySummary;
+	/** Run lifecycle milestones for the current turn. */
+	lifecycle?: AgentRunLifecycle;
 	/** Opaque lineage slot assigned by the registry generation. */
 	readonly lineage?: { readonly rootId: string; readonly parentId?: string; readonly generation: number };
 }
@@ -285,6 +297,8 @@ export interface RegisterInput {
 	createdAt?: number;
 	lastActivity?: number;
 	history?: AgentHistorySummary;
+	/** Run lifecycle milestones restored from persisted history, when known. */
+	lifecycle?: AgentRunLifecycle;
 }
 
 export interface AgentMetadataUpdate {
@@ -637,7 +651,7 @@ export class AgentRegistry {
 		const requestedOptions: CreateAgentSessionOptions = options.settings
 			? { ...options, settings: options.settings.snapshot() }
 			: options;
-		const { getApiKey, mcpManager, ...authorityOptions } = requestedOptions;
+		const { getApiKey, mcpManager, credentialSourceSessionId, ...authorityOptions } = requestedOptions;
 		const frozenAuthorityData = cloneAndFreezeAuthorityInput({
 			...authorityOptions,
 			agentId: reservation.id,
@@ -652,6 +666,7 @@ export class AgentRegistry {
 		const creationOptions = Object.freeze({
 			...frozenAuthorityData,
 			...(getApiKey === undefined ? {} : { getApiKey }),
+			...(credentialSourceSessionId === undefined ? {} : { credentialSourceSessionId }),
 			...(mcpManager === undefined ? {} : { mcpManager }),
 		}) satisfies CreateAgentSessionOptions;
 		if (deriveRestrictedStartupPolicy(creationOptions).restricted && !this.#durableState) {
@@ -1400,6 +1415,7 @@ export class AgentRegistry {
 			lastActivity: input.lastActivity ?? now,
 			activity: input.activity,
 			history: inputHistory ? { ...inputHistory, permissionSummary } : undefined,
+			lifecycle: input.lifecycle,
 			lineage,
 		};
 		if (recoveredActor && recoveredLineage) this.#durableActorRecords.set(ref, recoveredActor);
@@ -1505,12 +1521,45 @@ export class AgentRegistry {
 			return status === "aborted" || this.#rejectStatusUpdate(ref.id, status, "aborted-is-terminal");
 		}
 		if (ref.status === status) return true;
+		const leftRunning = ref.status === "running";
 		this.#persistDurableActorState(ref, status === "aborted" ? "aborted" : "active");
 		ref.status = status;
 		if (status !== "running") ref.activity = undefined;
 		ref.lastActivity = Date.now();
+		if (status === "running") {
+			ref.lifecycle = undefined;
+		} else if (leftRunning) {
+			ref.lifecycle = { ...ref.lifecycle, terminalAt: ref.lastActivity };
+		}
 		this.#emit({ type: "status_changed", ref });
 		return true;
+	}
+
+	/** Record final-result acceptance and expose accepted runs missed by status mirroring. */
+	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.status === "aborted") return false;
+		const matches =
+			expected === undefined ||
+			this.#matchesPublicExpected(ref, expected) ||
+			this.#matchesInternalExpected(ref, expected as RegistryAgentRef | AgentSession);
+		if (!matches) return false;
+		const now = Date.now();
+		ref.lifecycle = {
+			...ref.lifecycle,
+			responseAt: responseAt ?? now,
+			acceptedAt: now,
+		};
+		if (ref.status === "running" && ref.session?.isStreaming !== true) this.#setStatus(ref, "idle");
+		else this.#emit({ type: "metadata_changed", ref });
+		return true;
+	}
+
+	/** Accepted final results whose ref still claims running without an active turn. */
+	staleAcceptedRuns(): AgentRef[] {
+		return this.list().filter(
+			ref => ref.status === "running" && ref.lifecycle?.acceptedAt !== undefined && !this.isRunning(ref),
+		);
 	}
 
 	#setStatusInternal(id: string, status: AgentStatus, expected: RegistryAgentRef | AgentSession): boolean {
@@ -1629,6 +1678,7 @@ export class AgentRegistry {
 				: ref.session !== expectedSession || !this.#matchesInternalExpected(ref, expectedSession))
 		)
 			return false;
+		this.#retireDescendants(ref);
 		this.#persistDurableActorState(ref, "aborted");
 		this.#terminating.set(ref.id, ref);
 		ref.session = null;
@@ -1644,12 +1694,54 @@ export class AgentRegistry {
 		return ref === expectedRef && !this.#terminating.has(ref.id) && this.#removeExactRef(ref);
 	}
 
-	#removeExactRef(ref: RegistryAgentRef): boolean {
+	#retireRef(ref: RegistryAgentRef): boolean {
 		if (this.#refs.get(ref.id) !== ref) return false;
 		this.#persistDurableActorState(ref, "retired");
 		this.#refs.delete(ref.id);
+		const session = ref.session;
 		this.#emit({ type: "removed", ref });
+		if (session && !session.isDisposed) {
+			try {
+				session.beginDispose();
+				void session.dispose().catch(error =>
+					logger.warn("AgentRegistry descendant retirement failed", {
+						id: ref.id,
+						error: error instanceof Error ? error.message : String(error),
+					}),
+				);
+			} catch (error) {
+				logger.warn("AgentRegistry descendant retirement failed", {
+					id: ref.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		return true;
+	}
+
+	#retireDescendants(ref: RegistryAgentRef): void {
+		const descendants = [...this.#refs.values()]
+			.filter(candidate => candidate !== ref && candidate.lineage?.rootId === ref.lineage?.rootId)
+			.map(candidate => {
+				let cursor: RegistryAgentRef | undefined = candidate;
+				let depth = 0;
+				const seen = new Set<string>();
+				while (cursor?.parentId !== undefined && !seen.has(cursor.id)) {
+					seen.add(cursor.id);
+					if (cursor.parentId === ref.id) return { ref: candidate, depth: depth + 1 };
+					cursor = this.#refs.get(cursor.parentId);
+					depth++;
+				}
+				return undefined;
+			})
+			.filter((entry): entry is { ref: RegistryAgentRef; depth: number } => entry !== undefined)
+			.sort((left, right) => right.depth - left.depth);
+		for (const descendant of descendants) this.#retireRef(descendant.ref);
+	}
+	#removeExactRef(ref: RegistryAgentRef): boolean {
+		if (this.#refs.get(ref.id) !== ref) return false;
+		this.#retireDescendants(ref);
+		return this.#retireRef(ref);
 	}
 
 	#unregisterInternal(id: string, expected: RegistryAgentRef | AgentSession): boolean {
@@ -1710,8 +1802,16 @@ export class AgentRegistry {
 		return () => this.#listeners.delete(listener);
 	}
 
+	// Dispatch walks a snapshot, not the live `Set`: `Set` iteration visits
+	// entries appended behind the cursor, so a listener that resubscribes itself
+	// while handling an event would be re-entered forever — an unbounded
+	// synchronous loop that starves the event loop and wedges the process. The
+	// membership re-check keeps the "an unsubscribed listener stops receiving
+	// events" contract for listeners dropped earlier in the same dispatch.
 	#emit(event: InternalRegistryEvent): void {
-		for (const listener of this.#internalListeners) {
+		const internalListeners = [...this.#internalListeners];
+		for (const listener of internalListeners) {
+			if (!this.#internalListeners.has(listener)) continue;
 			try {
 				listener(event);
 			} catch {
@@ -1720,7 +1820,9 @@ export class AgentRegistry {
 		}
 		if (this.#listeners.size === 0) return;
 		const publicEvent = Object.freeze({ type: event.type, ref: this.#observe(event.ref) }) as RegistryEvent;
-		for (const listener of this.#listeners) {
+		const listeners = [...this.#listeners];
+		for (const listener of listeners) {
+			if (!this.#listeners.has(listener)) continue;
 			try {
 				listener(publicEvent);
 			} catch {

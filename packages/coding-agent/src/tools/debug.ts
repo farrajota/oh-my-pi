@@ -38,10 +38,9 @@ import {
 	selectAttachAdapter,
 	selectLaunchAdapter,
 } from "../dap";
-import type { Theme } from "../modes/theme/theme";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import debugDescription from "../prompts/tools/debug.md" with { type: "text" };
-import { renderStatusLine } from "../tui";
-import { CachedOutputBlock, markFramedBlockComponent } from "../tui/output-block";
+import { CachedOutputBlock, markFramedBlockComponent, renderStatusLine } from "@oh-my-pi/pi-tui/render";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import type { OutputMeta } from "./output-meta";
@@ -53,7 +52,7 @@ import {
 	shortenPath,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
-} from "./render-utils";
+} from "@oh-my-pi/pi-tui/render/render-utils";
 import { PREVIEW_LIMITS } from "./preview-limits";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";

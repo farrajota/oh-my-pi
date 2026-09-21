@@ -6,19 +6,21 @@ import * as url from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
-import { getMarkdownTheme, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getMarkdownTheme, initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import {
 	applyHyperlinkSetting,
 	fileHyperlink,
 	isHyperlinkEnabled,
-	resolveMarkdownLinkTargets,
-	tryResolveInternalUrlSync,
 	uriHyperlink,
 	urlHyperlink,
 	urlHyperlinkAlways,
-} from "@oh-my-pi/pi-coding-agent/tui/hyperlink";
+} from "@oh-my-pi/pi-tui/render";
+import {
+	resolveMarkdownLinkTargets,
+	tryResolveInternalUrlSync,
+} from "@oh-my-pi/pi-coding-agent/internal-urls/hyperlink-targets";
 import * as terminalCaps from "@oh-my-pi/pi-tui";
 
 // OSC 8 sequence markers

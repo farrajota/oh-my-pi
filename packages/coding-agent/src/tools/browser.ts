@@ -10,7 +10,7 @@ import browserPython from "./browser/prelude.py" with { type: "text" };
 import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
-import { enforceInlineByteCap } from "../session/streaming-output";
+import { enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { truncateForPrompt } from "./approval";
 import { resolveCmuxKind } from "./browser/cmux/rpc";
 import { resolveSpawnArgs } from "./browser/attach";

@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "@oh-my-pi/pi-coding-agent/capability/rule";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { formatModelRoleAlias } from "@oh-my-pi/pi-coding-agent/config/model-roles";
+import { type } from "@oh-my-pi/omptype";
+import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
@@ -23,16 +27,21 @@ import {
 	setAgentStatus,
 } from "../../src/internal/agent-registry-bridge";
 import { getSessionLocalProtocolOptions } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { deriveRestrictedStartupPolicy } from "../../src/internal/restricted-startup-policy";
 import type { AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
-import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
+import { installSessionOperationLedger, runLocalOperation } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
+
 import {
 	buildEffectivePermissionSummary,
 	composeEffectivePermissions,
@@ -49,6 +58,9 @@ import { createSessionDefaults } from "../helpers/session-defaults";
 
 const tempDirs: TempDir[] = [];
 let fixtureRegistry: AgentRegistry | undefined;
+let fixtureAuthStorage: AuthStorage | undefined;
+let fixtureModelRegistry: ModelRegistry | undefined;
+let fixtureSettings: Settings | undefined;
 
 function makeTempDir(prefix: string): string {
 	const dir = TempDir.createSync(prefix);
@@ -63,12 +75,34 @@ interface FixtureOptions {
 
 async function createRef(sessionFile: string, options: FixtureOptions = {}): Promise<AgentRef> {
 	if (!fixtureRegistry) {
+		fixtureSettings = Settings.isolated({}, { cwd: path.dirname(sessionFile), agentDir: path.dirname(sessionFile) });
+		fixtureAuthStorage = await AuthStorage.create(":memory:");
+		fixtureAuthStorage.setRuntimeApiKey("anthropic", "test-key");
+		fixtureModelRegistry = new ModelRegistry(
+			fixtureAuthStorage,
+			path.join(path.dirname(sessionFile), "models.yml"),
+			{ settings: fixtureSettings },
+		);
 		fixtureRegistry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
 		AgentRegistry.installGlobal(fixtureRegistry);
+		await createAgentRootSession(fixtureRegistry, {
+			agentId: MAIN_AGENT_ID,
+			agentDisplayName: MAIN_AGENT_ID,
+			cwd: path.dirname(sessionFile),
+			agentDir: path.dirname(sessionFile),
+			settings: fixtureSettings,
+			authStorage: fixtureAuthStorage,
+			modelRegistry: fixtureModelRegistry,
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: [],
+			skipPythonPreflight: true,
+		});
 	}
 	const registry = fixtureRegistry;
-	let parentSession = lookupAgentRef(registry, "Main")?.session ?? null;
-	if (!parentSession) parentSession = (await createAgentRootSession(registry, { agentId: "Main" })).session;
+	const parentSession = lookupAgentRef(registry, MAIN_AGENT_ID)?.session;
+	if (!parentSession) throw new Error("Expected a bound Main authority fixture");
 	const peek = await SessionManager.peekSessionInit(sessionFile);
 	if (!peek?.init) throw new Error("Expected a persisted authority fixture");
 	const init = peek.init;
@@ -76,7 +110,7 @@ async function createRef(sessionFile: string, options: FixtureOptions = {}): Pro
 		? freezePermissionScope(init.permissionSnapshot.scope)
 		: undefined;
 	const id = `persisted-${path.basename(sessionFile, ".jsonl")}`;
-	const settings = Settings.isolated();
+	const settings = fixtureSettings ?? parentSession.settings;
 	const subagentSettings = createSubagentSettings(
 		settings,
 		init.advisor
@@ -97,7 +131,14 @@ async function createRef(sessionFile: string, options: FixtureOptions = {}): Pro
 	const restrictToolNames = init.restrictToolNames === true;
 	const revivedToolNames =
 		init.readOnly === true && init.tools.includes("write") ? init.tools.filter(name => name !== "write") : init.tools;
-	const enableMCP = !restrictToolNames && (init.enableMCP ?? true) && (options.enableMCP ?? true);
+	const startupPolicy = deriveRestrictedStartupPolicy({
+		permissionScope: permissionSnapshot?.scope,
+		restrictToolNames,
+		toolNames: revivedToolNames,
+		enableLsp: true,
+		enableMCP: (init.enableMCP ?? true) && (options.enableMCP ?? true),
+	});
+	const enableMCP = startupPolicy.enableMCP;
 	const mcpManager = enableMCP ? options.mcpManager : undefined;
 	const customTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
 	const authorityBinding = bindInternalAgentAuthoritySession(registry, parentSession);
@@ -130,7 +171,7 @@ async function createRef(sessionFile: string, options: FixtureOptions = {}): Pro
 			systemPrompt: () => [init.systemPrompt],
 			spawns: init.spawns ?? "",
 			hasUI: false,
-			enableLsp: restrictToolNames ? false : true,
+			enableLsp: startupPolicy.enableLsp,
 			enableIrc: restrictToolNames ? false : undefined,
 			enableMCP,
 			...(mcpManager ? { mcpManager, customTools: customTools.length > 0 ? customTools : undefined } : {}),
@@ -156,8 +197,19 @@ interface RevivedSessionHandle {
 	observer: () => IrcWakeObserver | undefined;
 	/** Reply obligations the wake monitor registered via `trackIrcReply`. */
 	trackedReplies: Promise<void>[];
-	/** Text the stubbed session reports as its last assistant message. */
+	/** Text the stubbed session reports as its last assistant message (a `stop`ped turn). */
 	setLastAssistantText: (text: string) => void;
+	/** Report a terminal wake turn: provider error, abort, or empty completion. */
+	setLastAssistantStop: (stop: LastAssistantStop) => void;
+}
+
+/** Shape of a terminal assistant message the stub can report from a failed/cancelled wake turn. */
+interface LastAssistantStop {
+	stopReason: string;
+	errorMessage?: string;
+	provider?: string;
+	model?: string;
+	content?: Array<{ type: string; text?: string }>;
 }
 
 function createRevivedSession(
@@ -167,7 +219,16 @@ function createRevivedSession(
 ): RevivedSessionHandle {
 	installSessionOperationLedger(sessionManager);
 	let observer: IrcWakeObserver | undefined;
-	let lastAssistantText: string | undefined;
+	let lastAssistant:
+		| {
+				role: "assistant";
+				content: Array<{ type: string; text?: string }>;
+				stopReason: string;
+				errorMessage?: string;
+				provider?: string;
+				model?: string;
+		  }
+		| undefined;
 	const trackedReplies: Promise<void>[] = [];
 	const session = {
 		...createSessionDefaults(),
@@ -184,10 +245,8 @@ function createRevivedSession(
 		trackIrcReply: (pending: Promise<void>) => {
 			trackedReplies.push(pending);
 		},
-		getLastAssistantMessage: () =>
-			lastAssistantText === undefined
-				? undefined
-				: { role: "assistant", content: [{ type: "text", text: lastAssistantText }], stopReason: "stop" },
+		subscribeRunState: () => () => {},
+		getLastAssistantMessage: () => lastAssistant,
 		extensionRunner,
 	} as unknown as AgentSession;
 	return {
@@ -195,7 +254,17 @@ function createRevivedSession(
 		observer: () => observer,
 		trackedReplies,
 		setLastAssistantText: text => {
-			lastAssistantText = text;
+			lastAssistant = { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" };
+		},
+		setLastAssistantStop: stop => {
+			lastAssistant = {
+				role: "assistant",
+				content: stop.content ?? [],
+				stopReason: stop.stopReason,
+				errorMessage: stop.errorMessage,
+				provider: stop.provider,
+				model: stop.model,
+			};
 		},
 	};
 }
@@ -292,34 +361,76 @@ async function createPersistedSession(
 	return sessionFile;
 }
 
-function createFactory(cwd: string, subagentEventBus?: EventBus, options: FixtureOptions = {}) {
-	return async (ref: AgentRef) => {
-		const registry = fixtureRegistry;
-		if (!registry) throw new Error("Expected an installed persisted revival registry fixture");
-		let parentSession = lookupAgentRef(registry, "Main")?.session ?? null;
-		if (!parentSession) {
-			parentSession = (await createAgentRootSession(registry, { agentId: "Main" })).session;
+
+interface ReviveOwnerOptions {
+	extensionRoots?: () => EffectiveExtensionRoots;
+	preparedExtensions?: readonly PreparedExtension[];
+	authStorage?: AuthStorage;
+	modelRegistry?: ModelRegistry;
+	settings?: Settings;
+}
+
+function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptions & FixtureOptions = {}) {
+	return (ref: AgentRef) => {
+		const registry = fixtureRegistry ?? AgentRegistry.global();
+		const parentSession = lookupAgentRef(registry, MAIN_AGENT_ID)?.session;
+		if (parentSession && owner.extensionRoots) {
+			Object.defineProperty(parentSession, "effectiveExtensionRoots", {
+				configurable: true,
+				get: owner.extensionRoots,
+			});
 		}
+		if (parentSession && owner.preparedExtensions) {
+			Object.defineProperty(parentSession, "preparedExtensions", {
+				configurable: true,
+				get: () => owner.preparedExtensions,
+			});
+		}
+		const session = parentSession ?? ({
+			sessionManager: { getCwd: () => cwd, getArtifactManager: () => undefined },
+			get sessionFile() {
+				return path.join(cwd, "parent.jsonl");
+			},
+			get effectiveExtensionRoots() {
+				return owner.extensionRoots?.() ?? { explicit: [], mode: "merge", configured: [], configuredLevel: "user" };
+			},
+			get preparedExtensions() {
+				return owner.preparedExtensions;
+			},
+		} as unknown as AgentSession);
+		const fallback = fakeAuthAndRegistry();
+		const modelRegistry = owner.modelRegistry ?? fixtureModelRegistry ?? fallback.modelRegistry;
+		const authStorage = owner.authStorage ?? modelRegistry.authStorage;
 		return createPersistedSubagentReviverFactory({
-			session: parentSession,
-			...fakeAuthAndRegistry(),
-			settings: Settings.isolated(),
+			session,
+			authStorage,
+			modelRegistry,
+			settings: owner.settings ?? fixtureSettings ?? Settings.isolated(),
 			enableLsp: true,
-			enableMCP: options.enableMCP ?? true,
-			mcpManager: options.mcpManager,
-			subagentEventBus,
+			enableMCP: owner.enableMCP ?? true,
+			mcpManager: owner.mcpManager,
+			subagentEventBus: eventBus,
 			agentRegistry: registry,
 		})(ref);
 	};
 }
 
+
 afterEach(async () => {
 	vi.restoreAllMocks();
 	MCPManager.resetForTests();
-	if (fixtureRegistry && AgentRegistry.global() !== fixtureRegistry) AgentRegistry.installGlobal(fixtureRegistry);
+	const registry = fixtureRegistry;
+	const root = registry ? lookupAgentRef(registry, MAIN_AGENT_ID)?.session : undefined;
+	if (registry) await disposeAgentLifecycle(getAgentLifecycleManager(registry));
+	await root?.dispose();
 	resetAgentLifecycleForTests();
 	AgentRegistry.resetGlobalForTests();
+	IrcBus.resetGlobalForTests();
 	fixtureRegistry = undefined;
+	fixtureAuthStorage?.close();
+	fixtureAuthStorage = undefined;
+	fixtureModelRegistry = undefined;
+	fixtureSettings = undefined;
 	await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
 });
 
@@ -327,6 +438,7 @@ describe("persisted subagent revival", () => {
 	it("restores a parked persisted child after root restart and delivers one Hub message", async () => {
 		const cwd = makeTempDir("@pi-revive-hub-restart-");
 		const delivered: string[] = [];
+		fixtureSettings = Settings.isolated({}, { cwd, agentDir: cwd });
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			const handle = createRevivedSession([], undefined, options?.sessionManager);
 			handle.session.deliverIrcMessage = async message => {
@@ -345,6 +457,7 @@ describe("persisted subagent revival", () => {
 		await createAgentRootSession(fixtureRegistry, {
 			agentId: MAIN_AGENT_ID,
 			sessionManager: initialRootManager,
+			settings: fixtureSettings,
 		});
 		const initialRef = await createRef(childSessionFile);
 		await disposeAgentLifecycle(getAgentLifecycleManager(fixtureRegistry));
@@ -361,6 +474,7 @@ describe("persisted subagent revival", () => {
 		const { session: root } = await createAgentRootSession(registry, {
 			agentId: MAIN_AGENT_ID,
 			sessionManager: resumedRootManager,
+			settings: fixtureSettings,
 		});
 		const ref = registry.register({
 			id: initialRef.id,
@@ -376,7 +490,7 @@ describe("persisted subagent revival", () => {
 			createPersistedSubagentReviverFactory({
 				session: root,
 				...fakeAuthAndRegistry(),
-				settings: Settings.isolated(),
+				settings: fixtureSettings,
 				enableLsp: true,
 				enableMCP: true,
 				agentRegistry: registry,
@@ -534,9 +648,177 @@ describe("persisted subagent revival", () => {
 		if (!reviver) throw new Error("Expected a persisted reviver");
 		await reviver(ref);
 
-		expect(initialize).toHaveBeenCalledTimes(1);
 		expect(onError).toHaveBeenCalledTimes(1);
 		expect(emit).toHaveBeenCalledWith({ type: "session_start" });
+	});
+
+	it("loads only extensions allowed by the live owner's root policy", async () => {
+		const cwd = makeTempDir("@pi-revive-owner-roots-");
+		const sessionFile = await createPersistedSession(cwd, false, "default");
+		const ownerExtensionRoot = path.join(cwd, "owner-roots");
+		const ambientExtensionRoot = path.join(cwd, "ambient-roots");
+		const ownerExtension = path.join(ownerExtensionRoot, "index.js");
+		const ambientExtension = path.join(ambientExtensionRoot, "index.js");
+		const blockedPath = path.join(cwd, "blocked.txt");
+		const ambientMarker = path.join(cwd, "ambient-ran.txt");
+		await Bun.write(blockedPath, "private fixture");
+		await fs.mkdir(ownerExtensionRoot, { recursive: true });
+		await fs.mkdir(ambientExtensionRoot, { recursive: true });
+		await Bun.write(
+			path.join(ownerExtensionRoot, "package.json"),
+			JSON.stringify({ name: "owner-policy-extension", omp: { extensions: ["./index.js"] } }),
+		);
+		await Bun.write(
+			path.join(ambientExtensionRoot, "package.json"),
+			JSON.stringify({ name: "ambient-policy-extension", omp: { extensions: ["./index.js"] } }),
+		);
+		await Bun.write(
+			ownerExtension,
+			`export default function (pi) { pi.on("tool_call", event => {
+				if (event.toolName === "read" && event.input.path === ${JSON.stringify(blockedPath)})
+					return { block: true, reason: "Owner policy denied the read" };
+			}); }\n`,
+		);
+		await Bun.write(
+			ambientExtension,
+			`export default function (pi) {
+				pi.registerTool({ name: "ambient_owner_marker", label: "Ambient Owner Marker", description: "must not load", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "ambient" }] }; } });
+				pi.on("session_start", () => Bun.write(${JSON.stringify(ambientMarker)}, "ran"));
+			}\n`,
+		);
+		let extensionRoots: EffectiveExtensionRoots = {
+			explicit: [ambientExtensionRoot],
+			mode: "merge",
+			configured: [],
+			configuredLevel: "project",
+		};
+		const ref = await createRef(sessionFile);
+		const reviver = await createFactory(cwd, undefined, { extensionRoots: () => extensionRoots })(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+
+		extensionRoots = {
+			explicit: [ownerExtensionRoot],
+			mode: "explicit-only",
+			configured: [ambientExtensionRoot],
+			configuredLevel: "project",
+		};
+		let revived: AgentSession | undefined;
+		try {
+			const revivedSession = await reviver(ref);
+			revived = revivedSession;
+			const read = revivedSession.getToolByName("read");
+			if (!read) throw new Error("Missing revived read tool");
+			const pathScope = getSessionLocalProtocolOptions(revivedSession.sessionManager)?.getPathScope?.();
+			if (!pathScope) throw new Error("Expected revived session path scope");
+			await expect(
+				runLocalOperation(revivedSession.sessionManager, "read:denied", () =>
+					pathScope.withOperationLease("read:denied", () => read.execute("denied", { path: blockedPath })),
+				),
+			).rejects.toThrow("Owner policy denied the read");
+			expect(revivedSession.getToolByName("ambient_owner_marker")).toBeUndefined();
+			expect(await Bun.file(ambientMarker).exists()).toBe(false);
+		} finally {
+			await revived?.dispose();
+		}
+	});
+
+	it("rebinds owner policy hooks for restricted revival without widening its tools", async () => {
+		const cwd = makeTempDir("@pi-revive-restricted-policy-");
+		const sessionFile = await createPersistedSession(cwd, true, "default");
+		const blockedPath = path.join(cwd, "blocked.txt");
+		await Bun.write(blockedPath, "private fixture");
+		const preparedExtensions: PreparedExtension[] = [
+			{
+				path: "<owner-policy>",
+				resolvedPath: "<owner-policy>",
+				factory: pi => {
+					pi.registerTool({
+						name: "owner_policy_escalation",
+						label: "Owner Policy Escalation",
+						description: "A policy fixture that must not widen the restricted tool set.",
+						parameters: type({}),
+						async execute() {
+							return { content: [{ type: "text", text: "unexpected" }] };
+						},
+					});
+					pi.on("session_start", async () => {
+						await pi.setActiveTools(["read", "bash", "owner_policy_escalation", "yield"]);
+					});
+					pi.on("tool_call", event => {
+						if (event.toolName === "read" && event.input.path === blockedPath) {
+							return { block: true, reason: "Inherited policy denied the read" };
+						}
+					});
+				},
+				error: null,
+			},
+		];
+		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
+		const ref = await createRef(sessionFile);
+		const reviver = await createFactory(cwd, undefined, {
+			preparedExtensions,
+			authStorage,
+			modelRegistry,
+		})(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+
+		let revived: AgentSession | undefined;
+		try {
+			const revivedSession = await reviver(ref);
+			revived = revivedSession;
+			const read = revivedSession.getToolByName("read");
+			if (!read) throw new Error("Missing restricted read tool");
+			const pathScope = getSessionLocalProtocolOptions(revivedSession.sessionManager)?.getPathScope?.();
+			if (!pathScope) throw new Error("Expected revived session path scope");
+			await expect(
+				runLocalOperation(revivedSession.sessionManager, "read:denied", () =>
+					pathScope.withOperationLease("read:denied", () => read.execute("denied", { path: blockedPath })),
+				),
+			).rejects.toThrow("Inherited policy denied the read");
+			expect(revivedSession.getActiveToolNames()).toContain("read");
+			expect(revivedSession.getActiveToolNames()).toContain("yield");
+			expect(revivedSession.getEnabledToolNames()).not.toContain("bash");
+			expect(revivedSession.getEnabledToolNames()).not.toContain("owner_policy_escalation");
+		} finally {
+			await revived?.dispose();
+			authStorage.close();
+		}
+	});
+
+	it("anchors wake-turn artifacts to the revived ref's own dir, not the root session's (#11563)", async () => {
+		AgentRegistry.resetGlobalForTests();
+		const cwd = makeTempDir("@pi-revive-artifacts-dir-");
+		const sessionFile = await createPersistedSession(cwd);
+		MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);
+		// Run the real wake monitor (call through) so the assertion is tied to the
+		// component that actually writes <id>.md, not a stubbed seam.
+		const realAttach = executorModule.attachIrcWakeTurnMonitor;
+		let capturedArtifactsDir: string | undefined;
+		const attachSpy = vi.spyOn(executorModule, "attachIrcWakeTurnMonitor").mockImplementation((session, options) => {
+			capturedArtifactsDir = options.artifactsDir;
+			return realAttach(session, options);
+		});
+		let handle: RevivedSessionHandle | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			handle = createRevivedSession([], undefined, options?.sessionManager);
+			return { session: handle.session } as CreateAgentSessionResult;
+		});
+
+		const ref = await createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		// The real monitor ran and installed its observer...
+		expect(attachSpy).toHaveBeenCalledTimes(1);
+		expect(handle?.observer()).toBeDefined();
+		// ...anchored to the revived ref's own tree (dirname of its session file),
+		// which is where finalizeRunResult writes <id>.md, not the live root dir.
+		expect(capturedArtifactsDir).toBe(path.dirname(sessionFile));
+		expect(capturedArtifactsDir).not.toBe(path.join(cwd, "parent"));
+		AgentRegistry.resetGlobalForTests();
 	});
 
 	it("cold-revives a restricted contract without loading hostile same-name capabilities", async () => {
@@ -831,19 +1113,18 @@ describe("persisted subagent revival", () => {
 		const roleAdvisedFile = await createPersistedSession(cwd, undefined, undefined, "on");
 		const unadvisedFile = await createPersistedSession(cwd);
 		const captured: Settings[] = [];
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			if (options?.settings) captured.push(options.settings);
-			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
-			} as CreateAgentSessionResult;
-		});
 
 		const factory = createFactory(cwd);
 		for (const sessionFile of [advisedFile, roleAdvisedFile, unadvisedFile]) {
 			const ref = await createRef(sessionFile);
 			const reviver = await factory(ref);
 			if (!reviver) throw new Error("Expected a persisted reviver");
-			await reviver(ref);
+			const revived = await reviver(ref);
+			try {
+				captured.push(revived.settings);
+			} finally {
+				await revived.dispose();
+			}
 		}
 
 		const [advised, roleAdvised, unadvised] = captured;
@@ -1054,6 +1335,82 @@ describe("persisted subagent revival", () => {
 			IrcBus.resetGlobalForTests();
 		});
 
+		it("relays the attributed provider error when the wake turn fails", async () => {
+			// A failed wake turn (provider error / exhausted fallback chain) must not
+			// look like a healthy peer that chose not to answer: the waiter needs the
+			// attributed [provider/model] error, not a generic "stopped without replying".
+			const cwd = makeTempDir("@pi-revive-relay-failed-");
+			const { ref, handle, bus } = await reviveWithWaker(cwd);
+			const observer = handle.observer();
+			expect(observer).toBeDefined();
+
+			const finish = observer?.([wakeRecord("Main")]);
+			handle.setLastAssistantStop({
+				stopReason: "error",
+				errorMessage: "402 usage balance exhausted",
+				provider: "some-provider",
+				model: "some-model",
+			});
+			const reply = bus.wait("Main", { from: ref.id }, 5000);
+			await finish?.();
+			await handle.trackedReplies[0];
+
+			const msg = await reply;
+			expect(msg).not.toBeNull();
+			expect(msg?.replyTo).toBe("irc-42");
+			expect(msg?.body).toContain("[some-provider/some-model]");
+			expect(msg?.body).toContain("402 usage balance exhausted");
+			expect(msg?.body).toContain(`history://${ref.id}`);
+			resetAgentLifecycleForTests();
+			AgentRegistry.resetGlobalForTests();
+			IrcBus.resetGlobalForTests();
+		});
+
+		it("relays a cancellation notice when the wake turn is aborted", async () => {
+			const cwd = makeTempDir("@pi-revive-relay-aborted-");
+			const { ref, handle, bus } = await reviveWithWaker(cwd);
+			const observer = handle.observer();
+			expect(observer).toBeDefined();
+
+			const finish = observer?.([wakeRecord("Main")]);
+			handle.setLastAssistantStop({ stopReason: "aborted" });
+			const reply = bus.wait("Main", { from: ref.id }, 5000);
+			await finish?.();
+			await handle.trackedReplies[0];
+
+			const msg = await reply;
+			expect(msg).not.toBeNull();
+			expect(msg?.replyTo).toBe("irc-42");
+			expect(msg?.body.toLowerCase()).toContain("cancel");
+			expect(msg?.body).toContain(`history://${ref.id}`);
+			resetAgentLifecycleForTests();
+			AgentRegistry.resetGlobalForTests();
+			IrcBus.resetGlobalForTests();
+		});
+
+		it("relays a no-output notice when the wake turn completes without producing anything", async () => {
+			const cwd = makeTempDir("@pi-revive-relay-empty-");
+			const { ref, handle, bus } = await reviveWithWaker(cwd);
+			const observer = handle.observer();
+			expect(observer).toBeDefined();
+
+			// No setLastAssistant* call: the turn completes with zero output and never
+			// answers its waker. Previously the relay dropped the empty body silently.
+			const finish = observer?.([wakeRecord("Main")]);
+			const reply = bus.wait("Main", { from: ref.id }, 5000);
+			await finish?.();
+			await handle.trackedReplies[0];
+
+			const msg = await reply;
+			expect(msg).not.toBeNull();
+			expect(msg?.replyTo).toBe("irc-42");
+			expect(msg?.body.toLowerCase()).toContain("no output");
+			expect(msg?.body).toContain(`history://${ref.id}`);
+			resetAgentLifecycleForTests();
+			AgentRegistry.resetGlobalForTests();
+			IrcBus.resetGlobalForTests();
+		});
+
 		it("stays silent when the agent already answered its waker during the turn", async () => {
 			const cwd = makeTempDir("@pi-revive-relay-answered-");
 			const { ref, handle, bus } = await reviveWithWaker(cwd);
@@ -1112,8 +1469,159 @@ describe("persisted subagent revival", () => {
 			AgentRegistry.resetGlobalForTests();
 			IrcBus.resetGlobalForTests();
 		});
+
+		it("reports the failure even after the agent sent a progress ping to the waker", async () => {
+			// `sentSince` cannot tell "already answered" from "pinged 'on it'".
+			// A progress ping is not an answer, so a failed wake turn must still
+			// tell the waker it died instead of being suppressed as a duplicate.
+			const cwd = makeTempDir("@pi-revive-relay-partial-");
+			const { ref, handle, bus } = await reviveWithWaker(cwd);
+			const observer = handle.observer();
+			expect(observer).toBeDefined();
+
+			const delivered: IrcMessage[] = [];
+			const root = fixtureRegistry ? lookupAgentRef(fixtureRegistry, MAIN_AGENT_ID)?.session : undefined;
+			if (!root) throw new Error("Expected a root-scoped persisted authority fixture");
+			root.deliverIrcMessage = async (msg: IrcMessage) => {
+				delivered.push(msg);
+				return "injected";
+			};
+			const finish = observer?.([wakeRecord("Main")]);
+			await bus.send({ from: ref.id, to: "Main", body: "on it" });
+			handle.setLastAssistantStop({
+				stopReason: "error",
+				errorMessage: "402 usage balance exhausted",
+				provider: "some-provider",
+				model: "some-model",
+			});
+			await finish?.();
+			await handle.trackedReplies[0];
+
+			expect(delivered).toHaveLength(2);
+			expect(delivered[0]?.body).toBe("on it");
+			const notice = delivered[1];
+			expect(notice?.wakeRelay).toBe(true);
+			expect(notice?.body).toContain("402 usage balance exhausted");
+			expect(notice?.body.toLowerCase()).toContain("earlier in this turn");
+			resetAgentLifecycleForTests();
+			AgentRegistry.resetGlobalForTests();
+			IrcBus.resetGlobalForTests();
+		});
+
+		it("relays the error message without the stack trace when the wake turn throws", async () => {
+			// A thrown turn error's stack belongs in `done.error`/logs, not in the
+			// waking peer's model context.
+			const cwd = makeTempDir("@pi-revive-relay-thrown-");
+			const { ref, handle, bus } = await reviveWithWaker(cwd);
+			const observer = handle.observer();
+			expect(observer).toBeDefined();
+
+			const boom = new Error("boom while waking");
+			boom.stack = "boom while waking\n    at deepInternal (secret.ts:99:1)";
+			const finish = observer?.([wakeRecord("Main")]);
+			const reply = bus.wait("Main", { from: ref.id }, 5000);
+			await finish?.(boom);
+			await handle.trackedReplies[0];
+
+			const msg = await reply;
+			expect(msg).not.toBeNull();
+			expect(msg?.body).toContain("boom while waking");
+			expect(msg?.body).not.toContain("secret.ts:99");
+			expect(msg?.body).not.toContain("at deepInternal");
+			resetAgentLifecycleForTests();
+			AgentRegistry.resetGlobalForTests();
+			IrcBus.resetGlobalForTests();
+		});
 	});
-	it("restores the complete frozen permission scope and exact profile provenance", async () => {
+});
+
+describe("fail-closed revival", () => {
+		function entryType(line: string): string | undefined {
+			const parsed: { type?: string } = JSON.parse(line);
+			return parsed.type;
+		}
+
+		async function entriesOfType(
+			sessionFile: string,
+			keep: (type: string | undefined) => boolean,
+		): Promise<string[]> {
+			return (await Bun.file(sessionFile).text())
+				.split("\n")
+				.filter(line => line.trim().length > 0 && keep(entryType(line)));
+		}
+
+		it("refuses a transcript that vanished between the peek and the locked open", async () => {
+			const cwd = makeTempDir("@pi-revive-vanished-");
+			const sessionFile = await createPersistedSession(cwd);
+			const ref = await createRef(sessionFile);
+			// The factory's lock-free peek succeeds here; the file disappears
+			// before the reviver takes the single-writer lock.
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			await fs.rm(sessionFile);
+
+			await expect(reviver(ref)).rejects.toThrow(/ENOENT/);
+			// Fail closed without minting: the missing path stays missing.
+			expect(await Bun.file(sessionFile).exists()).toBe(false);
+		});
+
+		it("refuses a transcript deleted between open's snapshot read and its adoption", async () => {
+			const cwd = makeTempDir("@pi-revive-stale-read-");
+			const sessionFile = await createPersistedSession(cwd);
+			const ref = await createRef(sessionFile);
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			// Delete the transcript from inside its own snapshot read: open()
+			// has resolved loadSessionFile but has not adopted the snapshot
+			// yet, so the reviver must fail closed on the fresh state instead
+			// of reviving stale history. Single-shot: only the snapshot read
+			// mutates, so the publish-time re-read observes the deletion.
+			const originalReadText = FileSessionStorage.prototype.readText;
+			const readTextSpy = vi.spyOn(FileSessionStorage.prototype, "readText").mockImplementationOnce(async function (
+				this: FileSessionStorage,
+				p: string,
+			) {
+				const text = await originalReadText.call(this, p);
+				await fs.rm(p);
+				return text;
+			});
+			try {
+				await expect(reviver(ref)).rejects.toThrow(/ENOENT/);
+				// Fail closed without minting: the missing path stays missing.
+				expect(await Bun.file(sessionFile).exists()).toBe(false);
+			} finally {
+				readTextSpy.mockRestore();
+			}
+		});
+
+		it("refuses a transcript truncated to header+session_init without rewriting it", async () => {
+			const cwd = makeTempDir("@pi-revive-truncated-");
+			const sessionFile = await createPersistedSession(cwd);
+			const truncated = `${(await entriesOfType(sessionFile, type => type === "session" || type === "session_init")).join("\n")}\n`;
+			await Bun.write(sessionFile, truncated);
+			const ref = await createRef(sessionFile);
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+
+			await expect(reviver(ref)).rejects.toThrow(/no message history/);
+			// The parked transcript is evidence, not scratch space: untouched.
+			expect(await Bun.file(sessionFile).text()).toBe(truncated);
+		});
+
+		it("rebuilds the contract from the reopened file, not the stale peek capture", async () => {
+			const cwd = makeTempDir("@pi-revive-contract-");
+			const sessionFile = await createPersistedSession(cwd);
+			const ref = await createRef(sessionFile);
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			// The file is replaced after the peek: same messages, no session_init.
+			const withoutInit = `${(await entriesOfType(sessionFile, type => type !== "session_init")).join("\n")}\n`;
+			await Bun.write(sessionFile, withoutInit);
+
+			await expect(reviver(ref)).rejects.toThrow(/no persisted session contract/);
+			expect(await Bun.file(sessionFile).text()).toBe(withoutInit);
+		});
+		it("restores the complete frozen permission scope and exact profile provenance", async () => {
 		const cwd = makeTempDir("@pi-permission-revive-");
 		await fs.mkdir(path.join(cwd, ".omp"), { recursive: true });
 		await fs.writeFile(

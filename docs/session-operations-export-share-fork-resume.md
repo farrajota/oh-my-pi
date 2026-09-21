@@ -22,7 +22,7 @@ This document describes operator-visible behavior for session export, sharing, c
 | `/new`                                  | Interactive slash command    | Yes (starts an empty conversation)            | Switches identity; assigns a new transcript path in persistent mode                        | None                                                                                |
 | `/fresh`                                | Slash command (TUI/headless) | Yes (provider-facing in-memory id/state only) | No; keeps current session file/header                                                      | None                                                                                |
 | `/clear`                                | Interactive slash command    | Yes (clears live/model conversation context)  | No; retains session identity, metadata, transcript file, and full on-disk history          | Appends a durable `reset_boundary`                                                  |
-| `/drop`                                 | Interactive slash command    | Yes (starts an empty conversation)            | Attempts to delete the current persisted session and artifacts, then switches to a new one | None                                                                                |
+| `/delete`                               | Interactive slash command    | Yes (starts an empty conversation)            | Attempts to delete the current persisted session and artifacts, then switches to a new one | None                                                                                |
 | `/fork`                                 | Interactive slash command    | Yes (active session identity changes)         | Creates new session file and switches current session to it (persistent mode only)         | Copies artifact directory to new session namespace when present                     |
 | `--fork <id\|path>`                     | CLI startup                  | Yes after session creation                    | Creates a new session fork from the selected source into current cwd/session dir           | None                                                                                |
 | `/resume [id\|@claude\|@codex]`         | Interactive slash command    | Yes (active in-memory state replaced)         | Switches to a selected/matched session, or imports a selected foreign session              | None                                                                                |
@@ -30,6 +30,7 @@ This document describes operator-visible behavior for session export, sharing, c
 | `--resume <id\|path>`                   | CLI startup                  | Yes after session creation                    | Opens existing session; a missing recorded cwd may be re-rooted into the current directory | None                                                                                |
 | `/restart`                              | Interactive slash command    | Yes (process relaunches)                      | Relaunches omp with the original launch flags and resumes the current session in place     | None                                                                                |
 | `--continue`                            | CLI startup                  | Yes after session creation                    | Opens terminal breadcrumb or most-recent session; creates new one if none exists           | None                                                                                |
+| `omp session repair <session-id-or-path> [--apply]` | CLI command | Dry-run is read-only; `--apply` appends authority closure records only | No transcript switch or provider mutation; apply requires the owning client to be stopped | Status, retained backup directory, and fresh-process resume command |
 
 ## Export and dump
 
@@ -182,7 +183,7 @@ keeping the conversation you can see.
 
 Because it keeps both the visible and model-facing conversation, `/fresh`
 differs from `/clear` (clear the live/model conversation in place), `/new`
-(start a brand-new empty session), and `/drop` (attempt to delete the current
+(start a brand-new empty session), and `/delete` (attempt to delete the current
 session and start a new one). Only `/fresh` preserves the existing conversation
 while giving the provider stream state a clean slate.
 
@@ -211,7 +212,7 @@ command aborts it and waits for it to stop before resetting.
 The TUI clears its rendered transcript after a successful clear. This differs
 from `/fresh`, which rotates provider stream state without clearing the
 conversation; `/new`, which creates a new session identity and transcript file;
-and `/drop`, which attempts to delete the old persisted session before starting
+and `/delete`, which attempts to delete the old persisted session before starting
 a new one.
 
 ## BTW history
@@ -271,6 +272,34 @@ Startup `--fork` is resolved before normal session creation:
 Use `--prompt-cache-key <key>` to pin the provider prompt-cache identity explicitly and independently from both the OMP session id and `--provider-session-id`. `--provider-session-id` continues to control provider session/routing headers and sticky credential selection; `--prompt-cache-key` controls the OpenAI Responses `prompt_cache_key` payload where supported.
 
 ## Resume and continue
+
+## Session authority repair
+
+`omp session repair <session-id-or-path>` is a provider-independent inspection and repair command for the durable authority sidecar associated with a saved session. The command accepts a session id or a path to a `.jsonl` file; use a quoted path placeholder when the path contains spaces.
+
+```sh
+omp session repair '/path/to/session.jsonl'
+```
+
+Repair is a **dry-run by default**. It reads and validates the complete authority journal, including its hash/history chain, root identity, actor generations, parent lineage, and permission snapshots. A dry-run never changes the journal or its quarantine marker and reports either `clean` or an explicitly `repairable` diagnosis. It refuses unexplained quarantine markers, hash/history corruption, cycles, root or lineage conflicts, scope drift, and other states that cannot be proven safe.
+
+Any actor records that repair appends are limited to verified legacy descendants of terminal ancestors (`retired` or `aborted`). A recognized quarantine marker may also be resolved when whole-history validation proves that no affected actor closure remains. The repair set is closed leaf-first: each affected descendant is retired before its terminal parent is relied on. This is authority recovery, not transcript repair; the session `.jsonl` and its conversation history are preserved.
+
+After reviewing a repairable dry-run, stop the client that owns the session before applying:
+
+```sh
+omp session repair '/path/to/session.jsonl' --apply
+```
+
+`--apply` takes the journal and, when present, quarantine-marker locks; rechecks the source bytes, metadata, journal head, and affected lineage; writes the exact pre-repair journal and marker bytes to a retained `.authority-repair-*` backup directory; and appends terminal closure records to the journal. A source change, lock conflict, or failed verification aborts safely rather than overwriting a competing source. The active quarantine marker is resolved only as part of a successful apply; do not manually delete the journal, marker, or backup.
+
+After a successful apply, start a **fresh process** with the reported command instead of trying to hot-reload the repaired authority:
+
+```sh
+omp --resume '/path/to/session.jsonl'
+```
+
+Do not use this command to deploy, repair live provider data, revive old actor authority, or alter unrelated session behavior.
 
 ## Interactive `/resume [value]`
 
@@ -395,8 +424,8 @@ When session manager is created with `SessionManager.inMemory()` (`--no-session`
 
 - `/share` custom-share failures do not degrade to the default encrypted share flow; they terminate the TUI command with an error.
 - `/export` argument tokenization does not preserve quoted paths with spaces.
-- `/drop` treats deletion as best-effort: it attempts to delete the current
+- `/delete` treats deletion as best-effort: it attempts to delete the current
   session JSONL and artifact directory, logs any deletion failure, and still
   creates and switches to a new session. A failed or partial deletion can leave
-  the old session or its artifacts on disk, so `/drop` is not a guaranteed
+  the old session or its artifacts on disk, so `/delete` is not a guaranteed
   erasure boundary.

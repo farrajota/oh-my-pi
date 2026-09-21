@@ -58,7 +58,7 @@ import type {
 	AsyncJobSnapshotOptions,
 	BackgroundControlResult,
 } from "../../async";
-import type { KeybindingsManager } from "../../config/keybindings";
+import type { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
@@ -67,8 +67,8 @@ import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
-import type { CustomEditor } from "../../modes/components/custom-editor";
-import type { Theme } from "../../modes/theme/theme";
+import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -138,7 +138,6 @@ export type {
 	BackgroundControlResult,
 	BackgroundControlStatus,
 } from "../../async";
-export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
 export type { AgentToolResult, AgentToolUpdateCallback };
 
@@ -431,6 +430,7 @@ export interface CompactOptions {
 	 * `customInstructions`.
 	 */
 	internalGuidance?: string;
+	suppressContinuation?: boolean;
 }
 
 /**
@@ -674,12 +674,16 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	 *  `"read"`: read-only operations. `"write"`: mutations. `"exec"`: code execution. */
 	approval?: ToolApproval;
 	/** Structured-output strict grammar opt-in/out. `false` is meaningful: OpenAI-family
-	 *  serializers preserve an explicit `strict: false` on the wire (#4336/#4340). */
+	 * serializers preserve an explicit `strict: false` on the wire (#4336/#4340). */
 	strict?: boolean;
+	/** Whether the tool can read skill instruction URIs supplied in its prompt. */
+	readsSkillUris?: boolean;
 	/** MCP server name for discovery/search metadata when this tool fronts an MCP server. */
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+	/** Previous public name when a rename changed minting. */
+	legacyName?: string;
 	/** Optional environment hook applied when the interactive user shell invokes this tool's shell surface. */
 	shellEnv?: ToolShellEnvironmentHook;
 	/** Authoritative originating file for a discovered custom-tool module. */
@@ -1688,10 +1692,10 @@ export type ExtensionFactory = (pi: ExtensionAPI) => void | Promise<void>;
 // ============================================================================
 // Loaded Extension Types
 // ============================================================================
-
 export interface RegisteredTool<TParams extends TSchema = TSchema, TDetails = unknown> {
 	definition: ToolDefinition<TParams, TDetails>;
 	extensionPath: string;
+	sourceInfo: SourceInfo;
 }
 
 /** Internal observer invoked when an already-loaded extension registers or replaces a tool. */

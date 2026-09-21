@@ -8,18 +8,18 @@ import { Text } from "@oh-my-pi/pi-tui";
 import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { getEditStore } from "../edit/store";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import { formatHashlineHeader } from "./hashline-format";
-import type { Theme } from "../modes/theme/theme";
+import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import astGrepDescription from "../prompts/tools/ast-grep.md" with { type: "text" };
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
-import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
+import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "@oh-my-pi/pi-tui/render";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import { materializeReadUrlToFile, parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
-import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "./grouped-file-output";
-import { formatMatchLine } from "./match-line-format";
+import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
+import { formatMatchLine } from "@oh-my-pi/pi-tui/tools/match-line-format";
 import type { OutputMeta } from "./output-meta";
 import { resolveToolSearchScope, toPathList } from "./path-utils";
 import { isRawSelector } from "./read-selector";
@@ -33,7 +33,7 @@ import {
 	formatErrorMessage,
 	formatParseErrors,
 	formatParseErrorsCountLabel,
-} from "./render-utils";
+} from "@oh-my-pi/pi-tui/render/render-utils";
 import { PREVIEW_LIMITS } from "./preview-limits";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";

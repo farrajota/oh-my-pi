@@ -15,19 +15,12 @@
  * work, which is the failure mode this whole feature exists to avoid.
  */
 
-import { truncateToWidth } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
-import { executeBash, type BashResult } from "../exec/bash-executor";
-import { PREVIEW_LIMITS } from "../tools/preview-limits";
-import { sanitizeStatusText } from "./sanitize-status-text";
-
-/** A `/loop --while` / `/loop --until` continue-condition. */
-export interface LoopConditionConfig {
-	/** Shell command line, run through the user's configured shell. */
-	command: string;
-	/** `--until`: continue while the command *fails*. `--while`: while it succeeds. */
-	until: boolean;
-}
+import type { LoopConditionConfig } from "@oh-my-pi/pi-tui/status-line/loop";
+import type { BashResult } from "../exec/bash-executor";
+import { executeBash } from "../exec/bash-executor";
+import { TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
+import { sanitizeStatusText } from "@oh-my-pi/pi-tui/chrome/shared";
 
 export type LoopConditionVerdict =
 	/** The condition says run another iteration. */
@@ -59,7 +52,7 @@ const LOOP_CONDITION_SESSION_KEY = "loop-condition";
 
 /** Sanitize + bound user command text for single-line status display. */
 function quoteCommand(command: string): string {
-	return `\`${truncateToWidth(sanitizeStatusText(command), PREVIEW_LIMITS.TITLE_WIDTH)}\``;
+	return `\`${truncateToWidth(sanitizeStatusText(command), TRUNCATE_LENGTHS.TITLE)}\``;
 }
 
 /** First meaningful line of a failed condition's output, bounded for display. */
@@ -69,7 +62,7 @@ function previewOutput(output: string): string {
 		.map(entry => entry.trim())
 		.find(entry => entry.length > 0);
 	if (!line) return "";
-	return truncateToWidth(sanitizeStatusText(line), PREVIEW_LIMITS.TITLE_WIDTH);
+	return truncateToWidth(sanitizeStatusText(line), TRUNCATE_LENGTHS.TITLE);
 }
 
 function formatTimeout(timeoutMs: number): string {
@@ -83,12 +76,6 @@ function formatTimeout(timeoutMs: number): string {
 /** Human-readable form of the condition, for enable/status messages. */
 export function describeLoopCondition(condition: LoopConditionConfig): string {
 	return `${condition.until ? "until" : "while"} ${quoteCommand(condition.command)} succeeds`;
-}
-
-/** Compact status-line form: `until: bun test`. */
-export function summarizeLoopCondition(condition: LoopConditionConfig, maxWidth: number): string {
-	const label = condition.until ? "until" : "while";
-	return `${label}: ${truncateToWidth(sanitizeStatusText(condition.command), Math.max(1, maxWidth - label.length - 2))}`;
 }
 
 /**
@@ -113,7 +100,7 @@ export async function evaluateLoopCondition(
 		logger.error("loop condition failed to start", { command: condition.command, error: String(error) });
 		return {
 			kind: "error",
-			message: `Loop condition ${quoteCommand(condition.command)} could not run: ${truncateToWidth(sanitizeStatusText(String(error)), PREVIEW_LIMITS.TITLE_WIDTH)}. Loop mode disabled.`,
+			message: `Loop condition ${quoteCommand(condition.command)} could not run: ${truncateToWidth(sanitizeStatusText(String(error)), TRUNCATE_LENGTHS.TITLE)}. Loop mode disabled.`,
 		};
 	}
 

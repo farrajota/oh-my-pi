@@ -225,7 +225,7 @@ import {
 	resolveThinkingLevelForModel,
 	shouldDisableReasoning,
 	toReasoningEffort,
-} from "./thinking";
+} from "@oh-my-pi/pi-tui/thinking";
 import {
 	BashTool,
 	BUILTIN_TOOLS,
@@ -270,7 +270,7 @@ import { ttsTool } from "./tools/tts";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
 import { EventBus } from "./utils/event-bus";
 import { normalizeProviderContextImagesForModel } from "./utils/image-loading";
-import { formatLocalCalendarDate } from "./utils/local-date";
+import { formatLocalCalendarDate } from "@oh-my-pi/pi-tui/chrome/local-date";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { buildNamedToolChoice } from "./utils/tool-choice";
 import { VibeSessionRegistry } from "./vibe/runtime";
@@ -415,6 +415,8 @@ export interface CreateAgentSessionOptions {
 	 * provider routing.
 	 */
 	getApiKey?: AgentOptions["getApiKey"];
+	/** Session whose OAuth account affinity should be used when resolving credentials. */
+	credentialSourceSessionId?: string;
 
 	/** Model to use. Default: from settings, else first available */
 	model?: Model;
@@ -586,6 +588,12 @@ export interface CreateAgentSessionOptions {
 	 * and ambient custom tools remain disabled. Default: false.
 	 */
 	allowRestrictedCustomTools?: boolean;
+	/**
+	 * Permit extension loading inside a restricted session when the caller owns
+	 * the effective extension-root policy. Ambient roots remain controlled by
+	 * {@link extensionRoots}; default: false.
+	 */
+	allowRestrictedExtensions?: boolean;
 
 	/** Output schema for structured completion (subagents). */
 	outputSchema?: unknown;
@@ -1054,9 +1062,12 @@ function registerEvalCleanup(): void {
 	postmortem.register("julia-cleanup", disposeAllJuliaKernelSessions);
 }
 
-export function customToolToDefinition(tool: CustomTool, sourcePath?: string): ToolDefinition {
+export function customToolToDefinition(
+	tool: CustomTool,
+	sourcePath?: string,
+): ToolDefinition & { readsSkillUris?: boolean } {
 	assertToolNameNotReserved(tool.name);
-	const definition: ToolDefinition & { [TOOL_DEFINITION_MARKER]: true } = {
+	const definition: ToolDefinition & { readsSkillUris?: boolean; [TOOL_DEFINITION_MARKER]: true } = {
 		name: tool.name,
 		label: tool.label,
 		description: tool.description,
@@ -1065,10 +1076,12 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 		defaultInactive: tool.hidden === true,
 		loadMode: defaultLoadModeForToolName(tool.name, tool.loadMode),
 		deferrable: tool.deferrable,
+		legacyName: tool.legacyName,
 		approval: typeof tool.approval === "function" ? tool.approval.bind(tool) : tool.approval,
 		// Preserved through RegisteredToolAdapter so MCP-backed tools' explicit
 		// `strict: false` (#4336/#4340) survives the custom-tool → definition bridge.
 		strict: tool.strict,
+		readsSkillUris: tool.readsSkillUris,
 		mcpServerName: tool.mcpServerName,
 		mcpToolName: tool.mcpToolName,
 		sourcePath,
@@ -1358,10 +1371,9 @@ function snapshotCreateAgentSessionOptions(options: CreateAgentSessionOptions): 
 			policy.allowExtensions && options.preloadedExtensionPaths
 				? (Object.freeze([...options.preloadedExtensionPaths]) as unknown as string[])
 				: undefined,
-		preloadedPreparedExtensions:
-			policy.allowExtensions && options.preloadedPreparedExtensions
-				? cloneAndFreezeStartupValue(options.preloadedPreparedExtensions)
-				: undefined,
+		preloadedPreparedExtensions: options.preloadedPreparedExtensions
+			? cloneAndFreezeStartupValue(options.preloadedPreparedExtensions)
+			: undefined,
 		preloadedCustomToolPaths:
 			policy.allowExtensions && options.preloadedCustomToolPaths
 				? cloneAndFreezeStartupValue(options.preloadedCustomToolPaths)
@@ -1592,6 +1604,9 @@ async function createAgentSessionScoped(
 		await sessionManager.setAdditionalDirectories(merged);
 	}
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
+	if (options.credentialSourceSessionId && options.credentialSourceSessionId !== providerSessionId) {
+		authStorage.inheritSessionCredentials(options.credentialSourceSessionId, providerSessionId);
+	}
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
 		options.modelPattern !== undefined ||
@@ -1971,6 +1986,7 @@ async function createAgentSessionScoped(
 			toolExecutionAuthority,
 			canPromptUser: options.interactivePrompts ?? options.hasUI ?? false,
 			getApiKey: options.getApiKey,
+			providerSessionId,
 			get additionalDirectories() {
 				return sessionManager.getAdditionalDirectories();
 			},
@@ -2030,6 +2046,8 @@ async function createAgentSessionScoped(
 				});
 			},
 			getSessionSpawns: () => options.spawns ?? "*",
+			getSessionAgents: () => session?.getSessionAgents() ?? [],
+			getLastAssistantText: () => session?.getLastAssistantText(),
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getActiveModel: () => agent?.state.model ?? model,
@@ -2345,11 +2363,18 @@ async function createAgentSessionScoped(
 		// the flag and pre-resolved the result already reflects that choice.
 		let extensionPaths: string[];
 		let extensionsResult: LoadExtensionsResult;
-		if (restrictToolNames) {
-			// Allocate a session runtime without evaluating caller-provided extension
-			// instances, paths, or factories.
+		if (restrictToolNames && !startupPolicy.allowExtensions) {
+			// Restricted sessions may inherit prepared policy handlers and provider
+			// factories, but only an authority caller may opt into filesystem
+			// extension discovery through allowRestrictedExtensions.
 			extensionPaths = [];
-			extensionsResult = await loadExtensions([], cwd, eventBus);
+			extensionsResult = await logger.time(
+				"bindPreparedRestrictedExtensions",
+				bindPreparedExtensions,
+				options.preloadedPreparedExtensions ?? [],
+				cwd,
+				eventBus,
+			);
 		} else if (options.preloadedExtensions) {
 			extensionsResult = {
 				...options.preloadedExtensions,
@@ -2430,11 +2455,13 @@ async function createAgentSessionScoped(
 		toolSession.preparedExtensions = extensionsResult.preparedExtensions;
 
 		// Only unrestricted startup may install or discover provider routes.
-		if (startupPolicy.allowProviderDiscovery) {
-			const activeExtensionSources = extensionsResult.extensions.map(extension => extension.path);
-			modelRegistry.syncExtensionSources(activeExtensionSources);
-			for (const sourceId of new Set(activeExtensionSources)) {
-				modelRegistry.clearSourceRegistrations(sourceId);
+		if (startupPolicy.allowProviderDiscovery || restrictToolNames) {
+			if (startupPolicy.allowProviderDiscovery) {
+				const activeExtensionSources = extensionsResult.extensions.map(extension => extension.path);
+				modelRegistry.syncExtensionSources(activeExtensionSources);
+				for (const sourceId of new Set(activeExtensionSources)) {
+					modelRegistry.clearSourceRegistrations(sourceId);
+				}
 			}
 			for (const { name, config, sourceId } of extensionsResult.runtime.pendingProviderRegistrations) {
 				modelRegistry.registerProvider(name, cloneAndFreezeStartupValue(config), sourceId);
@@ -3050,7 +3077,11 @@ async function createAgentSessionScoped(
 			...registeredTools,
 			...sdkCustomTools.map(tool => {
 				const definition = isCustomTool(tool) ? customToolToDefinition(tool) : tool;
-				return { definition, extensionPath: "<sdk>" };
+				return {
+					definition,
+					extensionPath: "<sdk>",
+					sourceInfo: { path: "<sdk>", source: "sdk", scope: "temporary", origin: "top-level" } as const,
+				};
 			}),
 		];
 		const wrappedExtensionTools: Tool[] = deduplicateMCPToolsByName(
@@ -3798,9 +3829,10 @@ async function createAgentSessionScoped(
 			repetitionPenalty: settings.get("repetitionPenalty") >= 0 ? settings.get("repetitionPenalty") : undefined,
 			hideThinkingSummary: settings.get("omitThinking"),
 			kimiApiFormat,
-			preferWebsockets: preferOpenAICodexWebsockets,
+			getApiKey:
+				options.getApiKey ??
+				(requestModel => modelRegistry.resolver(requestModel, options.credentialSourceSessionId ?? agent.sessionId)),
 			getToolContext: tc => toolContextStore.getContext(tc),
-			getApiKey: options.getApiKey ?? (requestModel => modelRegistry.resolver(requestModel, agent.sessionId)),
 			streamFn: (streamModel, context, streamOptions) => {
 				if (notifyFirstChatDispatch) {
 					const cb = notifyFirstChatDispatch;
@@ -4002,7 +4034,7 @@ async function createAgentSessionScoped(
 			modelRegistry,
 			rebindModelAfterDiscovery: options.model === undefined || options.rebindModelAfterDiscovery === true,
 			toolRegistry,
-			memoryAgentDir: agentDir,
+			memoryAgentDir: restrictToolNames ? undefined : agentDir,
 			memoryTaskDepth: taskDepth,
 			createMemoryTools: restrictToolNames
 				? undefined
@@ -4029,6 +4061,7 @@ async function createAgentSessionScoped(
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
 			getEvalPreludes,
+			evalToolSession: toolSession,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
 			xdev: toolSession.xdev,
 			presentationPinnedToolNames: explicitlyRequestedToolNameSet,

@@ -1,13 +1,16 @@
 import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import { type Component, Container, isFocusable, type OverlayOptions, setKeybindings } from "@oh-my-pi/pi-tui";
-import { KeybindingsManager } from "../../../src/config/keybindings";
+import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { ExtensionAskDialogQuestion, ExtensionUIContext } from "../../../src/extensibility/extensions";
-import { AskDialogComponent } from "../../../src/modes/components/ask-dialog";
-import { CustomEditor } from "../../../src/modes/components/custom-editor";
-import { HookEditorComponent } from "../../../src/modes/components/hook-editor";
+import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
 import { ExtensionUiController } from "../../../src/modes/controllers/extension-ui-controller";
 import { InputController } from "../../../src/modes/controllers/input-controller";
-import { getEditorTheme, getThemeByName, setThemeInstance } from "../../../src/modes/theme/theme";
+
+import { getEditorTheme, getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
+import * as operationLease from "../../../src/registry/operation-lease";
+
 import type { InteractiveModeContext } from "../../../src/modes/types";
 
 afterEach(() => {
@@ -20,7 +23,7 @@ beforeAll(async () => {
 	setThemeInstance(dark);
 });
 
-function makeHarness() {
+function makeHarness(options: { extensionRunner?: object } = {}) {
 	const editor = new CustomEditor(getEditorTheme());
 	const editorContainer = new Container();
 	editorContainer.addChild(editor);
@@ -40,6 +43,8 @@ function makeHarness() {
 		isHidden: vi.fn(() => false),
 	};
 	const showOverlay = vi.fn(() => fakeHandle);
+	const switchSession = vi.fn(async () => true);
+	const prepareSessionSwitch = vi.fn(async () => {});
 	let uiContext: ExtensionUIContext | undefined;
 	const ctx = {
 		editor,
@@ -52,9 +57,18 @@ function makeHarness() {
 		},
 		editorContainer,
 		session: {
-			extensionRunner: undefined,
+			extensionRunner: options.extensionRunner,
 			setUsageFallbackConfirmer: vi.fn(),
+			switchSession,
 		},
+		sessionManager: {
+			getSessionFile: () => "/tmp/current-session.jsonl",
+			getSessionName: () => "Current session",
+			getCwd: () => "/tmp",
+		},
+		prepareSessionSwitch,
+		renderInitialMessages: vi.fn(async () => {}),
+		reloadTodos: vi.fn(async () => {}),
 		setToolUIContext(context: ExtensionUIContext, hasUI: boolean): void {
 			expect(hasUI).toBe(true);
 			uiContext = context;
@@ -74,6 +88,9 @@ function makeHarness() {
 		getFocused,
 		setFocus,
 		showOverlay,
+		ctx,
+		switchSession,
+		prepareSessionSwitch,
 		fakeHandle,
 		controller,
 		inputController: (readText: () => Promise<string>) =>
@@ -521,5 +538,31 @@ describe("ExtensionUiController custom overlay", () => {
 		expect(component.dispose).toHaveBeenCalledTimes(1);
 		expect(harness.editorContainer.children).toEqual([harness.editor]);
 		expect(harness.editor.getText()).toBe("draft typed while factory is pending");
+	});
+});
+
+describe("ExtensionUiController bound resume preflight", () => {
+	it("rejects both extension switch actions before session preparation", async () => {
+		const commandActions: Array<{ switchSession: (sessionPath: string) => Promise<{ cancelled: boolean }> }> = [];
+		const extensionRunner = {
+			getComposerShapes: () => [],
+			initialize: (_actions: unknown, _contextActions: unknown, actions: unknown) => {
+				commandActions.push(actions as { switchSession: (sessionPath: string) => Promise<{ cancelled: boolean }> });
+			},
+			onError: () => {},
+			emit: async () => undefined,
+		};
+		const { controller, prepareSessionSwitch, switchSession } = makeHarness({ extensionRunner });
+		vi.spyOn(operationLease, "hasBoundSessionOperationAuthority").mockReturnValue(true);
+
+		await controller.initHooksAndCustomTools();
+		controller.initializeHookRunner({} as ExtensionUIContext, true);
+		expect(commandActions).toHaveLength(2);
+		for (const actions of commandActions) {
+			await expect(actions.switchSession("/tmp/other-session.jsonl")).rejects.toThrow(/fresh process|--resume/);
+		}
+
+		expect(prepareSessionSwitch).not.toHaveBeenCalled();
+		expect(switchSession).not.toHaveBeenCalled();
 	});
 });

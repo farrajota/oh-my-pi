@@ -23,11 +23,11 @@ import {
 	type IrcDeliveryReceipt,
 	type IrcMessage,
 } from "../../irc/bus";
-import type { Theme } from "../../modes/theme/theme";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { type AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../../registry/persisted-agents";
 import { canSpawnAtDepth } from "../../task/types";
-import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
+import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "@oh-my-pi/pi-tui/render";
 import {
 	createCachedComponent,
 	formatBadge,
@@ -35,7 +35,7 @@ import {
 	getPreviewLines,
 	replaceTabs,
 	type ToolUIColor,
-} from "../render-utils";
+} from "@oh-my-pi/pi-tui/render/render-utils";
 import { PREVIEW_LIMITS } from "../preview-limits";
 import {
 	boundCoordinationResult,
@@ -464,7 +464,14 @@ export async function executeSend(
 
 /** Pure message wait: no jobs in play, block on the bus with peer liveness. */
 export async function executeMessageWait(
-	deps: { registry: AgentRegistry; senderId: string; settings: Settings; bus?: IrcBus; rootId?: string },
+	deps: {
+		registry: AgentRegistry;
+		senderId: string;
+		settings: Settings;
+		bus?: IrcBus;
+		rootId?: string;
+		liveness?: boolean;
+	},
 	params: { from?: string; timeoutMs?: number },
 	signal?: AbortSignal,
 	transaction?: HubAdmissionStateTransaction,
@@ -475,7 +482,7 @@ export async function executeMessageWait(
 	const timeoutMs = resolveMessageTimeoutMs(settings, params.timeoutMs);
 	try {
 		const waited = await (deps.bus ?? IrcBus.global()).wait(senderId, { from }, timeoutMs, signal, {
-			liveness: { registry, senderId },
+			...(deps.liveness === false ? {} : { liveness: { registry, senderId } }),
 			...(transaction ? { transaction } : {}),
 		});
 		if (!waited) {

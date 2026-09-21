@@ -10,14 +10,14 @@ import { formatGroupedPaths, hasFsCode, isEnoent, prompt, untilAborted } from "@
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { splitMemoryGlobPattern } from "../internal-urls/memory-protocol";
-import type { Theme } from "../modes/theme/theme";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import globDescription from "../prompts/tools/glob.md" with { type: "text" };
-import { type TruncationResult, truncateHead } from "../session/streaming-output";
+import { type TruncationResult, truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
-import { Ellipsis, fileHyperlink, renderFileList, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
+import { Ellipsis, fileHyperlink, renderFileList, renderStatusLine, renderTreeList, truncateToWidth } from "@oh-my-pi/pi-tui/render";
 import type { ToolSession } from ".";
-import { applyListLimit } from "./list-limit";
+import { applyListLimit } from "@oh-my-pi/pi-tui/tools/list-limit";
 import { formatFullOutputReference, type OutputMeta } from "./output-meta";
 import {
 	expandDelimitedPathEntries,
@@ -31,7 +31,7 @@ import {
 	resolveToCwd,
 	toPathList,
 } from "./path-utils";
-import { createCachedComponent, formatCount, formatEmptyMessage, formatErrorMessage } from "./render-utils";
+import { createCachedComponent, formatCount, formatEmptyMessage, formatErrorMessage } from "@oh-my-pi/pi-tui/render/render-utils";
 import { PREVIEW_LIMITS } from "./preview-limits";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";

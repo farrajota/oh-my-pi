@@ -6,13 +6,14 @@ import { Text } from "@oh-my-pi/pi-tui";
 import { isRecord, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import type { Theme } from "../modes/theme/theme";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import type { SessionEntry } from "../session/session-entries";
-import { framedBlock, renderStatusLine, renderTreeList } from "../tui";
+import { renderStatusLine, renderTreeList } from "@oh-my-pi/pi-tui/render";
+import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
 import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
-import { formatErrorDetail, formatMoreItems, pluralize, replaceTabs } from "./render-utils";
+import { formatErrorDetail, formatMoreItems, pluralize, replaceTabs } from "@oh-my-pi/pi-tui/render/render-utils";
 import { PREVIEW_LIMITS } from "./preview-limits";
 
 // =============================================================================
@@ -61,6 +62,20 @@ export interface TodoToolDetails {
 	phases: TodoPhase[];
 	storage: "session" | "memory";
 	completedTasks?: TodoCompletionTransition[];
+}
+
+/**
+ * Phases a successful, state-changing `todo` result committed, or undefined
+ * for errors and pure `view` reads. A direct call lands these on the branch
+ * through its own toolResult entry; a caller that produces no `todo`
+ * toolResult (the eval bridge) must persist them itself or the next branch
+ * rehydration (resume, rewind, fork, /btw) silently reverts the change.
+ */
+export function committedTodoPhases(result: AgentToolResult): TodoPhase[] | undefined {
+	if (result.isError || !isRecord(result.details)) return undefined;
+	const { op, phases } = result.details;
+	if (op === "view" || !Array.isArray(phases) || !phases.every(isTodoPhase)) return undefined;
+	return phases;
 }
 
 // =============================================================================
@@ -175,26 +190,104 @@ export function nextActionableTask(phases: readonly TodoPhase[]): TodoItem | und
 
 export const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
 
-export function getLatestTodoPhasesFromEntries(entries: SessionEntry[]): TodoPhase[] {
+export const TODO_HUD_STATE_CUSTOM_TYPE = "todo_hud_state";
+
+export type TodoHudVisibility = "dismissed" | "revealed";
+
+export interface TodoSnapshotIdentity {
+	sourceEntryId: string;
+	fingerprint: string;
+}
+
+export interface TodoHudStateEntryData extends TodoSnapshotIdentity {
+	visibility: TodoHudVisibility;
+}
+
+function todoPhasesFingerprint(phases: readonly TodoPhase[]): string {
+	return JSON.stringify(
+		phases.map(phase => ({
+			name: phase.name,
+			tasks: phase.tasks.map(task =>
+				task.blocker === undefined
+					? { content: task.content, status: task.status }
+					: { content: task.content, status: task.status, blocker: task.blocker },
+			),
+		})),
+	);
+}
+
+function canonicalTodoPhases(entry: SessionEntry): TodoPhase[] | undefined {
+	if (entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE) {
+		const phases = (entry.data as { phases?: unknown } | undefined)?.phases;
+		return Array.isArray(phases) ? (phases as TodoPhase[]) : undefined;
+	}
+	if (entry.type !== "message") return undefined;
+	const message = entry.message as {
+		role?: string;
+		toolName?: string;
+		details?: { op?: unknown; phases?: unknown };
+		isError?: boolean;
+	};
+	if (message.role !== "toolResult" || message.toolName !== "todo" || message.isError) return undefined;
+	if (message.details?.op === "view") return undefined;
+	const phases = message.details?.phases;
+	return Array.isArray(phases) ? (phases as TodoPhase[]) : undefined;
+}
+
+/** Identify the latest durable canonical todo snapshot on the active branch. */
+export function getLatestTodoSnapshotIdentity(entries: SessionEntry[]): TodoSnapshotIdentity | undefined {
+	let latest: TodoPhase[] | undefined;
+	let sourceEntryId: string | undefined;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const phases = canonicalTodoPhases(entries[i]);
+		if (phases) {
+			latest = phases;
+			sourceEntryId = entries[i].id;
+			break;
+		}
+	}
+	if (!latest || !sourceEntryId) return undefined;
+	return { sourceEntryId, fingerprint: todoPhasesFingerprint(latest) };
+}
+
+/** Return the persisted HUD choice only when it targets the current canonical snapshot exactly. */
+export function getTodoHudVisibility(
+	entries: SessionEntry[],
+	phases: readonly TodoPhase[],
+): TodoHudVisibility | undefined {
+	const snapshot = getLatestTodoSnapshotIdentity(entries);
+	if (!snapshot || snapshot.fingerprint !== todoPhasesFingerprint(phases)) return undefined;
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
-		if (entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE) {
-			const data = entry.data as { phases?: unknown } | undefined;
-			if (data && Array.isArray(data.phases)) {
-				return clonePhases(data.phases as TodoPhase[]);
-			}
-			continue;
+		if (entry.type !== "custom" || entry.customType !== TODO_HUD_STATE_CUSTOM_TYPE) continue;
+		const data = entry.data as Partial<TodoHudStateEntryData> | undefined;
+		if (
+			data?.sourceEntryId === snapshot.sourceEntryId &&
+			data.fingerprint === snapshot.fingerprint &&
+			(data.visibility === "dismissed" || data.visibility === "revealed")
+		) {
+			return data.visibility;
 		}
-		if (entry.type !== "message") continue;
-		const message = entry.message as { role?: string; toolName?: string; details?: unknown; isError?: boolean };
-		if (message.role !== "toolResult" || message.toolName !== "todo" || message.isError) continue;
-
-		const details = message.details as { phases?: unknown } | undefined;
-		if (!details || !Array.isArray(details.phases)) continue;
-
-		return clonePhases(details.phases as TodoPhase[]);
 	}
+	return undefined;
+}
 
+/** Build persisted HUD metadata only for phases matching the latest durable canonical snapshot. */
+export function createTodoHudStateData(
+	entries: SessionEntry[],
+	phases: readonly TodoPhase[],
+	visibility: TodoHudVisibility,
+): TodoHudStateEntryData | undefined {
+	const snapshot = getLatestTodoSnapshotIdentity(entries);
+	if (!snapshot || snapshot.fingerprint !== todoPhasesFingerprint(phases)) return undefined;
+	return { ...snapshot, visibility };
+}
+
+export function getLatestTodoPhasesFromEntries(entries: SessionEntry[]): TodoPhase[] {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const phases = canonicalTodoPhases(entries[i]);
+		if (phases) return clonePhases(phases);
+	}
 	return [];
 }
 
@@ -1162,12 +1255,11 @@ export const todoToolRenderer = {
 		if (result.isError) {
 			const errorText = result.content?.find(content => content.type === "text")?.text ?? "Todo operation failed";
 			const header = renderStatusLine({ icon: "error", title: "Todo" }, uiTheme);
-			return framedBlock(uiTheme, width => ({
+			return framedToolCard(uiTheme, () => ({
 				header,
-				sections: [{ lines: formatErrorDetail(errorText, uiTheme).split("\n") }],
-				state: "error",
+				sections: [{ content: formatErrorDetail(errorText, uiTheme).split("\n") }],
+				phase: "error",
 				borderColor: "error",
-				width,
 			}));
 		}
 
@@ -1199,7 +1291,7 @@ export const todoToolRenderer = {
 			return new Text(`${header}\n  ${uiTheme.fg("dim", fallback)}`, 0, 0);
 		}
 
-		return framedBlock(uiTheme, width => {
+		return framedToolCard(uiTheme, () => {
 			const { expanded, spinnerFrame } = options;
 			const multiPhase = phases.length > 1;
 			const indent = multiPhase ? "  " : "";
@@ -1262,11 +1354,10 @@ export const todoToolRenderer = {
 			while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
 			return {
 				header,
-				sections: bodyLines.length > 0 ? [{ lines: bodyLines }] : [],
-				state: options.isPartial ? "pending" : "success",
+				sections: bodyLines.length > 0 ? [{ content: bodyLines }] : [],
+				phase: options.isPartial ? "partial" : "success",
 				borderColor: "borderMuted",
 				applyBg: false,
-				width,
 			};
 		});
 	},

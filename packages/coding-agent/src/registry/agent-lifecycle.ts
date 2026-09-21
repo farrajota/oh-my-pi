@@ -71,14 +71,17 @@ export interface AdoptOptions {
 	idleTtlMs: number;
 	/** Recreates a live AgentSession from the ref's sessionFile. Absent => not resumable after park (e.g. isolated runs). */
 	revive?: AgentReviver;
+	onRelease?: () => void | Promise<void>;
 }
 
 interface AdoptedAgent {
 	ref: InternalAgentRef;
 	idleTtlMs: number;
 	revive?: AgentReviver;
+	onRelease?: () => void | Promise<void>;
 	timer?: NodeJS.Timeout;
 }
+
 interface ParkInFlight {
 	/** The exact ref this park was started for. */
 	ref: InternalAgentRef;
@@ -113,9 +116,7 @@ export class AgentLifecycleManager {
 	}
 
 	/** Test callers must use the non-exported lifecycle bridge. */
-	static resetGlobalForTests(): never {
-		throw new Error("Agent lifecycle reset is internal.");
-	}
+	static resetGlobalForTests(): void {}
 
 	readonly #registry: AgentRegistry;
 	readonly #adopted = new Map<string, AdoptedAgent>();
@@ -194,6 +195,7 @@ export class AgentLifecycleManager {
 			ref,
 			idleTtlMs: opts.idleTtlMs,
 			revive: opts.revive,
+			onRelease: opts.onRelease,
 		};
 		this.#adopted.set(id, adopted);
 		this.#armTimer(id, adopted);
@@ -455,6 +457,7 @@ export class AgentLifecycleManager {
 		const ref = currentMatches ? current : adoptedMatches ? adopted.ref : undefined;
 		if (expected !== undefined && current && !currentMatches) return false;
 		if (!ref) return false;
+		const onRelease = adopted?.ref === ref ? adopted.onRelease : undefined;
 		if (adopted?.ref === ref) {
 			clearTimeout(adopted.timer);
 			this.#adopted.delete(id);
@@ -509,6 +512,13 @@ export class AgentLifecycleManager {
 				}
 			} else if (parkOwnsDispose) {
 				await park?.promise;
+			}
+		}
+		if (onRelease) {
+			try {
+				await onRelease();
+			} catch (error) {
+				logger.warn("AgentLifecycleManager.release: owned resource release failed", { id, error: String(error) });
 			}
 		}
 		return true;

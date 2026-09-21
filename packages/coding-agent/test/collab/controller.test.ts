@@ -20,16 +20,18 @@ import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost, CollabHostStoppedError } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import * as registry from "@oh-my-pi/pi-coding-agent/collab/registry";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import * as sdk from "@oh-my-pi/pi-coding-agent/sdk";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as pluginHelpers from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
-import { Composer } from "@oh-my-pi/pi-coding-agent/modes/composer";
+import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { beginStartupComposer, stopPendingStartupComposer } from "@oh-my-pi/pi-coding-agent/modes/startup-composer";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
@@ -426,6 +428,131 @@ describe("interactive collaboration startup", () => {
 		await remote.start(RELAY_URL);
 		return { local: mode, remote, localFile };
 	}
+
+	async function bindRootAuthority(local: InteractiveMode): Promise<void> {
+		const createSession = spyOn(sdk, "createAgentSession").mockResolvedValueOnce({
+			session: local.session,
+		} as sdk.CreateAgentSessionResult);
+		try {
+			await new AgentRegistry().createIsolatedRootSession({ agentId: "Main" });
+		} finally {
+			createSession.mockRestore();
+		}
+	}
+
+	it("refuses a bound join before changing editor or writing a replica", async () => {
+		const { local, remote, localFile } = await prepareGuestMode();
+		await bindRootAuthority(local);
+		local.editor.setText("keep this draft");
+		const parsed = parseCollabLink(remote.link);
+		if ("error" in parsed) throw new Error(parsed.error);
+		const replicaPath = path.join(tmp, "collab", `${parsed.roomId}.jsonl`);
+
+		await executeBuiltinSlashCommand(`/join ${remote.link}`, { ctx: local });
+
+		expect(local.editor.getText()).toBe("keep this draft");
+		expect(local.collabGuest).toBeUndefined();
+		expect(local.sessionManager.getSessionFile()).toBe(localFile);
+		expect(await fs.stat(replicaPath).catch(() => undefined)).toBeUndefined();
+	});
+
+	it("preserves the draft when authority binds during join teardown", async () => {
+		const { local, remote, localFile } = await prepareGuestMode();
+		local.editor.setText("draft survives teardown");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const stop = local.collabController.stop.bind(local.collabController);
+		const stopSpy = spyOn(local.collabController, "stop").mockImplementation(async reason => {
+			entered.resolve();
+			await release.promise;
+			await stop(reason);
+		});
+		const joining = executeBuiltinSlashCommand(`/join ${remote.link}`, { ctx: local });
+		try {
+			await entered.promise;
+			await bindRootAuthority(local);
+		} finally {
+			release.resolve();
+			try {
+				await joining;
+			} finally {
+				stopSpy.mockRestore();
+			}
+		}
+		expect(local.editor.getText()).toBe("draft survives teardown");
+		expect(local.sessionManager.getSessionFile()).toBe(localFile);
+		expect(local.collabGuest).toBeUndefined();
+	});
+
+	it("preserves a pending host start when a bound join is refused", async () => {
+		const { local, remote } = await prepareGuestMode();
+		await bindRootAuthority(local);
+		const starting = local.collabController.start({ access: "view" }).catch(error => error);
+		await executeBuiltinSlashCommand(`/join ${remote.link}`, { ctx: local });
+		expect(await starting).toBe(local.collabHost);
+		await local.collabController.idle();
+		const hosts = await registry.listCollabHosts({ dir: tmp });
+		expect(hosts.find(host => host.instanceId === local.collabController.instanceId)).toMatchObject({
+			access: "view",
+		});
+		expect(local.collabGuest).toBeUndefined();
+	});
+
+	it("refuses bound local restoration before clearing guest UI", async () => {
+		const { local, remote } = await prepareGuestMode();
+		const guest = new CollabGuestLink(local);
+		await guest.join(remote.link);
+		await bindRootAuthority(local);
+		const status = spyOn(local.statusLine, "setCollabStatus");
+
+		await expect(guest.leave("bound refusal")).rejects.toThrow();
+
+		expect(status).not.toHaveBeenCalledWith(null);
+		expect(local.collabGuest).toBe(guest);
+	});
+
+	it("preserves existing replica bytes when authority binds before the delayed snapshot", async () => {
+		const { local, remote, localFile } = await prepareGuestMode();
+		const parsed = parseCollabLink(remote.link);
+		if ("error" in parsed) throw new Error(parsed.error);
+		const replicaPath = path.join(tmp, "collab", `${parsed.roomId}.jsonl`);
+		await fs.mkdir(path.dirname(replicaPath), { recursive: true });
+		await fs.writeFile(replicaPath, "previous replica bytes\n");
+		const connection = Promise.withResolvers<() => void>();
+		const connect = CollabSocket.prototype.connect;
+		spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			connection.resolve(() => connect.call(this));
+		});
+		const guest = new CollabGuestLink(local);
+		const joining = guest.join(remote.link);
+		const release = await connection.promise;
+		await bindRootAuthority(local);
+		release();
+		await expect(joining).rejects.toThrow("Cross-session resume");
+		expect(await fs.readFile(replicaPath, "utf8")).toBe("previous replica bytes\n");
+		expect(local.sessionManager.getSessionFile()).toBe(localFile);
+		expect(local.collabGuest).toBeUndefined();
+	});
+
+	it("allows a bound guest to activate and restore the same replica file", async () => {
+		const { local, remote, localFile } = await prepareGuestMode();
+		const parsed = parseCollabLink(remote.link);
+		if ("error" in parsed) throw new Error(parsed.error);
+		const replicaPath = path.join(tmp, "collab", `${parsed.roomId}.jsonl`);
+		await fs.mkdir(path.dirname(replicaPath), { recursive: true });
+		await fs.copyFile(localFile, replicaPath);
+		await local.session.switchSession(replicaPath);
+		await local.collabController.idle();
+		await executeBuiltinSlashCommand("/collab stop", { ctx: local });
+		await bindRootAuthority(local);
+		const guest = new CollabGuestLink(local);
+		await guest.join(remote.link);
+		expect(local.collabGuest).toBe(guest);
+		expect(local.sessionManager.getSessionFile()).toBe(replicaPath);
+		await guest.leave("same-file restoration");
+		expect(local.collabGuest).toBeUndefined();
+		expect(local.sessionManager.getSessionFile()).toBe(replicaPath);
+	});
 
 	it("does not restart a stopped host when join fails before replica activation", async () => {
 		const { local, remote, localFile } = await prepareGuestMode();

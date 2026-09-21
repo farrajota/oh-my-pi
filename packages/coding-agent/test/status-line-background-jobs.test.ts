@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import type { AsyncJobSnapshotItem, AsyncJobType } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+
+import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 import { StatusLineTestComponents } from "./helpers/status-line";
 
@@ -72,7 +74,7 @@ function makeComponent(running: AsyncJobSnapshotItem[]): StatusLineComponent {
 		},
 		getContextUsage: () => undefined,
 	} as unknown as ConstructorParameters<typeof StatusLineComponent>[0];
-	const component = statusLines.track(new StatusLineComponent(session));
+	const component = statusLines.track(new StatusLineComponent(session, statusLineHost));
 	component.updateSettings({
 		preset: "custom",
 		leftSegments: [],
