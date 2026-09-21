@@ -1,11 +1,12 @@
 import * as fs from "node:fs";
 import type { AgentHubDeps, AgentHubRemote } from "@oh-my-pi/pi-tui/overlays/agent-hub";
-import type { AgentRecordLike, AgentHubRegistry } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
+import type { AgentRecordLike } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
 import type { AgentTranscriptSource } from "@oh-my-pi/pi-tui/overlays/agent-transcript-viewer";
 import { AgentActivityIndex } from "../activity";
 import { getRoleInfo } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import { IrcBus } from "../irc/bus";
+import { toAgentHubRegistry } from "../registry/agent-hub-registry-adapter";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { AgentRegistry } from "../registry/agent-registry";
 import { registerPersistedSubagents } from "../registry/persisted-agents";
@@ -34,14 +35,7 @@ export function createAgentHubRuntime(
 	"registry" | "lifecycle" | "irc" | "activity" | "manageActivityLive" | "transcript" | "loadPersisted" | "getRoleInfo"
 > {
 	const sourceRegistry = options.registry ?? AgentRegistry.global();
-	const registry: AgentHubRegistry = {
-		list: () => sourceRegistry.list().map(ref => ({ ...ref, session: null })),
-		get: id => {
-			const ref = sourceRegistry.get(id);
-			return ref ? { ...ref, session: null } : undefined;
-		},
-		onChange: listener => sourceRegistry.onChange(() => listener()),
-	};
+	const registry = toAgentHubRegistry(sourceRegistry);
 	return {
 		registry,
 		lifecycle: () => {

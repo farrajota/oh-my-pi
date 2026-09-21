@@ -107,6 +107,7 @@ import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type:
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import type { AgentHubRegistry } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
+import { toAgentHubRegistry } from "../registry/agent-hub-registry-adapter";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
 	type AgentSession,
@@ -288,17 +289,6 @@ import { UiHelpers } from "./utils/ui-helpers";
 
 const STILL_CLOSING_DELAY_MS = 3_000;
 const DEFAULT_WORKING_MESSAGE = "Working…";
-
-function toAgentHubRegistry(registry: AgentRegistry): AgentHubRegistry {
-	return {
-		list: () => registry.list().map(ref => ({ ...ref, session: null })),
-		get: id => {
-			const ref = registry.get(id);
-			return ref ? { ...ref, session: null } : undefined;
-		},
-		onChange: listener => registry.onChange(() => listener()),
-	};
-}
 
 function normalizeStatusLineSegments(segments: readonly string[]): TuiStatusLineSegmentId[] {
 	return segments.filter((segment): segment is TuiStatusLineSegmentId =>

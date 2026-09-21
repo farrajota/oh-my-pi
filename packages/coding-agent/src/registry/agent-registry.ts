@@ -1802,8 +1802,16 @@ export class AgentRegistry {
 		return () => this.#listeners.delete(listener);
 	}
 
+	// Dispatch walks a snapshot, not the live `Set`: `Set` iteration visits
+	// entries appended behind the cursor, so a listener that resubscribes itself
+	// while handling an event would be re-entered forever — an unbounded
+	// synchronous loop that starves the event loop and wedges the process. The
+	// membership re-check keeps the "an unsubscribed listener stops receiving
+	// events" contract for listeners dropped earlier in the same dispatch.
 	#emit(event: InternalRegistryEvent): void {
-		for (const listener of this.#internalListeners) {
+		const internalListeners = [...this.#internalListeners];
+		for (const listener of internalListeners) {
+			if (!this.#internalListeners.has(listener)) continue;
 			try {
 				listener(event);
 			} catch {
@@ -1812,7 +1820,9 @@ export class AgentRegistry {
 		}
 		if (this.#listeners.size === 0) return;
 		const publicEvent = Object.freeze({ type: event.type, ref: this.#observe(event.ref) }) as RegistryEvent;
-		for (const listener of this.#listeners) {
+		const listeners = [...this.#listeners];
+		for (const listener of listeners) {
+			if (!this.#listeners.has(listener)) continue;
 			try {
 				listener(publicEvent);
 			} catch {
