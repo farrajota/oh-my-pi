@@ -22,6 +22,7 @@ import {
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
+import { getRoleInfo } from "../config/model-roles";
 import type { PromptTemplate } from "../config/prompt-templates";
 import {
 	buildServiceTierByFamily,
@@ -73,7 +74,12 @@ import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
+import {
+	type ConfiguredThinkingLevel,
+	prewalkWouldBeNoop,
+	resolveTaskEffortLevel,
+	type TaskEffort,
+} from "@oh-my-pi/pi-tui/thinking";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { resolveEvalBackends } from "../tools/eval-backends";
 
@@ -121,6 +127,33 @@ import { arrayValuedLabels, assembleYieldResult } from "./yield-assembly";
 
 export type { YieldItem } from "./types";
 
+function cloneUsage(usage: Usage | undefined): Usage | undefined {
+	if (!usage) return undefined;
+	return {
+		...usage,
+		cost: { ...usage.cost },
+	};
+}
+
+function resolveModelRoleDisplay(role: string | undefined, settings: Settings): AgentProgress["modelRoleDisplay"] {
+	if (!role) return undefined;
+	const info = getRoleInfo(role, settings);
+	if (!info) return undefined;
+	return {
+		...(info.tag !== undefined ? { tag: info.tag } : {}),
+		...(info.name !== undefined ? { name: info.name } : {}),
+		...(info.color !== undefined ? { color: info.color } : {}),
+	};
+}
+
+function cloneProgress(progress: AgentProgress): AgentProgress {
+	return {
+		...progress,
+		usage: cloneUsage(progress.usage),
+		recentTools: progress.recentTools.map(tool => ({ ...tool })),
+		recentOutput: progress.recentOutput.slice(),
+	};
+}
 const MCP_CALL_TIMEOUT_MS = 60_000;
 const TASK_ABORT_CLEANUP_GRACE_MS = 10_000;
 
@@ -1057,6 +1090,7 @@ interface RunMonitorArgs {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	modelRoleDisplay?: AgentProgress["modelRoleDisplay"];
 	/** Raw request-local model selector, retained for task progress rendering. */
 	requestedModel?: string;
 	permissionSummary?: EffectivePermissionSummary;
@@ -1074,6 +1108,7 @@ interface RunMonitorArgs {
 	softRequestBudgetNotice: boolean;
 	/** Wall-clock cap in ms; 0 disables the timer. */
 	maxRuntimeMs: number;
+	startTime: number;
 }
 
 /**
@@ -1158,8 +1193,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
+		startTime,
 	} = args;
-	const startTime = Date.now();
 
 	const progress: AgentProgress = {
 		index,
@@ -1179,8 +1214,10 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		tokens: 0,
 		cost: 0,
 		durationMs: 0,
+		startedAtMs: startTime,
 		modelOverride: args.modelOverride,
 		modelRole: args.modelRole,
+		modelRoleDisplay: args.modelRoleDisplay,
 		requestedModel: args.requestedModel,
 	};
 
@@ -1399,7 +1436,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const emitProgressNow = () => {
 		refreshRecentOutput();
 		progress.durationMs = Date.now() - startTime;
-		onProgress?.({ ...progress });
+		onProgress?.(cloneProgress(progress));
 		const activityGist =
 			progress.lastIntent ?? (progress.currentTool ? `running ${progress.currentTool}` : undefined);
 		if (activityGist) args.agentRegistry.setActivity(id, activityGist);
@@ -1411,7 +1448,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			parentToolCallId: args.parentToolCallId,
 			detached: args.detached,
 			assignment,
-			progress: { ...progress },
+			progress: cloneProgress(progress),
 			sessionFile: args.sessionFile,
 		};
 		emitSubagentFrame(undefined, args.subagentEventBus, TASK_SUBAGENT_PROGRESS_CHANNEL, progressPayload);
@@ -1534,6 +1571,30 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		}
 	};
 
+	const evaluateSoftRequestBudget = (): void => {
+		if (softRequestBudget <= 0 || abortSent || yieldCallPending) return;
+		const stopThreshold = softRequestBudget * 1.5;
+		if (budgetStopRequested) {
+			if (progress.requests >= stopThreshold + BUDGET_STOP_GRACE_REQUESTS) requestAbort("budget");
+			return;
+		}
+		if (progress.requests >= stopThreshold) {
+			requestBudgetStop();
+			return;
+		}
+		if (!softRequestBudgetNotice || budgetSteerSent || progress.requests < softRequestBudget) return;
+		budgetSteerSent = true;
+		const steerSession = activeSession;
+		if (!steerSession) return;
+		const notice = buildBudgetNotice(progress.requests, softRequestBudget);
+		void Promise.resolve()
+			.then(() => steerSession.sendUserMessage(notice, { deliverAs: "steer", attribution: "agent" }))
+			.catch(err => {
+				logger.warn("Subagent budget steer failed", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+	};
 	const processEvent = (event: AgentEvent) => {
 		if (resolved) return;
 		const now = Date.now();
@@ -1626,6 +1687,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 
 					if (event.toolName === "yield") {
 						yieldCallPending = false;
+						if (!yieldCalled) evaluateSoftRequestBudget();
 					}
 
 					// Check if handler wants to terminate the session
@@ -1743,35 +1805,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 							}
 						}
 					}
-					if (softRequestBudget > 0 && !abortSent && !yieldCallPending) {
-						const stopThreshold = softRequestBudget * 1.5;
-						if (budgetStopRequested) {
-							// Grace window after the stop: the forced yield needs a
-							// request or two; a child that keeps burning requests
-							// instead of yielding is hard-aborted.
-							if (progress.requests >= stopThreshold + BUDGET_STOP_GRACE_REQUESTS) {
-								requestAbort("budget");
-							}
-						} else if (progress.requests >= stopThreshold) {
-							requestBudgetStop();
-						} else if (softRequestBudgetNotice && !budgetSteerSent && progress.requests >= softRequestBudget) {
-							budgetSteerSent = true;
-							const steerSession = activeSession;
-							if (steerSession) {
-								// Build the notice now (the count at crossing time), but send
-								// behind an async boundary: a synchronously-throwing send must
-								// never take down event processing (which escalates to terminate).
-								const notice = buildBudgetNotice(progress.requests, softRequestBudget);
-								void Promise.resolve()
-									.then(() => steerSession.sendUserMessage(notice, { deliverAs: "steer", attribution: "agent" }))
-									.catch(err => {
-										logger.warn("Subagent budget steer failed", {
-											error: err instanceof Error ? err.message : String(err),
-										});
-									});
-							}
-						}
-					}
+					evaluateSoftRequestBudget();
 				}
 				// Extract and accumulate usage (prefer message.usage, fallback to event.usage)
 				const eventUsage = isRecord(event) && "usage" in event ? event.usage : undefined;
@@ -1807,6 +1841,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 							progress.contextTokens = perTurnTotal;
 						}
 					}
+					progress.usage = hasUsage ? cloneUsage(accumulatedUsage) : undefined;
 				}
 				break;
 			}
@@ -2500,6 +2535,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		output: truncatedOutput,
 		stderr,
 		truncated: Boolean(truncated),
+		startedAtMs: progress.startedAtMs,
 		...(finalized.structuredOutput ? { structuredOutput: finalized.structuredOutput } : {}),
 		durationMs: Date.now() - args.startTime,
 		tokens: progress.tokens,
@@ -2507,6 +2543,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		contextTokens: progress.contextTokens,
 		contextWindow: progress.contextWindow,
 		modelOverride,
+		modelRoleDisplay: progress.modelRoleDisplay,
 		modelRole,
 		requestedModel,
 		resolvedModel: progress.resolvedModel,
@@ -2517,7 +2554,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
-		usage: monitor.hasUsage() ? monitor.accumulatedUsage : undefined,
+		usage: monitor.hasUsage() ? cloneUsage(monitor.accumulatedUsage) : undefined,
 		outputPath,
 		extractedToolData: progress.extractedToolData,
 		retryFailure: progress.retryFailure,
@@ -2533,6 +2570,7 @@ export interface IrcWakeTurnMonitorOptions {
 	agent: AgentDefinition;
 	description?: string;
 	modelOverride?: string | string[];
+	modelRoleDisplay?: AgentProgress["modelRoleDisplay"];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
 	permissionSummary?: EffectivePermissionSummary;
@@ -2677,6 +2715,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			description: options.description,
 			modelOverride: options.modelOverride,
 			modelRole: options.modelRole,
+			modelRoleDisplay: options.modelRoleDisplay,
 			permissionSummary: options.permissionSummary,
 			agentRegistry: options.agentRegistry,
 			ircBus: options.ircBus,
@@ -2687,6 +2726,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			softRequestBudget: 0,
 			softRequestBudgetNotice: false,
 			maxRuntimeMs,
+			startTime: turnStartTime,
 		});
 
 		const startedPayload = {
@@ -2929,6 +2969,7 @@ export interface FollowUpTurnOptions {
 	/** The follow-up message; sent as the turn's user prompt. */
 	message: string;
 	index?: number;
+	modelRoleDisplay?: AgentProgress["modelRoleDisplay"];
 	description?: string;
 	/** Explicit pre-expansion model role alias retained from the original run. */
 	modelRole?: string;
@@ -3019,6 +3060,8 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	const ref = registry.get(id);
 	const sessionFile = ref?.sessionFile ?? undefined;
 	const permissionSummary = options.permissionSummary ?? ref?.history?.permissionSummary;
+	const modelRole = options.modelRole ?? ref?.history?.modelRole;
+	const modelRoleDisplay = options.modelRoleDisplay ?? resolveModelRoleDisplay(modelRole, session.settings);
 
 	const monitor = createSubagentRunMonitor({
 		index,
@@ -3027,7 +3070,8 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		task: message,
 		agentRegistry: registry,
 		description: options.description,
-		modelRole: options.modelRole,
+		modelRole,
+		modelRoleDisplay,
 		permissionSummary,
 		signal,
 		onProgress: options.onProgress,
@@ -3038,6 +3082,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		softRequestBudget: 0,
 		softRequestBudgetNotice: false,
 		maxRuntimeMs: options.maxRuntimeMs ?? 0,
+		startTime,
 	});
 
 	const startedPayload = {
@@ -3100,7 +3145,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		id,
 		agent,
 		task: message,
-		modelRole: options.modelRole,
+		modelRole,
 		outputSchema: options.outputSchema,
 		outputSchemaMode: options.outputSchemaMode,
 		outputSchemaSource: options.outputSchemaSource,
@@ -3176,6 +3221,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			stderr: "Cancelled before start",
 			truncated: false,
 			modelOverride,
+			startedAtMs: startTime,
 			durationMs: 0,
 			tokens: 0,
 			requests: 0,
@@ -3255,7 +3301,15 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 	const canInjectHub = !isReadOnlyAgent(agent) || agent.spawns !== undefined;
 	// sessions must not widen their explicit host tool list.
 	const peerPromptEnabled = canInjectHub && ircEnabled;
-	if (toolNames && options.enableIrc === true && ircEnabled && !options.restrictToolNames && !isReadOnlyAgent(agent) && !toolNames.includes("irc") && !ircDenied) {
+	if (
+		toolNames &&
+		options.enableIrc === true &&
+		ircEnabled &&
+		!options.restrictToolNames &&
+		!isReadOnlyAgent(agent) &&
+		!toolNames.includes("irc") &&
+		!ircDenied
+	) {
 		toolNames = [...toolNames, "irc"];
 	}
 	if (toolNames && !options.restrictToolNames && canInjectHub && !toolNames.includes("hub")) {
@@ -3295,6 +3349,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		modelRegistry: options.modelRegistry,
 		settings,
 		modelRole,
+		modelRoleDisplay: resolveModelRoleDisplay(modelRole, settings),
 		requestedModel,
 		permissionSummary: options.permissionSummary,
 		signal,
@@ -3307,6 +3362,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
+		startTime,
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
@@ -3321,6 +3377,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			id,
 			index,
 			agent,
+			modelRoleDisplay: resolveModelRoleDisplay(modelRole, settings),
 			description: options.description,
 			modelOverride,
 			modelRole,
@@ -3670,7 +3727,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 							ircPeers: ircRoster?.peers ?? [],
 							ircParkedCount: ircRoster?.parkedCount ?? 0,
 							ircOmittedCount: ircRoster?.omittedCount ?? 0,
-								ircSelfId: peerPromptEnabled ? id : "",
+							ircSelfId: peerPromptEnabled ? id : "",
 							permissionBlock: formatPermissionScopeForPrompt(options.permissionScope),
 						});
 						return defaultPrompt.length === 0
@@ -3755,9 +3812,13 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 						suppressBreadcrumb: true,
 					});
-					const hasMessageHistory = reopened.getEntries().some(
-						entry => entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"),
-					);
+					const hasMessageHistory = reopened
+						.getEntries()
+						.some(
+							entry =>
+								entry.type === "message" &&
+								(entry.message.role === "user" || entry.message.role === "assistant"),
+						);
 					if (!hasMessageHistory) {
 						await reopened.close();
 						throw new Error(`Cannot revive subagent "${id}": no message history`);

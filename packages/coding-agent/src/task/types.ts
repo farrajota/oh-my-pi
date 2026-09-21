@@ -3,6 +3,7 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import type { AgentSessionEvent } from "../session/agent-session";
+import type { ThemeColor } from "@oh-my-pi/pi-tui/theme";
 import type { ConfiguredThinkingLevel, TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { TaskPermissionRequest } from "./permission-profiles";
 import type { TaskToolProfileName } from "./tool-profiles";
@@ -535,6 +536,8 @@ export interface AgentProgress {
 	requests: number;
 	/** Cumulative input + output + cacheWrite tokens across all turns. Excludes cacheRead (re-reads cached context every turn, making cumulative sum misleading). */
 	tokens: number;
+	/** Immutable cumulative usage snapshot for the run. */
+	usage?: Usage;
 	/**
 	 * Current per-turn context size: latest assistant message's `usage.totalTokens`.
 	 * This is the number to compare against `contextWindow` — what compaction
@@ -547,9 +550,13 @@ export interface AgentProgress {
 	/** Cumulative billing cost in USD, accumulated incrementally from message_end events. */
 	cost: number;
 	durationMs: number;
+	/** Stable epoch timestamp for the beginning of this run. */
+	startedAtMs?: number;
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	/** Host-resolved display metadata for the selected model role. */
+	modelRoleDisplay?: { tag?: string; name?: string; color?: ThemeColor };
 	/** Raw request-local model selector, when supplied by the caller. */
 	requestedModel?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Undefined when the model could not be resolved. */
@@ -639,6 +646,8 @@ export interface SingleResult {
 	 * selected an output schema or strict schema mode.
 	 */
 	structuredOutput?: StructuredSubagentOutput;
+	/** Stable epoch timestamp for the beginning of this run. */
+	startedAtMs?: number;
 	durationMs: number;
 	/** Cumulative input + output + cacheWrite tokens across all turns. Excludes cacheRead (re-reads cached context every turn, making cumulative sum misleading). */
 	tokens: number;
@@ -651,6 +660,8 @@ export interface SingleResult {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	/** Host-resolved display metadata for the selected model role. */
+	modelRoleDisplay?: { tag?: string; name?: string; color?: ThemeColor };
 	/** Raw request-local model selector, when supplied by the caller. */
 	requestedModel?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Omitted from tool-result JSON when undefined to keep wire payloads small. */

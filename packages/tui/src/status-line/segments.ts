@@ -4,6 +4,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { getTimeBasedPricingPeriod } from "@oh-my-pi/pi-catalog/models";
 import { SPINNER_ADVANCE_MS, TERMINAL } from "../index";
 import {
+	VERSION,
 	formatDuration,
 	formatNumber,
 	getProjectDir,
@@ -178,6 +179,23 @@ const piSegment: StatusLineSegment = {
 					? theme.icon.omp
 					: "";
 		return { content: `${fgAnsi}${content}\x1b[39m`, visible: true };
+	},
+};
+
+const ompVersionSegment: StatusLineSegment = {
+	id: "omp_version",
+	render() {
+		const content = withIcon(theme.icon.omp, VERSION);
+		return { content: theme.fg("muted", content), visible: true };
+	},
+};
+
+const dockerContainerSegment: StatusLineSegment = {
+	id: "docker_container",
+	render(ctx) {
+		const name = process.env.DOCKER_CONTAINER_NAME || process.env.HOSTNAME || os.hostname();
+		const content = withIcon(theme.icon.host, sanitizeStatusText(statusValue(ctx, name)));
+		return { content: theme.fg("muted", content), visible: true };
 	},
 };
 /** Current braille-spinner glyph on the shared clock, at the Loader's 80ms cadence. */
@@ -895,6 +913,8 @@ const usageSegment: StatusLineSegment = {
 
 export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	pi: piSegment,
+	omp_version: ompVersionSegment,
+	docker_container: dockerContainerSegment,
 	status: statusSegment,
 	model: modelSegment,
 	mode: modeSegment,

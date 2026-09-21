@@ -29,6 +29,16 @@ import { writeToolRenderer } from "./write";
 import { setXdevRendererLookup } from "./xdev";
 
 export * from "./renderer";
+export {
+	formatAgentRowMetadata,
+	formatCompactTokens,
+	formatCost,
+	formatElapsed,
+	formatRoleBadge,
+	formatRowMetadata,
+	type AgentRoleDisplay,
+	type AgentRowMetadata,
+} from "./agent-tree";
 
 /** Renderers keyed by tool name (plus `apply_patch`/`reject` aliases that share a renderer). */
 export const toolRenderers: Record<string, ToolRenderer> = {

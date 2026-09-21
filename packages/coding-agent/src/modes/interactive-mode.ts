@@ -87,6 +87,12 @@ import type { Skill } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
+import {
+	formatAgentRowMetadata,
+	formatRoleBadge,
+	type AgentRoleDisplay,
+	type AgentRowMetadata,
+} from "@oh-my-pi/pi-tui/tools";
 import type { GoalModeState } from "../goals/state";
 import { rebindMemoryBackendForCwd } from "../hindsight/backend";
 import { copyLocalArtifacts, resolveLocalUrlToPath } from "../internal-urls";
@@ -131,8 +137,7 @@ import { formatCoarseDuration } from "@oh-my-pi/pi-tui/chrome/format";
 import { STTController, type SttState } from "../stt";
 import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
-import { labelEchoesHandle } from "../task/label";
-import { agentTypeBadge, formatTaskId } from "@oh-my-pi/pi-tui/tools/task";
+import { formatTaskId } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { tinyTitleClient } from "../tiny/title-client";
 import { isMCPToolName } from "../tools/builtin-names";
@@ -141,10 +146,7 @@ import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
 import { StreamPublisher } from "../stream/publisher";
 import { StreamRedactor } from "../stream/redactor";
 import {
-	FEED_MODEL_BADGE_WIDTH,
-	formatFeedModelBadge,
 	formatMoreItems,
-	isFeedModelBadgeEnabled,
 	replaceTabs,
 	shortenEmbeddedPaths,
 	shortenPath,
@@ -213,7 +215,11 @@ import { SessionInfoOverlay } from "@oh-my-pi/pi-tui/overlays/session-info-overl
 import { SkillMessageComponent } from "@oh-my-pi/pi-tui/chat/skill-message";
 import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
 import { statusLineHost } from "./status-line-host";
-import { stopSharedSpinnerTicker, type ToolExecutionHandle } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import {
+	sharedSpinnerFrame,
+	stopSharedSpinnerTicker,
+	type ToolExecutionHandle,
+} from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import type { LspServerInfo as WelcomeLspServerInfo } from "@oh-my-pi/pi-tui/prompt/welcome";
 import { Composer, PINNED_HUD_TOGGLE_ID, type ComposerStatusSnapshot } from "@oh-my-pi/pi-tui/prompt/composer";
@@ -627,6 +633,7 @@ export class SubagentHudComponent implements Component {
 }
 
 const SUBAGENT_OBSERVER_UI_COALESCE_MS = 100;
+const SUBAGENT_HUD_TICK_MS = 100;
 
 /** Item rows a collapsed jump list shows before the expander. */
 const SUBAGENT_HUD_COLLAPSED_LIMIT = 3;
@@ -659,8 +666,8 @@ export function layoutPinnedHud(runningTotal: number, expanded: boolean): Pinned
 
 /**
  * Build the anchored subagent HUD block: a bold accent "Subagents" header plus
- * a bounded set of running-agent rows in the same `Id ⟨role⟩: description` shape
- * the inline task rows use (muted task preview when no description was given).
+ * bounded running-agent rows formatted as
+ * `ID · model · role · elapsed · input · output · cost`.
  * Layout mirrors the Todos HUD exactly: unindented header, then
  * `renderTreeList` rows (dim connectors) shifted right by one space.
  * Every active subagent is listed — detached background spawns and sync task
@@ -671,9 +678,7 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 	const running = sessions.filter(isHudSubagent);
 	if (running.length === 0) return [];
 	const layout = layoutPinnedHud(running.length, expanded);
-	const dot = theme.styledSymbol("status.done", "accent");
 	const items = running.slice(0, layout.itemRows);
-	const showModelBadge = isFeedModelBadgeEnabled();
 	const outerIndent = " ";
 	const rows = renderTreeList(
 		{
@@ -681,47 +686,21 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 			expanded: true,
 			renderItem: (session, context) => {
 				const rowWidth = Math.max(0, columns - visibleWidth(outerIndent) - (context.prefixWidth ?? 0));
-				const role = session.agent ?? session.progress?.agent;
-				const displayId = truncateToWidth(
-					formatTaskId(session.id),
-					Math.max(0, rowWidth - visibleWidth(`${dot} `)),
-				);
-				const badge = truncateToWidth(
-					agentTypeBadge(role, theme),
-					Math.max(0, rowWidth - visibleWidth(`${dot} ${displayId}`)),
-				);
-				const titleBudget = Math.max(0, rowWidth - visibleWidth(`${dot} ${displayId}${badge}`));
-				const modelBadge = showModelBadge
-					? formatFeedModelBadge(
-							session.progress?.resolvedModelIdentity ?? session.progress?.resolvedModel,
-							session.progress?.resolvedThinkingLevel,
-							session.progress?.advisor,
-							theme,
-							Math.min(FEED_MODEL_BADGE_WIDTH, Math.max(0, titleBudget - 1)),
-						)
-					: "";
-				const modelLead = modelBadge ? `${modelBadge} ` : "";
-				let line = `${dot} ${modelLead}${theme.fg("accent", theme.bold(displayId))}${badge}`;
-				const description = session.description?.trim() || session.progress?.description?.trim();
-				const distinctDescription =
-					description && !labelEchoesHandle(session.id, description) ? description : undefined;
-				if (distinctDescription) {
-					const budget = Math.max(0, rowWidth - visibleWidth(line) - visibleWidth(": "));
-					const formatted = replaceTabs(distinctDescription).replace(/\s*[\r\n]+\s*/g, " ↵ ");
-					if (budget > 0) {
-						line += `${theme.fg("accent", ":")} ${theme.fg("accent", truncateToWidth(formatted, budget))}`;
-					}
-				} else {
-					// No spawn description: fall back to a muted task preview, same as
-					// the inline task rows when a row has no label.
-					const taskPreview = session.progress?.task?.trim();
-					if (taskPreview && !labelEchoesHandle(session.id, taskPreview)) {
-						const formatted = replaceTabs(taskPreview).replace(/\s*[\r\n]+\s*/g, " ↵ ");
-						const budget = Math.min(TRUNCATE_LENGTHS.SHORT, Math.max(0, rowWidth - visibleWidth(line) - 1));
-						if (budget > 0) line += ` ${theme.fg("muted", truncateToWidth(formatted, budget))}`;
-					}
-				}
-				return truncateToWidth(line, rowWidth, "");
+				const progress = session.progress;
+				const roleDisplay = progress?.modelRoleDisplay as AgentRoleDisplay | undefined;
+				const role = progress?.modelRole ?? progress?.agent ?? session.agent;
+				const metadata: AgentRowMetadata = {
+					id: formatTaskId(session.id),
+					model: progress?.resolvedModelIdentity ?? progress?.resolvedModel,
+					role: role ? formatRoleBadge(role, roleDisplay, theme) : undefined,
+					startedAtMs: progress?.startedAtMs,
+					usage: progress?.usage,
+					cost: progress?.cost,
+					nowMs: Date.now(),
+				};
+				const frame = sharedSpinnerFrame(theme.spinnerFrames.length);
+				const spinner = theme.fg("accent", theme.spinnerFrames[frame] ?? theme.status.running);
+				return truncateToWidth(`${spinner} ${formatAgentRowMetadata(metadata, theme)}`, rowWidth, "");
 			},
 		},
 		theme,
@@ -1155,6 +1134,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#subagentEventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#observerUiSyncTimer?: NodeJS.Timeout;
+	#subagentHudTicker?: NodeJS.Timeout;
 	#observerUiSyncNeedsTodoReconcile = false;
 	#agentRegistryUnsubscribe?: () => void;
 	#agentRegistrySubscriptionTarget?: AgentHubRegistry;
@@ -3387,15 +3367,44 @@ export class InteractiveMode implements InteractiveModeContext {
 	#renderSubagentList(): void {
 		this.subagentContainer.clear();
 		const mode = settings.get("display.pinnedAgents");
-		if (mode === "off") return;
+		if (mode === "off") {
+			this.#stopSubagentHudTicker();
+			return;
+		}
 		const sessions = this.#observerRegistry.getSessions();
 		const running = sessions.filter(isHudSubagent);
 		const expanded = this.#pinnedHudOverride ?? mode === "full";
 		const lines = renderSubagentHudLines(sessions, this.ui.terminal.columns, expanded);
-		if (lines.length === 0) return;
+		if (lines.length === 0) {
+			this.#stopSubagentHudTicker();
+			return;
+		}
 		const layout = layoutPinnedHud(running.length, expanded);
 		const order = running.map(session => session.id);
 		this.subagentContainer.addChild(new SubagentHudComponent(lines, order, layout.toggleRow));
+		this.#ensureSubagentHudTicker();
+	}
+
+	#ensureSubagentHudTicker(): void {
+		if (this.#subagentHudTicker) return;
+		this.#subagentHudTicker = setInterval(() => {
+			if (
+				settings.get("display.pinnedAgents") === "off" ||
+				!this.#observerRegistry.getSessions().some(isHudSubagent)
+			) {
+				this.#stopSubagentHudTicker();
+				return;
+			}
+			this.#renderSubagentList();
+			this.ui.requestRender();
+		}, SUBAGENT_HUD_TICK_MS);
+		this.#subagentHudTicker.unref?.();
+	}
+
+	#stopSubagentHudTicker(): void {
+		if (!this.#subagentHudTicker) return;
+		clearInterval(this.#subagentHudTicker);
+		this.#subagentHudTicker = undefined;
 	}
 
 	#vibeParentSession(): VibeParentSession {
@@ -5531,6 +5540,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Stop the shared tool-spinner ticker: a live block missed by per-component
 		// stopAnimation would otherwise keep an 80ms interval pinning the process.
 		stopSharedSpinnerTicker();
+		this.#stopSubagentHudTicker();
 		this.#liveCommandController.dispose();
 		this.#cancelTodoAutoClearTimer();
 		this.#cancelObserverUiSyncTimer();
