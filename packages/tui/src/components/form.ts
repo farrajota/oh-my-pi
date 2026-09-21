@@ -334,13 +334,13 @@ export class TextFormField extends FormField {
 	}
 }
 
-/** Options for a SelectList-backed form field with optional live preview. */
+/** Options for a SelectList-backed form field with optional live preview rows. */
 export interface SelectFormFieldOptions extends Omit<FormFieldOptions, "preview"> {
 	items: ReadonlyArray<SelectItem>;
 	currentValue?: string;
 	maxVisible?: number;
 	selectTheme: SelectListTheme;
-	getPreview?: () => string;
+	getPreview?: () => readonly string[];
 	onSelectionChange?: (value: string) => void | Promise<void>;
 	onSubmit(value: string): void | Promise<void>;
 	onCancel(): void;
@@ -348,11 +348,28 @@ export interface SelectFormFieldOptions extends Omit<FormFieldOptions, "preview"
 	requestRender?: () => void;
 }
 
+/** Component that mounts each preview row independently, never as embedded newlines. */
+class PreviewLines implements Component {
+	#lines: readonly string[];
+
+	constructor(lines: readonly string[]) {
+		this.#lines = lines;
+	}
+
+	setLines(lines: readonly string[]): void {
+		this.#lines = lines;
+	}
+
+	render(width: number): readonly string[] {
+		return this.#lines.map(line => truncateToWidth(line, width));
+	}
+}
+
 /** SelectList field that centralizes selection, cancellation, preview refresh, and mouse routing. */
 export class SelectFormField extends FormField {
 	readonly selectList: SelectList;
-	readonly #previewText: StyledText | undefined;
-	readonly #getPreview: (() => string) | undefined;
+	readonly #previewText: PreviewLines | undefined;
+	readonly #getPreview: (() => readonly string[]) | undefined;
 	readonly #requestRender: (() => void) | undefined;
 	#previewRequestId = 0;
 
@@ -365,7 +382,7 @@ export class SelectFormField extends FormField {
 		const currentIndex = options.items.findIndex(item => item.value === options.currentValue);
 		if (currentIndex !== -1) selectList.setSelectedIndex(currentIndex);
 
-		const previewText = options.getPreview ? new StyledText(options.getPreview(), text => text) : undefined;
+		const previewText = options.getPreview ? new PreviewLines(options.getPreview()) : undefined;
 		super(selectList, {
 			...options,
 			previewLabel: previewText ? (options.previewLabel ?? "Preview:") : undefined,
@@ -438,7 +455,7 @@ export class SelectFormField extends FormField {
 
 	#updatePreview(): void {
 		if (!this.#previewText || !this.#getPreview) return;
-		this.#previewText.setText(this.#getPreview());
+		this.#previewText.setLines(this.#getPreview());
 	}
 }
 

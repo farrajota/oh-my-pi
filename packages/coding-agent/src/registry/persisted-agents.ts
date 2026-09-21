@@ -111,8 +111,17 @@ function inferBundledAgent(systemPrompt: string): { agent?: string; modelRole?: 
 }
 
 function usageTokens(usage: Record<string, unknown>): number {
-	const computed = finiteNumber(usage.input) + finiteNumber(usage.output) + finiteNumber(usage.cacheWrite);
-	return computed > 0 ? computed : finiteNumber(usage.totalTokens);
+	if (typeof usage.totalTokens === "number" && Number.isFinite(usage.totalTokens)) return usage.totalTokens;
+	const orchestration = recordOf(usage.orchestration);
+	return (
+		finiteNumber(usage.input) +
+		finiteNumber(usage.output) +
+		finiteNumber(usage.cacheRead) +
+		finiteNumber(usage.cacheWrite) +
+		finiteNumber(orchestration?.input ?? usage.orchestrationInput) +
+		finiteNumber(orchestration?.output ?? usage.orchestrationOutput) +
+		finiteNumber(orchestration?.cacheRead ?? usage.orchestrationCacheRead)
+	);
 }
 
 interface AssistantMetrics {
@@ -169,6 +178,7 @@ async function readPersistedAgentHistory(
 ): Promise<AgentHistorySummary> {
 	const parents = new Map<string, string | undefined>();
 	const assistantById = new Map<string, AssistantMetrics>();
+	const directUsageById = new Map<string, AssistantMetrics>();
 	const modelChangeById = new Map<string, { model: string; role?: string; resolvedModelIsFallback: boolean }>();
 	let sessionInitModelRole: string | undefined;
 	let permissionSummary: AgentHistorySummary["permissionSummary"];
@@ -204,15 +214,25 @@ async function readPersistedAgentHistory(
 					});
 					return;
 				}
-				if (record.type !== "message") return;
-				const message = recordOf(record.message);
-				if (message?.role === "assistant") assistantById.set(id, assistantMetrics(message));
+				if (record.type === "message") {
+					const message = recordOf(record.message);
+					if (message?.role === "assistant") {
+						const metrics = assistantMetrics(message);
+						assistantById.set(id, metrics);
+						directUsageById.set(id, metrics);
+					}
+				} else if (record.type === "model_usage") {
+					const usage = recordOf(record.usage);
+					if (usage) {
+						directUsageById.set(id, {
+							tokens: usageTokens(usage),
+							tools: 0,
+							cost: finiteNumber(recordOf(usage.cost)?.total),
+							served: false,
+						});
+					}
+				}
 			},
-			// Advisor transcripts are the one file that can grow pathologically large
-			// (issue #9553); cap their scan so one bad transcript can't stall the Hub
-			// on the render thread. Healthy advisor files sit far below this bound,
-			// so their metrics stay exact; a capped legacy file reports approximate
-			// (lower-bound) cost/tokens rather than freezing `hub list`.
 			{
 				shouldContinue,
 				maxRecords: isAdvisorTranscriptName(path.basename(transcript.sessionFile))
@@ -221,10 +241,6 @@ async function readPersistedAgentHistory(
 			},
 		);
 	} catch (error) {
-		// Malformed and truncated records are skipped in-band; a vanished file
-		// (ENOENT) degrades to empty history. Any other filesystem fault is
-		// transient and surfaces to the caller instead of masquerading as a
-		// transcript with no history.
 		if (isFilesystemError(error)) throw error;
 		return {};
 	}
@@ -241,10 +257,12 @@ async function readPersistedAgentHistory(
 		),
 		durationKind: "span",
 	};
-	// Attribution walks leaf → root and stops at the newest turn that actually
-	// produced output: that model did this run's work. A `model_change` newer
-	// than it was never served (a fallback the session died on), so crediting the
-	// run to it would report work the previous model did.
+	for (const direct of directUsageById.values()) {
+		metrics.requests++;
+		metrics.tokens += direct.tokens;
+		metrics.tools += direct.tools;
+		metrics.cost += direct.cost;
+	}
 	let resolvedModel: string | undefined;
 	let resolvedModelIsFallback: boolean | undefined;
 	let modelRole: string | undefined = sessionInitModelRole;
@@ -257,13 +275,7 @@ async function readPersistedAgentHistory(
 		const modelChange = modelChangeById.get(id);
 		if (modelChange) {
 			latestModelChange ??= modelChange;
-			if (modelRole === undefined && isLegacyModelChangeRole(modelChange.role)) {
-				modelRole = modelChange.role;
-			}
-			// The transition that installed the serving model: it carries the
-			// fallback flag the raw message lacks. Every writer records the selector
-			// through `formatModelStringWithRouting`, which appends an `@upstream`
-			// gateway route the message's bare `provider/model` never has.
+			if (modelRole === undefined && isLegacyModelChangeRole(modelChange.role)) modelRole = modelChange.role;
 			if (
 				servedModel !== undefined &&
 				resolvedModel === undefined &&
@@ -275,19 +287,10 @@ async function readPersistedAgentHistory(
 		}
 		const assistant = assistantById.get(id);
 		if (!assistant) continue;
-		if (servedModel === undefined && assistant.served && assistant.resolvedModel) {
+		if (servedModel === undefined && assistant.served && assistant.resolvedModel)
 			servedModel = assistant.resolvedModel;
-		}
-		metrics.requests++;
-		metrics.tokens += assistant.tokens;
-		metrics.tools += assistant.tools;
-		metrics.cost += assistant.cost;
 		contextTokens ??= assistant.contextTokens;
 	}
-	// No transition described the serving model (pre-`model_change` transcript, or
-	// the spawn record was pruned) — the message's own model still beats a
-	// transition that never ran. Nothing served at all leaves only the last
-	// transition to report.
 	if (resolvedModel === undefined) {
 		resolvedModel = servedModel ?? latestModelChange?.model;
 		resolvedModelIsFallback = servedModel !== undefined ? false : latestModelChange?.resolvedModelIsFallback;

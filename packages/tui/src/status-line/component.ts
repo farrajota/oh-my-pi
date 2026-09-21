@@ -17,6 +17,7 @@ import {
 	SPINNER_ADVANCE_MS,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "../index";
 import { adjustHsv, formatNumber, getProjectDir, hexToRgb, rgbToHex } from "@oh-my-pi/pi-utils";
 import type {
@@ -2402,7 +2403,11 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		width: number,
 		layout: StatusLineLayout = "box",
 		previewTitle?: string,
-		options?: { readonly placeholders?: boolean },
+		options?: {
+			readonly placeholders?: boolean;
+			readonly preserveOverflow?: boolean;
+			readonly collectOverflow?: { parts: string[] };
+		},
 	): CachedStatusLine {
 		const effectiveSettings = this.#resolveSettings();
 		const placeholders = options?.placeholders === true;
@@ -2414,7 +2419,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			this.#invalidateStatusLineRenderCache();
 		}
 
-		const cached = this.#statusLineRenderCache[layout];
+		const cached =
+			options?.preserveOverflow || options?.collectOverflow ? undefined : this.#statusLineRenderCache[layout];
 		if (
 			cached &&
 			cached.availableWidth === width &&
@@ -2439,7 +2445,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			previewTitle,
 			externalInputs,
 		};
-		this.#statusLineRenderCache[layout] = result;
+		if (!options?.preserveOverflow && !options?.collectOverflow) this.#statusLineRenderCache[layout] = result;
 		return result;
 	}
 
@@ -2462,7 +2468,13 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		width: number,
 		layout: StatusLineLayout,
 		previewTitle: string | undefined,
-		options: { readonly placeholders?: boolean } | undefined,
+		options:
+			| {
+					readonly placeholders?: boolean;
+					readonly preserveOverflow?: boolean;
+					readonly collectOverflow?: { parts: string[] };
+			  }
+			| undefined,
 		nowMs: number,
 	): string {
 		const effectiveSettings = this.#resolveSettings();
@@ -2615,14 +2627,16 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			return embeddedContextWidth;
 		};
 		const totalWidth = () => leftWidth + rightWidth + minimumGapWidth();
+		const originalLeft = [...left];
+		const originalRight = [...right];
 
-		if (topFillWidth > 0) {
+		if (topFillWidth > 0 && !options?.preserveOverflow) {
 			// Truncate the session-name segment before dropping right segments —
 			// the title is the only elastic one on the right, and dropping it
 			// wholesale left narrow bars (and the ≤76-col composer previews)
 			// without any title.
 			const nameSegIdx = rightSegIds.indexOf("session_name");
-			if (nameSegIdx >= 0 && totalWidth() > topFillWidth) {
+			if (nameSegIdx >= 0 && totalWidth() > topFillWidth && !options?.collectOverflow) {
 				// Badge/job parts were unshifted ahead of the tracked segment ids.
 				const nameIdx = nameSegIdx + (right.length - rightSegIds.length);
 				const currentNameVW = visibleWidth(right[nameIdx]);
@@ -2639,7 +2653,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			}
 			// Shrink path before dropping left segments — path is the only elastic segment
 			const pathIdx = leftSegIds.indexOf("path");
-			if (pathIdx >= 0 && totalWidth() > topFillWidth) {
+			if (pathIdx >= 0 && totalWidth() > topFillWidth && !options?.collectOverflow) {
 				const overflow = totalWidth() - topFillWidth;
 				const currentPathVW = visibleWidth(left[pathIdx]);
 				const minPathVW = 8; // icon + ellipsis + a few chars
@@ -2682,11 +2696,25 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			};
 
 			while (totalWidth() > topFillWidth && left.length > 0) {
-				const dropIdx = leftOverflowDropIndex();
+				const dropIdx = options?.collectOverflow ? left.length - 1 : leftOverflowDropIndex();
 				left.splice(dropIdx, 1);
 				leftSegIds.splice(dropIdx, 1);
 				leftWidth = groupWidth(left, leftCapWidth + bandCapWidth, leftSepWidth);
 			}
+		}
+
+		if (options?.collectOverflow) {
+			const missing = (original: readonly string[], rendered: readonly string[]): string[] => {
+				const remaining = [...rendered];
+				const overflow: string[] = [];
+				for (const part of original) {
+					const index = remaining.indexOf(part);
+					if (index >= 0) remaining.splice(index, 1);
+					else overflow.push(part);
+				}
+				return overflow;
+			};
+			options.collectOverflow.parts.push(...missing(originalLeft, left), ...missing(originalRight, right));
 		}
 
 		const renderGroup = (parts: string[], direction: "left" | "right"): string => {
@@ -2892,6 +2920,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		};
 	}
 
+	getTopBorderLines(width: number, previewTitle?: string): string[] {
+		return this.#buildStatusLineLines(width, "box", previewTitle);
+	}
+
 	/** Flush-left soft-capped powerline band (the band composer's top row). */
 	getBandTopBorder(width: number, previewTitle?: string): { content: string; width: number; revision: number } {
 		const statusLine = this.#buildStatusLine(width, "band", previewTitle);
@@ -2900,6 +2932,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			width: statusLine.width,
 			revision: this.#renderRevision,
 		};
+	}
+
+	getBandTopBorderLines(width: number, previewTitle?: string): string[] {
+		return this.#buildStatusLineLines(width, "band", previewTitle);
 	}
 
 	/** Dim the whole bar while focus-proxied. Group/cap terminators emit full
@@ -2939,6 +2975,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		};
 	}
 
+	getStandaloneTopBorderLines(width: number, previewTitle?: string): string[] {
+		return this.#buildStatusLineLines(width, "plain-right", previewTitle);
+	}
+
 	/**
 	 * The plain standalone bottom bar through the real segment/gauge pipeline —
 	 * `groups` picks which segment groups it carries. Used by the live render
@@ -2947,6 +2987,59 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	 */
 	renderBottomBar(width: number, groups: "left" | "full", previewTitle?: string): string {
 		return this.#buildStatusLine(width, groups === "left" ? "plain-left" : "plain-full", previewTitle).dimmedContent;
+	}
+
+	/** Lossless standalone rows. Overflow wraps below the first row instead of dropping segments. */
+	renderBottomBarLines(width: number, groups: "left" | "full", previewTitle?: string): string[] {
+		return this.#buildStatusLineLines(width, groups === "left" ? "plain-left" : "plain-full", previewTitle);
+	}
+	#buildStatusLineLines(
+		width: number,
+		layout: StatusLineLayout,
+		previewTitle?: string,
+		placeholders = false,
+	): string[] {
+		if (width <= 0) return [];
+		const overflow = { parts: [] as string[] };
+		const statusLine = this.#buildStatusLine(width, layout, previewTitle, {
+			placeholders,
+			collectOverflow: overflow,
+		});
+		const lines = statusLine.dimmedContent ? [statusLine.dimmedContent] : [];
+		if (overflow.parts.length === 0) return lines;
+
+		const separator = layout === "plain-full" || layout === "plain-left" || layout === "plain-right" ? " · " : " ";
+		let current = "";
+		let currentWidth = 0;
+		const continuation: string[] = [];
+		const flush = (): void => {
+			if (current) continuation.push(this.#dimWhileFocusProxied(current));
+			current = "";
+			currentWidth = 0;
+		};
+		for (const part of overflow.parts) {
+			const partWidth = visibleWidth(part);
+			if (partWidth > width) {
+				flush();
+				continuation.push(...wrapTextWithAnsi(this.#dimWhileFocusProxied(part), width));
+				continue;
+			}
+			const separatorWidth = current ? visibleWidth(separator) : 0;
+			if (current && currentWidth + separatorWidth + partWidth > width) flush();
+			if (!current) {
+				current = part;
+				currentWidth = partWidth;
+			} else {
+				current += separator + part;
+				currentWidth += separatorWidth + partWidth;
+			}
+		}
+		flush();
+		return [...lines, ...continuation];
+	}
+
+	renderStartupPlaceholderLines(width: number, layout: StatusLineLayout): string[] {
+		return this.#buildStatusLineLines(width, layout, undefined, true);
 	}
 	/**
 	 * Status bar lines for a composer layout, rendered through the real
@@ -2961,13 +3054,14 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			style?.bottomBar ?? (this.#standalone === false ? "none" : this.#standalone === "left-only" ? "left" : "full");
 		const lines: string[] = [];
 		if (attachment === "top-border") {
-			const border = this.getTopBorder(width);
-			if (border.content) lines.push(border.content);
+			lines.push(...this.getTopBorderLines(width));
 		} else if (attachment === "top-band") {
-			const band = this.getBandTopBorder(width);
-			if (band.content) lines.push(band.content);
+			lines.push(...this.getBandTopBorderLines(width));
 		} else if (attachment === "top-rule-chip") {
 			// Render the chip on its rule exactly as the claude composer does.
+			const ruleLines = this.getStandaloneTopBorderLines(width);
+			const primary = this.getStandaloneTopBorder(width);
+			const content = ruleLines[0] ?? primary.content;
 			const rule = claudeComposerStyle.renderTop({
 				width,
 				paddingX: 0,
@@ -2975,13 +3069,13 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 				accentColor: str => theme.fg("accent", str),
 				surfaceColor: str => theme.bgFill("userMessageBg", theme.fgOnBg("userMessageText", "userMessageBg", str)),
 				box: theme.boxRound,
-				topBorder: this.getStandaloneTopBorder(width),
+				topBorder: { ...primary, content, width: visibleWidth(content) },
 			});
 			if (rule !== undefined) lines.push(rule);
+			lines.push(...ruleLines.slice(1));
 		}
 		if (bottomBar !== "none") {
-			const main = this.renderBottomBar(width, bottomBar);
-			if (main) lines.push(main);
+			lines.push(...this.renderBottomBarLines(width, bottomBar));
 		}
 		return lines;
 	}
@@ -2989,10 +3083,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	render(width: number): readonly string[] {
 		const lines: string[] = [];
 		if (this.#standalone && !this.#autocompleteActiveProbe?.()) {
-			const content = this.renderBottomBar(width, this.#standalone === "left-only" ? "left" : "full");
-			if (content) {
+			const content = this.renderBottomBarLines(width, this.#standalone === "left-only" ? "left" : "full");
+			if (content.length > 0) {
 				if (this.#standaloneGap) lines.push("");
-				lines.push(content);
+				lines.push(...content);
 			}
 		}
 		const showHooks = this.#settings.showHookStatus ?? true;

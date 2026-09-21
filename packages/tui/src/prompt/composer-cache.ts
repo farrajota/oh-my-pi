@@ -7,7 +7,7 @@ import type { ComposerPreferences, ComposerStatusSnapshot } from "./composer";
 import type { SymbolPreset } from "../theme/theme";
 
 const CACHE_VERSION = 1;
-const STATUS_CACHE_VERSION = 3;
+const STATUS_CACHE_VERSION = 4;
 /** Theme inputs cached from the last resolved settings load for stable prepaint colors. */
 export interface ComposerThemePreferences {
 	readonly symbolPreset?: SymbolPreset;
@@ -133,14 +133,25 @@ function readStatus(file: string): ComposerStatusSnapshot | undefined {
 	const shape = field(parsed, "shape");
 	const rawBorderColor = field(parsed, "borderColor");
 	const rawTopBorder = field(parsed, "topBorder");
+	const rawTopContinuationLines = field(parsed, "topContinuationLines");
+	const terminalWidth = field(parsed, "terminalWidth");
+	const topWidth = field(parsed, "topWidth");
+	const bottomWidth = field(parsed, "bottomWidth");
 	const bottomLines = field(parsed, "bottomLines");
 	if (
 		typeof shape !== "string" ||
+		typeof terminalWidth !== "number" ||
+		typeof topWidth !== "number" ||
+		typeof bottomWidth !== "number" ||
 		!Array.isArray(bottomLines) ||
-		!bottomLines.every(line => typeof line === "string")
+		!bottomLines.every(line => typeof line === "string") ||
+		(rawTopContinuationLines !== undefined &&
+			(!Array.isArray(rawTopContinuationLines) || !rawTopContinuationLines.every(line => typeof line === "string")))
 	) {
 		return undefined;
 	}
+	const topContinuationLines =
+		rawTopContinuationLines === undefined ? undefined : (rawTopContinuationLines as string[]);
 	let borderColor: ComposerStatusSnapshot["borderColor"];
 	if (rawBorderColor !== undefined) {
 		if (typeof rawBorderColor !== "object" || rawBorderColor === null || Array.isArray(rawBorderColor)) {
@@ -151,12 +162,23 @@ function readStatus(file: string): ComposerStatusSnapshot | undefined {
 		if (typeof prefix !== "string" || typeof suffix !== "string") return undefined;
 		borderColor = { prefix, suffix };
 	}
-	if (rawTopBorder === undefined) return { shape, borderColor, bottomLines };
+	if (rawTopBorder === undefined) {
+		return { shape, borderColor, terminalWidth, topWidth, bottomWidth, topContinuationLines, bottomLines };
+	}
 	if (typeof rawTopBorder !== "object" || rawTopBorder === null || Array.isArray(rawTopBorder)) return undefined;
 	const borderContent = field(rawTopBorder, "content");
 	const borderWidth = field(rawTopBorder, "width");
 	if (typeof borderContent !== "string" || typeof borderWidth !== "number") return undefined;
-	return { shape, borderColor, topBorder: { content: borderContent, width: borderWidth }, bottomLines };
+	return {
+		shape,
+		borderColor,
+		terminalWidth,
+		topWidth,
+		bottomWidth,
+		topBorder: { content: borderContent, width: borderWidth },
+		topContinuationLines,
+		bottomLines,
+	};
 }
 
 function readUiState(file: string): { preferences: ComposerPreferences; theme: ComposerThemePreferences } | undefined {

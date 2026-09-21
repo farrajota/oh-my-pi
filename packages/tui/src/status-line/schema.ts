@@ -1,6 +1,8 @@
 /** Status line segment identifiers accepted by custom status-line settings. */
 export const STATUS_LINE_SEGMENT_IDS = [
 	"pi",
+	"omp_version",
+	"docker_container",
 	"status",
 	"model",
 	"mode",

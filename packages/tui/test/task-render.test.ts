@@ -259,11 +259,7 @@ describe("task live progress rendering", () => {
 		expect(text).not.toContain("more agents");
 	});
 
-	it("does not request spinner ticks for static partial progress", () => {
-		expect("animatedPartialResult" in taskToolRenderer).toBe(false);
-	});
-
-	it("renders running progress identically across spinner frames", () => {
+	it("renders running progress with different spinner frames", () => {
 		const progress = makeProgress([]);
 		const details: TaskToolDetails = {
 			projectAgentsDir: null,
@@ -280,7 +276,7 @@ describe("task live progress rendering", () => {
 				).render(120),
 			);
 
-		expect(render(0)).toBe(render(1));
+		expect(render(0)).not.toBe(render(1));
 	});
 });
 

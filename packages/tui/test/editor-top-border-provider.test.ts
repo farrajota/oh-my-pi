@@ -18,6 +18,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import { Editor, type EditorTopBorder } from "@oh-my-pi/pi-tui/components/editor";
+import { visibleWidth } from "@oh-my-pi/pi-tui";
 import { defaultEditorTheme } from "./test-themes";
 
 function stubTopBorder(label: string): EditorTopBorder {
@@ -89,5 +90,29 @@ describe("Editor lazy top-border provider (#4145)", () => {
 		expect(widths).toHaveLength(2);
 		expect(widths[0]).toBe(editor.getTopBorderAvailableWidth(80));
 		expect(widths[1]).toBe(editor.getTopBorderAvailableWidth(120));
+	});
+
+	it("renders continuation rows through the active composer row chrome", () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setTopBorderProvider(() => ({ content: "PRIMARY", width: 7 }));
+		editor.setTopBorderContinuationProvider(() => ["CONTINUATION"]);
+
+		const frame = editor.render(40);
+		expect(frame[0]).toContain("PRIMARY");
+		expect(frame[1]).toContain("CONTINUATION");
+		expect(frame[1]).toContain(defaultEditorTheme.symbols.boxRound.vertical);
+	});
+
+	it("keeps band and top-rule continuation rows full-width under overflow", () => {
+		for (const style of ["band", "claude"] as const) {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setBorderStyle(style);
+			editor.setTopBorderProvider(() => ({ content: "PRIMARY", width: 7 }));
+			editor.setTopBorderContinuationProvider(() => ["x".repeat(80)]);
+
+			const frame = editor.render(40);
+			expect(frame[1]).toContain("x".repeat(40));
+			expect(visibleWidth(frame[1] ?? "")).toBe(40);
+		}
 	});
 });

@@ -4,6 +4,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { getTimeBasedPricingPeriod } from "@oh-my-pi/pi-catalog/models";
 import { SPINNER_ADVANCE_MS, TERMINAL } from "../index";
 import {
+	VERSION,
 	formatDuration,
 	formatNumber,
 	getProjectDir,
@@ -178,6 +179,23 @@ const piSegment: StatusLineSegment = {
 					? theme.icon.omp
 					: "";
 		return { content: `${fgAnsi}${content}\x1b[39m`, visible: true };
+	},
+};
+
+const ompVersionSegment: StatusLineSegment = {
+	id: "omp_version",
+	render() {
+		const content = withIcon(theme.icon.omp, VERSION);
+		return { content: theme.fg("muted", content), visible: true };
+	},
+};
+
+const dockerContainerSegment: StatusLineSegment = {
+	id: "docker_container",
+	render(ctx) {
+		const name = process.env.DOCKER_CONTAINER_NAME || process.env.HOSTNAME || os.hostname();
+		const content = withIcon(theme.icon.host, sanitizeStatusText(statusValue(ctx, name)));
+		return { content: theme.fg("muted", content), visible: true };
 	},
 };
 /** Current braille-spinner glyph on the shared clock, at the Loader's 80ms cadence. */
@@ -528,12 +546,9 @@ const tokenOutSegment: StatusLineSegment = singleStatSegment("token_out", "outpu
 const tokenTotalSegment: StatusLineSegment = {
 	id: "token_total",
 	render(ctx) {
-		// Excludes cacheRead: that field re-reads the full cached context every
-		// turn, making the cumulative sum N×context_size. Orchestration cache read
-		// follows the same rule; orchestration input/output remain in the total so
-		// provider-side service work is preserved without labeling it prompt input.
-		const { input, output, cacheWrite, orchestrationInput, orchestrationOutput } = ctx.usageStats;
-		const total = input + output + cacheWrite + orchestrationInput + orchestrationOutput;
+		// `totalTokens` is the provider-authoritative total; reasoning is already
+		// included in output and must not be added a second time.
+		const total = ctx.usageStats.totalTokens;
 		if (!total) return { content: "", visible: false };
 
 		const content = formatMetric({
@@ -895,6 +910,8 @@ const usageSegment: StatusLineSegment = {
 
 export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	pi: piSegment,
+	omp_version: ompVersionSegment,
+	docker_container: dockerContainerSegment,
 	status: statusSegment,
 	model: modelSegment,
 	mode: modeSegment,

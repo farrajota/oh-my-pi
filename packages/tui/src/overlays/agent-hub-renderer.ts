@@ -3,8 +3,7 @@ import { Ellipsis, visibleWidth } from "../utils";
 import { formatMetricRow } from "../components/metric";
 import { renderProgressBar } from "../components/progress-bar";
 import { renderTableRow } from "../components/table";
-import { formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
-import type { ThemeColor } from "../theme/theme";
+import { formatNumber } from "@oh-my-pi/pi-utils";
 import { type AgentRecordLike, MAIN_AGENT_ID } from "./agent-hub-types";
 import { parseThinkingLevel } from "../thinking";
 import { TRUNCATE_LENGTHS, truncateToWidth } from "../render/render-utils";
@@ -12,6 +11,9 @@ import { sanitizeDisplaySingleLine } from "./extensions/display-text";
 import type { ObservableSession } from "./session-observer-registry";
 import { theme } from "../theme/theme";
 import type { AgentMetrics } from "./agent-hub-projection";
+import { formatCost, formatElapsed } from "../tools/agent-tree";
+
+export { formatCost, formatRoleBadge, type AgentRoleDisplay } from "../tools/agent-tree";
 
 export interface RosterRender {
 	lines: string[];
@@ -72,18 +74,6 @@ function formatModelBadge(modelId: string, level: ThinkingLevel | undefined): st
 	return `${model} ${theme.getThinkingBorderColor(level)(display)}`;
 }
 
-/** Host-resolved model-role label and color. */
-export interface AgentRoleDisplay {
-	color?: ThemeColor;
-	tag?: string;
-	name?: string;
-}
-
-/** Textual model-role tag; color reinforces (but never replaces) the label. */
-export function formatRoleBadge(role: string, info: AgentRoleDisplay): string {
-	return theme.fg(info.color ?? "muted", sanitizeDisplaySingleLine(info.tag ?? info.name ?? role));
-}
-
 /** Format a resolved selector, preserving provider identity when requested. */
 function formatResolvedModelBadge(resolved: string, preserveProvider = false, fallbackLevel?: ThinkingLevel): string {
 	const cleanResolved = sanitizeDisplaySingleLine(resolved);
@@ -129,14 +119,7 @@ export function formatMetricDuration(metrics: AgentMetrics): string | undefined 
 	const durationMs = metricNumber(metrics.durationMs);
 	if (durationMs <= 0) return undefined;
 	const label = metrics.durationKind === "active" ? "active" : metrics.durationKind === "span" ? "span" : "duration";
-	return `${formatDuration(durationMs)} ${label}`;
-}
-
-export function formatCost(cost: number): string {
-	const amount = metricNumber(cost);
-	if (amount < 0.01) return `$${amount.toFixed(4)}`;
-	if (amount < 1) return `$${amount.toFixed(3)}`;
-	return `$${amount.toFixed(2)}`;
+	return `${formatElapsed(durationMs)} ${label}`;
 }
 
 export function formatMetrics(metrics: AgentMetrics): string {

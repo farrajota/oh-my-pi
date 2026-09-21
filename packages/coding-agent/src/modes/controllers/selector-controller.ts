@@ -129,7 +129,10 @@ import { TreeSelectorComponent } from "@oh-my-pi/pi-tui/overlays/tree-selector";
 import { UsageDashboardComponent } from "@oh-my-pi/pi-tui/overlays/usage-dashboard";
 import { renderUsageReports } from "./command-controller";
 import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
-import { STATUS_LINE_SEGMENT_IDS, type StatusLineSegmentId as TuiStatusLineSegmentId } from "@oh-my-pi/pi-tui/status-line/schema";
+import {
+	STATUS_LINE_SEGMENT_IDS,
+	type StatusLineSegmentId as TuiStatusLineSegmentId,
+} from "@oh-my-pi/pi-tui/status-line/schema";
 
 function normalizeStatusLineSegments(segments: readonly string[]): TuiStatusLineSegmentId[] {
 	return segments.filter((segment): segment is TuiStatusLineSegmentId =>
@@ -315,10 +318,10 @@ export class SelectorController {
 						this.ctx.ui.requestRender();
 					},
 					getStatusLinePreview: () => {
-						// The bar exactly as the active composer shape renders it (box top
-						// border, claude rule + chip, or the plain standalone bottom bar).
+						// Preserve each status row so narrow continuation rows remain independently
+						// width-bounded in the settings preview.
 						const availableWidth = this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
-						return this.ctx.statusLine.getPreviewLines(availableWidth).join("\n");
+						return this.ctx.statusLine.getPreviewLines(availableWidth);
 					},
 					onPluginsChanged: async () => {
 						const projectPath = await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd());

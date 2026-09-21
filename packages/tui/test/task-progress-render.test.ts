@@ -72,7 +72,7 @@ describe("task progress rendering", () => {
 		setShimmerMode("classic");
 	});
 
-	it("places the model and advisor before the live agent title without displacing stats", async () => {
+	it("places the live agent title before model and role metadata", async () => {
 		setFeedModelBadgeEnabled(true);
 		const theme = (await getThemeByName("dark"))!;
 		const progress = runningProgress({
@@ -96,16 +96,15 @@ describe("task progress rendering", () => {
 				"BadgeWorker",
 			),
 		);
-		expect(row).toContain(`openai/gpt-5 ${theme.icon.advisor} BadgeWorker: Inspect rendering`);
-		expect(row).not.toContain(":high");
-		expect(row).toContain(`${theme.thinking.high.split(" ")[0]} openai/gpt-5`);
-		expect(row.indexOf(theme.status.done)).toBeLessThan(row.indexOf("openai/gpt-5"));
-		expect(row).toContain(`${theme.format.bracketLeft}scout${theme.format.bracketRight}`);
-		expect(row.indexOf("3 req")).toBeGreaterThan(row.indexOf("BadgeWorker"));
-		expect(row).toContain("$0.25");
+		expect(row).toContain("BadgeWorker");
+		expect(row.indexOf("BadgeWorker")).toBeLessThan(row.indexOf("gpt-5"));
+		expect(row).not.toContain(theme.thinking.high.split(" ")[0]);
+		expect(row).not.toContain(theme.icon.advisor);
+		expect(row).not.toContain("3 req");
+		expect(row).toContain("$0.250");
 	});
 
-	it("keeps the settled model before the name and only marks an enabled advisor", async () => {
+	it("keeps the settled ID before the model without advisor-only metadata", async () => {
 		setFeedModelBadgeEnabled(true);
 		const theme = (await getThemeByName("dark"))!;
 		const renderRow = (advisor: boolean): string =>
@@ -138,11 +137,14 @@ describe("task progress rendering", () => {
 				),
 			);
 		const withoutAdvisor = renderRow(false);
-		expect(withoutAdvisor).toContain("openai/gpt-5 SettledWorker: Inspect rendering");
+		expect(withoutAdvisor).toContain("SettledWorker");
+		expect(withoutAdvisor).toContain("gpt-5");
+		expect(withoutAdvisor.indexOf("SettledWorker")).toBeLessThan(withoutAdvisor.indexOf("gpt-5"));
 		expect(withoutAdvisor).not.toContain(theme.icon.advisor);
 		expect(withoutAdvisor).not.toContain(":high");
-		expect(withoutAdvisor.indexOf("3 req")).toBeGreaterThan(withoutAdvisor.indexOf("SettledWorker"));
-		expect(renderRow(true)).toContain(`openai/gpt-5 ${theme.icon.advisor} SettledWorker`);
+		expect(withoutAdvisor).not.toContain("3 req");
+		expect(renderRow(true)).toContain("gpt-5");
+		expect(renderRow(true)).not.toContain(theme.icon.advisor);
 	});
 
 	it("keeps the name and status on the first row at 40 columns across resizes", async () => {
@@ -186,27 +188,21 @@ describe("task progress rendering", () => {
 				const firstStatusRow = plainRows.find(row => row.startsWith(theme.boxRound.vertical));
 				expect(firstStatusRow).toBeDefined();
 				expect(firstStatusRow).toContain(metadata.id);
-				expect(firstStatusRow).toContain(`${theme.format.bracketLeft}scout${theme.format.bracketRight}`);
-				if (status) {
+				if (width === 160) expect(firstStatusRow).toContain("scout");
+				if (status && width === 160) {
 					expect(firstStatusRow).toContain(`${theme.format.bracketLeft}${status}${theme.format.bracketRight}`);
 				}
 				expect(plainRows.join("\n")).toContain(metadata.description);
 				if (width === 160) {
-					const thinkingGlyph = theme.thinking.high.split(" ")[0];
-					expect(firstStatusRow).toContain("openai/");
-					expect(firstStatusRow).toContain(":high");
-					expect(firstStatusRow).toContain(thinkingGlyph);
-					const badge = firstStatusRow!
-						.slice(firstStatusRow!.indexOf(thinkingGlyph), firstStatusRow!.indexOf(metadata.id))
-						.trimEnd();
-					expect(visibleWidth(badge)).toBeLessThanOrEqual(FEED_MODEL_BADGE_WIDTH);
-					expect(firstStatusRow).toContain(theme.icon.advisor);
+					expect(firstStatusRow).toContain("custom-architecture-model:high");
+					expect(firstStatusRow).not.toContain(theme.thinking.high.split(" ")[0]);
+					expect(firstStatusRow).not.toContain(theme.icon.advisor);
 				}
 			}
 		}
 	});
 
-	it("hides model and advisor metadata together on progress and settled rows", async () => {
+	it("shows resolved model metadata even when the old feed toggle is disabled", async () => {
 		setFeedModelBadgeEnabled(false);
 		const theme = (await getThemeByName("dark"))!;
 		const metadata = {
@@ -231,8 +227,8 @@ describe("task progress rendering", () => {
 					"HiddenBadge",
 				),
 			);
-			expect(row).toContain(`${theme.status.done} HiddenBadge`);
-			expect(row).not.toContain("openai/gpt-5");
+			expect(row).toContain("HiddenBadge");
+			expect(row).toContain("gpt-5");
 			expect(row).not.toContain(theme.icon.advisor);
 		}
 	});
@@ -247,7 +243,7 @@ describe("task progress rendering", () => {
 		const component = getSubprocessToolRenderer("task")!.renderFinal!([details], theme, false);
 		const text = Bun.stripANSI(component.render(120).join("\n"));
 		expect(text).toContain("UnknownWidthWorker");
-		expect(text).toContain(`${theme.format.bracketLeft}scout${theme.format.bracketRight}`);
+		expect(text).toContain("scout");
 		expect(text).toContain(`${theme.format.bracketLeft}failed${theme.format.bracketRight}`);
 	});
 
@@ -277,7 +273,7 @@ describe("task progress rendering", () => {
 					for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
 					const statusRow = rows.find(row => row.includes("LongWorker"))!;
 					expect(statusRow).toContain("LongWorker");
-					expect(statusRow).toContain(`${theme.format.bracketLeft}failed${theme.format.bracketRight}`);
+					expect(statusRow).toContain(theme.status.error);
 					const text = rows.join("").replaceAll(theme.boxRound.vertical, "").replace(/\s+/g, "");
 					expect(text).toContain(description.replace(/\s+/g, ""));
 				}
@@ -304,47 +300,46 @@ describe("task progress rendering", () => {
 					"LegacyWorker",
 				),
 			);
-			expect(row).toContain(`${theme.status.done} custom/model:high LegacyWorker`);
+			expect(row).toContain("LegacyWorker · model:high");
 			expect(row).not.toContain(theme.thinking.high.split(" ")[0]);
 		}
 	});
 
-	it("renders running task rows static with the agent dot", async () => {
+	it("renders running task rows with an animated status", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		expect(theme).toBeDefined();
-		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
+		const options: RenderResultOptions = { expanded: false, isPartial: true };
 		const progress = runningProgress({ id: "CountPackages", description: "List workspace packages" });
 
-		const renderRow = (timeMs: number): string => {
+		const renderRow = (timeMs: number, spinnerFrame: number): string => {
 			vi.spyOn(Date, "now").mockReturnValue(timeMs);
 			return findRow(
 				taskToolRenderer.renderResult(
 					{ content: [{ type: "text", text: "" }], details: detailsFor(progress) },
-					options,
+					{ ...options, spinnerFrame },
 					theme,
 				),
 				"CountPackages",
 			);
 		};
 
-		const rawRow0 = renderRow(0);
-		const rawRow1 = renderRow(700);
+		const rawRow0 = renderRow(0, 0);
+		const rawRow1 = renderRow(0, 1);
 		const strippedRow = Bun.stripANSI(rawRow0);
 
-		expect(strippedRow).toContain(`${theme.status.done} CountPackages: List workspace packages`);
+		expect(strippedRow).toContain(`${theme.getSpinnerFrames("status")[0]} CountPackages`);
 		expect(strippedRow).not.toContain(theme.symbol("tool.task"));
-		expect(strippedRow).not.toContain(theme.status.running);
-		expect(strippedRow).not.toContain(theme.getSpinnerFrames("status")[0]);
-		expect(rawRow0).toBe(rawRow1);
+		expect(strippedRow).not.toContain(theme.status.done);
+		expect(rawRow0).not.toBe(rawRow1);
 	});
 
-	// Regression: the ⟨agent⟩ type badge must survive past the streaming call
+	// Regression: the unbracketed agent type must survive past the streaming call
 	// preview — it stays on live progress rows and on finished result rows, and
-	// the generic `task` worker stays bare.
-	it("keeps the agent type badge on progress and result rows", async () => {
+	// the generic `task` worker remains explicit.
+	it("keeps the unbracketed agent type on progress and result rows", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
-		const badge = `${theme.format.bracketLeft}sonic${theme.format.bracketRight}`;
+		const badge = "sonic";
 
 		const progressRow = Bun.stripANSI(
 			findRow(
@@ -391,7 +386,7 @@ describe("task progress rendering", () => {
 				"PlainWorker",
 			),
 		);
-		expect(genericRow).not.toContain(`${theme.format.bracketLeft}task${theme.format.bracketRight}`);
+		expect(genericRow).toContain("task");
 	});
 
 	it("shows the spawn count without a joined agent-type list in the header", async () => {
@@ -419,7 +414,7 @@ describe("task progress rendering", () => {
 		expect(header).not.toContain("scout, sonic");
 	});
 
-	it("keeps the agent dot when shimmer is disabled", async () => {
+	it("keeps the running spinner when shimmer is disabled", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		setShimmerMode("disabled");
 		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
@@ -435,9 +430,8 @@ describe("task progress rendering", () => {
 			),
 		);
 
-		expect(strippedRow).toContain(`${theme.status.done} KeySettingsHotPaths`);
-		expect(strippedRow).not.toContain(theme.status.running);
-		expect(strippedRow).not.toContain(theme.getSpinnerFrames("status")[0]);
+		expect(strippedRow).toContain(theme.getSpinnerFrames("status")[0]);
+		expect(strippedRow).not.toContain(theme.status.done);
 	});
 
 	it("keeps normal retry progress on the retrying badge and countdown", async () => {
@@ -511,8 +505,8 @@ describe("task progress rendering", () => {
 				.join("\n"),
 		);
 
-		expect(rendered).toContain("waiting-limit");
-		expect(rendered).toContain("waiting for session limit reset (round 3) in");
+		expect(rendered).toContain("retrying");
+		expect(rendered).toContain("retrying 4/10 in 15m");
 		expect(rendered).toContain("Claude session limit reached");
 		expect(rendered).toContain("LimitFailed");
 		expect(rendered).toContain("rate-limited");
@@ -544,7 +538,7 @@ describe("task progress rendering", () => {
 		expect(rendered).not.toContain("auto-retry gave up");
 	});
 
-	it("renders pending task rows with the agent dot, not the pending glyph", async () => {
+	it("renders pending task rows with the pending glyph", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
 		const progress = runningProgress({
@@ -569,12 +563,12 @@ describe("task progress rendering", () => {
 		const rawRow1 = renderRow(700);
 		const strippedRow = Bun.stripANSI(rawRow0);
 
-		expect(strippedRow).toContain(`${theme.status.done} BestGpt: Combine winners for gpt`);
-		expect(strippedRow).not.toContain(theme.status.pending);
+		expect(strippedRow).toContain(`${theme.status.pending} BestGpt`);
+		expect(strippedRow).not.toContain(theme.status.done);
 		expect(rawRow0).toBe(rawRow1);
 	});
 
-	it("settles completed rows to the foreground color with the same dot", async () => {
+	it("settles completed rows to the foreground color", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
 		const progress = runningProgress({
@@ -593,11 +587,10 @@ describe("task progress rendering", () => {
 		);
 
 		const stripped = Bun.stripANSI(row);
-		expect(stripped).toContain(`${theme.status.done} DonePkg: List workspace packages`);
+		expect(stripped).toContain(`${theme.status.done} DonePkg`);
 		expect(stripped).not.toContain(theme.symbol("tool.task"));
-		// Same dot as live rows; completion reads as the label settling from
-		// accent to the plain foreground color.
-		const titlePart = `${theme.bold("DonePkg")}: List workspace packages`;
+		// Completion reads as the label settling from accent to the plain foreground color.
+		const titlePart = theme.bold("DonePkg");
 		expect(row).toContain(theme.fg("text", titlePart));
 		expect(row).not.toContain(theme.fg("accent", titlePart));
 	});

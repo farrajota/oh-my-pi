@@ -8,7 +8,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { getAgentLifecycleManager, releaseAgent, resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
+import {
+	getAgentLifecycleManager,
+	releaseAgent,
+	resetAgentLifecycleForTests,
+} from "../../src/internal/agent-lifecycle-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
@@ -21,7 +25,7 @@ import {
 	runSubagentFollowUpTurn,
 	runSubprocess,
 } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition, AgentProgress } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 const AGENT_ID = "accepted-result";
@@ -71,7 +75,7 @@ interface SessionHarness {
  * `subscribeRunState` never fires — the run-state mirror omits `idle`, which is
  * exactly the leak the acceptance boundary must cover.
  */
-function createHarness(options?: { hangPrompt?: boolean }): SessionHarness {
+function createHarness(options?: { hangPrompt?: boolean; usageMessages?: AssistantMessage[] }): SessionHarness {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const messages: AssistantMessage[] = [];
 	const promptEntered = Promise.withResolvers<void>();
@@ -99,10 +103,12 @@ function createHarness(options?: { hangPrompt?: boolean }): SessionHarness {
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		sessionManager: { appendSessionInit: () => {}, getArtifactManager: () => undefined },
+		settings: { get: () => ({}) },
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		getToolByName: () => undefined,
+		getPermissionSummary: () => undefined,
 		setActiveToolsByName: async () => {},
 		setWorkPoolYieldItems: () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
@@ -118,9 +124,17 @@ function createHarness(options?: { hangPrompt?: boolean }): SessionHarness {
 				await hangingPrompt.promise;
 				return;
 			}
-			const message = assistantStopMessage("submitting");
-			messages.push(message);
-			emit({ type: "message_end", message } as AgentSessionEvent);
+			if (options?.usageMessages) {
+				for (const message of options.usageMessages) {
+					messages.push(message);
+					emit({ type: "message_end", message } as AgentSessionEvent);
+					message.usage.input = -1;
+				}
+			} else {
+				const message = assistantStopMessage("submitting");
+				messages.push(message);
+				emit({ type: "message_end", message } as AgentSessionEvent);
+			}
 			emitTerminalYield({ report: text });
 		},
 		waitForIdle: async () => {},
@@ -149,13 +163,14 @@ function createHarness(options?: { hangPrompt?: boolean }): SessionHarness {
 	};
 }
 
-function registerRunning(session: AgentSession) {
+function registerRunning(session: AgentSession, modelRole?: string) {
 	return AgentRegistry.global().register({
 		id: AGENT_ID,
 		displayName: AGENT_ID,
 		kind: "sub",
 		session,
 		status: "running",
+		...(modelRole ? { history: { modelRole } } : {}),
 	});
 }
 
@@ -188,8 +203,9 @@ describe("runSubprocess result acceptance", () => {
 		AgentRegistry.resetGlobalForTests();
 	});
 
-	it("terminalizes the ref and stamps the run lifecycle when the yield is accepted", async () => {
+	it("terminalizes the ref and preserves the accepted result metadata", async () => {
 		const harness = createHarness();
+		const progress: AgentProgress[] = [];
 		const ref = registerRunning(harness.session);
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 			session: harness.session,
@@ -204,18 +220,69 @@ describe("runSubprocess result acceptance", () => {
 			task: "do the work",
 			index: 0,
 			id: AGENT_ID,
+			onProgress: snapshot => progress.push(snapshot),
 			...authorityOptions(),
 		});
 
 		expect(result.exitCode).toBe(0);
+		expect(JSON.parse(result.output)).toEqual({ report: "do the work" });
+		expect(result.startedAtMs).toBeNumber();
+		expect(progress.some(snapshot => snapshot.startedAtMs === result.startedAtMs)).toBe(true);
 		const settled = AgentRegistry.global().get(AGENT_ID);
 		expect(settled?.status).not.toBe("running");
 		expect(settled?.lifecycle?.responseAt).toBeNumber();
 		expect(settled?.lifecycle?.acceptedAt).toBeNumber();
 		expect(settled?.lifecycle?.terminalAt).toBeNumber();
 		expect(AgentRegistry.global().staleAcceptedRuns()).toEqual([]);
-		// Launch milestone is the registration timestamp the acceptance must not move.
 		expect(settled?.createdAt).toBe(ref.createdAt);
+	});
+
+	it("keeps usage snapshots immutable across progress updates", async () => {
+		const first = assistantStopMessage("first");
+		first.usage.input = 3;
+		first.usage.output = 5;
+		first.usage.cacheRead = 7;
+		first.usage.cacheWrite = 11;
+		first.usage.totalTokens = 26;
+		first.usage.cost.input = 0.001;
+		const second = assistantStopMessage("second");
+		second.usage.input = 13;
+		second.usage.output = 17;
+		second.usage.cacheRead = 19;
+		second.usage.cacheWrite = 23;
+		second.usage.totalTokens = 72;
+		second.usage.cost.input = 0.002;
+		const harness = createHarness({ usageMessages: [first, second] });
+		registerRunning(harness.session);
+		const snapshots: AgentProgress[] = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
+			session: harness.session,
+			extensionsResult: {} as unknown as LoadExtensionsResult,
+			setToolUIContext: () => {},
+			eventBus: new EventBus(),
+		} as CreateAgentSessionResult);
+
+		const result = await runSubprocess({
+			cwd: "/tmp",
+			agent: baseAgent,
+			task: "usage",
+			index: 0,
+			id: AGENT_ID,
+			onProgress: snapshot => snapshots.push(snapshot),
+			...authorityOptions(),
+		});
+
+		const finalSnapshot = snapshots.at(-1);
+		expect(finalSnapshot?.usage?.input).toBe(16);
+		expect(finalSnapshot?.usage?.cacheRead).toBe(26);
+		expect(finalSnapshot?.usage?.cacheWrite).toBe(34);
+		expect(result.usage?.input).toBe(16);
+		expect(result.usage?.cacheRead).toBe(26);
+		expect(result.usage?.cacheWrite).toBe(34);
+		expect(result.tokens).toBe(72);
+		expect(finalSnapshot?.usage).not.toBe(result.usage);
+		finalSnapshot!.usage!.input = 999;
+		expect(result.usage?.input).toBe(16);
 	});
 
 	it("settles the owning task job when Agent Hub tombstones a running subagent", async () => {
@@ -278,6 +345,31 @@ describe("runSubprocess result acceptance", () => {
 			agentLifecycle: getAgentLifecycleManager(AgentRegistry.global()),
 		});
 		expect(result.exitCode).toBe(0);
+		const settled = AgentRegistry.global().get(AGENT_ID);
+		expect(settled?.status).not.toBe("running");
+		expect(settled?.lifecycle?.responseAt).toBeNumber();
+		expect(settled?.lifecycle?.acceptedAt).toBeNumber();
+		expect(settled?.lifecycle?.terminalAt).toBeNumber();
+	});
+
+	it("terminalizes an existing ref on a follow-up turn and preserves role display", async () => {
+		const harness = createHarness();
+		registerRunning(harness.session, "task");
+		const roleDisplay = { tag: "TASK", name: "Subtask", color: "muted" };
+		const progress: AgentProgress[] = [];
+
+		const result = await runSubagentFollowUpTurn({
+			id: AGENT_ID,
+			agent: baseAgent,
+			message: "continue",
+			onProgress: snapshot => progress.push(snapshot),
+			agentRegistry: AgentRegistry.global(),
+			agentLifecycle: getAgentLifecycleManager(AgentRegistry.global()),
+		});
+		expect(result.exitCode).toBe(0);
+		expect(result.modelRole).toBe("task");
+		expect(result.modelRoleDisplay).toEqual(roleDisplay);
+		expect(progress.map(snapshot => snapshot.modelRoleDisplay)).toContainEqual(roleDisplay);
 		const settled = AgentRegistry.global().get(AGENT_ID);
 		expect(settled?.status).not.toBe("running");
 		expect(settled?.lifecycle?.responseAt).toBeNumber();

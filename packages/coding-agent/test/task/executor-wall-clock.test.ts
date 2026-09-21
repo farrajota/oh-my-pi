@@ -41,6 +41,7 @@ function createHangingSession(): HangingSessionHandle {
 		} as never,
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
+		getPermissionSummary: () => undefined,
 		subscribe: (_listener: (event: AgentSessionEvent) => void) => () => {},
 		prompt: async (_text: string, _options?: PromptOptions) => {
 			await hang;

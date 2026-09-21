@@ -174,6 +174,11 @@ function addUsageTotals(target: Usage, usage: Partial<Usage>): void {
 	target.cost.total += cost.total;
 }
 
+function cloneUsageSnapshot(usage: Usage | undefined): Usage | undefined {
+	if (!usage) return undefined;
+	return { ...usage, cost: { ...usage.cost } };
+}
+
 // Re-export types and utilities
 export { loadBundledAgents as BUNDLED_AGENTS } from "./agents";
 export { discoverCommands, expandCommand, getCommand } from "./commands";
@@ -570,7 +575,7 @@ function mergeSyncPayloads(
 		const text = payload.content.find(part => part.type === "text")?.text;
 		if (text) contentParts.push(text);
 		for (const result of payload.details?.results ?? []) {
-			results.push({ ...result, index });
+			results.push({ ...result, usage: cloneUsageSnapshot(result.usage), index });
 			if (result.usage) {
 				addUsageTotals(usageTotals, result.usage);
 				hasUsage = true;
@@ -1581,11 +1586,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			let syncProjectAgentsDir: string | null = null;
 			const buildAsyncDetails = (): TaskToolDetails => ({
 				projectAgentsDir: syncProjectAgentsDir,
-				results: [...syncResults],
+				results: syncResults.map(result => ({ ...result, usage: cloneUsageSnapshot(result.usage) })),
 				totalDurationMs: Date.now() - callStartedAt,
-				usage: syncUsage,
+				usage: cloneUsageSnapshot(syncUsage),
 				outputPaths: syncOutputPaths,
-				progress: spawns.map(spawn => ({ ...spawn.progress })),
+				progress: spawns.map(spawn => ({ ...spawn.progress, usage: cloneUsageSnapshot(spawn.progress.usage) })),
 				async: {
 					state: settledCount < asyncSpawns.length ? "running" : failedCount > 0 ? "failed" : "completed",
 					jobId: primaryJobId,
@@ -1828,6 +1833,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				try {
 					markRunning();
 					progress.status = "running";
+					progress.startedAtMs ??= startedAt;
 					await reportProgress(
 						`Running background task ${agentId}...`,
 						buildDetails() as unknown as Record<string, unknown>,
@@ -1841,6 +1847,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							// and running counters without reverting the "running"
 							// status back to the subagent's initial "pending" snapshot.
 							progress.modelRole = nextProgress.modelRole ?? progress.modelRole;
+							progress.startedAtMs = nextProgress.startedAtMs ?? progress.startedAtMs;
+							progress.modelRoleDisplay = nextProgress.modelRoleDisplay ?? progress.modelRoleDisplay;
+							progress.usage = cloneUsageSnapshot(nextProgress.usage);
 							progress.resolvedModel = nextProgress.resolvedModel;
 							progress.requestedModel = nextProgress.requestedModel;
 							progress.resolvedModelIdentity = nextProgress.resolvedModelIdentity;
@@ -1903,6 +1912,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						singleResult.error !== undefined;
 					progress.status = singleResult?.aborted ? "aborted" : resultFailed ? "failed" : "completed";
 					progress.durationMs = singleResult?.durationMs ?? Math.max(0, Date.now() - startedAt);
+					progress.startedAtMs = singleResult?.startedAtMs ?? progress.startedAtMs;
+					progress.modelRoleDisplay = singleResult?.modelRoleDisplay ?? progress.modelRoleDisplay;
+					progress.usage = cloneUsageSnapshot(singleResult?.usage);
 					progress.tokens = singleResult?.tokens ?? 0;
 					progress.requests = singleResult?.requests ?? 0;
 					progress.contextTokens = singleResult?.contextTokens;
@@ -2274,7 +2286,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						projectAgentsDir,
 						results: [],
 						totalDurationMs: Date.now() - startTime,
-						progress: [progress],
+						progress: [{ ...progress, usage: cloneUsageSnapshot(progress.usage) }],
 					},
 				});
 			};
@@ -2327,7 +2339,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				maxRuntimeMs,
 				signal,
 				onProgress: (progress: AgentProgress) => {
-					const nextProgress = { ...progress, recentTools: progress.recentTools.slice() };
+					const nextProgress = {
+						...progress,
+						usage: cloneUsageSnapshot(progress.usage),
+						recentTools: progress.recentTools.map(tool => ({ ...tool })),
+						recentOutput: progress.recentOutput.slice(),
+					};
 					latestProgress = nextProgress;
 					onUpdate?.({
 						content: [{ type: "text", text: `Running agent ${progress.id}...` }],
@@ -2387,6 +2404,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							output: "",
 							stderr: message,
 							truncated: false,
+							startedAtMs: taskStart,
 							durationMs: Date.now() - taskStart,
 							tokens: 0,
 							requests: 0,

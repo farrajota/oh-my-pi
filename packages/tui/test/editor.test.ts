@@ -2214,6 +2214,21 @@ describe("Editor component", () => {
 			expect(editor.getCursor()).toEqual({ line: 6, col: 2 });
 		});
 
+		it("pages by editable height after continuation rows consume the viewport", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setMaxHeight(6);
+			editor.setTopBorderProvider(() => ({ content: "PRIMARY", width: 7 }));
+			editor.setTopBorderContinuationProvider(() => ["CONT-1", "CONT-2"]);
+			editor.setText("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
+
+			const rendered = editor.render(40);
+			expect(rendered.length).toBeLessThanOrEqual(6);
+			editor.handleInput("\x1b[5~");
+			expect(editor.getCursor()).toEqual({ line: 8, col: 2 });
+			editor.handleInput("\x1b[6~");
+			expect(editor.getCursor()).toEqual({ line: 9, col: 2 });
+		});
+
 		it("PageUp/PageDown on an idle editor never step prompt history (#4754)", () => {
 			const editor = new Editor(defaultEditorTheme);
 

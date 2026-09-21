@@ -256,6 +256,71 @@ describe("persisted agent model attribution", () => {
 		expect(history?.resolvedModelIsFallback).toBe(true);
 	});
 
+	it("sums direct usage across branches while keeping context on the leaf chain", async () => {
+		const branch = JSON.stringify({
+			type: "message",
+			id: "a2",
+			parentId: "a1",
+			timestamp: "2026-08-07T11:00:30.000Z",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "branch" }],
+				provider: SONNET.provider,
+				model: SONNET.model,
+				stopReason: "stop",
+				usage: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1, totalTokens: 40, cost: { total: 0.2 } },
+			},
+		});
+		using tempDir = TempDir.createSync("@omp-attribution-usage-");
+		const leaf = JSON.stringify({
+			type: "message",
+			id: "a3",
+			parentId: "a1",
+			timestamp: "2026-08-07T11:01:00.000Z",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "leaf" }],
+				provider: SONNET.provider,
+				model: SONNET.model,
+				stopReason: "stop",
+				usage: {
+					input: 2,
+					output: 3,
+					cacheRead: 4,
+					cacheWrite: 5,
+					orchestration: { input: 9 },
+					cost: { total: 0.25 },
+				},
+			},
+		});
+		const modelUsage = JSON.stringify({
+			type: "model_usage",
+			id: "mu1",
+			parentId: "a2",
+			timestamp: "2026-08-07T11:01:01.000Z",
+			usage: { input: 7, output: 7, totalTokens: 7, cost: { total: 0.1 } },
+		});
+		const taskResult = JSON.stringify({
+			type: "message",
+			id: "task-result",
+			parentId: "a3",
+			timestamp: "2026-08-07T11:01:02.000Z",
+			message: { role: "toolResult", toolName: "task", details: { usage: { totalTokens: 10_000 } } },
+		});
+		const registry = await historyFor(tempDir.path(), "Usage", [
+			...transcriptHead(),
+			assistant("a1", "si", SONNET, "stop", [{ type: "text", text: "root" }]),
+			branch,
+			leaf,
+			modelUsage,
+			taskResult,
+		]);
+		const metrics = registry.get("Usage")?.history?.metrics;
+		expect(metrics?.tokens).toBe(100);
+		expect(metrics?.requests).toBe(4);
+		expect(metrics?.contextTokens).toBe(30);
+	});
+
 	it("restores a bounded permission summary on parked history", async () => {
 		using tempDir = TempDir.createSync("@omp-attribution-permission-summary-");
 		const permissionSummary = {

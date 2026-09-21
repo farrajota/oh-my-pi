@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { COMPOSER_DEFAULTS, type ComposerStatusSnapshot } from "@oh-my-pi/pi-tui/prompt/composer";
+import { COMPOSER_DEFAULTS, Composer, type ComposerStatusSnapshot } from "@oh-my-pi/pi-tui/prompt/composer";
 import {
 	readComposerStartupCache,
 	writeComposerLspCache,
@@ -12,6 +12,7 @@ import {
 	writeComposerWelcomeCache,
 } from "@oh-my-pi/pi-tui/prompt/composer-cache";
 import { getComposerCacheDir } from "@oh-my-pi/pi-utils/dirs";
+import { VirtualTerminal } from "./virtual-terminal";
 
 describe("composer startup cache", () => {
 	it("round-trips per-project UI, status, recent-session JSONL, and LSP speculation", async () => {
@@ -25,7 +26,11 @@ describe("composer startup cache", () => {
 			const lspServers = [{ name: "rust-analyzer", status: "connecting" as const, fileTypes: [".rs"] }];
 			const status: ComposerStatusSnapshot = {
 				shape: "rail",
+				terminalWidth: 80,
+				topWidth: 76,
+				bottomWidth: 80,
 				topBorder: { content: "placeholder", width: 11 },
+				topContinuationLines: ["continuation"],
 				bottomLines: ["", "placeholder"],
 			};
 			await Promise.all([
@@ -142,6 +147,54 @@ describe("composer startup cache", () => {
 			expect(stdout).toBe("true");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("composer status snapshot replay", () => {
+	it("replays only at the cached width and clears speculative chrome on status handoff", () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const snapshot: ComposerStatusSnapshot = {
+			shape: "band",
+			terminalWidth: 80,
+			topWidth: 80,
+			bottomWidth: 80,
+			topBorder: { content: "CACHED-TOP", width: 10 },
+			topContinuationLines: ["CACHED-CONTINUATION"],
+			bottomLines: ["CACHED-BOTTOM"],
+		};
+		const composer = new Composer({
+			terminal,
+			preferences: { ...COMPOSER_DEFAULTS, composerShape: "band", quiet: true },
+			status: snapshot,
+		});
+		composer.start();
+		try {
+			const frameText = (): string =>
+				composer.renderFrame({ columns: terminal.columns, rows: terminal.rows }).viewport.join("\n");
+			const expectSnapshot = (visible: boolean): void => {
+				const frame = frameText();
+				for (const label of ["CACHED-TOP", "CACHED-CONTINUATION", "CACHED-BOTTOM"]) {
+					expect(frame.includes(label)).toBe(visible);
+				}
+			};
+
+			expectSnapshot(true);
+			terminal.resize(60, 24);
+			expectSnapshot(false);
+			terminal.resize(100, 24);
+			expectSnapshot(false);
+			terminal.resize(80, 24);
+			expectSnapshot(true);
+
+			composer.setStatusComponent({ render: () => ["LIVE-STATUS"] });
+			const handedOff = frameText();
+			expect(handedOff).toContain("LIVE-STATUS");
+			for (const label of ["CACHED-TOP", "CACHED-CONTINUATION", "CACHED-BOTTOM"]) {
+				expect(handedOff).not.toContain(label);
+			}
+		} finally {
+			composer.stop();
 		}
 	});
 });

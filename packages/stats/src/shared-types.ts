@@ -55,6 +55,8 @@ export interface AggregatedStats {
 export interface ModelStats extends AggregatedStats {
 	model: string;
 	provider: string;
+	/** Provider-authoritative total token count, including orchestration tokens. */
+	totalTokens: number;
 }
 
 /**
@@ -92,6 +94,8 @@ export interface ModelTimeSeriesPoint {
 	provider: string;
 	/** Request count */
 	requests: number;
+	/** Provider-authoritative total tokens in this bucket. */
+	totalTokens: number;
 }
 
 /**
@@ -198,6 +202,8 @@ export interface AgentTypeStats {
  */
 export interface ModelAgentTypeStats extends AgentTypeStats {
 	model: string;
+	/** Provider-authoritative total, including orchestration tokens when reported. */
+	totalTokens: number;
 	provider: string;
 }
 
@@ -369,7 +375,7 @@ export interface ProviderAggregate {
 	totalOutputTokens: number;
 	totalCacheReadTokens: number;
 	totalCacheWriteTokens: number;
-	/** Uncached input + cache reads + cache writes + output. */
+	/** Provider-authoritative total, including orchestration when reported; the four breakdown columns remain separate and need not sum to it. */
 	totalTokens: number;
 	totalCost: number;
 	/** Requests excluded because no public-equivalent subscription price exists. */

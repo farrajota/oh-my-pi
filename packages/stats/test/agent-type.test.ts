@@ -181,7 +181,7 @@ describe("getSessionStatsByModelAndAgentType", () => {
 			5,
 			1,
 			1,
-			57,
+			70,
 			0,
 			0,
 			0,
@@ -213,6 +213,7 @@ describe("getSessionStatsByModelAndAgentType", () => {
 			totalOutputTokens: 15,
 			totalCacheReadTokens: 2,
 			totalCacheWriteTokens: 3,
+			totalTokens: 183,
 			totalCost: 0.53,
 		});
 		expect(rows[1]).toMatchObject({
@@ -221,6 +222,7 @@ describe("getSessionStatsByModelAndAgentType", () => {
 			totalOutputTokens: 80,
 			totalCacheReadTokens: 14,
 			totalCacheWriteTokens: 16,
+			totalTokens: 910,
 			totalCost: 0.06,
 		});
 		expect(rows[2]).toMatchObject({
@@ -229,6 +231,7 @@ describe("getSessionStatsByModelAndAgentType", () => {
 			totalOutputTokens: 60,
 			totalCacheReadTokens: 10,
 			totalCacheWriteTokens: 12,
+			totalTokens: 682,
 			totalCost: 0.06,
 		});
 	});

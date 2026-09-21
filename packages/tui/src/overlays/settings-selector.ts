@@ -3,10 +3,9 @@ import type { Effort } from "@oh-my-pi/pi-ai";
 import {
 	type Component,
 	Container,
+	clampScrollOffset,
 	extractPrintableText,
 	fuzzyRank,
-	getKeybindings,
-	getSettingItemFilterText,
 	type ImageBudget,
 	Input,
 	matchesKey,
@@ -20,8 +19,11 @@ import {
 	type Tab,
 	TabBar,
 	truncateToWidth,
+	viewportRange,
 	visibleWidth,
 } from "../index";
+import { getKeybindings } from "../keybindings";
+import { getSettingItemFilterText } from "../components/settings-list";
 import type { ShapeTarget } from "@oh-my-pi/snapcompact";
 import type {
 	ContextLineMode,
@@ -90,7 +92,7 @@ function createSettingsSelectField(
 	onSelect: (value: string) => void,
 	onCancel: () => void,
 	onSelectionChange?: (value: string) => void | Promise<void>,
-	getPreview?: () => string,
+	getPreview?: () => readonly string[],
 	footer?: Component,
 	requestRender?: () => void,
 ): SelectFormField {
@@ -480,8 +482,8 @@ export interface SettingsCallbacks {
 	onThemePreview?: (theme: string) => void | Promise<void>;
 	/** Called for status line preview while configuring */
 	onStatusLinePreview?: (settings: StatusLinePreviewSettings) => void;
-	/** Get current rendered status line for inline preview */
-	getStatusLinePreview?: () => string;
+	/** Get current rendered status line rows for inline preview. */
+	getStatusLinePreview?: () => readonly string[];
 	/** Called when plugins change */
 	onPluginsChanged?: () => void | Promise<void>;
 	/** Called when settings panel is closed */
@@ -513,6 +515,12 @@ export class SettingsSelectorComponent implements Component {
 	#tabRowCount = 0;
 	#contentRowStart = 0;
 	#contentRowCount = 0;
+	/** Bounded scroll region for overflowed appearance preview rows. */
+	#previewRowStart = 0;
+	#previewRowCount = 0;
+	#previewTotalRows = 0;
+	#previewViewportRows = 0;
+	#previewScrollOffset = 0;
 	#sidebarWidth: number;
 	readonly #context: SettingsRuntimeContext;
 	readonly #callbacks: SettingsCallbacks;
@@ -599,19 +607,36 @@ export class SettingsSelectorComponent implements Component {
 	 * then a footer hint pinned above the bottom border.
 	 */
 	render(width: number): readonly string[] {
-		const height = Math.max(14, process.stdout.rows || 40);
+		const height = Math.max(1, process.stdout.rows || 40);
 		const innerWidth = Math.max(1, width - 4);
 
 		const tabLines = this.#tabBar.render(innerWidth);
 		const searching = this.#searchList !== null;
 		const showPreview = !searching && this.#currentTabId === "appearance";
-		const previewLines = showPreview ? ["", theme.fg("muted", "Preview:"), this.#getStatusPreviewString()] : [];
+		const allPreviewLines = showPreview ? ["", theme.fg("muted", "Preview:"), ...this.#getStatusPreviewLines()] : [];
 
 		// Fixed chrome: top border, tabs, divider, [search row], divider, hint, bottom border.
 		const fixedRows = 1 + tabLines.length + 1 + (searching ? 1 : 0) + 1 + 1 + 1;
-		const contentRows = Math.max(7, height - fixedRows - previewLines.length);
-
+		const remainingRows = Math.max(0, height - fixedRows);
 		const list = this.#searchList ?? this.#currentList;
+		const minimumListRows =
+			allPreviewLines.length > 0 && list ? Math.min(3, Math.max(0, remainingRows - (remainingRows > 1 ? 1 : 0))) : 0;
+		this.#previewTotalRows = allPreviewLines.length;
+		this.#previewViewportRows =
+			allPreviewLines.length > 0 ? Math.min(allPreviewLines.length, remainingRows - minimumListRows) : 0;
+		const contentRows =
+			allPreviewLines.length > 0 && list
+				? remainingRows - this.#previewViewportRows
+				: list !== null || this.#pluginComponent !== null
+					? remainingRows
+					: 0;
+		this.#previewScrollOffset = clampScrollOffset(
+			this.#previewScrollOffset,
+			this.#previewTotalRows,
+			this.#previewViewportRows,
+		);
+		const previewRange = viewportRange(this.#previewTotalRows, this.#previewViewportRows, this.#previewScrollOffset);
+		const previewLines = allPreviewLines.slice(previewRange.start, previewRange.end);
 		let contentLines: readonly string[];
 		if (list) {
 			// SettingsList pads itself to viewport + blank + 3 description rows.
@@ -639,13 +664,17 @@ export class SettingsSelectorComponent implements Component {
 		for (let i = 0; i < contentRows; i++) {
 			out.push(row(contentLines[i] ?? "", width));
 		}
+		this.#previewRowStart = out.length;
+		this.#previewRowCount = previewLines.length;
 		for (const line of previewLines) {
 			out.push(row(line, width));
 		}
 		out.push(divider(width));
 		out.push(row(theme.fg("dim", this.#footerHintText()), width));
-		out.push(bottomBorder(width));
-		return out;
+		const frameBottom = bottomBorder(width);
+		out.push(frameBottom);
+		if (out.length <= height) return out;
+		return [...out.slice(0, Math.max(0, height - 1)), frameBottom];
 	}
 
 	/**
@@ -665,6 +694,7 @@ export class SettingsSelectorComponent implements Component {
 		const contentColInset = 2;
 		const innerCol = event.col - contentColInset;
 		const contentLine = event.row - this.#contentRowStart;
+		const previewLine = event.row - this.#previewRowStart;
 
 		// An open submenu owns the pointer: wheel, hover, and clicks route into
 		// it (text-input submenus ignore routed events).
@@ -676,10 +706,21 @@ export class SettingsSelectorComponent implements Component {
 		const tabLine = event.row - this.#tabRowStart;
 		const overTabs = tabLine >= 0 && tabLine < this.#tabRowCount;
 		const overContent = contentLine >= 0 && contentLine < this.#contentRowCount;
+		const overPreview = previewLine >= 0 && previewLine < this.#previewRowCount;
 
 		if (event.wheel !== null) {
 			if (overContent) {
 				list?.handleWheelAt(event.wheel, contentLine, innerCol);
+			} else if (overPreview) {
+				const next = clampScrollOffset(
+					this.#previewScrollOffset + event.wheel,
+					this.#previewTotalRows,
+					this.#previewViewportRows,
+				);
+				if (next !== this.#previewScrollOffset) {
+					this.#previewScrollOffset = next;
+					this.#context.requestRender?.();
+				}
 			}
 			return true;
 		}
@@ -1290,14 +1331,10 @@ export class SettingsSelectorComponent implements Component {
 		this.#currentList.setItems(this.#buildItemsForDefs(defs));
 	}
 
-	/**
-	 * Get the status line preview string.
-	 */
-	#getStatusPreviewString(): string {
-		if (this.#callbacks.getStatusLinePreview) {
-			return this.#callbacks.getStatusLinePreview();
-		}
-		return theme.fg("dim", "(preview not available)");
+	/** Get status preview rows without flattening continuation rows into a newline. */
+	#getStatusPreviewLines(): readonly string[] {
+		if (this.#callbacks.getStatusLinePreview) return this.#callbacks.getStatusLinePreview();
+		return [theme.fg("dim", "(preview not available)")];
 	}
 
 	/**

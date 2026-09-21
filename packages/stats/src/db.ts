@@ -95,6 +95,7 @@ interface SessionModelAgentTypeRow {
 	total_output_tokens: number;
 	total_cache_read_tokens: number;
 	total_cache_write_tokens: number;
+	total_tokens: number;
 	total_cost: number;
 }
 
@@ -130,6 +131,7 @@ interface AggregatedStatsRow {
 interface ModelStatsRow extends AggregatedStatsRow {
 	model: string;
 	provider: string;
+	total_tokens: number | null;
 }
 
 interface FolderStatsRow extends AggregatedStatsRow {
@@ -969,6 +971,7 @@ export function getStatsByModel(cutoff?: number): ModelStats[] {
 			SUM(output_tokens) as total_output_tokens,
 			SUM(cache_read_tokens) as total_cache_read_tokens,
 			SUM(cache_write_tokens) as total_cache_write_tokens,
+			SUM(total_tokens) as total_tokens,
 			SUM(premium_requests) as total_premium_requests,
 			SUM(cost_total) as total_cost,
 			SUM(${UNPRICED_REQUEST_SQL}) as unpriced_requests,
@@ -986,12 +989,13 @@ export function getStatsByModel(cutoff?: number): ModelStats[] {
 		GROUP BY model, provider
 		ORDER BY total_requests DESC
 	`);
-
 	const rows = (hasCutoff ? stmt.all(cutoff) : stmt.all()) as ModelStatsRow[];
+
 	return rows.map(row => ({
 		model: row.model,
 		provider: row.provider,
 		...buildAggregatedStats([row]),
+		totalTokens: row.total_tokens ?? 0,
 	}));
 }
 
@@ -1016,6 +1020,7 @@ export function getSessionStatsByModelAndAgentType(sessionFile: string): ModelAg
 			SUM(output_tokens) as total_output_tokens,
 			SUM(cache_read_tokens) as total_cache_read_tokens,
 			SUM(cache_write_tokens) as total_cache_write_tokens,
+			SUM(total_tokens) as total_tokens,
 			SUM(cost_total) as total_cost
 		FROM messages
 		WHERE root_session_file = ?
@@ -1039,6 +1044,7 @@ export function getSessionStatsByModelAndAgentType(sessionFile: string): ModelAg
 		totalOutputTokens: row.total_output_tokens || 0,
 		totalCacheReadTokens: row.total_cache_read_tokens || 0,
 		totalCacheWriteTokens: row.total_cache_write_tokens || 0,
+		totalTokens: row.total_tokens || 0,
 		totalCost: row.total_cost || 0,
 	}));
 }
@@ -1174,7 +1180,8 @@ export function getModelTimeSeries(
 			(timestamp / ?) * ? as bucket,
 			model,
 			provider,
-			COUNT(*) as requests
+			COUNT(*) as requests,
+			SUM(total_tokens) as total_tokens
 		FROM messages
 		${hasCutoff ? "WHERE timestamp >= ?" : ""}
 		GROUP BY bucket, model, provider
@@ -1182,12 +1189,19 @@ export function getModelTimeSeries(
 	`);
 
 	const rowsRaw = hasCutoff ? stmt.all(bucketMs, bucketMs, seriesCutoff) : stmt.all(bucketMs, bucketMs);
-	const rows = rowsRaw as Array<{ bucket: number; model: string; provider: string; requests: number }>;
+	const rows = rowsRaw as Array<{
+		bucket: number;
+		model: string;
+		provider: string;
+		requests: number;
+		total_tokens: number | null;
+	}>;
 	return rows.map(row => ({
 		timestamp: row.bucket,
 		model: row.model,
 		provider: row.provider,
 		requests: row.requests,
+		totalTokens: row.total_tokens ?? 0,
 	}));
 }
 
@@ -1208,7 +1222,7 @@ export function getStatsByProvider(cutoff?: number | null): ProviderAggregate[] 
 			SUM(output_tokens) as total_output_tokens,
 			SUM(cache_read_tokens) as total_cache_read_tokens,
 			SUM(cache_write_tokens) as total_cache_write_tokens,
-			SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) as total_tokens,
+			SUM(total_tokens) as total_tokens,
 			SUM(cost_total) as total_cost,
 			SUM(${UNPRICED_REQUEST_SQL}) as unpriced_requests,
 			SUM(premium_requests) as total_premium_requests,
@@ -1264,7 +1278,7 @@ export function getProviderHourlyBurn(cutoff?: number | null): ProviderHourlyPoi
 		SELECT
 			provider,
 			CAST(strftime('%H', timestamp / 1000, 'unixepoch', 'localtime') AS INTEGER) as hour,
-			SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) as total_tokens,
+			SUM(total_tokens) as total_tokens,
 			SUM(output_tokens) as output_tokens,
 			COUNT(*) as requests
 		FROM messages
@@ -1306,7 +1320,7 @@ export function getProviderTimeSeries(
 		SELECT
 			(timestamp / ?) * ? as bucket,
 			provider,
-			SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) as total_tokens,
+			SUM(total_tokens) as total_tokens,
 			SUM(cost_total) as cost,
 			SUM(${UNPRICED_REQUEST_SQL}) as unpriced_requests,
 			COUNT(*) as requests

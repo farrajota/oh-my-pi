@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "omp://skill-cutover/cutover-intent.schema.json",
+  "title": "Skill-set transaction intent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "set_id", "operation", "parent_set_id", "source_root", "identities", "expected_manifest", "desired_manifest", "members"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "set_id": {"type": "string", "pattern": "^ds-[0-9a-f]{64}$"},
+    "operation": {"enum": ["cutover-v1", "baseline-v1"]},
+    "parent_set_id": {"type": ["string", "null"], "pattern": "^ds-[0-9a-f]{64}$"},
+    "source_root": {"type": "string", "minLength": 1},
+    "identities": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "expected_manifest": {"type": "object"},
+    "desired_manifest": {"type": "object"},
+    "members": {"type": "array", "minItems": 1, "items": {"$ref": "member-evidence.schema.json"}}
+  }
+}

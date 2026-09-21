@@ -36,8 +36,9 @@ describe("composer shape preview", () => {
 				const content = `BAND ${previewTitle ?? ""}`;
 				return { content, width: content.length };
 			},
-			renderBottomBar: (_width: number, groups: "left" | "full", previewTitle?: string) =>
+			renderBottomBarLines: (_width: number, groups: "left" | "full", previewTitle?: string) => [
 				`BOTTOM-${groups.toUpperCase()} ${previewTitle ?? ""}`,
+			],
 		};
 
 		const box = renderComposerShapePreview("box", 80, status).join("\n");
@@ -76,6 +77,29 @@ describe("composer shape preview", () => {
 			expect(rendered.join("\n")).toContain("omp");
 			expect(rendered.join("\n")).toContain("BOTTOM-FULL");
 			expect(rendered[rendered.length - 2]).toBe(""); // spacer row before the bar
+		}
+	});
+
+	it("mounts top continuation rows after each primary status row", async () => {
+		await setTheme("dark");
+		const status = {
+			getTopBorder: () => ({ content: "TOP", width: 3 }),
+			getTopBorderLines: () => ["TOP", "TOP-CONT"],
+			getBandTopBorder: () => ({ content: "BAND", width: 4 }),
+			getBandTopBorderLines: () => ["BAND", "BAND-CONT"],
+			getStandaloneTopBorder: () => ({ content: "RULE", width: 4 }),
+			getStandaloneTopBorderLines: () => ["RULE", "RULE-CONT"],
+			renderBottomBarLines: () => [],
+		};
+		for (const [shape, primary, continuation] of [
+			["box", "TOP", "TOP-CONT"],
+			["band", "BAND", "BAND-CONT"],
+			["claude", "RULE", "RULE-CONT"],
+		] as const) {
+			const lines = renderComposerShapePreview(shape, 80, status);
+			const primaryIndex = lines.findIndex(line => line.includes(primary));
+			expect(primaryIndex).toBeGreaterThanOrEqual(0);
+			expect(lines[primaryIndex + 1]).toContain(continuation);
 		}
 	});
 

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "omp://skill-cutover/journal-record.schema.json",
+  "title": "Append-only skill cutover journal record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "sequence", "previous_record_sha256", "binding", "phase", "timestamp_ns", "data", "record_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "sequence": {"type": "integer", "minimum": 1},
+    "previous_record_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "binding": {
+      "type": "object",
+      "required": ["transaction_id", "operation"],
+      "properties": {
+        "transaction_id": {"type": "string", "minLength": 1},
+        "operation": {"enum": ["cutover-v1", "baseline-v1"]}
+      }
+    },
+    "phase": {"type": "string", "minLength": 1},
+    "timestamp_ns": {"type": "integer", "minimum": 1},
+    "data": {"type": "object"},
+    "record_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

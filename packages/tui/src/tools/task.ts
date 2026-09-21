@@ -16,19 +16,16 @@ import { Text } from "../components/text";
 import { visibleWidth, wrapTextWithAnsi } from "../utils";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "./renderer";
-import { formatAgentStatRun, renderAgentTreeRow } from "./agent-tree";
+import { formatRoleBadge, renderAgentTreeRow, type AgentRoleDisplay } from "./agent-tree";
 import { getMarkdownTheme, type Theme } from "../theme/theme";
 import { stripGeneratedOutputNotice, stripRawOutputArtifactNotice, stripTrailingNotice } from "./output-meta";
 import {
 	capPreviewLines,
-	FEED_MODEL_BADGE_WIDTH,
 	formatBadge,
 	formatDuration,
 	formatExpandHint,
-	formatFeedModelBadge,
 	formatMoreItems,
 	formatNumber,
-	isFeedModelBadgeEnabled,
 	previewLine,
 	previewWindowRows,
 	replaceTabs,
@@ -675,14 +672,21 @@ function renderAgentProgress(
 			advisor: progress.advisor,
 			spinnerFrame,
 			frozen,
-			roleBadge: agentTypeBadge(progress.agent, theme),
+			roleBadge: formatRoleBadge(progress.modelRole ?? progress.agent, progress.modelRoleDisplay ?? {}, theme),
 			statusBadge,
 			description: fullDescription,
 			preview:
 				progress.status === "running" && !fullDescription
 					? ` ${theme.fg("muted", previewLine(sanitizeText(progress.assignment ?? progress.task), 40))}`
 					: undefined,
-			stats: progress.status === "running" || progress.status === "completed" ? progress : undefined,
+			metadata: {
+				model: progress.resolvedModelIdentity ?? progress.resolvedModel,
+				role: formatRoleBadge(progress.modelRole ?? progress.agent, progress.modelRoleDisplay ?? {}, theme),
+				elapsedMs:
+					progress.startedAtMs !== undefined ? Math.max(0, nowMs - progress.startedAtMs) : progress.durationMs,
+				usage: progress.usage,
+				cost: progress.cost,
+			},
 		},
 		theme,
 	);
@@ -958,13 +962,6 @@ function renderAgentResult(
 	const mergeFailed = !aborted && result.exitCode === 0 && !!result.error;
 	const success = !aborted && result.exitCode === 0 && !result.error;
 	const needsWarning = Boolean(missingCompleteWarning) && success;
-	const icon = aborted
-		? theme.status.aborted
-		: needsWarning
-			? theme.status.warning
-			: success
-				? theme.styledSymbol("status.done", "text")
-				: theme.status.error;
 	const iconColor = needsWarning ? "warning" : success ? "success" : mergeFailed ? "warning" : "error";
 	const statusText = aborted
 		? "aborted"
@@ -976,59 +973,37 @@ function renderAgentResult(
 					? "merge failed"
 					: "failed";
 
-	// Reserve the name and required badges before optional model metadata and details.
 	const fullDescription = result.description ? replaceTabs(sanitizeText(result.description)).trim() : undefined;
-	const indent = prefix ? `${prefix} ` : "";
 	const statusBadge = ` ${formatBadge(statusText, iconColor, theme)}`;
-	const displayId = truncateTaskRow(
-		formatTaskId(result.id),
-		Math.max(0, maxWidth - visibleWidth(`${indent}${icon} ${statusBadge}`)),
-	);
-	const roleBadge = truncateTaskRow(
-		agentTypeBadge(result.agent, theme),
-		Math.max(0, maxWidth - visibleWidth(`${indent}${icon} ${displayId}${statusBadge}`)),
-	);
-	const badges = `${roleBadge}${statusBadge}`;
-	const modelBadge = isFeedModelBadgeEnabled()
-		? formatFeedModelBadge(
-				result.resolvedModelIdentity ?? result.resolvedModel,
-				result.resolvedThinkingLevel,
-				result.advisor,
-				theme,
-				Math.min(
-					FEED_MODEL_BADGE_WIDTH,
-					Math.max(0, maxWidth - visibleWidth(`${indent}${icon} ${displayId}${badges}`) - 1),
-				),
-			)
-		: "";
-	const modelLead = modelBadge ? `${modelBadge} ` : "";
-	const description =
-		fullDescription &&
-		visibleWidth(`${indent}${icon} ${modelLead}${displayId}: ${fullDescription}${badges}`) <= maxWidth
-			? fullDescription
-			: undefined;
-	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
-	let statusLine = `${indent}${theme.fg(iconColor, icon)} ${modelLead}${theme.fg(
-		success && !needsWarning ? "text" : "accent",
-		titlePart,
-	)}${badges}`;
-	statusLine += formatAgentStatRun(
+	const row = renderAgentTreeRow(
 		{
-			requests: result.requests,
-			contextTokens: result.contextTokens,
-			contextWindow: result.contextWindow,
-			cost: result.usage?.cost.total ?? 0,
+			presentation: "task",
+			status: aborted ? "aborted" : success ? "completed" : "failed",
+			prefix,
+			id: formatTaskId(result.id),
+			width: maxWidth,
+			model: result.resolvedModelIdentity ?? result.resolvedModel,
+			thinkingLevel: result.resolvedThinkingLevel,
+			advisor: result.advisor,
+			roleBadge: formatRoleBadge(result.modelRole ?? result.agent, result.modelRoleDisplay ?? {}, theme),
+			statusBadge,
+			description: fullDescription,
+			metadata: {
+				model: result.resolvedModelIdentity ?? result.resolvedModel,
+				role: formatRoleBadge(result.modelRole ?? result.agent, result.modelRoleDisplay ?? {}, theme),
+				elapsedMs: result.durationMs,
+				usage: result.usage,
+				cost: result.usage?.cost.total,
+			},
 		},
 		theme,
 	);
-	statusLine += `${theme.sep.dot}${theme.fg("dim", formatDuration(result.durationMs))}`;
 
-	if (result.truncated) {
-		statusLine += ` ${theme.fg("warning", "[truncated]")}`;
-	}
+	let statusLine = row.line;
+	if (result.truncated) statusLine += ` ${theme.fg("warning", "[truncated]")}`;
 
 	lines.push(truncateTaskRow(statusLine, maxWidth, ""));
-	if (fullDescription && !description) {
+	if (fullDescription && !row.descriptionShown) {
 		lines.push(...renderDescriptionLines(fullDescription, continuePrefix, maxWidth, theme));
 	}
 
@@ -1862,6 +1837,12 @@ export interface AgentProgress {
 	contextTokens?: number;
 	/** Model's context window in tokens, when known. Lets the UI render `<curr>/<window>` gauges. */
 	contextWindow?: number;
+	/** Aggregated usage for this in-flight run. */
+	usage?: Usage;
+	/** Wall-clock start used to render live elapsed time. */
+	startedAtMs?: number;
+	/** Host-resolved role display metadata. */
+	modelRoleDisplay?: AgentRoleDisplay;
 	/** Cumulative billing cost in USD, accumulated incrementally from message_end events. */
 	cost: number;
 	durationMs: number;
@@ -1893,6 +1874,12 @@ export interface AgentProgress {
 		delayMs: number;
 		errorMessage: string;
 		startedAtMs: number;
+		mode?: "normal" | "repeated";
+		round?: number;
+		deadlineMs?: number;
+		timeoutMs?: number;
+		reason?: "max-retries" | "max-delay";
+		resetAware?: boolean;
 	};
 	/**
 	 * Terminal retry failure surfaced once the subagent gave up retrying
@@ -1934,6 +1921,10 @@ export interface SingleResult {
 	 */
 	structuredOutput?: StructuredSubagentOutput;
 	durationMs: number;
+	/** Wall-clock start retained for the final row when available. */
+	startedAtMs?: number;
+	/** Host-resolved role display metadata. */
+	modelRoleDisplay?: AgentRoleDisplay;
 	/** Cumulative input + output + cacheWrite tokens across all turns. Excludes cacheRead (re-reads cached context every turn, making cumulative sum misleading). */
 	tokens: number;
 	/** Count of assistant requests (assistant message_end events) across the run. */
