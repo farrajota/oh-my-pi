@@ -546,12 +546,9 @@ const tokenOutSegment: StatusLineSegment = singleStatSegment("token_out", "outpu
 const tokenTotalSegment: StatusLineSegment = {
 	id: "token_total",
 	render(ctx) {
-		// Excludes cacheRead: that field re-reads the full cached context every
-		// turn, making the cumulative sum N×context_size. Orchestration cache read
-		// follows the same rule; orchestration input/output remain in the total so
-		// provider-side service work is preserved without labeling it prompt input.
-		const { input, output, cacheWrite, orchestrationInput, orchestrationOutput } = ctx.usageStats;
-		const total = input + output + cacheWrite + orchestrationInput + orchestrationOutput;
+		// `totalTokens` is the provider-authoritative total; reasoning is already
+		// included in output and must not be added a second time.
+		const total = ctx.usageStats.totalTokens;
 		if (!total) return { content: "", visible: false };
 
 		const content = formatMetric({

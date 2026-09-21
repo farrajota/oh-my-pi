@@ -28,12 +28,15 @@ import { theme } from "../theme/theme";
 export interface ComposerPreviewStatusSource {
 	/** Powerline bar with the context gauge (box top border content). */
 	getTopBorder(width: number, previewTitle?: string): { content: string; width: number };
+	getTopBorderLines?: (width: number, previewTitle?: string) => string[];
 	/** Flush soft-capped powerline band (band composer top row). */
 	getBandTopBorder(width: number, previewTitle?: string): { content: string; width: number };
+	getBandTopBorderLines?: (width: number, previewTitle?: string) => string[];
 	/** Plain right-group chip (claude top rule content). */
 	getStandaloneTopBorder(width: number, previewTitle?: string): { content: string; width: number };
-	/** Plain standalone bottom bar carrying the given segment groups. */
-	renderBottomBar(width: number, groups: "left" | "full", previewTitle?: string): string;
+	getStandaloneTopBorderLines?: (width: number, previewTitle?: string) => string[];
+	/** Lossless plain standalone bottom-bar rows carrying the given segment groups. */
+	renderBottomBarLines(width: number, groups: "left" | "full", previewTitle?: string): string[];
 }
 
 export interface ComposerShapePreviewOptions {
@@ -55,13 +58,26 @@ export function renderComposerShapePreview(
 	const chromeWidth = style.sideChromeWidth(paddingX);
 
 	let topBorder: EditorTopBorder | undefined;
+	let topContinuation: readonly string[] = [];
 	if (status) {
 		if (style.statusAttachment === "top-border") {
-			topBorder = status.getTopBorder(Math.max(1, previewWidth - chromeWidth * 2), PREVIEW_TITLE);
+			const topLines = status.getTopBorderLines?.(Math.max(1, previewWidth - chromeWidth * 2), PREVIEW_TITLE);
+			const primary = status.getTopBorder(Math.max(1, previewWidth - chromeWidth * 2), PREVIEW_TITLE);
+			const content = topLines?.[0] ?? primary.content;
+			topBorder = { ...primary, content, width: visibleWidth(content) };
+			topContinuation = topLines?.slice(1) ?? [];
 		} else if (style.statusAttachment === "top-band") {
-			topBorder = status.getBandTopBorder(previewWidth, PREVIEW_TITLE);
+			const bandLines = status.getBandTopBorderLines?.(previewWidth, PREVIEW_TITLE);
+			const primary = status.getBandTopBorder(previewWidth, PREVIEW_TITLE);
+			const content = bandLines?.[0] ?? primary.content;
+			topBorder = { ...primary, content, width: visibleWidth(content) };
+			topContinuation = bandLines?.slice(1) ?? [];
 		} else if (style.statusAttachment === "top-rule-chip") {
-			topBorder = status.getStandaloneTopBorder(previewWidth, PREVIEW_TITLE);
+			const ruleLines = status.getStandaloneTopBorderLines?.(previewWidth, PREVIEW_TITLE);
+			const primary = status.getStandaloneTopBorder(previewWidth, PREVIEW_TITLE);
+			const content = ruleLines?.[0] ?? primary.content;
+			topBorder = { ...primary, content, width: visibleWidth(content) };
+			topContinuation = ruleLines?.slice(1) ?? [];
 		}
 	}
 
@@ -90,6 +106,22 @@ export function renderComposerShapePreview(
 	const lines: string[] = [];
 	const top = style.renderTop(ctx);
 	if (top !== undefined) lines.push(top);
+	const continuationWidth = Math.max(1, previewWidth - chromeWidth * 2);
+	for (const line of topContinuation) {
+		const continuationText = truncateToWidth(line, continuationWidth);
+		lines.push(
+			...style.renderRow({
+				...ctx,
+				text: continuationText,
+				pad: padding(Math.max(0, continuationWidth - visibleWidth(continuationText))),
+				gutter: "",
+				isLastRow: false,
+				cursorOverflow: 0,
+				imeSafeCursorTail: false,
+				scrollbarThumb: false,
+			}),
+		);
+	}
 	lines.push(
 		...style.renderRow({
 			...ctx,
@@ -106,10 +138,10 @@ export function renderComposerShapePreview(
 	if (bottom !== undefined) lines.push(bottom);
 
 	if (style.bottomBar !== "none" && status) {
-		const bar = status.renderBottomBar(previewWidth, style.bottomBar, PREVIEW_TITLE);
-		if (bar) {
+		const bar = status.renderBottomBarLines(previewWidth, style.bottomBar, PREVIEW_TITLE);
+		if (bar.length > 0) {
 			if (style.bottomBarGap) lines.push("");
-			lines.push(bar);
+			lines.push(...bar);
 		}
 	}
 	return lines;

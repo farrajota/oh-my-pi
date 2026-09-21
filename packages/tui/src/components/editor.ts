@@ -26,6 +26,7 @@ import {
 	sliceByColumn,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "../utils";
 import {
 	lastGraphemeStart,
@@ -598,6 +599,7 @@ export class Editor implements Component, Focusable {
 	#wrapCacheEpoch = -1;
 	#paddingXOverride: number | undefined;
 	#maxHeight?: number;
+	#lastTopContinuationRows = 0;
 	#scrollOffset: number = 0;
 	/** When true, the right border shows a scrollbar track/thumb when content
 	 *  overflows {@link #maxHeight}. Enabled by {@link HookEditorComponent} and
@@ -701,6 +703,7 @@ export class Editor implements Component, Focusable {
 	// per-event rebuilds down to one per rendered frame (see #4145).
 	#topBorderContent?: EditorTopBorder;
 	#topBorderProvider?: (availableWidth: number) => EditorTopBorder | undefined;
+	#topBorderContinuationProvider?: (availableWidth: number) => readonly string[] | undefined;
 	#borderVisible = true;
 
 	#borderStyle: EditorBorderStyle = "box";
@@ -779,6 +782,14 @@ export class Editor implements Component, Focusable {
 	setTopBorderProvider(provider: ((availableWidth: number) => EditorTopBorder | undefined) | undefined): void {
 		if (this.#topBorderProvider === provider) return;
 		this.#topBorderProvider = provider;
+	}
+
+	/** Install rows that follow the status-bearing top chrome without embedding newlines in it. */
+	setTopBorderContinuationProvider(
+		provider: ((availableWidth: number) => readonly string[] | undefined) | undefined,
+	): void {
+		if (this.#topBorderContinuationProvider === provider) return;
+		this.#topBorderContinuationProvider = provider;
 	}
 
 	/**
@@ -1217,9 +1228,11 @@ export class Editor implements Component, Focusable {
 		return `${text.slice(0, insertAt)}${marker}${text.slice(insertAt)}`;
 	}
 
-	#getPageScrollStep(totalVisualLines: number): number {
+	#getPageScrollStep(totalVisualLines: number, continuationRows = this.#lastTopContinuationRows): number {
 		const visibleHeight =
-			this.#maxHeight === undefined ? DEFAULT_PAGE_SCROLL_LINES : this.#getVisibleContentHeight(totalVisualLines);
+			this.#maxHeight === undefined
+				? DEFAULT_PAGE_SCROLL_LINES
+				: Math.max(1, this.#getVisibleContentHeight(totalVisualLines) - continuationRows);
 		return Math.max(1, visibleHeight - 1);
 	}
 
@@ -1253,9 +1266,30 @@ export class Editor implements Component, Focusable {
 		const box = this.#theme.symbols.boxRound;
 		const borderWidth = this.#getHorizontalChromeWidth(paddingX);
 
-		// Layout the text
+		// Resolve custom top-border rows before budgeting the editable content so
+		// maxHeight accounts for every mounted continuation row.
+		const topFillWidth = Math.max(0, width - borderWidth * 2);
+		let topBorder: EditorTopBorder | undefined;
+		let topBorderContinuation: readonly string[] | undefined;
+		if (style.statusAttachment !== "none") {
+			if (this.#topBorderProvider) {
+				topBorder = this.#topBorderProvider(topFillWidth);
+			} else {
+				topBorder = this.#topBorderContent;
+			}
+			topBorderContinuation = (this.#topBorderContinuationProvider?.(topFillWidth) ?? []).flatMap(line =>
+				wrapTextWithAnsi(line, Math.max(1, topFillWidth)),
+			);
+		}
+
+		// Layout the text.
 		const layoutLines = this.#layoutText(layoutWidth);
-		const visibleContentHeight = this.#getVisibleContentHeight(layoutLines.length);
+		const continuationRows = topBorderContinuation?.length ?? 0;
+		this.#lastTopContinuationRows = continuationRows;
+		const visibleContentHeight =
+			this.#maxHeight === undefined
+				? layoutLines.length
+				: Math.max(1, this.#maxHeight - style.verticalChrome - continuationRows);
 		this.#updateScrollOffset(layoutWidth, layoutLines, visibleContentHeight);
 		const visibleLayoutLines = layoutLines.slice(this.#scrollOffset, this.#scrollOffset + visibleContentHeight);
 
@@ -1265,19 +1299,6 @@ export class Editor implements Component, Focusable {
 		let scrollbarThumb: { start: number; end: number } | null = null;
 		if (needsScrollbar && visibleContentHeight > 0) {
 			scrollbarThumb = scrollbarThumbRange(visibleContentHeight, layoutLines.length, this.#scrollOffset);
-		}
-
-		// Resolve the custom top-border content once per frame; the style decides
-		// how (and whether) to draw it. Provider evaluation stays editor-owned,
-		// coalescing per-event rebuilds to one per painted frame.
-		const topFillWidth = Math.max(0, width - borderWidth * 2);
-		let topBorder: EditorTopBorder | undefined;
-		if (style.statusAttachment !== "none") {
-			if (this.#topBorderProvider) {
-				topBorder = this.#topBorderProvider(topFillWidth);
-			} else {
-				topBorder = this.#topBorderContent;
-			}
 		}
 
 		const chromeCtx: ComposerChromeContext = {
@@ -1290,14 +1311,29 @@ export class Editor implements Component, Focusable {
 			topBorder,
 		};
 
+		const lineContentWidth = contentAreaWidth;
 		const topRow = style.renderTop(chromeCtx);
 		if (topRow !== undefined) result.push(topRow);
-
+		if (topBorderContinuation) {
+			for (const text of topBorderContinuation) {
+				result.push(
+					...style.renderRow({
+						...chromeCtx,
+						text,
+						pad: padding(Math.max(0, topFillWidth - visibleWidth(text))),
+						gutter: "",
+						isLastRow: false,
+						cursorOverflow: 0,
+						imeSafeCursorTail: false,
+						scrollbarThumb: false,
+					}),
+				);
+			}
+		}
 		// Render each layout line
 		// Keep the hardware cursor at the text insertion point while autocomplete
 		// rows render below it; terminals use that position to anchor IME candidates.
 		const emitCursorMarker = this.focused;
-		const lineContentWidth = contentAreaWidth;
 
 		// Compute inline hint text (dim ghost text after cursor)
 		const inlineHint = this.#getInlineHint();

@@ -2660,16 +2660,38 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.statusLine.setAutocompleteActiveProbe(() => this.editor.isAutocompleteActive());
 		switch (style.statusAttachment) {
 			case "top-border":
-				this.editor.setTopBorderProvider(availableWidth => this.statusLine.getTopBorder(availableWidth));
+				this.editor.setTopBorderProvider(availableWidth => {
+					const primary = this.statusLine.getTopBorder(availableWidth);
+					const content = this.statusLine.getTopBorderLines(availableWidth)[0] ?? "";
+					return { ...primary, content, width: visibleWidth(content) };
+				});
+				this.editor.setTopBorderContinuationProvider(availableWidth =>
+					this.statusLine.getTopBorderLines(availableWidth).slice(1),
+				);
 				break;
 			case "top-band":
-				this.editor.setTopBorderProvider(availableWidth => this.statusLine.getBandTopBorder(availableWidth));
+				this.editor.setTopBorderProvider(availableWidth => {
+					const primary = this.statusLine.getBandTopBorder(availableWidth);
+					const content = this.statusLine.getBandTopBorderLines(availableWidth)[0] ?? "";
+					return { ...primary, content, width: visibleWidth(content) };
+				});
+				this.editor.setTopBorderContinuationProvider(availableWidth =>
+					this.statusLine.getBandTopBorderLines(availableWidth).slice(1),
+				);
 				break;
 			case "top-rule-chip":
-				this.editor.setTopBorderProvider(availableWidth => this.statusLine.getStandaloneTopBorder(availableWidth));
+				this.editor.setTopBorderProvider(availableWidth => {
+					const primary = this.statusLine.getStandaloneTopBorder(availableWidth);
+					const content = this.statusLine.getStandaloneTopBorderLines(availableWidth)[0] ?? "";
+					return { ...primary, content, width: visibleWidth(content) };
+				});
+				this.editor.setTopBorderContinuationProvider(availableWidth =>
+					this.statusLine.getStandaloneTopBorderLines(availableWidth).slice(1),
+				);
 				break;
 			case "none":
 				this.editor.setTopBorderProvider(undefined);
+				this.editor.setTopBorderContinuationProvider(undefined);
 				this.editor.setTopBorder(undefined);
 				break;
 		}
@@ -2689,23 +2711,25 @@ export class InteractiveMode implements InteractiveModeContext {
 		const style = getComposerStyle(shape);
 		const terminalWidth = this.ui.terminal.columns;
 		const availableWidth = this.editor.getTopBorderAvailableWidth(terminalWidth);
-		const topContent =
+		const topLines =
 			style.statusAttachment === "top-border"
-				? this.statusLine.renderStartupPlaceholder(availableWidth, "box")
+				? this.statusLine.renderStartupPlaceholderLines(availableWidth, "box")
 				: style.statusAttachment === "top-band"
-					? this.statusLine.renderStartupPlaceholder(availableWidth, "band")
+					? this.statusLine.renderStartupPlaceholderLines(availableWidth, "band")
 					: style.statusAttachment === "top-rule-chip"
-						? this.statusLine.renderStartupPlaceholder(availableWidth, "plain-right")
-						: undefined;
+						? this.statusLine.renderStartupPlaceholderLines(availableWidth, "plain-right")
+						: [];
+		const topContent = topLines[0];
+		const topContinuationLines = topLines.slice(1);
 		const bottomLines: string[] = [];
 		if (style.bottomBar !== "none") {
-			const content = this.statusLine.renderStartupPlaceholder(
+			const content = this.statusLine.renderStartupPlaceholderLines(
 				terminalWidth,
 				style.bottomBar === "left" ? "plain-left" : "plain-full",
 			);
-			if (content) {
+			if (content.length > 0) {
 				if (style.bottomBarGap) bottomLines.push("");
-				bottomLines.push(content);
+				bottomLines.push(...content);
 			}
 		}
 		// Recover the border's ANSI wrapper by coloring a sentinel and splitting around it.
@@ -2718,7 +2742,11 @@ export class InteractiveMode implements InteractiveModeContext {
 				markerIndex < 0
 					? undefined
 					: { prefix: colored.slice(0, markerIndex), suffix: colored.slice(markerIndex + marker.length) },
+			terminalWidth,
+			topWidth: availableWidth,
+			bottomWidth: terminalWidth,
 			topBorder: topContent ? { content: topContent, width: visibleWidth(topContent) } : undefined,
+			topContinuationLines: topContinuationLines.length > 0 ? topContinuationLines : undefined,
 			bottomLines,
 		};
 		void writeComposerStatusCache(this.sessionManager.getCwd(), snapshot).catch(error => {

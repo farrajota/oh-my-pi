@@ -6,7 +6,6 @@ import {
 	type SessionMessageEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ProviderResponseMetadata, Usage } from "@oh-my-pi/pi-ai";
-import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { ContextUsage } from "../extensibility/extensions/types";
@@ -150,10 +149,6 @@ export class SessionStatsTracker {
 				userMessages++;
 			} else if (message.role === "toolResult") {
 				toolResults++;
-				if (message.toolName === "task") {
-					const usage = taskToolUsage(message.details);
-					if (usage) addUsage(usage);
-				}
 			} else if (message.role === "assistant") {
 				assistantMessages++;
 				for (const content of message.content) {
@@ -414,22 +409,4 @@ export class SessionStatsTracker {
 			responseStatus: response.status,
 		});
 	}
-}
-
-function taskToolUsage(details: unknown): Usage | undefined {
-	if (!details || typeof details !== "object") return undefined;
-	const usage = Reflect.get(details, "usage");
-	return isUsage(usage) ? usage : undefined;
-}
-
-function isUsage(value: unknown): value is Usage {
-	if (!isRecord(value) || !isRecord(value.cost)) return false;
-	return (
-		typeof value.input === "number" &&
-		typeof value.output === "number" &&
-		typeof value.cacheRead === "number" &&
-		typeof value.cacheWrite === "number" &&
-		typeof value.totalTokens === "number" &&
-		typeof value.cost.total === "number"
-	);
 }

@@ -12,7 +12,7 @@ import {
 	type TUIOptions,
 	type ViewportSize,
 } from "../tui";
-import { sliceWithWidth, truncateToWidth, visibleWidth } from "../utils";
+import { sliceWithWidth, visibleWidth } from "../utils";
 import { postmortem } from "@oh-my-pi/pi-utils";
 import { CustomEditor } from "./custom-editor";
 import { type AnimationFrame, TranscriptContainer } from "../chrome/transcript-container";
@@ -75,6 +75,12 @@ export interface ComposerStatusSnapshot {
 		readonly content: string;
 		readonly width: number;
 	};
+	/** Terminal dimensions used to render the speculative rows. */
+	readonly terminalWidth?: number;
+	readonly topWidth?: number;
+	readonly bottomWidth?: number;
+	/** Overflow rows mounted below the embedded status row. */
+	readonly topContinuationLines?: readonly string[];
 	/** Standalone bottom-bar rows (`pi`/`claude` shapes), gap row included. */
 	readonly bottomLines: readonly string[];
 }
@@ -110,24 +116,28 @@ export interface ComposerStartOptions {
  */
 class StatusHost implements Component {
 	#lines: readonly string[] = [];
+	#linesWidth: number | undefined;
 	#component: Component | undefined;
 
 	get mounted(): boolean {
 		return this.#component !== undefined;
 	}
 
-	setLines(lines: readonly string[]): void {
+	setLines(lines: readonly string[], width?: number): void {
 		this.#lines = lines;
+		this.#linesWidth = width;
 	}
 
 	setComponent(component: Component): void {
 		this.#component = component;
 		this.#lines = [];
+		this.#linesWidth = undefined;
 	}
 
 	render(width: number): readonly string[] {
 		if (this.#component) return this.#component.render(width);
-		return this.#lines.map(line => truncateToWidth(line, width));
+		if (this.#linesWidth !== undefined && this.#linesWidth !== width) return [];
+		return this.#lines;
 	}
 }
 
@@ -813,26 +823,45 @@ export class Composer implements TerminalFrameProvider {
 	 * provider through its composer-shape sync.
 	 */
 	setStatusComponent(component: Component): void {
-		this.#statusHost.setComponent(component);
 		this.#statusSnapshot = undefined;
 		this.editor.setTopBorderProvider(undefined);
+		this.editor.setTopBorderContinuationProvider(undefined);
+		this.#statusHost.setComponent(component);
 	}
 
 	/** Cached placeholder top-border content fitted to the current editor width. */
 	#speculativeTopBorder(availableWidth: number): EditorTopBorder | undefined {
 		const border = this.#statusSnapshot?.topBorder;
-		if (!border) return undefined;
+		if (!border || !this.#snapshotWidthsMatch(availableWidth)) return undefined;
 		if (border.width <= availableWidth) return { content: border.content, width: border.width };
-		const content = truncateToWidth(border.content, availableWidth);
-		return { content, width: visibleWidth(content) };
+		return undefined;
 	}
 
-	/** Install the cached chrome for the current shape; a shape mismatch clears it. */
+	#snapshotWidthsMatch(renderedTopWidth?: number): boolean {
+		const snapshot = this.#statusSnapshot;
+		if (!snapshot) return false;
+		const terminalWidth = Math.max(1, this.ui.terminal.columns);
+		const topWidth = renderedTopWidth ?? this.editor.getTopBorderAvailableWidth(terminalWidth);
+		return (
+			snapshot.terminalWidth === terminalWidth &&
+			(snapshot.topBorder === undefined || snapshot.topWidth === topWidth) &&
+			(snapshot.bottomLines.length === 0 || snapshot.bottomWidth === terminalWidth)
+		);
+	}
+
+	/** Install the cached chrome for the current shape and matching terminal width. */
 	#applyStatusSnapshot(): void {
 		if (this.#statusHost.mounted) return;
 		const snapshot = this.#statusSnapshot;
 		if (!snapshot || snapshot.shape !== this.#preferences.composerShape) {
 			this.editor.setTopBorderProvider(undefined);
+			this.editor.setTopBorderContinuationProvider(undefined);
+			this.#statusHost.setLines([]);
+			return;
+		}
+		if (!this.#snapshotWidthsMatch()) {
+			this.editor.setTopBorderProvider(undefined);
+			this.editor.setTopBorderContinuationProvider(undefined);
 			this.#statusHost.setLines([]);
 			return;
 		}
@@ -843,7 +872,12 @@ export class Composer implements TerminalFrameProvider {
 		this.editor.setTopBorderProvider(
 			snapshot.topBorder ? availableWidth => this.#speculativeTopBorder(availableWidth) : undefined,
 		);
-		this.#statusHost.setLines(snapshot.bottomLines);
+		this.editor.setTopBorderContinuationProvider(
+			snapshot.topContinuationLines
+				? availableWidth => (this.#snapshotWidthsMatch(availableWidth) ? snapshot.topContinuationLines : undefined)
+				: undefined,
+		);
+		this.#statusHost.setLines(snapshot.bottomLines, snapshot.bottomWidth);
 	}
 
 	/** Mount or replace session-aware root children while preserving the header and status hosts. */

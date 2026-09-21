@@ -3,7 +3,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getProviderDashboardStats } from "@oh-my-pi/omp-stats/aggregator";
-import { initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
+import { getModelTimeSeries, getStatsByModel, initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
 import type { MessageStats } from "@oh-my-pi/omp-stats/types";
 import {
 	computeUsageWindowStats,
@@ -328,7 +328,7 @@ describe("getProviderDashboardStats", () => {
 					output: 50,
 					cacheRead: 0,
 					cacheWrite: 0,
-					totalTokens: 150,
+					totalTokens: 160,
 					cost: { input: 0.001, output: 0.002, cacheRead: 0, cacheWrite: 0, total: 0.003 },
 				},
 			}),
@@ -346,6 +346,8 @@ describe("getProviderDashboardStats", () => {
 		expect(provA.failedRequests).toBe(1);
 		expect(provA.totalTokens).toBe(2000);
 		expect(provA.models).toBe(1);
+		const provB = stats.providers[1];
+		expect(provB.totalTokens).toBe(160);
 
 		// All prov-a messages land in one hour bucket. Bun test pins JS `Date`
 		// to UTC while SQLite 'localtime' uses the OS timezone, so assert the
@@ -355,9 +357,15 @@ describe("getProviderDashboardStats", () => {
 		expect(provAHours[0].hour).toBeGreaterThanOrEqual(0);
 		expect(provAHours[0].hour).toBeLessThan(24);
 		expect(provAHours[0].totalTokens).toBe(2000);
+		const provBHours = stats.hourly.filter(p => p.provider === "prov-b");
+		expect(provBHours[0]?.totalTokens).toBe(160);
 		expect(provAHours[0].outputTokens).toBe(600);
 		expect(provAHours[0].requests).toBe(2);
-		expect(stats.series.some(p => p.provider === "prov-b" && p.totalTokens === 150)).toBe(true);
+		expect(stats.series.some(p => p.provider === "prov-b" && p.totalTokens === 160)).toBe(true);
+		const modelStats = getStatsByModel();
+		expect(modelStats.find(row => row.provider === "prov-b")?.totalTokens).toBe(160);
+		const modelSeries = getModelTimeSeries(14, null);
+		expect(modelSeries.find(row => row.provider === "prov-b")?.totalTokens).toBe(160);
 
 		expect(stats.windowInsights).toHaveLength(1);
 		const insight = stats.windowInsights[0];
