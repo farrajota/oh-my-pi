@@ -54,6 +54,9 @@ export class SessionMemory {
 	get transition(): Promise<void> {
 		return this.#memoryBackendTransition;
 	}
+	get enabled(): boolean {
+		return this.#host.settings.get("memory.backend") !== "off";
+	}
 
 	/** Base prompt captured before a per-turn memory promotion. */
 	get promotionSnapshot(): string[] | undefined {

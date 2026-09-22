@@ -355,7 +355,11 @@ describe("runSubprocess result acceptance", () => {
 	it("terminalizes an existing ref on a follow-up turn and preserves role display", async () => {
 		const harness = createHarness();
 		registerRunning(harness.session, "task");
-		const roleDisplay = { tag: "TASK", name: "Subtask", color: "muted" };
+		const roleDisplay: NonNullable<AgentProgress["modelRoleDisplay"]> = {
+			tag: "TASK",
+			name: "Subtask",
+			color: "muted",
+		};
 		const progress: AgentProgress[] = [];
 
 		const result = await runSubagentFollowUpTurn({

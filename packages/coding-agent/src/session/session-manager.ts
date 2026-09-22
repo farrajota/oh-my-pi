@@ -65,7 +65,13 @@ import {
 	type TtsrInjectionEntry,
 	type UsageStatistics,
 } from "./session-entries";
-import { findMostRecentSession, listAllSessions, listSessions, type SessionInfo } from "./session-listing";
+import {
+	filterSessionsForPicker,
+	findMostRecentSession,
+	listAllSessions,
+	listSessions,
+	type SessionInfo,
+} from "./session-listing";
 import {
 	loadEntriesFromFile,
 	loadSessionFile,
@@ -177,7 +183,7 @@ function emptyUsageStatistics(): UsageStatistics {
 	return {
 		input: 0,
 		output: 0,
-		cacheRead: 0,
+    cacheRead: 0,
 		cacheWrite: 0,
 		totalTokens: 0,
 		orchestrationInput: 0,
@@ -297,7 +303,7 @@ class SessionEntryIndex {
 			else this.#labels.delete(entry.targetId);
 		}
 
-		addUsage(this.#usage, entryUsage(entry));
+
 	}
 
 	has(id: string): boolean {
@@ -497,7 +503,7 @@ export class ForkSourceNotFoundError extends Error {
  * `commitGuard` then refuses to clobber the fresher body.
  *
  * During {@link moveTo}, appends write a full body to the live relocation path
- * (source until rename, destination once the rename has landed) so a crash mid-
+ *
  * move still preserves completed entries without recreating a vacated source.
  * A trailing atomic rewrite still rewrites the header cwd after the path is
  * repointed.
@@ -3308,10 +3314,23 @@ export class SessionManager {
 		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
 	}
 
+	static async listForPicker(
+		cwd: string,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<SessionInfo[]> {
+		const pinnedIds = await loadPinnedSessionIds();
+		return filterSessionsForPicker(await SessionManager.list(cwd, sessionDir, storage), pinnedIds);
+	}
+
 	/** List all sessions across all project directories, pinned sessions first. */
 	static async listAll(storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo[]> {
 		const sessions = await listAllSessions(storage);
 		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
+	}
+	static async listAllForPicker(storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo[]> {
+		const pinnedIds = await loadPinnedSessionIds();
+		return filterSessionsForPicker(await SessionManager.listAll(storage), pinnedIds);
 	}
 }
 

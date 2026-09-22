@@ -40,6 +40,7 @@ import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { XdevState } from "../tools/xdev";
+import type { ToolSession } from "../tools";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
 import type { EffectiveSubagentPermissions } from "../task/permission-profiles";
 import type { SessionManager } from "./session-manager";
@@ -194,6 +195,7 @@ export interface AgentSessionConfig {
 	/** Whether the startup model may be replaced by refreshed same-selector registry metadata. */
 	rebindModelAfterDiscovery?: boolean;
 	/** Tool registry for LSP and settings. */
+	evalToolSession?: ToolSession;
 	toolRegistry?: Map<string, AgentTool>;
 	/** Creates tools registered only while vibe mode is active. */
 	createVibeTools?: () => AgentTool[];

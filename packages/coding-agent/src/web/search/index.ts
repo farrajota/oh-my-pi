@@ -31,10 +31,29 @@ import { applyQueryConstraints, parseSearchQuery } from "./query";
 import {
 	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
 	MAX_WEB_SEARCH_TIMEOUT_SECONDS,
+	SEARCH_PROVIDER_OPTIONS,
 	SearchProviderError,
+	type SearchProviderId,
 	type SearchResponse,
 	type SearchResultDetails,
 } from "./types";
+
+const configuredSearchProviderOrder: SearchProviderId[] = [];
+const excludedSearchProviders = new Set<SearchProviderId>();
+
+export function isSearchProviderId(value: unknown): value is SearchProviderId {
+	return typeof value === "string" && SEARCH_PROVIDER_OPTIONS.some(option => option.value === value && option.value !== "auto");
+}
+
+export function setSearchProviderOrder(order: readonly SearchProviderId[]): void {
+	configuredSearchProviderOrder.splice(0, configuredSearchProviderOrder.length, ...order);
+}
+
+export function setExcludedSearchProviders(providers: readonly SearchProviderId[]): void {
+	excludedSearchProviders.clear();
+	for (const provider of providers) excludedSearchProviders.add(provider);
+}
+
 
 /** Web search tool parameters schema */
 export const webSearchSchema = type({
@@ -147,6 +166,14 @@ async function executeSearch(
 				return resolved.model ? [{ model: resolved.model, explicit: true }] : [];
 			})()
 		: resolveRoleChain("web", settings, pool);
+const providerRank = new Map(configuredSearchProviderOrder.map((provider, index) => [provider, index]));
+	const orderedCandidates = candidates
+		.filter(candidate => candidate.explicit || !isSearchProviderId(candidate.model.id) || !excludedSearchProviders.has(candidate.model.id))
+		.sort((left, right) => {
+			const leftRank = isSearchProviderId(left.model.id) ? (providerRank.get(left.model.id) ?? Number.MAX_SAFE_INTEGER) : Number.MAX_SAFE_INTEGER;
+			const rightRank = isSearchProviderId(right.model.id) ? (providerRank.get(right.model.id) ?? Number.MAX_SAFE_INTEGER) : Number.MAX_SAFE_INTEGER;
+			return leftRank - rightRank;
+		});
 
 	const parsedQuery = parseSearchQuery(params.query);
 
@@ -172,7 +199,7 @@ async function executeSearch(
 	let availableProviderCount = 0;
 	let lastProvider: { id: string; label: string } | undefined;
 	let failedResponseProvider: SearchResponse["provider"] = "none";
-	for (const candidate of candidates) {
+for (const candidate of orderedCandidates) {
 		let provider: SearchProvider | undefined;
 		const candidateMeta = { id: candidate.model.id, label: candidate.model.name };
 		lastProvider = candidateMeta;

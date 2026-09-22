@@ -58,6 +58,7 @@ import {
 import {
 	detachAgentSession,
 	lookupAgentRef,
+	onInternalRegistryChange,
 	setAgentHistory,
 	setAgentStatus,
 	syncAgentSessionStatus,
@@ -3365,6 +3366,13 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		startTime,
 	});
 	const progress = monitor.progress;
+	const runRef = lookupAgentRef(agentRegistry, id);
+	const unsubscribeRegistryAbort = onInternalRegistryChange(agentRegistry, event => {
+		if (event.ref !== runRef) return;
+		if (event.type === "status_changed" && event.ref.status === "aborted") {
+			monitor.requestAbort("signal");
+		}
+	});
 	let unsubscribe: (() => void) | null = null;
 	let reviveSession: AgentReviver | null = null;
 	let historyAuthority: AgentSession | undefined;
@@ -4205,39 +4213,43 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		};
 	};
 
-	const done = await runSubagent();
-	monitor.finish();
+	try {
+		const done = await runSubagent();
+		monitor.finish();
 
-	const result = await finalizeRunResult({
-		monitor,
-		done,
-		artifactManager: options.parentArtifactManager,
-		index,
-		id,
-		agent,
-		task,
-		assignment,
-		modelOverride,
-		modelRole,
-		requestedModel,
-		outputSchema,
-		outputSchemaMode: options.outputSchemaMode,
-		outputSchemaSource: options.outputSchemaSource,
-		signal,
-		artifactsDir: options.artifactsDir,
-		subagentEventBus: options.subagentEventBus,
-		parentToolCallId: options.parentToolCallId,
-		detached: options.detached,
-		sessionFile: subtaskSessionFile,
-		startTime,
-	});
-	if (historyAuthority) {
-		setAgentHistory(agentRegistry, historyAuthority, {
-			outputPath: result.outputPath,
-			resolvedModel: result.resolvedModel,
-			resolvedModelIsFallback: result.resolvedModelIsFallback,
-			permissionSummary: result.permissionSummary,
+		const result = await finalizeRunResult({
+			monitor,
+			done,
+			artifactManager: options.parentArtifactManager,
+			index,
+			id,
+			agent,
+			task,
+			assignment,
+			modelOverride,
+			modelRole,
+			requestedModel,
+			outputSchema,
+			outputSchemaMode: options.outputSchemaMode,
+			outputSchemaSource: options.outputSchemaSource,
+			signal,
+			artifactsDir: options.artifactsDir,
+			subagentEventBus: options.subagentEventBus,
+			parentToolCallId: options.parentToolCallId,
+			detached: options.detached,
+			sessionFile: subtaskSessionFile,
+			startTime,
 		});
+		if (historyAuthority) {
+			setAgentHistory(agentRegistry, historyAuthority, {
+				outputPath: result.outputPath,
+				resolvedModel: result.resolvedModel,
+				resolvedModelIsFallback: result.resolvedModelIsFallback,
+				permissionSummary: result.permissionSummary,
+			});
+		}
+		return result;
+	} finally {
+		unsubscribeRegistryAbort();
 	}
-	return result;
 }

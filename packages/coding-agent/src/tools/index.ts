@@ -61,6 +61,7 @@ import { GlobTool } from "./glob";
 import { GrepTool } from "./grep";
 import { HubTool, isIrcEnabled } from "./hub";
 import { InspectImageTool } from "./inspect-image";
+import { FindTool } from "./jfind";
 import { LearnTool } from "./learn";
 import { ManageSkillTool } from "./manage-skill";
 import { MemoryEditTool } from "./memory-edit";
@@ -110,6 +111,7 @@ export * from "./grep";
 export * from "./hub";
 export * from "./image-gen";
 export * from "./inspect-image";
+export * from "./jfind";
 export * from "./learn";
 export * from "./manage-skill";
 export * from "./memory-edit";
@@ -503,6 +505,7 @@ export const BUILTIN_TOOLS: Readonly<Record<BuiltinToolName, ToolFactory>> = Obj
 	github: s => GithubTool.createIf(s),
 	glob: s => new GlobTool(s, { rootPathAlias: true }),
 	grep: s => new GrepTool(s),
+	find: s => new FindTool(s),
 	lsp: s => LspTool.createIf(s),
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),

@@ -19,9 +19,15 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { AgentRegistry } from "../registry/agent-registry";
+import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { ArtifactManager } from "../session/artifacts";
 import { applyQuery, pathToQuery } from "./json-query";
-import { agentRefsForContext, artifactsDirsForContext, isBoundResourceContext } from "./registry-helpers";
+import {
+	agentRefsForContext,
+	artifactsDirsForContext,
+	artifactsDirsFromRegistry,
+	isBoundResourceContext,
+} from "./registry-helpers";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
 /**
@@ -50,7 +56,18 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		}
 
 		const bound = isBoundResourceContext(context);
-		const dirs = artifactsDirsForContext(context);
+		const registry = context?.agentRegistry ?? AgentRegistry.global();
+		const rootSessionFile = context?.sessionFile
+			? await ensurePersistedRoster(registry, context.sessionFile)
+			: undefined;
+		const contextDirs = artifactsDirsForContext(context);
+		let dirs = contextDirs;
+		if (!bound) {
+			const registryDirs = artifactsDirsFromRegistry(
+				rootSessionFile ? { preferredDir: rootSessionFile.slice(0, -6) } : undefined,
+			);
+			dirs = [...new Set([...contextDirs, ...registryDirs])];
+		}
 		if (bound && dirs.length === 0) throw new Error("No caller-owned agent outputs available");
 		if (dirs.length === 0) throw new Error("No session - agent outputs unavailable");
 
@@ -78,7 +95,8 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		}
 		if (!scan.foundPath) {
 			const target = nestedId ?? outputId;
-			throw new Error(`Not found: ${target}`);
+			const available = scan.availableIds.size > 0 ? [...scan.availableIds].sort().join(", ") : "none";
+			throw new Error(`Not found: ${target}\nAvailable: ${available}`);
 		}
 
 		const rawContent = await Bun.file(scan.foundPath).text();
@@ -159,8 +177,9 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		matchedId?: string;
 		jsonPath?: string;
 		anyDirExists: boolean;
+		availableIds: Set<string>;
 	}> {
-		const { managers, anyDirExists } = await this.#artifactManagers(dirs);
+		const { managers, anyDirExists, availableIds } = await this.#artifactManagers(dirs);
 		for (const id of candidateIds) {
 			for (const manager of managers) {
 				const foundPath = await manager.getNamedPath("agent-output", id);
@@ -170,28 +189,34 @@ export class AgentProtocolHandler implements ProtocolHandler {
 					matchedId: id,
 					jsonPath: (await manager.getNamedPath("agent-sidecar", id)) ?? undefined,
 					anyDirExists,
+					availableIds,
 				};
 			}
 		}
-		return { anyDirExists };
+		return { anyDirExists, availableIds };
 	}
 
 	async #artifactManagers(dirs: string[]): Promise<{
 		managers: ArtifactManager[];
 		anyDirExists: boolean;
+		availableIds: Set<string>;
 	}> {
 		const managers: ArtifactManager[] = [];
+		const availableIds = new Set<string>();
 		for (const dir of dirs) {
+			let entries: string[];
 			try {
-				const handle = await fs.opendir(dir);
-				await handle.close();
+				entries = await fs.readdir(dir);
 			} catch (err) {
 				if (isEnoent(err)) continue;
 				throw err;
 			}
+			for (const entry of entries) {
+				if (entry.endsWith(".md")) availableIds.add(entry.slice(0, -3));
+			}
 			managers.push(new ArtifactManager(dir));
 		}
-		return { managers, anyDirExists: managers.length > 0 };
+		return { managers, anyDirExists: managers.length > 0, availableIds };
 	}
 
 	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {

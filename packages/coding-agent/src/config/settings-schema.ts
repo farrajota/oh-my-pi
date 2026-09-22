@@ -1,5 +1,5 @@
 import { ADVISOR_DEFAULT_BUDGET_PER_UPDATE } from "../advisor/emission-guard";
-import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { DEFAULT_SHARE_URL, DEFAULT_STREAM_URL } from "@oh-my-pi/pi-wire";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
 import {
@@ -9,6 +9,7 @@ import {
 } from "../blob-broker/destinations";
 import { DEFAULT_RELAY_URL } from "../collab/protocol";
 import { DEFAULT_LIVE_VOICE, LIVE_VOICE_OPTIONS, LIVE_VOICE_VALUES } from "../live/voices";
+import { MAGIC_KEYWORDS, type MagicKeywordId } from "../modes/magic-keywords";
 import {
 	COMPACTION_METHOD_CHOICES,
 	type CompactionMethod,
@@ -296,6 +297,24 @@ interface UiBase {
 }
 
 interface UiBoolean extends UiBase {}
+
+interface MagicKeywordSettingDef {
+	readonly type: "boolean";
+	readonly default: true;
+	readonly ui: UiBoolean;
+}
+
+/** One `magicKeywords.<id>` toggle per registered keyword, derived so the table stays the only list. */
+const MAGIC_KEYWORD_SETTINGS = Object.fromEntries(
+	MAGIC_KEYWORDS.map((keyword): [string, MagicKeywordSettingDef] => [
+		`magicKeywords.${keyword.id}`,
+		{
+			type: "boolean",
+			default: true,
+			ui: { tab: "interaction", group: "Magic Keywords", label: keyword.label, description: keyword.description },
+		},
+	]),
+) as { readonly [K in MagicKeywordId as `magicKeywords.${K}`]: MagicKeywordSettingDef };
 
 interface UiEnum<T extends readonly string[]> extends UiBase {
 	/** Submenu options. When omitted, the enum renders as an inline toggle derived from `values`. */
@@ -2437,42 +2456,10 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			group: "Magic Keywords",
 			label: "Magic Keywords",
-			description: "Enable hidden notices for standalone ultrathink, orchestrate, and workflowz keywords",
+			description: `Enable hidden notices for standalone ${MAGIC_KEYWORDS.map(keyword => keyword.word).join(", ")} keywords`,
 		},
 	},
-
-	"magicKeywords.ultrathink": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "interaction",
-			group: "Magic Keywords",
-			label: "Ultrathink Keyword",
-			description: "Let standalone ultrathink request maximum automatic thinking and append its hidden notice",
-		},
-	},
-
-	"magicKeywords.orchestrate": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "interaction",
-			group: "Magic Keywords",
-			label: "Orchestrate Keyword",
-			description: "Let standalone orchestrate append its hidden multi-agent orchestration notice",
-		},
-	},
-
-	"magicKeywords.workflow": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "interaction",
-			group: "Magic Keywords",
-			label: "Workflow Keyword",
-			description: "Let standalone workflowz append its hidden eval workflow notice",
-		},
-	},
+	...MAGIC_KEYWORD_SETTINGS,
 
 	// Notifications
 	"completion.notify": {
@@ -4437,6 +4424,17 @@ export const SETTINGS_SCHEMA = {
 			group: "Available Tools",
 			label: "Glob",
 			description: "Enable the glob tool for glob-based file lookup",
+		},
+	},
+
+	"find.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Available Tools",
+			label: "Find",
+			description: "Enable the semantic file search tool",
 		},
 	},
 

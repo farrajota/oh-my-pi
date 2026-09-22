@@ -329,6 +329,8 @@ function toolContent(result: DaemonRpcResult, params: LaunchParams): string {
 			if (result.timedOut) {
 				const pending = readyPendingSummary(result.daemon);
 				lines.push(`Wait timed out${pending.length > 0 ? ` (still waiting on: ${pending.join("; ")})` : ""}.`);
+			} else if (params.pattern && result.matched === undefined) {
+				lines.push(`Process exited before output pattern /${params.pattern}/ matched.`);
 			}
 			return lines.join("\n");
 		}

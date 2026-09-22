@@ -20,6 +20,17 @@ import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { resolveReadPath } from "./path-utils";
 
+let configuredImageProviderOrder: readonly string[] = [];
+
+export function setImageProviderOrder(order: readonly string[]): void {
+	configuredImageProviderOrder = [...order];
+}
+function orderImageCandidates(candidates: Model[]): Model[] {
+	if (configuredImageProviderOrder.length === 0) return candidates;
+	const rank = new Map(configuredImageProviderOrder.map((provider, index) => [provider, index]));
+	return [...candidates].sort((left, right) => (rank.get(left.provider) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.provider) ?? Number.MAX_SAFE_INTEGER));
+}
+
 const IMAGE_TIMEOUT = 3 * 60 * 1000;
 const MAX_IMAGE_SIZE = 35 * 1024 * 1024;
 
@@ -211,9 +222,11 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					throw new Error(`Image model selector did not match an available image model: ${params.model}`);
 				candidates = [selected];
 			} else {
-				candidates = resolveRoleChain("image", effectiveSettings, pool, {
-					hoistProvider: ctx.model?.provider,
-				}).map(candidate => candidate.model);
+candidates = orderImageCandidates(
+					resolveRoleChain("image", effectiveSettings, pool, {
+						hoistProvider: ctx.model?.provider,
+					}).map(candidate => candidate.model),
+				);
 			}
 
 			const failures: ProviderHttpError[] = [];

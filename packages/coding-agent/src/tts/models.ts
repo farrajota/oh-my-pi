@@ -55,6 +55,9 @@ export const KOKORO_VOICES: readonly TtsLocalVoiceSpec[] = [
 /** Default voice within the default model — Kokoro's flagship grade-A voice. */
 export const DEFAULT_TTS_VOICE = "af_heart";
 
+/** Default local TTS model used by settings and worker fallback. */
+export const DEFAULT_TTS_LOCAL_MODEL_KEY = "kokoro";
+
 /**
  * Local TTS model registry. Kokoro-82M is the on-device SoTA tiny TTS (tops the
  * TTS Arena leaderboard); the `onnx-community` ONNX export runs through
@@ -76,6 +79,13 @@ export const TTS_LOCAL_MODELS = [
 ] as const satisfies readonly TtsLocalModelSpec[];
 
 export type TtsLocalModelKey = (typeof TTS_LOCAL_MODELS)[number]["key"];
+
+export const TTS_LOCAL_MODEL_VALUES = TTS_LOCAL_MODELS.map(model => model.key) as readonly TtsLocalModelKey[];
+export const TTS_LOCAL_MODEL_OPTIONS = TTS_LOCAL_MODELS.map(model => ({
+	value: model.key,
+	label: model.label,
+	description: model.description,
+})) as ReadonlyArray<{ value: TtsLocalModelKey; label: string; description: string }>;
 
 /** Voice options for the `tts.localVoice` setting picker (default model's catalog). */
 export const TTS_LOCAL_VOICE_OPTIONS = KOKORO_VOICES.map(voice => ({

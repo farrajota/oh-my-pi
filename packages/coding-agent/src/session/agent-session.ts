@@ -166,12 +166,11 @@ import type { IrcMessage } from "../irc/bus";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
-import { containsOrchestrate, renderOrchestrateNotice } from "../modes/orchestrate";
+import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
+import { MAGIC_KEYWORDS, type MagicKeywordId, type MagicKeywordNoticeType } from "../modes/magic-keywords";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { parseTurnBudget } from "../modes/turn-budget";
-import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
 import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
-import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
 import { type PlanApprovalDetails, resolveApprovedPlan } from "../plan-mode/approved-plan";
 import { listPlanFiles, readPlanFile } from "../plan-mode/plan-files";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
@@ -6310,7 +6309,7 @@ export class AgentSession {
 		return this.#providerBoundary.normalizeAgentMessageImages(message);
 	}
 
-	#magicKeywordEnabled(keyword: "orchestrate" | "ultrathink" | "workflow"): boolean {
+	#magicKeywordEnabled(keyword: MagicKeywordId): boolean {
 		return this.settings.get("magicKeywords.enabled") && this.settings.get(`magicKeywords.${keyword}`);
 	}
 
@@ -6319,50 +6318,32 @@ export class AgentSession {
 		const turnBudget = parseTurnBudget(text);
 		this.sessionManager.beginTurnBudget(turnBudget?.total ?? null, turnBudget?.hard ?? false);
 		const keywordNotices: CustomMessage[] = [];
-		if (this.#magicKeywordEnabled("ultrathink") && containsUltrathink(text)) {
+		const enabledToolNames = this.getEnabledToolNames();
+		const keywordContext = {
+			tools: enabledToolNames,
+			taskBatch: this.settings.get("task.batch"),
+			scoutAvailable: this.#isScoutAvailable(),
+			evalTools: this.settings.get("eval.tools.enabled"),
+		} as const;
+
+		for (const keyword of MAGIC_KEYWORDS) {
+			if (!this.#magicKeywordEnabled(keyword.id)) continue;
+			if (!containsMagicKeyword(text, keyword.word)) continue;
+			if (!keyword.requires.every(toolName => enabledToolNames.includes(toolName))) continue;
+
 			keywordNotices.push({
 				role: "custom",
-				customType: "ultrathink-notice",
-				content: ULTRATHINK_NOTICE,
+				customType: `${keyword.id}-notice` as MagicKeywordNoticeType,
+				content: keyword.notice(keywordContext),
 				display: false,
 				attribution: "user",
 				timestamp,
 			});
 		}
-		if (this.#magicKeywordEnabled("orchestrate") && containsOrchestrate(text)) {
-			const enabledToolNames = this.getEnabledToolNames();
-			// The contract is entirely about `task` subagent dispatch; without the
-			// task tool the notice would demand an unavailable capability.
-			if (enabledToolNames.includes("task")) {
-				keywordNotices.push({
-					role: "custom",
-					customType: "orchestrate-notice",
-					content: renderOrchestrateNotice({ tools: enabledToolNames }),
-					display: false,
-					attribution: "user",
-					timestamp,
-				});
-			}
-		}
-		if (this.#magicKeywordEnabled("workflow") && containsWorkflow(text)) {
-			const enabledToolNames = this.getEnabledToolNames();
-			if (enabledToolNames.includes("task") && enabledToolNames.includes("eval")) {
-				keywordNotices.push({
-					role: "custom",
-					customType: "workflow-notice",
-					content: renderWorkflowNotice({
-						taskBatch: this.settings.get("task.batch"),
-						scoutAvailable: this.#isScoutAvailable(),
-						evalTools: this.settings.get("eval.tools.enabled"),
-					}),
-					display: false,
-					attribution: "user",
-					timestamp,
-				});
-			}
-		}
+
 		return keywordNotices;
 	}
+
 
 	/**
 	 * Send a prompt to the agent.
@@ -6423,8 +6404,8 @@ export class AgentSession {
 		this.#modelMentions.syncFromBranch();
 		expandedText = this.#modelMentions.expandMentions(expandedText);
 
-		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
-		// user's message that steer this turn. User-authored prompts only — synthetic /
+		// Magic keywords append hidden system notices after the user's message that steer this turn.
+		// User-authored prompts only — synthetic /
 		// agent-initiated turns never trigger them.
 		const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
 

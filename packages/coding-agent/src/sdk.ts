@@ -458,13 +458,11 @@ export interface CreateAgentSessionOptions {
 	/** Force read-only plan mode at start, auto-approve on the model's first resolve call, then switch to execute. */
 	planYolo?: PlanYolo;
 
-	/** Provider-facing system prompt override. Replaces the fully rendered default blocks. */
-	systemPrompt?: string | string[] | ((defaultPrompt: string[]) => string | string[]);
-	/** Already-loaded custom prompt text rendered through the bundled custom system prompt template. */
-	customSystemPrompt?: string;
-	/** Already-loaded text appended through the bundled system prompt templates. */
-	appendSystemPrompt?: string;
-	/**
+    systemPrompt?: string | string[] | ((defaultPrompt: string[]) => string | string[]);
+    systemPromptTemplate?: string;
+    customSystemPrompt?: string;
+    appendSystemPrompt?: string;
+    /**
 	 * Already-loaded title-generation system prompt override (typically
 	 * {@link discoverTitleSystemPromptFile} → {@link resolvePromptInput}). When
 	 * set, every automatic session-title generation path on this session — the
@@ -971,6 +969,7 @@ export interface BuildSystemPromptOptions {
 	agentDir?: string;
 	customPrompt?: string;
 	appendPrompt?: string;
+    systemPromptTemplate?: string;
 	inlineToolDescriptors?: boolean;
 	includeWorkspaceTree?: boolean;
 	/** Include the read-only security:// resource inventory entry. Default: false. */
@@ -999,6 +998,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles: options.contextFiles,
 		customPrompt: options.customPrompt,
 		appendSystemPrompt: options.appendPrompt,
+		systemPromptTemplate: options.systemPromptTemplate,
 		inlineToolDescriptors: options.inlineToolDescriptors,
 		includeWorkspaceTree: options.includeWorkspaceTree,
 		securityEnabled: options.securityEnabled,
@@ -1391,6 +1391,7 @@ function snapshotCreateAgentSessionOptions(options: CreateAgentSessionOptions): 
 		systemPrompt: Array.isArray(options.systemPrompt)
 			? (Object.freeze([...options.systemPrompt]) as unknown as string[])
 			: options.systemPrompt,
+        systemPromptTemplate: options.systemPromptTemplate,
 		outputSchema: cloneAndFreezeStartupValue(options.outputSchema),
 		contextFiles: options.contextFiles ? cloneAndFreezeStartupValue(options.contextFiles) : undefined,
 		workspaceTree: options.workspaceTree ? cloneAndFreezeStartupValue(options.workspaceTree) : undefined,
@@ -1612,6 +1613,7 @@ async function createAgentSessionScoped(
 		options.modelPattern !== undefined ||
 		options.thinkingLevel !== undefined ||
 		options.systemPrompt !== undefined ||
+        options.systemPromptTemplate !== undefined ||
 		options.customSystemPrompt !== undefined ||
 		options.appendSystemPrompt !== undefined ||
 		options.toolNames !== undefined ||
@@ -3473,6 +3475,7 @@ async function createAgentSessionScoped(
 					? xdevDocsAll(toolSession.xdev, settings.get("tools.xdevDocs"), settings.get("tools.xdevInlineDevices"))
 					: "",
 				resolvedCustomPrompt: options.customSystemPrompt,
+				systemPromptTemplate: options.systemPromptTemplate,
 				skills: (session?.settings ?? settings).get("skillful") === false ? [] : (session?.skills ?? skills),
 				contextFiles,
 				tools: promptTools,

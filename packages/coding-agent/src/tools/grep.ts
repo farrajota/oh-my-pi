@@ -1089,7 +1089,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 		return prompt.render(grepDescription, {
 			IS_HL_MODE: displayMode.hashLines,
 			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
-			hasFind: this.session.isToolActive?.("find") ?? this.session.settings.get("find.enabled"),
+			hasFind: this.session.isToolActive?.("find") ?? false,
 			eagerDelegation: sessionDelegationBias(this.session) === "eager",
 			scoutAvailable: isScoutSpawnable(
 				this.session.settings.get("task.disabledAgents") as string[] | undefined,

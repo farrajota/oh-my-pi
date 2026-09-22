@@ -381,7 +381,6 @@ export function createPersistedSubagentReviverFactory(
 				const startupPolicy = deriveRestrictedStartupPolicy({
 					permissionScope: permissionSnapshot.scope,
 					restrictToolNames,
-					allowRestrictedExtensions: true,
 					toolNames: revivedToolNames,
 					enableLsp: ctx.enableLsp,
 					enableMCP: (init.enableMCP ?? true) && ctx.enableMCP,

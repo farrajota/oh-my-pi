@@ -1,3 +1,6 @@
+/** Online model sentinel used by settings to select the configured tiny role. */
+export const ONLINE_TINY_TITLE_MODEL_KEY = "online";
+
 /** Local model the `tiny-models` CLI downloads when none is named. */
 export const DEFAULT_TINY_TITLE_LOCAL_MODEL_KEY = "lfm2.5-230m";
 
@@ -46,6 +49,24 @@ export const TINY_TITLE_LOCAL_MODELS = [
 		contextNote: "Use on constrained machines where download size matters most.",
 	},
 ] as const satisfies readonly TinyTitleLocalModelSpec[];
+
+export const TINY_TITLE_MODEL_VALUES = [
+	ONLINE_TINY_TITLE_MODEL_KEY,
+	...TINY_TITLE_LOCAL_MODELS.map(model => model.key),
+] as const;
+export type TinyTitleModelKey = (typeof TINY_TITLE_MODEL_VALUES)[number];
+export const TINY_TITLE_MODEL_OPTIONS = [
+	{
+		value: ONLINE_TINY_TITLE_MODEL_KEY,
+		label: "Online (TINY role, else @smol)",
+		description: "Use the configured online tiny-role model without downloading a local model.",
+	},
+	...TINY_TITLE_LOCAL_MODELS.map(model => ({
+		value: model.key,
+		label: model.label,
+		description: model.description,
+	})),
+] satisfies ReadonlyArray<{ value: TinyTitleModelKey; label: string; description: string }>;
 
 export type TinyTitleLocalModelKey = (typeof TINY_TITLE_LOCAL_MODELS)[number]["key"];
 
@@ -121,6 +142,25 @@ export const TINY_MEMORY_LOCAL_MODELS = [
 	},
 ] as const satisfies readonly TinyTitleLocalModelSpec[];
 
+export const ONLINE_MEMORY_MODEL_KEY = "online";
+export const TINY_MEMORY_MODEL_VALUES = [
+	ONLINE_MEMORY_MODEL_KEY,
+	...TINY_MEMORY_LOCAL_MODELS.map(model => model.key),
+] as const;
+export type TinyMemoryModelKey = (typeof TINY_MEMORY_MODEL_VALUES)[number];
+export const TINY_MEMORY_MODEL_OPTIONS = [
+	{
+		value: ONLINE_MEMORY_MODEL_KEY,
+		label: "Online (TINY role, else @smol)",
+		description: "Use the configured online tiny-role model without downloading a local model.",
+	},
+	...TINY_MEMORY_LOCAL_MODELS.map(model => ({
+		value: model.key,
+		label: model.label,
+		description: model.description,
+	})),
+] satisfies ReadonlyArray<{ value: TinyMemoryModelKey; label: string; description: string }>;
+
 export type TinyMemoryLocalModelKey = (typeof TINY_MEMORY_LOCAL_MODELS)[number]["key"];
 
 export function isTinyMemoryLocalModelKey(value: string): value is TinyMemoryLocalModelKey {
@@ -159,3 +199,12 @@ export const TINY_LOCAL_MODELS = [
 	...TINY_TITLE_LOCAL_MODELS,
 	...TINY_MEMORY_LOCAL_MODELS,
 ] as const satisfies readonly TinyTitleLocalModelSpec[];
+
+export const ONLINE_AUTO_THINKING_MODEL_KEY = ONLINE_MEMORY_MODEL_KEY;
+export const AUTO_THINKING_MODEL_VALUES = TINY_MEMORY_MODEL_VALUES;
+export type AutoThinkingModelKey = TinyMemoryModelKey;
+export const AUTO_THINKING_MODEL_OPTIONS = TINY_MEMORY_MODEL_OPTIONS satisfies ReadonlyArray<{
+	value: AutoThinkingModelKey;
+	label: string;
+	description: string;
+}>;

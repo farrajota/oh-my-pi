@@ -44,6 +44,7 @@ import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 
 export { type AriaSnapshotOptions, buildAriaSnapshotScript, parseAriaRefSelector } from "./browser/aria/aria-snapshot";
+export { diffAriaSnapshot, postProcessAriaSnapshot } from "./browser/snapshot-plus";
 export { cmuxSnapshotToObservation, mapWaitUntil, resolveCmuxKind, serializeEval } from "./browser/cmux/rpc";
 export { CmuxSocketClient } from "./browser/cmux/socket-client";
 export { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./browser/readable";
