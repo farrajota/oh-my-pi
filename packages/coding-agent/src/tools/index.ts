@@ -215,6 +215,13 @@ export interface ToolSession {
 	workspaceTree?: WorkspaceTree;
 	/** Skills materialized for this session; fresh children rediscover by identity. */
 	skills?: readonly Skill[];
+	/**
+	 * Frozen skill-URI hint visibility: snapshot taken at the last system-prompt
+	 * rebuild. Tools with a provider-side `skill://` hint read this instead of
+	 * the live `skillful` setting so the tool prefix stays byte-stable between
+	 * rebuilds (mid-session `/skillful` toggles ride the prompt, not the prefix).
+	 */
+	skillHintVisible?: boolean;
 	/** Rediscover live session skills after a tool mutates their backing files. */
 	refreshSkills?: () => Promise<void>;
 	/** Prompt templates materialized for this session. */
@@ -844,3 +851,28 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 
 	return tools;
 }
+
+export type { AskToolDetails, QuestionResult } from "@oh-my-pi/pi-tui/tools/ask";
+// Issue #12680: extensions that shadow the built-in ask tool reach the native
+// renderer through the injected pi.pi namespace (the root barrel of this
+// package). Re-export it so the pi-tui renderer migration doesn't drop it.
+export { askToolRenderer } from "@oh-my-pi/pi-tui/tools/ask";
+export type {
+	TodoStatus,
+	TodoOperation,
+	TodoItem,
+	TodoPhase,
+	TodoCompletionTransition,
+	TodoToolDetails,
+	CollapsedTodoSelection,
+} from "@oh-my-pi/pi-tui/tools/todo";
+export type { ThinkRenderArgs } from "@oh-my-pi/pi-tui/tools/think";
+export type { ResolutionDeviceName, ResolveDetails } from "@oh-my-pi/pi-tui/tools/resolve";
+export type {
+	GhToolDetails,
+	GhPrCheckoutSummary,
+	GhRunWatchJobDetails,
+	GhRunWatchRunDetails,
+	GhRunWatchFailedLogDetails,
+	GhRunWatchViewDetails,
+} from "@oh-my-pi/pi-tui/tools/github";

@@ -4392,11 +4392,22 @@ async function openCodexSseEventStream(
 	let clearPreResponseTimeout: (() => void) | undefined;
 	const fetchAttempt: FetchImpl = async (input, init) => {
 		if (!startCodexTransportAttempt(transportAttemptState)) throw new CodexTransportAttemptLimitError();
+		let response: Response | undefined;
 		try {
-			return await (fetchOverride ?? globalThis.fetch)(input, init);
+			response = await (fetchOverride ?? globalThis.fetch)(input, init);
+			return response;
 		} finally {
-			clearPreResponseTimeout?.();
-			clearPreResponseTimeout = undefined;
+			// A successful streaming body is governed by the iterator-level idle
+			// watchdog, so disarm the pre-response guard the instant headers arrive.
+			// Keep it armed for a non-2xx response: the error body is still
+			// consumed under this deadline — by fetchWithRetry's
+			// retry-status inspection and by CodexApiError.fromResponse — otherwise a
+			// server that sends headers then stalls the body hangs the turn past every
+			// configured first-event/idle deadline (issue #12664).
+			if (!response || response.ok) {
+				clearPreResponseTimeout?.();
+				clearPreResponseTimeout = undefined;
+			}
 		}
 	};
 	const bodyJson = JSON.stringify(body);
@@ -4420,6 +4431,9 @@ async function openCodexSseEventStream(
 			body: requestBody,
 			signal,
 			prepareInit: () => {
+				// A retried non-2xx attempt leaves its guard armed for the retry-status
+				// body read; disarm it before arming the next attempt's guard.
+				clearPreResponseTimeout?.();
 				const watchdog = armPreResponseTimeout(signal, firstEventTimeoutMs);
 				clearPreResponseTimeout = watchdog.clear;
 				return { signal: watchdog.signal };
@@ -4444,8 +4458,9 @@ async function openCodexSseEventStream(
 				});
 			response = await send(bodyJson);
 		}
-	} finally {
+	} catch (error) {
 		clearPreResponseTimeout?.();
+		throw error;
 	}
 	CODEX_DEBUG &&
 		logger.debug("[codex] codex response", {
@@ -4456,7 +4471,14 @@ async function openCodexSseEventStream(
 			cfRay: response.headers.get("cf-ray") || null,
 		});
 	if (!response.ok) {
-		throw await CodexApiError.fromResponse(response);
+		// The pre-response guard is still armed for a non-2xx response; keep it live
+		// across the error-body read so a stalled body is bounded, then disarm once
+		// the read settles (issue #12664).
+		try {
+			throw await CodexApiError.fromResponse(response);
+		} finally {
+			clearPreResponseTimeout?.();
+		}
 	}
 	updateCodexSessionMetadataFromHeaders(turnState, state, response.headers);
 	if (!response.body) {

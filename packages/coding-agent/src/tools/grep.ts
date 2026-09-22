@@ -24,6 +24,7 @@ import { getEditStore } from "../edit/store";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import type { LocalProtocolOptions } from "../internal-urls/local-protocol";
+import { isOmpDocsRoot, ompDocsScopeEntries } from "../internal-urls/omp-scope";
 import { InternalUrlRouter } from "../internal-urls/router";
 import type { InternalResource, ResolveContext } from "../internal-urls/types";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
@@ -369,8 +370,6 @@ interface IndexedContentLines {
 	lines: string[];
 	starts: number[];
 }
-
-const OMP_ROOT_URL_RE = /^omp:\/\/(?:\/?|docs\/?)$/i;
 
 function normalizeSearchLine(line: string): string {
 	return line.endsWith("\r") ? line.slice(0, -1) : line;
@@ -895,25 +894,13 @@ function mergeGrepResults(left: GrepResult, right: GrepResult, maxCount: number)
 async function expandVirtualInternalResource(
 	rawPath: string,
 	resource: InternalResource,
-	internalRouter: InternalUrlRouter,
 	context: ResolveContext,
 	ranges: readonly LineRange[] | undefined,
 ): Promise<VirtualSearchResource[]> {
-	if (OMP_ROOT_URL_RE.test(rawPath)) {
-		const completions = await internalRouter.complete("omp", "");
-		if (completions && completions.length > 0) {
-			const resources: VirtualSearchResource[] = [];
-			const seen = new Set<string>();
-			for (const completion of completions) {
-				if (seen.has(completion.value)) continue;
-				seen.add(completion.value);
-				const docUrl = `omp://${completion.value}`;
-				const doc = await internalRouter.resolve(docUrl, context);
-				if (!doc.sourcePath) {
-					resources.push({ path: docUrl, content: doc.content, ranges });
-				}
-			}
-			if (resources.length > 0) return resources;
+	if (isOmpDocsRoot(rawPath)) {
+		const entries = await ompDocsScopeEntries(context);
+		if (entries.length > 0) {
+			return entries.map(entry => ({ path: entry.url, content: entry.content, ranges }));
 		}
 	}
 
@@ -1001,13 +988,7 @@ async function resolveInternalSearchInputs(opts: {
 		}
 
 		const ranges = opts.pathSpecs[idx]?.ranges;
-		const expanded = await expandVirtualInternalResource(
-			rawPath,
-			resource,
-			internalRouter,
-			{ ...context, pathOnly: false },
-			ranges,
-		);
+		const expanded = await expandVirtualInternalResource(rawPath, resource, { ...context, pathOnly: false }, ranges);
 		virtualInputIndexes.add(idx);
 		for (const virtual of expanded) {
 			virtualResources.push(virtual);

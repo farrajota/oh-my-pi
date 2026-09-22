@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
+import { ArtifactManager, writeArtifact } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 describe("ArtifactManager publication integrity", () => {
@@ -34,6 +34,43 @@ describe("ArtifactManager publication integrity", () => {
 		);
 	});
 
+	it("rejects an incomplete write without publishing the allocated artifact", async () => {
+		const manager = new ArtifactManager(freshDir());
+		const allocation = await manager.allocatePath("task");
+		const content = "complete report";
+		const partial = "partial";
+		const originalWrite = Bun.write;
+		const writeSpy = spyOn(Bun, "write").mockImplementationOnce(
+			(async (destination: string | URL | Bun.BunFile) => originalWrite(destination, partial)) as typeof Bun.write,
+		);
+
+		try {
+			await expect(writeArtifact(allocation.path, content)).rejects.toThrow(
+				`Artifact write incomplete: wrote ${Buffer.byteLength(partial)} of ${Buffer.byteLength(content)} bytes`,
+			);
+		} finally {
+			writeSpy.mockRestore();
+		}
+
+		expect(await manager.getPath(allocation.id)).toBeNull();
+		expect(await manager.listFiles()).toEqual([]);
+		await expect(fs.access(allocation.path)).rejects.toThrow();
+	});
+
+	it("publishes an allocated artifact only after writeArtifact completes", async () => {
+		const manager = new ArtifactManager(freshDir());
+		const allocation = await manager.allocatePath("task");
+		const content = "complete report";
+
+		expect(await manager.getPath(allocation.id)).toBeNull();
+		expect(await manager.listFiles()).toEqual([]);
+
+		expect(await writeArtifact(allocation.path, content)).toBe(Buffer.byteLength(content));
+		expect(await manager.getPath(allocation.id)).toBe(allocation.path);
+		expect(await manager.listFiles()).toEqual([allocation.path]);
+		expect(await fs.readFile(allocation.path, "utf8")).toBe(content);
+	});
+
 	it("rejects tampered staged bytes and keeps the reserved id invisible", async () => {
 		const manager = new ArtifactManager(freshDir());
 		const reservation = await manager.reserve("task");
@@ -62,6 +99,7 @@ describe("ArtifactManager publication integrity", () => {
 		expect(await manager.exists(id)).toBe(false);
 		expect(await manager.listFiles()).toEqual([]);
 		expect((await manager.recover()).quarantined).toContain(id);
+
 	});
 
 	it("does not expose a raw filename without a publication manifest", async () => {

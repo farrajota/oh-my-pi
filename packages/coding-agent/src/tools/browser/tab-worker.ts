@@ -52,7 +52,146 @@ import {
 	isPuppeteerHandle,
 	loadPuppeteerInWorker,
 } from "./launch";
-import { extractReadableFromHtml, type ReadableFormat } from "./readable";
+import { extractReadableFromHtml, type ReadableExtractOptions, type ReadableFormat } from "./readable";
+import { assertTabPressArgs } from "./tab-arguments";
+import {
+	type BrowserCookie,
+	type ClearCookiesOptions,
+	clearPageCookies,
+	type CookieQueryOptions,
+	loadStorageState,
+	type LoadStateResult,
+	readCookies,
+	readStorage,
+	saveStorageState,
+	setPageCookies,
+	setPageStorage,
+	clearPageStorage,
+	type StorageKind,
+} from "./storage-state";
+import { enableReact, type ReactEnableResult } from "./react/devtools-hook";
+import { collectReactRenders, type ReactRendersAction, type ReactRendersResult } from "./react/renders";
+import { readReactSuspense, type ReactSuspenseBoundary, type ReactSuspenseOptions } from "./react/suspense";
+import {
+	inspectReactFiber,
+	type ReactInspectResult,
+	type ReactTreeNode,
+	type ReactTreeOptions,
+	readReactTree,
+} from "./react/tree";
+import { collectVitals, installVitalsObservers, type VitalsOptions, type VitalsResult } from "./react/vitals";
+import { registerSemanticQueryHandlers } from "./query-handlers";
+import {
+	type ElementQueryHelpers,
+	enrichElementQueries,
+	queryAttribute,
+	queryBox,
+	queryChecked,
+	queryCount,
+	queryEnabled,
+	queryHtml,
+	type QueryBox,
+	queryStyles,
+	queryText,
+	queryValue,
+	queryVisible,
+	waitForPageText,
+} from "./queries";
+import { DownloadManager, type BrowserDownload } from "./downloads";
+import { InitScriptManager, type InitScriptInfo } from "./init-scripts";
+import { applyIgnoreHttpsErrors } from "./open-options";
+import {
+	BrowserNetworkManager,
+	type HarContentPolicy,
+	type NetworkPattern,
+	type NetworkRequestDetail,
+	type NetworkRequestRecord,
+	type NetworkRequestsOptions,
+	type NetworkRouteDescription,
+	type NetworkRouteOptions,
+} from "./network";
+import {
+	type BrowserCaptureResult,
+	type BrowserConsoleEntry,
+	type BrowserConsoleOptions,
+	type BrowserErrorEntry,
+	type BrowserErrorOptions,
+	PageConsoleCapture,
+} from "./console-capture";
+import {
+	type BrowserMetrics,
+	type BrowserProfileStopOptions,
+	type BrowserTraceStartOptions,
+	type BrowserTraceStopOptions,
+	BrowserTracingController,
+} from "./tracing";
+import {
+	installWebMcp,
+	type WebMcpController,
+	type WebMcpEventsOptions,
+	type WebMcpEventsResult,
+	type WebMcpInvokeOptions,
+	type WebMcpInvokeResult,
+	type WebMcpListOptions,
+	type WebMcpListResult,
+} from "./webmcp";
+import {
+	RecordingController,
+	type RecordingOptions,
+	type RecordingStartResult,
+	type RecordingStatus,
+	type RecordingStopResult,
+} from "./recording";
+import {
+	type AriaSnapshotBaseline,
+	type AriaSnapshotDiffResult,
+	ariaSnapshotBaselineKey,
+	diffAriaSnapshot,
+} from "./snapshot-plus";
+import {
+	clickAt,
+	clickElement,
+	clickQueryHandlerText,
+	highlightElement,
+	type HighlightOptions,
+	type InteractionHandle,
+	keyDown,
+	keyUp,
+	mouseDown,
+	mouseMove,
+	mouseUp,
+	setElementChecked,
+	type ScrollOptions,
+	uploadFilesToElement,
+	wheel,
+} from "./interactions";
+import {
+	captureScreenshotBuffer,
+	createPngDiff,
+	type DiffScreenshotOptions,
+	type DiffScreenshotResult,
+	formatScreenshotLegend,
+	installScreenshotAnnotations,
+	type PdfOptions,
+	pngPixelChangeRatio,
+	type ScreenshotAnnotationTarget,
+	type ScreenshotChangeResult,
+	type ScreenshotHistory,
+	type ScreenshotOptions,
+	screenshotQuality,
+	screenshotScope,
+	screenshotThreshold,
+} from "./screenshot";
+import { RuntimeDialogController, type DialogPolicy, type DialogState } from "./dialogs";
+import {
+	type BrowserFrameApi,
+	type BrowserFrameInfo,
+	captureFrameScreenshot,
+	createFrameApi,
+	listFrames,
+	resolveFrame,
+} from "./frames";
+import { pushState, reloadPage, traverseHistory, type NavigationWaitUntil } from "./navigation";
 
 import { cloneSafe, RunOutput } from "./run-output";
 import type {
@@ -1778,6 +1917,7 @@ export class WorkerCore {
 				),
 			press: (key, opts) =>
 				op(`tab.press(${JSON.stringify(key)})`, actionOpMs, async sig => {
+					assertTabPressArgs(key, opts);
 					const selector = opts?.selector;
 					if (selector) {
 						if (parseAriaRefSelector(selector) !== null) {

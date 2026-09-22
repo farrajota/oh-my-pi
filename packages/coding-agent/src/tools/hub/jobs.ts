@@ -14,8 +14,9 @@ import type { HubAdmissionStateTransaction } from "../../internal/hub-admission"
 import { shimmerEnabled, shimmerText, type Theme } from "@oh-my-pi/pi-tui/theme";
 import { terminateSubagent } from "../../registry/agent-control";
 import type { AgentRef } from "../../registry/agent-registry";
-import { renderStructuredJson } from "../../session/async-job-delivery";
+import { renderStructuredJson, structuredStatusLabel } from "../../session/async-job-delivery";
 import type { StructuredSubagentOutput } from "../../task/types";
+import { formatArtifactErrorNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "@oh-my-pi/pi-tui/render";
 import type { ToolSession } from "..";
@@ -179,7 +180,7 @@ interface TrackedJobLike {
 export function snapshotJobs(
 	session: ToolSession,
 	jobs: TrackedJobLike[],
-	observation?: AsyncJobResultObservation,
+	options: { includeResults?: boolean; observation?: AsyncJobResultObservation } = {},
 ): JobSnapshot[] {
 	const now = Date.now();
 	return jobs.map(j => {
@@ -189,8 +190,10 @@ export function snapshotJobs(
 		// so a newly settled body stays withheld until buildJobResult enlists it.
 		const resultWithheld =
 			latest.status !== "running" &&
-			(!observation || session.asyncJobManager?.ownsObservedJobResult(observation, latest.id) !== true);
+			(!options.observation || session.asyncJobManager?.ownsObservedJobResult(options.observation, latest.id) !== true);
+		const resultConsumed = session.asyncJobManager?.isJobResultConsumed(latest.id) ?? false;
 		let resolvedModel: string | undefined;
+		const exitCode = typeof latest.latestDetails?.exitCode === "number" ? latest.latestDetails.exitCode : undefined;
 		let resolvedModelIdentity: string | undefined;
 		let resolvedThinkingLevel: JobSnapshot["resolvedThinkingLevel"];
 		let advisor = false;
@@ -230,15 +233,24 @@ export function snapshotJobs(
 			status: latest.status as JobSnapshot["status"],
 			label: latest.label,
 			durationMs: Math.max(0, now - latest.startTime),
+			...(exitCode !== undefined ? { exitCode } : {}),
 			...(resolvedModel ? { resolvedModel } : {}),
 			...(resolvedModelIdentity ? { resolvedModelIdentity } : {}),
 			...(resolvedThinkingLevel !== undefined ? { resolvedThinkingLevel } : {}),
 			...(advisor ? { advisor: true } : {}),
-			...(!resultWithheld && latest.resultText ? { resultText: latest.resultText } : {}),
-			...(!resultWithheld && latest.errorText ? { errorText: latest.errorText } : {}),
-			...(!resultWithheld && latest.structured
-				? { structured: latest.structured, agentUrlId: current?.agentId ?? latest.id }
+			...(!resultWithheld && !resultConsumed && options.includeResults !== false && latest.resultText
+				? { resultText: latest.resultText }
 				: {}),
+			...(!resultWithheld && !resultConsumed && options.includeResults !== false && latest.errorText
+				? { errorText: latest.errorText }
+				: {}),
+			...((options.includeResults === false || (!resultWithheld && !resultConsumed)) && latest.latestDetails?.meta
+				? { meta: latest.latestDetails.meta }
+				: {}),
+			...(!resultWithheld && !resultConsumed && options.includeResults !== false && latest.structured
+				? { structured: latest.structured }
+				: {}),
+			...(latest.type === "task" ? { agentUrlId: current?.agentId ?? latest.id } : {}),
 		};
 	});
 }
@@ -266,12 +278,25 @@ export function buildJobResult(
 		uniqueJobs.filter(job => job.status !== "running").map(job => job.id),
 		ownerId ? { ownerId } : undefined,
 	);
-	const jobResults = transaction.select(() => snapshotJobs(session, uniqueJobs, observation));
+	const jobResults = transaction.select(() =>
+		snapshotJobs(session, uniqueJobs, { includeResults: op !== "jobs", observation }),
+	);
 	const alreadyConsumed = new Set(
 		jobResults
-			.filter(job => job.status !== "running" && !manager.ownsObservedJobResult(observation, job.id))
+			.filter(
+				job =>
+					job.status !== "running" &&
+					(manager.isJobResultConsumed(job.id) || !manager.ownsObservedJobResult(observation, job.id)),
+			)
 			.map(job => job.id),
 	);
+
+	if (op !== "jobs") {
+		const consumable = jobResults
+			.filter(job => job.status !== "running" && manager.ownsObservedJobResult(observation, job.id))
+			.map(job => job.id);
+		manager.consumeJobResults(consumable);
+	}
 
 	const completed = jobResults.filter(j => j.status !== "running");
 	const running = jobResults.filter(j => j.status === "running");
@@ -284,7 +309,24 @@ export function buildJobResult(
 		lines.push("");
 	}
 
-	if (completed.length > 0) {
+	if (op === "jobs" && jobResults.length > 0) {
+		lines.push(`## Jobs (${jobResults.length})\n`);
+		for (const j of jobResults) {
+			const exit = j.exitCode === undefined ? "" : ` — exit ${j.exitCode}`;
+			const artifactId = j.meta?.truncation?.artifactId;
+			const artifact = artifactId ? ` — artifact://${artifactId}` : "";
+			const capture =
+				j.meta?.artifactError === undefined ? "" : ` — ${formatArtifactErrorNotice(j.meta.artifactError)}`;
+			const delivery =
+				j.status === "running" || j.status === "cancelled"
+					? ""
+					: ` — delivery ${alreadyConsumed.has(j.id) ? "delivered" : "pending"}`;
+			const agent = j.agentUrlId ? ` — agent://${j.agentUrlId}` : "";
+			lines.push(
+				`- \`${j.id}\` [${j.type}] — ${j.status} — ${j.label.replace(/\s+/g, " ")}${exit}${artifact}${capture}${delivery}${agent}`,
+			);
+		}
+	} else if (completed.length > 0) {
 		lines.push(`## Completed (${completed.length})\n`);
 		for (const j of completed) {
 			lines.push(`### ${j.id} [${j.type}] — ${j.status}`);
@@ -304,7 +346,7 @@ export function buildJobResult(
 			}
 			if (j.structured) {
 				const hasData = Object.hasOwn(j.structured, "data");
-				let header = `Structured output: schema ${j.structured.status}`;
+				let header = `Structured output: ${structuredStatusLabel(j.structured.status)}`;
 				if (j.structured.error) header += `: ${j.structured.error}`;
 				// Valid results never inline the JSON here — it duplicates the
 				// `<output>` block above (or breaks mid-JSON once truncated at
@@ -322,7 +364,7 @@ export function buildJobResult(
 		}
 	}
 
-	if (running.length > 0) {
+	if (op !== "jobs" && running.length > 0) {
 		lines.push(`## Still Running (${running.length})\n`);
 		for (const j of running) {
 			lines.push(`- \`${j.id}\` [${j.type}] — ${j.label}`);

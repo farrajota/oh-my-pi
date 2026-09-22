@@ -26,6 +26,7 @@ export interface CommitAgentInput {
 	settings: Settings;
 	modelRegistry: ModelRegistry;
 	authStorage: AuthStorage;
+	sessionManager?: SessionManager;
 	userContext?: string;
 	contextFiles?: Array<{ path: string; content: string }>;
 	changelogTargets: string[];
@@ -67,6 +68,7 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
 	const { session } = await createAgentRootSession(registry, {
 		cwd: input.cwd,
+		sessionManager: input.sessionManager,
 		authStorage: input.authStorage,
 		modelRegistry: input.modelRegistry,
 		settings: input.settings,

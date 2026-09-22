@@ -3792,6 +3792,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				);
 			}
 
+			const hasExistingModelRole = sessionManager.getLastModelChangeRole() !== undefined;
 			const sessionPromise = createSubagentSession(buildSubagentSessionOptions(sessionManager));
 			let session: AgentSession;
 			try {
@@ -3805,6 +3806,18 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			}
 			historyAuthority = session;
 			options.onHistoryAuthorityClaimed?.(session);
+			// The SDK records a new session's initial model as the default role.
+			// Pin the child's own chain so a parent default sharing that model
+			// cannot steal its fallback routing. Resumed history keeps its role.
+			if (
+				!hasExistingModelRole &&
+				retryFallbackRole &&
+				model &&
+				session.model &&
+				formatModelStringWithRouting(session.model) === formatModelStringWithRouting(model)
+			) {
+				sessionManager.appendModelChange(formatModelStringWithRouting(model), retryFallbackRole);
+			}
 			sessionCreatedAt = performance.now();
 
 			monitor.setActiveSession(session);

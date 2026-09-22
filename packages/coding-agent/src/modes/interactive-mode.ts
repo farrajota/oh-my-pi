@@ -36,6 +36,7 @@ import {
 	TERMINAL,
 	Text,
 	type TUI,
+	renderProgressBar,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
@@ -105,6 +106,11 @@ import {
 	type McpConnectionStatusEvent,
 } from "../mcp/startup-events";
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approved-plan";
+import {
+	isJudgmentBatchProgress,
+	JUDGMENT_BATCH_PROGRESS_EVENT_CHANNEL,
+	type JudgmentBatchProgress,
+} from "../eval/judgment-batch-events";
 import { autosaveApprovedPlan, planSaveFileName } from "../plan-mode/plan-autosave";
 import { resolvePlanModelTransition } from "../plan-mode/model-transition";
 import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
@@ -295,6 +301,9 @@ import type { TodoItem, TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { UiHelpers } from "./utils/ui-helpers";
 
 const STILL_CLOSING_DELAY_MS = 3_000;
+const JUDGMENT_BATCH_PROGRESS_RETAIN_MS = 1_000;
+const JUDGMENT_BATCH_PROGRESS_BAR_WIDTH = 18;
+const JUDGMENT_BATCH_PROGRESS_MIN_BAR_WIDTH = 4;
 const DEFAULT_WORKING_MESSAGE = "Working…";
 
 function normalizeStatusLineSegments(segments: readonly string[]): TuiStatusLineSegmentId[] {
@@ -527,6 +536,75 @@ class StatusHudContainer extends AnchoredLiveContainer {
 	}
 }
 
+/** Editor-anchored, right-aligned progress rows for concurrent judge batches. */
+class JudgmentBatchProgressHud implements Component {
+	readonly #batches = new Map<string, JudgmentBatchProgress>();
+
+	update(progress: JudgmentBatchProgress): void {
+		this.#batches.set(progress.id, progress);
+	}
+
+	delete(id: string): void {
+		this.#batches.delete(id);
+	}
+
+	clear(): void {
+		this.#batches.clear();
+	}
+
+	render(width: number): readonly string[] {
+		const rowWidth = Number.isFinite(width) ? Math.max(0, Math.trunc(width)) : 0;
+		if (rowWidth === 0) return [];
+		const rows: string[] = [];
+		for (const progress of this.#batches.values()) rows.push(this.#renderRow(progress, rowWidth));
+		return rows;
+	}
+
+	#renderRow(progress: JudgmentBatchProgress, width: number): string {
+		const countText = `${progress.done}/${progress.total}`;
+		const failedText = progress.failed > 0 ? ` · ${progress.failed} failed` : "";
+		const compactFailedText = progress.failed > 0 ? ` +${progress.failed}!` : "";
+		let failure = failedText;
+		if (
+			failure &&
+			visibleWidth(countText) + visibleWidth(failure) + JUDGMENT_BATCH_PROGRESS_MIN_BAR_WIDTH + 1 > width &&
+			visibleWidth(countText) + visibleWidth(compactFailedText) <= width
+		) {
+			failure = compactFailedText;
+		}
+
+		const styledCount = theme.bold(theme.fg("text", countText));
+		const styledFailure = failure ? theme.fg("warning", failure) : "";
+		let tail = `${styledCount}${styledFailure}`;
+		let remaining = width - visibleWidth(tail);
+		if (remaining > 1) {
+			const barWidth = Math.min(JUDGMENT_BATCH_PROGRESS_BAR_WIDTH, remaining - 1);
+			const bar = renderProgressBar(progress.done, barWidth, {
+				min: 0,
+				max: Math.max(1, progress.total),
+				minWidth: barWidth,
+				maxWidth: barWidth,
+				style: {
+					filled: "━",
+					empty: "─",
+					styleFilled: text => theme.fg("accent", text),
+					styleEmpty: text => theme.fg("dim", text),
+				},
+			});
+			tail = `${bar} ${tail}`;
+			remaining = width - visibleWidth(tail);
+		}
+
+		const intent = sanitizeStatusText(progress.intent);
+		if (remaining > 1) {
+			const label = truncateToWidth(intent, remaining - 1, "");
+			if (label) tail = `${theme.fg("dim", label)} ${tail}`;
+		}
+		if (visibleWidth(tail) > width) tail = theme.bold(theme.fg("text", truncateToWidth(countText, width, "")));
+		return `${" ".repeat(Math.max(0, width - visibleWidth(tail)))}${tail}`;
+	}
+}
+
 /**
  * Preview of the command panels queued while the agent streams, rendered above
  * the editor so `/usage` and friends answer immediately mid-turn.
@@ -743,6 +821,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	ui: TUI;
 	chatContainer: TranscriptContainer;
 	pendingMessagesContainer: Container;
+	judgmentBatchProgressContainer: Container;
 	statusContainer: Container;
 	/** Whether {@link statusContainer} rendered lines in the latest frame; the band composer's editor top gap collapses only then. */
 	statusRowOccupied = false;
@@ -790,6 +869,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#todoAutoClearTimer: NodeJS.Timeout | undefined;
 	#todoAutoClearGeneration = 0;
 	#modelCycleClearTimer: NodeJS.Timeout | undefined;
+	readonly #judgmentBatchProgressHud = new JudgmentBatchProgressHud();
+	readonly #judgmentBatchProgressClearTimers = new Map<string, NodeJS.Timeout>();
 	#nextAppearanceRequestToken = 1;
 	#appearanceRefreshRequest: { token: TerminalAppearanceRequestToken; deadline: number } | undefined;
 	todoPhases: TodoPhase[] = [];
@@ -1108,6 +1189,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.statusContainer.disposeChildren();
 		this.pendingMessagesContainer.disposeChildren();
+		this.#clearJudgmentBatchProgress();
 		this.#cancelModelCycleClearTimer();
 		this.modelCycleContainer.disposeChildren();
 		this.deferredCommandContainer.disposeChildren();
@@ -1259,6 +1341,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		});
 		this.chatContainer = new TranscriptContainer();
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
+		this.judgmentBatchProgressContainer = new AnchoredLiveContainer();
+		this.judgmentBatchProgressContainer.addChild(this.#judgmentBatchProgressHud);
 		this.statusContainer = new StatusHudContainer(this);
 		this.todoContainer = new TodoHudContainer(this);
 		this.subagentContainer = new AnchoredLiveContainer();
@@ -1269,6 +1353,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.modelCycleContainer = new AnchoredLiveContainer();
 		this.deferredCommandContainer = new AnchoredLiveContainer();
 		this.editor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
+		if (eventBus) {
+			this.#eventBusUnsubscribers.push(
+				eventBus.on(JUDGMENT_BATCH_PROGRESS_EVENT_CHANNEL, data => {
+					if (!isJudgmentBatchProgress(data)) {
+						logger.warn("Ignoring malformed eval:judgment-batch-progress event", { data });
+						return;
+					}
+					this.#handleJudgmentBatchProgress(data);
+				}),
+			);
+		}
 		this.editor.setImeSafeCursorLayout(settings.get("tui.imeSafeCursor"));
 		this.#applyVimMode(this.editor);
 		this.editor.setAutocompleteMaxVisible(settings.get("autocompleteMaxVisible"));
@@ -1372,6 +1467,33 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session.setTitleGenerationStart?.(() => this.#inputController.notifyTitleGenerationStart());
 		this.session.setPromptDropped?.(prompt => this.#restoreDroppedPrompt(prompt));
 		this.#observerRegistry = new SessionObserverRegistry();
+	}
+
+	#handleJudgmentBatchProgress(progress: JudgmentBatchProgress): void {
+		const pendingClear = this.#judgmentBatchProgressClearTimers.get(progress.id);
+		if (pendingClear) {
+			clearTimeout(pendingClear);
+			this.#judgmentBatchProgressClearTimers.delete(progress.id);
+		}
+
+		this.#judgmentBatchProgressHud.update(progress);
+		if (!progress.running) {
+			const timer = setTimeout(() => {
+				this.#judgmentBatchProgressClearTimers.delete(progress.id);
+				this.#judgmentBatchProgressHud.delete(progress.id);
+				this.ui.requestRender();
+			}, JUDGMENT_BATCH_PROGRESS_RETAIN_MS);
+			timer.unref?.();
+			this.#judgmentBatchProgressClearTimers.set(progress.id, timer);
+		}
+		this.ui.requestRender();
+	}
+
+	#clearJudgmentBatchProgress(requestRender = false): void {
+		for (const timer of this.#judgmentBatchProgressClearTimers.values()) clearTimeout(timer);
+		this.#judgmentBatchProgressClearTimers.clear();
+		this.#judgmentBatchProgressHud.clear();
+		if (requestRender) this.ui.requestRender();
 	}
 
 	#handleMcpConnectionStatusEvent(event: McpConnectionStatusEvent): void {
@@ -1541,6 +1663,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.errorBannerContainer,
 			this.modelCycleContainer,
 			this.deferredCommandContainer,
+			// Judge batches stay editor-anchored and update independently of eval
+			// transcript output, directly above the working/throughput/title row.
+			this.judgmentBatchProgressContainer,
 			// Working loader / transient status sits below the sticky todo + subagent
 			// HUDs, just above the editor's hook-widget top margin — so it reads next to
 			// the prompt while keeping the one-line gap above the editor (the band
@@ -2347,7 +2472,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const conditionSuffix = parsed.condition ? ` Continuing ${describeLoopCondition(parsed.condition)}.` : "";
 		const tail = parsed.prompt ? "Repeating it after each turn." : "Your next prompt will repeat after each turn.";
 		this.showStatus(
-			`Loop mode enabled.${limitSuffix}${remainingSuffix}${conditionSuffix} ${tail} Esc cancels the current iteration; /loop again to disable.`,
+			`Loop mode enabled.${limitSuffix}${remainingSuffix}${conditionSuffix} ${tail} Esc suspends the ongoing loop; /loop again to disable.`,
 		);
 		// Hand any inline prompt back to the dispatcher so the normal submit flow
 		// runs the first iteration — it records the text as the loop prompt and
@@ -5578,6 +5703,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		stopSharedSpinnerTicker();
 		this.#stopSubagentHudTicker();
 		this.#liveCommandController.dispose();
+		this.#clearJudgmentBatchProgress();
 		this.#cancelTodoAutoClearTimer();
 		this.#cancelObserverUiSyncTimer();
 		this.#cancelGoalContinuation();
@@ -6440,6 +6566,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async prepareSessionSwitch(): Promise<void> {
+		this.#clearJudgmentBatchProgress(true);
 		await this.#btwController.dispose();
 		this.#omfgController.dispose();
 		this.#cleanseController.dispose();

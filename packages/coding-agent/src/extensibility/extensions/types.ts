@@ -1279,6 +1279,8 @@ export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family exte
 
 /**
  * ExtensionAPI passed to extension factory functions.
+ *
+ * Methods retain their extension binding when destructured or passed as callbacks.
  */
 export interface ExtensionAPI {
 	// =========================================================================

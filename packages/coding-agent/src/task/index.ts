@@ -180,7 +180,6 @@ function cloneUsageSnapshot(usage: Usage | undefined): Usage | undefined {
 }
 
 // Re-export types and utilities
-export { loadBundledAgents as BUNDLED_AGENTS } from "./agents";
 export { discoverCommands, expandCommand, getCommand } from "./commands";
 export { discoverAgents, getAgent } from "./discovery";
 export { AgentOutputManager } from "./output-manager";
@@ -197,10 +196,10 @@ export type {
 } from "./types";
 export * from "./result-summary";
 export {
+	taskSchema,
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
-	taskSchema,
 } from "./types";
 
 /**
@@ -1668,7 +1667,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						content: [
 							{
 								type: "text",
-								text: `Spawned agent \`${agentId}\` (job \`${jobId}\`). Its result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first. ${coordinationHint}`,
+								text: `Spawned agent \`${agentId}\` (job \`${jobId}\`). Its result auto-delivers on yield; \`hub jobs\` only summarizes it, while \`hub wait\` can consume it first. ${coordinationHint}`,
 							},
 						],
 						details: buildAsyncDetails(),
@@ -1685,7 +1684,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					content: [
 						{
 							type: "text",
-							text: `Spawned ${started.length} background agents using ${agentLabel}.${scheduleFailureSummary} Each result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first.\n${startedListing}\n${coordinationHint}`,
+							text: `Spawned ${started.length} background agents using ${agentLabel}.${scheduleFailureSummary} Each result auto-delivers on yield; \`hub jobs\` only summarizes it, while \`hub wait\` can consume it first.\n${startedListing}\n${coordinationHint}`,
 						},
 					],
 					details: buildAsyncDetails(),
@@ -1749,7 +1748,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			const spawnedSummary =
 				started.length > 0
-					? `Spawned ${started.length} background agent${started.length === 1 ? "" : "s"}.${scheduleFailureSummary} Each result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first.\n${started.map(({ agentId, jobId }) => `- \`${agentId}\` (job \`${jobId}\`)`).join("\n")}\n${coordinationHint}`
+					? `Spawned ${started.length} background agent${started.length === 1 ? "" : "s"}.${scheduleFailureSummary} Each result auto-delivers on yield; \`hub jobs\` only summarizes it, while \`hub wait\` can consume it first.\n${started.map(({ agentId, jobId }) => `- \`${agentId}\` (job \`${jobId}\`)`).join("\n")}\n${coordinationHint}`
 					: scheduleFailureSummary.trim();
 			const text = [merged.contentParts.join("\n\n"), spawnedSummary]
 				.filter(section => section.trim().length > 0)
