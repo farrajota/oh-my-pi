@@ -285,6 +285,7 @@ export const taskSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	"effort?": effortRule,
+	"model?": type("string").atLeastLength(1),
 	task: "string",
 	"agentSource?": agentSourceRule,
 	"agentDefinitionSha256?": sha256Rule,

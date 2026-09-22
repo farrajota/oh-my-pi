@@ -66,9 +66,12 @@ describe("ArtifactManager publication integrity", () => {
 		expect(await manager.listFiles()).toEqual([]);
 
 		expect(await writeArtifact(allocation.path, content)).toBe(Buffer.byteLength(content));
-		expect(await manager.getPath(allocation.id)).toBe(allocation.path);
-		expect(await manager.listFiles()).toEqual([allocation.path]);
-		expect(await fs.readFile(allocation.path, "utf8")).toBe(content);
+		const publishedPath = path.join(path.dirname(path.dirname(allocation.path)), `${allocation.id}.task.log`);
+		expect(await manager.getPath(allocation.id)).toBe(publishedPath);
+		expect(publishedPath).not.toBe(allocation.path);
+		expect(await manager.listFiles()).toEqual([path.basename(publishedPath)]);
+		expect(await fs.readFile(publishedPath, "utf8")).toBe(content);
+		await expect(fs.access(allocation.path)).rejects.toThrow();
 	});
 
 	it("rejects tampered staged bytes and keeps the reserved id invisible", async () => {

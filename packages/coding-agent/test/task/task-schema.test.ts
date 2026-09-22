@@ -44,11 +44,12 @@ describe("task schema (single-spawn)", () => {
 		}
 	});
 
-	it("retains caller outputSchema, schemaMode, and eval tool names while stripping stale keys", () => {
+	it("retains caller model, outputSchema, schemaMode, and eval tool names while stripping stale keys", () => {
 		const outputSchema = { type: "object", properties: { answer: { type: "string" } } };
 		const parsed = taskSchema({
 			agent: "scout",
 			task: "Map the auth module.",
+			model: "openai/gpt-5.2",
 			outputSchema,
 			schemaMode: "strict",
 			tools: ["word_count"],
@@ -58,6 +59,7 @@ describe("task schema (single-spawn)", () => {
 		});
 		expect(parsed instanceof type.errors).toBe(false);
 		if (!(parsed instanceof type.errors)) {
+			expect(parsed.model).toBe("openai/gpt-5.2");
 			expect(parsed.outputSchema).toEqual(outputSchema);
 			expect(parsed.schemaMode).toBe("strict");
 			expect(parsed.tools).toEqual(["word_count"]);

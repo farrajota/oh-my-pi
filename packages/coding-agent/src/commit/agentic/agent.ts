@@ -59,20 +59,20 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		enableAnalyzeFiles: true,
 	});
 
-	const sessionManager = SessionManager.create(
+	const localSessionManager = SessionManager.create(
 		input.cwd,
 		SessionManager.getDefaultSessionDir(input.cwd, input.settings.getAgentDir()),
 	);
+	const sessionManager = input.sessionManager ?? localSessionManager;
 	const sessionFile = sessionManager.getSessionFile();
 	if (!sessionFile) throw new Error("Commit agent restricted startup requires a persisted session file.");
 	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
 	const { session } = await createAgentRootSession(registry, {
 		cwd: input.cwd,
-		sessionManager: input.sessionManager,
+		sessionManager,
 		authStorage: input.authStorage,
 		modelRegistry: input.modelRegistry,
 		settings: input.settings,
-		sessionManager,
 		model: input.model,
 		thinkingLevel: input.thinkingLevel,
 		systemPrompt: [systemPrompt],
