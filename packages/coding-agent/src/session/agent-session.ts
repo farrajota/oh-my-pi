@@ -42,6 +42,7 @@ import {
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
 	type ThinkingLevel,
 	type ToolChoiceDirective,
+    type QueuedMessagePreparation,
 } from "@oh-my-pi/pi-agent-core";
 import {
 	type CompactionPreparation,
@@ -411,6 +412,16 @@ import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
+const AGENT_START_POLICY_MAX_ATTEMPTS = 3;
+
+/** A failed preparation, not a provider failure: the ordinary input can still be restored. */
+class AgentStartPolicyChangedError extends Error {
+	constructor() {
+		super("System prompt changed repeatedly during before_agent_start; original input was not delivered.");
+		this.name = "AgentStartPolicyChangedError";
+	}
+}
+
 const EXPERIMENTAL_CONTEXT_REQUIRED_TOOLS: Record<string, true> = {
 	context_notes: true,
 	new_context: true,
@@ -1473,6 +1484,7 @@ export class AgentSession {
 				throw new DOMException("Usage preflight cancelled", "AbortError");
 			}
 		});
+		this.agent.prepareQueuedMessages = this.#prepareQueuedUserMessages;
 		this.#detachUsageBeforeModelCall = this.agent.addBeforeModelCallHook(async signal => {
 			if (!this.settings.get("retry.usageAwareFallback")) return;
 			if (this.#usagePreflightReadyForNextModelCall) {
@@ -4743,6 +4755,9 @@ export class AgentSession {
 		this.#detachUsageBeforeQueueDequeue = undefined;
 		this.#detachUsageBeforeModelCall?.();
 		this.#detachUsageBeforeModelCall = undefined;
+		if (this.agent.prepareQueuedMessages === this.#prepareQueuedUserMessages) {
+			this.agent.prepareQueuedMessages = undefined;
+		}
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
@@ -5645,9 +5660,6 @@ export class AgentSession {
 		return this.#tools.refreshBaseSystemPrompt(commitIf);
 	}
 
-	#buildSystemPromptForAgentStart(promptText: string, isCurrent: () => boolean) {
-		return this.#tools.buildSystemPromptForAgentStart(promptText, isCurrent);
-	}
 
 	/** Replaces connected MCP tools and enables them immediately. */
 	refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
@@ -6534,6 +6546,11 @@ export class AgentSession {
 							]
 						: undefined,
 			});
+		} catch (error) {
+			if (error instanceof AgentStartPolicyChangedError && message.role === "user") {
+				this.#promptDropped?.({ text: typedText, images: options?.images });
+			}
+			throw error;
 		} finally {
 			// Clean up residual eager-todo directive if the prompt never consumed it
 			// (e.g., compaction aborted, validation failed).
@@ -6626,7 +6643,6 @@ export class AgentSession {
 			...options,
 			prependMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
 		});
-		return outcome.sessionClaimed;
 	}
 
 	/** Queue ownership belongs to Agent; only actual user deliveries refresh submission policy. */
