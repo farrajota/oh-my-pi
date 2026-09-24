@@ -1,10 +1,13 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { $flag, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
+import type { MCPManager } from "../mcp/manager";
+import { resolveMCPTimeoutMs } from "../mcp/timeout";
 import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_MS } from "../session/agent-session";
 import { isSilentAbort } from "../session/messages";
 import { flushTelemetryExport } from "../telemetry-export";
 import { initializeExtensions } from "./runtime-init";
+import { formatPersistenceFailure } from "./persistence-failure";
 
 export interface PrintModeOptions {
 	mode: "text" | "json";
@@ -13,11 +16,19 @@ export interface PrintModeOptions {
 	initialImages?: ImageContent[];
 	printThoughts?: boolean;
 	planYolo?: boolean;
+	/** Manager returned by session creation; only print mode waits for its servers. */
+	mcpManager?: MCPManager;
 }
 
 export const PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS = 10 * 60_000;
 export const PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS = 30_000;
 
+/** Sanitize untrusted text (server names, errors) into one stderr-safe line. */
+function singleLine(text: string): string {
+	return sanitizeText(text).replace(/[\r\n\t]+/g, " ");
+}
+
+/** Drop the provider-opaque replay payload (e.g. encrypted reasoning items) before printing. */
 function stripProviderPayload<T extends AgentMessage>(message: T): T {
 	if (!("providerPayload" in message) || message.providerPayload === undefined) return message;
 	const { providerPayload: _providerPayload, ...rest } = message;
@@ -58,16 +69,70 @@ export function printableEvent(event: AgentSessionEvent): unknown {
 export async function runPrintMode(session: AgentSession, options: PrintModeOptions): Promise<number> {
 	const { mode, messages = [], initialMessage, initialImages, printThoughts, planYolo = false } = options;
 	let stdoutTail: Promise<void> = Promise.resolve();
+	let stderrTail: Promise<void> = Promise.resolve();
+	let durabilityFailure = false;
+	let persistenceError: Error | undefined;
+	let signalShutdown = false;
+	let pendingDispose: Promise<void> | undefined;
+	const disposeSession = (reason?: postmortem.Reason): Promise<void> => {
+		pendingDispose ??= session.dispose({
+			mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
+			reason,
+		});
+		return pendingDispose;
+	};
+	const preexistingPersistenceError = session.sessionManager.getPersistenceError?.();
 	const writeStdoutLine = (text: string): void => {
 		stdoutTail = stdoutTail.then(() => {
-			const { promise, resolve, reject } = Promise.withResolvers<void>();
-			process.stdout.write(text, err => {
-				if (err) reject(err);
-				else resolve();
-			});
+			const { promise, resolve } = Promise.withResolvers<void>();
+			try {
+				process.stdout.write(text, err => {
+					if (err) durabilityFailure = true;
+					resolve();
+				});
+			} catch {
+				durabilityFailure = true;
+				resolve();
+			}
 			return promise;
 		});
 	};
+	const writeStderrLine = (text: string): void => {
+		stderrTail = stderrTail.then(() => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			try {
+				if (
+					process.stderr.write(`${text}\n`, err => {
+						if (err) durabilityFailure = true;
+						resolve();
+					})
+				)
+					resolve();
+			} catch {
+				durabilityFailure = true;
+				resolve();
+			}
+			return promise;
+		});
+	};
+	const unsubscribePersistenceError = session.sessionManager.onPersistenceError?.(error => {
+		if (persistenceError) return;
+		persistenceError = error;
+		if (!preexistingPersistenceError)
+			writeStderrLine(`${formatPersistenceFailure(error.message)} Writes are retried.`);
+	});
+	const unregisterSignalTeardown = postmortem.register("print-session-teardown", async reason => {
+		signalShutdown ||=
+			reason === postmortem.Reason.SIGINT ||
+			reason === postmortem.Reason.SIGTERM ||
+			reason === postmortem.Reason.SIGHUP;
+		try {
+			await disposeSession(reason);
+		} finally {
+			await stdoutTail;
+			await stderrTail;
+		}
+	});
 
 	if (mode === "json") {
 		const header = session.sessionManager.getHeader();
@@ -101,6 +166,34 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		if (mode === "json") writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
 	});
 
+	const timeoutMs = resolveMCPTimeoutMs();
+	let strictMCPFailure = false;
+	if (options.mcpManager) {
+		const readiness = await options.mcpManager.waitForStartup(timeoutMs);
+		// The manager's initial callback may have fired before SDK wiring, or a
+		// reconnect may have fired it without awaiting the session mutation.
+		// Refresh is serialized by AgentSession, so turn one sees the final snapshot.
+		await session.refreshMCPTools(options.mcpManager.getTools());
+		const unavailable: string[] = [];
+		for (const name of readiness.pending) {
+			const server = singleLine(name);
+			unavailable.push(server);
+			const after = timeoutMs > 0 ? ` after ${timeoutMs}ms` : "";
+			writeStderrLine(`Warning: MCP server "${server}" not ready${after}; its tools are unavailable for this run.`);
+		}
+		for (const { name, error } of readiness.failed) {
+			const server = singleLine(name);
+			unavailable.push(server);
+			writeStderrLine(
+				`Warning: MCP server "${server}" failed to connect: ${singleLine(error)}; its tools are unavailable for this run.`,
+			);
+		}
+		if ($flag("OMP_MCP_REQUIRE_READY") && unavailable.length > 0) {
+			writeStderrLine(`Error: MCP servers not ready: ${unavailable.join(", ")}`);
+			strictMCPFailure = true;
+		}
+	}
+
 	let wroteTextWorkingIndicator = false;
 	const writeTextWorkingIndicator = (): void => {
 		if (mode !== "text" || wroteTextWorkingIndicator) return;
@@ -108,27 +201,41 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		wroteTextWorkingIndicator = true;
 	};
 
-	if (initialMessage !== undefined) {
+	// Send initial message with attachments
+	if (!strictMCPFailure && !signalShutdown && initialMessage !== undefined) {
 		writeTextWorkingIndicator();
 		if (mode === "text") session.setTextOutputCommitted(false);
 		await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
 	}
-	for (const message of messages) {
-		writeTextWorkingIndicator();
-		if (mode === "text") session.setTextOutputCommitted(false);
-		await logger.time("print:prompt:next", () => session.prompt(message));
+
+	// Send remaining messages
+	if (!strictMCPFailure) {
+		for (const message of messages) {
+			if (signalShutdown) break;
+			writeTextWorkingIndicator();
+			if (mode === "text") session.setTextOutputCommitted(false);
+			await logger.time("print:prompt:next", () => session.prompt(message));
+		}
 	}
 
 	session.prepareForHeadlessAdvisorDrain();
 	const assistantMsg = session.getLastAssistantMessage();
 	const terminalFailure =
+		!strictMCPFailure &&
 		assistantMsg !== undefined &&
-		(assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") &&
+		(assistantMsg.stopReason === "error" || (assistantMsg.stopReason === "aborted" && !signalShutdown)) &&
 		!isSilentAbort(assistantMsg);
 
-	if (mode === "text" && !terminalFailure) {
+	// In text mode, output the final response. A terminal failure prints only
+	// the error line below; JSON mode already emitted the assistant message and
+	// stop reason through the event subscription.
+	if (mode === "text" && !terminalFailure && !strictMCPFailure) {
 		if (assistantMsg) {
-			if (assistantMsg.errorMessage && assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+			if (
+				assistantMsg.errorMessage &&
+				assistantMsg.stopReason !== "error" &&
+				assistantMsg.stopReason !== "aborted"
+			) {
 				process.stderr.write(`${sanitizeText(assistantMsg.errorMessage)}\n`);
 			}
 			for (const content of assistantMsg.content) {
@@ -140,12 +247,35 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		session.setTextOutputCommitted(true);
 	}
 
-	await session.waitForAdvisorCatchup(
-		terminalFailure ? PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS : PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS,
-	);
+	// A turn-fatal exit cannot hold automation for the full normal drain budget.
+	if (!strictMCPFailure && !signalShutdown) {
+		await session.waitForAdvisorCatchup(
+			terminalFailure ? PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS : PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS,
+		);
+	}
+	// Error spans must reach the exporter; the postmortem `exit` handler can't await.
 	if (terminalFailure) await flushTelemetryExport();
 	await stdoutTail;
-	await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
+	try {
+		await disposeSession();
+	} catch (error) {
+		if (!persistenceError || error !== persistenceError) throw error;
+	} finally {
+		unsubscribePersistenceError?.();
+		unregisterSignalTeardown();
+	}
+	if (persistenceError) {
+		const currentFailure = session.sessionManager.getPersistenceError?.();
+		if (currentFailure) {
+			if (preexistingPersistenceError) writeStderrLine(formatPersistenceFailure(persistenceError.message));
+			else writeStderrLine("Session persistence failed: Session transcript is not durable.");
+			durabilityFailure = true;
+		} else if (preexistingPersistenceError) {
+			writeStderrLine(
+				`${formatPersistenceFailure(persistenceError.message)} Writes are retried; transcript recovered.`,
+			);
+		}
+	}
 
 	if (mode === "text" && terminalFailure && assistantMsg) {
 		const errorLine = sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
@@ -155,5 +285,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			await promise;
 		}
 	}
-	return terminalFailure ? 1 : 0;
+
+	await stderrTail;
+	return terminalFailure || durabilityFailure || strictMCPFailure ? 1 : 0;
 }

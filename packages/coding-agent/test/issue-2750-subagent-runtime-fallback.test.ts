@@ -216,7 +216,7 @@ describe("subagent runtime model resolution", () => {
 				setToolUIContext: () => {},
 			} as never;
 		});
-		await runSubprocess({
+		await runWithAuthority({
 			cwd: "/tmp",
 			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
 			task: "work",

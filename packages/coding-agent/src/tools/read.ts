@@ -75,6 +75,7 @@ import { postProcessToolResult, resolveOutputMaxColumns } from "./output-meta";
 import {
 	expandPath,
 	formatPathRelativeToCwd,
+	isInternalUrlPath,
 	type LineRange,
 	pathTargetsSsh,
 	probeLiteralPathExists,
@@ -645,7 +646,9 @@ export function splitImageQuestionTarget(readPath: string): { path: string; ques
 const MAX_IMAGE_SIZE = getMaxImageInputBytes();
 
 const readSchema = type({
-	path: type("string").describe("Local path, internal URI (e.g. memory://, skill://), or URL. Inline selectors are supported."),
+	path: type("string").describe(
+		"Local path, internal URI (e.g. memory://, skill://), or URL. Inline selectors are supported.",
+	),
 });
 
 const readSchemaWithoutMemory = type({
@@ -653,7 +656,7 @@ const readSchemaWithoutMemory = type({
 });
 
 const readSchemaWithoutSkills = type({
-	path: type("string").describe("Local path, internal URI, or URL. Inline selectors are supported."),
+	path: type("string").describe("Local path, internal URI (e.g. memory://), or URL. Inline selectors are supported."),
 });
 
 const readSchemaWithoutMemoryAndSkills = type({
@@ -1037,6 +1040,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const notes = [notice];
 		const content: Array<TextContent | ImageContent> = [];
 		const displayReadTargets: string[] = [];
+		const displayReadTargetLinks: Array<string | null> = [];
 		let pendingText = notice;
 		const flushText = () => {
 			if (pendingText.length === 0) return;
@@ -1050,7 +1054,23 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		for (const part of parts) {
 			try {
 				const result = await this.execute("read-delimited-part", { path: part }, signal);
-				displayReadTargets.push(result.details?.suffixResolution?.to ?? part);
+				const displayTarget = result.details?.suffixResolution?.to ?? part;
+				displayReadTargets.push(displayTarget);
+				const normalizedTarget = expandPath(displayTarget);
+				const targetPath = result.details?.resolvedPath;
+				const isNonFilesystemTarget =
+					isInternalUrlPath(normalizedTarget) ||
+					!!parseReadUrlTarget(normalizedTarget) ||
+					pathTargetsSsh(normalizedTarget);
+				displayReadTargetLinks.push(
+					targetPath ??
+						(isNonFilesystemTarget
+							? null
+							: resolveReadPath(
+									(await splitPathAndSelPreferringLiteral(normalizedTarget, this.session.cwd)).path,
+									this.session.cwd,
+								)),
+				);
 				for (const block of result.content) {
 					if (block.type === "text") {
 						appendText(block.text);
@@ -1065,12 +1085,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const errorNote = `Could not read ${part}: ${message}`;
 				notes.push(errorNote);
 				displayReadTargets.push(part);
+				displayReadTargetLinks.push(null);
 				appendText(`[${errorNote}]`);
 			}
 		}
 		flushText();
 
-		return toolResult<ReadToolDetails>({ notes, displayReadTargets }).content(content).done();
+		return toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks }).content(content).done();
 	}
 
 	/**

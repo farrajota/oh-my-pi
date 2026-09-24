@@ -30,6 +30,7 @@ export const ASYNC_PREVIEW_MAX_CHARS = 4_000;
 export interface AsyncResultEntry {
 	jobId: string;
 	result: string;
+	followUpSaveFailed?: boolean;
 	job: AsyncJob | undefined;
 	durationMs: number | undefined;
 	/**
@@ -47,6 +48,7 @@ type AsyncResultJobDetails = {
 	type?: AsyncJobType;
 	label?: string;
 	durationMs?: number;
+	followUpSaveFailed?: boolean;
 	/** Source capture metadata belongs to this job, not to the enclosing delivery report. */
 	meta?: OutputMeta;
 	/** Full structured payload (source/mode/status/data/error), when the job used an output schema. */
@@ -104,6 +106,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			type: entry.job?.type,
 			label: entry.job?.label,
 			durationMs: entry.durationMs,
+			followUpSaveFailed: entry.followUpSaveFailed,
 			meta: entry.job?.latestDetails?.meta,
 			structured,
 			structuredJson,
@@ -121,6 +124,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			type: job.type,
 			label: job.label,
 			durationMs: job.durationMs,
+			...(job.followUpSaveFailed ? { followUpSaveFailed: true } : {}),
 			...(job.meta ? { meta: job.meta } : {}),
 			...(job.structured ? { schema: job.structured } : {}),
 		})),

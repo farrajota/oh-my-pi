@@ -55,7 +55,9 @@ export class SessionMemory {
 		return this.#memoryBackendTransition;
 	}
 	get enabled(): boolean {
-		return this.#host.settings.get("memory.backend") !== "off";
+		return (
+			!!this.#memoryAgentDir && this.#memoryTaskDepth === 0 && this.#host.settings.get("memory.backend") !== "off"
+		);
 	}
 
 	/** Base prompt captured before a per-turn memory promotion. */
@@ -198,7 +200,7 @@ export class SessionMemory {
 		if (this.#host.isDisposed()) return;
 		try {
 			await this.#disposeMemoryBackendState(true, retainMnemopi);
-			if (this.#memoryAgentDir && this.#memoryTaskDepth === 0 && !this.#host.isDisposed()) {
+			if (this.#memoryAgentDir && this.enabled && !this.#host.isDisposed()) {
 				const backend = await resolveMemoryBackend(this.#host.settings);
 				await backend.start({
 					session: this.#host.memoryBackendSession(),

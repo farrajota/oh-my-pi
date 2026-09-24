@@ -1,9 +1,5 @@
 /** Compact title-model input for a user-invoked `/skill:<name>` prompt. */
-export function skillPromptTitleInput(input: {
-	name?: string;
-	args?: string;
-	queueChipText?: string;
-}): string {
+export function skillPromptTitleInput(input: { name?: string; args?: string; queueChipText?: string }): string {
 	const chip = input.queueChipText?.trim();
 	if (chip) return chip;
 	const name = input.name?.trim();

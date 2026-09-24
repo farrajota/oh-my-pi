@@ -18,7 +18,11 @@ import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import { materializeReadUrlToFile, parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
-import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
+import {
+	classifyGroupedLines,
+	formatGroupedFiles,
+	groupLineIndicesByBlank,
+} from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import { formatMatchLine } from "@oh-my-pi/pi-tui/tools/match-line-format";
 import type { OutputMeta } from "./output-meta";
 import { resolveToolSearchScope, toPathList } from "./path-utils";

@@ -9,6 +9,7 @@ import type { AsyncJobType } from "../../async";
 import type { HubAdmissionStateTransaction } from "../../internal/hub-admission";
 import type { IrcDeliveryReceipt, IrcMessage } from "../../irc/bus";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import type { StructuredSubagentOutput } from "../../task/types";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { LaunchParams, LaunchToolDetails } from "./launch";
@@ -151,6 +152,7 @@ export interface JobSnapshot {
 	status: "running" | "completed" | "failed" | "cancelled";
 	label: string;
 	durationMs: number;
+	exitCode?: number;
 	/** Effective task model selector, including an explicit reasoning suffix when configured. */
 	resolvedModel?: string;
 	/** Provider/id including routing, with no added thinking suffix. */
@@ -161,6 +163,7 @@ export interface JobSnapshot {
 	advisor?: boolean;
 	resultText?: string;
 	errorText?: string;
+	meta?: OutputMeta;
 	structured?: StructuredSubagentOutput;
 	/**
 	 * `agent://<id>` handle backing this job's artifacts — the job-row's

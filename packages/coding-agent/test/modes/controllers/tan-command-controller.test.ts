@@ -65,7 +65,6 @@ function createCloneStub(overrides?: {
 	activeToolNames?: string[];
 	enabledToolNames?: string[];
 }) {
-
 	const messages: AgentMessage[] = [];
 	const appendMessage = vi.fn((message: AgentMessage) => {
 		messages.push(message);
@@ -113,10 +112,7 @@ function createCloneStub(overrides?: {
 	};
 }
 
-function mockTanSessionCreation(
-	stub: TanCloneStub,
-	onCreate?: (options: CreateAgentSessionOptions) => void,
-) {
+function mockTanSessionCreation(stub: TanCloneStub, onCreate?: (options: CreateAgentSessionOptions) => void) {
 	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 		if (!options) throw new Error("Tan test session requires create options");
 		onCreate?.(options);
@@ -201,7 +197,10 @@ async function createContext(overrides?: {
 		session,
 	} as unknown as CreateAgentSessionResult);
 	try {
-		await createAgentRootSession(AgentRegistry.global(), { agentId: overrides?.agentId ?? MAIN_AGENT_ID, sessionManager });
+		await createAgentRootSession(AgentRegistry.global(), {
+			agentId: overrides?.agentId ?? MAIN_AGENT_ID,
+			sessionManager,
+		});
 	} finally {
 		rootCreate.mockRestore();
 	}
@@ -348,7 +347,8 @@ describe("TanCommandController", () => {
 	it("keeps the tangent alive until successive descendant results produce the final answer", async () => {
 		const harness = await createContext();
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
-		const { clone } = createCloneStub();
+		const stub = createCloneStub();
+		const { clone } = stub;
 		const firstEntered = Promise.withResolvers<void>();
 		const secondEntered = Promise.withResolvers<void>();
 		const firstResult = Promise.withResolvers<void>();
@@ -369,9 +369,7 @@ describe("TanCommandController", () => {
 			generation++;
 		});
 		clone.getLastAssistantMessage.mockImplementation(() => assistantText(answer));
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
-			session: clone,
-		} as unknown as CreateAgentSessionResult);
+		mockTanSessionCreation(stub);
 		await new TanCommandController(harness.ctx).start("integrate descendant results");
 		const run = harness.capturedRun;
 		if (!run) throw new Error("run function was not captured");
@@ -390,14 +388,14 @@ describe("TanCommandController", () => {
 			expect(await Promise.race([firstEntered.promise.then(() => "waiting"), result.then(() => "returned")])).toBe(
 				"waiting",
 			);
-			expect(clone.dispose).not.toHaveBeenCalled();
+			expect(stub.dispose).not.toHaveBeenCalled();
 			firstResult.resolve();
 			await secondEntered.promise;
 			expect(returned).toBe(false);
-			expect(clone.dispose).not.toHaveBeenCalled();
+			expect(stub.dispose).not.toHaveBeenCalled();
 			secondResult.resolve();
 			expect(await result).toBe("final answer incorporating both descendant results");
-			expect(clone.dispose).toHaveBeenCalledTimes(1);
+			expect(stub.dispose).toHaveBeenCalledTimes(1);
 		} finally {
 			firstResult.resolve();
 			secondResult.resolve();
@@ -408,7 +406,8 @@ describe("TanCommandController", () => {
 	it("cancels a tangent while descendant settlement is pending and disposes its clone", async () => {
 		const harness = await createContext();
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
-		const { clone } = createCloneStub();
+		const stub = createCloneStub();
+		const { clone } = stub;
 		const settling = Promise.withResolvers<void>();
 		const settled = Promise.withResolvers<void>();
 		clone.hasPendingAsyncWork.mockReturnValue(true);
@@ -416,9 +415,7 @@ describe("TanCommandController", () => {
 			settling.resolve();
 			await settled.promise;
 		});
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
-			session: clone,
-		} as unknown as CreateAgentSessionResult);
+		mockTanSessionCreation(stub);
 		await new TanCommandController(harness.ctx).start("wait for a descendant");
 		const run = harness.capturedRun;
 		if (!run) throw new Error("run function was not captured");
@@ -429,7 +426,7 @@ describe("TanCommandController", () => {
 			abort.abort();
 			await expect(result).rejects.toThrow();
 			expect(clone.abort).toHaveBeenCalledTimes(1);
-			expect(clone.dispose).toHaveBeenCalledTimes(1);
+			expect(stub.dispose).toHaveBeenCalledTimes(1);
 			expect(clone.getLastAssistantMessage).not.toHaveBeenCalled();
 		} finally {
 			clone.hasPendingAsyncWork.mockReturnValue(false);
@@ -665,7 +662,6 @@ describe("TanCommandController", () => {
 		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: enabledToolNames }));
 	});
 
-
 	it("restores the request when compaction summarizes an already-dispatched turn", async () => {
 		const harness = await createContext();
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
@@ -727,9 +723,7 @@ describe("TanCommandController", () => {
 				compacted.resolve();
 			},
 		});
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
-			session: stub.clone,
-		} as unknown as CreateAgentSessionResult);
+		mockTanSessionCreation(stub);
 		const controller = new TanCommandController(harness.ctx);
 
 		await controller.start("follow the tangent");
@@ -763,9 +757,7 @@ describe("TanCommandController", () => {
 				compacted.resolve();
 			},
 		});
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
-			session: stub.clone,
-		} as unknown as CreateAgentSessionResult);
+		mockTanSessionCreation(stub);
 		const controller = new TanCommandController(harness.ctx);
 
 		await controller.start("follow the tangent");

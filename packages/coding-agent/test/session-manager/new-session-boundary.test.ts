@@ -159,4 +159,27 @@ describe("SessionManager.continueRecent /new boundary", () => {
 			await relaunched.close();
 		}
 	});
+
+	it("does not let a foreign project's fresh breadcrumb hide local work", async () => {
+		const local = SessionManager.create(cwd);
+		local.appendMessage({ role: "user", content: "local work", timestamp: 1 });
+		local.appendMessage(makeAssistantMessage());
+		await local.flush();
+		const localFile = local.getSessionFile();
+		await local.close();
+
+		const foreignCwd = path.join(testAgentDir, "foreign-project");
+		fs.mkdirSync(foreignCwd, { recursive: true });
+		const foreign = SessionManager.create(foreignCwd);
+		expect(fs.existsSync(foreign.getSessionFile()!)).toBe(false);
+		await foreign.close();
+
+		const resumed = await SessionManager.continueRecent(cwd);
+		try {
+			expect(resumed.getSessionFile()).toBe(localFile);
+			expect(JSON.stringify(resumed.getEntries())).toContain("local work");
+		} finally {
+			await resumed.close();
+		}
+	});
 });

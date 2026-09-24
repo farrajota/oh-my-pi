@@ -77,12 +77,10 @@ async function createRef(sessionFile: string, options: FixtureOptions = {}): Pro
 	if (!fixtureRegistry) {
 		fixtureSettings = Settings.isolated({}, { cwd: path.dirname(sessionFile), agentDir: path.dirname(sessionFile) });
 		fixtureAuthStorage = await AuthStorage.create(":memory:");
-		fixtureAuthStorage.setRuntimeApiKey("anthropic", "test-key");
-		fixtureModelRegistry = new ModelRegistry(
-			fixtureAuthStorage,
-			path.join(path.dirname(sessionFile), "models.yml"),
-			{ settings: fixtureSettings },
-		);
+		fixtureAuthStorage.keys.setRuntime("anthropic", "test-key");
+		fixtureModelRegistry = new ModelRegistry(fixtureAuthStorage, path.join(path.dirname(sessionFile), "models.yml"), {
+			settings: fixtureSettings,
+		});
 		fixtureRegistry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
 		AgentRegistry.installGlobal(fixtureRegistry);
 		await createAgentRootSession(fixtureRegistry, {
@@ -361,7 +359,6 @@ async function createPersistedSession(
 	return sessionFile;
 }
 
-
 interface ReviveOwnerOptions {
 	extensionRoots?: () => EffectiveExtensionRoots;
 	preparedExtensions?: readonly PreparedExtension[];
@@ -386,18 +383,22 @@ function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptio
 				get: () => owner.preparedExtensions,
 			});
 		}
-		const session = parentSession ?? ({
-			sessionManager: { getCwd: () => cwd, getArtifactManager: () => undefined },
-			get sessionFile() {
-				return path.join(cwd, "parent.jsonl");
-			},
-			get effectiveExtensionRoots() {
-				return owner.extensionRoots?.() ?? { explicit: [], mode: "merge", configured: [], configuredLevel: "user" };
-			},
-			get preparedExtensions() {
-				return owner.preparedExtensions;
-			},
-		} as unknown as AgentSession);
+		const session =
+			parentSession ??
+			({
+				sessionManager: { getCwd: () => cwd, getArtifactManager: () => undefined },
+				get sessionFile() {
+					return path.join(cwd, "parent.jsonl");
+				},
+				get effectiveExtensionRoots() {
+					return (
+						owner.extensionRoots?.() ?? { explicit: [], mode: "merge", configured: [], configuredLevel: "user" }
+					);
+				},
+				get preparedExtensions() {
+					return owner.preparedExtensions;
+				},
+			} as unknown as AgentSession);
 		const fallback = fakeAuthAndRegistry();
 		const modelRegistry = owner.modelRegistry ?? fixtureModelRegistry ?? fallback.modelRegistry;
 		const authStorage = owner.authStorage ?? modelRegistry.authStorage;
@@ -414,7 +415,6 @@ function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptio
 		})(ref);
 	};
 }
-
 
 afterEach(async () => {
 	vi.restoreAllMocks();
@@ -693,6 +693,7 @@ describe("persisted subagent revival", () => {
 			configuredLevel: "project",
 		};
 		const ref = await createRef(sessionFile);
+		MCPManager.setInstance(new MCPManager(cwd));
 		const reviver = await createFactory(cwd, undefined, { extensionRoots: () => extensionRoots })(ref);
 		if (!reviver) throw new Error("Expected a persisted reviver");
 
@@ -754,7 +755,7 @@ describe("persisted subagent revival", () => {
 			},
 		];
 		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
 		const ref = await createRef(sessionFile);
 		const reviver = await createFactory(cwd, undefined, {
@@ -1536,92 +1537,89 @@ describe("persisted subagent revival", () => {
 });
 
 describe("fail-closed revival", () => {
-		function entryType(line: string): string | undefined {
-			const parsed: { type?: string } = JSON.parse(line);
-			return parsed.type;
-		}
+	function entryType(line: string): string | undefined {
+		const parsed: { type?: string } = JSON.parse(line);
+		return parsed.type;
+	}
 
-		async function entriesOfType(
-			sessionFile: string,
-			keep: (type: string | undefined) => boolean,
-		): Promise<string[]> {
-			return (await Bun.file(sessionFile).text())
-				.split("\n")
-				.filter(line => line.trim().length > 0 && keep(entryType(line)));
-		}
+	async function entriesOfType(sessionFile: string, keep: (type: string | undefined) => boolean): Promise<string[]> {
+		return (await Bun.file(sessionFile).text())
+			.split("\n")
+			.filter(line => line.trim().length > 0 && keep(entryType(line)));
+	}
 
-		it("refuses a transcript that vanished between the peek and the locked open", async () => {
-			const cwd = makeTempDir("@pi-revive-vanished-");
-			const sessionFile = await createPersistedSession(cwd);
-			const ref = await createRef(sessionFile);
-			// The factory's lock-free peek succeeds here; the file disappears
-			// before the reviver takes the single-writer lock.
-			const reviver = await createFactory(cwd)(ref);
-			if (!reviver) throw new Error("Expected a persisted reviver");
-			await fs.rm(sessionFile);
+	it("refuses a transcript that vanished between the peek and the locked open", async () => {
+		const cwd = makeTempDir("@pi-revive-vanished-");
+		const sessionFile = await createPersistedSession(cwd);
+		const ref = await createRef(sessionFile);
+		// The factory's lock-free peek succeeds here; the file disappears
+		// before the reviver takes the single-writer lock.
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await fs.rm(sessionFile);
 
+		await expect(reviver(ref)).rejects.toThrow(/ENOENT/);
+		// Fail closed without minting: the missing path stays missing.
+		expect(await Bun.file(sessionFile).exists()).toBe(false);
+	});
+
+	it("refuses a transcript deleted between open's snapshot read and its adoption", async () => {
+		const cwd = makeTempDir("@pi-revive-stale-read-");
+		const sessionFile = await createPersistedSession(cwd);
+		const ref = await createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		// Delete the transcript from inside its own snapshot read: open()
+		// has resolved loadSessionFile but has not adopted the snapshot
+		// yet, so the reviver must fail closed on the fresh state instead
+		// of reviving stale history. Single-shot: only the snapshot read
+		// mutates, so the publish-time re-read observes the deletion.
+		const originalReadText = FileSessionStorage.prototype.readText;
+		const readTextSpy = vi.spyOn(FileSessionStorage.prototype, "readText").mockImplementationOnce(async function (
+			this: FileSessionStorage,
+			p: string,
+		) {
+			const text = await originalReadText.call(this, p);
+			await fs.rm(p);
+			return text;
+		});
+		try {
 			await expect(reviver(ref)).rejects.toThrow(/ENOENT/);
 			// Fail closed without minting: the missing path stays missing.
 			expect(await Bun.file(sessionFile).exists()).toBe(false);
-		});
+		} finally {
+			readTextSpy.mockRestore();
+		}
+	});
 
-		it("refuses a transcript deleted between open's snapshot read and its adoption", async () => {
-			const cwd = makeTempDir("@pi-revive-stale-read-");
-			const sessionFile = await createPersistedSession(cwd);
-			const ref = await createRef(sessionFile);
-			const reviver = await createFactory(cwd)(ref);
-			if (!reviver) throw new Error("Expected a persisted reviver");
-			// Delete the transcript from inside its own snapshot read: open()
-			// has resolved loadSessionFile but has not adopted the snapshot
-			// yet, so the reviver must fail closed on the fresh state instead
-			// of reviving stale history. Single-shot: only the snapshot read
-			// mutates, so the publish-time re-read observes the deletion.
-			const originalReadText = FileSessionStorage.prototype.readText;
-			const readTextSpy = vi.spyOn(FileSessionStorage.prototype, "readText").mockImplementationOnce(async function (
-				this: FileSessionStorage,
-				p: string,
-			) {
-				const text = await originalReadText.call(this, p);
-				await fs.rm(p);
-				return text;
-			});
-			try {
-				await expect(reviver(ref)).rejects.toThrow(/ENOENT/);
-				// Fail closed without minting: the missing path stays missing.
-				expect(await Bun.file(sessionFile).exists()).toBe(false);
-			} finally {
-				readTextSpy.mockRestore();
-			}
-		});
+	it("refuses a transcript truncated to header+session_init without rewriting it", async () => {
+		const cwd = makeTempDir("@pi-revive-truncated-");
+		const sessionFile = await createPersistedSession(cwd);
+		const truncated = `${(await entriesOfType(sessionFile, type => type === "session" || type === "session_init")).join("\n")}\n`;
+		await Bun.write(sessionFile, truncated);
+		const ref = await createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
 
-		it("refuses a transcript truncated to header+session_init without rewriting it", async () => {
-			const cwd = makeTempDir("@pi-revive-truncated-");
-			const sessionFile = await createPersistedSession(cwd);
-			const truncated = `${(await entriesOfType(sessionFile, type => type === "session" || type === "session_init")).join("\n")}\n`;
-			await Bun.write(sessionFile, truncated);
-			const ref = await createRef(sessionFile);
-			const reviver = await createFactory(cwd)(ref);
-			if (!reviver) throw new Error("Expected a persisted reviver");
+		await expect(reviver(ref)).rejects.toThrow(/no message history/);
+		// The parked transcript is evidence, not scratch space: untouched.
+		expect(await Bun.file(sessionFile).text()).toBe(truncated);
+	});
 
-			await expect(reviver(ref)).rejects.toThrow(/no message history/);
-			// The parked transcript is evidence, not scratch space: untouched.
-			expect(await Bun.file(sessionFile).text()).toBe(truncated);
-		});
+	it("rebuilds the contract from the reopened file, not the stale peek capture", async () => {
+		const cwd = makeTempDir("@pi-revive-contract-");
+		const sessionFile = await createPersistedSession(cwd);
+		const ref = await createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		// The file is replaced after the peek: same messages, no session_init.
+		const withoutInit = `${(await entriesOfType(sessionFile, type => type !== "session_init")).join("\n")}\n`;
+		await Bun.write(sessionFile, withoutInit);
 
-		it("rebuilds the contract from the reopened file, not the stale peek capture", async () => {
-			const cwd = makeTempDir("@pi-revive-contract-");
-			const sessionFile = await createPersistedSession(cwd);
-			const ref = await createRef(sessionFile);
-			const reviver = await createFactory(cwd)(ref);
-			if (!reviver) throw new Error("Expected a persisted reviver");
-			// The file is replaced after the peek: same messages, no session_init.
-			const withoutInit = `${(await entriesOfType(sessionFile, type => type !== "session_init")).join("\n")}\n`;
-			await Bun.write(sessionFile, withoutInit);
-
-			await expect(reviver(ref)).rejects.toThrow(/no persisted session contract/);
-			expect(await Bun.file(sessionFile).text()).toBe(withoutInit);
-		});
-		it("restores the complete frozen permission scope and exact profile provenance", async () => {
+		await expect(reviver(ref)).rejects.toThrow(/no persisted session contract/);
+		expect(await Bun.file(sessionFile).text()).toBe(withoutInit);
+	});
+	it("restores the complete frozen permission scope and exact profile provenance", async () => {
 		const cwd = makeTempDir("@pi-permission-revive-");
 		await fs.mkdir(path.join(cwd, ".omp"), { recursive: true });
 		await fs.writeFile(

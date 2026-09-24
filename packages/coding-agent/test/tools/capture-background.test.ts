@@ -2,12 +2,13 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as evalIndex from "@oh-my-pi/pi-coding-agent/eval";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
@@ -20,8 +21,29 @@ import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-m
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createHubAuthorityFixture, type HubAuthorityFixture } from "./hub-fixtures";
 
-function sessionFor(root: string, manager?: AsyncJobManager): ToolSession {
+function captureSettings(snapshot = false): Settings {
+	return Settings.isolated({
+		"async.enabled": true,
+		"bashInterceptor.enabled": false,
+		"bash.autoBackground.enabled": false,
+		"eval.autoBackground.enabled": true,
+		"eval.autoBackground.thresholdMs": 0,
+		"tools.outputMaxColumns": 8,
+		...(snapshot
+			? {
+					"tools.artifactSpillThreshold": 1,
+					"tools.artifactHeadBytes": 1,
+					"tools.artifactTailBytes": 1,
+					"tools.artifactTailLines": 10,
+					"tools.outputMaxColumns": 0,
+				}
+			: {}),
+	});
+}
+
+function sessionFor(root: string): ToolSession {
 	return {
 		cwd: root,
 		hasUI: false,
@@ -30,26 +52,31 @@ function sessionFor(root: string, manager?: AsyncJobManager): ToolSession {
 		getArtifactsDir: () => path.join(root, "artifacts"),
 		getSessionId: () => "capture-regression",
 		allocateOutputArtifact: async () => ({ path: root, id: "failed" }),
-		asyncJobManager: manager,
-		settings: Settings.isolated({
-			"async.enabled": true,
-			"bashInterceptor.enabled": false,
-			"bash.autoBackground.enabled": false,
-			"eval.autoBackground.enabled": true,
-			"eval.autoBackground.thresholdMs": 0,
-			"tools.outputMaxColumns": 8,
-		}),
+		settings: captureSettings(),
 	};
 }
 
-function snapshotSessionFor(root: string, manager: AsyncJobManager, store: SessionManager): ToolSession {
-	store.adoptArtifactManager(new ArtifactManager(path.join(root, "artifacts")));
-	const session = sessionFor(root, manager);
-	session.settings.override("tools.artifactSpillThreshold", 1);
-	session.settings.override("tools.artifactHeadBytes", 1);
-	session.settings.override("tools.artifactTailBytes", 1);
-	session.settings.override("tools.artifactTailLines", 10);
-	session.settings.override("tools.outputMaxColumns", 0);
+function registeredSessionFor(
+	fixture: HubAuthorityFixture,
+	id: string,
+	manager: AsyncJobManager,
+): ToolSession & { sessionManager: SessionManager } {
+	const session = fixture.createToolSession(id);
+	session.asyncJobManager = manager;
+	session.settings = captureSettings();
+	return session;
+}
+
+function snapshotSessionFor(
+	fixture: HubAuthorityFixture,
+	id: string,
+	manager: AsyncJobManager,
+): ToolSession & { sessionManager: SessionManager } {
+	const session = registeredSessionFor(fixture, id, manager);
+	session.settings = captureSettings(true);
+	const store = session.sessionManager;
+	if (!store) throw new Error("Expected a registered session manager");
+	store.adoptArtifactManager(new ArtifactManager(path.join(session.cwd, "artifacts")));
 	session.localProtocolOptions = {
 		getArtifactsDir: () => store.getArtifactsDir(),
 		getSessionId: () => store.getSessionId(),
@@ -57,7 +84,14 @@ function snapshotSessionFor(root: string, manager: AsyncJobManager, store: Sessi
 	return session;
 }
 
-function registerResult(manager: AsyncJobManager, id: string, text: string, meta?: OutputMeta, failed = false): string {
+function registerResult(
+	manager: AsyncJobManager,
+	id: string,
+	text: string,
+	ownerId: string,
+	meta?: OutputMeta,
+	failed = false,
+): string {
 	const jobId = manager.register(
 		"bash",
 		id,
@@ -67,7 +101,7 @@ function registerResult(manager: AsyncJobManager, id: string, text: string, meta
 			if (failed) throw new Error(result);
 			return result;
 		},
-		{ id },
+		{ id, ownerId },
 	);
 	manager.acknowledgeDeliveries([jobId]);
 	return jobId;
@@ -110,13 +144,13 @@ describe("capture failure across background and cancellation boundaries", () => 
 	it("delivers capture warnings for successful async bash without changing its outcome", async () => {
 		await using temp = await TempDir.create("@capture-background-bash-");
 		const deliveries: string[] = [];
-		const manager = new AsyncJobManager({
-			onJobComplete: async (_id, text) => {
-				deliveries.push(text);
-			},
+		const manager = new AsyncJobManager({});
+		const unregister = manager.registerDeliverySink("capture-bash", (_id, text) => {
+			deliveries.push(text);
 		});
-		const session = sessionFor(temp.path(), manager);
-		const sessionManager = SessionManager.inMemory(temp.path());
+		const fixture = await createHubAuthorityFixture(new AgentRegistry(), "capture-bash");
+		const session = registeredSessionFor(fixture, "capture-bash", manager);
+		session.allocateOutputArtifact = async () => ({ path: temp.path(), id: "failed" });
 		try {
 			vi.spyOn(bashExecutor, "executeBash").mockResolvedValue({
 				output: "x".repeat(20_000),
@@ -139,30 +173,31 @@ describe("capture failure across background and cancellation boundaries", () => 
 			expect(deliveries[0]).toContain("not saved completely");
 			expect(deliveries[0]).not.toContain("artifact://");
 		} finally {
+			unregister();
 			await manager.dispose();
-			await sessionManager.close();
+			await fixture.dispose();
 		}
 	});
 
 	it("keeps a mixed snapshot's complete job result recoverable after both results are consumed", async () => {
-		await using temp = await TempDir.create("@capture-mixed-snapshot-");
+		const rootId = "capture-mixed";
+		const fixture = await createHubAuthorityFixture(new AgentRegistry(), rootId);
 		const deliveries: string[] = [];
-		const manager = new AsyncJobManager({
-			onJobComplete: (_id, text) => {
-				deliveries.push(text);
-			},
+		const manager = new AsyncJobManager({});
+		const unregister = manager.registerDeliverySink(rootId, (_id, text) => {
+			deliveries.push(text);
 		});
-		const store = SessionManager.inMemory(temp.path());
-		const session = snapshotSessionFor(temp.path(), manager, store);
+		const session = snapshotSessionFor(fixture, rootId, manager);
+		const store = session.sessionManager;
 		const context = { sessionManager: store, settings: session.settings } as unknown as AgentToolContext;
 		const tool = wrapToolWithMetaNotice(new HubTool(session));
 		const reader = wrapToolWithMetaNotice(new ReadTool(session));
 		const marker = "COMPLETE-JOB-UNIQUE-MIDDLE-MARKER";
 		const complete = `${"healthy head line\n".repeat(300)}${marker}\n${"healthy tail line\n".repeat(300)}`;
-		const failedCaptureId = registerResult(manager, "failed-capture", "surviving preview", {
+		const failedCaptureId = registerResult(manager, "failed-capture", "surviving preview", rootId, {
 			artifactError: "write",
 		});
-		const completeId = registerResult(manager, "complete-capture", complete);
+		const completeId = registerResult(manager, "complete-capture", complete, rootId);
 		try {
 			await Promise.all([manager.getJob(failedCaptureId)!.promise, manager.getJob(completeId)!.promise]);
 			const snapshot = await tool.execute(
@@ -205,21 +240,26 @@ describe("capture failure across background and cancellation boundaries", () => 
 			const reread = await reader.execute("recover-again", { path: `${artifactUrl}:raw:1-1000` });
 			expect(reread.content.map(block => (block.type === "text" ? block.text : "")).join("\n")).toContain(complete);
 		} finally {
+			unregister();
 			await manager.dispose();
-			await store.close();
+			await fixture.dispose();
 		}
 	});
 
 	it("shows each short job capture warning once in model text and live or rebuilt Hub rows", async () => {
-		await using temp = await TempDir.create("@capture-short-snapshot-");
+		const rootId = "capture-short";
+		const fixture = await createHubAuthorityFixture(new AgentRegistry(), rootId);
 		const manager = new AsyncJobManager({});
-		const store = SessionManager.inMemory(temp.path());
-		const session = snapshotSessionFor(temp.path(), manager, store);
-		const successful = registerResult(manager, "successful-command", "success preview", { artifactError: "open" });
+		const session = snapshotSessionFor(fixture, rootId, manager);
+		const store = session.sessionManager;
+		const successful = registerResult(manager, "successful-command", "success preview", rootId, {
+			artifactError: "open",
+		});
 		const failed = registerResult(
 			manager,
 			"failed-command",
 			"Command exited with code 7",
+			rootId,
 			{ artifactError: "write" },
 			true,
 		);
@@ -255,7 +295,7 @@ describe("capture failure across background and cancellation boundaries", () => 
 			}
 		} finally {
 			await manager.dispose();
-			await store.close();
+			await fixture.dispose();
 		}
 	});
 
@@ -326,12 +366,13 @@ describe("capture failure across background and cancellation boundaries", () => 
 	});
 
 	it("spills a single incomplete job as a report without advertising its preview as the full command log", async () => {
-		await using temp = await TempDir.create("@capture-single-snapshot-");
+		const rootId = "capture-single";
+		const fixture = await createHubAuthorityFixture(new AgentRegistry(), rootId);
 		const manager = new AsyncJobManager({});
-		const store = SessionManager.inMemory(temp.path());
-		const session = snapshotSessionFor(temp.path(), manager, store);
+		const session = snapshotSessionFor(fixture, rootId, manager);
+		const store = session.sessionManager;
 		const preview = `${"surviving head\n".repeat(100)}PREVIEW-MIDDLE\n${"surviving tail\n".repeat(100)}Command exited with code 7`;
-		const id = registerResult(manager, "single-failed-command", preview, { artifactError: "end" }, true);
+		const id = registerResult(manager, "single-failed-command", preview, rootId, { artifactError: "end" }, true);
 		try {
 			await manager.getJob(id)!.promise;
 			const snapshot = await wrapToolWithMetaNotice(new HubTool(session)).execute(
@@ -355,18 +396,20 @@ describe("capture failure across background and cancellation boundaries", () => 
 			expect(recovered.match(/artifact end failed/g)).toHaveLength(1);
 		} finally {
 			await manager.dispose();
-			await store.close();
+			await fixture.dispose();
 		}
 	});
 
 	it("delivers an eval background capture failure without failing the completed cell", async () => {
 		await using temp = await TempDir.create("@capture-background-eval-");
 		const deliveries: string[] = [];
-		const manager = new AsyncJobManager({
-			onJobComplete: async (_id, text) => {
-				deliveries.push(text);
-			},
+		const manager = new AsyncJobManager({});
+		const unregister = manager.registerDeliverySink("capture-eval", (_id, text) => {
+			deliveries.push(text);
 		});
+		const fixture = await createHubAuthorityFixture(new AgentRegistry(), "capture-eval");
+		const session = registeredSessionFor(fixture, "capture-eval", manager);
+		session.allocateOutputArtifact = async () => ({ path: temp.path(), id: "failed" });
 		try {
 			const gate = Promise.withResolvers<void>();
 			vi.spyOn(evalIndex.jsBackend, "execute").mockImplementation(async (_code, options) => {
@@ -385,7 +428,7 @@ describe("capture failure across background and cancellation boundaries", () => 
 					artifactId: undefined,
 				};
 			});
-			const result = await new EvalTool(sessionFor(temp.path(), manager)).execute("eval", {
+			const result = await new EvalTool(session).execute("eval", {
 				language: "js",
 				code: "display('example')",
 			});
@@ -399,7 +442,9 @@ describe("capture failure across background and cancellation boundaries", () => 
 			expect(deliveries[0]).toContain("not saved completely");
 			expect(deliveries[0]).not.toContain("artifact://");
 		} finally {
+			unregister();
 			await manager.dispose();
+			await fixture.dispose();
 		}
 	});
 });

@@ -27,8 +27,16 @@ import {
 } from "./agent-activity";
 import type { KeyId } from "../app-keybindings";
 import type { MessageRenderer } from "../chat/extension-types";
-import type { AgentLifecycleLike, IrcBusLike } from "./agent-hub-types";
-import { type AgentRecordLike, type AgentHubRegistry, type AgentStatus, MAIN_AGENT_ID } from "./agent-hub-types";
+import {
+	type AgentHubSessionFacts,
+	type AgentHubLiveMetrics,
+	type AgentLifecycleLike,
+	type IrcBusLike,
+	type AgentRecordLike,
+	type AgentHubRegistry,
+	type AgentStatus,
+	MAIN_AGENT_ID,
+} from "./agent-hub-types";
 import { USER_INTERRUPT_LABEL } from "../chat/messages";
 import { shortenPath, truncateToWidth } from "../render/render-utils";
 import { formatLocalDateTimeWithOffset } from "../chrome/local-date";
@@ -80,6 +88,20 @@ type ActivityScope = "all" | "agent" | "subtree";
 
 type HubViewMode = "roster" | "tree";
 
+interface CapturedRowOrder {
+	order: number;
+	rootId?: string;
+	generation?: number;
+	createdAt: number;
+}
+
+function matchesRowGeneration(captured: CapturedRowOrder, ref: AgentRecordLike): boolean {
+	if (captured.generation !== undefined || ref.lineage?.generation !== undefined) {
+		return captured.generation === ref.lineage?.generation && captured.rootId === ref.lineage?.rootId;
+	}
+	return captured.createdAt === ref.createdAt;
+}
+
 /** Refresh cadence for the relative-time column. */
 const AGE_TICK_MS = 5_000;
 const DATA_CHANGE_RENDER_COALESCE_MS = 100;
@@ -110,6 +132,65 @@ function activityClock(timestamp: number): string {
 		hour12: false,
 	});
 }
+
+function permissionOmittedCount(value: unknown): number {
+	if (!value || typeof value !== "object") return 0;
+	const count = (value as Record<string, unknown>).omittedCount;
+	return typeof count === "number" && Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+}
+
+function permissionItems(value: unknown, field?: "code"): { items: string[]; omitted: number } {
+	if (!value || typeof value !== "object") return { items: [], omitted: 0 };
+	const source = value as Record<string, unknown>;
+	const listed = Array.isArray(source.items) ? source.items : [];
+	const items: string[] = [];
+	for (let index = 0; index < listed.length && index < 4; index++) {
+		const item = listed[index];
+		const candidate = field
+			? item && typeof item === "object"
+				? (item as Record<string, unknown>)[field]
+				: undefined
+			: item;
+		if (typeof candidate !== "string") continue;
+		const label = sanitizeDisplaySingleLine(candidate).trim();
+		if (label) items.push(truncateToWidth(label, 40));
+	}
+	return {
+		items,
+		omitted: permissionOmittedCount(source) + Math.max(0, listed.length - 4),
+	};
+}
+
+function permissionSummaryLines(value: unknown): string[] {
+	if (!value || typeof value !== "object") return [];
+	const summary = value as Record<string, unknown>;
+	const lines: string[] = [];
+	if (typeof summary.mode === "string") {
+		const mode = truncateToWidth(sanitizeDisplaySingleLine(summary.mode), 24);
+		if (mode) lines.push(`Permissions: mode ${mode}`);
+	}
+	const profiles = permissionItems(summary.profiles);
+	if (profiles.items.length > 0 || profiles.omitted > 0) {
+		const omitted = profiles.omitted > 0 ? ` (+${formatNumber(profiles.omitted)} omitted)` : "";
+		lines.push(`Profiles: ${profiles.items.join(", ")}${omitted}`);
+	}
+	const omittedClauses = permissionOmittedCount(summary.clauses);
+	if (omittedClauses > 0) lines.push(`Clauses omitted: ${formatNumber(omittedClauses)}`);
+	const recentDenials = permissionItems(summary.recentDenials, "code");
+	if (recentDenials.items.length > 0 || recentDenials.omitted > 0) {
+		const omitted = recentDenials.omitted > 0 ? ` (+${formatNumber(recentDenials.omitted)} omitted)` : "";
+		lines.push(`Recent denial codes: ${recentDenials.items.join(", ")}${omitted}`);
+	}
+	const guardrails = summary.guardrails;
+	if (guardrails && typeof guardrails === "object") {
+		const source = guardrails as Record<string, unknown>;
+		const active: string[] = [];
+		if (source.noNetwork === true) active.push("no network");
+		if (source.secretsBlind === true) active.push("secrets blind");
+		if (active.length > 0) lines.push(`Guardrails: ${active.join(", ")}`);
+	}
+	return lines;
+}
 /** Result of one host-backed transcript read for the Agent Hub viewer. */
 export interface AgentHubRemoteTranscript {
 	text: string;
@@ -132,6 +213,8 @@ export interface AgentHubDeps<TRecord extends AgentRecordLike = AgentRecordLike>
 	observers: SessionObserverRegistry;
 	/** Resolve the current display metadata for a model role. */
 	getRoleInfo?: (role: string) => AgentRoleDisplay;
+	getSessionFacts?: (id: string) => AgentHubSessionFacts | undefined;
+	getLiveMetrics?: (id: string, sample: boolean) => AgentHubLiveMetrics | undefined;
 	/** Host-backed transcript parsing and local reads. */
 	transcript: AgentTranscriptSource;
 	/** Register persisted roster entries while the overlay remains alive. */
@@ -183,6 +266,8 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	#registry: AgentHubRegistry<TRecord>;
 	#observers: SessionObserverRegistry;
 	#getRoleInfo: ((role: string) => AgentRoleDisplay) | undefined;
+	#getSessionFacts: ((id: string) => AgentHubSessionFacts | undefined) | undefined;
+	#getLiveMetrics: ((id: string, sample: boolean) => AgentHubLiveMetrics | undefined) | undefined;
 	#transcript: AgentTranscriptSource;
 	#irc: IrcBusLike;
 	#lifecycle: () => AgentLifecycleLike<TRecord>;
@@ -218,7 +303,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	/** Stable roster order captured on first refresh: keyboard navigation must
 	 *  not jump as agents heartbeat. Existing agent generations keep their rank
 	 *  while the hub is open; newly appearing generations append at the end. */
-	#rowOrder: Map<TRecord, number> | undefined;
+	#rowOrder: Map<string, CapturedRowOrder> | undefined;
 	#nextRowOrder = 0;
 	#hoveredRow: number | null = null;
 	/** Per-render screen-line to agent-row map, shared by click and hover routing. */
@@ -250,6 +335,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	#childrenByParent = new Map<string, TRecord[]>();
 	/** Transcript-derived fallback stats are sampled only on the bounded age cadence. */
 	#sessionMetrics = new WeakMap<object, { metrics: AgentMetrics | undefined }>();
+	#liveMetrics = new Map<string, AgentHubLiveMetrics>();
 	/** Avoid a cadence-time row scan for the common persisted-only roster. */
 	#hasFallbackLiveSessions = false;
 	/** On narrow terminals Tab replaces the roster with the selected-agent inspector. */
@@ -318,6 +404,8 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		this.#registry = deps.registry;
 		this.#observers = deps.observers;
 		this.#getRoleInfo = deps.getRoleInfo;
+		this.#getSessionFacts = deps.getSessionFacts;
+		this.#getLiveMetrics = deps.getLiveMetrics;
 		this.#transcript = deps.transcript;
 		this.#irc = deps.irc;
 		this.#lifecycle = deps.lifecycle;
@@ -559,17 +647,35 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			);
 			if (!this.#loadingPersistedSubagents && ordered.length > 0) {
 				this.#rowOrder = new Map();
-				for (const ref of ordered) this.#rowOrder.set(ref, this.#nextRowOrder++);
+				for (const ref of ordered) {
+					this.#rowOrder.set(ref.id, {
+						order: this.#nextRowOrder++,
+						rootId: ref.lineage?.rootId,
+						generation: ref.lineage?.generation,
+						createdAt: ref.createdAt,
+					});
+				}
 			}
 		} else {
-			for (const rankedRef of rowOrder.keys()) {
-				if (!refs.includes(rankedRef)) rowOrder.delete(rankedRef);
+			const refsById = new Map(refs.map(ref => [ref.id, ref]));
+			for (const [id, captured] of rowOrder) {
+				const ref = refsById.get(id);
+				if (!ref || !matchesRowGeneration(captured, ref)) rowOrder.delete(id);
 			}
 			ordered = refs.sort(
-				(a, b) => (rowOrder.get(a) ?? Number.MAX_SAFE_INTEGER) - (rowOrder.get(b) ?? Number.MAX_SAFE_INTEGER),
+				(a, b) =>
+					(rowOrder.get(a.id)?.order ?? Number.MAX_SAFE_INTEGER) -
+					(rowOrder.get(b.id)?.order ?? Number.MAX_SAFE_INTEGER),
 			);
 			for (const ref of ordered) {
-				if (!rowOrder.has(ref)) rowOrder.set(ref, this.#nextRowOrder++);
+				if (!rowOrder.has(ref.id)) {
+					rowOrder.set(ref.id, {
+						order: this.#nextRowOrder++,
+						rootId: ref.lineage?.rootId,
+						generation: ref.lineage?.generation,
+						createdAt: ref.createdAt,
+					});
+				}
 			}
 		}
 		const query = this.#agentFilter.trim();
@@ -691,6 +797,10 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	#metricsFor(ref: TRecord, observed: ObservableSession | undefined): AgentMetrics | undefined {
 		if (observed?.progress) return progressMetrics(observed);
 		if (ref.history?.metrics) return ref.history.metrics;
+		if (this.#getLiveMetrics) {
+			const current = this.#getLiveMetrics(ref.id, false);
+			return current?.generation === this.#liveMetrics.get(ref.id)?.generation ? current?.metrics : undefined;
+		}
 		const session = this.#fallbackStatsSession(ref, observed);
 		return session ? this.#sessionMetrics.get(session)?.metrics : undefined;
 	}
@@ -1028,6 +1138,8 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			metricsFor: (ref, observed) => this.#metricsFor(ref, observed),
 			fallbackStatsSession: (ref, observed) => this.#fallbackStatsSession(ref, observed),
 			sessionMetrics: this.#sessionMetrics,
+			getLiveMetrics: this.#getLiveMetrics,
+			liveMetrics: this.#liveMetrics,
 			refreshFallback,
 		});
 		this.#aggregate = result.metrics;
@@ -1073,7 +1185,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		const modelDetails: string[] = [];
 		const modelRole = progress?.modelRole ?? ref.history?.modelRole;
 		if (modelRole && this.#getRoleInfo) modelDetails.push(formatRoleBadge(modelRole, this.#getRoleInfo(modelRole)));
-		const badge = modelBadge(ref, observed);
+		const badge = modelBadge(ref, observed, this.#getSessionFacts?.(ref.id));
 		if (badge) modelDetails.push(badge);
 		if (modelDetails.length > 0) add(modelDetails.join(theme.sep.dot));
 
@@ -1102,6 +1214,15 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			}
 		} else {
 			add(theme.fg("dim", "usage —"));
+		}
+
+		const progressPermissionSummary = progress
+			? (progress as typeof progress & { permissionSummary?: unknown }).permissionSummary
+			: undefined;
+		const permissionLines = permissionSummaryLines(progressPermissionSummary ?? ref.history?.permissionSummary);
+		if (permissionLines.length > 0) {
+			section("Permissions", permissionLines.length);
+			for (const line of permissionLines) add(line);
 		}
 
 		section("Lineage");
@@ -1189,7 +1310,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		if (modelRole && this.#getRoleInfo) {
 			meta.push(formatRoleBadge(modelRole, this.#getRoleInfo(modelRole)));
 		}
-		const badge = modelBadge(ref, observed);
+		const badge = modelBadge(ref, observed, this.#getSessionFacts?.(ref.id));
 		if (badge) meta.push(badge);
 		const right = meta.join(theme.sep.dot);
 

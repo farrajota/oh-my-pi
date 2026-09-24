@@ -270,7 +270,6 @@ describe("runSubprocess soft request budget", () => {
 		registry.register({ id, displayName: id, kind: "sub", session, status: "running" });
 	}
 
-
 	it("a budget stop drives one forced final yield and finishes as a normal completion", async () => {
 		const id = "BudgetScout";
 		let abortCallsAtReminder: number | undefined;
@@ -425,7 +424,6 @@ describe("runSubprocess soft request budget", () => {
 		expect(idleReceipt.outcome).toBe("woken");
 		await idleTerminal;
 		expectRpcTurn(true);
-
 
 		await parkAgent(lifecycle, id);
 		expect(registry.get(id)?.status).toBe("parked");

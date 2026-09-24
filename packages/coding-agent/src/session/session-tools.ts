@@ -894,7 +894,12 @@ export class SessionTools {
 					}
 					// Preserve the exact arguments authorized by a selected or
 					// persisted ACP grant; inner handlers may mutate `args` in place.
-					const approvedCtx = (ctx ? { ...ctx, acpApprovedArgs: structuredCloneJSON(args) } : ctx) as never;
+					const approvedCtx = {
+						...ctx,
+						acpApprovedArgs: structuredCloneJSON(args),
+						acpApprovedToolCallId: toolCallId,
+						acpApprovedToolName: target.name,
+					} as AgentToolContext;
 					const command =
 						target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)
 							? stringProperty(args, "command")

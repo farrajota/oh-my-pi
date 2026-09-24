@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -19,7 +20,9 @@ import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 
 const ATTRIBUTION_OWNER = "vibe-parent";
 
-function resultFor(options: Pick<ExecutorOptions, "id" | "agent"> & Partial<Pick<ExecutorOptions, "index" | "task">>): SingleResult {
+function resultFor(
+	options: Pick<ExecutorOptions, "id" | "agent"> & Partial<Pick<ExecutorOptions, "index" | "task">>,
+): SingleResult {
 	return {
 		index: options.index ?? 0,
 		id: options.id,
@@ -39,13 +42,33 @@ function resultFor(options: Pick<ExecutorOptions, "id" | "agent"> & Partial<Pick
 describe("vibe_send attribution", () => {
 	let manager: AsyncJobManager;
 	let parent: ToolSession;
+	let authoritySession: AgentSession | undefined;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const registry = AgentRegistry.global();
+		const settings = Settings.isolated();
+		const root = await createAgentRootSession(registry, {
+			agentId: ATTRIBUTION_OWNER,
+			agentDisplayName: ATTRIBUTION_OWNER,
+			cwd: "/tmp",
+			agentDir: "/tmp",
+			settings,
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: [],
+			skipPythonPreflight: true,
+		});
+		authoritySession = root.session;
+		const authority = bindInternalAgentAuthoritySession(registry, root.session);
+		if (!authority) throw new Error("Test fixture requires parent authority");
 		parent = {
 			cwd: "/tmp",
-			settings: Settings.isolated(),
+			settings,
 			asyncJobManager: manager,
+			agentRegistry: registry,
+			createAuthoritySession: authority.create,
 			getAgentId: () => ATTRIBUTION_OWNER,
 			getSessionId: () => "vibe-parent-session",
 			getSessionFile: () => null,
@@ -57,6 +80,8 @@ describe("vibe_send attribution", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		await authoritySession?.dispose();
+		authoritySession = undefined;
 		await manager.dispose({ timeoutMs: 100 });
 		VibeSessionRegistry.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();

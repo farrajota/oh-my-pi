@@ -1098,7 +1098,10 @@ export class AsyncJobManager {
 				this.#jobs.delete(id);
 				continue;
 			}
-			this.#scheduleEviction(id, this.#consumedJobResults.has(id) ? this.#consumedResultEvictionMs : this.#retentionMs);
+			this.#scheduleEviction(
+				id,
+				this.#consumedJobResults.has(id) ? this.#consumedResultEvictionMs : this.#retentionMs,
+			);
 			restoredJobIds.push(id);
 		}
 		this.#durableRecovery = undefined;

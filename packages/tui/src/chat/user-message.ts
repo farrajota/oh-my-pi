@@ -140,7 +140,12 @@ export class UserMessageComponent extends Container implements ReactionTarget {
 		});
 		md.setIgnoreTight(true);
 		this.addChild(md);
-		if (!options.synthetic && options.timestamp !== undefined && Number.isFinite(options.timestamp) && options.timestamp > 0) {
+		if (
+			!options.synthetic &&
+			options.timestamp !== undefined &&
+			Number.isFinite(options.timestamp) &&
+			options.timestamp > 0
+		) {
 			this.addChild(new Text(theme.fg("dim", formatUsageTimestamp(options.timestamp)), 1, 0));
 		}
 	}

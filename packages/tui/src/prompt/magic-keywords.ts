@@ -39,6 +39,7 @@ function magicKeywordRegex(word: string, flags = ""): RegExp {
 interface RegisteredKeyword {
 	readonly word: string;
 	readonly highlight: KeywordHighlighter;
+	readonly hue: readonly [number, number];
 }
 
 let registry: readonly RegisteredKeyword[] = [];
@@ -62,6 +63,7 @@ function matcherFor(word: string): RegExp {
 export function setMagicKeywords(specs: readonly MagicKeywordSpec[]): void {
 	registry = specs.map(({ word, hue: [from, to] }) => ({
 		word,
+		hue: [from, to],
 		highlight: createGradientHighlighter({
 			probe: word,
 			highlight: magicKeywordRegex(word, "g"),
@@ -69,6 +71,10 @@ export function setMagicKeywords(specs: readonly MagicKeywordSpec[]): void {
 			hue: t => (from + t * (to - from)) % 360,
 		}),
 	}));
+}
+
+export function getMagicKeywords(): readonly MagicKeywordSpec[] {
+	return registry.map(({ word, hue: [from, to] }) => ({ word, hue: [from, to] }));
 }
 
 /** Whether `word` is exactly a registered magic keyword (used to shield it from spelling autocorrect). */

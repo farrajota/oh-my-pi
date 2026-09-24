@@ -3,6 +3,7 @@ import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import type { AgentProgress, SingleResult, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { taskToolRenderer } from "@oh-my-pi/pi-tui/tools/task";
 import { formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
+import { visibleWidth } from "../src/utils";
 
 describe("task renderer: nested live rendering", () => {
 	beforeAll(async () => {
@@ -81,7 +82,7 @@ describe("task renderer: nested live rendering", () => {
 		};
 	}
 
-	async function render(progress: AgentProgress): Promise<string> {
+	async function render(progress: AgentProgress, width = 160): Promise<string> {
 		const theme = (await getThemeByName("dark"))!;
 		const details: TaskToolDetails = {
 			projectAgentsDir: null,
@@ -94,7 +95,7 @@ describe("task renderer: nested live rendering", () => {
 			{ expanded: false, isPartial: true, spinnerFrame: 0 },
 			theme,
 		);
-		return Bun.stripANSI(component.render(160).join("\n"));
+		return Bun.stripANSI(component.render(width).join("\n"));
 	}
 
 	it("renders completed nested task results stored in extractedToolData.task while parent is in-progress", async () => {
@@ -228,6 +229,36 @@ describe("task renderer: nested live rendering", () => {
 		expect(text).not.toContain("Σ");
 	});
 
+	it("keeps a retry badge visible in a narrow live row with long metadata", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const width = 40;
+		const longModel = "long-model-name-".repeat(8);
+		const row = (
+			await render(
+				makeRunningProgress({
+					id: "Worker",
+					resolvedModelIdentity: `provider/${longModel}`,
+					modelRole: "verbose-role-".repeat(8),
+					retryState: {
+						attempt: 2,
+						maxAttempts: 5,
+						startedAtMs: Date.now(),
+						delayMs: 60_000,
+						errorMessage: "HTTP 429 rate limit",
+					},
+				}),
+				width,
+			)
+		)
+			.split("\n")
+			.find(line => line.includes("Worker"))!;
+
+		expect(row).toContain(`${theme.getSpinnerFrames("status")[0]} Worker`);
+		expect(row).toContain("long-model");
+		expect(row).toContain("retrying");
+		expect(visibleWidth(row)).toBeLessThanOrEqual(width);
+	});
+
 	it("renders a static result header and static running task row", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const details: TaskToolDetails = {
@@ -256,7 +287,10 @@ describe("task renderer: nested live rendering", () => {
 		// Header and per-agent body rows are static; only the tool header owns live animation.
 		expect(header0).toBe(header1);
 		expect(body0).toBe(body1);
-		expect(Bun.stripANSI(body1)).toContain(`${theme.status.done} Probe: Investigate padding`);
+		const strippedBody = Bun.stripANSI(body1);
+		expect(strippedBody).toContain(`${theme.getSpinnerFrames("status")[0]} Probe`);
+		expect(f1.join("\n")).toContain("Investigate padding");
+		expect(strippedBody).not.toContain(theme.status.done);
 	});
 
 	it("wraps the completed run summary in bracket glyphs, dropping the Total: label", async () => {

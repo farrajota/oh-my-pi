@@ -21,6 +21,7 @@ const BEL = "\x07";
 const DETECTED_TERMINAL_HYPERLINKS = TERMINAL.hyperlinks;
 type HyperlinkMode = "off" | "auto" | "always";
 let hyperlinkMode: HyperlinkMode = "auto";
+let hyperlinkSettingInitialized = false;
 
 /** Stable 8-char hex ID derived from a URI — hints terminals to coalesce identical adjacent links. */
 function buildLinkId(uri: string): string {
@@ -34,26 +35,15 @@ function buildLinkId(uri: string): string {
 
 /**
  * Build the OSC 8 target for a file path on `terminalId`.
- *
- * A `file:` URI handed to an editor has to be a plain path. `Paths.get(URI)`
- * rejects one carrying a query or a fragment outright — `IllegalArgumentException:
- * URI has a query component` / `URI has a fragment component` — so appending
- * `?line=` made every JVM-based language server (Kotlin LSP, Eclipse JDT LS)
- * fail *every* request for the resulting document, and VS Code reads the query
- * as part of the resource identity rather than as a cursor position: a blank
- * editor tab that navigates nowhere and persists across window reloads (#12109).
- *
- * The VS Code family instead navigates the documented
- * `vscode://file/<path>:<line>:<col>` form. Everywhere else the plain `file:`
- * URI is right, with the location left in the visible text — terminals that
- * parse a `path:line:col` suffix resolve that on their own.
  */
 export function fileUriForTerminal(
 	filePath: string,
 	opts: { line?: number; col?: number } | undefined,
 	terminalId: TerminalId,
 ): string {
-	if (terminalId !== "vscode") return url.pathToFileURL(filePath).href;
+	if (terminalId !== "vscode") {
+		return url.pathToFileURL(filePath).href;
+	}
 	// vscode:// takes a filesystem path with forward slashes. Encode each
 	// segment independently so separators and a Windows drive colon stay
 	// structural while reserved bytes in file names cannot become URI syntax.
@@ -79,10 +69,10 @@ function buildFileUri(filePath: string, opts?: { line?: number; col?: number }):
  * - `"off"`: never
  * - `"auto"`: when `process.stdout.isTTY`, `NO_COLOR` is unset, and the detected terminal reports hyperlink support
  * - `"always"`: unconditionally (useful for viewers that support OSC 8 without advertising it)
- * Uses the last policy pushed by the host, defaulting to `"auto"`.
+ * Uses the last policy pushed by the host; disabled before the first policy is applied.
  */
 export function isHyperlinkEnabled(): boolean {
-	return resolveHyperlinkMode(hyperlinkMode);
+	return hyperlinkSettingInitialized && resolveHyperlinkMode(hyperlinkMode);
 }
 
 function resolveHyperlinkMode(mode: HyperlinkMode): boolean {
@@ -108,7 +98,10 @@ function resolveHyperlinkMode(mode: HyperlinkMode): boolean {
  * back to the last policy pushed by the host.
  */
 export function applyHyperlinkSetting(mode?: unknown): void {
-	if (mode === "off" || mode === "auto" || mode === "always") hyperlinkMode = mode;
+	if (mode === "off" || mode === "auto" || mode === "always") {
+		hyperlinkMode = mode;
+		hyperlinkSettingInitialized = true;
+	}
 	setTerminalHyperlinks(isHyperlinkEnabled());
 }
 
@@ -159,12 +152,12 @@ export function urlHyperlink(url: string, displayText: string): string {
 /**
  * Wrap `displayText` in an OSC 8 hyperlink pointing at an HTTP(S) URL,
  * bypassing terminal capability auto-detection. Used for auth prompts where
- * an inert "click" label blocks login on terminals whose capabilities are
- * not advertised. Still returns plain text when the host has explicitly opted
- * out by pushing the `"off"` policy.
+ * an inert "click" label blocks login on terminals whose capabilities are not
+ * advertised. Returns plain text before a policy is applied or when the host
+ * opts out by pushing the "off" policy.
  */
 export function urlHyperlinkAlways(url: string, displayText: string): string {
-	if (hyperlinkMode === "off") return displayText;
+	if (!hyperlinkSettingInitialized || hyperlinkMode === "off") return displayText;
 	const normalized = url.match(/^www\./i) ? `https://${url}` : url;
 	try {
 		const parsed = new URL(normalized);
@@ -185,7 +178,7 @@ export function urlHyperlinkAlways(url: string, displayText: string): string {
  *
  * @param filePath - Filesystem path
  * @param displayText - Text to render as the hyperlink anchor (may contain ANSI codes)
- * @param opts - Optional line/col position appended as `?line=N&col=M` query params
+ * @param opts - Optional line/col position used by VS Code links; omitted from file:// targets
  */
 export function fileHyperlink(filePath: string, displayText: string, opts?: { line?: number; col?: number }): string {
 	return wrapHyperlink(buildFileUri(filePath, opts), displayText);

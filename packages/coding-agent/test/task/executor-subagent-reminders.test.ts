@@ -303,7 +303,7 @@ describe("runSubprocess yield reminders", () => {
 				}
 			},
 		});
-		AgentRegistry.global().register({
+		registry.register({
 			id: "subagent-race",
 			displayName: "subagent-race",
 			kind: "sub",

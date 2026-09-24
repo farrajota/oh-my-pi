@@ -99,6 +99,7 @@ import {
 import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/tools/task";
 import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
 import {
+	applySpawnHook,
 	type EffectiveSubagentPolicy,
 	resolveEffectiveSubagentPolicy,
 	StructuredSubagentError,
@@ -1857,6 +1858,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								? nextProgress.resolvedModelIsFallback
 								: undefined;
 							progress.advisor = nextProgress.advisor ?? progress.advisor;
+							progress.resolvedModelRoute = nextProgress.resolvedModelRoute ?? progress.resolvedModelRoute;
 							progress.tokens = nextProgress.tokens;
 							progress.requests = nextProgress.requests;
 							progress.contextTokens = nextProgress.contextTokens;
@@ -1925,6 +1927,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.modelRole = singleResult?.modelRole ?? progress.modelRole;
 					progress.requestedModel = singleResult?.requestedModel;
 					progress.advisor = singleResult?.advisor ?? progress.advisor;
+					progress.resolvedModelRoute = singleResult?.resolvedModelRoute ?? progress.resolvedModelRoute;
 					if (singleResult?.resolvedModel) {
 						progress.resolvedModel = singleResult.resolvedModel;
 						progress.resolvedModelIdentity = singleResult.resolvedModelIdentity;
@@ -2217,7 +2220,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const planModeEnabled = preparedPolicy.planMode;
 		const maxRuntimeMs = preparedReservation.maxRuntimeMs;
 		const allowEffortOverride = preparedReservation.allowEffortOverride;
-		const modelOverride = preparedPolicy.modelOverride;
+		let modelOverride = preparedPolicy.modelOverride;
+		let modelRoute = preparedPolicy.modelRoute;
 		const modelRole = preparedPolicy.modelRole;
 		const requestedModel = params.model;
 		const exactModelOverride = requestedModel !== undefined;
@@ -2250,6 +2254,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		let executionInvoked = false;
 		try {
+			const routedPolicy = await applySpawnHook(
+				{
+					session: this.session,
+					settings: preparedSettings,
+					invocationKind: "task",
+					identity: { id: preAllocatedId! },
+					index: preparedReservation.index,
+					parentToolCallId: toolCallId,
+					signal,
+				},
+				preparedPolicy,
+			);
+			modelOverride = routedPolicy.modelOverride;
+			modelRoute = routedPolicy.modelRoute;
 			await fs.mkdir(effectiveArtifactsDir, { recursive: true });
 
 			const agentId = preAllocatedId!;
@@ -2324,6 +2342,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				detached,
 				persistArtifacts: detached,
 				modelOverride,
+				modelRoute,
 				modelRole,
 				requestedModel,
 				requestedPermissionProfiles: params.permissions?.profiles,

@@ -216,7 +216,7 @@ function buildRule(
 	source: SourceMeta,
 	options?: RuleMarkdownOptions,
 ): Rule {
-	const { condition, astCondition, scope } = parseRuleConditionAndScope(frontmatter);
+	const { condition, astCondition, question, scope } = parseRuleConditionAndScope(frontmatter);
 
 	let globs: string[] | undefined;
 	if (Array.isArray(frontmatter.globs)) {
@@ -240,6 +240,7 @@ function buildRule(
 		description: typeof frontmatter.description === "string" ? frontmatter.description : undefined,
 		condition,
 		astCondition,
+		question,
 		scope,
 		agents: parseRuleAgents(frontmatter.agents),
 		interruptMode,

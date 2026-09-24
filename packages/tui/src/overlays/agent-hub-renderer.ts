@@ -4,7 +4,7 @@ import { formatMetricRow } from "../components/metric";
 import { renderProgressBar } from "../components/progress-bar";
 import { renderTableRow } from "../components/table";
 import { formatNumber } from "@oh-my-pi/pi-utils";
-import { type AgentRecordLike, MAIN_AGENT_ID } from "./agent-hub-types";
+import { type AgentHubSessionFacts, type AgentRecordLike, MAIN_AGENT_ID } from "./agent-hub-types";
 import { parseThinkingLevel } from "../thinking";
 import { TRUNCATE_LENGTHS, truncateToWidth } from "../render/render-utils";
 import { sanitizeDisplaySingleLine } from "./extensions/display-text";
@@ -88,18 +88,22 @@ function formatResolvedModelBadge(resolved: string, preserveProvider = false, fa
 
 /**
  * Resolved model + reasoning level for a hub row. Exact executor progress is
- * authoritative (and survives completion); direct live sessions are the
- * fallback for agents without an observer snapshot — the main session has no
- * snapshot at all, so its row is read straight off the live session.
+ * authoritative (and survives completion); host-supplied read-only session
+ * facts are the fallback for agents without an observer snapshot, including
+ * the main session.
  *
  * Every source reports the model that produced the row's work, never the one
  * the session merely points at: an armed fallback that has not served yet stays
  * attributed to whichever model last actually spoke.
  */
-export function modelBadge(ref: AgentRecordLike, observed: ObservableSession | undefined): string | undefined {
+export function modelBadge(
+	ref: AgentRecordLike,
+	observed: ObservableSession | undefined,
+	sessionFacts?: AgentHubSessionFacts,
+): string | undefined {
 	const progress = observed?.progress;
-	const liveThinkingLevel = ref.session?.thinkingLevel;
-	const serving = ref.session?.servingModel;
+	const liveThinkingLevel = sessionFacts?.thinkingLevel;
+	const serving = sessionFacts?.servingModel;
 	const fallbackSelector =
 		(serving?.isFallback ? serving.selector : undefined) ??
 		(progress?.resolvedModelIsFallback ? progress.resolvedModel : undefined) ??
@@ -109,17 +113,18 @@ export function modelBadge(ref: AgentRecordLike, observed: ObservableSession | u
 	}
 	const resolvedModel = progress?.resolvedModel ?? ref.history?.resolvedModel ?? serving?.selector;
 	if (resolvedModel) return formatResolvedModelBadge(resolvedModel, false, liveThinkingLevel);
-	const model = ref.session?.model;
-	if (!model) return undefined;
-	const level = model.thinking ? liveThinkingLevel : undefined;
-	return formatModelBadge(model.id, level);
+	const modelId = sessionFacts?.modelId;
+	if (!modelId) return undefined;
+	const modelSupportsThinking = sessionFacts?.modelSupportsThinking;
+	const level = modelSupportsThinking ? liveThinkingLevel : undefined;
+	return formatModelBadge(modelId, level);
 }
 
 export function formatMetricDuration(metrics: AgentMetrics): string | undefined {
 	const durationMs = metricNumber(metrics.durationMs);
 	if (durationMs <= 0) return undefined;
 	const label = metrics.durationKind === "active" ? "active" : metrics.durationKind === "span" ? "span" : "duration";
-	return `${formatElapsed(durationMs)} ${label}`;
+	return `${formatElapsed(durationMs).replaceAll(" ", "")} ${label}`;
 }
 
 export function formatMetrics(metrics: AgentMetrics): string {

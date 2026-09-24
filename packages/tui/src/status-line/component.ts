@@ -56,6 +56,18 @@ const BRAND_FADE_MS = 450;
 /** Repaint cadence while the brand fade is in flight (rust omp's `FADE_FRAME`). */
 const BRAND_FADE_FRAME_MS = 40;
 
+/**
+ * Providers whose subscription quota is a single monthly bucket, so their
+ * `monthly`/`30d` window is the one the usage segment must show. Providers that
+ * merely report a monthly side-counter (GitHub Copilot's premium requests) stay
+ * out: their monthly row is not the session quota.
+ */
+const MONTHLY_SUBSCRIPTION_PROVIDERS: Record<string, true> = {
+	"alibaba-token-plan": true,
+	cursor: true,
+	"opencode-go": true,
+};
+
 /** A displayable limit after provider, account, model, and window filtering. */
 interface UsageWindowCandidate {
 	id?: string;
@@ -530,6 +542,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	#vibeWorkerTokenRate: (() => number | null) | null = null;
 	#collabStatus: CollabStatus | null = null;
 	#streamStatus: { viewers: number } | null = null;
+	#recording = false;
 	#focusedAgentId: string | undefined;
 	#activeRepoCache: ActiveRepoCache | undefined;
 
@@ -926,6 +939,13 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	setStreamStatus(status: { viewers: number } | null): void {
 		if (this.#streamStatus?.viewers === status?.viewers) return;
 		this.#streamStatus = status;
+		this.#invalidateStatusLineRenderCache();
+	}
+
+	/** Toggle the `● REC` badge shown while `/record` captures the screen. */
+	setRecording(recording: boolean): void {
+		if (this.#recording === recording) return;
+		this.#recording = recording;
 		this.#invalidateStatusLineRenderCache();
 	}
 
@@ -1833,6 +1853,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		const activeModelId = normalizeUsageScopeValue(context.modelId);
 		const activeAntigravityCounter =
 			context.provider === "google-antigravity" ? getAntigravityCounterKeyForModel(context.modelId) : undefined;
+		const monthlySubscriptionProvider =
+			context.provider !== undefined && MONTHLY_SUBSCRIPTION_PROVIDERS[context.provider] === true;
 		const scopeGroups = new Map<string, UsageScopeGroup>();
 		for (const report of reports) {
 			if (!report || typeof report !== "object") continue;
@@ -1895,10 +1917,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 										: undefined;
 				const windowClass =
 					subscriptionWindow ??
-					((context.provider === "cursor" || context.provider === "opencode-go") &&
-					(windowId === "monthly" || windowId === "30d")
-						? "monthly"
-						: undefined);
+					(monthlySubscriptionProvider && (windowId === "monthly" || windowId === "30d") ? "monthly" : undefined);
 				if (!windowClass) continue;
 
 				const modelId = normalizeUsageScopeValue("modelId" in scope ? scope.modelId : undefined);
@@ -2173,6 +2192,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			vim: this.#vimStatus,
 			collab: this.#collabStatus,
 			stream: this.#streamStatus,
+			recording: this.#recording,
 			usageStats,
 			contextPercent,
 			contextTokens,
@@ -2670,8 +2690,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			return embeddedContextWidth;
 		};
 		const totalWidth = () => leftWidth + rightWidth + minimumGapWidth();
-		const originalLeft = [...left];
-		const originalRight = [...right];
+		const overflowLeft: string[] | undefined = options?.collectOverflow ? [] : undefined;
+		const overflowRight: string[] | undefined = options?.collectOverflow ? [] : undefined;
 
 		if (topFillWidth > 0 && !options?.preserveOverflow) {
 			// Truncate the session-name segment before dropping right segments —
@@ -2691,7 +2711,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 				}
 			}
 			while (totalWidth() > topFillWidth && right.length > 0) {
-				right.pop();
+				const dropped = right.pop();
+				if (dropped !== undefined) overflowRight?.push(dropped);
 				rightWidth = groupWidth(right, rightCapWidth, rightSepWidth);
 			}
 			// Shrink path before dropping left segments — path is the only elastic segment
@@ -2740,24 +2761,17 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 
 			while (totalWidth() > topFillWidth && left.length > 0) {
 				const dropIdx = options?.collectOverflow ? left.length - 1 : leftOverflowDropIndex();
-				left.splice(dropIdx, 1);
+				const [dropped] = left.splice(dropIdx, 1);
+				if (dropped !== undefined) overflowLeft?.push(dropped);
 				leftSegIds.splice(dropIdx, 1);
 				leftWidth = groupWidth(left, leftCapWidth + bandCapWidth, leftSepWidth);
 			}
 		}
 
 		if (options?.collectOverflow) {
-			const missing = (original: readonly string[], rendered: readonly string[]): string[] => {
-				const remaining = [...rendered];
-				const overflow: string[] = [];
-				for (const part of original) {
-					const index = remaining.indexOf(part);
-					if (index >= 0) remaining.splice(index, 1);
-					else overflow.push(part);
-				}
-				return overflow;
-			};
-			options.collectOverflow.parts.push(...missing(originalLeft, left), ...missing(originalRight, right));
+			overflowLeft?.reverse();
+			overflowRight?.reverse();
+			options.collectOverflow.parts.push(...(overflowLeft ?? []), ...(overflowRight ?? []));
 		}
 
 		const renderGroup = (parts: string[], direction: "left" | "right"): string => {
@@ -3126,10 +3140,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	render(width: number): readonly string[] {
 		const lines: string[] = [];
 		if (this.#standalone && !this.#autocompleteActiveProbe?.()) {
-			const content = this.renderBottomBarLines(width, this.#standalone === "left-only" ? "left" : "full");
+			const content = this.renderBottomBar(width, this.#standalone === "left-only" ? "left" : "full");
 			if (content.length > 0) {
 				if (this.#standaloneGap) lines.push("");
-				lines.push(...content);
+				lines.push(content);
 			}
 		}
 		const showHooks = this.#settings.showHookStatus ?? true;

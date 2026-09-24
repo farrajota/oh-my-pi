@@ -474,7 +474,7 @@ export class CollabGuestLink {
 		}
 		this.#replicaActivated = true;
 		if (this.#left) return;
-		this.#clearTransientUi();
+		this.#clearTransientUi(true);
 		this.#clearAgentMirror();
 		this.state = pending.state;
 		reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
@@ -484,8 +484,13 @@ export class CollabGuestLink {
 		this.#ctx.syncRunningSubagentBadge();
 		this.#assistantStreamSynced = false;
 		setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
-		this.#ctx.chatContainer.disposeChildren();
-		await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
+		try {
+			await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
+		} catch (err) {
+			for (const block of this.#ctx.pendingTools.values()) block.seal();
+			for (const block of this.#ctx.eventController.takeDisplaceableComponents()) block.seal();
+			throw err;
+		}
 		if (this.#left) return;
 		await this.#ctx.reloadTodos();
 		if (this.#left) return;
@@ -776,14 +781,14 @@ export class CollabGuestLink {
 		for (const abort of aborts.reverse()) abort.abort();
 	}
 
-	#clearTransientUi(): void {
+	#clearTransientUi(preservePendingTools = false): void {
 		this.#clearUiRequests();
 		clearGuestTransientStatus(this.#ctx);
 		this.#ctx.pendingMessagesContainer.clear();
 		this.#ctx.compactionQueuedMessages = [];
 		this.#ctx.streamingComponent = undefined;
 		this.#ctx.streamingMessage = undefined;
-		this.#ctx.pendingTools.clear();
+		if (!preservePendingTools) this.#ctx.pendingTools.clear();
 		if (this.#ctx.loadingAnimation) {
 			this.#ctx.loadingAnimation.stop();
 			this.#ctx.loadingAnimation = undefined;

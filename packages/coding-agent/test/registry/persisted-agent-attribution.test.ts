@@ -316,7 +316,7 @@ describe("persisted agent model attribution", () => {
 			taskResult,
 		]);
 		const metrics = registry.get("Usage")?.history?.metrics;
-		expect(metrics?.tokens).toBe(100);
+		expect(metrics?.tokens).toBe(66); // Input, output, cache writes, and orchestration; not cache reads.
 		expect(metrics?.requests).toBe(4);
 		expect(metrics?.contextTokens).toBe(30);
 	});

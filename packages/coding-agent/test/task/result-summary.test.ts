@@ -74,7 +74,7 @@ describe("formatTaskResultSummary", () => {
 		const error = "Anthropic stream envelope error: stream ended before message_stop";
 		const summary = formatTaskResultSummary(
 			{ ...settledResult("I'll systematically investigate the codebase"), exitCode: 1, stderr: error, error },
-			{ totalDurationMs: 5 },
+			{ totalDurationMs: 5, agentRegistry: registry },
 		);
 		expect(summary).toContain('status="failed (exit 1)"');
 		expect(summary).toContain(`<error>${error}</error>`);
@@ -84,7 +84,7 @@ describe("formatTaskResultSummary", () => {
 	it("does not repeat an error that is already the preview", () => {
 		const summary = formatTaskResultSummary(
 			{ ...settledResult(""), exitCode: 1, stderr: "agent failed", error: "agent failed" },
-			{ totalDurationMs: 5 },
+			{ totalDurationMs: 5, agentRegistry: registry },
 		);
 		expect(summary).toContain("<output>\nagent failed\n</output>");
 		expect(summary).not.toContain("<error>");

@@ -60,6 +60,8 @@ export interface PythonToolInvokeOptions {
 export interface PythonExecutorOptions {
 	/** Working directory for command execution */
 	cwd?: string;
+	/** Source filename for file-backed execution and tracebacks. */
+	filename?: string;
 	/** Timeout in milliseconds */
 	timeoutMs?: number;
 	/** Absolute wall-clock deadline in milliseconds since epoch */
@@ -590,6 +592,7 @@ export async function executePython(code: string, options?: PythonExecutorOption
 			);
 		}
 
+		await ensureToolBridge(executionOptions);
 		const kernelMode = executionOptions.kernelMode ?? "session";
 		if (kernelMode === "per-call") {
 			return await executePerCall(code, cwd, executionOptions);

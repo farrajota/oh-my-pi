@@ -4,14 +4,9 @@ import {
 } from "@oh-my-pi/pi-tui/overlays/agent-transcript-viewer";
 import { agentTranscriptSource } from "../agent-hub-runtime";
 
-export type ReadOnlyAgentTranscriptViewerDeps = Omit<
-	AgentTranscriptViewerDeps,
-	"remote" | "lifecycle" | "transcript"
->;
+export type ReadOnlyAgentTranscriptViewerDeps = Omit<AgentTranscriptViewerDeps, "remote" | "lifecycle" | "transcript">;
 
-export function createReadOnlyAgentTranscriptViewer(
-	deps: ReadOnlyAgentTranscriptViewerDeps,
-): AgentTranscriptViewer {
+export function createReadOnlyAgentTranscriptViewer(deps: ReadOnlyAgentTranscriptViewerDeps): AgentTranscriptViewer {
 	const expectedRef = deps.registry.get(deps.agentId);
 	const pinnedRegistry: AgentTranscriptViewerDeps["registry"] = {
 		get: id => {
@@ -70,11 +65,11 @@ export * from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 export * from "@oh-my-pi/pi-tui/overlays/model-browser";
 export * from "@oh-my-pi/pi-tui/overlays/model-hub";
 export {
-    BROWSER_FRAME_ROWS,
-    ModelPickerComponent,
-    type ModelPickerCallbacks,
-    type ModelPickerOptions,
-    type ModelPickerRegistry,
+	BROWSER_FRAME_ROWS,
+	ModelPickerComponent,
+	type ModelPickerCallbacks,
+	type ModelPickerOptions,
+	type ModelPickerRegistry,
 } from "@oh-my-pi/pi-tui/overlays/model-picker";
 export * from "@oh-my-pi/pi-tui/overlays/oauth-selector";
 export * from "@oh-my-pi/pi-tui/overlays/queue-mode-selector";

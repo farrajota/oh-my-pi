@@ -93,7 +93,7 @@ describe("fresh child discovery identity", () => {
 		]);
 		const authStorage = await AuthStorage.create(path.join(path.dirname(projectDir), "auth.db"));
 		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("openai", "test-key");
+		authStorage.keys.setRuntime("openai", "test-key");
 		const model = getBundledModel("openai", "gpt-4o-mini");
 		if (!model) throw new Error("Expected bundled test model");
 		const settings = Settings.isolated({ extensions: [ambientExtensionDir] }, { cwd: projectDir, agentDir });

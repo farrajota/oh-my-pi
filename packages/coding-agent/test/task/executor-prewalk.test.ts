@@ -275,7 +275,7 @@ describe("runSubprocess per-agent prewalk", () => {
 		const authority = await createAuthorityFixture();
 		const authStorage = await AuthStorage.create(":memory:");
 		authorityAuthStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage);
 		const snapshotHistory = () => {
 			const history = authority.agentRegistry.get(id)?.history;

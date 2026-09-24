@@ -310,7 +310,7 @@ export class ChatTranscriptBuilder {
 						this.#trackExpandable(collapsed);
 						this.container.addChild(collapsed);
 					} else {
-						this.container.addChild(new UserMessageComponent(userText));
+						this.container.addChild(new UserMessageComponent(userText, { timestamp: message.timestamp }));
 					}
 				}
 				break;

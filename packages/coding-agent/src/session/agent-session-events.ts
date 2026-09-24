@@ -32,7 +32,7 @@ export type AgentSessionEvent =
 	  }
 	| AutoRetryStartEvent
 	| AutoRetryEndEvent
-	| { type: "retry_fallback_applied"; from: string; to: string; role: string }
+	| { type: "retry_fallback_applied"; from: string; to: string; role: string; reason?: string }
 	| { type: "retry_fallback_succeeded"; model: string; role: string }
 	| { type: "model_changed" }
 	| { type: "config_warnings_changed" }

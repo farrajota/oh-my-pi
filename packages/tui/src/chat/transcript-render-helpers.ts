@@ -40,6 +40,7 @@ export function buildAsyncResultBlock(message: CustomOrHookMessage): ToolActivit
 				label?: string;
 				durationMs?: number;
 				meta?: OutputMeta;
+				followUpSaveFailed?: boolean;
 			}>;
 			meta?: OutputMeta;
 		}>
@@ -70,6 +71,10 @@ export function buildAsyncResultBlock(message: CustomOrHookMessage): ToolActivit
 		});
 		if (job.meta?.artifactError) {
 			rows.push({ parts: [theme.fg("warning", formatArtifactErrorNotice(job.meta.artifactError))] });
+		} else if (job.followUpSaveFailed) {
+			rows.push({
+				parts: [theme.fg("warning", "Full async output could not be saved; only the preview is available.")],
+			});
 		}
 	}
 	if (details?.meta?.artifactError) {

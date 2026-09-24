@@ -295,6 +295,10 @@ describe("hub jobs snapshot", () => {
 	test("wait returns an undelivered result body once for manual recovery", async () => {
 		const fixture = await createManager();
 		const { manager } = fixture;
+		const jobId = manager.register("task", "recover child", async () => "recover this child report", {
+			ownerId: "Main",
+		});
+		await manager.getJob(jobId)!.promise;
 		const tool = new HubTool(createToolSession({ fixture }));
 		const recovered = await tool.execute("first", { op: "wait", ids: [jobId] });
 		const consumed = await tool.execute("second", { op: "wait", ids: [jobId] });

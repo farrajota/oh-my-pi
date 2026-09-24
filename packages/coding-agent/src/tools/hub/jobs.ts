@@ -18,7 +18,14 @@ import { renderStructuredJson, structuredStatusLabel } from "../../session/async
 import type { StructuredSubagentOutput } from "../../task/types";
 import { formatArtifactErrorNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "@oh-my-pi/pi-tui/render";
+import {
+	Ellipsis,
+	Hasher,
+	type RenderCache,
+	renderStatusLine,
+	renderTreeList,
+	truncateToWidth,
+} from "@oh-my-pi/pi-tui/render";
 import type { ToolSession } from "..";
 import {
 	FEED_MODEL_BADGE_WIDTH,
@@ -128,7 +135,12 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 	const staleAccepted = new Set(registry.staleAcceptedRuns().map(ref => ref.id));
 	const out: AgentActivitySnapshot[] = [];
 	for (const ref of registry.list()) {
-		if ((rootId ? ref.lineage?.rootId !== rootId : ref.parentId !== selfId) || ref.kind !== "sub" || ref.status !== "running") continue;
+		if (
+			(rootId ? ref.lineage?.rootId !== rootId : ref.parentId !== selfId) ||
+			ref.kind !== "sub" ||
+			ref.status !== "running"
+		)
+			continue;
 		if (ref.id === selfId || covered.has(ref.id)) continue;
 		const acceptedAt = staleAccepted.has(ref.id) ? ref.lifecycle?.acceptedAt : undefined;
 		out.push({
@@ -190,7 +202,8 @@ export function snapshotJobs(
 		// so a newly settled body stays withheld until buildJobResult enlists it.
 		const resultWithheld =
 			latest.status !== "running" &&
-			(!options.observation || session.asyncJobManager?.ownsObservedJobResult(options.observation, latest.id) !== true);
+			(!options.observation ||
+				session.asyncJobManager?.ownsObservedJobResult(options.observation, latest.id) !== true);
 		const resultConsumed = session.asyncJobManager?.isJobResultConsumed(latest.id) ?? false;
 		let resolvedModel: string | undefined;
 		const exitCode = typeof latest.latestDetails?.exitCode === "number" ? latest.latestDetails.exitCode : undefined;

@@ -125,7 +125,7 @@ describe("ExtensionRunner async job context", () => {
 		mkdirSync(sessionDir, { recursive: true });
 		const sessionManager = SessionManager.create(tempDir.path(), sessionDir);
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model");
 		const agent = new Agent({

@@ -230,6 +230,170 @@ describe("task spawn routing", () => {
 		extensionRoots.explicit.push("/late/task-extension");
 		expect(captured?.extensionRoots?.explicit).toEqual(["/task/explicit"]);
 	});
+
+	it("fires before_subagent_spawn once per child even though the task preflight resolves policy first", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [{ ...taskAgent, model: ["anthropic/claude-sonnet-4"] }],
+			projectAgentsDir: null,
+		});
+		const runSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		const manager = createManager();
+		const session = await createSession({ manager });
+		const signals: Array<AbortSignal | undefined> = [];
+		const spawnKeys: Array<string | undefined> = [];
+		session.emitBeforeSubagentSpawn = async (event, signal) => {
+			spawnKeys.push(event.spawnKey);
+			signals.push(signal);
+			return { model: `openai/gpt-4.1-mini-${signals.length}`, note: `pool ${signals.length}` };
+		};
+		const tool = await TaskTool.create(session);
+
+		const result = await tool.execute("tc-route", { agent: "task", name: "Routed", task: "Do it." } as TaskParams);
+		await manager.getJob(result.details!.async!.jobId!)!.promise;
+
+		expect(signals).toHaveLength(1);
+		expect(spawnKeys).toEqual([runSpy.mock.calls[0]?.[0].id]);
+		expect(signals[0]).toBeInstanceOf(AbortSignal);
+		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["openai/gpt-4.1-mini-1"]);
+		expect(runSpy.mock.calls[0]?.[0].modelRoute).toBe("pool 1");
+	});
+
+	it("applies before_subagent_spawn routing to isolated TaskTool dispatch", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [{ ...taskAgent, model: ["anthropic/claude-sonnet-4"] }],
+			projectAgentsDir: null,
+		});
+		const repoRoot = process.cwd();
+		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
+			repoRoot,
+			baseline: {
+				root: { repoRoot, headCommit: "HEAD", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
+				nested: [],
+			},
+		});
+		const runSpy = vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts => ({
+			...makeResult(opts.agentId),
+			isolated: true,
+			patchPath: `${opts.artifactsDir}/${opts.agentId}.patch`,
+		}));
+		const normalRunSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		const manager = createManager();
+		const session = await createSession({
+			manager,
+			settings: { "task.isolation.enabled": true, "task.isolation.apply": false },
+		});
+		const signals: Array<AbortSignal | undefined> = [];
+		const spawnKeys: Array<string | undefined> = [];
+		session.emitBeforeSubagentSpawn = async (event, signal) => {
+			signals.push(signal);
+			spawnKeys.push(event.spawnKey);
+			return { model: "openai/gpt-4.1-mini-isolated", note: "isolated pool" };
+		};
+		const tool = await TaskTool.create(session);
+
+		const result = await tool.execute("tc-isolated-route", {
+			agent: "task",
+			name: "RoutedIsolated",
+			task: "Do it.",
+			isolated: true,
+		} as TaskParams);
+		await manager.getJob(result.details!.async!.jobId!)!.promise;
+
+		const options = runSpy.mock.calls[0]?.[0];
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(normalRunSpy).not.toHaveBeenCalled();
+		expect(signals).toHaveLength(1);
+		expect(signals[0]).toBeInstanceOf(AbortSignal);
+		expect(spawnKeys).toEqual([options?.agentId]);
+		expect(options?.baseOptions.modelOverride).toEqual(["openai/gpt-4.1-mini-isolated"]);
+		expect(options?.baseOptions.modelRoute).toBe("isolated pool");
+	});
+
+	for (const isolated of [false, true]) {
+		const dispatch = isolated ? "isolated" : "normal";
+		it(`blocks ${dispatch} dispatch before either subprocess entry point and releases its child ID`, async () => {
+			vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+				agents: [taskAgent],
+				projectAgentsDir: null,
+			});
+			if (isolated) {
+				const repoRoot = process.cwd();
+				vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
+					repoRoot,
+					baseline: {
+						root: {
+							repoRoot,
+							headCommit: "HEAD",
+							staged: "",
+							unstaged: "",
+							untracked: [],
+							untrackedPatch: "",
+						},
+						nested: [],
+					},
+				});
+			}
+			const runSpy = vi
+				.spyOn(executorModule, "runSubprocess")
+				.mockImplementation(async options => makeResult(options.id ?? "?"));
+			const isolatedRunSpy = vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts => ({
+				...makeResult(opts.agentId),
+				isolated: true,
+				patchPath: `${opts.artifactsDir}/${opts.agentId}.patch`,
+			}));
+			const manager = createManager();
+			const session = await createSession({
+				manager,
+				settings: {
+					"async.enabled": true,
+					...(isolated ? { "task.isolation.enabled": true, "task.isolation.apply": false } : {}),
+				},
+			});
+			const spawnKeys: Array<string | undefined> = [];
+			const signals: Array<AbortSignal | undefined> = [];
+			session.emitBeforeSubagentSpawn = async (event, signal) => {
+				spawnKeys.push(event.spawnKey);
+				signals.push(signal);
+				return spawnKeys.length === 1 ? { block: true, reason: "blocked by extension" } : undefined;
+			};
+			const tool = await TaskTool.create(session);
+			const createParams = () =>
+				({
+					agent: "task",
+					name: "ReusableChild",
+					task: "Do it.",
+					...(isolated ? { isolated: true } : {}),
+				}) as TaskParams;
+
+			const blocked = await tool.execute("tc-hook-block", createParams());
+			const blockedJob = manager.getJob(blocked.details!.async!.jobId!)!;
+			await blockedJob.promise.catch(() => {});
+			expect(`${blockedJob.resultText ?? ""}${blockedJob.errorText ?? ""}`).toContain("blocked by extension");
+			expect(runSpy).not.toHaveBeenCalled();
+			expect(isolatedRunSpy).not.toHaveBeenCalled();
+
+			const retry = await tool.execute("tc-hook-retry", createParams());
+			await manager.getJob(retry.details!.async!.jobId!)!.promise;
+
+			expect(spawnKeys).toHaveLength(2);
+			expect(spawnKeys[1]).toBe(spawnKeys[0]);
+			expect(signals).toHaveLength(2);
+			expect(signals[0]).toBeInstanceOf(AbortSignal);
+			expect(signals[1]).toBeInstanceOf(AbortSignal);
+			if (isolated) {
+				expect(runSpy).not.toHaveBeenCalled();
+				expect(isolatedRunSpy).toHaveBeenCalledTimes(1);
+			} else {
+				expect(isolatedRunSpy).not.toHaveBeenCalled();
+				expect(runSpy).toHaveBeenCalledTimes(1);
+			}
+		});
+	}
+
 	for (const { label, runnerOverrides, expectRetained } of [
 		{
 			label: "tells the parent an isolated agent cannot be messaged instead of calling it idle",

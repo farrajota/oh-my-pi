@@ -40,9 +40,8 @@ describe("ArtifactManager publication integrity", () => {
 		const content = "complete report";
 		const partial = "partial";
 		const originalWrite = Bun.write;
-		const writeSpy = spyOn(Bun, "write").mockImplementationOnce(
-			(async (destination: string | URL | Bun.BunFile) => originalWrite(destination, partial)) as typeof Bun.write,
-		);
+		const writeSpy = spyOn(Bun, "write").mockImplementationOnce((async (destination: string | URL | Bun.BunFile) =>
+			originalWrite(destination, partial)) as typeof Bun.write);
 
 		try {
 			await expect(writeArtifact(allocation.path, content)).rejects.toThrow(
@@ -102,7 +101,6 @@ describe("ArtifactManager publication integrity", () => {
 		expect(await manager.exists(id)).toBe(false);
 		expect(await manager.listFiles()).toEqual([]);
 		expect((await manager.recover()).quarantined).toContain(id);
-
 	});
 
 	it("does not expose a raw filename without a publication manifest", async () => {

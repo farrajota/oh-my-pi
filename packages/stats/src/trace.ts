@@ -1069,17 +1069,22 @@ function basenameTimestamp(base: string): number | undefined {
 // poll is pure syscall churn. TTL is deliberately short so a just-created
 // session appears within seconds.
 let diskRootsMemo:
-	| { atMs: number; limit: number; roots: Array<{ file: string; mtimeMs: number; startedAt: number }> }
+	| {
+			atMs: number;
+			sessionsDir: string;
+			limit: number;
+			roots: Array<{ file: string; mtimeMs: number; startedAt: number }>;
+	  }
 	| undefined;
 const DISK_ROOTS_TTL_MS = 5_000;
 
 async function scanDiskRoots(limit: number): Promise<Array<{ file: string; mtimeMs: number; startedAt: number }>> {
+	const sessionsDir = getSessionsDir();
 	const now = Date.now();
 	const memo = diskRootsMemo;
-	if (memo && memo.limit >= limit && now - memo.atMs < DISK_ROOTS_TTL_MS) {
+	if (memo && memo.sessionsDir === sessionsDir && memo.limit === limit && now - memo.atMs < DISK_ROOTS_TTL_MS) {
 		return memo.roots.slice(0, limit);
 	}
-	const sessionsDir = getSessionsDir();
 	let projects: string[] = [];
 	try {
 		projects = await fs.readdir(sessionsDir);
@@ -1111,7 +1116,7 @@ async function scanDiskRoots(limit: number): Promise<Array<{ file: string; mtime
 		}),
 	);
 	roots.sort((a, b) => b.mtimeMs - a.mtimeMs);
-	if (roots.length <= 1000) diskRootsMemo = { atMs: Date.now(), limit, roots };
+	if (roots.length <= 1000) diskRootsMemo = { atMs: Date.now(), sessionsDir, limit, roots };
 	return roots.slice(0, limit);
 }
 

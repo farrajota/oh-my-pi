@@ -4,7 +4,13 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { renderStatusLine } from "@oh-my-pi/pi-tui/render";
 import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
-import { formatErrorDetail, formatExpandHint, replaceTabs, shortenPath, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
+import {
+	formatErrorDetail,
+	formatExpandHint,
+	replaceTabs,
+	shortenPath,
+	truncateToWidth,
+} from "@oh-my-pi/pi-tui/render/render-utils";
 
 interface InspectImageRenderArgs {
 	path?: string;

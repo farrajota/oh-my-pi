@@ -168,7 +168,9 @@ export class SessionFocusController {
 		if (!gone && !dead) return;
 		void this.#detachToMain().then(() => {
 			if (!this.#focusedAgentId) {
-				this.ctx.showStatus(`Agent ${event.ref.id} is ${gone ? "gone" : event.ref.status}; returned to main session`);
+				this.ctx.showStatus(
+					`Agent ${event.ref.id} is ${gone ? "gone" : event.ref.status}; returned to main session`,
+				);
 			}
 		});
 	}

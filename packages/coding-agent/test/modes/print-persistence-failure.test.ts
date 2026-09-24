@@ -192,6 +192,7 @@ describe("headless persistence-failure surface", () => {
 			subscribe: () => {},
 			settings: { get: () => false },
 			sessionManager: {
+				getPersistenceError: () => undefined,
 				onPersistenceError: (callback: (error: Error) => void) => {
 					notifyPersistenceError = callback;
 					return () => {};

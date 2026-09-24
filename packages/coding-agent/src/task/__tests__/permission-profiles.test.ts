@@ -248,8 +248,8 @@ describe("permission profile composition and evaluation", () => {
 			mode: "enforce",
 		});
 
-		expect(scope.tools).toEqual(expect.arrayContaining(["grep", "glob"]));
-		expect(scope.tools).not.toEqual(expect.arrayContaining(["search", "find"]));
+		expect(scope.tools).toEqual(expect.arrayContaining(["grep", "find"]));
+		expect(scope.tools).not.toContain("search");
 		expect(evaluate(scope, "grep", {}, cwd).action).toBe("allow");
 		expect(evaluate(scope, "edit", {}, cwd)).toMatchObject({ action: "deny" });
 	});
@@ -549,7 +549,7 @@ describe("W2 permission clauses and structural proofs", () => {
 			profiles: BUILTIN_PERMISSION_PROFILES,
 		});
 		expect(result.ok).toBe(true);
-		if (result.ok) expect(result.value.tools).toEqual(expect.arrayContaining(["read", "grep", "glob", "hub"]));
+		if (result.ok) expect(result.value.tools).toEqual(expect.arrayContaining(["read", "grep", "find", "hub"]));
 		if (result.ok) expect(result.value.tools).not.toContain("write");
 	});
 

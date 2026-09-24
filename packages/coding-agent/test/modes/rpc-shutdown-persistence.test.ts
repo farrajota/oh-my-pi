@@ -87,6 +87,30 @@ function spawnRpcChild(options: { root: string; sessionDir: string }) {
 		fifo,
 		release: () => fs.closeSync(fifo),
 		stderrText: () => stderrText,
+		waitForReady: async (budgetMs: number): Promise<void> => {
+			const deadline = Date.now() + budgetMs;
+			const buffer = Buffer.alloc(64 * 1024);
+			let output = "";
+			for (;;) {
+				try {
+					const count = fs.readSync(fifo, buffer, 0, buffer.length, null);
+					output += buffer.toString("utf8", 0, count);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EAGAIN") throw error;
+				}
+				let newline = output.indexOf("\n");
+				while (newline !== -1) {
+					const frame: unknown = JSON.parse(output.slice(0, newline));
+					if (isRecord(frame) && frame.type === "ready") return;
+					output = output.slice(newline + 1);
+					newline = output.indexOf("\n");
+				}
+				if (child.exitCode !== null || Date.now() > deadline) {
+					throw new Error(`RPC startup did not become ready (exit ${child.exitCode}): ${stderrText}`);
+				}
+				await Bun.sleep(10);
+			}
+		},
 		waitForStderr: async (needle: string, budgetMs: number): Promise<boolean> => {
 			const deadline = Date.now() + budgetMs;
 			while (!stderrText.includes(needle)) {
@@ -170,10 +194,11 @@ describe.skipIf(unsupportedHarness)("RPC shutdown on a failed session store", ()
 		// exactly as a full or unplugged disk would.
 		const sessionDir = path.join(root, "sessions");
 		fs.mkdirSync(sessionDir, { recursive: true });
-		fs.chmodSync(sessionDir, 0o500);
 
-		const { child, fifo, release, stderrText } = spawnRpcChild({ root, sessionDir });
+		const { child, fifo, release, stderrText, waitForReady } = spawnRpcChild({ root, sessionDir });
 		try {
+			await waitForReady(20_000);
+			fs.chmodSync(sessionDir, 0o500);
 			child.stdin.write(backlogFrames());
 			await child.stdin.flush();
 			child.stdin.end();
@@ -204,10 +229,11 @@ describe.skipIf(unsupportedHarness)("RPC shutdown on a failed session store", ()
 		const root = dir.path();
 		const sessionDir = path.join(root, "sessions");
 		fs.mkdirSync(sessionDir, { recursive: true });
-		fs.chmodSync(sessionDir, 0o500);
 
-		const { child, fifo, release, waitForStderr } = spawnRpcChild({ root, sessionDir });
+		const { child, fifo, release, waitForStderr, waitForReady } = spawnRpcChild({ root, sessionDir });
 		try {
+			await waitForReady(20_000);
+			fs.chmodSync(sessionDir, 0o500);
 			child.stdin.write(backlogFrames());
 			await child.stdin.flush();
 			// The store rejects the first write, so a notice is queued behind the

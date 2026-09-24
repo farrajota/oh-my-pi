@@ -286,7 +286,6 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(forwarded?.parentTaskPrefix).toBe("ChildAgent");
 	});
 
-
 	it("removes MCP and fresh discovery sources for a restricted child", async () => {
 		const session = yieldEmittingSession();
 		const persistedInits: Array<{ restrictToolNames?: boolean; tools: string[] }> = [];
@@ -321,7 +320,6 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(created?.outputSchemaMode).toBe("strict");
 		expect(persistedInits).toHaveLength(1);
 		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, tools: ["read", "yield"] });
-
 	});
 
 	it("persists bridge-only tools in the enabled Code Mode set", async () => {

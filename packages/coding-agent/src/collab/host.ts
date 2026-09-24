@@ -54,6 +54,7 @@ import {
 import { CollabSocket } from "./relay-client";
 import {
 	COLLAB_ENTRY_OMITTED_CUSTOM_TYPE,
+	copyForReplication,
 	oversizedEntryNotice,
 	type ReplicatedEntry,
 	replicationByteLength,
@@ -731,7 +732,7 @@ export class CollabHost {
 		const canWrite = this.#verifyWriteToken(writeToken);
 		this.#peers.set(fromPeer, { name: cleanName, canWrite });
 
-		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
+		const snapshot = this.#ctx.sessionManager.snapshotForReplication(copyForReplication);
 		const snapshotBytes = replicationByteLength(snapshot);
 		if (snapshotBytes === null || snapshotBytes > WELCOME_IMAGE_STRIP_THRESHOLD) {
 			let stripped = 0;

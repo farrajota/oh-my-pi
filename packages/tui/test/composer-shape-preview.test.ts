@@ -148,7 +148,7 @@ describe("composer shape preview", () => {
 			getTopBorder: (width: number) => ({ content: "", width }),
 			getStandaloneTopBorder: (width: number) => ({ content: "", width }),
 			getBandTopBorder: (width: number) => ({ content: " ".repeat(width - 6) + "STATUS", width }),
-			renderBottomBar: () => "",
+			renderBottomBarLines: () => [],
 		};
 
 		const [statusBand] = renderComposerShapePreview("band", 200, status);

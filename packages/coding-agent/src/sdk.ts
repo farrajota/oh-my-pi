@@ -23,6 +23,7 @@ import type {
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
+import type { DiscoverAuthStorageOptions } from "@oh-my-pi/pi-ai/auth-broker/discover";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import {
 	getOpenAICodexTransportDetails,
@@ -175,7 +176,11 @@ import {
 	type SecretObfuscator,
 } from "./secrets";
 import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
-import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
+import {
+	discoverAuthStorage as discoverAuthStorageFromConfig,
+	type EffectiveSettingsScope,
+	loadEffectiveAuthAccountPolicyConfig,
+} from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { DateCwdReminderInjector } from "./session/date-cwd-reminder";
 import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
@@ -195,6 +200,7 @@ import {
 	type RetryFallbackResolutionContext,
 	resolveRetryFallbackChainKey,
 } from "./session/retry-fallback-chains";
+import { describeUsageFallback } from "./session/retry-fallback-reason";
 import { getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
 import { collectMountedMCPToolRoutes, projectMountedMCPXdevGuidance } from "./session/session-tools";
@@ -207,6 +213,7 @@ import { unmountAll } from "./ssh/sshfs-mount";
 import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
+	composeAppendPrompt,
 	loadProjectContextFiles as loadContextFilesInternal,
 	projectSystemPromptToolMetadata,
 } from "./system-prompt";
@@ -458,11 +465,11 @@ export interface CreateAgentSessionOptions {
 	/** Force read-only plan mode at start, auto-approve on the model's first resolve call, then switch to execute. */
 	planYolo?: PlanYolo;
 
-    systemPrompt?: string | string[] | ((defaultPrompt: string[]) => string | string[]);
-    systemPromptTemplate?: string;
-    customSystemPrompt?: string;
-    appendSystemPrompt?: string;
-    /**
+	systemPrompt?: string | string[] | ((defaultPrompt: string[]) => string | string[]);
+	systemPromptTemplate?: string;
+	customSystemPrompt?: string;
+	appendSystemPrompt?: string;
+	/**
 	 * Already-loaded title-generation system prompt override (typically
 	 * {@link discoverTitleSystemPromptFile} → {@link resolvePromptInput}). When
 	 * set, every automatic session-title generation path on this session — the
@@ -772,11 +779,28 @@ export {
  * back into the broker through the {@link AuthStorageOptions.refreshOAuthCredential}
  * override to re-mint access tokens when needed.
  *
+ * Account routing (`auth.accountPolicies`, `retry.usageReservePct`) comes from
+ * effective settings: `options.settings` when given, else the matching global
+ * instance, else a read-only load for `options.cwd`; explicit option values win.
+ *
  * Delegates to {@link ./session/auth-broker-config} so the TUI and the catalog
  * generator share the same credential-discovery logic.
  */
-export async function discoverAuthStorage(agentDir: string = getAgentDir()): Promise<AuthStorage> {
-	return discoverAuthStorageFromConfig(agentDir);
+export async function discoverAuthStorage(
+	agentDir: string = getAgentDir(),
+	options: Omit<DiscoverAuthStorageOptions, "agentDir" | "configValueResolver"> &
+		Omit<EffectiveSettingsScope, "agentDir"> = {},
+): Promise<AuthStorage> {
+	const { settings, cwd, ...discoveryOptions } = options;
+	const policy = await loadEffectiveAuthAccountPolicyConfig({ settings, cwd, agentDir });
+	return discoverAuthStorageFromConfig(agentDir, {
+		...discoveryOptions,
+		accountPolicies: discoveryOptions.accountPolicies ?? policy.accountPolicies,
+		authStorageOptions: {
+			...discoveryOptions.authStorageOptions,
+			defaultReservePct: discoveryOptions.authStorageOptions?.defaultReservePct ?? policy.defaultReservePct,
+		},
+	});
 }
 
 /**
@@ -969,7 +993,7 @@ export interface BuildSystemPromptOptions {
 	agentDir?: string;
 	customPrompt?: string;
 	appendPrompt?: string;
-    systemPromptTemplate?: string;
+	systemPromptTemplate?: string;
 	inlineToolDescriptors?: boolean;
 	includeWorkspaceTree?: boolean;
 	/** Include the read-only security:// resource inventory entry. Default: false. */
@@ -1391,7 +1415,7 @@ function snapshotCreateAgentSessionOptions(options: CreateAgentSessionOptions): 
 		systemPrompt: Array.isArray(options.systemPrompt)
 			? (Object.freeze([...options.systemPrompt]) as unknown as string[])
 			: options.systemPrompt,
-        systemPromptTemplate: options.systemPromptTemplate,
+		systemPromptTemplate: options.systemPromptTemplate,
 		outputSchema: cloneAndFreezeStartupValue(options.outputSchema),
 		contextFiles: options.contextFiles ? cloneAndFreezeStartupValue(options.contextFiles) : undefined,
 		workspaceTree: options.workspaceTree ? cloneAndFreezeStartupValue(options.workspaceTree) : undefined,
@@ -1491,7 +1515,7 @@ async function createAgentSessionScoped(
 	const modelRegistry =
 		options.modelRegistry ??
 		new ModelRegistry(
-			options.authStorage ?? (await logger.time("discoverModels", discoverAuthStorage, agentDir)),
+			options.authStorage ?? (await logger.time("discoverModels", discoverAuthStorage, agentDir, { settings, cwd })),
 			path.join(agentDir, "models.yml"),
 			{
 				settings,
@@ -1513,7 +1537,7 @@ async function createAgentSessionScoped(
 	// buffer — so we can't rely on it to catch startup events for the extension runner.
 	const startupCredentialDisabledEvents: CredentialDisabledEvent[] = [];
 	let credentialDisabledTarget: ExtensionRunner | undefined;
-	const unsubscribeCredentialDisabled: (() => void) | undefined = authStorage.onCredentialDisabled(event => {
+	const unsubscribeCredentialDisabled: (() => void) | undefined = authStorage.credentials.onDisabled(event => {
 		if (credentialDisabledTarget) {
 			// Discard return: any handler error is routed through runner.onError listeners.
 			void credentialDisabledTarget.emitCredentialDisabled(event);
@@ -1606,14 +1630,14 @@ async function createAgentSessionScoped(
 	}
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
 	if (options.credentialSourceSessionId && options.credentialSourceSessionId !== providerSessionId) {
-		authStorage.inheritSessionCredentials(options.credentialSourceSessionId, providerSessionId);
+		modelRegistry.authStorage.sessions.inherit(options.credentialSourceSessionId, providerSessionId);
 	}
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
 		options.modelPattern !== undefined ||
 		options.thinkingLevel !== undefined ||
 		options.systemPrompt !== undefined ||
-        options.systemPromptTemplate !== undefined ||
+		options.systemPromptTemplate !== undefined ||
 		options.customSystemPrompt !== undefined ||
 		options.appendSystemPrompt !== undefined ||
 		options.toolNames !== undefined ||
@@ -1816,33 +1840,53 @@ async function createAgentSessionScoped(
 	}
 
 	// Discover rules and bucket them in one pass to avoid repeated scans over large rule sets.
-	const { ttsrManager, rulebookRules, alwaysApplyRules, allRules } = await logger.time(
-		"discoverTtsrRules",
-		async () => {
-			const { TtsrManager } = await import("./export/ttsr");
-			const ttsrSettings = settings.getGroup("ttsr");
-			const ttsrManager = new TtsrManager(ttsrSettings);
-			const rulesResult =
-				options.rules !== undefined
-					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, {
-							cwd,
-							agentDir,
-							disabledExtensions: disabledExtensionIds,
-							extensionRoots,
-						});
-			const { rulebookRules, alwaysApplyRules } = bucketRules(rulesResult.items, ttsrManager, {
-				builtinRules: ttsrSettings.builtinRules,
-				disabledRules: ttsrSettings.disabledRules,
-				agentName:
-					options.agentName ?? ((options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? undefined : "main"),
-			});
-			if (existingSession.injectedTtsrRules.length > 0) {
-				ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
-			}
-			return { ttsrManager, rulebookRules, alwaysApplyRules, allRules: rulesResult.items };
-		},
-	);
+	const ttsrSettings = settings.getGroup("ttsr");
+	const ruleSnapshot = await logger.time("discoverTtsrRules", async () => {
+		const { TtsrManager } = await import("./export/ttsr");
+		const ttsrManager = new TtsrManager(ttsrSettings);
+		const rulesResult =
+			options.rules !== undefined
+				? { items: options.rules, warnings: undefined }
+				: await loadCapability<Rule>(ruleCapability.id, {
+						cwd,
+						agentDir,
+						disabledExtensions: disabledExtensionIds,
+						extensionRoots,
+					});
+		const { rulebookRules, alwaysApplyRules } = bucketRules(rulesResult.items, ttsrManager, {
+			builtinRules: ttsrSettings.builtinRules,
+			disabledRules: ttsrSettings.disabledRules,
+			agentName:
+				options.agentName ?? ((options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? undefined : "main"),
+		});
+		if (existingSession.injectedTtsrRules.length > 0) {
+			ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
+		}
+		return { ttsrManager, rulebookRules, alwaysApplyRules, allRules: rulesResult.items };
+	});
+	const { ttsrManager } = ruleSnapshot;
+	let { rulebookRules, alwaysApplyRules, allRules } = ruleSnapshot;
+	const refreshRulesForBoundary = async (): Promise<void> => {
+		if (options.rules !== undefined) return;
+		const rulesResult = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: sessionManager.getCwd(),
+			agentDir,
+			disabledExtensions: disabledExtensionIds,
+			extensionRoots,
+		});
+		const buckets = bucketRules(rulesResult.items, ttsrManager, {
+			builtinRules: ttsrSettings.builtinRules,
+			disabledRules: ttsrSettings.disabledRules,
+			agentName:
+				options.agentName ?? ((options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? undefined : "main"),
+		});
+		rulebookRules = buckets.rulebookRules;
+		alwaysApplyRules = buckets.alwaysApplyRules;
+		allRules = rulesResult.items;
+		if (!options.parentTaskPrefix) {
+			setActiveRules([...rulebookRules, ...alwaysApplyRules, ...ttsrManager.getRules()]);
+		}
+	};
 
 	// Resolve contextFiles up-front (it's needed before tool creation). The
 	// workspace tree scan is slow on large repos and we MUST NOT block startup on
@@ -1976,7 +2020,7 @@ async function createAgentSessionScoped(
 			permissionScope: () => options.permissionScope,
 			recordPermissionDenial,
 		});
-		const toolSession: ToolSession & { lspShared: boolean } = {
+		const toolSession: ToolSession & { lspShared: boolean; refreshRulesForBoundary: () => Promise<void> } = {
 			pathScope,
 			get cwd() {
 				return sessionManager.getCwd();
@@ -2022,7 +2066,10 @@ async function createAgentSessionScoped(
 				return session?.skills ?? skills;
 			},
 			refreshSkills: () => session.refreshSkills(),
-			rules: allRules,
+			get rules() {
+				return allRules;
+			},
+			refreshRulesForBoundary,
 			eventBus,
 			subagentEventBus,
 			outputSchema: options.outputSchema,
@@ -2075,6 +2122,8 @@ async function createAgentSessionScoped(
 			getTurnBudget: () => sessionManager.getTurnBudget(),
 			recordEvalSubagentUsage: output => sessionManager.recordEvalSubagentOutput(output),
 			getClientBridge: () => session?.clientBridge,
+			emitBeforeSubagentSpawn: (event, signal) =>
+				session?.extensionRunner?.emitBeforeSubagentSpawn(event, signal) ?? Promise.resolve(undefined),
 			queueDeferredDiagnostics: entry => session?.yieldQueue.enqueue(LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE, entry),
 			queueLaunchCompletion: notification =>
 				session?.queueLaunchCompletion(notification) ??
@@ -2229,6 +2278,7 @@ async function createAgentSessionScoped(
 				});
 		const mcpDiscoverOptions = {
 			onStatus: onMCPStatus,
+			startupTimeoutMs: settings.get("mcp.startupTimeoutMs"),
 			enableProjectConfig: settings.get("mcp.enableProjectConfig") ?? true,
 			// Always filter Exa - we have native integration
 			filterExa: true,
@@ -2590,6 +2640,7 @@ async function createAgentSessionScoped(
 			// window.
 			await logger.time("resolveModelDiscoveryDeferredRetry", startRuntimeDiscovery);
 			const matchPreferences = getModelMatchPreferences(settings);
+			const disabledProviders = new Set(settings.get("disabledProviders"));
 			const runtimeResolved = deferredModelPatterns.some(pattern =>
 				pattern.split(",").some(selector => {
 					const trimmedSelector = selector.trim();
@@ -2606,7 +2657,7 @@ async function createAgentSessionScoped(
 					// short-circuit the fallback refresh below — otherwise `@role`
 					// selectors pointing at discovery-backed models never trigger the
 					// fetch and fail with `Model "@role" not found`.
-					return Boolean(resolved.model);
+					return Boolean(resolved.model && !disabledProviders.has(resolved.model.provider));
 				}),
 			);
 			if (!runtimeResolved && modelRegistry.getDiscoverableProviders().length > 0) {
@@ -2614,8 +2665,10 @@ async function createAgentSessionScoped(
 					modelRegistry.refresh("online-if-uncached"),
 				);
 			}
-			const allModels = modelRegistry.getAll();
-			const availableModels = modelRegistry.getAvailable();
+			const allModels = modelRegistry.getAll().filter(candidate => !disabledProviders.has(candidate.provider));
+			const availableModels = modelRegistry
+				.getAvailable()
+				.filter(candidate => !disabledProviders.has(candidate.provider));
 			const expandedModelPatterns = deferredModelPatterns.flatMap(pattern =>
 				pattern.split(",").flatMap(selector => {
 					const trimmedSelector = selector.trim();
@@ -2696,6 +2749,7 @@ async function createAgentSessionScoped(
 				? availableModels
 				: allModels;
 			let usageFallbackTriggered = false;
+			let usageFallbackReason: { from: string; reason: string } | undefined;
 			for (let patternIndex = 0; patternIndex < expandedModelPatterns.length; patternIndex += 1) {
 				const { pattern, retryFallback } = expandedModelPatterns[patternIndex];
 				const primary = parseModelPattern(pattern, resolutionModels, matchPreferences);
@@ -2725,7 +2779,7 @@ async function createAgentSessionScoped(
 				) {
 					let usageHealth: ModelUsageHealth | undefined;
 					try {
-						usageHealth = await modelRegistry.authStorage.getModelUsageHealth(primary.model.provider, {
+						usageHealth = await modelRegistry.authStorage.health.model(primary.model.provider, {
 							modelId: primary.model.id,
 							baseUrl: primary.model.baseUrl,
 							reserveFraction: settings.get("retry.usageReservePct") / 100,
@@ -2745,6 +2799,13 @@ async function createAgentSessionScoped(
 						}
 						if (modelFallbackEnabled) {
 							usageFallbackTriggered = true;
+							usageFallbackReason ??= {
+								from: formatModelSelectorValue(
+									formatModelStringWithRouting(primary.model),
+									primary.thinkingLevel,
+								),
+								reason: describeUsageFallback(usageHealth, settings.get("retry.usageReservePct")),
+							};
 							continue;
 						}
 					}
@@ -2759,6 +2820,13 @@ async function createAgentSessionScoped(
 							(usageReservePolicy === "auto" || (!options.hasUI && !options.deferUsageReserveConfirmation))
 						) {
 							usageFallbackTriggered = true;
+							usageFallbackReason ??= {
+								from: formatModelSelectorValue(
+									formatModelStringWithRouting(primary.model),
+									primary.thinkingLevel,
+								),
+								reason: describeUsageFallback(usageHealth, settings.get("retry.usageReservePct")),
+							};
 							continue;
 						}
 					}
@@ -2856,6 +2924,13 @@ async function createAgentSessionScoped(
 						? resolveProvisionalAutoLevel(selectedModel)
 						: resolveThinkingLevelForModel(selectedModel, effectiveThinkingLevel),
 				);
+				if (usageFallbackReason) {
+					const target = formatModelSelectorValue(
+						formatModelStringWithRouting(selectedModel),
+						effectiveThinkingLevel,
+					);
+					modelFallbackMessage = `Fallback: ${usageFallbackReason.from} -> ${target}\n${usageFallbackReason.reason}`;
+				}
 				preconnectModelHost(selectedModel.baseUrl);
 				break;
 			}
@@ -3464,7 +3539,7 @@ async function createAgentSessionScoped(
 					appendParts.push(`### ${srvName}\n${truncated}`);
 				}
 			}
-			let appendPrompt: string | undefined = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
+			const appendPrompt = composeAppendPrompt(appendParts, options.appendSystemPrompt);
 			// Owned/in-band tool dialects (non-native) require the full functions-
 			// namespace catalog; native tool calling lets the compact name list suffice.
 			const nativeTools = resolveDialect(settings.get("tools.format"), agent?.state.model ?? model) === undefined;
@@ -3472,11 +3547,6 @@ async function createAgentSessionScoped(
 				tools,
 				nativeTools && !inlineToolDescriptors ? { mode: "compact", toolNames } : { mode: "full" },
 			);
-			if (options.appendSystemPrompt) {
-				appendPrompt = appendPrompt
-					? `${appendPrompt}\n\n${options.appendSystemPrompt}`
-					: options.appendSystemPrompt;
-			}
 			const evalPreludes = getEvalPreludes();
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
@@ -3846,7 +3916,8 @@ async function createAgentSessionScoped(
 			kimiApiFormat,
 			getApiKey:
 				options.getApiKey ??
-				(requestModel => modelRegistry.resolver(requestModel, options.credentialSourceSessionId ?? agent.sessionId)),
+				(requestModel =>
+					modelRegistry.resolver(requestModel, options.credentialSourceSessionId ?? agent.sessionId)),
 			getToolContext: tc => toolContextStore.getContext(tc),
 			streamFn: (streamModel, context, streamOptions) => {
 				if (notifyFirstChatDispatch) {

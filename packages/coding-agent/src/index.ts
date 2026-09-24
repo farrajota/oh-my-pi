@@ -57,6 +57,7 @@ export * from "@oh-my-pi/pi-tui/theme";
 // SDK for programmatic usage
 export * from "./sdk";
 export type { ContextUsage } from "./extensibility/extensions/types";
+export { isToolCallEventType } from "./extensibility/extensions/types";
 export * from "./session/agent-session";
 // Auth and model registry
 export * from "./session/auth-storage";

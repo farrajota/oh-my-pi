@@ -49,7 +49,6 @@ export interface LoopConditionOptions {
  */
 const LOOP_CONDITION_SESSION_KEY = "loop-condition";
 
-
 /** Sanitize + bound user command text for single-line status display. */
 function quoteCommand(command: string): string {
 	return `\`${truncateToWidth(sanitizeStatusText(command), TRUNCATE_LENGTHS.TITLE)}\``;

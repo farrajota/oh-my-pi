@@ -7,9 +7,7 @@ import type { HTMLElement } from "@oh-my-pi/pi-utils/dom";
 import type {
 	Browser,
 	CDPSession,
-	Dialog,
 	ElementHandle,
-	ElementScreenshotOptions,
 	HTTPResponse,
 	JSHandle,
 	KeyboardTypeOptions,
@@ -37,6 +35,7 @@ import {
 } from "../run-scope";
 import { ToolAbortError, throwIfAborted } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { type BrowserA11yOptions, type BrowserA11yResult, formatA11ySummary, runA11yAudit } from "./a11y/audit";
 import {
 	type AriaSnapshotOptions,
 	assertSelectorString,
@@ -51,6 +50,8 @@ import {
 	DEFAULT_VIEWPORT,
 	isPuppeteerHandle,
 	loadPuppeteerInWorker,
+	loadedKnownDevices,
+	loadedNetworkConditions,
 } from "./launch";
 import { extractReadableFromHtml, type ReadableExtractOptions, type ReadableFormat } from "./readable";
 import { assertTabPressArgs } from "./tab-arguments";
@@ -152,6 +153,7 @@ import {
 	clickAt,
 	clickElement,
 	clickQueryHandlerText,
+	fillViaHandle,
 	highlightElement,
 	type HighlightOptions,
 	type InteractionHandle,
@@ -177,7 +179,6 @@ import {
 	type ScreenshotAnnotationTarget,
 	type ScreenshotChangeResult,
 	type ScreenshotHistory,
-	type ScreenshotOptions,
 	screenshotQuality,
 	screenshotScope,
 	screenshotThreshold,
@@ -192,6 +193,13 @@ import {
 	resolveFrame,
 } from "./frames";
 import { pushState, reloadPage, traverseHistory, type NavigationWaitUntil } from "./navigation";
+import {
+	BrowserEmulationController,
+	type BrowserEmulateOptions,
+	type ClipboardActionResult,
+	type ClipboardReadResult,
+} from "./emulation";
+import type { ClickAtOptions, MouseMoveOptions, MouseButtonOptions } from "./interactions";
 
 import { cloneSafe, RunOutput } from "./run-output";
 import type {
@@ -257,6 +265,12 @@ const LEGACY_SELECTOR_PREFIXES = ["p-aria/", "p-text/", "p-xpath/", "p-pierce/"]
 
 const SELECTOR_HANDLER_PREFIXES = [
 	"aria/",
+	"role/",
+	"label/",
+	"placeholder/",
+	"testid/",
+	"alt/",
+	"title/",
 	"text/",
 	"xpath/",
 	"pierce/",
@@ -275,14 +289,7 @@ const SELECTOR_HANDLER_PREFIXES = [
 const PLAYWRIGHT_ONLY_SELECTOR_RE =
 	/:has-text\(|:text\(|:text-is\(|:text-matches\(|:visible\b|:hidden\b|:nth-match\(|:near\(|:above\(|:below\(|:right-of\(|:left-of\(/;
 
-type DialogPolicy = "accept" | "dismiss";
 type DragTarget = string | { readonly x: number; readonly y: number };
-type ActionabilityResult = { ok: true; x: number; y: number } | { ok: false; reason: string };
-/** Last JS dialog seen on the page; kept for timeout attribution until handled or navigation. */
-interface OpenDialogInfo {
-	type: string;
-	message: string;
-}
 
 /**
  * Per-op fail-fast ceilings for `tab.*` helpers. All are kept strictly under the cell
@@ -377,6 +384,11 @@ interface ScreenshotOptions {
 	selector?: string;
 	fullPage?: boolean;
 	silent?: boolean;
+	annotate?: boolean;
+	format?: "png" | "jpeg";
+	quality?: number;
+	ifChanged?: boolean;
+	threshold?: number;
 }
 
 interface TabApi {
@@ -389,15 +401,23 @@ interface TabApi {
 		url: string,
 		opts?: { waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2" },
 	): Promise<void>;
-	observe(opts?: { includeAll?: boolean; viewportOnly?: boolean }): Promise<Observation>;
-	ariaSnapshot(selector?: string, opts?: AriaSnapshotOptions): Promise<string>;
-	screenshot(opts?: ScreenshotOptions): Promise<string>;
-	extract(format?: ReadableFormat): Promise<string>;
+	observe(opts?: {
+		includeAll?: boolean;
+		viewportOnly?: boolean;
+		selector?: string;
+		compact?: boolean;
+	}): Promise<Observation>;
+	ariaSnapshot(selector?: string, opts?: AriaSnapshotOptions): Promise<string | AriaSnapshotDiffResult>;
+	a11y(options?: BrowserA11yOptions): Promise<BrowserA11yResult>;
+	screenshot(opts?: ScreenshotOptions): Promise<string | ScreenshotChangeResult>;
+	diffScreenshot(baselinePath: string, opts?: DiffScreenshotOptions): Promise<DiffScreenshotResult>;
+	pdf(opts?: PdfOptions): Promise<string>;
+	extract(format?: ReadableFormat, opts?: ReadableExtractOptions): Promise<string>;
 	click(selector: string): Promise<void>;
 	type(selector: string, text: string): Promise<void>;
 	fill(selector: string, value: string): Promise<void>;
 	press(key: KeyInput, opts?: { selector?: string }): Promise<void>;
-	scroll(deltaX: number, deltaY: number): Promise<void>;
+	scroll(deltaX: number, deltaY: number, opts?: ScrollOptions): Promise<void>;
 	drag(from: DragTarget, to: DragTarget): Promise<void>;
 	waitFor(selector: string, opts?: { timeout?: number }): Promise<ActionableHandle>;
 	evaluate<R, TArgs extends unknown[]>(fn: string | ((...args: TArgs) => R | Promise<R>), ...args: TArgs): Promise<R>;
@@ -419,6 +439,88 @@ interface TabApi {
 	}): Promise<HTTPResponse | null>;
 	id(n: number): Promise<ActionableHandle>;
 	ref(id: string): Promise<ActionableHandle>;
+	back(opts?: { waitUntil?: NavigationWaitUntil }): Promise<string>;
+	forward(opts?: { waitUntil?: NavigationWaitUntil }): Promise<string>;
+	reload(opts?: { waitUntil?: NavigationWaitUntil }): Promise<string>;
+	pushState(url: string): Promise<string>;
+	frames(): Promise<BrowserFrameInfo[]>;
+	frame(selector: string): Promise<BrowserFrameApi>;
+	dialog(): Promise<DialogState>;
+	handleDialog(opts: { accept: boolean; text?: string }): Promise<void>;
+	setDialogs(policy: DialogPolicy | null): Promise<void>;
+	dblclick(selector: string): Promise<void>;
+	hover(selector: string): Promise<void>;
+	focus(selector: string): Promise<void>;
+	check(selector: string): Promise<void>;
+	uncheck(selector: string): Promise<void>;
+	keyDown(key: KeyInput): Promise<void>;
+	keyUp(key: KeyInput): Promise<void>;
+	mouseMove(x: number, y: number, opts?: MouseMoveOptions): Promise<void>;
+	mouseDown(opts?: MouseButtonOptions): Promise<void>;
+	mouseUp(opts?: MouseButtonOptions): Promise<void>;
+	clickAt(x: number, y: number, opts?: ClickAtOptions): Promise<void>;
+	wheel(deltaX: number, deltaY: number): Promise<void>;
+	highlight(selector: string, opts?: HighlightOptions): Promise<void>;
+	console(opts?: BrowserConsoleOptions): Promise<BrowserCaptureResult<BrowserConsoleEntry>>;
+	errors(opts?: BrowserErrorOptions): Promise<BrowserCaptureResult<BrowserErrorEntry>>;
+	clearConsole(): Promise<void>;
+	traceStart(opts?: BrowserTraceStartOptions): Promise<void>;
+	traceStop(opts?: BrowserTraceStopOptions): Promise<string>;
+	profileStart(): Promise<void>;
+	profileStop(opts?: BrowserProfileStopOptions): Promise<string>;
+	metrics(): Promise<BrowserMetrics>;
+	emulate(opts?: BrowserEmulateOptions): Promise<BrowserEmulateOptions>;
+	devices(): Promise<string[]>;
+	clipboardRead(): Promise<ClipboardReadResult>;
+	clipboardWrite(text: string): Promise<ClipboardActionResult>;
+	clipboardCopy(): Promise<ClipboardActionResult>;
+	clipboardPaste(): Promise<ClipboardActionResult>;
+	text(selector: string): Promise<string | null>;
+	html(selector: string): Promise<string | null>;
+	value(selector: string): Promise<string | null>;
+	attr(selector: string, name: string): Promise<string | null>;
+	count(selector: string): Promise<number>;
+	box(selector: string): Promise<QueryBox | null>;
+	styles(selector: string, props?: string[]): Promise<Record<string, string> | null>;
+	isVisible(selector: string): Promise<boolean>;
+	isEnabled(selector: string): Promise<boolean>;
+	isChecked(selector: string): Promise<boolean>;
+	waitForText(text: string, opts?: { timeout?: number; selector?: string; exact?: boolean }): Promise<void>;
+	addInitScript(source: string): Promise<{ id: string }>;
+	removeInitScript(id: string): Promise<void>;
+	initScripts(): Promise<InitScriptInfo[]>;
+	waitForDownload(opts?: { timeout?: number }): Promise<BrowserDownload>;
+	downloads(): Promise<BrowserDownload[]>;
+	cookies(opts?: CookieQueryOptions): Promise<BrowserCookie[]>;
+	setCookies(...cookies: unknown[]): Promise<void>;
+	clearCookies(opts?: ClearCookiesOptions): Promise<void>;
+	storage(kind: StorageKind, opts?: { key?: string }): Promise<Record<string, string> | string | null>;
+	setStorage(kind: StorageKind, keyOrEntries: string | Record<string, unknown>, value?: unknown): Promise<void>;
+	clearStorage(kind: StorageKind): Promise<void>;
+	saveState(path?: string): Promise<string>;
+	loadState(path: string): Promise<LoadStateResult>;
+	route(pattern: NetworkPattern, opts?: NetworkRouteOptions): Promise<void>;
+	unroute(pattern?: NetworkPattern): Promise<void>;
+	routes(): Promise<NetworkRouteDescription[]>;
+	requests(opts?: NetworkRequestsOptions): Promise<NetworkRequestRecord[]>;
+	request(id: string | number): Promise<NetworkRequestDetail>;
+	clearRequests(): Promise<void>;
+	harStart(opts?: { content?: HarContentPolicy }): Promise<void>;
+	harStop(opts?: { path?: string }): Promise<string>;
+	allowedDomains(): Promise<string[]>;
+	recordStart(path: string, opts?: RecordingOptions): Promise<RecordingStartResult>;
+	recordStop(): Promise<RecordingStopResult>;
+	recordRestart(path: string, opts?: RecordingOptions): Promise<RecordingStartResult>;
+	recording(): Promise<RecordingStatus>;
+	webmcpList(opts?: WebMcpListOptions): Promise<WebMcpListResult>;
+	webmcpInvoke(name: string, params: Record<string, unknown>, opts?: WebMcpInvokeOptions): Promise<WebMcpInvokeResult>;
+	webmcpEvents(opts?: WebMcpEventsOptions): Promise<WebMcpEventsResult>;
+	vitals(opts?: VitalsOptions): Promise<VitalsResult>;
+	reactEnable(): Promise<ReactEnableResult>;
+	reactTree(opts?: ReactTreeOptions): Promise<ReactTreeNode[]>;
+	reactInspect(id: number): Promise<ReactInspectResult>;
+	reactRenders(opts: { action: ReactRendersAction }): Promise<ReactRendersResult>;
+	reactSuspense(opts?: ReactSuspenseOptions): Promise<ReactSuspenseBoundary[]>;
 }
 
 export function normalizeSelector(selector: string): string {
@@ -467,7 +569,7 @@ function asElementHandle(handle: unknown): ElementHandle | null {
 }
 
 /** ElementHandle enriched with the `fill()` the tool docs promise on handles from `tab.id()`/`tab.ref()`/`tab.waitFor()`. */
-export type ActionableHandle = ElementHandle & { fill(value: string): Promise<void> };
+export type ActionableHandle = InteractionHandle & ElementQueryHelpers & { fill(value: string): Promise<void> };
 
 /**
  * A named per-op guard: runs `fn` inside the active run's fail-fast deadline and
@@ -643,7 +745,7 @@ export function toActionableHandle(
 	}
 
 	for (const method of GUARDED_HANDLE_METHODS) {
-		if (method === "type") continue;
+		if (method === "type" || method === "click") continue;
 		const original = originals.interactive[method];
 		if (!original) continue;
 		methods[method] = (...args) =>
@@ -658,6 +760,25 @@ export function toActionableHandle(
 				),
 			);
 	}
+	enriched.click = () =>
+		guard("handle.click()", signal =>
+			runGuardedHandleAction(
+				enriched,
+				originals,
+				"handle.click()",
+				signal,
+				() => clickElement(enriched, "handle.click()", signal),
+				invalidate,
+			),
+		);
+	enriched.dblclick = () =>
+		guard("handle.dblclick()", signal => clickElement(enriched, "handle.dblclick()", signal, { clickCount: 2 }));
+	enriched.check = () =>
+		guard("handle.check()", signal => setElementChecked(enriched, true, "handle.check()", signal));
+	enriched.uncheck = () =>
+		guard("handle.uncheck()", signal => setElementChecked(enriched, false, "handle.uncheck()", signal));
+	enriched.highlight = options => guard("handle.highlight()", signal => highlightElement(enriched, options, signal));
+	enrichElementQueries(enriched, guard);
 	enriched.type = (text, options) =>
 		guard<void>("handle.type()", signal =>
 			runGuardedHandleAction(
@@ -702,23 +823,6 @@ async function typeViaHandle(
 	}
 }
 
-/** Focus, clear any existing value, then retype — shared by `tab.fill(aria-ref)` and enriched handles. */
-async function fillViaHandle(
-	handle: ElementHandle,
-	value: string,
-	signal?: AbortSignal,
-	type: (text: string) => Promise<unknown> = text => handle.type(text, { delay: 0 }),
-): Promise<void> {
-	await untilAborted(signal, () =>
-		handle.evaluate(el => {
-			const node = el as unknown as { value?: string; focus?: () => void };
-			node.focus?.();
-			if ("value" in node) node.value = "";
-		}),
-	);
-	await untilAborted(signal, () => type(value));
-}
-
 /**
  * Strip `user:pass@` from a URL before surfacing it in tool outputs / details
  * so Basic Auth credentials don't leak into transcripts. Returns the original
@@ -750,7 +854,11 @@ export interface RunPageScope {
  * Puppeteer's Page wraps an internal emitter, so `removeAllListeners("request")`
  * would also remove its forwarding listener; the facade removes only user handlers.
  */
-export function createRunPageScope(page: Page, preserveRequestInterception = false): RunPageScope {
+export function createRunPageScope(
+	page: Page,
+	preserveRequestInterception = false,
+	restoreInterception?: () => Promise<void>,
+): RunPageScope {
 	const requestHandlers: unknown[] = [];
 	const on = page.on;
 	const off = page.off;
@@ -828,7 +936,7 @@ export function createRunPageScope(page: Page, preserveRequestInterception = fal
 				requestHandlers.length = 0;
 				try {
 					await withTimeout(
-						page.setRequestInterception(false),
+						restoreInterception ? restoreInterception() : page.setRequestInterception(false),
 						REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS,
 						"Timed out clearing browser request interception",
 					);
@@ -925,10 +1033,16 @@ async function collectObservationEntries(
 	core: WorkerCore,
 	node: SerializedAXNode,
 	entries: ObservationEntry[],
-	options: { viewportOnly: boolean; includeAll: boolean },
+	options: { viewportOnly: boolean; includeAll: boolean; compact?: boolean; signal?: AbortSignal },
 ): Promise<void> {
-	if (options.includeAll || isInteractiveNode(node)) {
-		const handle = await node.elementHandle();
+	throwIfAborted(options.signal);
+	const emptyStructural =
+		options.compact &&
+		!node.name &&
+		!node.value &&
+		(node.role === "generic" || node.role === "none" || node.role === "group");
+	if (!emptyStructural && (options.includeAll || isInteractiveNode(node))) {
+		const handle = await untilAborted(options.signal, () => node.elementHandle());
 		if (handle) {
 			let inViewport = true;
 			if (options.viewportOnly) {
@@ -970,122 +1084,6 @@ async function collectObservationEntries(
 	for (const child of node.children ?? []) {
 		await collectObservationEntries(core, child, entries, options);
 	}
-}
-
-async function resolveActionableQueryHandlerClickTarget(handles: ElementHandle[]): Promise<ElementHandle | null> {
-	const candidates: Array<{
-		handle: ElementHandle;
-		rect: { x: number; y: number; w: number; h: number };
-		ownedProxy?: ElementHandle;
-	}> = [];
-	for (const handle of handles) {
-		let clickable: ElementHandle = handle;
-		let clickableProxy: ElementHandle | null = null;
-		try {
-			const proxy = await handle.evaluateHandle(el => {
-				const target =
-					(el as Element).closest(
-						'a,button,[role="button"],[role="link"],input[type="button"],input[type="submit"]',
-					) ?? el;
-				return target;
-			});
-			clickableProxy = asElementHandle(proxy.asElement());
-			if (clickableProxy) clickable = clickableProxy;
-		} catch {}
-		try {
-			const intersecting = await clickable.isIntersectingViewport();
-			if (!intersecting) continue;
-			const rect = (await clickable.evaluate(el => {
-				const r = (el as Element).getBoundingClientRect();
-				return { x: r.left, y: r.top, w: r.width, h: r.height };
-			})) as { x: number; y: number; w: number; h: number };
-			if (rect.w < 1 || rect.h < 1) continue;
-			candidates.push({ handle: clickable, rect, ownedProxy: clickableProxy ?? undefined });
-		} catch {
-		} finally {
-			if (clickableProxy && clickableProxy !== handle && clickable !== clickableProxy) {
-				await clickableProxy.dispose().catch(() => undefined);
-			}
-		}
-	}
-	if (!candidates.length) return null;
-	candidates.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
-	const winner = candidates[0]?.handle ?? null;
-	for (let i = 1; i < candidates.length; i++) {
-		const candidate = candidates[i]!;
-		if (candidate.ownedProxy) await candidate.ownedProxy.dispose().catch(() => undefined);
-	}
-	return winner;
-}
-
-async function isClickActionable(handle: ElementHandle): Promise<ActionabilityResult> {
-	return (await handle.evaluate(el => {
-		const element = el as HTMLElement;
-		const style = globalThis.getComputedStyle(element);
-		if (style.display === "none") return { ok: false as const, reason: "display:none" };
-		if (style.visibility === "hidden") return { ok: false as const, reason: "visibility:hidden" };
-		if (style.pointerEvents === "none") return { ok: false as const, reason: "pointer-events:none" };
-		if (Number(style.opacity) === 0) return { ok: false as const, reason: "opacity:0" };
-		const r = element.getBoundingClientRect();
-		if (r.width < 1 || r.height < 1) return { ok: false as const, reason: "zero-size" };
-		const left = Math.max(0, Math.min(globalThis.innerWidth, r.left));
-		const right = Math.max(0, Math.min(globalThis.innerWidth, r.right));
-		const top = Math.max(0, Math.min(globalThis.innerHeight, r.top));
-		const bottom = Math.max(0, Math.min(globalThis.innerHeight, r.bottom));
-		if (right - left < 1 || bottom - top < 1) return { ok: false as const, reason: "off-viewport" };
-		const x = Math.floor((left + right) / 2);
-		const y = Math.floor((top + bottom) / 2);
-		const topEl = globalThis.document.elementFromPoint(x, y);
-		if (!topEl) return { ok: false as const, reason: "elementFromPoint-null" };
-		if (topEl === element || element.contains(topEl) || (topEl as Element).contains(element))
-			return { ok: true as const, x, y };
-		return { ok: false as const, reason: "obscured" };
-	})) as ActionabilityResult;
-}
-
-async function clickQueryHandlerText(
-	page: Page,
-	selector: string,
-	timeoutMs: number,
-	signal?: AbortSignal,
-): Promise<void> {
-	const timeoutSignal = AbortSignal.timeout(timeoutMs);
-	const clickSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-	const start = Date.now();
-	let lastSeen = 0;
-	let lastReason: string | null = null;
-	while (Date.now() - start < timeoutMs) {
-		throwIfAborted(clickSignal);
-		const handles = (await untilAborted(clickSignal, () => page.$$(selector))) as ElementHandle[];
-		try {
-			lastSeen = handles.length;
-			const target = await resolveActionableQueryHandlerClickTarget(handles);
-			if (!target) {
-				lastReason = handles.length ? "no-visible-candidate" : "no-matches";
-				await untilAborted(clickSignal, () => Bun.sleep(100));
-				continue;
-			}
-			const actionability = await isClickActionable(target);
-			if (!actionability.ok) {
-				lastReason = actionability.reason;
-				await untilAborted(clickSignal, () => Bun.sleep(100));
-				continue;
-			}
-			try {
-				await untilAborted(clickSignal, () => target.click());
-				return;
-			} catch (err) {
-				lastReason = err instanceof Error ? err.message : String(err);
-				await untilAborted(clickSignal, () => Bun.sleep(100));
-			}
-		} finally {
-			await Promise.all(handles.map(async handle => handle.dispose().catch(() => undefined)));
-		}
-	}
-	throw new ToolError(
-		`Timed out clicking ${selector} (seen ${lastSeen} matches; last reason: ${lastReason ?? "unknown"}). ` +
-			"If there are multiple matching elements, use observe + tab.id() or a more specific selector.",
-	);
 }
 
 /**
@@ -1158,6 +1156,7 @@ export class WorkerCore {
 	#targetId?: string;
 	#elementCache = new Map<number, ElementHandle>();
 	#elementCounter = 0;
+	#screenshotHistory = new Map<string, ScreenshotHistory>();
 	#active: ActiveRun | null = null;
 	#runtime: JsRuntime | null = null;
 	#unsub: () => void;
@@ -1165,9 +1164,16 @@ export class WorkerCore {
 	#uninstallRejectionGuard: () => void;
 	#mode?: WorkerInitPayload["mode"];
 	#activateForScreenshot = true;
-	#dialogPolicy?: DialogPolicy;
-	#dialogHandler?: (dialog: Dialog) => void;
-	#openDialog?: OpenDialogInfo;
+	#dialogs?: RuntimeDialogController;
+	#console = new PageConsoleCapture();
+	#tracing?: BrowserTracingController;
+	#emulation?: BrowserEmulationController;
+	#network?: BrowserNetworkManager;
+	#downloads?: DownloadManager;
+	#initScripts?: InitScriptManager;
+	#webmcp?: WebMcpController;
+	#recording = new RecordingController();
+	#ariaBaselines = new Map<string, AriaSnapshotBaseline>();
 
 	constructor(transport: Transport, isolated: boolean) {
 		this.#transport = transport;
@@ -1268,9 +1274,10 @@ export class WorkerCore {
 
 	async #init(payload: WorkerInitPayload): Promise<void> {
 		try {
-			this.#mode = payload.mode;
+			this.#mode = payload.mode === "attach" && payload.emulateFocus ? "headless" : payload.mode;
 			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
+			registerSemanticQueryHandlers(puppeteer);
 			this.#browser = await puppeteer.connect({
 				browserWSEndpoint: payload.browserWSEndpoint,
 				defaultViewport: null,
@@ -1289,10 +1296,8 @@ export class WorkerCore {
 				this.#page = await createTrackedHeadlessPage(this.#browser, targetId => {
 					this.#transport.send({ type: "page-created", targetId });
 				});
-				this.#observeDialogs();
 				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
 				if (payload.emulateViewport !== false) await applyViewport(this.#page, payload.viewport);
-				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 			} else {
 				const target = await this.#findAttachedTarget(payload.targetId);
 				// Post-timeout recycle: unblock the target BEFORE adopting the page — an open
@@ -1303,9 +1308,29 @@ export class WorkerCore {
 				if (!page) throw new ToolError(`Target ${payload.targetId} is no longer available on the attached browser`);
 				this.#page = page;
 				await this.#claimRelayTarget(page);
-				this.#observeDialogs();
-				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 			}
+			const page = this.#page;
+			this.#dialogs = new RuntimeDialogController(page, (message, details) => this.#log("debug", message, details));
+			this.#dialogs.observe();
+			if (payload.dialogs) await this.#dialogs.setPolicy(payload.dialogs);
+			this.#tracing = new BrowserTracingController(page);
+			this.#emulation = new BrowserEmulationController(
+				page,
+				loadedKnownDevices(),
+				loadedNetworkConditions(),
+				await this.#browser.userAgent(),
+			);
+			this.#network = new BrowserNetworkManager(page, payload.allowedDomains);
+			await this.#network.start();
+			this.#initScripts = new InitScriptManager(page);
+			for (const source of payload.initScripts ?? []) await this.#initScripts.add(source);
+			if (payload.userAgent) await this.#emulation.emulate({ userAgent: payload.userAgent });
+			if (payload.ignoreHttpsErrors) await applyIgnoreHttpsErrors(page);
+			this.#downloads = new DownloadManager(this.#browser, page, await targetIdForPage(page));
+			if (payload.downloadsPath) await this.#downloads.enable(payload.downloadsPath);
+			await this.#console.install(page);
+			this.#webmcp = await installWebMcp(page);
+			await installVitalsObservers(page);
 			if (payload.mode === "headless" || payload.emulateFocus) {
 				// Background Chromium tabs stop producing frames, stalling rAF,
 				// IntersectionObserver, and input acknowledgements. Keep owned tabs
@@ -1326,6 +1351,7 @@ export class WorkerCore {
 			// browser (the supervisor retries with a fresh worker), so close it before
 			// reporting. Attach mode adopts an existing target — never close it.
 			const page = this.#page;
+			await this.#disposePageResources();
 			if (payload.mode === "headless" && page && !page.isClosed()) {
 				await page.close().catch(() => undefined);
 			}
@@ -1385,54 +1411,16 @@ export class WorkerCore {
 		}
 	}
 
-	/**
-	 * Record JS dialogs for timeout attribution without handling them (semantics of an
-	 * unset `dialogs` policy are unchanged — the page stays blocked until user code or
-	 * the policy handler acts). Cleared when the policy handler settles the dialog or a
-	 * main-frame navigation proves the modal is gone.
-	 */
-	#observeDialogs(): void {
-		const page = this.#requirePage();
-		page.on("dialog", dialog => {
-			this.#openDialog = { type: dialog.type(), message: dialog.message() };
-		});
-		page.on("framenavigated", frame => {
-			if (frame === page.mainFrame()) this.#openDialog = undefined;
-		});
-	}
-
 	async #currentReadyInfo(): Promise<ReadyInfo> {
 		const page = this.#requirePage();
 		const targetId = this.#targetId ?? (await targetIdForPage(page));
 		this.#targetId = targetId;
 		return {
 			url: redactUrlCredentials(page.url()),
-			title: await page.title().catch(() => undefined),
+			title: this.#dialogs?.state().open ? undefined : await page.title().catch(() => undefined),
 			viewport: page.viewport() ?? DEFAULT_VIEWPORT,
 			targetId,
 		};
-	}
-
-	#applyDialogPolicy(policy: DialogPolicy): void {
-		const page = this.#requirePage();
-		if (this.#dialogPolicy === policy && this.#dialogHandler) return;
-		if (this.#dialogHandler) page.off("dialog", this.#dialogHandler);
-		const handler = (dialog: Dialog): void => {
-			const action = policy === "accept" ? dialog.accept() : dialog.dismiss();
-			void action.then(
-				() => {
-					this.#openDialog = undefined;
-				},
-				err =>
-					this.#log("debug", "Dialog auto-handler failed", {
-						policy,
-						error: err instanceof Error ? err.message : String(err),
-					}),
-			);
-		};
-		page.on("dialog", handler);
-		this.#dialogPolicy = policy;
-		this.#dialogHandler = handler;
 	}
 
 	async #postReadyInfo(): Promise<void> {
@@ -1455,6 +1443,7 @@ export class WorkerCore {
 			});
 			return;
 		}
+		const captureStart = this.#console.nextSequence;
 		const timeoutSignal = AbortSignal.timeout(msg.timeoutMs);
 		const ac = new AbortController();
 		const runAc = new AbortController();
@@ -1482,7 +1471,11 @@ export class WorkerCore {
 		let runPage: RunPageScope | undefined;
 		try {
 			throwIfAborted(signal);
-			runPage = createRunPageScope(this.#requirePage(), msg.preserveRequestInterception === true);
+			runPage = createRunPageScope(
+				this.#requirePage(),
+				msg.preserveRequestInterception === true,
+				this.#network ? () => this.#network!.restoreInterception() : undefined,
+			);
 			const browser = this.#requireBrowser();
 			const tabApi = this.#createTabApi(msg.name, msg.timeoutMs, signal, msg.session, output, screenshots, active);
 			const runtime = this.#ensureRuntime(msg.session);
@@ -1520,13 +1513,13 @@ export class WorkerCore {
 						: new ToolAbortError(undefined, { cause: signal.reason });
 				if (timeoutSignal.aborted) {
 					const stalled = describeInflight(active.inflight);
-					const dialog = this.#openDialog;
-					const dialogNote = dialog
-						? `; a ${dialog.type}(${JSON.stringify(dialog.message.slice(0, 80))}) dialog opened during this run and may still block the page — reopen the tab with dialogs:"accept"|"dismiss" or handle page.on('dialog')`
+					const dialog = this.#dialogs?.state();
+					const dialogNote = dialog?.open
+						? `; a ${dialog.type}(${JSON.stringify(dialog.message?.slice(0, 80))}) dialog is blocking the page — use tab.handleDialog() or tab.setDialogs()`
 						: "";
 					rejectCancel(
 						new ToolError(
-							`Browser code execution timed out after ${msg.timeoutMs}ms${stalled ? ` (stalled on ${stalled})` : ""}${dialogNote}`,
+							`Browser code execution timed out after ${msg.timeoutMs}ms${stalled ? ` (stalled on ${stalled})` : ""}${dialogNote}${this.#console.errorCountSince(captureStart) ? `; ${this.#console.errorCountSince(captureStart)} page error(s) since run start — see tab.errors()` : ""}`,
 						),
 					);
 				} else {
@@ -1764,6 +1757,16 @@ export class WorkerCore {
 		active: ActiveRun,
 	): TabApi {
 		const page = this.#requirePage();
+		const dialogs = this.#dialogs;
+		const tracing = this.#tracing;
+		const emulation = this.#emulation;
+		const network = this.#network;
+		const downloads = this.#downloads;
+		const initScripts = this.#initScripts;
+		const webmcp = this.#webmcp;
+		if (!dialogs || !tracing || !emulation || !network || !downloads || !initScripts || !webmcp) {
+			throw new ToolError("Tab worker page resources are not initialized");
+		}
 		const { budgetBound, quickOpMs, actionOpMs } = resolveOpTimeouts(timeoutMs);
 		const waitMs = (explicit?: number): number => resolveWaitTimeout(timeoutMs, explicit);
 		const INF = Number.POSITIVE_INFINITY;
@@ -1786,10 +1789,210 @@ export class WorkerCore {
 					await this.#stopLoading();
 				},
 			);
+		const action = <T>(
+			method: string,
+			selector: string,
+			fn: (handle: ElementHandle, sig: AbortSignal, label: string) => Promise<T>,
+		): Promise<T> => {
+			const label = `tab.${method}(${JSON.stringify(selector)})`;
+			return op(
+				label,
+				actionOpMs,
+				async sig => {
+					const handle = await this.#resolveActionHandle(selector, actionOpMs, sig);
+					try {
+						return await fn(handle, sig, label);
+					} finally {
+						await handle.dispose().catch(() => undefined);
+					}
+				},
+				{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
+			);
+		};
+		const navigate = (
+			method: "back" | "forward" | "reload",
+			opts?: { waitUntil?: NavigationWaitUntil },
+		): Promise<string> =>
+			op(`tab.${method}()`, budgetBound, async sig => {
+				this.#clearElementCache();
+				try {
+					return method === "reload"
+						? await reloadPage(page, opts?.waitUntil ?? "load", budgetBound, sig)
+						: await traverseHistory(page, method, opts?.waitUntil ?? "load", budgetBound, sig);
+				} catch (error) {
+					if (sig.aborted || (error instanceof Error && error.name === "TimeoutError")) await this.#stopLoading();
+					throw error;
+				}
+			});
 		return {
 			name,
 			page,
 			signal,
+			back: opts => navigate("back", opts),
+			forward: opts => navigate("forward", opts),
+			reload: opts => navigate("reload", opts),
+			pushState: url => op("tab.pushState()", budgetBound, sig => pushState(page, url, sig)),
+			frames: () => op("tab.frames()", quickOpMs, sig => listFrames(page, sig)),
+			frame: selector =>
+				op("tab.frame()", quickOpMs, async sig =>
+					createFrameApi(await resolveFrame(page, selector, normalizeSelector, sig), {
+						quickOpMs,
+						actionOpMs,
+						zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS,
+						normalizeSelector,
+						waitMs,
+						// Page-level selector watchdogs cannot inspect a child document.
+						op: (label, deadline, fn) => op(label, deadline, fn),
+						captureScreenshot: (frame, target, frameSignal) =>
+							captureFrameScreenshot(
+								frame,
+								target,
+								frameSignal,
+								normalizeSelector,
+								session,
+								output,
+								screenshots,
+							),
+					}),
+				),
+			dialog: () => op("tab.dialog()", quickOpMs, async () => dialogs.state()),
+			handleDialog: opts =>
+				op("tab.handleDialog()", quickOpMs, sig => untilAborted(sig, () => dialogs.handle(opts))),
+			setDialogs: policy =>
+				op("tab.setDialogs()", quickOpMs, sig => untilAborted(sig, () => dialogs.setPolicy(policy))),
+			console: opts => op("tab.console()", quickOpMs, sig => untilAborted(sig, () => this.#console.console(opts))),
+			errors: opts => op("tab.errors()", quickOpMs, sig => untilAborted(sig, () => this.#console.errors(opts))),
+			clearConsole: () => op("tab.clearConsole()", quickOpMs, async () => this.#console.clear()),
+			traceStart: opts =>
+				op("tab.traceStart()", quickOpMs, sig => untilAborted(sig, () => tracing.traceStart(opts))),
+			traceStop: opts =>
+				op("tab.traceStop()", budgetBound, sig => untilAborted(sig, () => tracing.traceStop(session.cwd, opts))),
+			profileStart: () =>
+				op("tab.profileStart()", quickOpMs, sig => untilAborted(sig, () => tracing.profileStart())),
+			profileStop: opts =>
+				op("tab.profileStop()", budgetBound, sig =>
+					untilAborted(sig, () => tracing.profileStop(session.cwd, opts)),
+				),
+			metrics: () => op("tab.metrics()", quickOpMs, sig => untilAborted(sig, () => tracing.metrics())),
+			emulate: opts => op("tab.emulate()", quickOpMs, sig => untilAborted(sig, () => emulation.emulate(opts))),
+			devices: () => op("tab.devices()", quickOpMs, async () => emulation.devices()),
+			clipboardRead: () =>
+				op("tab.clipboardRead()", quickOpMs, sig => untilAborted(sig, () => emulation.clipboardRead())),
+			clipboardWrite: text =>
+				op("tab.clipboardWrite()", quickOpMs, sig => untilAborted(sig, () => emulation.clipboardWrite(text))),
+			clipboardCopy: () =>
+				op("tab.clipboardCopy()", actionOpMs, sig => untilAborted(sig, () => emulation.clipboardCopy())),
+			clipboardPaste: () =>
+				op("tab.clipboardPaste()", actionOpMs, sig => untilAborted(sig, () => emulation.clipboardPaste())),
+			dblclick: selector =>
+				action("dblclick", selector, (handle, sig, label) => clickElement(handle, label, sig, { clickCount: 2 })),
+			hover: selector => action("hover", selector, (handle, sig) => untilAborted(sig, () => handle.hover())),
+			focus: selector => action("focus", selector, (handle, sig) => untilAborted(sig, () => handle.focus())),
+			check: selector =>
+				action("check", selector, (handle, sig, label) => setElementChecked(handle, true, label, sig)),
+			uncheck: selector =>
+				action("uncheck", selector, (handle, sig, label) => setElementChecked(handle, false, label, sig)),
+			highlight: (selector, opts) =>
+				action("highlight", selector, (handle, sig) => highlightElement(handle, opts, sig)),
+			keyDown: key => op("tab.keyDown()", actionOpMs, sig => keyDown(page, key, sig)),
+			keyUp: key => op("tab.keyUp()", actionOpMs, sig => keyUp(page, key, sig)),
+			mouseMove: (x, y, opts) => op("tab.mouseMove()", actionOpMs, sig => mouseMove(page, x, y, opts, sig)),
+			mouseDown: opts => op("tab.mouseDown()", actionOpMs, sig => mouseDown(page, opts, sig)),
+			mouseUp: opts => op("tab.mouseUp()", actionOpMs, sig => mouseUp(page, opts, sig)),
+			clickAt: (x, y, opts) => op("tab.clickAt()", actionOpMs, sig => clickAt(page, x, y, opts, sig)),
+			wheel: (x, y) => op("tab.wheel()", actionOpMs, sig => wheel(page, x, y, sig)),
+			text: selector => op("tab.text()", quickOpMs, sig => queryText(page, normalizeSelector(selector), sig)),
+			html: selector => op("tab.html()", quickOpMs, sig => queryHtml(page, normalizeSelector(selector), sig)),
+			value: selector => op("tab.value()", quickOpMs, sig => queryValue(page, normalizeSelector(selector), sig)),
+			attr: (selector, name) =>
+				op("tab.attr()", quickOpMs, sig => queryAttribute(page, normalizeSelector(selector), name, sig)),
+			count: selector => op("tab.count()", quickOpMs, sig => queryCount(page, normalizeSelector(selector), sig)),
+			box: selector => op("tab.box()", quickOpMs, sig => queryBox(page, normalizeSelector(selector), sig)),
+			styles: (selector, props) =>
+				op("tab.styles()", quickOpMs, sig => queryStyles(page, normalizeSelector(selector), props, sig)),
+			isVisible: selector =>
+				op("tab.isVisible()", quickOpMs, sig => queryVisible(page, normalizeSelector(selector), sig)),
+			isEnabled: selector =>
+				op("tab.isEnabled()", quickOpMs, sig => queryEnabled(page, normalizeSelector(selector), sig)),
+			isChecked: selector =>
+				op("tab.isChecked()", quickOpMs, sig => queryChecked(page, normalizeSelector(selector), sig)),
+			waitForText: (text, opts) =>
+				op("tab.waitForText()", waitMs(opts?.timeout), sig =>
+					waitForPageText(page, text, {
+						...opts,
+						selector: opts?.selector ? normalizeSelector(opts.selector) : undefined,
+						timeout: waitMs(opts?.timeout),
+						signal: sig,
+					}),
+				),
+			addInitScript: source =>
+				op("tab.addInitScript()", quickOpMs, sig => untilAborted(sig, () => initScripts.add(source))),
+			removeInitScript: id =>
+				op("tab.removeInitScript()", quickOpMs, sig => untilAborted(sig, () => initScripts.remove(id))),
+			initScripts: () => op("tab.initScripts()", quickOpMs, async () => initScripts.list()),
+			waitForDownload: opts => op("tab.waitForDownload()", waitMs(opts?.timeout), sig => downloads.wait(sig)),
+			downloads: () => op("tab.downloads()", quickOpMs, async () => downloads.list()),
+			cookies: opts => op("tab.cookies()", quickOpMs, sig => readCookies(page, opts, sig)),
+			setCookies: (...cookies) => op("tab.setCookies()", quickOpMs, sig => setPageCookies(page, cookies, sig)),
+			clearCookies: opts => op("tab.clearCookies()", quickOpMs, sig => clearPageCookies(page, opts, sig)),
+			storage: (kind, opts) => op("tab.storage()", quickOpMs, sig => readStorage(page, kind, opts, sig)),
+			setStorage: (kind, keyOrEntries, value) =>
+				op("tab.setStorage()", quickOpMs, sig => setPageStorage(page, kind, keyOrEntries, value, sig)),
+			clearStorage: kind => op("tab.clearStorage()", quickOpMs, sig => clearPageStorage(page, kind, sig)),
+			saveState: dest =>
+				op("tab.saveState()", quickOpMs, sig => saveStorageState(page, name, dest, session.cwd, sig)),
+			loadState: source =>
+				op("tab.loadState()", budgetBound, sig =>
+					loadStorageState(page, source, session.cwd, {
+						allowOtherOrigins: this.#mode === "headless",
+						navigationTimeoutMs: budgetBound,
+						signal: sig,
+					}),
+				),
+			route: (pattern, opts) => op("tab.route()", quickOpMs, sig => network.route(pattern, opts, sig)),
+			unroute: pattern => op("tab.unroute()", quickOpMs, sig => network.unroute(pattern, sig)),
+			routes: () => op("tab.routes()", quickOpMs, async () => network.routes()),
+			requests: opts => op("tab.requests()", quickOpMs, async () => network.requests(opts)),
+			request: id => op("tab.request()", quickOpMs, sig => network.request(id, sig)),
+			clearRequests: () => op("tab.clearRequests()", quickOpMs, async () => network.clearRequests()),
+			harStart: opts => op("tab.harStart()", quickOpMs, async () => network.harStart(opts?.content)),
+			harStop: opts =>
+				op("tab.harStop()", budgetBound, sig =>
+					network.harStop(
+						opts?.path
+							? resolveToCwd(opts.path, session.cwd)
+							: path.join(os.tmpdir(), `omp-browser-${Snowflake.next()}.har`),
+						sig,
+					),
+				),
+			allowedDomains: () => op("tab.allowedDomains()", quickOpMs, async () => network.allowedDomains()),
+			recordStart: (dest, opts) =>
+				op("tab.recordStart()", budgetBound, sig => this.#recording.start(page, dest, session.cwd, opts, sig)),
+			recordStop: () =>
+				op("tab.recordStop()", budgetBound, sig =>
+					this.#recording.stop({ signal: sig, output, excludeWebP: session.excludeWebP }),
+				),
+			recordRestart: (dest, opts) =>
+				op("tab.recordRestart()", budgetBound, sig =>
+					this.#recording.restart(page, dest, session.cwd, opts, {
+						signal: sig,
+						output,
+						excludeWebP: session.excludeWebP,
+					}),
+				),
+			recording: () => op("tab.recording()", quickOpMs, async () => this.#recording.status()),
+			webmcpList: opts => op("tab.webmcpList()", quickOpMs, sig => untilAborted(sig, () => webmcp.list(opts))),
+			webmcpInvoke: (name, params, opts) =>
+				op("tab.webmcpInvoke()", waitMs(opts?.timeout), sig =>
+					untilAborted(sig, () => webmcp.invoke(name, params, { ...opts, timeout: waitMs(opts?.timeout) })),
+				),
+			webmcpEvents: opts => op("tab.webmcpEvents()", quickOpMs, sig => untilAborted(sig, () => webmcp.events(opts))),
+			vitals: opts => op("tab.vitals()", budgetBound, sig => collectVitals(page, opts, sig)),
+			reactEnable: () => op("tab.reactEnable()", budgetBound, sig => enableReact(page, sig)),
+			reactTree: opts => op("tab.reactTree()", quickOpMs, sig => readReactTree(page, opts, sig)),
+			reactInspect: id => op("tab.reactInspect()", quickOpMs, sig => inspectReactFiber(page, id, sig)),
+			reactRenders: opts => op("tab.reactRenders()", quickOpMs, sig => collectReactRenders(page, opts, sig)),
+			reactSuspense: opts => op("tab.reactSuspense()", quickOpMs, sig => readReactSuspense(page, opts, sig)),
 			url: () => page.url(),
 			title: () => op("tab.title()", INF, sig => untilAborted(sig, () => page.title())),
 			goto: (url, opts) =>
@@ -1831,20 +2034,83 @@ export class WorkerCore {
 								);
 						}
 						try {
-							return await untilAborted(sig, () => captureAriaSnapshot(page, root, opts));
+							const snapshot = await untilAborted(sig, () => captureAriaSnapshot(page, root, opts));
+							return opts?.diff
+								? diffAriaSnapshot(
+										this.#ariaBaselines,
+										ariaSnapshotBaselineKey(selector, opts),
+										page.url(),
+										snapshot,
+									)
+								: snapshot;
 						} finally {
 							await root?.dispose().catch(() => undefined);
 						}
 					},
 				),
+			a11y: (options = {}) =>
+				op("tab.a11y()", budgetBound, async sig => {
+					const result = await untilAborted(sig, () => runA11yAudit(page, options));
+					output.push({ type: "text", text: formatA11ySummary(result) });
+					return result;
+				}),
 			screenshot: opts =>
 				op(describeScreenshot(opts), quickOpMs, sig =>
 					this.#captureScreenshot(session, output, screenshots, sig, opts),
 				),
-			extract: (format = "markdown") =>
+			diffScreenshot: (baselinePath, opts = {}) =>
+				op("tab.diffScreenshot()", quickOpMs, async sig => {
+					const baseline = await untilAborted(sig, () =>
+						fs.promises.readFile(resolveToCwd(baselinePath, session.cwd)),
+					);
+					await preparePageForScreenshot(page, sig, this.#activateForScreenshot);
+					const current = await captureScreenshotBuffer(page, {}, sig, async () => null);
+					const diff = createPngDiff(baseline, current);
+					const changed = diff.pixelChangeRatio > screenshotThreshold(opts.threshold);
+					const diffPath = opts.output
+						? resolveToCwd(opts.output, session.cwd)
+						: path.join(os.tmpdir(), `omp-screenshot-diff-${Snowflake.next()}.png`);
+					await fs.promises.mkdir(path.dirname(diffPath), { recursive: true });
+					await Bun.write(diffPath, diff.png);
+					const resized = await resizeImage(
+						{ type: "image", data: diff.png.toString("base64"), mimeType: "image/png" },
+						{
+							maxWidth: 1024,
+							maxHeight: 1024,
+							maxBytes: 150 * 1024,
+							jpegQuality: 70,
+							excludeWebP: session.excludeWebP,
+						},
+					);
+					screenshots.push({
+						dest: diffPath,
+						mimeType: "image/png",
+						bytes: diff.png.length,
+						width: resized.width,
+						height: resized.height,
+					});
+					output.push({
+						type: "text",
+						text: `Screenshot diff: ${diff.pixelChangeRatio.toFixed(6)} changed-pixel ratio (${changed ? "changed" : "unchanged"}); saved to ${diffPath}`,
+					});
+					output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
+					return { pixelChangeRatio: diff.pixelChangeRatio, changed, diffPath };
+				}),
+			pdf: (opts = {}) =>
+				op("tab.pdf()", quickOpMs, async sig => {
+					const pdfPath = opts.path
+						? resolveToCwd(opts.path, session.cwd)
+						: path.join(os.tmpdir(), `omp-browser-${Snowflake.next()}.pdf`);
+					await fs.promises.mkdir(path.dirname(pdfPath), { recursive: true });
+					const bytes = await untilAborted(sig, () => page.pdf({ ...opts, path: undefined }));
+					await Bun.write(pdfPath, bytes);
+					output.push({ type: "text", text: `PDF saved to ${pdfPath}` });
+					return pdfPath;
+				}),
+			extract: (format = "markdown", opts) =>
 				op(`tab.extract(${JSON.stringify(format)})`, quickOpMs, async sig => {
 					const html = (await untilAborted(sig, () => page.content())) as string;
-					const result = await extractReadableFromHtml(html, page.url(), format);
+					const result = await extractReadableFromHtml(html, page.url(), format, opts);
 					if (!result) {
 						throw new ToolError(
 							`tab.extract(${JSON.stringify(format)}) found no readable content on ${page.url()}`,
@@ -1863,21 +2129,16 @@ export class WorkerCore {
 					`tab.click(${JSON.stringify(selector)})`,
 					actionOpMs,
 					async sig => {
-						if (parseAriaRefSelector(selector) !== null) {
-							const handle = await this.#resolveAriaRef(selector);
-							try {
-								await untilAborted(sig, () => handle.click());
-							} finally {
-								await handle.dispose().catch(() => undefined);
-							}
-							return;
-						}
+						const label = `tab.click(${JSON.stringify(selector)})`;
 						const resolved = normalizeSelector(selector);
-						if (resolved.startsWith("text/")) await clickQueryHandlerText(page, resolved, actionOpMs, sig);
-						else
-							await untilAborted(sig, () =>
-								page.locator(resolved).setTimeout(actionOpMs).click({ signal: sig }),
-							);
+						if (resolved.startsWith("text/"))
+							return await clickQueryHandlerText(page, resolved, label, actionOpMs, sig);
+						const handle = await this.#resolveActionHandle(selector, actionOpMs, sig);
+						try {
+							await clickElement(handle, label, sig);
+						} finally {
+							await handle.dispose().catch(() => undefined);
+						}
 					},
 					{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
 				),
@@ -1888,7 +2149,7 @@ export class WorkerCore {
 					async sig => {
 						const handle = await this.#resolveActionHandle(selector, actionOpMs, sig);
 						try {
-							await untilAborted(sig, () => handle.type(text, { delay: 0 }));
+							await typeViaHandle(handle, text, { delay: 0 }, sig);
 						} finally {
 							await handle.dispose().catch(() => undefined);
 						}
@@ -1900,18 +2161,12 @@ export class WorkerCore {
 					`tab.fill(${JSON.stringify(selector)})`,
 					actionOpMs,
 					async sig => {
-						if (parseAriaRefSelector(selector) !== null) {
-							const handle = await this.#resolveAriaRef(selector);
-							try {
-								await fillViaHandle(handle, value, sig);
-							} finally {
-								await handle.dispose().catch(() => undefined);
-							}
-							return;
+						const handle = await this.#resolveActionHandle(selector, actionOpMs, sig);
+						try {
+							await fillViaHandle(handle, value, sig, text => typeViaHandle(handle, text, { delay: 0 }, sig));
+						} finally {
+							await handle.dispose().catch(() => undefined);
 						}
-						await untilAborted(sig, () =>
-							page.locator(normalizeSelector(selector)).setTimeout(actionOpMs).fill(value, { signal: sig }),
-						);
 					},
 					{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
 				),
@@ -1931,10 +2186,26 @@ export class WorkerCore {
 					}
 					await untilAborted(sig, () => page.keyboard.press(key));
 				}),
-			scroll: (deltaX, deltaY) =>
-				op("tab.scroll()", actionOpMs, sig =>
-					untilAborted(sig, () => dispatchScroll(() => page.mouse.wheel({ deltaX, deltaY }))),
-				),
+			scroll: (deltaX, deltaY, opts) =>
+				op("tab.scroll()", actionOpMs, async sig => {
+					if (opts?.selector) {
+						const handle = await this.#resolveActionHandle(opts.selector, actionOpMs, sig);
+						try {
+							await untilAborted(sig, () =>
+								handle.evaluate(
+									(element, x, y) => {
+										const target = element as unknown as { scrollBy(x: number, y: number): void };
+										target.scrollBy(x, y);
+									},
+									deltaX,
+									deltaY,
+								),
+							);
+						} finally {
+							await handle.dispose().catch(() => undefined);
+						}
+					} else await untilAborted(sig, () => dispatchScroll(() => page.mouse.wheel({ deltaX, deltaY })));
+				}),
 			drag: (from, to) => op("tab.drag()", actionOpMs, sig => this.#drag(from, to, sig)),
 			waitFor: (selector, opts) => {
 				const w = waitMs(opts?.timeout);
@@ -2044,18 +2315,36 @@ export class WorkerCore {
 	async #collectObservation(options: {
 		includeAll?: boolean;
 		viewportOnly?: boolean;
+		selector?: string;
+		compact?: boolean;
 		signal?: AbortSignal;
 	}): Promise<Observation> {
 		const page = this.#requirePage();
 		this.#clearElementCache();
 		const includeAll = options.includeAll ?? false;
 		const viewportOnly = options.viewportOnly ?? false;
-		const snapshot = (await untilAborted(options.signal, () =>
-			page.accessibility.snapshot({ interestingOnly: !includeAll }),
-		)) as SerializedAXNode | null;
+		let root: ElementHandle | null = null;
+		let snapshot: SerializedAXNode | null;
+		try {
+			if (options.selector) {
+				root = await untilAborted(options.signal, () => page.$(normalizeSelector(options.selector!)));
+				if (!root)
+					throw new ToolError(`tab.observe: selector ${JSON.stringify(options.selector)} matched no element`);
+			}
+			snapshot = await untilAborted(options.signal, () =>
+				page.accessibility.snapshot({ interestingOnly: !includeAll, root: root ?? undefined }),
+			);
+		} finally {
+			await root?.dispose().catch(() => undefined);
+		}
 		if (!snapshot) throw new ToolError("Accessibility snapshot unavailable");
 		const entries: ObservationEntry[] = [];
-		await collectObservationEntries(this, snapshot, entries, { includeAll, viewportOnly });
+		await collectObservationEntries(this, snapshot, entries, {
+			includeAll,
+			viewportOnly,
+			compact: options.compact,
+			signal: options.signal,
+		});
 		const scroll = (await untilAborted(options.signal, () =>
 			page.evaluate(() => {
 				const win = globalThis as unknown as {
@@ -2091,87 +2380,108 @@ export class WorkerCore {
 		screenshots: ScreenshotResult[],
 		signal: AbortSignal | undefined,
 		opts: ScreenshotOptions = {},
-	): Promise<string> {
+	): Promise<string | ScreenshotChangeResult> {
 		const page = this.#requirePage();
-		// Multiple tabs can share one Chromium (sibling headless tabs on a shared
-		// endpoint, cdp/app attach). CDP `Page.captureScreenshot` reads the
-		// compositor surface, which follows the *active* target: a backgrounded
-		// page can stall waiting for a fresh frame (the 20s screenshot timeouts)
-		// or hand back a sibling tab's pixels. Activate first; best-effort so an
-		// already-active or freshly-closed target never fails the capture.
-		//
-		// For a user-driven browser, redundant activation would steal window focus.
-		// The supervisor disables it only after adopting the visible tab; if the user
-		// later switches away, reject capture rather than risk sibling-tab pixels.
+		// A shared Chromium captures the active target's compositor surface. An attached
+		// user tab must remain visible rather than stealing focus from the user.
 		await preparePageForScreenshot(page, signal, this.#activateForScreenshot);
-		const fullPage = opts.selector ? false : (opts.fullPage ?? false);
-		const captureType = "png";
-		const captureMime = "image/png" as const;
-		let buffer: Buffer;
-		if (opts.selector) {
-			const handle =
-				parseAriaRefSelector(opts.selector) !== null
-					? await this.#resolveAriaRef(opts.selector)
-					: asElementHandle(await untilAborted(signal, () => page.$(normalizeSelector(opts.selector!))));
-			if (!handle) throw new ToolError("Screenshot selector did not resolve to an element");
-			try {
-				// Bring the element into view with a single instant scroll instead of puppeteer's
-				// scrollIntoViewIfNeeded(), whose IntersectionObserver promise can stall indefinitely
-				// on continuously-animating pages (WebGL / backdrop-filter "glass" effects). Best-effort.
-				await untilAborted(signal, () =>
-					handle.evaluate(el => {
-						const target = el as unknown as {
-							scrollIntoView: (opts: { behavior: string; block: string; inline: string }) => void;
-						};
-						target.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
-					}),
-				).catch(() => undefined);
-				// scrollIntoView:false skips the same IntersectionObserver check inside screenshot();
-				// captureBeyondViewport (puppeteer's default) still renders the clipped region.
-				const shotOpts: ElementScreenshotOptions = { type: captureType, scrollIntoView: false };
-				buffer = (await untilAborted(signal, () => handle.screenshot(shotOpts))) as Buffer;
-			} finally {
-				await handle.dispose().catch(() => undefined);
+		const format = opts.format ?? "png";
+		screenshotQuality(opts);
+		const threshold = screenshotThreshold(opts.threshold);
+		const changeOnly = opts.ifChanged === true || opts.threshold !== undefined;
+		const scope = screenshotScope(opts);
+		const targets: ScreenshotAnnotationTarget[] = [];
+		let removeAnnotations: (() => Promise<void>) | undefined;
+		if (opts.annotate) {
+			const observation = await this.#collectObservation({ signal });
+			const scroll = await untilAborted(signal, () =>
+				page.evaluate(() => {
+					const win = globalThis as unknown as { scrollX: number; scrollY: number };
+					return { x: win.scrollX, y: win.scrollY };
+				}),
+			);
+			for (const entry of observation.elements) {
+				const handle = this.#elementCache.get(entry.id);
+				const box = handle ? await untilAborted(signal, () => handle.boundingBox()) : null;
+				if (box && box.width > 0 && box.height > 0) {
+					targets.push({
+						id: entry.id,
+						role: entry.role,
+						name: entry.name,
+						x: box.x + scroll.x,
+						y: box.y + scroll.y,
+						width: box.width,
+						height: box.height,
+					});
+				}
 			}
-		} else {
-			buffer = (await untilAborted(signal, () => page.screenshot({ type: captureType, fullPage }))) as Buffer;
+			removeAnnotations = await installScreenshotAnnotations(page, targets, signal);
 		}
-		const resized = await resizeImage(
-			{ type: "image", data: buffer.toBase64(), mimeType: captureMime },
-			{ maxWidth: 1024, maxHeight: 1024, maxBytes: 150 * 1024, jpegQuality: 70, excludeWebP: session.excludeWebP },
-		);
-		const saveFullRes = !!session.browserScreenshotDir;
-		const savedBuffer = saveFullRes ? buffer : resized.buffer;
-		const savedMimeType = saveFullRes ? captureMime : resized.mimeType;
-		const ext = savedMimeType === "image/webp" ? "webp" : savedMimeType === "image/jpeg" ? "jpg" : "png";
-		const dest = session.browserScreenshotDir
-			? path.join(
-					session.browserScreenshotDir,
-					`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.${ext}`,
-				)
-			: path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.${ext}`);
-		await fs.promises.mkdir(path.dirname(dest), { recursive: true });
-		await Bun.write(dest, savedBuffer);
-		const info: ScreenshotResult = {
-			dest,
-			mimeType: savedMimeType,
-			bytes: savedBuffer.length,
-			width: resized.width,
-			height: resized.height,
-		};
-		screenshots.push(info);
-		if (!opts.silent) {
-			const lines = formatScreenshot({
-				saveFullRes,
-				savedMimeType,
-				savedByteLength: savedBuffer.length,
+		try {
+			const resolveSelector = async (selector: string): Promise<ElementHandle | null> =>
+				parseAriaRefSelector(selector) !== null
+					? this.#resolveAriaRef(selector)
+					: asElementHandle(await untilAborted(signal, () => page.$(normalizeSelector(selector))));
+			const captured = await captureScreenshotBuffer(page, opts, signal, resolveSelector, format);
+			let revision = 0;
+			let ratio = 1;
+			if (changeOnly) {
+				const png =
+					format === "png" ? captured : await captureScreenshotBuffer(page, opts, signal, resolveSelector, "png");
+				const previous = this.#screenshotHistory.get(scope);
+				ratio = previous ? pngPixelChangeRatio(previous.png, png) : 1;
+				revision = previous?.revision ?? 0;
+				if (previous && ratio <= threshold) {
+					return { changed: false, revision, pixelChangeRatio: ratio };
+				}
+				this.#screenshotHistory.set(scope, { png, revision: ++revision });
+			}
+			const captureMime = format === "jpeg" ? "image/jpeg" : "image/png";
+			const resized = await resizeImage(
+				{ type: "image", data: captured.toBase64(), mimeType: captureMime },
+				{
+					maxWidth: 1024,
+					maxHeight: 1024,
+					maxBytes: 150 * 1024,
+					jpegQuality: 70,
+					excludeWebP: session.excludeWebP,
+				},
+			);
+			const saveFullRes = !!session.browserScreenshotDir || format === "jpeg";
+			const savedBuffer = saveFullRes ? captured : resized.buffer;
+			const savedMimeType = saveFullRes ? captureMime : resized.mimeType;
+			const ext = savedMimeType === "image/webp" ? "webp" : savedMimeType === "image/jpeg" ? "jpg" : "png";
+			const dest = session.browserScreenshotDir
+				? path.join(
+						session.browserScreenshotDir,
+						`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.${ext}`,
+					)
+				: path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.${ext}`);
+			await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+			await Bun.write(dest, savedBuffer);
+			screenshots.push({
 				dest,
-				resized,
+				mimeType: savedMimeType,
+				bytes: savedBuffer.length,
+				width: resized.width,
+				height: resized.height,
 			});
-			output.push({ type: "text", text: lines.join("\n") });
-			output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
+			if (!opts.silent) {
+				const lines = formatScreenshot({
+					saveFullRes,
+					savedMimeType,
+					savedByteLength: savedBuffer.length,
+					dest,
+					resized,
+				});
+				output.push({ type: "text", text: lines.join("\n") });
+				output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
+			}
+			if (opts.annotate) output.push({ type: "text", text: formatScreenshotLegend(targets) });
+			return changeOnly ? { path: dest, changed: true, revision, pixelChangeRatio: ratio } : dest;
+		} finally {
+			await removeAnnotations?.();
 		}
-		return dest;
 	}
 
 	async #drag(from: DragTarget, to: DragTarget, signal: AbortSignal): Promise<void> {
@@ -2278,15 +2588,13 @@ export class WorkerCore {
 		const handle = await this.#resolveActionHandle(selector, timeoutMs, signal);
 		try {
 			const absolute = filePaths.map(filePath => resolveToCwd(filePath, session.cwd));
-			const upload = handle as unknown as { uploadFile: (...paths: string[]) => Promise<void> };
-			const tagName = (await untilAborted(signal, () =>
-				handle.evaluate(el => (el as unknown as { tagName: string }).tagName),
-			)) as string;
-			if (tagName !== "INPUT")
-				throw new ToolError(
-					`tab.uploadFile() requires an <input type="file"> element (got <${tagName.toLowerCase()}>)`,
-				);
-			await untilAborted(signal, () => upload.uploadFile(...absolute));
+			await uploadFilesToElement(
+				this.#requirePage(),
+				handle,
+				absolute,
+				`tab.uploadFile(${JSON.stringify(selector)})`,
+				signal,
+			);
 		} finally {
 			await handle.dispose().catch(() => undefined);
 		}
@@ -2362,9 +2670,11 @@ export class WorkerCore {
 	 */
 	async #resolveActionHandle(selector: string, timeoutMs: number, sig: AbortSignal): Promise<ElementHandle> {
 		if (parseAriaRefSelector(selector) !== null) return this.#resolveAriaRef(selector);
-		return (await untilAborted(sig, () =>
-			this.#requirePage().locator(normalizeSelector(selector)).setTimeout(timeoutMs).waitHandle({ signal: sig }),
-		)) as ElementHandle;
+		const handle = await untilAborted(sig, () =>
+			this.#requirePage().waitForSelector(normalizeSelector(selector), { timeout: timeoutMs, signal: sig }),
+		);
+		if (!handle) throw new ToolError(`Selector ${JSON.stringify(selector)} matched no element`);
+		return handle;
 	}
 	#clearElementCache(): void {
 		if (this.#elementCache.size === 0) {
@@ -2393,12 +2703,30 @@ export class WorkerCore {
 		}
 	}
 
+	async #disposePageResources(): Promise<void> {
+		this.#dialogs?.dispose();
+		this.#emulation?.dispose();
+		const results = await Promise.allSettled([
+			this.#console.detach(),
+			this.#tracing?.dispose(),
+			this.#network?.close(),
+			this.#downloads?.close(),
+			this.#webmcp?.dispose(),
+			this.#recording.close(),
+		]);
+		for (const result of results) {
+			if (result.status === "rejected")
+				this.#log("warn", "Browser resource cleanup failed", { error: String(result.reason) });
+		}
+	}
+
 	async #close(): Promise<void> {
 		this.#unsub();
 		this.#uninstallRejectionGuard();
 		this.#clearElementCache();
 		const page = this.#page;
-		if (this.#dialogHandler && page && !page.isClosed()) page.off("dialog", this.#dialogHandler);
+		this.#active?.ac.abort(new ToolAbortError("Browser tab closed"));
+		await this.#disposePageResources();
 		if (this.#mode === "headless" && page && !page.isClosed()) await page.close().catch(() => undefined);
 		if (this.#browser?.connected) this.#browser.disconnect();
 		this.#transport.send({ type: "closed" });

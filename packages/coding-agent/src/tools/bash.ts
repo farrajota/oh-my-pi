@@ -26,7 +26,12 @@ import type {
 	ClientBridgeTerminalHandle,
 	ClientBridgeTerminalOutput,
 } from "../session/client-bridge";
-import { DEFAULT_MAX_BYTES, enforceInlineByteCap, streamTailUpdates, TailBuffer } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import {
+	DEFAULT_MAX_BYTES,
+	enforceInlineByteCap,
+	streamTailUpdates,
+	TailBuffer,
+} from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import type { ToolSession } from ".";
@@ -39,7 +44,8 @@ import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-ski
 import { formatExitCodeNotice, formatWallTimeNotice } from "./bash-result-format";
 import { resolveEvalBackends } from "./eval-backends";
 import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
-import { type OutputMeta, resolveInlineByteCapBudget } from "./output-meta";
+import { type OutputMeta, formatOutputNotice, resolveInlineByteCapBudget } from "./output-meta";
+import { isFindEnabled } from "./jfind";
 import { resolveToCwd } from "./path-utils";
 import { extractLeadingCdTarget, extractLiteralAndChainSegments, tokenizeShellSegments } from "./shell-tokenize";
 import { ToolAbortError, ToolError } from "./tool-errors";
@@ -540,7 +546,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			hasAstEdit: isToolActive("ast_edit", this.session.settings.get("astEdit.enabled")),
 			hasGrep: isToolActive("grep", this.session.settings.get("grep.enabled")),
 			hasGlob: isToolActive("glob", this.session.settings.get("glob.enabled")),
-			hasFind: isToolActive("find", this.session.settings.get("find.enabled")),
+			hasFind: this.session.isToolActive?.("find") ?? isFindEnabled(this.session),
 			hasRead: isToolActive("read", true),
 			// Frozen at the last prompt rebuild (managed sessions). SDK consumers
 			// building a bare ToolSession lack the rebuild lifecycle, so fall back
@@ -604,7 +610,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			// the latter.
 			const out = normalizeResultOutput(result);
 			const annotated = out.startsWith("[Command cancelled]") ? out : out ? `${out}\n\n[Command aborted]` : out;
-			throw new ToolError(annotated || "Command aborted");
+			throw new ToolError(
+				(annotated || "Command aborted") + formatOutputNotice({ artifactError: result.artifactError }),
+			);
 		}
 		if (result.timedOut === true) {
 			const out = normalizeResultOutput(result);
@@ -613,7 +621,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			throw new ToolError(out ? `${out}\n\n[${message}]` : message);
 		}
 		if (result.exitCode === undefined) {
-			throw new ToolError(`${outputText}\n\nCommand failed: missing exit status`);
+			throw new ToolError(
+				`${outputText}\n\nCommand failed: missing exit status${formatOutputNotice({ artifactError: result.artifactError })}`,
+			);
 		}
 	}
 
@@ -801,7 +811,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 								notices: options.notices ?? [],
 								wallTimeMs,
 							});
-							const finalText = this.#extractTextResult(finalResult);
+							const finalText =
+								this.#extractTextResult(finalResult) + formatOutputNotice(finalResult.details?.meta);
 							latestText = finalText;
 							const images = finalResult.content.filter(
 								(block): block is ImageContent => block.type === "image",
@@ -1418,10 +1429,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					: out
 						? `${out}\n\n[Command aborted]`
 						: "Command aborted";
+				const diagnostic = message + formatOutputNotice({ artifactError: result.artifactError });
 				if (signal?.aborted) {
-					throw new ToolAbortError(message);
+					throw new ToolAbortError(diagnostic);
 				}
-				throw new ToolError(message);
+				throw new ToolError(diagnostic);
 			}
 		}
 		return this.#buildCompletedResult(result, timeoutSec, {

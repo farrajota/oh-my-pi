@@ -8,6 +8,7 @@ import {
 	lookupAgentRef,
 } from "../../src/internal/agent-registry-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -16,7 +17,7 @@ export interface HubAuthorityFixture {
 	readonly registry: AgentRegistry;
 	readonly bus: IrcBus;
 	createChild(id: string, parentId?: string): Promise<CreateAgentSessionResult>;
-	createToolSession(id: string): ToolSession;
+	createToolSession(id: string): ToolSession & { sessionManager: SessionManager };
 	dispose(): Promise<void>;
 }
 
@@ -55,11 +56,13 @@ export async function createHubAuthorityFixture(registry: AgentRegistry, rootId:
 			owned.set(id, child);
 			return child;
 		},
-		createToolSession(id: string): ToolSession {
+		createToolSession(id: string): ToolSession & { sessionManager: SessionManager } {
 			const ref = lookupAgentRef(registry, id);
 			const owner = ref?.session;
 			if (!ref || !owner) throw new Error(`Expected an authority-owned session for ${id}.`);
-			const toolSession: ToolSession = {
+			const sessionManager = owner.sessionManager;
+			if (!sessionManager) throw new Error(`Expected a session manager for ${id}.`);
+			const toolSession: ToolSession & { sessionManager: SessionManager } = {
 				cwd: tempDir.path(),
 				hasUI: false,
 				getSessionFile: () => ref.sessionFile,
@@ -67,6 +70,7 @@ export async function createHubAuthorityFixture(registry: AgentRegistry, rootId:
 				settings: Settings.isolated(),
 				agentRegistry: registry,
 				getAgentId: () => id,
+				sessionManager,
 			};
 			registerToolSessionLifecycleAuthority(toolSession, registry, owner);
 			return toolSession;

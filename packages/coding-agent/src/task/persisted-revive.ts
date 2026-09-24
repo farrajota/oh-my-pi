@@ -95,7 +95,7 @@ async function validatePersistedRevivalContract(
 			init: PersistedRevivalInit;
 			permissionSnapshot: PermissionScopeSnapshot;
 			permissionSummary: EffectivePermissionSummary;
-		}
+	  }
 	| undefined
 > {
 	const persistedSnapshot = init.permissionSnapshot;
@@ -327,8 +327,7 @@ export function createPersistedSubagentReviverFactory(
 				});
 				await fs.stat(sessionFile);
 				const currentPeek = await SessionManager.peekSessionInit(sessionFile);
-				if (!currentPeek?.init)
-					throw new Error("Persisted subagent transcript has no persisted session contract.");
+				if (!currentPeek?.init) throw new Error("Persisted subagent transcript has no persisted session contract.");
 				await fs.stat(currentPeek.cwd);
 				const hasMessageHistory = reopened.getEntries().some(entry => entry.type === "message");
 				if (!hasMessageHistory) throw new Error("Persisted subagent transcript has no message history.");
@@ -340,11 +339,7 @@ export function createPersistedSubagentReviverFactory(
 					durableState,
 				);
 				if (!currentContract) throw new Error("Persisted subagent transcript contract is invalid.");
-				const {
-					init,
-					permissionSnapshot,
-					permissionSummary,
-				} = currentContract;
+				const { init, permissionSnapshot, permissionSummary } = currentContract;
 				const currentParentScope = parentSession.getPermissionScope?.();
 				const currentInheritedScopeRequired =
 					permissionSnapshot.scope.clauses?.some(clause => clause.source === "inherited") === true;
@@ -385,6 +380,10 @@ export function createPersistedSubagentReviverFactory(
 					enableLsp: ctx.enableLsp,
 					enableMCP: (init.enableMCP ?? true) && ctx.enableMCP,
 				});
+				const ownerExtensionRoots = ctx.session.effectiveExtensionRoots;
+				const ownerPreparedExtensions = ctx.session.preparedExtensions;
+				const hasOwnerExtensionRoots = ownerExtensionRoots !== undefined;
+				const allowOwnerExtensions = hasOwnerExtensionRoots || (ownerPreparedExtensions?.length ?? 0) > 0;
 				const artifactManager = ctx.session.sessionManager.getArtifactManager();
 				if (artifactManager) reopened.adoptArtifactManager(artifactManager);
 				const enableMCP = startupPolicy.enableMCP;
@@ -402,9 +401,9 @@ export function createPersistedSubagentReviverFactory(
 						...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
 						modelPatternAuthFallback: init.resolvedModel,
 						settings: subagentSettings,
-						extensionRoots: () => ctx.session.effectiveExtensionRoots,
-						...(ctx.session.preparedExtensions?.length
-							? { preloadedPreparedExtensions: ctx.session.preparedExtensions }
+						extensionRoots: () => ownerExtensionRoots,
+						...(ownerPreparedExtensions?.length
+							? { preloadedPreparedExtensions: ownerPreparedExtensions }
 							: undefined),
 						sessionManager: reopened,
 						localProtocolOptions: getSessionLocalProtocolOptions(parentSession.sessionManager),
@@ -434,7 +433,7 @@ export function createPersistedSubagentReviverFactory(
 						outputSchema: init.outputSchema,
 						outputSchemaMode: init.outputSchemaMode,
 						restrictToolNames,
-						allowRestrictedExtensions: startupPolicy.allowExtensions,
+						allowRestrictedExtensions: startupPolicy.allowExtensions || allowOwnerExtensions,
 						permissionScope: permissionSnapshot?.scope,
 						requireYieldTool: true,
 						systemPrompt: () => [init.systemPrompt],

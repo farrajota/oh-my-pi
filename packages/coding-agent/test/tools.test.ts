@@ -545,7 +545,9 @@ function createTestToolContext(toolNames: string[]): AgentToolContext {
 function createAuthorityModelRegistry() {
 	return {
 		authStorage: {
-			onCredentialDisabled: () => () => {},
+			credentials: {
+				onDisabled: () => () => {},
+			},
 		},
 		hydrateCredentialScopedModelCaches: async () => {},
 		hasConfiguredAuth: () => true,

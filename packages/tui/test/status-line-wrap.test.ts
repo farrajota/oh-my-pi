@@ -1,9 +1,12 @@
+import * as path from "node:path";
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { VERSION } from "@oh-my-pi/pi-utils";
+import { getProjectDir, VERSION } from "@oh-my-pi/pi-utils";
 import { StatusLineComponent } from "../src/status-line/component";
 import type { StatusLineHost, StatusLineSession } from "../src/status-line/host";
 import { initTheme } from "../src/theme";
 import { visibleWidth } from "../src/utils";
+
+const projectName = path.basename(getProjectDir());
 
 beforeAll(async () => {
 	await initTheme();
@@ -88,11 +91,11 @@ describe("status-line overflow", () => {
 	test("wraps configured segments once in source order across all composer layouts", () => {
 		const status = createStatusLine({ leftSegments: ["omp_version", "path"], rightSegments: ["mode"], mode: true });
 		const rows = [
-			{ lines: status.renderBottomBarLines(10, "full"), order: [VERSION, "farrajota", "Goal"] },
-			{ lines: status.getTopBorderLines(10), order: [VERSION, "farrajota", "Goal"] },
-			{ lines: status.getBandTopBorderLines(10), order: [VERSION, "farrajota", "Goal"] },
+			{ lines: status.renderBottomBarLines(10, "full"), order: [VERSION, projectName, "Goal"] },
+			{ lines: status.getTopBorderLines(10), order: [VERSION, projectName, "Goal"] },
+			{ lines: status.getBandTopBorderLines(10), order: [VERSION, projectName, "Goal"] },
 			{ lines: status.getStandaloneTopBorderLines(10), order: ["Goal"] },
-			{ lines: status.renderBottomBarLines(10, "left"), order: [VERSION, "farrajota"] },
+			{ lines: status.renderBottomBarLines(10, "left"), order: [VERSION, projectName] },
 		];
 		for (const { lines, order } of rows) {
 			const plain = lines.map(line => Bun.stripANSI(line)).join("");
@@ -103,6 +106,23 @@ describe("status-line overflow", () => {
 				expect(plain.indexOf(order[index - 1])).toBeLessThan(plain.indexOf(order[index]));
 			}
 		}
+	});
+
+	test("preserves repeated configured segment output across overflow rows", () => {
+		const status = createStatusLine({ leftSegments: ["omp_version", "path", "omp_version"], rightSegments: [] });
+		const lines = status.renderBottomBarLines(10, "left");
+		const plain = lines.map(line => Bun.stripANSI(line)).join("");
+		const firstVersion = plain.indexOf(VERSION);
+		const pathIndex = plain.indexOf(projectName);
+		const secondVersion = plain.indexOf(VERSION, firstVersion + VERSION.length);
+
+		expect(lines.length).toBeGreaterThan(1);
+		expect(lines.every(line => visibleWidth(line) <= 10)).toBe(true);
+		expect(plain.split(VERSION).length - 1).toBe(2);
+		expect(plain.split(projectName).length - 1).toBe(1);
+		expect(firstVersion).toBeGreaterThanOrEqual(0);
+		expect(firstVersion).toBeLessThan(pathIndex);
+		expect(pathIndex).toBeLessThan(secondVersion);
 	});
 
 	test("wraps one overwide segment without clipping it", () => {
@@ -122,7 +142,7 @@ describe("status-line overflow", () => {
 		const plain = lines.map(line => Bun.stripANSI(line)).join("");
 		expect(lines.every(line => visibleWidth(line) <= 10)).toBe(true);
 		expect(plain).toContain("Goal");
-		expect(plain.indexOf("farrajota")).toBeLessThan(plain.indexOf("Goal"));
+		expect(plain.indexOf(projectName)).toBeLessThan(plain.indexOf("Goal"));
 	});
 
 	test("uses authoritative totalTokens without adding reasoning", () => {

@@ -11,6 +11,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { ReadToolDetails, ReadTruncationStats } from "@oh-my-pi/pi-tui/tools/read";
 import { formatTruncationMetaNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import { readToolRenderer } from "@oh-my-pi/pi-tui/tools/read";
 import { writeArchive } from "@oh-my-pi/pi-utils/ar";
 
@@ -111,8 +112,8 @@ describe("read truncation metadata", () => {
 
 	it("retains the partial UTF-8 preview and oversized-line warning for streamed artifact reads", async () => {
 		const line = "é".repeat(36_000);
-		await Bun.write(path.join(root, "artifacts", "0.read.log"), `before\n${line}\nafter`);
-		const result = persistedResult(await tool.execute("artifact-line", { path: "artifact://0:raw:2-2" }));
+		const artifactId = await new ArtifactManager(path.join(root, "artifacts")).save(`before\n${line}\nafter`, "read");
+		const result = persistedResult(await tool.execute("artifact-line", { path: `artifact://${artifactId}:raw:2-2` }));
 		const preview = line.slice(0, DEFAULT_MAX_BYTES / 2);
 
 		expect(textOutput(result)).toBe(preview);
@@ -131,7 +132,9 @@ describe("read truncation metadata", () => {
 		});
 		expect(result.details?.meta?.truncation?.nextOffset).toBeUndefined();
 		const rendered = readToolRenderer
-			.renderResult(result, { expanded: false, isPartial: false }, uiTheme, { path: "artifact://0:raw:2-2" })
+			.renderResult(result, { expanded: false, isPartial: false }, uiTheme, {
+				path: `artifact://${artifactId}:raw:2-2`,
+			})
 			.render(100)
 			.map(line => Bun.stripANSI(line))
 			.join("\n");

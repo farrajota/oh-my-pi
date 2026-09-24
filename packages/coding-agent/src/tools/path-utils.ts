@@ -759,12 +759,14 @@ export async function splitDelimitedPathEntry(
 		return null;
 	}
 
-	return (
+	const parts =
 		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "semicolon", "none")) ??
 		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "comma", "some")) ??
 		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "whitespace", "all")) ??
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "mixed", "all"))
-	);
+		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "mixed", "all"));
+	if (!parts) return null;
+	const nestedParts = await Promise.all(parts.map(part => splitDelimitedPathEntry(part, cwd, options)));
+	return parts.flatMap((part, index) => nestedParts[index] ?? [part]);
 }
 
 /** Expand delimited entries in-place while preserving unsplit entries. */

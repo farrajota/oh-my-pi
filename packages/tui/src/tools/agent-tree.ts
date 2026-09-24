@@ -69,7 +69,11 @@ export interface AgentRowMetadata {
 }
 
 /** Render metadata cells in the order shared by task rows and Agent Hub. */
-export function formatRowMetadata(metadata: AgentRowMetadata, targetTheme: Theme = defaultTheme): string {
+export function formatRowMetadata(
+	metadata: AgentRowMetadata,
+	targetTheme: Theme = defaultTheme,
+	stats?: AgentStats,
+): string {
 	const elapsedMs =
 		metadata.elapsedMs ??
 		(metadata.startedAtMs !== undefined
@@ -77,7 +81,7 @@ export function formatRowMetadata(metadata: AgentRowMetadata, targetTheme: Theme
 			: undefined);
 	const input = (metadata.usage?.input ?? 0) + (metadata.usage?.cacheWrite ?? 0);
 	const output = metadata.usage?.output ?? 0;
-	const cost = metadata.usage?.cost?.total ?? metadata.cost;
+	const cost = metadata.usage?.cost?.total ?? metadata.cost ?? stats?.cost;
 	const cells = [
 		...(metadata.id ? [metadata.id] : []),
 		formatAgentModel(metadata.model, targetTheme),
@@ -85,6 +89,7 @@ export function formatRowMetadata(metadata: AgentRowMetadata, targetTheme: Theme
 		formatElapsed(elapsedMs),
 		`${formatCompactTokens(input)} in`,
 		`${formatCompactTokens(output)} out`,
+		...(stats ? formatAgentStatCells({ ...stats, cost: undefined }, targetTheme) : []),
 		formatCost(cost),
 	];
 	return cells.join(targetTheme.sep.dot);
@@ -102,25 +107,32 @@ export interface AgentStats {
 	cost?: number;
 }
 
-/** Format the shared tool-count, request, context, and cost stat run. */
-export function formatAgentStatRun(stats: AgentStats, theme: Theme): string {
-	let line = "";
+function formatAgentStatCells(stats: AgentStats, theme: Theme): string[] {
+	const cells: string[] = [];
 	if (stats.toolCount) {
-		line += `${theme.sep.dot}${theme.fg("dim", `${formatNumber(stats.toolCount)} ${theme.icon.extensionTool}`)}`;
+		cells.push(theme.fg("dim", `${formatNumber(stats.toolCount)} ${theme.icon.extensionTool}`));
 	}
 	if (stats.requests) {
-		line += `${theme.sep.dot}${theme.fg("dim", `${formatNumber(stats.requests)} req`)}`;
+		cells.push(theme.fg("dim", `${formatNumber(stats.requests)} req`));
 	}
 	if (stats.contextTokens && stats.contextTokens > 0) {
 		const context =
 			stats.contextWindow && stats.contextWindow > 0
 				? formatContextUsage((stats.contextTokens / stats.contextWindow) * 100, stats.contextWindow)
 				: formatNumber(stats.contextTokens);
-		line += `${theme.sep.dot}${theme.fg("dim", context)}`;
+		cells.push(theme.fg("dim", context));
 	}
-	if (stats.cost && stats.cost > 0)
-		line += `${theme.sep.dot}${theme.fg("statusLineCost", `$${stats.cost.toFixed(2)}`)}`;
-	return line;
+	if (stats.cost && stats.cost > 0) {
+		cells.push(theme.fg("statusLineCost", `$${stats.cost.toFixed(2)}`));
+	}
+	return cells;
+}
+
+/** Format the shared tool-count, request, context, and cost stat run. */
+export function formatAgentStatRun(stats: AgentStats, theme: Theme): string {
+	return formatAgentStatCells(stats, theme)
+		.map(cell => `${theme.sep.dot}${cell}`)
+		.join("");
 }
 
 /** Tool-specific presentation layered onto a bounded agent progress row. */
@@ -191,6 +203,7 @@ export function renderAgentTreeRow(
 					role: options.metadata.role ?? roleBadge,
 				},
 				theme,
+				options.stats,
 			)
 		: undefined;
 	const modelLead = model ? `${model} ` : "";
@@ -203,12 +216,25 @@ export function renderAgentTreeRow(
 	} else {
 		title = theme.fg(nameColor, title);
 	}
-	let line = metadata ? `${lead}${title}${theme.sep.dot}${metadata}` : `${lead}${title}${modelLead}${badges}`;
+	let line = metadata
+		? `${lead}${title}`
+		: `${lead}${task ? `${title}${modelLead}` : `${modelLead}${title}`}${badges}`;
 	if (options.preview && !metadata) line += options.preview;
 	if (!metadata && options.stats) line += formatAgentStatRun(options.stats, theme);
 	if (!metadata && options.durationMs !== undefined && options.durationMs > 0) {
 		line += `${theme.sep.dot}${theme.fg("dim", formatDuration(options.durationMs))}`;
 	}
-	if (metadata) line += statusBadge;
+	if (metadata) {
+		if (!Number.isFinite(width)) {
+			line += `${theme.sep.dot}${metadata}`;
+		} else {
+			const metadataWidth = width - visibleWidth(line) - visibleWidth(theme.sep.dot) - visibleWidth(statusBadge);
+			if (metadataWidth > 0) {
+				const boundedMetadata = truncateToWidth(metadata, metadataWidth, "");
+				if (boundedMetadata) line += `${theme.sep.dot}${boundedMetadata}`;
+			}
+		}
+		line += statusBadge;
+	}
 	return { line: Number.isFinite(width) ? truncateToWidth(line, width, "") : line, descriptionShown };
 }

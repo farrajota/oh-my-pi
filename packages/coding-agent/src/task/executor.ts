@@ -287,9 +287,9 @@ function resolveSubagentInheritedRetryFallbackChain(
 	modelRegistry: ModelRegistry,
 	role: string | undefined,
 ): string[] | undefined {
-	const fallbackChain =
-		(role !== undefined ? settings.get("retry.fallbackChains")[role] : undefined) ??
-		settings.get("retry.fallbackChains").default;
+	const fallbackChains = settings.get("retry.fallbackChains");
+	if (!isRecord(fallbackChains)) return undefined;
+	const fallbackChain = (role !== undefined ? fallbackChains[role] : undefined) ?? fallbackChains.default;
 	if (
 		!Array.isArray(fallbackChain) ||
 		fallbackChain.length === 0 ||
@@ -498,6 +498,8 @@ export interface RunSubprocessOptions {
 	permissionSummary?: EffectivePermissionSummary;
 	/** A caller-selected task model must not fall back to another model. */
 	exactModelOverride?: boolean;
+	/** Extension routing note for the chosen model; surfaced as `resolvedModelRoute`. */
+	modelRoute?: string;
 	/**
 	 * Active model selector of the parent session, used as an auth-aware fallback
 	 * if the resolved subagent model has no working credentials. See #985.
@@ -1095,6 +1097,8 @@ interface RunMonitorArgs {
 	/** Raw request-local model selector, retained for task progress rendering. */
 	requestedModel?: string;
 	permissionSummary?: EffectivePermissionSummary;
+	/** Extension routing note for the chosen model. */
+	modelRoute?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	subagentEventBus?: EventBus;
@@ -1145,6 +1149,7 @@ interface SubagentRunMonitor {
 	yieldTurnStopRequested(): boolean;
 	/** Resolves when the yield turn-stop session abort has settled (immediately when none fired). */
 	waitForYieldTurnStop(): Promise<void>;
+	setForcedYieldTurn(forced: boolean): void;
 	/** The abort kind for this run, when an abort was requested. */
 	abortKind(): AbortReason | undefined;
 	terminalError(): string | undefined;
@@ -1220,6 +1225,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		modelRole: args.modelRole,
 		modelRoleDisplay: args.modelRoleDisplay,
 		requestedModel: args.requestedModel,
+		resolvedModelRoute: args.modelRoute,
 	};
 
 	const outputChunks: string[] = [];
@@ -1241,6 +1247,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let yieldCallPending = false;
 	let yieldInvalidatedByAsync = false;
 	let yieldTurnStopRequested = false;
+	let forcedYieldTurn = false;
 	let yieldTurnStopPromise: Promise<void> | null = null;
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
 	const accumulatedUsage: Usage = {
@@ -1260,6 +1267,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let terminalError: string | undefined;
 	let consecutiveYieldToolErrors = 0;
 	let lastAssistantSalvageText: string | undefined;
+	let reportingTurnText: string | undefined;
 	let activeSessionAbortPromise: Promise<void> | undefined;
 
 	const abortActiveSession = (): Promise<void> => {
@@ -1563,7 +1571,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		if (toolName === "yield") {
 			const item = isRecord(data) ? data : undefined;
 			const incremental = Array.isArray(item?.type) && item.type.length > 0;
-			yieldCalled = !incremental || item?.complete === true || item?.status === "aborted";
+			yieldCalled = !incremental || item?.complete === true || item?.status === "aborted" || forcedYieldTurn;
 			yieldCallPending = false;
 			if (yieldCalled) {
 				yieldInvalidatedByAsync = false;
@@ -1616,6 +1624,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					yieldCalled = false;
 					yieldAcceptedAt = undefined;
 					yieldInvalidatedByAsync = true;
+					reportingTurnText = undefined;
 				}
 				break;
 
@@ -1685,10 +1694,13 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 							recordExtractedToolData(event.toolName, data);
 						}
 					}
-
 					if (event.toolName === "yield") {
 						yieldCallPending = false;
 						if (!yieldCalled) evaluateSoftRequestBudget();
+						if (yieldCalled && forcedYieldTurn && !abortSent) {
+							if (sessionHasPendingAsyncWork()) requestYieldTurnStop();
+							else requestAbort("terminate");
+						}
 					}
 
 					// Check if handler wants to terminate the session
@@ -1804,6 +1816,23 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 								yieldCallPending = true;
 								flushProgress = true;
 							}
+						}
+					}
+					if (Array.isArray(messageContent)) {
+						const hasWork = messageContent.some(
+							block => isRecord(block) && block.type === "toolCall" && block.name !== "yield",
+						);
+						if (hasWork) {
+							reportingTurnText = undefined;
+						} else if (event.message.stopReason === "stop") {
+							const text = messageContent
+								.filter(
+									(block): block is { type: "text"; text: string } =>
+										isRecord(block) && block.type === "text" && typeof block.text === "string",
+								)
+								.map(block => block.text)
+								.join("\n");
+							reportingTurnText = text.trim() ? text : undefined;
 						}
 					}
 					evaluateSoftRequestBudget();
@@ -2030,6 +2059,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				}
 			}
 		},
+		setForcedYieldTurn: forced => {
+			forcedYieldTurn = forced;
+		},
 		// A soft stop that never escalated still identifies as a budget abort so
 		// the lifecycle can park the agent as resumable instead of killing it.
 		abortKind: () => abortReason ?? (budgetStopRequested ? "budget" : undefined),
@@ -2056,7 +2088,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		},
 		attach,
 		captureSalvage,
-		lastAssistantSalvageText: () => lastAssistantSalvageText,
+		lastAssistantSalvageText: () => lastAssistantSalvageText ?? reportingTurnText,
 		rawOutput: () => (finalOutputChunks.length > 0 ? finalOutputChunks.join("") : outputChunks.join("")),
 		scheduleProgress,
 		finish: () => {
@@ -2189,8 +2221,8 @@ async function driveSessionToYield(
 						maxRetries: MAX_YIELD_RETRIES,
 						budgetStop,
 					});
-
 					const isFinalRetry = retryCount >= MAX_YIELD_RETRIES;
+					monitor.setForcedYieldTurn(isFinalRetry);
 					await awaitAbortable(
 						session.prompt(reminder, {
 							attribution: "agent",
@@ -2201,16 +2233,14 @@ async function driveSessionToYield(
 					await awaitAbortable(session.waitForIdle());
 				} catch (err) {
 					if (abortSignal.aborted || err instanceof ToolAbortError) {
-						// Benign control-flow exit — user cancel (^C) or compaction aborting
-						// pending operations both surface here as ToolAbortError. The outer
-						// catch and finally already mark the run aborted; logging at ERROR
-						// would spam operator dashboards with non-failures.
 						logger.debug("Subagent prompt aborted");
 					} else {
 						logger.error("Subagent prompt failed", {
 							error: err instanceof Error ? err.message : String(err),
 						});
 					}
+				} finally {
+					monitor.setForcedYieldTurn(false);
 				}
 			}
 		};
@@ -2551,6 +2581,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		resolvedModelIdentity: progress.resolvedModelIdentity,
 		resolvedThinkingLevel: progress.resolvedThinkingLevel,
 		resolvedModelIsFallback: progress.resolvedModelIsFallback,
+		resolvedModelRoute: progress.resolvedModelRoute,
 		advisor: progress.advisor,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
@@ -3121,6 +3152,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 			} else {
 				await session.waitForIdle();
 			}
+			resetYieldTurnState(session.getToolByName("yield"));
 			await session.setWorkPoolYieldItems(options.workPoolYieldItems ?? []);
 			attemptUnsubscribe = monitor.attach(session);
 		});
@@ -3353,6 +3385,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		modelRoleDisplay: resolveModelRoleDisplay(modelRole, settings),
 		requestedModel,
 		permissionSummary: options.permissionSummary,
+		modelRoute: options.modelRoute,
 		signal,
 		onProgress,
 		subagentEventBus: options.subagentEventBus,

@@ -30,6 +30,7 @@ import {
 	cancelIdleCloseForOwner,
 	dropHeadlessTabs,
 	getTab,
+	listTabs,
 	releaseAllTabs,
 	releaseIdleTabsForOwner,
 	releaseTab,
@@ -42,6 +43,7 @@ import { resolveToCwd } from "./path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
+import { resolveInitScriptSources } from "./browser/open-options";
 
 export { type AriaSnapshotOptions, buildAriaSnapshotScript, parseAriaRefSelector } from "./browser/aria/aria-snapshot";
 export { diffAriaSnapshot, postProcessAriaSnapshot } from "./browser/snapshot-plus";
@@ -68,7 +70,7 @@ const tabCallStepSchema = type({
 });
 
 const browserSchema = type({
-	action: type("'open' | 'close' | 'run' | 'call'").describe("operation"),
+	action: type("'open' | 'close' | 'run' | 'call' | 'tabs'").describe("operation"),
 	"name?": type("string").describe("tab id (default 'main')"),
 	"url?": type("string").describe("url to open"),
 	"app?": appSchema,
@@ -81,6 +83,13 @@ const browserSchema = type({
 		"navigation wait condition",
 	),
 	"dialogs?": type("'accept' | 'dismiss'").describe("auto-handle dialogs"),
+	"allowed_domains?": type("string[]").describe("allowed hostname patterns"),
+	"init_scripts?": type("string[]").describe("document-start JavaScript or source-file paths"),
+	"downloads?": type("string").describe("download directory"),
+	"user_agent?": type("string").describe("tab user agent"),
+	"ignore_https_errors?": type("boolean").describe("ignore invalid page certificates"),
+	"allow_file_access?": type("boolean").describe("allow local file access in owned Chromium"),
+	"headed?": type("boolean").describe("override browser display mode"),
 	"code?": type("string").describe("js body to run in tab"),
 	"fn?": type("string").describe("serialized JavaScript function to run in tab"),
 	"args?": type("unknown[]").describe("arguments passed to a serialized function"),
@@ -204,8 +213,9 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 	if (cmuxKind) {
 		return cmuxKind;
 	}
-	const headless = session.settings.get("browser.headless") as boolean;
-	return { kind: "headless", headless };
+	const headless =
+		params.headed === undefined ? (session.settings.get("browser.headless") as boolean) : !params.headed;
+	return { kind: "headless", headless, allowFileAccess: params.allow_file_access };
 }
 
 /**
@@ -324,6 +334,11 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			const details: BrowserToolDetails = { action: params.action, name };
 
 			switch (params.action) {
+				case "tabs": {
+					const value = listTabs(this.options.dedicatedAuditId, this.session.getSessionId?.() ?? undefined);
+					details.value = value;
+					return toolResult(details).text(JSON.stringify(value)).done();
+				}
 				case "open":
 					return await this.#open(name, params, details, timeoutMs, signal);
 				case "close":
@@ -403,7 +418,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			holdBrowser(browser);
 			let result: AcquireTabResult;
 			try {
-				result = await untilAborted(openSignal, () =>
+				result = await untilAborted(openSignal, async () =>
 					acquireTab(name, browser, {
 						url: params.url,
 						waitUntil: params.wait_until,
@@ -418,6 +433,11 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 						timeoutMs,
 						deadlineStartMs: deadlineStart,
 						dialogs: params.dialogs,
+						allowedDomains: params.allowed_domains,
+						initScripts: await resolveInitScriptSources(params.init_scripts, this.session.cwd),
+						downloadsPath: params.downloads ? resolveToCwd(params.downloads, this.session.cwd) : undefined,
+						userAgent: params.user_agent,
+						ignoreHttpsErrors: params.ignore_https_errors,
 						signal: openSignal,
 						ownerSessionId: this.session.getSessionId?.() ?? undefined,
 						persist: params.persist,
@@ -604,7 +624,8 @@ function describeKind(kind: BrowserKind): string {
 
 function sameBrowserKind(a: BrowserKind, b: BrowserKind): boolean {
 	if (a.kind !== b.kind) return false;
-	if (a.kind === "headless" && b.kind === "headless") return a.headless === b.headless;
+	if (a.kind === "headless" && b.kind === "headless")
+		return a.headless === b.headless && !!a.allowFileAccess === !!b.allowFileAccess;
 	if (a.kind === "spawned" && b.kind === "spawned")
 		return a.path === b.path && JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? []);
 	if (a.kind === "connected" && b.kind === "connected") return a.cdpUrl === b.cdpUrl;

@@ -234,7 +234,7 @@ describe("TaskTool toolProfile execution", () => {
 		});
 
 		const tools = runSpy.mock.calls[0]?.[0].agent.tools?.filter(tool => tool !== "irc");
-		expect(tools).toEqual(["read", "grep", "glob", "hub"]);
+		expect(tools).toEqual(["read", "grep", "find", "hub"]);
 		expect(tools).not.toEqual(expect.arrayContaining(["edit", "write"]));
 	});
 

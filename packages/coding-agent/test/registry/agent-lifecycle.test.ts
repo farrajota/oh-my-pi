@@ -142,22 +142,25 @@ describe("AgentLifecycleManager", () => {
 		const rebound = getAgentLifecycleManager(current);
 		expect(rebound).not.toBe(staleManager);
 
+		const stub = makeSessionStub();
 		const ref = current.register({
 			id: "Remote-Killed-Sub",
 			displayName: "remote kill",
 			kind: "sub",
-			session: makeSessionStub().session,
+			session: stub.session,
 			sessionFile: null,
 			status: "running",
 		});
 		const killed = deferred();
 		const unsubscribe = current.onChange(event => {
-			if (event.ref === ref && event.type === "status_changed" && event.ref.status === "aborted") killed.resolve();
+			if (event.ref.id === ref.id && event.type === "status_changed" && event.ref.status === "aborted")
+				killed.resolve();
 		});
 		try {
-			await rebound.release("Remote-Killed-Sub", ref, { tombstone: true });
+			await releaseAgent(rebound, "Remote-Killed-Sub", ref, { tombstone: true });
 			await killed.promise;
-			expect(current.get("Remote-Killed-Sub")).toMatchObject({ status: "aborted", session: null });
+			expect(current.get("Remote-Killed-Sub")).toMatchObject({ status: "aborted" });
+			expect(stub.disposeCalls()).toBe(1);
 		} finally {
 			unsubscribe();
 		}

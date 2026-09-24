@@ -779,8 +779,16 @@ describe("SessionManager.moveTo", () => {
 		// it: the colliding source entry stays where it was. Same for a nested
 		// name that exists on both sides.
 		const { session, homeArtifactsDir, awayArtifactsDir } = await sessionAwayFromHome();
-		const id = (await session.saveArtifact("written while away", "bash"))!;
+		const id = (await session.saveArtifact("written by a stale writer", "bash"))!;
+		await fsp.cp(
+			path.join(awayArtifactsDir, ".artifact-state-v1", id),
+			path.join(homeArtifactsDir, ".artifact-state-v1", id),
+			{
+				recursive: true,
+			},
+		);
 		await fsp.writeFile(path.join(homeArtifactsDir, `${id}.bash.log`), "written by a stale writer");
+		await fsp.writeFile(path.join(awayArtifactsDir, `${id}.bash.log`), "written while away");
 		await fsp.writeFile(path.join(awayArtifactsDir, "unique.md"), "moves fine");
 		for (const dir of [homeArtifactsDir, awayArtifactsDir]) {
 			await fsp.mkdir(path.join(dir, "Sub"));
@@ -793,9 +801,16 @@ describe("SessionManager.moveTo", () => {
 		expect(await fsp.readFile(path.join(homeArtifactsDir, `${id}.bash.log`), "utf8")).toBe(
 			"written by a stale writer",
 		);
-		expect((await fsp.readdir(homeArtifactsDir)).sort()).toEqual([`${id}.bash.log`, "Sub", "unique.md"]);
+		expect((await fsp.readdir(homeArtifactsDir)).filter(name => !name.startsWith(".artifact-")).sort()).toEqual([
+			`${id}.bash.log`,
+			"Sub",
+			"unique.md",
+		]);
 		expect(await fsp.readFile(path.join(homeArtifactsDir, "Sub", "same.md"), "utf8")).toBe("home copy");
-		expect((await fsp.readdir(awayArtifactsDir)).sort()).toEqual([`${id}.bash.log`, "Sub"]);
+		expect((await fsp.readdir(awayArtifactsDir)).filter(name => !name.startsWith(".artifact-")).sort()).toEqual([
+			`${id}.bash.log`,
+			"Sub",
+		]);
 		expect(await fsp.readFile(path.join(awayArtifactsDir, `${id}.bash.log`), "utf8")).toBe("written while away");
 		expect(await fsp.readdir(path.join(awayArtifactsDir, "Sub"))).toEqual(["same.md"]);
 	});
@@ -810,9 +825,16 @@ describe("SessionManager.moveTo", () => {
 
 		await session.moveTo(cwdA);
 
-		expect(await session.getArtifactPath(id)).toBe(path.join(homeArtifactsDir, `${id}.read.log`));
-		expect(await fsp.readdir(homeArtifactsDir)).toEqual([`${id}.read.log`]);
-		expect(await fsp.readdir(awayArtifactsDir)).toEqual([`${id}.bash.log`]);
+		expect((await fsp.readdir(homeArtifactsDir)).filter(name => !name.startsWith(".artifact-"))).toEqual([
+			`${id}.read.log`,
+		]);
+		expect((await fsp.readdir(awayArtifactsDir)).filter(name => !name.startsWith(".artifact-"))).toEqual([
+			`${id}.bash.log`,
+		]);
+		expect(await fsp.readFile(path.join(homeArtifactsDir, `${id}.read.log`), "utf8")).toBe(
+			"written by a stale writer",
+		);
+		expect(await fsp.readFile(path.join(awayArtifactsDir, `${id}.bash.log`), "utf8")).toBe("written while away");
 	});
 
 	it("finishes the merge and keeps the session at the destination when one entry cannot move", async () => {
@@ -878,9 +900,17 @@ describe("SessionManager.moveTo", () => {
 			readdirSpy.mockRestore();
 		}
 
-		expect((await fsp.readdir(homeArtifactsDir)).sort()).toEqual([`${id}.read.log`, "stale.md"]);
-		expect(await session.getArtifactPath(id)).toBe(path.join(homeArtifactsDir, `${id}.read.log`));
-		expect(await fsp.readdir(awayArtifactsDir)).toEqual([`${id}.bash.log`]);
+		expect((await fsp.readdir(homeArtifactsDir)).filter(name => !name.startsWith(".artifact-")).sort()).toEqual([
+			`${id}.read.log`,
+			"stale.md",
+		]);
+		expect((await fsp.readdir(awayArtifactsDir)).filter(name => !name.startsWith(".artifact-"))).toEqual([
+			`${id}.bash.log`,
+		]);
+		expect(await fsp.readFile(path.join(homeArtifactsDir, `${id}.read.log`), "utf8")).toBe(
+			"published after the listing",
+		);
+		expect(await fsp.readFile(path.join(awayArtifactsDir, `${id}.bash.log`), "utf8")).toBe("written while away");
 	});
 
 	it("does not merge through a symlink on either side", async () => {
@@ -939,7 +969,10 @@ describe("SessionManager.moveTo", () => {
 		}
 
 		expect(session.getSessionFile()!.slice(0, -6)).toBe(homeArtifactsDir);
-		expect((await fsp.readdir(homeArtifactsDir)).sort()).toEqual(["stale.md", "unique.md"]);
+		expect((await fsp.readdir(homeArtifactsDir)).filter(name => !name.startsWith(".artifact-")).sort()).toEqual([
+			"stale.md",
+			"unique.md",
+		]);
 		expect(await fsp.readdir(awayArtifactsDir)).toEqual([`${id}.bash.log`]);
 	});
 

@@ -20,7 +20,11 @@ import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import { parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
-import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
+import {
+	classifyGroupedLines,
+	formatGroupedFiles,
+	groupLineIndicesByBlank,
+} from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import type { OutputMeta } from "./output-meta";
 import { isInternalUrlPath, resolveToolSearchScope } from "./path-utils";
 import {

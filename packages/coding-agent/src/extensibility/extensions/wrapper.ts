@@ -12,10 +12,10 @@ import type { PermissionDenialDetails } from "@oh-my-pi/pi-wire";
 import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import {
 	truncateForPrompt,
-	type ApprovalMode,
 	denyError,
 	formatApprovalPrompt,
 	resolveApproval,
+	resolveApprovalFromContext,
 } from "../../tools/approval";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
@@ -226,6 +226,34 @@ function approvalArgs(params: unknown, context: AgentToolContext | undefined): u
 	return metadata?.type === "computer" ? { actions: metadata.actions } : params;
 }
 
+type AcpApprovalContext = AgentToolContext & {
+	acpApprovedArgs?: unknown;
+	acpApprovedToolCallId?: string;
+	acpApprovedToolName?: string;
+};
+
+function isAcpApprovedInvocation(
+	context: AgentToolContext | undefined,
+	toolName: string,
+	toolCallId: string,
+	params: unknown,
+): boolean {
+	const approval = context as AcpApprovalContext | undefined;
+	if (
+		approval?.acpApprovedToolName !== toolName ||
+		approval.acpApprovedToolCallId !== toolCallId ||
+		approval.acpApprovedArgs === undefined
+	) {
+		return false;
+	}
+	try {
+		const approvedArgs = JSON.stringify(approval.acpApprovedArgs);
+		return approvedArgs !== undefined && approvedArgs === JSON.stringify(params);
+	} catch {
+		return false;
+	}
+}
+
 function toolEventArgs(params: unknown, context: AgentToolContext | undefined): Record<string, unknown> {
 	const metadata = context?.toolCall?.providerMetadata;
 	if (metadata?.type === "computer") {
@@ -406,6 +434,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 		assertAuthorized(effectiveParams);
+		const acpBypass =
+			!extensionInputChanged && isAcpApprovedInvocation(context, this.tool.name, toolCallId, effectiveParams);
 		const pathScope = runner.getPathScope?.call(this.runner);
 		const pathInput = recordParams(effectiveParams);
 		if (pathScope && Object.keys(pathInput).length > 0) {
@@ -415,10 +445,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const rewrittenParams = rewriteAuthorizedInput(pathInput, replacements) as typeof effectiveParams;
 			if (rewrittenParams !== pathInput) effectiveParams = rewrittenParams;
 		}
-		const settings = context?.settings;
-		const approvalMode: ApprovalMode =
-			context?.autoApprove === true ? "yolo" : (settings?.get("tools.approvalMode") ?? "yolo");
-		const userPolicies = (settings?.get("tools.approval") ?? {}) as Record<string, unknown>;
+		const { approvalMode, userPolicies } =
+			context === undefined
+				? { approvalMode: "yolo" as const, userPolicies: {} }
+				: resolveApprovalFromContext(context);
 		const scope = runner.getPermissionScope?.call(this.runner);
 		const enforcePreparation = scope?.mode === "enforce";
 		const authority = runner.getToolExecutionAuthority?.call(this.runner);
@@ -482,11 +512,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// and tool-demanded overrides still prompt. Provider safety checks are
 			// stronger: yolo, per-tool allow, and xdev approval never acknowledge
 			// them on the user's behalf.
-			const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
+			const configuredPrompt = Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
 			const xdevBypass = context?.xdevApproved === true && !extensionInputChanged;
 			const approvalCheck = {
 				required:
-					pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
+					pendingSafetyChecks.length > 0 ||
+					(resolved.policy === "prompt" && !acpBypass && (resolved.override || configuredPrompt || !xdevBypass)),
 				reason: resolved.reason,
 			};
 

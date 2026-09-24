@@ -395,8 +395,6 @@ export function outputMeta(): OutputMetaBuilder {
 // Tool wrapper
 // =============================================================================
 
-
-
 /**
  * Append output notice to tool result content if meta is present.
  */
@@ -499,6 +497,15 @@ async function spillLargeResultToArtifact(
 
 	// Skip if tool already saved an artifact
 	const existingMeta: OutputMeta | undefined = result.details?.meta;
+	const reportOnly =
+		toolName === "hub" &&
+		Array.isArray(result.details?.jobs) &&
+		(existingMeta?.artifactError !== undefined ||
+			result.details.jobs.some(
+				(job: unknown) =>
+					isRecord(job) &&
+					(job.artifactError !== undefined || (isRecord(job.meta) && job.meta.artifactError !== undefined)),
+			));
 	if (existingMeta?.truncation?.artifactId) return result;
 
 	// Reading an artifact already addresses recoverable full output. Spilling that
@@ -532,9 +539,7 @@ async function spillLargeResultToArtifact(
 	// `enforceInlineByteCap`: always truncate past the threshold, and only
 	// attach the `artifact://` recovery link when the save actually succeeded.
 	let artifactId: string | undefined;
-	// A failed stream capture only left a preview here. Saving that preview
-	// would invent a misleading full-output recovery link.
-	if (!existingMeta?.artifactError) {
+	if (!existingMeta?.artifactError || reportOnly) {
 		try {
 			artifactId = await runArtifactOperation(
 				context?.sessionManager,
@@ -571,7 +576,10 @@ async function spillLargeResultToArtifact(
 			newContent.push(block);
 		}
 	}
-	newContent.push({ type: "text", text: truncated.content });
+	newContent.push({
+		type: "text",
+		text: truncated.content + (reportOnly && artifactId ? `\n\nRead artifact://${artifactId} for full report.` : ""),
+	});
 
 	// Build truncation meta
 	const outputLines = truncated.outputLines ?? truncated.totalLines;
@@ -602,7 +610,7 @@ async function spillLargeResultToArtifact(
 				: {}),
 			elidedLines,
 			elidedBytes,
-			artifactId,
+			artifactId: reportOnly ? undefined : artifactId,
 			nextOffset: existingMeta?.truncation?.nextOffset,
 		};
 	} else {
@@ -616,7 +624,7 @@ async function spillLargeResultToArtifact(
 			outputBytes,
 			maxBytes: tailBytes,
 			shownRange: { start: shownStart, end: truncated.totalLines },
-			artifactId,
+			artifactId: reportOnly ? undefined : artifactId,
 			nextOffset: existingMeta?.truncation?.nextOffset,
 		};
 	}

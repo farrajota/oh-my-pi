@@ -88,7 +88,7 @@ describe("createAgentSession cwd after /move", () => {
 				);
 				const settings = await Settings.loadIsolated({ cwd: cwdA, agentDir });
 				const sessionManager = SessionManager.create(cwdA, path.join(tempDir, "sessions"));
-				authStorage.setRuntimeApiKey("openai", "test-key");
+				authStorage.keys.setRuntime("openai", "test-key");
 				({ session } = await createAgentSession({
 					cwd: cwdA,
 					agentDir,
@@ -257,6 +257,27 @@ describe("createAgentSession cwd after /move", () => {
 			expect(session.getMnemopiSessionState()).toBeUndefined();
 			// Explicit backend reapplication must preserve the same startup policy.
 			await session.applyMemoryBackend();
+			expect(session.getHindsightSessionState()).toBeUndefined();
+			expect(session.getMnemopiSessionState()).toBeUndefined();
+			expect(session.getActiveToolNames()).toEqual(["read"]);
+
+			const rollbackOutput: string[] = [];
+			await executeAcpBuiltinSlashCommand("/move " + cwdA, {
+				session,
+				sessionManager,
+				settings,
+				cwd: cwdB,
+				output: text => {
+					rollbackOutput.push(text);
+				},
+				refreshCommands: () => {},
+				reloadPlugins: async () => {
+					if (sessionManager.getCwd() === cwdA) throw new Error("Destination plugin reload failed");
+				},
+			});
+			expect(rollbackOutput.join("\n")).toContain("Move failed: Destination plugin reload failed");
+			expect(sessionManager.getCwd()).toBe(cwdB);
+			expect(getProjectDir()).toBe(cwdB);
 			expect(session.getHindsightSessionState()).toBeUndefined();
 			expect(session.getMnemopiSessionState()).toBeUndefined();
 			expect(session.getActiveToolNames()).toEqual(["read"]);

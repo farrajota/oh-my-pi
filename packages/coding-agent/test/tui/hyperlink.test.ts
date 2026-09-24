@@ -170,14 +170,14 @@ describe("fileHyperlink", () => {
 		expect(uri).not.toContain(" ");
 	});
 
-	it("percent-encodes URL-reserved path bytes before appending query params", () => {
+	it("percent-encodes URL-reserved path bytes without a query", () => {
 		setHyperlinkMode("always");
 		const filePath = path.resolve("/Users/foo/a#b?c% d.ts");
 		const result = fileHyperlink(filePath, "a#b?c% d.ts", { line: 12 });
 		const uri = extractLinkUri(result);
-		const expectedUri = new URL(url.pathToFileURL(path.resolve(filePath)).href);
-		expectedUri.searchParams.set("line", "12");
-		expect(uri).toBe(expectedUri.href);
+		expect(uri).toBe(url.pathToFileURL(path.resolve(filePath)).href);
+		expect(new URL(uri!).search).toBe("");
+		expect(new URL(uri!).hash).toBe("");
 	});
 
 	it("resolves relative paths before building file URIs", () => {
@@ -188,13 +188,12 @@ describe("fileHyperlink", () => {
 		expect(decodeURIComponent(new URL(uri!).pathname)).toEndWith("/relative file#1.ts");
 	});
 
-	it("appends line and col as query params when provided", () => {
+	it("keeps file URIs usable by clients that reject query parameters", () => {
 		setHyperlinkMode("always");
 		const filePath = path.resolve("/Users/foo/bar.ts");
 		const result = fileHyperlink(filePath, "bar.ts", { line: 42, col: 7 });
 		const uri = extractLinkUri(result);
-		expect(uri).toContain("line=42");
-		expect(uri).toContain("col=7");
+		expect(uri).toBe(url.pathToFileURL(filePath).href);
 	});
 
 	it("omits query params when line/col are not provided", () => {

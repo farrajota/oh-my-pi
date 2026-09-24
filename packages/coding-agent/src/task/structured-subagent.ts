@@ -9,7 +9,11 @@ import * as os from "node:os";
 import path from "node:path";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { snapshotEffectiveExtensionRoots } from "../capability/types";
-import { resolveAgentModelSelection, resolveModelOverride } from "../config/model-resolver";
+import {
+	resolveAgentModelSelection,
+	resolveConfiguredModelPatterns,
+	resolveModelOverride,
+} from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { type ServiceTierInheritSettingValue, validateAgentServiceTierOverrides } from "../config/service-tier";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -146,9 +150,11 @@ export interface EffectiveSubagentPolicy {
 	agentName: string;
 	agent: AgentDefinition;
 	effectiveAgent: AgentDefinition;
-	modelOverride?: string | string[];
+	modelOverride?: string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	/** Extension routing note explaining a `before_subagent_spawn` model replacement. */
+	modelRoute?: string;
 	/** Exact-name `task.agentServiceTierOverrides` entry for this agent, applied after model resolution. */
 	serviceTierOverride?: ServiceTierInheritSettingValue;
 	parentActiveModelPattern?: string;
@@ -289,7 +295,10 @@ export async function resolveEffectiveSubagentPolicy(
 	const sessionAgents = request.session.getSessionAgents?.() ?? [];
 	const knownNames = new Set(discovered.agents.map(candidate => candidate.name));
 	const discovery = sessionAgents.length
-		? { ...discovered, agents: [...discovered.agents, ...sessionAgents.filter(candidate => !knownNames.has(candidate.name))] }
+		? {
+				...discovered,
+				agents: [...discovered.agents, ...sessionAgents.filter(candidate => !knownNames.has(candidate.name))],
+			}
 		: discovered;
 	const agent = getAgent(discovery.agents, agentName);
 	if (!agent) {
@@ -318,9 +327,7 @@ export async function resolveEffectiveSubagentPolicy(
 		}
 	}
 	const agentModelOverrides = settings.get("task.agentModelOverrides");
-	const agentServiceTierOverrides = validateAgentServiceTierOverrides(
-		settings.get("task.agentServiceTierOverrides"),
-	);
+	const agentServiceTierOverrides = validateAgentServiceTierOverrides(settings.get("task.agentServiceTierOverrides"));
 	const serviceTierOverride = Object.hasOwn(agentServiceTierOverrides, agentName)
 		? agentServiceTierOverrides[agentName]
 		: undefined;
@@ -381,6 +388,46 @@ export async function resolveEffectiveSubagentPolicy(
 			(request.enableIrc ??
 				(request.session.enableIrc !== false && isIrcEnabled(settings, request.session.taskDepth ?? 0))),
 	};
+}
+
+/**
+ * Fire `before_subagent_spawn` for an actual child dispatch. Kept out of
+ * {@link resolveEffectiveSubagentPolicy} because frontends run that as a
+ * side-effect-free preflight too; stateful routing handlers must see exactly
+ * one event per spawned child.
+ */
+export async function applySpawnHook(
+	request: Pick<
+		StructuredSubagentRequest,
+		"session" | "settings" | "invocationKind" | "identity" | "index" | "parentToolCallId" | "signal"
+	>,
+	policy: EffectiveSubagentPolicy,
+): Promise<EffectiveSubagentPolicy> {
+	const emit = request.session.emitBeforeSubagentSpawn;
+	if (!emit) return policy;
+	const spawnKey =
+		request.identity?.id ??
+		request.identity?.label ??
+		(request.parentToolCallId !== undefined ? `${request.parentToolCallId}:${request.index ?? 0}` : undefined);
+	const spawnResult = await emit(
+		{
+			type: "before_subagent_spawn",
+			agent: policy.agentName,
+			invocationKind: request.invocationKind,
+			modelRole: policy.modelRole,
+			patterns: policy.modelOverride ?? [],
+			spawnKey,
+		},
+		request.signal,
+	);
+	if (spawnResult?.block) {
+		throw new StructuredSubagentError("preflight", spawnResult.reason ?? "Subagent spawn blocked by extension.");
+	}
+	if (spawnResult?.model === undefined) return policy;
+	const settings = request.settings ?? request.session.settings;
+	const replacement = resolveConfiguredModelPatterns(spawnResult.model, settings);
+	if (replacement.length === 0) return policy;
+	return { ...policy, modelOverride: replacement, modelRoute: spawnResult.note };
 }
 
 /** Reserve a session-global agent id only after preflight has succeeded. */
@@ -474,6 +521,7 @@ function buildExecutorOptions(
 		modelRole: policy.modelRole,
 		requestedModel,
 		exactModelOverride,
+		modelRoute: policy.modelRoute,
 		serviceTierOverride: policy.serviceTierOverride,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
@@ -654,7 +702,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			"Authority subagent creation requires a live parent-bound session creator.",
 		);
 	}
-	const policy = await resolveEffectiveSubagentPolicy(request);
+	const policy = await applySpawnHook(request, await resolveEffectiveSubagentPolicy(request));
 	const lease = await leaseArtifacts(request.session, request.invocationKind);
 	let changesApplied: boolean | null = null;
 	let mergeSummary = "";

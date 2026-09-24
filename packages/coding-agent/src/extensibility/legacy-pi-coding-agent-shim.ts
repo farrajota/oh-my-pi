@@ -1430,10 +1430,10 @@ export async function createAgentSession(
 }
 
 /**
- * Synchronous auth storage surface retained for legacy extensions.
+ * Legacy auth storage surface with synchronous reads and asynchronous writes.
  *
- * Modern OMP auth storage is asynchronous, while older provider extensions
- * call `AuthStorage.create().get()` during module initialization.
+ * Older provider extensions call `AuthStorage.create().get()` during module
+ * initialization; writes now await the underlying credential store.
  */
 export class AuthStorage {
 	constructor() {
@@ -1453,10 +1453,10 @@ export class AuthStorage {
 		}
 	}
 
-	set(provider: string, credential: AuthCredential): void {
+	async set(provider: string, credential: AuthCredential): Promise<void> {
 		const store = new SqliteAuthCredentialStore(new Database(getAgentDbPath()));
 		try {
-			store.upsertAuthCredentialForProvider(provider, credential);
+			await store.upsertAuthCredential(provider, credential);
 		} finally {
 			store.close();
 		}
@@ -1591,6 +1591,7 @@ export { CONFIG_DIR_NAME } from "@oh-my-pi/pi-utils";
 export { parseArgs } from "../cli/args";
 
 export * from "../index";
+export { isToolCallEventType } from "./extensions/types";
 export { formatBytes as formatSize } from "@oh-my-pi/pi-tui/render/render-utils";
 export { copyToClipboard } from "../utils/clipboard";
 export { Type } from "./legacy-typebox";

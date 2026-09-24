@@ -67,7 +67,6 @@ const sessionTools = new SessionTools(host, {
 });
 const connection = { name: "alpha" } as MCPServerConnection;
 
-
 // The refresh loop lives in its own frame so the arrays it materialises
 // (wrapper lists, dedupe sets, promise plumbing) are not left in this module's
 // register slots when the collector scans the stack conservatively.
@@ -77,7 +76,6 @@ async function refreshRepeatedly(): Promise<void> {
 	}
 }
 await refreshRepeatedly();
-
 
 // Collect from a fresh event-loop turn, twice: each turn re-enters the native
 // stack at a different depth, so a stale pointer that one scan happened to

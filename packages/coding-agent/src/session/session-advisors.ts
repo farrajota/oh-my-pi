@@ -457,6 +457,9 @@ export class SessionAdvisors {
 	#advisorPrimaryTurnsCompleted = 0;
 	#advisorInterruptImmuneTurnStart: number | undefined;
 	#pendingAdvisorCardEvents = new Set<Promise<void>>();
+	#advisorCardEventFailure: unknown;
+	#advisorCardEventFailed = false;
+	#advisorCardEventGeneration = 0;
 	#advisorYieldQueueUnsubscribe: (() => void) | undefined;
 
 	constructor(host: SessionAdvisorsHost, options: SessionAdvisorsOptions) {
@@ -627,7 +630,7 @@ export class SessionAdvisors {
 		for (const [slug, providers] of providersBySlug) {
 			if ((costs.get(slug) ?? 0) <= 0) continue;
 			for (const provider of providers) {
-				if (auth.hasOAuth(provider)) {
+				if (auth.credentials.hasOAuth(provider)) {
 					slugs.add(slug);
 					break;
 				}
@@ -732,8 +735,18 @@ export class SessionAdvisors {
 
 	/** Tracks persistence of a visible advisor card emitted outside the primary loop. */
 	trackCardEvent(processing: Promise<void>): void {
+		const generation = this.#advisorCardEventGeneration;
 		this.#pendingAdvisorCardEvents.add(processing);
-		void processing.finally(() => this.#pendingAdvisorCardEvents.delete(processing)).catch(() => {});
+		void processing.then(
+			() => this.#pendingAdvisorCardEvents.delete(processing),
+			error => {
+				if (generation === this.#advisorCardEventGeneration) {
+					this.#advisorCardEventFailed = true;
+					this.#advisorCardEventFailure = error;
+				}
+				this.#pendingAdvisorCardEvents.delete(processing);
+			},
+		);
 	}
 
 	/** Waits for all advisor-card persistence handlers currently in flight. */
@@ -825,6 +838,10 @@ export class SessionAdvisors {
 	 * so none of them inject into the new conversation.
 	 */
 	#resetAdvisorSessionState(preserveCost: boolean): void {
+		this.#advisorCardEventGeneration++;
+		this.#pendingAdvisorCardEvents.clear();
+		this.#advisorCardEventFailure = undefined;
+		this.#advisorCardEventFailed = false;
 		if (!preserveCost) {
 			this.#advisorCosts.clear();
 			this.#advisorSubscriptionSlugs.clear();
@@ -1595,7 +1612,7 @@ export class SessionAdvisors {
 
 		const accountPolicyDenial = AIError.is(errorId, AIError.Flag.AccountPolicy);
 		if (accountPolicyDenial) {
-			const switched = await this.#host.modelRegistry.authStorage.rotateSessionCredential(
+			const switched = await this.#host.modelRegistry.authStorage.limits.rotate(
 				currentModel.provider,
 				advisor.providerSessionId,
 				{ error: message, modelId: currentModel.id, signal },
@@ -1614,7 +1631,7 @@ export class SessionAdvisors {
 		let usagePriorBlockedUntilMs: number | undefined;
 		let usagePriorBlockedUntilTimed: boolean | undefined;
 		if (usageLimit) {
-			const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
+			const outcome = await this.#host.modelRegistry.authStorage.limits.markReached(
 				currentModel.provider,
 				advisor.providerSessionId,
 				{
@@ -1706,6 +1723,7 @@ export class SessionAdvisors {
 					from: currentSelector,
 					to: selector.raw,
 					role,
+					reason: `Advisor request failed: ${message}`,
 				});
 				return true;
 			}
@@ -2105,7 +2123,9 @@ export class SessionAdvisors {
 		while (this.#pendingAdvisorCardEvents.size > 0) {
 			const remainingMs = deadline - Date.now();
 			if (remainingMs <= 0) return false;
-			const settled = Promise.allSettled(this.#pendingAdvisorCardEvents).then(() => true as const);
+			const settled = Promise.allSettled(this.#pendingAdvisorCardEvents).then(
+				results => !results.some(result => result.status === "rejected"),
+			);
 			const { promise: timedOut, resolve } = Promise.withResolvers<false>();
 			const timer = setTimeout(() => resolve(false), remainingMs);
 			try {
@@ -2114,7 +2134,7 @@ export class SessionAdvisors {
 				clearTimeout(timer);
 			}
 		}
-		return true;
+		return !this.#advisorCardEventFailed;
 	}
 
 	/**
@@ -2124,8 +2144,10 @@ export class SessionAdvisors {
 	 */
 	async waitForAdvisorCatchup(timeoutMs: number): Promise<boolean> {
 		const deadline = Date.now() + timeoutMs;
+		const pendingCardEvents = this.#waitForPendingAdvisorCardEvents(Math.max(0, timeoutMs));
 		const results = await Promise.all(this.#advisors.map(advisor => advisor.runtime.waitForCatchup(timeoutMs, 1)));
-		const cardEventsCaughtUp = await this.#waitForPendingAdvisorCardEvents(Math.max(0, deadline - Date.now()));
+		const cardEventsCaughtUp =
+			(await pendingCardEvents) && (await this.#waitForPendingAdvisorCardEvents(Math.max(0, deadline - Date.now())));
 		const abandoned = this.#advisors.filter(
 			(advisor, index) => results[index] === false && advisor.runtime.backlog > 0,
 		);
@@ -2134,6 +2156,11 @@ export class SessionAdvisors {
 				timeoutMs,
 				advisors: abandoned.map(advisor => ({ name: advisor.name, backlog: advisor.runtime.backlog })),
 				pendingAdvisorCards: this.#pendingAdvisorCardEvents.size,
+				cardEventFailure: this.#advisorCardEventFailed
+					? this.#advisorCardEventFailure instanceof Error
+						? this.#advisorCardEventFailure.message
+						: String(this.#advisorCardEventFailure)
+					: undefined,
 			});
 			return false;
 		}

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -6,6 +6,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
+import { createHubAuthorityFixture, type HubAuthorityFixture } from "./hub-fixtures";
 
 function makeDirectSession(manager: AsyncJobManager): ToolSession {
 	const registry = new AgentRegistry();
@@ -28,25 +29,12 @@ function makeDirectSession(manager: AsyncJobManager): ToolSession {
 }
 
 const SELF_ID = "Main";
+let authorityFixture: HubAuthorityFixture;
 
 function makeSession(manager: AsyncJobManager): ToolSession {
-	const registry = new AgentRegistry();
-	registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null, status: "running" });
-	return {
-		cwd: process.cwd(),
-		settings: {
-			get(key: string): unknown {
-				if (key === "irc.timeoutMs") return 120_000;
-				return undefined;
-			},
-		},
-		agentRegistry: registry,
-		asyncJobManager: manager,
-		getAgentId: () => SELF_ID,
-		getSessionFile: () => "structured-job-test",
-		getSessionSpawns: () => "*",
-		isDisposed: () => false,
-	} as unknown as ToolSession;
+	const session = authorityFixture.createToolSession(SELF_ID) as ToolSession & { asyncJobManager?: AsyncJobManager };
+	session.asyncJobManager = manager;
+	return session;
 }
 
 function registerSettledJob(
@@ -56,18 +44,21 @@ function registerSettledJob(
 	structured: StructuredSubagentOutput,
 	jobId = agentId,
 ): string {
-	return manager.register(
-		"task",
+	return manager.register("task", agentId, async () => ({ text, structured }), {
+		ownerId: SELF_ID,
 		agentId,
-		async ({ reportProgress }) => {
-			await reportProgress(text, { structured });
-			return text;
-		},
-		{ ownerId: SELF_ID, agentId, id: jobId },
-	);
+		id: jobId,
+	});
 }
 
-afterEach(() => {
+beforeEach(async () => {
+	const registry = new AgentRegistry();
+	AgentRegistry.installGlobal(registry);
+	authorityFixture = await createHubAuthorityFixture(registry, SELF_ID);
+});
+
+afterEach(async () => {
+	await authorityFixture.dispose();
 	IrcBus.resetGlobalForTests();
 	AgentRegistry.resetGlobalForTests();
 });
@@ -114,6 +105,7 @@ describe("hub direct-session job isolation", () => {
 		expect(text).toContain("full payload at agent://ValidJob");
 		expect(text).toContain("fields via agent://ValidJob/<field>");
 		expect(text).not.toContain("```json");
+		expect(manager.isJobResultConsumed(jobId)).toBe(true);
 	});
 
 	test("a schema-invalid result keeps the truncated JSON preview alongside the pointer", async () => {
@@ -134,6 +126,7 @@ describe("hub direct-session job isolation", () => {
 		expect(text).toContain("full payload at agent://InvalidJob");
 		expect(text).toContain("```json");
 		expect(text).toContain('"wrong": "shape"');
+		expect(manager.isJobResultConsumed(jobId)).toBe(true);
 	});
 
 	test("a run that failed before yielding reports the provider error, not a schema verdict", async () => {
@@ -156,6 +149,7 @@ describe("hub direct-session job isolation", () => {
 		expect(text).not.toContain("schema unavailable");
 		expect(text).not.toContain("full payload at");
 		expect(text).not.toContain("```json");
+		expect(manager.isJobResultConsumed(jobId)).toBe(true);
 	});
 
 	test("advertises the disambiguated agentId, not the collision-suffixed job id", async () => {
@@ -172,16 +166,18 @@ describe("hub direct-session job isolation", () => {
 		expect(jobId).not.toBe("Foo");
 		await manager.getJob(jobId)!.promise;
 		const tool = new HubTool(makeSession(manager));
-		const summary = await tool.execute("summary", { op: "jobs" });
-		const summaryText = summary.content[0]?.type === "text" ? summary.content[0].text : "";
-		expect(summaryText).toContain(`- \`${jobId}\` [task] — completed — Foo — delivery pending — agent://Foo`);
-		expect(summaryText).not.toContain("<task-result>done</task-result>");
-		if (!summary.details || !("jobs" in summary.details)) throw new Error("Expected job summary details");
-		expect(summary.details.jobs?.find(job => job.id === jobId)?.structured).toBeUndefined();
 
 		const result = await tool.execute("call_3", { op: "wait", ids: [jobId] });
 		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 
 		expect(text).toContain(`full payload at agent://Foo,`);
+		const summary = await tool.execute("summary", { op: "jobs" });
+		const summaryText = summary.content[0]?.type === "text" ? summary.content[0].text : "";
+		expect(summaryText).toContain(`- \`${jobId}\` [task] — completed — Foo — delivery delivered — agent://Foo`);
+		expect(summaryText).not.toContain("<task-result>done</task-result>");
+		if (!summary.details || !("jobs" in summary.details)) throw new Error("Expected job summary details");
+		expect(summary.details.jobs?.find(job => job.id === jobId)?.structured).toBeUndefined();
+		expect(manager.isJobResultConsumed(jobId)).toBe(true);
+		expect(manager.isJobResultConsumed("Foo")).toBe(false);
 	});
 });

@@ -65,6 +65,7 @@ function createCtx(overrides?: {
 		vim: null,
 		collab: null,
 		stream: null,
+		recording: false,
 		usageStats: {
 			input: 0,
 			output: 0,
@@ -469,7 +470,6 @@ describe("overflow gap budgeting by layout", () => {
 		const cwd = path.join(root, "controlled-path-boundary");
 		fs.mkdirSync(cwd);
 		setProjectDir(cwd);
-
 
 		const session = createStatusLineSession("boundary test");
 		const component = statusLines.track(new StatusLineComponent(session, statusLineHost));

@@ -593,9 +593,7 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 					(!from || ref.id === from),
 			);
 			const legacyRunning = runningPeers.some(
-				ref =>
-					(ref.lineage === undefined || ref.lineage.rootId === ref.id) &&
-					(!from || ref.id === from),
+				ref => (ref.lineage === undefined || ref.lineage.rootId === ref.id) && (!from || ref.id === from),
 			);
 			if (!from && !inScopeRunning && !legacyRunning) {
 				return transaction.select(() => nothingToWaitForResult(this.session));

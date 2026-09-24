@@ -29,7 +29,6 @@ import { DEFAULT_HUB_LIST_LIMIT, MAX_HUB_LIST_LIMIT } from "@oh-my-pi/pi-tui/too
 import { prompt, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { createHubAuthorityFixture } from "./hub-fixtures";
 
-
 function sessionHeader(id: string): string {
 	return JSON.stringify({
 		type: "session",
@@ -1466,7 +1465,6 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 			},
 		} as unknown as AgentSession;
 	}
-
 
 	it("direct send, history://, and agent:// target each caller root's parked Worker without a prior list", async () => {
 		using tempDir = TempDir.createSync("@omp-hub-direct-root-");

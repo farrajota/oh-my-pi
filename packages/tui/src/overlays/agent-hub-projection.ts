@@ -1,4 +1,4 @@
-import type { AgentMetricsSummary, AgentRecordLike, AgentStatus } from "./agent-hub-types";
+import type { AgentHubLiveMetrics, AgentMetricsSummary, AgentRecordLike, AgentStatus } from "./agent-hub-types";
 import { MAIN_AGENT_ID } from "./agent-hub-types";
 import type { ObservableSession } from "./session-observer-registry";
 
@@ -185,6 +185,8 @@ export function aggregateMetrics<TRecord extends AgentRecordLike>(args: {
 		observed: ObservableSession | undefined,
 	) => NonNullable<AgentRecordLike["session"]> | undefined;
 	sessionMetrics: WeakMap<object, { metrics: AgentMetrics | undefined }>;
+	getLiveMetrics?: (id: string, sample: boolean) => AgentHubLiveMetrics | undefined;
+	liveMetrics?: Map<string, AgentHubLiveMetrics>;
 	refreshFallback: boolean;
 }): { metrics: AggregateMetrics; hasFallbackLiveSessions: boolean } {
 	const total: AggregateMetrics = {
@@ -198,9 +200,17 @@ export function aggregateMetrics<TRecord extends AgentRecordLike>(args: {
 		activeDurationAgents: 0,
 	};
 	let hasFallbackLiveSessions = false;
-	const countedFallbackSessions = new Set<NonNullable<AgentRecordLike["session"]>>();
+	const countedFallbackSessions = new Set<NonNullable<AgentRecordLike["session"]> | number>();
 	for (const ref of args.rows) {
 		const observed = args.observedById.get(ref.id);
+		const live =
+			!observed?.progress && !ref.history?.metrics ? args.getLiveMetrics?.(ref.id, args.refreshFallback) : undefined;
+		if (live) {
+			hasFallbackLiveSessions = true;
+			args.liveMetrics?.set(ref.id, live);
+		} else {
+			args.liveMetrics?.delete(ref.id);
+		}
 		const fallbackSession = args.fallbackStatsSession(ref, observed);
 		if (fallbackSession) {
 			hasFallbackLiveSessions = true;
@@ -210,9 +220,11 @@ export function aggregateMetrics<TRecord extends AgentRecordLike>(args: {
 		}
 		const metrics =
 			args.metricsFor(ref, observed) ??
+			live?.metrics ??
 			(fallbackSession ? args.sessionMetrics.get(fallbackSession)?.metrics : undefined);
-		if (!metrics || (fallbackSession && countedFallbackSessions.has(fallbackSession))) continue;
-		if (fallbackSession) countedFallbackSessions.add(fallbackSession);
+		const fallbackIdentity = live?.generation ?? fallbackSession;
+		if (!metrics || (fallbackIdentity !== undefined && countedFallbackSessions.has(fallbackIdentity))) continue;
+		if (fallbackIdentity !== undefined) countedFallbackSessions.add(fallbackIdentity);
 		total.reportedAgents++;
 		total.tokens += finiteMetric(metrics.tokens);
 		total.requests += finiteMetric(metrics.requests);

@@ -625,7 +625,9 @@ export class Sidebar {
 		if (target.kind === "section") return target.area === "unstaged" ? { type: "stage" } : { type: "unstage" };
 		const selected = this.#selectionFor(target);
 		if (!selected) return null;
-		return selected.area === "unstaged" ? { type: "stage", selection: selected } : { type: "unstage", selection: selected };
+		return selected.area === "unstaged"
+			? { type: "stage", selection: selected }
+			: { type: "unstage", selection: selected };
 	}
 
 	/** Discard action for a file or dir row; null on a commit-area row. */

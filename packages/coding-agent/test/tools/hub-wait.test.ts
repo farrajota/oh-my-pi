@@ -197,11 +197,7 @@ describe("hub unified wait", () => {
 		expect(details.waited?.body).toBe("picked up the lock");
 		// Consumed exactly one message, not merely peeked or drained the backlog.
 		expect(authorityFixture.bus.unreadCount(SELF_ID)).toBe(1);
-		expect(
-			authorityFixture.bus
-				.inbox(SELF_ID)
-				.map(message => message.body),
-		).toEqual(["starting the edit"]);
+		expect(authorityFixture.bus.inbox(SELF_ID).map(message => message.body)).toEqual(["starting the edit"]);
 	});
 	test("direct sessions cannot wait on peer messages or caller-owned jobs", async () => {
 		const registry = new AgentRegistry();
@@ -219,5 +215,4 @@ describe("hub unified wait", () => {
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("unavailable");
 	});
-
 });

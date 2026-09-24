@@ -42,7 +42,10 @@ const configuredSearchProviderOrder: SearchProviderId[] = [];
 const excludedSearchProviders = new Set<SearchProviderId>();
 
 export function isSearchProviderId(value: unknown): value is SearchProviderId {
-	return typeof value === "string" && SEARCH_PROVIDER_OPTIONS.some(option => option.value === value && option.value !== "auto");
+	return (
+		typeof value === "string" &&
+		SEARCH_PROVIDER_OPTIONS.some(option => option.value === value && option.value !== "auto")
+	);
 }
 
 export function setSearchProviderOrder(order: readonly SearchProviderId[]): void {
@@ -53,7 +56,6 @@ export function setExcludedSearchProviders(providers: readonly SearchProviderId[
 	excludedSearchProviders.clear();
 	for (const provider of providers) excludedSearchProviders.add(provider);
 }
-
 
 /** Web search tool parameters schema */
 export const webSearchSchema = type({
@@ -166,12 +168,21 @@ async function executeSearch(
 				return resolved.model ? [{ model: resolved.model, explicit: true }] : [];
 			})()
 		: resolveRoleChain("web", settings, pool);
-const providerRank = new Map(configuredSearchProviderOrder.map((provider, index) => [provider, index]));
+	const providerRank = new Map(configuredSearchProviderOrder.map((provider, index) => [provider, index]));
 	const orderedCandidates = candidates
-		.filter(candidate => candidate.explicit || !isSearchProviderId(candidate.model.id) || !excludedSearchProviders.has(candidate.model.id))
+		.filter(
+			candidate =>
+				candidate.explicit ||
+				!isSearchProviderId(candidate.model.id) ||
+				!excludedSearchProviders.has(candidate.model.id),
+		)
 		.sort((left, right) => {
-			const leftRank = isSearchProviderId(left.model.id) ? (providerRank.get(left.model.id) ?? Number.MAX_SAFE_INTEGER) : Number.MAX_SAFE_INTEGER;
-			const rightRank = isSearchProviderId(right.model.id) ? (providerRank.get(right.model.id) ?? Number.MAX_SAFE_INTEGER) : Number.MAX_SAFE_INTEGER;
+			const leftRank = isSearchProviderId(left.model.id)
+				? (providerRank.get(left.model.id) ?? Number.MAX_SAFE_INTEGER)
+				: Number.MAX_SAFE_INTEGER;
+			const rightRank = isSearchProviderId(right.model.id)
+				? (providerRank.get(right.model.id) ?? Number.MAX_SAFE_INTEGER)
+				: Number.MAX_SAFE_INTEGER;
 			return leftRank - rightRank;
 		});
 
@@ -199,7 +210,7 @@ const providerRank = new Map(configuredSearchProviderOrder.map((provider, index)
 	let availableProviderCount = 0;
 	let lastProvider: { id: string; label: string } | undefined;
 	let failedResponseProvider: SearchResponse["provider"] = "none";
-for (const candidate of orderedCandidates) {
+	for (const candidate of orderedCandidates) {
 		let provider: SearchProvider | undefined;
 		const candidateMeta = { id: candidate.model.id, label: candidate.model.name };
 		lastProvider = candidateMeta;

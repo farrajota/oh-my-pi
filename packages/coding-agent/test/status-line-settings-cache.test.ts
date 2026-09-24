@@ -214,13 +214,9 @@ describe("StatusLineComponent effective settings cache", () => {
 		const component = makeComponent({
 			preset: Settings.instance.get("statusLine.preset"),
 			leftSegments:
-				leftSegments.length === 0
-					? undefined
-					: (leftSegments as unknown as StatusLineSettings["leftSegments"]),
+				leftSegments.length === 0 ? undefined : (leftSegments as unknown as StatusLineSettings["leftSegments"]),
 			rightSegments:
-				rightSegments.length === 0
-					? undefined
-					: (rightSegments as unknown as StatusLineSettings["rightSegments"]),
+				rightSegments.length === 0 ? undefined : (rightSegments as unknown as StatusLineSettings["rightSegments"]),
 			sessionAccent: false,
 		});
 

@@ -6,6 +6,7 @@ import * as url from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
+import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import {
 	resolveMarkdownLinkTargets,
 	tryResolveInternalUrlSync,
@@ -145,12 +146,21 @@ describe("resource links in chat markdown", () => {
 		await fs.rm(tempDir, { recursive: true, force: true });
 	});
 
-	it("expands labeled, reference, and table links to real local and artifact files", async () => {
-		const localFile = path.join(tempDir, "local", "reviewed findings#.json");
-		const artifactFile = path.join(tempDir, "42.txt");
+	it("resolves caller-bound local and published artifact links, but not unpublished files", async () => {
+		const artifactDir = path.join(tempDir, "artifacts");
+		const localFile = path.join(artifactDir, "local", "reviewed findings#.json");
+		const artifactManager = new ArtifactManager(artifactDir);
+		const artifactId = await artifactManager.save("artifact output", "mcp");
+		const artifactFile = await artifactManager.getPath(artifactId);
+		if (!artifactFile) throw new Error("Expected published artifact path");
+		await fs.mkdir(path.dirname(localFile), { recursive: true });
 		await Bun.write(localFile, '{"reviewed":true}');
-		await Bun.write(artifactFile, "artifact output");
+		const unpublishedArtifactId = "0";
+		const unpublishedFile = path.join(artifactDir, `${unpublishedArtifactId}.mcp.log`);
+		await Bun.write(unpublishedFile, "arbitrary artifact-looking file");
+		expect(await artifactManager.getPath(unpublishedArtifactId)).toBeNull();
 		const href = "local://reviewed%20findings%23.json";
+		const unpublishedHref = `artifact://${unpublishedArtifactId}`;
 		const text = [
 			`[Reviewed findings](${href})`,
 			"",
@@ -158,13 +168,19 @@ describe("resource links in chat markdown", () => {
 			"| --- |",
 			"| [Artifact][output] |",
 			"",
-			"[output]: artifact://42",
+			`[Unpublished artifact](${unpublishedHref})`,
+			"",
+			`[output]: artifact://${artifactId}`,
 		].join("\n");
 		const targets = await resolveMarkdownLinkTargets([text], {
-			localProtocolOptions: { getArtifactsDir: () => tempDir },
+			localProtocolOptions: {
+				getArtifactsDir: () => artifactDir,
+				getSessionId: () => "test-session",
+			},
 		});
 		const localUri = url.pathToFileURL(await fs.realpath(localFile)).href;
 		const artifactUri = url.pathToFileURL(artifactFile).href;
+		const unpublishedUri = url.pathToFileURL(await fs.realpath(unpublishedFile)).href;
 		const markdown = new terminalCaps.Markdown(text, 0, 0, {
 			...getMarkdownTheme(),
 			resolveLink: href => targets.get(href),
@@ -172,9 +188,12 @@ describe("resource links in chat markdown", () => {
 		const output = markdown.render(300).join("\n");
 		expect(extractAnyTerminatorLinkUri(output)).toBe(localUri);
 		expect(output).toContain(`\x1b]8;;${artifactUri}\x07`);
+		expect(targets.has(unpublishedHref)).toBe(false);
+		expect(output).toContain(`\x1b]8;;${unpublishedHref}\x07`);
+		expect(output).not.toContain(unpublishedUri);
 		const visible = stripVTControlCharacters(output);
 		expect(visible).toContain(`Reviewed findings (${href})`);
-		expect(visible).toContain("Artifact (artifact://42)");
+		expect(visible).toContain(`Artifact (artifact://${artifactId})`);
 		expect(visible).not.toContain("file://");
 	});
 

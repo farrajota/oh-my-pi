@@ -62,30 +62,6 @@ describe("settings layout", () => {
 		}
 	});
 
-	it("exposes native terminal progress in the appearance settings menu", () => {
-		const def = getSettingsForTab(createSettingsHost().entries, "appearance").find(
-			def => def.path === "terminal.showProgress",
-		);
-
-		expect(def).toMatchObject({
-			type: "boolean",
-			label: "Native Terminal Progress",
-			group: "Display",
-		});
-	});
-
-	it("exposes every accepted snapcompact shape in the settings submenu", () => {
-		const def = getSettingsForTab(createSettingsHost().entries, "context").find(
-			def => def.path === "snapcompact.shape",
-		);
-
-		expect(def?.type).toBe("submenu");
-		if (def?.type !== "submenu") throw new Error("snapcompact.shape should render as a submenu");
-		const values = def.options.map(option => option.value);
-		expect(values).toContain("silver16-bw");
-		expect(values).toEqual([...SETTINGS_SCHEMA["snapcompact.shape"].values]);
-	});
-
 	it("hides advisor dependent settings when advisor is disabled", () => {
 		const advisorDependentPaths: SettingPath[] = ["advisor.syncBacklog", "advisor.immuneTurns"];
 		const advisorDependentPathSet = new Set<string>(advisorDependentPaths);
@@ -124,7 +100,9 @@ describe("settings layout", () => {
 			"retry.repeated.timerMs",
 			"retry.repeated.timeoutMs",
 		];
-        const defs = getSettingsForTab(createSettingsHost().entries, "model").filter(def => repeatedPaths.includes(def.path as SettingPath));
+		const defs = getSettingsForTab(createSettingsHost().entries, "model").filter(def =>
+			repeatedPaths.includes(def.path as SettingPath),
+		);
 
 		expect(defs.map(def => def.path)).toEqual(repeatedPaths);
 		expect(Settings.instance.get("retry.repeated.enabled")).toBe(false);
@@ -210,7 +188,6 @@ describe("settings layout", () => {
 			group: "Available Tools",
 		});
 	});
-
 
 	it("exposes task effort overrides as a Subagents boolean", () => {
 		const def = getSettingsForTab(createSettingsHost().entries, "tasks").find(

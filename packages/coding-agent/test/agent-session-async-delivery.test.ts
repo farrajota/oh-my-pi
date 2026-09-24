@@ -70,7 +70,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const manager = new AsyncJobManager({});
 		AsyncJobManager.setInstance(manager);
 
@@ -140,7 +140,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const manager = new AsyncJobManager({});
 		const sessionManager = SessionManager.inMemory();
 		const allocate = vi.spyOn(sessionManager, "allocateArtifactPath");
@@ -159,7 +159,8 @@ describe("AgentSession owner-routed async delivery", () => {
 				"failed capture",
 				async ({ reportProgress }) => {
 					const meta = { artifactError: "write" } as const;
-					const text = "preview-only ".repeat(2000) + formatOutputNotice(meta);
+					const text =
+						"preview-only not saved completely (ordinary output) ".repeat(600) + formatOutputNotice(meta);
 					await reportProgress(text, { meta });
 					return text;
 				},
@@ -174,7 +175,7 @@ describe("AgentSession owner-routed async delivery", () => {
 						: message.content.map(block => (block.type === "text" ? block.text : "")).join("\n"),
 				)
 				.find(text => text.includes("preview-only"));
-			expect(delivered?.match(/not saved completely/g)).toHaveLength(1);
+			expect(delivered?.match(/artifact write failed/g)).toHaveLength(1);
 			expect(delivered).not.toContain("Full output: artifact://");
 			expect(allocate).not.toHaveBeenCalled();
 			const custom = agent.state.messages.find(
@@ -189,9 +190,141 @@ describe("AgentSession owner-routed async delivery", () => {
 					.map(line => Bun.stripANSI(line))
 					.join("\n");
 				expect(rendered).toContain("not saved completely");
+				expect(rendered.match(/artifact write failed/g)).toHaveLength(1);
+				expect(rendered).not.toContain("only the preview is available");
 			}
 		} finally {
 			allocate.mockRestore();
+		}
+	});
+
+	it("recovers complete background output ending in a capture diagnostic", async () => {
+		await using temp = await TempDir.create("@capture-followup-literal-");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+		const store = SessionManager.inMemory(temp.path());
+		store.adoptArtifactManager(new ArtifactManager(path.join(temp.path(), "artifacts")));
+		const settings = Settings.isolated();
+		session = new AgentSession({
+			agent,
+			sessionManager: store,
+			settings,
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "LiteralCaptureOwner",
+			asyncJobManager: manager,
+		});
+		const complete = `${"complete output\n".repeat(2500)}UNIQUE-CAPTURE-END\n[Full output was not saved completely (artifact write failed)]`;
+		try {
+			manager.register("bash", "literal diagnostic", async () => complete, {
+				id: "literal-capture",
+				ownerId: "LiteralCaptureOwner",
+			});
+			await session.settleAsyncWork();
+			const delivered = agent.state.messages.find(
+				(message): message is CustomMessage => message.role === "custom" && message.customType === "async-result",
+			);
+			if (!delivered || typeof delivered.content !== "string") throw new Error("Expected async delivery text");
+			const reference = delivered.content.match(/Full output: (artifact:\/\/\d+)/)?.[1];
+			if (!reference) throw new Error("Expected full output recovery artifact");
+			await initTheme(false, undefined, undefined, "dark", "light");
+			const rendered = buildAsyncResultBlock(delivered)
+				.render(100)
+				.map(line => Bun.stripANSI(line))
+				.join("\n");
+			expect(rendered).not.toContain("artifact write failed");
+			expect(rendered).not.toContain("only the preview is available");
+			const readSession: ToolSession = {
+				cwd: temp.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => null,
+				settings,
+				localProtocolOptions: {
+					getArtifactsDir: () => store.getArtifactsDir(),
+					getSessionId: () => store.getSessionId(),
+				},
+			};
+			const recovered = await new ReadTool(readSession).execute("recover-literal", {
+				path: `${reference}:raw:2500-2502`,
+			});
+			expect(recovered.content.map(block => (block.type === "text" ? block.text : "")).join("\n")).toContain(
+				"UNIQUE-CAPTURE-END\n[Full output was not saved completely (artifact write failed)]",
+			);
+		} finally {
+			await session.dispose();
+			await store.close();
+		}
+	});
+
+	it("warns when saving an oversized async follow-up artifact fails", async () => {
+		await using temp = await TempDir.create("@capture-followup-save-failure-");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+		const store = SessionManager.inMemory(temp.path());
+		store.adoptArtifactManager(new ArtifactManager(path.join(temp.path(), "artifacts")));
+		const artifactManager = store.getArtifactManager();
+		if (!artifactManager) throw new Error("Expected artifact manager");
+		const save = vi.spyOn(artifactManager, "save").mockRejectedValue(new Error("disk full"));
+		session = new AgentSession({
+			agent,
+			sessionManager: store,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "FailedSaveOwner",
+			asyncJobManager: manager,
+		});
+		try {
+			manager.register("bash", "complete output", async () => "complete result\n".repeat(2500), {
+				id: "failed-save",
+				ownerId: "FailedSaveOwner",
+			});
+			await session.settleAsyncWork();
+			const delivered = agent.state.messages.find(
+				(message): message is CustomMessage => message.role === "custom" && message.customType === "async-result",
+			);
+			if (!delivered || typeof delivered.content !== "string") throw new Error("Expected async delivery text");
+			expect(delivered.content.match(/only the preview is available/g)).toHaveLength(1);
+			expect(delivered.content).toContain("Rerun the job to recover the missing output");
+			expect(delivered.content).not.toContain("Full output: artifact://");
+			await initTheme(false, undefined, undefined, "dark", "light");
+			const persisted = JSON.parse(JSON.stringify(delivered)) as typeof delivered;
+			for (const message of [delivered, persisted]) {
+				const rendered = buildAsyncResultBlock(message)
+					.render(100)
+					.map(line => Bun.stripANSI(line))
+					.join("\n");
+				expect(rendered).toContain("only the preview is available");
+				expect(rendered.match(/only the preview is available/g)).toHaveLength(1);
+				expect(rendered).not.toContain("complete result");
+				expect(rendered).not.toContain("artifact write failed");
+			}
+			expect(save).toHaveBeenCalledTimes(1);
+		} finally {
+			save.mockRestore();
+			await session.dispose();
+			await store.close();
 		}
 	});
 
@@ -207,7 +340,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const manager = new AsyncJobManager({});
 		AsyncJobManager.setInstance(manager);
 		const store = SessionManager.inMemory(temp.path());
@@ -221,7 +354,7 @@ describe("AgentSession owner-routed async delivery", () => {
 			agentId: "MixedCaptureOwner",
 			asyncJobManager: manager,
 		});
-		const complete = `${"healthy output\n".repeat(600)}FOLLOWUP-UNIQUE-MIDDLE\n${"healthy tail\n".repeat(600)}`;
+		const complete = `${"healthy output not saved completely (ordinary output)\n".repeat(600)}FOLLOWUP-UNIQUE-MIDDLE\n${"healthy tail\n".repeat(600)}`;
 		try {
 			const failedId = manager.register(
 				"bash",
@@ -256,6 +389,7 @@ describe("AgentSession owner-routed async delivery", () => {
 			expect(manager.getJob(failedId)?.status).toBe("completed");
 			const artifactUrl = text.match(/artifact:\/\/\d+/)?.[0];
 			if (!artifactUrl) throw new Error("Expected complete job recovery artifact");
+			expect(text).toContain("healthy output not saved completely (ordinary output)");
 			const readSession: ToolSession = {
 				cwd: temp.path(),
 				hasUI: false,
@@ -280,7 +414,7 @@ describe("AgentSession owner-routed async delivery", () => {
 	});
 
 	it("retains every capture warning on its own live and rebuilt async batch row", async () => {
-		const entries = ["open", "write", undefined].map((artifactError, index): AsyncResultEntry => {
+		const entries = ["open", "write", undefined, undefined].map((artifactError, index): AsyncResultEntry => {
 			const meta: OutputMeta | undefined =
 				artifactError === "open" || artifactError === "write" ? { artifactError } : undefined;
 			const jobId = `batch-${index}`;
@@ -288,6 +422,7 @@ describe("AgentSession owner-routed async delivery", () => {
 			return {
 				jobId,
 				result,
+				...(index === 2 ? { followUpSaveFailed: true } : {}),
 				durationMs: 1000,
 				epoch: 0,
 				job: {
@@ -315,6 +450,8 @@ describe("AgentSession owner-routed async delivery", () => {
 				.map(line => Bun.stripANSI(line))
 				.join("\n");
 			expect(rendered).toMatch(/batch-0[^]*artifact open failed[^]*batch-1[^]*artifact write failed[^]*batch-2/);
+			expect(rendered).toMatch(/batch-2[^]*only the preview is available[^]*batch-3/);
+			expect(rendered.match(/only the preview is available/g)).toHaveLength(1);
 			expect(rendered.match(/artifact open failed/g)).toHaveLength(1);
 			expect(rendered.match(/artifact write failed/g)).toHaveLength(1);
 		}
@@ -494,7 +631,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const sessionManager = SessionManager.inMemory();
 		const owner = `${sessionManager.getSessionId()}-advisor`;
 		session = new AgentSession({
@@ -548,7 +685,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const manager = new AsyncJobManager({ retentionMs: 60_000 });
 		AsyncJobManager.setInstance(manager);
 
@@ -602,7 +739,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const manager = new AsyncJobManager({ retentionMs: 60_000 });
 		AsyncJobManager.setInstance(manager);
 
@@ -657,7 +794,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const manager = new AsyncJobManager({ retentionMs: 60_000 });
 		AsyncJobManager.setInstance(manager);
 
@@ -714,7 +851,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const manager = new AsyncJobManager({});
 		AsyncJobManager.setInstance(manager);
 
@@ -755,7 +892,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const manager = new AsyncJobManager({});
 		AsyncJobManager.setInstance(manager);
 

@@ -7,18 +7,18 @@ describe("task tool profiles", () => {
 	});
 
 	test("inspect normalizes search/find aliases", () => {
-		expect(resolveTaskToolProfile("inspect")).toEqual(["read", "grep", "glob"]);
+		expect(resolveTaskToolProfile("inspect")).toEqual(["read", "grep", "find"]);
 	});
 
 	test("edit keeps mutation tools but excludes broad execution and delegation tools", () => {
 		const tools = resolveTaskToolProfile("edit");
 
-		expect(tools).toEqual(["read", "grep", "glob", "ast_grep", "edit", "write"]);
+		expect(tools).toEqual(["read", "grep", "find", "ast_grep", "edit", "write"]);
 		expect(tools).not.toEqual(expect.arrayContaining(["bash", "eval", "browser", "task"]));
 	});
 
 	test("an absent agent tool list receives the selected profile", () => {
-		expect(applyTaskToolProfile(undefined, "review")).toEqual(["read", "grep", "glob", "ast_grep"]);
+		expect(applyTaskToolProfile(undefined, "review")).toEqual(["read", "grep", "find", "ast_grep"]);
 	});
 
 	test("profile application preserves only the intersection with explicit agent tools", () => {

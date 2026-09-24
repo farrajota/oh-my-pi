@@ -23,6 +23,7 @@ export interface RestrictedStartupPolicyInput {
 	readonly restrictToolNames?: boolean;
 	readonly toolNames?: readonly string[];
 	readonly allowRestrictedCustomTools?: boolean;
+	readonly allowRestrictedExtensions?: boolean;
 	readonly enableMCP?: boolean;
 	readonly enableLsp?: boolean;
 	readonly lspReadOnly?: boolean;
@@ -117,7 +118,7 @@ export function deriveRestrictedStartupPolicy(input: RestrictedStartupPolicyInpu
 		hasPathConstraints,
 		toolNames: frozenToolNames,
 		zeroTools: restricted && frozenToolNames?.length === 0,
-		allowExtensions: !restricted,
+		allowExtensions: !restricted || input.allowRestrictedExtensions === true,
 		allowCustomTools:
 			!restricted ||
 			(!unprovableEffects && input.allowRestrictedCustomTools === true && frozenToolNames !== undefined),

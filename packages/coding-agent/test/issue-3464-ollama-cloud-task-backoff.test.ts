@@ -39,9 +39,9 @@ describe("issue #3464: ollama-cloud task backoff", () => {
 	beforeAll(async () => {
 		tempDir = TempDir.createSync("@omp-issue-3464-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
-		authStorage.setRuntimeApiKey("openai", "openai-test-key");
-		authStorage.setRuntimeApiKey("ollama-cloud", "ollama-cloud-test-key");
+		authStorage.keys.setRuntime("anthropic", "anthropic-test-key");
+		authStorage.keys.setRuntime("openai", "openai-test-key");
+		authStorage.keys.setRuntime("ollama-cloud", "ollama-cloud-test-key");
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
@@ -92,6 +92,46 @@ describe("issue #3464: ollama-cloud task backoff", () => {
 		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
 
 		await session.prompt("Task role should inherit the default fallback chain");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`]);
+		expect(session.model?.provider).toBe(fallback.provider);
+		expect(session.model?.id).toBe(fallback.id);
+	});
+
+	it("uses the default fallback chain for an Ollama Cloud task role after rate limiting", async () => {
+		const primary = requireModel("ollama-cloud", "gpt-oss:120b");
+		const fallback = requireModel("openai", "gpt-4o-mini");
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		let primaryAttempts = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				if (model.provider === primary.provider && model.id === primary.id && primaryAttempts === 0) {
+					primaryAttempts += 1;
+					mock.push({ throw: "rate limit exceeded retry-after-ms=200" });
+				} else {
+					mock.push({ content: [`ok:${model.provider}/${model.id}`] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 1,
+			"retry.fallbackChains": {
+				default: [`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			},
+		});
+		settings.setModelRole("task", `${primary.provider}/${primary.id}`);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		await session.prompt("An Ollama Cloud task-role rate limit should use the default fallback chain");
 		await session.waitForIdle();
 
 		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`]);

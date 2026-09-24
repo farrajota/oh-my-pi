@@ -5,12 +5,22 @@ import { formatBackgroundNotice } from "../async";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { truncateToVisualLines } from "@oh-my-pi/pi-tui/chrome";
 import { highlightCode, type Theme } from "@oh-my-pi/pi-tui/theme";
-import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth, renderStatusLine } from "@oh-my-pi/pi-tui/render";
+import {
+	CachedOutputBlock,
+	markFramedBlockComponent,
+	outputBlockContentWidth,
+	renderStatusLine,
+} from "@oh-my-pi/pi-tui/render";
 import { getSixelLineMask } from "@oh-my-pi/pi-tui/render";
 import type { BashToolDetails } from "./bash";
 import { formatExitCodeNotice, formatWallTimeNotice, formatWallTimeSeconds } from "./bash-result-format";
 import { formatStyledTruncationWarning, stripOutputNotice, stripRawOutputArtifactNotice } from "./output-meta";
-import { capPreviewLines, formatToolWorkingDirectory, previewWindowRows, replaceTabs } from "@oh-my-pi/pi-tui/render/render-utils";
+import {
+	capPreviewLines,
+	formatToolWorkingDirectory,
+	previewWindowRows,
+	replaceTabs,
+} from "@oh-my-pi/pi-tui/render/render-utils";
 import { DEFAULT_TERMINAL_PREVIEW_LINES } from "./preview-limits";
 
 export const BASH_DEFAULT_PREVIEW_LINES = DEFAULT_TERMINAL_PREVIEW_LINES;

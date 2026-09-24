@@ -14,6 +14,7 @@
  * same append path over the host's byte-capped transcript reads.
  */
 import type * as fs from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Component, TUI } from "../tui";
 import { Editor } from "../components/editor";
@@ -38,6 +39,7 @@ import {
 import { sanitizeErrorLine } from "../chrome/error-block";
 import type { ScrollRangeAnchor } from "../components/scroll-view";
 import { formatContextUsage } from "../chrome/context-thresholds";
+import { sanitizeStatusText } from "../chrome/shared";
 
 /** Parsed message and model metadata relevant to a transcript viewer. */
 export type AgentTranscriptEntry = SessionMessageEntryLike | { type: "model_change"; model: string };
@@ -96,6 +98,7 @@ interface LocalTranscriptState {
 	mtimeMs: number;
 	offset: number;
 	pending: string;
+	decoder: StringDecoder;
 	sentinels: LocalTranscriptSentinel[];
 }
 
@@ -304,7 +307,8 @@ export class AgentTranscriptViewer implements Component {
 		// (no terminating newline). Carry those bytes as `pending` so the next
 		// poll's `#appendLocal` joins them with the completion bytes instead of
 		// parsing a headless line fragment and dropping the entry.
-		const text = data.toString("utf-8");
+		const decoder = new StringDecoder("utf8");
+		const text = decoder.write(data);
 		const lastNewline = text.lastIndexOf("\n");
 		const complete = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : "";
 		const pending = lastNewline >= 0 ? text.slice(lastNewline + 1) : text;
@@ -317,6 +321,7 @@ export class AgentTranscriptViewer implements Component {
 			mtimeMs: post.mtimeMs,
 			offset: data.byteLength,
 			pending,
+			decoder,
 			sentinels: sentinelsFromBuffer(data),
 		};
 		this.#model = undefined;
@@ -326,12 +331,9 @@ export class AgentTranscriptViewer implements Component {
 	#appendLocal(sessionFile: string, stat: fs.Stats, state: LocalTranscriptState): void {
 		let chunk: string;
 		try {
-			chunk = readFileRangeSync(
-				this.#deps.transcript.fs,
-				sessionFile,
-				state.offset,
-				stat.size - state.offset,
-			).toString("utf-8");
+			chunk = state.decoder.write(
+				readFileRangeSync(this.#deps.transcript.fs, sessionFile, state.offset, stat.size - state.offset),
+			);
 		} catch (err) {
 			logger.debug("transcript viewer: tail read failed", { err: String(err) });
 			this.#loadLocalFull(sessionFile, stat);
@@ -579,7 +581,7 @@ export class AgentTranscriptViewer implements Component {
 		const { contentWidth, chromeWidth } = context;
 		const ref = this.#deps.registry.get(this.#deps.agentId);
 
-		const headerLines = this.#headerLines(ref?.status, ref?.kind, ref?.parentId);
+		const headerLines = this.#headerLines(ref?.status, ref?.kind, ref?.parentId, chromeWidth);
 		const footerLines = this.#footerLines();
 		const noticeLine = this.#notice
 			? theme.fg("error", sanitizeErrorLine(this.#notice, chromeWidth))
@@ -613,12 +615,35 @@ export class AgentTranscriptViewer implements Component {
 		};
 	}
 
-	#headerLines(status: AgentStatus | undefined, kind: string | undefined, parentId: string | undefined): string[] {
-		const lines = [theme.fg("accent", `Agent Hub ${theme.sep.dot} ${this.#deps.agentId}`)];
-		if (status && kind) {
-			const kindTag = theme.fg("dim", ` ${parentId ? `${kind} ${theme.sep.dot} of ${parentId}` : kind}`);
-			const modelLabel = this.#model ? theme.fg("muted", `${theme.sep.dot}${this.#model}`) : "";
-			lines.push(`${theme.bold(this.#deps.agentId)} ${statusBadge(status)}${kindTag}${modelLabel}`);
+	#headerLines(
+		status: AgentStatus | undefined,
+		kind: string | undefined,
+		parentId: string | undefined,
+		chromeWidth: number,
+	): string[] {
+		const maxWidth = Math.max(0, chromeWidth);
+		const agentId = sanitizeStatusText(this.#deps.agentId);
+		const safeKind = kind ? sanitizeStatusText(kind) : "";
+		const safeParentId = parentId ? sanitizeStatusText(parentId) : "";
+		const model = this.#model ? sanitizeStatusText(this.#model) : "";
+		const title = `Agent Hub ${theme.sep.dot} ${agentId}`;
+		const lines = [theme.fg("accent", title.slice(0, maxWidth))];
+		if (status && maxWidth >= status.length) {
+			const kindTag = safeKind ? ` ${safeKind}${safeParentId ? ` ${theme.sep.dot} of ${safeParentId}` : ""}` : "";
+			const modelLabel = model ? `${theme.sep.dot}${model}` : "";
+			const idBudget = Math.max(0, maxWidth - status.length - 1);
+			const visibleAgentId = agentId.slice(0, idBudget);
+			const separator = visibleAgentId || (!agentId && maxWidth > status.length) ? " " : "";
+			let metadataWidth = maxWidth - visibleAgentId.length - separator.length - status.length;
+			const visibleKindTag = kindTag.slice(0, metadataWidth);
+			metadataWidth -= visibleKindTag.length;
+			const visibleModelLabel = modelLabel.slice(0, metadataWidth);
+			const idLabel = visibleAgentId ? theme.bold(visibleAgentId) : "";
+			lines.push(
+				`${idLabel}${separator}${statusBadge(status)}` +
+					`${visibleKindTag ? theme.fg("dim", visibleKindTag) : ""}` +
+					`${visibleModelLabel ? theme.fg("muted", visibleModelLabel) : ""}`,
+			);
 		}
 		return lines;
 	}

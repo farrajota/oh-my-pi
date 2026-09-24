@@ -111,16 +111,13 @@ function inferBundledAgent(systemPrompt: string): { agent?: string; modelRole?: 
 }
 
 function usageTokens(usage: Record<string, unknown>): number {
-	if (typeof usage.totalTokens === "number" && Number.isFinite(usage.totalTokens)) return usage.totalTokens;
 	const orchestration = recordOf(usage.orchestration);
 	return (
 		finiteNumber(usage.input) +
 		finiteNumber(usage.output) +
-		finiteNumber(usage.cacheRead) +
 		finiteNumber(usage.cacheWrite) +
 		finiteNumber(orchestration?.input ?? usage.orchestrationInput) +
-		finiteNumber(orchestration?.output ?? usage.orchestrationOutput) +
-		finiteNumber(orchestration?.cacheRead ?? usage.orchestrationCacheRead)
+		finiteNumber(orchestration?.output ?? usage.orchestrationOutput)
 	);
 }
 

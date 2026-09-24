@@ -107,6 +107,10 @@ export interface WorkerTabSession extends TabSessionBase<PuppeteerBrowserHandle>
 	backend: "worker";
 	worker: WorkerHandle;
 	activateForScreenshot: boolean;
+	openOptions?: Pick<
+		WorkerInitPayload,
+		"allowedDomains" | "initScripts" | "downloadsPath" | "userAgent" | "ignoreHttpsErrors"
+	>;
 }
 
 export interface CmuxTabSession extends TabSessionBase<CmuxBrowserHandle> {
@@ -135,6 +139,11 @@ export interface AcquireTabOptions {
 	 */
 	deadlineStartMs?: number;
 	dialogs?: DialogPolicy;
+	allowedDomains?: string[];
+	initScripts?: string[];
+	downloadsPath?: string;
+	userAgent?: string;
+	ignoreHttpsErrors?: boolean;
 	cmuxSurface?: string;
 	/**
 	 * Session id of the acquirer. Recorded on the tab when created (never on
@@ -244,6 +253,25 @@ export function getTab(name: string, auditId?: string): TabSession | undefined {
 }
 export function hasTab(name: string): boolean {
 	return tabs.has(name);
+}
+
+/** Return cached live metadata for the caller's accessible managed tabs. */
+export function listTabs(auditId?: string, ownerSessionId?: string) {
+	return [...tabs.values()]
+		.filter(
+			tab =>
+				tab.state === "alive" &&
+				canAccessTab(tab, auditId) &&
+				(ownerSessionId === undefined || tab.ownerSessionId === ownerSessionId),
+		)
+		.map(tab => ({
+			name: tab.name,
+			url: tab.info.url,
+			title: tab.info.title ?? "",
+			targetId: tab.targetId,
+			kind: tab.kindTag,
+			persist: tab.persist === true,
+		}));
 }
 
 export function acquireTab(name: string, browser: BrowserHandle, opts: AcquireTabOptions): Promise<AcquireTabResult> {
@@ -469,6 +497,13 @@ async function acquireTabImpl(
 		dialogPolicy: opts.dialogs,
 		kindTag: browser.kind.kind,
 		activateForScreenshot: initPayload.mode === "headless" || initPayload.activateForScreenshot !== false,
+		openOptions: {
+			allowedDomains: opts.allowedDomains,
+			initScripts: opts.initScripts,
+			downloadsPath: opts.downloadsPath,
+			userAgent: opts.userAgent,
+			ignoreHttpsErrors: opts.ignoreHttpsErrors,
+		},
 		ownerSessionId: opts.ownerSessionId,
 		persist: opts.persist ?? false,
 		lastActivityAt: Date.now(),
@@ -875,7 +910,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 	if (wasAlive) {
 		try {
 			tab.worker.send({ type: "close" });
-			await waitForClosed(tab);
+			await waitForClosed(tab, timeoutMs);
 		} catch {
 			forced = true;
 		}
@@ -1261,6 +1296,11 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 			emulateViewport: browser.kind.kind === "audit" ? true : browser.kind.headless,
 			viewport: opts.viewport,
 			dialogs: opts.dialogs,
+			allowedDomains: opts.allowedDomains,
+			initScripts: opts.initScripts,
+			downloadsPath: opts.downloadsPath,
+			userAgent: opts.userAgent,
+			ignoreHttpsErrors: opts.ignoreHttpsErrors,
 			url: opts.url,
 			waitUntil: opts.waitUntil,
 			timeoutMs: opts.timeoutMs,
@@ -1282,6 +1322,11 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 		safeDir,
 		targetId,
 		dialogs: opts.dialogs,
+		allowedDomains: opts.allowedDomains,
+		initScripts: opts.initScripts,
+		downloadsPath: opts.downloadsPath,
+		userAgent: opts.userAgent,
+		ignoreHttpsErrors: opts.ignoreHttpsErrors,
 		url: opts.url,
 		waitUntil: opts.waitUntil,
 		timeoutMs: opts.timeoutMs,
@@ -1387,6 +1432,7 @@ async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number
 		safeDir: getPuppeteerDir(),
 		targetId: tab.targetId,
 		dialogs: tab.dialogPolicy,
+		...tab.openOptions,
 		// Unblock a wedged page (open JS dialog, hung navigation) before adopting it —
 		// otherwise init stalls, times out, and the tab gets force-killed.
 		recover: true,
@@ -1502,13 +1548,13 @@ function closeAbandonedWorkerPage(browser: PuppeteerBrowserHandle, worker: Worke
 		.finally(() => void releaseBrowser(browser, { kill: false }).catch(() => undefined));
 }
 
-async function waitForClosed(tab: WorkerTabSession): Promise<void> {
+async function waitForClosed(tab: WorkerTabSession, timeoutMs: number): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 	const unsubscribe = tab.worker.onMessage(msg => {
 		if (msg.type === "closed") resolve();
 	});
 	try {
-		await raceWithTimeout(promise, GRACE_MS, "Timed out closing browser tab worker");
+		await raceWithTimeout(promise, timeoutMs, "Timed out closing browser tab worker");
 	} finally {
 		unsubscribe();
 	}

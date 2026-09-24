@@ -16,6 +16,17 @@ export interface AgentMetricsSummary {
 	contextTokens?: number;
 	contextWindow?: number;
 }
+export interface AgentHubLiveMetrics {
+	readonly generation: number;
+	readonly metrics: AgentMetricsSummary | undefined;
+}
+export interface AgentHubSessionFacts {
+	readonly modelId?: string;
+	readonly modelSupportsThinking?: boolean;
+	readonly thinkingLevel?: ThinkingLevel;
+	readonly servingModel?: { readonly selector: string; readonly isFallback: boolean };
+}
+
 /** Live session data and actions used by the agent hub. */
 export interface AgentHubSession {
 	readonly thinkingLevel: ThinkingLevel | undefined;
@@ -50,6 +61,7 @@ export interface AgentRecordLike {
 		resolvedModel?: string;
 		resolvedModelIsFallback?: boolean;
 		metrics?: AgentMetricsSummary;
+		permissionSummary?: unknown;
 		readOnly?: boolean;
 		outputPath?: string;
 		patchPath?: string;

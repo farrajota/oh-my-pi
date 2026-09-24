@@ -223,7 +223,7 @@ export async function rebindMemoryBackendForCwd(session: AgentSession): Promise<
 		// The manager already has the new cwd, and this may also be rollback
 		// from a destination that never committed. Drain existing writes without
 		// capturing the transcript under either transient scope.
-		await session.applyMemoryBackend();
+		await session.applyMemoryBackend({ retainMnemopi: false });
 	}
 
 	let task: PrimaryRebuildTask | undefined = schedulePrimaryStateRebuild(session);
@@ -236,7 +236,11 @@ export async function rebindMemoryBackendForCwd(session: AgentSession): Promise<
 	}
 
 	// Startup is best-effort, but a move must not commit an unusable memory backend.
-	if (session.settings.get("memory.backend") === "mnemopi" && !session.getMnemopiSessionState()) {
+	if (
+		session.memoryBackendEnabled() &&
+		session.settings.get("memory.backend") === "mnemopi" &&
+		!session.getMnemopiSessionState()
+	) {
 		throw new Error("Mnemopi backend failed to initialise for the destination cwd.");
 	}
 }

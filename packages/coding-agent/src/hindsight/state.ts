@@ -613,7 +613,7 @@ export class HindsightSessionState {
 		commitIf?: () => boolean,
 	): Promise<boolean> {
 		try {
-			await this.session.refreshBaseSystemPrompt();
+			await this.session.refreshBaseSystemPrompt(commitIf);
 			return !commitIf || commitIf();
 		} catch (err) {
 			logger.debug(`Hindsight: refreshBaseSystemPrompt after ${reason} failed`, { error: String(err) });

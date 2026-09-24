@@ -225,7 +225,11 @@ describe("cursor todo persistence", () => {
 		const h = newHarness([{ name: "Auth", tasks: [{ content: "oauth", status: "completed" }] }]);
 		const before = h.current();
 
-		const result = h.handlers.todoSync({ merged: false, todos: [{ content: "oauth", status: "completed" }] }, "read-call", null);
+		const result = h.handlers.todoSync(
+			{ merged: false, todos: [{ content: "oauth", status: "completed" }] },
+			"read-call",
+			null,
+		);
 
 		expect(h.current()).toBe(before);
 		expect(h.entries).toEqual([]);
@@ -237,7 +241,11 @@ describe("cursor todo persistence", () => {
 		const h = newHarness([{ name: "Auth", tasks: [{ content: "oauth", status: "pending" }] }]);
 		const before = h.current();
 
-		const result = h.handlers.todoSync({ merged: false, todos: [{ content: "oauth", status: "completed" }] }, "read-call", null);
+		const result = h.handlers.todoSync(
+			{ merged: false, todos: [{ content: "oauth", status: "completed" }] },
+			"read-call",
+			null,
+		);
 
 		expect(h.current()).not.toBe(before);
 		expect(h.entries).toHaveLength(1);

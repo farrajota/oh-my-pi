@@ -135,6 +135,7 @@ export class TanCommandController {
 				// context; its cost must reflect its own work, not the parent's
 				// accumulated spend that session cost is otherwise derived from.
 				resetInheritedCost: true,
+				repairInterruptedTail: true,
 			});
 
 			jobId = manager.register("task", label, async ({ signal, jobId: registeredJobId }) =>
@@ -204,9 +205,29 @@ export class TanCommandController {
 							// history, after which the clone re-adopts the parent's task as its
 							// own (the summary blends both). Re-inject after every successful
 							// compaction so the fork boundary survives summarization.
+							let requestDispatched = false;
 							const unsubscribeCompaction = activeClone.subscribe(event => {
+								if (event.type === "agent_start") requestDispatched = true;
 								if (event.type === "auto_compaction_end" && event.result && !event.aborted) {
-									injectContextSwitch();
+									const requestRetained =
+										requestDispatched &&
+										activeClone.agent.state.messages.some(
+											message =>
+												message.role === "user" &&
+												Array.isArray(message.content) &&
+												message.content.some(part => part.type === "text" && part.text === trimmedWork),
+										);
+									if (!requestRetained) {
+										injectContextSwitch();
+										if (requestDispatched) {
+											activeClone.agent.appendMessage({
+												role: "user",
+												content: [{ type: "text", text: trimmedWork }],
+												attribution: "user",
+												timestamp: Date.now(),
+											});
+										}
+									}
 								}
 							});
 							try {
@@ -219,6 +240,22 @@ export class TanCommandController {
 								// this agent must focus exclusively on the user's request.
 								injectContextSwitch();
 								await activeClone.prompt(trimmedWork, { attribution: "user" });
+								while (activeClone.hasPendingAsyncWork()) {
+									if (signal.aborted) throw new Error("Aborted during descendant settlement");
+									let onAbort: (() => void) | undefined;
+									try {
+										await Promise.race([
+											activeClone.settleAsyncWork(),
+											new Promise<never>((_, reject) => {
+												onAbort = () => reject(new Error("Aborted during descendant settlement"));
+												signal.addEventListener("abort", onAbort, { once: true });
+												if (signal.aborted) onAbort();
+											}),
+										]);
+									} finally {
+										if (onAbort) signal.removeEventListener("abort", onAbort);
+									}
+								}
 								await activeClone.waitForIdle();
 								return extractAssistantText(activeClone.getLastAssistantMessage()) || "(no output)";
 							} finally {

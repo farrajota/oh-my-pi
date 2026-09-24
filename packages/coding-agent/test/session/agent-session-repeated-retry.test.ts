@@ -234,7 +234,7 @@ async function createHarness(
 	if (!model) throw new Error("Test model not found");
 
 	const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
-	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	authStorage.keys.setRuntime("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 	const settings = Settings.isolated();
 	settings.set("retry.enabled", true);

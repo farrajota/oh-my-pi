@@ -70,11 +70,13 @@ async function runEvalAgentAndWait(args: unknown, options: EvalAgentBridgeOption
 
 const authoritySessions = new Set<AgentSession>();
 
-async function createFixtureSession(options: {
-	sessionManager?: SessionManager;
-	settings?: Settings;
-	asyncJobManager?: AsyncJobManager;
-} = {}): Promise<ToolSession> {
+async function createFixtureSession(
+	options: {
+		sessionManager?: SessionManager;
+		settings?: Settings;
+		asyncJobManager?: AsyncJobManager;
+	} = {},
+): Promise<ToolSession> {
 	const settings = options.settings ?? Settings.isolated({ "task.isolation.enabled": false });
 	const sessionManager = options.sessionManager ?? SessionManager.inMemory("/tmp");
 	const operationLedger = installSessionOperationLedger(sessionManager);
@@ -236,7 +238,10 @@ describe("runEvalAgent", () => {
 		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
 		vi.spyOn(taskExecutor, "runSubprocess").mockResolvedValue(createResult({ usage: createUsage(1_234) }));
 
-		await runEvalAgentAndWait({ prompt: "do work", agent: "task" }, { session: await createBudgetSession(sessionManager) });
+		await runEvalAgentAndWait(
+			{ prompt: "do work", agent: "task" },
+			{ session: await createBudgetSession(sessionManager) },
+		);
 
 		expect(sessionManager.getTurnBudget()).toEqual({
 			total: 100_000,
@@ -265,7 +270,10 @@ describe("runEvalAgent", () => {
 		);
 
 		await expect(
-			runEvalAgentAndWait({ prompt: "do work", agent: "task" }, { session: await createBudgetSession(sessionManager) }),
+			runEvalAgentAndWait(
+				{ prompt: "do work", agent: "task" },
+				{ session: await createBudgetSession(sessionManager) },
+			),
 		).rejects.toThrow("agent failed");
 
 		expect(sessionManager.getTurnBudget().spent).toBe(2_345);
@@ -280,10 +288,7 @@ describe("runEvalAgent", () => {
 		};
 		const sessionManager = SessionManager.inMemory();
 		sessionManager.beginTurnBudget(100_000, true);
-		const session = await createBudgetSession(
-			sessionManager,
-			Settings.isolated({ "task.isolation.enabled": true }),
-		);
+		const session = await createBudgetSession(sessionManager, Settings.isolated({ "task.isolation.enabled": true }));
 		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
 		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
 			repoRoot: "/tmp",

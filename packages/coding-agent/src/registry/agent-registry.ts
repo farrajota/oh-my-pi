@@ -94,7 +94,6 @@ export interface AgentRunLifecycle {
 	terminalAt?: number;
 }
 
-
 /** Historical identity and telemetry that remain available after the live observer is gone. */
 export interface AgentHistorySummary {
 	agent?: string;
@@ -1719,9 +1718,14 @@ export class AgentRegistry {
 		return true;
 	}
 
-	#retireDescendants(ref: RegistryAgentRef): void {
+	#retireDescendants(ref: RegistryAgentRef, preserveParkedDescendants = false): void {
 		const descendants = [...this.#refs.values()]
-			.filter(candidate => candidate !== ref && candidate.lineage?.rootId === ref.lineage?.rootId)
+			.filter(
+				candidate =>
+					candidate !== ref &&
+					candidate.lineage?.rootId === ref.lineage?.rootId &&
+					!(preserveParkedDescendants && candidate.status === "parked" && candidate.session === null),
+			)
 			.map(candidate => {
 				let cursor: RegistryAgentRef | undefined = candidate;
 				let depth = 0;
@@ -1740,7 +1744,7 @@ export class AgentRegistry {
 	}
 	#removeExactRef(ref: RegistryAgentRef): boolean {
 		if (this.#refs.get(ref.id) !== ref) return false;
-		this.#retireDescendants(ref);
+		this.#retireDescendants(ref, ref.kind === "main" && ref.parentId === undefined);
 		return this.#retireRef(ref);
 	}
 

@@ -63,8 +63,8 @@ beforeAll(async () => {
 	sharedDir = path.join(os.tmpdir(), `pi-concurrent-shared-${Snowflake.next()}`);
 	fs.mkdirSync(sharedDir, { recursive: true });
 	sharedAuthStorage = await AuthStorage.create(path.join(sharedDir, "auth.db"));
-	sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
-	sharedAuthStorage.setRuntimeApiKey("openai-codex", "test-key");
+	sharedAuthStorage.keys.setRuntime("anthropic", "test-key");
+	sharedAuthStorage.keys.setRuntime("openai-codex", "test-key");
 	sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir, "models.yml"));
 });
 
@@ -348,6 +348,115 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.waitForIdle();
 
 		expect(emitSessionStop).not.toHaveBeenCalled();
+	});
+
+	it("preserves successor session_stop state when an older hook settles", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const firstStopStarted = Promise.withResolvers<void>();
+		const staleStopHook = Promise.withResolvers<{ continue: true; additionalContext: string }>();
+		const continuationTurnStarted = Promise.withResolvers<void>();
+		const releaseContinuationTurn = Promise.withResolvers<void>();
+		const stopHookActiveValues: boolean[] = [];
+		let firstStopSignal: AbortSignal | undefined;
+		let stopCount = 0;
+		let streamCallCount = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				const streamCall = ++streamCallCount;
+				const finish = () => {
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: [{ type: "text", text: "Done" }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				};
+				if (streamCall === 3) {
+					continuationTurnStarted.resolve();
+					void releaseContinuationTurn.promise.then(finish);
+				} else {
+					queueMicrotask(finish);
+				}
+				return stream;
+			},
+			convertToLlm,
+		});
+		const extensionRuntime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("session_stop", event => {
+					stopCount++;
+					stopHookActiveValues.push(event.stop_hook_active);
+					if (stopCount === 1) {
+						firstStopSignal = event.signal;
+						firstStopStarted.resolve();
+						return staleStopHook.promise;
+					}
+					if (stopCount === 2) {
+						return { continue: true, additionalContext: "Successor continuation." };
+					}
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"stale-session-stop",
+		);
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			sharedModelRegistry,
+		);
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry: sharedModelRegistry,
+			extensionRunner,
+		});
+		let firstPrompt: Promise<boolean> | undefined;
+		let secondPrompt: Promise<boolean> | undefined;
+		try {
+			firstPrompt = session.prompt("First message");
+			await firstStopStarted.promise;
+			await session.abort();
+			expect(firstStopSignal?.aborted).toBe(true);
+
+			secondPrompt = session.prompt("Second message");
+			await continuationTurnStarted.promise;
+			staleStopHook.resolve({ continue: true, additionalContext: "Stale continuation." });
+			await firstPrompt;
+
+			releaseContinuationTurn.resolve();
+			await secondPrompt;
+			await session.waitForIdle();
+
+			expect(stopHookActiveValues).toEqual([false, false, true]);
+			expect(streamCallCount).toBe(3);
+		} finally {
+			staleStopHook.resolve({ continue: true, additionalContext: "Stale continuation." });
+			releaseContinuationTurn.resolve();
+		}
 	});
 
 	it("cancels an active session_stop pass without applying stale continuation feedback", async () => {

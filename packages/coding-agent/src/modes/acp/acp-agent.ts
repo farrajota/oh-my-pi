@@ -1474,7 +1474,9 @@ export class AcpAgent implements Agent {
 			record.liveMessageProgress = undefined;
 			this.#finishPrompt(record, {
 				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
-				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
+				usage:
+					this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()) ??
+					this.#buildTurnUsageFromMessages(event.messages),
 			});
 		}
 	}
@@ -2222,6 +2224,40 @@ export class AcpAgent implements Agent {
 			outputTokens,
 			totalTokens,
 		};
+		if (cachedReadTokens > 0) {
+			usage.cachedReadTokens = cachedReadTokens;
+		}
+		if (cachedWriteTokens > 0) {
+			usage.cachedWriteTokens = cachedWriteTokens;
+		}
+		return usage;
+	}
+
+	#buildTurnUsageFromMessages(
+		messages: readonly { role: string; usage?: AssistantMessage["usage"] }[],
+	): Usage | undefined {
+		let inputTokens = 0;
+		let outputTokens = 0;
+		let cachedReadTokens = 0;
+		let cachedWriteTokens = 0;
+		let totalTokens = 0;
+
+		for (const message of messages) {
+			if (message.role !== "assistant" || !message.usage) {
+				continue;
+			}
+			inputTokens += message.usage.input;
+			outputTokens += message.usage.output;
+			cachedReadTokens += message.usage.cacheRead;
+			cachedWriteTokens += message.usage.cacheWrite;
+			totalTokens += message.usage.totalTokens;
+		}
+
+		if (totalTokens === 0) {
+			return undefined;
+		}
+
+		const usage: Usage = { inputTokens, outputTokens, totalTokens };
 		if (cachedReadTokens > 0) {
 			usage.cachedReadTokens = cachedReadTokens;
 		}

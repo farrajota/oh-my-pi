@@ -20,7 +20,7 @@ import type { RelayKind } from "./relay/kind";
 import { ensureSharedBrowser } from "./shared-daemon";
 
 export type PuppeteerBrowserKind =
-	| { kind: "headless"; headless: boolean }
+	| { kind: "headless"; headless: boolean; allowFileAccess?: boolean }
 	/** A non-pooled, OMP-owned browser/profile reserved for one Browser Audit run. */
 	| { kind: "audit"; auditId: string }
 	| { kind: "spawned"; path: string; args?: string[] }
@@ -122,7 +122,7 @@ export function forgetAuditBrowserLaunch(auditId: string): void {
 export function browserKey(kind: BrowserKind): string {
 	switch (kind.kind) {
 		case "headless":
-			return `headless:${kind.headless ? "1" : "0"}`;
+			return `headless:${kind.headless ? "1" : "0"}${kind.allowFileAccess ? ":file-access" : ""}`;
 		case "audit":
 			return `audit:${kind.auditId}`;
 		case "spawned":
@@ -236,11 +236,12 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		// Audit browsers deliberately bypass the process/project headless pool.
 		// Their unique registry key and separately launched temporary profile prevent
 		// cookies, storage, default context, and ownership from crossing an audit boundary.
-		if (kind.kind === "headless" && (isCompiledBinary() || workerHostEntry() !== null)) {
+		if (kind.kind === "headless" && !kind.allowFileAccess && (isCompiledBinary() || workerHostEntry() !== null)) {
 			return await openSharedHeadlessHandle(kind, opts);
 		}
 		const { browser, userDataDir } = await launchHeadlessBrowser({
-			headless: true,
+			headless: kind.kind === "audit" ? true : kind.headless,
+			allowFileAccess: kind.kind === "headless" && kind.allowFileAccess,
 			viewport: opts.viewport,
 			args: kind.kind === "audit" ? AUDIT_CHROMIUM_ARGS : opts.appArgs,
 		});

@@ -168,7 +168,7 @@ describe("IRC", () => {
 	beforeAll(async () => {
 		authDir = TempDir.createSync("@pi-irc-auth-");
 		authStorage = await AuthStorage.create(authDir.join("auth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		modelRegistry = new ModelRegistry(authStorage, authDir.join("models.yml"));
 	});
 	afterAll(() => {
@@ -1088,7 +1088,6 @@ describe("IRC", () => {
 				timeoutMs: 5_000,
 			});
 			try {
-
 				await autoReplyStarted.promise;
 				let settled = false;
 				void resultP.then(
@@ -1189,7 +1188,6 @@ describe("IRC", () => {
 			const details = result.details as CoordinationDetails | undefined;
 			expect(details?.receipts?.[0]?.outcome).toBe("failed");
 		});
-
 
 		it("op=wait returns a clean non-error timeout after the ladder floor", async () => {
 			const fake = makeFakeSession();

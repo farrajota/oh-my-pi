@@ -85,7 +85,16 @@ function createMockSession(
 		hasPendingAsyncWork: () => asyncPending.value,
 		getAsyncJobSnapshot: () => ({
 			running: asyncPending.value
-				? [{ id: "bg_1", label: "pytest", type: "bash" as const, status: "running" as const, startTime: 0, queued: false }]
+				? [
+						{
+							id: "bg_1",
+							label: "pytest",
+							type: "bash" as const,
+							status: "running" as const,
+							startTime: 0,
+							queued: false,
+						},
+					]
 				: [],
 			recent: [],
 			delivery: { queued: 0, delivering: false, pendingJobIds: [] },

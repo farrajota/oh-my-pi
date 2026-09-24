@@ -14,8 +14,11 @@ import {
 	getBlobsDir,
 	getProjectDir,
 	getSessionsDir,
+	isEexist,
 	isEnoent,
 	isEnotdir,
+	isEnotempty,
+	isFsError,
 	logger,
 	stringifyJson,
 	toError,
@@ -25,7 +28,7 @@ import type { EffectivePermissionSummary } from "../task/types";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { ArtifactManager } from "./artifacts";
-import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
+import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
 import {
 	type BashExecutionMessage,
@@ -69,7 +72,9 @@ import {
 } from "./session-entries";
 import {
 	filterSessionsForPicker,
+	findMostRecentNonEmptySession,
 	findMostRecentSession,
+	isEmptySession,
 	listAllSessions,
 	listSessions,
 	type SessionInfo,
@@ -130,12 +135,11 @@ async function movePath(source: string, destination: string, recursive: boolean)
 	try {
 		await fs.promises.rename(source, destination);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+		if (!isFsError(error) || error.code !== "EXDEV") throw error;
 		await fs.promises.cp(source, destination, { recursive, force: true, errorOnExist: false });
 		await fs.promises.rm(source, { recursive, force: true });
 	}
 }
-
 
 /** Copy a session's artifact directory to another session, matching interactive `/fork`. */
 export async function copySessionArtifacts(sourceSessionFile: string, destinationSessionFile: string): Promise<void> {
@@ -349,7 +353,7 @@ function emptyUsageStatistics(): UsageStatistics {
 	return {
 		input: 0,
 		output: 0,
-    cacheRead: 0,
+		cacheRead: 0,
 		cacheWrite: 0,
 		totalTokens: 0,
 		orchestrationInput: 0,
@@ -468,8 +472,7 @@ class SessionEntryIndex {
 			if (entry.label) this.#labels.set(entry.targetId, entry.label);
 			else this.#labels.delete(entry.targetId);
 		}
-
-
+		addUsage(this.#usage, entryUsage(entry));
 	}
 
 	has(id: string): boolean {
@@ -990,6 +993,7 @@ export class SessionManager {
 						new Error("Authoritative session repair was superseded before verification."),
 					]);
 				}
+				if (!this.#storage.defersSyncPublish) this.#expectedDiskSize = Buffer.byteLength(body, "utf8");
 			} while (this.#atomicRewriteDirty);
 
 			this.#fileIsCurrent = true;
@@ -1078,15 +1082,19 @@ export class SessionManager {
 			this.#diskEpoch++;
 			this.#diskTail = Promise.resolve();
 			this.#closeWriterEventually();
-			const expectedSize = this.#storage.existsSync(targetPath) ? this.#storage.statSync(targetPath).size : null;
+			const expectedSize = this.#storage.defersSyncPublish
+				? this.#storage.existsSync(targetPath)
+					? this.#storage.statSync(targetPath).size
+					: null
+				: this.#expectedDiskSize;
 			this.#storage.writeTextSync(targetPath, body, { expectedSize });
 			const deferred = this.#storage.defersSyncPublish === true;
-            if (!deferred) this.#expectedDiskSize = Buffer.byteLength(body, "utf8");
-            this.#clearDiskError();
-            // Only mark the manager current when writing the active session path.
-            // Mid-move writes update the live relocation path; `#sessionFile` is
-            // still the pre-repoint source until moveTo repoints it.
-            if (!deferred && (!this.#sessionFileRelocating || targetPath === this.#sessionFile)) {
+			if (!deferred) this.#expectedDiskSize = Buffer.byteLength(body, "utf8");
+			this.#clearDiskError();
+			// Only mark the manager current when writing the active session path.
+			// Mid-move writes update the live relocation path; `#sessionFile` is
+			// still the pre-repoint source until moveTo repoints it.
+			if (!deferred && (!this.#sessionFileRelocating || targetPath === this.#sessionFile)) {
 				this.#fileIsCurrent = true;
 				this.#materializeBreadcrumb();
 				this.#rewriteRequired = false;
@@ -1134,7 +1142,10 @@ export class SessionManager {
 			await this.#storage.drain();
 			if (this.#diskFailure) throw this.#diskFailure;
 			const bodySize = Buffer.byteLength(this.#fileBody(), "utf8");
-			if (this.#storage.existsSync(this.#sessionFile) && this.#storage.statSync(this.#sessionFile).size === bodySize) {
+			if (
+				this.#storage.existsSync(this.#sessionFile) &&
+				this.#storage.statSync(this.#sessionFile).size === bodySize
+			) {
 				this.#expectedDiskSize = bodySize;
 				this.#fileIsCurrent = true;
 				this.#rewriteRequired = false;
@@ -1162,12 +1173,17 @@ export class SessionManager {
 				if (!sessionFile) return false;
 				if (this.#diskEpoch !== epoch) return false;
 				const body = this.#fileBody();
-				const expectedSize = this.#storage.existsSync(sessionFile) ? this.#storage.statSync(sessionFile).size : null;
+				const expectedSize = this.#storage.defersSyncPublish
+					? this.#storage.existsSync(sessionFile)
+						? this.#storage.statSync(sessionFile).size
+						: null
+					: this.#expectedDiskSize;
 				await this.#storage.writeTextAtomic(sessionFile, body, {
 					expectedSize,
 					commitGuard: () => !this.#released && this.#diskEpoch === epoch,
 				});
 				if (this.#diskEpoch !== epoch) return false;
+				if (!this.#storage.defersSyncPublish) this.#expectedDiskSize = Buffer.byteLength(body, "utf8");
 			} while (this.#atomicRewriteDirty);
 			return true;
 		} finally {
@@ -1241,23 +1257,30 @@ export class SessionManager {
 			const line = this.#lineFor(entry);
 			if (writer.appendSync) {
 				writer.appendSync(line);
-				if (this.#storage.defersSyncPublish) {
-					this.#expectedDiskSize = null;
-				} else if (this.#expectedDiskSize !== null) {
-					this.#expectedDiskSize += Buffer.byteLength(line, "utf8");
-				} else if (this.#sessionFile && this.#storage.existsSync(this.#sessionFile)) {
-					this.#expectedDiskSize = this.#storage.statSync(this.#sessionFile).size;
-				}
-			} else {
-				void writer.append(line).then(() => {
-					if (!this.#storage.defersSyncPublish && this.#sessionFile && this.#storage.existsSync(this.#sessionFile)) {
+				if (!this.#storage.defersSyncPublish) {
+					if (this.#expectedDiskSize !== null) {
+						this.#expectedDiskSize += Buffer.byteLength(line, "utf8");
+					} else if (this.#sessionFile && this.#storage.existsSync(this.#sessionFile)) {
 						this.#expectedDiskSize = this.#storage.statSync(this.#sessionFile).size;
 					}
-				}).catch(err => {
-					this.#fileIsCurrent = false;
-					this.#rewriteRequired = true;
-					this.#noteDiskFailure(err);
-				});
+				}
+			} else {
+				void writer
+					.append(line)
+					.then(() => {
+						if (
+							!this.#storage.defersSyncPublish &&
+							this.#sessionFile &&
+							this.#storage.existsSync(this.#sessionFile)
+						) {
+							this.#expectedDiskSize = this.#storage.statSync(this.#sessionFile).size;
+						}
+					})
+					.catch(err => {
+						this.#fileIsCurrent = false;
+						this.#rewriteRequired = true;
+						this.#noteDiskFailure(err);
+					});
 			}
 		} catch (err) {
 			this.#fileIsCurrent = false;
@@ -1369,12 +1392,12 @@ export class SessionManager {
 		}
 		this.#titleUpdatedAt = timestamp;
 
-        this.#entries = [];
-        this.#index.clear();
-        this.#expectedDiskSize = null;
-        this.#fileIsCurrent = false;
-        this.#rewriteRequired = false;
-        this.#forceFileCreation = false;
+		this.#entries = [];
+		this.#index.clear();
+		this.#expectedDiskSize = null;
+		this.#fileIsCurrent = false;
+		this.#rewriteRequired = false;
+		this.#forceFileCreation = false;
 		this.#draftOnlySessionCleanupArmed = false;
 		this.#turnBudgetTotal = null;
 		this.#turnBudgetHard = false;
@@ -1650,10 +1673,10 @@ export class SessionManager {
 		const switchGeneration = ++this.#sessionFileSwitchGeneration;
 		this.#sessionFileSwitching = true;
 		try {
-            await this.#drainAndCloseWriter();
-            this.#clearDiskError();
-            this.#expectedDiskSize = null;
-            this.#draftOnlySessionCleanupArmed = false;
+			await this.#drainAndCloseWriter();
+			this.#clearDiskError();
+			this.#expectedDiskSize = null;
+			this.#draftOnlySessionCleanupArmed = false;
 			const resolvedSessionFile = path.resolve(sessionFile);
 			const loaded = loadedSession ?? (await loadSessionFile(resolvedSessionFile, this.#storage));
 			if (loaded.invalidHeader) {
@@ -1702,16 +1725,16 @@ export class SessionManager {
 				this.#fallbackRuntimeOnly = false;
 			}
 
-            this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
-            this.#additionalDirectories = header.additionalDirectories ?? [];
-            this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
-            this.#hasTitleSlot = titleSlot !== undefined;
-            this.#expectedDiskSize = this.#storage.existsSync(resolvedSessionFile)
-                ? this.#storage.statSync(resolvedSessionFile).size
-                : null;
-            this.#fileIsCurrent = true;
-            this.#rewriteRequired = migrated || loaded.malformedRecords > 0;
-            this.#forceFileCreation = true;
+			this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
+			this.#additionalDirectories = header.additionalDirectories ?? [];
+			this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
+			this.#hasTitleSlot = titleSlot !== undefined;
+			this.#expectedDiskSize = this.#storage.existsSync(resolvedSessionFile)
+				? this.#storage.statSync(resolvedSessionFile).size
+				: null;
+			this.#fileIsCurrent = true;
+			this.#rewriteRequired = migrated || loaded.malformedRecords > 0;
+			this.#forceFileCreation = true;
 			this.#artifactManager = null;
 			this.#artifactManagerSessionFile = null;
 
@@ -1759,8 +1782,8 @@ export class SessionManager {
 
 		const timestamp = nowIso();
 		this.#sessionId = mintSessionId();
-        this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
-        this.#expectedDiskSize = null;
+		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
+		this.#expectedDiskSize = null;
 		this.#header = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -1859,7 +1882,7 @@ export class SessionManager {
 						try {
 							const artifactStat = await fs.promises.stat(oldArtifactsDir);
 							if (artifactStat.isDirectory()) {
-								await movePath(oldArtifactsDir, newArtifactsDir, true);
+								await relocateArtifactsDirectory(oldArtifactsDir, newArtifactsDir);
 								artifactsMoved = true;
 							}
 						} catch (err) {
@@ -1901,8 +1924,7 @@ export class SessionManager {
 					];
 				}
 
-                this.#sessionFile = newSessionFile;
-                this.#expectedDiskSize = null;
+				this.#sessionFile = newSessionFile;
 				this.#artifactManager = null;
 				this.#artifactManagerSessionFile = null;
 				// Path is repointed; hot-path appends may use `#sessionFile` again.
@@ -2073,7 +2095,9 @@ export class SessionManager {
 		}
 		if (this.#diskFailure) throw this.#diskFailure;
 		const bodySize = Buffer.byteLength(this.#fileBody(), "utf8");
-		const publishedSize = this.#storage.existsSync(this.#sessionFile) ? this.#storage.statSync(this.#sessionFile).size : null;
+		const publishedSize = this.#storage.existsSync(this.#sessionFile)
+			? this.#storage.statSync(this.#sessionFile).size
+			: null;
 		if (publishedSize === bodySize) {
 			this.#fileIsCurrent = true;
 			this.#rewriteRequired = false;
@@ -2500,6 +2524,10 @@ export class SessionManager {
 		};
 	}
 
+	getPersistenceError(): Error | undefined {
+		return this.#diskFailure;
+	}
+
 	onPersistenceError(cb: (error: Error) => void): () => void {
 		this.#persistenceErrorCallbacks.add(cb);
 		if (this.#diskFailure) {
@@ -2573,8 +2601,11 @@ export class SessionManager {
 	 * copy of every entry (the host mutates entries in place on rewrite paths, so
 	 * guests must not share references).
 	 */
-	snapshotForReplication(): { header: SessionHeader; entries: SessionEntry[] } {
-		return { header: structuredClone(this.#header), entries: structuredClone(this.#entries) as SessionEntry[] };
+	snapshotForReplication(copy: <T>(value: T) => T = structuredClone): {
+		header: SessionHeader;
+		entries: SessionEntry[];
+	} {
+		return { header: copy(this.#header), entries: copy(this.#entries) as SessionEntry[] };
 	}
 
 	/**
@@ -2962,7 +2993,10 @@ export class SessionManager {
 	 * the full-history display transcript, from the current leaf path.
 	 */
 	buildSessionContext(options?: BuildSessionContextOptions): SessionContext {
-		return buildSessionContext(this.#entries, this.#index.leafId(), this.#index.entriesById(), options);
+		return buildSessionContext(this.#entries, this.#index.leafId(), this.#index.entriesById(), {
+			...options,
+			resolveFrameData: options?.resolveFrameData ?? (data => lazyImageDataSync(this.#blobs, data)),
+		});
 	}
 
 	/** Strip stale OpenAI Responses assistant replay metadata from loaded entries. */
@@ -3127,11 +3161,11 @@ export class SessionManager {
 			this.#fileIsCurrent = false;
 			this.#rewriteRequired = false;
 			return undefined;
-        }
-        this.#sessionFile = newSessionFile;
-        this.#expectedDiskSize = null;
-        this.#rewriteSynchronously();
-        this.#rememberBreadcrumb(this.#cwd, newSessionFile);
+		}
+		this.#sessionFile = newSessionFile;
+		this.#expectedDiskSize = null;
+		this.#rewriteSynchronously();
+		this.#rememberBreadcrumb(this.#cwd, newSessionFile);
 		return newSessionFile;
 	}
 
@@ -3178,15 +3212,15 @@ export class SessionManager {
 		return file;
 	}
 
-/**
- * Fork a session into the current project directory: copy history from another
- * session file while creating a fresh session file in this sessionDir.
- *
- * `options.sessionFile` pins the new session's file path (default: an
- * auto-named `<timestamp>_<id>.jsonl` in `sessionDir`). Artifacts are copied
- * recursively by default; nested agents that deliberately share their parent's
- * artifact root may disable this with `copyArtifacts: false`.
- */
+	/**
+	 * Fork a session into the current project directory: copy history from another
+	 * session file while creating a fresh session file in this sessionDir.
+	 *
+	 * `options.sessionFile` pins the new session's file path (default: an
+	 * auto-named `<timestamp>_<id>.jsonl` in `sessionDir`). Artifacts are copied
+	 * recursively by default; nested agents that deliberately share their parent's
+	 * artifact root may disable this with `copyArtifacts: false`.
+	 */
 	static async forkFrom(
 		sourcePath: string,
 		cwd: string,
@@ -3416,6 +3450,7 @@ export class SessionManager {
 		const resolvedCwd = path.resolve(cwd);
 		const breadcrumb = await readTerminalBreadcrumbEntry();
 		let chosenSession: string | null | undefined;
+		let preserveCurrentBreadcrumb = false;
 
 		if (breadcrumb) {
 			breadcrumb.sessionFile = resolveBreadcrumbToInteractiveRoot(breadcrumb.sessionFile);
@@ -3423,32 +3458,30 @@ export class SessionManager {
 			const breadcrumbFile = path.resolve(breadcrumb.sessionFile);
 			const targetDir = path.resolve(dir);
 			const breadcrumbInTargetDir = path.dirname(breadcrumbFile) === targetDir;
-			if (breadcrumb.fresh && !breadcrumb.exists && (!sessionDir || breadcrumbInTargetDir)) {
+			if (breadcrumb.fresh && !breadcrumb.exists && breadcrumbCwd === resolvedCwd && breadcrumbInTargetDir) {
 				const manager = new SessionManager(cwd, dir, true, storage);
 				manager.#resetToNewSession();
 				return manager;
 			}
 			if (breadcrumbCwd === resolvedCwd) {
-				if (breadcrumbInTargetDir) chosenSession = breadcrumb.sessionFile;
-			} else {
-				let newestInTargetDir = await findMostRecentSession(dir, storage);
-				const newestIsBreadcrumb = newestInTargetDir ? path.resolve(newestInTargetDir) === breadcrumbFile : false;
-				let currentProjectAlreadyHasSession = false;
-				if (!fs.existsSync(breadcrumbCwd) && newestIsBreadcrumb) {
-					const localSession = (await SessionManager.list(cwd, dir, storage)).find(
-						session =>
-							path.resolve(session.path) !== breadcrumbFile &&
-							session.cwd &&
-							path.resolve(session.cwd) === resolvedCwd,
-					);
-					if (localSession) {
-						newestInTargetDir = localSession.path;
-						currentProjectAlreadyHasSession = true;
-					}
+				if (breadcrumbInTargetDir) {
+					chosenSession = breadcrumb.sessionFile;
+					preserveCurrentBreadcrumb = true;
 				}
+			} else {
+				const localSession = (await listSessions(dir, storage)).find(
+					session =>
+						path.resolve(session.path) !== breadcrumbFile &&
+						session.cwd &&
+						path.resolve(session.cwd) === resolvedCwd &&
+						!isEmptySession(session),
+				);
+				const newestInTargetDir = await findMostRecentSession(dir, storage);
+				const newestIsBreadcrumb = newestInTargetDir ? path.resolve(newestInTargetDir) === breadcrumbFile : false;
 				const looksLikeMovedProject =
+					!localSession &&
 					hasPositiveMovedProjectEvidence(breadcrumb.cwdIdentity, resolvedCwd) &&
-					(newestInTargetDir === null || (newestIsBreadcrumb && !currentProjectAlreadyHasSession));
+					(newestInTargetDir === null || newestIsBreadcrumb);
 				if (looksLikeMovedProject) {
 					const manager = await SessionManager.open(breadcrumb.sessionFile, undefined, storage, {
 						initialCwd: breadcrumbCwd,
@@ -3456,11 +3489,12 @@ export class SessionManager {
 					await manager.moveTo(cwd, sessionDir);
 					return manager;
 				}
-				chosenSession = newestInTargetDir;
+				chosenSession = localSession?.path;
 			}
 		}
 
-		if (chosenSession === undefined) chosenSession = await findMostRecentSession(dir, storage);
+		if (!chosenSession && !preserveCurrentBreadcrumb)
+			chosenSession = await findMostRecentNonEmptySession(dir, storage);
 
 		const manager = new SessionManager(cwd, dir, true, storage);
 		if (chosenSession) await manager.setSessionFile(chosenSession);

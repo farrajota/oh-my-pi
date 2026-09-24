@@ -255,7 +255,9 @@ describe("tools.approvalMode setting", () => {
 			{
 				settings: promptSettings,
 				acpApprovedArgs: { command: "echo acp-explicit" },
-			} as AgentToolContext,
+				acpApprovedToolName: "bash",
+				acpApprovedToolCallId: "acp-explicit-prompt",
+			} as unknown as AgentToolContext,
 		);
 		expect(textOf(explicitResult)).toContain("acp-explicit");
 
@@ -268,9 +270,31 @@ describe("tools.approvalMode setting", () => {
 			{
 				settings: overrideSettings,
 				acpApprovedArgs: { command: "rm -f /tmp/bun-fake-timer-probe.test.ts" },
-			} as AgentToolContext,
+				acpApprovedToolName: "bash",
+				acpApprovedToolCallId: "acp-tool-override",
+			} as unknown as AgentToolContext,
 		);
 		expect(textOf(overrideResult)).toContain("(no output)");
+	});
+
+	it("ACP grants cannot authorize changed arguments or a different call", async () => {
+		const settings = approvalSettings({
+			"tools.approvalMode": "always-ask",
+			"tools.approval": { bash: "prompt" },
+		});
+		for (const [callId, approvedArgs] of [
+			["different-call", { command: "echo blocked" }],
+			["approved-call", { command: "echo other" }],
+		] as const) {
+			await expect(
+				bashTool().execute(callId, { command: "echo blocked" }, undefined, undefined, {
+					settings,
+					acpApprovedArgs: approvedArgs,
+					acpApprovedToolName: "bash",
+					acpApprovedToolCallId: "approved-call",
+				} as unknown as AgentToolContext),
+			).rejects.toThrow(/requires approval but no interactive UI available/);
+		}
 	});
 
 	it("ACP-approved arguments do not bypass deny policies", async () => {
@@ -279,7 +303,9 @@ describe("tools.approvalMode setting", () => {
 			bashTool().execute("acp-denied", { command: "rm -rf /tmp/never-run" }, undefined, undefined, {
 				settings,
 				acpApprovedArgs: { command: "rm -rf /tmp/never-run" },
-			} as AgentToolContext),
+				acpApprovedToolName: "bash",
+				acpApprovedToolCallId: "acp-denied",
+			} as unknown as AgentToolContext),
 		).rejects.toThrow(/blocked by tool policy/);
 	});
 

@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { syncAllSessions } from "@oh-my-pi/omp-stats/aggregator";
 import { buildSessionTrace, getTraceEntry, listSessionSummaries, TracePathError } from "@oh-my-pi/omp-stats/trace";
-import { getSessionsDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getSessionsDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-trace-");
@@ -585,6 +585,23 @@ describe("getTraceEntry", () => {
 });
 
 describe("listSessionSummaries", () => {
+	it("refreshes disk sessions after switching roots within the cache TTL", async () => {
+		const originalAgentDir = getAgentDir();
+		try {
+			setAgentDir(path.join(originalAgentDir, "root-switch-first"));
+			const firstRootFile = await writeFixture();
+			const firstRows = await listSessionSummaries();
+			expect(firstRows.some(row => row.file === firstRootFile)).toBe(true);
+
+			setAgentDir(path.join(originalAgentDir, "root-switch-second"));
+			const secondRootFile = await writeFixture();
+			const secondRows = await listSessionSummaries();
+			expect(secondRows.some(row => row.file === secondRootFile)).toBe(true);
+		} finally {
+			setAgentDir(originalAgentDir);
+		}
+	});
+
 	it("uses the session cwd for home-relative storage keys and keeps the legacy path fallback", async () => {
 		const sessionsDir = getSessionsDir();
 		const currentFile = path.join(sessionsDir, "-project-omp-kit", "current.jsonl");

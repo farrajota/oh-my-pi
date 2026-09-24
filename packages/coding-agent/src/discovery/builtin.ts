@@ -74,7 +74,7 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 	return result;
 }
 
-function getAncestorDirs(cwd: string, stopAt?: string | null): Array<{ dir: string; depth: number }> {
+export function getAncestorDirs(cwd: string, stopAt?: string | null): Array<{ dir: string; depth: number }> {
 	const ancestors: Array<{ dir: string; depth: number }> = [];
 	let current = cwd;
 	let depth = 0;
@@ -239,33 +239,32 @@ registerProvider<MCPServer>(mcpCapability.id, {
 	load: loadMCPServers,
 });
 
-// System Prompt (SYSTEM.md)
+// System Prompt (SYSTEM.md and SYSTEM_TEMPLATE.md)
 async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemPrompt>> {
 	const items: SystemPrompt[] = [];
+	const loadFromDir = async (dir: string, level: "user" | "project") => {
+		for (const [filename, kind] of [
+			["SYSTEM.md", "text"],
+			["SYSTEM_TEMPLATE.md", "template"],
+		] as const) {
+			const filePath = path.join(dir, filename);
+			const content = await readFile(filePath);
+			if (content) {
+				items.push({
+					path: filePath,
+					content,
+					kind,
+					level,
+					_source: createSourceMeta(PROVIDER_ID, filePath, level),
+				});
+			}
+		}
+	};
 
-	const userPath = path.join(scopedAgentDir(ctx), "SYSTEM.md");
-	const userContent = await readFile(userPath);
-	if (userContent) {
-		items.push({
-			path: userPath,
-			content: userContent,
-			level: "user",
-			_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
-		});
-	}
-
+	await loadFromDir(scopedAgentDir(ctx), "user");
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
 	if (nearestProjectConfigDir) {
-		const projectPath = path.join(nearestProjectConfigDir.dir, "SYSTEM.md");
-		const projectContent = await readFile(projectPath);
-		if (projectContent) {
-			items.push({
-				path: projectPath,
-				content: projectContent,
-				level: "project",
-				_source: createSourceMeta(PROVIDER_ID, projectPath, "project"),
-			});
-		}
+		await loadFromDir(nearestProjectConfigDir.dir, "project");
 	}
 
 	return { items, warnings: [] };
@@ -274,7 +273,7 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 registerProvider<SystemPrompt>(systemPromptCapability.id, {
 	id: PROVIDER_ID,
 	displayName: DISPLAY_NAME,
-	description: "Custom system prompt from SYSTEM.md",
+	description: "Custom system prompt from SYSTEM.md or SYSTEM_TEMPLATE.md",
 	priority: PRIORITY,
 	load: loadSystemPrompt,
 });

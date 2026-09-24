@@ -561,7 +561,9 @@ describe("Agent hub row ordering", () => {
 		} as unknown as AgentSession;
 		agents.register({ id: "MainAgent", displayName: "Main Agent", kind: "sub", session });
 
-		const hub = makeHub(agents, { observers: new SessionObserverRegistry() });
+		const runtime = createAgentHubRuntime({ registry: agents });
+		expect(runtime.registry.get("MainAgent")?.session).toBeNull();
+		const hub = makeHub(agents, { ...runtime, observers: new SessionObserverRegistry() });
 
 		try {
 			const rendered = Bun.stripANSI(hub.render(120).join("\n"));
@@ -588,7 +590,9 @@ describe("Agent hub row ordering", () => {
 		} as unknown as AgentSession;
 		agents.register({ id: "UnprovenAgent", displayName: "Unproven Agent", kind: "sub", session });
 
-		const hub = makeHub(agents, { observers: new SessionObserverRegistry() });
+		const runtime = createAgentHubRuntime({ registry: agents });
+		expect(runtime.registry.get("UnprovenAgent")?.session).toBeNull();
+		const hub = makeHub(agents, { ...runtime, observers: new SessionObserverRegistry() });
 
 		try {
 			expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain("fallback → openai-codex/gpt-5.6-sol");
@@ -665,7 +669,9 @@ describe("Agent hub row ordering", () => {
 				progress: { resolvedModel: "openai/gpt-5.4:low" } as never,
 			},
 		]);
-		const hub = makeHub(agents, { observers });
+		const runtime = createAgentHubRuntime({ registry: agents });
+		expect(runtime.registry.list().every(ref => ref.session === null)).toBe(true);
+		const hub = makeHub(agents, { ...runtime, observers });
 
 		try {
 			const inherited = renderedRosterEntry(hub, "InheritedLevel", 140);
@@ -676,6 +682,57 @@ describe("Agent hub row ordering", () => {
 			expect(explicit).toContain("gpt-5.4");
 			expect(explicit).toContain(theme.thinking.low);
 			expect(explicit).not.toContain(theme.thinking.high);
+		} finally {
+			hub.dispose();
+		}
+	});
+
+	it("shows sampled live-only usage without exposing a session through the registry", () => {
+		geometry = stubStdoutGeometry(140);
+		geometry.setRows(28);
+		vi.useFakeTimers();
+		setSystemTime(10_000);
+		const agents = new AgentRegistry();
+		const stats = {
+			tokens: { input: 120, output: 30, cacheWrite: 5 },
+			assistantMessages: 3,
+			toolCalls: 2,
+			cost: 0.42,
+		};
+		const first = { getSessionStats: () => stats } as unknown as AgentSession;
+		agents.register({ id: "LiveUsage", displayName: "Live Usage", kind: "sub", session: first, createdAt: 5_000 });
+		const runtime = createAgentHubRuntime({ registry: agents });
+		const hub = makeHub(agents, { ...runtime });
+		try {
+			expect(runtime.registry.get("LiveUsage")?.session).toBeNull();
+			expect(runtime.registry.list()[0]?.session).toBeNull();
+			let rendered = Bun.stripANSI(hub.render(140).join("\n"));
+			expect(rendered).toContain("155 tok");
+			expect(rendered).toContain("3 req");
+			expect(rendered).toContain("2 tools");
+			expect(rendered).toContain("$0.42");
+			expect(rendered).toContain("5.0s span");
+			expect(rendered).toContain("1/1 measured");
+			stats.tokens.input = 220;
+			vi.advanceTimersByTime(5_000);
+			rendered = Bun.stripANSI(hub.render(140).join("\n"));
+			expect(rendered).toContain("255 tok");
+			agents.unregister("LiveUsage", first);
+			const second = {
+				getSessionStats: () => ({
+					...stats,
+					tokens: { input: 1, output: 2, cacheWrite: 0 },
+					assistantMessages: 1,
+					toolCalls: 0,
+					cost: 0.01,
+				}),
+			} as unknown as AgentSession;
+			agents.register({ id: "LiveUsage", displayName: "Replacement", kind: "sub", session: second });
+			vi.advanceTimersByTime(100);
+			rendered = Bun.stripANSI(hub.render(140).join("\n"));
+			expect(rendered).toContain("3 tok");
+			expect(rendered).not.toContain("255 tok");
+			expect(runtime.registry.get("LiveUsage")?.session).toBeNull();
 		} finally {
 			hub.dispose();
 		}

@@ -32,8 +32,7 @@ import { cursorMcpPrefersReplaceEdit, normalizeCursorReplaceArgs } from "./curso
 import type { FilesystemOperation, SessionPathScope } from "./internal/session-path-scope";
 import type { MCPResourceReadResult } from "./mcp/types";
 import { runBoundFilesystemOperation } from "./registry/operation-lease";
-import type { ApprovalMode } from "./tools/approval";
-import { resolveApproval } from "./tools/approval";
+import { resolveApproval, resolveApprovalFromContext } from "./tools/approval";
 import { confineToWorkspace, resolveToCwd } from "./tools/path-utils";
 import type { TodoPhase, TodoStatus } from "./tools/todo";
 
@@ -339,15 +338,12 @@ function allowsDirectFileMutation(options: CursorExecBridgeOptions): boolean {
  * proceed, or the refusal text to answer with.
  */
 function refuseByWritePolicy(options: CursorExecBridgeOptions, toolName: string, pathArg: string): string | null {
-	const context = options.getToolContext?.();
-	const settings = context?.settings;
-	const approvalMode: ApprovalMode =
-		context?.autoApprove === true ? "yolo" : (settings?.get("tools.approvalMode") ?? "yolo");
+	const { approvalMode, userPolicies } = resolveApprovalFromContext(options.getToolContext?.());
 	const approval = resolveApproval(
 		{ name: toolName, approval: "write" },
 		{ path: pathArg },
 		approvalMode,
-		(settings?.get("tools.approval") ?? {}) as Record<string, unknown>,
+		userPolicies,
 	);
 	if (approval.policy === "allow") return null;
 	return approval.policy === "deny"
@@ -945,9 +941,25 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 				grouped.delete(phase.name);
 			}
 			for (const [name, tasks] of grouped) next.push({ name, tasks });
-			setPhases(next);
-			this.options.persistTodoPhases?.(next);
-			phases = next;
+			const unchanged =
+				next.length === existing.length &&
+				next.every((phase, index) => {
+					const previous = existing[index];
+					return (
+						previous?.name === phase.name &&
+						previous.tasks.length === phase.tasks.length &&
+						phase.tasks.every(
+							(task, taskIndex) =>
+								task.content === previous.tasks[taskIndex]?.content &&
+								task.status === previous.tasks[taskIndex]?.status,
+						)
+					);
+				});
+			if (!unchanged) {
+				setPhases(next);
+				this.options.persistTodoPhases?.(next);
+				phases = next;
+			}
 		}
 
 		const result = buildTodoSyncResult(toolCallId, phases, error);
@@ -1012,15 +1024,12 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			? this.options.getEditReplaceTool?.()
 			: (this.options.getExecutableTool?.(toolName) ?? this.options.tools.get(toolName));
 		if (!tool) return false;
-		const context = this.options.getToolContext?.();
-		const settings = context?.settings;
-		const approvalMode: ApprovalMode =
-			context?.autoApprove === true ? "yolo" : (settings?.get("tools.approvalMode") ?? "yolo");
+		const { approvalMode, userPolicies } = resolveApprovalFromContext(this.options.getToolContext?.());
 		const approval = resolveApproval(
 			tool,
 			preferReplace ? normalizeCursorReplaceArgs(args) : args,
 			approvalMode,
-			(settings?.get("tools.approval") ?? {}) as Record<string, unknown>,
+			userPolicies,
 		);
 		return approval.policy === "allow";
 	}
