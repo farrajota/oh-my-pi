@@ -65,9 +65,23 @@ pub fn persist_new(resolved: &Resolved, after_lf: &str) -> EditResult<String> {
 	Ok(after_lf.to_owned())
 }
 
+/// Immutable host-provided source bytes for one edit session.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SourceSnapshot {
+	pub canonical_path: PathBuf,
+	pub exists:         bool,
+	pub bytes:          Option<Vec<u8>>,
+}
+
+/// Native request and canonical path aliases to their shared immutable source.
+pub type SourceSnapshotMap = HashMap<PathBuf, Arc<SourceSnapshot>>;
+
 /// Filesystem view an engine reads through.
 pub trait FileSource {
 	fn policy(&self) -> &PathPolicy;
+
+	/// Return the stable identity for a resolved path.
+	fn canonical(&mut self, absolute: &Path) -> EditResult<PathBuf>;
 
 	/// Resolve an authored path without reading it. When `must_exist` and
 	/// the resolved file is missing, unique-suffix recovery may substitute a
@@ -102,21 +116,67 @@ fn stamp(absolute: &Path) -> Option<Stamp> {
 /// Default [`FileSource`] backed by `std::fs`.
 pub struct FileCache {
 	policy:      PathPolicy,
-	reads:       HashMap<PathBuf, (Stamp, Arc<FileRead>)>,
+	reads:       HashMap<PathBuf, (Option<Stamp>, Arc<FileRead>)>,
 	/// Authored path → resolution (so paired hunks share one recovery).
 	resolutions: HashMap<(String, bool), Resolved>,
+	/// Present only for closed-world, immutable host-provided reads.
+	snapshots:   Option<Arc<SourceSnapshotMap>>,
 }
 
 impl FileCache {
 	pub fn new(policy: PathPolicy) -> Self {
-		Self { policy, reads: HashMap::new(), resolutions: HashMap::new() }
+		Self::with_source_snapshots(policy, None)
+	}
+
+	pub fn with_snapshots(policy: PathPolicy, snapshots: Arc<SourceSnapshotMap>) -> Self {
+		Self::with_source_snapshots(policy, Some(snapshots))
+	}
+
+	fn with_source_snapshots(policy: PathPolicy, snapshots: Option<Arc<SourceSnapshotMap>>) -> Self {
+		Self { policy, reads: HashMap::new(), resolutions: HashMap::new(), snapshots }
+	}
+
+	fn snapshot_for(&self, absolute: &Path) -> Option<&Arc<SourceSnapshot>> {
+		self.snapshots.as_ref()?.get(absolute)
 	}
 
 	fn read_resolved(&mut self, resolved: &Resolved) -> EditResult<Option<Arc<FileRead>>> {
+		if let Some(snapshots) = &self.snapshots {
+			let Some(snapshot) = snapshots.get(&resolved.absolute).cloned() else {
+				return Err(EditError::apply(format!(
+					"Source snapshot unavailable: {}",
+					resolved.display
+				)));
+			};
+			if !snapshot.exists {
+				return Ok(None);
+			}
+			if let Some((None, read)) = self.reads.get(&resolved.absolute)
+				&& read.resolved.display == resolved.display
+			{
+				return Ok(Some(Arc::clone(read)));
+			}
+			let Some(bytes) = snapshot.bytes.as_deref() else {
+				return Err(EditError::apply(format!(
+					"Source snapshot content unavailable: {}",
+					resolved.display
+				)));
+			};
+			let read = Arc::new(self.decode_read(
+				resolved,
+				bytes.to_vec(),
+				snapshot.canonical_path.clone(),
+			)?);
+			self
+				.reads
+				.insert(resolved.absolute.clone(), (None, Arc::clone(&read)));
+			return Ok(Some(read));
+		}
+
 		let Some(current) = stamp(&resolved.absolute) else {
 			return Ok(None);
 		};
-		if let Some((cached_stamp, read)) = self.reads.get(&resolved.absolute)
+		if let Some((Some(cached_stamp), read)) = self.reads.get(&resolved.absolute)
 			&& *cached_stamp == current
 			&& read.resolved.display == resolved.display
 		{
@@ -127,6 +187,19 @@ impl FileCache {
 			Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
 			Err(source) => return Err(EditError::Io { path: resolved.absolute.clone(), source }),
 		};
+		let read = Arc::new(self.decode_read(resolved, bytes, canonical_key(&resolved.absolute))?);
+		self
+			.reads
+			.insert(resolved.absolute.clone(), (Some(current), Arc::clone(&read)));
+		Ok(Some(read))
+	}
+
+	fn decode_read(
+		&self,
+		resolved: &Resolved,
+		bytes: Vec<u8>,
+		canonical: PathBuf,
+	) -> EditResult<FileRead> {
 		if let Some(message) = self
 			.policy
 			.auto_generated_message(&resolved.display, &bytes[..bytes.len().min(1024)])
@@ -151,19 +224,7 @@ impl FileCache {
 		} else {
 			detect_line_ending(strip_bom(&raw).1)
 		};
-		let read = Arc::new(FileRead {
-			canonical: canonical_key(&resolved.absolute),
-			resolved: resolved.clone(),
-			raw,
-			bom,
-			ending,
-			text,
-			is_notebook,
-		});
-		self
-			.reads
-			.insert(resolved.absolute.clone(), (current, Arc::clone(&read)));
-		Ok(Some(read))
+		Ok(FileRead { canonical, resolved: resolved.clone(), raw, bom, ending, text, is_notebook })
 	}
 }
 
@@ -172,13 +233,32 @@ impl FileSource for FileCache {
 		&self.policy
 	}
 
+	fn canonical(&mut self, absolute: &Path) -> EditResult<PathBuf> {
+		if self.snapshots.is_some() {
+			return self
+				.snapshot_for(absolute)
+				.map(|snapshot| snapshot.canonical_path.clone())
+				.ok_or_else(|| {
+					EditError::apply(format!("Source snapshot unavailable: {}", absolute.display()))
+				});
+		}
+		Ok(canonical_key(absolute))
+	}
+
 	fn resolve(&mut self, authored: &str, must_exist: bool) -> EditResult<Resolved> {
 		let key = (authored.to_owned(), must_exist);
 		if let Some(resolved) = self.resolutions.get(&key) {
 			return Ok(resolved.clone());
 		}
 		let mut resolved = self.policy.resolve(authored)?;
-		if must_exist
+		if let Some(snapshots) = &self.snapshots {
+			if !snapshots.contains_key(&resolved.absolute) {
+				return Err(EditError::apply(format!(
+					"Source snapshot unavailable: {}",
+					resolved.display
+				)));
+			}
+		} else if must_exist
 			&& !crate::path_policy::is_internal_url(authored)
 			&& stamp(&resolved.absolute).is_none()
 			&& let Some(recovered) = self.policy.recover_missing(authored)
@@ -190,6 +270,11 @@ impl FileSource for FileCache {
 	}
 
 	fn exists(&mut self, absolute: &Path) -> bool {
+		if let Some(snapshots) = &self.snapshots {
+			return snapshots
+				.get(absolute)
+				.is_some_and(|snapshot| snapshot.exists);
+		}
 		stamp(absolute).is_some()
 	}
 
@@ -207,5 +292,89 @@ impl FileSource for FileCache {
 	fn clear(&mut self) {
 		self.reads.clear();
 		self.resolutions.clear();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn policy(root: &Path) -> PathPolicy {
+		PathPolicy {
+			cwd:                  root.to_owned(),
+			home_dir:             root.to_owned(),
+			local_sandbox_root:   None,
+			vault_roots:          None,
+			plan_active:          false,
+			block_auto_generated: false,
+		}
+	}
+
+	#[test]
+	fn immutable_snapshots_are_closed_world_and_survive_clear() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path();
+		let canonical_path = root.join("source.rs");
+		std::fs::write(&canonical_path, "disk version").unwrap();
+		let request_path = root.join("request.rs");
+		let raw = "\u{feff}snapshot\r\n";
+		let source = Arc::new(SourceSnapshot {
+			canonical_path: canonical_path.clone(),
+			exists:         true,
+			bytes:          Some(raw.as_bytes().to_vec()),
+		});
+		let missing_path = root.join("missing.rs");
+		let destination_path = root.join("destination.rs");
+		let mut snapshots = HashMap::new();
+		snapshots.insert(request_path.clone(), Arc::clone(&source));
+		snapshots.insert(canonical_path.clone(), source);
+		snapshots.insert(
+			missing_path.clone(),
+			Arc::new(SourceSnapshot {
+				canonical_path: missing_path.clone(),
+				exists:         false,
+				bytes:          None,
+			}),
+		);
+		snapshots.insert(
+			destination_path.clone(),
+			Arc::new(SourceSnapshot {
+				canonical_path: destination_path.clone(),
+				exists:         true,
+				bytes:          None,
+			}),
+		);
+		let mut cache = FileCache::with_snapshots(policy(root), Arc::new(snapshots));
+
+		let request = request_path.display().to_string();
+		let first = cache.read(&request).unwrap();
+		assert_eq!(first.raw, raw);
+		assert_eq!(first.text, "snapshot\n");
+		assert_eq!(first.persist(&first.text).unwrap(), raw);
+		assert_eq!(first.canonical, canonical_path);
+		assert_eq!(cache.canonical(&request_path).unwrap(), first.canonical);
+
+		std::fs::write(&canonical_path, "changed on disk").unwrap();
+		cache.clear();
+		assert_eq!(cache.read(&request).unwrap().raw, raw);
+
+		assert!(!cache.exists(&missing_path));
+		assert!(
+			cache
+				.try_read(&Resolved { absolute: missing_path.clone(), display: "missing.rs".into() })
+				.unwrap()
+				.is_none()
+		);
+		assert!(cache.exists(&destination_path));
+		assert!(
+			cache
+				.try_read(&Resolved { absolute: destination_path, display: "destination.rs".into() })
+				.is_err()
+		);
+
+		let disk_only = root.join("nested/unique.rs");
+		std::fs::create_dir_all(disk_only.parent().unwrap()).unwrap();
+		std::fs::write(disk_only, "not snapshotted").unwrap();
+		assert!(cache.resolve("unique.rs", true).is_err());
 	}
 }

@@ -23,7 +23,7 @@ use std::{
 
 use async_trait::async_trait;
 use napi::{
-	bindgen_prelude::{Promise, Result},
+	bindgen_prelude::{Promise, Result, Uint8Array},
 	threadsafe_function::{ThreadsafeFunction, UnknownReturnValue},
 };
 use napi_derive::napi;
@@ -59,6 +59,15 @@ pub struct EditVaultRoot {
 	pub root: String,
 }
 
+/// Immutable source bytes captured by the host before native session creation.
+#[napi(object)]
+pub struct EditSourceSnapshot {
+	pub path:           String,
+	pub canonical_path: String,
+	pub exists:         bool,
+	pub bytes:          Option<Uint8Array>,
+}
+
 /// Session-wide policy; TypeScript builds it once per tool call.
 #[napi(object)]
 pub struct EditPolicy {
@@ -77,6 +86,7 @@ pub struct EditPolicy {
 	pub home_dir:             String,
 	/// The payload is a verbatim custom-format string, not JSON.
 	pub raw_input:            bool,
+	pub source_snapshots:     Option<Vec<EditSourceSnapshot>>,
 }
 
 impl EditPolicy {
@@ -100,8 +110,49 @@ impl EditPolicy {
 			fuzzy_threshold:    self.fuzzy_threshold,
 			enforce_seen_lines: self.enforce_seen_lines,
 			raw_input:          self.raw_input,
+			source_snapshots:   self.source_snapshots.map(source_snapshot_map).transpose()?,
 		})
 	}
+}
+
+fn source_snapshot_map(
+	snapshots: Vec<EditSourceSnapshot>,
+) -> Result<Arc<pi_edit::files::SourceSnapshotMap>> {
+	let mut map: pi_edit::files::SourceSnapshotMap =
+		std::collections::HashMap::with_capacity(snapshots.len().saturating_mul(2));
+	for snapshot in snapshots {
+		let path = PathBuf::from(snapshot.path);
+		let canonical_path = PathBuf::from(snapshot.canonical_path);
+		let source = Arc::new(pi_edit::files::SourceSnapshot {
+			canonical_path: canonical_path.clone(),
+			exists:         snapshot.exists,
+			bytes:          snapshot.bytes.map(|bytes| bytes.to_vec()),
+		});
+		let source = if let Some(previous) = map.get(&canonical_path) {
+			if previous.as_ref() != source.as_ref() {
+				return Err(napi::Error::from_reason(format!(
+					"Conflicting edit source snapshots for {}",
+					canonical_path.display()
+				)));
+			}
+			Arc::clone(previous)
+		} else {
+			source
+		};
+		for alias in [path, canonical_path] {
+			if let Some(previous) = map.get(&alias) {
+				if previous.as_ref() != source.as_ref() {
+					return Err(napi::Error::from_reason(format!(
+						"Conflicting edit source snapshots for {}",
+						alias.display()
+					)));
+				}
+			} else {
+				map.insert(alias, Arc::clone(&source));
+			}
+		}
+	}
+	Ok(Arc::new(map))
 }
 
 /// One file's streamed diff preview.

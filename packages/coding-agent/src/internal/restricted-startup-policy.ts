@@ -38,16 +38,26 @@ const NETWORK_TOOLS: Readonly<Record<string, true>> = Object.freeze({
 });
 
 const MUTATION_TOOLS: Readonly<Record<string, true>> = Object.freeze({ ast_edit: true, edit: true, write: true });
+const MUTATION_INERT_INPUT_FIELDS: Readonly<Record<string, Readonly<Record<string, true>>>> = Object.freeze({
+	ast_edit: Object.freeze({ i: true, ops: true }),
+	edit: Object.freeze({ i: true, input: true, old_string: true, new_string: true }),
+	write: Object.freeze({ i: true, content: true }),
+});
 const EXTERNAL_READ_SCHEME = /^(?:https?|ftp|ssh|mcp|issue|pr):\/\//i;
 const BARE_NETWORK_TARGET = /^(?:localhost|(?:[a-z0-9-]+\.)+[a-z]{2,}|\d{1,3}(?:\.\d{1,3}){3}):\d+(?:\/|$)/i;
 const NETWORK_COMMAND =
 	/(?:\b(?:curl|wget|fetch|ssh|scp|sftp|telnet|ping|traceroute|nc|ncat|netcat|socat|dig|nslookup|host|gh)\b|\/dev\/(?:tcp|udp)\/|\b(?:git\s+(?:clone|fetch|pull|push|ls-remote)|(?:npm|pnpm|yarn|bun|pip|pip3|cargo)\s+(?:add|install|update)|go\s+get)\b|(?:https?|ftp|ssh):\/\/)/i;
 const EVAL_NETWORK_ACCESS =
 	/(?:\bfetch\s*\(|\bXMLHttpRequest\b|\bWebSocket\b|\bEventSource\b|\b(?:requests|httpx|urllib3?|aiohttp)\b|\b(?:node:)?https?\b|\b(?:browser|computer)\s*\.)/i;
-const SECRET_PATH =
-	/(?:^|[\\/])(?:\.env(?:\.[^\\/]*)?|\.ssh|\.kube)(?:[\\/]|$)|\/proc\/(?:self|\d+)\/environ|(?:secret|credential)|private[^\\/]*key/i;
-const ENV_ACCESS =
-	/(?:\bprocess\.env\b|\bBun\.env\b|\bos\.environ\b|\bgetenv\s*\(|\bENV\s*\[|\/proc\/(?:self|\d+)\/environ|\b(?:printenv|env)\b|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)/i;
+const PROC_ENVIRON = String.raw`\/proc\/(?:self|thread-self|\d+(?:\/task\/\d+)?)\/environ`;
+const SECRET_PATH = new RegExp(
+	String.raw`(?:^|[\\/])(?:\.env(?:\.[^\\/]*)?|\.ssh|\.kube)(?:[\\/]|$)|${PROC_ENVIRON}|(?:secret|credential)|private[^\\/]*key`,
+	"i",
+);
+const ENV_ACCESS = new RegExp(
+	String.raw`(?:\bprocess\.env\b|\bBun\.env\b|\bos\.environ\b|\bgetenv\s*\(|\bENV\s*\[|${PROC_ENVIRON}|\b(?:printenv|env)\b|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)`,
+	"i",
+);
 
 function uniqueNormalizedToolNames(values: readonly string[]): string[] {
 	const result: string[] = [];
@@ -134,14 +144,57 @@ function visitInput(
 	visitor: (value: string, key?: string) => boolean,
 	key?: string,
 	seen = new WeakSet<object>(),
+	ignoredRootKeys?: Readonly<Record<string, true>>,
+	atRoot = true,
 ): boolean {
 	if (typeof value === "string") return visitor(value, key);
 	if (value === null || typeof value !== "object") return false;
 	if (seen.has(value)) return false;
 	seen.add(value);
-	if (Array.isArray(value)) return value.some(item => visitInput(item, visitor, key, seen));
+	if (Array.isArray(value)) {
+		return value.some(item => visitInput(item, visitor, key, seen, ignoredRootKeys, false));
+	}
 	for (const [childKey, child] of Object.entries(value as Record<string, unknown>)) {
-		if (visitInput(child, visitor, childKey, seen)) return true;
+		if (atRoot && ignoredRootKeys?.[childKey] === true) continue;
+		if (visitInput(child, visitor, childKey, seen, ignoredRootKeys, false)) return true;
+	}
+	return false;
+}
+function visitEditInput(value: Record<string, unknown>, visitor: (value: string, key?: string) => boolean): boolean {
+	const ignored = { ...MUTATION_INERT_INPUT_FIELDS.edit };
+	// Only native replace and patch payloads are inert; nested destinations and unknown keys remain visible.
+	if (
+		typeof value.path !== "string" ||
+		Array.isArray(value.edits) ||
+		typeof value.old_string !== "string" ||
+		typeof value.new_string !== "string"
+	) {
+		delete ignored.old_string;
+		delete ignored.new_string;
+	}
+	const seen = new WeakSet<object>();
+	for (const [key, child] of Object.entries(value)) {
+		if (ignored[key] === true) continue;
+		if (
+			key === "edits" &&
+			typeof value.path === "string" &&
+			Array.isArray(child) &&
+			value.old_string === undefined &&
+			value.new_string === undefined
+		) {
+			for (const entry of child) {
+				if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+					if (visitInput(entry, visitor, key, seen)) return true;
+					continue;
+				}
+				for (const [entryKey, entryValue] of Object.entries(entry)) {
+					if (entryKey === "diff" && typeof entryValue === "string") continue;
+					if (visitInput(entryValue, visitor, entryKey, seen)) return true;
+				}
+			}
+			continue;
+		}
+		if (visitInput(child, visitor, key, seen)) return true;
 	}
 	return false;
 }
@@ -170,10 +223,11 @@ export function evaluateRestrictedToolGuardrails(input: {
 	readonly scope?: EffectiveSubagentPermissions;
 	readonly toolName: string;
 	readonly toolInput: Record<string, unknown>;
+	readonly canonicalFilesystemTarget?: true;
 }): PermissionDenial {
 	const guardrails = input.scope?.guardrails;
 	const toolName = normalizePermissionToolName(input.toolName).toLowerCase();
-	if (guardrails?.noNetwork) {
+	if (input.canonicalFilesystemTarget !== true && guardrails?.noNetwork) {
 		if (NETWORK_TOOLS[toolName] === true || toolName.startsWith("mcp__")) {
 			return deny(
 				`no-network guardrail denied tool '${input.toolName}'.`,
@@ -208,11 +262,23 @@ export function evaluateRestrictedToolGuardrails(input: {
 		}
 	}
 	if (guardrails?.secretsBlind) {
-		const sensitive = visitInput(input.toolInput, (value, key) => {
+		const inspect = (value: string, key?: string): boolean => {
 			if (SECRET_PATH.test(value)) return true;
 			if ((toolName === "bash" || toolName === "eval") && ENV_ACCESS.test(value)) return true;
 			return (toolName === "bash" || toolName === "eval") && key !== undefined && /^(?:env|environment)$/i.test(key);
-		});
+		};
+		const sensitive =
+			input.canonicalFilesystemTarget === true
+				? typeof input.toolInput.path === "string" && SECRET_PATH.test(input.toolInput.path)
+				: toolName === "edit"
+					? visitEditInput(input.toolInput, inspect)
+					: visitInput(
+							input.toolInput,
+							inspect,
+							undefined,
+							new WeakSet<object>(),
+							MUTATION_INERT_INPUT_FIELDS[toolName],
+						);
 		if (sensitive) {
 			return deny(
 				"secrets-blind guardrail denied an environment, credential, or private-" + "key source.",

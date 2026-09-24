@@ -1342,6 +1342,7 @@ export interface EditPolicy {
   homeDir: string
   /** The payload is a verbatim custom-format string, not JSON. */
   rawInput: boolean
+  sourceSnapshots?: Array<EditSourceSnapshot>
 }
 
 /** A batch of previews for one session generation. */
@@ -1351,6 +1352,14 @@ export interface EditPreviewBatch {
   /** False for the final untrimmed pass after `finish()`. */
   streaming: boolean
   files: Array<EditFilePreview>
+}
+
+/** Immutable source bytes captured by the host before native session creation. */
+export interface EditSourceSnapshot {
+  path: string
+  canonicalPath: string
+  exists: boolean
+  bytes?: Uint8Array
 }
 
 /** A cached `vault://` root. */

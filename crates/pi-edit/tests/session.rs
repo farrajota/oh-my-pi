@@ -428,6 +428,7 @@ async fn hashline_rem_streaming_preview_does_not_error_on_invalid_utf8() {
 		fuzzy_threshold:    0.95,
 		enforce_seen_lines: false,
 		raw_input:          false,
+		source_snapshots:   None,
 	};
 	let mut session = Session::new(config, EditStore::new());
 	// Completed REM section followed by an incomplete trailing section.

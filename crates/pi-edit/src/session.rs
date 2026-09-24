@@ -4,7 +4,7 @@
 //! Threading and callbacks live in the napi layer; this type is single
 //! threaded and pure apart from file reads and the writer trait.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 
@@ -12,9 +12,9 @@ use crate::{
 	diff_string::{CompactDiffOptions, build_compact_diff_preview},
 	engine::{EditMode, FileOp, HeaderKind, ModeEngine, PreviewFile, StagedFile},
 	error::{EditError, EditResult},
-	files::{FileCache, FileSource},
+	files::{FileCache, FileSource, SourceSnapshotMap},
 	notebook,
-	path_policy::{PathPolicy, canonical_key},
+	path_policy::PathPolicy,
 	store::{EditStore, file_hash},
 	stream_json::ArgStream,
 	text::{normalize_to_lf, strip_bom, utf16_len},
@@ -30,6 +30,9 @@ pub struct SessionConfig {
 	pub enforce_seen_lines: bool,
 	/// The payload is not JSON (custom-format tool): the buffer is `input`.
 	pub raw_input:          bool,
+	/// Closed-world, immutable source view captured by the host before session
+	/// creation.
+	pub source_snapshots:   Option<Arc<SourceSnapshotMap>>,
 }
 
 /// One streamed preview pass. Empty `files` means "nothing to show yet";
@@ -140,7 +143,10 @@ impl Session {
 			config.fuzzy_threshold,
 			config.enforce_seen_lines,
 		);
-		let files = FileCache::new(config.policy.clone());
+		let files = match &config.source_snapshots {
+			Some(snapshots) => FileCache::with_snapshots(config.policy.clone(), Arc::clone(snapshots)),
+			None => FileCache::new(config.policy.clone()),
+		};
 		Self {
 			args: ArgStream::new(config.raw_input),
 			config,
@@ -243,7 +249,7 @@ impl Session {
 		let last_write = staged.iter().rposition(|file| file.op != FileOp::Noop);
 		let mut files = Vec::with_capacity(staged.len());
 		for (index, mut file) in staged.into_iter().enumerate() {
-			let canonical = canonical_key(&file.absolute);
+			let canonical = self.files.canonical(&file.absolute)?;
 			let response = if file.op == FileOp::Noop {
 				WriteResponse::default()
 			} else {
@@ -269,7 +275,11 @@ impl Session {
 					}
 				},
 				FileOp::Create | FileOp::Update => {
-					let dest_canonical = file.move_to.as_ref().map(|m| canonical_key(&m.absolute));
+					let dest_canonical = if let Some(destination) = &file.move_to {
+						Some(self.files.canonical(&destination.absolute)?)
+					} else {
+						None
+					};
 					if let Some(dest) = &dest_canonical {
 						self.store.relocate(&canonical, dest);
 					}

@@ -1,3 +1,5 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
@@ -15,7 +17,7 @@ import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text
 import { Ellipsis, fileHyperlink, renderStatusLine, truncateToWidth } from "@oh-my-pi/pi-tui/render";
 import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
-import type { AuthorizedFilesystemTarget } from "../internal/session-path-scope";
+import type { AuthorizedFilesystemTarget, FilesystemOperation } from "../internal/session-path-scope";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import { parseReadUrlTarget } from "./fetch";
@@ -149,24 +151,180 @@ function runAstEditOnce(
 	});
 }
 
-async function authorizeAstMutationTargets(
-	session: ToolSession,
-	result: AstEditAggregatedResult,
-	commonBasePath: string,
-): Promise<readonly AuthorizedFilesystemTarget[]> {
-	if (!session.pathScope) return [];
-	const paths = new Set<string>();
-	for (const fileChange of result.fileChanges) paths.add(path.resolve(commonBasePath, fileChange.path));
-	for (const change of result.changes) paths.add(path.resolve(commonBasePath, change.path));
+interface ScopedAstEditSnapshot {
+	before: string;
+	after: string;
+	canonicalPath: string;
+}
+
+interface ScopedAstEditWrite {
+	target: AuthorizedFilesystemTarget;
+	content: string;
+}
+
+interface ScopedAstEditRun {
+	result: AstEditAggregatedResult;
+	snapshots: ReadonlyMap<string, ScopedAstEditSnapshot>;
+	writes: readonly ScopedAstEditWrite[];
+}
+
+function sameFilesystemIdentity(left: AuthorizedFilesystemTarget, right: AuthorizedFilesystemTarget): boolean {
+	return Boolean(
+		left.identity &&
+		right.identity &&
+		left.identity.dev === right.identity.dev &&
+		left.identity.ino === right.identity.ino &&
+		left.identity.mode === right.identity.mode,
+	);
+}
+
+async function readAuthorizedAstSource(
+	operation: FilesystemOperation,
+	filePath: string,
+	assertAstEditPermission: (canonicalTarget: string) => void,
+): Promise<{ target: AuthorizedFilesystemTarget; content: string }> {
+	const target = await operation.authorize(filePath, "read");
+	assertAstEditPermission(target.canonicalTarget);
+	const handle = await operation.openRead(target, "filesystem");
 	try {
-		const targets = await session.pathScope
-			.currentOperation()
-			.preflight(Array.from(paths, filePath => ({ path: filePath, kind: "write" as const })));
-		for (const target of targets) session.pathScope.assertPermission("ast_edit", target.canonicalTarget);
-		return targets;
-	} catch {
-		throw new ToolError("AST edit includes a filesystem target outside this operation's authority.");
+		return { target, content: await handle.readFile({ encoding: "utf8" }) };
+	} finally {
+		await handle.close();
 	}
+}
+
+/** Native astEdit only sees private copies of authorized source snapshots. */
+async function runScopedAstEdit(
+	targets: Array<{ basePath: string; glob?: string }>,
+	commonBasePath: string,
+	options: AstEditCallOptions,
+	operation: FilesystemOperation,
+	assertAstEditPermission: (canonicalTarget: string) => void,
+): Promise<ScopedAstEditRun> {
+	const changes: AstReplaceChange[] = [];
+	const fileCounts = new Map<string, number>();
+	const snapshots = new Map<string, ScopedAstEditSnapshot>();
+	const writes: ScopedAstEditWrite[] = [];
+	const parseErrors: string[] = [];
+	const seenPaths = new Set<string>();
+	let totalReplacements = 0;
+	let filesSearched = 0;
+	let limitReached = false;
+	let scratchDir: string | undefined;
+	let scratchIndex = 0;
+
+	try {
+		for (const target of targets) {
+			const rootTarget = await operation.authorize(target.basePath, "search");
+			const matcher = target.glob ? new Bun.Glob(target.glob) : undefined;
+			let targetFilesTouched = 0;
+			let targetLimitReached = false;
+			await operation.walkAuthorized(rootTarget, {
+				signal: options.signal,
+				include: entry => {
+					if (entry.isDirectory) return true;
+					if (!entry.isFile) return false;
+					if (!matcher) return !rootTarget.isFile || entry.path === rootTarget.canonicalTarget;
+					const relative = path.relative(rootTarget.canonicalTarget, entry.path).replace(/\\/g, "/");
+					return relative !== "." && relative.length > 0 && matcher.match(relative);
+				},
+				descend: entry => entry.isDirectory,
+				visit: async entry => {
+					if (targetLimitReached || !entry.isFile) return;
+					const absolutePath = path.resolve(entry.path);
+					if (seenPaths.has(absolutePath)) return;
+					seenPaths.add(absolutePath);
+
+					const { target: readTarget, content: source } = await readAuthorizedAstSource(
+						operation,
+						entry.path,
+						assertAstEditPermission,
+					);
+					// Keep the original basename (including extension and special names such as Dockerfile)
+					// so native language detection is identical to a scan of the real file.
+					scratchDir ??= await fs.mkdtemp(path.join(os.tmpdir(), "omp-ast-edit-"));
+					const scratchParent = path.join(scratchDir, String(scratchIndex++));
+					await fs.mkdir(scratchParent);
+					const scratchFile = path.join(scratchParent, path.basename(entry.path));
+					await fs.writeFile(scratchFile, source);
+					const rewritten = await astEdit({
+						path: scratchFile,
+						rewrites: options.rewrites,
+						dryRun: false,
+						maxFiles: options.maxFiles,
+						failOnParseError: options.failOnParseError,
+						signal: options.signal,
+					});
+					filesSearched += rewritten.filesSearched;
+					for (const error of rewritten.parseErrors ?? []) {
+						parseErrors.push(error.replaceAll(scratchFile, entry.path));
+					}
+					limitReached = limitReached || rewritten.limitReached;
+					if (rewritten.totalReplacements === 0) return;
+					if (targetFilesTouched >= options.maxFiles) {
+						targetLimitReached = true;
+						limitReached = true;
+						return;
+					}
+
+					let writeTarget: AuthorizedFilesystemTarget;
+					try {
+						writeTarget = await operation.authorize(readTarget.canonicalTarget, "write");
+						assertAstEditPermission(writeTarget.canonicalTarget);
+					} catch {
+						throw new ToolError("AST edit includes a filesystem target outside this operation's authority.");
+					}
+					if (!sameFilesystemIdentity(readTarget, writeTarget)) {
+						throw new ToolError(`AST edit target changed while reading ${entry.path}.`);
+					}
+					const resultPath = path.relative(commonBasePath, readTarget.canonicalTarget).replace(/\\/g, "/");
+					const after = await fs.readFile(scratchFile, "utf8");
+					targetFilesTouched++;
+					changes.push(...rewritten.changes.map(change => ({ ...change, path: resultPath })));
+					const count = rewritten.fileChanges.reduce((sum, change) => sum + change.count, 0);
+					fileCounts.set(resultPath, (fileCounts.get(resultPath) ?? 0) + count);
+					totalReplacements += rewritten.totalReplacements;
+					snapshots.set(resultPath, {
+						before: source,
+						after,
+						canonicalPath: writeTarget.canonicalTarget,
+					});
+					writes.push({ target: writeTarget, content: after });
+				},
+				stop: () => targetLimitReached,
+			});
+		}
+	} finally {
+		if (scratchDir) await fs.rm(scratchDir, { recursive: true, force: true });
+	}
+
+	const fileChanges: AstReplaceFileChange[] = Array.from(fileCounts, ([filePath, count]) => ({
+		path: filePath,
+		count,
+	}));
+	return {
+		result: {
+			changes,
+			fileChanges,
+			totalReplacements,
+			filesTouched: fileChanges.length,
+			filesSearched,
+			applied: !options.dryRun,
+			limitReached,
+			parseErrors: parseErrors.length > 0 ? parseErrors : undefined,
+		},
+		snapshots,
+		writes,
+	};
+}
+
+async function applyScopedAstWrites(
+	operation: FilesystemOperation,
+	writes: readonly ScopedAstEditWrite[],
+): Promise<void> {
+	for (const write of writes) await operation.verify(write.target);
+	for (const write of writes) await operation.writeFile(write.target, write.content);
+	for (const write of writes) await operation.verifyPostWrite(write.target);
 }
 
 export interface AstEditToolDetails {
@@ -324,21 +482,39 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
-			if (this.session.pathScope) {
-				const roots = multiTargets?.map(target => target.basePath) ?? [resolvedSearchPath];
-				await this.session.pathScope
-					.currentOperation()
-					.preflight(roots.map(root => ({ path: root, kind: "search" as const })));
+			const astTargets = multiTargets ?? [{ basePath: resolvedSearchPath, glob: globFilter }];
+			const assertAstEditPermission = (canonicalTarget: string): void => {
+				this.session.pathScope!.assertPermission("ast_edit", canonicalTarget);
+			};
+			let scopedRun: ScopedAstEditRun | undefined;
+			if (this.session.pathScope?.isRestricted) {
+				const operation = this.session.pathScope.currentOperation();
+				const roots = astTargets.map(target => target.basePath);
+				const rootTargets = await operation.preflight(roots.map(root => ({ path: root, kind: "search" as const })));
+				for (const target of rootTargets) assertAstEditPermission(target.canonicalTarget);
+				scopedRun = await runScopedAstEdit(
+					astTargets,
+					resolvedSearchPath,
+					{
+						rewrites: normalizedRewrites,
+						dryRun: true,
+						maxFiles,
+						failOnParseError: false,
+						signal,
+					},
+					operation,
+					assertAstEditPermission,
+				);
 			}
-
-			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-				rewrites: normalizedRewrites,
-				dryRun: true,
-				maxFiles,
-				failOnParseError: false,
-				signal,
-			});
-			await authorizeAstMutationTargets(this.session, result, resolvedSearchPath);
+			const result =
+				scopedRun?.result ??
+				(await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+					rewrites: normalizedRewrites,
+					dryRun: true,
+					maxFiles,
+					failOnParseError: false,
+					signal,
+				}));
 
 			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(result.parseErrors);
 			const formatPath = (filePath: string): string =>
@@ -384,9 +560,25 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 
 			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
 			const hashContexts = new Map<string, { tag: string }>();
+			const previewSnapshots = new Map<string, ScopedAstEditSnapshot>();
+			if (scopedRun) {
+				for (const [filePath, snapshot] of scopedRun.snapshots) {
+					previewSnapshots.set(formatPath(filePath), snapshot);
+				}
+			}
 			if (useHashLines) {
 				const snapshotStore = getEditStore(this.session);
 				for (const relativePath of fileList) {
+					const scopedSnapshot = previewSnapshots.get(relativePath);
+					if (this.session.pathScope?.isRestricted) {
+						if (!scopedSnapshot) continue;
+						const tag = snapshotStore.recordSnapshot(
+							scopedSnapshot.canonicalPath,
+							normalizeToLF(scopedSnapshot.before),
+						);
+						hashContexts.set(relativePath, { tag });
+						continue;
+					}
 					const absolutePath = path.resolve(this.session.cwd, relativePath);
 					try {
 						const fullText = normalizeToLF(await Bun.file(absolutePath).text());
@@ -475,25 +667,34 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					label: `AST Edit: ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}`,
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
+						let appliedScopedRun: ScopedAstEditRun | undefined;
 						const applyChanges = async (): Promise<AstEditAggregatedResult> => {
-							if (this.session.pathScope) {
-								const roots = multiTargets?.map(target => target.basePath) ?? [resolvedSearchPath];
-								const rootTargets = await this.session.pathScope
-									.currentOperation()
-									.preflight(roots.map(root => ({ path: root, kind: "search" as const })));
-								for (const target of rootTargets)
-									this.session.pathScope.assertPermission("ast_edit", target.canonicalTarget);
-							}
+							const operation = this.session.pathScope!.currentOperation();
+							const rootTargets = await operation.preflight(
+								astTargets.map(target => ({ path: target.basePath, kind: "search" as const })),
+							);
+							for (const target of rootTargets) assertAstEditPermission(target.canonicalTarget);
 
-							const currentPreview = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-								rewrites: normalizedRewrites,
-								dryRun: true,
-								maxFiles,
-								failOnParseError: false,
-							});
+							const currentScopedRun = await runScopedAstEdit(
+								astTargets,
+								resolvedSearchPath,
+								{
+									rewrites: normalizedRewrites,
+									dryRun: true,
+									maxFiles,
+									failOnParseError: false,
+								},
+								operation,
+								assertAstEditPermission,
+							);
+							const currentPreview = currentScopedRun.result;
 							const currentCounts = new Map(
 								currentPreview.fileChanges.map(change => [formatPath(change.path), change.count]),
 							);
+							const currentSnapshots = new Map<string, ScopedAstEditSnapshot>();
+							for (const [filePath, snapshot] of currentScopedRun.snapshots) {
+								currentSnapshots.set(formatPath(filePath), snapshot);
+							}
 							const previewChanged =
 								currentPreview.totalReplacements !== result.totalReplacements ||
 								currentPreview.filesTouched !== result.filesTouched ||
@@ -502,27 +703,29 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 								) ||
 								currentPreview.fileChanges.some(
 									change => fileReplacementCounts.get(formatPath(change.path)) !== change.count,
-								);
+								) ||
+								previewSnapshots.size !== currentSnapshots.size ||
+								Array.from(previewSnapshots).some(([filePath, snapshot]) => {
+									const current = currentSnapshots.get(filePath);
+									return (
+										!current ||
+										current.canonicalPath !== snapshot.canonicalPath ||
+										current.before !== snapshot.before ||
+										current.after !== snapshot.after
+									);
+								});
 							if (previewChanged) {
 								throw new ToolError("AST edit preview is stale; no replacements were applied.");
 							}
-							const targets = await authorizeAstMutationTargets(
-								this.session,
-								currentPreview,
-								resolvedSearchPath,
-							);
-							for (const target of targets) await this.session.pathScope!.currentOperation().verify(target);
-							const applied = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-								rewrites: normalizedRewrites,
-								dryRun: false,
-								maxFiles,
-								failOnParseError: false,
-							});
-							for (const target of targets)
-								await this.session.pathScope!.currentOperation().verifyPostWrite(target);
-							return applied;
+
+							await applyScopedAstWrites(operation, currentScopedRun.writes);
+							appliedScopedRun = {
+								...currentScopedRun,
+								result: { ...currentPreview, applied: true },
+							};
+							return appliedScopedRun.result;
 						};
-						const applyResult = this.session.pathScope
+						const applyResult = this.session.pathScope?.isRestricted
 							? await applyChanges()
 							: await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 									rewrites: normalizedRewrites,
@@ -550,9 +753,25 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						// invalidated them. Re-record post-apply snapshots (canonical keys)
 						// so the model's next hashline edit anchors against fresh tags.
 						const freshTagLines: string[] = [];
+						const appliedSnapshots = new Map<string, ScopedAstEditSnapshot>();
+						if (appliedScopedRun) {
+							for (const [filePath, snapshot] of appliedScopedRun.snapshots) {
+								appliedSnapshots.set(formatPath(filePath), snapshot);
+							}
+						}
 						if (useHashLines) {
 							const snapshotStore = getEditStore(this.session);
 							for (const relativePath of appliedFileList) {
+								const scopedSnapshot = appliedSnapshots.get(relativePath);
+								if (this.session.pathScope?.isRestricted) {
+									if (!scopedSnapshot) continue;
+									const freshTag = snapshotStore.recordSnapshot(
+										scopedSnapshot.canonicalPath,
+										normalizeToLF(scopedSnapshot.after),
+									);
+									freshTagLines.push(formatHashlineHeader(relativePath, freshTag));
+									continue;
+								}
 								const appliedAbsolutePath = path.resolve(this.session.cwd, relativePath);
 								try {
 									const fullText = normalizeToLF(await Bun.file(appliedAbsolutePath).text());

@@ -119,6 +119,7 @@ impl Workspace {
 			fuzzy_threshold: 0.95,
 			enforce_seen_lines: false,
 			raw_input: false,
+			source_snapshots: None,
 		};
 		Self { dir, store: EditStore::new(), config }
 	}

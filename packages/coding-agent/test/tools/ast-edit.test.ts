@@ -3,10 +3,96 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { adaptSchemaForStrict, toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import { astEdit } from "@oh-my-pi/pi-natives";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { SessionPathScope } from "../../src/internal/session-path-scope";
+import {
+	bindSessionOperationAuthority,
+	installSessionOperationLedger,
+	issueBoundSessionOperationAuthority,
+	runFilesystemOperation,
+} from "../../src/registry/operation-lease";
+import type { EffectiveSubagentPermissions } from "../../src/task/permission-profiles";
+
+function createAstEditPermissionScope(allowPaths: string[], denyPaths: string[] = []): EffectiveSubagentPermissions {
+	return {
+		mode: "enforce",
+		toolsEnabled: true,
+		pathsEnabled: true,
+		actorId: "AstEditPathScopeTest",
+		actorKind: "sub",
+		profiles: [],
+		tools: ["ast_edit"],
+		denyTools: [],
+		allowPaths,
+		denyPaths,
+		guardrails: { noNetwork: false, secretsBlind: false },
+	};
+}
+
+type ScopedAstEditFixture = {
+	session: ToolSession;
+	manager: object;
+	pathScope: SessionPathScope;
+	close(): Promise<void>;
+	operationNumber: number;
+};
+
+function createScopedAstEditFixture(
+	cwd: string,
+	permissionScope: EffectiveSubagentPermissions,
+	queue?: ToolChoiceQueue,
+): ScopedAstEditFixture {
+	const manager = {};
+	const operationControl = installSessionOperationLedger(manager);
+	const authority = issueBoundSessionOperationAuthority(
+		{
+			capability: {},
+			actorId: permissionScope.actorId,
+			rootId: "AstEditPathScopeTestRoot",
+			generation: 1,
+			sessionFile: null,
+			validate: () => true,
+		},
+		manager,
+	);
+	bindSessionOperationAuthority(manager, authority);
+
+	const pathScope = new SessionPathScope({
+		actorId: () => permissionScope.actorId,
+		sessionId: () => "ast-edit-path-scope-test",
+		cwd: () => cwd,
+		permissionScope: () => permissionScope,
+		operationManager: () => manager,
+	});
+	return {
+		session: createTestSession(cwd, {
+			pathScope,
+			getPermissionScope: () => permissionScope,
+			...(queue
+				? {
+						getToolChoiceQueue: () => queue,
+						buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
+						steer: () => {},
+					}
+				: {}),
+		}),
+		manager,
+		pathScope,
+		close: () => operationControl.close(),
+		operationNumber: 0,
+	};
+}
+
+async function withScopedAstEditOperation<T>(fixture: ScopedAstEditFixture, run: () => Promise<T>): Promise<T> {
+	const operationId = `ast_edit:ast-edit-path-scope-${++fixture.operationNumber}`;
+	return runFilesystemOperation(fixture.manager, operationId, () =>
+		fixture.pathScope.withOperationLease(operationId, run),
+	);
+}
 
 type InvokedToolResult = {
 	content: Array<{ type: string; text?: string }>;
@@ -132,6 +218,45 @@ describe("ast_edit tool schema", () => {
 			).toBe(1);
 			const updated = await Bun.file(filePath).text();
 			expect(updated).toContain("modernWrap(x, value)");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+	it("keeps ordinary session AST preview and apply usable with a path scope", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-ordinary-scope-"));
+		try {
+			const filePath = path.join(tempDir, "legacy.ts");
+			await Bun.write(filePath, "legacyWrap(x, value)\n");
+			const queue = new ToolChoiceQueue();
+			const pathScope = new SessionPathScope({
+				actorId: () => "main",
+				sessionId: () => "ordinary-ast-edit",
+				cwd: () => tempDir,
+				permissionScope: () => undefined,
+			});
+			const tools = await createTools(
+				createTestSession(tempDir, {
+					pathScope,
+					getToolChoiceQueue: () => queue,
+					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
+					steer: () => {},
+				}),
+				["ast_edit"],
+			);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+			const preview = await tool!.execute("ast-edit-ordinary-preview", {
+				ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+				paths: [filePath],
+			});
+			expect((preview.details as { totalReplacements?: number } | undefined)?.totalReplacements).toBe(1);
+			expect(await Bun.file(filePath).text()).toBe("legacyWrap(x, value)\n");
+			const result = (await queue.peekPendingInvoker()!({
+				action: "apply",
+				reason: "apply preview",
+			})) as InvokedToolResult;
+			expect(result.isError).toBeUndefined();
+			expect(await Bun.file(filePath).text()).toBe("modernWrap(x, value)\n");
 		} finally {
 			await removeWithRetries(tempDir);
 		}
@@ -278,6 +403,234 @@ describe("ast_edit tool schema", () => {
 			await invoker({ action: "apply", reason: "apply tlaplus AST edit" });
 			expect(await Bun.file(filePath).text()).toContain("Start == x = 0");
 		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+});
+
+describe("ast_edit scoped filesystem authorization", () => {
+	it("matches native multi-rule variadic-capture rewrites", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-scoped-parity-"));
+		const scopedFile = path.join(tempDir, "scoped.ts");
+		const nativeFile = path.join(tempDir, "native.ts");
+		const source = "const result = legacyWrap(alpha, beta, gamma);\n";
+		const ops = [
+			{ pat: "legacyWrap($$$ARGS)", out: "intermediateWrap($$$ARGS)" },
+			{ pat: "intermediateWrap($$$ARGS)", out: "modernWrap($$$ARGS)" },
+		];
+		const queue = new ToolChoiceQueue();
+		const fixture = createScopedAstEditFixture(tempDir, createAstEditPermissionScope([scopedFile]), queue);
+		try {
+			await fs.writeFile(scopedFile, source);
+			await fs.writeFile(nativeFile, source);
+			const native = await astEdit({
+				path: nativeFile,
+				rewrites: Object.fromEntries(ops.map(op => [op.pat, op.out])),
+				dryRun: false,
+			});
+			const tools = await createTools(fixture.session, ["ast_edit"]);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+			const preview = await withScopedAstEditOperation(fixture, () =>
+				tool!.execute("ast-edit-scoped-parity-preview", { ops, paths: [scopedFile] }),
+			);
+			expect(preview.details).toMatchObject({ totalReplacements: native.totalReplacements });
+			const invoker = queue.peekPendingInvoker()!;
+			const applied = await withScopedAstEditOperation(
+				fixture,
+				async () =>
+					(await invoker({ action: "apply", reason: "compare native capture rewrite" })) as InvokedToolResult,
+			);
+			expect(applied.isError).toBeUndefined();
+			expect(await fs.readFile(scopedFile, "utf8")).toBe(await fs.readFile(nativeFile, "utf8"));
+		} finally {
+			await fixture.close();
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("rejects a same-inode source change even when rewrite counts are unchanged", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-scoped-stale-"));
+		const sourceFile = path.join(tempDir, "source.ts");
+		const queue = new ToolChoiceQueue();
+		const fixture = createScopedAstEditFixture(tempDir, createAstEditPermissionScope([sourceFile]), queue);
+		try {
+			await fs.writeFile(sourceFile, "legacyWrap(a, b)\n");
+			const tools = await createTools(fixture.session, ["ast_edit"]);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+			const preview = await withScopedAstEditOperation(fixture, () =>
+				tool!.execute("ast-edit-scoped-stale-preview", {
+					ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+					paths: [sourceFile],
+				}),
+			);
+			expect(preview.details).toMatchObject({ totalReplacements: 1 });
+			const originalStat = await fs.stat(sourceFile);
+			await fs.writeFile(sourceFile, "legacyWrap(c, d)\n");
+			expect((await fs.stat(sourceFile)).ino).toBe(originalStat.ino);
+			const invoker = queue.peekPendingInvoker()!;
+			await expect(
+				withScopedAstEditOperation(
+					fixture,
+					async () => await invoker({ action: "apply", reason: "attempt stale AST rewrite" }),
+				),
+			).rejects.toThrow("AST edit preview is stale");
+			expect(await fs.readFile(sourceFile, "utf8")).toBe("legacyWrap(c, d)\n");
+		} finally {
+			await fixture.close();
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("does not parse a denied no-match nested child during preview or apply", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-scoped-nested-"));
+		const sourceDir = path.join(tempDir, "src");
+		const nestedDir = path.join(sourceDir, "nested");
+		const allowedFile = path.join(sourceDir, "allowed.ts");
+		const noMatchFile = path.join(nestedDir, "no-match.ts");
+		const malformedFile = path.join(nestedDir, "malformed.ts");
+		const queue = new ToolChoiceQueue();
+		const fixture = createScopedAstEditFixture(
+			tempDir,
+			createAstEditPermissionScope([sourceDir, nestedDir, allowedFile]),
+			queue,
+		);
+		try {
+			await fs.mkdir(nestedDir, { recursive: true });
+			await Bun.write(allowedFile, "legacyWrap(allowedValue, allowedArg)\n");
+			await Bun.write(noMatchFile, "export const untouched = 1;\n");
+			await Bun.write(malformedFile, "export const = ;\n");
+
+			const tools = await createTools(fixture.session, ["ast_edit"]);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			const previewResult = await withScopedAstEditOperation(fixture, () =>
+				tool!.execute("ast-edit-scoped-preview", {
+					ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+					paths: [sourceDir],
+				}),
+			);
+			const previewDetails = previewResult.details as
+				| {
+						totalReplacements?: number;
+						filesSearched?: number;
+						parseErrors?: string[];
+						fileReplacements?: Array<{ path: string; count: number }>;
+				  }
+				| undefined;
+			expect(previewDetails?.totalReplacements).toBe(1);
+			expect(previewDetails?.filesSearched).toBe(1);
+			expect(previewDetails?.parseErrors).toBeUndefined();
+			expect(previewDetails?.fileReplacements).toEqual([
+				expect.objectContaining({ path: expect.stringMatching(/(?:^|\/)allowed\.ts$/), count: 1 }),
+			]);
+
+			const invoker = queue.peekPendingInvoker()!;
+			const applyResult = (await withScopedAstEditOperation(
+				fixture,
+				async () =>
+					(await invoker({ action: "apply", reason: "apply authorized AST preview" })) as InvokedToolResult,
+			)) as InvokedToolResult;
+			const applyText = applyResult.content.find(content => content.type === "text")?.text ?? "";
+			const applyDetails = applyResult.details as
+				| {
+						sourceResultDetails?: { filesSearched?: number; parseErrors?: string[]; totalReplacements?: number };
+				  }
+				| undefined;
+			expect(applyResult.isError).toBeUndefined();
+			expect(applyText).toContain("Applied 1 replacement in 1 file.");
+			expect(applyDetails?.sourceResultDetails?.totalReplacements).toBe(1);
+			expect(applyDetails?.sourceResultDetails?.filesSearched).toBe(1);
+			expect(applyDetails?.sourceResultDetails?.parseErrors).toBeUndefined();
+			expect(await Bun.file(allowedFile).text()).toContain("modernWrap(allowedValue, allowedArg)");
+			expect(await Bun.file(noMatchFile).text()).toBe("export const untouched = 1;\n");
+			expect(await Bun.file(malformedFile).text()).toBe("export const = ;\n");
+		} finally {
+			await fixture.close();
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("skips denied nested children under every AST edit root", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-scoped-multi-root-"));
+		const firstRoot = path.join(tempDir, "first");
+		const secondRoot = path.join(tempDir, "second");
+		const firstNested = path.join(firstRoot, "nested");
+		const secondNested = path.join(secondRoot, "nested");
+		const firstChild = path.join(firstNested, "first.ts");
+		const secondChild = path.join(secondNested, "second.ts");
+		const fixture = createScopedAstEditFixture(
+			tempDir,
+			createAstEditPermissionScope([firstRoot, firstNested, secondRoot, secondNested]),
+		);
+		try {
+			await fs.mkdir(firstNested, { recursive: true });
+			await fs.mkdir(secondNested, { recursive: true });
+			await Bun.write(firstChild, "legacyWrap(firstSecret, firstArg)\n");
+			await Bun.write(secondChild, "legacyWrap(secondSecret, secondArg)\n");
+
+			const tools = await createTools(fixture.session, ["ast_edit"]);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			const result = await withScopedAstEditOperation(fixture, () =>
+				tool!.execute("ast-edit-scoped-multi-root", {
+					ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+					paths: [firstRoot, secondRoot],
+				}),
+			);
+			const details = result.details as
+				| { totalReplacements?: number; filesSearched?: number; parseErrors?: string[] }
+				| undefined;
+			expect(details?.totalReplacements).toBe(0);
+			expect(details?.filesSearched).toBe(0);
+			expect(details?.parseErrors).toBeUndefined();
+			expect(await Bun.file(firstChild).text()).toBe("legacyWrap(firstSecret, firstArg)\n");
+			expect(await Bun.file(secondChild).text()).toBe("legacyWrap(secondSecret, secondArg)\n");
+		} finally {
+			await fixture.close();
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("authorizes a symlink child by its canonical sensitive target before parsing", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-scoped-canonical-"));
+		const sourceDir = path.join(tempDir, "src");
+		const nestedDir = path.join(sourceDir, "nested");
+		const secretDir = path.join(tempDir, "credentials");
+		const aliasPath = path.join(nestedDir, "ordinary.ts");
+		const secretPath = path.join(secretDir, "private_key.ts");
+		const fixture = createScopedAstEditFixture(
+			tempDir,
+			createAstEditPermissionScope([sourceDir, nestedDir, aliasPath, secretPath], [secretPath]),
+		);
+		try {
+			await fs.mkdir(nestedDir, { recursive: true });
+			await fs.mkdir(secretDir, { recursive: true });
+			await Bun.write(secretPath, "legacyWrap(secretValue, secretArg)\n");
+			await fs.symlink(secretPath, aliasPath);
+
+			const tools = await createTools(fixture.session, ["ast_edit"]);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			const result = await withScopedAstEditOperation(fixture, () =>
+				tool!.execute("ast-edit-scoped-canonical-child", {
+					ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+					paths: [sourceDir],
+				}),
+			);
+			const details = result.details as
+				| { totalReplacements?: number; filesSearched?: number; parseErrors?: string[] }
+				| undefined;
+			expect(details?.totalReplacements).toBe(0);
+			expect(details?.filesSearched).toBe(0);
+			expect(details?.parseErrors).toBeUndefined();
+			expect(await Bun.file(secretPath).text()).toBe("legacyWrap(secretValue, secretArg)\n");
+		} finally {
+			await fixture.close();
 			await removeWithRetries(tempDir);
 		}
 	});

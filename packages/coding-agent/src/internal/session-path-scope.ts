@@ -8,6 +8,7 @@ import { durableTargetHash, type DurableResourceClass, type DurableResourceRecor
 import type { EffectiveSubagentPermissions } from "../task/permission-profiles";
 import { evaluateSubagentPermission } from "../task/permission-profiles";
 import { expandDelimitedPathEntries, isInternalUrlPath, resolveSyscallTarget } from "../tools/path-utils";
+import { evaluateRestrictedToolGuardrails } from "./restricted-startup-policy";
 export interface SessionPathScopeOptions {
 	readonly actorId: () => string | null | undefined;
 	readonly sessionId: () => string | null | undefined;
@@ -836,6 +837,10 @@ export class SessionPathScope {
 		this.#identityKey = this.#currentIdentity().key;
 	}
 
+	get isRestricted(): boolean {
+		return this.#options.permissionScope()?.mode === "enforce";
+	}
+
 	/** Compatibility observation: only the operation in this async invocation is visible. */
 	get lease(): FilesystemOperationLease | undefined {
 		return this.#context.getStore()?.lease;
@@ -899,15 +904,27 @@ export class SessionPathScope {
 	}
 
 	assertPermission(toolName: string, canonicalPath: string): void {
+		const scope = this.#options.permissionScope();
+		const toolInput = { path: canonicalPath };
 		const decision = evaluateSubagentPermission({
-			scope: this.#options.permissionScope(),
+			scope,
 			toolName,
-			toolInput: { path: canonicalPath },
+			toolInput,
 			cwd: this.#options.cwd(),
 		});
 		if (decision.action === "deny") {
 			this.#options.recordPermissionDenial?.(decision.details);
 			throw new Error(decision.reason);
+		}
+		const guardrailDecision = evaluateRestrictedToolGuardrails({
+			scope,
+			toolName,
+			toolInput,
+			canonicalFilesystemTarget: true,
+		});
+		if (guardrailDecision.action === "deny") {
+			this.#options.recordPermissionDenial?.(guardrailDecision.details);
+			throw new Error(guardrailDecision.reason);
 		}
 	}
 
