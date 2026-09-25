@@ -279,6 +279,89 @@ describe("StatusLineComponent context breakdown", () => {
 		expect(plain).toContain("1.8%/272K");
 	});
 
+	it("renders context against the session-resolved compaction threshold", () => {
+		settings.override("compaction.thresholdPercent", 50);
+		try {
+			const { session } = makeSession({
+				messages: [userMessage("hi"), assistantMessage("done")],
+				contextWindow: 100_000,
+				usage: { tokens: 20_000, contextWindow: 100_000, percent: 20 },
+				settings: Settings.isolated({
+					"compaction.enabled": true,
+					"compaction.thresholdPercent": 80,
+					"compaction.thresholdTokens": -1,
+				}),
+			});
+			const comp = statusLines.track(new StatusLineComponent(session, statusLineHost));
+			comp.updateSettings({
+				preset: "custom",
+				leftSegments: ["context_pct"],
+				rightSegments: [],
+				separator: "powerline-thin",
+			});
+
+			const plain = comp.getTopBorder(80).content.replaceAll(/\x1b\[[0-9;]*m/g, "");
+			// The session's 80% threshold wins over the host's 50% fallback.
+			expect(plain).toContain("[25%]/20.0%/100K");
+		} finally {
+			settings.clearOverride("compaction.thresholdPercent");
+		}
+	});
+
+	it("caps threshold-relative usage at the boundary and beyond it", () => {
+		const sessionSettings = Settings.isolated({
+			"compaction.enabled": true,
+			"compaction.thresholdPercent": 80,
+			"compaction.thresholdTokens": -1,
+		});
+		const renderAtUsage = (tokens: number): string => {
+			const { session } = makeSession({
+				messages: [userMessage("hi"), assistantMessage("done")],
+				contextWindow: 100_000,
+				usage: { tokens, contextWindow: 100_000, percent: tokens / 1_000 },
+				settings: sessionSettings,
+			});
+			const comp = statusLines.track(new StatusLineComponent(session, statusLineHost));
+			comp.updateSettings({
+				preset: "custom",
+				leftSegments: ["context_pct"],
+				rightSegments: [],
+				separator: "powerline-thin",
+			});
+			return comp.getTopBorder(80).content.replaceAll(/\x1b\[[0-9;]*m/g, "");
+		};
+
+		expect(renderAtUsage(80_000)).toContain("[100%]/80.0%/100K");
+		expect(renderAtUsage(90_000)).toContain("[100%]/90.0%/100K");
+	});
+
+	it("keeps context usage and indicators when session compaction is disabled", () => {
+		const { session } = makeSession({
+			messages: [userMessage("hi"), assistantMessage("done")],
+			contextWindow: 100_000,
+			usage: { tokens: 20_000, contextWindow: 100_000, percent: 20 },
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"compaction.thresholdPercent": 80,
+				"compaction.thresholdTokens": -1,
+			}),
+		});
+		const comp = statusLines.track(new StatusLineComponent(session, statusLineHost));
+		comp.updateSettings({
+			preset: "custom",
+			leftSegments: ["context_pct"],
+			rightSegments: [],
+			separator: "powerline-thin",
+		});
+
+		const border = comp.getTopBorder(80).content;
+		const plain = border.replaceAll(/\x1b\[[0-9;]*m/g, "");
+		expect(plain).toContain("20.0%/100K");
+		expect(plain).not.toContain("[25%]");
+		expect(plain).toContain(theme.icon.context);
+		expect(plain).toContain(theme.icon.auto);
+	});
+
 	it("renders speculative percent instead of ? after compaction", () => {
 		const { session } = makeSession({
 			messages: [userMessage("compaction summary")],
@@ -444,6 +527,41 @@ describe("StatusLineComponent context breakdown", () => {
 		expect(plain).toContain("200K");
 	});
 
+	it("renders the session threshold fill in embedded context at a constrained width", () => {
+		settings.override("compaction.thresholdPercent", 50);
+		try {
+			const { session } = makeSession({
+				messages: [userMessage("hi"), assistantMessage("done")],
+				contextWindow: 100_000,
+				usage: { tokens: 20_000, contextWindow: 100_000, percent: 20 },
+				settings: Settings.isolated({
+					"compaction.enabled": true,
+					"compaction.thresholdPercent": 80,
+					"compaction.thresholdTokens": -1,
+				}),
+				sessionName: "28大学生AI赋能司法行政创新挑战 law agent",
+			});
+			const comp = statusLines.track(new StatusLineComponent(session, statusLineHost));
+			comp.updateSettings({
+				preset: "custom",
+				leftSegments: ["pi", "model", "path", "context_pct"],
+				rightSegments: ["session_name"],
+				separator: "powerline-thin",
+				sessionAccent: false,
+				contextLine: "embedded",
+			});
+
+			const border = comp.getTopBorder(48);
+			const plain = border.content.replaceAll(/\x1b\[[0-9;]*m/g, "");
+			expect(border.width).toBe(48);
+			expect(plain).toContain("[25%]/20%");
+			expect(plain).toContain("100K");
+			expect(plain).not.toContain("20.0%/100K");
+		} finally {
+			settings.clearOverride("compaction.thresholdPercent");
+		}
+	});
+
 	it("preserves a status segment when embedded context labels cannot fit", () => {
 		const { session } = makeSession({
 			messages: [userMessage("hi"), assistantMessage("done")],
@@ -483,9 +601,9 @@ describe("StatusLineComponent context breakdown", () => {
 			expect(border.width).toBe(120);
 			expect(windowIndex).toBeGreaterThanOrEqual(0);
 			expect(percentIndex).toBeGreaterThan(windowIndex);
-			// The clamped label must not render alongside the overflow one.
-			expect(plain).not.toContain("100%");
-			expect(border.content).toContain(`${theme.getFgAnsi("error")}120%`);
+			// The fill saturates, but raw context usage remains above 100%.
+			expect(plain).toContain("[100%]/120%");
+			expect(border.content).toContain(`${theme.getFgAnsi("error")}[100%]/120%`);
 		} finally {
 			settings.clearOverride("statusLine.contextLine");
 			settings.clearOverride("statusLine.rightSegments");

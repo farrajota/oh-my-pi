@@ -38,6 +38,26 @@ function withIcon(icon: string, text: string): string {
 function statusValue(ctx: SegmentContext, value: string): string {
 	return ctx.startupPlaceholder ? STARTUP_PLACEHOLDER : value;
 }
+
+export function formatCompactionFillPrefix(
+	ctx: Pick<
+		SegmentContext,
+		"contextPercent" | "compactionThresholdPercent" | "autoCompactEnabled" | "startupPlaceholder"
+	>,
+): string {
+	const pct = ctx.contextPercent;
+	const boundary = ctx.compactionThresholdPercent;
+	return !ctx.startupPlaceholder &&
+		ctx.autoCompactEnabled &&
+		typeof pct === "number" &&
+		Number.isFinite(pct) &&
+		typeof boundary === "number" &&
+		Number.isFinite(boundary) &&
+		boundary > 0
+		? `[${Math.min(100, Math.max(0, Math.round((100 * pct) / boundary)))}%]/`
+		: "";
+}
+
 /**
  * Hash-derived accent ANSI for the session title (or preview stand-in title).
  * Undefined when `statusLine.sessionAccent` is off or the session is unnamed,
@@ -634,9 +654,12 @@ const contextPctSegment: StatusLineSegment = {
 						: theme.fg(color, theme.icon.auto)
 			}`;
 		}
+		const fillPrefix = formatCompactionFillPrefix(ctx);
 		const text = theme.fg(
 			color,
-			ctx.startupPlaceholder ? STARTUP_PLACEHOLDER : formatContextUsage(pct, window, ctx.contextTokens),
+			ctx.startupPlaceholder
+				? STARTUP_PLACEHOLDER
+				: `${fillPrefix}${formatContextUsage(pct, window, ctx.contextTokens)}`,
 		);
 		const content = withIcon(theme.icon.context, `${text}${autoIcon}`);
 

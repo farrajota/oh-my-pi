@@ -38,7 +38,7 @@ import {
 import { canReuseCachedPr, createPrCacheContext, isSamePrCacheContext, type PrCacheContext } from "./git-utils";
 import { summarizeUsageResetCredits } from "../overlays/usage-display";
 import { getPreset } from "./presets";
-import { renderSegment, type SegmentContext } from "./segments";
+import { formatCompactionFillPrefix, renderSegment, type SegmentContext } from "./segments";
 import { getSeparator } from "./separators";
 import type {
 	CollabStatus,
@@ -420,8 +420,12 @@ function formatEmbeddedContextPercent(percent: number): string {
 	return `${percent > 0 && percent < 1 ? percent.toFixed(1) : Math.round(percent)}%`;
 }
 
-function embeddedContextGaugeMinWidth(percent: number, contextWindow: number): number {
-	return formatEmbeddedContextPercent(percent).length + formatNumber(contextWindow).length + 4;
+function embeddedContextGaugeMinWidth(ctx: SegmentContext, percent: number): number {
+	const candidatePercent = ctx.startupPlaceholder
+		? "…%"
+		: `${formatCompactionFillPrefix(ctx)}${formatEmbeddedContextPercent(percent)}`;
+	const candidateWindow = ctx.startupPlaceholder ? "…" : formatNumber(ctx.contextWindow);
+	return candidatePercent.length + candidateWindow.length + 4;
 }
 
 function hasGitSegment(segments: readonly StatusLineSegmentId[]): boolean {
@@ -2148,6 +2152,9 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			contextTokens = collabState.contextUsage.tokens ?? contextTokens;
 			contextPercent = collabState.contextUsage.percent ?? contextPercent;
 		}
+		const autoCompactEnabled = this.#autoCompactEnabled;
+		const compactionBoundaries =
+			autoCompactEnabled && contextWindow > 0 ? this.#compactionBoundaries(contextWindow) : null;
 
 		const shouldResolveActiveRepo = this.#gitEnabled() && (includePath || includeGit || includePr);
 		const projectDir = getProjectDir();
@@ -2197,7 +2204,9 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			contextPercent,
 			contextTokens,
 			contextWindow,
-			autoCompactEnabled: this.#autoCompactEnabled,
+			compactionThresholdPercent: compactionBoundaries?.thresholdPercent ?? null,
+			compactionSpeculationPercent: compactionBoundaries?.speculationPercent ?? null,
+			autoCompactEnabled,
 			compactionSpeculation,
 			speculationBlinkOn: this.#speculationBlinkOn,
 			subagentCount: this.#subagentCount,
@@ -2671,11 +2680,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		// handling, so the gauge must reserve enough room for both labels. Without
 		// this budget a long path/session title can leave a one-cell gap: the
 		// context segment is gone, and the gauge silently omits its labels too.
-		const embeddedContextWidth = embedContext
-			? ctx.startupPlaceholder
-				? "…%".length + "…".length + 4
-				: embeddedContextGaugeMinWidth(ctx.contextPercent ?? 0, ctx.contextWindow)
-			: 0;
+		const embeddedContextPercent = ctx.contextPercent ?? 0;
+		const embeddedContextLabelPercent =
+			embeddedContextPercent > 100 ? embeddedContextPercent : Math.min(100, Math.max(0, embeddedContextPercent));
+		const embeddedContextWidth = embedContext ? embeddedContextGaugeMinWidth(ctx, embeddedContextLabelPercent) : 0;
 		const minimumGapWidth = (): number => {
 			const hasLeft = left.length > 0;
 			const hasRight = right.length > 0;
@@ -2858,9 +2866,9 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		if (embedContext) {
 			const candidatePercent = ctx.startupPlaceholder
 				? "…%"
-				: formatEmbeddedContextPercent(percentOverflow ? pct : clampedPct);
+				: `${formatCompactionFillPrefix(ctx)}${formatEmbeddedContextPercent(percentOverflow ? pct : clampedPct)}`;
 			const candidateWindow = ctx.startupPlaceholder ? "…" : formatNumber(ctx.contextWindow);
-			const minimumLabelWidth = candidatePercent.length + candidateWindow.length + 4;
+			const minimumLabelWidth = embeddedContextGaugeMinWidth(ctx, percentOverflow ? pct : clampedPct);
 			if (gapWidth >= minimumLabelWidth) {
 				percentLabel = candidatePercent;
 				windowLabel = candidateWindow;
@@ -2884,14 +2892,19 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		let speculationIdx = -1;
 		let thresholdIdx = -1;
 		if ((mode === "annotated" || mode === "embedded") && ctx.autoCompactEnabled && gapWidth >= 8) {
-			const boundaries = this.#compactionBoundaries(ctx.contextWindow);
-			if (boundaries) {
-				const cellFor = (percent: number) =>
-					Math.min(scaleWidth - 1, Math.max(0, Math.round((percent / 100) * scaleWidth)));
-				thresholdIdx = cellFor(boundaries.thresholdPercent);
+			const thresholdPercent = ctx.compactionThresholdPercent;
+			if (thresholdPercent !== null && thresholdPercent !== undefined) {
+				const lastScaleCell = scaleWidth - 1;
+				thresholdIdx = Math.min(lastScaleCell, Math.max(0, Math.round((thresholdPercent / 100) * scaleWidth)));
 				// null = no background speculation will run (async disabled or the
 				// first available method is local/instant) — no tick to show.
-				if (boundaries.speculationPercent !== null) speculationIdx = cellFor(boundaries.speculationPercent);
+				const speculationPercent = ctx.compactionSpeculationPercent;
+				if (speculationPercent !== null && speculationPercent !== undefined) {
+					speculationIdx = Math.min(
+						lastScaleCell,
+						Math.max(0, Math.round((speculationPercent / 100) * scaleWidth)),
+					);
+				}
 				if (speculationIdx === thresholdIdx) speculationIdx = -1; // threshold wins the cell
 			}
 		}
@@ -2915,6 +2928,9 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 					percentStart = right;
 					break;
 				}
+			}
+			if (percentStart < 0 && maxStart >= 1) {
+				percentStart = preferredStart;
 			}
 		}
 

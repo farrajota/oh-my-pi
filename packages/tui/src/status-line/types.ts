@@ -145,6 +145,10 @@ export interface SegmentContext {
 	contextPercent: number | null;
 	contextTokens: number;
 	contextWindow: number;
+	/** Effective auto-compaction firing boundary for this session, when available. */
+	compactionThresholdPercent?: number | null;
+	/** Speculative-compaction marker paired with the resolved threshold for the context gauge. */
+	compactionSpeculationPercent?: number | null;
 	autoCompactEnabled: boolean;
 	/** Background speculative-compaction state (async compaction). */
 	compactionSpeculation: "idle" | "running" | "armed";
