@@ -13,6 +13,8 @@
 - Fixed interactive prompt submission and resumed sessions crashing with `TypeError` when a custom editor was active after the upstream merge dropped `pendingImages` and `pendingImageLinks` initialization.
 - Fixed extension async-job snapshots so callers can exclude agent-backed rows by authoritative `agentId` metadata without changing unified delivery or `/jobs` behavior, and retained independent bounded agent/non-agent terminal histories so filtering before `recentLimit` cannot starve background Bash completions.
 - Fixed full-suite order-dependent failures across built-in tool and renderer initialization, MCP refresh retention, browser lifecycle handling, internal URL authority, and isolated session state.
+- Fixed session moves racing completed appends and occupied paths, preserving unrelated files during native and cross-device publication or rollback; retained committed output after Responses timeout recovery.
+- Fixed broker idle shutdown racing pending client handshakes and restored artifact links for column-truncated eval output.
 - Fixed session authority recovery so `omp session repair <session-id-or-path>` is provider-independent and dry-run by default, rejects unverifiable journal or lineage corruption, preserves exact source bytes in retained apply backups, closes only verified terminal descendants leaf-first, and directs users to a fresh process after repair.
 
 ## [17.0.1] - 2026-07-16

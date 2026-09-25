@@ -1,5 +1,18 @@
 import * as AIError from "../error";
 import type { AssistantMessage, AssistantMessageEvent } from "../types";
+import { copyCursorExecResolved, getStreamingPartialJson, setStreamingPartialJson } from "./block-symbols";
+
+type AssistantContent = AssistantMessage["content"][number];
+
+function snapshotContent(block: AssistantContent): AssistantContent {
+	const snapshot = structuredClone(block);
+	if (block.type === "toolCall" && snapshot.type === "toolCall") {
+		const partialJson = getStreamingPartialJson(block);
+		if (partialJson !== undefined) setStreamingPartialJson(snapshot, partialJson);
+		copyCursorExecResolved(snapshot, block);
+	}
+	return snapshot;
+}
 
 /** Anything a stream watchdog can consult for in-flight consumer-side local work. */
 export interface LocalWorkSource {
@@ -167,6 +180,9 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 }
 
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
+	#finalizedContent = new WeakMap<object, AssistantContent>();
+	#openContent = new Map<number, AssistantContent>();
+
 	constructor() {
 		super(
 			event => event.type === "done" || event.type === "error",
@@ -179,6 +195,65 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 				throw new AIError.ProviderResponseError("Unexpected event type for final result", { kind: "envelope" });
 			},
 		);
+	}
+
+	#snapshotEvent(event: AssistantMessageEvent): AssistantMessageEvent {
+		if (!("partial" in event)) return event;
+
+		const partial = event.partial;
+		const { content, ...metadata } = partial;
+		let contentSnapshot: AssistantContent[];
+
+		if (event.type === "start") {
+			this.#finalizedContent = new WeakMap();
+			this.#openContent.clear();
+			contentSnapshot = content.map((block, index) => {
+				this.#openContent.set(index, block);
+				return snapshotContent(block);
+			});
+		} else {
+			const contentIndex = event.contentIndex;
+			contentSnapshot = content.map((block, index) => {
+				if (this.#openContent.get(index) !== block) this.#openContent.delete(index);
+				const finalized = this.#finalizedContent.get(block);
+				if (finalized) return finalized;
+				if (index === contentIndex) this.#openContent.set(index, block);
+				return snapshotContent(block);
+			});
+
+			const source = content[contentIndex];
+			if (
+				source &&
+				(event.type === "text_end" ||
+					event.type === "thinking_end" ||
+					event.type === "image_end" ||
+					event.type === "toolcall_end")
+			) {
+				this.#finalizedContent.set(source, contentSnapshot[contentIndex]!);
+				this.#openContent.delete(contentIndex);
+			}
+		}
+
+		const snapshot: AssistantMessage = {
+			...structuredClone(metadata),
+			content: contentSnapshot,
+		};
+
+		if (event.type === "image_end") {
+			const image =
+				event.content === partial.content[event.contentIndex]
+					? (snapshot.content[event.contentIndex] as typeof event.content)
+					: structuredClone(event.content);
+			return { ...event, content: image, partial: snapshot };
+		}
+		if (event.type === "toolcall_end") {
+			const toolCall =
+				event.toolCall === partial.content[event.contentIndex]
+					? (snapshot.content[event.contentIndex] as typeof event.toolCall)
+					: (snapshotContent(event.toolCall) as typeof event.toolCall);
+			return { ...event, toolCall, partial: snapshot };
+		}
+		return { ...event, partial: snapshot };
 	}
 
 	override push(event: AssistantMessageEvent): void {
@@ -195,7 +270,7 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 			this.resolveFinalResult(this.extractResult(event));
 		}
 
-		this.deliver(event);
+		this.deliver(this.#snapshotEvent(event));
 	}
 
 	override end(result?: AssistantMessage): void {

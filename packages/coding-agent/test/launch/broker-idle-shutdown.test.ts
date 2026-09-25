@@ -7,10 +7,12 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as net from "node:net";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient } from "../../src/launch/client";
 import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
+import { daemonBrokerEndpoint } from "../../src/launch/paths";
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) delete process.env[name];
@@ -72,6 +74,84 @@ describe("daemon broker idle shutdown", () => {
 			await broker;
 		} finally {
 			process.title = previousTitle;
+		}
+	}, 30_000);
+
+	it("keeps a pending client handshake alive past idle grace", async () => {
+		using tempDir = TempDir.createSync("@omp-launch-handshake-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+
+		const previousTitle = process.title;
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 100 });
+		const token = (await fs.readFile(path.join(runtimeDir, "broker.token"), "utf8")).trim();
+		const broker = startBroker(projectDir, runtimeDir, 100);
+		await client.request({ op: "ping" });
+		const socket = net.createConnection({ path: daemonBrokerEndpoint(projectDir, runtimeDir) });
+		try {
+			const connected = Promise.withResolvers<void>();
+			socket.once("connect", connected.resolve);
+			socket.once("error", connected.reject);
+			await connected.promise;
+			client.close();
+			// This race requires the real broker timer to elapse while the accepted socket stays open.
+			const idleGraceElapsed = Promise.withResolvers<void>();
+			setTimeout(idleGraceElapsed.resolve, 150);
+			await idleGraceElapsed.promise;
+			if (socket.destroyed) throw new Error("Broker closed before authenticating the pending request");
+
+			const response = Promise.withResolvers<{ ok: boolean; result?: { op: string } }>();
+			let buffer = "";
+			const onData = (chunk: Buffer): void => {
+				buffer += chunk.toString("utf8");
+				const newline = buffer.indexOf("\n");
+				if (newline < 0) return;
+				socket.off("data", onData);
+				socket.off("error", onError);
+				socket.off("close", onClose);
+				try {
+					response.resolve(JSON.parse(buffer.slice(0, newline)));
+				} catch (error) {
+					response.reject(error);
+				}
+			};
+			const onError = (error: Error): void => {
+				socket.off("data", onData);
+				socket.off("close", onClose);
+				response.reject(error);
+			};
+			const onClose = (): void => {
+				socket.off("data", onData);
+				socket.off("error", onError);
+				response.reject(new Error("Broker closed before authenticating the pending request"));
+			};
+			socket.on("data", onData);
+			socket.once("error", onError);
+			socket.once("close", onClose);
+
+			socket.write(
+				`${JSON.stringify({
+					id: "pending-handshake",
+					token,
+					owners: [],
+					detachedOwners: [],
+					completionEvents: true,
+					completionSubscriptionId: "pending-handshake",
+					completionUnsubscribes: [],
+					completionReplays: [],
+					operation: { op: "ping" },
+				})}\n`,
+			);
+			expect(await response.promise).toMatchObject({ ok: true, result: { op: "ping" } });
+		} finally {
+			socket.destroy();
+			client.close();
+			try {
+				await broker;
+			} finally {
+				process.title = previousTitle;
+			}
 		}
 	}, 30_000);
 });

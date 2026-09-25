@@ -418,7 +418,7 @@ describe("OpenAI Responses transient stream retry", () => {
 		const deltaText = { type: "text", text: "draft", textSignature: JSON.stringify({ v: 1, id: "msg_live" }) };
 		expect(observedBeforeTerminal).toEqual([
 			{ type: "start", content: undefined },
-			{ type: "text_start", content: [deltaText] },
+			{ type: "text_start", content: [{ ...deltaText, text: "" }] },
 			{ type: "text_delta", content: [deltaText] },
 			{ type: "text_end", content: [deltaText] },
 			{

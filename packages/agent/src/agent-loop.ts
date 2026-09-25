@@ -2071,10 +2071,6 @@ async function streamAssistantResponse(
 						return await finishAbortedStream();
 					}
 
-					// Yield to the event loop periodically to prevent busy-wait
-					// when the LLM is streaming chunks faster than the loop can rest.
-					await yieldIfDue();
-
 					if (event.type === "toolcall_start") {
 						const block = event.partial.content[event.contentIndex];
 						if (block?.type === "toolCall") {

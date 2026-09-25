@@ -202,7 +202,7 @@ describe("EvalTool display() text surfacing", () => {
 
 		expect(Buffer.byteLength(JSON.stringify(result.details), "utf-8")).toBeLessThan(20_000);
 		expect(await Bun.file(artifactPath).text()).toContain(huge);
-		expect(result.details?.meta?.truncation?.artifactId).toBe("large-display");
+		expect(result.details?.meta?.limits?.columnTruncated?.artifactId).toBe("large-display");
 	});
 
 	it("retains the full display value in details when no artifact is available", async () => {

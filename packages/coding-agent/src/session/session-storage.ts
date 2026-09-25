@@ -15,6 +15,8 @@ const utf8Decoder = new TextDecoder("utf-8");
 
 export interface SessionStorageStat {
 	size: number;
+	dev?: number;
+	ino?: number;
 	mtimeMs: number;
 	mtime: Date;
 }
@@ -54,6 +56,7 @@ export interface SessionStorageWriter {
 export interface SessionStorageWriteOptions {
 	/** Current UTF-8 byte length, or `null` when the target must not exist. */
 	expectedSize?: number | null;
+	expectedIdentity?: { dev: number; ino: number };
 }
 
 /**
@@ -389,17 +392,22 @@ function isPidAlive(pid: number): boolean {
 }
 
 export class FileSessionStorage implements SessionStorage {
-	#assertExpectedSize(fpath: string, expectedSize: number | null | undefined): void {
-		if (expectedSize === undefined) return;
-		let actualSize: number | null;
+	#assertExpectedSize(fpath: string, options?: SessionStorageWriteOptions): void {
+		if (options?.expectedSize === undefined && !options?.expectedIdentity) return;
+		let actual: fs.Stats | undefined;
 		try {
-			actualSize = fs.statSync(fpath).size;
+			actual = fs.statSync(fpath);
 		} catch (error) {
 			if (!isEnoent(error)) throw error;
-			actualSize = null;
 		}
-		if (actualSize !== expectedSize) {
-			throw new SessionWriteConflictError(fpath, expectedSize, actualSize);
+		if (options?.expectedSize !== undefined && (actual?.size ?? null) !== options.expectedSize) {
+			throw new SessionWriteConflictError(fpath, options.expectedSize, actual?.size ?? null);
+		}
+		if (
+			options?.expectedIdentity &&
+			(!actual || actual.dev !== options.expectedIdentity.dev || actual.ino !== options.expectedIdentity.ino)
+		) {
+			throw new Error(`Session file identity changed before rewrite: ${fpath}`);
 		}
 	}
 
@@ -615,7 +623,7 @@ export class FileSessionStorage implements SessionStorage {
 		// append between the size check and the rename.
 		try {
 			this.#withPublishLock(fpath, () => {
-				this.#assertExpectedSize(fpath, options?.expectedSize);
+				this.#assertExpectedSize(fpath, options);
 				try {
 					this.renameSync(tempPath, fpath);
 				} catch (err) {
@@ -650,7 +658,7 @@ export class FileSessionStorage implements SessionStorage {
 
 	statSync(path: string): SessionStorageStat {
 		const stats = fs.statSync(path);
-		return { size: stats.size, mtimeMs: stats.mtimeMs, mtime: stats.mtime };
+		return { size: stats.size, dev: stats.dev, ino: stats.ino, mtimeMs: stats.mtimeMs, mtime: stats.mtime };
 	}
 
 	listFilesSync(dir: string, pattern: string): string[] {
@@ -721,7 +729,7 @@ export class FileSessionStorage implements SessionStorage {
 			// its EPERM fallback): a cooperating appender or rewrite cannot
 			// interleave, and appenders re-open a replaced path before writing.
 			this.#withPublishLock(fpath, () => {
-				this.#assertExpectedSize(fpath, options?.expectedSize);
+				this.#assertExpectedSize(fpath, options);
 				try {
 					this.renameSync(tempPath, fpath);
 					return;

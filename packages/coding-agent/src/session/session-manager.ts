@@ -141,6 +141,36 @@ async function movePath(source: string, destination: string, recursive: boolean)
 	}
 }
 
+function moveSessionFileWithoutReplacing(
+	source: string,
+	destination: string,
+	expectedSourceIdentity: { dev: number; ino: number },
+): { dev: number; ino: number } {
+	const identity = fs.lstatSync(source);
+	if (identity.dev !== expectedSourceIdentity.dev || identity.ino !== expectedSourceIdentity.ino) {
+		throw new Error("Relocating session source identity changed");
+	}
+	fs.linkSync(source, destination);
+	try {
+		const current = fs.lstatSync(source);
+		if (current.dev !== expectedSourceIdentity.dev || current.ino !== expectedSourceIdentity.ino) {
+			throw new Error("Relocating session source identity changed");
+		}
+		fs.unlinkSync(source);
+	} catch (error) {
+		try {
+			const published = fs.lstatSync(destination, { throwIfNoEntry: false });
+			if (published?.dev === identity.dev && published.ino === identity.ino) {
+				fs.unlinkSync(destination);
+			}
+		} catch (rollbackError) {
+			throw new AggregateError([error, rollbackError], "Failed to remove session source and rollback publication");
+		}
+		throw error;
+	}
+	return { dev: identity.dev, ino: identity.ino };
+}
+
 /** Copy a session's artifact directory to another session, matching interactive `/fork`. */
 export async function copySessionArtifacts(sourceSessionFile: string, destinationSessionFile: string): Promise<void> {
 	const sourceArtifactsDir = artifactsDirectoryFor(sourceSessionFile);
@@ -753,10 +783,17 @@ export class SessionManager {
 	/**
 	 * Active {@link moveTo} relocation. Concurrent completed appends write a
 	 * full body to the live path: source while it still exists, destination
-	 * once rename has landed (source gone). Never recreates a vacated source.
+	 * once publication releases the source. Never recreates a vacated source.
 	 * `null` outside an active relocation.
 	 */
-	#sessionFileRelocating: { source: string; dest: string; copying?: boolean } | null = null;
+	#sessionFileRelocating: {
+		source: string;
+		dest: string;
+		destIdentity?: { dev: number; ino: number };
+		sourceIdentity?: { dev: number; ino: number };
+		copying?: boolean;
+		sourceSizesDuringCopy?: Set<number>;
+	} | null = null;
 	/** Atomic entry batch currently staged for a full-file commit. */
 	#atomicEntryBatch: AtomicEntryBatch | undefined;
 
@@ -1047,20 +1084,41 @@ export class SessionManager {
 		return this.#forceFileCreation || this.#fileIsCurrent || this.#historyContainsAssistantMessage();
 	}
 
-	/**
-	 * Live path for concurrent completed appends during {@link moveTo}.
-	 * Prefers destination once rename has landed (source gone); otherwise
-	 * source. Never invents a path that does not already exist.
-	 */
+	#relocationIdentity(file: string): { dev: number; ino: number } {
+		const { dev, ino } = this.#storage.statSync(file);
+		if (dev === undefined || ino === undefined) throw new Error("Relocating session file identity is unavailable");
+		return { dev, ino };
+	}
+
 	#liveRelocationWritePath(): string | null {
 		const relocating = this.#sessionFileRelocating;
 		if (!relocating) return null;
-		if (relocating.copying && this.#storage.existsSync(relocating.source)) return relocating.source;
-		if (this.#storage.existsSync(relocating.dest)) return relocating.dest;
-		if (this.#storage.existsSync(relocating.source)) return relocating.source;
-		// Rename in flight with neither path visible (rare cross-device edge):
-		// fall back to destination so we do not recreate a vacated source.
-		return relocating.dest;
+		if (relocating.destIdentity) {
+			const actual = this.#relocationIdentity(relocating.dest);
+			if (actual.dev !== relocating.destIdentity.dev || actual.ino !== relocating.destIdentity.ino) {
+				throw new Error("Relocating session destination identity changed");
+			}
+			return relocating.dest;
+		}
+		if (this.#storage.existsSync(relocating.source)) {
+			const actual = this.#relocationIdentity(relocating.source);
+			if (
+				!relocating.sourceIdentity ||
+				actual.dev !== relocating.sourceIdentity.dev ||
+				actual.ino !== relocating.sourceIdentity.ino
+			) {
+				throw new Error("Relocating session source identity changed");
+			}
+			return relocating.source;
+		}
+		if (this.#storage.existsSync(relocating.dest) && relocating.sourceIdentity) {
+			const actual = this.#relocationIdentity(relocating.dest);
+			if (actual.dev === relocating.sourceIdentity.dev && actual.ino === relocating.sourceIdentity.ino) {
+				relocating.destIdentity = actual;
+				return relocating.dest;
+			}
+		}
+		throw new Error("Relocating session file has no confirmed write target");
 	}
 
 	/**
@@ -1068,16 +1126,16 @@ export class SessionManager {
 	 * writer; the next append re-opens one. `writeTextSync` returns with the
 	 * bytes in the kernel page cache, so the file is software-crash durable.
 	 *
-	 * During {@link moveTo}, writes to the live relocation path (source pre-
-	 * rename, destination post-rename) rather than always `#sessionFile`, so
+	 * During {@link moveTo}, writes to the live relocation path (source before
+	 * publication, destination after release) rather than always `#sessionFile`, so
 	 * concurrent completed entries are durable without recreating a vacated source.
 	 */
 	#rewriteSynchronously(): void {
 		if (this.#released) return;
 		if (!this.#persist || !this.#shouldHaveSessionFile()) return;
-		const targetPath = this.#liveRelocationWritePath() ?? this.#sessionFile;
-		if (!targetPath) return;
 		try {
+			const targetPath = this.#liveRelocationWritePath() ?? this.#sessionFile;
+			if (!targetPath) return;
 			const body = this.#fileBody();
 			this.#diskEpoch++;
 			this.#diskTail = Promise.resolve();
@@ -1087,9 +1145,30 @@ export class SessionManager {
 					? this.#storage.statSync(targetPath).size
 					: null
 				: this.#expectedDiskSize;
-			this.#storage.writeTextSync(targetPath, body, { expectedSize });
+			this.#storage.writeTextSync(targetPath, body, {
+				expectedSize,
+				expectedIdentity: this.#sessionFileRelocating
+					? targetPath === this.#sessionFileRelocating.dest
+						? this.#sessionFileRelocating.destIdentity
+						: this.#sessionFileRelocating.sourceIdentity
+					: undefined,
+			});
 			const deferred = this.#storage.defersSyncPublish === true;
-			if (!deferred) this.#expectedDiskSize = Buffer.byteLength(body, "utf8");
+			if (!deferred) {
+				this.#expectedDiskSize = Buffer.byteLength(body, "utf8");
+				this.#sessionFileRelocating?.sourceSizesDuringCopy?.add(this.#expectedDiskSize);
+			}
+			if (this.#sessionFileRelocating && !deferred) {
+				const identity = this.#relocationIdentity(targetPath);
+				if (targetPath === this.#sessionFileRelocating.source) {
+					this.#sessionFileRelocating.sourceIdentity = Object.assign(
+						this.#sessionFileRelocating.sourceIdentity ?? {},
+						identity,
+					);
+				} else {
+					this.#sessionFileRelocating.destIdentity = identity;
+				}
+			}
 			this.#clearDiskError();
 			// Only mark the manager current when writing the active session path.
 			// Mid-move writes update the live relocation path; `#sessionFile` is
@@ -1129,7 +1208,6 @@ export class SessionManager {
 			async () => {
 				if (await this.#runFencedAtomicRewrite(startEpoch)) {
 					const deferred = this.#storage.defersSyncPublish === true;
-					if (!deferred) this.#expectedDiskSize = Buffer.byteLength(this.#fileBody(), "utf8");
 					this.#fileIsCurrent = !deferred;
 					this.#materializeBreadcrumb();
 					this.#rewriteRequired = deferred;
@@ -1180,10 +1258,26 @@ export class SessionManager {
 					: this.#expectedDiskSize;
 				await this.#storage.writeTextAtomic(sessionFile, body, {
 					expectedSize,
+					expectedIdentity: this.#sessionFileRelocating
+						? sessionFile === this.#sessionFileRelocating.source
+							? this.#sessionFileRelocating.sourceIdentity
+							: this.#sessionFileRelocating.destIdentity
+						: undefined,
 					commitGuard: () => !this.#released && this.#diskEpoch === epoch,
 				});
 				if (this.#diskEpoch !== epoch) return false;
 				if (!this.#storage.defersSyncPublish) this.#expectedDiskSize = Buffer.byteLength(body, "utf8");
+				if (this.#sessionFileRelocating && !this.#storage.defersSyncPublish) {
+					const identity = this.#relocationIdentity(sessionFile);
+					if (sessionFile === this.#sessionFileRelocating.source) {
+						this.#sessionFileRelocating.sourceIdentity = Object.assign(
+							this.#sessionFileRelocating.sourceIdentity ?? {},
+							identity,
+						);
+					} else {
+						this.#sessionFileRelocating.destIdentity = identity;
+					}
+				}
 			} while (this.#atomicRewriteDirty);
 			return true;
 		} finally {
@@ -1223,8 +1317,8 @@ export class SessionManager {
 
 		// Atomic replacement / move window: do not open a fresh append writer that
 		// a Windows EPERM replace could detach from the current JSONL path.
-		// - moveTo: write a full body to the live relocation path (source pre-
-		//   rename, destination post-rename) so completed entries are durable
+		// - moveTo: write a full body to the live relocation path (source before
+		//   publication, destination after release) so completed entries are durable
 		//   without recreating a vacated source.
 		// - in-place atomic fence: supersede the pending publish with a
 		//   synchronous full-body rewrite; bumping `#diskEpoch` abandons the
@@ -1606,11 +1700,13 @@ export class SessionManager {
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
 
+		const expectedDiskSize =
+			this.#sessionFile === snapshot.sessionFile ? this.#expectedDiskSize : snapshot.expectedDiskSize;
 		this.#cwd = snapshot.cwd;
 		this.#sessionDir = snapshot.sessionDir;
 		this.#sessionFile = snapshot.sessionFile;
 		this.#fileIsCurrent = snapshot.onDisk;
-		this.#expectedDiskSize = snapshot.expectedDiskSize;
+		this.#expectedDiskSize = expectedDiskSize;
 		this.#rewriteRequired = snapshot.needsRewrite;
 		this.#forceFileCreation = snapshot.onDisk;
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
@@ -1636,7 +1732,7 @@ export class SessionManager {
 	 * header is persisted after relocation so a fresh open of the source
 	 * session sees the pre-move metadata, including workspace roots the move
 	 * filtered out. Rollbacks must not re-enter forward-move hooks, so this
-	 * bypasses AgentSession entirely. If the rename-back itself fails, the
+	 * bypasses AgentSession entirely. If the inverse relocation itself fails, the
 	 * manager stays pointed at the actual moved file (restoring the snapshot
 	 * would split the transcript across a recreated source and the stranded
 	 * target) and the error names where the session file actually lives.
@@ -1835,15 +1931,15 @@ export class SessionManager {
 		}
 
 		let sessionFileExisted = false;
-		// Track source+dest for concurrent completed appends during relocation
-		// (see `#sessionFileRelocating`). Existence of either path decides the
-		// live write target — not a `#diskEpoch` bump, which would cancel any
-		// disk task already queued at the current epoch (e.g. a header-only
-		// `ensureOnDisk()` materializing rewrite) before the drain below runs it.
 		if (this.#persist && this.#sessionFile) {
 			const source = this.#sessionFile;
 			const dest = path.join(nextSessionDir, path.basename(source));
-			this.#sessionFileRelocating = { source, dest };
+			const sourceIdentity = this.#storage.existsSync(source) ? this.#relocationIdentity(source) : undefined;
+			this.#sessionFileRelocating = {
+				source,
+				dest,
+				sourceIdentity,
+			};
 		}
 
 		try {
@@ -1862,18 +1958,44 @@ export class SessionManager {
 					newArtifactsDir !== null &&
 					path.resolve(oldArtifactsDir) !== path.resolve(newArtifactsDir);
 				sessionFileExisted = this.#storage.existsSync(oldSessionFile);
+				if (sessionFileExisted && this.#sessionFileRelocating) {
+					const owned = this.#sessionFileRelocating.sourceIdentity;
+					const current = this.#relocationIdentity(oldSessionFile);
+					if (!owned || owned.dev !== current.dev || owned.ino !== current.ino) {
+						throw new Error("Relocating session source identity changed");
+					}
+				}
+				if (!sessionFileExisted) this.#expectedDiskSize = null;
 
 				let sessionMoved = false;
 				let artifactsMoved = false;
 
 				try {
 					if (sessionFileExisted && sessionPathChanged) {
+						const owned = this.#sessionFileRelocating?.sourceIdentity;
+						if (!owned) throw new Error("Relocating session source identity changed");
 						try {
-							await fs.promises.rename(oldSessionFile, newSessionFile);
+							const published = moveSessionFileWithoutReplacing(oldSessionFile, newSessionFile, owned);
+							if (this.#sessionFileRelocating) this.#sessionFileRelocating.destIdentity = published;
 						} catch (error) {
 							if (!isFsError(error) || error.code !== "EXDEV") throw error;
-							if (this.#sessionFileRelocating) this.#sessionFileRelocating.copying = true;
-							await moveFileAcrossDevices(oldSessionFile, newSessionFile);
+							const relocating = this.#sessionFileRelocating;
+							if (relocating) {
+								relocating.copying = true;
+								relocating.sourceSizesDuringCopy = new Set<number>();
+								if (this.#expectedDiskSize !== null) {
+									relocating.sourceSizesDuringCopy.add(this.#expectedDiskSize);
+								}
+							}
+							await moveFileAcrossDevices(oldSessionFile, newSessionFile, owned, identity => {
+								if (relocating) relocating.destIdentity = identity;
+							});
+							if (relocating?.sourceSizesDuringCopy) {
+								const copiedSize = this.#storage.statSync(newSessionFile).size;
+								if (relocating.sourceSizesDuringCopy.has(copiedSize)) {
+									this.#expectedDiskSize = copiedSize;
+								}
+							}
 						}
 						sessionMoved = true;
 					}
@@ -1889,6 +2011,13 @@ export class SessionManager {
 							if (!isEnoent(err)) throw err;
 						}
 					}
+					if (sessionMoved) {
+						const owned = this.#sessionFileRelocating?.destIdentity;
+						const current = this.#relocationIdentity(newSessionFile);
+						if (!owned || owned.dev !== current.dev || owned.ino !== current.ino) {
+							throw new Error("Relocating session destination identity changed");
+						}
+					}
 				} catch (err) {
 					if (artifactsMoved && oldArtifactsDir && newArtifactsDir) {
 						try {
@@ -1902,11 +2031,16 @@ export class SessionManager {
 
 					if (sessionMoved) {
 						try {
+							const owned = this.#sessionFileRelocating?.destIdentity;
+							const current = this.#relocationIdentity(newSessionFile);
+							if (!owned || owned.dev !== current.dev || owned.ino !== current.ino) {
+								throw new Error("Relocating session destination identity changed before rollback");
+							}
 							try {
-								await fs.promises.rename(newSessionFile, oldSessionFile);
+								moveSessionFileWithoutReplacing(newSessionFile, oldSessionFile, owned);
 							} catch (error) {
 								if (!isFsError(error) || error.code !== "EXDEV") throw error;
-								await moveFileAcrossDevices(newSessionFile, oldSessionFile);
+								await moveFileAcrossDevices(newSessionFile, oldSessionFile, owned);
 							}
 						} catch (rollbackErr) {
 							throw new Error(
@@ -1927,14 +2061,12 @@ export class SessionManager {
 				this.#sessionFile = newSessionFile;
 				this.#artifactManager = null;
 				this.#artifactManagerSessionFile = null;
-				// Path is repointed; hot-path appends may use `#sessionFile` again.
-				this.#sessionFileRelocating = null;
 			}
 
 			this.#cwd = resolvedCwd;
 			this.#sessionDir = nextSessionDir;
 			this.#header.cwd = resolvedCwd;
-			// Clear only after the rename has landed. If the move threw,
+			// Clear only after publication has landed. If the move threw,
 			// keep the flag so the next relocation retries.
 			this.#fallbackRuntimeOnly = false;
 			if (this.#additionalDirectories.length === 0) {

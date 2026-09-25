@@ -57,6 +57,7 @@ interface FakeAcpBuiltinSession {
 	setTodoPhases(phases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>): void;
 	refreshBaseSystemPrompt(): Promise<void>;
 	getHindsightSessionState(): undefined;
+	memoryBackendEnabled(): boolean;
 	applyMemoryBackend(): Promise<void>;
 	getToolByName(name: string): unknown;
 	compact(args?: string): Promise<void>;
@@ -148,6 +149,7 @@ function createRuntime() {
 		async refreshBaseSystemPrompt() {},
 		// Headless `/move` and `/wt` rebind memory for the destination project.
 		getHindsightSessionState: () => undefined,
+		memoryBackendEnabled: () => false,
 		async applyMemoryBackend() {},
 		getAsyncJobSnapshot: () => null,
 		formatSessionAsText: () => "",

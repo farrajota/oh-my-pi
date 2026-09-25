@@ -495,6 +495,7 @@ describe("AgentSession synthetic follow-up marking", () => {
 	});
 	it("persists a user-attributed custom prompt with its original submission timestamp", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let providerCompletedAt: number | undefined;
 		const mock = createMockModel({
 			// Real provider delay: the session's internal settle timers use the
 			// platform clock, so fake timers would freeze both the submission and
@@ -502,6 +503,7 @@ describe("AgentSession synthetic follow-up marking", () => {
 			// way to separate the two and prove the entry carries the submission.
 			handler: async () => {
 				await Bun.sleep(150);
+				providerCompletedAt = Date.now();
 				return { content: ["Done"] };
 			},
 		});
@@ -524,7 +526,6 @@ describe("AgentSession synthetic follow-up marking", () => {
 				emitSessionStop: vi.fn(async () => undefined),
 			} as unknown as ExtensionRunner,
 		});
-		const submittedAt = Date.now();
 		try {
 			await session.promptCustomMessage({
 				customType: "collab-prompt",
@@ -537,7 +538,8 @@ describe("AgentSession synthetic follow-up marking", () => {
 			expect(entry).toBeDefined();
 			const entryMs = new Date((entry as { timestamp: string }).timestamp).getTime();
 			// The entry carries the submission instant, not the post-run emission.
-			expect(entryMs - submittedAt).toBeLessThan(50);
+			if (providerCompletedAt === undefined) throw new Error("Mock provider did not complete");
+			expect(entryMs).toBeLessThan(providerCompletedAt);
 		} finally {
 			await session.dispose();
 		}

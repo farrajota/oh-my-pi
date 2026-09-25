@@ -36,6 +36,7 @@ import { resolveDaemonSpawnOptions } from "./spawn-options";
 import { renderTerminalOutput } from "./terminal-output";
 
 const DEFAULT_IDLE_GRACE_MS = 3_000;
+const CLIENT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_LOG_BYTES = 25 * 1024 * 1024;
 const LOG_READ_BYTES = 2 * 1024 * 1024;
@@ -478,7 +479,12 @@ class DaemonBroker {
 
 	#accept(socket: net.Socket): void {
 		this.#sockets.add(socket);
+		clearTimeout(this.#idleTimer);
+		this.#idleTimer = undefined;
 		let authenticated = false;
+		const authenticationTimer = setTimeout(() => {
+			if (!authenticated) socket.destroy();
+		}, CLIENT_HANDSHAKE_TIMEOUT_MS);
 		let buffer = "";
 		socket.setEncoding("utf8");
 		socket.on("data", chunk => {
@@ -496,6 +502,7 @@ class DaemonBroker {
 				void this.#handleLine(socket, line, () => {
 					if (authenticated) return;
 					authenticated = true;
+					clearTimeout(authenticationTimer);
 					this.#clients.add(socket);
 					clearTimeout(this.#idleTimer);
 					this.#idleTimer = undefined;
@@ -506,8 +513,12 @@ class DaemonBroker {
 			// Socket closure performs client accounting.
 		});
 		socket.on("close", () => {
+			clearTimeout(authenticationTimer);
 			this.#sockets.delete(socket);
-			if (!authenticated) return;
+			if (!authenticated) {
+				this.#scheduleIdleShutdown();
+				return;
+			}
 			this.#clients.delete(socket);
 			this.#scheduleIdleShutdown();
 			for (const [owner, registration] of this.#ownerSockets) {
@@ -1419,7 +1430,7 @@ class DaemonBroker {
 	}
 
 	#scheduleIdleShutdown(): void {
-		if (this.#shuttingDown || this.#clients.size > 0) return;
+		if (this.#shuttingDown || this.#sockets.size > 0) return;
 		clearTimeout(this.#idleTimer);
 		this.#idleTimer = setTimeout(() => {
 			this.#idleTimer = undefined;
@@ -1427,12 +1438,12 @@ class DaemonBroker {
 				const livePersistent = [...this.#records.values()].some(
 					record => record.spec.persist && !terminalState(record.snapshot.state),
 				);
-				if (this.#clients.size > 0 || livePersistent) return;
+				if (this.#sockets.size > 0 || livePersistent) return;
 				if (await hasLiveDaemonProjectPresence(this.#runtimeDir)) {
 					this.#scheduleIdleShutdown();
 					return;
 				}
-				if (this.#clients.size === 0) await this.shutdown();
+				if (this.#sockets.size === 0 && this.#idleTimer === undefined) await this.shutdown();
 			})();
 		}, this.#idleGraceMs);
 	}

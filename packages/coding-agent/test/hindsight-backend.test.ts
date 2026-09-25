@@ -33,6 +33,9 @@ function makeFakeSession(deps: FakeSessionDeps) {
 	const session = {
 		sessionId: deps.sessionId,
 		memoryEnabled: true,
+		memoryBackendEnabled() {
+			return this.memoryEnabled;
+		},
 		settings: deps.settings ?? Settings.isolated(),
 		sessionManager: {
 			getEntries: () =>

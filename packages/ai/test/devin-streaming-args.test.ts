@@ -79,8 +79,8 @@ describe("streamDevin args streaming", () => {
 		const result = await stream.result();
 
 		expect(snapshots[0]).toEqual({ agent: "task", note: "initial" });
-		expect(snapshots[1]).toBe(snapshots[0]);
-		expect(snapshots[2]).toBe(snapshots[0]);
+		expect(snapshots[1]).toEqual(snapshots[0]);
+		expect(snapshots[2]).toEqual(snapshots[0]);
 		expect(result.content[0]?.type).toBe("toolCall");
 		expect((result.content[0] as ToolCall).arguments).toEqual({ agent: "task", note: "initial", step: 12 });
 	});
