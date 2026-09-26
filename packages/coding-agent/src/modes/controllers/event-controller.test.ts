@@ -30,7 +30,11 @@ function source(streaming = false, activeRunStartedAt: number | undefined = 1_00
 	return {
 		activeRunStartedAt,
 		isStreaming: streaming,
-		agent: { state: { isStreaming: streaming }, tokenizer: { countMessage: () => 0 } },
+		agent: {
+			state: { isStreaming: streaming },
+			tokenizer: { countMessage: () => 0 },
+			getPendingToolResults: () => [],
+		},
 	} as unknown as AgentSession;
 }
 
@@ -40,6 +44,7 @@ type StreamingComponentDouble = {
 	updateContent(): void;
 	markTranscriptBlockFinalized(): void;
 	setCompletionFooter(): void;
+	setServedModelMismatch(): void;
 };
 
 function createStreamingComponent() {
@@ -52,6 +57,7 @@ function createStreamingComponent() {
 			transcriptBlockFinalized = true;
 		},
 		setCompletionFooter() {},
+		setServedModelMismatch() {},
 	};
 }
 
@@ -122,6 +128,7 @@ function createContext(viewSession = source()) {
 			disposeChildren: () => calls.statusDisposeChildren++,
 		},
 		retryLoader: undefined,
+		servedModelTracker: { check: () => undefined },
 		streamingComponent: undefined,
 		streamingMessage: undefined,
 		pendingTools: new Map(),

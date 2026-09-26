@@ -168,7 +168,12 @@ afterAll(async () => {
 	// Restore the real transport first so the global is clean even if stop() throws;
 	// the host's socket holds its own FakeWebSocket/relay refs, so teardown still works.
 	uninstallInMemoryRelay();
-	await host.stop("test done");
+	try {
+		await host.stop("test done");
+	} finally {
+		// Aborted tombstones intentionally remain registered after host teardown.
+		AgentRegistry.resetGlobalForTests();
+	}
 });
 
 describe("collab read-only links", () => {
