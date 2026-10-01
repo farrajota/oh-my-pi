@@ -864,6 +864,32 @@ export const cfgBareSlashCommands = register({
 	},
 });
 
+// Read by the omp-prompt-suggestions extension (.omp/agent/extensions) through the package entry point.
+export const cfgPromptSuggestionsEnabled = register({
+	id: "promptSuggestions.enabled",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "interaction",
+		group: "Input",
+		label: "Prompt Suggestions",
+		description: "Show context-aware next-prompt ghost suggestions after agent responses",
+	},
+});
+
+export const cfgPromptSuggestionsModel = register({
+	id: "promptSuggestions.model",
+	type: "string",
+	default: "pi/smol",
+	ui: {
+		tab: "interaction",
+		group: "Input",
+		label: "Prompt Suggestions Model",
+		description:
+			"Model or role used to generate next-prompt suggestions (smol/default/slow, pi/<role>, or provider/model)",
+	},
+});
+
 export const cfgTreeFilterMode = register({
 	id: "treeFilterMode",
 	type: "enum",

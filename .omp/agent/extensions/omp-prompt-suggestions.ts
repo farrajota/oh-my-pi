@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	CustomEditor,
+	cfgPromptSuggestionsEnabled,
+	cfgPromptSuggestionsModel,
 	convertToLlm,
 	getAgentDir,
 	settings,
@@ -61,7 +63,6 @@ interface PromptSuggestionsConfig {
 }
 
 type PromptSuggestionsConfigInput = Partial<PromptSuggestionsConfig>;
-type PromptSuggestionSettingPath = "promptSuggestions.enabled" | "promptSuggestions.model";
 
 let cachedSuggestion: string | undefined;
 let visibleSuggestion: string | undefined;
@@ -180,17 +181,8 @@ export default function ompPromptSuggestions(pi: ExtensionAPI): void {
 	});
 }
 
-function readPromptSuggestionSetting(path: PromptSuggestionSettingPath, fallback: unknown): unknown {
-	try {
-		return settings.get(path as never);
-	} catch (error) {
-		if (error instanceof TypeError && String(error.message).includes("segments")) return fallback;
-		throw error;
-	}
-}
-
 function isPromptSuggestionsEnabled(): boolean {
-	return readPromptSuggestionSetting("promptSuggestions.enabled", true) !== false;
+	return cfgPromptSuggestionsEnabled.get(settings);
 }
 
 function resetSuggestion(ctx = lastCtx): void {
@@ -621,9 +613,8 @@ function mergeConfigInputs(...configs: PromptSuggestionsConfigInput[]): PromptSu
 }
 
 function getPromptSuggestionModelSpec(): string {
-	const value = readPromptSuggestionSetting("promptSuggestions.model", DEFAULT_SUGGESTION_MODEL);
-	if (typeof value === "string" && value.trim().length > 0) return value.trim();
-	return DEFAULT_SUGGESTION_MODEL;
+	const value = cfgPromptSuggestionsModel.get(settings).trim();
+	return value.length > 0 ? value : DEFAULT_SUGGESTION_MODEL;
 }
 
 function normalizeSuggestionModelSpec(spec: string): string {
@@ -700,7 +691,6 @@ export const __test__ = {
 	isPrintableOrMutatingEditKey,
 	isPromptSuggestionsEnabled,
 	loadConfig,
-	readPromptSuggestionSetting,
 	loadSuggestionSystemPrompt,
 	mergeConfigInputs,
 	normalizeSuggestionModelSpec,

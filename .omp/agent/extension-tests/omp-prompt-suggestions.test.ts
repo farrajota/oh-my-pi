@@ -89,11 +89,11 @@ mock.module("@oh-my-pi/pi-coding-agent", () => ({
 			if (data.length === 1 && data.charCodeAt(0) >= 32) this.value += data;
 		}
 	},
+	cfgPromptSuggestionsEnabled: { get: () => settingsGetMock("promptSuggestions.enabled") },
+	cfgPromptSuggestionsModel: { get: () => settingsGetMock("promptSuggestions.model") },
 	convertToLlm: (messages: unknown[]) => messages,
 	getAgentDir: () => testAgentDir,
-	settings: {
-		get: settingsGetMock,
-	},
+	settings: {},
 }));
 
 // Dynamic import is required here because Bun test module mocks must be
@@ -211,7 +211,6 @@ describe("omp prompt suggestions", () => {
 
 	test("defaults use smol suggestion model role", () => {
 		resetTestState();
-		settingsValues.delete("promptSuggestions.model");
 
 		expect(__test__.getPromptSuggestionModelSpec()).toBe("pi/smol");
 		expect(__test__.normalizeSuggestionModelSpec("smol")).toBe("pi/smol");
@@ -219,16 +218,6 @@ describe("omp prompt suggestions", () => {
 		expect(__test__.normalizeSuggestionModelSpec("slow")).toBe("pi/slow");
 		expect(__test__.normalizeSuggestionModelSpec("pi/slow")).toBe("pi/slow");
 		expect(__test__.normalizeSuggestionModelSpec("cliproxy-codex/gpt-5.5")).toBe("cliproxy-codex/gpt-5.5");
-	});
-
-	test("settings getters fall back when schema path segments are missing", () => {
-		resetTestState();
-		settingsGetMock.mockImplementation(() => {
-			throw new TypeError("undefined is not an object (evaluating 'segments')");
-		});
-
-		expect(__test__.isPromptSuggestionsEnabled()).toBe(true);
-		expect(__test__.getPromptSuggestionModelSpec()).toBe("pi/smol");
 	});
 
 	test("settings getters rethrow unrelated settings errors", () => {

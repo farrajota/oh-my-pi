@@ -16,6 +16,7 @@ export * from "./config/prompt-templates";
 export type { SkillsSettings } from "./extensibility/settings";
 export type { RetrySettings } from "./session/settings";
 export { Settings, settings } from "./config/settings";
+export { cfgPromptSuggestionsEnabled, cfgPromptSuggestionsModel } from "./modes/settings";
 // Custom commands
 export type * from "./extensibility/custom-commands/types";
 // Custom tools
