@@ -9,7 +9,7 @@ import type { AgentRegistry } from "../registry/agent-registry";
 import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { CustomMessage } from "../session/messages";
 import type { ToolSession } from "../tools";
-import { isIrcEnabled } from "../tools/hub";
+import { isIrcEnabled } from "../irc/messaging";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { runSubagentFollowUpTurn } from "./executor";
 import {
@@ -17,8 +17,11 @@ import {
 	reserveStructuredSubagentId,
 	runStructuredSubagent,
 } from "./structured-subagent";
-import { type AgentProgress, oneLineLabel, type SingleResult, type TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
+import { type AgentProgress, oneLineLabel, type SingleResult, type TaskToolDetails } from "./types";
 import { buildWorkPoolOutputSchema, type WorkPoolYieldItem } from "./workpool-yield";
+
+import { cfgEvalWorkpoolFreshAgents } from "../eval/settings";
+import { cfgTaskMaxConcurrency, cfgTaskMaxRuntimeMs } from "./settings";
 
 /** One user-supplied unit tracked through a workpool batch. */
 export interface WorkPoolItem {
@@ -136,7 +139,7 @@ export class WorkPool {
 		this.policy = options.policy;
 		this.context = options.context;
 		this.customTools = options.customTools ?? [];
-		this.freshAgents = session.settings.get("eval.workpool.freshAgents");
+		this.freshAgents = cfgEvalWorkpoolFreshAgents.get(session.settings);
 		this.agentRegistry = session.agentRegistry;
 		this.agentLifecycle = getAgentLifecycleManager(this.agentRegistry);
 		if (!session.asyncJobManager) {
@@ -149,7 +152,7 @@ export class WorkPool {
 
 	/** Current worker ceiling from the live `task.maxConcurrency` setting. */
 	limit(): number {
-		const configured = this.session.settings.get("task.maxConcurrency");
+		const configured = cfgTaskMaxConcurrency.get(this.session.settings);
 		return configured > 0 ? configured : Infinity;
 	}
 
@@ -415,7 +418,7 @@ export class WorkPool {
 							agentRegistry: this.agentRegistry,
 							agentLifecycle: this.agentLifecycle,
 							artifactsDir: this.session.getSessionFile()?.slice(0, -6),
-							maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
+							maxRuntimeMs: cfgTaskMaxRuntimeMs.get(this.session.settings),
 						});
 					}
 				} catch (error) {

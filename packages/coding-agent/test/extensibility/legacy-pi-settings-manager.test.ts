@@ -4,7 +4,8 @@ import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
-import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { ExtensionRunner, TOP_LEVEL_AGENT } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ExtensionToolWrapper, wrapRegisteredTool } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { SettingsManager } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -266,5 +267,16 @@ describe("legacy pi SettingsManager shim (issue #10397)", () => {
 		} finally {
 			authStorage.close();
 		}
+	});
+});
+
+describe("top-level extension identity", () => {
+	it("uses the default main identity", () => {
+		expect(TOP_LEVEL_AGENT).toEqual({
+			kind: "main",
+			id: MAIN_AGENT_ID,
+			name: "main",
+			depth: 0,
+		});
 	});
 });

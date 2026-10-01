@@ -487,8 +487,18 @@ export class CollabGuestLink {
 		try {
 			await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
 		} catch (err) {
-			for (const block of this.#ctx.pendingTools.values()) block.seal();
-			for (const block of this.#ctx.eventController.takeDisplaceableComponents()) block.seal();
+			// Preserve both sets of live rows across resync rollback: pending tool
+			// blocks were retained above, while displaceable results are tracked by
+			// EventController. A failed initial render restores the previous tree,
+			// so these rows are still visible; seal them without disposing their
+			// renderer children.
+			const orphanedLiveBlocks = [
+				...this.#ctx.pendingTools.values(),
+				...this.#ctx.eventController.takeDisplaceableComponents(),
+			];
+			for (const handle of orphanedLiveBlocks) {
+				handle.seal();
+			}
 			throw err;
 		}
 		if (this.#left) return;

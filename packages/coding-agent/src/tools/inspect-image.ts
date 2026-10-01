@@ -1,3 +1,5 @@
+import { lookup as lookupSetting } from "../config/registry";
+import { cfgImagesQuestionTimeoutMs } from "./settings";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
@@ -150,7 +152,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 		_onUpdate?: AgentToolUpdateCallback<InspectImageToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<InspectImageToolDetails>> {
-		if (this.session.settings.get("images.blockImages")) {
+		if (lookupSetting("images.blockImages")!.get(this.session.settings)) {
 			throw new ToolError(
 				"Image submission is disabled by settings (images.blockImages=true). Disable it to use inspect_image.",
 			);
@@ -205,7 +207,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 		}
 
 		let imageInput: LoadedImageInput | null;
-		const autoResize = this.session.settings.get("images.autoResize");
+		const autoResize = lookupSetting("images.autoResize")!.get(this.session.settings) === true;
 		const excludeWebP = webpExclusionForModel(model);
 		const attachmentReference = parseImageAttachmentReference(params.path);
 		const imageTarget = attachmentReference
@@ -254,7 +256,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 		}
 
 		const telemetry = resolveTelemetry(this.session.getTelemetry?.(), this.session.getSessionId?.() ?? undefined);
-		const timeoutMs = this.session.settings.get("images.questionTimeoutMs");
+		const timeoutMs = cfgImagesQuestionTimeoutMs.get(this.session.settings);
 		const hasTimeout = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0;
 		const timeoutSignal = hasTimeout ? AbortSignal.timeout(timeoutMs) : undefined;
 		const effectiveSignal = timeoutSignal

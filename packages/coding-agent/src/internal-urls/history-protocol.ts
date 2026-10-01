@@ -44,7 +44,35 @@ import {
 	sessionFilesFromContext,
 	sessionFilesFromDisk,
 } from "./registry-helpers";
-import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
+import historyPromptDoc from "../prompts/internal-urls/history.md" with { type: "text" };
+import type {
+	InternalResource,
+	InternalUrl,
+	ProtocolHandler,
+	ResolveContext,
+	SchemeSpec,
+	UrlCompletion,
+} from "./types";
+
+/** Registry lookup for a `history://<id>` URL, bound to the caller's root. */
+interface RefLookup {
+	ref?: AgentRef;
+	/** Registered, non-advisor refs visible to this caller. */
+	visible: AgentRef[];
+	/** Caller root's artifact dir, scanned first by on-disk fallbacks. */
+	preferredArtifactDir?: string;
+	registry: AgentRegistry;
+}
+
+/** True for `history://current/full`; throws unless selectors are the only suffix. */
+function isCurrentFullRoute(url: InternalUrl): boolean {
+	const agentId = url.rawHost || url.hostname;
+	if (agentId.toLowerCase() !== "current" || !url.pathname || url.pathname === "/") return false;
+	if (url.pathname !== "/full" || url.search || url.hash) {
+		throw new Error("Invalid history://current route; use exactly history://current/full (selectors may follow it)");
+	}
+	return true;
+}
 
 /** Humanize a last-activity timestamp as `Ns/Nm/Nh/Nd ago`. */
 function formatAgo(timestamp: number): string {
@@ -269,7 +297,51 @@ export function formatCurrentBranchFullHistory(entries: readonly SessionEntry[])
  */
 export class HistoryProtocolHandler implements ProtocolHandler {
 	readonly scheme = "history";
-	readonly immutable = false;
+	readonly spec: SchemeSpec = { backing: "virtual", selectors: "lines", immutable: false, linkable: true };
+
+	promptDoc(): string {
+		return historyPromptDoc.trim();
+	}
+
+	/**
+	 * The JSONL session file the transcript is rendered from. The index and
+	 * `history://current/full` render from memory, so they locate to null, as
+	 * do live agents without a session file and unknown ids.
+	 */
+	async locate(url: InternalUrl, context?: ResolveContext): Promise<string | null> {
+		if (isCurrentFullRoute(url)) return null;
+		const agentId = url.rawHost || url.hostname;
+		if (!agentId) return null;
+		const { ref, preferredArtifactDir, registry } = await this.#lookup(agentId, context);
+		if (ref?.sessionFile) return ref.sessionFile;
+		if (ref && lookupAgentRef(registry, ref.id)?.session) return null;
+		return (await this.#findOnDisk(ref?.id ?? agentId, context, preferredArtifactDir))?.file ?? null;
+	}
+
+	/**
+	 * Find the registry ref for `agentId` (exact, then case-insensitive),
+	 * skipping advisor transcripts.
+	 */
+	async #lookup(agentId: string, context: ResolveContext | undefined): Promise<RefLookup> {
+		const registry = context?.agentRegistry ?? AgentRegistry.global();
+		// Refresh the caller root before resolving possibly parked agents; a
+		// same-named ref restored from another root must not shadow its transcript.
+		const rootSessionFile = context?.sessionFile
+			? await ensurePersistedRoster(registry, context.sessionFile)
+			: undefined;
+		const bound = isBoundResourceContext(context);
+		const dirs = artifactsDirsForContext(context);
+		if (bound && dirs.length === 0) throw new Error("No caller-owned history available");
+		const preferredArtifactDir = rootSessionFile?.slice(0, -".jsonl".length);
+		// Advisor transcripts are observability-only — surfaced in the Agent Hub,
+		// never in the agent-facing roster, lookup, or completions.
+		const visible = agentRefsForContext(registry, context).filter(ref => ref.kind !== "advisor");
+		const lower = agentId.toLowerCase();
+		const ref =
+			visible.find(candidate => candidate.id === agentId) ??
+			visible.find(candidate => candidate.id.toLowerCase() === lower);
+		return { ref, visible, preferredArtifactDir, registry };
+	}
 
 	#resolveCurrentFull(url: InternalUrl, context: ResolveContext | undefined): InternalResource {
 		if (!context?.experimentalContextManagement) {
@@ -291,26 +363,9 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		};
 	}
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		if (isCurrentFullRoute(url)) return this.#resolveCurrentFull(url, context);
 		const agentId = url.rawHost || url.hostname;
-		if (agentId.toLowerCase() === "current" && url.pathname && url.pathname !== "/") {
-			if (url.pathname !== "/full" || url.search || url.hash) {
-				throw new Error(
-					"Invalid history://current route; use exactly history://current/full (selectors may follow it)",
-				);
-			}
-			return this.#resolveCurrentFull(url, context);
-		}
-		const bound = isBoundResourceContext(context);
-		const registry = context?.agentRegistry ?? (bound ? undefined : AgentRegistry.global());
-		const dirs = artifactsDirsForContext(context);
-		if (bound && dirs.length === 0) throw new Error("No caller-owned history available");
-		// Refresh the caller root before resolving possibly parked agents.
-		let rootSessionFile: string | undefined;
-		if (agentId && registry && context?.sessionFile)
-			rootSessionFile = await ensurePersistedRoster(registry, context.sessionFile);
-		const preferredArtifactDir = rootSessionFile?.slice(0, -".jsonl".length);
-		const visible = registry ? agentRefsForContext(registry, context).filter(ref => ref.kind !== "advisor") : [];
-
+		const { ref, visible, preferredArtifactDir, registry } = await this.#lookup(agentId, context);
 		if (!agentId) {
 			const content = await this.#renderIndex(visible, context);
 			return {
@@ -321,10 +376,6 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			};
 		}
 
-		const ref =
-			visible.find(candidate => candidate.id === agentId) ??
-			visible.find(candidate => candidate.id.toLowerCase() === agentId.toLowerCase());
-
 		if (!ref) {
 			const disk = await this.#resolveFromDisk(agentId, context, preferredArtifactDir);
 			if (disk) return { ...disk, url: url.href };
@@ -333,7 +384,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 
 		const notes: string[] = [];
 		let messages: unknown[];
-		const liveSession = registry ? lookupAgentRef(registry, ref.id)?.session : undefined;
+		const liveSession = lookupAgentRef(registry, ref.id)?.session;
 		if (liveSession) {
 			messages = liveSession.messages;
 			notes.push("Source: live session");
@@ -369,30 +420,38 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		context: ResolveContext | undefined,
 		preferredArtifactDir?: string,
 	): Promise<InternalResource | undefined> {
-		const files = isBoundResourceContext(context)
-			? await sessionFilesFromContext(context)
-			: await sessionFilesFromDisk(preferredArtifactDir);
-		const lower = agentId.toLowerCase();
-		let matchedId: string | undefined;
-		let sessionFile: string | undefined;
-		for (const [id, file] of files) {
-			if (id === agentId || id.toLowerCase() === lower) {
-				matchedId = id;
-				sessionFile = file;
-				if (id === agentId) break;
-			}
-		}
-		if (!matchedId || !sessionFile) return undefined;
-		const messages = await loadSessionMessagesReadOnly(sessionFile);
-		const content = formatSessionHistoryMarkdown(messages, { title: `${matchedId} (on disk)` });
+		const match = await this.#findOnDisk(agentId, context, preferredArtifactDir);
+		if (!match) return undefined;
+		const messages = await loadSessionMessagesReadOnly(match.file);
+		const content = formatSessionHistoryMarkdown(messages, { title: `${match.id} (on disk)` });
 		return {
 			url: "",
 			content,
 			contentType: "text/markdown",
 			size: Buffer.byteLength(content, "utf-8"),
-			sourcePath: sessionFile,
+			sourcePath: match.file,
 			notes: ["Source: session file (read-only, unregistered)"],
 		};
+	}
+
+	/** On-disk `<id>.jsonl`; exact id wins, else the last case-insensitive match. */
+	async #findOnDisk(
+		agentId: string,
+		context: ResolveContext | undefined,
+		preferredArtifactDir?: string,
+	): Promise<{ id: string; file: string } | undefined> {
+		const files = isBoundResourceContext(context)
+			? await sessionFilesFromContext(context)
+			: await sessionFilesFromDisk(preferredArtifactDir);
+		const lower = agentId.toLowerCase();
+		let match: { id: string; file: string } | undefined;
+		for (const [id, file] of files) {
+			if (id === agentId || id.toLowerCase() === lower) {
+				match = { id, file };
+				if (id === agentId) break;
+			}
+		}
+		return match;
 	}
 
 	async #renderIndex(refs: AgentRef[], context?: ResolveContext): Promise<string> {

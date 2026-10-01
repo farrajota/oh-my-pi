@@ -74,6 +74,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"strictResponsesPairing?": "boolean",
 		"supportsImageDetailOriginal?": "boolean",
 		"supportsConfigurationUpdate?": "boolean",
+		"supportsSteering?": "boolean",
 		"stripImageInput?": "boolean",
 		// anthropic-messages compat flags (same `compat` slot, per-api interpretation)
 		"supportsContextManagement?": "boolean",
@@ -290,7 +291,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 	});
 
 	const ProviderDiscoverySchema = type({
-		type: '"ollama" | "llama.cpp" | "lm-studio" | "openai-models-list" | "proxy" | "litellm"',
+		type: '"ollama" | "llama.cpp" | "lm-studio" | "openai-models-list" | "proxy" | "litellm" | "apple-foundation-models"',
 		"timeoutMs?": "number",
 		/**
 		 * Defaults to `true`. Set `false` to fetch the model list from

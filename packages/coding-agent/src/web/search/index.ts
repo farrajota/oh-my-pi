@@ -14,6 +14,7 @@ import { ModelRegistry } from "../../config/model-registry";
 import { resolveModelRoleValue, resolveRoleChain } from "../../config/model-resolver";
 import { roleCandidatePool } from "../../config/model-roles";
 import { settings } from "../../config/settings";
+import { cfgProvidersAntigravityEndpoint, cfgProvidersWebSearchTimeoutSeconds } from "../../session/settings";
 import type { CustomTool, CustomToolContext } from "../../extensibility/custom-tools/types";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
@@ -165,7 +166,9 @@ async function executeSearch(
 	const candidates = params.model
 		? (() => {
 				const resolved = resolveModelRoleValue(params.model, pool, { settings });
-				return resolved.model ? [{ model: resolved.model, explicit: true }] : [];
+				return resolved.model
+					? [{ model: resolved.model, explicit: true, thinkingLevel: resolved.thinkingLevel }]
+					: [];
 			})()
 		: resolveRoleChain("web", settings, pool);
 	const providerRank = new Map(configuredSearchProviderOrder.map((provider, index) => [provider, index]));
@@ -191,14 +194,14 @@ async function executeSearch(
 	// Invariant across candidates; resolve once before walking the role chain.
 	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;
 	try {
-		antigravityEndpointMode = settings.get("providers.antigravityEndpoint");
+		antigravityEndpointMode = cfgProvidersAntigravityEndpoint.get(settings);
 	} catch {
 		antigravityEndpointMode = undefined;
 	}
 
 	let timeoutMs = DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS * 1_000;
 	try {
-		const configuredSeconds = settings.get("providers.webSearchTimeoutSeconds");
+		const configuredSeconds = cfgProvidersWebSearchTimeoutSeconds.get(settings);
 		if (Number.isFinite(configuredSeconds) && configuredSeconds > 0) {
 			timeoutMs = Math.ceil(Math.min(configuredSeconds, MAX_WEB_SEARCH_TIMEOUT_SECONDS) * 1_000);
 		}
@@ -249,6 +252,7 @@ async function executeSearch(
 				timeoutMs,
 				authStorage,
 				model: candidate.model,
+				thinkingLevel: candidate.thinkingLevel,
 				modelRegistry,
 				explicit: candidate.explicit,
 				sessionId,

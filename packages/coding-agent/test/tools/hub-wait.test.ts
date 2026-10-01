@@ -10,8 +10,9 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { type CoordinationDetails } from "@oh-my-pi/pi-tui/tools/hub";
-import { HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { lookup } from "../../src/config/registry";
+import { HubTool, type CoordinationDetails } from "@oh-my-pi/pi-coding-agent/tools/hub";
 import { lookupAgentRef } from "../../src/internal/agent-registry-bridge";
 import { createHubAuthorityFixture, type HubAuthorityFixture } from "./hub-fixtures";
 const SELF_ID = "Main";
@@ -24,8 +25,11 @@ function makeSession(manager: AsyncJobManager | undefined): ToolSession {
 		asyncJobManager?: AsyncJobManager;
 	};
 	session.asyncJobManager = manager;
-	session.settings.override("irc.timeoutMs", 120_000);
-	session.settings.override("async.pollWaitDuration", "smart");
+	const ircTimeoutMs = lookup("irc.timeoutMs");
+	const pollWaitDuration = lookup("async.pollWaitDuration");
+	if (!ircTimeoutMs || !pollWaitDuration) throw new Error("Expected wait settings to be registered");
+	ircTimeoutMs.override(session.settings, 120_000);
+	pollWaitDuration.override(session.settings, "smart");
 	return session;
 }
 
@@ -84,8 +88,9 @@ describe("hub unified wait", () => {
 		}
 	});
 
-	test("an incoming message settles the wait while watched jobs keep running", async () => {
+	test("op=wait filters peer messages while watched jobs keep running", async () => {
 		const registry = AgentRegistry.global();
+		registry.register({ id: "Other", displayName: "task", kind: "sub", parentId: SELF_ID, session: null });
 		registry.register({ id: "Peer", displayName: "task", kind: "sub", parentId: SELF_ID, session: null });
 
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
@@ -93,8 +98,9 @@ describe("hub unified wait", () => {
 		const tool = new HubTool(makeSession(manager));
 
 		// The bus waiter is parked synchronously before execute()'s first
-		// suspension, so the send below cannot race the park.
-		const pending = tool.execute("call_1", { op: "wait" });
+		// suspension, so sends below cannot race the park.
+		const pending = tool.execute("call_1", { op: "wait", from: "Peer" });
+		await authorityFixture.bus.send({ from: "Other", to: SELF_ID, body: "not for this wait" });
 		await authorityFixture.bus.send({ from: "Peer", to: SELF_ID, body: "shared file is yours" });
 
 		const result = await pending;
@@ -103,13 +109,14 @@ describe("hub unified wait", () => {
 		expect(details.op).toBe("wait");
 		expect(details.waited?.from).toBe("Peer");
 		expect(details.waited?.body).toBe("shared file is yours");
+		expect(authorityFixture.bus.inbox(SELF_ID).map(message => message.from)).toEqual(["Other"]);
 		// The job was not consumed by the message win.
 		expect(manager.getJob(job.id)?.status).toBe("running");
 
 		manager.cancel(job.id);
 	});
 
-	test("a settling job returns the snapshot exactly like the old poll", async () => {
+	test("op=wait returns a settling job's completed snapshot", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: "Peer", displayName: "task", kind: "sub", parentId: SELF_ID, session: null });
 
@@ -127,6 +134,28 @@ describe("hub unified wait", () => {
 		expect(details.jobs?.[0]?.resultText).toBe("done output");
 		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 		expect(text).toContain("## Completed (1)");
+	});
+	test("op=wait returns when the first watched job settles", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const first = registerHangingJob(manager, "first job");
+		const later = registerHangingJob(manager, "later job");
+		const tool = new HubTool(makeSession(manager));
+
+		try {
+			const pending = tool.execute("call_2_first_event", { op: "wait", ids: [first.id, later.id] });
+			first.finish("first result");
+
+			const result = await pending;
+			const details = result.details as CoordinationDetails;
+			expect(details.jobs?.find(job => job.id === first.id)).toMatchObject({
+				status: "completed",
+				resultText: "first result",
+			});
+			expect(details.jobs?.find(job => job.id === later.id)).toMatchObject({ status: "running" });
+			expect(manager.getJob(later.id)?.status).toBe("running");
+		} finally {
+			manager.cancel(later.id);
+		}
 	});
 
 	test("bare wait with no jobs and no running peers returns immediately", async () => {
@@ -205,7 +234,7 @@ describe("hub unified wait", () => {
 		registry.register({ id: "Peer", displayName: "peer", kind: "sub", session: null, status: "idle" });
 		const tool = new HubTool({
 			cwd: process.cwd(),
-			settings: { get: () => undefined },
+			settings: Settings.isolated(),
 			agentRegistry: registry,
 			asyncJobManager: new AsyncJobManager({}),
 			getAgentId: () => SELF_ID,

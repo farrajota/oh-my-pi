@@ -29,7 +29,7 @@ import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../..
 import { SessionManager } from "../../src/session/session-manager";
 import { ArtifactManager } from "../../src/session/artifacts";
 import * as taskDiscovery from "../../src/task/discovery";
-import type { ExecutorOptions } from "../../src/task/executor";
+import type { RunSubprocessOptions } from "../../src/task/executor";
 import * as taskExecutor from "../../src/task/executor";
 import * as isolationRunner from "../../src/task/isolation-runner";
 import { AgentOutputManager } from "../../src/task/output-manager";
@@ -185,7 +185,7 @@ function spyOverlapBarrier(count: number): { maxInFlight: () => number } {
 	return { maxInFlight: () => maxInFlight };
 }
 
-function singleResult(options: ExecutorOptions, overrides: Partial<SingleResult> = {}): SingleResult {
+function singleResult(options: RunSubprocessOptions, overrides: Partial<SingleResult> = {}): SingleResult {
 	return {
 		index: options.index,
 		id: options.id,
@@ -784,7 +784,7 @@ describe("agent() through eval runtimes", () => {
 		mockAgents();
 		const releaseCompletion = Promise.withResolvers<void>();
 
-		const makeProgress = (options: ExecutorOptions, overrides: Partial<AgentProgress>): AgentProgress => ({
+		const makeProgress = (options: RunSubprocessOptions, overrides: Partial<AgentProgress>): AgentProgress => ({
 			index: options.index,
 			id: options.id,
 			agent: options.agent.name,

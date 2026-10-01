@@ -22,10 +22,13 @@ import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/sessi
 import { collectIrcPeerRoster } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
-import type { CoordinationDetails } from "@oh-my-pi/pi-tui/tools/hub";
-import { HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
+import {
+	DEFAULT_HUB_LIST_LIMIT,
+	HubTool,
+	MAX_HUB_LIST_LIMIT,
+	type CoordinationDetails,
+} from "@oh-my-pi/pi-coding-agent/tools/hub";
 import { executeList, executeSend } from "@oh-my-pi/pi-coding-agent/tools/hub/messaging";
-import { DEFAULT_HUB_LIST_LIMIT, MAX_HUB_LIST_LIMIT } from "@oh-my-pi/pi-tui/tools/hub";
 import { prompt, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { createHubAuthorityFixture } from "./hub-fixtures";
 
@@ -930,20 +933,21 @@ describe("hub list", () => {
 		expect(result.details.counts?.truncated).toBe(0);
 	});
 
-	it("send still revives a known parked id omitted from the default list", async () => {
+	it("op=send can revive a known parked id omitted by op=list", async () => {
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		IrcBus.resetGlobalForTests();
+		const registry = new AgentRegistry();
+		const fixture = await createHubAuthorityFixture(registry, MAIN_AGENT_ID);
 		try {
-			const registry = AgentRegistry.global();
 			registry.register({
-				id: MAIN_AGENT_ID,
-				displayName: MAIN_AGENT_ID,
-				kind: "main",
+				id: "Sleeper",
+				displayName: "task",
+				kind: "sub",
+				parentId: MAIN_AGENT_ID,
 				session: null,
-				status: "running",
+				status: "parked",
 			});
-			registry.register({ id: "Sleeper", displayName: "task", kind: "sub", session: null, status: "parked" });
 			const delivered: string[] = [];
 			const revived = {
 				isStreaming: false,
@@ -964,21 +968,48 @@ describe("hub list", () => {
 				sleeperRef,
 			);
 
-			const listed = await executeList(registry, MAIN_AGENT_ID);
-			expect(listed.details?.peers?.map(peer => peer.id)).not.toContain("Sleeper");
-
-			const sent = await executeSend(
-				{ registry, senderId: MAIN_AGENT_ID, settings: Settings.isolated() },
-				{ to: "Sleeper", message: "wake up" },
+			const tool = new HubTool(fixture.createToolSession(MAIN_AGENT_ID));
+			const listed = await tool.execute("parked-default", { op: "list" });
+			expect((listed.details as CoordinationDetails | undefined)?.peers?.map(peer => peer.id)).not.toContain(
+				"Sleeper",
 			);
+
+			const sent = await tool.execute("wake-known-parked", {
+				op: "send",
+				to: "Sleeper",
+				message: "wake up",
+			});
 			expect(sent.isError).toBeFalsy();
-			expect(sent.details?.receipts).toEqual([{ to: "Sleeper", outcome: "revived" }]);
+			expect((sent.details as CoordinationDetails | undefined)?.receipts).toEqual([
+				{ to: "Sleeper", outcome: "revived" },
+			]);
 			expect(delivered).toEqual(["wake up"]);
 			expect(registry.get("Sleeper")?.status).not.toBe("parked");
 		} finally {
+			await fixture.dispose();
 			AgentRegistry.resetGlobalForTests();
 			resetAgentLifecycleForTests();
 			IrcBus.resetGlobalForTests();
+		}
+	});
+	it("lists peers through a registry-attested tool session using op=list", async () => {
+		const registry = new AgentRegistry();
+		const fixture = await createHubAuthorityFixture(registry, MAIN_AGENT_ID);
+		try {
+			await fixture.createChild("Peer");
+			const tool = new HubTool(fixture.createToolSession(MAIN_AGENT_ID));
+			const listed = await tool.execute("list-bound", { op: "list", status: "running", limit: 1 });
+			const details = listed.details as CoordinationDetails | undefined;
+
+			expect(listed.isError).toBeFalsy();
+			expect(details).toMatchObject({
+				op: "list",
+				peers: [{ id: "Peer", status: "running" }],
+				counts: { running: 1, idle: 0, parked: 0, shown: 1, truncated: 0 },
+			});
+			expect(listText(listed)).toContain("1 peer(s)");
+		} finally {
+			await fixture.dispose();
 		}
 	});
 });
@@ -1014,20 +1045,6 @@ describe("hub list session authority", () => {
 		const sent = await tool.execute("send-unbound", { op: "send", to: "Peer", message: "forged" });
 		expect(sent.isError).toBe(true);
 		expect(listText(sent)).toContain("unavailable");
-	});
-
-	it("lists peers through a registry-attested tool session", async () => {
-		const registry = new AgentRegistry();
-		const fixture = await createHubAuthorityFixture(registry, MAIN_AGENT_ID);
-		try {
-			await fixture.createChild("Peer");
-			const tool = new HubTool(fixture.createToolSession(MAIN_AGENT_ID));
-			const listed = await tool.execute("list-bound", { op: "list" });
-			expect(listed.isError).toBeFalsy();
-			expect((listed.details as CoordinationDetails | undefined)?.peers?.map(peer => peer.id)).toEqual(["Peer"]);
-		} finally {
-			await fixture.dispose();
-		}
 	});
 
 	it("preserves live, aborted, advisor, vibe-owned, and nested same-root collisions", async () => {

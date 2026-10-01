@@ -1,11 +1,12 @@
 /** Tool wrappers for extensions. */
-import type {
-	AgentTool,
-	AgentToolContext,
-	AgentToolPreparedExecution,
-	AgentToolResult,
-	AgentToolUpdateCallback,
-	ToolLoadMode,
+import {
+	type AgentTool,
+	type AgentToolContext,
+	type AgentToolPreparedExecution,
+	type AgentToolResult,
+	type AgentToolUpdateCallback,
+	isNonBlankContext,
+	type ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import type { PermissionDenialDetails } from "@oh-my-pi/pi-wire";
@@ -395,6 +396,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// runs with. Doing this BEFORE the approval gate means approval (below) resolves against the
 		// input that actually executes, closing the "approve one thing, run another" gap: the prompt
 		// text, policy resolution, and provider safety checks all see `effectiveParams`.
+		// Passive context collected here is forwarded only once the call has run
+		// and produced a non-error result: a block, deny, user reject, fail-closed
+		// safety refusal, or failed execution never injects instructions. This
+		// matches the loop's rule for context prepared at arg-prep time.
+		let pendingAdditionalContext: string | undefined;
 		let effectiveParams = params;
 		// Keep this separate from path authorization: canonicalization is not an extension mutation.
 		let extensionInputChanged = false;
@@ -422,6 +428,13 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					const reason = callResult.reason || "Tool execution was blocked by an extension";
 					throw new Error(reason);
 				}
+				if (isNonBlankContext(callResult?.additionalContext)) {
+					pendingAdditionalContext = callResult.additionalContext;
+				}
+				// A non-blocking handler may replace the execution input. The returned object is the raw
+				// input passed to `execute` (handler-owned; not re-normalized). Skipped for `computer`
+				// tool calls, whose event input is a synthetic {actions,pendingSafetyChecks} view
+				// (see toolEventArgs) rather than the real execution params.
 				if (callResult?.input !== undefined && context?.toolCall?.providerMetadata?.type !== "computer") {
 					extensionInputChanged = true;
 					effectiveParams = callResult.input as typeof params;
@@ -666,7 +679,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				if (resultResult) {
 					const modifiedContent: (TextContent | ImageContent)[] = resultResult.content ?? result.content;
 					const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
-					const effectiveError = resultResult.isError ?? !!executionError;
+					const effectiveError = resultResult.isError ?? (!!executionError || result.isError === true);
+					if (!effectiveError && pendingAdditionalContext !== undefined) {
+						context?.addAdditionalContext?.(pendingAdditionalContext);
+					}
 					return {
 						content: modifiedContent,
 						details: modifiedDetails,
@@ -679,6 +695,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// No extension modification
 			if (executionError) {
 				throw executionError;
+			}
+			if (result.isError !== true && pendingAdditionalContext !== undefined) {
+				context?.addAdditionalContext?.(pendingAdditionalContext);
 			}
 			return result;
 		} finally {

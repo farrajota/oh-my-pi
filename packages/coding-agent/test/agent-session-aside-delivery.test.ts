@@ -776,13 +776,13 @@ describe("AgentSession aside delivery", () => {
 		const host: IrcBridgeHost = {
 			agent: {} as Agent,
 			sessionManager: {} as SessionManager,
-			settings: {} as Settings,
 			isDisposed: () => false,
 			isStreaming: () => false,
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
-			runEphemeralTurn: async () => ({ replyText: "" }),
+			autoReplyIrcEnabled: () => false,
+			autoReplyIrc: async () => {},
 		};
 		const irc = new IrcBridge(host);
 
@@ -820,13 +820,13 @@ describe("AgentSession aside delivery", () => {
 		const host: IrcBridgeHost = {
 			agent: {} as Agent,
 			sessionManager: {} as SessionManager,
-			settings: {} as Settings,
 			isDisposed: () => false,
 			isStreaming: () => false,
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
-			runEphemeralTurn: async () => ({ replyText: "" }),
+			autoReplyIrcEnabled: () => false,
+			autoReplyIrc: async () => {},
 		};
 		const irc = new IrcBridge(host);
 		const wake: AgentMessage = {
@@ -856,13 +856,13 @@ describe("AgentSession aside delivery", () => {
 				emitExternalEvent: (event: { message: AgentMessage }) => emitted.push(event.message),
 			} as unknown as Agent,
 			sessionManager: {} as SessionManager,
-			settings: {} as Settings,
 			isDisposed: () => false,
 			isStreaming: () => false,
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
-			runEphemeralTurn: async () => ({ replyText: "" }),
+			autoReplyIrcEnabled: () => false,
+			autoReplyIrc: async () => {},
 		};
 		const irc = new IrcBridge(host);
 		const wake: AgentMessage = {

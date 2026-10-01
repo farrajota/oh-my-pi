@@ -87,7 +87,7 @@ describe("read tool large artifact handling", () => {
 		expect(output).not.toContain("line-001");
 	});
 
-	it("streams bounded artifact reads without materializing the whole artifact", async () => {
+	it("streams bounded artifact reads and points large artifacts at paging and search workflows", async () => {
 		const result = await tool.execute("call-range", { path: `artifact://${artifactId}:1-3` });
 		const output = getTextOutput(result);
 
@@ -96,19 +96,19 @@ describe("read tool large artifact handling", () => {
 		expect(output).toContain("Artifact storage:");
 		expect(output).toContain(`artifact://${artifactId}:raw:N-M`);
 		expect(output).not.toContain("line-400");
+		// A large artifact page surfaces its backing file for search/copy workflows.
+		expect(output).toContain(artifactFilename);
+		expect(result.details?.meta?.source).toEqual({ type: "internal", value: `artifact://${artifactId}` });
 	});
 
 	it("keeps bounded raw artifact chunks verbatim (no workflow notice appended)", async () => {
 		const result = await tool.execute("call-raw-range", { path: `artifact://${artifactId}:raw:1-2` });
 		const output = getTextOutput(result);
 
-		expect(output).toStartWith("line-001");
-		expect(output).toContain("line-002");
-		expect(output).not.toContain("line-400");
-		// Raw chunks must stay verbatim so copy/paste workflows do not eat the
-		// workflow notice into the artifact bytes.
+		expect(output.split("\n")).toEqual(largeArtifactText().split("\n").slice(0, 2));
 		expect(output).not.toContain("Artifact storage:");
 		expect(output).not.toContain(`artifact://${artifactId}:raw:N-M`);
+		expect(output).not.toMatch(/0\.mcp\.log/);
 	});
 
 	it("returns exactly the requested raw artifact range without context padding", async () => {

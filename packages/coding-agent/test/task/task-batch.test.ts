@@ -21,6 +21,7 @@ import { Effort, type ServiceTierByFamily } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { lookup as lookupSetting } from "../../src/config/registry";
 import { resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
@@ -54,11 +55,17 @@ const taskAgent: AgentDefinition = {
 
 const scoutAgent: AgentDefinition = {
 	name: "scout",
-	description: "Read-only research agent",
-	systemPrompt: "You are a scout agent.",
-	tools: ["read"],
+	description: "Read-only repository researcher",
+	systemPrompt: "Inspect the repository without editing files.",
 	source: "bundled",
+	tools: ["read"],
 };
+
+function settingHandle(id: string) {
+	const handle = lookupSetting(id);
+	if (!handle) throw new Error(`Setting ${id} is not registered`);
+	return handle;
+}
 
 function createSession(
 	options: {
@@ -174,14 +181,12 @@ describe("task.batch schema gating", () => {
 		expect(itemProperties.schemaMode).toBeDefined();
 	});
 
-	it("requires coordination instead of promising same-file auto-resolution", async () => {
+	it("requires shared-file coordination and an integration owner", async () => {
 		mockDiscovery();
 		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
 
-		expect(tool.description).toContain("Same-file edits are not guaranteed to merge");
-		expect(tool.description).toContain("coordinate through `hub` before editing shared files");
+		expect(tool.description).toContain("coordinate through `write agent://<id>` before editing shared files");
 		expect(tool.description).toContain("Name one integration owner");
-		expect(tool.description).not.toContain("Concurrent edits to the same files auto-resolve");
 	});
 
 	it("describes a restricted specialist as the spawn-policy default", async () => {
@@ -203,7 +208,7 @@ describe("task.batch schema gating", () => {
 		expect(getSchemaProperties(flat).effort).toBeUndefined();
 		expect(flat.description).not.toContain("`effort`");
 
-		flatSession.settings.override("task.allowEffortOverride", true);
+		settingHandle("task.allowEffortOverride").override(flatSession.settings, true);
 		expect(getSchemaProperties(flat).effort).toBeDefined();
 		expect(flat.description).toContain("`effort`");
 
@@ -212,7 +217,7 @@ describe("task.batch schema gating", () => {
 		expect(getBatchItemProperties(batch).effort).toBeUndefined();
 		expect(batch.description).not.toContain("`effort`");
 
-		batchSession.settings.override("task.allowEffortOverride", true);
+		settingHandle("task.allowEffortOverride").override(batchSession.settings, true);
 		expect(getBatchItemProperties(batch).effort).toBeDefined();
 		expect(batch.description).toContain("`effort`");
 	});
@@ -1218,7 +1223,7 @@ describe("task exact preparation", () => {
 				source: "user",
 				filePath,
 			});
-			let capturedOptions: executorModule.ExecutorOptions | undefined;
+			let capturedOptions: executorModule.RunSubprocessOptions | undefined;
 			vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 				capturedOptions = options;
 				const nativeSession = createSession({ agentId: options.id });
@@ -1375,12 +1380,12 @@ describe("task exact preparation", () => {
 			permissions: { tools: ["read"] },
 		} as TaskParams;
 		const prepared = await tool.prepareExecution("call-permissions", params, undefined, undefined, {});
-		session.settings.set("task.permissions.mode", "off");
+		settingHandle("task.permissions.mode").set(session.settings, "off");
 
 		await tool.execute("call-permissions", params, undefined, undefined, undefined, prepared);
 
 		expect(observedMode).toBe("enforce");
-		expect(observedTools).toEqual(["read", "hub"]);
+		expect(observedTools).toEqual(["read"]);
 	});
 
 	it("keeps prepared model effort prewalk and child feature settings", async () => {
@@ -1397,10 +1402,10 @@ describe("task exact preparation", () => {
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			observed = {
 				modelOverride: options.modelOverride,
-				maxEffort: options.settings?.get("task.maxEffort"),
-				prewalk: options.settings?.get("task.prewalk"),
-				agentPrewalk: options.settings?.get("task.agentPrewalk"),
-				maxDepth: options.settings?.get("task.maxRecursionDepth"),
+				maxEffort: options.settings ? settingHandle("task.maxEffort").get(options.settings) : undefined,
+				prewalk: options.settings ? settingHandle("task.prewalk").get(options.settings) : undefined,
+				agentPrewalk: options.settings ? settingHandle("task.agentPrewalk").get(options.settings) : undefined,
+				maxDepth: options.settings ? settingHandle("task.maxRecursionDepth").get(options.settings) : undefined,
 				enableLsp: options.enableLsp,
 				enableIrc: options.enableIrc,
 			};
@@ -1411,7 +1416,7 @@ describe("task exact preparation", () => {
 				"async.enabled": false,
 				"task.batch": false,
 				"task.agentModelOverrides": { task: "prepared/model" },
-				"task.maxEffort": "med",
+				"task.maxEffort": "medium",
 				"task.prewalk": true,
 				"task.agentPrewalk": { task: "prepared/prewalk" },
 				"task.maxRecursionDepth": 2,
@@ -1421,18 +1426,18 @@ describe("task exact preparation", () => {
 		const tool = await TaskTool.create(session);
 		const params = { name: "FrozenPolicy", agent: "task", task: "Use prepared policy." } as TaskParams;
 		const prepared = await tool.prepareExecution("call-frozen-policy", params, undefined, undefined, {});
-		session.settings.set("task.agentModelOverrides", { task: "mutated/model" });
-		session.settings.set("task.maxEffort", Effort.High);
-		session.settings.set("task.prewalk", false);
-		session.settings.set("task.agentPrewalk", {});
-		session.settings.set("task.maxRecursionDepth", 0);
-		session.settings.set("task.enableLsp", false);
+		settingHandle("task.agentModelOverrides").set(session.settings, { task: "mutated/model" });
+		settingHandle("task.maxEffort").set(session.settings, Effort.High);
+		settingHandle("task.prewalk").set(session.settings, false);
+		settingHandle("task.agentPrewalk").set(session.settings, {});
+		settingHandle("task.maxRecursionDepth").set(session.settings, 0);
+		settingHandle("task.enableLsp").set(session.settings, false);
 
 		await tool.execute("call-frozen-policy", params, undefined, undefined, undefined, prepared);
 
 		expect(observed).toEqual({
 			modelOverride: ["prepared/model"],
-			maxEffort: "med",
+			maxEffort: "medium",
 			prewalk: true,
 			agentPrewalk: { task: "prepared/prewalk" },
 			maxDepth: 2,
@@ -1458,7 +1463,7 @@ describe("task exact preparation", () => {
 		const tool = await TaskTool.create(session);
 		const params = { name: "FrozenDispatch", agent: "task", task: "Use prepared dispatch." } as TaskParams;
 		const prepared = await tool.prepareExecution("call-frozen-dispatch", params, undefined, undefined, {});
-		session.settings.set("async.enabled", true);
+		settingHandle("async.enabled").set(session.settings, true);
 		(session as ToolSession & { getServiceTierByFamily: () => ServiceTierByFamily }).getServiceTierByFamily = () => ({
 			openai: "priority",
 		});
@@ -1498,7 +1503,7 @@ describe("task exact preparation", () => {
 		const preparing = tool.prepareExecution("call-entry-snapshot", params, undefined, undefined, {});
 		await entered.promise;
 		(session as ToolSession & { taskDepth: number }).taskDepth = 2;
-		session.settings.set("async.enabled", true);
+		settingHandle("async.enabled").set(session.settings, true);
 		(session as ToolSession & { getServiceTierByFamily: () => ServiceTierByFamily }).getServiceTierByFamily = () => ({
 			openai: "priority",
 		});
@@ -1526,7 +1531,7 @@ describe("task exact preparation", () => {
 			tasks: [{ name: "FrozenBatch", agent: "task", task: "Use shared context." }],
 		} as TaskParams;
 		const prepared = await tool.prepareExecution("call-batch-context", params, undefined, undefined, {});
-		session.settings.set("task.batch", false);
+		settingHandle("task.batch").set(session.settings, false);
 
 		await tool.execute("call-batch-context", params, undefined, undefined, undefined, prepared);
 

@@ -77,7 +77,7 @@ describe("AgentStorage model perf aggregates", () => {
 	it("records task subagent samples in the shared model performance aggregate", async () => {
 		tempDir = TempDir.createSync("@omp-subagent-perf-");
 		const parent = await Settings.loadIsolated({ cwd: tempDir.path(), agentDir: tempDir.path() });
-		const subagent = createSubagentSettings(parent);
+		const subagent = await createSubagentSettings(parent);
 
 		const write = subagent.getStorage()!.recordModelPerf("opencode-go/deepseek-v4-flash", {
 			outputTokens: 130,

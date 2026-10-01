@@ -21,14 +21,40 @@ import { isEnoent } from "@oh-my-pi/pi-utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { ArtifactManager } from "../session/artifacts";
+import { executeSend, isIrcEnabled } from "../irc/messaging";
 import { applyQuery, pathToQuery } from "./json-query";
+import agentPromptDoc from "../prompts/internal-urls/agent.md" with { type: "text" };
 import {
 	agentRefsForContext,
 	artifactsDirsForContext,
 	artifactsDirsFromRegistry,
 	isBoundResourceContext,
 } from "./registry-helpers";
-import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
+import type {
+	InternalResource,
+	InternalWriteResult,
+	InternalUrl,
+	ProtocolHandler,
+	ResolveContext,
+	SchemeSpec,
+	UrlCompletion,
+	WriteContext,
+} from "./types";
+
+/** Result of resolving candidates in the caller's artifact dirs. */
+interface OutputScan {
+	foundPath?: string;
+	matchedId?: string;
+	jsonPath?: string;
+	anyDirExists: boolean;
+	availableIds: Set<string>;
+}
+
+/** True when the URL names a path extraction rather than a whole output. */
+function isPathExtraction(url: InternalUrl): boolean {
+	const pathname = url.rawPathname ?? url.pathname;
+	return pathname !== "" && pathname !== "/";
+}
 
 /**
  * Handler for agent:// URLs.
@@ -38,38 +64,87 @@ import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, Ur
  */
 export class AgentProtocolHandler implements ProtocolHandler {
 	readonly scheme = "agent";
-	readonly immutable = true;
+	readonly spec: SchemeSpec = {
+		backing: "file",
+		selectors: "lines",
+		immutable: true,
+		linkable: true,
+		write: { via: "handler", payload: "verbatim", scope: "coordination", tier: () => "read" },
+	};
+
+	promptDoc(): string {
+		return agentPromptDoc.trim();
+	}
+
+	/**
+	 * The `<id>.md` output file. JSON-path URLs (`/<json-path>`) render a value
+	 * rather than the file, so they locate to null, as do missing ids.
+	 */
+	async locate(url: InternalUrl, context?: ResolveContext): Promise<string | null> {
+		const outputId = url.rawHost || url.hostname;
+		if (!outputId) throw new Error("agent:// URL requires an output ID: agent://<id>");
+		if (outputId === "all" || isPathExtraction(url)) return null;
+		const dirs = await this.#outputDirs(context);
+		if (dirs.length === 0) return null;
+		return (await this.#findOutput(dirs, [outputId])).foundPath ?? null;
+	}
+
+	async write(url: InternalUrl, content: string, context?: WriteContext): Promise<InternalWriteResult> {
+		const session = context?.session;
+		if (!session) throw new Error("agent:// messaging requires a tool session");
+		const registry = session.agentRegistry;
+		const senderId = session.getAgentId?.();
+		if (
+			!registry ||
+			!senderId ||
+			session.enableIrc === false ||
+			!isIrcEnabled(session.settings, session.taskDepth ?? 0)
+		) {
+			throw new Error("Peer messaging is unavailable in this session.");
+		}
+		const to = url.rawHost || url.hostname;
+		if (!to) throw new Error("agent:// URL requires a recipient: agent://<id>");
+		if (isPathExtraction(url)) {
+			throw new Error("agent:// message target cannot have a JSON-path suffix.");
+		}
+		if (!content.trim()) throw new Error("agent:// messages require non-empty content.");
+		const result = await executeSend(
+			{ registry, senderId, sessionFileHint: session.getSessionFile?.() },
+			{ to, message: content },
+		);
+		return {
+			content: [
+				{
+					type: "text",
+					text: result.content.find(item => item.type === "text")?.text ?? "Message delivery failed.",
+				},
+			],
+			details: { message: result.details },
+			isError: result.isError,
+		};
+	}
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
 		const outputId = url.rawHost || url.hostname;
+		if (outputId === "all") throw new Error("agent://all is write-only; use it to broadcast a message.");
 		if (!outputId) {
 			throw new Error("agent:// URL requires an output ID: agent://<id>");
 		}
 
-		const urlPath = url.pathname;
+		const urlPath = url.rawPathname ?? url.pathname;
+		const hasPathExtraction = isPathExtraction(url);
 		const queryParam = url.searchParams.get("q");
-		const hasPathExtraction = urlPath && urlPath !== "/" && urlPath !== "";
 		const hasQueryExtraction = queryParam !== null && queryParam !== "";
-
 		if (hasPathExtraction && hasQueryExtraction) {
 			throw new Error("agent:// URL cannot combine path extraction with ?q=");
 		}
 
 		const bound = isBoundResourceContext(context);
-		const registry = context?.agentRegistry ?? AgentRegistry.global();
-		const rootSessionFile = context?.sessionFile
-			? await ensurePersistedRoster(registry, context.sessionFile)
-			: undefined;
-		const contextDirs = artifactsDirsForContext(context);
-		let dirs = contextDirs;
-		if (!bound) {
-			const registryDirs = artifactsDirsFromRegistry(
-				rootSessionFile ? { preferredDir: rootSessionFile.slice(0, -6) } : undefined,
-			);
-			dirs = [...new Set([...contextDirs, ...registryDirs])];
+		const dirs = await this.#outputDirs(context);
+		if (dirs.length === 0) {
+			if (bound) throw new Error("No caller-owned agent outputs available");
+			throw new Error("No session - agent outputs unavailable");
 		}
-		if (bound && dirs.length === 0) throw new Error("No caller-owned agent outputs available");
-		if (dirs.length === 0) throw new Error("No session - agent outputs unavailable");
 
 		// A subagent allocates its own children as dot-qualified ids
 		// (`Parent.Child`), so the slash path form is first tried as a hierarchy
@@ -93,18 +168,19 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		if (!scan.anyDirExists) {
 			throw new Error("No artifacts directory found");
 		}
-		if (!scan.foundPath) {
+		const foundPath = scan.foundPath;
+		if (!foundPath) {
 			const target = nestedId ?? outputId;
 			const available = scan.availableIds.size > 0 ? [...scan.availableIds].sort().join(", ") : "none";
 			throw new Error(`Not found: ${target}\nAvailable: ${available}`);
 		}
 
-		const rawContent = await Bun.file(scan.foundPath).text();
+		const rawContent = await Bun.file(foundPath).text();
 		const notes: string[] = [];
 		let content = rawContent;
 		let contentType: InternalResource["contentType"] = "text/markdown";
 		const extract = hasQueryExtraction || (hasPathExtraction && scan.matchedId !== nestedId);
-		let extractedFrom = scan.foundPath;
+		let extractedFrom = foundPath;
 		if (extract) {
 			let jsonValue: unknown;
 			let parsed = false;
@@ -146,7 +222,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 				content = JSON.stringify(jsonValue, null, 2);
 				contentType = "application/json";
 			}
-			if (parsed) notes.push(`Source: ${path.basename(extractedFrom!)}`);
+			if (parsed) notes.push(`Source: ${path.basename(extractedFrom)}`);
 		}
 
 		const sourcePath =
@@ -161,7 +237,25 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath,
 			notes,
+			shape: extract ? "value" : "document",
 		};
+	}
+
+	/**
+	 * Caller-owned artifact dirs win exclusively for bound callers; contextless
+	 * and settings-only reads retain the process-global registry ordering.
+	 */
+	async #outputDirs(context: ResolveContext | undefined): Promise<string[]> {
+		const registry = context?.agentRegistry ?? AgentRegistry.global();
+		const rootSessionFile = context?.sessionFile
+			? await ensurePersistedRoster(registry, context.sessionFile)
+			: undefined;
+		const contextDirs = artifactsDirsForContext(context);
+		if (isBoundResourceContext(context)) return contextDirs;
+		const registryDirs = artifactsDirsFromRegistry(
+			rootSessionFile ? { preferredDir: rootSessionFile.slice(0, -".jsonl".length) } : undefined,
+		);
+		return [...new Set([...contextDirs, ...registryDirs])];
 	}
 
 	/**
@@ -169,16 +263,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 	 * artifact head. Candidate priority remains global: a nested id in a later
 	 * directory wins over a base id in an earlier directory.
 	 */
-	async #findOutput(
-		dirs: string[],
-		candidateIds: string[],
-	): Promise<{
-		foundPath?: string;
-		matchedId?: string;
-		jsonPath?: string;
-		anyDirExists: boolean;
-		availableIds: Set<string>;
-	}> {
+	async #findOutput(dirs: string[], candidateIds: string[]): Promise<OutputScan> {
 		const { managers, anyDirExists, availableIds } = await this.#artifactManagers(dirs);
 		for (const id of candidateIds) {
 			for (const manager of managers) {

@@ -22,11 +22,16 @@ import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { RegistryDurableStateStore } from "../registry/durable-state";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
-import { SessionManager } from "../session/session-manager";
+import { extractSessionInit, SessionManager } from "../session/session-manager";
 import type { SessionInitEntry } from "../session/session-entries";
 import type { EventBus } from "../utils/event-bus";
 import { IrcBus } from "../irc/bus";
-import { attachIrcWakeTurnMonitor, createMCPProxyTools, createSubagentSettings } from "./executor";
+import {
+	attachIrcWakeTurnMonitor,
+	compactionThresholdSettings,
+	createMCPProxyTools,
+	createSubagentSettings,
+} from "./executor";
 import type { EffectivePermissionSummary } from "./types";
 import type { AgentDefinition } from "./types";
 import {
@@ -82,6 +87,7 @@ type PersistedRevivalInit = Pick<
 	| "spawns"
 	| "readSummarize"
 	| "advisor"
+	| "compactionThreshold"
 	| "isolated"
 >;
 
@@ -188,7 +194,7 @@ export function createPersistedSubagentReviverFactory(
 		// and the parent was told messaging is impossible. A retained workspace
 		// (capture/persist failure) still exists on disk and would pass the cwd
 		// probe below, so gate on the stamped contract instead — otherwise a
-		// restart + Hub message revives the agent outside isolation, in the
+		// restart + peer message revives the agent outside isolation, in the
 		// parent cwd, contradicting the delivery notice.
 		if (peek.init.isolated) return undefined;
 		try {
@@ -270,45 +276,6 @@ export function createPersistedSubagentReviverFactory(
 			taskDepth++;
 			parentId = lookupAgentRef(registry, parentId)?.parentId;
 		}
-		// Rebuild the same advisor opt-in the original spawn resolved: `"on"` =
-		// advisor-role model, anything else = the explicit pattern stamped onto
-		// this session's `modelRoles.advisor`. Absent = unadvised (the
-		// createSubagentSettings default).
-		const subagentSettings = createSubagentSettings(
-			ctx.settings,
-			{
-				...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
-				...(init.advisor
-					? {
-							"advisor.enabled": true,
-							...(init.advisor !== "on"
-								? { modelRoles: { ...ctx.settings.getModelRoles(), advisor: init.advisor } }
-								: undefined),
-						}
-					: undefined),
-			},
-			undefined,
-			{ cwd: peek.cwd, agentDir: ctx.settings.getAgentDir() },
-		);
-		const persistedModelPattern =
-			init.modelRole && init.modelRole !== "default"
-				? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]
-				: init.resolvedModel;
-		// Older session files persisted the synthetic xd:// write transport in the
-		// enabled set. A read-only agent definition could never grant full write,
-		// so remove that transport name before replaying tools as explicit grants.
-		const revivedToolNames =
-			init.readOnly === true && init.tools.includes("write")
-				? init.tools.filter(name => name !== "write")
-				: init.tools;
-		const restrictToolNames = init.restrictToolNames === true;
-		const startupPolicy = deriveRestrictedStartupPolicy({
-			permissionScope: permissionSnapshot.scope,
-			restrictToolNames,
-			toolNames: revivedToolNames,
-			enableLsp: ctx.enableLsp,
-			enableMCP: (init.enableMCP ?? true) && ctx.enableMCP,
-		});
 		return async expectedRef => {
 			const currentParentScope = parentSession.getPermissionScope?.();
 			if (
@@ -339,7 +306,14 @@ export function createPersistedSubagentReviverFactory(
 					durableState,
 				);
 				if (!currentContract) throw new Error("Persisted subagent transcript contract is invalid.");
-				const { init, permissionSnapshot, permissionSummary } = currentContract;
+				const { permissionSnapshot, permissionSummary } = currentContract;
+				const persistedInit = extractSessionInit(reopened.getEntries());
+				const init = {
+					...currentContract.init,
+					...(persistedInit?.compactionThreshold !== undefined
+						? { compactionThreshold: persistedInit.compactionThreshold }
+						: undefined),
+				};
 				const currentParentScope = parentSession.getPermissionScope?.();
 				const currentInheritedScopeRequired =
 					permissionSnapshot.scope.clauses?.some(clause => clause.source === "inherited") === true;
@@ -348,9 +322,10 @@ export function createPersistedSubagentReviverFactory(
 					(currentParentScope !== undefined && !isScopeNoBroader(currentParentScope, permissionSnapshot.scope))
 				)
 					throw new Error("Persisted subagent parent authority changed before revival.");
-				const subagentSettings = createSubagentSettings(
+				const subagentSettings = await createSubagentSettings(
 					ctx.settings,
 					{
+						...compactionThresholdSettings(init.compactionThreshold),
 						...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 						...(init.advisor
 							? {
@@ -362,7 +337,7 @@ export function createPersistedSubagentReviverFactory(
 							: undefined),
 					},
 					undefined,
-					{ cwd: currentPeek.cwd, agentDir: ctx.settings.getAgentDir() },
+					{ cwd: currentPeek.cwd },
 				);
 				const persistedModelPattern =
 					init.modelRole && init.modelRole !== "default"
@@ -401,6 +376,7 @@ export function createPersistedSubagentReviverFactory(
 						...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
 						modelPatternAuthFallback: init.resolvedModel,
 						settings: subagentSettings,
+						skillsSettings: parentSession.skillsSettings,
 						extensionRoots: () => ownerExtensionRoots,
 						...(ownerPreparedExtensions?.length
 							? { preloadedPreparedExtensions: ownerPreparedExtensions }

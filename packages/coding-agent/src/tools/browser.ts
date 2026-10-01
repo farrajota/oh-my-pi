@@ -1,3 +1,4 @@
+import type { AriaSnapshotOptions } from "./browser/aria/aria-snapshot";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
@@ -45,7 +46,29 @@ import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 import { resolveInitScriptSources } from "./browser/open-options";
 
-export { type AriaSnapshotOptions, buildAriaSnapshotScript, parseAriaRefSelector } from "./browser/aria/aria-snapshot";
+import {
+	cfgBrowserCdpUrl,
+	cfgBrowserCmux,
+	cfgBrowserEnabled,
+	cfgBrowserHeadless,
+	cfgBrowserIdleCloseSec,
+	cfgBrowserRelay,
+	cfgBrowserRelayUrl,
+} from "./browser/settings";
+import { cfgToolsMaxTimeout } from "./settings";
+
+export type { AriaSnapshotOptions } from "./browser/aria/aria-snapshot";
+
+/** First-use boundary for the generated Playwright ARIA evaluator bundle. */
+export function buildAriaSnapshotScript(selector: string | undefined, options: AriaSnapshotOptions = {}): string {
+	return require("./browser/aria/aria-snapshot").buildAriaSnapshotScript(selector, options);
+}
+
+/** First-use boundary for ARIA-ref parsing; keeps evaluator construction out of tool registration. */
+export function parseAriaRefSelector(selector: string): string | null {
+	return require("./browser/aria/aria-snapshot").parseAriaRefSelector(selector);
+}
+
 export { diffAriaSnapshot, postProcessAriaSnapshot } from "./browser/snapshot-plus";
 export { cmuxSnapshotToObservation, mapWaitUntil, resolveCmuxKind, serializeEval } from "./browser/cmux/rpc";
 export { CmuxSocketClient } from "./browser/cmux/socket-client";
@@ -110,7 +133,7 @@ export function createBrowserPrelude(session: ToolSession): EvalPreludeDefinitio
 		exports: ["browser"],
 		codeModeDeclarations: browserDeclarations,
 		approval: "exec",
-		enabled: () => session.settings.get("browser.enabled"),
+		enabled: () => cfgBrowserEnabled.get(session.settings),
 		invoke: (parameters, context) => invokeBrowser(session, parameters, context),
 	};
 }
@@ -146,7 +169,7 @@ export async function restartBrowserForModeChange(): Promise<void> {
 function sweepIdleOwnedTabs(session: ToolSession): Promise<number> {
 	const ownerId = session.getSessionId?.() ?? undefined;
 	if (!ownerId) return Promise.resolve(0);
-	const idleSec = session.settings.get("browser.idleCloseSec");
+	const idleSec = cfgBrowserIdleCloseSec.get(session.settings);
 	if (!(idleSec > 0)) {
 		cancelIdleCloseForOwner(ownerId);
 		return Promise.resolve(0);
@@ -185,7 +208,7 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 		const exe = resolveToCwd(app.path, session.cwd);
 		return { kind: "spawned", path: exe, args: resolveSpawnArgs(exe, app.args, session.cwd) };
 	}
-	const relayUrl = session.settings.get("browser.relayUrl") as string | undefined;
+	const relayUrl = cfgBrowserRelayUrl.get(session.settings);
 	// Explicit app.relay wins over every setting; PI_BROWSER_RELAY stays the
 	// final kill switch (a relay that is down would otherwise brick the tool).
 	if (app?.relay) {
@@ -198,23 +221,22 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 	// app options win.
 	if (app?.relay !== false) {
 		const relayKind = resolveRelayKind({
-			settingEnabled: session.settings.get("browser.relay") as boolean | undefined,
+			settingEnabled: cfgBrowserRelay.get(session.settings),
 			url: relayUrl,
 		});
 		if (relayKind) return relayKind;
 	}
-	const configuredCdpUrl = (session.settings.get("browser.cdpUrl") as string | undefined)?.trim();
+	const configuredCdpUrl = cfgBrowserCdpUrl.get(session.settings)?.trim();
 	if (configuredCdpUrl) {
 		return { kind: "connected", cdpUrl: configuredCdpUrl.replace(/\/+$/, "") };
 	}
 	const cmuxKind = resolveCmuxKind({
-		settingEnabled: session.settings.get("browser.cmux") as boolean | undefined,
+		settingEnabled: cfgBrowserCmux.get(session.settings),
 	});
 	if (cmuxKind) {
 		return cmuxKind;
 	}
-	const headless =
-		params.headed === undefined ? (session.settings.get("browser.headless") as boolean) : !params.headed;
+	const headless = params.headed === undefined ? cfgBrowserHeadless.get(session.settings) : !params.headed;
 	return { kind: "headless", headless, allowFileAccess: params.allow_file_access };
 }
 
@@ -328,7 +350,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 	): Promise<AgentToolResult<BrowserToolDetails>> {
 		try {
 			throwIfAborted(signal);
-			const timeoutSeconds = clampTimeout("browser", params.timeout, this.session.settings.get("tools.maxTimeout"));
+			const timeoutSeconds = clampTimeout("browser", params.timeout, cfgToolsMaxTimeout.get(this.session.settings));
 			const timeoutMs = timeoutSeconds * 1000;
 			const name = params.name ?? DEFAULT_TAB_NAME;
 			const details: BrowserToolDetails = { action: params.action, name };

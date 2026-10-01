@@ -1,10 +1,10 @@
 {
   "type": "module",
   "name": "@oh-my-pi/pi-tui",
-  "version": "18.2.11",
+  "version": "18.3.1",
   "description": "Terminal User Interface library with differential rendering for efficient text-based applications",
   "homepage": "https://omp.sh",
-  "author": "Stencil Labs, Inc.",
+  "author": { "name": "Stencil Labs, Inc.", "url": "https://stencil.so" },
   "contributors": [
     "Mario Zechner"
   ],
@@ -89,6 +89,11 @@
     "./status-line": {
       "types": "./src/status-line/index.ts",
       "import": "./src/status-line/index.ts"
+    },
+    "./overlays/*.js": "./src/overlays/*.ts",
+    "./overlays/*": {
+      "types": "./src/overlays/*.ts",
+      "import": "./src/overlays/*.ts"
     },
     "./*": {
       "types": "./src/*.ts",

@@ -9,6 +9,7 @@ import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { MODEL_ROLE_IDS } from "@oh-my-pi/pi-coding-agent/config/model-roles";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { ReadToolGroupComponent } from "@oh-my-pi/pi-tui/chat/read-tool-group";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
@@ -22,6 +23,12 @@ import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 let settingsState: SettingsTestState | undefined;
+
+function setting(id: string) {
+	const handle = lookup(id);
+	if (!handle) throw new Error(`Missing setting handle: ${id}`);
+	return handle;
+}
 
 beforeEach(async () => {
 	settingsState = beginSettingsTest();
@@ -42,14 +49,14 @@ describe("selector setting side effects", () => {
 			ui: { requestRender },
 		} as unknown as InteractiveModeContext);
 
-		Settings.instance.override("git.enabled", false);
+		setting("git.enabled").override(Settings.instance, false);
 		controller.handleSettingChange("git.enabled", false);
 
 		expect(updateSettings).toHaveBeenCalledWith(
 			expect.objectContaining({
-				preset: Settings.instance.get("statusLine.preset"),
-				leftSegments: Settings.instance.get("statusLine.leftSegments"),
-				rightSegments: Settings.instance.get("statusLine.rightSegments"),
+				preset: setting("statusLine.preset").get(Settings.instance),
+				leftSegments: setting("statusLine.leftSegments").get(Settings.instance),
+				rightSegments: setting("statusLine.rightSegments").get(Settings.instance),
 			}),
 		);
 		// The setting-change side effect is a single render request — the lazy
@@ -81,11 +88,11 @@ describe("selector setting side effects", () => {
 
 		try {
 			setTerminalHyperlinks(false);
-			Settings.instance.override("tui.hyperlinks", "always");
+			setting("tui.hyperlinks").override(Settings.instance, "always");
 			controller.handleSettingChange("tui.hyperlinks", "always");
 			expect(TERMINAL.hyperlinks).toBe(true);
 
-			Settings.instance.override("tui.hyperlinks", "off");
+			setting("tui.hyperlinks").override(Settings.instance, "off");
 			controller.handleSettingChange("tui.hyperlinks", "off");
 			expect(TERMINAL.hyperlinks).toBe(false);
 			expect(statusInvalidate).toHaveBeenCalledTimes(2);
@@ -247,7 +254,7 @@ describe("selector setting side effects", () => {
 		const autoApplied = Promise.withResolvers<void>();
 		const setThinkingLevel = vi.fn((level: ThinkingLevel | typeof AUTO_THINKING, persist: boolean) => {
 			if (level === AUTO_THINKING && persist) {
-				settings.set("defaultThinkingLevel", level);
+				setting("defaultThinkingLevel").set(settings, level);
 				autoApplied.resolve();
 			}
 		});
@@ -404,7 +411,7 @@ describe("selector setting side effects", () => {
 			await assignmentApplied.promise;
 
 			expect(settings.getModelRole("task")).toBe(`${taskSelector}:auto`);
-			expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
+			expect(setting("defaultThinkingLevel").get(settings)).toBe(ThinkingLevel.High);
 			expect(setThinkingLevel).not.toHaveBeenCalled();
 			const lines = hub.render(220).map(line => stripVTControlCharacters(line));
 			const defaultRow = lines.find(line => line.includes("DEFAULT"));
@@ -823,7 +830,7 @@ describe("selector setting side effects", () => {
 				if (message.startsWith("Project default model:")) projectAssignmentApplied.resolve();
 				if (
 					message.startsWith("Project default model:") &&
-					settings.get("defaultThinkingLevel") === AUTO_THINKING
+					setting("defaultThinkingLevel").get(settings) === AUTO_THINKING
 				) {
 					autoApplied.resolve();
 				}
@@ -884,7 +891,7 @@ describe("selector setting side effects", () => {
 				hub.handleInput("\x1b[C"); // Off → auto.
 				hub.handleInput("\n");
 				await autoApplied.promise;
-				expect(settings.get("defaultThinkingLevel")).toBe(AUTO_THINKING);
+				expect(setting("defaultThinkingLevel").get(settings)).toBe(AUTO_THINKING);
 				await settings.flush();
 
 				expect(settings.getProjectModelRole("default")).toBe(projectSelector);
@@ -996,7 +1003,7 @@ describe("selector setting side effects", () => {
 		setThemeInstance(testTheme);
 
 		const settings = Settings.isolated({});
-		settings.set("retry.fallbackChains", { default: "not-an-array" } as unknown as Record<string, string[]>);
+		setting("retry.fallbackChains").set(settings, { default: "not-an-array" } as unknown as Record<string, string[]>);
 		const fallback = buildModel({
 			id: "retry-fallback-model",
 			name: "retry-fallback-model",
@@ -1061,7 +1068,7 @@ describe("selector setting side effects", () => {
 			await Promise.resolve();
 
 			expect(showError).not.toHaveBeenCalled();
-			expect(settings.get("retry.fallbackChains")).toEqual({ default: ["test/retry-fallback-model"] });
+			expect(setting("retry.fallbackChains").get(settings)).toEqual({ default: ["test/retry-fallback-model"] });
 			expect(showStatus).toHaveBeenCalledWith("DEFAULT fallbacks: test/retry-fallback-model");
 		} finally {
 			hub.dispose();
@@ -1727,7 +1734,7 @@ describe("selector setting side effects", () => {
 		const setModel = vi.fn(async () => ({ switched: true }));
 		const setThinkingLevel = vi.fn((level: unknown, persist?: boolean) => {
 			if (level === AUTO_THINKING && persist) {
-				settings.set("defaultThinkingLevel", AUTO_THINKING);
+				setting("defaultThinkingLevel").set(settings, AUTO_THINKING);
 			}
 		});
 		const roleCleared = Promise.withResolvers<void>();

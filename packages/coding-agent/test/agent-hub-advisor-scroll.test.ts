@@ -29,6 +29,8 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
+import { cfgTerminalShowImages } from "@oh-my-pi/pi-coding-agent/modes/settings";
+
 const TS = new Date().toISOString();
 
 function buildJsonl(): string {
@@ -316,7 +318,7 @@ describe("AgentTranscriptViewer", () => {
 	});
 
 	it("renders tool-result images through the shared Kitty placeholder budget", () => {
-		Settings.instance.override("terminal.showImages", true);
+		cfgTerminalShowImages.override(Settings.instance, true);
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-image-"));
 		const file = path.join(dir, "__advisor.jsonl");
 		fs.writeFileSync(file, buildImageJsonl());
@@ -340,7 +342,7 @@ describe("AgentTranscriptViewer", () => {
 			expect(imageBudget.takeTransmits().join("")).toContain("a=t");
 		} finally {
 			viewer.dispose();
-			Settings.instance.clearOverride("terminal.showImages");
+			cfgTerminalShowImages.clearOverride(Settings.instance);
 			setKittyGraphics(previousGraphics);
 			setTerminalImageProtocol(previousProtocol);
 			removeSyncWithRetries(dir);

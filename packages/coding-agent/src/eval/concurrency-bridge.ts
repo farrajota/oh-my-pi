@@ -5,6 +5,7 @@
  * setting so an eval fan-out runs as wide as a `task` tool batch would. `0` means
  * unbounded — run every item at once, exactly like `task.maxConcurrency = 0`.
  */
+import { cfgTaskMaxConcurrency } from "../task/settings";
 import type { ToolSession } from "../tools";
 import type { JsStatusEvent } from "./js/shared/types";
 
@@ -28,7 +29,7 @@ export interface EvalConcurrencyResult {
  * values collapse to `0` (unbounded), matching the `task` tool's own handling.
  */
 export function runEvalConcurrency(_args: unknown, options: EvalConcurrencyBridgeOptions): EvalConcurrencyResult {
-	const raw = options.session.settings.get("task.maxConcurrency");
+	const raw = cfgTaskMaxConcurrency.get(options.session.settings);
 	const limit = Number.isFinite(raw) ? Math.trunc(raw) : 0;
 	return { limit: limit > 0 ? limit : 0 };
 }

@@ -3,7 +3,7 @@
  * every subagent), keyed by stable id.
  *
  * Tracks each agent's status and (when live) its AgentSession so peers can be
- * addressed by id (`hub`, `task resume`, `history://`). Sessions are
+ * addressed by id (`agent://`, `task resume`, `history://`). Sessions are
  * registered explicitly at creation; finished agents stay registered as
  * `idle` (live) or `parked` (session disposed, ref + sessionFile retained for
  * revival) and are only removed on explicit release/teardown.
@@ -45,8 +45,9 @@ import {
 	RegistryDurableStateStore,
 } from "./durable-state";
 import { type EffectivePermissionSummary, oneLineLabel } from "../task/types";
+import { MAIN_AGENT_ID } from "./agent-identity";
 
-export const MAIN_AGENT_ID = "Main";
+export { MAIN_AGENT_ID };
 
 /** Sidecar marker retained beside a child transcript after an explicit kill. */
 const AGENT_TOMBSTONE_SUFFIX = ".tombstone";
@@ -69,7 +70,7 @@ type AgentDurationKind = "active" | "span" | "unknown";
  * - `main`/`sub`: the user-facing agent tree (driving agent + task subagents).
  * - `advisor`: a passive review transcript persisted like a subagent for usage
  *   attribution and Agent Hub observability, but never a peer — hidden from
- *   agent-facing rosters (`hub`, `history://`) and not messageable/revivable.
+ *   agent-facing rosters (`proc://`, `history://`) and not messageable/revivable.
  */
 export type AgentKind = "main" | "sub" | "advisor";
 
@@ -1534,7 +1535,22 @@ export class AgentRegistry {
 		return true;
 	}
 
-	/** Record final-result acceptance and expose accepted runs missed by status mirroring. */
+	/**
+	 * Record that this agent's run produced and handed over its final result,
+	 * and terminalize the ref when no turn is in flight. Acceptance is the
+	 * executor's run boundary: the result is settled, so a ref still `running`
+	 * with nothing streaming is a missed terminal transition the parent's
+	 * `wait` would otherwise keep blocking on. A ref with a genuinely
+	 * streaming session (a wake turn started at the boundary) stays `running`
+	 * and is surfaced by {@link staleAcceptedRuns} instead.
+	 *
+	 * Milestones are run-scoped: `responseAt` is the CURRENT call's response
+	 * time (never a previous run's, which {@link setStatus} cleared when the
+	 * ref re-entered `running`).
+	 *
+	 * Returns false when the id is gone, aborted, or no longer owned by
+	 * `expected`; those cases must not stamp a newer generation.
+	 */
 	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean {
 		const ref = this.#refs.get(id);
 		if (!ref || ref.status === "aborted") return false;
@@ -1554,7 +1570,12 @@ export class AgentRegistry {
 		return true;
 	}
 
-	/** Accepted final results whose ref still claims running without an active turn. */
+	/**
+	 * Accepted-but-running refs: the run's final result was handed over but the
+	 * ref never left `running`, and no turn is in flight. This is the lifecycle
+	 * leak the `proc://` running-agents roster reports so the parent can cancel it
+	 * instead of waiting on a run that already finished.
+	 */
 	staleAcceptedRuns(): AgentRef[] {
 		return this.list().filter(
 			ref => ref.status === "running" && ref.lifecycle?.acceptedAt !== undefined && !this.isRunning(ref),
@@ -1673,7 +1694,7 @@ export class AgentRegistry {
 			ref.status === "aborted" ||
 			this.#terminating.has(ref.id) ||
 			(expectedSession === undefined
-				? ref.status !== "parked" || ref.session !== null
+				? (ref.status !== "parked" && ref.status !== "running") || ref.session !== null
 				: ref.session !== expectedSession || !this.#matchesInternalExpected(ref, expectedSession))
 		)
 			return false;

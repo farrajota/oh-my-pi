@@ -16,7 +16,7 @@
  */
 
 import { type } from "@oh-my-pi/omptype";
-import { POLL_WAIT_LADDER_MS } from "../../async/job-manager";
+import { POLL_WAIT_LADDER_MS } from "../../async";
 import type {
 	AgentTool,
 	AgentToolContext,
@@ -47,6 +47,7 @@ import hubDescription from "../../prompts/tools/hub.md" with { type: "text" };
 import type { AgentRegistry } from "../../registry/agent-registry";
 import type { ToolActivitySummary } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { ToolSession } from "..";
+import { cfgLaunchEnabled } from "../settings";
 import {
 	buildJobResult,
 	executeCancel,
@@ -60,7 +61,7 @@ import {
 	resolvePollWindow,
 	snapshotJobs,
 	visibleJobs,
-} from "./jobs";
+} from "../../async/job-control";
 import {
 	executeLaunch,
 	type LaunchParams,
@@ -90,7 +91,7 @@ import {
 	MAX_HUB_LIST_LIMIT,
 } from "./types";
 
-export { isWaitingPollDetails } from "./jobs";
+export { isWaitingPollDetails } from "../../async/job-control";
 export type { LaunchParams, LaunchToolDetails } from "./launch";
 export { createIrcMessageCard, isIrcEnabled } from "./messaging";
 export * from "./types";
@@ -523,7 +524,7 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		op: LaunchParams["op"],
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<HubDetails>> {
-		if (!this.session.settings.get("launch.enabled")) {
+		if (!cfgLaunchEnabled.get(this.session.settings)) {
 			return hubErrorResult("Process supervision is disabled (launch.enabled=false).", { op: params.op });
 		}
 		const { op: _hubOp, ...rest } = params;

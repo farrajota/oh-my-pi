@@ -108,6 +108,8 @@ import {
 } from "./utils";
 import { runWorkspaceDiagnostics } from "./workspace-diagnostics";
 
+import { cfgToolsMaxTimeout } from "../tools/settings";
+
 const MAX_RENAME_PAIRS = 1000;
 
 interface FileRenamePair {
@@ -225,7 +227,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		if (this.session.lspReadOnly && !LSP_READONLY_ACTIONS.has(action)) {
 			throw new ToolError(`LSP action ${action} is disabled in this read-only session`);
 		}
-		const timeoutSec = clampTimeout("lsp", timeout, this.session.settings.get("tools.maxTimeout"));
+		const timeoutSec = clampTimeout("lsp", timeout, cfgToolsMaxTimeout.get(this.session.settings));
 		const timeoutSignal = AbortSignal.timeout(timeoutSec * 1000);
 		const callerSignal = signal;
 		signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;

@@ -99,7 +99,7 @@ describe("EvalTool auto-background", () => {
 		await Promise.all(operationLedgers.splice(0).map(ledger => ledger.close()));
 	});
 
-	it("keeps fast cells inline and suppresses their job delivery", async () => {
+	it("keeps fast cells inline without a job row or delivery", async () => {
 		const deliveries: string[] = [];
 		const asyncJobManager = new AsyncJobManager({
 			onJobComplete: async (_jobId, text) => {
@@ -124,10 +124,10 @@ describe("EvalTool auto-background", () => {
 		expect(text).toContain("quick");
 		expect(result.details?.async).toBeUndefined();
 		expect(result.details?.cells?.[0]?.status).toBe("complete");
+		await asyncJobManager.waitForAll();
 		await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
-		const [job] = asyncJobManager.getAllJobs();
-		await job?.promise;
-		expect(job && asyncJobManager.isJobResultConsumed(job.id)).toBe(true);
+		expect(asyncJobManager.getAllJobs()).toEqual([]);
+		expect(asyncJobManager.getJob("bg_1")).toBeUndefined();
 		expect(deliveries).toEqual([]);
 		await asyncJobManager.dispose();
 	});

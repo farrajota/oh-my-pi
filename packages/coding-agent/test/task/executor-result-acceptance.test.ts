@@ -13,6 +13,7 @@ import {
 	releaseAgent,
 	resetAgentLifecycleForTests,
 } from "../../src/internal/agent-lifecycle-bridge";
+import { Settings } from "../../src/config/settings";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
@@ -75,7 +76,11 @@ interface SessionHarness {
  * `subscribeRunState` never fires — the run-state mirror omits `idle`, which is
  * exactly the leak the acceptance boundary must cover.
  */
-function createHarness(options?: { hangPrompt?: boolean; usageMessages?: AssistantMessage[] }): SessionHarness {
+function createHarness(options?: {
+	hangPrompt?: boolean;
+	usageMessages?: AssistantMessage[];
+	asyncJobManager?: AsyncJobManager;
+}): SessionHarness {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const messages: AssistantMessage[] = [];
 	const promptEntered = Promise.withResolvers<void>();
@@ -104,7 +109,7 @@ function createHarness(options?: { hangPrompt?: boolean; usageMessages?: Assista
 		model: undefined,
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {}, getArtifactManager: () => undefined },
-		settings: { get: () => ({}) },
+		settings: Settings.isolated(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		getToolByName: () => undefined,
@@ -154,6 +159,7 @@ function createHarness(options?: { hangPrompt?: boolean; usageMessages?: Assista
 		},
 		trackIrcReply: () => {},
 		subscribeRunState: () => () => {},
+		asyncJobManager: options?.asyncJobManager,
 	};
 	return {
 		session: session as unknown as AgentSession,
@@ -412,5 +418,61 @@ describe("runSubprocess result acceptance", () => {
 		expect(settled?.lifecycle?.responseAt).toBeNumber();
 		expect(settled?.lifecycle?.acceptedAt).toBeNumber();
 		expect(settled?.lifecycle?.terminalAt).toBeNumber();
+	});
+
+	it("delivers every yield of a woken agent to its parent as a job completion", async () => {
+		const manager = new AsyncJobManager({});
+		const delivered: string[] = [];
+		manager.registerDeliverySink("Parent", (_jobId, text) => {
+			delivered.push(text);
+		});
+		const harness = createHarness({ asyncJobManager: manager });
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			agentRegistry: AgentRegistry.global(),
+			ircBus: new IrcBus(),
+		});
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+
+		try {
+			for (const report of ["followup-done", "broadcast-ok"]) {
+				const finish = observer([
+					{
+						role: "custom",
+						customType: "irc:incoming",
+						content: "follow up",
+						display: false,
+						details: { id: `msg-${report}`, from: "Parent", message: "follow up" },
+						attribution: "agent",
+						timestamp: Date.now(),
+					} as unknown as AgentMessage,
+				]);
+				harness.emitTerminalYield({ report });
+				// Pending from acceptance until finalization: the parent's `wait` can block on it.
+				const [job] = manager.getRunningJobs({ ownerId: "Parent" });
+				expect(manager.getRunningJobs({ ownerId: "Parent" })).toHaveLength(1);
+				expect(job).toMatchObject({ type: "task", agentId: AGENT_ID, ownerId: "Parent", status: "running" });
+				await finish?.(undefined);
+				await manager.waitForAll();
+				expect(manager.getJob(job!.id)?.status).toBe("completed");
+				await manager.drainDeliveries({ timeoutMs: 1000 });
+			}
+
+			expect(delivered).toHaveLength(2);
+			expect(delivered[0]).toContain("followup-done");
+			expect(delivered[1]).toContain("broadcast-ok");
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
 	});
 });

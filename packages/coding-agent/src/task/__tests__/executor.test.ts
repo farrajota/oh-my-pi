@@ -3,6 +3,7 @@ import type { TSchema } from "@oh-my-pi/pi-ai";
 import { type } from "arktype";
 import type { ModelRegistry } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
+import { lookup as lookupSetting } from "../../config/registry";
 import type { CustomTool } from "../../extensibility/custom-tools/types";
 import type { MCPManager } from "../../mcp/manager";
 import * as sdk from "../../sdk";
@@ -13,6 +14,12 @@ import { AgentRegistry } from "../../registry/agent-registry";
 import { createMCPProxyTools, runSubprocess } from "../executor";
 import * as taskLabel from "../label";
 import type { AgentDefinition } from "../types";
+
+function settingHandle(id: string) {
+	const handle = lookupSetting(id);
+	if (!handle) throw new Error(`Setting ${id} is not registered`);
+	return handle;
+}
 
 const emptyParams = type({}) as unknown as TSchema;
 
@@ -186,7 +193,7 @@ describe("runSubprocess task label generation", () => {
 		const labelSpy = vi.spyOn(taskLabel, "generateTaskLabel").mockResolvedValue(null);
 
 		try {
-			expect(settings.get("task.generateLabels")).toBe(true);
+			expect(settingHandle("task.generateLabels").get(settings)).toBe(true);
 			await runWithAgentTools([], settings);
 			expect(labelSpy).toHaveBeenCalledTimes(1);
 			expect(labelSpy).toHaveBeenCalledWith(

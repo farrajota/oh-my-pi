@@ -293,6 +293,7 @@ describe("AgentLifecycleManager", () => {
 		setReviverFactory(async ref => {
 			factoryCalls++;
 			expect(ref).toMatchObject({ id: cold.id, lineage: cold.lineage, status: "parked" });
+			expect(ref).toBe(cold);
 			expect("session" in ref).toBe(false);
 			return async () => revived.session;
 		}, 0);

@@ -31,7 +31,7 @@ import type { AgentSession } from "../session/agent-session";
 import type { ToolSession } from "../tools";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import { trackLateCleanup } from "../utils/late-cleanup";
-import type { ExecutorOptions } from "./executor";
+import type { RunSubprocessOptions } from "./executor";
 import { runSubprocess } from "./executor";
 import { needsNativeTeardown, writeRetainedBackend } from "./isolation-ownership";
 import type { SingleResult } from "./types";
@@ -50,6 +50,8 @@ import {
 	type NestedRepoPatch,
 	type WorktreeBaseline,
 } from "./worktree";
+
+import { cfgTaskIsolationCommits } from "./settings";
 
 type IsoBackendKind = natives.IsoBackendKind;
 
@@ -163,7 +165,7 @@ export type BuildCommitMessage = () => undefined | ((diff: string) => Promise<st
  */
 export function makeIsolationCommitMessage(session: ToolSession): BuildCommitMessage {
 	return () => {
-		const style = session.settings.get("task.isolation.commits");
+		const style = cfgTaskIsolationCommits.get(session.settings);
 		if (style !== "ai" || !session.modelRegistry) return undefined;
 		const registry = session.modelRegistry;
 		const settings = session.settings;
@@ -174,7 +176,7 @@ export function makeIsolationCommitMessage(session: ToolSession): BuildCommitMes
 
 export interface IsolatedRunOptions {
 	/** Base run options handed to the subagent subprocess with the isolated worktree. */
-	baseOptions: ExecutorOptions;
+	baseOptions: RunSubprocessOptions;
 	/** Context returned by {@link prepareIsolationContext}. Baseline is cloned per spawn. */
 	context: IsolationContext;
 	/** PAL backend hint from `parseIsolationBackend(...)` (undefined ⇒ resolver picks). */

@@ -32,6 +32,8 @@ import {
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
+import { cfgTaskShowResolvedModelBadge } from "@oh-my-pi/pi-coding-agent/task/settings";
+
 function makeSession(overrides: Partial<ObservableSession> & { id: string }): ObservableSession {
 	return {
 		kind: "subagent",
@@ -156,7 +158,7 @@ describe("subagent HUD lines", () => {
 				agent: "reviewer",
 				progress: makeProgress({ id: "HiddenBadge", agent: "reviewer", resolvedModelIdentity: "openai/gpt-5" }),
 			});
-			Settings.instance.override("task.showResolvedModelBadge", false);
+			cfgTaskShowResolvedModelBadge.override(Settings.instance, false);
 			const row = liveRow([session], "HiddenBadge");
 			expect(row).toContain("HiddenBadge");
 			expect(row).toContain("gpt-5");
@@ -217,7 +219,7 @@ describe("subagent HUD lines", () => {
 					}),
 				];
 				for (const enabled of [true, false]) {
-					Settings.instance.override("task.showResolvedModelBadge", enabled);
+					cfgTaskShowResolvedModelBadge.override(Settings.instance, enabled);
 					for (const width of [40, 120, 40]) {
 						const rows = render(sessions, width).split("\n");
 						expect(rows.find(row => row.includes("LongWorker"))).toStartWith(" 界├ ");

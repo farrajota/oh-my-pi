@@ -69,6 +69,8 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import type { SendUserMessageOptions } from "../../session/agent-session";
+import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -475,6 +477,29 @@ export interface ExtensionActorIdentity {
 /** Runtime host mode exposed to Pi-compatible extensions. */
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
+/**
+ * The agent a session runs. Extension factories are rebound to every subagent session
+ * (task tool, eval `agent()`, `/tan` clones), so this tells a handler which agent it is serving.
+ */
+export interface ExtensionAgentIdentity {
+	/**
+	 * `"main"` for a top-level session, `"sub"` for any spawned session. Check this, not `depth`,
+	 * to tell subagents apart: `/tan` clones are subagents at depth 0.
+	 */
+	kind: "main" | "sub";
+	/** Agent registry id, e.g. `"Main"` or `"0-Explore"`. */
+	id: string;
+	/**
+	 * Lowercased agent definition name, e.g. `"main"`, `"task"`, `"explore"`. Subagents spawned
+	 * without a definition (such as `/tan` clones) report `"sub"`.
+	 */
+	name: string;
+	/** Task-tool nesting depth: 0 for a top-level session and for subagents not spawned by `task`. */
+	depth: number;
+	/** Registry id of the spawning agent; absent for a top-level session. */
+	parentId?: string;
+}
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -510,6 +535,8 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
+	/** Identity of the agent this session runs: the top-level session or a subagent. */
+	agent: ExtensionAgentIdentity;
 	/**
 	 * Whether the current project/workspace is trusted. OMP performs no
 	 * project-trust gating — project-level settings and extensions load
@@ -528,6 +555,14 @@ export interface ExtensionContext {
 	cancelAsyncJob(jobId: string): Promise<BackgroundControlResult>;
 	/** Permanently terminate one owned descendant subagent. */
 	terminateSubagent(agentId: string): Promise<BackgroundControlResult>;
+
+	/** Run a /btw-style side turn without appending to history or executing tool calls.
+	 * Pass tools: false to omit tool definitions; existing context/provider hooks still run.
+	 * Inherits event-handler and registered-tool cancellation, combined with options.signal.
+	 * Hooks reached within a running side turn cannot start another one (bounded recursion).
+	 * Optional for compatibility with hosts that do not provide side turns.
+	 */
+	runEphemeralTurn?(options: EphemeralTurnOptions): Promise<EphemeralTurnResult>;
 	/** Structured memory runtime for status/search/save across the configured backend. */
 	memory?: MemoryRuntimeContext;
 	/**
@@ -548,6 +583,13 @@ export interface ExtensionContext {
 	setTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
 	/** Clear a timer scheduled via {@link setInterval} or {@link setTimeout}. */
 	clearTimer(timer: Timer): void;
+	/**
+	 * Attach trusted, extension-authored instructions to the next provider
+	 * request with developer/system priority where supported. Present only while
+	 * a registered tool is executing. Raw tool output and other untrusted data
+	 * must stay in the ordinary tool result.
+	 */
+	addAdditionalContext?(context: string): void;
 	/**
 	 * Run the NATIVE built-in implementation of the tool this handler re-registered, with `params`,
 	 * and return its result. Lets a tool that re-registers a built-in (e.g. wrapping `write` to add
@@ -898,6 +940,14 @@ export interface CredentialDisabledEvent {
 	provider: string;
 	/** Verbatim error captured for forensics (truncated upstream). */
 	disabledCause: string;
+	/** Database row id of the disabled credential. */
+	credentialId?: number;
+	/** Account identity recorded on the disabled OAuth credential, when the provider supplied one. */
+	email?: string;
+	accountId?: string;
+	/** Organization/workspace the credential was scoped to. */
+	orgId?: string;
+	orgName?: string;
 }
 
 // ============================================================================
@@ -1214,7 +1264,7 @@ export type { ToolResultEventResult } from "../shared-events";
 export interface BeforeAgentStartEventResult {
 	message?: CustomMessagePayload;
 	/** Replace the system prompt for this turn. If multiple extensions return this, they are chained. */
-	systemPrompt?: string[];
+	systemPrompt?: string | string[];
 }
 
 export interface BeforeSubagentSpawnEventResult {
@@ -1837,6 +1887,7 @@ export interface ExtensionContextActions {
 	cancelAsyncJob?: (jobId: string) => Promise<BackgroundControlResult>;
 	/** Optional for hosts that do not manage subagents; ctx returns a safe not-found result. */
 	terminateSubagent?: (agentId: string) => Promise<BackgroundControlResult>;
+	runEphemeralTurn?: (options: EphemeralTurnOptions) => Promise<EphemeralTurnResult>;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

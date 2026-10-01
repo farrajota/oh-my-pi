@@ -17,10 +17,8 @@ import {
 	urlHyperlink,
 	urlHyperlinkAlways,
 } from "@oh-my-pi/pi-tui/render";
-import {
-	resolveMarkdownLinkTargets,
-	tryResolveInternalUrlSync,
-} from "@oh-my-pi/pi-coding-agent/internal-urls/hyperlink-targets";
+import { resolveMarkdownLinkTargets } from "@oh-my-pi/pi-coding-agent/internal-urls/hyperlink-targets";
+import { lookup as lookupSetting } from "@oh-my-pi/pi-coding-agent/config/registry";
 import * as terminalCaps from "@oh-my-pi/pi-tui";
 
 // OSC 8 sequence markers
@@ -29,6 +27,12 @@ const ST = "\x1b\\";
 const BEL = "\x07";
 const LINK_END = `${OSC}8;;${ST}`;
 const ORIGINAL_NO_COLOR = Bun.env.NO_COLOR;
+
+function testFilePath(...segments: string[]): string {
+	return path.join(os.tmpdir(), "omp-hyperlink-test", ...segments);
+}
+
+const cfgTuiHyperlinks = lookupSetting("tui.hyperlinks")!;
 
 /** Extract the hyperlink URI from a wrapped string. Returns undefined if not wrapped. */
 function extractLinkUri(text: string): string | undefined {
@@ -47,7 +51,7 @@ function isHyperlinked(text: string): boolean {
 
 /** Set the `tui.hyperlinks` mode via a non-persistent runtime override. */
 function setHyperlinkMode(mode: "off" | "auto" | "always"): void {
-	settings.override("tui.hyperlinks", mode);
+	cfgTuiHyperlinks.override(settings, mode);
 }
 
 beforeAll(async () => {
@@ -60,7 +64,7 @@ afterAll(() => {
 });
 
 afterEach(() => {
-	settings.clearOverride("tui.hyperlinks");
+	cfgTuiHyperlinks.clearOverride(settings);
 	if (ORIGINAL_NO_COLOR === undefined) {
 		delete Bun.env.NO_COLOR;
 	} else {
@@ -73,7 +77,7 @@ describe("isHyperlinkEnabled", () => {
 		resetSettingsForTest();
 		try {
 			expect(isHyperlinkEnabled()).toBe(false);
-			expect(fileHyperlink(path.resolve("/Users/foo/bar.ts"), "bar.ts")).toBe("bar.ts");
+			expect(fileHyperlink(testFilePath("bar.ts"), "bar.ts")).toBe("bar.ts");
 			expect(urlHyperlinkAlways("https://example.com/path", "example")).toBe("example");
 		} finally {
 			await Settings.init({ inMemory: true });
@@ -139,14 +143,14 @@ describe("isHyperlinkEnabled", () => {
 describe("fileHyperlink", () => {
 	it("returns plain text when hyperlinks are disabled (mode=off)", () => {
 		setHyperlinkMode("off");
-		const filePath = path.resolve("/Users/foo/bar.ts");
+		const filePath = testFilePath("bar.ts");
 		const result = fileHyperlink(filePath, "bar.ts");
 		expect(result).toBe("bar.ts");
 	});
 
 	it("wraps text in OSC 8 when hyperlinks are enabled (mode=always)", () => {
 		setHyperlinkMode("always");
-		const filePath = path.resolve("/Users/foo/bar.ts");
+		const filePath = testFilePath("bar.ts");
 		const result = fileHyperlink(filePath, "bar.ts");
 		expect(isHyperlinked(result)).toBe(true);
 		expect(result).toContain("bar.ts");
@@ -154,7 +158,7 @@ describe("fileHyperlink", () => {
 
 	it("builds a valid file:// URI with the absolute path", () => {
 		setHyperlinkMode("always");
-		const filePath = path.resolve("/Users/foo/bar.ts");
+		const filePath = testFilePath("bar.ts");
 		const result = fileHyperlink(filePath, "bar.ts");
 		const uri = extractLinkUri(result);
 		expect(uri).toMatch(/^file:\/\//);
@@ -163,7 +167,7 @@ describe("fileHyperlink", () => {
 
 	it("encodes spaces in the path", () => {
 		setHyperlinkMode("always");
-		const filePath = path.resolve("/Users/foo/my file.ts");
+		const filePath = testFilePath("my file.ts");
 		const result = fileHyperlink(filePath, "my file.ts");
 		const uri = extractLinkUri(result);
 		expect(uri).toContain("%20");
@@ -172,7 +176,7 @@ describe("fileHyperlink", () => {
 
 	it("percent-encodes URL-reserved path bytes without a query", () => {
 		setHyperlinkMode("always");
-		const filePath = path.resolve("/Users/foo/a#b?c% d.ts");
+		const filePath = testFilePath("a#b?c% d.ts");
 		const result = fileHyperlink(filePath, "a#b?c% d.ts", { line: 12 });
 		const uri = extractLinkUri(result);
 		expect(uri).toBe(url.pathToFileURL(path.resolve(filePath)).href);
@@ -190,7 +194,7 @@ describe("fileHyperlink", () => {
 
 	it("keeps file URIs usable by clients that reject query parameters", () => {
 		setHyperlinkMode("always");
-		const filePath = path.resolve("/Users/foo/bar.ts");
+		const filePath = testFilePath("bar.ts");
 		const result = fileHyperlink(filePath, "bar.ts", { line: 42, col: 7 });
 		const uri = extractLinkUri(result);
 		expect(uri).toBe(url.pathToFileURL(filePath).href);
@@ -198,7 +202,7 @@ describe("fileHyperlink", () => {
 
 	it("omits query params when line/col are not provided", () => {
 		setHyperlinkMode("always");
-		const filePath = path.resolve("/Users/foo/bar.ts");
+		const filePath = testFilePath("bar.ts");
 		const result = fileHyperlink(filePath, "bar.ts");
 		const uri = extractLinkUri(result);
 		expect(uri).not.toContain("?");
@@ -206,7 +210,7 @@ describe("fileHyperlink", () => {
 
 	it("produces a stable id for the same path", () => {
 		setHyperlinkMode("always");
-		const filePath = path.resolve("/Users/foo/bar.ts");
+		const filePath = testFilePath("bar.ts");
 		const r1 = fileHyperlink(filePath, "bar.ts");
 		const r2 = fileHyperlink(filePath, "different display text");
 		// Extract id= from params (between "id=" and next ";")
@@ -218,9 +222,9 @@ describe("fileHyperlink", () => {
 
 	it("does not double-wrap text that already contains an OSC 8 sequence", () => {
 		setHyperlinkMode("always");
-		const alreadyWrappedUri = url.pathToFileURL(path.resolve("/foo/bar.ts")).href;
+		const alreadyWrappedUri = url.pathToFileURL(testFilePath("bar.ts")).href;
 		const alreadyWrapped = `${OSC}8;id=abc123;${alreadyWrappedUri}${ST}bar.ts${LINK_END}`;
-		const result = fileHyperlink(path.resolve("/Users/foo/other.ts"), alreadyWrapped);
+		const result = fileHyperlink(testFilePath("other.ts"), alreadyWrapped);
 		// Should return the already-wrapped text unchanged
 		expect(result).toBe(alreadyWrapped);
 	});
@@ -228,7 +232,7 @@ describe("fileHyperlink", () => {
 	it("preserves ANSI color codes inside the hyperlink", () => {
 		setHyperlinkMode("always");
 		const colored = "\x1b[32mbar.ts\x1b[0m";
-		const filePath = path.resolve("/Users/foo/bar.ts");
+		const filePath = testFilePath("bar.ts");
 		const result = fileHyperlink(filePath, colored);
 		expect(result).toContain(colored);
 		expect(isHyperlinked(result)).toBe(true);
@@ -286,11 +290,7 @@ describe("urlHyperlinkAlways", () => {
 	});
 });
 
-describe("tryResolveInternalUrlSync", () => {
-	// The "no session options" contract below asserts on process-global state
-	// (AgentRegistry main session, LocalProtocolHandler override) that sibling
-	// test files in the same worker may have populated. Pin the premise
-	// explicitly so the test is full-suite safe, not just file-local safe.
+describe("resolveMarkdownLinkTargets fallback", () => {
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
 		LocalProtocolHandler.resetOverrideForTests();
@@ -301,28 +301,28 @@ describe("tryResolveInternalUrlSync", () => {
 		LocalProtocolHandler.resetOverrideForTests();
 	});
 
-	it("returns undefined for non-internal URLs", () => {
-		expect(tryResolveInternalUrlSync("/abs/path/file.ts")).toBeUndefined();
-		expect(tryResolveInternalUrlSync("relative/path.ts")).toBeUndefined();
-		expect(tryResolveInternalUrlSync("https://example.com/foo")).toBeUndefined();
+	it("leaves missing filesystem and remote destinations unresolved", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-hyperlink-fallback-"));
+		try {
+			const missingFile = url.pathToFileURL(path.join(cwd, "missing", "file.ts")).href;
+			const targets = await resolveMarkdownLinkTargets(
+				[`[absolute](${missingFile})`, "[relative](missing-relative/file.ts)", "[remote](https://example.com/foo)"],
+				{ cwd },
+			);
+			expect([...targets]).toEqual([]);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
 	});
 
-	it("returns undefined for unsupported internal URL schemes", () => {
-		// Async-resolved schemes are intentionally not handled here.
-		expect(tryResolveInternalUrlSync("artifact://123")).toBeUndefined();
-		expect(tryResolveInternalUrlSync("agent://abc")).toBeUndefined();
-		expect(tryResolveInternalUrlSync("skill://foo")).toBeUndefined();
-		expect(tryResolveInternalUrlSync("omp://docs.md")).toBeUndefined();
+	it("returns no target for local URLs without session options", async () => {
+		const targets = await resolveMarkdownLinkTargets(["[local](local://foo.md)"]);
+		expect([...targets]).toEqual([]);
 	});
 
-	it("returns undefined when local:// resolution has no session options", () => {
-		// No AgentRegistry main session in this unit test, no override installed.
-		expect(tryResolveInternalUrlSync("local://foo.md")).toBeUndefined();
-	});
-
-	it("swallows errors from malformed URLs", () => {
-		// Malformed input should not throw, just return undefined.
-		expect(tryResolveInternalUrlSync("local://%ZZ")).toBeUndefined();
+	it("does not throw or resolve malformed internal URLs", async () => {
+		const targets = await resolveMarkdownLinkTargets(["[malformed](local://%ZZ)"]);
+		expect([...targets]).toEqual([]);
 	});
 });
 
@@ -444,7 +444,7 @@ describe("resource links in chat markdown", () => {
 		const file = path.join(tempDir, "src", "my file.ts");
 		await Bun.write(file, "export const value = 1;");
 		const relative = "src/my%20file.ts#L7";
-		const absolute = file.replaceAll("\\", "/").replaceAll(" ", "%20");
+		const absolute = url.pathToFileURL(file).href;
 		const text = `[Source](${relative}) and [Absolute](${absolute}) and [Missing](src/missing.ts) and [Heading](#heading)`;
 		const targets = await resolveMarkdownLinkTargets([text], { cwd: tempDir });
 		const fileUri = url.pathToFileURL(file).href;
@@ -527,15 +527,15 @@ describe("applyHyperlinkSetting on project-scoped reload", () => {
 		const dirB = path.join(os.tmpdir(), "omp-hyperlink-reload-b");
 		try {
 			terminalCaps.setTerminalHyperlinks(false);
-			settings.override("tui.hyperlinks", "always");
+			cfgTuiHyperlinks.override(settings, "always");
 			await settings.reloadForCwd(dirA);
 			expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
 
-			settings.override("tui.hyperlinks", "off");
+			cfgTuiHyperlinks.override(settings, "off");
 			await settings.reloadForCwd(dirB);
 			expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
 		} finally {
-			settings.clearOverride("tui.hyperlinks");
+			cfgTuiHyperlinks.clearOverride(settings);
 			terminalCaps.setTerminalHyperlinks(origHyperlinks);
 		}
 	});

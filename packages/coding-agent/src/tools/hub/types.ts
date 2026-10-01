@@ -163,6 +163,7 @@ export interface JobSnapshot {
 	advisor?: boolean;
 	resultText?: string;
 	errorText?: string;
+	artifactError?: OutputMeta["artifactError"];
 	meta?: OutputMeta;
 	structured?: StructuredSubagentOutput;
 	/**
@@ -208,6 +209,7 @@ export interface AgentActivitySnapshot {
 /** Result details for messaging and job ops; fields are disjoint per op. */
 export interface CoordinationDetails {
 	op: HubOp;
+	meta?: OutputMeta;
 	from?: string;
 	to?: string;
 	receipts?: IrcDeliveryReceipt[];

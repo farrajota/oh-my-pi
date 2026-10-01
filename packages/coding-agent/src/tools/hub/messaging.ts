@@ -13,6 +13,8 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { formatAge, formatDuration } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
+import { lookup } from "../../config/registry";
+import { cfgTaskMaxRecursionDepth } from "../../task/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { lookupAgentRef } from "../../internal/agent-registry-bridge";
 import type { HubAdmissionStateTransaction } from "../../internal/hub-admission";
@@ -125,7 +127,7 @@ export function isIrcEnabled(settings: Settings, taskDepth: number): boolean {
 	if (taskDepth > 0) return true;
 	// Top-level session: peers exist only if it can still spawn subagents — the
 	// same capacity gate the task tool uses, reused here to avoid drift.
-	const maxDepth = settings.get("task.maxRecursionDepth") ?? 2;
+	const maxDepth = cfgTaskMaxRecursionDepth.get(settings) ?? 2;
 	return canSpawnAtDepth(maxDepth, taskDepth);
 }
 
@@ -145,7 +147,8 @@ export function normalizeIrcTimeoutMs(value: number): number {
 /** Effective message-wait timeout: explicit param wins, then `irc.timeoutMs`. */
 export function resolveMessageTimeoutMs(settings: Settings, explicit?: number): number {
 	if (explicit !== undefined) return normalizeIrcTimeoutMs(explicit);
-	return normalizeIrcTimeoutMs(settings.get("irc.timeoutMs"));
+	const timeoutMs = lookup("irc.timeoutMs")?.get(settings);
+	return normalizeIrcTimeoutMs(typeof timeoutMs === "number" ? timeoutMs : Number.NaN);
 }
 
 /** Session-buffered inbox drain used before parking a bus waiter. */

@@ -28,7 +28,7 @@ import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
 import { snapshotEffectiveExtensionRoots } from "../capability/types";
 import { resolveAgentModelSelection } from "../config/model-resolver";
-import type { LocalProtocolOptions } from "../internal-urls";
+import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { getAgentLifecycleManager, lifecycleHasAgent, releaseAgent } from "../internal/agent-lifecycle-bridge";
@@ -41,7 +41,7 @@ import {
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { getBundledAgent } from "../task/agents";
-import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
+import { type RunSubprocessOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
 import { generateTaskName } from "../task/name-generator";
 import { AgentOutputManager } from "../task/output-manager";
 import { type AgentDefinition } from "../task/types";
@@ -61,6 +61,8 @@ import {
 	type VibeTombstoneReason,
 } from "./lifecycle";
 import { type VibeCli } from "@oh-my-pi/pi-tui/tools/vibe";
+
+import { cfgTaskAgentModelOverrides, cfgTaskEnableLsp } from "../task/settings";
 /**
  * CLI flavor → bundled agent type. This IS the model-tier mapping: `sonic`
  * carries `model: "@smol"` (the configured fast/low-latency role) and `task`
@@ -359,7 +361,7 @@ export class VibeSessionRegistry {
 		if (!agent) {
 			throw new ToolError(`Bundled agent "${agentName}" for vibe cli "${cli}" is unavailable.`);
 		}
-		const agentModelOverrides = session.settings.get("task.agentModelOverrides");
+		const agentModelOverrides = cfgTaskAgentModelOverrides.get(session.settings);
 		// Same contract as the task spawn path: the expansion discards the role
 		// alias (`@task`, `@smol`), so patterns and role identity come from one
 		// call — the child's inherited retry-fallback chain is keyed off the role.
@@ -1298,14 +1300,14 @@ export class VibeSessionRegistry {
 			});
 	}
 
-	/** Build the ExecutorOptions for a first spawn, mirroring the `task`/eval-bridge plumbing. */
+	/** Build the RunSubprocessOptions for a first spawn, mirroring the `task`/eval-bridge plumbing. */
 	async #buildSpawnOptions(
 		session: ToolSession,
 		record: VibeRecord,
 		message: string,
 		signal: AbortSignal,
 		onProgress: (progress: AgentProgress) => void,
-	): Promise<ExecutorOptions> {
+	): Promise<RunSubprocessOptions> {
 		const registry = this.#registry(session);
 		if (!session.createAuthoritySession)
 			throw new ToolError("Vibe sessions require a live parent-bound session creator.");
@@ -1314,10 +1316,7 @@ export class VibeSessionRegistry {
 		const artifactsDir = sessionArtifactsDir ?? path.join(os.tmpdir(), `omp-vibe-${Snowflake.next()}`);
 		await fs.mkdir(artifactsDir, { recursive: true });
 		if (!sessionArtifactsDir) registerArtifactsDir(artifactsDir);
-		const localProtocolOptions: LocalProtocolOptions = session.localProtocolOptions ?? {
-			getArtifactsDir: session.getArtifactsDir ?? (() => null),
-			getSessionId: session.getSessionId ?? (() => null),
-		};
+		const localProtocolOptions = sessionLocalProtocolOptions(session);
 		return {
 			cwd: session.cwd,
 			additionalDirectories: session.additionalDirectories,
@@ -1339,7 +1338,7 @@ export class VibeSessionRegistry {
 			sessionFile,
 			persistArtifacts: Boolean(sessionFile),
 			artifactsDir,
-			enableLsp: (session.enableLsp ?? true) && session.settings.get("task.enableLsp"),
+			enableLsp: (session.enableLsp ?? true) && cfgTaskEnableLsp.get(session.settings),
 			signal,
 			subagentEventBus: session.subagentEventBus,
 			onProgress,

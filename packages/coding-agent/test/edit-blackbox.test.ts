@@ -5,8 +5,7 @@ import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool, getEditStore, type PatchParams } from "@oh-my-pi/pi-coding-agent/edit";
 import { SessionPathScope } from "@oh-my-pi/pi-coding-agent/internal/session-path-scope";
-import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls";
-import { planLocalProtocolOptions } from "@oh-my-pi/pi-coding-agent/tools/plan-mode-guard";
+import { resolvePlanPath } from "@oh-my-pi/pi-coding-agent/tools/plan-mode-guard";
 import {
 	installSessionOperationLedger,
 	markUnregisteredSessionOperationProjection,
@@ -176,7 +175,7 @@ describe("edit parse-regression blackbox", () => {
 
 		const sloppyPath = await writeFixture("sloppy.ts");
 		const sloppyArg = {
-			input: "*** SM:EDIT sloppy.ts\n*** SM:FIND\n\treturn 1;\n*** SM:PUT\n\treturn (;",
+			input: "*** Edit File: sloppy.ts\n*** Find\n\treturn 1;\n*** Replace\n\treturn (;",
 		};
 		await new EditTool(session, "sloppy").execute("sloppy", sloppyArg);
 		expected.push({
@@ -323,7 +322,7 @@ describe("edit parse-regression blackbox", () => {
 		const artifactsDir = path.join(tempDir, "local-artifacts");
 		await fs.mkdir(artifactsDir, { recursive: true });
 		const localSession = { ...session, getArtifactsDir: () => artifactsDir } as ToolSession;
-		const localRoot = path.resolve(resolveLocalRoot(planLocalProtocolOptions(localSession)));
+		const localRoot = path.resolve(await resolvePlanPath(localSession, "local://"));
 		await fs.mkdir(localRoot, { recursive: true });
 
 		const allowedUpdatePath = path.join(localRoot, "allowed-update.ts");
@@ -331,11 +330,17 @@ describe("edit parse-regression blackbox", () => {
 		const deniedMoveSourcePath = path.join(localRoot, "allowed-denied-move-source.ts");
 		const allowedMoveDestinationPath = path.join(localRoot, "allowed-move-destination.ts");
 		const deniedMoveDestinationPath = path.join(localRoot, "denied-move-destination.ts");
-		const colonPath = path.join(tempDir, "allowed:notes.ts");
+
+		const allowedPaths = [path.join(localRoot, "allowed-*")];
+		let colonPath: string | undefined;
+		if (os.platform() !== "win32") {
+			colonPath = path.join(tempDir, "allowed:notes.ts");
+			await fs.writeFile(colonPath, SOURCE);
+			allowedPaths.push(colonPath);
+		}
 		await fs.writeFile(allowedUpdatePath, SOURCE);
 		await fs.writeFile(allowedMoveSourcePath, SOURCE);
 		await fs.writeFile(deniedMoveSourcePath, SOURCE);
-		await fs.writeFile(colonPath, SOURCE);
 
 		const operationManager = {};
 		const ledger = installSessionOperationLedger(operationManager);
@@ -348,7 +353,7 @@ describe("edit parse-regression blackbox", () => {
 			actorKind: "sub",
 			profiles: [],
 			denyTools: [],
-			allowPaths: [path.join(localRoot, "allowed-*"), colonPath],
+			allowPaths: allowedPaths,
 			denyPaths: [deniedMoveDestinationPath],
 		};
 		const pathScope = new SessionPathScope({
@@ -369,12 +374,20 @@ describe("edit parse-regression blackbox", () => {
 				"+\treturn 2;",
 				"*** End Patch",
 			].join("\n");
-		const runPatch = async (operationId: string, input: string) => {
+		const runPatch = async (operationId: string, input: string, onPreflight?: () => void) => {
 			try {
 				const result = await runFilesystemOperation(operationManager, operationId, () =>
-					pathScope.withOperationLease(operationId, () =>
-						new EditTool(scopedSession, "apply_patch").execute(operationId, { input }),
-					),
+					pathScope.withOperationLease(operationId, () => {
+						if (onPreflight) {
+							const operation = pathScope.currentOperation();
+							const originalPreflight = operation.preflight.bind(operation);
+							operation.preflight = async candidates => {
+								onPreflight();
+								return originalPreflight(candidates);
+							};
+						}
+						return new EditTool(scopedSession, "apply_patch").execute(operationId, { input });
+					}),
 				);
 				return {
 					isError: result.isError === true,
@@ -385,14 +398,22 @@ describe("edit parse-regression blackbox", () => {
 			}
 		};
 		try {
-			const update = await runPatch("edit:local-update", applyPatch("local://allowed-update.ts"));
+			const update = await runPatch("edit:local-update", applyPatch("LOCAL://allowed-update.ts"));
 			expect(update.isError).toBe(false);
 			expect(await Bun.file(allowedUpdatePath).text()).toBe(SOURCE.replace("return 1;", "return 2;"));
+			let malformedPreflightCalls = 0;
+			const malformed = await runPatch("edit:malformed-uri", applyPatch("demo:/n.md"), () => {
+				malformedPreflightCalls++;
+			});
+			expect(malformed.isError).toBe(true);
+			expect(malformed.text).toContain("Unsupported scoped edit path scheme: demo://");
+			expect(malformedPreflightCalls).toBe(0);
 
-			const colonUpdate = await runPatch("edit:colon-filename", applyPatch("allowed:notes.ts"));
-			expect(colonUpdate.isError).toBe(false);
-			expect(await Bun.file(colonPath).text()).toBe(SOURCE.replace("return 1;", "return 2;"));
-
+			if (colonPath !== undefined) {
+				const colonUpdate = await runPatch("edit:colon-filename", applyPatch("allowed:notes.ts"));
+				expect(colonUpdate.isError).toBe(false);
+				expect(await Bun.file(colonPath).text()).toBe(SOURCE.replace("return 1;", "return 2;"));
+			}
 			const allowedMove = await runPatch(
 				"edit:local-allowed-move",
 				applyPatch("local://allowed-move-source.ts", "local://allowed-move-destination.ts"),

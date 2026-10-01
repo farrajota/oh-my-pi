@@ -146,7 +146,7 @@ describe("fresh child discovery identity", () => {
 	test("fresh subagent settings use child cwd while retaining parent agentDir", async () => {
 		const { projectDir, agentDir, worktree } = await makeRoots();
 		const parent = Settings.isolated({}, { cwd: projectDir, agentDir });
-		const child = createSubagentSettings(parent, undefined, undefined, { cwd: worktree });
+		const child = await createSubagentSettings(parent, undefined, undefined, { cwd: worktree });
 
 		expect(child.getCwd()).toBe(path.normalize(worktree));
 		expect(child.getAgentDir()).toBe(path.normalize(agentDir));

@@ -9,7 +9,7 @@
  * {@link AgentLifecycleManager.ensureLive}. Only this manager flips
  * `parked` ↔ `idle`.
  *
- * Park/dispose is gated against concurrent ensureLive/hub-send:
+ * Park/dispose is gated against concurrent ensureLive/peer sends:
  * - A disposing session is never handed out.
  * - ensureLive during an in-flight park either cancels the park (session still
  *   live) or waits for detach+park and then revives.
@@ -128,10 +128,11 @@ export class AgentLifecycleManager {
 	readonly #parks = new Map<string, ParkInFlight>();
 	/** In-flight revives, bound to the parked ref that initiated them, so concurrent {@link ensureLive} calls coalesce. */
 	readonly #revivals = new Map<string, RevivingAgent>();
+	readonly #persistedObservations = new Map<string, { ref: InternalAgentRef; observation: AgentRef }>();
 	#unsubscribe: (() => void) | undefined;
 	#persistedReviverFactory: PersistedSubagentReviverFactory | undefined;
-	/** TTL applied when a cold-revived ref is adopted on demand. */
-	#persistedReviveTtlMs = 0;
+	/** Resolves the TTL applied when a cold-revived ref is adopted on demand (read per revive). */
+	#persistedReviveTtlMs: () => number = () => 0;
 	/** Set once {@link dispose} runs; blocks late revivals from adopting into a torn-down manager. */
 	#disposed = false;
 
@@ -148,6 +149,7 @@ export class AgentLifecycleManager {
 		for (const adopted of this.#adopted.values()) clearTimeout(adopted.timer);
 		this.#adopted.clear();
 		this.#revivals.clear();
+		this.#persistedObservations.clear();
 		this.#parks.clear();
 		this.#persistedReviverFactory = undefined;
 	}
@@ -156,15 +158,16 @@ export class AgentLifecycleManager {
 	 * Install the factory used to cold-revive `parked` refs restored from disk
 	 * (Agent Hub scan, collab mirror, resumed process) — they carry a sessionFile
 	 * but no adoption. Set by the top-level session, which owns the ambient deps
-	 * (auth, models, MCP, artifacts) the factory needs at revive time.
+	 * (auth, models, MCP, artifacts) the factory needs at revive time. The TTL may
+	 * be a fixed value from the internal bridge or a provider resolved per revive.
 	 */
 	setPersistedSubagentReviverFactory(
 		factory: PersistedSubagentReviverFactory,
-		idleTtlMs: number,
+		idleTtlMs: number | (() => number),
 		_capability?: unknown,
 	): void {
 		this.#persistedReviverFactory = factory;
-		this.#persistedReviveTtlMs = idleTtlMs;
+		this.#persistedReviveTtlMs = typeof idleTtlMs === "function" ? idleTtlMs : () => idleTtlMs;
 	}
 
 	/**
@@ -230,7 +233,21 @@ export class AgentLifecycleManager {
 		const persistedFactory = ref.sessionFile ? this.#persistedReviverFactory : undefined;
 		if (persistedFactory) {
 			try {
-				if (await persistedFactory(observeAgentRef(this.#registry, ref))) return false;
+				const revive = await persistedFactory(expected);
+				if (revive) {
+					if (
+						!this.#disposed &&
+						lookupAgentRef(this.#registry, id) === ref &&
+						ref.status === "parked" &&
+						!ref.session &&
+						!this.#adopted.has(id) &&
+						!this.#parks.has(id) &&
+						!this.#revivals.has(id)
+					) {
+						this.#persistedObservations.set(id, { ref, observation: expected });
+					}
+					return false;
+				}
 			} catch (error) {
 				logger.warn("AgentLifecycleManager.reclaimDeadCorpse: persisted reviver probe failed", {
 					id,
@@ -269,7 +286,7 @@ export class AgentLifecycleManager {
 	 * agent `parked`. No-op unless the id is adopted and live.
 	 *
 	 * The session is detached (and status flipped to `parked`) *before*
-	 * `session.dispose()` so concurrent {@link ensureLive}/hub-send never
+	 * `session.dispose()` so concurrent {@link ensureLive}/peer sends never
 	 * observe or inject into a disposing session. A concurrent ensureLive that
 	 * arrives before detach cancels the park and keeps the live session.
 	 */
@@ -397,7 +414,15 @@ export class AgentLifecycleManager {
 		let revive = adoption?.ref === ref ? adoption.revive : undefined;
 		let coldAdopted = false;
 		if (!revive && ref.status === "parked" && ref.sessionFile && this.#persistedReviverFactory) {
-			revive = await this.#persistedReviverFactory(observeAgentRef(this.#registry, ref));
+			const retained = this.#persistedObservations.get(id);
+			let observation: AgentRef;
+			if (retained?.ref === ref) {
+				observation = retained.observation;
+			} else {
+				if (retained) this.#persistedObservations.delete(id);
+				observation = observeAgentRef(this.#registry, ref);
+			}
+			revive = await this.#persistedReviverFactory(observation);
 			// Teardown can complete during the factory await. A late cold revive must
 			// never repopulate or attach to a disposed lifecycle manager.
 			if (this.#disposed) {
@@ -406,7 +431,7 @@ export class AgentLifecycleManager {
 				);
 			}
 			if (revive) {
-				adoption = { ref, idleTtlMs: this.#persistedReviveTtlMs, revive };
+				adoption = { ref, idleTtlMs: this.#persistedReviveTtlMs(), revive };
 				this.#adopted.set(id, adoption);
 				coldAdopted = true;
 			}
@@ -527,6 +552,7 @@ export class AgentLifecycleManager {
 	/** Teardown everything; disposing the global manager makes its next owner a fresh instance. */
 	async dispose(deadlineAt: number = Date.now() + AGENT_RELEASE_GRACE_MS, _capability?: unknown): Promise<void> {
 		this.#unsubscribe?.();
+		this.#persistedObservations.clear();
 		this.#disposed = true;
 		this.#unsubscribe = undefined;
 		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
@@ -614,6 +640,10 @@ export class AgentLifecycleManager {
 	}
 
 	#onRegistryEvent(event: InternalRegistryEvent): void {
+		const retained = this.#persistedObservations.get(event.ref.id);
+		if (retained && (retained.ref === event.ref || lookupAgentRef(this.#registry, event.ref.id) !== retained.ref)) {
+			this.#persistedObservations.delete(event.ref.id);
+		}
 		const adopted = this.#adopted.get(event.ref.id);
 		if (!adopted || adopted.ref !== event.ref) return;
 		if (event.type === "removed") {

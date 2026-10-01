@@ -22,9 +22,19 @@ import { initTheme, setSymbolPreset, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { getSessionAccentAnsi } from "@oh-my-pi/pi-tui/theme/session-color";
 import { adjustHsv } from "@oh-my-pi/pi-utils";
+import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { StatusLineTestComponents } from "./helpers/status-line";
 
+import {
+	cfgStatusLineContextLine,
+	cfgStatusLineLeftSegments,
+	cfgStatusLinePreset,
+	cfgStatusLineRightSegments,
+} from "@oh-my-pi/pi-coding-agent/modes/settings";
+
 const statusLines = new StatusLineTestComponents();
+
+const cfgCompactionThresholdPercent = lookup("compaction.thresholdPercent")!;
 beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
@@ -280,7 +290,7 @@ describe("StatusLineComponent context breakdown", () => {
 	});
 
 	it("renders context against the session-resolved compaction threshold", () => {
-		settings.override("compaction.thresholdPercent", 50);
+		cfgCompactionThresholdPercent.override(settings, 50);
 		try {
 			const { session } = makeSession({
 				messages: [userMessage("hi"), assistantMessage("done")],
@@ -304,7 +314,7 @@ describe("StatusLineComponent context breakdown", () => {
 			// The session's 80% threshold wins over the host's 50% fallback.
 			expect(plain).toContain("[25%]/20.0%/100K");
 		} finally {
-			settings.clearOverride("compaction.thresholdPercent");
+			cfgCompactionThresholdPercent.clearOverride(settings);
 		}
 	});
 
@@ -446,10 +456,10 @@ describe("StatusLineComponent context breakdown", () => {
 			messages: [userMessage("hi"), assistantMessage("done")],
 			usage: { tokens: 80_000, contextWindow: 1_000_000, percent: 8 },
 		});
-		settings.override("statusLine.preset", "custom");
-		settings.override("statusLine.leftSegments", ["pi", "context_pct"]);
-		settings.override("statusLine.rightSegments", ["context_total", "session_name"]);
-		settings.override("statusLine.contextLine", "embedded");
+		cfgStatusLinePreset.override(settings, "custom");
+		cfgStatusLineLeftSegments.override(settings, ["pi", "context_pct"]);
+		cfgStatusLineRightSegments.override(settings, ["context_total", "session_name"]);
+		cfgStatusLineContextLine.override(settings, "embedded");
 
 		try {
 			const comp = statusLines.track(new StatusLineComponent(session, statusLineHost));
@@ -467,10 +477,10 @@ describe("StatusLineComponent context breakdown", () => {
 			expect(windowIndex).toBeGreaterThan(compactionIndex);
 			expect(plain.indexOf("1M", windowIndex + 1)).toBe(-1);
 		} finally {
-			settings.clearOverride("statusLine.contextLine");
-			settings.clearOverride("statusLine.rightSegments");
-			settings.clearOverride("statusLine.leftSegments");
-			settings.clearOverride("statusLine.preset");
+			cfgStatusLineContextLine.clearOverride(settings);
+			cfgStatusLineRightSegments.clearOverride(settings);
+			cfgStatusLineLeftSegments.clearOverride(settings);
+			cfgStatusLinePreset.clearOverride(settings);
 		}
 	});
 	it("keeps embedded context on the gauge while the session is unnamed", () => {
@@ -483,10 +493,10 @@ describe("StatusLineComponent context breakdown", () => {
 			usage: { tokens: 80_000, contextWindow: 1_000_000, percent: 8 },
 			sessionName: null,
 		});
-		settings.override("statusLine.preset", "custom");
-		settings.override("statusLine.leftSegments", ["pi", "context_pct"]);
-		settings.override("statusLine.rightSegments", ["session_name"]);
-		settings.override("statusLine.contextLine", "embedded");
+		cfgStatusLinePreset.override(settings, "custom");
+		cfgStatusLineLeftSegments.override(settings, ["pi", "context_pct"]);
+		cfgStatusLineRightSegments.override(settings, ["session_name"]);
+		cfgStatusLineContextLine.override(settings, "embedded");
 
 		try {
 			const comp = statusLines.track(new StatusLineComponent(session, statusLineHost));
@@ -497,10 +507,10 @@ describe("StatusLineComponent context breakdown", () => {
 			expect(plain).toContain("8%");
 			expect(plain).toContain("1M");
 		} finally {
-			settings.clearOverride("statusLine.contextLine");
-			settings.clearOverride("statusLine.rightSegments");
-			settings.clearOverride("statusLine.leftSegments");
-			settings.clearOverride("statusLine.preset");
+			cfgStatusLineContextLine.clearOverride(settings);
+			cfgStatusLineRightSegments.clearOverride(settings);
+			cfgStatusLineLeftSegments.clearOverride(settings);
+			cfgStatusLinePreset.clearOverride(settings);
 		}
 	});
 
@@ -528,7 +538,7 @@ describe("StatusLineComponent context breakdown", () => {
 	});
 
 	it("renders the session threshold fill in embedded context at a constrained width", () => {
-		settings.override("compaction.thresholdPercent", 50);
+		cfgCompactionThresholdPercent.override(settings, 50);
 		try {
 			const { session } = makeSession({
 				messages: [userMessage("hi"), assistantMessage("done")],
@@ -558,7 +568,7 @@ describe("StatusLineComponent context breakdown", () => {
 			expect(plain).toContain("100K");
 			expect(plain).not.toContain("20.0%/100K");
 		} finally {
-			settings.clearOverride("compaction.thresholdPercent");
+			cfgCompactionThresholdPercent.clearOverride(settings);
 		}
 	});
 
@@ -587,10 +597,10 @@ describe("StatusLineComponent context breakdown", () => {
 			contextWindow: 200_000,
 			usage: { tokens: 240_000, contextWindow: 200_000, percent: 120 },
 		});
-		settings.override("statusLine.preset", "custom");
-		settings.override("statusLine.leftSegments", ["pi", "context_pct"]);
-		settings.override("statusLine.rightSegments", ["context_total", "session_name"]);
-		settings.override("statusLine.contextLine", "embedded");
+		cfgStatusLinePreset.override(settings, "custom");
+		cfgStatusLineLeftSegments.override(settings, ["pi", "context_pct"]);
+		cfgStatusLineRightSegments.override(settings, ["context_total", "session_name"]);
+		cfgStatusLineContextLine.override(settings, "embedded");
 
 		try {
 			const comp = statusLines.track(new StatusLineComponent(session, statusLineHost));
@@ -605,10 +615,10 @@ describe("StatusLineComponent context breakdown", () => {
 			expect(plain).toContain("[100%]/120%");
 			expect(border.content).toContain(`${theme.getFgAnsi("error")}[100%]/120%`);
 		} finally {
-			settings.clearOverride("statusLine.contextLine");
-			settings.clearOverride("statusLine.rightSegments");
-			settings.clearOverride("statusLine.leftSegments");
-			settings.clearOverride("statusLine.preset");
+			cfgStatusLineContextLine.clearOverride(settings);
+			cfgStatusLineRightSegments.clearOverride(settings);
+			cfgStatusLineLeftSegments.clearOverride(settings);
+			cfgStatusLinePreset.clearOverride(settings);
 		}
 	});
 	it("uses semantic Nerd Font markers for async speculation and compaction boundaries", async () => {

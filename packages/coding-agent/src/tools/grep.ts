@@ -20,14 +20,16 @@ import {
 	openArchive,
 	parseArchivePathCandidates,
 } from "@oh-my-pi/pi-utils/ar";
+import { lookup as lookupSetting } from "../config/registry";
 import { getEditStore } from "../edit/store";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
-import type { LocalProtocolOptions } from "../internal-urls/local-protocol";
-import { isOmpDocsRoot, ompDocsScopeEntries } from "../internal-urls/omp-scope";
+import { sessionResolveContext } from "../internal-urls/context";
+import { parseInternalUrl } from "../internal-urls";
 import { InternalUrlRouter } from "../internal-urls/router";
 import type { InternalResource, ResolveContext } from "../internal-urls/types";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
 import grepDescription from "../prompts/tools/grep.md" with { type: "text" };
 import {
 	DEFAULT_MAX_COLUMN,
@@ -47,12 +49,11 @@ import {
 	truncateToWidth,
 	uriHyperlink,
 } from "@oh-my-pi/pi-tui/render";
-import { tryResolveInternalUrlSync } from "../internal-urls/hyperlink-targets";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
-import { getExperimentalContextSession } from "./context-notes";
+import { resolveToolTier } from "./approval";
 import { materializeReadUrlToFile, parseReadUrlTarget } from "./fetch";
-import { createFileRecorder, formatResultPath } from "./file-recorder";
+import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file-recorder";
 import {
 	classifyGroupedLines,
 	formatGroupedFiles,
@@ -63,14 +64,15 @@ import type { OutputMeta } from "./output-meta";
 import { isFindEnabled } from "./jfind";
 import {
 	expandDelimitedPathEntries,
+	formatPathRelativeToCwd,
 	hasGlobPathChars,
 	isLineInRanges,
 	type LineRange,
 	parseLineRanges,
-	pathTargetsSsh,
 	probeLiteralPathExists,
-	type ResolvedSearchTarget,
+	relativeSearchResultPath,
 	resolveReadPath,
+	resolveSearchResultPath,
 	resolveToolSearchScope,
 	selectorLineRanges,
 	splitInternalUrlSel,
@@ -92,19 +94,15 @@ import { PREVIEW_LIMITS } from "./preview-limits";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-const searchPathEntry = type("string").describe(
-	'file, directory, glob, internal URL, or "<file>:<lines>" selector to search (e.g. "src/foo.ts:50-100", "src/foo.ts:50+10", "src/foo.ts:50-100,200-300")',
-);
+import { cfgGrepContextAfter, cfgGrepContextBefore } from "./settings";
+import { cfgTaskDisabledAgents } from "../task/settings";
+
 const searchSchema = type({
-	pattern: type("string").describe("regex pattern"),
-	"path?": searchPathEntry.describe(
-		'file, directory, glob, internal URL, or "<file>:<lines>" selector to search; pass several as a semicolon-delimited list ("src; tests"). Omitted -> searches the workspace root (".")',
-	),
-	"case?": type("boolean").describe("case-sensitive search"),
-	"gitignore?": type("boolean").describe("respect gitignore"),
-	"skip?": type("number")
-		.or("null")
-		.describe("files to skip before collecting results — use to paginate when the prior call hit the file limit"),
+	pattern: type("string"),
+	"path?": "string",
+	"case?": "boolean",
+	"gitignore?": "boolean",
+	"skip?": type("number").or("null"),
 });
 
 export type GrepToolInput = typeof searchSchema.infer;
@@ -193,14 +191,15 @@ function isReadSelectorGrammar(sel: string): boolean {
 
 async function parsePathSpecs(rawEntries: readonly string[], cwd: string): Promise<GrepPathSpec[]> {
 	const specs: GrepPathSpec[] = [];
+	const router = InternalUrlRouter.instance();
 	for (const entry of rawEntries) {
-		// Internal URLs (`artifact://`, `skill://`, …) use the URL-aware splitter,
-		// which peels selector-shaped tails only for selector-capable schemes and
-		// leaves opaque ones (`mcp://`) intact. Unlike filesystem paths, their
+		// Internal URLs (single-slash aliases included) use the router's splitter,
+		// which peels selector-shaped tails only for schemes declaring line
+		// selectors and leaves opaque server-defined URIs intact. Unlike filesystem paths, their
 		// verbatim/index display modes (`raw`, `conflicts`) carry no meaning for
 		// content search, so we accept them — searching the whole resource — and
 		// still honor any embedded line range as a match filter.
-		const internalSplit = splitInternalUrlSel(entry);
+		const internalSplit = router.split(entry);
 		if (internalSplit.sel !== undefined) {
 			// Reject selectors read's parseSel would reject (`:1-1:1-2`, `:conflicts:1-1`)
 			// plus read-only tails (`:-10`) instead of silently widening the search or
@@ -210,7 +209,11 @@ async function parsePathSpecs(rawEntries: readonly string[], cwd: string): Promi
 					`path entry "${entry}" has an invalid selector ":${internalSplit.sel}" — use ":N-M" line ranges, ":raw"/":conflicts", a range plus ":raw", or percent-encode a literal ":" as %3A`,
 				);
 			}
-			specs.push({ original: entry, clean: internalSplit.path, ranges: selectorLineRanges(internalSplit.sel) });
+			const ranges = selectorLineRanges(internalSplit.sel);
+			if (ranges && router.isGlob(internalSplit.path)) {
+				throw new ToolError(`Line-range selector requires a single file, not a glob: ${entry}`);
+			}
+			specs.push({ original: entry, clean: internalSplit.path, ranges });
 			continue;
 		}
 		// Prefer a literal filesystem match when one exists — a real file named
@@ -252,12 +255,6 @@ function mergeRangesInto(map: Map<string, LineRange[]>, absKey: string, ranges: 
 	} else {
 		map.set(absKey, [...ranges]);
 	}
-}
-
-function matchAbsolutePath(matchPath: string, searchPath: string): string {
-	if (matchPath === "") return searchPath;
-	if (path.isAbsolute(matchPath)) return matchPath;
-	return path.resolve(searchPath, matchPath);
 }
 
 /**
@@ -367,43 +364,26 @@ interface InternalSearchInputResolution {
 	virtualScopePath?: string;
 }
 
-function isImmutableSourcePath(filePath: string, immutableSourcePaths: ReadonlySet<string>): boolean {
-	for (const immutablePath of immutableSourcePaths) {
-		if (filePath === immutablePath || filePath.startsWith(`${immutablePath}${path.sep}`)) {
-			return true;
-		}
-	}
-	return false;
-}
-
 interface IndexedContentLines {
 	lines: string[];
 	starts: number[];
 }
 
-function normalizeSearchLine(line: string): string {
-	return line.endsWith("\r") ? line.slice(0, -1) : line;
-}
-
 function splitSearchLines(content: string): string[] {
 	const lines = content.split("\n");
-	if (lines.length > 0 && lines[lines.length - 1] === "") {
-		lines.pop();
-	}
-	return lines.map(normalizeSearchLine);
+	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+	return lines.map(line => (line.endsWith("\r") ? line.slice(0, -1) : line));
 }
 
 function indexSearchLines(content: string): IndexedContentLines {
 	const rawLines = content.split("\n");
-	if (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") {
-		rawLines.pop();
-	}
+	if (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") rawLines.pop();
 	const lines: string[] = [];
 	const starts: number[] = [];
 	let offset = 0;
 	for (const rawLine of rawLines) {
 		starts.push(offset);
-		lines.push(normalizeSearchLine(rawLine));
+		lines.push(rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine);
 		offset += rawLine.length + 1;
 	}
 	return { lines, starts };
@@ -411,6 +391,15 @@ function indexSearchLines(content: string): IndexedContentLines {
 
 function lineAllowed(lineNumber: number, ranges: readonly LineRange[] | undefined): boolean {
 	return !ranges || isLineInRanges(lineNumber, ranges);
+}
+
+function isImmutableSourcePath(filePath: string, immutableSourcePaths: ReadonlySet<string>): boolean {
+	for (const immutablePath of immutableSourcePaths) {
+		if (filePath === immutablePath || filePath.startsWith(`${immutablePath}${path.sep}`)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 /**
@@ -907,11 +896,13 @@ async function expandVirtualInternalResource(
 	context: ResolveContext,
 	ranges: readonly LineRange[] | undefined,
 ): Promise<VirtualSearchResource[]> {
-	if (isOmpDocsRoot(rawPath)) {
-		const entries = await ompDocsScopeEntries(context);
-		if (entries.length > 0) {
-			return entries.map(entry => ({ path: entry.url, content: entry.content, ranges }));
+	const normalizedPath = InternalUrlRouter.instance().normalize(rawPath).toLowerCase();
+	if (resource.isDirectory && normalizedPath.startsWith("omp://")) {
+		const entries = await InternalUrlRouter.instance().enumerate(rawPath, context);
+		if (!entries?.length) {
+			throw new ToolError(`No documentation files found under ${rawPath}`);
 		}
+		return entries.map(entry => ({ path: entry.url, content: entry.content, ranges }));
 	}
 
 	return [{ path: rawPath, content: resource.content, ranges }];
@@ -920,19 +911,8 @@ async function expandVirtualInternalResource(
 async function resolveInternalSearchInputs(opts: {
 	pathSpecs: readonly GrepPathSpec[];
 	resolvedPaths: string[];
-	cwd: string;
-	settings: unknown;
-	signal?: AbortSignal;
 	archiveDisplayMap: ReadonlyMap<string, string>;
-	localProtocolOptions?: LocalProtocolOptions;
-	skills?: ResolveContext["skills"];
-	rules?: ResolveContext["rules"];
-	sessionFile?: string;
-	experimentalContextManagement: boolean;
-	getSessionBranch: ResolveContext["getSessionBranch"];
-	sessionId?: string;
-	agentRegistry?: ResolveContext["agentRegistry"];
-	callerMemory?: ResolveContext["callerMemory"];
+	context: ResolveContext;
 }): Promise<InternalSearchInputResolution> {
 	const internalRouter = InternalUrlRouter.instance();
 	const paths = opts.resolvedPaths.slice();
@@ -941,64 +921,45 @@ async function resolveInternalSearchInputs(opts: {
 	const virtualInputIndexes = new Set<number>();
 	const immutableSourcePaths = new Set<string>();
 	let virtualScopePath: string | undefined;
-	const context: ResolveContext = {
-		cwd: opts.cwd,
-		settings: opts.settings,
-		signal: opts.signal,
-		sessionFile: opts.sessionFile,
-		sessionId: opts.sessionId,
-		agentRegistry: opts.agentRegistry,
-		localProtocolOptions: opts.localProtocolOptions,
-		skills: opts.skills,
-		rules: opts.rules,
-		callerMemory: opts.callerMemory,
-		experimentalContextManagement: opts.experimentalContextManagement,
-		getSessionBranch: opts.getSessionBranch,
-		skipDirectoryListing: true,
-		// Try path-only first so large artifacts (and any other handler that
-		// separates path from content) resolve without materializing bytes.
-		// Handlers that ignore the flag still return content, and virtual
-		// resources without a sourcePath fall through to a second resolve.
-		pathOnly: true,
-	};
 
 	for (let idx = 0; idx < paths.length; idx++) {
 		const rawPath = paths[idx];
-		if (!rawPath || opts.archiveDisplayMap.has(rawPath) || !internalRouter.canHandle(rawPath)) {
+		if (!rawPath || opts.archiveDisplayMap.has(rawPath) || !internalRouter.canHandle(rawPath)) continue;
+		const globTarget = /^ssh:\/\//i.test(rawPath) ? rawPath.replace(/^ssh:\/\/[^/]*/i, "") : rawPath;
+		const normalizedPath = internalRouter.normalize(rawPath);
+		const skillName = /^skill:\/\/([^/?#]+)/i.exec(normalizedPath)?.[1];
+		const localGlob = normalizedPath.toLowerCase().startsWith("local://") && internalRouter.isGlob(normalizedPath);
+		if (hasGlobPathChars(globTarget)) {
+			if (skillName && hasGlobPathChars(skillName)) {
+				await internalRouter.resolve("skill://", opts.context);
+			}
+			if (!localGlob) {
+				throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
+			}
 			continue;
 		}
-		// `ssh://[::1]/path` carries `[`/`]` in the IPv6 authority — glob metacharacters
-		// — so check only the path portion for ssh:// (the SSH handler reads a single
-		// remote file; there is no glob expansion). A glob in the remote path still trips.
-		const globTarget = /^ssh:\/\//i.test(rawPath) ? rawPath.replace(/^ssh:\/\/[^/]*/i, "") : rawPath;
-		if (hasGlobPathChars(globTarget)) {
-			throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
+		const target = await internalRouter.target(rawPath, opts.context);
+		if (!target) continue;
+		if (target.kind === "file") {
+			paths[idx] = target.path;
+			if (target.spec.immutable) immutableSourcePaths.add(path.resolve(target.path));
+			continue;
 		}
-		let resource = await internalRouter.resolve(rawPath, context);
-		// A directory listing with no backing local path (e.g. a remote ssh:// dir)
-		// has no real contents to grep — searching its listing text would be
-		// misleading. Local/skill/vault dir resources set `sourcePath` and skip this.
-		if (resource.isDirectory && !resource.sourcePath) {
+
+		const resource = await internalRouter.resolve(rawPath, opts.context);
+		if (resource.isDirectory && !resource.sourcePath && !normalizedPath.toLowerCase().startsWith("omp://")) {
 			throw new ToolError(
 				`grep cannot recurse the directory listing at ${rawPath}; grep a specific file under it (e.g. ${rawPath.replace(/\/+$/, "")}/<file>) or read ${rawPath} to list its entries`,
 			);
 		}
 		if (resource.sourcePath) {
 			paths[idx] = resource.sourcePath;
-			if (resource.immutable) {
-				immutableSourcePaths.add(path.resolve(resource.sourcePath));
-			}
+			if (resource.immutable) immutableSourcePaths.add(path.resolve(resource.sourcePath));
 			continue;
 		}
 
-		// No sourcePath: this handler needs its content materialized so the
-		// virtual expansion can search it. Re-resolve without pathOnly.
-		if (context.pathOnly) {
-			resource = await internalRouter.resolve(rawPath, { ...context, pathOnly: false });
-		}
-
 		const ranges = opts.pathSpecs[idx]?.ranges;
-		const expanded = await expandVirtualInternalResource(rawPath, resource, { ...context, pathOnly: false }, ranges);
+		const expanded = await expandVirtualInternalResource(rawPath, resource, opts.context, ranges);
 		virtualInputIndexes.add(idx);
 		for (const virtual of expanded) {
 			virtualResources.push(virtual);
@@ -1035,6 +996,8 @@ export interface GrepToolDetails {
 	 * `result.text` lines but uses a `│` gutter and `*` to mark match lines (vs space for
 	 * context). The TUI uses this directly so it never parses model-facing hashline anchors. */
 	displayContent?: string;
+	/** Filesystem hyperlink targets resolved for internal URL headers at execution time. */
+	displayTargets?: Record<string, string>;
 	/** Absolute base directory used during search. Used by the renderer to resolve
 	 * display-relative paths to absolute paths for OSC 8 hyperlinks. */
 	searchPath?: string;
@@ -1070,11 +1033,12 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 	readonly name = "grep";
 	readonly approval = (args: unknown): ToolTier => {
 		const a = args as { path?: string | string[]; paths?: string | string[] };
-		return toPathList(a.path ?? a.paths).some(pathTargetsSsh) ? "exec" : "read";
+		// Substring scan over the raw entries: delimited lists are only split after approval.
+		return InternalUrlRouter.instance().readTier(toPathList(a.path ?? a.paths).join("\n"));
 	};
 	readonly label = "Grep";
 	readonly loadMode = "discoverable";
-	readonly summary = "Grep file contents using ripgrep (fast regex search)";
+	readonly summary = "Search file contents by regex";
 	get description(): string {
 		const displayMode = resolveFileDisplayMode(this.session);
 		return prompt.render(grepDescription, {
@@ -1083,7 +1047,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 			hasFind: this.session.isToolActive?.("find") ?? isFindEnabled(this.session),
 			eagerDelegation: sessionDelegationBias(this.session) === "eager",
 			scoutAvailable: isScoutSpawnable(
-				this.session.settings.get("task.disabledAgents") as string[] | undefined,
+				cfgTaskDisabledAgents.get(this.session.settings),
 				this.session.getSessionSpawns?.() ?? "*",
 			),
 		});
@@ -1131,6 +1095,13 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 			const effectivePaths = scopedPaths.length > 0 ? scopedPaths : ["."];
 			const rawEntries = await expandDelimitedPathEntries(effectivePaths, this.session.cwd);
 			const pathSpecs = await parsePathSpecs(rawEntries, this.session.cwd);
+			const resolveContext = sessionResolveContext(this.session, { signal });
+			// Internal URLs resolve inside the native search, bounded by the tier this call was approved at.
+			const urlFilesystem = new InternalUrlFilesystem({
+				context: resolveContext,
+				tier: resolveToolTier(this, params),
+			});
+			const filesystem = urlFilesystem.shellFilesystem();
 			const materializedExternalPaths = new Map<string, string>();
 			const materializeExternalUrlForSearch = async (rawPath: string) => {
 				const target = parseReadUrlTarget(rawPath);
@@ -1151,36 +1122,25 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				cleanup: cleanupArchiveScratch,
 			} = await resolveArchiveSearchPaths(pathSpecs, this.session.cwd);
 			try {
+				const memoryBackend = lookupSetting("memory.backend")?.get(this.session.settings);
 				const internalResolution = await resolveInternalSearchInputs({
 					pathSpecs,
 					resolvedPaths,
-					cwd: this.session.cwd,
 					archiveDisplayMap,
-					settings: this.session.settings,
-					signal,
-					localProtocolOptions: this.session.localProtocolOptions,
-					skills: this.session.skills,
-					rules: this.session.activeRules,
-					sessionFile: this.session.getSessionFile() ?? undefined,
-					experimentalContextManagement:
-						this.session.settings.get("compaction.experimentalContextManagement") === true,
-					getSessionBranch: () => getExperimentalContextSession(this.session).getBranch(),
-					sessionId: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
-					agentRegistry: this.session.agentRegistry,
-					callerMemory: {
-						backend: this.session.settings.get("memory.backend"),
-						getMnemopiSessionState: this.session.getMnemopiSessionState,
+					context: {
+						...resolveContext,
+						skipDirectoryListing: true,
+						callerMemory: {
+							backend: typeof memoryBackend === "string" ? memoryBackend : undefined,
+							getMnemopiSessionState: this.session.getMnemopiSessionState,
+						},
 					},
 				});
 				const searchablePaths = internalResolution.paths;
 				const { virtualResources, virtualPathSet, virtualInputIndexes } = internalResolution;
 				const rangesByAbsPath = new Map<string, LineRange[]>();
 
-				if (
-					archiveUnreadable.length > 0 &&
-					searchablePaths.length === archiveUnreadable.length &&
-					virtualResources.length === 0
-				) {
+				if (archiveUnreadable.length > 0 && resolvedPaths.length === archiveUnreadable.length) {
 					// All inputs were archive selectors we couldn't materialize; surface the
 					// reason instead of a downstream "path not found" from the scope resolver.
 					throw new ToolError(
@@ -1189,103 +1149,64 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 							`or pass a UTF-8 text member.`,
 					);
 				}
-				const normalizedContextBefore = this.#contextOverride ?? this.session.settings.get("grep.contextBefore");
-				const normalizedContextAfter = this.#contextOverride ?? this.session.settings.get("grep.contextAfter");
+				const normalizedContextBefore = this.#contextOverride ?? cfgGrepContextBefore.get(this.session.settings);
+				const normalizedContextAfter = this.#contextOverride ?? cfgGrepContextAfter.get(this.session.settings);
 				const ignoreCase = !(caseSensitive ?? true);
 				const useGitignore = gitignore ?? true;
 				const patternHasNewline = normalizedPattern.includes("\n") || normalizedPattern.includes("\\n");
 				const effectiveMultiline = patternHasNewline;
 
-				let searchPath: string;
-				let scopePath: string;
-				let globFilter: string | undefined;
-				let isDirectory: boolean;
-				let multiTargets: ResolvedSearchTarget[] | undefined;
-				let exactFilePaths: string[] | undefined;
-				let missingPaths: string[];
-				const immutableSourcePaths = new Set(internalResolution.immutableSourcePaths);
-				if (searchablePaths.length > 0) {
-					const scope = await resolveToolSearchScope({
-						rawPaths: searchablePaths,
-						cwd: this.session.cwd,
-						internalUrlAction: "search",
-						settings: this.session.settings,
-						localProtocolOptions: this.session.localProtocolOptions,
-						skills: this.session.skills,
-						rules: this.session.activeRules,
-						sessionFile: this.session.getSessionFile() ?? undefined,
-						sessionId:
-							this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
-						agentRegistry: this.session.agentRegistry,
-						resolveExternalUrl: materializeExternalUrlForSearch,
-						trackImmutableSources: true,
-						surfaceExactFilePaths: true,
-						fanOutFileTargets: true,
-						multipathStatHint: " (`path` list entries must each exist relative to cwd)",
-					});
-					searchPath = scope.searchPath;
-					isDirectory = scope.isDirectory;
-					multiTargets = scope.multiTargets;
-					exactFilePaths = scope.exactFilePaths;
-					missingPaths = scope.missingPaths;
-					globFilter = scope.globFilter;
-					for (const immutablePath of scope.immutableSourcePaths) {
-						immutableSourcePaths.add(immutablePath);
+				const scope = await resolveToolSearchScope({
+					rawPaths: resolvedPaths,
+					cwd: this.session.cwd,
+					internalUrlAction: "search",
+					filesystem: urlFilesystem,
+					resolveExternalUrl: materializeExternalUrlForSearch,
+					trackImmutableSources: true,
+					surfaceExactFilePaths: true,
+					fanOutFileTargets: true,
+					multipathStatHint: " (`path` list entries must each exist relative to cwd)",
+				});
+				const { searchPath, isDirectory, multiTargets, exactFilePaths, missingPaths, globFilter } = scope;
+				const immutableSourcePaths = scope.immutableSourcePaths;
+				// Build the per-file line-range filter after URL materialization has run:
+				// archive entries are keyed by scratch path, external URL entries by read-cache
+				// content path, internal URLs by their URL, and ordinary files by their resolved path.
+				const router = InternalUrlRouter.instance();
+				for (let idx = 0; idx < pathSpecs.length; idx++) {
+					const spec = pathSpecs[idx];
+					if (!spec.ranges) continue;
+					const resolved = resolvedPaths[idx];
+					if (!resolved) continue;
+					const materializedExternalPath = materializedExternalPaths.get(spec.clean);
+					if (materializedExternalPath) {
+						mergeRangesInto(rangesByAbsPath, path.resolve(materializedExternalPath), spec.ranges);
+						continue;
 					}
-					// Build the per-file line-range filter after URL materialization has run:
-					// archive entries are keyed by scratch path, URL entries by read-cache
-					// content path, and ordinary files by their resolved filesystem path.
-					for (let idx = 0; idx < pathSpecs.length; idx++) {
-						const spec = pathSpecs[idx];
-						if (!spec.ranges) continue;
-						if (virtualInputIndexes.has(idx)) continue;
-						const resolved = internalResolution.resolvedPathsByInput[idx];
-						if (!resolved) continue;
-						const materializedExternalPath = materializedExternalPaths.get(spec.clean);
-						if (materializedExternalPath) {
-							mergeRangesInto(rangesByAbsPath, path.resolve(materializedExternalPath), spec.ranges);
-							continue;
+					if (resolved === spec.clean && !archiveDisplayMap.has(resolved)) {
+						// Non-archive entry; ensure the cleaned path resolves to a regular file.
+						const absKey = router.canHandle(resolved)
+							? resolved
+							: path.resolve(resolveReadPath(resolved, this.session.cwd));
+						const stats = await urlFilesystem.stat(absKey).catch(() => null);
+						if (!stats) {
+							throw new ToolError(`Path not found for line-range selector: ${spec.original}`);
 						}
-						if (resolved === spec.clean && !archiveDisplayMap.has(resolved)) {
-							// Non-archive entry; ensure the cleaned path resolves to a regular file.
-							const absKey = path.resolve(resolveReadPath(resolved, this.session.cwd));
-							const stats = await stat(absKey).catch(() => null);
-							if (!stats) {
-								throw new ToolError(`Path not found for line-range selector: ${spec.original}`);
-							}
-							if (!stats.isFile()) {
-								throw new ToolError(
-									`Line-range selector requires a single file: ${spec.original} is a directory`,
-								);
-							}
-							mergeRangesInto(rangesByAbsPath, absKey, spec.ranges);
-						} else {
-							mergeRangesInto(rangesByAbsPath, path.resolve(resolved), spec.ranges);
+						if (stats.type !== "file") {
+							throw new ToolError(`Line-range selector requires a single file: ${spec.original} is a directory`);
 						}
+						mergeRangesInto(rangesByAbsPath, absKey, spec.ranges);
+					} else {
+						mergeRangesInto(rangesByAbsPath, path.resolve(resolved), spec.ranges);
 					}
-					// When the only input was an archive selector, surface that selector instead
-					// of the temp scratch path the resolver substituted in.
-					const physicalScopePath =
-						searchablePaths.length === 1 && archiveDisplayMap.get(searchPath)
-							? (archiveDisplayMap.get(searchPath) as string)
-							: scope.scopePath;
-					scopePath = internalResolution.virtualScopePath
-						? `${physicalScopePath}, ${internalResolution.virtualScopePath}`
-						: physicalScopePath;
-				} else {
-					searchPath = this.session.cwd;
-					scopePath = internalResolution.virtualScopePath ?? ".";
-					globFilter = undefined;
-					isDirectory = false;
-					multiTargets = undefined;
-					exactFilePaths = undefined;
-					missingPaths = [];
 				}
-				if (
-					missingPaths.length > 0 &&
-					missingPaths.length === searchablePaths.length &&
-					virtualResources.length === 0
-				) {
+				// When the only input was an archive selector, surface that selector instead
+				// of the temp scratch path the resolver substituted in.
+				const scopePath =
+					resolvedPaths.length === 1 && archiveDisplayMap.get(searchPath)
+						? (archiveDisplayMap.get(searchPath) as string)
+						: scope.scopePath;
+				if (missingPaths.length > 0 && missingPaths.length === resolvedPaths.length) {
 					const archiveHint =
 						archiveUnreadable.length > 0
 							? ` (archive members were not searchable: ${archiveUnreadable.join(", ")})`
@@ -1297,11 +1218,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const baseDisplayMode = resolveFileDisplayMode(this.session);
 
 				const effectiveOutputMode = GrepOutputMode.Content;
-				const isMultiScope =
-					isDirectory ||
-					Boolean(exactFilePaths) ||
-					Boolean(multiTargets) ||
-					(virtualResources.length > 0 && (virtualResources.length > 1 || searchablePaths.length > 0));
+				const isMultiScope = isDirectory || Boolean(exactFilePaths) || Boolean(multiTargets);
 				const perFileMatchCap = isMultiScope ? MULTI_FILE_PER_FILE_MATCHES : SINGLE_FILE_MATCHES;
 				// Range filtering happens in JS after the native fetch, so out-of-range
 				// matches consume fetch budget. Widen the per-file budget just enough
@@ -1454,6 +1371,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				// Run native grep only for unrestricted scopes. Constrained scopes above
 				// search content from exact handles authorized during incremental traversal.
 				let skippedOversizedCount = 0;
+				// Scope globs are relative to their base path: `dir/*.go` must stay in
+				// `dir`. Only a bare glob rooted at cwd (`*.ts`) matches at any depth.
+				const cwdRoot = path.resolve(this.session.cwd);
 				try {
 					if (!constrainedSearch && searchablePaths.length > 0) {
 						if (exactFilePaths || multiTargets) {
@@ -1475,6 +1395,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 										pattern: normalizedPattern,
 										path: target.basePath,
 										glob: target.glob,
+										recursive: path.resolve(target.basePath) === cwdRoot,
 										ignoreCase,
 										multiline: effectiveMultiline,
 										hidden: true,
@@ -1487,23 +1408,16 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 										maxCountPerFile: nativeMaxCountPerFile,
 										signal,
 										timeoutMs: remainingSearchTime(searchDeadline, signal),
+										filesystem,
 									},
 									undefined,
 								);
-								checkSearchDeadline(searchDeadline, signal);
 								skippedOversizedCount += targetResult.skippedOversized ?? 0;
 								limitReached = limitReached || Boolean(targetResult.limitReached);
 								totalMatches += targetResult.totalMatches;
 								filesSearched += targetResult.filesSearched;
 								for (const match of targetResult.matches) {
-									const absolute = path.resolve(target.basePath, match.path);
-									if (this.session.pathScope) {
-										try {
-											await this.session.pathScope.authorizePath("grep", absolute, true);
-										} catch {
-											continue;
-										}
-									}
+									const absolute = resolveSearchResultPath(target.basePath, match.path);
 									// Overlapping targets (a directory plus a file nested
 									// inside it) surface the same physical line twice;
 									// keep the first occurrence.
@@ -1513,8 +1427,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 										continue;
 									}
 									seenMatchKeys.add(matchKey);
-									const rebased = path.relative(searchPath, absolute).replace(/\\/g, "/");
-									matches.push({ ...match, path: rebased });
+									matches.push({ ...match, path: relativeSearchResultPath(searchPath, absolute) });
 								}
 							}
 							result = {
@@ -1530,6 +1443,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 									pattern: normalizedPattern,
 									path: searchPath,
 									glob: globFilter,
+									recursive: path.resolve(searchPath) === cwdRoot,
 									ignoreCase,
 									multiline: effectiveMultiline,
 									hidden: true,
@@ -1542,6 +1456,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 									maxCountPerFile: nativeMaxCountPerFile,
 									signal,
 									timeoutMs: remainingSearchTime(searchDeadline, signal),
+									filesystem,
 								},
 								undefined,
 							);
@@ -1603,7 +1518,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				if (rangesByAbsPath.size > 0) {
 					const filteredMatches: GrepMatch[] = [];
 					for (const match of result.matches) {
-						const abs = matchAbsolutePath(match.path, searchPath);
+						const abs = resolveSearchResultPath(searchPath, match.path);
 						const ranges = rangesByAbsPath.get(abs);
 						if (!ranges) {
 							// Path has no line-range constraint (e.g. a peer entry without `:N-M`).
@@ -1631,14 +1546,13 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				}
 				if (archiveDisplayMap.size > 0) {
 					for (const match of result.matches) {
-						const abs = matchAbsolutePath(match.path, searchPath);
-						const display = archiveDisplayMap.get(abs);
+						const display = archiveDisplayMap.get(resolveSearchResultPath(searchPath, match.path));
 						if (display) match.path = display;
 					}
 				}
 
 				const formatPath = (filePath: string): string =>
-					archiveDisplaySet.has(filePath) || virtualPathSet.has(filePath)
+					archiveDisplaySet.has(filePath)
 						? filePath
 						: formatResultPath(filePath, isDirectory, searchPath, this.session.cwd);
 
@@ -1723,7 +1637,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					const explicitFileTargets: string[] = [];
 					if (exactFilePaths) {
 						explicitFileTargets.push(...exactFilePaths);
-					} else if (searchablePaths.length > 0 && !isDirectory && !multiTargets) {
+					} else if (!isDirectory && !multiTargets) {
 						explicitFileTargets.push(searchPath);
 					}
 					if (explicitFileTargets.length === 0) return undefined;
@@ -1731,9 +1645,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					await Promise.all(
 						explicitFileTargets.map(async target => {
 							try {
-								const st = await stat(target);
-								if (st.isFile() && st.size > NATIVE_GREP_MAX_FILE_BYTES) {
-									oversized.push(path.relative(this.session.cwd, target) || target);
+								const st = await urlFilesystem.stat(target);
+								if (st.type === "file" && st.size > NATIVE_GREP_MAX_FILE_BYTES) {
+									oversized.push(formatPathRelativeToCwd(target, this.session.cwd));
 								}
 							} catch {
 								// Stat failures here are surfaced by other code paths.
@@ -1796,17 +1710,18 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					matchesByFile.get(relativePath)!.push(match);
 				}
 				const displayLines: string[] = [];
-				const hashContexts = new Map<string, { tag: string }>();
+				const hashContexts = new Map<string, { tag: string; path: string }>();
 				if (baseDisplayMode.hashLines) {
 					for (const relativePath of fileList) {
-						if (archiveDisplaySet.has(relativePath) || virtualPathSet.has(relativePath)) continue;
-						const absoluteFilePath = path.resolve(this.session.cwd, relativePath);
-						if (isImmutableSourcePath(absoluteFilePath, immutableSourcePaths)) continue;
+						if (archiveDisplaySet.has(relativePath)) continue;
+						// Immutable schemes get no host file; mutable URLs (`local://`) bind to their backing file.
+						const snapshotPath = await resultSnapshotPath(relativePath, this.session.cwd, resolveContext);
+						if (snapshotPath === undefined || isImmutableSourcePath(snapshotPath, immutableSourcePaths)) continue;
 						// Mint a whole-file content tag so any anchor validates while the
 						// file is unchanged; over-cap / unreadable files get no tag (and
 						// therefore plain, non-editable line output).
-						const tag = getEditStore(this.session).recordSnapshotFile(absoluteFilePath);
-						if (tag) hashContexts.set(relativePath, { tag });
+						const tag = getEditStore(this.session).recordSnapshotFile(snapshotPath);
+						if (tag) hashContexts.set(relativePath, { tag, path: snapshotPath });
 					}
 				}
 				const renderMatchesForFile = (relativePath: string): { model: string[]; display: string[] } => {
@@ -1852,9 +1767,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						fileMatchCounts.set(relativePath, (fileMatchCounts.get(relativePath) ?? 0) + 1);
 					}
 					if (hashContext?.tag) {
-						const absoluteFilePath = path.resolve(this.session.cwd, relativePath);
 						getEditStore(this.session).recordSeenLinesFromBody(
-							absoluteFilePath,
+							hashContext.path,
 							hashContext.tag,
 							modelOut.join("\n"),
 						);
@@ -1901,6 +1815,14 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
 				const output = truncation.content;
 				const displayText = displayLines.join("\n");
+				let displayTargets: Record<string, string> | undefined;
+				for (const line of displayLines) {
+					const header = /^#+\s+([a-z][a-z0-9+.-]*:\/\/.*)$/i.exec(line);
+					if (!header) continue;
+					const target = header[1]!.trimEnd().replace(/\s+\([^)]*\)\s*$/, "");
+					const resolved = InternalUrlRouter.instance().locateSync(target);
+					if (resolved) (displayTargets ??= {})[target] = resolved;
+				}
 				const truncated = Boolean(
 					fileLimitReached ||
 					perFileLimitReached ||
@@ -1928,6 +1850,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 							? perFileMatchCap
 							: undefined,
 					displayContent: displayText,
+					displayTargets,
 					missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 				};
 				if (truncation.truncated) details.truncation = truncation;
@@ -1978,7 +1901,7 @@ function searchScopeMeta(details: GrepToolDetails | undefined): string | undefin
 }
 
 function linkUrlLikeSearchHeader(raw: string, styled: string): { line: string; absPath?: string } {
-	const resolvedPath = tryResolveInternalUrlSync(raw);
+	const resolvedPath = InternalUrlRouter.instance().locateSync(raw);
 	if (resolvedPath) return { line: fileHyperlink(resolvedPath, styled), absPath: resolvedPath };
 	return { line: uriHyperlink(raw, styled) };
 }

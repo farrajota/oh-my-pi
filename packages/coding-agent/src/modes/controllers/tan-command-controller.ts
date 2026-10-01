@@ -18,6 +18,8 @@ import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
 import { runJobOperation } from "../../registry/operation-lease";
 import type { InteractiveModeContext } from "../types";
 
+import { cfgTaskEnableLsp } from "../../task/settings";
+
 const TAN_LABEL_PREVIEW_LENGTH = 80;
 
 function previewWork(work: string): string {
@@ -112,9 +114,9 @@ export class TanCommandController {
 		// session) rather than as a top-level sibling, so it shares the parent's
 		// artifacts in place — no copy needed.
 		const sessionDir = parentFile.slice(0, -6);
-		const settings = createSubagentSettings(this.ctx.settings);
+		const settings = await createSubagentSettings(this.ctx.settings);
 		const customTools = mcpManager ? createMCPProxyTools(mcpManager) : undefined;
-		const enableLsp = this.ctx.settings.get("task.enableLsp") !== false;
+		const enableLsp = cfgTaskEnableLsp.get(this.ctx.settings) !== false;
 		const agentRegistry = AgentRegistry.global();
 		const authorityBinding = bindInternalAgentAuthoritySession(agentRegistry, session);
 		if (!authorityBinding) throw new Error("Invalid live parent session authority.");

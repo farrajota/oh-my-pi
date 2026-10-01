@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -8,17 +7,23 @@ import * as evalIndex from "@oh-my-pi/pi-coding-agent/eval";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
-import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	HubTool,
+	hubToolRenderer,
+	type CoordinationDetails,
+	type JobSnapshot,
+} from "@oh-my-pi/pi-coding-agent/tools/hub";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import {
+	formatOutputNotice,
+	type OutputMeta,
+	wrapToolWithMetaNotice,
+} from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
-import { HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
-import { hubToolRenderer } from "@oh-my-pi/pi-tui/tools/hub";
-import type { CoordinationDetails, JobSnapshot } from "@oh-my-pi/pi-tui/tools/hub";
-import { type OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
-import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
-import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
-import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createHubAuthorityFixture, type HubAuthorityFixture } from "./hub-fixtures";
@@ -299,8 +304,9 @@ describe("capture failure across background and cancellation boundaries", () => 
 		}
 	});
 
+	type LegacyJobSnapshot = JobSnapshot & Pick<OutputMeta, "artifactError">;
 	it("retains each legacy Hub capture warning once when rebuilding short and truncated rows", async () => {
-		const jobs: JobSnapshot[] = [
+		const jobs: LegacyJobSnapshot[] = [
 			{
 				id: "legacy-short",
 				type: "bash",
@@ -339,20 +345,22 @@ describe("capture failure across background and cancellation boundaries", () => 
 	});
 
 	it("retains a historical Hub aggregate warning when no persisted row identifies the failed capture", async () => {
-		const details: CoordinationDetails = {
-			op: "jobs",
-			meta: { artifactError: "end" },
-			jobs: [
-				{
-					id: "legacy-root",
-					type: "bash",
-					status: "completed",
-					label: "legacy command",
-					durationMs: 1,
-					resultText: "long preview\n".repeat(20) + formatOutputNotice({ artifactError: "end" }),
-				},
-			],
-		};
+		const details = JSON.parse(
+			JSON.stringify({
+				op: "jobs",
+				meta: { artifactError: "end" },
+				jobs: [
+					{
+						id: "legacy-root",
+						type: "bash",
+						status: "completed",
+						label: "legacy command",
+						durationMs: 1,
+						resultText: "long preview\n".repeat(20) + formatOutputNotice({ artifactError: "end" }),
+					},
+				],
+			}),
+		) as CoordinationDetails;
 		const uiTheme = await getThemeByName("dark");
 		if (!uiTheme) throw new Error("Expected dark theme");
 		for (const expanded of [false, true]) {

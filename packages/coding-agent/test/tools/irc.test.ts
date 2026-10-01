@@ -1,12 +1,9 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { createMockModel, type MockHandler } from "@oh-my-pi/pi-ai/providers/mock";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { SettingPath } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
+import { lookup } from "../../src/config/registry";
 
-import { IrcBus, type IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { IrcBus, type IrcDeliveryContext, type IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import {
 	adoptAgent,
 	getAgentLifecycleManager,
@@ -16,22 +13,24 @@ import {
 } from "../../src/internal/agent-lifecycle-bridge";
 import { lookupAgentRef, setAgentStatus } from "../../src/internal/agent-registry-bridge";
 import { createHubAuthorityFixture, type HubAuthorityFixture, installHubIrcControls } from "./hub-fixtures";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { HubTool, isIrcEnabled, type CoordinationDetails } from "@oh-my-pi/pi-coding-agent/tools/hub";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { IrcBridge } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, type CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { type CoordinationDetails } from "@oh-my-pi/pi-tui/tools/hub";
-import { HubTool, isIrcEnabled } from "@oh-my-pi/pi-coding-agent/tools/hub";
-import { TempDir } from "@oh-my-pi/pi-utils";
 
 interface FakeSession {
 	session: AgentSession;
 	/** Messages delivered into this session via deliverIrcMessage. */
 	delivered: IrcMessage[];
+	deliveryContexts: Array<IrcDeliveryContext | undefined>;
 	/** Display-only relay observations emitted on this session. */
 	relayed: CustomMessage[];
 	/** Outcome the fake reports (busy vs idle recipient). */
@@ -39,7 +38,7 @@ interface FakeSession {
 	/** Cause the next deliverIrcMessage call to throw. */
 	setError: (error: Error) => void;
 	/** Side effect run on delivery (e.g. reply via the bus). */
-	onDeliver: (fn: (msg: IrcMessage) => void) => void;
+	onDeliver: (fn: (msg: IrcMessage, context?: IrcDeliveryContext) => void) => void;
 	/** Emit a terminal `agent_end` to the session's subscribers. */
 	endTurn: (options?: { isTerminal?: boolean }) => void;
 }
@@ -47,9 +46,10 @@ interface FakeSession {
 function makeFakeSession(): FakeSession {
 	let outcome: "injected" | "woken" = "injected";
 	let nextError: Error | null = null;
-	let deliverHook: ((msg: IrcMessage) => void) | undefined;
+	let deliverHook: ((msg: IrcMessage, context?: IrcDeliveryContext) => void) | undefined;
 	const listeners = new Set<(event: AgentSessionEvent) => void>();
 	const delivered: IrcMessage[] = [];
+	const deliveryContexts: Array<IrcDeliveryContext | undefined> = [];
 	const relayed: CustomMessage[] = [];
 	const session = {
 		isStreaming: true,
@@ -58,14 +58,15 @@ function makeFakeSession(): FakeSession {
 			return () => listeners.delete(listener);
 		},
 		waitForIrcReplies: async () => {},
-		deliverIrcMessage: async (msg: IrcMessage) => {
+		deliverIrcMessage: async (msg: IrcMessage, context?: IrcDeliveryContext) => {
 			if (nextError) {
 				const err = nextError;
 				nextError = null;
 				throw err;
 			}
 			delivered.push(msg);
-			deliverHook?.(msg);
+			deliveryContexts.push(context);
+			deliverHook?.(msg, context);
 			return outcome;
 		},
 		emitIrcRelayObservation: (record: CustomMessage) => {
@@ -75,6 +76,7 @@ function makeFakeSession(): FakeSession {
 	return {
 		session: session as unknown as AgentSession,
 		delivered,
+		deliveryContexts,
 		relayed,
 		setOutcome: value => {
 			outcome = value;
@@ -104,7 +106,7 @@ function makeToolSession(registry: AgentRegistry, agentId: string): ToolSession 
 	return hubFixture.createToolSession(agentId);
 }
 
-function createRealSession(overrides: Partial<Record<SettingPath, unknown>> = {}): {
+function createRealSession(overrides: Parameters<typeof Settings.isolated>[0] = {}): {
 	session: AgentSession;
 	sessionManager: SessionManager;
 } {
@@ -124,28 +126,26 @@ function createRealSession(overrides: Partial<Record<SettingPath, unknown>> = {}
 	return { session, sessionManager };
 }
 
-/** A real `AgentSession` driven by a mock model, so a prompt runs a genuine
- *  turn and emits the real terminal `agent_end` after prompt unwind. */
+let authStorage: AuthStorage;
+let modelRegistry: ModelRegistry;
+
 function createStreamingSession(
 	modelRegistry: ModelRegistry,
-	responses: MockHandler[],
-	options?: { tools?: HubTool[]; settings?: Partial<Record<SettingPath, unknown>> },
+	responses: MockResponse[],
+	options: { tools?: HubTool[] } = {},
 ): { session: AgentSession } {
-	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-	if (!model) throw new Error("Expected bundled anthropic model to exist");
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	const mock = createMockModel({ responses });
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["system prompt"], tools: options.tools ?? [] },
+		convertToLlm,
+		streamFn: mock.stream,
+	});
 	const session = new AgentSession({
-		agent: new Agent({
-			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: ["system prompt"], tools: options?.tools ?? [], messages: [] },
-			streamFn: mock.stream,
-		}),
+		agent,
 		sessionManager: SessionManager.inMemory("/tmp"),
-		settings: Settings.isolated({
-			"compaction.enabled": false,
-			"retry.enabled": false,
-			...options?.settings,
-		}),
+		settings: Settings.isolated({ "compaction.enabled": false }),
 		modelRegistry,
 	});
 	return { session };
@@ -162,25 +162,15 @@ describe("IRC", () => {
 	}
 
 	const sessions: AgentSession[] = [];
-	let authDir: TempDir;
-	let authStorage: AuthStorage;
-	let modelRegistry: ModelRegistry;
-	beforeAll(async () => {
-		authDir = TempDir.createSync("@pi-irc-auth-");
-		authStorage = await AuthStorage.create(authDir.join("auth.db"));
-		authStorage.keys.setRuntime("anthropic", "test-key");
-		modelRegistry = new ModelRegistry(authStorage, authDir.join("models.yml"));
-	});
-	afterAll(() => {
-		authStorage.close();
-		authDir.removeSync();
-	});
 	beforeEach(() => {
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		IrcBus.resetGlobalForTests();
 		registry = AgentRegistry.global();
 		bus = IrcBus.global();
+		authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		modelRegistry = new ModelRegistry(authStorage);
 	});
 	afterEach(async () => {
 		vi.restoreAllMocks();
@@ -188,6 +178,7 @@ describe("IRC", () => {
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
 		}
+		await authStorage.close();
 	});
 
 	describe("IrcBus", () => {
@@ -206,7 +197,42 @@ describe("IRC", () => {
 			expect(sub.delivered.map(msg => msg.body)).toEqual(["ping", "ping again"]);
 			expect(sub.delivered[0]?.from).toBe("0-Main");
 			expect(sub.delivered[0]?.id).toBeTruthy();
-			expect(bus.unreadCount("0-Sub")).toBe(0);
+			expect(bus.take("0-Sub")).toBeUndefined();
+		});
+
+		it("provides reply context only for awaited sends and correlates replies on the global bus", async () => {
+			const main = makeFakeSession();
+			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
+			const sub = makeFakeSession();
+			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session });
+
+			await bus.send({ from: "0-Main", to: "0-Sub", body: "fire and forget" });
+			expect(sub.deliveryContexts[0]).toBeUndefined();
+
+			const waiting = bus.wait("0-Main", { from: "0-Sub" }, 1000);
+			const receipt = await bus.send(
+				{ from: "0-Main", to: "0-Sub", body: "question", replyTo: "prior-message" },
+				{ expectsReply: true },
+			);
+			expect(receipt).toEqual({ to: "0-Sub", outcome: "injected" });
+
+			const original = sub.delivered[1];
+			const context = sub.deliveryContexts[1];
+			if (!original || !context) throw new Error("Expected awaited delivery context.");
+			expect(original).not.toHaveProperty("sendReply");
+			const origin = { id: original.id, from: original.from, to: original.to };
+			Object.assign(original, { id: "mutated-id", from: "mutated-from", to: "mutated-to" });
+			const replyReceipt = await context.sendReply("answer");
+			expect(replyReceipt).toEqual({ to: origin.from, outcome: "injected" });
+
+			const reply = await waiting;
+			expect(reply).toMatchObject({
+				from: origin.to,
+				to: origin.from,
+				body: "answer",
+				replyTo: origin.id,
+			});
+			expect(reply?.replyTo).toBe(origin.id);
 		});
 
 		it("relays only subagent-to-subagent traffic to the main UI", async () => {
@@ -242,7 +268,7 @@ describe("IRC", () => {
 			sub.setError(new Error("boom"));
 			const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "ping" });
 			expect(receipt).toEqual({ to: "0-Sub", outcome: "failed", error: "boom" });
-			expect(bus.unreadCount("0-Sub")).toBe(1);
+			expect((await bus.wait("0-Sub", {}, 5))?.body).toBe("ping");
 		});
 
 		it("send revives a parked recipient through the lifecycle manager", async () => {
@@ -344,7 +370,7 @@ describe("IRC", () => {
 			expect(reviverRuns).toBe(0);
 			expect(lookupAgentRef(registry, "0-Parking")?.session).toBe(session);
 			expect(registry.get("0-Parking")?.status).toBe("idle");
-			expect(bus.unreadCount("0-Parking")).toBe(0);
+			expect(bus.take("0-Parking")).toBeUndefined();
 			resolveDispose();
 		});
 
@@ -398,7 +424,7 @@ describe("IRC", () => {
 			// Blocked on dispose — must not inject into the dying session or buffer.
 			expect(sendSettled).toBe(false);
 			expect(reviverRuns).toBe(0);
-			expect(bus.unreadCount("0-Parking")).toBe(0);
+			expect(bus.take("0-Parking")).toBeUndefined();
 
 			resolveDispose();
 			const receipt = await sendPromise;
@@ -409,6 +435,7 @@ describe("IRC", () => {
 			expect(reviverRuns).toBe(1);
 			expect(lookupAgentRef(registry, "0-Parking")?.session).toBe(revived.session);
 			expect(bus.unreadCount("0-Parking")).toBe(0);
+			expect(bus.take("0-Parking")).toBeUndefined();
 		});
 
 		it("multiple concurrent sends during park coalesce revive and all deliver", async () => {
@@ -457,7 +484,7 @@ describe("IRC", () => {
 			expect(reviverRuns).toBe(1);
 			expect(receipts.every(r => r.outcome === "revived")).toBe(true);
 			expect(revived.delivered.map(msg => msg.body).sort()).toEqual(["one", "three", "two"]);
-			expect(bus.unreadCount("0-Parking")).toBe(0);
+			expect(bus.take("0-Parking")).toBeUndefined();
 		});
 
 		it("wait consumes a matching send instead of delivering it to the session", async () => {
@@ -474,7 +501,7 @@ describe("IRC", () => {
 			expect(msg?.body).toBe("pong");
 			// The waiter consumed the message: no session delivery, no inbox copy.
 			expect(main.delivered).toEqual([]);
-			expect(bus.unreadCount("0-Main")).toBe(0);
+			expect(bus.take("0-Main")).toBeUndefined();
 		});
 
 		it("wait from-filter ignores messages from other senders", async () => {
@@ -516,12 +543,11 @@ describe("IRC", () => {
 			main.setError(new Error("temporarily unavailable"));
 			const receipt = await bus.send({ from: "0-Sub", to: "0-Main", body: "earlier" });
 			expect(receipt.outcome).toBe("failed");
-			expect(bus.unreadCount("0-Main")).toBe(1);
 
 			// Resolves from the mailbox synchronously; the timeout never fires.
 			const msg = await bus.wait("0-Main", { from: "0-Sub" }, 5);
 			expect(msg?.body).toBe("earlier");
-			expect(bus.unreadCount("0-Main")).toBe(0);
+			expect(bus.take("0-Main")).toBeUndefined();
 		});
 
 		it("inbox peeks or drains pending messages", async () => {
@@ -544,7 +570,6 @@ describe("IRC", () => {
 			expect(bus.unreadCount("0-Main")).toBe(0);
 			expect(bus.inbox("0-Main")).toEqual([]);
 		});
-
 		it("wait does not leak the waiter after timeout or abort", async () => {
 			const main = makeFakeSession();
 			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
@@ -556,7 +581,7 @@ describe("IRC", () => {
 			const afterTimeout = await bus.send({ from: "0-Sub", to: "0-Main", body: "after timeout" });
 			expect(afterTimeout.outcome).toBe("injected");
 			expect(main.delivered.map(msg => msg.body)).toEqual(["after timeout"]);
-			expect(bus.unreadCount("0-Main")).toBe(0);
+			expect(bus.take("0-Main")).toBeUndefined();
 
 			// Aborted waiter is removed too: the dead waiter never consumes mail.
 			const controller = new AbortController();
@@ -565,7 +590,7 @@ describe("IRC", () => {
 			await expect(waiting).rejects.toThrow("cancelled");
 			await bus.send({ from: "0-Sub", to: "0-Main", body: "after abort" });
 			expect(main.delivered.map(msg => msg.body)).toEqual(["after timeout", "after abort"]);
-			expect(bus.unreadCount("0-Main")).toBe(0);
+			expect(bus.take("0-Main")).toBeUndefined();
 		});
 
 		it("resolves waiters in FIFO order", async () => {
@@ -583,7 +608,7 @@ describe("IRC", () => {
 			expect((await second)?.body).toBe("two");
 			// Both messages were consumed by waiters, none reached the session.
 			expect(main.delivered).toEqual([]);
-			expect(bus.unreadCount("0-Main")).toBe(0);
+			expect(bus.take("0-Main")).toBeUndefined();
 		});
 
 		it("mailbox rejects the 101st message without evicting the oldest", async () => {
@@ -639,7 +664,7 @@ describe("IRC", () => {
 			const receipt = await bus.send({ from: "0-Main", to: "0-Parked", body: "wake up" });
 			expect(receipt).toEqual({ to: "0-Parked", outcome: "failed", error: "revive exploded" });
 			// Failed revival never enqueues: the message is lost, not buffered.
-			expect(bus.unreadCount("0-Parked")).toBe(0);
+			expect(bus.take("0-Parked")).toBeUndefined();
 		});
 
 		it("wait with liveness aborts when the last running sender becomes idle after commitment", async () => {
@@ -675,9 +700,8 @@ describe("IRC", () => {
 			hubFixture = undefined;
 		});
 		it("isIrcEnabled returns false for a top-level session that cannot spawn tasks", () => {
-			const settings = Settings.isolated();
+			const settings = Settings.isolated({ "task.maxRecursionDepth": 0 });
 			// Depth 0 with spawning gated off: no peers exist or can be created.
-			settings.set("task.maxRecursionDepth", 0);
 			expect(isIrcEnabled(settings, 0)).toBe(false);
 		});
 
@@ -689,9 +713,8 @@ describe("IRC", () => {
 		});
 
 		it("isIrcEnabled returns true for a subagent even at the recursion-depth cap", () => {
-			const settings = Settings.isolated();
+			const settings = Settings.isolated({ "task.maxRecursionDepth": 2 });
 			// A leaf subagent cannot spawn, but its parent (and siblings) exist.
-			settings.set("task.maxRecursionDepth", 2);
 			expect(isIrcEnabled(settings, 2)).toBe(true);
 		});
 
@@ -877,6 +900,36 @@ describe("IRC", () => {
 			expect(b.delivered.map(msg => msg.body)).toEqual(["anyone there?"]);
 		});
 
+		it("routes awaited replies through the root-scoped bus that delivered them", async () => {
+			const sub = makeFakeSession();
+			registry.register({
+				id: "0-Sub",
+				displayName: "task",
+				kind: "sub",
+				parentId: "0-Main",
+				session: sub.session,
+			});
+
+			const waiting = bus.wait("0-Main", { from: "0-Sub" }, 1000);
+			const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "question" }, { expectsReply: true });
+			expect(receipt).toEqual({ to: "0-Sub", outcome: "injected" });
+
+			const original = sub.delivered[0];
+			const context = sub.deliveryContexts[0];
+			if (!original || !context) throw new Error("Expected awaited delivery context.");
+			const replyReceipt = await context.sendReply("root answer");
+			expect(replyReceipt).toEqual({ to: "0-Main", outcome: "injected" });
+
+			const reply = await waiting;
+			expect(reply).toMatchObject({
+				from: "0-Sub",
+				to: "0-Main",
+				body: "root answer",
+				replyTo: original.id,
+			});
+			expect(reply?.replyTo).toBe(original.id);
+		});
+
 		it("op=send await=true round-trips the recipient's reply", async () => {
 			const sub = installHubIrcControls((await hubFixture!.createChild("0-Sub", "0-Main")).session);
 			const subRef = lookupAgentRef(registry, "0-Sub");
@@ -920,7 +973,9 @@ describe("IRC", () => {
 			await hubFixture!.createChild("0-Sub", "0-Main");
 
 			const session = makeToolSession(registry, "0-Main");
-			session.settings.set("irc.timeoutMs", 5);
+			const timeoutSetting = lookup("irc.timeoutMs");
+			if (!timeoutSetting) throw new Error("Expected IRC timeout setting to be registered");
+			timeoutSetting.override(session.settings, 5);
 			const tool = new HubTool(session);
 			const result = await tool.execute("call-1", {
 				op: "send",
@@ -1444,69 +1499,160 @@ describe("IRC", () => {
 			if (parentSteer?.role !== "user") throw new Error("expected queued parent IRC steer");
 			expect(parentSteer.content).toContain("change approach");
 		});
-
-		it("auto-replies via an ephemeral side turn when the sender awaits and async execution is disabled", async () => {
+		it("auto-replies via a recipient side turn when the sender awaits and async execution is disabled", async () => {
+			const sender = makeFakeSession();
+			registry.register({
+				id: "0-Sender",
+				displayName: "sender",
+				kind: "sub",
+				parentId: "Main",
+				session: sender.session,
+			});
 			const { session } = createRealSession({ "async.enabled": false });
 			sessions.push(session);
-			registry.register({ id: "Main", displayName: "main", kind: "main", session });
-			const sub = makeFakeSession();
-			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session });
+			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", parentId: "Main", session });
 			Object.defineProperty(session, "isStreaming", { value: true, configurable: true });
 			const ephemeralSpy = vi
 				.spyOn(session, "runEphemeralTurn")
 				.mockResolvedValue({ replyText: "auto answer", assistantMessage: {} as never });
+			const historySpy = vi.spyOn(session.agent, "emitExternalEvent");
+			const incomingEvent = new Promise<CustomMessage>(resolve => {
+				session.subscribe(event => {
+					if (event.type === "irc_message" && event.message.customType === "irc:incoming") {
+						resolve(event.message);
+					}
+				});
+			});
+			const autoReplyObservations: CustomMessage[] = [];
 			const autoReplyEvent = new Promise<CustomMessage>(resolve => {
 				session.subscribe(event => {
 					if (event.type === "irc_message" && event.message.customType === "irc:autoreply") {
+						autoReplyObservations.push(event.message);
 						resolve(event.message);
 					}
 				});
 			});
 
-			// The sender parks a waiter (the `await: true` path), then sends with
-			// the expectsReply hint — exactly what the irc tool does.
-			const waiting = bus.wait("0-Sub", { from: "Main" }, 1000);
+			const waiting = bus.wait("0-Sender", { from: "0-Sub" }, 1000);
 			const receipt = await bus.send(
-				{ from: "0-Sub", to: "Main", body: "which PR did you mean?" },
+				{ from: "0-Sender", to: "0-Sub", body: "which PR did you mean?", replyTo: "earlier-thread-message" },
 				{ expectsReply: true },
 			);
-			expect(receipt).toEqual({ to: "Main", outcome: "injected" });
+			expect(receipt).toEqual({ to: "0-Sub", outcome: "injected" });
 
-			// The side-channel reply resolves the sender's waiter as a real bus
-			// message threaded to the original send.
-			const reply = await waiting;
-			expect(reply?.from).toBe("Main");
-			expect(reply?.body).toBe("auto answer");
-			expect(reply?.replyTo).toBeTruthy();
-			expect(ephemeralSpy.mock.calls[0]?.[0]?.promptText).toContain("which PR did you mean?");
+			const incoming = await incomingEvent;
+			expect(incoming).toMatchObject({
+				customType: "irc:incoming",
+				details: { from: "0-Sender", message: "which PR did you mean?" },
+			});
+			expect(incoming.content).toContain("A side turn is handling the reply to this message.");
+			expect(incoming.content).not.toContain("No one replies on your behalf");
+			const incomingDetails = incoming.details;
+			if (
+				typeof incomingDetails !== "object" ||
+				incomingDetails === null ||
+				!("id" in incomingDetails) ||
+				typeof incomingDetails.id !== "string"
+			) {
+				throw new Error("expected incoming IRC message identity");
+			}
+			const incomingId = incomingDetails.id;
 
-			// The recipient records what was said on its behalf.
+			const reply: IrcMessage | null = await waiting;
+			expect(reply).toMatchObject({
+				from: "0-Sub",
+				to: "0-Sender",
+				body: "auto answer",
+				replyTo: incomingId,
+			});
+			expect(reply?.id).not.toBe(incomingId);
+			const autoReplyPrompt = ephemeralSpy.mock.calls[0]?.[0]?.promptText ?? "";
+			expect(autoReplyPrompt).toContain("IRC message from agent");
+			expect(autoReplyPrompt).toContain("0-Sender");
+			expect(autoReplyPrompt).toContain("replying to");
+			expect(autoReplyPrompt).toContain("earlier-thread-message");
+			expect(autoReplyPrompt).toContain("mid-task");
+			expect(autoReplyPrompt).toContain("Side-channel");
+			expect(autoReplyPrompt).toContain("briefly");
+			expect(autoReplyPrompt).toContain("directly");
+			expect(autoReplyPrompt).toContain("available conversation context");
+			expect(autoReplyPrompt).toContain("NEVER call tools");
+			expect(autoReplyPrompt).toContain("Text delivered to");
+			expect(autoReplyPrompt).toContain("as your answer");
+			expect(autoReplyPrompt).toContain("which PR did you mean?");
+
 			const record = await autoReplyEvent;
-			expect(record.details).toMatchObject({ to: "0-Sub", body: "auto answer" });
+			expect(record.details).toMatchObject({
+				to: "0-Sender",
+				body: "auto answer",
+				replyTo: incomingId,
+			});
+			await session.waitForIrcReplies();
+			session.beginDispose();
+			const historyReply = historySpy.mock.calls
+				.map(([event]) => (event.type === "message_start" ? event.message : undefined))
+				.find(message => message?.role === "custom" && message.customType === "irc:autoreply");
+			expect(historyReply).toBe(record);
+			expect(autoReplyObservations).toEqual([record]);
+			expect(bus.take("0-Sender")).toBeUndefined();
 		});
 
 		it("does not auto-reply when async execution is enabled or the sender does not await", async () => {
+			const sender = makeFakeSession();
+			registry.register({ id: "Main", displayName: "main", kind: "main", session: sender.session });
 			const enabled = createRealSession({ "async.enabled": true });
 			sessions.push(enabled.session);
-			registry.register({ id: "Main", displayName: "main", kind: "main", session: enabled.session });
+			registry.register({
+				id: "0-Enabled",
+				displayName: "task",
+				kind: "sub",
+				parentId: "Main",
+				session: enabled.session,
+			});
 			Object.defineProperty(enabled.session, "isStreaming", { value: true, configurable: true });
 			const enabledSpy = vi
 				.spyOn(enabled.session, "runEphemeralTurn")
 				.mockResolvedValue({ replyText: "nope", assistantMessage: {} as never });
-			const awaited = await bus.send({ from: "0-Sub", to: "Main", body: "q?" }, { expectsReply: true });
+			const enabledIncoming = new Promise<CustomMessage>(resolve => {
+				enabled.session.subscribe(event => {
+					if (event.type === "irc_message" && event.message.customType === "irc:incoming") {
+						resolve(event.message);
+					}
+				});
+			});
+			const awaited = await bus.send({ from: "Main", to: "0-Enabled", body: "q?" }, { expectsReply: true });
 			expect(awaited.outcome).toBe("injected");
 			expect(enabledSpy).not.toHaveBeenCalled();
+			const enabledPrompt = await enabledIncoming;
+			expect(enabledPrompt.content).toContain("No one replies on your behalf");
+			expect(enabledPrompt.content).not.toContain("A side turn is handling the reply");
 
 			const disabled = createRealSession({ "async.enabled": false });
 			sessions.push(disabled.session);
-			registry.register({ id: "Main2", displayName: "main", kind: "main", session: disabled.session });
+			registry.register({
+				id: "0-Sub",
+				displayName: "task",
+				kind: "sub",
+				parentId: "Main",
+				session: disabled.session,
+			});
 			Object.defineProperty(disabled.session, "isStreaming", { value: true, configurable: true });
 			const disabledSpy = vi
 				.spyOn(disabled.session, "runEphemeralTurn")
 				.mockResolvedValue({ replyText: "nope", assistantMessage: {} as never });
-			const fireAndForget = await bus.send({ from: "0-Sub", to: "Main2", body: "fyi" });
+			const disabledIncoming = new Promise<CustomMessage>(resolve => {
+				disabled.session.subscribe(event => {
+					if (event.type === "irc_message" && event.message.customType === "irc:incoming") {
+						resolve(event.message);
+					}
+				});
+			});
+			const fireAndForget = await bus.send({ from: "Main", to: "0-Sub", body: "fyi" });
 			expect(fireAndForget.outcome).toBe("injected");
 			expect(disabledSpy).not.toHaveBeenCalled();
+			const disabledPrompt = await disabledIncoming;
+			expect(disabledPrompt.content).toContain("No one replies on your behalf");
+			expect(disabledPrompt.content).not.toContain("A side turn is handling the reply");
 		});
 	});
 });

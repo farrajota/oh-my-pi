@@ -2,14 +2,22 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentTool,
+	AgentToolContext,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ToolApprovalDecision,
+} from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
-import { type AstReplaceChange, type AstReplaceFileChange, astEdit } from "@oh-my-pi/pi-natives";
+import { type AstReplaceChange, type AstReplaceFileChange, astEdit, type ShellFilesystem } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { replaceTabs, Text } from "@oh-my-pi/pi-tui";
-import { $envpos, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { $envpos, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
+import { InternalUrlRouter, sessionResolveContext } from "../internal-urls";
+import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
 import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
@@ -19,16 +27,21 @@ import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { AuthorizedFilesystemTarget, FilesystemOperation } from "../internal/session-path-scope";
 import type { ToolSession } from ".";
-import { truncateForPrompt } from "./approval";
+import { resolveToolTier, strictestApproval, truncateForPrompt } from "./approval";
 import { parseReadUrlTarget } from "./fetch";
-import { createFileRecorder, formatResultPath } from "./file-recorder";
+import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file-recorder";
 import {
 	classifyGroupedLines,
 	formatGroupedFiles,
 	groupLineIndicesByBlank,
 } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import type { OutputMeta } from "./output-meta";
-import { isInternalUrlPath, resolveToolSearchScope } from "./path-utils";
+import {
+	isInternalUrlPath,
+	relativeSearchResultPath,
+	resolveSearchResultPath,
+	resolveToolSearchScope,
+} from "./path-utils";
 import {
 	appendParseErrorsBulletList,
 	capParseErrors,
@@ -64,6 +77,7 @@ interface AstEditCallOptions {
 	maxFiles: number;
 	failOnParseError: boolean;
 	signal?: AbortSignal;
+	filesystem: ShellFilesystem;
 }
 
 interface AstEditAggregatedResult {
@@ -98,6 +112,7 @@ async function runAstEditTargets(
 			maxFiles: options.maxFiles,
 			failOnParseError: options.failOnParseError,
 			signal: options.signal,
+			filesystem: options.filesystem,
 		});
 		totalReplacements += targetResult.totalReplacements;
 		filesSearched += targetResult.filesSearched;
@@ -105,13 +120,12 @@ async function runAstEditTargets(
 		applied = applied && targetResult.applied;
 		if (targetResult.parseErrors) parseErrors.push(...targetResult.parseErrors);
 		for (const change of targetResult.changes) {
-			const absolute = path.resolve(target.basePath, change.path);
-			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
-			aggregatedChanges.push({ ...change, path: rebased });
+			const absolute = resolveSearchResultPath(target.basePath, change.path);
+			aggregatedChanges.push({ ...change, path: relativeSearchResultPath(commonBasePath, absolute) });
 		}
 		for (const fileChange of targetResult.fileChanges) {
-			const absolute = path.resolve(target.basePath, fileChange.path);
-			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
+			const absolute = resolveSearchResultPath(target.basePath, fileChange.path);
+			const rebased = relativeSearchResultPath(commonBasePath, absolute);
 			fileCounts.set(rebased, (fileCounts.get(rebased) ?? 0) + fileChange.count);
 		}
 	}
@@ -148,6 +162,7 @@ function runAstEditOnce(
 		maxFiles: options.maxFiles,
 		failOnParseError: options.failOnParseError,
 		signal: options.signal,
+		filesystem: options.filesystem,
 	});
 }
 
@@ -355,11 +370,18 @@ type AstEditSchemaInfer = typeof astEditSchema.infer;
 
 export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolDetails> {
 	readonly name = "ast_edit";
-	readonly approval = (args: unknown) => {
-		const paths = Array.isArray((args as Partial<AstEditSchemaInfer>).paths)
-			? ((args as Partial<AstEditSchemaInfer>).paths as string[])
-			: [];
-		return paths.length > 0 && paths.every(path => isInternalUrlPath(path)) ? "read" : "write";
+	/** Strictest write decision ({@link strictestApproval}) over every path; "write" when none is given. */
+	readonly approval = (args: unknown): ToolApprovalDecision => {
+		const paths = isRecord(args) ? args.paths : undefined;
+		if (!Array.isArray(paths) || paths.length === 0) return "write";
+		const router = InternalUrlRouter.instance();
+		const decisions: ToolApprovalDecision[] = [];
+		for (const target of paths) {
+			// A malformed entry fails closed rather than reaching a tier decision.
+			if (typeof target !== "string") return "exec";
+			decisions.push(router.writeTier(target, undefined, undefined));
+		}
+		return strictestApproval(decisions);
 	};
 	readonly formatApprovalDetails = (args: unknown): string[] => {
 		const params = args as Partial<AstEditSchemaInfer>;
@@ -461,18 +483,16 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			const normalizedRewrites = Object.fromEntries(ops);
 			const maxFiles = $envpos("PI_MAX_AST_FILES", 1000);
 
+			const resolveContext = sessionResolveContext(this.session, { signal });
+			// Internal URLs resolve inside the native rewrite, bounded by the tier this call was approved at.
+			const tier = resolveToolTier(this, params);
+			const urlFilesystem = new InternalUrlFilesystem({ context: resolveContext, tier });
 			const scope = await resolveToolSearchScope({
 				rawPaths: params.paths,
 				cwd: this.session.cwd,
 				internalUrlAction: "rewrite",
-				settings: this.session.settings,
-				signal,
-				sessionFile: this.session.getSessionFile() ?? undefined,
-				sessionId: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
-				agentRegistry: this.session.agentRegistry,
-				localProtocolOptions: this.session.localProtocolOptions,
-				skills: this.session.skills,
-				rules: this.session.activeRules,
+				filesystem: urlFilesystem,
+				fileWritableOnly: true,
 				resolveExternalUrl: async rawPath => {
 					if (!parseReadUrlTarget(rawPath)) return undefined;
 					throw new ToolError(
@@ -487,6 +507,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				this.session.pathScope!.assertPermission("ast_edit", canonicalTarget);
 			};
 			let scopedRun: ScopedAstEditRun | undefined;
+			const filesystem = urlFilesystem.shellFilesystem();
 			if (this.session.pathScope?.isRestricted) {
 				const operation = this.session.pathScope.currentOperation();
 				const roots = astTargets.map(target => target.basePath);
@@ -501,6 +522,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						maxFiles,
 						failOnParseError: false,
 						signal,
+						filesystem,
 					},
 					operation,
 					assertAstEditPermission,
@@ -514,8 +536,8 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					maxFiles,
 					failOnParseError: false,
 					signal,
+					filesystem,
 				}));
-
 			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(result.parseErrors);
 			const formatPath = (filePath: string): string =>
 				formatResultPath(filePath, isDirectory, resolvedSearchPath, this.session.cwd);
@@ -579,10 +601,11 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						hashContexts.set(relativePath, { tag });
 						continue;
 					}
-					const absolutePath = path.resolve(this.session.cwd, relativePath);
+					const snapshotPath = await resultSnapshotPath(relativePath, this.session.cwd, resolveContext);
+					if (snapshotPath === undefined) continue;
 					try {
-						const fullText = normalizeToLF(await Bun.file(absolutePath).text());
-						const tag = snapshotStore.recordSnapshot(absolutePath, fullText);
+						const fullText = normalizeToLF(await Bun.file(snapshotPath).text());
+						const tag = snapshotStore.recordSnapshot(snapshotPath, fullText);
 						hashContexts.set(relativePath, { tag });
 					} catch {
 						// Best-effort: if a file disappears between ast-edit and rendering, emit plain line output.
@@ -668,6 +691,8 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
 						let appliedScopedRun: ScopedAstEditRun | undefined;
+						const applyContext = sessionResolveContext(this.session);
+						const applyFilesystem = new InternalUrlFilesystem({ context: applyContext, tier }).shellFilesystem();
 						const applyChanges = async (): Promise<AstEditAggregatedResult> => {
 							const operation = this.session.pathScope!.currentOperation();
 							const rootTargets = await operation.preflight(
@@ -683,6 +708,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 									dryRun: true,
 									maxFiles,
 									failOnParseError: false,
+									filesystem: applyFilesystem,
 								},
 								operation,
 								assertAstEditPermission,
@@ -732,6 +758,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 									dryRun: false,
 									maxFiles,
 									failOnParseError: false,
+									filesystem: applyFilesystem,
 								});
 						const { errors: cappedApplyParseErrors, total: applyParseErrorsTotal } = capParseErrors(
 							applyResult.parseErrors,
@@ -772,10 +799,11 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 									freshTagLines.push(formatHashlineHeader(relativePath, freshTag));
 									continue;
 								}
-								const appliedAbsolutePath = path.resolve(this.session.cwd, relativePath);
+								const appliedPath = await resultSnapshotPath(relativePath, this.session.cwd, applyContext);
+								if (appliedPath === undefined) continue;
 								try {
-									const fullText = normalizeToLF(await Bun.file(appliedAbsolutePath).text());
-									const freshTag = snapshotStore.recordSnapshot(appliedAbsolutePath, fullText);
+									const fullText = normalizeToLF(await Bun.file(appliedPath).text());
+									const freshTag = snapshotStore.recordSnapshot(appliedPath, fullText);
 									freshTagLines.push(formatHashlineHeader(relativePath, freshTag));
 								} catch {
 									// File disappeared between apply and re-read; skip its tag.

@@ -32,6 +32,10 @@ import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 import { resetYieldTurnState } from "@oh-my-pi/pi-coding-agent/tools/yield";
 import { logger, removeSyncWithRetries, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 
+import { cfgExternalThinking } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
+import { cfgToolsXdev } from "@oh-my-pi/pi-coding-agent/tools/settings";
+
 const toolActivationExtension: ExtensionFactory = pi => {
 	pi.registerTool({
 		name: "default_inactive_tool",
@@ -392,19 +396,17 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getToolByName("think")).toBeUndefined();
 			expect(session.getActiveToolNames()).not.toContain("think");
 
-			await session.setThinkToolEnabled(true);
-			expect(session.getToolByName("think")).toBeUndefined();
-			expect(session.getActiveToolNames()).not.toContain("think");
-
-			settings.set("externalThinking", true);
-			await session.setThinkToolEnabled(true);
+			cfgExternalThinking.set(settings, true);
+			await Promise.resolve();
+			await session.refreshBaseSystemPrompt();
 
 			expect(session.getToolByName("think")).toBeDefined();
 			expect(session.getActiveToolNames()).toContain("think");
 			expect(session.getXdevToolEntries().map(entry => entry.name)).not.toContain("think");
 
-			settings.set("externalThinking", false);
-			await session.setThinkToolEnabled(false);
+			cfgExternalThinking.set(settings, false);
+			await Promise.resolve();
+			await session.refreshBaseSystemPrompt();
 			expect(session.getActiveToolNames()).not.toContain("think");
 			expect(session.getToolByName("think")).toBeDefined();
 		} finally {
@@ -1979,7 +1981,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const tempDir = makeTempDir();
 
 		const settings = Settings.isolated();
-		settings.set("plan.enabled", false);
+		cfgPlanEnabled.set(settings, false);
 
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
@@ -2226,14 +2228,14 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		};
 
 		const restrictedSettings = configuredSettings();
-		restrictedSettings.set("externalThinking", true);
+		cfgExternalThinking.set(restrictedSettings, true);
 
 		const { session: restricted } = await createAgentSession({
 			...baseOptions(restrictedDir),
 			settings: restrictedSettings,
 			extensions: [toolActivationExtension, restrictedLateExtension],
 			customTools: [sdkCustomTool],
-			toolNames: ["read", "lsp", "hub"],
+			toolNames: ["read", "lsp"],
 			requireYieldTool: true,
 			restrictToolNames: true,
 			enableMCP: true,
@@ -2247,7 +2249,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 				reportSendError: vi.fn(),
 				reportRuntimeError: vi.fn(),
 			});
-			await restricted.setThinkToolEnabled(true);
 			expect(restricted.getAllToolNames()).toEqual(["read", "lsp", "yield"]);
 			expect(restricted.getActiveToolNames()).toEqual(["read", "lsp", "yield"]);
 			for (const name of [
@@ -2688,7 +2689,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		// because the absence of that state is precisely what is under test.
 		const tempDir = makeTempDir();
 		const settings = Settings.isolated();
-		settings.set("tools.xdev", false);
+		cfgToolsXdev.set(settings, false);
 
 		await withProviderAuth(["openai"], async () => {
 			const { session } = await createAgentSession({ ...baseOptions(tempDir), settings });

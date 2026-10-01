@@ -9,7 +9,12 @@ const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
 const DELIVERY_RETRY_JITTER_MS = 200;
 const DEFAULT_RETENTION_MS = 5 * 60 * 1000;
-const DEFAULT_CONSUMED_RESULT_EVICTION_MS = 30 * 1000;
+/**
+ * A consumed settled result has already served its inspection purpose; keep
+ * its row briefly for follow-up artifact reads, while unconsumed results keep
+ * the full retention window.
+ */
+const DEFAULT_CONSUMED_RESULT_EVICTION_MS = 30_000;
 /**
  * Extra delay after an `async-result` delivery settles (its `ASIDE_MESSAGE_COMMIT`
  * hook fires, resolving `enqueueWithReceipt()`) before retained artifacts are
@@ -55,7 +60,6 @@ interface PollEscalationState {
 	/** Timestamp (ms) when the most recent poll wait returned. */
 	lastPollEndAt: number;
 }
-
 /** Kind of work a managed job runs; drives job-row badges and delivery labels. */
 export type AsyncJobType = "bash" | "task" | "eval";
 
@@ -90,7 +94,7 @@ export interface AsyncJob {
 	type: AsyncJobType;
 	status: "running" | "completed" | "failed" | "cancelled";
 	startTime: number;
-	/** Timestamp captured when this job became terminal. */
+	/** When the run settled; endTime - startTime is its frozen run duration. */
 	endTime?: number;
 	label: string;
 	abortController: AbortController;
@@ -105,7 +109,7 @@ export interface AsyncJob {
 	 * Parsed structured completion for a job whose work selected an output
 	 * schema. Set from the body's {@link AsyncJobRunResult} or from an
 	 * {@link AsyncJobError}. The job row is the carrier — every delivery
-	 * attempt, redelivery, and `hub` snapshot reads it from here.
+	 * attempt, redelivery, and `proc://` snapshot reads it from here.
 	 */
 	structured?: StructuredSubagentOutput;
 	/** Latest tool-render details reported by the running job. */
@@ -129,6 +133,13 @@ export interface AsyncJob {
 	 * until the caller invokes `markRunning()` from the run context.
 	 */
 	queued?: boolean;
+	/**
+	 * Job backs a foreground tool call that may still auto-background. It is
+	 * hidden from job listings and its delivery is suppressed until
+	 * {@link AsyncJobManager.backgroundJob} promotes it; a call that finishes in
+	 * the foreground hands it to {@link AsyncJobManager.releaseForegroundJob}.
+	 */
+	foreground?: boolean;
 	/**
 	 * Disposal closure for a detached spawn's temporary artifacts directory
 	 * that `runStructuredSubagent()` retained past completion (so a
@@ -205,7 +216,8 @@ export interface AsyncJobManagerOptions {
 	 * would leak one agent's result into another session.
 	 */
 	onJobComplete?: AsyncJobDeliverySink;
-	maxRunningJobs?: number;
+	/** Running-job cap; a function is re-read on every capacity check so a live setting resizes the cap. */
+	maxRunningJobs?: number | (() => number);
 	retentionMs?: number;
 	/** Delay after a settled result is consumed before its row is evicted. */
 	consumedResultEvictionMs?: number;
@@ -245,7 +257,10 @@ interface AsyncJobDelivery {
 	 * retrying) — without it, a recovered delivery would silently drop
 	 * `structured` even though `text` survives on the delivery itself.
 	 */
-	jobSnapshot?: Pick<AsyncJob, "type" | "status" | "startTime" | "label" | "structured" | "agentId" | "latestDetails">;
+	jobSnapshot?: Pick<
+		AsyncJob,
+		"type" | "status" | "startTime" | "endTime" | "label" | "structured" | "agentId" | "latestDetails"
+	>;
 }
 
 export interface AsyncJobDeliveryState {
@@ -278,6 +293,8 @@ export interface AsyncJobRegisterOptions {
 	onProgress?: (text: string, details?: AsyncJobDetails) => void | Promise<void>;
 	/** Register the job in queued state; see {@link AsyncJob.queued}. */
 	queued?: boolean;
+	/** Register the job as backing a foreground call; see {@link AsyncJob.foreground}. */
+	foreground?: boolean;
 }
 
 export interface AsyncJobRecoveryBatch {
@@ -315,12 +332,13 @@ interface DurableRecoveryState {
 }
 
 /**
- * Filter applied to job query/cancel APIs. When supplied, `ownerId` is matched
- * exactly — including `undefined` — so an unowned session cannot see another
- * owner's jobs.
+ * Filter applied to job query/cancel/delivery APIs. Matches jobs registered by
+ * exactly `ownerId` (registry id from `AgentRegistry`, e.g. "Main",
+ * "AuthLoader"); `ownerId: undefined` matches only unowned jobs. Omit the
+ * filter entirely for a manager-wide view.
  */
 export interface AsyncJobFilter {
-	ownerId?: string;
+	ownerId: string | undefined;
 }
 
 export class AsyncJobManager {
@@ -358,9 +376,13 @@ export class AsyncJobManager {
 	readonly #resultObservationOwnership = new WeakMap<object, (jobId: string) => boolean>();
 	readonly #pendingResultObservations = new Set<string>();
 	readonly #pollEscalation = new Map<string | undefined, PollEscalationState>();
+	readonly #releasedForegroundJobs = new Set<string>();
+	readonly #foregroundAutoJobIds = new Set<string>();
+	readonly #reusableForegroundAutoIds = new Set<string>();
+	#nextAutoId = 1;
 	readonly #deliverySinks = new Map<string, AsyncJobDeliverySink>();
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
-	readonly #maxRunningJobs: number;
+	readonly #maxRunningJobsOption: AsyncJobManagerOptions["maxRunningJobs"];
 	readonly #retentionMs: number;
 	readonly #consumedResultEvictionMs: number;
 	readonly #retainedArtifactsCleanupGraceMs: number;
@@ -386,9 +408,13 @@ export class AsyncJobManager {
 		return out;
 	}
 
+	#visibleJobs(filter?: AsyncJobFilter): AsyncJob[] {
+		return this.#filterJobs(this.#jobs.values(), filter).filter(job => !job.foreground);
+	}
+
 	constructor(options: AsyncJobManagerOptions) {
 		this.#onJobComplete = options.onJobComplete;
-		this.#maxRunningJobs = Math.max(1, Math.floor(options.maxRunningJobs ?? DEFAULT_MAX_RUNNING_JOBS));
+		this.#maxRunningJobsOption = options.maxRunningJobs;
 		this.#retentionMs = Math.max(0, Math.floor(options.retentionMs ?? DEFAULT_RETENTION_MS));
 		this.#consumedResultEvictionMs = Math.max(
 			0,
@@ -414,6 +440,13 @@ export class AsyncJobManager {
 			throw new Error("Async job manager already has a different durable store.");
 		}
 		this.#durableStore ??= store;
+	}
+
+	/** Effective running-job cap (at least 1), resolved at check time. */
+	get #maxRunningJobs(): number {
+		const option = this.#maxRunningJobsOption;
+		const value = typeof option === "function" ? option() : option;
+		return Math.max(1, Math.floor(value ?? DEFAULT_MAX_RUNNING_JOBS));
 	}
 
 	/** True when the running-job count has reached the configured cap. */
@@ -448,9 +481,10 @@ export class AsyncJobManager {
 		for (const existing of this.#jobs.values()) {
 			if (existing.status === "running" && !existing.queued) activeCount++;
 		}
-		if (activeCount >= this.#maxRunningJobs) {
+		const maxRunningJobs = this.#maxRunningJobs;
+		if (activeCount >= maxRunningJobs) {
 			throw new Error(
-				`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
+				`Background job limit reached (${maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
 			);
 		}
 
@@ -459,6 +493,9 @@ export class AsyncJobManager {
 		this.#jobIncarnations.set(id, incarnationId);
 		this.#suppressedDeliveries.delete(id);
 		this.#consumedJobResults.delete(id);
+		this.#releasedForegroundJobs.delete(id);
+		if (options?.foreground && !options?.id?.trim()) this.#foregroundAutoJobIds.add(id);
+		if (options?.foreground) this.#suppressedDeliveries.add(id);
 		const abortController = new AbortController();
 		const startTime = Date.now();
 
@@ -473,6 +510,7 @@ export class AsyncJobManager {
 			ownerId: options?.ownerId,
 			agentId: options?.agentId,
 			queued: options?.queued === true,
+			...(options?.foreground ? { foreground: true } : {}),
 		};
 		this.#jobs.set(id, job);
 		this.#persistJob(job, "registered");
@@ -505,48 +543,42 @@ export class AsyncJobManager {
 						}
 					},
 				});
+				job.endTime = Date.now();
 				const text = typeof outcome === "string" ? outcome : outcome.text;
 				const structured = typeof outcome === "string" ? undefined : outcome.structured;
 				if (structured) job.structured = structured;
 				if (job.status === "cancelled") {
 					job.resultText = text;
-					this.#persistJob(job, "terminal");
-					this.#recordTerminalHistory(job);
-					this.#scheduleEviction(id);
-					return;
+				} else {
+					job.status = "completed";
+					job.resultText = text;
+					this.#enqueueDelivery(id, text);
 				}
-				job.status = "completed";
-				job.endTime = Date.now();
-				job.resultText = text;
 				this.#persistJob(job, "terminal");
 				this.#recordTerminalHistory(job);
-				this.#enqueueDelivery(id, text);
-				this.#scheduleEviction(id);
 			} catch (error) {
+				job.endTime = Date.now();
 				if (error instanceof AsyncJobError && error.structured) job.structured = error.structured;
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
-					this.#persistJob(job, "terminal");
-					this.#recordTerminalHistory(job);
-					this.#scheduleEviction(id);
-					return;
+				} else {
+					const errorText = error instanceof Error ? error.message : String(error);
+					job.status = "failed";
+					job.errorText = errorText;
+					this.#enqueueDelivery(id, errorText);
 				}
-				const errorText = error instanceof Error ? error.message : String(error);
-				job.status = "failed";
-				job.endTime = Date.now();
-				job.errorText = errorText;
 				this.#persistJob(job, "terminal");
 				this.#recordTerminalHistory(job);
-				this.#enqueueDelivery(id, errorText);
-				this.#scheduleEviction(id);
 			}
+			if (this.#releasedForegroundJobs.has(id)) this.#discardForegroundJob(id);
+			else this.#scheduleEviction(id);
 		})();
 
 		return id;
 	}
 
 	/**
-	 * Cancel a single job by id. When `filter.ownerId` is set and does not
+	 * Cancel a single job by id. When a filter is given and its owner does not
 	 * match the job's owner, the call is treated as not-found (returns false)
 	 * so cross-agent cancellation is rejected at the manager level.
 	 */
@@ -609,12 +641,14 @@ export class AsyncJobManager {
 		};
 	}
 
+	/** Running background jobs; foreground-backed jobs stay hidden until promoted. */
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[] {
-		return this.#filterJobs(this.#jobs.values(), filter).filter(job => job.status === "running");
+		return this.#visibleJobs(filter).filter(job => job.status === "running");
 	}
 
+	/** Settled background jobs, newest first; foreground-backed jobs stay hidden. */
 	getRecentJobs(limit = 10, filter?: AsyncJobFilter): AsyncJob[] {
-		return this.#filterJobs(this.#jobs.values(), filter)
+		return this.#visibleJobs(filter)
 			.filter(job => job.status !== "running")
 			.sort((a, b) => (b.endTime ?? b.startTime) - (a.endTime ?? a.startTime))
 			.slice(0, limit);
@@ -628,7 +662,7 @@ export class AsyncJobManager {
 		const filter = options?.filter;
 		const includeAgentJobs = options?.includeAgentJobs !== false;
 		const running = this.#filterJobs(this.#jobs.values(), filter)
-			.filter(job => job.status === "running" && (includeAgentJobs || job.agentId === undefined))
+			.filter(job => job.status === "running" && !job.foreground && (includeAgentJobs || job.agentId === undefined))
 			.map(job => this.#snapshotItem(job));
 		const histories = this.#hasOwnerFilter(filter)
 			? [this.#terminalHistory.get(filter.ownerId)].filter(
@@ -659,8 +693,40 @@ export class AsyncJobManager {
 		}
 	}
 
+	/** Every background job row; foreground-backed jobs stay hidden until promoted. */
 	getAllJobs(filter?: AsyncJobFilter): AsyncJob[] {
-		return this.#filterJobs(this.#jobs.values(), filter);
+		return this.#visibleJobs(filter);
+	}
+
+	/**
+	 * Promote a foreground-backed job to a real background job: it becomes
+	 * visible to listings and its completion is delivered (re-enqueued when it
+	 * already settled during the foreground wait). Returns false for unknown ids.
+	 */
+	backgroundJob(jobId: string): boolean {
+		const job = this.#jobs.get(jobId);
+		if (!job) return false;
+		if (!job.foreground) return true;
+		job.foreground = undefined;
+		this.#foregroundAutoJobIds.delete(jobId);
+		this.#recordTerminalHistory(job);
+		this.#suppressedDeliveries.delete(jobId);
+		if (job.status === "completed" || job.status === "failed") {
+			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
+		}
+		return true;
+	}
+
+	/**
+	 * Drop a foreground-backed job whose result the foreground call already
+	 * returned (or whose call aborted). The row is discarded as soon as its run
+	 * settles and never surfaces as a background job.
+	 */
+	releaseForegroundJob(jobId: string): void {
+		const job = this.#jobs.get(jobId);
+		if (!job?.foreground) return;
+		if (job.endTime !== undefined) this.#discardForegroundJob(jobId);
+		else this.#releasedForegroundJobs.add(jobId);
 	}
 
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState {
@@ -721,12 +787,24 @@ export class AsyncJobManager {
 		return uniqueJobIds.length;
 	}
 
+	/**
+	 * Stop watching jobs. Settled jobs whose delivery was skipped while watched
+	 * and not consumed are re-enqueued.
+	 */
 	unwatchJobs(jobIds: string[]): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		let removed = 0;
 		for (const jobId of uniqueJobIds) {
-			if (this.#watchedJobs.delete(jobId)) {
-				removed += 1;
+			if (!this.#watchedJobs.delete(jobId)) continue;
+			removed += 1;
+			const job = this.#jobs.get(jobId);
+			if (!job || (job.status !== "completed" && job.status !== "failed")) continue;
+			if (this.isDeliverySuppressed(jobId) || this.#consumedJobResults.has(jobId)) continue;
+			const queued =
+				this.#deliveries.some(delivery => delivery.jobId === jobId) ||
+				this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
+			if (!queued) {
+				this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
 			}
 		}
 		return removed;
@@ -757,7 +835,6 @@ export class AsyncJobManager {
 		const prev = this.#pollEscalation.get(ownerId);
 		this.#pollEscalation.set(ownerId, { level: prev?.level ?? 0, lastPollEndAt: now });
 	}
-
 	acknowledgeDeliveries(jobIds: string[]): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		if (uniqueJobIds.length === 0) return 0;
@@ -774,6 +851,20 @@ export class AsyncJobManager {
 		);
 		this.#notifyDeliveryQueueChanged();
 		return before - this.#deliveries.length;
+	}
+
+	#resumeDeliveries(jobIds: string[]): void {
+		for (const rawId of jobIds) {
+			const jobId = rawId.trim();
+			if (!jobId || !this.#suppressedDeliveries.delete(jobId)) continue;
+			const job = this.#jobs.get(jobId);
+			if (!job || (job.status !== "completed" && job.status !== "failed")) continue;
+			const queued =
+				this.#deliveries.some(delivery => delivery.jobId === jobId) ||
+				this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
+			if (queued) continue;
+			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
+		}
 	}
 
 	/** Atomically reserve unseen settled results for one exact Hub admission attempt. */
@@ -794,7 +885,7 @@ export class AsyncJobManager {
 				for (const id of held) this.#consumeJobResult(id, false);
 				this.acknowledgeDeliveries([...held]);
 			} else {
-				this.resumeDeliveries([...held]);
+				this.#resumeDeliveries([...held]);
 			}
 		};
 		const observation = Object.freeze({
@@ -827,7 +918,7 @@ export class AsyncJobManager {
 					state = "held";
 				} catch (error) {
 					for (const id of held) this.#pendingResultObservations.delete(id);
-					this.resumeDeliveries([...held]);
+					this.#resumeDeliveries([...held]);
 					held.clear();
 					state = "fresh";
 					throw error;
@@ -872,18 +963,6 @@ export class AsyncJobManager {
 		}
 		return consumed;
 	}
-	/**
-	 * Mark a foreground-returned job result consumed once the job record has
-	 * terminalized. Foreground races resolve before the registered body returns,
-	 * so immediate consumption would see a running job and do nothing.
-	 */
-	consumeJobResultWhenSettled(jobId: string): void {
-		const job = this.#jobs.get(jobId);
-		if (!job) return;
-		void job.promise.then(() => {
-			this.consumeJobResults([jobId]);
-		});
-	}
 
 	/** True once a result was auto-delivered or recovered by a foreground snapshot. */
 	isJobResultConsumed(jobId: string): boolean {
@@ -891,28 +970,8 @@ export class AsyncJobManager {
 	}
 
 	/**
-	 * Lift a foreground-wait suppression set via `acknowledgeDeliveries`. If the
-	 * job already finished while suppressed (its delivery enqueue was skipped),
-	 * re-enqueue the completion so the result is still delivered exactly once.
-	 */
-	resumeDeliveries(jobIds: string[]): void {
-		for (const rawId of jobIds) {
-			const jobId = rawId.trim();
-			if (!jobId) continue;
-			if (!this.#suppressedDeliveries.delete(jobId)) continue;
-			const job = this.#jobs.get(jobId);
-			if (!job || (job.status !== "completed" && job.status !== "failed")) continue;
-			const queued =
-				this.#deliveries.some(delivery => delivery.jobId === jobId) ||
-				this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
-			if (queued) continue;
-			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
-		}
-	}
-
-	/**
-	 * Cancel running jobs. With `filter.ownerId` set, cancels only jobs the
-	 * matching agent registered; with no filter, cancels every running job
+	 * Cancel running jobs. With a filter, cancels only jobs the matching owner
+	 * registered; with no filter, cancels every running job
 	 * (used by `dispose()` to nuke the manager's state).
 	 *
 	 * `reason` is forwarded to each job's `AbortController.abort`, so a session
@@ -925,7 +984,8 @@ export class AsyncJobManager {
 	}
 
 	#cancelJobs(filter?: AsyncJobFilter, reason?: unknown): void {
-		for (const job of this.getRunningJobs(filter)) {
+		for (const job of this.#filterJobs(this.#jobs.values(), filter)) {
+			if (job.status !== "running") continue;
 			job.status = "cancelled";
 			job.endTime = Date.now();
 			this.#persistJob(job, "terminal");
@@ -1141,7 +1201,7 @@ export class AsyncJobManager {
 	 * awaited too. Returns false when `timeoutMs` elapses first.
 	 *
 	 * `excludeSuppressed` skips jobs whose delivery is suppressed (acknowledged
-	 * or `hub`-watched): those can never re-wake a run, so quiescence barriers
+	 * or `wait`-watched): those can never re-wake a run, so quiescence barriers
 	 * pass it to share one contract with the pending-async-wake predicate.
 	 * Teardown reaps omit it — worktree safety concerns every owner process.
 	 */
@@ -1179,7 +1239,7 @@ export class AsyncJobManager {
 		if (settled) {
 			return { settled: true, pendingJobIds: [], completion: Promise.resolve() };
 		}
-		const pendingJobIds = this.getAllJobs({ ownerId })
+		const pendingJobIds = this.#filterJobs(this.#jobs.values(), { ownerId })
 			.filter(job => job.status === "running" || job.status === "cancelled")
 			.map(job => job.id);
 		const completion = this.waitForOwnerJobs(ownerId).then(() => {});
@@ -1279,6 +1339,9 @@ export class AsyncJobManager {
 		this.#resultPins.clear();
 		this.#pendingResultObservations.clear();
 		this.#pollEscalation.clear();
+		this.#releasedForegroundJobs.clear();
+		this.#foregroundAutoJobIds.clear();
+		this.#reusableForegroundAutoIds.clear();
 		this.#deliverySinks.clear();
 		return jobsSettled && drained;
 	}
@@ -1297,7 +1360,12 @@ export class AsyncJobManager {
 	}
 
 	#recordTerminalHistory(job: AsyncJob): void {
-		if (job.status === "running" || this.#historySuppressedJobs.has(job) || this.#capturedTerminalJobs.has(job))
+		if (
+			job.status === "running" ||
+			job.foreground ||
+			this.#historySuppressedJobs.has(job) ||
+			this.#capturedTerminalJobs.has(job)
+		)
 			return;
 		const history = this.#terminalHistory.get(job.ownerId) ?? { agent: [], nonAgent: [] };
 		const bucket = job.agentId !== undefined ? history.agent : history.nonAgent;
@@ -1377,21 +1445,38 @@ export class AsyncJobManager {
 		return true;
 	}
 
+	/**
+	 * Drop a released foreground row after its work settles. The durable journal
+	 * retains its incarnation, so this id must never be recycled.
+	 */
+	#discardForegroundJob(jobId: string): void {
+		this.#releasedForegroundJobs.delete(jobId);
+		const reusableAutoId = this.#foregroundAutoJobIds.has(jobId);
+		if (this.#evictJob(jobId) && reusableAutoId) this.#reusableForegroundAutoIds.add(jobId);
+	}
+
 	#resolveJobId(preferredId: string | undefined, incarnationId: string): string {
 		const preferred = preferredId?.trim();
 		const reserve = (candidate: string): boolean => {
 			if (this.#hasJobId(candidate)) return false;
 			return this.#durableStore?.reserve("job", candidate, incarnationId) ?? true;
 		};
-		if (preferred && reserve(preferred)) return preferred;
 		if (preferred) {
+			if (reserve(preferred)) {
+				this.#reusableForegroundAutoIds.delete(preferred);
+				return preferred;
+			}
 			for (let suffix = 2; ; suffix++) {
 				const candidate = `${preferred}-${suffix}`;
 				if (reserve(candidate)) return candidate;
 			}
 		}
+		for (const candidate of this.#reusableForegroundAutoIds) {
+			this.#reusableForegroundAutoIds.delete(candidate);
+			if (reserve(candidate)) return candidate;
+		}
 		for (;;) {
-			const candidate = `bg_${crypto.randomUUID().replaceAll("-", "")}`;
+			const candidate = `bg_${this.#nextAutoId++}`;
 			if (reserve(candidate)) return candidate;
 		}
 	}
@@ -1503,6 +1588,7 @@ export class AsyncJobManager {
 		clearTimeout(this.#evictionTimers.get(jobId));
 		this.#evictionTimers.delete(jobId);
 		if ((this.#resultPins.get(jobId)?.size ?? 0) > 0) return false;
+		this.#foregroundAutoJobIds.delete(jobId);
 		this.#suppressedDeliveries.delete(jobId);
 		this.#watchedJobs.delete(jobId);
 		this.#consumedJobResults.delete(jobId);
@@ -1603,6 +1689,7 @@ export class AsyncJobManager {
 						type: job.type,
 						status: job.status,
 						startTime: job.startTime,
+						endTime: job.endTime,
 						label: job.label,
 						structured: job.structured,
 						agentId: job.agentId,
@@ -1752,6 +1839,7 @@ export class AsyncJobManager {
 			type: snapshot.type,
 			status: snapshot.status,
 			startTime: snapshot.startTime,
+			endTime: snapshot.endTime,
 			label: snapshot.label,
 			abortController: new AbortController(),
 			promise: Promise.resolve(),

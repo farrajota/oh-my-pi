@@ -42,8 +42,7 @@ describe("IRC roster activity", () => {
 		expect(text).not.toMatch(/running\] —\s*,/);
 	});
 	it("setActivity refreshes lastActivity so a working agent is not shown as stale", () => {
-		// irc list renders "active <lastActivity> ago" and both list views sort by
-		// lastActivity, so an activity update must refresh it or live work looks idle.
+		// Recency must refresh on activity, including repeated identical heartbeats.
 		const now = spyOn(Date, "now");
 		now.mockReturnValue(1_000);
 		registry.register({ id: "Worker", displayName: "task", kind: "sub", session: null, status: "running" });
@@ -72,8 +71,7 @@ describe("IRC roster activity", () => {
 	});
 
 	it("normalizes a multi-line activity gist to one bounded line", () => {
-		// A model-authored intent with newlines/tabs must not break out of its one
-		// roster row; setActivity collapses it centrally so every caller is safe.
+		// A model-authored intent with newlines/tabs must remain one bounded line.
 		registry.register({ id: "Noisy", displayName: "task", kind: "sub", session: null, status: "running" });
 		registry.setActivity("Noisy", "editing\n- fake roster line\twith tabs");
 		expect(registry.get("Noisy")?.activity).toBe("editing - fake roster line with tabs");

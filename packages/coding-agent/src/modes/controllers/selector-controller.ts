@@ -5,7 +5,7 @@ import type { getOAuthProviders as GetOAuthProviders } from "@oh-my-pi/pi-ai/oau
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { Component, OverlayHandle, ResizeScrollbackMode } from "@oh-my-pi/pi-tui";
-import { Loader, Spacer, setTuiTight, Text } from "@oh-my-pi/pi-tui";
+import { Loader, setTuiTight, Spacer, Text } from "@oh-my-pi/pi-tui";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -101,7 +101,6 @@ import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-o
 import { AgentHubOverlayComponent } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import { createAgentHubRuntime } from "../agent-hub-runtime";
 import { AgentsHubComponent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
-import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { CopySelectorComponent } from "@oh-my-pi/pi-tui/overlays/copy-selector";
 import { ExtensionDashboard } from "@oh-my-pi/pi-tui/overlays/extensions/extension-dashboard";
 import { listLiveToolRecords, liveToolRecordFromSession } from "@oh-my-pi/pi-tui/overlays/extensions/live-tool-session";
@@ -117,29 +116,38 @@ import { createModelBrowserSource } from "../model-browser-source";
 import type { ModelPickerComponent as ModelPickerComponentType } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import type { OAuthSelectorComponent as OAuthSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/oauth-selector";
 import { PluginSelectorComponent } from "@oh-my-pi/pi-tui/overlays/plugin-selector";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { ReadToolGroupComponent } from "@oh-my-pi/pi-tui/chat/read-tool-group";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { type ResetUsageAccount, ResetUsageSelectorComponent } from "@oh-my-pi/pi-tui/overlays/reset-usage-selector";
 import { type BranchVariantPath, RewindSelectorComponent } from "@oh-my-pi/pi-tui/overlays/rewind-selector";
 import { renderSegmentTrack } from "@oh-my-pi/pi-tui/chrome/segment-track";
 import { SessionAccountSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-account-selector";
 import { SessionSelectorComponent, type SessionSelectorOptions } from "@oh-my-pi/pi-tui/overlays/session-selector";
 import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
-import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { TranscriptBlock } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { TreeSelectorComponent } from "@oh-my-pi/pi-tui/overlays/tree-selector";
 import { UsageDashboardComponent } from "@oh-my-pi/pi-tui/overlays/usage-dashboard";
 import { renderUsageReports } from "./command-controller";
 import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
-import {
-	STATUS_LINE_SEGMENT_IDS,
-	type StatusLineSegmentId as TuiStatusLineSegmentId,
-} from "@oh-my-pi/pi-tui/status-line/schema";
 
-function normalizeStatusLineSegments(segments: readonly string[]): TuiStatusLineSegmentId[] {
-	return segments.filter((segment): segment is TuiStatusLineSegmentId =>
-		STATUS_LINE_SEGMENT_IDS.includes(segment as TuiStatusLineSegmentId),
-	);
-}
+import { cfgBranchSummaryEnabled } from "../../session/context-settings";
+import { cfgCycleOrder, cfgDisabledProviders, cfgModelRoleStorage } from "../../config/model-settings";
+import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "../../session/settings";
+import {
+	cfgStatusLineCompactThinkingLevel,
+	cfgStatusLineContextLine,
+	cfgStatusLineLeftSegments,
+	cfgStatusLinePreset,
+	cfgStatusLineRightSegments,
+	cfgStatusLineSegmentOptions,
+	cfgStatusLineSeparator,
+	cfgStatusLineSessionAccent,
+	cfgStatusLineShowHookStatus,
+	cfgStatusLineTransparent,
+	cfgTreeFilterMode,
+} from "../settings";
+import { cfgTaskAgentModelOverrides } from "../../task/settings";
 
 const MANUAL_LOGIN_PROMPT = "Paste the authorization code (or full redirect URL), then press Enter:";
 
@@ -181,7 +189,6 @@ interface ProviderToggleModules {
 	enableProvider: typeof EnableProvider;
 }
 
-/** Settings-only boundary for provider discovery mutations. */
 function loadProviderToggles(): ProviderToggleModules {
 	const discovery = require("../../discovery");
 	return { disableProvider: discovery.disableProvider, enableProvider: discovery.enableProvider };
@@ -305,15 +312,16 @@ export class SelectorController {
 					onStatusLinePreview: previewSettings => {
 						// Update status line with preview settings
 						this.ctx.statusLine.updateSettings({
-							preset: settings.get("statusLine.preset"),
-							leftSegments: normalizeStatusLineSegments(settings.get("statusLine.leftSegments")),
-							rightSegments: normalizeStatusLineSegments(settings.get("statusLine.rightSegments")),
-							separator: settings.get("statusLine.separator"),
-							showHookStatus: settings.get("statusLine.showHookStatus"),
-							sessionAccent: settings.get("statusLine.sessionAccent"),
-							transparent: settings.get("statusLine.transparent"),
-							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
-							contextLine: settings.get("statusLine.contextLine"),
+							preset: cfgStatusLinePreset.get(settings),
+							leftSegments: cfgStatusLineLeftSegments.get(settings),
+							rightSegments: cfgStatusLineRightSegments.get(settings),
+							separator: cfgStatusLineSeparator.get(settings),
+							showHookStatus: cfgStatusLineShowHookStatus.get(settings),
+							sessionAccent: cfgStatusLineSessionAccent.get(settings),
+							transparent: cfgStatusLineTransparent.get(settings),
+							compactThinkingLevel: cfgStatusLineCompactThinkingLevel.get(settings),
+							contextLine: cfgStatusLineContextLine.get(settings),
+							segmentOptions: cfgStatusLineSegmentOptions.get(settings),
 							...previewSettings,
 						});
 						this.ctx.ui.requestRender();
@@ -336,15 +344,16 @@ export class SelectorController {
 						done();
 						// Restore status line to saved settings
 						this.ctx.statusLine.updateSettings({
-							preset: settings.get("statusLine.preset"),
-							leftSegments: normalizeStatusLineSegments(settings.get("statusLine.leftSegments")),
-							rightSegments: normalizeStatusLineSegments(settings.get("statusLine.rightSegments")),
-							separator: settings.get("statusLine.separator"),
-							showHookStatus: settings.get("statusLine.showHookStatus"),
-							sessionAccent: settings.get("statusLine.sessionAccent"),
-							transparent: settings.get("statusLine.transparent"),
-							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
-							contextLine: settings.get("statusLine.contextLine"),
+							preset: cfgStatusLinePreset.get(settings),
+							leftSegments: cfgStatusLineLeftSegments.get(settings),
+							rightSegments: cfgStatusLineRightSegments.get(settings),
+							separator: cfgStatusLineSeparator.get(settings),
+							showHookStatus: cfgStatusLineShowHookStatus.get(settings),
+							sessionAccent: cfgStatusLineSessionAccent.get(settings),
+							transparent: cfgStatusLineTransparent.get(settings),
+							compactThinkingLevel: cfgStatusLineCompactThinkingLevel.get(settings),
+							contextLine: cfgStatusLineContextLine.get(settings),
+							segmentOptions: cfgStatusLineSegmentOptions.get(settings),
 						});
 						this.ctx.ui.requestRender();
 					},
@@ -599,9 +608,11 @@ export class SelectorController {
 	}
 
 	/**
-	 * Handle setting changes from the settings selector.
-	 * Most settings are saved directly via SettingsManager in the definitions.
-	 * This handles side effects and session-specific settings.
+	 * Apply the side effects of a setting change the user made in this process
+	 * (settings selector, approved `cfg://` writes); the value is already stored.
+	 * Only `defaultThinkingLevel` needs this: it also switches the live session,
+	 * which config reloads and parent-session writes must not do. Every other
+	 * setting applies through handle listeners owned by the session and InteractiveMode.
 	 */
 	handleSettingChange(id: string, value: unknown): void {
 		// Discovery provider toggles
@@ -646,7 +657,6 @@ export class SelectorController {
 				this.ctx.session.setInterruptMode(value as "immediate" | "wait", true);
 				break;
 			case "thinkingLevel":
-			case "defaultThinkingLevel":
 				this.ctx.session.setThinkingLevel(value as ConfiguredThinkingLevel, true);
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
@@ -666,11 +676,6 @@ export class SelectorController {
 					this.ctx.showError(`Failed to apply memory backend: ${err}`);
 				});
 				break;
-			case "externalThinking":
-				void this.ctx.session.setThinkToolEnabled(value as boolean).catch(err => {
-					this.ctx.showError(`Failed to apply external thinking: ${err}`);
-				});
-				break;
 			case "compaction.idleEnabled":
 			case "compaction.idleThresholdTokens":
 			case "compaction.idleTimeoutSeconds":
@@ -683,16 +688,7 @@ export class SelectorController {
 			case "spelling.typoDetection":
 			case "spelling.autocomplete":
 			case "spelling.autocorrect":
-				this.ctx.syncEditorSpelling();
 				this.ctx.ui.requestRender();
-				break;
-
-			case "tui.vimMode":
-			case "tui.vimModeDisplay":
-				this.ctx.applyVimModeSetting();
-				break;
-			case "display.pinnedAgents":
-				this.ctx.applyPinnedAgentsSetting();
 				break;
 
 			// Settings with UI side effects
@@ -881,15 +877,15 @@ export class SelectorController {
 			case "statusLineTimeFormat":
 			case "statusLineTimeShowSeconds": {
 				const statusLineSettings = {
-					preset: settings.get("statusLine.preset"),
-					leftSegments: normalizeStatusLineSegments(settings.get("statusLine.leftSegments")),
-					rightSegments: normalizeStatusLineSegments(settings.get("statusLine.rightSegments")),
-					separator: settings.get("statusLine.separator"),
-					showHookStatus: settings.get("statusLine.showHookStatus"),
-					sessionAccent: settings.get("statusLine.sessionAccent"),
-					transparent: settings.get("statusLine.transparent"),
-					segmentOptions: settings.get("statusLine.segmentOptions"),
-					compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
+					preset: cfgStatusLinePreset.get(settings),
+					leftSegments: cfgStatusLineLeftSegments.get(settings),
+					rightSegments: cfgStatusLineRightSegments.get(settings),
+					separator: cfgStatusLineSeparator.get(settings),
+					showHookStatus: cfgStatusLineShowHookStatus.get(settings),
+					sessionAccent: cfgStatusLineSessionAccent.get(settings),
+					transparent: cfgStatusLineTransparent.get(settings),
+					segmentOptions: cfgStatusLineSegmentOptions.get(settings),
+					compactThinkingLevel: cfgStatusLineCompactThinkingLevel.get(settings),
 				};
 				this.ctx.statusLine.updateSettings(statusLineSettings);
 				this.ctx.ui.requestRender();
@@ -904,6 +900,12 @@ export class SelectorController {
 			// All other settings are handled by the definitions (get/set on SettingsManager)
 			// No additional side effects needed
 		}
+		if (id !== cfgDefaultThinkingLevel.id || typeof value !== "string") return;
+		const level = parseConfiguredThinkingLevel(value);
+		if (level === undefined || level === this.ctx.session.configuredThinkingLevel()) return;
+		this.ctx.session.setThinkingLevel(level);
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorBorderColor();
 	}
 
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
@@ -977,12 +979,12 @@ export class SelectorController {
 		const { ModelPickerComponent } = loadModelOverlayComponents();
 		const currentContextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
 		const current = this.ctx.session.model;
-		const quickRoleOrder = this.ctx.settings.get("cycleOrder");
+		const quickRoleOrder = cfgCycleOrder.get(this.ctx.settings);
 		const quickRoleCycle = this.ctx.session.getRoleModelCycle(quickRoleOrder);
 		const currentSelector = current ? `${current.provider}/${current.id}` : undefined;
 		// Preselect the effective Task model in task mode: the configured override,
 		// else the session model (the bundled task agent inherits it by default).
-		const taskOverride = this.ctx.settings.get("task.agentModelOverrides").task;
+		const taskOverride = cfgTaskAgentModelOverrides.get(this.ctx.settings).task;
 		const taskSelector = (Array.isArray(taskOverride) ? taskOverride[0] : taskOverride) ?? currentSelector;
 		let closed = false;
 		const done = () => {
@@ -1028,8 +1030,8 @@ export class SelectorController {
 				onPickTask: (_model, selector) => {
 					// Session-only: layer the Task override onto the runtime settings
 					// layer so it is never persisted, mirroring the session-model pick.
-					this.ctx.settings.override("task.agentModelOverrides", {
-						...this.ctx.settings.get("task.agentModelOverrides"),
+					cfgTaskAgentModelOverrides.override(this.ctx.settings, {
+						...cfgTaskAgentModelOverrides.get(this.ctx.settings),
 						task: selector,
 					});
 					this.ctx.showStatus(`Task subagent model (session-only): ${selector}. Use /agents to persist.`);
@@ -1085,7 +1087,7 @@ export class SelectorController {
 			{
 				onAssign: async (model, role, thinkingLevel, selector, scope?: ModelRoleSelectionScope) => {
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
-					const configuredStorage = this.ctx.settings.get("modelRoleStorage");
+					const configuredStorage = cfgModelRoleStorage.get(this.ctx.settings);
 					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
 					const selectorValue = selector ?? `${model.provider}/${model.id}`;
 					const scopeLabel =
@@ -1115,7 +1117,7 @@ export class SelectorController {
 									formatModelSelectorValue(selectorValue, concreteThinking),
 								);
 								if (isAuto) {
-									this.ctx.settings.set("defaultThinkingLevel", AUTO_THINKING);
+									cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
 								}
 							} else if (shadowedProject) {
 								this.ctx.settings.setProjectModelRole(
@@ -1123,7 +1125,7 @@ export class SelectorController {
 									formatModelSelectorValue(selectorValue, concreteThinking),
 								);
 								if (isAuto) {
-									this.ctx.settings.set("defaultThinkingLevel", AUTO_THINKING);
+									cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
 								}
 							} else {
 								const { switched } = await this.ctx.session.setModel(model, role, {
@@ -1171,7 +1173,7 @@ export class SelectorController {
 				},
 				onUnassign: async (role, scope?: ModelRoleSelectionScope) => {
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
-					const configuredStorage = this.ctx.settings.get("modelRoleStorage");
+					const configuredStorage = cfgModelRoleStorage.get(this.ctx.settings);
 					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
 					const scopeLabel =
 						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
@@ -1215,7 +1217,7 @@ export class SelectorController {
 									let isAutoFromDefault = false;
 									if (!resolved.explicitThinkingLevel && !concreteThinking) {
 										const defaultLevel = parseConfiguredThinkingLevel(
-											this.ctx.settings.get("defaultThinkingLevel"),
+											cfgDefaultThinkingLevel.get(this.ctx.settings),
 										);
 										if (defaultLevel === AUTO_THINKING) {
 											isAutoFromDefault = true;
@@ -1250,13 +1252,13 @@ export class SelectorController {
 				},
 				onFallbackChainChange: (role, chain) => {
 					try {
-						const chains = { ...this.ctx.settings.get("retry.fallbackChains") };
+						const chains = { ...cfgRetryFallbackChains.get(this.ctx.settings) };
 						if (chain.length === 0) {
 							delete chains[role];
 						} else {
 							chains[role] = chain;
 						}
-						this.ctx.settings.set("retry.fallbackChains", chains);
+						cfgRetryFallbackChains.set(this.ctx.settings, chains);
 						const roleInfo = getRoleInfo(role, settings);
 						this.ctx.showStatus(
 							chain.length > 0
@@ -1274,7 +1276,7 @@ export class SelectorController {
 				},
 				onCycleOrderChange: order => {
 					try {
-						this.ctx.settings.set("cycleOrder", order);
+						cfgCycleOrder.set(this.ctx.settings, order);
 						this.ctx.showStatus(
 							order.length > 0 ? `Quick-switch cycle: ${order.join(" → ")}` : "Quick-switch cycle cleared",
 						);
@@ -1619,7 +1621,7 @@ export class SelectorController {
 					let wantsSummary = options.summarize;
 					let customInstructions: string | undefined;
 
-					const branchSummariesEnabled = settings.get("branchSummary.enabled");
+					const branchSummariesEnabled = cfgBranchSummaryEnabled.get(settings);
 
 					while (!wantsSummary && branchSummariesEnabled) {
 						const summaryChoice = await this.ctx.showHookSelector("Summarize branch?", [
@@ -1747,7 +1749,7 @@ export class SelectorController {
 					this.ctx.sessionManager.appendLabelChange(entryId, label);
 					this.ctx.ui.requestRender();
 				},
-				settings.get("treeFilterMode"),
+				cfgTreeFilterMode.get(settings),
 			);
 			return { component: selector, focus: selector };
 		});
@@ -2310,7 +2312,7 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 				{
-					disabledProviders: settings.get("disabledProviders"),
+					disabledProviders: cfgDisabledProviders.get(settings),
 					validateAuth: async (selectedProviderId: string) => {
 						const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
 							selectedProviderId,

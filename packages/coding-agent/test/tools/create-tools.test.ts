@@ -1,12 +1,11 @@
 import { describe, expect, test, vi } from "bun:test";
 import { Settings } from "../../src/config/settings";
-import type { SettingPath } from "../../src/config/settings-schema";
 import * as pyKernel from "../../src/eval/py/kernel";
 import { createTools, type ToolSession } from "../../src/tools/index";
 
 function makeSession(
 	overrides: Partial<ToolSession> = {},
-	settingOverrides: Partial<Record<SettingPath, unknown>> = {},
+	settingOverrides: Parameters<typeof Settings.isolated>[0] = {},
 ): ToolSession {
 	const settings = Settings.isolated({
 		"astGrep.enabled": true,
@@ -44,7 +43,7 @@ function makeSession(
 async function namesFor(
 	toolNames?: string[],
 	sessionOverrides?: Partial<ToolSession>,
-	settingOverrides?: Partial<Record<SettingPath, unknown>>,
+	settingOverrides?: Parameters<typeof Settings.isolated>[0],
 ) {
 	const tools = await createTools(
 		makeSession({ restrictToolNames: toolNames !== undefined, ...sessionOverrides }, settingOverrides),

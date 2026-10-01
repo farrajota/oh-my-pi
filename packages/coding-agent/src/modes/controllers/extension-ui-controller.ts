@@ -224,6 +224,7 @@ export class ExtensionUiController {
 			getAsyncJobOutput: jobId => this.ctx.session.getAsyncJobOutput(jobId),
 			cancelAsyncJob: jobId => this.ctx.session.cancelAsyncJob(jobId),
 			terminateSubagent: agentId => this.ctx.session.terminateSubagent(agentId),
+			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -460,6 +461,7 @@ export class ExtensionUiController {
 			getAsyncJobOutput: jobId => this.ctx.session.getAsyncJobOutput(jobId),
 			cancelAsyncJob: jobId => this.ctx.session.cancelAsyncJob(jobId),
 			terminateSubagent: agentId => this.ctx.session.terminateSubagent(agentId),
+			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),

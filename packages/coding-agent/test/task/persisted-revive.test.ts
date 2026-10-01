@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-
+import { resolveThresholdTokens, shouldCompact } from "@oh-my-pi/pi-agent-core/compaction";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "@oh-my-pi/pi-coding-agent/capability/rule";
@@ -8,6 +8,7 @@ import { formatModelRoleAlias } from "@oh-my-pi/pi-coding-agent/config/model-rol
 import { type } from "@oh-my-pi/omptype";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
@@ -49,12 +50,19 @@ import {
 	loadPermissionProfiles,
 	type PermissionScopeSnapshot,
 } from "@oh-my-pi/pi-coding-agent/task/permission-profiles";
-import { createMCPProxyTools, createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/executor";
+import {
+	compactionThresholdSettings,
+	createMCPProxyTools,
+	createSubagentSettings,
+} from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { EffectivePermissionSummary, PermissionDenialDetails } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { IrcBus, type IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createSessionDefaults } from "../helpers/session-defaults";
+
+import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 
 const tempDirs: TempDir[] = [];
 let fixtureRegistry: AgentRegistry | undefined;
@@ -71,6 +79,7 @@ function makeTempDir(prefix: string): string {
 interface FixtureOptions {
 	enableMCP?: boolean;
 	mcpManager?: MCPManager;
+	settings?: Settings;
 }
 
 async function createRef(sessionFile: string, options: FixtureOptions = {}): Promise<AgentRef> {
@@ -108,19 +117,25 @@ async function createRef(sessionFile: string, options: FixtureOptions = {}): Pro
 		? freezePermissionScope(init.permissionSnapshot.scope)
 		: undefined;
 	const id = `persisted-${path.basename(sessionFile, ".jsonl")}`;
-	const settings = fixtureSettings ?? parentSession.settings;
-	const subagentSettings = createSubagentSettings(
+	const settings = options.settings ?? fixtureSettings ?? parentSession.settings;
+	const subagentSettings = await createSubagentSettings(
 		settings,
-		init.advisor
-			? {
-					"advisor.enabled": true,
-					...(init.advisor !== "on"
-						? { modelRoles: { ...settings.getModelRoles(), advisor: init.advisor } }
-						: undefined),
-				}
-			: undefined,
+		{
+			...compactionThresholdSettings(
+				Reflect.get(init, "compactionThreshold") as Parameters<typeof compactionThresholdSettings>[0],
+			),
+			...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
+			...(init.advisor
+				? {
+						"advisor.enabled": true,
+						...(init.advisor !== "on"
+							? { modelRoles: { ...settings.getModelRoles(), advisor: init.advisor } }
+							: undefined),
+					}
+				: undefined),
+		},
 		undefined,
-		{ cwd: peek.cwd, agentDir: settings.getAgentDir() },
+		{ cwd: peek.cwd },
 	);
 	const persistedModelPattern =
 		init.modelRole && init.modelRole !== "default"
@@ -213,8 +228,9 @@ interface LastAssistantStop {
 function createRevivedSession(
 	activeToolNames: string[][],
 	extensionRunner?: unknown,
-	sessionManager = SessionManager.inMemory("/tmp"),
+	options?: CreateAgentSessionOptions,
 ): RevivedSessionHandle {
+	const sessionManager = options?.sessionManager ?? SessionManager.inMemory("/tmp");
 	installSessionOperationLedger(sessionManager);
 	let observer: IrcWakeObserver | undefined;
 	let lastAssistant:
@@ -230,8 +246,10 @@ function createRevivedSession(
 	const trackedReplies: Promise<void>[] = [];
 	const session = {
 		...createSessionDefaults(),
+		...(options?.settings ? { settings: options.settings } : {}),
 		sessionManager,
 		getPermissionSummary: () => sessionManager.getLatestPermissionSummary(),
+		getPermissionScope: () => options?.permissionScope,
 		getMountedXdevToolNames: () => [],
 		setActiveToolsByName: async (names: string[]) => {
 			activeToolNames.push(names);
@@ -287,6 +305,7 @@ async function createPersistedSession(
 		omitPermissionProvenance?: boolean;
 		omitPermissionSnapshot?: boolean;
 		recentDenials?: PermissionDenialDetails[];
+		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	},
 ): Promise<string> {
 	const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
@@ -337,6 +356,9 @@ async function createPersistedSession(
 		enableMCP: contract?.enableMCP,
 		isolated: contract?.isolated,
 		...persistedPermissions,
+		...(contract?.compactionThreshold !== undefined
+			? { compactionThreshold: contract.compactionThreshold }
+			: undefined),
 	});
 	manager.appendMessage({
 		role: "assistant",
@@ -440,7 +462,7 @@ describe("persisted subagent revival", () => {
 		const delivered: string[] = [];
 		fixtureSettings = Settings.isolated({}, { cwd, agentDir: cwd });
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			const handle = createRevivedSession([], undefined, options?.sessionManager);
+			const handle = createRevivedSession([], undefined, options);
 			handle.session.deliverIrcMessage = async message => {
 				delivered.push(message.body);
 				return "woken";
@@ -514,7 +536,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
 			async options =>
 				({
-					session: createRevivedSession([], undefined, options?.sessionManager).session,
+					session: createRevivedSession([], undefined, options).session,
 				}) as CreateAgentSessionResult,
 		);
 		const sessionFile = await createPersistedSession(cwd, false, "default", undefined, { agent: "task" });
@@ -578,7 +600,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
 			async options =>
 				({
-					session: createRevivedSession([], undefined, options?.sessionManager).session,
+					session: createRevivedSession([], undefined, options).session,
 				}) as CreateAgentSessionResult,
 		);
 		for (const field of ["actorId", "parentId", "provenance"] as const) {
@@ -606,7 +628,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
 			async options =>
 				({
-					session: createRevivedSession([], undefined, options?.sessionManager).session,
+					session: createRevivedSession([], undefined, options).session,
 				}) as CreateAgentSessionResult,
 		);
 		const ref = await createRef(await createPersistedSession(cwd));
@@ -639,7 +661,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
 			async options =>
 				({
-					session: createRevivedSession([], extensionRunner, options?.sessionManager).session,
+					session: createRevivedSession([], extensionRunner, options).session,
 				}) as CreateAgentSessionResult,
 		);
 
@@ -803,7 +825,7 @@ describe("persisted subagent revival", () => {
 		});
 		let handle: RevivedSessionHandle | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			handle = createRevivedSession([], undefined, options?.sessionManager);
+			handle = createRevivedSession([], undefined, options);
 			return { session: handle.session } as CreateAgentSessionResult;
 		});
 
@@ -832,7 +854,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession(activeToolNames, undefined, options?.sessionManager).session,
+				session: createRevivedSession(activeToolNames, undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -869,7 +891,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession(activeToolNames, undefined, options?.sessionManager).session,
+				session: createRevivedSession(activeToolNames, undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -893,7 +915,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession(activeToolNames, undefined, options?.sessionManager).session,
+				session: createRevivedSession(activeToolNames, undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -915,7 +937,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -942,7 +964,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -966,7 +988,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -990,7 +1012,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -1027,7 +1049,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -1049,7 +1071,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -1067,7 +1089,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -1090,7 +1112,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -1129,11 +1151,11 @@ describe("persisted subagent revival", () => {
 		}
 
 		const [advised, roleAdvised, unadvised] = captured;
-		expect(advised.get("advisor.enabled")).toBe(true);
+		expect(cfgAdvisorEnabled.get(advised)).toBe(true);
 		expect(advised.getModelRole("advisor")).toBe("moonshot/k3");
-		expect(roleAdvised.get("advisor.enabled")).toBe(true);
+		expect(cfgAdvisorEnabled.get(roleAdvised)).toBe(true);
 		expect(roleAdvised.getModelRole("advisor")).toBeUndefined();
-		expect(unadvised.get("advisor.enabled")).toBe(false);
+		expect(cfgAdvisorEnabled.get(unadvised)).toBe(false);
 	});
 
 	it("restores the persisted custom model role before reopening the session", async () => {
@@ -1143,7 +1165,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -1156,6 +1178,39 @@ describe("persisted subagent revival", () => {
 		expect(capturedOptions?.modelPatternAuthFallback).toBe("anthropic/claude-sonnet-4-5");
 	});
 
+	it("restores compaction threshold behavior after parent settings change", async () => {
+		const cwd = makeTempDir("@pi-compaction-threshold-revive-");
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, {
+			compactionThreshold: { thresholdPercent: 72, thresholdTokens: -1 },
+		});
+		const parentSettings = Settings.isolated(
+			{
+				"compaction.thresholdPercent": 45,
+				"compaction.thresholdTokens": 120_000,
+			},
+			{ cwd, agentDir: cwd },
+		);
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			return { session: createRevivedSession([], undefined, options).session } as CreateAgentSessionResult;
+		});
+
+		const ref = await createRef(sessionFile, { settings: parentSettings });
+		const reviver = await createFactory(cwd, undefined, { settings: parentSettings })(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		const revivedSettings = capturedOptions?.settings;
+		if (!revivedSettings) throw new Error("Expected revived child settings");
+		const parentCompaction = cfgCompaction.get(parentSettings);
+		const revivedCompaction = cfgCompaction.get(revivedSettings);
+		expect(shouldCompact(130_000, 200_000, parentCompaction)).toBe(true);
+		expect(resolveThresholdTokens(200_000, revivedCompaction)).toBe(144_000);
+		expect(shouldCompact(130_000, 200_000, revivedCompaction)).toBe(false);
+		expect(shouldCompact(144_001, 200_000, revivedCompaction)).toBe(true);
+	});
+
 	it("pins the persisted concrete model when the default role is revived", async () => {
 		const cwd = makeTempDir("@pi-default-role-revive-");
 		const sessionFile = await createPersistedSession(cwd, false, "default");
@@ -1163,7 +1218,7 @@ describe("persisted subagent revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 
@@ -1184,7 +1239,7 @@ describe("persisted subagent revival", () => {
 		MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);
 		let handle: RevivedSessionHandle | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			handle = createRevivedSession([], undefined, options?.sessionManager);
+			handle = createRevivedSession([], undefined, options);
 			return { session: handle.session } as CreateAgentSessionResult;
 		});
 		const eventBus = new EventBus();
@@ -1237,7 +1292,7 @@ describe("persisted subagent revival", () => {
 		MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);
 		let handle: RevivedSessionHandle | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			handle = createRevivedSession([], undefined, options?.sessionManager);
+			handle = createRevivedSession([], undefined, options);
 			return { session: handle.session } as CreateAgentSessionResult;
 		});
 
@@ -1284,7 +1339,7 @@ describe("persisted subagent revival", () => {
 			MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);
 			let handle: RevivedSessionHandle | undefined;
 			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-				handle = createRevivedSession([], undefined, options?.sessionManager);
+				handle = createRevivedSession([], undefined, options);
 				return { session: handle.session } as CreateAgentSessionResult;
 			});
 			const ref = await createRef(sessionFile);
@@ -1642,7 +1697,7 @@ describe("fail-closed revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			captured = options;
 			return {
-				session: createRevivedSession([], undefined, options?.sessionManager).session,
+				session: createRevivedSession([], undefined, options).session,
 			} as CreateAgentSessionResult;
 		});
 		const ref = await createRef(sessionFile);
@@ -1667,7 +1722,7 @@ describe("fail-closed revival", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
 			async options =>
 				({
-					session: createRevivedSession([], undefined, options?.sessionManager).session,
+					session: createRevivedSession([], undefined, options).session,
 				}) as CreateAgentSessionResult,
 		);
 		const missingProvenanceFile = await createPersistedSession(cwd, true, undefined, undefined, {

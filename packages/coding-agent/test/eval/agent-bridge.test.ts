@@ -36,6 +36,8 @@ interface SessionOperationLedgerControl {
 	close(): Promise<void>;
 }
 
+import { cfgTaskIsolationEnabled } from "@oh-my-pi/pi-coding-agent/task/settings";
+
 const jobManagers = new Set<AsyncJobManager>();
 const operationLedgers = new Set<SessionOperationLedgerControl>();
 const lifecycleManagers = new Set<AgentLifecycleManager>();
@@ -288,7 +290,8 @@ describe("runEvalAgent", () => {
 		};
 		const sessionManager = SessionManager.inMemory();
 		sessionManager.beginTurnBudget(100_000, true);
-		const session = await createBudgetSession(sessionManager, Settings.isolated({ "task.isolation.enabled": true }));
+		const session = await createBudgetSession(sessionManager);
+		cfgTaskIsolationEnabled.set(session.settings, true);
 		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
 		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
 			repoRoot: "/tmp",

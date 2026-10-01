@@ -1,6 +1,6 @@
 import { type CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { IrcBus, type IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { registerToolSessionLifecycleAuthority } from "../../src/internal/agent-lifecycle-bridge";
 import {
 	bindInternalAgentAuthoritySession,
@@ -83,7 +83,7 @@ export async function createHubAuthorityFixture(registry: AgentRegistry, rootId:
 		},
 	};
 }
-type IrcControlMessage = { id: string; from: string; to: string; body: string; ts: number; replyTo?: string };
+type IrcControlMessage = Pick<IrcMessage, "id" | "from" | "to" | "body" | "ts" | "replyTo" | "wakeRelay">;
 
 type IrcControllableSession = AgentSession & {
 	deliverIrcMessage(message: IrcControlMessage): Promise<"injected" | "woken">;

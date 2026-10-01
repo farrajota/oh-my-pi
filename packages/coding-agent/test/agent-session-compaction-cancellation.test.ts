@@ -20,6 +20,11 @@ import {
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
+import {
+	cfgCompactionAutoContinue,
+	cfgCompactionExperimentalContextManagement,
+} from "@oh-my-pi/pi-coding-agent/session/context-settings";
+
 type HookMode = "extension-veto" | "park";
 
 describe.each([false, true])("AgentSession compaction cancellation source (experimental=%s)", experimental => {
@@ -206,7 +211,7 @@ describe.each([false, true])("AgentSession compaction cancellation source (exper
 		// so the turn the abort cut must still resume; otherwise a manual /compact
 		// mid-turn leaves the agent idle exactly as before the fix.
 		session = await createSession("park");
-		session.settings.override("compaction.autoContinue", true);
+		cfgCompactionAutoContinue.override(session.settings, true);
 		session.agent.state.isStreaming = true;
 		vi.spyOn(session, "abort").mockImplementation(async () => {
 			session.agent.state.isStreaming = false;
@@ -227,6 +232,32 @@ describe.each([false, true])("AgentSession compaction cancellation source (exper
 		expect(prompted).toHaveLength(1);
 		expect(prompted[0]?.some(message => message.role === "developer" && message.synthetic === true)).toBe(true);
 	});
+
+	if (!experimental) {
+		it("does not resume the interrupted turn when append fails before commit", async () => {
+			session = await createSession("park");
+			cfgCompactionAutoContinue.override(session.settings, true);
+			session.agent.state.isStreaming = true;
+			vi.spyOn(session, "abort").mockImplementation(async () => {
+				session.agent.state.isStreaming = false;
+			});
+			vi.spyOn(session.sessionManager, "appendCompaction").mockImplementation(() => {
+				throw new Error("append failed before commit");
+			});
+			type Dispatched = { role: string; synthetic?: boolean };
+			const prompted: Dispatched[][] = [];
+			vi.spyOn(session.agent, "prompt").mockImplementation(async message => {
+				prompted.push((Array.isArray(message) ? message : [message]) as Dispatched[]);
+			});
+
+			await expect(session.compact()).rejects.toThrow("append failed before commit");
+			expect(session.sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
+			await session.waitForIdle();
+
+			expect(prompted).toHaveLength(0);
+			expect(session.isCompacting).toBe(false);
+		});
+	}
 	if (experimental) {
 		for (const mutation of ["branch", "disable"] as const) {
 			it(`rejects a rollover when ${mutation} changes during an awaited hook`, async () => {
@@ -240,7 +271,7 @@ describe.each([false, true])("AgentSession compaction cancellation source (exper
 					if (!first) throw new Error("Expected seeded history");
 					session.sessionManager.branch(first.id);
 				} else {
-					session.settings.override("compaction.experimentalContextManagement", false);
+					cfgCompactionExperimentalContextManagement.override(session.settings, false);
 				}
 				gate.resolve();
 				await cancellation;
@@ -254,7 +285,7 @@ describe.each([false, true])("AgentSession compaction cancellation source (exper
 				version: 1,
 				text: "Preserve the rollback decision.",
 			});
-			session.settings.override("compaction.experimentalContextManagement", false);
+			cfgCompactionExperimentalContextManagement.override(session.settings, false);
 			const result = await session.compact();
 			expect(result.summary).toBe("compacted");
 			expect(JSON.stringify(session.agent.state.messages)).toContain("Preserve the rollback decision.");

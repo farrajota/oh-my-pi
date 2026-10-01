@@ -8,6 +8,7 @@ import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mo
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -237,13 +238,13 @@ async function createHarness(
 	authStorage.keys.setRuntime("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 	const settings = Settings.isolated();
-	settings.set("retry.enabled", true);
-	settings.set("retry.maxRetries", 0);
-	settings.set("retry.baseDelayMs", 1);
-	settings.set("retry.maxDelayMs", 10_000);
-	settings.set("retry.repeated.enabled", true);
-	settings.set("retry.repeated.timerMs", TIMER_MS);
-	settings.set("retry.repeated.timeoutMs", TIMEOUT_MS);
+	lookup("retry.enabled")!.set(settings, true);
+	lookup("retry.maxRetries")!.set(settings, 0);
+	lookup("retry.baseDelayMs")!.set(settings, 1);
+	lookup("retry.maxDelayMs")!.set(settings, 10_000);
+	lookup("retry.repeated.enabled")!.set(settings, true);
+	lookup("retry.repeated.timerMs")!.set(settings, TIMER_MS);
+	lookup("retry.repeated.timeoutMs")!.set(settings, TIMEOUT_MS);
 	configure?.(settings);
 	const extensionRunner = new SpecializedRetryHookRunner(subscribeToGenericAutoRetryEnd);
 
@@ -313,8 +314,8 @@ describe("AgentSession repeated retry runtime", () => {
 
 	test("leaves retry exhaustion behavior unchanged when repeated retry is disabled", async () => {
 		harness = await createHarness([errorResponse("stream_read_error: temporary upstream failure")], settings => {
-			settings.set("retry.repeated.enabled", false);
-			settings.set("retry.maxRetries", 0);
+			lookup("retry.repeated.enabled")!.set(settings, false);
+			lookup("retry.maxRetries")!.set(settings, 0);
 		});
 		holdLongWaits = false;
 
@@ -341,9 +342,9 @@ describe("AgentSession repeated retry runtime", () => {
 
 	test("enters repeated wait when normal retry delay exceeds maxDelay", async () => {
 		harness = await createHarness([errorResponse(SESSION_LIMIT), successResponse()], settings => {
-			settings.set("retry.maxRetries", 3);
-			settings.set("retry.baseDelayMs", 120_000);
-			settings.set("retry.maxDelayMs", 1_000);
+			lookup("retry.maxRetries")!.set(settings, 3);
+			lookup("retry.baseDelayMs")!.set(settings, 120_000);
+			lookup("retry.maxDelayMs")!.set(settings, 1_000);
 		});
 
 		const prompt = harness.session.prompt("hit max delay");
@@ -411,7 +412,7 @@ describe("AgentSession repeated retry runtime", () => {
 				successResponse("recovered"),
 			],
 			settings => {
-				settings.set("retry.maxRetries", 1);
+				lookup("retry.maxRetries")!.set(settings, 1);
 			},
 		);
 		harness.agent.providerMaxAttempts = 4;
@@ -490,8 +491,8 @@ describe("AgentSession repeated retry runtime", () => {
 				}),
 			],
 			settings => {
-				settings.set("retry.maxRetries", 0);
-				settings.set("retry.repeated.enabled", true);
+				lookup("retry.maxRetries")!.set(settings, 0);
+				lookup("retry.repeated.enabled")!.set(settings, true);
 			},
 		);
 
@@ -507,7 +508,7 @@ describe("AgentSession repeated retry runtime", () => {
 
 	test("times out a repeated retry chain at the configured deadline", async () => {
 		harness = await createHarness([errorResponse(SESSION_LIMIT), errorResponse(SESSION_LIMIT)], settings => {
-			settings.set("retry.repeated.timeoutMs", TIMER_MS);
+			lookup("retry.repeated.timeoutMs")!.set(settings, TIMER_MS);
 		});
 
 		void harness.session.prompt("eventually timeout");
@@ -668,8 +669,8 @@ describe("AgentSession repeated retry runtime", () => {
 	});
 	test("non-recoverable usage_not_included fails fast without repeated wait", async () => {
 		harness = await createHarness([errorResponse(USAGE_NOT_INCLUDED)], settings => {
-			settings.set("retry.baseDelayMs", 120_000);
-			settings.set("retry.maxDelayMs", 1_000);
+			lookup("retry.baseDelayMs")!.set(settings, 120_000);
+			lookup("retry.maxDelayMs")!.set(settings, 1_000);
 		});
 		holdLongWaits = false;
 

@@ -6,6 +6,11 @@
 //! for the lifetime of one preview/apply pass. Engines never touch
 //! `std::fs` directly; the session clears the cache before `apply` so a final
 //! stage always sees fresh bytes.
+//!
+//! [`FileCache`] also owns the host's internal-URL answers: a URL target
+//! missing from that table is recorded (see [`FileCache::take_unresolved`])
+//! and fails with [`EditError::UnresolvedUrl`] until the host
+//! [`FileCache::provide`]s it.
 
 use std::{
 	collections::HashMap,
@@ -15,10 +20,10 @@ use std::{
 };
 
 use crate::{
-	engine::Resolved,
+	engine::{FileOp, Resolved},
 	error::{EditError, EditResult},
 	notebook,
-	path_policy::{PathPolicy, canonical_key},
+	path_policy::{PathPolicy, UrlResolution, canonical_key},
 	text::{LineEnding, detect_line_ending, normalize_to_lf, restore_line_endings, strip_bom},
 };
 
@@ -85,7 +90,8 @@ pub trait FileSource {
 
 	/// Resolve an authored path without reading it. When `must_exist` and
 	/// the resolved file is missing, unique-suffix recovery may substitute a
-	/// different display/absolute pair.
+	/// different display/absolute pair (never for internal URLs, which fail
+	/// with [`EditError::UnresolvedUrl`] until the host answers them).
 	fn resolve(&mut self, authored: &str, must_exist: bool) -> EditResult<Resolved>;
 
 	/// Whether `absolute` currently exists (file or directory).
@@ -98,7 +104,7 @@ pub trait FileSource {
 	/// Read an already-resolved target; `Ok(None)` when it does not exist.
 	fn try_read(&mut self, resolved: &Resolved) -> EditResult<Option<Arc<FileRead>>>;
 
-	/// Drop every cached read.
+	/// Drop every cached read and path resolution. Host URL answers survive.
 	fn clear(&mut self);
 }
 
@@ -121,9 +127,14 @@ pub struct FileCache {
 	resolutions: HashMap<(String, bool), Resolved>,
 	/// Present only for closed-world, immutable host-provided reads.
 	snapshots:   Option<Arc<SourceSnapshotMap>>,
+	/// Host answers keyed by [`PathPolicy::url_target`].
+	urls:        HashMap<String, UrlResolution>,
+	/// URLs that missed `urls`, deduped in first-seen order.
+	unresolved:  Vec<String>,
 }
 
 impl FileCache {
+	/// Empty cache over `policy`.
 	pub fn new(policy: PathPolicy) -> Self {
 		Self::with_source_snapshots(policy, None)
 	}
@@ -133,11 +144,56 @@ impl FileCache {
 	}
 
 	fn with_source_snapshots(policy: PathPolicy, snapshots: Option<Arc<SourceSnapshotMap>>) -> Self {
-		Self { policy, reads: HashMap::new(), resolutions: HashMap::new(), snapshots }
+		Self {
+			policy,
+			reads: HashMap::new(),
+			resolutions: HashMap::new(),
+			snapshots,
+			urls: HashMap::new(),
+			unresolved: Vec::new(),
+		}
 	}
 
 	fn snapshot_for(&self, absolute: &Path) -> Option<&Arc<SourceSnapshot>> {
 		self.snapshots.as_ref()?.get(absolute)
+	}
+
+	/// Record the host answer for `url`, dropping cached resolutions and
+	/// reads made for it.
+	pub fn provide(&mut self, url: String, resolution: UrlResolution) {
+		let policy = &self.policy;
+		let names_url = |authored: &str| policy.url_target(authored).as_deref() == Some(url.as_str());
+		self
+			.resolutions
+			.retain(|(authored, _), _| !names_url(authored));
+		self
+			.reads
+			.retain(|_, (_, read)| !names_url(&read.resolved.display));
+		self.unresolved.retain(|missed| *missed != url);
+		self.urls.insert(url, resolution);
+	}
+
+	/// Drain URLs that missed the resolution table since the last call
+	/// (deduped, first-seen order).
+	pub fn take_unresolved(&mut self) -> Vec<String> {
+		std::mem::take(&mut self.unresolved)
+	}
+
+	/// Drop every host URL answer and recorded miss, plus every cached read
+	/// and resolution (some were made from those answers), so URL targets ask
+	/// the host again.
+	pub fn forget_urls(&mut self) {
+		self.clear();
+		self.urls.clear();
+		self.unresolved.clear();
+	}
+
+	/// Plan-mode write guard, judging URL targets by their host answers.
+	///
+	/// # Errors
+	/// [`EditError::Plan`] when plan mode refuses the write.
+	pub fn enforce_write(&self, display: &str, op: FileOp, move_to: Option<&str>) -> EditResult<()> {
+		self.policy.enforce_write(display, op, move_to, &self.urls)
 	}
 
 	fn read_resolved(&mut self, resolved: &Resolved) -> EditResult<Option<Arc<FileRead>>> {
@@ -250,7 +306,13 @@ impl FileSource for FileCache {
 		if let Some(resolved) = self.resolutions.get(&key) {
 			return Ok(resolved.clone());
 		}
-		let mut resolved = self.policy.resolve(authored)?;
+		let resolved = self.policy.resolve(authored, &self.urls);
+		if let Err(EditError::UnresolvedUrl(url)) = &resolved
+			&& !self.unresolved.contains(url)
+		{
+			self.unresolved.push(url.clone());
+		}
+		let mut resolved = resolved?;
 		if let Some(snapshots) = &self.snapshots {
 			if !snapshots.contains_key(&resolved.absolute) {
 				return Err(EditError::apply(format!(
@@ -259,7 +321,7 @@ impl FileSource for FileCache {
 				)));
 			}
 		} else if must_exist
-			&& !crate::path_policy::is_internal_url(authored)
+			&& !self.policy.is_internal_url(authored)
 			&& stamp(&resolved.absolute).is_none()
 			&& let Some(recovered) = self.policy.recover_missing(authored)
 		{
@@ -303,8 +365,9 @@ mod tests {
 		PathPolicy {
 			cwd:                  root.to_owned(),
 			home_dir:             root.to_owned(),
-			local_sandbox_root:   None,
-			vault_roots:          None,
+			url_schemes:          Vec::new(),
+			url_alias_schemes:    Vec::new(),
+			plan_writable_roots:  Vec::new(),
 			plan_active:          false,
 			block_auto_generated: false,
 		}

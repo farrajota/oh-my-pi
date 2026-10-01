@@ -12,6 +12,7 @@ import {
 	markUnregisteredSessionOperationProjection,
 } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 
@@ -34,16 +35,11 @@ const session = {
 	getAgentId: () => "autobg-probe-owner",
 	sessionManager,
 	asyncJobManager: manager,
-	settings: {
-		get(key: string) {
-			if (key === "bash.autoBackground.enabled") return true;
-			if (key === "bash.autoBackground.thresholdMs") return THRESHOLD_MS;
-			return undefined;
-		},
-		getBashInterceptorRules() {
-			return [];
-		},
-	},
+	settings: Settings.isolated({
+		"async.enabled": false,
+		"bash.autoBackground.enabled": true,
+		"bash.autoBackground.thresholdMs": THRESHOLD_MS,
+	}),
 	getClientBridge: () => undefined,
 } as unknown as ToolSession;
 

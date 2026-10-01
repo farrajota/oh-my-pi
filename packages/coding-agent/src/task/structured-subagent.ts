@@ -15,9 +15,13 @@ import {
 	resolveModelOverride,
 } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
+import {
+	type CompactionThresholdPair,
+	validateAgentCompactionThresholdOverrides,
+} from "../config/compaction-threshold";
 import { type ServiceTierInheritSettingValue, validateAgentServiceTierOverrides } from "../config/service-tier";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import type { LocalProtocolOptions } from "../internal-urls";
+import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
@@ -26,11 +30,11 @@ import isolationRecoveryHintTemplate from "../prompts/tools/isolation-recovery-h
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
-import { isIrcEnabled } from "../tools/hub";
+import { isIrcEnabled } from "../irc/messaging";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
-import { type ExecutorOptions, runSubprocess } from "./executor";
+import { type RunSubprocessOptions, runSubprocess } from "./executor";
 import { composeEffectivePermissions, freezePermissionScope } from "./permission-profiles";
 import {
 	applyEligibleNestedPatches,
@@ -54,6 +58,19 @@ import {
 } from "./types";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import { parseIsolationBackend } from "./worktree";
+
+import {
+	cfgIsolationBackend,
+	cfgTaskAgentCompactionThresholdOverrides,
+	cfgTaskAgentModelOverrides,
+	cfgTaskAgentServiceTierOverrides,
+	cfgTaskDisabledAgents,
+	cfgTaskEnableLsp,
+	cfgTaskIsolationApply,
+	cfgTaskIsolationEnabled,
+	cfgTaskIsolationMerge,
+	cfgTaskMaxRecursionDepth,
+} from "./settings";
 
 /** Validation behavior requested for an effective output schema. */
 export type StructuredSubagentSchemaMode = "permissive" | "strict";
@@ -157,6 +174,8 @@ export interface EffectiveSubagentPolicy {
 	modelRoute?: string;
 	/** Exact-name `task.agentServiceTierOverrides` entry for this agent, applied after model resolution. */
 	serviceTierOverride?: ServiceTierInheritSettingValue;
+	/** Exact-name entry normalized to both child compaction threshold fields. */
+	compactionThresholdOverride?: CompactionThresholdPair;
 	parentActiveModelPattern?: string;
 	schema: StructuredSubagentSchemaResolution;
 	planMode: boolean;
@@ -250,7 +269,7 @@ function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode:
 function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentName: string): void {
 	const settings = request.settings ?? request.session.settings;
 	const taskDepth = request.taskDepth ?? request.session.taskDepth ?? 0;
-	const maxDepth = settings.get("task.maxRecursionDepth") ?? 2;
+	const maxDepth = cfgTaskMaxRecursionDepth.get(settings);
 	if (!canSpawnAtDepth(maxDepth, taskDepth)) {
 		throw new StructuredSubagentError(
 			"preflight",
@@ -305,7 +324,7 @@ export async function resolveEffectiveSubagentPolicy(
 		const available = discovery.agents.map(candidate => candidate.name).join(", ") || "none";
 		throw new StructuredSubagentError("preflight", `Unknown agent "${agentName}". Available: ${available}`);
 	}
-	const disabledAgents = settings.get("task.disabledAgents") as string[];
+	const disabledAgents = cfgTaskDisabledAgents.get(settings);
 	if (disabledAgents.includes(agentName)) {
 		const enabled = discovery.agents
 			.filter(candidate => !disabledAgents.includes(candidate.name))
@@ -326,10 +345,16 @@ export async function resolveEffectiveSubagentPolicy(
 			throw new StructuredSubagentError("preflight", `Invalid ${scope} output schema: ${error}`);
 		}
 	}
-	const agentModelOverrides = settings.get("task.agentModelOverrides");
-	const agentServiceTierOverrides = validateAgentServiceTierOverrides(settings.get("task.agentServiceTierOverrides"));
+	const agentModelOverrides = cfgTaskAgentModelOverrides.get(settings);
+	const agentServiceTierOverrides = validateAgentServiceTierOverrides(cfgTaskAgentServiceTierOverrides.get(settings));
 	const serviceTierOverride = Object.hasOwn(agentServiceTierOverrides, agentName)
 		? agentServiceTierOverrides[agentName]
+		: undefined;
+	const compactionThresholdOverrides = validateAgentCompactionThresholdOverrides(
+		cfgTaskAgentCompactionThresholdOverrides.get(settings),
+	);
+	const compactionThresholdOverride = Object.hasOwn(compactionThresholdOverrides, agentName)
+		? compactionThresholdOverrides[agentName]
 		: undefined;
 	const parentActiveModelPattern = request.session.getActiveModelString?.();
 	const modelResolution = {
@@ -358,7 +383,7 @@ export async function resolveEffectiveSubagentPolicy(
 			`Task model selector ${JSON.stringify(requestedTaskModel)} did not resolve to an enabled model.`,
 		);
 	}
-	const isolationEnabled = !planMode && settings.get("task.isolation.enabled");
+	const isolationEnabled = !planMode && cfgTaskIsolationEnabled.get(settings);
 	const isIsolated = request.isolation?.requested === true;
 	if (isIsolated && !isolationEnabled) {
 		throw new StructuredSubagentError(
@@ -374,19 +399,21 @@ export async function resolveEffectiveSubagentPolicy(
 		modelOverride,
 		modelRole,
 		serviceTierOverride,
+		compactionThresholdOverride,
 		parentActiveModelPattern,
 		schema,
 		planMode,
 		isIsolated,
-		mergeMode: request.isolation?.merge ?? settings.get("task.isolation.merge"),
+		mergeMode: request.isolation?.merge ?? cfgTaskIsolationMerge.get(settings),
 		applyChanges:
-			request.isolation?.apply ?? (request.invocationKind === "task" ? settings.get("task.isolation.apply") : true),
+			request.isolation?.apply ?? (request.invocationKind === "task" ? cfgTaskIsolationApply.get(settings) : true),
 		enableLsp:
-			!planMode && (request.enableLsp ?? ((request.session.enableLsp ?? true) && settings.get("task.enableLsp"))),
+			!planMode && (request.enableLsp ?? ((request.session.enableLsp ?? true) && cfgTaskEnableLsp.get(settings))),
 		enableIrc:
 			!planMode &&
 			(request.enableIrc ??
-				(request.session.enableIrc !== false && isIrcEnabled(settings, request.session.taskDepth ?? 0))),
+				(request.session.enableIrc !== false &&
+					isIrcEnabled(settings, request.taskDepth ?? request.session.taskDepth ?? 0))),
 	};
 }
 
@@ -466,19 +493,16 @@ async function leaseArtifacts(
 	return { sessionFile: null, artifactsDir, temporary: true, unregister: registerArtifactsDir(artifactsDir) };
 }
 
-function buildExecutorOptions(
+function buildRunSubprocessOptions(
 	request: StructuredSubagentRequest,
 	policy: EffectiveSubagentPolicy,
 	lease: ArtifactLease,
 	id: string,
-): ExecutorOptions {
+): RunSubprocessOptions {
 	const requestedModel = typeof request.model === "string" ? request.model : undefined;
 	const exactModelOverride = request.invocationKind === "task" && request.model !== undefined;
 	const { session } = request;
-	const localProtocolOptions: LocalProtocolOptions = session.localProtocolOptions ?? {
-		getArtifactsDir: session.getArtifactsDir ?? (() => null),
-		getSessionId: session.getSessionId ?? (() => null),
-	};
+	const localProtocolOptions = sessionLocalProtocolOptions(session);
 	const restrictToolNames = policy.planMode || session.restrictToolNames === true;
 	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
 	const inheritedPermissions = session.getPermissionScope?.();
@@ -514,7 +538,7 @@ function buildExecutorOptions(
 		id,
 		agentRegistry: session.agentRegistry!,
 		createAuthoritySession: session.createAuthoritySession!,
-		taskDepth: session.taskDepth ?? 0,
+		taskDepth: request.taskDepth ?? session.taskDepth ?? 0,
 		invokedAt: request.invokedAt,
 		acquiredAt: request.acquiredAt,
 		modelOverride: policy.modelOverride,
@@ -523,6 +547,7 @@ function buildExecutorOptions(
 		exactModelOverride,
 		modelRoute: policy.modelRoute,
 		serviceTierOverride: policy.serviceTierOverride,
+		compactionThresholdOverride: policy.compactionThresholdOverride,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
@@ -547,7 +572,8 @@ function buildExecutorOptions(
 		onProgress: request.onProgress,
 		authStorage: session.authStorage,
 		modelRegistry: session.modelRegistry,
-		settings: session.settings,
+		settings: request.settings ?? session.settings,
+		skillsSettings: session.skillsSettings,
 		mcpManager: enableMCP ? session.mcpManager : undefined,
 		enableMCP,
 		customTools: request.customTools,
@@ -569,11 +595,10 @@ async function loadPlanReference(
 	policy: EffectiveSubagentPolicy,
 ): Promise<{ path: string; content: string } | undefined> {
 	if (policy.planMode) return undefined;
-	const localProtocolOptions: LocalProtocolOptions = request.session.localProtocolOptions ?? {
-		getArtifactsDir: request.session.getArtifactsDir ?? (() => null),
-		getSessionId: request.session.getSessionId ?? (() => null),
-	};
-	return loadOverallPlanReference(request.session.getPlanReferencePath?.() ?? "local://PLAN.md", localProtocolOptions);
+	return loadOverallPlanReference(
+		request.session.getPlanReferencePath?.() ?? "local://PLAN.md",
+		sessionLocalProtocolOptions(request.session),
+	);
 }
 
 function buildFailureResult(
@@ -719,7 +744,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			...request.identity,
 			label: request.identity?.label ?? (request.invocationKind === "eval" ? "EvalAgent" : undefined),
 		});
-		const baseOptions = buildExecutorOptions(request, policy, lease, id);
+		const baseOptions = buildRunSubprocessOptions(request, policy, lease, id);
 		baseOptions.onCleanupDeferred = completion => {
 			deferredCleanup = completion;
 		};
@@ -745,7 +770,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			result = await runIsolatedSubprocess({
 				baseOptions,
 				context: isolationContext,
-				preferredBackend: parseIsolationBackend(request.session.settings.get("isolation.backend")),
+				preferredBackend: parseIsolationBackend(cfgIsolationBackend.get(request.session.settings)),
 				agentId: id,
 				mergeMode: policy.mergeMode,
 				artifactsDir: lease.artifactsDir,

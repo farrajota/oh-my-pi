@@ -43,12 +43,15 @@ import { loadOverallPlanReference, type OverallPlanReference } from "../plan-mod
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
+import taskCoordinationAdvisoryTemplate from "../prompts/tools/task-coordination-advisory.md" with { type: "text" };
+import taskSpawnFeedbackTemplate from "../prompts/tools/task-spawn-feedback.md" with { type: "text" };
+import taskSpecializationAdvisoryTemplate from "../prompts/tools/task-specialization-advisory.md" with { type: "text" };
 import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { type: "text" };
 import { TASK_EFFORTS, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { canonicalBytes } from "../tools/browser-audit";
-
-import { isIrcEnabled } from "../tools/hub";
+import { hasWaitTool } from "../tools/wait";
+import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
@@ -66,11 +69,12 @@ import {
 	type TaskToolSchemaInstance,
 } from "./types";
 import { AsyncJobError, type AsyncJobManager } from "../async";
+import { lookup as lookupSetting } from "../config/registry";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import { parseAgent } from "./agents";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled, listEvalTools } from "./eval-tools";
-import { type ExecutorOptions, runSubprocess } from "./executor";
+import { type RunSubprocessOptions, runSubprocess } from "./executor";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -128,6 +132,25 @@ async function collectLivePermissionCapabilities(
 		byName.set(intrinsic, { name: intrinsic, source: "builtin", intrinsic: true });
 	}
 	return [...byName.values()];
+}
+
+import { cfgAsyncEnabled } from "../tools/settings";
+import {
+	cfgIsolationBackend,
+	cfgTaskBatch,
+	cfgTaskDisabledAgents,
+	cfgTaskEnableLsp,
+	cfgTaskIsolationApply,
+	cfgTaskIsolationEnabled,
+	cfgTaskMaxConcurrency,
+	cfgTaskMaxRecursionDepth,
+	cfgTaskMaxRuntimeMs,
+} from "./settings";
+
+function settingValue<T>(id: string, settings: Settings): T {
+	const handle = lookupSetting(id);
+	if (!handle) throw new Error(`Setting ${id} is not registered`);
+	return handle.get(settings) as T;
 }
 
 function renderSubagentUserPrompt(assignment: string): string {
@@ -610,16 +633,18 @@ export function buildSpecializationAdvisory(
 	if (!depthCapacity) return undefined;
 	const generics = agentNames.filter(name => GENERIC_SPAWN_AGENTS.has(name));
 	if (generics.length < 2) return undefined;
-	const specialist = scoutAvailable
-		? `Check the agent list for a closer specialist type — e.g. read-only research belongs on ` +
-			`\`agent: "scout"\`, which runs on a faster model.`
-		: `Check the agent list for a closer specialist type.`;
-	return `Tip: this call spawned ${generics.length} generic \`${generics[0]}\` workers. ${specialist}`;
+	return prompt
+		.render(taskSpecializationAdvisoryTemplate, {
+			count: generics.length,
+			agent: generics[0],
+			scoutAvailable,
+		})
+		.trim();
 }
 
 /**
  * Suggestion — never a rejection — nudging the spawner to coordinate via the
- * hub when one call creates ≥2 live siblings and it still holds spawn
+ * peer messages when one call creates ≥2 live siblings and it still holds spawn
  * capacity. Returns undefined when there is nothing to coordinate or peer
  * messaging is unavailable.
  */
@@ -629,11 +654,7 @@ export function buildCoordinationAdvisory(
 	ircEnabled: boolean,
 ): string | undefined {
 	if (!depthCapacity || !ircEnabled || items.length < 2) return undefined;
-	return (
-		`Coordinate: ${items.length} siblings are running together. If their work overlaps, have them ` +
-		`message each other via \`hub\` (by id, or "all" to broadcast) before editing shared files — ` +
-		`live coordination beats a serial handoff. Check \`hub\` op:"list" to see who is doing what.`
-	);
+	return prompt.render(taskCoordinationAdvisoryTemplate, { count: items.length }).trim();
 }
 
 /**
@@ -734,6 +755,7 @@ interface PreparedSpawnReservation {
 	permissionSummary: EffectivePermissionSummary;
 	permissionSnapshot: PermissionScopeSnapshot;
 	settings: Settings;
+	taskDepth: number;
 	sharedContext?: string;
 	isIsolated: boolean;
 	applyChanges: boolean;
@@ -752,6 +774,7 @@ interface PreparedSpawnReservation {
 }
 interface PreparedTaskState {
 	params: TaskParams;
+	settings: Settings;
 	defaultAgent: string;
 	asyncEnabled: boolean;
 	depthCapacity: boolean;
@@ -927,7 +950,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	// defaults independently, so the success path is unchanged.
 	readonly lenientArgValidation = true;
 	readonly validateRawArguments = (args: unknown): void => {
-		validateRawTaskArguments(args, this.session.settings.get("task.allowModelOverride"));
+		validateRawTaskArguments(args, settingValue<boolean>("task.allowModelOverride", this.session.settings));
 	};
 	readonly renderResult = renderResult;
 	// Suppress the streaming call preview once a (partial or final) result exists
@@ -952,20 +975,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 	get parameters(): TaskToolSchemaInstance {
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
-		const isolationEnabled = !planMode && this.session.settings.get("task.isolation.enabled");
-		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
+		const isolationEnabled = !planMode && cfgTaskIsolationEnabled.get(this.session.settings);
+		const permissionMode = settingValue<SubagentPermissionMode>("task.permissions.mode", this.session.settings);
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		return getTaskSchema({
 			isolationEnabled,
 			batchEnabled: this.#isBatchEnabled(),
-			effortEnabled: this.session.settings.get("task.allowEffortOverride"),
-			modelEnabled: this.session.settings.get("task.allowModelOverride"),
+			effortEnabled: settingValue<boolean>("task.allowEffortOverride", this.session.settings),
+			modelEnabled: settingValue<boolean>("task.allowModelOverride", this.session.settings),
 			evalToolsEnabled: evalToolsEnabled(this.session),
 			defaultAgent,
 			permissions: {
 				enabled: permissionMode !== "off",
-				toolsEnabled: this.session.settings.get("task.permissions.tools.enabled"),
-				pathsEnabled: this.session.settings.get("task.permissions.paths.enabled"),
+				toolsEnabled: settingValue<boolean>("task.permissions.tools.enabled", this.session.settings),
+				pathsEnabled: settingValue<boolean>("task.permissions.paths.enabled", this.session.settings),
 			},
 		});
 	}
@@ -976,28 +999,28 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 	/** Dynamic description that reflects current task settings. */
 	get description(): string {
-		const disabledAgents = this.session.settings.get("task.disabledAgents") as string[];
+		const disabledAgents = cfgTaskDisabledAgents.get(this.session.settings);
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
-		const isolationEnabled = !planMode && this.session.settings.get("task.isolation.enabled");
-		const permissionMode = this.session.settings.get("task.permissions.mode") as SubagentPermissionMode;
+		const isolationEnabled = !planMode && cfgTaskIsolationEnabled.get(this.session.settings);
+		const permissionMode = settingValue<SubagentPermissionMode>("task.permissions.mode", this.session.settings);
 		return renderDescription({
 			agents:
 				discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
 				this.#discoveredAgents,
 			isolationEnabled: !planMode && isolationEnabled,
-			applyIsolatedChanges: this.session.settings.get("task.isolation.apply"),
+			applyIsolatedChanges: cfgTaskIsolationApply.get(this.session.settings),
 			disabledAgents,
 			batchEnabled: this.#isBatchEnabled(),
-			effortEnabled: this.session.settings.get("task.allowEffortOverride"),
-			modelEnabled: this.session.settings.get("task.allowModelOverride"),
+			effortEnabled: settingValue<boolean>("task.allowEffortOverride", this.session.settings),
+			modelEnabled: settingValue<boolean>("task.allowModelOverride", this.session.settings),
 			evalToolsEnabled: evalToolsEnabled(this.session),
-			asyncEnabled: this.session.settings.get("async.enabled"),
+			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
 			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
 			permissionsEnabled: permissionMode !== "off",
 			permissionMode,
-			permissionToolsEnabled: this.session.settings.get("task.permissions.tools.enabled"),
-			permissionPathsEnabled: this.session.settings.get("task.permissions.paths.enabled"),
+			permissionToolsEnabled: settingValue<boolean>("task.permissions.tools.enabled", this.session.settings),
+			permissionPathsEnabled: settingValue<boolean>("task.permissions.paths.enabled", this.session.settings),
 			permissionProfiles: this.#permissionProfiles,
 			permissionProfileErrors: this.#permissionProfileErrors,
 		});
@@ -1017,11 +1040,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	#isBatchEnabled(): boolean {
-		return this.session.settings.get("task.batch");
+		return cfgTaskBatch.get(this.session.settings);
 	}
 
 	#getSpawnSemaphore(): Semaphore {
-		const max = this.session.settings.get("task.maxConcurrency");
+		const max = cfgTaskMaxConcurrency.get(this.session.settings);
 		if (this.#spawnSemaphore) {
 			this.#spawnSemaphore.resize(max);
 		} else {
@@ -1057,9 +1080,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			...(params.effort !== undefined ? { effort: params.effort } : {}),
 			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 			blockedAgent: this.#blockedAgent,
-			enableLsp: (this.session.enableLsp ?? true) && settings.get("task.enableLsp"),
+			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(settings),
 			enableIrc: isIrcEnabled(settings, taskDepth),
-			maxRuntimeMs: settings.get("task.maxRuntimeMs"),
+			maxRuntimeMs: cfgTaskMaxRuntimeMs.get(settings),
 		});
 	}
 
@@ -1141,8 +1164,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		signal?.throwIfAborted();
 		const preparedSettings = this.session.settings.snapshot();
 		const taskDepth = this.session.taskDepth ?? 0;
-		const asyncEnabled = preparedSettings.get("async.enabled");
-		const depthCapacity = canSpawnAtDepth(preparedSettings.get("task.maxRecursionDepth") ?? 2, taskDepth);
+		const asyncEnabled = cfgAsyncEnabled.get(preparedSettings);
+		const depthCapacity = canSpawnAtDepth(cfgTaskMaxRecursionDepth.get(preparedSettings) ?? 2, taskDepth);
 		const ircEnabled = isIrcEnabled(preparedSettings, taskDepth);
 		const parentServiceTier = this.session.getServiceTierByFamily
 			? structuredClone(this.session.getServiceTierByFamily() ?? null)
@@ -1150,13 +1173,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const parentId = this.session.getAgentId?.() ?? MAIN_AGENT_ID;
 		const params = repairTaskParams(rawParams as TaskParams);
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
-		const batchEnabled = preparedSettings.get("task.batch");
-		const permissionMode = preparedSettings.get("task.permissions.mode") as SubagentPermissionMode;
-		const permissionToolsEnabled = preparedSettings.get("task.permissions.tools.enabled");
-		const permissionPathsEnabled = preparedSettings.get("task.permissions.paths.enabled");
+		const batchEnabled = cfgTaskBatch.get(preparedSettings);
+		const permissionMode = settingValue<SubagentPermissionMode>("task.permissions.mode", preparedSettings);
+		const permissionToolsEnabled = settingValue<boolean>("task.permissions.tools.enabled", preparedSettings);
+		const permissionPathsEnabled = settingValue<boolean>("task.permissions.paths.enabled", preparedSettings);
 		const validationError =
 			validateIdentityPins(params) ??
-			validateModelParams(params, preparedSettings.get("task.allowModelOverride")) ??
+			validateModelParams(params, settingValue<boolean>("task.allowModelOverride", preparedSettings)) ??
 			validateShapeParams(batchEnabled, permissionMode !== "off", params) ??
 			validateSpawnParams(params, batchEnabled);
 		if (validationError) throw new StructuredSubagentError("preflight", validationError);
@@ -1190,12 +1213,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
 			getSessionId: this.session.getSessionId ?? (() => null),
 		};
-		const maxRuntimeMs = preparedSettings.get("task.maxRuntimeMs");
-		const preferredIsolationBackend = parseIsolationBackend(preparedSettings.get("isolation.backend"));
+		const maxRuntimeMs = cfgTaskMaxRuntimeMs.get(preparedSettings);
+		const preferredIsolationBackend = parseIsolationBackend(cfgIsolationBackend.get(preparedSettings));
 		signal?.throwIfAborted();
 
 		const manager = this.#getOutputManager();
-		const allowEffortOverride = preparedSettings.get("task.allowEffortOverride");
+		const allowEffortOverride = settingValue<boolean>("task.allowEffortOverride", preparedSettings);
 		const reservations: PreparedSpawnReservation[] = [];
 		const reservedIds: string[] = [];
 		try {
@@ -1243,19 +1266,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						: undefined;
 					const candidateTools = permissionAgent.tools ?? permissionScope.tools ?? activeToolNames;
 					if (candidateTools !== undefined) {
-						let nextTools = candidateTools.filter(tool => {
+						const nextTools = candidateTools.filter(tool => {
 							const normalized = tool.toLowerCase();
 							if (deniedTools.has(normalized)) return false;
 							if (allowlistedTools && !allowlistedTools.has(normalized)) return false;
 							return this.session.getToolByName ? this.session.getToolByName(tool) !== undefined : true;
 						});
-						if (
-							policy.enableIrc &&
-							!deniedTools.has("hub") &&
-							!nextTools.some(tool => tool.toLowerCase() === "hub")
-						) {
-							nextTools = [...nextTools, "hub"];
-						}
 						permissionAgent = { ...permissionAgent, tools: nextTools };
 					}
 				}
@@ -1275,6 +1291,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					effectiveAgent: profiledAgent,
 					permissionAgent,
 					settings: preparedSettings,
+					taskDepth,
 					permissionScope,
 					permissionSummary,
 					permissionSnapshot,
@@ -1302,6 +1319,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		return {
 			params,
+			settings: preparedSettings,
 			defaultAgent,
 			batchEnabled,
 			spawnItems,
@@ -1419,6 +1437,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 		const {
 			params,
+			settings: preparedSettings,
 			defaultAgent,
 			spawnItems,
 			resolvedAgents,
@@ -1430,17 +1449,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			ircEnabled,
 		} = prepared;
 		try {
-			// Execution mode is per item: an item whose agent type declares
-			// `blocking: true` runs inline on this turn (the parent waits on its
-			// result); every other item becomes a background job when async
-			// execution is available.
+			// Execution mode is per item: blocking agents run inline; other items
+			// use background jobs only when both async execution and its manager exist.
 			const manager = asyncEnabled ? this.session.asyncJobManager : undefined;
 			const asyncItems = manager ? spawnItems.filter((_, index) => !itemBlocking[index]) : [];
 
 			if (!manager || asyncItems.length === 0) {
-				// Sync fallback: async execution disabled, orphaned host that never
-				// wired a job manager, or every item's agent type declares
-				// `blocking: true`.
+				// Sync fallback: async is disabled, the host has no job manager, or all
+				// items declare blocking execution.
 				if (asyncEnabled && !this.session.asyncJobManager) {
 					logger.warn("task: no AsyncJobManager registered; falling back to sync execution");
 				}
@@ -1453,7 +1469,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							ircEnabled,
 							willRunAsync: false,
 							scoutAvailable: isScoutSpawnable(
-								this.session.settings.get("task.disabledAgents") as string[] | undefined,
+								cfgTaskDisabledAgents.get(preparedSettings),
 								this.session.getSessionSpawns?.() ?? "*",
 							),
 						});
@@ -1482,9 +1498,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				return { ...result, content };
 			}
 
-			// Coordination only makes sense for spawns that keep running after this
-			// call returns (the async subset). Blocking items have already completed
-			// by then, so a "coordinate while they run" hint would misfire.
+			// Coordination only helps for the subset that outlives this call.
 			const advisory = this.session.suppressSpawnAdvisory
 				? undefined
 				: composeSpawnAdvisory({
@@ -1492,15 +1506,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						items: asyncItems,
 						depthCapacity,
 						ircEnabled,
-						willRunAsync: asyncItems.length > 0,
+						willRunAsync: true,
 						scoutAvailable: isScoutSpawnable(
-							this.session.settings.get("task.disabledAgents") as string[] | undefined,
+							cfgTaskDisabledAgents.get(preparedSettings),
 							this.session.getSessionSpawns?.() ?? "*",
 						),
 					});
-			// Returns a fresh result (copied content array, copied text part) rather
-			// than mutating the caller's — task results are short-lived here, but an
-			// in-place edit on a shared/cached AgentToolResult would be a hidden trap.
 			const withAdvisory = (result: AgentToolResult<TaskToolDetails>): AgentToolResult<TaskToolDetails> => {
 				if (!advisory) return result;
 				let appended = false;
@@ -1514,22 +1525,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (!appended) content.push({ type: "text", text: advisory });
 				return { ...result, content };
 			};
-			if (asyncItems.length === 0) {
-				return withAdvisory(
-					await this.#executeSyncFanout(
-						toolCallId,
-						params,
-						reservations.map(reservation => ({
-							item: reservation.item,
-							index: reservation.index,
-							preAllocatedId: reservation.id,
-						})),
-						defaultAgent,
-						signal,
-						onUpdate,
-					),
-				);
-			}
 
 			const callStartedAt = Date.now();
 			const spawns: Array<{
@@ -1542,7 +1537,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			for (const [index, item] of spawnItems.entries()) {
 				const agentType = resolvedAgents[index]!;
 				const policy = policies[index]!;
-				const agentSource = policy.agent.source;
 				const agentId = reservations[index]!.id;
 				const assignment = (item.task ?? "").trim();
 				spawns.push({
@@ -1554,7 +1548,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						index,
 						id: agentId,
 						agent: agentType,
-						agentSource,
+						agentSource: policy.agent.source,
 						modelRole: policy.modelRole,
 						status: "pending",
 						task: renderSubagentUserPrompt(assignment),
@@ -1646,61 +1640,45 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				failedSchedules.length > 0
 					? ` Failed to schedule ${failedSchedules.length} spawn${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.join("; ")}.`
 					: "";
-			const coordinationHint = [
-				started.length === 1
-					? ircEnabled
-						? `DM \`${started[0].agentId}\` via \`hub\` send to coordinate while it runs; use \`hub\` only to inspect (\`jobs\`), wait, or cancel a stuck task.`
-						: `Use \`hub\` to inspect (\`jobs\`), wait, or cancel a stuck task.`
-					: ircEnabled
-						? `DM these ids via \`hub\` send to coordinate while they run; use \`hub\` only to inspect (\`jobs\`), wait, or cancel a stuck task.`
-						: `Use \`hub\` to inspect (\`jobs\`), wait, or cancel a stuck task by id.`,
-				taskAsyncContractTemplate.trim(),
-			].join("\n");
+			const guidance = prompt
+				.render(taskAsyncContractTemplate, { ircEnabled, waitTool: hasWaitTool(this.session) })
+				.trim();
+			const renderSpawnFeedback = (mixed: boolean): string =>
+				prompt
+					.render(taskSpawnFeedbackTemplate, {
+						mixed,
+						singular: started.length === 1,
+						singleCall: spawns.length === 1,
+						showListing: mixed || spawns.length > 1,
+						count: started.length,
+						agentId: started[0]?.agentId,
+						jobId: started[0]?.jobId,
+						agentLabel,
+						started,
+						scheduleFailureSummary,
+						guidance,
+					})
+					.trim();
 
 			if (syncSpawns.length === 0) {
-				if (spawns.length === 1) {
-					const { agentId, jobId } = started[0];
-					onUpdate?.({
-						content: [{ type: "text", text: `Spawned agent \`${agentId}\`...` }],
-						details: buildAsyncDetails(),
-					});
-					return withAdvisory({
-						content: [
-							{
-								type: "text",
-								text: `Spawned agent \`${agentId}\` (job \`${jobId}\`). Its result auto-delivers on yield; \`hub jobs\` only summarizes it, while \`hub wait\` can consume it first. ${coordinationHint}`,
-							},
-						],
-						details: buildAsyncDetails(),
-					});
-				}
-				const startedListing = started
-					.map(({ agentId, jobId }) => `- \`${agentId}\` (job \`${jobId}\`)`)
-					.join("\n");
 				onUpdate?.({
 					content: [{ type: "text", text: `Spawned ${started.length} agents...` }],
 					details: buildAsyncDetails(),
 				});
 				return withAdvisory({
-					content: [
-						{
-							type: "text",
-							text: `Spawned ${started.length} background agents using ${agentLabel}.${scheduleFailureSummary} Each result auto-delivers on yield; \`hub jobs\` only summarizes it, while \`hub wait\` can consume it first.\n${startedListing}\n${coordinationHint}`,
-						},
-					],
+					content: [{ type: "text", text: renderSpawnFeedback(false) }],
 					details: buildAsyncDetails(),
 				});
 			}
 
-			// Mixed call: the async jobs above already run detached; the blocking
-			// subset runs inline and gates the call's return — exactly what each
-			// agent type declares (`blocking: true` = the parent waits on it).
+			// The async subset is detached; blocking items still gate this call's
+			// return. Keep both execution modes visible in the live tool block.
 			const syncLabel = syncSpawns.map(spawn => `\`${spawn.agentId}\``).join(", ");
 			onUpdate?.({
 				content: [
 					{
 						type: "text",
-						text: `Running ${syncLabel} inline; ${started.length} background agent${started.length === 1 ? "" : "s"} spawned...`,
+						text: `Running ${syncLabel} inline; ${renderSpawnFeedback(true)}`,
 					},
 				],
 				details: buildAsyncDetails(),
@@ -1730,11 +1708,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			syncUsage = merged.usage;
 			syncOutputPaths = merged.outputPaths;
 			syncProjectAgentsDir = merged.projectAgentsDir;
-			// Settle the inline spawns' progress rows from their merged results so
-			// post-return job updates carry final statuses, not the last snapshot.
+			// Settle inline progress rows so later job updates carry terminal states.
 			for (let position = 0; position < syncSpawns.length; position++) {
 				const spawn = syncSpawns[position];
-				const result = merged.results.find(r => r.id === spawn.agentId);
+				const result = merged.results.find(candidate => candidate.id === spawn.agentId);
 				if (result) {
 					spawn.progress.status = result.aborted
 						? "aborted"
@@ -1747,10 +1724,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				}
 			}
 
-			const spawnedSummary =
-				started.length > 0
-					? `Spawned ${started.length} background agent${started.length === 1 ? "" : "s"}.${scheduleFailureSummary} Each result auto-delivers on yield; \`hub jobs\` only summarizes it, while \`hub wait\` can consume it first.\n${started.map(({ agentId, jobId }) => `- \`${agentId}\` (job \`${jobId}\`)`).join("\n")}\n${coordinationHint}`
-					: scheduleFailureSummary.trim();
+			const spawnedSummary = started.length > 0 ? renderSpawnFeedback(true) : scheduleFailureSummary.trim();
 			const text = [merged.contentParts.join("\n\n"), spawnedSummary]
 				.filter(section => section.trim().length > 0)
 				.join("\n\n");
@@ -1762,7 +1736,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			await this.#releasePreparedState(prepared);
 		}
 	}
-
 	/**
 	 * Register one background job that runs a single spawn to completion and
 	 * delivers its yield text. The job body mirrors the sync path; `buildDetails`
@@ -2314,7 +2287,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				? createEvalCustomTools(this.session, await describeEvalTools(this.session, params.tools, signal))
 				: [];
 
-			const sharedRunOptions: ExecutorOptions = {
+			const sharedRunOptions: RunSubprocessOptions = {
 				settings: preparedSettings,
 				artifactsDir: this.session.getArtifactsDir?.() ?? effectiveArtifactsDir,
 
@@ -2349,8 +2322,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				effectivePermissionProfiles: [...permissionScope.profiles],
 				permissionSummary,
 				exactModelOverride,
+				taskDepth: preparedReservation.taskDepth,
+				parentActiveModelPattern: preparedPolicy.parentActiveModelPattern,
+				serviceTierOverride: preparedPolicy.serviceTierOverride,
+				compactionThresholdOverride: preparedPolicy.compactionThresholdOverride,
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
+				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 				enableLsp: auditConstrained ? false : planModeEnabled ? false : subagentLspEnabled,
 				enableIrc: auditConstrained ? false : planModeEnabled ? false : ircEnabled,
 				restrictToolNames: auditConstrained || planModeEnabled || undefined,
@@ -2375,6 +2353,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					});
 				},
 				authStorage: this.session.authStorage,
+				skillsSettings: this.session.skillsSettings,
 				modelRegistry: this.session.modelRegistry,
 				mcpManager: this.session.mcpManager,
 				enableMCP: this.session.enableMCP ?? true,
@@ -2388,7 +2367,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				permissionScope,
 				permissionSnapshot,
 				parentServiceTier,
-			} satisfies ExecutorOptions;
+			} satisfies RunSubprocessOptions;
 			bindBrowserAuditRunOptions(sharedRunOptions.agent, browserAudit);
 
 			const runTask = async (): Promise<SingleResult> => {

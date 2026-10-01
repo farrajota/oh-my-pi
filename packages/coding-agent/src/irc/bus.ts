@@ -6,15 +6,13 @@
  * AgentRegistry — parked agents are revived through the
  * AgentLifecycleManager, idle agents are woken with a real turn, and busy
  * agents receive the message as a non-interrupting aside at the next step
- * boundary (see AgentSession.deliverIrcMessage). Replies are real turns by
- * the recipient, observed via `wait` — with one exception: when the sender
- * awaits a reply and the recipient cannot run a real reply turn in time
- * (mid-turn with async execution disabled — possibly blocked in a
- * synchronous task spawn whose batch includes the sender — or idle in plan
- * mode, where autonomous wake turns are suppressed), the recipient session
- * generates an ephemeral side-channel auto-reply.
+ * boundary (see AgentSession.deliverIrcMessage).
  */
 
+import type {
+	IrcDeliveryReceipt as TuiIrcDeliveryReceipt,
+	IrcMessage as TuiIrcMessage,
+} from "@oh-my-pi/pi-tui/tools/irc";
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import {
 	ensureAgentLive,
@@ -32,16 +30,7 @@ import type { AgentSessionEvent } from "../session/agent-session-events";
 import type { CustomMessage } from "../session/messages";
 import { DurableHubStore, type HubDurableMutation, type HubDurableRecord } from "../internal/hub-durable-state";
 
-export interface IrcMessage {
-	id: string;
-	/** Sender agent id. */
-	from: string;
-	/** Recipient agent id (resolved; "all" is expanded by the tool, not stored). */
-	to: string;
-	body: string;
-	ts: number;
-	/** Message id being answered. */
-	replyTo?: string;
+export interface IrcMessage extends TuiIrcMessage {
 	/**
 	 * Automated wake-turn relay of a woken subagent's stop output (task executor
 	 * `relayWakeTurnOutput`). Relays are answers, never wake sources: the
@@ -51,10 +40,11 @@ export interface IrcMessage {
 	wakeRelay?: boolean;
 }
 
-export interface IrcDeliveryReceipt {
-	to: string;
-	outcome: "injected" | "woken" | "revived" | "failed";
-	error?: string;
+export type IrcDeliveryReceipt = TuiIrcDeliveryReceipt;
+
+/** Transient capability for replying to a delivered awaited message. */
+export interface IrcDeliveryContext {
+	sendReply(body: string): Promise<IrcDeliveryReceipt>;
 }
 
 declare const ircDeliveryBatchBrand: unique symbol;
@@ -264,13 +254,6 @@ export class IrcBus {
 	 * context, so buffering it too would double-deliver via a later
 	 * `wait`/`inbox` and inflate unread counts. Only a failed live hand-off
 	 * is buffered for the recipient to drain later.
-	 *
-	 * `opts.expectsReply` marks sends whose caller is blocked on an answer
-	 * (`send await:true`). It is forwarded to the recipient session so a
-	 * mid-turn recipient that cannot reach a step boundary (async execution
-	 * disabled — e.g. blocked in a synchronous task spawn awaiting the
-	 * sender's own batch) can generate an ephemeral side-channel auto-reply
-	 * instead of stranding the sender until timeout.
 	 *
 	 * `opts.suppressRelay` skips the display-only main-UI relay for this leg.
 	 * Set by broadcast fan-out when the same broadcast also targets the main
@@ -561,7 +544,17 @@ export class IrcBus {
 		}
 
 		try {
-			const delivery = await session.deliverIrcMessage(message, opts);
+			let deliveryContext: IrcDeliveryContext | undefined;
+			if (opts?.expectsReply) {
+				const replyFrom = message.to;
+				const replyTo = message.from;
+				const replyToMessageId = message.id;
+				deliveryContext = {
+					sendReply: (body: string) =>
+						this.send({ from: replyFrom, to: replyTo, body, replyTo: replyToMessageId }),
+				};
+			}
+			const delivery = await session.deliverIrcMessage(message, deliveryContext);
 			if (!opts?.suppressRelay) this.#relayToMainUi(message);
 			return { to: message.to, outcome: revived ? "revived" : delivery };
 		} catch (error) {
@@ -996,6 +989,7 @@ export class IrcBus {
 		};
 	}
 
+	/** Unread count for the local Agent Hub overlay. */
 	unreadCount(agentId: string): number {
 		return this.#state.mailboxes.get(agentId)?.length ?? 0;
 	}

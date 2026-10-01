@@ -347,6 +347,8 @@ function toolContent(result: DaemonRpcResult, params: LaunchParams): string {
 				`Cwd: ${shortenPath(result.spec.cwd)}`,
 				`PTY: ${result.spec.pty}; restart=${result.spec.restart}; persist=${result.spec.persist}; detached=${result.spec.detached}`,
 			].join("\n");
+		default:
+			throw new ToolError(`Unknown daemon result ${result.op}`);
 	}
 }
 
@@ -390,6 +392,8 @@ async function toolDetails(result: DaemonRpcResult, params: LaunchParams): Promi
 		case "ping":
 		case "shutdown":
 			throw new ToolError(`Internal daemon result ${result.op} is not tool-visible`);
+		default:
+			throw new ToolError(`Unknown daemon result ${result.op}`);
 	}
 }
 

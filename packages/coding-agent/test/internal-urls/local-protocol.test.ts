@@ -1,10 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import {
 	InternalUrlRouter,
 	LocalProtocolHandler,
+	parseInternalUrl,
+	prepareLocalFileWrite,
 	resolveLocalRoot,
 	resolveLocalUrlToPath,
 } from "@oh-my-pi/pi-coding-agent/internal-urls";
@@ -25,6 +30,10 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 }
 
 describe("LocalProtocolHandler", () => {
+	beforeAll(async () => {
+		await Settings.init({ inMemory: true });
+	});
+
 	beforeEach(() => {
 		LocalProtocolHandler.resetOverrideForTests();
 		InternalUrlRouter.resetForTests();
@@ -72,24 +81,15 @@ describe("LocalProtocolHandler", () => {
 		});
 	});
 
-	it("resolves path-only files and directories without returning their contents", async () => {
+	it("locates files and the root directory, and nothing for missing entries", async () => {
 		await withTempDir(async tempDir => {
 			const localFile = path.join(tempDir, "local", "report.json");
 			await Bun.write(localFile, '{"report":true}');
-			const context = {
-				localProtocolOptions: { getArtifactsDir: () => tempDir },
-				pathOnly: true,
-			};
+			const context = { localProtocolOptions: { getArtifactsDir: () => tempDir } };
 			const router = InternalUrlRouter.instance();
-			const file = await router.resolve("local://report.json", context);
-			expect(file.sourcePath).toBe(await fs.realpath(localFile));
-			expect(file.content).toBe("");
-			expect(file.isDirectory).toBe(false);
-			const directory = await router.resolve("local://", context);
-			expect(directory.sourcePath).toBe(await fs.realpath(path.dirname(localFile)));
-			expect(directory.content).toBe("");
-			expect(directory.isDirectory).toBe(true);
-			await expect(router.resolve("local://missing.json", context)).rejects.toThrow("Local file not found");
+			expect(await router.locate("local://report.json", context)).toBe(await fs.realpath(localFile));
+			expect(await router.locate("local://", context)).toBe(await fs.realpath(path.dirname(localFile)));
+			expect(await router.locate("local://missing.json", context)).toBeNull();
 		});
 	});
 
@@ -158,6 +158,78 @@ describe("LocalProtocolHandler", () => {
 			});
 			const router = InternalUrlRouter.instance();
 			await expect(router.resolve("local://linked/secret.txt")).rejects.toThrow("local:// URL escapes local root");
+		});
+	});
+
+	it("refuses write targets reaching outside the local root through missing dirs or dangling symlinks", async () => {
+		if (process.platform === "win32") return;
+
+		await withTempDir(async tempDir => {
+			const localRoot = path.join(tempDir, "local");
+			const outsideDir = path.join(tempDir, "outside");
+			await fs.mkdir(localRoot, { recursive: true });
+			await fs.mkdir(outsideDir, { recursive: true });
+			await fs.symlink(outsideDir, path.join(localRoot, "link"));
+			await fs.symlink(path.join(outsideDir, "victim.txt"), path.join(localRoot, "dangling"));
+			const context = { localProtocolOptions: { getArtifactsDir: () => tempDir } };
+			const router = InternalUrlRouter.instance();
+
+			await expect(router.locate("local://link/newdir/f", context, { create: true })).rejects.toThrow(
+				"local:// URL escapes local root",
+			);
+			await expect(router.locate("local://dangling", context, { create: true })).rejects.toThrow(
+				"local:// URL goes through a dangling symlink",
+			);
+			expect(await router.locate("local://fresh/dir/f", context, { create: true })).toBe(
+				path.join(localRoot, "fresh", "dir", "f"),
+			);
+		});
+	});
+
+	it("names the URL, never the host path, when a write target cannot be created", async () => {
+		if (process.platform === "win32") return;
+
+		await withTempDir(async tempDir => {
+			const localRoot = path.join(tempDir, "local");
+			await fs.mkdir(localRoot, { recursive: true });
+			await fs.symlink(path.join(localRoot, "loopB"), path.join(localRoot, "loopA"));
+			await fs.symlink(path.join(localRoot, "loopA"), path.join(localRoot, "loopB"));
+			await Bun.write(path.join(localRoot, "file.txt"), "x");
+			const context = { localProtocolOptions: { getArtifactsDir: () => tempDir } };
+			const router = InternalUrlRouter.instance();
+			const failure = async (url: string) => {
+				const error = await router.locate(url, context, { create: true }).then(
+					() => undefined,
+					(caught: unknown) => caught,
+				);
+				expect(error).toBeInstanceOf(Error);
+				return error instanceof Error ? error.message : "";
+			};
+
+			const loop = await failure("local://loopA/x.md");
+			expect(loop).toBe("local:// URL goes through a symlink loop: local://loopA/x.md");
+			const notDir = await failure("local://file.txt/x.md");
+			expect(notDir).toBe("local:// URL goes through a file, not a directory: local://file.txt/x.md");
+		});
+	});
+
+	it("refuses write targets under a local root that is a dangling symlink", async () => {
+		if (process.platform === "win32") return;
+
+		await withTempDir(async tempDir => {
+			await fs.symlink(path.join(tempDir, "gone"), path.join(tempDir, "local"));
+			const context = { localProtocolOptions: { getArtifactsDir: () => tempDir } };
+			const router = InternalUrlRouter.instance();
+
+			await expect(router.locate("local://x.md", context, { create: true })).rejects.toThrow(
+				"local:// URL goes through a dangling symlink: local://x.md",
+			);
+			expect(await router.locate("local://x.md", context)).toBeNull();
+			// A merely missing root is created by the write.
+			const missing = { localProtocolOptions: { getArtifactsDir: () => path.join(tempDir, "fresh") } };
+			expect(await router.locate("local://x.md", missing, { create: true })).toBe(
+				path.join(tempDir, "fresh", "local", "x.md"),
+			);
 		});
 	});
 
@@ -234,34 +306,66 @@ describe("LocalProtocolHandler", () => {
 		});
 	});
 
-	it("quarantines a recovered local head when caller-validated backing bytes changed", async () => {
+	it("fails closed for a caller-bound WriteContext without local options", async () => {
+		await withTempDir(async tempDir => {
+			const staleArtifactsDir = path.join(tempDir, "stale-artifacts");
+			const staleFile = path.join(staleArtifactsDir, "local", "PLAN.md");
+			await fs.mkdir(path.dirname(staleFile), { recursive: true });
+			await Bun.write(staleFile, "stale");
+			LocalProtocolHandler.setOverride({ getArtifactsDir: () => staleArtifactsDir, getSessionId: () => "stale" });
+			const session = {
+				getSessionFile: () => path.join(tempDir, "caller.jsonl"),
+			} as unknown as ToolSession;
+
+			await expect(prepareLocalFileWrite(parseInternalUrl("local://PLAN.md"), { session })).rejects.toThrow(
+				"No session - local:// unavailable",
+			);
+			expect(await Bun.file(staleFile).text()).toBe("stale");
+		});
+	});
+
+	it("quarantines a recovered local head when backing bytes changed", async () => {
 		await withTempDir(async tempDir => {
 			const artifactsDir = path.join(tempDir, "artifacts");
 			const journalPath = path.join(tempDir, "authority.jsonl");
 			const firstStore = new RegistryDurableStateStore(journalPath);
 			const firstLocalState = new DurableLocalState(firstStore, "restart-session");
-			const router = InternalUrlRouter.instance();
 			const firstOptions = {
 				getArtifactsDir: () => artifactsDir,
 				getSessionId: () => "restart-session",
 				getDurableLocalState: () => firstLocalState,
 			};
-			await router.write("local://PLAN.md", "# durable", { localProtocolOptions: firstOptions });
+			const createTool = (localProtocolOptions: typeof firstOptions) =>
+				new WriteTool({
+					cwd: tempDir,
+					enableLsp: false,
+					getSessionFile: () => null,
+					localProtocolOptions,
+					settings: Settings.isolated(),
+				} as unknown as ToolSession);
+			const router = InternalUrlRouter.instance();
+			await createTool(firstOptions).execute("durable-local-write", {
+				path: "local://PLAN.md",
+				content: "# durable",
+			});
 
 			const localPath = resolveLocalUrlToPath("local://PLAN.md", firstOptions);
+			expect(await fs.readFile(localPath, "utf8")).toBe("# durable");
 			await fs.writeFile(localPath, "# tampered", "utf8");
 			const restartedStore = new RegistryDurableStateStore(journalPath);
 			const restartedLocalState = new DurableLocalState(restartedStore, "restart-session");
 			await expect(
-				router.write("local://PLAN.md", "# replacement", {
-					localProtocolOptions: {
-						getArtifactsDir: () => artifactsDir,
-						getSessionId: () => "restart-session",
-						getDurableLocalState: () => restartedLocalState,
-					},
+				createTool({
+					getArtifactsDir: () => artifactsDir,
+					getSessionId: () => "restart-session",
+					getDurableLocalState: () => restartedLocalState,
+				}).execute("durable-local-replacement", {
+					path: "local://PLAN.md",
+					content: "# replacement",
 				}),
 			).rejects.toBeInstanceOf(DurableStateUnavailableError);
 			expect(restartedStore.available).toBe(false);
+			expect(router.fileWritable("local://PLAN.md")).toBe(true);
 		});
 	});
 });

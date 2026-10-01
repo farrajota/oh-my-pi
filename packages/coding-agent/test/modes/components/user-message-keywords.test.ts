@@ -3,6 +3,7 @@ import * as path from "node:path";
 import * as url from "node:url";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgTuiHyperlinks } from "@oh-my-pi/pi-coding-agent/modes/settings";
 
 import { ChatTranscriptBuilder } from "@oh-my-pi/pi-tui/chat/chat-transcript-builder";
 import { formatUsageTimestamp } from "@oh-my-pi/pi-tui/overlays/usage-row";
@@ -22,7 +23,7 @@ let previousMagicKeywords: readonly MagicKeywordSpec[];
 beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
-	Settings.instance.set("tui.hyperlinks", "always");
+	cfgTuiHyperlinks.set(Settings.instance, "always");
 	await initTheme(false);
 	previousMagicKeywords = getMagicKeywords();
 	setMagicKeywords([{ word: "orchestrate", hue: [270, 310] }]);

@@ -7,15 +7,20 @@ import { stripVTControlCharacters } from "node:util";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
-import {
-	resolveMarkdownLinkTargets,
-	tryResolveInternalUrlSync,
-} from "@oh-my-pi/pi-coding-agent/internal-urls/hyperlink-targets";
+import { resolveMarkdownLinkTargets } from "@oh-my-pi/pi-coding-agent/internal-urls/hyperlink-targets";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { getMarkdownTheme, initTheme } from "@oh-my-pi/pi-tui/theme";
 import * as terminalCaps from "@oh-my-pi/pi-tui";
-import { isHyperlinkEnabled } from "@oh-my-pi/pi-tui/render/hyperlink";
+import { isHyperlinkEnabled } from "@oh-my-pi/pi-tui/render";
 import { isFeedModelBadgeEnabled, resolveImageOptions } from "@oh-my-pi/pi-tui/render/render-utils";
+
+import { cfgTaskShowResolvedModelBadge } from "@oh-my-pi/pi-coding-agent/task/settings";
+import {
+	cfgTuiHyperlinks,
+	cfgTuiMaxInlineImageColumns,
+	cfgTuiMaxInlineImageRows,
+} from "@oh-my-pi/pi-coding-agent/modes/settings";
 
 function extractAnyTerminatorLinkUri(text: string): string | undefined {
 	return text.match(/\x1b\]8;[^;]*;([^\x1b\x07]+)(?:\x1b\\|\x07)/)?.[1];
@@ -31,7 +36,7 @@ afterAll(() => {
 	resetSettingsForTest();
 });
 
-describe("tryResolveInternalUrlSync", () => {
+describe("InternalUrlRouter.locateSync", () => {
 	// The "no session options" contract below asserts on process-global state
 	// (AgentRegistry main session, LocalProtocolHandler override) that sibling
 	// test files in the same worker may have populated. Pin the premise
@@ -47,27 +52,20 @@ describe("tryResolveInternalUrlSync", () => {
 	});
 
 	it("returns undefined for non-internal URLs", () => {
-		expect(tryResolveInternalUrlSync("/abs/path/file.ts")).toBeUndefined();
-		expect(tryResolveInternalUrlSync("relative/path.ts")).toBeUndefined();
-		expect(tryResolveInternalUrlSync("https://example.com/foo")).toBeUndefined();
-	});
-
-	it("returns undefined for unsupported internal URL schemes", () => {
-		// Async-resolved schemes are intentionally not handled here.
-		expect(tryResolveInternalUrlSync("artifact://123")).toBeUndefined();
-		expect(tryResolveInternalUrlSync("agent://abc")).toBeUndefined();
-		expect(tryResolveInternalUrlSync("skill://foo")).toBeUndefined();
-		expect(tryResolveInternalUrlSync("omp://docs.md")).toBeUndefined();
+		const router = InternalUrlRouter.instance();
+		expect(router.locateSync("/abs/path/file.ts")).toBeUndefined();
+		expect(router.locateSync("relative/path.ts")).toBeUndefined();
+		expect(router.locateSync("https://example.com/foo")).toBeUndefined();
 	});
 
 	it("returns undefined when local:// resolution has no session options", () => {
 		// No AgentRegistry main session in this unit test, no override installed.
-		expect(tryResolveInternalUrlSync("local://foo.md")).toBeUndefined();
+		expect(InternalUrlRouter.instance().locateSync("local://foo.md")).toBeUndefined();
 	});
 
-	it("swallows errors from malformed URLs", () => {
-		// Malformed input should not throw, just return undefined.
-		expect(tryResolveInternalUrlSync("local://%ZZ")).toBeUndefined();
+	it("swallows errors from malformed URL path encoding", () => {
+		// Keep the authority valid and use well-formed escapes for invalid UTF-8 in the path, which decoders reject consistently across platforms.
+		expect(InternalUrlRouter.instance().locateSync("local://malformed/%C0%AF")).toBeUndefined();
 	});
 });
 
@@ -78,26 +76,26 @@ describe("renderer settings propagation", () => {
 		try {
 			Object.defineProperty(process.stdout, "rows", { value: 40, configurable: true });
 			await Settings.init({ inMemory: true });
-			settings.set("tui.maxInlineImageColumns", 64);
-			settings.set("tui.maxInlineImageRows", 7);
-			settings.set("task.showResolvedModelBadge", true);
-			settings.set("tui.hyperlinks", "always");
+			cfgTuiMaxInlineImageColumns.set(settings, 64);
+			cfgTuiMaxInlineImageRows.set(settings, 7);
+			cfgTaskShowResolvedModelBadge.set(settings, true);
+			cfgTuiHyperlinks.set(settings, "always");
 			expect(resolveImageOptions()).toEqual({ maxWidthCells: 64, maxHeightCells: 7 });
 			expect(isFeedModelBadgeEnabled()).toBe(true);
 			expect(isHyperlinkEnabled()).toBe(true);
 
-			settings.override("tui.maxInlineImageColumns", 72);
-			settings.override("tui.maxInlineImageRows", 0);
-			settings.override("task.showResolvedModelBadge", false);
-			settings.override("tui.hyperlinks", "off");
+			cfgTuiMaxInlineImageColumns.override(settings, 72);
+			cfgTuiMaxInlineImageRows.override(settings, 0);
+			cfgTaskShowResolvedModelBadge.override(settings, false);
+			cfgTuiHyperlinks.override(settings, "off");
 			expect(resolveImageOptions()).toEqual({ maxWidthCells: 72, maxHeightCells: 24 });
 			expect(isFeedModelBadgeEnabled()).toBe(false);
 			expect(isHyperlinkEnabled()).toBe(false);
 
-			settings.clearOverride("tui.maxInlineImageColumns");
-			settings.clearOverride("tui.maxInlineImageRows");
-			settings.clearOverride("task.showResolvedModelBadge");
-			settings.clearOverride("tui.hyperlinks");
+			cfgTuiMaxInlineImageColumns.clearOverride(settings);
+			cfgTuiMaxInlineImageRows.clearOverride(settings);
+			cfgTaskShowResolvedModelBadge.clearOverride(settings);
+			cfgTuiHyperlinks.clearOverride(settings);
 			expect(resolveImageOptions()).toEqual({ maxWidthCells: 64, maxHeightCells: 7 });
 			expect(isFeedModelBadgeEnabled()).toBe(true);
 			expect(isHyperlinkEnabled()).toBe(true);
@@ -274,8 +272,8 @@ describe("resource links in chat markdown", () => {
 });
 
 describe("applyHyperlinkSetting on project-scoped reload", () => {
-	// A cross-project reload (`/move`, resume, rollback) fires SETTING_HOOKS via
-	// Settings.reloadForCwd → the tui.hyperlinks hook reapplies the policy, so
+	// A cross-project reload (`/move`, resume, rollback) notifies changed values via
+	// Settings.reloadForCwd → the tui.hyperlinks effect reapplies the policy, so
 	// renderers gating on TERMINAL.hyperlinks never keep the previous project's
 	// value while path links already track the new one (#10196 review).
 	it("reapplies the effective policy so the runtime flag tracks the reloaded setting", async () => {
@@ -284,15 +282,15 @@ describe("applyHyperlinkSetting on project-scoped reload", () => {
 		const dirB = path.join(os.tmpdir(), "omp-hyperlink-reload-b");
 		try {
 			terminalCaps.setTerminalHyperlinks(false);
-			settings.override("tui.hyperlinks", "always");
+			cfgTuiHyperlinks.override(settings, "always");
 			await settings.reloadForCwd(dirA);
 			expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
 
-			settings.override("tui.hyperlinks", "off");
+			cfgTuiHyperlinks.override(settings, "off");
 			await settings.reloadForCwd(dirB);
 			expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
 		} finally {
-			settings.clearOverride("tui.hyperlinks");
+			cfgTuiHyperlinks.clearOverride(settings);
 			terminalCaps.setTerminalHyperlinks(origHyperlinks);
 		}
 	});

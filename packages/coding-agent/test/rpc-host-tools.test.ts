@@ -188,6 +188,7 @@ describe("RpcClient custom tools", () => {
 			`
 const encoder = new TextEncoder();
 let buffer = "";
+let promptId;
 
 function write(frame) {
 	process.stdout.write(JSON.stringify(frame) + "\\n");
@@ -218,6 +219,7 @@ function handle(frame) {
 		return;
 	}
 	if (frame.type === "prompt") {
+		promptId = frame.id;
 		write({ id: frame.id, type: "response", command: "prompt", success: true });
 		write({ type: "agent_start" });
 		write({
@@ -248,6 +250,7 @@ function handle(frame) {
 			isError: frame.isError === true,
 		});
 		write({ type: "agent_end", messages: [] });
+		write({ type: "prompt_result", id: promptId, agentInvoked: true, status: "completed" });
 	}
 }
 `,

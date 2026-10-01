@@ -13,7 +13,8 @@ export * from "./config/model-registry";
 // Prompt templates
 export type * from "./config/prompt-templates";
 export * from "./config/prompt-templates";
-export type { RetrySettings, SkillsSettings } from "./config/settings";
+export type { SkillsSettings } from "./extensibility/settings";
+export type { RetrySettings } from "./session/settings";
 export { Settings, settings } from "./config/settings";
 // Custom commands
 export type * from "./extensibility/custom-commands/types";
@@ -58,6 +59,7 @@ export * from "@oh-my-pi/pi-tui/theme";
 export * from "./sdk";
 export type { ContextUsage } from "./extensibility/extensions/types";
 export { isToolCallEventType } from "./extensibility/extensions/types";
+export type { AsyncJobSnapshot, AsyncJobSnapshotItem } from "./async";
 export * from "./session/agent-session";
 // Auth and model registry
 export * from "./session/auth-storage";

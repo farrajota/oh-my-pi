@@ -9,7 +9,7 @@ import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } fr
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
-import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type AsyncJobRunResult } from "../async";
 import { snapshotEffectiveExtensionRoots, type EffectiveExtensionRoots } from "../capability/types";
 import { ModelRegistry } from "../config/model-registry";
 import {
@@ -26,12 +26,13 @@ import { getRoleInfo } from "../config/model-roles";
 import type { PromptTemplate } from "../config/prompt-templates";
 import {
 	buildServiceTierByFamily,
+	isServiceTierForFamily,
 	resolveAgentServiceTierOverride,
 	resolveSubagentServiceTier,
 	type ServiceTierInheritSettingValue,
 } from "../config/service-tier";
+import type { CompactionThresholdPair } from "../config/compaction-threshold";
 import { Settings } from "../config/settings";
-import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
@@ -67,7 +68,7 @@ import {
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
-import { type CreateAgentSessionOptions, discoverAuthStorage } from "../sdk";
+import { type CreateAgentSessionOptions, discoverAuthStorage, type SkillsSettings } from "../sdk";
 import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-session";
 import { ArtifactManager } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
@@ -83,11 +84,10 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { resolveEvalBackends } from "../tools/eval-backends";
-
 import { normalizeToolNames } from "../tools/builtin-names";
-import { isIrcEnabled } from "../tools/hub";
-import { LIST_STATUS_ORDER } from "../tools/hub/messaging";
-import { DEFAULT_HUB_LIST_LIMIT } from "../tools/hub/types";
+import { isIrcEnabled } from "../irc/messaging";
+import { LIST_STATUS_ORDER } from "@oh-my-pi/pi-tui/tools/irc";
+import { DEFAULT_PEER_ROSTER_LIMIT } from "@oh-my-pi/pi-tui/tools/irc";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { ToolAbortError } from "../tools/tool-errors";
@@ -102,7 +102,6 @@ import {
 	formatPermissionScopeForPrompt,
 	type PermissionScopeSnapshot,
 	permissionScopeDrifted,
-	normalizePermissionToolName,
 } from "./permission-profiles";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
@@ -125,6 +124,33 @@ import {
 	type YieldItem,
 } from "./types";
 import { arrayValuedLabels, assembleYieldResult } from "./yield-assembly";
+import {
+	cfgTaskGenerateLabels,
+	cfgTaskPrewalk,
+	cfgTaskAgentPrewalk,
+	cfgTaskMaxEffort,
+	cfgTaskSoftRequestBudgetNotice,
+	cfgTaskSoftRequestBudget,
+	cfgTaskAgentIdleTtlMs,
+	cfgTaskMaxRuntimeMs,
+	cfgTaskMaxRecursionDepth,
+	cfgTaskAgentAdvisor,
+} from "./settings";
+import {
+	cfgTierSubagent,
+	cfgTierGoogle,
+	cfgTierAnthropic,
+	cfgTierOpenai,
+	cfgRetryFallbackChains,
+	cfgDefaultThinkingLevel,
+} from "../session/settings";
+import { cfgModelRoles, cfgDisabledProviders } from "../config/model-settings";
+import { cfgCompactionThresholdPercent, cfgCompactionThresholdTokens } from "../session/context-settings";
+
+function shouldGenerateTaskLabel(settings: Settings | undefined): boolean {
+	if (!settings) return false;
+	return cfgTaskGenerateLabels.get(settings) === true;
+}
 
 export type { YieldItem } from "./types";
 
@@ -251,7 +277,7 @@ function resolveSubagentRetryFallbackCandidates(
 ): SubagentRetryFallbackCandidate[] {
 	const candidates: SubagentRetryFallbackCandidate[] = [];
 	const seen = new Set<string>();
-	const disabledProviders = new Set(settings.get("disabledProviders"));
+	const disabledProviders = new Set(cfgDisabledProviders.get(settings));
 	for (const pattern of modelPatterns) {
 		const resolved = resolveModelOverride([pattern], modelRegistry, settings);
 		if (!resolved.model) continue;
@@ -287,9 +313,10 @@ function resolveSubagentInheritedRetryFallbackChain(
 	modelRegistry: ModelRegistry,
 	role: string | undefined,
 ): string[] | undefined {
-	const fallbackChains = settings.get("retry.fallbackChains");
-	if (!isRecord(fallbackChains)) return undefined;
-	const fallbackChain = (role !== undefined ? fallbackChains[role] : undefined) ?? fallbackChains.default;
+	const configuredChains = cfgRetryFallbackChains.get(settings);
+	// An explicitly emptied role chain means "no fallbacks", not "inherit
+	// default" — mirrors expandDefaultRetryFallbackChains.
+	const fallbackChain = (role !== undefined ? configuredChains?.[role] : undefined) ?? configuredChains?.default;
 	if (
 		!Array.isArray(fallbackChain) ||
 		fallbackChain.length === 0 ||
@@ -297,7 +324,7 @@ function resolveSubagentInheritedRetryFallbackChain(
 	) {
 		return undefined;
 	}
-	const disabledProviders = new Set(settings.get("disabledProviders"));
+	const disabledProviders = new Set(cfgDisabledProviders.get(settings));
 	return fallbackChain.filter(entry => {
 		const resolved = resolveModelOverride([entry], modelRegistry, settings);
 		return !resolved.model || !disabledProviders.has(resolved.model.provider);
@@ -320,7 +347,7 @@ function installSubagentRetryFallbackChain(args: {
 	);
 	if (selectedIndex < 0) return undefined;
 	const fallbackSelectors = candidates.slice(selectedIndex + 1).map(candidate => candidate.selector);
-	const existingFallbackChains = settings.get("retry.fallbackChains");
+	const existingFallbackChains = cfgRetryFallbackChains.get(settings);
 	// A single configured model may reuse its role's (or the default) configured chain, but never an implicit parent fallback.
 	const fallbackChain = fallbackSelectors.length > 0 ? fallbackSelectors : inheritedFallbackChain;
 	if (
@@ -341,7 +368,7 @@ function installSubagentRetryFallbackChain(args: {
 		}
 	}
 	modelRoles[role] = candidates[selectedIndex].selector;
-	settings.override("modelRoles", modelRoles);
+	cfgModelRoles.override(settings, modelRoles);
 	// Insert the task-specific role first so another role assigned to the same model cannot capture fallback routing.
 	const fallbackChains: Record<string, string[]> = {
 		[role]: fallbackChain,
@@ -351,7 +378,7 @@ function installSubagentRetryFallbackChain(args: {
 			fallbackChains[existingRole] = existingFallbackChains[existingRole];
 		}
 	}
-	settings.override("retry.fallbackChains", fallbackChains);
+	cfgRetryFallbackChains.override(settings, fallbackChains);
 	return role;
 }
 
@@ -363,7 +390,7 @@ export interface IrcPeerRosterRow {
 }
 
 export interface IrcPeerRosterData {
-	/** Live (running+idle) peer rows, bounded at DEFAULT_HUB_LIST_LIMIT. */
+	/** Live (running+idle) peer rows, bounded at DEFAULT_PEER_ROSTER_LIMIT. */
 	peers: IrcPeerRosterRow[];
 	/** Current-root parked refs, counted but never named. */
 	parkedCount: number;
@@ -376,7 +403,7 @@ export function collectIrcPeerRoster(
 	selfId: string,
 	rootSessionFile?: string,
 ): IrcPeerRosterData {
-	// Same ordering as `hub list`: running before idle, then newest activity
+	// Running before idle, then newest activity
 	// first — so the cap keeps the newest relevant siblings, not an
 	// insertion-order prefix.
 	const live = registry
@@ -385,7 +412,7 @@ export function collectIrcPeerRoster(
 			(a, b) =>
 				(LIST_STATUS_ORDER[a.status] ?? 9) - (LIST_STATUS_ORDER[b.status] ?? 9) || b.lastActivity - a.lastActivity,
 		);
-	const limit = DEFAULT_HUB_LIST_LIMIT;
+	const limit = DEFAULT_PEER_ROSTER_LIMIT;
 	const omittedCount = Math.max(0, live.length - limit);
 	const peers = (omittedCount > 0 ? live.slice(0, limit) : live).map(peer => ({
 		id: peer.id,
@@ -580,6 +607,7 @@ export interface RunSubprocessOptions {
 	settings?: Settings;
 	contextFiles?: CreateAgentSessionOptions["contextFiles"];
 	skills?: CreateAgentSessionOptions["skills"];
+	skillsSettings?: SkillsSettings;
 	promptTemplates?: CreateAgentSessionOptions["promptTemplates"];
 	workspaceTree?: CreateAgentSessionOptions["workspaceTree"];
 	rules?: CreateAgentSessionOptions["rules"];
@@ -602,6 +630,8 @@ export interface RunSubprocessOptions {
 	 * `tier.subagent` (Vibe workers) omit it.
 	 */
 	serviceTierOverride?: ServiceTierInheritSettingValue;
+	/** Exact-name `task.agentCompactionThresholdOverrides` pair selected by dispatch. */
+	compactionThresholdOverride?: CompactionThresholdPair;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -632,8 +662,6 @@ export interface RunSubprocessOptions {
 	/** Internal cleanup grace override for deterministic lifecycle tests. */
 	cleanupGraceMs?: number;
 }
-
-export type ExecutorOptions = RunSubprocessOptions;
 
 function parseStringifiedJson(value: unknown): unknown {
 	if (typeof value !== "string") return value;
@@ -1016,62 +1044,96 @@ export function createMCPProxyTools(mcpManager: MCPManager, allowedToolNames?: r
 		});
 }
 
+/**
+ * Per-family tiers a subagent inherits: the parent's live tiers when a live session supplied
+ * them, else its configured `tier.*`. Live entries a family can't realize (a resumed session
+ * file may carry `{anthropic: "flex"}`) are dropped — the subagent overlay rejects them.
+ */
 function inheritedSubagentServiceTiers(
 	baseSettings: Settings,
 	inheritedServiceTier?: ServiceTierByFamily | null,
 ): ServiceTierByFamily {
-	return inheritedServiceTier === undefined
-		? buildServiceTierByFamily(
-				baseSettings.get("tier.openai"),
-				baseSettings.get("tier.anthropic"),
-				baseSettings.get("tier.google"),
-			)
-		: (inheritedServiceTier ?? {});
+	if (inheritedServiceTier === undefined) {
+		return buildServiceTierByFamily(
+			cfgTierOpenai.get(baseSettings),
+			cfgTierAnthropic.get(baseSettings),
+			cfgTierGoogle.get(baseSettings),
+		);
+	}
+	const tiers: ServiceTierByFamily = {};
+	for (const family of ["openai", "anthropic", "google"] as const) {
+		const tier = inheritedServiceTier?.[family];
+		if (isServiceTierForFamily(family, tier)) tiers[family] = tier;
+	}
+	return tiers;
 }
 
-export function createSubagentSettings(
-	baseSettings: Settings,
-	overrides?: Partial<Record<SettingPath, unknown>>,
-	inheritedServiceTier?: ServiceTierByFamily | null,
-	scope?: { cwd?: string; agentDir?: string },
-): Settings {
-	const snapshot: Partial<Record<SettingPath, unknown>> = {};
-	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
-		snapshot[key] = baseSettings.get(key);
-	}
-	// Resolve the subagent's per-family tiers from `tier.subagent` ("inherit" =
-	// match the parent's live tiers when a live session supplied them, else the
-	// subagent's own configured tier.* settings). The result is stamped back onto
-	// the snapshot so createAgentSession's tier.* reads pick it up.
-	const inheritedTiers = inheritedSubagentServiceTiers(baseSettings, inheritedServiceTier);
-	const subagentTiers = resolveSubagentServiceTier(baseSettings.get("tier.subagent"), inheritedTiers);
-	snapshot["tier.openai"] = subagentTiers.openai ?? "none";
-	snapshot["tier.anthropic"] = subagentTiers.anthropic ?? "none";
-	snapshot["tier.google"] = subagentTiers.google ?? "none";
-	return Settings.isolated(
-		{
-			...snapshot,
-			// Async jobs and bash/eval auto-backgrounding are inherited from the parent:
-			// background jobs are owner-routed to the subagent's own session, and
-			// the run driver's quiescence barrier + teardown reap guarantee no
-			// owner job outlives the run, so worktree capture/cleanup stays
-			// race-free (previously both were force-disabled here).
+/**
+ * Compaction thresholds of the root (non-subagent) settings a subagent chain
+ * started from. Per-agent `task.agentCompactionThresholdOverrides` entries
+ * replace `compaction.threshold*` only for the agent they name; every other
+ * descendant resolves against these root values, not an ancestor's override.
+ */
+const kRootCompactionThresholds = Symbol("task.rootCompactionThresholds");
 
-			// Subagents run headless — there is no UI to confirm prompts against, so
-			// the parent task approval is the authorization boundary. Use yolo mode
-			// to preserve unattended subagent execution. User `tools.approval` policies still apply.
-			"tools.approvalMode": "yolo",
-			// Subagents run unadvised by default; runSubprocess opts a spawn back in
-			// per agent (frontmatter `advisor` / `task.agentAdvisor`) via overrides.
-			"advisor.enabled": false,
-			...overrides,
-		},
-		{
-			storage: baseSettings.getStorage(),
-			cwd: scope?.cwd ?? baseSettings.getCwd(),
-			agentDir: scope?.agentDir ?? baseSettings.getAgentDir(),
-		},
-	);
+/** Settings from {@link createSubagentSettings}, tagged with its chain's root compaction thresholds. */
+interface SubagentChainSettings extends Settings {
+	[kRootCompactionThresholds]?: CompactionThresholdPair;
+}
+
+/** Settings overrides applying an exact-name compaction threshold entry to one subagent. */
+export function compactionThresholdSettings(
+	threshold: CompactionThresholdPair | undefined,
+): Readonly<Record<string, unknown>> | undefined {
+	return threshold === undefined
+		? undefined
+		: {
+				"compaction.thresholdPercent": threshold.thresholdPercent,
+				"compaction.thresholdTokens": threshold.thresholdTokens,
+			};
+}
+
+export async function createSubagentSettings(
+	baseSettings: SubagentChainSettings,
+	overrides?: Readonly<Record<string, unknown>>,
+	inheritedServiceTier?: ServiceTierByFamily | null,
+	scope?: { cwd?: string },
+): Promise<Settings> {
+	// Settings.overlay inherits the parent's cwd. For isolated worktrees or a
+	// persisted transcript rooted elsewhere, clone through the upstream scoped
+	// settings API before creating the child overlay.
+	const scopedBaseSettings =
+		scope?.cwd && scope.cwd !== baseSettings.getCwd() ? await baseSettings.cloneForCwd(scope.cwd) : baseSettings;
+	// Resolve tiers from the owning parent settings, not from an agent-specific
+	// child override; the result is stamped onto the child overlay.
+	const inheritedTiers = inheritedSubagentServiceTiers(baseSettings, inheritedServiceTier);
+	const subagentTiers = resolveSubagentServiceTier(cfgTierSubagent.get(baseSettings), inheritedTiers);
+	// A parent's own threshold must not leak to descendants. Keep every chain
+	// anchored to the original root settings even when cwd requires a scoped clone.
+	const inheritedRootThresholds = baseSettings[kRootCompactionThresholds];
+	const rootThresholds = inheritedRootThresholds ?? {
+		thresholdPercent: cfgCompactionThresholdPercent.get(baseSettings),
+		thresholdTokens: cfgCompactionThresholdTokens.get(baseSettings),
+	};
+	const subagentSettings = scopedBaseSettings.overlay({
+		...compactionThresholdSettings(inheritedRootThresholds),
+		// A subagent's thinking level is chosen at spawn and must not be re-steered
+		// by a later parent default edit.
+		defaultThinkingLevel: cfgDefaultThinkingLevel.get(baseSettings),
+		"tier.openai": subagentTiers.openai ?? "none",
+		"tier.anthropic": subagentTiers.anthropic ?? "none",
+		"tier.google": subagentTiers.google ?? "none",
+		// Async jobs and bash/eval auto-backgrounding are inherited from the parent.
+		// Owner-routed jobs quiesce before teardown, protecting worktree cleanup.
+		// Headless children cannot prompt for approval; the parent task is the
+		// authorization boundary. User tools.approval policies still apply.
+		"tools.approvalMode": "yolo",
+		// Advisor use is opt-in per agent or explicit spawn override.
+		"advisor.enabled": false,
+		...overrides,
+	});
+	(subagentSettings as SubagentChainSettings)[kRootCompactionThresholds] = rootThresholds;
+	return subagentSettings;
 }
 
 export type AbortReason = "signal" | "shutdown" | "terminate" | "timeout" | "budget";
@@ -1114,6 +1176,8 @@ interface RunMonitorArgs {
 	/** Wall-clock cap in ms; 0 disables the timer. */
 	maxRuntimeMs: number;
 	startTime: number;
+	/** Fires each time a terminal `yield` is recorded for this run. */
+	onYieldAccepted?: () => void;
 }
 
 /**
@@ -1496,8 +1560,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	// a late label still lands via the finalize-time reads of `progress.description`;
 	// failures just leave the label unset.
 	const labelSource = assignment?.trim();
-	if (!args.description && args.modelRegistry && args.settings?.get("task.generateLabels") && labelSource) {
-		generateTaskLabel(labelSource, args.modelRegistry, args.settings, id, abortSignal)
+	const settings = args.settings;
+	if (!args.description && args.modelRegistry && settings && shouldGenerateTaskLabel(settings) && labelSource) {
+		generateTaskLabel(labelSource, args.modelRegistry, settings, id, abortSignal)
 			.then(label => {
 				if (!label || abortSignal.aborted || progress.description) return;
 				progress.description = label;
@@ -1576,6 +1641,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			if (yieldCalled) {
 				yieldInvalidatedByAsync = false;
 				yieldAcceptedAt = Date.now();
+				args.onYieldAccepted?.();
 			}
 		}
 	};
@@ -1680,6 +1746,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				const handler = subprocessToolRegistry.getHandler(event.toolName);
 				const eventRecord: unknown = event;
 				const eventArgs = isRecord(eventRecord) && isRecord(eventRecord.args) ? eventRecord.args : {};
+				let yieldDataExtracted = false;
 				if (handler) {
 					// Extract data using handler
 					if (handler.extractData) {
@@ -1691,6 +1758,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 							isError: event.isError,
 						});
 						if (data !== undefined) {
+							if (event.toolName === "yield") yieldDataExtracted = true;
 							recordExtractedToolData(event.toolName, data);
 						}
 					}
@@ -1721,6 +1789,12 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 						} else {
 							requestAbort("terminate");
 						}
+					}
+				}
+				if (event.toolName === "yield" && !yieldDataExtracted && !event.isError) {
+					const details = isRecord(event.result?.details) ? event.result.details : undefined;
+					if (details?.status === "success" && details.data !== undefined) {
+						recordExtractedToolData("yield", details.data);
 					}
 				}
 				if (event.toolName === "yield") {
@@ -2261,11 +2335,11 @@ async function driveSessionToYield(
 		// pending owner work left is terminal — the isolation runner captures
 		// and destroys the worktree right after this run resolves, so no
 		// owner job that could still re-wake the session may outlive it.
-		// Suppressed (acknowledged / hub-watched) jobs never re-wake the run
+		// Suppressed (acknowledged / wait-watched) jobs never re-wake the run
 		// and are reaped at teardown.
 		//
 		// Before blocking on running jobs, tell the model ONCE what it is
-		// waiting on so it can `hub` wait/cancel instead of sitting silent
+		// waiting on so it can stand by or cancel via `write proc://<id>/kill` instead of sitting silent
 		// until the jobs (or the runtime limit) expire. Runs that never yield
 		// (ladder exhausted / terminal model error) skip the barrier — more
 		// injected turns just multiply the failure noise; the teardown reap
@@ -2406,9 +2480,9 @@ interface FinalizeRunArgs {
 	detached?: boolean;
 	/**
 	 * This finalize is a revival/wake or explicit follow-up turn, not the initial
-	 * run. Such turns only publish a fresh `<id>.md` generation when they produce
-	 * a real `yield`, so a conversational hub wake cannot replace the completed
-	 * result with a missing-yield warning body (issue #9518).
+	 * run. Such turns only advance the authoritative `<id>.md` head when they
+	 * produce a real `yield`; a conversational peer-message wake cannot overwrite
+	 * the completed result with a missing-yield warning body (issue #9518).
 	 */
 	followUpTurn?: boolean;
 	sessionFile?: string;
@@ -2471,9 +2545,12 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		maxLines: MAX_OUTPUT_LINES,
 	});
 
-	// Publish output and structured sidecar as one marker-gated generation.
-	// A revival/follow-up turn only advances the head when it produced a real
-	// yield, so a conversational hub wake cannot replace the completed result.
+	// Write output and structured sidecar through one marker-gated generation;
+	// input and JSONL artifacts have already been written in real time.
+	// Initial runs retain their missing-yield artifact. A revival/follow-up turn
+	// advances the authoritative `<id>.md` head only on a real `yield`, so a
+	// conversational peer-message wake cannot replace the completed result with
+	// a missing-yield warning body (issue #9518).
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
 	let outputPath: string | undefined;
 	const artifactManager =
@@ -2648,8 +2725,8 @@ function wakeSources(records: AgentMessage[], selfId: string): WakeSource[] {
  * did not answer them itself. A re-`yield` delivers the `<task-result>`
  * envelope (the artifact was just rewritten, so it carries the `agent://`
  * pointer); a plain turn delivers its final assistant text. Without this, a
- * recipient that lacks the `hub` tool — every read-only scout — can never get
- * an answer back to a `send await:true` sender, and its re-yield silently
+ * recipients without a dedicated messaging tool can still answer a sender;
+ * otherwise their re-yield silently
  * updates the artifact nobody is told to re-read.
  */
 async function relayWakeTurnOutput(args: {
@@ -2657,19 +2734,23 @@ async function relayWakeTurnOutput(args: {
 	records: AgentMessage[];
 	turnStartTime: number;
 	yielded: boolean;
-	result: SingleResult;
+	result?: SingleResult;
 	turnText: string;
+	/** Failure, cancellation, or empty output must reach the waker even after a progress message. */
 	force: boolean;
+	/** Skip peer already receiving the result through its owner-routed async job. */
+	jobOwnerId?: string;
 	agentRegistry: AgentRegistry;
 	ircBus: IrcBus;
 }): Promise<void> {
 	const bus = args.ircBus;
 	const pending = wakeSources(args.records, args.id).filter(
-		source => args.force || !bus.sentSince(args.id, source.from, args.turnStartTime),
+		source =>
+			source.from !== args.jobOwnerId && (args.force || !bus.sentSince(args.id, source.from, args.turnStartTime)),
 	);
 	if (pending.length === 0) return;
 	const body =
-		args.yielded && args.result.outputPath
+		args.yielded && args.result?.outputPath
 			? formatTaskResultSummary(args.result, {
 					totalDurationMs: args.result.durationMs,
 					agentRegistry: args.agentRegistry,
@@ -2738,7 +2819,34 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		const turnStartTime = Date.now();
 		const relay = Promise.withResolvers<void>();
 		session.trackIrcReply(relay.promise);
-		const sessionFile = options.agentRegistry.get(id)?.sessionFile ?? options.sessionFile ?? undefined;
+		const registry = options.agentRegistry;
+		const ref = registry.get(id);
+		const sessionFile = ref?.sessionFile ?? options.sessionFile ?? undefined;
+		// A woken agent's yield is a completion its parent must receive exactly
+		// like the first run's. Register an owner-routed job when the yield is
+		// accepted so the parent's `wait` can block while this turn finalizes.
+		let wakeJob: { ownerId: string; outcome: PromiseWithResolvers<AsyncJobRunResult> } | undefined;
+		const registerWakeJob = (): void => {
+			if (wakeJob) return;
+			const currentRef = lookupAgentRef(registry, id);
+			const ownerId = currentRef?.parentId;
+			const manager = session.asyncJobManager;
+			if (!ownerId || !manager || currentRef?.session !== session) return;
+			const outcome = Promise.withResolvers<AsyncJobRunResult>();
+			try {
+				manager.register("task", id, ({ signal }) => untilAborted(signal, () => outcome.promise), {
+					id,
+					agentId: id,
+					ownerId,
+				});
+				wakeJob = { ownerId, outcome };
+			} catch (error) {
+				logger.warn("IRC wake-turn job registration failed", {
+					id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		};
 		const turnMonitor = createSubagentRunMonitor({
 			index,
 			id,
@@ -2759,6 +2867,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			softRequestBudgetNotice: false,
 			maxRuntimeMs,
 			startTime: turnStartTime,
+			onYieldAccepted: registerWakeJob,
 		});
 
 		const startedPayload = {
@@ -2783,10 +2892,11 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			const lastAssistant = session.getLastAssistantMessage();
 			const yielded = turnMonitor.yieldCalled();
 			if (yielded) {
-				options.agentRegistry.markResultAccepted(id, session, turnMonitor.yieldAcceptedAt());
+				registry.markResultAccepted(id, session, turnMonitor.yieldAcceptedAt());
 			}
 			const runtimeLimitExceeded = turnMonitor.runtimeLimitExceeded();
 			const aborted = runtimeLimitExceeded || (lastAssistant?.stopReason === "aborted" && !yielded);
+			const abortReason = aborted ? turnMonitor.resolveAbortReasonText() : undefined;
 			const error =
 				lastAssistant?.stopReason === "error"
 					? attributeSubagentError(lastAssistant.errorMessage, lastAssistant)
@@ -2796,17 +2906,28 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 							: String(turnError)
 						: undefined;
 			turnMonitor.finish();
-			// Read before finalization: a schema-bearing agent that answered in
-			// prose gets a missing-yield warning prepended to `result.output`.
+			// Capture before finalization adds a missing-yield warning to the result.
 			const turnText = turnMonitor.rawOutput() || (turnMonitor.lastAssistantSalvageText() ?? "");
+			const hadEarlierMessage = wakeSources(records, id).some(source =>
+				options.ircBus.sentSince(id, source.from, turnStartTime),
+			);
+			const relayText = error
+				? `${error}${hadEarlierMessage ? "\n\nThe agent sent a progress update earlier in this turn before failing." : ""}\n\nFull transcript: history://${id}`
+				: aborted
+					? `Wake turn cancelled${abortReason ? `: ${abortReason}` : ""}. Full transcript: history://${id}`
+					: turnText.trim()
+						? turnText
+						: `Wake turn completed with no output. Full transcript: history://${id}`;
+			let result: SingleResult | undefined;
+			let finalizeError: unknown;
 			try {
-				const result = await finalizeRunResult({
+				result = await finalizeRunResult({
 					monitor: turnMonitor,
 					done: {
 						exitCode: aborted || error ? 1 : 0,
 						error,
 						aborted,
-						abortReason: aborted ? turnMonitor.resolveAbortReasonText() : undefined,
+						abortReason,
 						durationMs: Date.now() - turnStartTime,
 					},
 					artifactManager: session.sessionManager.getArtifactManager() ?? undefined,
@@ -2827,34 +2948,59 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					sessionFile,
 					startTime: turnStartTime,
 				});
-				const hadEarlierMessage = wakeSources(records, id).some(source =>
-					options.ircBus.sentSince(id, source.from, turnStartTime),
-				);
-				const relayText = error
-					? `${error}${hadEarlierMessage ? "\n\nThe agent sent a progress update earlier in this turn before failing." : ""}\n\nFull transcript: history://${id}`
-					: aborted
-						? `Wake turn cancelled. Full transcript: history://${id}`
-						: turnText.trim()
-							? turnText
-							: `Wake turn completed with no output. Full transcript: history://${id}`;
-				await relayWakeTurnOutput({
-					id,
-					records,
-					turnStartTime,
-					yielded,
-					result,
-					turnText: relayText,
-					force: Boolean(error) || aborted || !turnText.trim(),
-					agentRegistry: options.agentRegistry,
-					ircBus: options.ircBus,
-				});
-			} catch (finalizeError) {
+			} catch (caught) {
+				finalizeError = caught;
 				logger.warn("IRC subagent turn finalization failed", {
 					id,
-					error: finalizeError instanceof Error ? finalizeError.message : String(finalizeError),
+					error: caught instanceof Error ? caught.message : String(caught),
 				});
 			} finally {
-				relay.resolve();
+				if (wakeJob) {
+					if (result) {
+						try {
+							const text = formatTaskResultSummary(result, {
+								totalDurationMs: result.durationMs,
+								agentRegistry: registry,
+							});
+							const structured = result.structuredOutput;
+							if (result.aborted || result.exitCode !== 0 || result.error !== undefined) {
+								wakeJob.outcome.reject(new AsyncJobError(text, structured));
+							} else {
+								wakeJob.outcome.resolve(structured ? { text, structured } : { text });
+							}
+						} catch (settlementError) {
+							wakeJob.outcome.reject(settlementError);
+						}
+					} else {
+						const message = finalizeError instanceof Error ? finalizeError.message : String(finalizeError);
+						wakeJob.outcome.reject(new Error(`Wake turn of ${id} failed to finalize: ${message}`));
+					}
+				}
+				const finalRelayText =
+					finalizeError === undefined
+						? relayText
+						: `Wake turn failed to finalize: ${finalizeError instanceof Error ? finalizeError.message : String(finalizeError)}\n\nFull transcript: history://${id}`;
+				try {
+					await relayWakeTurnOutput({
+						id,
+						records,
+						turnStartTime,
+						yielded,
+						result,
+						turnText: finalRelayText,
+						force: Boolean(error) || aborted || finalizeError !== undefined || !turnText.trim(),
+						jobOwnerId: wakeJob?.ownerId,
+						agentRegistry: registry,
+						ircBus: options.ircBus,
+					});
+				} catch (relayError) {
+					logger.warn("IRC wake-turn relay threw", {
+						id,
+						error: relayError instanceof Error ? relayError.message : String(relayError),
+					});
+				} finally {
+					relay.resolve();
+				}
 			}
 		};
 	});
@@ -3021,7 +3167,7 @@ export interface FollowUpTurnOptions {
 	/**
 	 * When set, a turn that produces a `yield` result publishes a fresh
 	 * `<artifactsDir>/<id>.md` generation so `agent://<id>` tracks the latest
-	 * completion. A yield-less hub wake leaves the existing head intact.
+	 * completion. A yield-less peer-message wake leaves the existing artifact intact (issue #9518).
 	 */
 	artifactsDir?: string;
 	/** Wall-clock cap in ms for this turn; 0 disables. */
@@ -3281,12 +3427,13 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 	// explicit model pattern lands on the child's `modelRoles.advisor` so role
 	// aliases and `:level` suffixes resolve inside the spawned session.
 	const advisorSelection = resolveAgentAdvisorSelection({
-		settingsOverride: settings.get("task.agentAdvisor")[agent.name],
+		settingsOverride: cfgTaskAgentAdvisor.get(settings)[agent.name],
 		agentAdvisor: agent.advisor,
 	});
-	const subagentSettings = createSubagentSettings(
+	const subagentSettings = await createSubagentSettings(
 		settings,
 		{
+			...compactionThresholdSettings(options.compactionThresholdOverride),
 			...(agent.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 			// Isolated runs must not expose roots outside the worktree.
 			...(worktree !== undefined ? { "workspace.additionalDirectories": [] } : undefined),
@@ -3298,25 +3445,21 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				: undefined),
 		},
 		options.parentServiceTier,
-		{ cwd: worktree ?? cwd, agentDir: settings.getAgentDir() },
+		{ cwd: worktree ?? cwd },
 	);
-	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
-	const maxRuntimeMs = Math.max(
-		0,
-		Math.trunc(Number(options.maxRuntimeMs ?? settings.get("task.maxRuntimeMs") ?? 0) || 0),
-	);
-	const agentIdleTtlMs = Math.trunc(Number(settings.get("task.agentIdleTtlMs") ?? 420_000) || 0);
-	const configuredDefaultBudget = Math.max(
-		0,
-		Math.trunc(Number(settings.get("task.softRequestBudget") ?? SOFT_REQUEST_BUDGET.default) || 0),
-	);
+	const maxRecursionDepth = cfgTaskMaxRecursionDepth.get(settings);
+	const maxRuntimeMs = Math.max(0, Math.trunc(Number(options.maxRuntimeMs ?? cfgTaskMaxRuntimeMs.get(settings)) || 0));
+	// TTL before an adopted idle subagent is parked by the lifecycle manager.
+	// <= 0 disables parking (the session stays live until process teardown).
+	const agentIdleTtlMs = Math.trunc(Number(cfgTaskAgentIdleTtlMs.get(settings)) || 0);
+	const configuredDefaultBudget = Math.max(0, Math.trunc(Number(cfgTaskSoftRequestBudget.get(settings)) || 0));
 	const softRequestBudget = resolveSoftRequestBudget(agent.name, configuredDefaultBudget);
-	const softRequestBudgetNotice = settings.get("task.softRequestBudgetNotice") ?? false;
+	const softRequestBudgetNotice = cfgTaskSoftRequestBudgetNotice.get(settings);
 	const parentDepth = options.taskDepth ?? 0;
 	const childDepth = parentDepth + 1;
 
 	const atMaxDepth = options.taskDepth !== undefined && maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
-	const ircEnabled = options.enableIrc !== false && isIrcEnabled(subagentSettings, childDepth);
+	const ircConfigured = options.enableIrc !== false && isIrcEnabled(subagentSettings, childDepth);
 	let toolNames: string[] | undefined;
 	if (agent.tools !== undefined) {
 		toolNames = agent.tools;
@@ -3328,26 +3471,6 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 	if (atMaxDepth && agent.spawns === undefined && toolNames?.includes("task")) {
 		toolNames = toolNames.filter(name => name !== "task");
 	}
-	const ircDenied =
-		options.permissionScope?.denyTools.some(tool => normalizePermissionToolName(tool).toLowerCase() === "hub") ??
-		false;
-	const canInjectHub = !isReadOnlyAgent(agent) || agent.spawns !== undefined;
-	// sessions must not widen their explicit host tool list.
-	const peerPromptEnabled = canInjectHub && ircEnabled;
-	if (
-		toolNames &&
-		options.enableIrc === true &&
-		ircEnabled &&
-		!options.restrictToolNames &&
-		!isReadOnlyAgent(agent) &&
-		!toolNames.includes("irc") &&
-		!ircDenied
-	) {
-		toolNames = [...toolNames, "irc"];
-	}
-	if (toolNames && !options.restrictToolNames && canInjectHub && !toolNames.includes("hub")) {
-		toolNames = [...toolNames, "hub"];
-	}
 	if (toolNames?.includes("exec")) {
 		const backends = resolveEvalBackends({ settings });
 		const expanded = toolNames.filter(name => name !== "exec");
@@ -3355,6 +3478,12 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 		expanded.push("bash");
 		toolNames = Array.from(new Set(expanded));
 	}
+	if (toolNames !== undefined && options.restrictToolNames !== true && agent.source !== "bundled") {
+		toolNames = [...toolNames.filter(toolName => toolName !== "irc" && toolName !== "hub"), "irc", "hub"];
+	}
+	// Peer coordination requires the upstream write transport to be available.
+	const ircEnabled = ircConfigured && (toolNames === undefined || toolNames.includes("write"));
+	const peerPromptEnabled = ircEnabled;
 
 	const normalizedModelOverride = normalizeModelPatterns(modelOverride);
 	const modelPatterns =
@@ -3590,7 +3719,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			// through to the normal selectors below.
 			// The ceiling outlives initial resolution: it rides into the session so
 			// retry-fallback recovery can never clamp effort back up past it.
-			const spawnEffortCeiling = options.effort !== undefined ? settings.get("task.maxEffort") : undefined;
+			const spawnEffortCeiling = options.effort !== undefined ? cfgTaskMaxEffort.get(settings) : undefined;
 			const effortLevel =
 				options.effort !== undefined
 					? resolveTaskEffortLevel(model, options.effort, spawnEffortCeiling)
@@ -3629,8 +3758,8 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 			// Resolution failures skip prewalk instead of failing the spawn.
 			let prewalk: Prewalk | undefined;
 			const prewalkPattern = resolveAgentPrewalkPattern({
-				settingsOverride: settings.get("task.agentPrewalk")[agent.name],
-				agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
+				settingsOverride: cfgTaskAgentPrewalk.get(settings)[agent.name],
+				agentPrewalk: resolveAgentPrewalkDefault(agent, cfgTaskPrewalk.get(settings)),
 			});
 			if (!exactModelOverride && prewalkPattern) {
 				await awaitAbortable(modelRegistry.awaitBackgroundRefresh());
@@ -3737,6 +3866,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 					requireYieldTool: true,
 					contextFiles: options.contextFiles,
 					skills: options.skills,
+					skillsSettings: options.skillsSettings,
 					promptTemplates: options.promptTemplates,
 					workspaceTree: options.workspaceTree,
 					rules: options.rules,
@@ -3966,6 +4096,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 				spawns: spawnsEnv,
 				readSummarize: agent.readSummarize,
 				advisor: advisorSelection ? (advisorSelection.model ?? "on") : undefined,
+				compactionThreshold: options.compactionThresholdOverride,
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: restrictToolNames || undefined,
@@ -4054,6 +4185,7 @@ export async function runSubprocess(options: RunSubprocessOptions): Promise<Sing
 						shutdown: () => {},
 						getContextUsage: () => session.getContextUsage(),
 						getSystemPrompt: () => session.systemPrompt,
+						runEphemeralTurn: args => session.runEphemeralTurn(args),
 						compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 						getAsyncJobSnapshot: options => session.getAsyncJobSnapshot(options),
 						getAsyncJobOutput: jobId => session.getAsyncJobOutput(jobId),

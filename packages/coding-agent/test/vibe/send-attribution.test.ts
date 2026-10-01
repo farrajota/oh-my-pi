@@ -12,7 +12,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { RunSubprocessOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -21,7 +21,7 @@ import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 const ATTRIBUTION_OWNER = "vibe-parent";
 
 function resultFor(
-	options: Pick<ExecutorOptions, "id" | "agent"> & Partial<Pick<ExecutorOptions, "index" | "task">>,
+	options: Pick<RunSubprocessOptions, "id" | "agent"> & Partial<Pick<RunSubprocessOptions, "index" | "task">>,
 ): SingleResult {
 	return {
 		index: options.index ?? 0,

@@ -36,6 +36,14 @@ function makeSession(spawns: string): ToolSession {
 	};
 }
 
+function availableAgentsSection(description: string): string {
+	const sectionStart = description.indexOf("# Available Agents\n");
+	if (sectionStart < 0) return "";
+	const contentStart = sectionStart + "# Available Agents\n".length;
+	const nextSection = description.indexOf("\n# ", contentStart);
+	return description.slice(contentStart, nextSection < 0 ? undefined : nextSection);
+}
+
 describe("task spawn policy surfaces", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -57,8 +65,9 @@ describe("task spawn policy surfaces", () => {
 		const tool = await TaskTool.create(makeSession("fact-finder"));
 		const description = tool.description;
 
-		expect(description).toContain("### fact-finder");
-		expect(description).not.toContain("### oracle");
+		const availableAgents = availableAgentsSection(description);
+		expect(availableAgents).toContain("### fact-finder\nFind facts.");
+		expect(availableAgents).not.toMatch(/^### oracle(?:\s|$)/m);
 	});
 });
 
@@ -127,6 +136,6 @@ describe("task tool description scout gating", () => {
 		// The read-only agent remains listed as an available agent (the spawn
 		// policy only filters disabledAgents, so reviewer stays); only the
 		// hard-coded scout guidance is dropped.
-		expect(description).toContain("### reviewer");
+		expect(availableAgentsSection(description)).toContain("### reviewer\nReviewer.");
 	});
 });

@@ -27,7 +27,9 @@ import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runne
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { AgentProgress, SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { snapshotJobs } from "@oh-my-pi/pi-coding-agent/tools/hub/jobs";
+import { snapshotJobs } from "@oh-my-pi/pi-coding-agent/async/job-control";
+
+import { cfgTaskMaxConcurrency } from "@oh-my-pi/pi-coding-agent/task/settings";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -182,8 +184,6 @@ describe("task spawn routing", () => {
 		await job!.promise;
 
 		expect(job!.status).toBe("completed");
-		expect(job!.resultText).toContain("Spawnling is now idle");
-		expect(job!.resultText).toContain("message it via `hub` to follow up");
 		expect(job!.resultText).toContain("history://Spawnling");
 		expect(runSpy).toHaveBeenCalledTimes(1);
 		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["openai/gpt-4.1-mini"]);
@@ -191,7 +191,7 @@ describe("task spawn routing", () => {
 
 	it("preserves explicitly supplied credential, workspace, MCP, and discovery policy", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
-		let captured: executorModule.ExecutorOptions | undefined;
+		let captured: executorModule.RunSubprocessOptions | undefined;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			captured = options;
 			return makeResult(options.id);
@@ -1044,7 +1044,7 @@ describe("task spawn routing", () => {
 		await pollUntil(() => started.length === 1);
 
 		// Tighten the cap mid-session. The next spawn MUST see the new ceiling.
-		settings.override("task.maxConcurrency", 1);
+		cfgTaskMaxConcurrency.override(settings, 1);
 		const second = await tool.execute("tc-2", { agent: "task", name: "Second", task: "Work B." } as TaskParams);
 		const secondJob = manager.getJob(second.details!.async!.jobId)!;
 
@@ -1094,7 +1094,7 @@ describe("task spawn routing", () => {
 		expect([...started].sort()).toEqual(["First", "Fourth", "Second", "Third"]);
 		expect(fifthJob.queued).toBe(true);
 
-		settings.override("task.maxConcurrency", 1);
+		cfgTaskMaxConcurrency.override(settings, 1);
 		gates.get("First")!.resolve();
 		await jobs[0]!.promise;
 		await Promise.resolve();

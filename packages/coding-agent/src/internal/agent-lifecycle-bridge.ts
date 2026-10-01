@@ -10,6 +10,7 @@ import {
 	lookupAgentAuthoritySession,
 	lookupAgentRef,
 	resolveAgentObservation,
+	observeAgentRef,
 	type InternalAgentRef,
 } from "./agent-registry-bridge";
 const lifecycleCapability = getAgentLifecycleCapability();
@@ -107,7 +108,9 @@ export function reclaimDeadAgent(
 	expected: AgentRef | InternalAgentRef,
 ): Promise<boolean> {
 	const exact = resolveExpected(manager, expected);
-	return exact && "id" in exact ? manager.reclaimDeadCorpse(id, exact, lifecycleCapability) : Promise.resolve(false);
+	if (!(exact && "id" in exact)) return Promise.resolve(false);
+	const observation = "session" in expected ? observeAgentRef(registryFor(manager), exact) : expected;
+	return manager.reclaimDeadCorpse(id, observation, lifecycleCapability);
 }
 
 export function releaseAgent(

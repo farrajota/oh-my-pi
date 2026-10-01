@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { AgentCompactionThresholdOverride } from "@oh-my-pi/pi-coding-agent/config/compaction-threshold";
 import type { BeforeSubagentSpawnEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import {
 	artifactsDirsFromRegistry,
@@ -25,6 +26,9 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
+import { cfgRetryModelFallback } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { cfgTaskAgentModelOverrides, cfgTaskEnableEffort } from "@oh-my-pi/pi-coding-agent/task/settings";
+
 const AGENT: AgentDefinition = {
 	name: "worker",
 	description: "Test worker",
@@ -45,6 +49,7 @@ function session(
 		isolationApply?: boolean;
 		modelRoles?: Record<string, string>;
 		agentServiceTierOverrides?: Record<string, string>;
+		agentCompactionThresholdOverrides?: Record<string, AgentCompactionThresholdOverride>;
 	} = {},
 ): ToolSession {
 	return {
@@ -62,6 +67,9 @@ function session(
 				...(options.isolationApply !== undefined ? { "task.isolation.apply": options.isolationApply } : {}),
 				...(options.agentServiceTierOverrides
 					? { "task.agentServiceTierOverrides": options.agentServiceTierOverrides }
+					: {}),
+				...(options.agentCompactionThresholdOverrides
+					? { "task.agentCompactionThresholdOverrides": options.agentCompactionThresholdOverrides }
 					: {}),
 			}),
 		agentRegistry: new AgentRegistry(),
@@ -238,7 +246,7 @@ describe("structured subagent primitive", () => {
 		try {
 			await Bun.write(
 				path.join(projectDir, ".omp", "config.yml"),
-				"task:\n  agentModelOverrides:\n    hot-worker: xai-oauth/grok-4.6:medium\nretry:\n  modelFallback: false\n",
+				"task:\n  enableEffort: false\n  agentModelOverrides:\n    hot-worker: xai-oauth/grok-4.6:medium\nretry:\n  modelFallback: false\n",
 			);
 			await Bun.write(
 				path.join(projectDir, ".omp", "agents", "hot-worker.md"),
@@ -248,7 +256,9 @@ describe("structured subagent primitive", () => {
 			const policy = await resolveEffectiveSubagentPolicy(request({ session: liveSession, agent: "hot-worker" }));
 
 			expect(policy.modelOverride).toEqual(["xai-oauth/grok-4.6:medium"]);
-			expect(liveSettings.get("retry.modelFallback")).toBe(false);
+			expect(liveSettings.getProvenance(cfgTaskEnableEffort)).toBe("project");
+			expect(cfgTaskEnableEffort.get(liveSettings)).toBe(false);
+			expect(cfgRetryModelFallback.get(liveSettings)).toBe(false);
 		} finally {
 			liveSettings.cancelPendingSaves();
 			await fs.rm(root, { recursive: true, force: true });
@@ -267,6 +277,21 @@ describe("structured subagent primitive", () => {
 			request({ session: session({ agentServiceTierOverrides: { Scout: "priority" } }), agent: "scout" }),
 		);
 		expect(differentCase.serviceTierOverride).toBeUndefined();
+	});
+
+	it("resolves only the exact case-sensitive compaction threshold override into the policy", async () => {
+		mockDiscovery({ ...AGENT, name: "scout" });
+		const resolve = (overrides: Record<string, AgentCompactionThresholdOverride>) =>
+			resolveEffectiveSubagentPolicy(
+				request({ session: session({ agentCompactionThresholdOverrides: overrides }), agent: "scout" }),
+			);
+
+		expect((await resolve({ scout: "80%", task: 90000 })).compactionThresholdOverride).toEqual({
+			thresholdPercent: 80,
+			thresholdTokens: -1,
+		});
+		expect((await resolve({ Scout: "80%" })).compactionThresholdOverride).toBeUndefined();
+		expect((await resolve({ task: 90000 })).compactionThresholdOverride).toBeUndefined();
 	});
 
 	it("reloads persisted per-agent service-tier overrides before each launch", async () => {
@@ -298,7 +323,7 @@ describe("structured subagent primitive", () => {
 		const customAgent = { ...AGENT, model: ["@reviewer:high"] };
 		mockDiscovery(customAgent);
 		const childSession = session({ modelRoles: { reviewer: "openai/gpt-4o" } });
-		const dispatched: executorModule.ExecutorOptions[] = [];
+		const dispatched: executorModule.RunSubprocessOptions[] = [];
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			dispatched.push(options);
 			return { ...result(), modelRole: options.modelRole };
@@ -315,7 +340,7 @@ describe("structured subagent primitive", () => {
 	});
 	it("does not treat a spawn handle as the HUD description", async () => {
 		mockDiscovery();
-		const dispatched: executorModule.ExecutorOptions[] = [];
+		const dispatched: executorModule.RunSubprocessOptions[] = [];
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			dispatched.push(options);
 			return result();
@@ -350,7 +375,7 @@ describe("structured subagent primitive", () => {
 				definition: "openai/gpt-4o",
 			},
 		});
-		roleSession.settings.override("task.agentModelOverrides", { worker: "@override" });
+		cfgTaskAgentModelOverrides.override(roleSession.settings, { worker: "@override" });
 
 		const requestPolicy = await resolveEffectiveSubagentPolicy(request({ session: roleSession, model: "@request" }));
 		expect(requestPolicy.modelRole).toBe("request");
@@ -364,7 +389,7 @@ describe("structured subagent primitive", () => {
 				definition: "openai/gpt-4o",
 			},
 		});
-		concreteOverrideSession.settings.override("task.agentModelOverrides", { worker: "openai/gpt-4o" });
+		cfgTaskAgentModelOverrides.override(concreteOverrideSession.settings, { worker: "openai/gpt-4o" });
 		const concreteOverridePolicy = await resolveEffectiveSubagentPolicy(
 			request({ session: concreteOverrideSession }),
 		);
@@ -390,7 +415,7 @@ describe("structured subagent primitive", () => {
 		const customAgent = { ...AGENT, model: ["@definition"] };
 		mockDiscovery(customAgent);
 		const childSession = session({ modelRoles: { definition: "openai/gpt-4o" } });
-		childSession.settings.override("task.agentModelOverrides", { worker: "" });
+		cfgTaskAgentModelOverrides.override(childSession.settings, { worker: "" });
 
 		const policy = await resolveEffectiveSubagentPolicy(request({ session: childSession }));
 
@@ -401,7 +426,7 @@ describe("structured subagent primitive", () => {
 		const customAgent = { ...AGENT, model: ["@definition"] };
 		mockDiscovery(customAgent);
 		const childSession = session({ modelRoles: { empty: "", definition: "openai/gpt-4o" } });
-		childSession.settings.override("task.agentModelOverrides", { worker: "@empty" });
+		cfgTaskAgentModelOverrides.override(childSession.settings, { worker: "@empty" });
 
 		const policy = await resolveEffectiveSubagentPolicy(request({ session: childSession }));
 
@@ -417,7 +442,7 @@ describe("structured subagent primitive", () => {
 			events.push(event);
 			return { model: "openai/gpt-4o", note: "pool test" };
 		};
-		const dispatched: executorModule.ExecutorOptions[] = [];
+		const dispatched: executorModule.RunSubprocessOptions[] = [];
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			dispatched.push(options);
 			return result();
@@ -460,7 +485,7 @@ describe("structured subagent primitive", () => {
 	it("does not assign a role when a child uses an explicit model selector", async () => {
 		mockDiscovery();
 		const childSession = session({ modelRoles: { reviewer: "openai/gpt-4o" } });
-		const dispatched: executorModule.ExecutorOptions[] = [];
+		const dispatched: executorModule.RunSubprocessOptions[] = [];
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			dispatched.push(options);
 			return result();
@@ -667,7 +692,7 @@ describe("structured subagent primitive", () => {
 			getApiKey,
 			mcpManager,
 		});
-		const options = [] as executorModule.ExecutorOptions[];
+		const options = [] as executorModule.RunSubprocessOptions[];
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async executorOptions => {
 			options.push(executorOptions);
 			return result();

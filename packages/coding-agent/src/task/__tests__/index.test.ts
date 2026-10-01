@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Settings } from "../../config/settings";
-import type { SettingPath } from "../../config/settings-schema";
 import type { PlanModeState } from "../../plan-mode/state";
 import { AgentRegistry } from "../../registry/agent-registry";
 import { createAgentSession } from "../../sdk";
@@ -47,7 +46,7 @@ function makeResult(agent: AgentDefinition): SingleResult {
 }
 
 function makeSession(
-	settingsOverrides: Partial<Record<SettingPath, unknown>> = {},
+	settingsOverrides: Parameters<typeof Settings.isolated>[0] = {},
 	sessionOverrides: Partial<ToolSession> = {},
 ): ToolSession {
 	const settings = Settings.isolated({
