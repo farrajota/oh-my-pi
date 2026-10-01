@@ -123,4 +123,39 @@ describe("rollups", () => {
 		await refreshRollups();
 		expect(getOverallStats(null).totalRequests).toBe(2);
 	});
+	it("uses exact raw model stats when the rollup backlog is large", async () => {
+		await initDb();
+		const cutoff = Date.now() - 14 * 24 * HOUR;
+		const start = Math.floor((Date.now() - 150 * HOUR) / HOUR) * HOUR;
+		insertMessageStats(
+			Array.from({ length: 97 }, (_, index) =>
+				message(`backlog-${index}`, start + index * HOUR, index === 96 ? { model: "model-y", provider: "prov-y" } : {}),
+			),
+		);
+		expect(getRollupStatus().dirtyHours).toBeGreaterThan(96);
+
+		const models = getStatsByModel(cutoff, { exactWhenRollupsStale: true });
+		expect(models).toHaveLength(2);
+		expect(models[0]).toMatchObject({
+			model: "model-x",
+			provider: "prov",
+			totalRequests: 96,
+			totalInputTokens: 9600,
+			totalOutputTokens: 3840,
+			totalCacheReadTokens: 5760,
+			totalCacheWriteTokens: 0,
+			totalTokens: 19200,
+		});
+		expect(models[1]).toMatchObject({
+			model: "model-y",
+			provider: "prov-y",
+			totalRequests: 1,
+			totalInputTokens: 100,
+			totalOutputTokens: 40,
+			totalCacheReadTokens: 60,
+			totalCacheWriteTokens: 0,
+			totalTokens: 200,
+		});
+	});
+
 });

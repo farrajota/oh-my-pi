@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added exact per-model results during large rollup backlogs, so usage includes messages still awaiting rollup.
+
 ## [18.4.4] - 2026-09-29
 
 ### Added

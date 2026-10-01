@@ -427,7 +427,12 @@ function dirtyIsSmall(database: Database): boolean {
  * Message facts covering `[cutoff, now]`, at hour granularity (5-minute raw
  * buckets when `fine`). See the module docs for the union's parts.
  */
-function messageSource(database: Database, cutoff: number | null, fine: boolean): Source {
+function messageSource(
+	database: Database,
+	cutoff: number | null,
+	fine: boolean,
+	dirtyHoursSmall = dirtyIsSmall(database),
+): Source {
 	const groupRaw = `GROUP BY 1, ${MESSAGE_DIMENSIONS}`;
 	if (fine) {
 		return {
@@ -436,7 +441,7 @@ function messageSource(database: Database, cutoff: number | null, fine: boolean)
 		};
 	}
 	const hi = cutoff === null ? null : Math.ceil(cutoff / HOUR_MS) * HOUR_MS;
-	const exact = dirtyIsSmall(database);
+	const exact = dirtyHoursSmall;
 	const parts: string[] = [];
 	const params: number[] = [];
 	parts.push(
@@ -461,6 +466,13 @@ function messageSource(database: Database, cutoff: number | null, fine: boolean)
 		if (hi !== null) params.push(hi);
 	}
 	return { sql: parts.join(" UNION ALL "), params };
+}
+
+function rawMessageSource(cutoff: number | null): Source {
+	return {
+		sql: `SELECT ${messageFacts("0", "")} FROM messages${cutoff === null ? "" : " WHERE timestamp >= ?"} GROUP BY ${MESSAGE_DIMENSIONS}`,
+		params: cutoff === null ? [] : [cutoff],
+	};
 }
 
 /** Tool facts covering `[cutoff, now]`; same union shape as {@link messageSource}. */
@@ -503,11 +515,21 @@ function toolSource(database: Database, cutoff: number | null, fine: boolean): S
 }
 
 /** Run `select … FROM (<facts>) f <tail>` over the message facts for a window. */
-function queryMessages<T>(window: Pick<RangeWindow, "cutoff"> & { bucketMs?: number }, select: string, tail = ""): T[] {
+function queryMessages<T>(
+	window: Pick<RangeWindow, "cutoff"> & { bucketMs?: number },
+	select: string,
+	tail = "",
+	exactWhenRollupsStale = false,
+): T[] {
 	const database = currentDb();
 	if (!database) return [];
+	const cutoff = normalizeCutoff(window.cutoff);
 	const fine = window.bucketMs !== undefined && window.bucketMs < HOUR_MS;
-	const source = messageSource(database, normalizeCutoff(window.cutoff), fine);
+	const dirtyHoursSmall = exactWhenRollupsStale ? dirtyIsSmall(database) : undefined;
+	const source =
+		dirtyHoursSmall === false
+			? rawMessageSource(cutoff)
+			: messageSource(database, cutoff, fine, dirtyHoursSmall);
 	return database.prepare(`SELECT ${select} FROM (${source.sql}) f ${tail}`).all(...source.params) as T[];
 }
 
@@ -605,12 +627,19 @@ export function getOverallStats(cutoff: number | null = null): AggregatedStats {
 	return toAggregatedStats(queryMessages<AggregateRow>({ cutoff }, AGGREGATE_COLUMNS)[0]);
 }
 
-/** Aggregates per (model, provider), busiest first. */
-export function getStatsByModel(cutoff: number | null = null): ModelStats[] {
+/**
+ * Aggregates per (model, provider), busiest first.
+ * `exactWhenRollupsStale` uses raw messages when the rollup backlog is too large for exact rollup reads.
+ */
+export function getStatsByModel(
+	cutoff: number | null = null,
+	options: { exactWhenRollupsStale?: boolean } = {},
+): ModelStats[] {
 	return queryMessages<AggregateRow & { model: string; provider: string; total_tokens: number | null }>(
 		{ cutoff },
 		`f.model AS model, f.provider AS provider, SUM(f.total_tokens) AS total_tokens, ${AGGREGATE_COLUMNS}`,
 		"GROUP BY f.model, f.provider ORDER BY requests DESC",
+		options.exactWhenRollupsStale,
 	).map(row => ({
 		model: row.model,
 		provider: row.provider,
