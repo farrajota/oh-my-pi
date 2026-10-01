@@ -285,7 +285,7 @@ import { resolveYieldReportText } from "./tools/yield";
 import { createBrowserPrelude } from "./tools/browser";
 import { createComputerPrelude } from "./tools/computer";
 import { assertToolNameNotReserved, isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
-import { createRatchetPrelude } from "./ratchet/prelude";
+import { createRatchetPrelude } from "./ratchet/prelude-definition";
 import { ToolContextStore } from "./tools/context";
 import { isIrcEnabled } from "./irc/messaging";
 import { imageGenTool } from "./tools/image-gen";
