@@ -901,12 +901,17 @@ export class AsyncJobManager {
 				try {
 					for (const id of candidates) {
 						const job = this.getJob(id, filter);
+						// An in-flight delivery is left to its sink (a `hub` snapshot or wait
+						// must not steal or replay it) unless a blocking `wait` watches the
+						// job: an owner sink parks it on the yield queue until the owner idles,
+						// so that wait would otherwise never see the result. The watch already
+						// makes the parked entry stale, and the suppression below keeps it so.
 						if (
 							!job ||
 							job.status === "running" ||
 							this.#consumedJobResults.has(id) ||
 							this.#pendingResultObservations.has(id) ||
-							this.#inFlightDeliveries.some(delivery => delivery.jobId === id)
+							(!this.#watchedJobs.has(id) && this.#inFlightDeliveries.some(delivery => delivery.jobId === id))
 						)
 							continue;
 						if (job.resultText === undefined && job.errorText === undefined) continue;

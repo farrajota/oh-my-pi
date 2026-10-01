@@ -65,7 +65,9 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 	if (projectDir) {
 		result.push({ dir: projectDir, level: "project" });
 	}
-	// Native user config is scoped to the loading session's agent directory.
+	// Native user config is profile-scoped: getAgentDir() points at the active
+	// profile's agent dir (~/.omp/profiles/<name>/agent), like sessions and MCP.
+	// A load that carries its own agentDir (an SDK session created with one) reads that dir.
 	const userDir = await ifNonEmptyDir(scopedAgentDir(ctx));
 	if (userDir) {
 		result.push({ dir: userDir, level: "user" });
@@ -396,7 +398,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	// https://omp.sh/docs/context-files: its full body is carried on every
 	// request (system-prompt text, or image frames under snapcompact
 	// system-prompt imaging) so it keeps its hold across long sessions.
-	// User scope:    ~/.omp/agent/RULES.md
+	// User scope:    <agentDir>/RULES.md (~/.omp/agent/RULES.md by default)
 	// Project scope: nearest .omp/RULES.md walking up from cwd to repoRoot
 	const userRulesFile = path.join(scopedAgentDir(ctx), "RULES.md");
 	const userRule = await loadStickyRulesFile(userRulesFile, "user");

@@ -15,6 +15,7 @@ import { createReadOnlyAgentTranscriptViewer } from "@oh-my-pi/pi-coding-agent";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentHubRemote } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import { AgentTranscriptViewer } from "@oh-my-pi/pi-tui/overlays/agent-transcript-viewer";
+import { formatKeyHint } from "@oh-my-pi/pi-tui/key-hint-format";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -667,7 +668,8 @@ describe("AgentTranscriptViewer", () => {
 				.map(line => Bun.stripANSI(line))
 				.join("\n");
 			expect(rendered).not.toContain("Enter:send");
-			expect(rendered).toMatch(/(?:esc|escape).*close/i);
+			// Key hints render through the active theme (`⎋` in unicode presets, `Esc` in ascii).
+			expect(rendered).toContain(`${formatKeyHint("escape")}:close`);
 			expect(rendered).toMatch(/scroll/i);
 		} finally {
 			viewer.dispose();

@@ -19,7 +19,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { InternalUrlRouter, sessionResolveContext } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { resetRegisteredArtifactDirsForTests } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import { InternalUrlFilesystem } from "@oh-my-pi/pi-coding-agent/internal-urls/url-filesystem";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -192,12 +192,17 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 		const registry = AgentRegistry.global();
 		await installGlobalMainB(registry, rootB);
 
-		const tool = new GlobTool(makeSession(dir, rootA, registry));
+		const session = makeSession(dir, rootA, registry);
+		const tool = new GlobTool(session);
 		const result = await tool.execute("find-history-a", { path: "history://Worker" });
+		// find is URL-native: a located internal URL is listed as the URL itself,
+		// never as another root's host path.
 		const text = getResultText(result);
-		expect(text).toContain("# a/main/");
-		expect(text).toContain("Worker.jsonl");
-		expect(text).not.toContain("# b/main/");
+		expect(text.trim()).toBe("history://Worker");
+		expect(text).not.toContain(path.join(dir, "b"));
+		// The URL find listed is backed by the caller root's transcript (same caller context).
+		const located = await InternalUrlRouter.instance().locate("history://Worker", sessionResolveContext(session));
+		expect(located).toBe(path.join(dir, "a", "main", "Worker.jsonl"));
 	});
 
 	it("bash opens the caller root's agent:// output when the global Main is the other root", async () => {

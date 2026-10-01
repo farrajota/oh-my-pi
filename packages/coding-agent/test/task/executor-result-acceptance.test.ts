@@ -127,7 +127,7 @@ function createHarness(options?: {
 			promptEntered.resolve();
 			if (options?.hangPrompt) {
 				await hangingPrompt.promise;
-				return;
+				return true;
 			}
 			if (options?.usageMessages) {
 				for (const message of options.usageMessages) {
@@ -141,6 +141,7 @@ function createHarness(options?: {
 				emit({ type: "message_end", message } as AgentSessionEvent);
 			}
 			emitTerminalYield({ report: text });
+			return true;
 		},
 		waitForIdle: async () => {},
 		isAdvisorActive: () => false,

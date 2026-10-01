@@ -55,6 +55,7 @@ function createMockSession(
 		},
 		prompt: async (text: string, _options?: PromptOptions) => {
 			onPrompt({ text, emit });
+			return true;
 		},
 	};
 	return session as unknown as AgentSession;
@@ -191,7 +192,6 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(created?.preloadedCustomToolPaths).toBeUndefined();
 		expect(created?.parentHindsightSessionState).toBeUndefined();
 		expect(created?.parentMnemopiSessionState).toBeUndefined();
-		expect(created?.parentEvalSessionId).toBeUndefined();
 	});
 
 	it("forwards an exact credential resolver without replacing it", async () => {
@@ -230,7 +230,7 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(spy.mock.calls[1]?.[0]?.toolNames).toBeUndefined();
 	});
 
-	it("never grants subagents wait, and requires write for peers", async () => {
+	it("grants wait only to unrestricted subagents that can start background work, and requires write for peers", async () => {
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 
@@ -242,20 +242,28 @@ describe("runSubprocess fresh child-session boundary", () => {
 		const writableResult = await runSubprocess({
 			...baseOptions,
 			id: "writable-child",
-			agent: { ...baseAgent, tools: ["read", "write"] },
+			agent: { ...baseAgent, tools: ["read", "write", "bash"] },
 		});
 		const spawningResult = await runSubprocess({
 			...baseOptions,
 			id: "spawning-child",
 			agent: { ...baseAgent, tools: ["read"], spawns: ["scout"] },
 		});
+		const restrictedResult = await runSubprocess({
+			...baseOptions,
+			id: "restricted-child",
+			agent: { ...baseAgent, tools: ["read", "bash"] },
+			restrictToolNames: true,
+		});
 
 		expect(readOnlyResult.exitCode).toBe(0);
 		expect(writableResult.exitCode).toBe(0);
 		expect(spawningResult.exitCode).toBe(0);
+		expect(restrictedResult.exitCode).toBe(0);
 		expect(spy.mock.calls[0]?.[0]?.toolNames).toEqual(["read", "grep", "glob"]);
-		expect(spy.mock.calls[1]?.[0]?.toolNames).toEqual(["read", "write"]);
-		expect(spy.mock.calls[2]?.[0]?.toolNames).toEqual(["read", "task"]);
+		expect(spy.mock.calls[1]?.[0]?.toolNames).toEqual(["read", "write", "bash", "wait"]);
+		expect(spy.mock.calls[2]?.[0]?.toolNames).toEqual(["read", "task", "wait"]);
+		expect(spy.mock.calls[3]?.[0]?.toolNames).toEqual(["read", "bash"]);
 
 		const promptText = (index: number): string => {
 			const prompt = spy.mock.calls[index]?.[0]?.systemPrompt;

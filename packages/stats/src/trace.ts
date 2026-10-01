@@ -13,8 +13,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getBundledModel, type GeneratedProvider } from "@oh-my-pi/pi-catalog/models";
 import { getSessionsDir, isEnoent } from "@oh-my-pi/pi-utils";
-import { getSessionRollups, getToolCallCountsBySession, isScheduledCatalogModel } from "./db";
+import { initDb, isScheduledCatalogModel } from "./db";
 import { extractFolderFromPath, parseAllSessionEntries, resolveUsageTotal } from "./parser";
+import { getSessionRollups } from "./rollup";
 import type {
 	SessionEntry,
 	SessionSummary,
@@ -1079,10 +1080,10 @@ let diskRootsMemo:
 const DISK_ROOTS_TTL_MS = 5_000;
 
 async function scanDiskRoots(limit: number): Promise<Array<{ file: string; mtimeMs: number; startedAt: number }>> {
-	const sessionsDir = getSessionsDir();
 	const now = Date.now();
+	const sessionsDir = getSessionsDir();
 	const memo = diskRootsMemo;
-	if (memo && memo.sessionsDir === sessionsDir && memo.limit === limit && now - memo.atMs < DISK_ROOTS_TTL_MS) {
+	if (memo && memo.sessionsDir === sessionsDir && memo.limit >= limit && now - memo.atMs < DISK_ROOTS_TTL_MS) {
 		return memo.roots.slice(0, limit);
 	}
 	let projects: string[] = [];
@@ -1125,8 +1126,9 @@ async function scanDiskRoots(limit: number): Promise<Array<{ file: string; mtime
  * transcript (subagents, advisors) into its root row.
  */
 export async function listSessionSummaries(limit = 100, q?: string): Promise<SessionSummary[]> {
+	// The Traces page may be the first thing a dashboard serves.
+	await initDb();
 	const sessionsDir = getSessionsDir();
-	const toolCounts = getToolCallCountsBySession();
 	const byRoot = new Map<string, SummaryFold>();
 
 	for (const row of getSessionRollups()) {
@@ -1157,7 +1159,7 @@ export async function listSessionSummaries(limit = 100, q?: string): Promise<Ses
 			byRoot.set(rootFile, fold);
 		}
 		fold.requests += row.requests;
-		fold.toolCalls += toolCounts.get(row.sessionFile) ?? 0;
+		fold.toolCalls += row.toolCalls;
 		if (isChild) fold.subagents++;
 		if (row.startedAt < fold.startedAt) fold.startedAt = row.startedAt;
 		if (row.endedAt > fold.endedAt) fold.endedAt = row.endedAt;

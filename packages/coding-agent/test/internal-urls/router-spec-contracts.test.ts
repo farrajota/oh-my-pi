@@ -159,8 +159,8 @@ describe("InternalUrlRouter write approval", () => {
 				source: "tool",
 			});
 		}
-		// Declared policies still decide: local:// is session scratch, approved at read tier.
-		expect(resolveApproval(tool, { path: "local:/notes.md", content: "x" }, "always-ask").policy).toBe("allow");
+		// Declared policies still decide: the fork keeps local:// writes at write tier, so always-ask prompts.
+		expect(resolveApproval(tool, { path: "local:/notes.md", content: "x" }, "always-ask").policy).toBe("prompt");
 		expect(resolveApproval(tool, { path: "notes.md", content: "x" }, "always-ask").policy).toBe("prompt");
 	});
 });

@@ -343,6 +343,8 @@ function createFakeWorkerSession(
 			return lastAssistant;
 		},
 		getPermissionSummary: () => undefined,
+		// The run monitor looks tools up for edit-mode-aware argument previews.
+		getToolByName: () => undefined,
 		setWorkPoolYieldItems: (_items: unknown[]) => {},
 		async abort(): Promise<void> {},
 		async dispose(): Promise<void> {
@@ -366,12 +368,20 @@ function createFakeWorkerSession(
 
 /** Scripted turn: one `read` tool call, then a successful `yield` carrying `data`. */
 function yieldTurnEvents(data: unknown): unknown[] {
+	// The run monitor pairs start/end edges by `toolCallId`, as real agent events always carry it.
 	return [
-		{ type: "tool_execution_start", toolName: "read", args: { path: "src/foo.ts" }, intent: "Reading foo" },
-		{ type: "tool_execution_end", toolName: "read", result: {}, isError: false },
-		{ type: "tool_execution_start", toolName: "yield", args: {} },
+		{
+			type: "tool_execution_start",
+			toolCallId: "call-read",
+			toolName: "read",
+			args: { path: "src/foo.ts" },
+			intent: "Reading foo",
+		},
+		{ type: "tool_execution_end", toolCallId: "call-read", toolName: "read", result: {}, isError: false },
+		{ type: "tool_execution_start", toolCallId: "call-yield", toolName: "yield", args: {} },
 		{
 			type: "tool_execution_end",
+			toolCallId: "call-yield",
 			toolName: "yield",
 			result: { details: { status: "success", data } },
 			isError: false,

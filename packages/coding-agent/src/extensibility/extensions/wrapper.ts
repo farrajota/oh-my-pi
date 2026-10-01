@@ -134,6 +134,36 @@ function operationRunnerForTool(tool: AgentTool, params: unknown): ClassFixedOpe
 }
 
 /**
+ * Second `renderCall` argument that satisfies both the omp and the upstream-pi
+ * renderer contracts.
+ *
+ * omp invokes renderers as `renderCall(args, options, theme)` (see
+ * `packages/tui/src/tools/renderer.ts`), while pi-era renderers — including
+ * every third-party plugin written against pi's published example — are
+ * declared `renderCall(args, theme, context)`. Both shapes take three
+ * parameters, so arity cannot discriminate them. The returned value carries
+ * both instead: own keys stay the render options, every other property
+ * resolves against the live theme. `Theme` keeps its state in `#private`
+ * fields, so delegated methods are bound to the theme instance rather than to
+ * the proxy.
+ */
+function renderOptionsWithTheme<T extends object>(options: T, theme: Theme): T & Theme {
+	const delegates = new Map<PropertyKey, unknown>();
+	return new Proxy(options, {
+		get(target, prop, receiver) {
+			if (Object.hasOwn(target, prop)) return Reflect.get(target, prop, receiver);
+			const delegate = delegates.get(prop);
+			if (delegate !== undefined) return delegate;
+			const value = Reflect.get(theme, prop, theme);
+			if (typeof value !== "function") return value;
+			const bound = value.bind(theme);
+			delegates.set(prop, bound);
+			return bound;
+		},
+	}) as T & Theme;
+}
+
+/**
  * Adapts a RegisteredTool into an AgentTool.
  */
 export class RegisteredToolAdapter implements AgentTool<any, any, any> {
@@ -160,7 +190,11 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		// discards tool result text (extensions without renderers show blank).
 		if (registeredTool.definition.renderCall) {
 			this.renderCall = (args: any, options: any, theme: any) =>
-				registeredTool.definition.renderCall!(args, options, theme as Theme);
+				registeredTool.definition.renderCall!(
+					args,
+					renderOptionsWithTheme(options, theme as Theme),
+					theme as Theme,
+				);
 		}
 		if (registeredTool.definition.renderResult) {
 			this.renderResult = (result: any, options: any, theme: any, args?: any) =>
@@ -216,6 +250,9 @@ export function wrapRegisteredTool(registeredTool: RegisteredTool, runner: Exten
 export function wrapRegisteredTools(registeredTools: RegisteredTool[], runner: ExtensionRunner): AgentTool[] {
 	return registeredTools.map(rt => wrapRegisteredTool(rt, runner));
 }
+
+const LOOP_DISPATCH_CONTEXT = Symbol("omp.loop-dispatch");
+type LoopAwareToolContext = AgentToolContext & { [LOOP_DISPATCH_CONTEXT]?: true };
 
 function computerSafetyChecks(context: AgentToolContext | undefined): ComputerSafetyCheck[] {
 	const metadata = context?.toolCall?.providerMetadata;
@@ -283,6 +320,10 @@ type OptionalRunnerCapabilities = {
 	getPathScope?: () => SessionPathScope | undefined;
 	getCwd?: () => string;
 	recordPermissionDenial?: (details: PermissionDenialDetails) => void;
+	consumeLoopToolCall?: (toolCallId: string, toolName: string) => boolean;
+	runToolCallPreflightBefore?: ExtensionRunner["runToolCallPreflightBefore"];
+	runToolCallPreflightAfter?: ExtensionRunner["runToolCallPreflightAfter"];
+	cancelToolCallPreflight?: (toolCallId: string) => void;
 	runScoped?: <T>(fn: () => T) => T;
 	isSharedLspEnabled?: () => boolean;
 	sessionId?: string;
@@ -365,6 +406,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// the loop never saw — nested xd:// device dispatches and direct
 		// (non-loop) execution such as Cursor exec handlers.
 		const runner = optionalRunnerCapabilities(this.runner);
+		const inheritedLoopDispatch = (context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === true;
+		const loopDispatchedToolCall =
+			(runner.consumeLoopToolCall?.call(this.runner, toolCallId, this.tool.name) ?? false) || inheritedLoopDispatch;
+		if (loopDispatchedToolCall && context && !inheritedLoopDispatch) {
+			(context as LoopAwareToolContext)[LOOP_DISPATCH_CONTEXT] = true;
+		}
 		const loopEmittedToolCall = runner.consumeToolCallEmitted?.call(this.runner, toolCallId, this.tool.name) ?? false;
 		const assertAuthorized = (candidate: Static<TParameters>): void => {
 			const scope = runner.getPermissionScope?.call(this.runner);
@@ -458,6 +505,21 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const rewrittenParams = rewriteAuthorizedInput(pathInput, replacements) as typeof effectiveParams;
 			if (rewrittenParams !== pathInput) effectiveParams = rewrittenParams;
 		}
+		if (!loopDispatchedToolCall) {
+			const preflight = await runner.runToolCallPreflightBefore?.call(
+				this.runner,
+				toolCallId,
+				this.tool,
+				effectiveParams,
+				context,
+			);
+			if (preflight?.block) {
+				throw new Error(preflight.reason || "Tool execution was blocked by a preflight rule");
+			}
+		}
+		// Every exit between a passed preflight and tool execution must release the
+		// preflight reservation; the finally below handles it for all throw paths.
+		let preflightSettled = loopDispatchedToolCall;
 		const { approvalMode, userPolicies } =
 			context === undefined
 				? { approvalMode: "yolo" as const, userPolicies: {} }
@@ -616,6 +678,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			let result: AgentToolResult<TDetails, TParameters>;
 			let executionError: Error | undefined;
 
+			preflightSettled = true;
 			try {
 				const executeTool = (executionSignal?: AbortSignal) => {
 					const runTool = () =>
@@ -660,6 +723,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					details: undefined as TDetails,
 				};
 			}
+			if (!loopDispatchedToolCall) {
+				const postflight = await runner.runToolCallPreflightAfter?.call(this.runner, toolCallId, result, context);
+				if (postflight) result = postflight as AgentToolResult<TDetails, TParameters>;
+			}
 
 			// Emit tool_result event - extensions can modify the result and error status.
 			if (hasRunnerHandlers(this.runner, "tool_result") && typeof runner.emitToolResult === "function") {
@@ -676,9 +743,19 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					isError: !!executionError || result.isError === true,
 				})) as ToolResultEventResult | undefined;
 
-				if (resultResult) {
-					const modifiedContent: (TextContent | ImageContent)[] = resultResult.content ?? result.content;
+				// Handler context reports into this call's sink like tool-authored
+				// context: it is delivered even for a failed call (the handler saw
+				// `isError`), and precedes any pending `tool_call` context.
+				if (resultResult?.additionalContext !== undefined) {
+					context?.addAdditionalContext?.(resultResult.additionalContext);
+				}
+
+				// `content` is present only when a handler modified the result.
+				if (resultResult?.content !== undefined) {
+					const modifiedContent: (TextContent | ImageContent)[] = resultResult.content;
 					const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
+					// Effective error state: an explicit handler override wins; otherwise the
+					// original execution outcome (thrown or non-throwing error result) stands.
 					const effectiveError = resultResult.isError ?? (!!executionError || result.isError === true);
 					if (!effectiveError && pendingAdditionalContext !== undefined) {
 						context?.addAdditionalContext?.(pendingAdditionalContext);
@@ -701,6 +778,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 			return result;
 		} finally {
+			if (!preflightSettled) runner.cancelToolCallPreflight?.call(this.runner, toolCallId);
 			if (ownsPreparation) await effectivePreparedExecution?.dispose();
 		}
 	}

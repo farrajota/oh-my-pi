@@ -21,6 +21,7 @@ import { getSessionLocalProtocolOptions } from "../internal-urls";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { RegistryDurableStateStore } from "../registry/durable-state";
 import type { AgentSession } from "../session/agent-session";
+import { installRetryFallbackRole } from "../session/retry-fallback-chains";
 import type { AuthStorage } from "../session/auth-storage";
 import { extractSessionInit, SessionManager } from "../session/session-manager";
 import type { SessionInitEntry } from "../session/session-entries";
@@ -31,6 +32,7 @@ import {
 	compactionThresholdSettings,
 	createMCPProxyTools,
 	createSubagentSettings,
+	subagentRetryFallbackRole,
 } from "./executor";
 import type { EffectivePermissionSummary } from "./types";
 import type { AgentDefinition } from "./types";
@@ -89,6 +91,7 @@ type PersistedRevivalInit = Pick<
 	| "advisor"
 	| "compactionThreshold"
 	| "isolated"
+	| "retryFallback"
 >;
 
 async function validatePersistedRevivalContract(
@@ -339,6 +342,12 @@ export function createPersistedSubagentReviverFactory(
 					undefined,
 					{ cwd: currentPeek.cwd },
 				);
+				// Restore the `subagent:<id>` fallback chain the spawn installed; the
+				// transcript alone cannot rebuild it (multi-model agent patterns and
+				// inherited role chains are resolved only at spawn).
+				if (init.retryFallback) {
+					installRetryFallbackRole(subagentSettings, subagentRetryFallbackRole(ref.id), init.retryFallback);
+				}
 				const persistedModelPattern =
 					init.modelRole && init.modelRole !== "default"
 						? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]

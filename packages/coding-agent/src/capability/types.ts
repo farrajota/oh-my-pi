@@ -47,10 +47,14 @@ export interface LoadContext {
 	cwd: string;
 	/** User home directory */
 	home: string;
-	/** Agent directory for user-scoped native discovery */
-	agentDir?: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
+	/**
+	 * Native user config dir for this load. Unset means the process-global
+	 * `getAgentDir()`; an SDK session created with its own `agentDir` passes it
+	 * so user-level rules and tools come from that dir.
+	 */
+	agentDir?: string;
 	/**
 	 * Session-local extension roots for sub-discovery. When set, extension
 	 * discovery uses these lanes instead of the invocation-scoped snapshot or
@@ -117,7 +121,7 @@ export interface LoadOptions<T = unknown> {
 	excludeProviders?: string[];
 	/** Custom cwd. Default: getProjectDir() */
 	cwd?: string;
-	/** Custom agent directory for user-scoped discovery. Default: getAgentDir() */
+	/** Native user config dir, forwarded to {@link LoadContext.agentDir}. Default: getAgentDir() */
 	agentDir?: string;
 	/** Include items even if they fail validation. Default: false */
 	includeInvalid?: boolean;
@@ -170,6 +174,16 @@ export interface SourceMeta {
 	 * tree — see `isSourceEnabled` in `extensibility/skills.ts` (#10743).
 	 */
 	origin?: string;
+	/**
+	 * Plugin or package name supplying this item, for registry-backed providers
+	 * (`claude-plugins` and `agent-plugins` use the plugin name, `omp-plugins`
+	 * the extension package directory name, `skillshare` the package name).
+	 * Preferred by `skillNamespace` in `extensibility/skills.ts` over parsing
+	 * the item's path, since installed plugin caches
+	 * (`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/...`)
+	 * put the version, not the plugin name, in the path segment owning `skills/`.
+	 */
+	pluginName?: string;
 }
 
 /**

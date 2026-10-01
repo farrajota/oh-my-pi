@@ -39,6 +39,14 @@ import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	findRetryFallbackCandidates,
+	getRetryFallbackChains,
+	type RetryFallbackResolutionContext,
+	type RetryFallbackRole,
+	resolveRetryFallbackChainKey,
+} from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
@@ -305,6 +313,7 @@ async function createPersistedSession(
 		omitPermissionProvenance?: boolean;
 		omitPermissionSnapshot?: boolean;
 		recentDenials?: PermissionDenialDetails[];
+		retryFallback?: RetryFallbackRole;
 		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	},
 ): Promise<string> {
@@ -356,6 +365,7 @@ async function createPersistedSession(
 		enableMCP: contract?.enableMCP,
 		isolated: contract?.isolated,
 		...persistedPermissions,
+		retryFallback: contract?.retryFallback,
 		...(contract?.compactionThreshold !== undefined
 			? { compactionThreshold: contract.compactionThreshold }
 			: undefined),
@@ -1229,6 +1239,44 @@ describe("persisted subagent revival", () => {
 
 		expect(capturedOptions?.modelPattern).toBe("anthropic/claude-sonnet-4-5");
 		expect(capturedOptions?.modelPatternAuthFallback).toBe("anthropic/claude-sonnet-4-5");
+	});
+
+	it("reinstalls the spawn's subagent fallback chain so it still routes at a changed effort (#13789)", async () => {
+		const cwd = makeTempDir("@pi-revive-retry-fallback-");
+		const sessionFile = await createPersistedSession(cwd, false, "task", undefined, {
+			retryFallback: { primary: "xai-oauth/grok-4.7:high", chain: ["openai/gpt-4o-mini"] },
+		});
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			// The registry rejects a revived session whose file differs from the reserved one.
+			return { session: createRevivedSession([], undefined, options).session } as CreateAgentSessionResult;
+		});
+
+		const ref = await createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		const revivedSettings = capturedOptions?.settings;
+		if (!revivedSettings) throw new Error("Expected revived child settings");
+		const grok = getBundledModel("xai-oauth", "grok-4.7");
+		const context: RetryFallbackResolutionContext = {
+			chains: getRetryFallbackChains(revivedSettings),
+			getModelRole: role => revivedSettings.getModelRole(role),
+			modelLookup: {
+				find: (provider, id) => (provider === grok.provider && id === grok.id ? grok : undefined),
+				hasProvider: provider => provider === grok.provider,
+			},
+		};
+		const live = "xai-oauth/grok-4.7:xhigh";
+		const chainKey = resolveRetryFallbackChainKey(context, live, grok);
+		// Fork fixture refs carry a session-file-derived id rather than a fixed one.
+		expect(chainKey).toBe(`subagent:${ref.id}`);
+		if (!chainKey) throw new Error("Expected the revived subagent chain");
+		expect(findRetryFallbackCandidates(context, chainKey, live, grok).map(candidate => candidate.raw)).toEqual([
+			"openai/gpt-4o-mini",
+		]);
 	});
 
 	it("installs an IRC wake monitor that emits cold-revive lifecycle frames on the shared bus", async () => {

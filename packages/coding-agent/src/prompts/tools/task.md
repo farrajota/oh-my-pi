@@ -18,13 +18,14 @@ Name one integration owner. Shared edits are not guaranteed to merge in the same
     Omitting `agent` selects the spawn-policy default (`{{defaultAgent}}`). Use it only when that agent fits the task.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
     NEVER pass the spawn-policy default explicitly. Only omit it after checking the available agents below.
   - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
+  - `solutionSpace`: Describe how open-ended the child's problem is: whether the fix or design is given, or which causes or designs remain open. Volume of work does not widen it; NEVER mention sibling agents or coordination. (`one fix: rename, names given`; `one fix: slice end in paginate`; `single-flight cache load; races easy to miss`; `several retry API shapes; error classes to choose`; `deadlock cause open, no repro`)
 {{#if modelEnabled}}  - `model`: Available only when `task.allowModelOverride` is enabled. Pass one non-empty request-local selector for this item (for example, `pi/taskpro`), never a comma-separated fallback chain. It overrides `task.agentModelOverrides`, agent frontmatter, and the parent model for this invocation only. Resolution is exact: no parent-auth fallback, configured runtime fallback chain, or prewalk handoff. Approval/call output shows the requested selector; progress/results show requested and resolved models.
 {{/if}}
   - `agentSource`: Optional exact source pin: `bundled`, `user`, or `project`.
   - `agentDefinitionSha256`: Optional lowercase SHA-256 pin for the exact file-backed agent definition bytes. A pin mismatch blocks before launch.
 {{#if evalToolsEnabled}}  - `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
 {{/if}}
-{{#if effortEnabled}}  - `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
+{{#if effortEnabled}}  - `effort`: Scale w/ how open-ended this task's problem is: `"lo"`|`"med"`|`"hi"`
 {{/if}}
   - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
   - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
@@ -41,13 +42,14 @@ Name one integration owner. Shared edits are not guaranteed to merge in the same
   Omitting `agent` selects the spawn-policy default (`{{defaultAgent}}`). Use it only when that agent fits the task.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
   NEVER pass the spawn-policy default explicitly. Only omit it after checking the available agents below.
 - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
+- `solutionSpace`: Describe how open-ended the child's problem is: whether the fix or design is given, or which causes or designs remain open. Volume of work does not widen it; NEVER mention sibling agents or coordination. (`one fix: rename, names given`; `one fix: slice end in paginate`; `single-flight cache load; races easy to miss`; `several retry API shapes; error classes to choose`; `deadlock cause open, no repro`)
 {{#if modelEnabled}}- `model`: Available only when `task.allowModelOverride` is enabled. Pass one non-empty request-local selector (for example, `pi/taskpro`), never a comma-separated fallback chain. It overrides `task.agentModelOverrides`, agent frontmatter, and the parent model for this invocation only. Resolution is exact: no parent-auth fallback, configured runtime fallback chain, or prewalk handoff. Approval/call output shows the requested selector; progress/results show requested and resolved models.
 {{/if}}
 - `agentSource`: Optional exact source pin: `bundled`, `user`, or `project`.
 - `agentDefinitionSha256`: Optional lowercase SHA-256 pin for the exact file-backed agent definition bytes. A pin mismatch blocks before launch.
 {{#if evalToolsEnabled}}- `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
 {{/if}}
-{{#if effortEnabled}}- `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
+{{#if effortEnabled}}- `effort`: Scale w/ how open-ended this task's problem is: `"lo"`|`"med"`|`"hi"`
 {{/if}}
 - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
 - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
@@ -99,7 +101,6 @@ Pass large payloads via `local://<path>` URIs, NEVER inline text.
 {{#if batchEnabled}}
 <context-fmt>
 # Goal         ← one sentence: what the batch accomplishes
-# Constraints  ← MUST/NEVER rules and session decisions
 # Contract     ← exact types/signatures if tasks share an interface
 </context-fmt>
 {{/if}}

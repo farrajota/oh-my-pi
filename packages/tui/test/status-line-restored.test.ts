@@ -11,7 +11,7 @@ beforeAll(async () => {
 	await initTheme();
 });
 
-const context = { startupPlaceholder: false } as SegmentContext;
+const context = {} as SegmentContext;
 
 const originalDockerName = process.env.DOCKER_CONTAINER_NAME;
 const originalHostname = process.env.HOSTNAME;

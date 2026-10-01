@@ -10,6 +10,7 @@ import type {
 import type { PermissionScopeSnapshot } from "../task/permission-profiles";
 import type { EffectivePermissionSummary, StructuredSubagentSchemaMode } from "../task/types";
 import type { CompactionMethod } from "./compaction-methods";
+import type { RetryFallbackRole } from "./retry-fallback-chains";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -266,6 +267,8 @@ export interface SessionInitEntry extends SessionEntryBase {
 	permissionSnapshot?: PermissionScopeSnapshot;
 	/** Sanitized bounded display metadata; never used to reconstruct authority. */
 	permissionSummary?: EffectivePermissionSummary;
+	/** Subagent's `subagent:<id>` retry fallback role as installed at spawn; cold revival reinstalls it. Absent when none was installed or on older files. */
+	retryFallback?: RetryFallbackRole;
 	/** Whether the agent definition is read-only, allowing an exact zero-LoC attribution. */
 	readOnly?: boolean;
 	/** Output schema if structured output was requested. */
@@ -363,6 +366,8 @@ export interface UsageStatistics {
 	orchestrationCacheRead: number;
 	premiumRequests: number;
 	cost: number;
+	/** Portion of {@link cost} carried by completed `task` results (direct children's spend). */
+	subagentCost: number;
 }
 /**
  * True when a raw JSONL line is a complete `message` record carrying an

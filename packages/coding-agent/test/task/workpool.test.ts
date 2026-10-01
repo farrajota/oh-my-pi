@@ -13,7 +13,7 @@ import {
 	lookupAgentRef,
 } from "../../src/internal/agent-registry-bridge";
 import type { AgentSession } from "../../src/session/agent-session";
-import { WaitTool } from "../../src/tools/wait";
+import { HubTool } from "../../src/tools/hub";
 import type { CustomMessage } from "../../src/session/messages";
 import * as executor from "../../src/task/executor";
 import type { EffectiveSubagentPolicy, StructuredSubagentResult } from "../../src/task/structured-subagent";
@@ -327,9 +327,12 @@ describe("WorkPool dispatch", () => {
 		const poolJob = manager.getJob("waiter");
 		expect(poolJob?.id).toBe("waiter");
 		expect(poolJob?.label).toBe("waiter");
-		const polled = await new WaitTool(session).execute("wait-workpool", {});
+		// The fork's `wait` tool re-reads settled jobs by id through the hub, so a
+		// zero-retention fixture evicts the aggregate before it can be reported;
+		// an explicit hub wait holds the running job for the whole poll instead.
+		const polled = await new HubTool(session).execute("poll-workpool", { op: "wait", ids: [workpool.name] });
 		const details = polled.details;
-		if (!details?.jobs) throw new Error("Expected a background-job wait result");
+		if (!details || !("jobs" in details)) throw new Error("Expected a background-job poll result");
 		expect(details.jobs?.map(job => job.id)).toEqual(["waiter"]);
 		expect(details.jobs?.map(job => job.status)).toEqual(["completed"]);
 		expect(workpool.peek().pending).toBe(0);

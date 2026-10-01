@@ -305,6 +305,7 @@ describe("selector setting side effects", () => {
 			hub.handleInput("\x1b[A"); // All models → Roles.
 			hub.handleInput("\n"); // Enter the role rows.
 			hub.handleInput("\n"); // Assign DEFAULT.
+			hub.handleInput("\n"); // Sidebar → model list.
 			hub.handleInput("\n"); // Pick the scoped replacement model.
 			await assignmentApplied.promise;
 			await Promise.resolve();
@@ -482,6 +483,7 @@ describe("selector setting side effects", () => {
 			hub.handleInput("\x1b[A"); // All models → Roles.
 			hub.handleInput("\n"); // Enter the role rows.
 			hub.handleInput("\n"); // Assign DEFAULT.
+			hub.handleInput("\n"); // Sidebar → model list.
 			hub.handleInput("\n"); // Pick the scoped model.
 			hub.handleInput("\n"); // Save the assignment to the project.
 			await assignmentApplied.promise;
@@ -1060,7 +1062,8 @@ describe("selector setting side effects", () => {
 			| undefined;
 		if (!hub) throw new Error("Expected model hub overlay to be shown");
 		try {
-			hub.handleInput("\n");
+			hub.handleInput("\n"); // Sidebar → model list.
+			hub.handleInput("\n"); // Open the role strip.
 			const frame = stripVTControlCharacters(hub.render(220).join("\n"));
 			expect(frame).toContain("retry-fallback");
 			hub.handleInput("\x1b[D");

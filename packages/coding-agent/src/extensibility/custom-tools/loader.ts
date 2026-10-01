@@ -223,9 +223,22 @@ export async function loadCustomTools(
 }
 
 /**
- * Collect the absolute tool-source paths to load without importing or binding
- * factories. Discovery runs under the session's own cwd, agent directory, and
- * immutable extension-root policy.
+ * Collect the absolute tool-source paths to load, without importing or
+ * binding factories. Hot path on session startup — the scan walks
+ * `.omp/tools/`, `.claude/tools/`, the plugin tree, and any configured paths.
+ * Discovery runs under the session's own cwd, agent directory, and immutable
+ * extension-root policy.
+ *
+ * Subagents reuse the parent's collected paths via the SDK's
+ * `preloadedCustomToolPaths` option, then call `loadCustomTools` themselves
+ * so each session re-binds factories with its own session-scoped
+ * `CustomToolAPI` (cwd, exec, pushPendingAction, UI).
+ *
+ * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
+ * @param cwd - Current working directory
+ * @param options.agentDir - Native user config dir. Default: getAgentDir()
+ * @param options.disabledExtensions - Explicit disabled extension IDs for this session
+ * @param options.extensionRoots - Session-scoped extension-root policy
  */
 export async function discoverCustomToolPaths(
 	configuredPaths: string[],
@@ -281,6 +294,7 @@ export async function discoverCustomToolPaths(
  * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
  * @param cwd - Current working directory
  * @param builtInToolNames - Names of built-in tools to check for conflicts
+ * @param agentDir - Native user config dir. Default: getAgentDir()
  */
 export async function discoverAndLoadCustomTools(
 	configuredPaths: string[],
@@ -292,7 +306,8 @@ export async function discoverAndLoadCustomTools(
 		apply(reason: string): Promise<AgentToolResult<unknown>>;
 		reject?(reason: string): Promise<AgentToolResult<unknown> | undefined>;
 	}) => void,
+	agentDir?: string,
 ) {
-	const pathsWithSources = await discoverCustomToolPaths(configuredPaths, cwd);
+	const pathsWithSources = await discoverCustomToolPaths(configuredPaths, cwd, { agentDir });
 	return loadCustomTools(pathsWithSources, cwd, builtInToolNames, pushPendingAction);
 }

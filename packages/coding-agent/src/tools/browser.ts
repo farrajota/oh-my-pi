@@ -24,6 +24,8 @@ import {
 	releaseBrowser,
 } from "./browser/registry";
 import { resolveRelayKind } from "./browser/relay/kind";
+import { resolveTernKind } from "./browser/tern/kind";
+import { isTernUnavailable } from "./browser/tern/wire";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import {
 	type AcquireTabResult,
@@ -54,6 +56,7 @@ import {
 	cfgBrowserIdleCloseSec,
 	cfgBrowserRelay,
 	cfgBrowserRelayUrl,
+	cfgBrowserTern,
 } from "./browser/settings";
 import { cfgToolsMaxTimeout } from "./settings";
 
@@ -74,6 +77,7 @@ export { cmuxSnapshotToObservation, mapWaitUntil, resolveCmuxKind, serializeEval
 export { CmuxSocketClient } from "./browser/cmux/socket-client";
 export { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./browser/readable";
 export { DEFAULT_RELAY_URL, type RelayKind, resolveRelayKind } from "./browser/relay/kind";
+export { type TernKind, resolveTernKind } from "./browser/tern/kind";
 export type { Observation, ObservationEntry } from "./browser/tab-protocol";
 
 const DEFAULT_TAB_NAME = "main";
@@ -83,6 +87,7 @@ const appSchema = type({
 	"path?": type("string").describe("binary path to spawn"),
 	"cdp_url?": type("string").describe("existing cdp endpoint"),
 	"relay?": type("boolean").describe("drive the user's own tabs via the omp browser relay"),
+	"tern?": type("boolean").describe("inside Tern: true forces a Tern picture-in-picture, false opts out"),
 	"args?": type("string[]").describe("extra cli args"),
 	"target?": type("string").describe("substring to pick a window"),
 });
@@ -199,7 +204,17 @@ export interface BrowserToolDetails {
 	meta?: OutputMeta;
 }
 
-function resolveBrowserKind(params: BrowserParams, session: ToolSession): BrowserKind {
+/**
+ * The browser an open drives, by precedence: explicit `app.*` options, the
+ * relay, `browser.cdpUrl`, a Tern PiP (inside a Tern pane, unless
+ * `headed: false` or `app.tern: false`; `app.tern: true` forces it), a cmux
+ * surface, then Chromium.
+ */
+export function resolveBrowserKind(
+	params: BrowserParams,
+	session: ToolSession,
+	env: Record<string, string | undefined> = process.env,
+): BrowserKind {
 	const app = params.app;
 	if (app?.cdp_url) {
 		return { kind: "connected", cdpUrl: app.cdp_url.replace(/\/+$/, "") };
@@ -212,30 +227,54 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 	// Explicit app.relay wins over every setting; PI_BROWSER_RELAY stays the
 	// final kill switch (a relay that is down would otherwise brick the tool).
 	if (app?.relay) {
-		const relayKind = resolveRelayKind({ settingEnabled: true, url: relayUrl });
+		const relayKind = resolveRelayKind({ settingEnabled: true, url: relayUrl }, env);
 		if (relayKind) return relayKind;
+	}
+	if (app?.tern === true) {
+		const ternKind = resolveTernKind({ settingEnabled: true }, env);
+		if (!ternKind) {
+			throw new ToolError(
+				"app.tern:true requires running inside a Tern pane (TERN_PANE_SOCKET and TERN_PANE are not set) with PI_BROWSER_TERN not set to 0.",
+			);
+		}
+		return ternKind;
 	}
 	// Relay before cdpUrl among settings: enabling the opt-out-by-default relay
 	// is a deliberate mode selection, while cdpUrl is a standing fallback
 	// endpoint. A configured endpoint is a default, not an override: explicit
 	// app options win.
 	if (app?.relay !== false) {
-		const relayKind = resolveRelayKind({
-			settingEnabled: cfgBrowserRelay.get(session.settings),
-			url: relayUrl,
-		});
+		const relayKind = resolveRelayKind(
+			{
+				settingEnabled: cfgBrowserRelay.get(session.settings),
+				url: relayUrl,
+			},
+			env,
+		);
 		if (relayKind) return relayKind;
 	}
 	const configuredCdpUrl = cfgBrowserCdpUrl.get(session.settings)?.trim();
 	if (configuredCdpUrl) {
 		return { kind: "connected", cdpUrl: configuredCdpUrl.replace(/\/+$/, "") };
 	}
-	const cmuxKind = resolveCmuxKind({
-		settingEnabled: cfgBrowserCmux.get(session.settings),
-	});
+	if (params.headed !== false && app?.tern !== false) {
+		const ternKind = resolveTernKind({ settingEnabled: cfgBrowserTern.get(session.settings) }, env);
+		if (ternKind) return ternKind;
+	}
+	const cmuxKind = resolveCmuxKind(
+		{
+			settingEnabled: cfgBrowserCmux.get(session.settings),
+		},
+		env,
+	);
 	if (cmuxKind) {
 		return cmuxKind;
 	}
+	return chromiumKind(params, session);
+}
+
+/** The Chromium browser an open launches when no attach/app mode applies. */
+function chromiumKind(params: BrowserParams, session: ToolSession): BrowserKind {
 	const headless = params.headed === undefined ? cfgBrowserHeadless.get(session.settings) : !params.headed;
 	return { kind: "headless", headless, allowFileAccess: params.allow_file_access };
 }
@@ -380,6 +419,12 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		}
 	}
 
+	/**
+	 * Open (or reuse) a tab. A Tern PiP chosen automatically (not forced with
+	 * `app.tern: true`) falls back to Chromium when Tern cannot host it — no
+	 * window, an unsupported platform, a refused or failed connection — and the
+	 * result says so; a tab that already fell back keeps its browser.
+	 */
 	async #open(
 		name: string,
 		params: BrowserParams,
@@ -387,11 +432,50 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
-		const kind = this.options.dedicatedAuditId
+		const resolved = this.options.dedicatedAuditId
 			? ({ kind: "audit", auditId: this.options.dedicatedAuditId } satisfies BrowserKind)
 			: this.options.isolatedHeadless
 				? ({ kind: "headless", headless: true } satisfies BrowserKind)
 				: resolveBrowserKind(params, this.session);
+		const autoTern = resolved.kind === "tern" && params.app?.tern !== true;
+		const existing = getTab(name, this.options.dedicatedAuditId);
+		const kind = autoTern && existing && existing.kindTag !== "tern" ? existing.browser.kind : resolved;
+		const startedAt = performance.now();
+		try {
+			return await this.#openOnKind(name, params, details, kind, timeoutMs, [], signal);
+		} catch (error) {
+			if (kind.kind !== "tern" || !autoTern || !isTernUnavailable(error) || signal?.aborted) throw error;
+			// A Tern tab under this name whose window went away still holds the name: release
+			// that one (and only that one) so the Chromium tab can take it.
+			if (getTab(name, this.options.dedicatedAuditId)?.kindTag === "tern") {
+				await releaseTab(name, { kill: false, timeoutMs, auditId: this.options.dedicatedAuditId }).catch(
+					() => false,
+				);
+			}
+			const note = `Tern cannot show a browser here (${error.message}); opened Chromium instead. Pass app.tern:false to skip Tern, or app.tern:true to require it.`;
+			logger.debug("Tern browser unavailable; falling back to Chromium", { error: error.message });
+			const remainingMs = Math.max(1, timeoutMs - (performance.now() - startedAt));
+			return await this.#openOnKind(
+				name,
+				params,
+				details,
+				chromiumKind(params, this.session),
+				remainingMs,
+				[note],
+				signal,
+			);
+		}
+	}
+
+	async #openOnKind(
+		name: string,
+		params: BrowserParams,
+		details: BrowserToolDetails,
+		kind: BrowserKind,
+		timeoutMs: number,
+		notes: readonly string[],
+		signal?: AbortSignal,
+	): Promise<AgentToolResult<BrowserToolDetails>> {
 		details.browser = kind.kind;
 
 		// If a tab with this name already exists on a different browser kind, fail fast — caller must close first.
@@ -485,6 +569,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 				`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(browser)}`,
 				`URL: ${url}`,
 				title ? `Title: ${title}` : null,
+				...notes,
 			].filter((l): l is string => typeof l === "string");
 			details.result = lines.join("\n");
 			return toolResult(details).text(lines.join("\n")).done();
@@ -610,6 +695,9 @@ async function saveBrowserOutputArtifact(session: ToolSession, fullText: string)
 }
 
 function describeBrowser(handle: BrowserHandle): string {
+	if ("tern" in handle) {
+		return `Tern browser picture-in-picture (pane ${handle.kind.pane})`;
+	}
 	if (!("browser" in handle)) {
 		return `cmux browser (${handle.kind.surface ?? "split"})`;
 	}
@@ -641,6 +729,8 @@ function describeKind(kind: BrowserKind): string {
 			return `relay:${kind.cdpUrl}`;
 		case "cmux":
 			return `cmux:${kind.surface ?? "split"}`;
+		case "tern":
+			return `tern:pane ${kind.pane}`;
 	}
 }
 
@@ -653,6 +743,7 @@ function sameBrowserKind(a: BrowserKind, b: BrowserKind): boolean {
 	if (a.kind === "connected" && b.kind === "connected") return a.cdpUrl === b.cdpUrl;
 	if (a.kind === "relay" && b.kind === "relay") return a.cdpUrl === b.cdpUrl;
 	if (a.kind === "cmux" && b.kind === "cmux") return a.socketPath === b.socketPath;
+	if (a.kind === "tern" && b.kind === "tern") return a.socketPath === b.socketPath && a.pane === b.pane;
 	return false;
 }
 

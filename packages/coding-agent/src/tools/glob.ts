@@ -8,7 +8,8 @@ import { Text } from "@oh-my-pi/pi-tui";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { formatGroupedPaths, hasFsCode, isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import { InternalUrlRouter, sessionResolveContext } from "../internal-urls";
+import { lookup as lookupSetting } from "../config/registry";
+import { InternalUrlRouter, type ResolveContext, sessionResolveContext } from "../internal-urls";
 import { InternalUrlFilesystem, type UrlFileStat } from "../internal-urls/url-filesystem";
 import { artifactsDirsForContext, isBoundResourceContext } from "../internal-urls/registry-helpers";
 import globDescription from "../prompts/tools/glob.md" with { type: "text" };
@@ -199,15 +200,39 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			}
 			const internalRouter = InternalUrlRouter.instance();
 			// Internal URLs resolve inside the native walk, bounded by the tier this call was approved at.
-			const resolveContext = sessionResolveContext(this.session, { signal });
+			const memoryBackend = lookupSetting("memory.backend")?.get(this.session.settings);
+			const resolveContext: ResolveContext = {
+				...sessionResolveContext(this.session, { signal }),
+				callerMemory: {
+					backend: typeof memoryBackend === "string" ? memoryBackend : undefined,
+					getMnemopiSessionState: this.session.getMnemopiSessionState,
+				},
+			};
 			const urlFilesystem = new InternalUrlFilesystem({
 				context: resolveContext,
 				tier: resolveToolTier(this, params),
 			});
-			const normalizedPatterns = aliasResolvedPatterns.map(pattern => internalRouter.normalize(pattern));
-			if (normalizedPatterns.some(pattern => pattern.length === 0)) {
+			const routedPatterns = aliasResolvedPatterns.map(pattern => internalRouter.normalize(pattern));
+			if (routedPatterns.some(pattern => pattern.length === 0)) {
 				throw new ToolError("`path` must contain non-empty globs or paths");
 			}
+			// A path scope authorizes host paths only, so a scoped session pins each
+			// internal URL root to its caller-bound backing path before preflight; an
+			// unbacked URL fails with its handler's diagnosis instead of a path error.
+			const normalizedPatterns = this.session.pathScope
+				? await Promise.all(
+						routedPatterns.map(async pattern => {
+							if (!internalRouter.canHandle(pattern)) return pattern;
+							const parsed = parseFindPattern(pattern);
+							const hostBase = await internalRouter.requireLocal(parsed.basePath, "glob", resolveContext, {
+								directory: true,
+							});
+							return parsed.hasGlob
+								? path.join(hostBase.replace(/[*?[{]/g, "[$&]"), parsed.globPattern)
+								: hostBase;
+						}),
+					)
+				: routedPatterns;
 
 			if (this.session.pathScope) {
 				const operation = this.session.pathScope.currentOperation();
@@ -275,6 +300,12 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 				throw new ToolError("Limit must be a positive number");
 			}
 			const effectiveLimit = Math.min(MAX_LIMIT, Math.max(1, Math.floor(requestedLimit)));
+			// A request above the hard cap is silently reduced today; say so up
+			// front so `limit=1000` no longer reads as "200 is all there is" (#13263).
+			const clampNotice =
+				requestedLimit > MAX_LIMIT
+					? `Requested limit ${requestedLimit} clamped to the max of ${MAX_LIMIT}`
+					: undefined;
 			const includeHidden = hidden ?? true;
 			const useGitignore = gitignore ?? true;
 			const timeoutMs = this.#timeoutMs;
@@ -336,6 +367,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 				const baseOutput = formatGroupedPaths(limited);
 				const trailingNotes: string[] = [];
 				if (notice) trailingNotes.push(notice);
+				if (clampNotice) trailingNotes.push(clampNotice);
 				if (missingPathsNote) trailingNotes.push(missingPathsNote);
 				const rawOutput = trailingNotes.length > 0 ? `${baseOutput}\n\n${trailingNotes.join("\n")}` : baseOutput;
 				const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
@@ -351,9 +383,21 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 				};
 
+				// Cap the doubled suggestion at MAX_LIMIT; once the reached count
+				// is already the cap there is no larger usable limit, so suppress
+				// the advice rather than recommend a value that clamps back (#13263).
+				const reachedLimit = limitMeta.resultLimit;
+				const cappedSuggestion =
+					reachedLimit === undefined ? undefined : Math.min(reachedLimit.reached * 2, MAX_LIMIT);
+				const resultLimitInput =
+					reachedLimit === undefined
+						? undefined
+						: cappedSuggestion !== undefined && cappedSuggestion > reachedLimit.reached
+							? { reached: reachedLimit.reached, suggestion: cappedSuggestion }
+							: { reached: reachedLimit.reached, suggestion: null };
 				const resultBuilder = toolResult(details)
 					.text(truncation.content)
-					.limits({ resultLimit: limitMeta.resultLimit?.reached });
+					.limits({ resultLimit: resultLimitInput });
 				if (truncation.truncated) {
 					resultBuilder.truncation(truncation, { direction: "head" });
 				}

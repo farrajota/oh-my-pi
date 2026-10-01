@@ -99,8 +99,9 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 			);
 
 			// Emit tool_result event - hooks can modify the result.
+			let resultResult: ToolResultEventResult | undefined;
 			if (this.hookRunner.hasHandlers("tool_result")) {
-				const resultResult = (await this.hookRunner.emit({
+				resultResult = (await this.hookRunner.emit({
 					type: "tool_result",
 					toolName: this.tool.name,
 					toolCallId,
@@ -112,28 +113,38 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 					details: result.details,
 					isError: result.isError === true,
 				})) as ToolResultEventResult | undefined;
-
-				if (resultResult) {
-					const effectiveError = resultResult.isError ?? result.isError === true;
-					if (!effectiveError && pendingAdditionalContext !== undefined) {
-						context?.addAdditionalContext?.(pendingAdditionalContext);
-					}
-					return {
-						content: resultResult.content ?? result.content,
-						details: (resultResult.details ?? result.details) as TDetails,
-						...(effectiveError ? { isError: true } : {}),
-					};
+				// tool_result context precedes the call's tool_call context, as in the agent loop.
+				if (isNonBlankContext(resultResult?.additionalContext)) {
+					context?.addAdditionalContext?.(resultResult.additionalContext);
 				}
 			}
 
-			if (result.isError !== true && pendingAdditionalContext !== undefined) {
+			// A hook may mark a successful call as failed, but a patch never turns a
+			// failed call into a success.
+			const effectiveError = result.isError === true || resultResult?.isError === true;
+			if (!effectiveError && pendingAdditionalContext !== undefined) {
 				context?.addAdditionalContext?.(pendingAdditionalContext);
 			}
+
+			// Apply modifications if any
+			if (
+				resultResult?.content !== undefined ||
+				resultResult?.details !== undefined ||
+				effectiveError !== (result.isError === true)
+			) {
+				return {
+					content: resultResult?.content ?? result.content,
+					details: (resultResult?.details ?? result.details) as TDetails,
+					...(effectiveError ? { isError: true } : {}),
+				};
+			}
+
 			return result;
 		} catch (err) {
-			// Emit tool_result event for errors so hooks can observe failures
+			// Emit tool_result event for errors so hooks can observe failures and
+			// attach failure-specific context; the result itself stays the error.
 			if (this.hookRunner.hasHandlers("tool_result")) {
-				await this.hookRunner.emit({
+				const failure = (await this.hookRunner.emit({
 					type: "tool_result",
 					toolName: this.tool.name,
 					toolCallId,
@@ -144,7 +155,10 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 					content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
 					details: undefined,
 					isError: true,
-				});
+				})) as ToolResultEventResult | undefined;
+				if (isNonBlankContext(failure?.additionalContext)) {
+					context?.addAdditionalContext?.(failure.additionalContext);
+				}
 			}
 			throw err; // Re-throw original error for agent-loop
 		}

@@ -1,17 +1,20 @@
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { TspSpan, TspTone } from "@oh-my-pi/pi-wire";
+import { span } from "../native/describe";
 import { Ellipsis, visibleWidth } from "../utils";
 import { formatMetricRow } from "../components/metric";
 import { renderProgressBar } from "../components/progress-bar";
 import { renderTableRow } from "../components/table";
 import { formatNumber } from "@oh-my-pi/pi-utils";
-import { type AgentHubSessionFacts, type AgentRecordLike, MAIN_AGENT_ID } from "./agent-hub-types";
+import type { ThemeColor } from "../theme/theme";
+import { type AgentHubSessionFacts, type AgentRecordLike, type AgentStatus, MAIN_AGENT_ID } from "./agent-hub-types";
 import { parseThinkingLevel } from "../thinking";
 import { TRUNCATE_LENGTHS, truncateToWidth } from "../render/render-utils";
 import { sanitizeDisplaySingleLine } from "./extensions/display-text";
 import type { ObservableSession } from "./session-observer-registry";
 import { theme } from "../theme/theme";
 import type { AgentMetrics } from "./agent-hub-projection";
-import { formatCost, formatElapsed } from "../tools/agent-tree";
+import { type AgentRoleDisplay, formatCost, formatElapsed } from "../tools/agent-tree";
 
 export { formatCost, formatRoleBadge, type AgentRoleDisplay } from "../tools/agent-tree";
 
@@ -39,18 +42,60 @@ export function clampHubLine(line: string, width: number): string {
 	return truncateToWidth(line.replace(/[\r\n]+/g, " "), Math.max(1, width), Ellipsis.Omit);
 }
 
-/** Status glyph, colored per theme status conventions. The title-line counts spell out the words. */
-export function statusGlyph(status: AgentRecordLike["status"]): string {
+/** Semantic tone of each roster status; shared by the ANSI glyphs and native spans. */
+const STATUS_TONE = {
+	running: "accent",
+	idle: "success",
+	parked: "muted",
+	aborted: "error",
+} as const satisfies Record<AgentStatus, TspTone & ThemeColor>;
+
+function statusSymbol(status: AgentStatus): string {
 	switch (status) {
 		case "running":
-			return theme.fg("accent", theme.status.running);
+			return theme.status.running;
 		case "idle":
-			return theme.fg("success", theme.status.enabled);
+			return theme.status.enabled;
 		case "parked":
-			return theme.fg("muted", theme.status.shadowed);
+			return theme.status.shadowed;
 		case "aborted":
-			return theme.fg("error", theme.status.aborted);
+			return theme.status.aborted;
 	}
+}
+
+/** Status glyph, colored per theme status conventions. The title-line counts spell out the words. */
+export function statusGlyph(status: AgentRecordLike["status"]): string {
+	return theme.fg(STATUS_TONE[status], statusSymbol(status));
+}
+
+/** Native tone for a roster status. */
+export function statusTone(status: AgentStatus): TspTone {
+	return STATUS_TONE[status];
+}
+
+/** Picker status dot per roster status: running agents take the live `pending` dot (§9.1). */
+const STATUS_DOT = {
+	running: "pending",
+	idle: "success",
+	parked: "muted",
+	aborted: "error",
+} as const satisfies Record<AgentStatus, TspTone>;
+
+/** Picker row dot for a roster status. */
+export function statusDot(status: AgentStatus): TspTone {
+	return STATUS_DOT[status];
+}
+
+const ASSIGNMENT_PREFIX = /^\s*Complete assignment thoroughly:\s*/i;
+
+/** One-line task summary: the subagent prompt's fixed assignment preamble is not part of the task. */
+export function taskSummary(task: string): string {
+	return sanitizeDisplaySingleLine(task.replace(ASSIGNMENT_PREFIX, ""));
+}
+
+/** Native span of {@link statusGlyph}. */
+export function statusGlyphSpan(status: AgentStatus): TspSpan {
+	return span(statusSymbol(status), STATUS_TONE[status]);
 }
 
 export function statusText(status: AgentRecordLike["status"], text: string): string {
@@ -66,16 +111,56 @@ export function statusText(status: AgentRecordLike["status"], text: string): str
 	}
 }
 
+function showsThinkingLevel(level: ThinkingLevel | undefined): level is Exclude<ThinkingLevel, "off" | "inherit"> {
+	return level !== undefined && level !== ThinkingLevel.Off && level !== ThinkingLevel.Inherit;
+}
+
 /** Model id + thinking level (`sonnet-4-6 ◒ high`), level colored per theme. */
 function formatModelBadge(modelId: string, level: ThinkingLevel | undefined): string {
 	const model = theme.fg("muted", sanitizeDisplaySingleLine(modelId));
-	if (!level || level === ThinkingLevel.Off || level === ThinkingLevel.Inherit) return model;
+	if (!showsThinkingLevel(level)) return model;
 	const display = theme.thinking[level] ?? level;
 	return `${model} ${theme.getThinkingBorderColor(level)(display)}`;
 }
 
-/** Format a resolved selector, preserving provider identity when requested. */
-function formatResolvedModelBadge(resolved: string, preserveProvider = false, fallbackLevel?: ThinkingLevel): string {
+/** Theme token matching {@link Theme.getThinkingBorderColor} for native spans. */
+function thinkingToken(level: ThinkingLevel): ThemeColor {
+	switch (level) {
+		case ThinkingLevel.Minimal:
+			return "thinkingMinimal";
+		case ThinkingLevel.Low:
+			return "thinkingLow";
+		case ThinkingLevel.Medium:
+			return "thinkingMedium";
+		case ThinkingLevel.High:
+			return "thinkingHigh";
+		case ThinkingLevel.XHigh:
+		case ThinkingLevel.Max:
+			return "thinkingXhigh";
+		default:
+			return "thinkingOff";
+	}
+}
+
+/** Native span of {@link formatRoleBadge}. */
+export function roleBadgeSpan(role: string, info: AgentRoleDisplay): TspSpan {
+	return span(sanitizeDisplaySingleLine(info.tag ?? info.name ?? role), info.color ?? "muted");
+}
+
+/** Model label and reasoning level a hub row reports; `fallback` marks a fallback model serving. */
+interface ResolvedModelBadge {
+	model: string;
+	level: ThinkingLevel | undefined;
+	fallback: boolean;
+}
+
+/** Resolve a selector, preserving provider identity when requested. */
+function resolveSelectorBadge(
+	resolved: string,
+	fallback: boolean,
+	preserveProvider: boolean,
+	fallbackLevel: ThinkingLevel | undefined,
+): ResolvedModelBadge {
 	const cleanResolved = sanitizeDisplaySingleLine(resolved);
 	// Model ids may themselves contain colons (`qwen3:14b`), so only treat the
 	// suffix as a thinking level when it parses as one.
@@ -83,7 +168,7 @@ function formatResolvedModelBadge(resolved: string, preserveProvider = false, fa
 	const explicitLevel = colon >= 0 ? parseThinkingLevel(cleanResolved.slice(colon + 1)) : undefined;
 	const selector = explicitLevel !== undefined ? cleanResolved.slice(0, colon) : cleanResolved;
 	const label = preserveProvider ? selector : selector.slice(selector.indexOf("/") + 1);
-	return formatModelBadge(label, explicitLevel ?? fallbackLevel);
+	return { model: label, level: explicitLevel ?? fallbackLevel, fallback };
 }
 
 /**
@@ -96,11 +181,11 @@ function formatResolvedModelBadge(resolved: string, preserveProvider = false, fa
  * the session merely points at: an armed fallback that has not served yet stays
  * attributed to whichever model last actually spoke.
  */
-export function modelBadge(
+function resolveModelBadge(
 	ref: AgentRecordLike,
 	observed: ObservableSession | undefined,
-	sessionFacts?: AgentHubSessionFacts,
-): string | undefined {
+	sessionFacts: AgentHubSessionFacts | undefined,
+): ResolvedModelBadge | undefined {
 	const progress = observed?.progress;
 	const liveThinkingLevel = sessionFacts?.thinkingLevel;
 	const serving = sessionFacts?.servingModel;
@@ -108,16 +193,70 @@ export function modelBadge(
 		(serving?.isFallback ? serving.selector : undefined) ??
 		(progress?.resolvedModelIsFallback ? progress.resolvedModel : undefined) ??
 		(ref.history?.resolvedModelIsFallback ? ref.history.resolvedModel : undefined);
-	if (fallbackSelector) {
-		return `${theme.fg("warning", "fallback →")} ${formatResolvedModelBadge(fallbackSelector, true, liveThinkingLevel)}`;
-	}
+	if (fallbackSelector) return resolveSelectorBadge(fallbackSelector, true, true, liveThinkingLevel);
 	const resolvedModel = progress?.resolvedModel ?? ref.history?.resolvedModel ?? serving?.selector;
-	if (resolvedModel) return formatResolvedModelBadge(resolvedModel, false, liveThinkingLevel);
+	if (resolvedModel) return resolveSelectorBadge(resolvedModel, false, false, liveThinkingLevel);
 	const modelId = sessionFacts?.modelId;
 	if (!modelId) return undefined;
-	const modelSupportsThinking = sessionFacts?.modelSupportsThinking;
-	const level = modelSupportsThinking ? liveThinkingLevel : undefined;
-	return formatModelBadge(modelId, level);
+	return {
+		model: modelId,
+		level: sessionFacts?.modelSupportsThinking ? liveThinkingLevel : undefined,
+		fallback: false,
+	};
+}
+
+export function modelBadge(
+	ref: AgentRecordLike,
+	observed: ObservableSession | undefined,
+	sessionFacts?: AgentHubSessionFacts,
+): string | undefined {
+	const badge = resolveModelBadge(ref, observed, sessionFacts);
+	if (!badge) return undefined;
+	const text = formatModelBadge(badge.model, badge.level);
+	return badge.fallback ? `${theme.fg("warning", "fallback →")} ${text}` : text;
+}
+
+/** A picker chip for the model that produced a row's work: label plus thinking-level colour token. */
+export interface ModelChip {
+	text: string;
+	/** Thinking level shown next to the model (`low`), when the model reasons. */
+	level?: string;
+	/** Theme token of {@link level}. */
+	dot?: string;
+	fallback: boolean;
+}
+
+/** Structured {@link modelBadge} for picker chips. */
+export function modelChip(
+	ref: AgentRecordLike,
+	observed: ObservableSession | undefined,
+	sessionFacts?: AgentHubSessionFacts,
+): ModelChip | undefined {
+	const badge = resolveModelBadge(ref, observed, sessionFacts);
+	if (!badge) return undefined;
+	return {
+		text: sanitizeDisplaySingleLine(badge.model),
+		level: showsThinkingLevel(badge.level) ? badge.level : undefined,
+		dot: showsThinkingLevel(badge.level) ? thinkingToken(badge.level) : undefined,
+		fallback: badge.fallback,
+	};
+}
+
+/** Native spans of {@link modelBadge}. */
+export function modelBadgeSpans(
+	ref: AgentRecordLike,
+	observed: ObservableSession | undefined,
+	sessionFacts?: AgentHubSessionFacts,
+): TspSpan[] | undefined {
+	const badge = resolveModelBadge(ref, observed, sessionFacts);
+	if (!badge) return undefined;
+	const spans: TspSpan[] = [];
+	if (badge.fallback) spans.push(span("fallback → ", "warning"));
+	spans.push(span(sanitizeDisplaySingleLine(badge.model), "muted"));
+	if (showsThinkingLevel(badge.level)) {
+		spans.push(span(` ${theme.thinking[badge.level] ?? badge.level}`, thinkingToken(badge.level)));
+	}
+	return spans;
 }
 
 export function formatMetricDuration(metrics: AgentMetrics): string | undefined {
@@ -138,6 +277,17 @@ export function formatMetrics(metrics: AgentMetrics): string {
 		],
 		{ separator: theme.sep.dot },
 	);
+}
+
+/** Plain-text {@link formatMetrics} for native spans. */
+export function metricsText(metrics: AgentMetrics): string {
+	return [
+		formatCost(metrics.cost),
+		formatMetricDuration(metrics) ?? "time —",
+		`${formatNumber(metrics.requests)} req`,
+		`${formatNumber(metrics.tools)} tools`,
+		`${formatNumber(metrics.tokens)} tok`,
+	].join(theme.sep.dot);
 }
 
 /** Row-grid variant of {@link formatMetrics}: fixed-width cells so every agent's metadata

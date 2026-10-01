@@ -61,7 +61,8 @@ interface RefLookup {
 	visible: AgentRef[];
 	/** Caller root's artifact dir, scanned first by on-disk fallbacks. */
 	preferredArtifactDir?: string;
-	registry: AgentRegistry;
+	/** Undefined for bound callers without their own registry: they never fall back to the global one. */
+	registry?: AgentRegistry;
 }
 
 /** True for `history://current/full`; throws unless selectors are the only suffix. */
@@ -314,7 +315,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		if (!agentId) return null;
 		const { ref, preferredArtifactDir, registry } = await this.#lookup(agentId, context);
 		if (ref?.sessionFile) return ref.sessionFile;
-		if (ref && lookupAgentRef(registry, ref.id)?.session) return null;
+		if (ref && registry && lookupAgentRef(registry, ref.id)?.session) return null;
 		return (await this.#findOnDisk(ref?.id ?? agentId, context, preferredArtifactDir))?.file ?? null;
 	}
 
@@ -323,19 +324,21 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 	 * skipping advisor transcripts.
 	 */
 	async #lookup(agentId: string, context: ResolveContext | undefined): Promise<RefLookup> {
-		const registry = context?.agentRegistry ?? AgentRegistry.global();
-		// Refresh the caller root before resolving possibly parked agents; a
-		// same-named ref restored from another root must not shadow its transcript.
-		const rootSessionFile = context?.sessionFile
-			? await ensurePersistedRoster(registry, context.sessionFile)
-			: undefined;
 		const bound = isBoundResourceContext(context);
+		const registry = context?.agentRegistry ?? (bound ? undefined : AgentRegistry.global());
 		const dirs = artifactsDirsForContext(context);
 		if (bound && dirs.length === 0) throw new Error("No caller-owned history available");
+		// Refresh the caller root before resolving possibly parked agents; a
+		// same-named ref restored from another root must not shadow its transcript.
+		// The bare index never rehydrates the roster: listing must not register refs.
+		const rootSessionFile =
+			agentId && registry && context?.sessionFile
+				? await ensurePersistedRoster(registry, context.sessionFile)
+				: undefined;
 		const preferredArtifactDir = rootSessionFile?.slice(0, -".jsonl".length);
 		// Advisor transcripts are observability-only — surfaced in the Agent Hub,
 		// never in the agent-facing roster, lookup, or completions.
-		const visible = agentRefsForContext(registry, context).filter(ref => ref.kind !== "advisor");
+		const visible = registry ? agentRefsForContext(registry, context).filter(ref => ref.kind !== "advisor") : [];
 		const lower = agentId.toLowerCase();
 		const ref =
 			visible.find(candidate => candidate.id === agentId) ??
@@ -384,7 +387,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 
 		const notes: string[] = [];
 		let messages: unknown[];
-		const liveSession = lookupAgentRef(registry, ref.id)?.session;
+		const liveSession = registry ? lookupAgentRef(registry, ref.id)?.session : undefined;
 		if (liveSession) {
 			messages = liveSession.messages;
 			notes.push("Source: live session");

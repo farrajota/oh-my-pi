@@ -8,7 +8,6 @@ import { Text } from "@oh-my-pi/pi-tui";
 import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { getEditStore } from "../edit/store";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
@@ -23,7 +22,8 @@ import { materializeReadUrlToFile, parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file-recorder";
 import {
 	classifyGroupedLines,
-	formatGroupedFiles,
+	type FileMatchSection,
+	formatFileMatches,
 	groupLineIndicesByBlank,
 } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import { formatMatchLine } from "@oh-my-pi/pi-tui/tools/match-line-format";
@@ -369,7 +369,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 			}
 			const outputLines: string[] = [];
 			const displayLines: string[] = [];
-			const renderMatchesForFile = (relativePath: string): { model: string[]; display: string[] } => {
+			const renderMatchesForFile = (relativePath: string): FileMatchSection => {
 				const modelOut: string[] = [];
 				const displayOut: string[] = [];
 				const fileMatches = matchesByFile.get(relativePath) ?? [];
@@ -407,38 +407,12 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 						modelOut.join("\n"),
 					);
 				}
-				return { model: modelOut, display: displayOut };
+				return { model: modelOut, display: displayOut, tag: hashContext?.tag };
 			};
 
-			if (isDirectory) {
-				const grouped = formatGroupedFiles(fileList, relativePath => {
-					const rendered = renderMatchesForFile(relativePath);
-					const hashContext = hashContexts.get(relativePath);
-					return {
-						modelLines: rendered.model,
-						displayLines: rendered.display,
-						headerSuffix: hashContext?.tag ? `#${hashContext.tag}` : "",
-						skip: rendered.model.length === 0,
-					};
-				});
-				outputLines.push(...grouped.model);
-				displayLines.push(...grouped.display);
-			} else {
-				for (const relativePath of fileList) {
-					const rendered = renderMatchesForFile(relativePath);
-					if (rendered.model.length === 0) continue;
-					if (outputLines.length > 0) {
-						outputLines.push("");
-						displayLines.push("");
-					}
-					const hashContext = hashContexts.get(relativePath);
-					if (hashContext?.tag) {
-						outputLines.push(formatHashlineHeader(relativePath, hashContext.tag));
-					}
-					outputLines.push(...rendered.model);
-					displayLines.push(...rendered.display);
-				}
-			}
+			const matchOutput = formatFileMatches(fileList, isDirectory, renderMatchesForFile);
+			outputLines.push(...matchOutput.model);
+			displayLines.push(...matchOutput.display);
 
 			const details: AstGrepToolDetails = {
 				...baseDetails,

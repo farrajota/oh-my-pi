@@ -8,6 +8,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { snapshotEffectiveExtensionRoots } from "../capability/types";
 import {
 	resolveAgentModelSelection,
@@ -27,6 +28,7 @@ import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import isolationRecoveryHintTemplate from "../prompts/tools/isolation-recovery-hint.md" with { type: "text" };
+import salvagedChildHintTemplate from "../prompts/tools/salvaged-child-hint.md" with { type: "text" };
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
@@ -124,6 +126,8 @@ export interface StructuredSubagentRequest {
 	schemaMode?: StructuredSubagentSchemaMode;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
 	effort?: TaskEffort;
+	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
+	solutionSpace?: string;
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -199,11 +203,18 @@ export interface StructuredSubagentResult {
 /** Machine-readable failure category so adapters can retain their native errors. */
 export class StructuredSubagentError extends Error {
 	readonly kind: "preflight" | "isolation" | "execution";
+	/** The child's settled result, when the child finished before a later step failed. */
+	readonly result?: SingleResult;
 
-	constructor(kind: "preflight" | "isolation" | "execution", message: string, options?: ErrorOptions) {
+	constructor(
+		kind: "preflight" | "isolation" | "execution",
+		message: string,
+		options?: ErrorOptions & { result?: SingleResult },
+	) {
 		super(message, options);
 		this.name = "StructuredSubagentError";
 		this.kind = kind;
+		this.result = options?.result;
 	}
 }
 
@@ -322,7 +333,11 @@ export async function resolveEffectiveSubagentPolicy(
 	const agent = getAgent(discovery.agents, agentName);
 	if (!agent) {
 		const available = discovery.agents.map(candidate => candidate.name).join(", ") || "none";
-		throw new StructuredSubagentError("preflight", `Unknown agent "${agentName}". Available: ${available}`);
+		const searched = discovery.searchedDirs?.map(dir => shortenPath(dir)).join(", ") || "none";
+		throw new StructuredSubagentError(
+			"preflight",
+			`Unknown agent "${agentName}". Available: ${available}. Searched: ${searched}`,
+		);
 	}
 	const disabledAgents = cfgTaskDisabledAgents.get(settings);
 	if (disabledAgents.includes(agentName)) {
@@ -551,6 +566,7 @@ function buildRunSubprocessOptions(
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
+		solutionSpace: request.solutionSpace?.trim() || undefined,
 		...(policy.schema.source === "none"
 			? {}
 			: {
@@ -574,6 +590,7 @@ function buildRunSubprocessOptions(
 		modelRegistry: session.modelRegistry,
 		settings: request.settings ?? session.settings,
 		skillsSettings: session.skillsSettings,
+		inheritedSessionAgents: session.getSessionAgents?.(),
 		mcpManager: enableMCP ? session.mcpManager : undefined,
 		enableMCP,
 		customTools: request.customTools,
@@ -713,6 +730,19 @@ function attachStructuredOutputMetadata(result: SingleResult, schema: Structured
 	};
 }
 
+/** Name a settled child's exit status and artifact for a post-settle failure message. */
+export function describeSalvagedWork(result: SingleResult): string {
+	const hint = prompt.render(salvagedChildHintTemplate, {
+		aborted: result.aborted,
+		abortReason: result.abortReason,
+		exitCode: result.exitCode,
+		error: result.error,
+		id: result.id,
+		outputPath: result.outputPath,
+	});
+	return `\n${hint.trim()}`;
+}
+
 /**
  * Execute a validated subagent. Preflight errors occur before any artifact
  * lease or child dispatch; callers keep responsibility for their result text.
@@ -735,6 +765,11 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 	let completedSuccessfully = false;
 	let hasValidStructuredOutput = false;
 	let deferredCleanup: Promise<void> | undefined;
+	// Set once the child returns: every later step (structured-output
+	// metadata, isolation merge, nested patch apply) can still throw, and the
+	// failure must carry the exit status and artifact the child produced.
+	let settled: SingleResult | undefined;
+	let retainSalvagedArtifact = false;
 	const onSubprocessResult =
 		request.invocationKind === "eval"
 			? (result: SingleResult) => request.session.recordEvalSubagentUsage?.(result.usage?.output ?? 0)
@@ -780,6 +815,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				onSubprocessResult,
 			});
 		}
+		settled = result;
 		attachStructuredOutputMetadata(result, policy.schema);
 		hasValidStructuredOutput = result.structuredOutput?.status === "valid";
 		requiresRecoveryArtifacts =
@@ -841,14 +877,18 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 		};
 	} catch (error) {
 		if (error instanceof StructuredSubagentError) throw error;
+		// The failure message points the parent at the artifact, so it must
+		// survive the cleanup below.
+		retainSalvagedArtifact = settled?.outputPath !== undefined;
 		throw new StructuredSubagentError(
 			"execution",
-			`Subagent execution failed: ${error instanceof Error ? error.message : String(error)}`,
-			{ cause: error },
+			`Subagent execution failed: ${error instanceof Error ? error.message : String(error)}${settled ? describeSalvagedWork(settled) : ""}`,
+			{ cause: error, result: settled },
 		);
 	} finally {
 		const shouldRetainArtifacts =
 			request.detached === true ||
+			retainSalvagedArtifact ||
 			(request.retainArtifacts && (completedSuccessfully || hasValidStructuredOutput)) ||
 			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
 		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;

@@ -281,7 +281,8 @@ describe("read and write route xd:// device URLs", () => {
 			if (typeof approval !== "function") throw new Error("expected a function approval");
 			const tier = (path: string, content: string) => approval({ path, content });
 
-			// ast_edit on a filesystem path → write; on read-tier sandbox URLs only → read.
+			// ast_edit on a filesystem path → write. The fork keeps local:// writes at
+			// write tier, so an ast_edit confined to local:// is write as well.
 			const astFsPath = JSON.stringify({
 				ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
 				paths: [filePath],
@@ -291,7 +292,7 @@ describe("read and write route xd:// device URLs", () => {
 				paths: ["local://notes.ts"],
 			});
 			expect(tier("xd://ast_edit", astFsPath)).toEqual({ tier: "write", policyKey: "ast_edit" });
-			expect(tier("xd://ast_edit", astInternalPath)).toEqual({ tier: "read", policyKey: "ast_edit" });
+			expect(tier("xd://ast_edit", astInternalPath)).toEqual({ tier: "write", policyKey: "ast_edit" });
 
 			// debug: inspection action → read; a real launch → exec (control).
 			expect(tier("xd://debug", JSON.stringify({ action: "sessions" }))).toEqual({

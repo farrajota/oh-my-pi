@@ -1,5 +1,8 @@
 import * as fs from "node:fs/promises";
 import { isEnoent } from "@oh-my-pi/pi-utils";
+import { type InternalAgentRef, lookupAgentRef } from "../../internal/agent-registry-bridge";
+import { AgentRegistry } from "../../registry/agent-registry";
+import type { AgentSession } from "../../session/agent-session";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
 import { type AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
@@ -262,4 +265,40 @@ export class RpcSubagentRegistry {
 
 		throw new Error("get_subagent_messages requires subagentId or sessionFile");
 	}
+}
+
+/** A running subagent from this session's roster, bound to its live registry ref. */
+export interface RpcOwnedSubagent {
+	/** Internal registry ref: stable identity across lookups, carries the live session. */
+	ref: InternalAgentRef;
+	session: AgentSession;
+}
+
+/**
+ * Resolve a `get_subagents` id to its running, live registry ref, or
+ * `undefined` when the host must not reach it (unknown, finished, accepted,
+ * parked, aborted, or another session's agent).
+ *
+ * Agent ids are unique only within one parent session's artifacts scope, and
+ * the process-global registry keeps the latest ref per id, so the ref must
+ * carry the transcript file this session's roster recorded
+ * (`<artifactsDir>/<id>.jsonl`). The ref must also still be `running`: it goes
+ * `idle` once the parent accepts its result, before the terminal lifecycle
+ * frame prunes the roster, and a running ref always holds a live session.
+ */
+export function resolveOwnedLiveSubagent(
+	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
+	subagentId: string,
+	agentRegistry: AgentRegistry = AgentRegistry.global(),
+): RpcOwnedSubagent | undefined {
+	const snapshot = subagentRegistry.getSubagents().find(candidate => candidate.id === subagentId);
+	// Progress can briefly report a terminal status before the terminal
+	// lifecycle frame prunes the snapshot; treat that as not running.
+	if ((snapshot?.status !== "running" && snapshot?.status !== "pending") || !snapshot.sessionFile) return undefined;
+	// Public observations carry no session handle; the bridge resolves the live ref.
+	const ref = lookupAgentRef(agentRegistry, subagentId);
+	if (ref?.kind !== "sub" || ref.status !== "running" || !ref.session || ref.sessionFile !== snapshot.sessionFile) {
+		return undefined;
+	}
+	return { ref, session: ref.session };
 }

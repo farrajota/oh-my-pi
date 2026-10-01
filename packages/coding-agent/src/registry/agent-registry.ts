@@ -19,7 +19,8 @@ import {
 } from "../internal/agent-registry-bridge";
 import { deriveRestrictedStartupPolicy } from "../internal/restricted-startup-policy";
 import type { AgentSession } from "../session/agent-session";
-import { createAgentSession, type CreateAgentSessionOptions, type CreateAgentSessionResult } from "../sdk";
+import type * as Sdk from "../sdk";
+import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../sdk";
 import {
 	composeEffectivePermissions,
 	freezePermissionScope,
@@ -317,6 +318,13 @@ export interface AgentAuthoritySessionBinding {
 export interface AgentRegistryOptions {
 	readonly durableState?: RegistryDurableStateStore;
 }
+
+// sdk is loaded on first construction, not imported statically: it pulls in the full tool
+// tree, and a static import closes a cycle (settings -> ... -> registry -> sdk -> tts-client
+// -> model-worker-host -> settings) that leaves module-level worker clients in their TDZ.
+// Caching the namespace keeps later constructions free of extra async hops, so they keep
+// their ordering against quiesce and cancellation.
+let sdkModule: typeof Sdk | undefined;
 
 export class AgentRegistry {
 	static #global: AgentRegistry | undefined;
@@ -746,7 +754,8 @@ export class AgentRegistry {
 				if (!revival) this.#durableState?.append({ ...durableConstruction, at: Date.now(), phase: "constructing" });
 				let constructed: CreateAgentSessionResult | undefined;
 				try {
-					constructed = await createAgentSession(creationOptions);
+					sdkModule ??= await import("../sdk");
+					constructed = await sdkModule.createAgentSession(creationOptions);
 					if (
 						parentAuthority &&
 						(this.#refs.get(reservation.parentId!) !== parentAuthority.ref ||

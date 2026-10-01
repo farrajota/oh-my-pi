@@ -229,7 +229,6 @@ async function awaitPrimaryStateRebuild(session: AgentSession): Promise<void> {
  * identical settings changes no setting, yet must still re-route the bank.
  */
 export async function rebindMemoryBackendForCwd(session: AgentSession): Promise<void> {
-	if (!session.memoryEnabled) return;
 	await session.settleMemoryBackend();
 	// Other backends have no Hindsight rebuild path. Reapply them on an
 	// explicit cwd move, but let an in-flight Hindsight transition finish (or
@@ -244,7 +243,12 @@ export async function rebindMemoryBackendForCwd(session: AgentSession): Promise<
 	await awaitPrimaryStateRebuild(session);
 
 	// Startup is best-effort, but a move must not commit an unusable memory backend.
-	if (cfgMemoryBackend.get(session.settings) === "mnemopi" && !session.getMnemopiSessionState()) {
+	// Sessions without a memory lifecycle (restricted, subagent) never own a mnemopi state.
+	if (
+		session.memoryBackendEnabled() &&
+		cfgMemoryBackend.get(session.settings) === "mnemopi" &&
+		!session.getMnemopiSessionState()
+	) {
 		throw new Error("Mnemopi backend failed to initialise for the destination cwd.");
 	}
 }

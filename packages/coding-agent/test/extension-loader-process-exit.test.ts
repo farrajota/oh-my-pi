@@ -16,7 +16,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("extension/hook loader process.exit guard (#3680)", () => {
 	let project: TempDir | undefined;
-	const childWatchdogTimeoutMs = 10_000;
+	const childWatchdogTimeoutMs = 20_000;
 
 	beforeEach(() => {
 		project = TempDir.createSync("@omp-exit-guard-");
@@ -44,6 +44,7 @@ describe("extension/hook loader process.exit guard (#3680)", () => {
 			stderr: "pipe",
 		});
 		// Real process signals cannot use fake timers; this only bounds a wedged child.
+		// 2 s SIGKILLed healthy children (exit 137) on loaded CI runners.
 		const watchdog = setTimeout(() => {
 			try {
 				proc.kill("SIGKILL");

@@ -37,6 +37,7 @@ import type {
 	UrlCompletion,
 	WriteContext,
 } from "./types";
+import { formatByteSize } from "../utils/video";
 
 export interface LocalProtocolOptions {
 	getArtifactsDir?: () => string | null;
@@ -141,17 +142,8 @@ const BINARY_FILE_EXTENSIONS = new Set([
 	".zip",
 ]);
 
-function formatLocalByteSize(bytes: number): string {
-	if (bytes < 1024) return `${bytes} B`;
-	const kib = bytes / 1024;
-	if (kib < 1024) return `${kib.toFixed(1)} KiB`;
-	const mib = kib / 1024;
-	if (mib < 1024) return `${mib.toFixed(1)} MiB`;
-	return `${(mib / 1024).toFixed(1)} GiB`;
-}
-
 function buildNonTextLocalResource(url: InternalUrl, filePath: string, size: number, reason: string): InternalResource {
-	const content = `[Cannot read binary local:// file '${url.href}' (${formatLocalByteSize(size)}): ${reason}. This resource is not text. Use a metadata/key-frame/video-specific workflow instead.]`;
+	const content = `[Cannot read binary local:// file '${url.href}' (${formatByteSize(size)}): ${reason}. This resource is not text. Use a metadata/key-frame/video-specific workflow instead.]`;
 	return {
 		url: url.href,
 		content,
@@ -163,7 +155,7 @@ function buildNonTextLocalResource(url: InternalUrl, filePath: string, size: num
 }
 
 function buildLargeLocalTextResource(url: InternalUrl, filePath: string, size: number): InternalResource {
-	const content = `[Cannot materialize local:// file '${url.href}' as an internal text resource (${formatLocalByteSize(size)} exceeds ${formatLocalByteSize(LOCAL_TEXT_RESOURCE_MAX_BYTES)}). Use the read tool's filesystem path handling or a line selector so content is streamed with file-size safeguards.]`;
+	const content = `[Cannot materialize local:// file '${url.href}' as an internal text resource (${formatByteSize(size)} exceeds ${formatByteSize(LOCAL_TEXT_RESOURCE_MAX_BYTES)}). Use the read tool's filesystem path handling or a line selector so content is streamed with file-size safeguards.]`;
 	return {
 		url: url.href,
 		content,
@@ -608,7 +600,11 @@ export async function prepareLocalFileWrite(url: InternalUrl, context?: WriteCon
  */
 export class LocalProtocolHandler implements ProtocolHandler {
 	readonly scheme = "local";
-	/** Session scratch space: `write` persists through its file pipeline via `locate({ create })`, approved at read tier. */
+	/**
+	 * Session scratch space: `write` persists through its file pipeline via `locate({ create })`.
+	 * Fork contract: local:// is a writable handler, so its writes keep write-tier approval
+	 * (fail-closed) instead of upstream's read tier.
+	 */
 	readonly spec: SchemeSpec = {
 		backing: "file",
 		selectors: "lines",
@@ -617,7 +613,7 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		linkable: true,
 		imageQuestion: true,
 		singleSlashAlias: true,
-		write: { via: "file", payload: "text", scope: "sandbox", tier: () => "read" },
+		write: { via: "file", payload: "text", scope: "sandbox", tier: () => "write" },
 	};
 
 	static #override: LocalProtocolOptions | undefined;

@@ -400,7 +400,9 @@ describe("history:// protocol", () => {
 			session: fakeLiveSession([{ role: "user", content: "hello from live", timestamp: 1 }]),
 			status: "idle",
 		});
-		const tool = new ReadTool(makeToolSession(os.tmpdir(), null));
+		// Unbound legacy caller (no session file, artifacts dir, or registry): it
+		// sees the process-global registry, where HubAgent lives.
+		const tool = new ReadTool(makeToolSession(os.tmpdir(), null, { getArtifactsDir: undefined }));
 
 		const result = await tool.execute("history-range", { path: "history://HubAgent:1-1" });
 		const output = result.content.find(content => content.type === "text");

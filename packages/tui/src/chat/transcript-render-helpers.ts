@@ -63,22 +63,22 @@ export function buildAsyncResultBlock(message: CustomOrHookMessage): ToolActivit
 		const duration = typeof job.durationMs === "number" ? formatDuration(job.durationMs) : undefined;
 		rows.push({
 			parts: [
-				theme.fg("success", `${theme.status.done} Background job completed`),
-				theme.fg("dim", typeLabel),
-				theme.fg("accent", jobId),
-				duration ? theme.fg("dim", `(${duration})`) : undefined,
+				{ text: `${theme.status.done} Background job completed`, color: "success" },
+				{ text: typeLabel, color: "dim" },
+				{ text: jobId, color: "accent" },
+				duration ? { text: `(${duration})`, color: "dim" } : undefined,
 			],
 		});
 		if (job.meta?.artifactError) {
-			rows.push({ parts: [theme.fg("warning", formatArtifactErrorNotice(job.meta.artifactError))] });
+			rows.push({ parts: [{ text: formatArtifactErrorNotice(job.meta.artifactError), color: "warning" }] });
 		} else if (job.followUpSaveFailed) {
 			rows.push({
-				parts: [theme.fg("warning", "Full async output could not be saved; only the preview is available.")],
+				parts: [{ text: "Full async output could not be saved; only the preview is available.", color: "warning" }],
 			});
 		}
 	}
 	if (details?.meta?.artifactError) {
-		rows.push({ parts: [theme.fg("warning", formatArtifactErrorNotice(details.meta.artifactError))] });
+		rows.push({ parts: [{ text: formatArtifactErrorNotice(details.meta.artifactError), color: "warning" }] });
 	}
 	return new ToolActivityContainer(new TranscriptStatusBlock(rows));
 }
@@ -93,7 +93,7 @@ export function buildLaunchCompletionBlock(message: CustomOrHookMessage): ToolAc
 	const rows: TranscriptStatusRow[] = [];
 	const daemons = details?.daemons ?? [];
 	if (daemons.length === 0 && typeof message.content === "string") {
-		rows.push({ parts: [theme.fg("dim", `${theme.status.done} ${message.content}`)] });
+		rows.push({ parts: [{ text: `${theme.status.done} ${message.content}`, color: "dim" }] });
 	}
 	for (const daemon of daemons) {
 		const failed = daemon.state === "failed" || (daemon.exitCode !== undefined && daemon.exitCode !== 0);
@@ -104,11 +104,11 @@ export function buildLaunchCompletionBlock(message: CustomOrHookMessage): ToolAc
 		rows.push({
 			parts: [
 				failed
-					? theme.fg("error", `${theme.status.error} Supervised process failed`)
-					: theme.fg("success", `${theme.status.done} Supervised process completed`),
-				theme.fg("accent", daemon.name),
-				daemon.exitCode !== undefined ? theme.fg("dim", `(exit ${daemon.exitCode})`) : undefined,
-				duration ? theme.fg("dim", `(${duration})`) : undefined,
+					? { text: `${theme.status.error} Supervised process failed`, color: "error" }
+					: { text: `${theme.status.done} Supervised process completed`, color: "success" },
+				{ text: daemon.name, color: "accent" },
+				daemon.exitCode !== undefined ? { text: `(exit ${daemon.exitCode})`, color: "dim" } : undefined,
+				duration ? { text: `(${duration})`, color: "dim" } : undefined,
 			],
 		});
 	}
@@ -178,9 +178,10 @@ export function buildFileMentionBlock(files: FileMentionMessage["files"], indent
 		}
 		rows.push({
 			parts: [
-				`${theme.fg("dim", `${theme.tree.last} `)}${theme.fg("muted", "Read")}`,
-				theme.fg("accent", file.path),
-				theme.fg("dim", suffix),
+				{ text: theme.tree.last, color: "dim", rowsOnly: true },
+				{ text: "Read", color: "muted" },
+				{ text: file.path, color: "accent" },
+				{ text: suffix, color: "dim" },
 			],
 			indent,
 		});

@@ -23,7 +23,6 @@ import {
 import { lookup as lookupSetting } from "../config/registry";
 import { getEditStore } from "../edit/store";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import { sessionResolveContext } from "../internal-urls/context";
 import { parseInternalUrl } from "../internal-urls";
 import { InternalUrlRouter } from "../internal-urls/router";
@@ -56,7 +55,8 @@ import { materializeReadUrlToFile, parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file-recorder";
 import {
 	classifyGroupedLines,
-	formatGroupedFiles,
+	type FileMatchSection,
+	formatFileMatches,
 	groupLineIndicesByBlank,
 } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import { formatMatchLine } from "@oh-my-pi/pi-tui/tools/match-line-format";
@@ -1016,15 +1016,18 @@ type SearchParams = typeof searchSchema.infer;
 /**
  * Construction-time overrides for callers that are not the model.
  *
- * The model-facing schema deliberately does not grow these: they exist for
- * wire bridges (the Cursor `pi_grep` frame) whose protocol carries an explicit
- * context width and total match cap, and which would otherwise have to drop
- * them. Unset means "use the session settings / built-in caps" — the behavior
- * every model-issued call keeps.
+ * The model-facing schema deliberately does not grow these: Cursor's native
+ * grep frames carry context widths and match caps that the shared tool cannot
+ * accept per call. Unset means "use session settings / built-in caps" for
+ * ordinary model-issued calls.
  */
 export interface GrepToolOptions {
-	/** Overrides `grep.contextBefore`/`grep.contextAfter` for every call on this instance. */
+	/** Overrides both context widths unless the corresponding direction is also supplied. */
 	context?: number;
+	/** Overrides the number of lines before each match. */
+	contextBefore?: number;
+	/** Overrides the number of lines after each match. */
+	contextAfter?: number;
 	/** Caps total surfaced matches. Applied on top of the built-in per-file and file-window caps, never above them. */
 	totalMatchLimit?: number;
 }
@@ -1055,15 +1058,18 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 	readonly parameters = searchSchema;
 	readonly strict = true;
 
-	readonly #contextOverride?: number;
+	readonly #contextBeforeOverride?: number;
+	readonly #contextAfterOverride?: number;
 	readonly #totalMatchLimit?: number;
 
 	constructor(
 		private readonly session: ToolSession,
 		options?: GrepToolOptions,
 	) {
-		const context = options?.context;
-		this.#contextOverride = context !== undefined ? Math.max(0, Math.floor(context)) : undefined;
+		const before = options?.contextBefore ?? options?.context;
+		const after = options?.contextAfter ?? options?.context;
+		this.#contextBeforeOverride = before !== undefined ? Math.max(0, Math.floor(before)) : undefined;
+		this.#contextAfterOverride = after !== undefined ? Math.max(0, Math.floor(after)) : undefined;
 		const total = options?.totalMatchLimit;
 		this.#totalMatchLimit = total !== undefined ? Math.max(1, Math.floor(total)) : undefined;
 	}
@@ -1095,7 +1101,15 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 			const effectivePaths = scopedPaths.length > 0 ? scopedPaths : ["."];
 			const rawEntries = await expandDelimitedPathEntries(effectivePaths, this.session.cwd);
 			const pathSpecs = await parsePathSpecs(rawEntries, this.session.cwd);
-			const resolveContext = sessionResolveContext(this.session, { signal });
+			const memoryBackend = lookupSetting("memory.backend")?.get(this.session.settings);
+			// The caller's own memory identity answers memory:// ids, including in the native URL walk.
+			const resolveContext: ResolveContext = {
+				...sessionResolveContext(this.session, { signal }),
+				callerMemory: {
+					backend: typeof memoryBackend === "string" ? memoryBackend : undefined,
+					getMnemopiSessionState: this.session.getMnemopiSessionState,
+				},
+			};
 			// Internal URLs resolve inside the native search, bounded by the tier this call was approved at.
 			const urlFilesystem = new InternalUrlFilesystem({
 				context: resolveContext,
@@ -1122,19 +1136,11 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				cleanup: cleanupArchiveScratch,
 			} = await resolveArchiveSearchPaths(pathSpecs, this.session.cwd);
 			try {
-				const memoryBackend = lookupSetting("memory.backend")?.get(this.session.settings);
 				const internalResolution = await resolveInternalSearchInputs({
 					pathSpecs,
 					resolvedPaths,
 					archiveDisplayMap,
-					context: {
-						...resolveContext,
-						skipDirectoryListing: true,
-						callerMemory: {
-							backend: typeof memoryBackend === "string" ? memoryBackend : undefined,
-							getMnemopiSessionState: this.session.getMnemopiSessionState,
-						},
-					},
+					context: { ...resolveContext, skipDirectoryListing: true },
 				});
 				const searchablePaths = internalResolution.paths;
 				const { virtualResources, virtualPathSet, virtualInputIndexes } = internalResolution;
@@ -1149,8 +1155,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 							`or pass a UTF-8 text member.`,
 					);
 				}
-				const normalizedContextBefore = this.#contextOverride ?? cfgGrepContextBefore.get(this.session.settings);
-				const normalizedContextAfter = this.#contextOverride ?? cfgGrepContextAfter.get(this.session.settings);
+				const normalizedContextBefore =
+					this.#contextBeforeOverride ?? cfgGrepContextBefore.get(this.session.settings);
+				const normalizedContextAfter = this.#contextAfterOverride ?? cfgGrepContextAfter.get(this.session.settings);
 				const ignoreCase = !(caseSensitive ?? true);
 				const useGitignore = gitignore ?? true;
 				const patternHasNewline = normalizedPattern.includes("\n") || normalizedPattern.includes("\\n");
@@ -1371,9 +1378,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				// Run native grep only for unrestricted scopes. Constrained scopes above
 				// search content from exact handles authorized during incremental traversal.
 				let skippedOversizedCount = 0;
-				// Scope globs are relative to their base path: `dir/*.go` must stay in
-				// `dir`. Only a bare glob rooted at cwd (`*.ts`) matches at any depth.
-				const cwdRoot = path.resolve(this.session.cwd);
+				// Only a glob spelled without a directory prefix matches at any depth.
+				// The parsed base alone cannot distinguish `*.ts` from `./*.ts`.
 				try {
 					if (!constrainedSearch && searchablePaths.length > 0) {
 						if (exactFilePaths || multiTargets) {
@@ -1386,6 +1392,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 								? exactFilePaths.map(filePath => ({
 										basePath: filePath,
 										glob: undefined as string | undefined,
+										bareGlob: false,
 									}))
 								: (multiTargets ?? []);
 							for (const target of targets) {
@@ -1395,7 +1402,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 										pattern: normalizedPattern,
 										path: target.basePath,
 										glob: target.glob,
-										recursive: path.resolve(target.basePath) === cwdRoot,
+										recursive: target.bareGlob === true,
 										ignoreCase,
 										multiline: effectiveMultiline,
 										hidden: true,
@@ -1443,7 +1450,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 									pattern: normalizedPattern,
 									path: searchPath,
 									glob: globFilter,
-									recursive: path.resolve(searchPath) === cwdRoot,
+									recursive: scope.bareGlob,
 									ignoreCase,
 									multiline: effectiveMultiline,
 									hidden: true,
@@ -1519,7 +1526,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					const filteredMatches: GrepMatch[] = [];
 					for (const match of result.matches) {
 						const abs = resolveSearchResultPath(searchPath, match.path);
-						const ranges = rangesByAbsPath.get(abs);
+						// Native absolute matches can retain forward slashes on Windows; range keys use path.resolve.
+						const ranges = rangesByAbsPath.get(path.isAbsolute(match.path) ? path.resolve(abs) : abs);
 						if (!ranges) {
 							// Path has no line-range constraint (e.g. a peer entry without `:N-M`).
 							filteredMatches.push(match);
@@ -1724,7 +1732,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						if (tag) hashContexts.set(relativePath, { tag, path: snapshotPath });
 					}
 				}
-				const renderMatchesForFile = (relativePath: string): { model: string[]; display: string[] } => {
+				const renderMatchesForFile = (relativePath: string): FileMatchSection => {
 					const modelOut: string[] = [];
 					const displayOut: string[] = [];
 					const fileMatches = matchesByFile.get(relativePath) ?? [];
@@ -1773,38 +1781,11 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 							modelOut.join("\n"),
 						);
 					}
-					return { model: modelOut, display: displayOut };
+					return { model: modelOut, display: displayOut, tag: hashContext?.tag };
 				};
-				const useGroupedOutput = isDirectory || isMultiScope;
-				if (useGroupedOutput) {
-					const grouped = formatGroupedFiles(fileList, relativePath => {
-						const rendered = renderMatchesForFile(relativePath);
-						const hashContext = hashContexts.get(relativePath);
-						return {
-							modelLines: rendered.model,
-							displayLines: rendered.display,
-							headerSuffix: hashContext?.tag ? `#${hashContext.tag}` : "",
-							skip: rendered.model.length === 0,
-						};
-					});
-					outputLines.push(...grouped.model);
-					displayLines.push(...grouped.display);
-				} else {
-					for (const relativePath of fileList) {
-						const rendered = renderMatchesForFile(relativePath);
-						if (rendered.model.length === 0) continue;
-						if (outputLines.length > 0) {
-							outputLines.push("");
-							displayLines.push("");
-						}
-						const hashContext = hashContexts.get(relativePath);
-						if (hashContext?.tag) {
-							outputLines.push(formatHashlineHeader(relativePath, hashContext.tag));
-						}
-						outputLines.push(...rendered.model);
-						displayLines.push(...rendered.display);
-					}
-				}
+				const matchOutput = formatFileMatches(fileList, isDirectory || isMultiScope, renderMatchesForFile);
+				outputLines.push(...matchOutput.model);
+				displayLines.push(...matchOutput.display);
 				if (limitMessage) {
 					outputLines.push("", limitMessage);
 				}

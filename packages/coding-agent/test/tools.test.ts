@@ -28,7 +28,6 @@ import { getSessionLocalProtocolOptions } from "../src/internal-urls/local-proto
 import { AgentRegistry } from "../src/registry/agent-registry";
 import { runLocalOperation } from "../src/registry/operation-lease";
 
-import { DEFAULT_BASH_INTERCEPTOR_RULES, cfgBashInterceptorPatterns } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import { cfgEditFuzzyMatch, cfgEditFuzzyThreshold } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import { cfgReadDefaultLimit } from "@oh-my-pi/pi-coding-agent/tools/settings";
 
@@ -1180,40 +1179,35 @@ describe("Coding Agent Tools", () => {
 				"tools.artifactTailLines": 10,
 				"tools.artifactHeadBytes": 1,
 			});
-			const spillManager = SessionManager.create(testDir, path.join(testDir, "url-spill-sessions"));
-			await spillManager.ensureOnDisk();
+			// Fork contract: tool-result spills save artifacts through the session operation
+			// ledger, so the read runs under the registry-bound authority fixture.
+			const authority = await createAuthorityToolFixture(testDir, spillSettings);
+			const spillManager = authority.sessionManager;
+			const spillSession = authority.toolSession;
 			const artifactsDir = spillManager.getArtifactsDir();
 			if (!artifactsDir) throw new Error("expected an on-disk artifacts dir");
 			fs.mkdirSync(artifactsDir, { recursive: true });
-			fs.writeFileSync(path.join(artifactsDir, "Worker.md"), JSON.stringify({ report: payload }));
-			fs.writeFileSync(path.join(artifactsDir, "Lines.md"), payload);
+			// agent:// discloses only outputs published through a durable named head.
+			const outputs = new ArtifactManager(artifactsDir);
+			await outputs.publishAgentArtifacts("Worker", JSON.stringify({ report: payload }));
+			await outputs.publishAgentArtifacts("Lines", payload);
 			fs.mkdirSync(path.join(artifactsDir, "local"), { recursive: true });
 			fs.writeFileSync(path.join(artifactsDir, "local", "big.md"), payload);
-			const spillReadTool = wrapToolWithMetaNotice(
-				new ReadTool(
-					createTestToolSession(testDir, spillSettings, {
-						getSessionFile: () => spillManager.getSessionFile() ?? null,
-						getArtifactsDir: () => artifactsDir,
-						localProtocolOptions: {
-							getArtifactsDir: () => artifactsDir,
-							getSessionId: () => spillManager.getSessionId(),
-						},
-						skills: [
-							{
-								name: "demo",
-								description: "d",
-								filePath: path.join(skillDir, "SKILL.md"),
-								baseDir: skillDir,
-								source: "test",
-							},
-						],
-					}),
-				),
-			);
+			spillSession.skills = [
+				{
+					name: "demo",
+					description: "d",
+					filePath: path.join(skillDir, "SKILL.md"),
+					baseDir: skillDir,
+					source: "test",
+				},
+			];
+			const spillReadTool = wrapToolWithMetaNotice(new ReadTool(spillSession));
 			const context = {
 				...createTestToolContext(["read"]),
 				settings: spillSettings,
 				sessionManager: spillManager,
+				localProtocolOptions: spillSession.localProtocolOptions,
 			};
 
 			try {
@@ -1223,7 +1217,9 @@ describe("Coding Agent Tools", () => {
 					"local://big.md:1-3000",
 					"agent://Lines:1-3000",
 				]) {
-					const result = await spillReadTool.execute(`spill-${url}`, { path: url }, undefined, undefined, context);
+					const result = await runAuthorityOperation(authority, `spill-${url}`, () =>
+						spillReadTool.execute(`spill-${url}`, { path: url }, undefined, undefined, context),
+					);
 					const output = getTextOutput(result);
 					expect(result.details?.meta?.truncation?.artifactId).toBeDefined();
 					expect(Buffer.byteLength(output, "utf-8")).toBeLessThan(20 * 1024);
@@ -1231,18 +1227,20 @@ describe("Coding Agent Tools", () => {
 
 				const artifactId = await spillManager.saveArtifact(payload, "read");
 				const saveArtifact = vi.spyOn(spillManager, "saveArtifact");
-				const artifactPage = await spillReadTool.execute(
-					"spill-artifact-page",
-					{ path: `artifact://${artifactId}:1-3000` },
-					undefined,
-					undefined,
-					context,
+				const artifactPage = await runAuthorityOperation(authority, "spill-artifact-page", () =>
+					spillReadTool.execute(
+						"spill-artifact-page",
+						{ path: `artifact://${artifactId}:1-3000` },
+						undefined,
+						undefined,
+						context,
+					),
 				);
 				expect(artifactPage.details?.meta?.truncation?.artifactId).toBeUndefined();
 				expect(getTextOutput(artifactPage)).toContain("payload line 2999");
 				expect(saveArtifact).not.toHaveBeenCalled();
 			} finally {
-				await spillManager.close();
+				await authority.dispose();
 			}
 		});
 
@@ -2427,17 +2425,6 @@ function b() {
 			expect(output).toMatch(/Wall time: \d+\.\d{2} seconds/);
 			expect(typeof result.details?.wallTimeMs).toBe("number");
 			expect(result.details?.wallTimeMs).toBeGreaterThanOrEqual(0);
-		});
-
-		it("should expose built-in interceptor defaults truthfully", () => {
-			const defaultSettings = Settings.isolated({ "bashInterceptor.enabled": true });
-			const explicitEmptySettings = Settings.isolated({
-				"bashInterceptor.enabled": true,
-				"bashInterceptor.patterns": [],
-			});
-
-			expect(cfgBashInterceptorPatterns.get(defaultSettings)).toEqual(DEFAULT_BASH_INTERCEPTOR_RULES);
-			expect(cfgBashInterceptorPatterns.get(explicitEmptySettings)).toEqual([]);
 		});
 
 		it("should block built-in interceptor commands when enabled with default patterns", async () => {
@@ -3772,20 +3759,5 @@ describe("edit tool CRLF handling", () => {
 		});
 		expect(result.isError).toBe(true);
 		expect(getTextOutput(result)).toMatch(/Found 2 occurrences/);
-	});
-
-	// TODO: CRLF preservation broken by LSP formatting - fix later
-	it.skip("should preserve UTF-8 BOM after edit", async () => {
-		const testFile = path.join(testDir, "bom-test.txt");
-		fs.writeFileSync(testFile, "\uFEFFfirst\r\nsecond\r\nthird\r\n");
-
-		await editTool.execute("test-bom", {
-			path: testFile,
-			old_string: "second\n",
-			new_string: "REPLACED\n",
-		});
-
-		const content = await Bun.file(testFile).text();
-		expect(content).toBe("\uFEFFfirst\r\nREPLACED\r\nthird\r\n");
 	});
 });

@@ -80,6 +80,7 @@ export function wrapLeakedThinkingStream(inner: AssistantMessageEventStream): As
 		try {
 			let projector: LeakedThinkingProjector | undefined;
 			for await (const event of inner) {
+				if ("partial" in event) projector?.syncMetadata(event.partial);
 				switch (event.type) {
 					case "start":
 						projector = new LeakedThinkingProjector(out, event.partial);
@@ -194,6 +195,17 @@ class LeakedThinkingProjector {
 		this.#out = out;
 		this.#partial = { ...seed, content: [] };
 		this.#out.push({ type: "start", partial: this.#partial });
+	}
+
+	/**
+	 * Mirror the source partial's envelope (usage, responseId, model, ...) onto
+	 * the projected partial. Source events carry per-push snapshots rather than
+	 * one live object, so metadata the provider fills in after `start` (Anthropic
+	 * `message_start` usage, for example) would otherwise stay frozen at the seed.
+	 */
+	syncMetadata(source: AssistantMessage): void {
+		const { content: _content, ...metadata } = source;
+		Object.assign(this.#partial, metadata);
 	}
 
 	/** Feed a visible-text delta through the healer, splitting leaked fences live. */

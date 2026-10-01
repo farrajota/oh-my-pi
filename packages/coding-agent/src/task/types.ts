@@ -173,6 +173,7 @@ function createTaskItemSchema(options: {
 		"name?": "string",
 		agent: taskAgentSchemaRule(options.defaultAgent ?? "task"),
 		task: "string",
+		solutionSpace: "string",
 		"agentSource?": agentSourceRule,
 		"agentDefinitionSha256?": sha256Rule,
 		"outputSchema?": outputSchemaInputSchema,
@@ -205,6 +206,7 @@ function createTaskSchema(options: {
 		"name?": "string",
 		agent: taskAgentSchemaRule(options.defaultAgent ?? "task"),
 		task: "string",
+		solutionSpace: "string",
 		"agentSource?": agentSourceRule,
 		"agentDefinitionSha256?": sha256Rule,
 		"outputSchema?": outputSchemaInputSchema,
@@ -259,6 +261,8 @@ export interface TaskItem {
 	agent?: string;
 	/** The work; required by the schema. */
 	task?: string;
+	/** How open-ended the work is; required by the schema and the child's sole `auto` thinking classification input. */
+	solutionSpace?: string;
 	/** Exact discovered source required for this spawn. */
 	agentSource?: AgentSource;
 	/** SHA-256 of the exact file-backed agent definition bytes required for this spawn. */
@@ -287,6 +291,7 @@ export const taskSchema = type({
 	"effort?": effortRule,
 	"model?": type("string").atLeastLength(1),
 	task: "string",
+	solutionSpace: "string",
 	"agentSource?": agentSourceRule,
 	"agentDefinitionSha256?": sha256Rule,
 	"outputSchema?": outputSchemaInputSchema,
@@ -300,6 +305,7 @@ const taskSchemaNoIsolation = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	solutionSpace: "string",
 	"effort?": effortRule,
 	"outputSchema?": outputSchemaInputSchema,
 	"agentSource?": agentSourceRule,
@@ -390,6 +396,8 @@ export interface TaskParams {
 	agent?: string;
 	/** The work (flat form). */
 	task?: string;
+	/** How open-ended the work is (flat form); see {@link TaskItem.solutionSpace}. */
+	solutionSpace?: string;
 	/** Request-local model selector for this spawn (flat form). */
 	model?: string;
 	/** Exact discovered source required for this spawn. */
@@ -529,8 +537,19 @@ export interface AgentProgress {
 	permissionSummary?: EffectivePermissionSummary;
 	currentTool?: string;
 	currentToolArgs?: string;
+	/** Argument key selected for the display preview, when known. */
+	currentToolArgsKey?: string;
+	/** Intent the model attached to the current call; undefined when that call carried none. */
+	currentToolIntent?: string;
 	currentToolStartMs?: number;
-	recentTools: Array<{ tool: string; args: string; endMs: number }>;
+	recentTools: Array<{
+		tool: string;
+		args: string;
+		argsKey?: string;
+		intent?: string;
+		isError?: boolean;
+		endMs: number;
+	}>;
 	recentOutput: string[];
 	toolCount: number;
 	/** Count of assistant requests (assistant message_end events) across the run. Drives the soft request budget guard. */

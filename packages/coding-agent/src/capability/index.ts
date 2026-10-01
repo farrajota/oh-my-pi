@@ -8,7 +8,7 @@
  */
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
 
 import type { Settings } from "../config/settings";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
@@ -329,9 +329,9 @@ export async function loadCapability<T>(
 
 	const cwd = options.cwd ?? getProjectDir();
 	const home = os.homedir();
-	const agentDir = options.agentDir ?? getAgentDir();
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home, agentDir, repoRoot };
+	const ctx: LoadContext = { cwd, home, repoRoot };
+	if (options.agentDir !== undefined) ctx.agentDir = options.agentDir;
 	if (options.providers) ctx.explicitProviders = new Set(options.providers);
 	if (options.includeDisabled) ctx.includeOptOutUserSources = true;
 	if (options.extensionRoots !== undefined) ctx.extensionRoots = options.extensionRoots;

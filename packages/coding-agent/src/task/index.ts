@@ -104,6 +104,7 @@ import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/too
 import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
 import {
 	applySpawnHook,
+	describeSalvagedWork,
 	type EffectiveSubagentPolicy,
 	resolveEffectiveSubagentPolicy,
 	StructuredSubagentError,
@@ -260,6 +261,7 @@ function appendPermissionDetails(lines: string[], permissions: TaskParams["permi
 }
 interface TaskDescriptionOptions {
 	agents: AgentDefinition[];
+	sessionAgents: readonly AgentDefinition[];
 	isolationEnabled: boolean;
 	applyIsolatedChanges: boolean;
 	disabledAgents: string[];
@@ -282,10 +284,9 @@ interface TaskDescriptionOptions {
 function renderDescription(options: TaskDescriptionOptions): string {
 	const spawnPolicy = resolveSpawnPolicy(options.parentSpawns);
 	const spawningDisabled = !spawnPolicy.enabled;
+	const agents = [...options.agents, ...options.sessionAgents];
 	let filteredAgents =
-		options.disabledAgents.length > 0
-			? options.agents.filter(agent => !options.disabledAgents.includes(agent.name))
-			: options.agents;
+		options.disabledAgents.length > 0 ? agents.filter(agent => !options.disabledAgents.includes(agent.name)) : agents;
 	if (spawningDisabled) {
 		filteredAgents = [];
 	} else if (spawnPolicy.allowedAgents !== null) {
@@ -312,6 +313,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		evalToolsEnabled: options.evalToolsEnabled,
 		asyncEnabled: options.asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
+		hasModelMentions: options.sessionAgents.length > 0,
 		ircEnabled: options.ircEnabled,
 		permissionsEnabled: options.permissionsEnabled,
 		permissionMode: options.permissionMode,
@@ -517,6 +519,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("model" in params) item.model = params.model;
 	if (params.permissions !== undefined) item.permissions = params.permissions;
 	if (params.toolProfile !== undefined) item.toolProfile = params.toolProfile;
+	if ("solutionSpace" in params) item.solutionSpace = params.solutionSpace;
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
 	if ("tools" in params) item.tools = params.tools;
@@ -543,6 +546,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if ("model" in item) spawn.model = item.model;
 	if (item.permissions !== undefined) spawn.permissions = item.permissions;
 	if (item.toolProfile !== undefined) spawn.toolProfile = item.toolProfile;
+	if (item.solutionSpace !== undefined) spawn.solutionSpace = item.solutionSpace;
 	if (params.context !== undefined) spawn.context = params.context;
 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
@@ -1007,6 +1011,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			agents:
 				discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
 				this.#discoveredAgents,
+			sessionAgents: this.session.advertisedSessionAgents?.() ?? this.session.getSessionAgents?.() ?? [],
 			isolationEnabled: !planMode && isolationEnabled,
 			applyIsolatedChanges: cfgTaskIsolationApply.get(this.session.settings),
 			disabledAgents,
@@ -1839,6 +1844,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							progress.cost = nextProgress.cost;
 							progress.toolCount = nextProgress.toolCount;
 							progress.currentTool = nextProgress.currentTool;
+							progress.currentToolArgs = nextProgress.currentToolArgs;
+							progress.currentToolArgsKey = nextProgress.currentToolArgsKey;
+							progress.currentToolIntent = nextProgress.currentToolIntent;
+							progress.currentToolStartMs = nextProgress.currentToolStartMs;
 							progress.lastIntent = nextProgress.lastIntent;
 							progress.recentTools = nextProgress.recentTools.slice();
 							progress.recentOutput = nextProgress.recentOutput.slice();
@@ -1878,8 +1887,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					// error on a zero exit (changes captured but not landed, or a
 					// retained workspace) is a failure too: the work needs manual
 					// recovery, which a "completed" job would hide. Mirrors the sync
-					// path's status derivation.
+					// path's status derivation. `isError` marks a child that finished
+					// before a later step (isolation merge, nested patch apply) threw.
 					const resultFailed =
+						result.isError === true ||
 						!singleResult ||
 						(singleResult.aborted ?? false) ||
 						singleResult.exitCode !== 0 ||
@@ -2226,6 +2237,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const parentArtifactManager = this.session.getArtifactManager?.() ?? undefined;
 
 		let executionInvoked = false;
+		// Set once the child returns: the isolation merge and nested patch apply
+		// can still throw, and the failure must carry the exit status and
+		// artifact the child produced so the parent does not redo the work.
+		let settled: SingleResult | undefined;
 		try {
 			const routedPolicy = await applySpawnHook(
 				{
@@ -2304,6 +2319,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				assignment,
 				context: sharedContext,
 				...(allowEffortOverride && params.effort !== undefined ? { effort: params.effort } : {}),
+				solutionSpace: params.solutionSpace,
 				planReference,
 				outputSchema: effectiveOutputSchema,
 				outputSchemaMode,
@@ -2354,6 +2370,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				},
 				authStorage: this.session.authStorage,
 				skillsSettings: this.session.skillsSettings,
+				inheritedSessionAgents: this.session.getSessionAgents?.(),
 				modelRegistry: this.session.modelRegistry,
 				mcpManager: this.session.mcpManager,
 				enableMCP: this.session.enableMCP ?? true,
@@ -2415,6 +2432,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 
 			const result = await runTask();
+			settled = result;
 
 			let mergeSummary = "";
 			let changesApplied: boolean | null = null;
@@ -2466,12 +2484,24 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		} catch (err) {
 			if (!executionInvoked) await this.#getOutputManager().release(preAllocatedId!);
 			const message = err instanceof Error ? err.message : String(err);
+			// `error` is set so nothing reads the salvaged zero exit code as a
+			// completed run. The temp artifacts dir is not cleaned on this path,
+			// so the artifact the message points at stays readable.
+			const salvaged = settled ? { ...settled, error: settled.error ?? message } : undefined;
 			return {
-				content: [{ type: "text", text: `Task execution failed: ${message}` }],
+				content: [
+					{
+						type: "text",
+						text: `Task execution failed: ${message}${settled ? describeSalvagedWork(settled) : ""}`,
+					},
+				],
+				isError: true,
 				details: {
 					projectAgentsDir,
-					results: [],
+					results: salvaged ? [salvaged] : [],
 					totalDurationMs: Date.now() - startTime,
+					...(salvaged?.usage ? { usage: salvaged.usage } : {}),
+					...(salvaged?.outputPath ? { outputPaths: [salvaged.outputPath] } : {}),
 					...(latestProgress ? { progress: [latestProgress] } : {}),
 				},
 			};

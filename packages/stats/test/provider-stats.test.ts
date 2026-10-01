@@ -2,8 +2,9 @@ import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getProviderDashboardStats } from "@oh-my-pi/omp-stats/aggregator";
-import { getModelTimeSeries, getStatsByModel, initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
+import { getProviderDashboardStats, getProviderWindowStats } from "@oh-my-pi/omp-stats/aggregator";
+import { initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
+import { getModelTimeSeries, getStatsByModel } from "@oh-my-pi/omp-stats/rollup";
 import type { MessageStats } from "@oh-my-pi/omp-stats/types";
 import {
 	computeUsageWindowStats,
@@ -364,15 +365,19 @@ describe("getProviderDashboardStats", () => {
 		expect(stats.series.some(p => p.provider === "prov-b" && p.totalTokens === 160)).toBe(true);
 		const modelStats = getStatsByModel();
 		expect(modelStats.find(row => row.provider === "prov-b")?.totalTokens).toBe(160);
-		const modelSeries = getModelTimeSeries(14, null);
+		const modelSeries = getModelTimeSeries({ cutoff: null, bucketMs: 24 * 60 * 60 * 1000 });
 		expect(modelSeries.find(row => row.provider === "prov-b")?.totalTokens).toBe(160);
 
-		expect(stats.windowInsights).toHaveLength(1);
-		const insight = stats.windowInsights[0];
+		const windows = await getProviderWindowStats("all", "prov-a");
+		expect(windows.windowInsights).toHaveLength(1);
+		const insight = windows.windowInsights[0];
 		expect(insight.fractionConsumed).toBeCloseTo(0.5, 10);
 		// prov-a burned 2000 tokens over 0.5 windows → 4000 tokens per window.
 		expect(insight.estTokensPerWindow).toBe(4000);
-		expect(stats.usageSeries).toHaveLength(1);
-		expect(stats.usageSeries[0].accountLabel).toBe("acct-1");
+		expect(windows.usageSeries).toHaveLength(1);
+		expect(windows.usageSeries[0].accountLabel).toBe("acct-1");
+
+		// Series are only shipped for the requested provider.
+		expect((await getProviderWindowStats("all", "prov-b")).usageSeries).toEqual([]);
 	});
 });

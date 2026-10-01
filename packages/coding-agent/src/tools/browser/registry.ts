@@ -18,6 +18,8 @@ import { reapOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl } from "./relay/daemon";
 import type { RelayKind } from "./relay/kind";
 import { ensureSharedBrowser } from "./shared-daemon";
+import type { TernKind } from "./tern/kind";
+import { TernSocketClient } from "./tern/wire";
 
 export type PuppeteerBrowserKind =
 	| { kind: "headless"; headless: boolean; allowFileAccess?: boolean }
@@ -27,7 +29,7 @@ export type PuppeteerBrowserKind =
 	| { kind: "connected"; cdpUrl: string }
 	| RelayKind;
 
-export type BrowserKind = PuppeteerBrowserKind | CmuxKind;
+export type BrowserKind = PuppeteerBrowserKind | CmuxKind | TernKind;
 
 export type BrowserKindTag = BrowserKind["kind"];
 
@@ -77,7 +79,14 @@ export interface CmuxBrowserHandle extends BrowserHandleCommon {
 	surface?: string;
 }
 
-export type BrowserHandle = PuppeteerBrowserHandle | CmuxBrowserHandle;
+/** A connection to the Tern daemon whose browser PiPs host this handle's tabs. */
+export interface TernBrowserHandle extends BrowserHandleCommon {
+	kind: TernKind;
+	/** The daemon connection every tab of this handle drives its PiP through. */
+	tern: TernSocketClient;
+}
+
+export type BrowserHandle = PuppeteerBrowserHandle | CmuxBrowserHandle | TernBrowserHandle;
 
 /** Controls bounded browser-handle teardown and identifies the owning resource in timeout diagnostics. */
 export interface ReleaseBrowserOptions {
@@ -133,6 +142,8 @@ export function browserKey(kind: BrowserKind): string {
 			return `relay:${kind.cdpUrl}`;
 		case "cmux":
 			return `cmux:${kind.socketPath}`;
+		case "tern":
+			return `tern:${kind.socketPath}:${kind.pane}`;
 	}
 }
 
@@ -151,7 +162,7 @@ export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOpti
 		const existing = browsers.get(key);
 		if (existing) {
 			if ("client" in existing) return existing;
-			if (existing.browser.connected) return existing;
+			if ("tern" in existing ? existing.tern.connected : existing.browser.connected) return existing;
 			browsers.delete(key);
 			await disposeBrowserHandle(existing, { kill: false });
 			continue;
@@ -231,6 +242,11 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			surface: kind.surface,
 			refCount: 0,
 		};
+	}
+	if (kind.kind === "tern") {
+		const tern = new TernSocketClient({ socketPath: kind.socketPath });
+		await tern.connect();
+		return { key: browserKey(kind), kind, tern, refCount: 0 };
 	}
 	if (kind.kind === "headless" || kind.kind === "audit") {
 		// Audit browsers deliberately bypass the process/project headless pool.
@@ -397,6 +413,10 @@ export function isBrowserRegistered(handle: BrowserHandle): boolean {
 async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserOptions): Promise<void> {
 	if ("client" in handle) {
 		handle.client.close();
+		return;
+	}
+	if ("tern" in handle) {
+		handle.tern.close();
 		return;
 	}
 	if (handle.kind.kind === "headless" || handle.kind.kind === "audit") {

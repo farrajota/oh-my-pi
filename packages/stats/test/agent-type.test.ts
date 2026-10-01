@@ -3,13 +3,8 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getOverviewStats } from "@oh-my-pi/omp-stats/aggregator";
-import {
-	closeDb,
-	getSessionStatsByModelAndAgentType,
-	getStatsByAgentType,
-	initDb,
-	insertMessageStats,
-} from "@oh-my-pi/omp-stats/db";
+import { closeDb, getSessionStatsByModelAndAgentType, initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
+import { getStatsByAgentType } from "@oh-my-pi/omp-stats/rollup";
 import { classifyAgentType } from "@oh-my-pi/omp-stats/parser";
 import type { AgentType, MessageStats } from "@oh-my-pi/omp-stats/types";
 import { getConfigRootDir, getSessionsDir, getStatsDbPath } from "@oh-my-pi/pi-utils";

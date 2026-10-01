@@ -33,6 +33,8 @@ describe.skipIf(!hasPtyHarness)("CLI initial-message title generation", () => {
 				"anthropic/claude-sonnet-4-5",
 				JSON.stringify("implement X"),
 			].join(" ");
+			// The child cold-starts and transpiles the CLI graph; loaded CI runners need far more than an idle
+			// boot. `timeout` stays below the test budget so a hung interactive session is killed and cleaned up.
 			const proc = Bun.spawn(["timeout", "--kill-after=5s", "60s", "script", "-q", "-c", command, "/dev/null"], {
 				cwd: repoRoot,
 				stdout: "pipe",

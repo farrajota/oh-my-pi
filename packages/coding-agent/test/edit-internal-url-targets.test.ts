@@ -46,13 +46,14 @@ afterEach(async () => {
 });
 
 describe("EditTool internal URL targets", () => {
-	it("edits the single-slash local:/ spelling in the sandbox its read-tier approval describes", async () => {
+	it("edits the single-slash local:/ spelling in the sandbox at the fork's write-tier approval", async () => {
 		const target = localFile("local://notes.md");
 		await Bun.write(target, "old\n");
 		const tool = new EditTool(createSession(), "replace");
 		const args = { path: "local:/notes.md", old_string: "old", new_string: "new" };
 
-		expect(tool.approval(args)).toBe("read");
+		// Fork contract: local:// is a writable handler, so its writes stay at write tier.
+		expect(tool.approval(args)).toBe("write");
 		const result = await tool.execute("single-slash", args);
 
 		expect(result.isError).not.toBe(true);
@@ -180,11 +181,14 @@ describe("EditTool approval of moves out of the local:// sandbox", () => {
 	];
 
 	for (const { mode, args } of moves) {
-		it(`${mode}: a working-tree destination raises the tier to write and is shown`, () => {
+		it(`${mode}: the move destination participates in the tier and is shown`, () => {
 			const tool = new EditTool(createSession(), mode);
 
-			expect(tool.approval(args("local://b.md"))).toBe("read");
+			// Fork contract: local:// writes are already write tier, so a stricter
+			// (exec-tier ssh://) destination proves the destination raises the tier.
+			expect(tool.approval(args("local://b.md"))).toBe("write");
 			expect(tool.approval(args("bunfig.toml"))).toBe("write");
+			expect(tool.approval(args("ssh://host/b.md"))).toBe("exec");
 			expect(tool.formatApprovalDetails(args("bunfig.toml")).join("\n")).toContain("bunfig.toml");
 		});
 	}
