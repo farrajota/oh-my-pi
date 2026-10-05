@@ -1355,7 +1355,7 @@ export class EventController {
 		if (
 			nextToolName === "wait" &&
 			previous.isDisplaceableBlock() &&
-			this.ctx.chatContainer.canRemoveBlock(previous)
+			this.ctx.chatContainer.canDisplaceBlock(previous)
 		) {
 			this.ctx.chatContainer.removeChild(previous);
 		}

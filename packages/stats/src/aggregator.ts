@@ -263,11 +263,12 @@ export async function smokeTestSyncWorker({ timeoutMs = 5_000 }: { timeoutMs?: n
 /**
  * Synchronize a supplied set of session transcript files.
  *
- * `workers: 1` pipelines file reads and parses inline, committing in discovery order.
- * Larger pools fan parsing out across workers
- * (one in-flight job per worker) while DB writes and offset bookkeeping stay on
- * the calling thread. Bounded batches commit rows and cursors atomically without
- * holding a database transaction open during file I/O.
+ * `workers: 1` pipelines file reads and parses inline, committing in input order.
+ * Larger pools fan parsing out across workers (one in-flight job per worker).
+ * A rolling window of at most one result per worker preserves the same ranked
+ * input order before DB writes and offset bookkeeping on the calling thread.
+ * Bounded batches commit rows and cursors atomically without holding a database
+ * transaction open during file I/O.
  * `onProgress` fires once per completed file (skipped files included so the
  * bar walks at a steady rate).
  */
@@ -279,7 +280,6 @@ async function syncSessionFiles(
 	let totalProcessed = 0;
 	let filesProcessed = 0;
 	let completed = 0;
-	let cursor = 0;
 	let reconcile = false;
 	let pending: ParsedSession[] = [];
 	let pendingRows = 0;
@@ -411,30 +411,35 @@ async function syncSessionFiles(
 	const poolSize = Math.min(files.length, requestedWorkers);
 	const handles: WorkerHandle[] = [];
 
-	async function drain(handle: WorkerHandle): Promise<void> {
-		try {
-			while (!failed) {
-				const idx = cursor++;
-				if (idx >= files.length) return;
-				const parsed = await prepareFile(idx, (file, fromOffset, parserState, replay) =>
-					dispatch(handle, { sessionFile: file, fromOffset, parserState, replay }),
-				);
-				if (!failed) acceptFile(files[idx], parsed);
-			}
-		} catch (error) {
-			failed = true;
-			throw error;
-		}
-	}
+	const active: Promise<PromiseSettledResult<ParsedSession | null>>[] = [];
+	const startFile = (handle: WorkerHandle, index: number): Promise<PromiseSettledResult<ParsedSession | null>> =>
+		prepareFile(index, (file, fromOffset, parserState, replay) =>
+			dispatch(handle, { sessionFile: file, fromOffset, parserState, replay }),
+		).then(
+			value => ({ status: "fulfilled" as const, value }),
+			reason => ({ status: "rejected" as const, reason }),
+		);
 
 	try {
 		for (let i = 0; i < poolSize; i++) handles.push(spawnWorker());
-		// Drain in-flight work before releasing the sync lock, even after a failed batch.
-		const results = await Promise.allSettled(handles.map(drain));
-		for (const result of results) {
+		for (let i = 0; i < poolSize; i++) active[i] = startFile(handles[i], i);
+		for (let index = 0; index < files.length; index++) {
+			const slot = index % poolSize;
+			const result = await active[slot];
 			if (result.status === "rejected") throw result.reason;
+			acceptFile(files[index], result.value);
+			// Refill only after accepting the oldest slot: a slow early file
+			// cannot buffer an unbounded tail of completed transcripts.
+			const next = index + poolSize;
+			if (next < files.length) active[slot] = startFile(handles[slot], next);
 		}
+	} catch (error) {
+		failed = true;
+		throw error;
 	} finally {
+		// Drain in-flight work before releasing the sync lock, including when
+		// parsing, a batch commit, or a durable-progress callback fails.
+		await Promise.all(active);
 		for (const handle of handles) handle.worker.terminate();
 	}
 
@@ -444,21 +449,49 @@ async function syncSessionFiles(
 /** Recency tiers for {@link orderForIngest}, newest first. */
 const INGEST_TIERS_MS = [24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000];
 
+/** Read the parent transcript path from the session header. */
+async function readParentSession(sessionFile: string): Promise<string | undefined> {
+	let handle: fs.promises.FileHandle | undefined;
+	try {
+		handle = await fs.promises.open(sessionFile, "r");
+		const chunk = Buffer.alloc(4096);
+		let contents = "";
+		let position = 0;
+		while (contents.length < 64 * 1024) {
+			const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+			if (bytesRead === 0) break;
+			position += bytesRead;
+			contents += chunk.toString("utf8", 0, bytesRead);
+			const newline = contents.indexOf("\n");
+			if (newline >= 0) {
+				const header = JSON.parse(contents.slice(0, newline));
+				return typeof header.parentSession === "string" ? header.parentSession : undefined;
+			}
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	} finally {
+		await handle?.close();
+	}
+	return undefined;
+}
+
 /**
- * Order a full sync so recent activity lands first: transcripts modified in
- * the last day, then the last week, then the rest. Within a tier files go in
- * creation order, so a fork still follows its parent and the parent keeps
- * ownership of the entries the fork copied (first writer wins). The only
- * exception is a from-scratch ingest where a fork was touched more recently
- * than a parent idle for a day: the fork then owns the copied entries, which
- * changes per-session attribution but never totals.
+ * Order full syncs by recency tier, then creation order. Within a tier, known
+ * parents precede their forks so first-writer deduplication preserves parent
+ * ownership; across tiers, recency takes precedence over ancestry.
  */
 async function orderForIngest(files: string[]): Promise<string[]> {
 	const now = Date.now();
 	const ranked: { file: string; tier: number; born: number; index: number }[] = [];
+	const parents = new Map<string, string>();
 	for (let start = 0; start < files.length; start += SYNC_METADATA_FILES) {
 		const batch = files.slice(start, start + SYNC_METADATA_FILES);
-		const stats = await Promise.all(batch.map(file => fs.promises.stat(file).catch(() => null)));
+		const [stats, parentFiles] = await Promise.all([
+			Promise.all(batch.map(file => fs.promises.stat(file).catch(() => null))),
+			Promise.all(batch.map(readParentSession)),
+		]);
 		for (let i = 0; i < batch.length; i++) {
 			const stat = stats[i];
 			const age = stat ? now - stat.mtimeMs : Number.POSITIVE_INFINITY;
@@ -469,10 +502,26 @@ async function orderForIngest(files: string[]): Promise<string[]> {
 				born: stat ? stat.birthtimeMs || stat.ctimeMs : 0,
 				index: start + i,
 			});
+			const parentFile = parentFiles[i];
+			if (parentFile) parents.set(batch[i], parentFile);
 		}
 	}
 	ranked.sort((a, b) => a.tier - b.tier || a.born - b.born || a.index - b.index);
-	return ranked.map(entry => entry.file);
+	const byFile = new Map(ranked.map(entry => [entry.file, entry]));
+	const ordered: string[] = [];
+	const visited = new Set<string>();
+	const visiting = new Set<string>();
+	const visit = (file: string) => {
+		if (visited.has(file) || visiting.has(file)) return;
+		visiting.add(file);
+		const parent = parents.get(file);
+		if (parent && byFile.get(parent)?.tier === byFile.get(file)?.tier) visit(parent);
+		visiting.delete(file);
+		visited.add(file);
+		ordered.push(file);
+	};
+	for (const { file } of ranked) visit(file);
+	return ordered;
 }
 
 async function syncAllSessionsLocked(

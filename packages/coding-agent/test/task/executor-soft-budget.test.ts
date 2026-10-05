@@ -18,6 +18,7 @@ import {
 	lookupAgentRef,
 } from "../../src/internal/agent-registry-bridge";
 import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import type { AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
@@ -179,31 +180,22 @@ function createMockSession(
 	};
 }
 
-function registerAuthorityChild(
-	options: Parameters<typeof sdkModule.createAgentSession>[0],
-	id: string,
+function mockCreateAgentSession(
 	session: AgentSession,
-	sessionFile: string | null = null,
+	onCreateOptions?: (options: NonNullable<Parameters<typeof sdkModule.createAgentSession>[0]>) => void,
 ) {
-	if (!options) throw new Error("Expected createAgentSession options");
-	const agentRegistry = options.agentRegistry;
-	if (!agentRegistry) throw new Error("Expected runSubprocess authority to provide an agent registry");
-	const ref = agentRegistry.register({
-		id,
-		displayName: id,
-		kind: "sub",
-		session,
-		sessionFile,
-		status: "running",
-	});
-	return { ref, lifecycle: getAgentLifecycleManager(agentRegistry) };
-}
-
-function mockCreateAgentSession(id: string, session: AgentSession, sessionFile: string | null = null) {
 	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 		if (!options) throw new Error("Expected createAgentSession options");
-		const existing = options.agentRegistry ? lookupAgentRef(options.agentRegistry, id) : undefined;
-		if (existing?.status !== "parked") registerAuthorityChild(options, id, session, sessionFile);
+		onCreateOptions?.(options);
+		if (options.sessionManager) {
+			installSessionOperationLedger(options.sessionManager);
+			Object.defineProperty(session, "sessionManager", {
+				configurable: true,
+				enumerable: true,
+				writable: true,
+				value: options.sessionManager,
+			});
+		}
 		return {
 			session,
 			extensionsResult: {} as unknown as LoadExtensionsResult,
@@ -225,6 +217,7 @@ describe("runSubprocess soft request budget", () => {
 	let tempDir: TempDir;
 	let registry: AgentRegistry;
 	let lifecycle: AgentLifecycleManager;
+	let authorityCreator: AgentAuthoritySessionBinding["create"];
 	beforeEach(async () => {
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
@@ -234,9 +227,9 @@ describe("runSubprocess soft request budget", () => {
 		registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
 		AgentRegistry.installGlobal(registry);
 		const { session: rootSession } = await createAgentRootSession(registry, { agentId: "Main" });
-		if (!bindInternalAgentAuthoritySession(registry, rootSession)) {
-			throw new Error("Expected bound Main authority fixture");
-		}
+		const authority = bindInternalAgentAuthoritySession(registry, rootSession);
+		if (!authority) throw new Error("Expected bound Main authority fixture");
+		authorityCreator = authority.create;
 		lifecycle = getAgentLifecycleManager(registry);
 	});
 	afterEach(() => {
@@ -248,8 +241,7 @@ describe("runSubprocess soft request budget", () => {
 	});
 
 	function baseOptions(id: string, subagentEventBus?: EventBus) {
-		const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-			sdkModule.createAgentSession({ ...options, agentRegistry: registry });
+		const createAuthoritySession = authorityCreator;
 		return {
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -263,11 +255,8 @@ describe("runSubprocess soft request budget", () => {
 			subagentEventBus,
 			agentRegistry: registry,
 			createAuthoritySession,
+			parentAgentId: "Main",
 		};
-	}
-
-	function registerRunning(id: string, session: AgentSession): void {
-		registry.register({ id, displayName: id, kind: "sub", session, status: "running" });
 	}
 
 	it("a budget stop drives one forced final yield and finishes as a normal completion", async () => {
@@ -311,8 +300,7 @@ describe("runSubprocess soft request budget", () => {
 			} as AgentSessionEvent);
 		});
 
-		const createAgentSessionSpy = mockCreateAgentSession(id, handle.session);
-		registerRunning(id, handle.session);
+		const createAgentSessionSpy = mockCreateAgentSession(handle.session);
 		const parentSessionFile = `${tempDir.path()}/parent.jsonl`;
 
 		const result = await runSubprocess({ ...baseOptions(id), sessionFile: parentSessionFile });
@@ -384,7 +372,7 @@ describe("runSubprocess soft request budget", () => {
 			}
 		});
 		const advisorActive = vi.spyOn(handle.session, "isAdvisorActive");
-		mockCreateAgentSession(id, handle.session);
+		mockCreateAgentSession(handle.session);
 
 		const result = await runSubprocess({
 			...baseOptions(id, eventBus),
@@ -458,8 +446,7 @@ describe("runSubprocess soft request budget", () => {
 				emit({ type: "message_end", message } as unknown as AgentSessionEvent);
 			}
 		});
-		mockCreateAgentSession(id, handle.session);
-		registerRunning(id, handle.session);
+		mockCreateAgentSession(handle.session);
 
 		const result = await runSubprocess(baseOptions(id));
 		expect(result.aborted).toBe(true);
@@ -484,18 +471,7 @@ describe("runSubprocess soft request budget", () => {
 		await Bun.write(rootSessionFile, "");
 		await Bun.write(
 			workerSessionFile,
-			[
-				JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-08-13T17:14:48.000Z", cwd: "/tmp" }),
-				JSON.stringify({
-					type: "session_init",
-					id: "si",
-					parentId: null,
-					timestamp: "2026-08-13T17:14:48.000Z",
-					systemPrompt: "system",
-					task: "work",
-					tools: ["read"],
-				}),
-			].join("\n"),
+			JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-08-13T17:14:48.000Z", cwd: "/tmp" }),
 		);
 		const controller = new AbortController();
 		// abort #1 = budget soft-stop (abortSent still false); abort #2 =
@@ -519,9 +495,17 @@ describe("runSubprocess soft request budget", () => {
 				}
 			},
 		);
-		mockCreateAgentSession(id, handle.session, workerSessionFile);
+		mockCreateAgentSession(handle.session, options => {
+			if (!options.sessionManager)
+				throw new Error("Expected claimed child session manager before durable initialization.");
+			options.sessionManager.appendSessionInit({ systemPrompt: "test", task: "work", tools: ["read"] });
+		});
 
-		const result = await runSubprocess({ ...baseOptions(id), signal: controller.signal });
+		const result = await runSubprocess({
+			...baseOptions(id),
+			artifactsDir: `${tempDir.path()}/main`,
+			signal: controller.signal,
+		});
 
 		expect(result.aborted).toBe(true);
 		expect(registry.get(id)).toBeUndefined();
@@ -539,18 +523,7 @@ describe("runSubprocess soft request budget", () => {
 		await Bun.write(rootSessionFile, "");
 		await Bun.write(
 			workerSessionFile,
-			[
-				JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-08-13T17:14:48.000Z", cwd: "/tmp" }),
-				JSON.stringify({
-					type: "session_init",
-					id: "si",
-					parentId: null,
-					timestamp: "2026-08-13T17:14:48.000Z",
-					systemPrompt: "system",
-					task: "work",
-					tools: ["read"],
-				}),
-			].join("\n"),
+			JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-08-13T17:14:48.000Z", cwd: "/tmp" }),
 		);
 		const promptStarted = Promise.withResolvers<void>();
 		const promptStopped = Promise.withResolvers<void>();
@@ -562,14 +535,22 @@ describe("runSubprocess soft request budget", () => {
 			},
 			() => promptStopped.resolve(),
 		);
-		mockCreateAgentSession(id, handle.session, workerSessionFile);
+		mockCreateAgentSession(handle.session, options => {
+			if (!options.sessionManager)
+				throw new Error("Expected claimed child session manager before durable initialization.");
+			options.sessionManager.appendSessionInit({ systemPrompt: "test", task: "work", tools: ["read"] });
+		});
 		const manager = new AsyncJobManager({ maxRunningJobs: 1 });
 		AsyncJobManager.setInstance(manager);
 		manager.register(
 			"task",
 			"shutdown regression",
 			async ({ signal }) => {
-				const result = await runSubprocess({ ...baseOptions(id), signal });
+				const result = await runSubprocess({
+					...baseOptions(id),
+					artifactsDir: `${tempDir.path()}/main`,
+					signal,
+				});
 				return result.output;
 			},
 			{ ownerId: "Main", agentId: id },
@@ -621,15 +602,8 @@ describe("runSubprocess soft request budget", () => {
 			emit({ type: "message_end", message } as unknown as AgentSessionEvent);
 		});
 		let capturedOptions: { subagentEventBus?: EventBus } | undefined;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		mockCreateAgentSession(handle.session, options => {
 			capturedOptions = options;
-			registerAuthorityChild(options, id, handle.session);
-			return {
-				session: handle.session,
-				extensionsResult: {} as unknown as LoadExtensionsResult,
-				setToolUIContext: () => {},
-				eventBus: new EventBus(),
-			} satisfies CreateAgentSessionResult;
 		});
 
 		const terminal = waitForTerminal();
@@ -666,15 +640,7 @@ describe("runSubprocess soft request budget", () => {
 			pushMessage(message);
 			emit({ type: "message_end", message } as unknown as AgentSessionEvent);
 		});
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			registerAuthorityChild(options, id, handle.session);
-			return {
-				session: handle.session,
-				extensionsResult: {} as unknown as LoadExtensionsResult,
-				setToolUIContext: () => {},
-				eventBus: new EventBus(),
-			} satisfies CreateAgentSessionResult;
-		});
+		mockCreateAgentSession(handle.session);
 
 		await runSubprocess(baseOptions(id, sharedBus));
 		await terminal.promise;
@@ -692,7 +658,7 @@ describe("runSubprocess soft request budget", () => {
 			emit({ type: "message_end", message } as unknown as AgentSessionEvent);
 			controller.abort();
 		});
-		mockCreateAgentSession(id, handle.session);
+		mockCreateAgentSession(handle.session);
 
 		const result = await runSubprocess({ ...baseOptions(id), signal: controller.signal });
 

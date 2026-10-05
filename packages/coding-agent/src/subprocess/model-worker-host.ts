@@ -1,6 +1,5 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { ModelDownloadActivity, type ModelLoadProgressEvent } from "../downloads/model-downloads";
-import { tinyModelEnvKey } from "../tiny/title-client";
 import { safeSend } from "../utils/ipc";
 import {
 	createUnavailableWorker,
@@ -45,6 +44,8 @@ export interface ModelWorkerHostOptions<Inbound, Outbound, Request> {
 	/** Log/error prefix, e.g. `"stt"`. */
 	name: string;
 	spawnWorker: () => RefCountedWorkerHandle<Inbound, Outbound>;
+	/** Resolved environment identity used to decide whether an idle worker is stale. */
+	getWorkerEnvKey: () => string;
 	/** Display label for a model key in the download registry. */
 	modelLabel: (modelKey: string) => string;
 	handleMessage: (message: ModelWorkerMessage<Outbound>) => void;
@@ -115,7 +116,7 @@ export class ModelWorkerHost<
 	#downloads: ModelDownloadActivity;
 	#nextRequestId = 0;
 	#refed = false;
-	/** {@link tinyModelEnvKey} the current worker was spawned under. */
+	/** Resolved environment identity under which the current worker was spawned. */
 	#workerEnvKey: string | undefined;
 	#options: ModelWorkerHostOptions<Inbound, Outbound, Request>;
 
@@ -139,7 +140,7 @@ export class ModelWorkerHost<
 	}
 
 	ensureWorker(): RefCountedWorkerHandle<Inbound, Outbound> {
-		const envKey = tinyModelEnvKey();
+		const envKey = this.#options.getWorkerEnvKey();
 		if (this.#worker) {
 			if (this.#workerEnvKey === envKey || this.pending.size > 0 || this.#options.hasStreams?.())
 				return this.#worker;

@@ -527,9 +527,7 @@ function queryMessages<T>(
 	const fine = window.bucketMs !== undefined && window.bucketMs < HOUR_MS;
 	const dirtyHoursSmall = exactWhenRollupsStale ? dirtyIsSmall(database) : undefined;
 	const source =
-		dirtyHoursSmall === false
-			? rawMessageSource(cutoff)
-			: messageSource(database, cutoff, fine, dirtyHoursSmall);
+		dirtyHoursSmall === false ? rawMessageSource(cutoff) : messageSource(database, cutoff, fine, dirtyHoursSmall);
 	return database.prepare(`SELECT ${select} FROM (${source.sql}) f ${tail}`).all(...source.params) as T[];
 }
 

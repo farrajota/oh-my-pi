@@ -94,13 +94,9 @@ describe("InteractiveMode shutdown when the session write conflicts (#12238)", (
 		await fs.appendFile(sessionFile, "you're now broken\n");
 		corruptedBytes = await Bun.file(sessionFile).text();
 
-		// Any real full-body rewrite (compaction, branch, entry discard, title
-		// repair) now runs the storage guard against the externally modified
-		// file. It throws the genuine SessionWriteConflictError, which the
-		// manager latches as its disk failure; the close() inside dispose()
-		// rethrows that latched error — this is the exact propagation the
-		// reporter hit, with no mocked error construction.
-		await sessionManager.rewriteEntries().catch(() => undefined);
+		// Any real full-body rewrite now runs the storage guard against the
+		// externally modified file and latches its genuine persistence failure.
+		await expect(sessionManager.rewriteEntries()).rejects.toBeInstanceOf(SessionWriteConflictError);
 
 		quitCalled = Promise.withResolvers<void>();
 		quitSpy = vi.spyOn(postmortem, "quit").mockImplementation(async () => {

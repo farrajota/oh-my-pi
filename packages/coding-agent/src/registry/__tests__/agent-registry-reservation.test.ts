@@ -40,6 +40,46 @@ describe("AgentRegistry authority session creation", () => {
 		await createAgentRootSession(registry, { agentId: "Main", agentDisplayName: "main" });
 		expect(registry.get("Main")?.lineage).toMatchObject({ rootId: "Main" });
 	});
+	test("publishes a reserved child with the same lineage it later removes", async () => {
+		const main = fakeSession("/main.jsonl");
+		const child = fakeSession("/worker.jsonl");
+		vi.spyOn(sdk, "createAgentSession")
+			.mockResolvedValueOnce({ session: main } as sdk.CreateAgentSessionResult)
+			.mockResolvedValueOnce({ session: child } as sdk.CreateAgentSessionResult);
+		const registry = new AgentRegistry();
+		await createAgentRootSession(registry, { agentId: "Main" });
+		let registeredCount = 0;
+		let removedCount = 0;
+		let registeredGeneration: number | undefined;
+		let registeredInternalGeneration: number | undefined;
+		let removedGeneration: number | undefined;
+		let registeredSession: AgentSession | undefined;
+		registry.onChange(event => {
+			if (event.ref.id !== "Main/worker") return;
+			if (event.type === "registered") {
+				registeredCount++;
+				registeredGeneration = event.ref.lineage?.generation;
+				const row = lookupAgentRef(registry, event.ref.id);
+				registeredInternalGeneration = row?.lineage?.generation;
+				registeredSession = row?.session ?? undefined;
+			} else if (event.type === "removed") {
+				removedCount++;
+				removedGeneration = event.ref.lineage?.generation;
+			}
+		});
+		const mainBinding = bindInternalAgentAuthoritySession(registry, main)!;
+		await mainBinding.create({ agentId: "Main/worker", agentDisplayName: "worker" });
+		const committedRow = lookupAgentRef(registry, "Main/worker");
+		expect(registeredCount).toBe(1);
+		expect(registeredSession).toBe(child);
+		expect(committedRow?.session).toBe(registeredSession);
+		expect(registeredInternalGeneration).toBe(committedRow?.lineage?.generation);
+		expect(registeredGeneration).toBe(registeredInternalGeneration);
+		await child.dispose();
+		expect(removedCount).toBe(1);
+		expect(removedGeneration).toBe(registeredGeneration);
+		expect(registry.get("Main/worker")).toBeUndefined();
+	});
 	test("rejects restricted authority startup before SDK assembly without a durable store", async () => {
 		const createSession = vi.spyOn(sdk, "createAgentSession");
 		const registry = new AgentRegistry();

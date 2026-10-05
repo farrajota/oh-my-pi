@@ -14,7 +14,8 @@ import {
 } from "../../src/internal/agent-lifecycle-bridge";
 import { lookupAgentRef } from "../../src/internal/agent-registry-bridge";
 import * as registryBridge from "../../src/internal/agent-registry-bridge";
-import { AgentRegistry, getAgentTombstonePath, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { getAgentTombstonePath } from "../../src/registry/agent-tombstone";
 import { ensurePersistedRoster, registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";

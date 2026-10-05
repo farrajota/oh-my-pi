@@ -42,6 +42,7 @@ export { formatOutputNotice };
 export type { OutputMeta, TruncationMeta };
 import {
 	cfgToolsArtifactHeadBytes,
+	cfgToolsArtifactMaxBytes,
 	cfgToolsArtifactSpillThreshold,
 	cfgToolsArtifactTailBytes,
 	cfgToolsArtifactTailLines,
@@ -203,7 +204,7 @@ export class OutputMetaBuilder {
 	truncationFromSummary(summary: OutputSummary, options: TruncationSummaryOptions): this {
 		const artifactId = summary.artifactError ? undefined : summary.artifactId;
 		if (summary.columnMax != null && summary.columnMax > 0 && (summary.columnTruncatedLines ?? 0) > 0) {
-			this.columnTruncated(summary.columnMax, "bytes", artifactId);
+			this.columnTruncated(summary.columnMax, "bytes", artifactId, summary.artifactElidedBytes);
 		}
 		if (summary.artifactError) {
 			this.artifactError(summary.artifactError);
@@ -212,6 +213,8 @@ export class OutputMetaBuilder {
 
 		const { direction, startLine = 1, totalFileLines } = options;
 		const totalLines = totalFileLines ?? summary.totalLines;
+		// A capped artifact holds only a head/tail sample; the notice must say so.
+		const artifactElidedBytes = artifactId ? summary.artifactElidedBytes : undefined;
 
 		// Middle elision: the sink retained head + tail with an elision marker.
 		if (summary.elidedBytes != null && summary.elidedBytes > 0) {
@@ -231,6 +234,7 @@ export class OutputMetaBuilder {
 				elidedBytes: summary.elidedBytes,
 				elidedLines,
 				artifactId,
+				...(artifactElidedBytes ? { artifactElidedBytes } : {}),
 			};
 			return this;
 		}
@@ -262,6 +266,7 @@ export class OutputMetaBuilder {
 			outputBytes: summary.outputBytes,
 			shownRange: { start: shownStart, end: shownEnd },
 			artifactId,
+			...(artifactElidedBytes ? { artifactElidedBytes } : {}),
 			nextOffset: direction === "head" ? shownEnd + 1 : undefined,
 		};
 
@@ -359,12 +364,22 @@ export class OutputMetaBuilder {
 		return this;
 	}
 
-	/** Add column truncation notice. No-op if maxColumn <= 0. */
-	columnTruncated(maxColumn: number, unit?: "bytes" | "chars", artifactId?: string): this {
+	/** Add column truncation notice. No-op if maxColumn <= 0. `unit` names the unit the producer enforced the cap in. */
+	columnTruncated(
+		maxColumn: number,
+		unit: "bytes" | "chars" = "chars",
+		artifactId?: string,
+		artifactElidedBytes?: number,
+	): this {
 		if (maxColumn <= 0) return this;
 		this.#meta.limits = {
 			...this.#meta.limits,
-			columnTruncated: { maxColumn, ...(unit ? { unit } : {}), ...(artifactId ? { artifactId } : {}) },
+			columnTruncated: {
+				maxColumn,
+				unit,
+				...(artifactId ? { artifactId } : {}),
+				...(artifactId && artifactElidedBytes ? { artifactElidedBytes } : {}),
+			},
 		};
 		return this;
 	}
@@ -495,6 +510,15 @@ export function resolveInlineByteCapBudget(s: Settings | undefined): number {
  */
 export function resolveOutputMaxColumns(s: Settings | undefined): number {
 	return s ? cfgToolsOutputMaxColumns.get(s) : cfgToolsOutputMaxColumns.default;
+}
+
+/**
+ * Resolve the OutputSink `artifactMaxBytes` cap (bytes) from session settings
+ * (`tools.artifactMaxBytes`, in MB). `0` keeps artifact files unbounded.
+ */
+export function resolveOutputSinkArtifactMaxBytes(s: Settings | undefined): number {
+	const megabytes = s ? cfgToolsArtifactMaxBytes.get(s) : cfgToolsArtifactMaxBytes.default;
+	return Math.max(0, Math.floor(megabytes * 1024 * 1024));
 }
 
 /**

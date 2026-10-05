@@ -1,3 +1,5 @@
+import type { CompactionThresholdPair } from "../config/compaction-threshold";
+import type { Settings } from "../config/settings";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { BoundSessionOperationAuthority } from "../registry/operation-lease";
@@ -10,6 +12,17 @@ import type {
 	RegisterInput,
 	RegistryEvent,
 } from "../registry/agent-registry";
+
+/**
+ * Original-root thresholds for a subagent settings chain. Named overrides apply
+ * to that child only; authority snapshots retain this metadata, not arbitrary
+ * symbol properties or session authority brands.
+ */
+export const kRootCompactionThresholds = Symbol("task.rootCompactionThresholds");
+
+export interface SubagentChainSettings extends Settings {
+	[kRootCompactionThresholds]?: Readonly<CompactionThresholdPair>;
+}
 
 /** Exact mutable registry row. This type is confined to non-package-exported code. */
 export type InternalAgentRef = AgentRef & { session: AgentSession | null };
@@ -31,6 +44,7 @@ interface AgentRegistryBridge {
 	ownershipToken(expected: InternalAgentRef | AgentRef): InternalAgentOwnershipToken | undefined;
 	bindAuthoritySession(parent: AgentSession): AgentAuthoritySessionBinding | undefined;
 	lookupAuthoritySession(parent: AgentSession): InternalAgentRef | undefined;
+	lookupAuthorityLineage(parentId: string): { readonly rootId: string; readonly parentId: string } | undefined;
 	operationAuthority(parent: AgentSession): BoundSessionOperationAuthority | undefined;
 	createRootSession(options?: CreateAgentSessionOptions): Promise<CreateAgentSessionResult>;
 	setHistory(expected: InternalAgentRef | AgentSession, history: AgentHistorySummary): boolean;
@@ -103,6 +117,13 @@ export function lookupAgentAuthoritySession(
 	parent: AgentSession,
 ): InternalAgentRef | undefined {
 	return bridgeFor(registry).lookupAuthoritySession(parent);
+}
+
+export function lookupAgentAuthorityLineage(
+	registry: AgentRegistry,
+	parentId: string,
+): { readonly rootId: string; readonly parentId: string } | undefined {
+	return bridgeFor(registry).lookupAuthorityLineage(parentId);
 }
 
 export function resolveAgentSessionOperationAuthority(

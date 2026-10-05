@@ -1213,8 +1213,6 @@ describe("task exact preparation", () => {
 					settings: {
 						"async.enabled": false,
 						"task.batch": false,
-						"task.allowModelOverride": true,
-						"task.agentModelOverrides": { "browser-audit-specialist": "fixture/model" },
 					},
 				}),
 			);
@@ -1224,7 +1222,6 @@ describe("task exact preparation", () => {
 				agentSource: "project",
 				agentDefinitionSha256: sha256,
 				task: "Audit exact bytes.",
-				model: "pi/task",
 			} as TaskParams;
 			await expect(
 				tool.prepareExecution(
@@ -1267,7 +1264,7 @@ describe("task exact preparation", () => {
 				source: "user",
 				filePath,
 			});
-			let capturedOptions: executorModule.RunSubprocessOptions | undefined;
+			let capturedOptions: executorModule.ExecutorOptions | undefined;
 			vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 				capturedOptions = options;
 				const nativeSession = createSession({ agentId: options.id });
@@ -1612,5 +1609,24 @@ describe("task exact preparation", () => {
 		const retried = await tool.execute("call-after-postrun-failure", params, undefined, undefined, undefined, second);
 
 		expect(retried.details?.results.map(item => item.id)).toEqual(["Used-2"]);
+	});
+});
+
+describe("batch model placement", () => {
+	afterEach(() => vi.restoreAllMocks());
+	it("rejects a top-level model before dispatch even when wire validation is bypassed", async () => {
+		mockDiscovery();
+		const run = vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("Unexpected"));
+		const tool = await TaskTool.create(
+			createSession({ settings: { "task.batch": true, "async.enabled": false, "task.allowModelOverride": true } }),
+		);
+		const result = await tool.execute("batch-model", {
+			context: "Shared context",
+			model: "p/requested",
+			tasks: [{ task: "Do work" }],
+		});
+		expect(getFirstText(result)).toMatch(/model.*tasks|model.*item/i);
+		expect(result.isError).toBe(true);
+		expect(run).not.toHaveBeenCalled();
 	});
 });

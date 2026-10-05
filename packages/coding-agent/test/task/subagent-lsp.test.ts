@@ -20,6 +20,8 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import "@oh-my-pi/pi-coding-agent/tools/yield";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 const TEST_TASK: TaskParams = { agent: "task", name: "CheckLsp", task: "Inspect LSP tools." };
@@ -131,23 +133,30 @@ function mockAgents(agent: AgentDefinition): void {
 	});
 }
 
-function mockCreateAuthoritySession(): {
+const authorityRoots: AgentSession[] = [];
+
+async function mockCreateAuthoritySession(): Promise<{
 	agentRegistry: AgentRegistry;
 	createAuthoritySession: NonNullable<ToolSession["createAuthoritySession"]>;
 	getOptions: () => CreateAgentSessionOptions | undefined;
-} {
+}> {
 	let capturedOptions: CreateAgentSessionOptions | undefined;
 	const agentRegistry = new AgentRegistry();
+	const root = await createAgentRootSession(agentRegistry, { agentId: "Main" });
+	authorityRoots.push(root.session);
+	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
+		session: createYieldingSession(),
+		extensionsResult: {} as unknown as LoadExtensionsResult,
+		setToolUIContext: () => {},
+		eventBus: new EventBus(),
+	} satisfies CreateAgentSessionResult);
 	return {
 		agentRegistry,
-		createAuthoritySession: async options => {
+		createAuthoritySession: async (options, reviveRef) => {
 			capturedOptions = options;
-			return {
-				session: createYieldingSession(),
-				extensionsResult: {} as unknown as LoadExtensionsResult,
-				setToolUIContext: () => {},
-				eventBus: new EventBus(),
-			} satisfies CreateAgentSessionResult;
+			return authority.create(options, reviveRef);
 		},
 		getOptions: () => capturedOptions,
 	};
@@ -180,8 +189,9 @@ function mockIsolation(): void {
 }
 
 describe("subagent LSP availability", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const root of authorityRoots.splice(0)) await root.dispose();
 	});
 
 	it("disables LSP for subagents by default", async () => {
@@ -192,7 +202,7 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["lsp"],
 		});
-		const creator = mockCreateAuthoritySession();
+		const creator = await mockCreateAuthoritySession();
 
 		const tool = await TaskTool.create(
 			createSession({
@@ -213,7 +223,7 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["lsp"],
 		});
-		const creator = mockCreateAuthoritySession();
+		const creator = await mockCreateAuthoritySession();
 
 		const tool = await TaskTool.create(
 			createSession({
@@ -236,7 +246,7 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["lsp"],
 		});
-		const creator = mockCreateAuthoritySession();
+		const creator = await mockCreateAuthoritySession();
 
 		const tool = await TaskTool.create(
 			createSession({
@@ -260,7 +270,7 @@ describe("subagent LSP availability", () => {
 			tools: ["lsp"],
 		});
 		mockIsolation();
-		const creator = mockCreateAuthoritySession();
+		const creator = await mockCreateAuthoritySession();
 
 		const tool = await TaskTool.create(
 			createSession({
@@ -284,7 +294,7 @@ describe("subagent LSP availability", () => {
 			tools: ["write"],
 		});
 		mockIsolation();
-		const creator = mockCreateAuthoritySession();
+		const creator = await mockCreateAuthoritySession();
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolated-session-cwd-"));
 		try {
 			const parentSessionFile = path.join(tempDir, "parent.jsonl");
@@ -296,9 +306,19 @@ describe("subagent LSP availability", () => {
 					createAuthoritySession: creator.createAuthoritySession,
 				}),
 			);
-			await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
+			const result = await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
+			const options = creator.getOptions();
+			if (!options) {
+				throw new Error(
+					`TaskTool.execute did not reach the bound authority creator: ${JSON.stringify({
+						isError: result.isError,
+						content: result.content,
+						details: result.details,
+					})}`,
+				);
+			}
 
-			const sessionManager = creator.getOptions()?.sessionManager as { getCwd?: () => string } | undefined;
+			const sessionManager = options.sessionManager as { getCwd?: () => string } | undefined;
 			expect(creator.getOptions()?.cwd).toBe("/tmp/isolated-subagent");
 			expect(sessionManager?.getCwd?.()).toBe("/tmp/isolated-subagent");
 		} finally {
@@ -314,7 +334,7 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["bash", "ast_grep", "memory_edit", "retain", "todo"],
 		});
-		const creator = mockCreateAuthoritySession();
+		const creator = await mockCreateAuthoritySession();
 		const planMode = { enabled: true, planFilePath: "local://PLAN.md" };
 
 		const tool = await TaskTool.create(

@@ -2,7 +2,7 @@
 {{#if asyncEnabled}}
 
 # Results
-`outputSchema` parsed payload, even invalid: `agent://<id>` (field `/<field>`, nested `/reports/0/data`); invalid preview inline.
+`outputSchema` parsed payload, even invalid: `agent://<id>`; JSON field paths such as `/<field>` and `/reports/0/data` fall back to extraction only when no matching nested-child artifact exists. Nested outputs use `agent://<id>.<child>` or `agent://<id>/<child>`; invalid preview inline.
 {{/if}}
 
 # Delegation
@@ -19,7 +19,7 @@ Name one integration owner. Shared edits are not guaranteed to merge in the same
     NEVER pass the spawn-policy default explicitly. Only omit it after checking the available agents below.
   - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
   - `solutionSpace`: Describe how open-ended the child's problem is: whether the fix or design is given, or which causes or designs remain open. Volume of work does not widen it; NEVER mention sibling agents or coordination. (`one fix: rename, names given`; `one fix: slice end in paginate`; `single-flight cache load; races easy to miss`; `several retry API shapes; error classes to choose`; `deadlock cause open, no repro`)
-{{#if modelEnabled}}  - `model`: Available only when `task.allowModelOverride` is enabled. Pass one non-empty request-local selector for this item (for example, `pi/taskpro`), never a comma-separated fallback chain. It overrides `task.agentModelOverrides`, agent frontmatter, and the parent model for this invocation only. Resolution is exact: no parent-auth fallback, configured runtime fallback chain, or prewalk handoff. Approval/call output shows the requested selector; progress/results show requested and resolved models.
+{{#if modelEnabled}}  - `model`: Available only when `task.allowModelOverride` is enabled. Pass one non-empty selector or ordered list of selectors for this item (for example, `pi/taskpro`, `@default`), not a comma-separated fallback chain. It overrides `task.agentModelOverrides`, agent frontmatter, and the parent model for this invocation only. Request-local selection is exact: no parent-auth fallback, configured runtime fallback chain, or prewalk handoff. Approval/call output shows the requested selector; progress/results show requested and resolved models.
 {{/if}}
   - `agentSource`: Optional exact source pin: `bundled`, `user`, or `project`.
   - `agentDefinitionSha256`: Optional lowercase SHA-256 pin for the exact file-backed agent definition bytes. A pin mismatch blocks before launch.
@@ -43,7 +43,7 @@ Name one integration owner. Shared edits are not guaranteed to merge in the same
   NEVER pass the spawn-policy default explicitly. Only omit it after checking the available agents below.
 - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
 - `solutionSpace`: Describe how open-ended the child's problem is: whether the fix or design is given, or which causes or designs remain open. Volume of work does not widen it; NEVER mention sibling agents or coordination. (`one fix: rename, names given`; `one fix: slice end in paginate`; `single-flight cache load; races easy to miss`; `several retry API shapes; error classes to choose`; `deadlock cause open, no repro`)
-{{#if modelEnabled}}- `model`: Available only when `task.allowModelOverride` is enabled. Pass one non-empty request-local selector (for example, `pi/taskpro`), never a comma-separated fallback chain. It overrides `task.agentModelOverrides`, agent frontmatter, and the parent model for this invocation only. Resolution is exact: no parent-auth fallback, configured runtime fallback chain, or prewalk handoff. Approval/call output shows the requested selector; progress/results show requested and resolved models.
+{{#if modelEnabled}}- `model`: Available only when `task.allowModelOverride` is enabled. Pass one non-empty selector or ordered list of selectors (for example, `pi/taskpro`, `@default`), not a comma-separated fallback chain. It overrides `task.agentModelOverrides`, agent frontmatter, and the parent model for this invocation only. Request-local selection is exact: no parent-auth fallback, configured runtime fallback chain, or prewalk handoff. Approval/call output shows the requested selector; progress/results show requested and resolved models.
 {{/if}}
 - `agentSource`: Optional exact source pin: `bundled`, `user`, or `project`.
 - `agentDefinitionSha256`: Optional lowercase SHA-256 pin for the exact file-backed agent definition bytes. A pin mismatch blocks before launch.

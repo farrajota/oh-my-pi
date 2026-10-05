@@ -450,7 +450,7 @@ export class UiHelpers {
 			if (
 				nextToolName === "wait" &&
 				previous.isDisplaceableBlock() &&
-				this.ctx.chatContainer.canRemoveBlock(previous)
+				this.ctx.chatContainer.canDisplaceBlock(previous)
 			) {
 				this.ctx.chatContainer.removeChild(previous);
 			}
@@ -879,6 +879,7 @@ export class UiHelpers {
 		// mutating anything.
 		const context = this.ctx.viewSession.buildTranscriptSessionContext({
 			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
+			keepDanglingToolCalls: this.ctx.viewSession.isStreaming,
 		});
 		for (const remaining of context.messages) {
 			if (remaining === message) return false;
@@ -950,7 +951,9 @@ export class UiHelpers {
 			// Resolve before replacing live component maps: streaming events may arrive during filesystem I/O.
 			await refreshAssistantMessageLinkTargets(
 				this.ctx,
-				context.messages.filter((message): message is AssistantMessage => message.role === "assistant"),
+				context.messages.filter(
+					(message: AgentMessage): message is AssistantMessage => message.role === "assistant",
+				),
 			);
 
 			this.ctx.chatContainer = stagedChatContainer;
@@ -996,7 +999,9 @@ export class UiHelpers {
 				replayEntryCount = this.ctx.viewSession.sessionManager.getEntries().length;
 				await refreshAssistantMessageLinkTargets(
 					this.ctx,
-					context.messages.filter((message): message is AssistantMessage => message.role === "assistant"),
+					context.messages.filter(
+						(message: AgentMessage): message is AssistantMessage => message.role === "assistant",
+					),
 				);
 				stagedChatContainer.disposeChildren();
 				this.ctx.transcriptMessageComponents = new WeakMap<AgentMessage, Component>();

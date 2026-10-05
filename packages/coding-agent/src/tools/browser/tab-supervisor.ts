@@ -7,6 +7,8 @@ import {
 	withTimeout,
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
+import { captureScreenshotBuffer } from "./screenshot";
+import { preparePageForScreenshot } from "./tab-worker";
 import type { CDPSession, Page, Target } from "puppeteer-core";
 import { callSessionTool } from "../../eval/js/tool-bridge";
 import { webpExclusionForModel } from "@oh-my-pi/pi-tui/chat/image-loading";
@@ -665,6 +667,45 @@ async function acquireTernTab(
 		await ternTab.close({ timeoutMs: DEFAULT_TAB_CLOSE_TIMEOUT_MS }).catch(() => undefined);
 		throw error;
 	}
+}
+
+/** Capture raw screenshot bytes only for the exact live audit-owned browser tab. */
+export async function captureBrowserAuditScreenshot(
+	auditId: string,
+	tabName: string,
+	signal?: AbortSignal,
+): Promise<Uint8Array> {
+	const tab = getTab(tabName, auditId);
+	if (
+		!tab ||
+		tab.backend !== "worker" ||
+		tab.state !== "alive" ||
+		tab.browser.kind.kind !== "audit" ||
+		tab.browser.kind.auditId !== auditId ||
+		tab.pending.size > 0
+	) {
+		throw new ToolError("Browser audit screenshot requires its idle owned tab");
+	}
+	if (signal?.aborted) throw new ToolAbortError();
+	if (!(await unfreezeTabSession(tab))) throw new ToolError("Browser audit tab could not be resumed for capture");
+	const target = await findTargetForTab(tab);
+	const page = await target?.page();
+	if (!page || tabs.get(tabName) !== tab || getTab(tabName, auditId) !== tab || tab.state !== "alive") {
+		throw new ToolError("Browser audit tab ownership changed before capture");
+	}
+	await preparePageForScreenshot(page, signal, true);
+	if (
+		signal?.aborted ||
+		tabs.get(tabName) !== tab ||
+		getTab(tabName, auditId) !== tab ||
+		tab.state !== "alive" ||
+		tab.pending.size > 0 ||
+		tab.browser.kind.kind !== "audit" ||
+		tab.browser.kind.auditId !== auditId
+	) {
+		throw new ToolError("Browser audit tab ownership changed before capture");
+	}
+	return await captureScreenshotBuffer(page, {}, signal, async () => null);
 }
 
 export async function runInTab(name: string, opts: RunInTabOptions): Promise<RunResultOk> {

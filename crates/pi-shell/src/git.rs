@@ -935,9 +935,23 @@ mod tests {
 		let wt = repo.parent().expect("parent").join("bare-wt");
 		assert!(!wt.join("tracked.txt").exists(), "--no-checkout handled by git");
 
-		// Branch already checked out: git's own fatal error and status.
+		// A checked-out branch must be rejected without creating another worktree.
 		let (code, output) = run(&repo, "git worktree add ../again main").await;
 		assert_eq!(code, Some(128));
-		assert!(output.contains("fatal: 'main' is already used by worktree"), "{output}");
+		let control = std::process::Command::new("git")
+			.args(["worktree", "add", "../again", "main"])
+			.current_dir(&repo)
+			.env_remove("GIT_CONFIG_GLOBAL")
+			.env_remove("GIT_CONFIG_SYSTEM")
+			.env_remove("GIT_CONFIG_NOSYSTEM")
+			.env_remove("GIT_CONFIG_PARAMETERS")
+			.output()
+			.expect("run git control");
+		assert_eq!(control.status.code(), Some(128));
+		assert_eq!(
+			output.as_bytes().strip_prefix(control.stdout.as_slice()),
+			Some(control.stderr.as_slice())
+		);
+		assert!(!repo.parent().expect("parent").join("again").exists(), "{output}");
 	}
 }

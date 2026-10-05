@@ -275,12 +275,22 @@ export class ArtifactManager {
 	readonly #stagingDir: string;
 	readonly #namedStateDir: string;
 	#dirCreated = false;
+	#initPromise: Promise<void> | null = null;
+	#existingIds = new Set<string>();
+	readonly #ready: Promise<void> | undefined;
 
-	constructor(dir: string) {
+	/**
+	 * @param dir Directory that will hold artifact files. Created lazily on first save.
+	 * @param ready Settles once `dir` is seeded (a session move copying the previous
+	 *   session's artifacts in the background). Id scans and lookups wait for it,
+	 *   so new ids never collide with copied ones. Must not reject.
+	 */
+	constructor(dir: string, ready?: Promise<void>) {
 		this.#dir = dir;
 		this.#stateDir = path.join(dir, ".artifact-state-v1");
 		this.#stagingDir = path.join(dir, ".artifact-staging-v1");
 		this.#namedStateDir = path.join(dir, ".artifact-named-state-v1");
+		this.#ready = ready;
 	}
 
 	get dir(): string {
@@ -288,14 +298,29 @@ export class ArtifactManager {
 	}
 
 	async #ensureDir(): Promise<void> {
-		if (this.#dirCreated) return;
-		await Promise.all([
-			fs.mkdir(this.#dir, { recursive: true }),
-			fs.mkdir(this.#stateDir, { recursive: true }),
-			fs.mkdir(this.#stagingDir, { recursive: true }),
-			fs.mkdir(this.#namedStateDir, { recursive: true }),
-		]);
-		this.#dirCreated = true;
+		await this.#ready;
+		if (!this.#dirCreated) {
+			await Promise.all([
+				fs.mkdir(this.#dir, { recursive: true }),
+				fs.mkdir(this.#stateDir, { recursive: true }),
+				fs.mkdir(this.#stagingDir, { recursive: true }),
+				fs.mkdir(this.#namedStateDir, { recursive: true }),
+			]);
+			this.#dirCreated = true;
+		}
+		// Memoize the first-use scan so concurrent callers share the same legacy
+		// artifact-ID snapshot before reserving IDs.
+		this.#initPromise ??= this.#scanExistingIds();
+		await this.#initPromise;
+	}
+
+	/** Seed occupied IDs from legacy artifact files before allocating reservations. */
+	async #scanExistingIds(): Promise<void> {
+		const entries = await fs.readdir(this.#dir, { withFileTypes: true });
+		for (const entry of entries) {
+			const match = /^(\d+)\..*\.log$/.exec(entry.name);
+			if (match) this.#existingIds.add(match[1]);
+		}
 	}
 
 	#recordDir(id: string): string {
@@ -361,9 +386,11 @@ export class ArtifactManager {
 		const metadataInputSha256 = artifactSha256(stableMetadata(options.metadata ?? {}));
 		for (let attempt = 0; attempt < MAX_ARTIFACT_ID_ATTEMPTS; attempt++) {
 			const id = BigInt(`0x${crypto.randomUUID().replaceAll("-", "")}`).toString(10);
+			if (this.#existingIds.has(id)) continue;
 			const stagingId = crypto.randomUUID();
 			try {
 				await fs.mkdir(this.#recordDir(id));
+				this.#existingIds.add(id);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
 				throw error;
@@ -469,7 +496,13 @@ export class ArtifactManager {
 				await this.#abandon(working, `publish-failed:${error instanceof Error ? error.message : String(error)}`);
 				throw error;
 			}
-			const existing = new Uint8Array(await fs.readFile(finalPath));
+			let existing: Uint8Array;
+			try {
+				existing = new Uint8Array(await fs.readFile(finalPath));
+			} catch (error) {
+				await this.#abandon(working, `publish-failed:${error instanceof Error ? error.message : String(error)}`);
+				throw error;
+			}
 			if (existing.byteLength !== working.bytes || artifactSha256(existing) !== working.contentSha256) {
 				await this.#abandon(working, "publish-collision");
 				throw new Error(`Artifact publication collision: ${id}`);
@@ -640,6 +673,7 @@ export class ArtifactManager {
 	}
 
 	async #getPublishedPath(id: string, audience: ArtifactState["audience"]): Promise<string | null> {
+		await this.#ready;
 		const state = await this.#readPhase(id, "published");
 		if (
 			!state ||

@@ -28,13 +28,15 @@ import type { AgentDefinition, AgentProgress } from "@oh-my-pi/pi-coding-agent/t
 import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 const TAIL_BYTES = 8 * 1024;
 
-function createAuthorityFixture() {
+async function createAuthorityFixture() {
 	const agentRegistry = new AgentRegistry();
-	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-		sdkModule.createAgentSession({ ...options, agentRegistry });
-	return { agentRegistry, createAuthoritySession };
+	const root = await createAgentRootSession(agentRegistry, { agentId: "Main" });
+	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	return { agentRegistry, authoritySession: root.session, createAuthoritySession: authority.create };
 }
 
 /**
@@ -261,9 +263,10 @@ async function runScenario(
 		for (const event of yieldEvents()) emit(event);
 	});
 
-	vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as CreateAgentSessionResult);
-
-	const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
+	const { agentRegistry, authoritySession, createAuthoritySession } = await createAuthorityFixture();
+	const childSessionSpy = vi
+		.spyOn(sdkModule, "createAgentSession")
+		.mockResolvedValue({ session } as CreateAgentSessionResult);
 	const result = await runSubprocess({
 		cwd: "/tmp",
 		agent,
@@ -289,6 +292,10 @@ async function runScenario(
 		},
 		agentRegistry,
 		createAuthoritySession,
+		parentAgentId: "Main",
+	}).finally(async () => {
+		childSessionSpy.mockRestore();
+		await authoritySession.dispose();
 	});
 
 	return { observations, tools, toolSnapshots, immutability, exitCode: result.exitCode, finalWant: ref.expected() };

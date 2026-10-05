@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,6 +17,7 @@ import {
 	retainIsolationWorkspace,
 	runIsolatedSubprocess,
 } from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
+import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import * as natives from "@oh-my-pi/pi-natives";
@@ -41,10 +43,28 @@ function result(overrides: Partial<SingleResult> = {}): SingleResult {
 	};
 }
 
-const testRegistry = new AgentRegistry();
-const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
+let testRegistry = AgentRegistry.global();
+const createAuthoritySession: ExecutorOptions["createAuthoritySession"] = options =>
 	sdkModule.createAgentSession({ ...options, agentRegistry: testRegistry });
 const tempRoots: string[] = [];
+
+function registerTaskAgent(id: string): void {
+	testRegistry.register({
+		id: "Main",
+		displayName: "Main",
+		kind: "main",
+		session: null,
+		status: "parked",
+	});
+	testRegistry.register({
+		id,
+		displayName: id,
+		kind: "sub",
+		parentId: "Main",
+		session: null,
+		status: "parked",
+	});
+}
 
 async function git(repoRoot: string, ...args: string[]): Promise<string> {
 	const result = await $`git ${args}`.cwd(repoRoot).quiet().nothrow();
@@ -52,6 +72,38 @@ async function git(repoRoot: string, ...args: string[]): Promise<string> {
 		throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
 	}
 	return result.text();
+}
+
+function gitBlobSha(content: string): string {
+	return createHash("sha1")
+		.update(`blob ${Buffer.byteLength(content)}\0`)
+		.update(content)
+		.digest("hex")
+		.slice(0, 7);
+}
+
+function trackedTextPatch(file: string, before: string, after: string): string {
+	return (
+		`diff --git a/${file} b/${file}\n` +
+		`index ${gitBlobSha(before)}..${gitBlobSha(after)} 100644\n` +
+		`--- a/${file}\n` +
+		`+++ b/${file}\n` +
+		`@@ -1 +1 @@\n` +
+		`-${before}` +
+		`+${after}`
+	);
+}
+
+function newTextFilePatch(file: string, content: string): string {
+	return (
+		`diff --git a/${file} b/${file}\n` +
+		`new file mode 100644\n` +
+		`index 0000000..${gitBlobSha(content)}\n` +
+		`--- /dev/null\n` +
+		`+++ b/${file}\n` +
+		`@@ -0,0 +1 @@\n` +
+		`+${content}`
+	);
 }
 
 async function seedFooRepo(finalContent: string): Promise<{ repoRoot: string; patchPath: string }> {
@@ -80,31 +132,51 @@ async function seedFooRepo(finalContent: string): Promise<{ repoRoot: string; pa
 	return { repoRoot, patchPath };
 }
 
+async function seedIsolatedRepo(options: { nested?: boolean } = {}): Promise<string> {
+	const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-workspace-"));
+	tempRoots.push(workspaceRoot);
+	const repoRoot = path.join(workspaceRoot, "repo");
+	await fs.mkdir(repoRoot, { recursive: true });
+	await git(repoRoot, "init", "-q", "-b", "main");
+	await git(repoRoot, "config", "user.email", "repro@example.com");
+	await git(repoRoot, "config", "user.name", "Repro");
+	await Bun.write(path.join(repoRoot, "task.txt"), "old\n");
+	await git(repoRoot, "add", "task.txt");
+	await git(repoRoot, "commit", "-q", "-m", "isolated fixture baseline");
+	if (options.nested) {
+		const nestedRoot = path.join(repoRoot, "inner");
+		await fs.mkdir(nestedRoot, { recursive: true });
+		await git(nestedRoot, "init", "-q", "-b", "main");
+		await git(nestedRoot, "config", "user.email", "repro@example.com");
+		await git(nestedRoot, "config", "user.name", "Repro");
+		await Bun.write(path.join(nestedRoot, "base.txt"), "nested baseline\n");
+		await git(nestedRoot, "add", "base.txt");
+		await git(nestedRoot, "commit", "-q", "-m", "nested fixture baseline");
+		await fs.appendFile(path.join(repoRoot, ".git", "info", "exclude"), "inner/\n");
+	}
+	return repoRoot;
+}
+
 describe("runIsolatedSubprocess", () => {
+	beforeEach(() => {
+		AgentRegistry.resetGlobalForTests();
+		testRegistry = AgentRegistry.global();
+	});
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
+		testRegistry = AgentRegistry.global();
 		await Promise.all(tempRoots.splice(0).map(tempRoot => fs.rm(tempRoot, { force: true, recursive: true })));
 	});
 
 	it("preserves branch-mode output as a patch when branch transfer fails", async () => {
-		const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-run-"));
-		tempRoots.push(repoRoot);
-		const isolationDir = path.join(repoRoot, "isolated");
-		const artifactsDir = path.join(repoRoot, "artifacts");
-		const baseline = {
-			root: {
-				repoRoot,
-				headCommit: "base",
-				staged: "",
-				unstaged: "",
-				untracked: [],
-				untrackedPatch: "",
-			},
-			nested: [],
-		};
-		const rootPatch = "diff --git a/task.txt b/task.txt\n--- a/task.txt\n+++ b/task.txt\n@@ -1 +1 @@\n-old\n+new\n";
+		const isolationDir = await seedIsolatedRepo();
+		const repoRoot = isolationDir;
+		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-artifacts-"));
+		tempRoots.push(artifactsDir);
+		const baseSha = (await git(repoRoot, "rev-parse", "HEAD")).trim();
+		const rootPatch = trackedTextPatch("task.txt", "old\n", "new\n");
 
 		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
 			mergedDir: isolationDir,
@@ -112,31 +184,15 @@ describe("runIsolatedSubprocess", () => {
 			fellBack: false,
 			fallbackReason: null,
 		});
-		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(result({ id: "PreserveBranchFailure" }));
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			await Bun.write(path.join(isolationDir, "task.txt"), "new\n");
+			return result({ id: options.id });
+		});
 		vi.spyOn(worktreeModule, "commitToBranch").mockRejectedValue(new Error("remote: object corrupt"));
-		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
-			rootPatch,
-			nestedPatches: [],
-		});
+		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch");
 		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
-		testRegistry.register({
-			id: "PreserveBranchFailure",
-			displayName: "PreserveBranchFailure",
-			kind: "sub",
-			session: null,
-			status: "parked",
-		});
-		// No branch was ever created, so the rescue probe finds nothing to keep.
-		const deleteSpy = vi.fn(async () => true);
-		const repository = {
-			deleteBranch: deleteSpy,
-			refExists: async () => false,
-			revListRange: async () => {
-				throw new Error("unknown revision");
-			},
-		} as unknown as natives.VcsGitRepo;
-		vi.spyOn(vcs, "git").mockReturnValue(repository);
-		vi.spyOn(vcs, "requireGit").mockReturnValue(repository);
+		registerTaskAgent("PreserveBranchFailure");
+		const deleteSpy = vi.spyOn(natives.VcsGitRepo.prototype, "deleteBranch");
 
 		const outcome = await runIsolatedSubprocess({
 			baseOptions: {
@@ -153,7 +209,7 @@ describe("runIsolatedSubprocess", () => {
 				agentRegistry: testRegistry,
 				createAuthoritySession,
 			},
-			context: { repoRoot, baseline },
+			context: { repoRoot },
 			preferredBackend: undefined,
 			agentId: "PreserveBranchFailure",
 			mergeMode: "branch",
@@ -166,7 +222,20 @@ describe("runIsolatedSubprocess", () => {
 		expect(outcome.patchPath).toBe(patchPath);
 		expect(await Bun.file(patchPath).text()).toBe(rootPatch);
 		expect(outcome.nestedPatches).toEqual([]);
-		expect(captureSpy).toHaveBeenCalledWith(isolationDir, baseline);
+		expect(captureSpy).toHaveBeenCalledWith(
+			isolationDir,
+			expect.objectContaining({
+				root: expect.objectContaining({
+					repoRoot,
+					headCommit: baseSha,
+					staged: "",
+					unstaged: "",
+					untracked: [],
+					untrackedPatch: "",
+				}),
+				nested: [],
+			}),
+		);
 		expect(deleteSpy).toHaveBeenCalledWith("omp/task/PreserveBranchFailure", true);
 		expect(cleanupSpy).toHaveBeenCalledTimes(1);
 		expect(testRegistry.get("PreserveBranchFailure")?.history?.patchPath).toBe(patchPath);
@@ -178,21 +247,16 @@ describe("runIsolatedSubprocess", () => {
 		// working-tree delta. A throw from that trailing step used to delete the
 		// branch while the isolation worktree — the only other copy — was torn
 		// down in `finally`, losing committed work outright.
-		const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-rescue-"));
-		tempRoots.push(repoRoot);
-		const isolationDir = path.join(repoRoot, "isolated");
-		const artifactsDir = path.join(repoRoot, "artifacts");
-		const baseline = {
-			root: {
-				repoRoot,
-				headCommit: "base",
-				staged: "",
-				unstaged: "",
-				untracked: [],
-				untrackedPatch: "",
-			},
-			nested: [],
-		};
+		const repoRoot = await seedIsolatedRepo();
+		const isolationDir = repoRoot;
+		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-rescue-artifacts-"));
+		tempRoots.push(artifactsDir);
+		const baseSha = (await git(repoRoot, "rev-parse", "HEAD")).trim();
+		await git(repoRoot, "checkout", "-b", "omp/task/RescueBranchCommits");
+		await Bun.write(path.join(repoRoot, "rescue.txt"), "committed branch bytes\n");
+		await git(repoRoot, "add", "rescue.txt");
+		await git(repoRoot, "commit", "-q", "-m", "task branch commit");
+		await git(repoRoot, "checkout", "main");
 
 		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
 			mergedDir: isolationDir,
@@ -204,27 +268,13 @@ describe("runIsolatedSubprocess", () => {
 		vi.spyOn(worktreeModule, "commitToBranch").mockRejectedValue(
 			new Error("git apply --3way failed for task RescueBranchCommits"),
 		);
-		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches: [] });
 		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
-		testRegistry.register({
-			id: "RescueBranchCommits",
-			displayName: "RescueBranchCommits",
-			kind: "sub",
-			session: null,
-			status: "parked",
-		});
-		const rangeSpy = vi.fn(async () => {
-			throw new Error("object database unavailable");
-		});
-		const refSpy = vi.fn(async () => true);
-		const deleteSpy = vi.fn(async () => true);
-		const repository = {
-			deleteBranch: deleteSpy,
-			refExists: refSpy,
-			revListRange: rangeSpy,
-		} as unknown as natives.VcsGitRepo;
-		vi.spyOn(vcs, "git").mockReturnValue(repository);
-		vi.spyOn(vcs, "requireGit").mockReturnValue(repository);
+		registerTaskAgent("RescueBranchCommits");
+		const rangeSpy = vi
+			.spyOn(natives.VcsGitRepo.prototype, "revListRange")
+			.mockRejectedValue(new Error("object database unavailable"));
+		const refSpy = vi.spyOn(natives.VcsGitRepo.prototype, "refExists");
+		const deleteSpy = vi.spyOn(natives.VcsGitRepo.prototype, "deleteBranch");
 
 		const outcome = await runIsolatedSubprocess({
 			baseOptions: {
@@ -241,7 +291,7 @@ describe("runIsolatedSubprocess", () => {
 				agentRegistry: testRegistry,
 				createAuthoritySession,
 			},
-			context: { repoRoot, baseline },
+			context: { repoRoot },
 			preferredBackend: undefined,
 			agentId: "RescueBranchCommits",
 			mergeMode: "branch",
@@ -249,7 +299,7 @@ describe("runIsolatedSubprocess", () => {
 			buildFailureResult: err => result({ exitCode: 1, error: String(err) }),
 		});
 
-		expect(rangeSpy).toHaveBeenCalledWith("base", "omp/task/RescueBranchCommits");
+		expect(rangeSpy).toHaveBeenCalledWith(baseSha, "omp/task/RescueBranchCommits");
 		expect(refSpy).toHaveBeenCalledWith("refs/heads/omp/task/RescueBranchCommits");
 		expect(deleteSpy).not.toHaveBeenCalled();
 		expect(outcome.error).toContain("git apply --3way failed");
@@ -260,8 +310,9 @@ describe("runIsolatedSubprocess", () => {
 
 	it("keeps an isolated worktree until deferred child cleanup settles", async () => {
 		const cleanupGate = Promise.withResolvers<void>();
+		const isolationDir = await seedIsolatedRepo();
 		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
-			mergedDir: "/repo/isolated",
+			mergedDir: isolationDir,
 			backend: natives.IsoBackendKind.Rcopy,
 			fellBack: false,
 			fallbackReason: null,
@@ -274,7 +325,7 @@ describe("runIsolatedSubprocess", () => {
 
 		const outcome = await runIsolatedSubprocess({
 			baseOptions: {
-				cwd: "/repo",
+				cwd: isolationDir,
 				agent: {
 					name: "task",
 					description: "Task agent",
@@ -287,20 +338,7 @@ describe("runIsolatedSubprocess", () => {
 				agentRegistry: testRegistry,
 				createAuthoritySession,
 			},
-			context: {
-				repoRoot: "/repo",
-				baseline: {
-					root: {
-						repoRoot: "/repo",
-						headCommit: "base",
-						staged: "",
-						unstaged: "",
-						untracked: [],
-						untrackedPatch: "",
-					},
-					nested: [],
-				},
-			},
+			context: { repoRoot: isolationDir },
 			preferredBackend: undefined,
 			agentId: "DeferredCleanup",
 			mergeMode: "patch",
@@ -320,21 +358,11 @@ describe("runIsolatedSubprocess", () => {
 	it("captures a successful yield's patch when child cleanup is deferred (issue #9670)", async () => {
 		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-defer-ok-"));
 		tempRoots.push(artifactsDir);
-		const rootPatch = "diff --git a/task.txt b/task.txt\n--- a/task.txt\n+++ b/task.txt\n@@ -1 +1 @@\n-old\n+new\n";
+		const rootPatch = trackedTextPatch("task.txt", "old\n", "new\n");
 		const cleanupGate = Promise.withResolvers<void>();
-		const baseline = {
-			root: {
-				repoRoot: "/repo",
-				headCommit: "base",
-				staged: "",
-				unstaged: "",
-				untracked: [],
-				untrackedPatch: "",
-			},
-			nested: [],
-		};
+		const isolationDir = await seedIsolatedRepo();
 		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
-			mergedDir: "/repo/isolated",
+			mergedDir: isolationDir,
 			backend: natives.IsoBackendKind.Rcopy,
 			fellBack: false,
 			fallbackReason: null,
@@ -343,17 +371,15 @@ describe("runIsolatedSubprocess", () => {
 		// exitCode 0 with a pending deferred cleanup.
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			options.onCleanupDeferred?.(cleanupGate.promise);
+			await Bun.write(path.join(isolationDir, "task.txt"), "new\n");
 			return result({ id: "DeferredSuccess", exitCode: 0 });
 		});
-		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
-			rootPatch,
-			nestedPatches: [],
-		});
+		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch");
 		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 
 		const run = runIsolatedSubprocess({
 			baseOptions: {
-				cwd: "/repo",
+				cwd: isolationDir,
 				agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
 				task: "Do work",
 				index: 0,
@@ -361,7 +387,7 @@ describe("runIsolatedSubprocess", () => {
 				agentRegistry: testRegistry,
 				createAuthoritySession,
 			},
-			context: { repoRoot: "/repo", baseline },
+			context: { repoRoot: isolationDir },
 			preferredBackend: undefined,
 			agentId: "DeferredSuccess",
 			mergeMode: "patch",
@@ -380,28 +406,20 @@ describe("runIsolatedSubprocess", () => {
 		expect(outcome.exitCode).toBe(0);
 		expect(outcome.patchPath).toBe(patchPath);
 		expect(await Bun.file(patchPath).text()).toBe(rootPatch);
-		expect(captureSpy).toHaveBeenCalledWith("/repo/isolated", baseline);
+		expect(captureSpy).toHaveBeenCalledWith(
+			isolationDir,
+			expect.objectContaining({ root: expect.objectContaining({ repoRoot: isolationDir }) }),
+		);
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(cleanupSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it("captures an isolated patch before cleanup for a kept-alive child", async () => {
-		const isolationDir = "/repo/isolated";
+		const isolationDir = await seedIsolatedRepo();
 		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-retained-"));
 		tempRoots.push(artifactsDir);
-		const rootPatch = "diff --git a/task.txt b/task.txt\n+captured\n";
-		const baseline = {
-			root: {
-				repoRoot: "/repo",
-				headCommit: "base",
-				staged: "",
-				unstaged: "",
-				untracked: [],
-				untrackedPatch: "",
-			},
-			nested: [],
-		};
+		const rootPatch = trackedTextPatch("task.txt", "old\n", "new\n");
 		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
 			mergedDir: isolationDir,
 			backend: natives.IsoBackendKind.Rcopy,
@@ -414,6 +432,7 @@ describe("runIsolatedSubprocess", () => {
 			dispose: async () => {},
 		} as unknown as AgentSession;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			await Bun.write(path.join(isolationDir, "task.txt"), "new\n");
 			options.agentRegistry.register({
 				id: options.id,
 				displayName: options.id,
@@ -435,15 +454,12 @@ describe("runIsolatedSubprocess", () => {
 			});
 			return result({ id: options.id, exitCode: 0 });
 		});
-		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
-			rootPatch,
-			nestedPatches: [],
-		});
+		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch");
 		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 
 		const outcome = await runIsolatedSubprocess({
 			baseOptions: {
-				cwd: "/repo",
+				cwd: isolationDir,
 				agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
 				task: "Do work",
 				index: 0,
@@ -451,7 +467,7 @@ describe("runIsolatedSubprocess", () => {
 				agentRegistry: testRegistry,
 				createAuthoritySession,
 			},
-			context: { repoRoot: "/repo", baseline },
+			context: { repoRoot: isolationDir },
 			preferredBackend: undefined,
 			agentId: "RetainedIsolation",
 			mergeMode: "patch",
@@ -468,21 +484,10 @@ describe("runIsolatedSubprocess", () => {
 	});
 
 	it("captures a one-shot isolated patch before cleanup", async () => {
-		const isolationDir = "/repo/isolated";
+		const isolationDir = await seedIsolatedRepo();
 		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-oneshot-"));
 		tempRoots.push(artifactsDir);
-		const rootPatch = "diff --git a/task.txt b/task.txt\n+captured\n";
-		const baseline = {
-			root: {
-				repoRoot: "/repo",
-				headCommit: "base",
-				staged: "",
-				unstaged: "",
-				untracked: [],
-				untrackedPatch: "",
-			},
-			nested: [],
-		};
+		const rootPatch = trackedTextPatch("task.txt", "old\n", "new\n");
 		const order: string[] = [];
 		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
 			mergedDir: isolationDir,
@@ -496,6 +501,7 @@ describe("runIsolatedSubprocess", () => {
 			dispose: async () => {},
 		} as unknown as AgentSession;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			await Bun.write(path.join(isolationDir, "task.txt"), "new\n");
 			options.agentRegistry.register({
 				id: options.id,
 				displayName: options.id,
@@ -517,9 +523,10 @@ describe("runIsolatedSubprocess", () => {
 			});
 			return result({ id: options.id, exitCode: 0 });
 		});
-		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockImplementation(async () => {
+		const captureDeltaPatch = worktreeModule.captureDeltaPatch.bind(worktreeModule);
+		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockImplementation(async (dir, baseline) => {
 			order.push("capture");
-			return { rootPatch, nestedPatches: [] };
+			return captureDeltaPatch(dir, baseline);
 		});
 		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockImplementation(async () => {
 			order.push("cleanup");
@@ -527,7 +534,7 @@ describe("runIsolatedSubprocess", () => {
 
 		const outcome = await runIsolatedSubprocess({
 			baseOptions: {
-				cwd: "/repo",
+				cwd: isolationDir,
 				agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
 				task: "Do work",
 				index: 0,
@@ -536,7 +543,7 @@ describe("runIsolatedSubprocess", () => {
 				agentRegistry: testRegistry,
 				createAuthoritySession,
 			},
-			context: { repoRoot: "/repo", baseline },
+			context: { repoRoot: isolationDir },
 			preferredBackend: undefined,
 			agentId: "OneShotIsolation",
 			mergeMode: "patch",
@@ -569,8 +576,9 @@ describe("runIsolatedSubprocess", () => {
 		});
 		const sessionManager = SessionManager.inMemory();
 		sessionManager.beginTurnBudget(100_000, true);
+		const isolationDir = await seedIsolatedRepo();
 		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
-			mergedDir: "/repo/isolated",
+			mergedDir: isolationDir,
 			backend: natives.IsoBackendKind.Rcopy,
 			fellBack: false,
 			fallbackReason: null,
@@ -584,7 +592,7 @@ describe("runIsolatedSubprocess", () => {
 		await expect(
 			runIsolatedSubprocess({
 				baseOptions: {
-					cwd: "/repo",
+					cwd: isolationDir,
 					agent: {
 						name: "task",
 						description: "Task agent",
@@ -597,20 +605,7 @@ describe("runIsolatedSubprocess", () => {
 					agentRegistry: testRegistry,
 					createAuthoritySession,
 				},
-				context: {
-					repoRoot: "/repo",
-					baseline: {
-						root: {
-							repoRoot: "/repo",
-							headCommit: "base",
-							staged: "",
-							unstaged: "",
-							untracked: [],
-							untrackedPatch: "",
-						},
-						nested: [],
-					},
-				},
+				context: { repoRoot: isolationDir },
 				preferredBackend: undefined,
 				agentId: "UsageAccounting",
 				mergeMode: "patch",
@@ -631,55 +626,24 @@ describe("runIsolatedSubprocess", () => {
 	it("writes nested-repo patches to disk before the workspace is torn down", async () => {
 		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-nested-"));
 		tempRoots.push(artifactsDir);
-		const nestedPatch =
-			"diff --git a/b.txt b/b.txt\nnew file mode 100644\n--- /dev/null\n+++ b/b.txt\n@@ -0,0 +1 @@\n+hi\n";
-		const baseline = {
-			root: {
-				repoRoot: "/repo",
-				headCommit: "base",
-				staged: "",
-				unstaged: "",
-				untracked: [],
-				untrackedPatch: "",
-			},
-			nested: [
-				{
-					relativePath: "inner",
-					baseline: {
-						repoRoot: "/repo/inner",
-						headCommit: "inner-base",
-						staged: "",
-						unstaged: "",
-						untracked: [],
-						untrackedPatch: "",
-					},
-				},
-			],
-		};
+		const isolationDir = await seedIsolatedRepo({ nested: true });
+		const nestedPatch = newTextFilePatch("b.txt", "hi\n");
 		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
-			mergedDir: "/repo/isolated",
+			mergedDir: isolationDir,
 			backend: natives.IsoBackendKind.Rcopy,
 			fellBack: false,
 			fallbackReason: null,
 		});
-		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(result({ id: "NestedPersist" }));
-		// The agent only touched the nested repo: the root diff is empty.
-		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
-			rootPatch: "",
-			nestedPatches: [{ relativePath: "inner", patch: nestedPatch }],
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			await Bun.write(path.join(isolationDir, "inner", "b.txt"), "hi\n");
+			return result({ id: options.id });
 		});
 		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
-		testRegistry.register({
-			id: "NestedPersist",
-			displayName: "NestedPersist",
-			kind: "sub",
-			session: null,
-			status: "parked",
-		});
+		registerTaskAgent("NestedPersist");
 
 		const outcome = await runIsolatedSubprocess({
 			baseOptions: {
-				cwd: "/repo",
+				cwd: isolationDir,
 				agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
 				task: "Do nested work",
 				index: 0,
@@ -687,7 +651,7 @@ describe("runIsolatedSubprocess", () => {
 				agentRegistry: testRegistry,
 				createAuthoritySession,
 			},
-			context: { repoRoot: "/repo", baseline },
+			context: { repoRoot: isolationDir },
 			preferredBackend: undefined,
 			agentId: "NestedPersist",
 			mergeMode: "patch",
@@ -711,43 +675,32 @@ describe("runIsolatedSubprocess", () => {
 		// A regular file where the artifacts directory should be: every write fails.
 		const artifactsDir = path.join(blockedDir, "artifacts");
 		await Bun.write(artifactsDir, "not a directory");
+		const isolationDir = await seedIsolatedRepo();
+		const originalWorkspaceRoot = path.dirname(isolationDir);
+		tempRoots.push(originalWorkspaceRoot);
 		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
-			mergedDir: "/repo/isolated",
+			mergedDir: isolationDir,
 			backend: natives.IsoBackendKind.Rcopy,
 			fellBack: false,
 			fallbackReason: null,
 		});
-		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(result({ id: "RetainOnWriteFailure" }));
-		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
-			rootPatch: "",
-			nestedPatches: [{ relativePath: "inner", patch: "diff --git a/b.txt b/b.txt\n" }],
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			await Bun.write(path.join(isolationDir, "task.txt"), "recoverable bytes\n");
+			return result({ id: options.id });
 		});
 		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 
 		const outcome = await runIsolatedSubprocess({
 			baseOptions: {
-				cwd: "/repo",
+				cwd: isolationDir,
 				agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
-				task: "Do nested work",
+				task: "Do work",
 				index: 0,
 				id: "RetainOnWriteFailure",
 				agentRegistry: testRegistry,
 				createAuthoritySession,
 			},
-			context: {
-				repoRoot: "/repo",
-				baseline: {
-					root: {
-						repoRoot: "/repo",
-						headCommit: "base",
-						staged: "",
-						unstaged: "",
-						untracked: [],
-						untrackedPatch: "",
-					},
-					nested: [],
-				},
-			},
+			context: { repoRoot: isolationDir },
 			preferredBackend: undefined,
 			agentId: "RetainOnWriteFailure",
 			mergeMode: "patch",
@@ -756,10 +709,19 @@ describe("runIsolatedSubprocess", () => {
 		});
 
 		expect(outcome.error).toContain("Patch capture failed");
-		expect(outcome.error).toContain("Isolation workspace retained at /repo/isolated");
+		expect(outcome.error).toContain("Isolation workspace retained at");
 		expect(outcome.error).not.toContain("mount metadata");
 		expect(outcome.nestedPatchPaths).toBeUndefined();
 		expect(cleanupSpy).not.toHaveBeenCalled();
+		const retainedDir = outcome.error?.match(/Isolation workspace retained at ([^\s]+)/)?.[1];
+		expect(retainedDir).toBeDefined();
+		if (!retainedDir) throw new Error("The retained workspace location was not reported.");
+		expect(retainedDir).not.toBe(isolationDir);
+		expect(await Bun.file(isolationDir).exists()).toBe(false);
+		expect(path.dirname(retainedDir).startsWith(`${originalWorkspaceRoot}.retained-`)).toBe(true);
+		expect(path.dirname(path.dirname(retainedDir))).toBe(path.dirname(originalWorkspaceRoot));
+		tempRoots.push(path.dirname(retainedDir));
+		expect(await Bun.file(path.join(retainedDir, "task.txt")).text()).toBe("recoverable bytes\n");
 	});
 
 	it("removes partial nested patches when a later write fails", async () => {

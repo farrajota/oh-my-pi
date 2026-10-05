@@ -770,6 +770,57 @@ function redactUrlCredentials(url: string): string {
 
 class RequestInterceptionCleanupError extends ToolError {}
 
+interface PersistentAuditFacadeLifetime {
+	controller: AbortController;
+	callerListeners: Map<AbortSignal, () => void>;
+	cleanup(): void;
+}
+
+const persistentAuditFacadeLifetimes = new WeakMap<Page, PersistentAuditFacadeLifetime>();
+
+/**
+ * Persistent audit guards outlive successful Browser.run cells, but remain tied
+ * to their page and caller cancellation/deadline instead of the cell run signal.
+ */
+export function persistentAuditFacadeSignal(page: Page, callerSignals: readonly AbortSignal[]): AbortSignal {
+	let lifetime = persistentAuditFacadeLifetimes.get(page);
+	if (!lifetime) {
+		const controller = new AbortController();
+		const callerListeners = new Map<AbortSignal, () => void>();
+		let closed = false;
+		const cleanup = (): void => {
+			if (closed) return;
+			closed = true;
+			page.off("close", onClose);
+			for (const [signal, listener] of callerListeners) signal.removeEventListener("abort", listener);
+			callerListeners.clear();
+		};
+		const abort = (reason: unknown): void => {
+			if (!controller.signal.aborted) controller.abort(reason);
+			cleanup();
+		};
+		const onClose = (): void => abort(new ToolAbortError("Browser audit page closed"));
+		page.on("close", onClose);
+		lifetime = { controller, callerListeners, cleanup };
+		persistentAuditFacadeLifetimes.set(page, lifetime);
+	}
+	for (const signal of callerSignals) {
+		if (signal.aborted) {
+			if (!lifetime.controller.signal.aborted) lifetime.controller.abort(signal.reason);
+			lifetime.cleanup();
+			break;
+		}
+		if (lifetime.callerListeners.has(signal)) continue;
+		const listener = (): void => {
+			if (!lifetime!.controller.signal.aborted) lifetime!.controller.abort(signal.reason);
+			lifetime!.cleanup();
+		};
+		lifetime.callerListeners.set(signal, listener);
+		signal.addEventListener("abort", listener, { once: true });
+	}
+	return lifetime.controller.signal;
+}
+
 export interface RunPageScope {
 	page: Page;
 	cleanup(): Promise<void>;
@@ -1407,9 +1458,17 @@ export class WorkerCore {
 			const runtime = this.#ensureRuntime(msg.session);
 			runtime.setCwd(msg.session.cwd);
 			const onFloatingRejection = (reason: unknown): void => this.#recordFloatingRejection(active, reason);
+			const facadeSignal =
+				msg.preserveRequestInterception === true
+					? persistentAuditFacadeSignal(this.#requirePage(), [timeoutSignal, ac.signal])
+					: signal;
+			const bindFacade = <T extends object>(target: T): T =>
+				msg.preserveRequestInterception === true
+					? bindRunFacade(target, facadeSignal)
+					: bindRunFacade(target, signal, active.rejectionOwner, onFloatingRejection);
 			runtime.setRunScope({
-				page: bindRunFacade(runPage.page, signal, active.rejectionOwner, onFloatingRejection),
-				browser: bindRunFacade(browser, signal, active.rejectionOwner, onFloatingRejection),
+				page: bindFacade(runPage.page),
+				browser: bindFacade(browser),
 				tab: bindRunFacade(tabApi, signal, active.rejectionOwner, onFloatingRejection),
 				assert: (cond: unknown, text?: string): void => {
 					if (!cond) throw new ToolError(text ?? "Assertion failed");

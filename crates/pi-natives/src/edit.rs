@@ -152,7 +152,7 @@ fn source_snapshot_map(
 				if previous.as_ref() != source.as_ref() {
 					return Err(napi::Error::from_reason(format!(
 						"Conflicting edit source snapshots for {}",
-					alias.display()
+						alias.display()
 					)));
 				}
 			} else {
@@ -172,7 +172,6 @@ pub struct EditUrlResolution {
 	pub error:         Option<String>,
 	/// Writable while plan mode is active (sandbox-scoped scheme).
 	pub plan_writable: bool,
-
 }
 
 /// One file's streamed diff preview.

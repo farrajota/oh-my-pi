@@ -1,9 +1,11 @@
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
+import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJob } from "../async";
-import { cancelAgentRegistration, runningAgentsOutsideJobs, snapshotJobs } from "../async/job-control";
+import { agentStaleNote, cancelAgentRegistration, runningAgentsOutsideJobs, snapshotJobs } from "../async/job-control";
 import {
 	findService,
-	listServices,
+	listServicesTolerant,
 	modeService,
 	sendService,
 	serviceLogPath,
@@ -41,6 +43,12 @@ function target(url: InternalUrl): { id: string; action: "stdin" | "mode" | "kil
 
 function ownerJobs(session: ToolSession): AsyncJob[] {
 	return session.asyncJobManager?.getAllJobs({ ownerId: session.getAgentId?.() ?? undefined }) ?? [];
+}
+function procJobSnapshots(session: ToolSession, jobs: AsyncJob[]) {
+	return snapshotJobs(session, jobs, { includeResults: true }).map((snapshot, index) => {
+		const command = jobs[index]?.process?.command;
+		return command === undefined ? snapshot : { ...snapshot, command };
+	});
 }
 
 function cancellationNotFound(id: string): InternalWriteResult {
@@ -109,7 +117,10 @@ export class ProcProtocolHandler implements ProtocolHandler {
 		const { id, action } = target(url);
 		if (action !== "stdin") throw new Error(`proc://<id>/${action} is writable only`);
 		const jobs = ownerJobs(session);
-		const services = cfgLaunchEnabled.get(session.settings) ? await listServices(session, context?.signal) : [];
+		// Jobs and agents are in-process; a hung broker must not hide them.
+		const { services, error: servicesError } = cfgLaunchEnabled.get(session.settings)
+			? await listServicesTolerant(session, context?.signal)
+			: { services: [], error: undefined };
 		if (!id) {
 			const now = Date.now();
 			const rows = [
@@ -121,12 +132,14 @@ export class ProcProtocolHandler implements ProtocolHandler {
 					return `${job.id} [${job.type}] ${job.status} ${duration} — ${job.label.replace(/\s+/g, " ")}`;
 				}),
 				...runningAgentsOutsideJobs(session).map(
-					agent => `${agent.id} [task] running up ${formatDuration(agent.ageMs)} — ${agent.activity ?? "agent"}`,
+					agent =>
+						`${agent.id} [task] running up ${formatDuration(agent.ageMs)} — ${agent.activity ?? "agent"}${agentStaleNote(agent)}`,
 				),
 				...services.map(service => serviceStatus(service)),
+				...(servicesError ? [`Services unavailable (daemon broker): ${servicesError}`] : []),
 			];
 			return textResource(url, rows.join("\n") || "No background jobs or services.", undefined, true, {
-				jobs: snapshotJobs(session, jobs, { includeResults: true }),
+				jobs: procJobSnapshots(session, jobs),
 				agents: runningAgentsOutsideJobs(session),
 				daemons: services,
 			});
@@ -164,7 +177,7 @@ export class ProcProtocolHandler implements ProtocolHandler {
 				if (typeof artifact === "string" && artifact) lines.push(`artifact://${artifact}`);
 			}
 			return textResource(url, lines.join("\n"), undefined, false, {
-				job: snapshotJobs(session, [job], { includeResults: true })[0],
+				job: procJobSnapshots(session, [job])[0],
 				log: lines.slice(1).join("\n"),
 			});
 		}
@@ -172,11 +185,13 @@ export class ProcProtocolHandler implements ProtocolHandler {
 		if (agent)
 			return textResource(
 				url,
-				`${agent.id} [task] — running — ${agent.activity ?? "agent"}\nhistory://${agent.id}`,
+				`${agent.id} [task] — running — ${agent.activity ?? "agent"}${agentStaleNote(agent)}\nhistory://${agent.id}`,
 				undefined,
 				false,
 				{ agents: [agent] },
 			);
+		if (servicesError)
+			throw new Error(`Background job or service not found: ${id} (services unavailable: ${servicesError})`);
 		throw new Error(`Background job or service not found: ${id}`);
 	}
 
@@ -188,9 +203,21 @@ export class ProcProtocolHandler implements ProtocolHandler {
 		const ownerId = session.getAgentId?.() ?? undefined;
 		const job = ownerJobs(session).find(item => item.id === id);
 		const agent = runningAgentsOutsideJobs(session).find(item => item.id === id);
-		const service = cfgLaunchEnabled.get(session.settings)
-			? await findService(session, id, context?.signal)
-			: undefined;
+		let service: DaemonSnapshot | undefined;
+		if (cfgLaunchEnabled.get(session.settings)) {
+			try {
+				service = await findService(session, id, context?.signal);
+			} catch (error) {
+				// Killing an in-process job or agent needs no broker. Skipping the
+				// lookup only loses the job/service collision check, which cannot be
+				// answered while the broker is down anyway.
+				if (context?.signal?.aborted || action !== "kill" || !(job || agent)) throw error;
+				logger.warn("Daemon broker lookup failed; cancelling in-process target", {
+					id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		if ((job || agent) && service)
 			throw new Error(`proc://${id} is ambiguous: both job ${id} and service ${id} exist.`);
 		if (action === "mode") {

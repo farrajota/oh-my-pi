@@ -645,9 +645,7 @@ describe("agentLoop with AgentMessage", () => {
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 		const events: AgentEvent[] = [];
 		const stream = agentLoop([createUserMessage("run echo")], context, config, undefined, mock.stream);
-		for await (const event of stream) {
-			events.push(event);
-		}
+		for await (const event of stream) events.push(event);
 		const messages = await stream.result();
 
 		expect(validatedArguments).toEqual([{ value: "hello", undeclared: "must remain visible" }]);
@@ -685,21 +683,11 @@ describe("agentLoop with AgentMessage", () => {
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
 		const mock = createMockModel({
 			responses: [
-				{
-					content: [
-						{
-							type: "toolCall",
-							id: "tool-1",
-							name: "echo",
-							arguments: { value: "42" },
-						},
-					],
-				},
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "42" } }] },
 				{ content: ["done"] },
 			],
 		});
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
-
 		const messages = await agentLoop(
 			[createUserMessage("run echo")],
 			context,
@@ -707,10 +695,52 @@ describe("agentLoop with AgentMessage", () => {
 			undefined,
 			mock.stream,
 		).result();
-
 		expect(executed).toEqual([{ value: 42 }]);
 		const toolResult = messages.find((message): message is ToolResultMessage => message.role === "toolResult");
 		expect(toolResult?.isError).toBeFalsy();
+	});
+
+	it("reports malformed JSON to the model instead of running a lenient tool with empty args", async () => {
+		const toolSchema = type({ value: "string" });
+		const executed: unknown[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			lenientArgValidation: true,
+			async execute(_toolCallId, params) {
+				executed.push(params);
+				return { content: [] };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tool-1",
+							name: "echo",
+							arguments: { __parseError: "Expected ',' or '}' in object", __rawJson: '{"value":"ok" nope}' },
+						},
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("run echo")], context, config, undefined, mock.stream);
+		for await (const event of stream) events.push(event);
+		const messages = await stream.result();
+		expect(executed).toEqual([]);
+		const toolResult = messages.find((message): message is ToolResultMessage => message.role === "toolResult");
+		expect(toolResult?.isError).toBe(true);
+		const resultText = toolResult?.content.map(block => (block.type === "text" ? block.text : "")).join("") ?? "";
+		expect(resultText).toContain("Expected ',' or '}' in object");
+		expect(resultText).toContain('{"value":"ok" nope}');
 	});
 
 	it("runs completed tool calls after a transient stream_read_error", async () => {

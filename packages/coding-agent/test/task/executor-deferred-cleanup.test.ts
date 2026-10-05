@@ -23,15 +23,25 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 
-const baseAgent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
+const authoritySessions: AgentSession[] = [];
 
-function createAuthorityFixture() {
+async function createAuthorityFixture() {
 	const agentRegistry = new AgentRegistry();
-	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-		sdkModule.createAgentSession({ ...options, agentRegistry });
-	return { agentRegistry, createAuthoritySession };
+	const root = await createAgentRootSession(agentRegistry, { agentId: "Main" });
+	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	authoritySessions.push(root.session);
+	return { agentRegistry, createAuthoritySession: authority.create };
 }
+
+const baseAgent: AgentDefinition = {
+	name: "task",
+	description: "test",
+	systemPrompt: "test",
+	source: "bundled",
+};
 
 function assistantStop(text: string): AssistantMessage {
 	return {
@@ -114,12 +124,14 @@ function emitYield(emit: (event: AgentSessionEvent) => void, data: unknown): voi
 }
 
 describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const session of authoritySessions.splice(0)) await session.dispose();
 	});
 
 	it("preserves a successful yield when disposal is deferred past the cleanup deadline", async () => {
 		const disposeGate = Promise.withResolvers<void>();
+		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 		const session = mockSession({
 			onPrompt: emit => emitYield(emit, { ok: true }),
 			// Disposal never settles within the (zero) grace window.
@@ -133,7 +145,6 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 		} as CreateAgentSessionResult);
 
 		let deferredCleanup: Promise<void> | undefined;
-		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -147,6 +158,7 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 			},
 			agentRegistry,
 			createAuthoritySession,
+			parentAgentId: "Main",
 		});
 
 		// The deferred teardown must not overwrite the successful yield.
@@ -163,6 +175,7 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 
 	it("keeps a genuinely aborted run aborted when its cleanup is deferred", async () => {
 		const controller = new AbortController();
+		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 		const abortGate = Promise.withResolvers<void>();
 		const session = mockSession({
 			// The caller cancels mid-run before any yield: a genuine abort.
@@ -178,7 +191,6 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 		} as CreateAgentSessionResult);
 
 		let deferredCleanup: Promise<void> | undefined;
-		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -193,6 +205,7 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 			},
 			agentRegistry,
 			createAuthoritySession,
+			parentAgentId: "Main",
 		});
 
 		expect(result.aborted).toBe(true);

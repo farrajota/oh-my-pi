@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { SecurityPublishParams, SecurityScanPlan } from "../../src/security";
+import { createSecurityScanId } from "../../src/security/contracts";
 import { createSecurityPublicationTool, SecurityStore } from "../../src/security";
 
 let temporaryRoot = "";
@@ -112,7 +113,10 @@ describe("security publication", () => {
 			undefined as never,
 		);
 		expect((await fs.stat(plan.output.root)).isDirectory()).toBeTrue();
-		expect((await fs.stat(plan.output.root)).mode & 0o777).toBe(0o700);
+		// Windows keeps no POSIX mode bits (directories read back 0666).
+		if (process.platform !== "win32") {
+			expect((await fs.stat(plan.output.root)).mode & 0o777).toBe(0o700);
+		}
 		expect((await fs.readdir(plan.output.root)).sort()).toEqual([
 			"findings.json",
 			"provenance.json",
@@ -321,6 +325,136 @@ describe("security publication", () => {
 				path: "missing-evidence.ts",
 				startLine: 7,
 				reason: "path_absent",
+			},
+		]);
+	});
+	test("normalizes detached-root citations against the immutable plan root", async () => {
+		const worktreeRoot = path.join(temporaryRoot, "worktree");
+		await fs.mkdir(worktreeRoot);
+		await fs.writeFile(path.join(worktreeRoot, "worktree-only.ts"), "one\ntwo\nthree\n");
+		const tool = createSecurityPublicationTool({
+			plan,
+			scanId: createSecurityScanId(),
+			store,
+			startedAt: "2026-07-29T00:00:00.000Z",
+			resolutionRoot: worktreeRoot,
+		});
+		const result = await tool.execute(
+			"publish",
+			{
+				findings: [
+					publishableFinding({
+						rule_id: "relative-citation",
+						title: "Relative citation in detached worktree",
+						locations: [{ path: "worktree-only.ts", start_line: 2 }],
+						evidence: [
+							{
+								label: "absolute-evidence",
+								explanation: "Absolute plan-root evidence location",
+								location: { path: path.join(repositoryRoot, "worktree-only.ts"), start_line: 3 },
+							},
+							{
+								label: "relative-evidence",
+								explanation: "Relative plan-root evidence location",
+								location: { path: "worktree-only.ts", start_line: 1 },
+							},
+						],
+					}),
+					publishableFinding({
+						rule_id: "absolute-citation",
+						title: "Absolute citation in detached worktree",
+						locations: [{ path: path.join(repositoryRoot, "worktree-only.ts"), start_line: 1 }],
+					}),
+				],
+				coverage: { completeness: "partial" },
+				report: "# Detached citations\n",
+			},
+			undefined,
+			undefined,
+			undefined as never,
+		);
+		expect(result.details?.findingCount).toBe(2);
+		expect(result.details?.droppedFindings).toEqual([]);
+		const published = JSON.parse(await Bun.file(path.join(plan.output.root, "findings.json")).text());
+		expect(published).toHaveLength(2);
+		for (const finding of published) {
+			expect(finding.occurrences[0].locations[0].path).toBe("worktree-only.ts");
+		}
+		expect(published[0].evidence.map((item: { location: { path: string } }) => item.location.path)).toEqual([
+			"worktree-only.ts",
+			"worktree-only.ts",
+		]);
+	});
+
+	test("keeps detached-root scope and line checks fail-closed", async () => {
+		const worktreeRoot = path.join(temporaryRoot, "worktree");
+		await fs.mkdir(worktreeRoot);
+		await fs.writeFile(path.join(worktreeRoot, "excluded.ts"), "one\n");
+		await fs.writeFile(path.join(worktreeRoot, "worktree-only.ts"), "one\n");
+		plan.target.excludePaths = ["excluded.ts"];
+		for (const [invalidPath, expectedMessage] of [
+			["excluded.ts", "Security finding path is outside the immutable scan scope"],
+			[path.join(temporaryRoot, "outside.ts"), "Security finding paths must be repository-relative"],
+		]) {
+			const tool = createSecurityPublicationTool({
+				plan,
+				scanId: createSecurityScanId(),
+				store,
+				startedAt: "2026-07-29T00:00:00.000Z",
+				resolutionRoot: worktreeRoot,
+			});
+			await expect(
+				tool.execute(
+					"publish",
+					{
+						findings: [
+							publishableFinding({
+								rule_id: `rejected-${path.basename(invalidPath)}`,
+								title: "Out-of-scope detached citation",
+								locations: [{ path: invalidPath, start_line: 1 }],
+							}),
+						],
+						coverage: { completeness: "partial" },
+						report: "# Rejected citation\n",
+					},
+					undefined,
+					undefined,
+					undefined as never,
+				),
+			).rejects.toThrow(expectedMessage);
+		}
+		const tool = createSecurityPublicationTool({
+			plan,
+			scanId: createSecurityScanId(),
+			store,
+			startedAt: "2026-07-29T00:00:00.000Z",
+			resolutionRoot: worktreeRoot,
+		});
+		const result = await tool.execute(
+			"publish",
+			{
+				findings: [
+					publishableFinding({
+						rule_id: "invalid-detached-line",
+						title: "Line outside detached file",
+						locations: [{ path: path.join(repositoryRoot, "worktree-only.ts"), start_line: 2 }],
+					}),
+				],
+				coverage: { completeness: "partial" },
+				report: "# Invalid line\n",
+			},
+			undefined,
+			undefined,
+			undefined as never,
+		);
+		expect(result.details?.findingCount).toBe(0);
+		expect(result.details?.droppedFindings).toEqual([
+			{
+				ruleId: "invalid-detached-line",
+				title: "Line outside detached file",
+				path: "worktree-only.ts",
+				startLine: 2,
+				reason: "line_out_of_range",
 			},
 		]);
 	});

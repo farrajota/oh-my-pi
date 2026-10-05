@@ -1,14 +1,14 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, Effort } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, type AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { getAgentLifecycleManager } from "../../src/internal/agent-lifecycle-bridge";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import {
 	finalizeSubprocessOutput,
@@ -22,6 +22,7 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { logger } from "@oh-my-pi/pi-utils";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 function createAssistantStopMessage(text: string): AssistantMessage {
 	return {
 		role: "assistant",
@@ -104,8 +105,10 @@ function mockCreateAgentSession(session: AgentSession) {
 }
 
 describe("runSubprocess yield reminders", () => {
-	afterEach(() => {
+	const authStorages: AuthStorage[] = [];
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const authStorage of authStorages.splice(0)) await authStorage.close();
 	});
 
 	const baseAgent: AgentDefinition = {
@@ -115,9 +118,9 @@ describe("runSubprocess yield reminders", () => {
 		source: "bundled",
 	};
 	const registry = new AgentRegistry();
+	let rootSession: AgentSession | undefined;
+	let createAuthoritySession: AgentAuthoritySessionBinding["create"];
 	const lifecycle = getAgentLifecycleManager(registry);
-	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-		sdkModule.createAgentSession({ ...options, agentRegistry: registry });
 
 	const baseOptions = {
 		cwd: "/tmp",
@@ -125,6 +128,7 @@ describe("runSubprocess yield reminders", () => {
 		task: "do work",
 		index: 0,
 		id: "subagent-1",
+		parentAgentId: "Main",
 		settings: Settings.isolated(),
 		modelRegistry: {
 			refresh: async () => {},
@@ -132,9 +136,22 @@ describe("runSubprocess yield reminders", () => {
 		enableLsp: false,
 		agentRegistry: registry,
 		agentLifecycle: lifecycle,
-		createAuthoritySession,
+		get createAuthoritySession() {
+			return createAuthoritySession;
+		},
 	};
 
+	beforeAll(async () => {
+		const root = await createAgentRootSession(registry, { agentId: "Main" });
+		rootSession = root.session;
+		const authority = bindInternalAgentAuthoritySession(registry, root.session);
+		if (!authority) throw new Error("Test fixture requires parent authority");
+		createAuthoritySession = authority.create;
+	});
+
+	afterAll(async () => {
+		await rootSession?.dispose();
+	});
 	it("waits for session_start extension user messages before prompting the subagent", async () => {
 		let extensionSendUserMessage: ExtensionActions["sendUserMessage"] | undefined;
 		let messageInFlight = false;
@@ -1215,16 +1232,17 @@ describe("runSubprocess yield reminders", () => {
 			});
 		});
 		const createAgentSessionSpy = mockCreateAgentSession(session);
-		const fakeAuthStorage = { sentinel: "registry-storage" } as unknown as AuthStorage;
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
 		const modelRegistry = {
-			authStorage: fakeAuthStorage,
+			authStorage,
 			refresh: async () => {},
 		} as unknown as import("@oh-my-pi/pi-coding-agent/config/model-registry").ModelRegistry;
 
 		await runSubprocess({ ...baseOptions, id: "subagent-registry-only", modelRegistry });
 
 		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
-		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.authStorage).toBe(fakeAuthStorage);
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.authStorage).toBe(authStorage);
 	});
 
 	it("rejects when options.authStorage and options.modelRegistry.authStorage are different instances", async () => {
@@ -1299,22 +1317,35 @@ describe("runSubprocess telemetry propagation", () => {
 	};
 
 	const registry = new AgentRegistry();
-	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-		sdkModule.createAgentSession({ ...options, agentRegistry: registry });
+	let rootSession: AgentSession | undefined;
+	let createAuthoritySession: AgentAuthoritySessionBinding["create"];
 	const baseOptions = {
 		cwd: "/tmp",
 		agent: baseAgent,
 		task: "do work",
 		index: 0,
 		id: "subagent-telemetry",
+		parentAgentId: "Main",
 		settings: Settings.isolated(),
 		modelRegistry: {
 			refresh: async () => {},
-		} as unknown as import("@oh-my-pi/pi-coding-agent/config/model-registry").ModelRegistry,
+		} as unknown as ModelRegistry,
 		enableLsp: false,
 		agentRegistry: registry,
-		createAuthoritySession,
+		get createAuthoritySession() {
+			return createAuthoritySession;
+		},
 	};
+	beforeAll(async () => {
+		const root = await createAgentRootSession(registry, { agentId: "Main" });
+		rootSession = root.session;
+		const authority = bindInternalAgentAuthoritySession(registry, root.session);
+		if (!authority) throw new Error("Test fixture requires parent authority");
+		createAuthoritySession = authority.create;
+	});
+	afterAll(async () => {
+		await rootSession?.dispose();
+	});
 
 	function buildSession() {
 		return createMockSession(({ emit }) => {

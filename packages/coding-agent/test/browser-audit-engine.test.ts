@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -8,6 +9,7 @@ import { runInNewContext } from "node:vm";
 import {
 	getTab,
 	getTabsMapForTest,
+	hasTab,
 	releaseAllTabs,
 	releaseTab,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
@@ -33,14 +35,27 @@ import {
 	validateBrowserAuditDispatch,
 	validateBrowserAuditFileDocumentAuthority,
 } from "@oh-my-pi/pi-coding-agent/tools/browser-audit";
+import type {
+	BrowserAuditBindingInput,
+	BrowserAuditTerminalSnapshotLease,
+} from "@oh-my-pi/pi-coding-agent/tools/browser-audit-production";
 import {
 	buildBrowserAuditInterceptionCode,
 	buildBrowserAuditViewportCode,
 	handoffBrowserAuditSnapshot,
 	readPinnedBrowserAuditFile,
 } from "@oh-my-pi/pi-coding-agent/tools/browser-audit-production";
+import { Settings } from "../src/config/settings";
+import {
+	bindBrowserAuditToolSession,
+	bindRegisteredBrowserAuditTaskAuthority,
+	createRegisteredBrowserAuditTool,
+	takeBrowserAuditTaskAuthority,
+} from "../src/internal/browser-audit-authority";
+import type { ToolSession } from "../src/tools";
 
-let auditSequence = 0;
+// Keep engine IDs in a valid hexadecimal range disjoint from other audit fixtures.
+let auditSequence = 0x1_0000_0000_0000;
 
 function createAuditId(): string {
 	auditSequence++;
@@ -169,6 +184,77 @@ function createEngine(executor: HostEffectExecutor, auditId?: string): BrowserAu
 		executor,
 	});
 }
+
+function registeredBinding(
+	locator: string,
+	screenshotMaxCount: number,
+	screenshotMaxBytes: number,
+	sink?: BrowserAuditBindingInput["terminal_snapshot_sink"],
+): BrowserAuditBindingInput {
+	const fixture = fixtures();
+	const origin = new URL(locator).origin;
+	return {
+		...fixture,
+		spawn_id: fixture.actor.actor_id,
+		authorization: {
+			...fixture.authorization,
+			document_locators: [locator],
+			origins: [origin],
+			route_states: fixture.authorization.route_states.map(route => ({ ...route, locator })),
+			screenshot_policy: {
+				mode: "allow-listed",
+				max_count: screenshotMaxCount,
+				max_bytes: screenshotMaxBytes,
+				allowed_check_ids: ["check"],
+			},
+			resource_policy: {
+				mode: "allow-listed",
+				allowed_origins: [origin],
+				allow_file_subresources: false,
+			},
+		},
+		file_document_authority: null,
+		terminal_snapshot_sink: sink,
+	};
+}
+
+function registeredTool(binding: BrowserAuditBindingInput) {
+	const session = {
+		cwd: process.cwd(),
+		hasUI: false,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "",
+		getAgentId: () => binding.spawn_id,
+		settings: Settings.isolated({
+			"tools.xdev": false,
+			"browser.enabled": true,
+			"browser.headless": true,
+			"browser.relay": false,
+			"browser.tern": false,
+			"browser.cmux": false,
+		}),
+	} as unknown as ToolSession;
+	bindRegisteredBrowserAuditTaskAuthority(session);
+	const taskAuthority = takeBrowserAuditTaskAuthority(session);
+	if (!taskAuthority) throw new Error("Browser audit task authority is unavailable");
+	const key = {};
+	taskAuthority.install(key, binding);
+	const capability = taskAuthority.activate(key, {
+		spawnId: binding.spawn_id,
+		parentAgentId: binding.actor.parent_actor_id,
+		agentName: "browser-audit-specialist",
+		agentSource: binding.dispatch.agent_source,
+		agentLogicalPath: binding.dispatch.agent_logical_path,
+		agentDefinitionSha256: binding.dispatch.agent_definition_sha256,
+		toolCallFingerprint: binding.dispatch.tool_call_fingerprint,
+	});
+	if (!capability) throw new Error("Browser audit task capability could not be activated");
+	bindBrowserAuditToolSession(session, capability);
+	const tool = createRegisteredBrowserAuditTool(session);
+	if (!tool) throw new Error("Registered browser audit tool is unavailable");
+	return tool;
+}
+
 describe("Browser Audit tab ownership", () => {
 	it("hides audit-owned tabs from ordinary lookup and close-all operations", async () => {
 		const name = "audit-browser-audit-ownership";
@@ -485,6 +571,187 @@ describe("BrowserAuditEngine fail-closed lifecycle", () => {
 		expect(await handoffBrowserAuditSnapshot(asynchronous, async () => {})).toBe(false);
 		expect(asynchronous.lifecycle).toBe("INVALID");
 	});
+});
+
+function expectRegisteredStatus(details: { status: string } | undefined, expected: string): void {
+	if (details === undefined) throw new Error("Registered browser audit operation omitted its required result details");
+	expect(details.status).toBe(expected);
+}
+
+describe("Browser Audit registered screenshot bounds", () => {
+	it("blocks screenshot count and cumulative captured-byte overages", async () => {
+		const chromium = "/usr/bin/chromium";
+		try {
+			await access(chromium, fsConstants.X_OK);
+		} catch (error) {
+			throw new Error(`Browser audit screenshot bounds require executable Chromium at ${chromium}`, {
+				cause: error,
+			});
+		}
+		const previousExecutable = process.env.PUPPETEER_EXECUTABLE_PATH;
+		process.env.PUPPETEER_EXECUTABLE_PATH = chromium;
+		try {
+			const pages = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch: () =>
+					new Response(
+						"<!doctype html><head><link rel=icon href='data:,'></head><meta charset=utf-8><main><button id=approved>approved</button><p>stable screenshot</p></main>",
+						{ headers: { "content-type": "text/html" } },
+					),
+			});
+			try {
+				const locator = `http://127.0.0.1:${pages.port}/audit`;
+				let calibrationLease: BrowserAuditTerminalSnapshotLease | undefined;
+				const calibrationBinding = registeredBinding(locator, 2, 4_194_304, lease => {
+					calibrationLease = lease;
+				});
+				const calibrationTool = registeredTool(calibrationBinding);
+				const calibrationSignal = AbortSignal.timeout(30_000);
+				const calibrationAuditId = calibrationBinding.dispatch.audit_id;
+				const calibrationTuple = calibrationBinding.tuples[0];
+				if (!calibrationTuple) throw new Error("Registered screenshot bounds fixture omitted its required tuple");
+				const tupleId = calibrationTuple.tuple_id;
+				try {
+					expectRegisteredStatus(
+						(
+							await calibrationTool.execute(
+								"calibration-open",
+								{ audit_id: calibrationAuditId, operation: "open" },
+								calibrationSignal,
+							)
+						).details,
+						"PASS",
+					);
+					for (const callId of ["calibration-inspect-one", "calibration-inspect-two"]) {
+						expectRegisteredStatus(
+							(
+								await calibrationTool.execute(
+									callId,
+									{ audit_id: calibrationAuditId, operation: "inspect", tuple_id: tupleId },
+									calibrationSignal,
+								)
+							).details,
+							"PASS",
+						);
+					}
+					expectRegisteredStatus(
+						(
+							await calibrationTool.execute("calibration-close", {
+								audit_id: calibrationAuditId,
+								operation: "close",
+							})
+						).details,
+						"CLOSED",
+					);
+				} finally {
+					await calibrationTool.execute("calibration-cleanup", {
+						audit_id: calibrationAuditId,
+						operation: "close",
+					});
+				}
+				const calibration = calibrationLease?.();
+				if (!calibration)
+					throw new Error("Successful registered captures did not hand off their terminal evidence");
+				const calibratedLengths = calibration.evidence
+					.filter(item => item.kind === "screenshot")
+					.map(item => item.captured_byte_length);
+				expect(calibratedLengths).toHaveLength(2);
+				const firstLength = calibratedLengths[0];
+				const secondLength = calibratedLengths[1];
+				if (firstLength === undefined || secondLength === undefined) {
+					throw new Error("Successful screenshot evidence omitted its captured byte length");
+				}
+				expect(firstLength).toBeGreaterThan(0);
+				expect(secondLength).toBeGreaterThan(0);
+
+				let countHandedOff = false;
+				const countBinding = registeredBinding(locator, 1, 4_194_304, () => {
+					countHandedOff = true;
+				});
+				const countTool = registeredTool(countBinding);
+				const countAuditId = countBinding.dispatch.audit_id;
+				const countSignal = AbortSignal.timeout(30_000);
+				try {
+					expectRegisteredStatus(
+						(await countTool.execute("count-open", { audit_id: countAuditId, operation: "open" }, countSignal))
+							.details,
+						"PASS",
+					);
+					expectRegisteredStatus(
+						(
+							await countTool.execute(
+								"count-inspect-one",
+								{ audit_id: countAuditId, operation: "inspect", tuple_id: tupleId },
+								countSignal,
+							)
+						).details,
+						"PASS",
+					);
+					expectRegisteredStatus(
+						(
+							await countTool.execute(
+								"count-inspect-over-limit",
+								{ audit_id: countAuditId, operation: "inspect", tuple_id: tupleId },
+								countSignal,
+							)
+						).details,
+						"BLOCKED",
+					);
+					expect(countHandedOff).toBe(false);
+					expect(hasTab(`audit-${countAuditId}`)).toBe(false);
+				} finally {
+					await countTool.execute("count-cleanup", { audit_id: countAuditId, operation: "close" });
+				}
+
+				const cumulativeLimit = firstLength + secondLength - 1;
+				expect(cumulativeLimit).toBeGreaterThanOrEqual(Math.max(firstLength, secondLength));
+				let bytesHandedOff = false;
+				const byteBinding = registeredBinding(locator, 2, cumulativeLimit, () => {
+					bytesHandedOff = true;
+				});
+				const byteTool = registeredTool(byteBinding);
+				const byteAuditId = byteBinding.dispatch.audit_id;
+				const byteSignal = AbortSignal.timeout(30_000);
+				try {
+					expectRegisteredStatus(
+						(await byteTool.execute("bytes-open", { audit_id: byteAuditId, operation: "open" }, byteSignal))
+							.details,
+						"PASS",
+					);
+					expectRegisteredStatus(
+						(
+							await byteTool.execute(
+								"bytes-inspect-one",
+								{ audit_id: byteAuditId, operation: "inspect", tuple_id: tupleId },
+								byteSignal,
+							)
+						).details,
+						"PASS",
+					);
+					expectRegisteredStatus(
+						(
+							await byteTool.execute(
+								"bytes-inspect-over-limit",
+								{ audit_id: byteAuditId, operation: "inspect", tuple_id: tupleId },
+								byteSignal,
+							)
+						).details,
+						"BLOCKED",
+					);
+					expect(bytesHandedOff).toBe(false);
+					expect(hasTab(`audit-${byteAuditId}`)).toBe(false);
+				} finally {
+					await byteTool.execute("bytes-cleanup", { audit_id: byteAuditId, operation: "close" });
+				}
+			} finally {
+				await pages.stop(true);
+			}
+		} finally {
+			if (previousExecutable === undefined) delete process.env.PUPPETEER_EXECUTABLE_PATH;
+			else process.env.PUPPETEER_EXECUTABLE_PATH = previousExecutable;
+		}
+	}, 120_000);
 });
 
 type HarnessListener = (...args: unknown[]) => unknown;

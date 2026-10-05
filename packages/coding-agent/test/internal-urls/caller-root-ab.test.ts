@@ -164,6 +164,17 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 	it("scopes bare history index and completion to the caller root", async () => {
 		const registry = AgentRegistry.global();
 		await installGlobalMainB(registry, rootB);
+		const foreignSessionFile = path.join(dir, "b", "main", "BOnlyWorker.jsonl");
+		await writeTranscriptWithLine(foreignSessionFile, "b-only-worker", "B-ONLY");
+		registry.register({
+			id: "BOnlyWorker",
+			displayName: "BOnlyWorker",
+			kind: "sub",
+			parentId: MAIN_AGENT_ID,
+			session: null,
+			sessionFile: foreignSessionFile,
+			status: "parked",
+		});
 		await Bun.write(path.join(dir, "a", "main", "OnlyA.jsonl"), sessionHeader("only-a"));
 		await Bun.write(path.join(dir, "b", "main", "OnlyB.jsonl"), sessionHeader("only-b"));
 		const context = { agentRegistry: registry, sessionFile: rootA };
@@ -175,7 +186,13 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 		expect(completions.map(entry => entry.value)).toContain("OnlyA");
 		expect(completions.map(entry => entry.value)).not.toContain("OnlyB");
 		const agentCompletions = (await InternalUrlRouter.instance().complete("agent", "", context)) ?? [];
-		expect(agentCompletions.map(entry => entry.value)).not.toContain("Worker");
+		expect(agentCompletions.map(entry => entry.value)).toContain("Worker");
+		expect(agentCompletions.map(entry => entry.value)).not.toContain("BOnlyWorker");
+		// The foreign negative is a real registered subagent still visible to its own root.
+		const foreignCompletions =
+			(await InternalUrlRouter.instance().complete("agent", "", { agentRegistry: registry, sessionFile: rootB })) ??
+			[];
+		expect(foreignCompletions.map(entry => entry.value)).toContain("BOnlyWorker");
 	});
 
 	it("grep agent://Worker serves the caller root's output artifact when the global Main is the other root", async () => {
@@ -252,9 +269,9 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 		await expect(
 			tool.execute("grep-history-c", { pattern: "secret-B-line", path: "history://Worker" }),
 		).rejects.toThrow("Unknown agent: Worker");
-		await expect(tool.execute("grep-agent-c", { pattern: "B OUTPUT", path: "agent://Worker" })).rejects.toThrow(
-			"No artifacts directory found",
-		);
+		const agentRead = tool.execute("grep-agent-c", { pattern: "B OUTPUT", path: "agent://Worker" });
+		await expect(agentRead).rejects.toThrow();
+		await expect(agentRead).rejects.not.toThrow("B OUTPUT");
 	});
 
 	it("agent://Worker/<field> pairs the sidecar with the SAME root as the matched Worker.md", async () => {

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,6 +24,7 @@ import {
 import { acquireTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { Browser, HTTPRequest, Page, Target } from "puppeteer-core";
+import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -98,11 +99,6 @@ async function spawnDisposableExecutable(args: string[] = []): Promise<Disposabl
 }
 
 describe("pickElectronTarget", () => {
-	beforeAll(async () => {
-		if (!CHROMIUM_AVAILABLE) return;
-		sharedHeadless = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-	});
-
 	afterAll(async () => {
 		if (sharedHeadless) await releaseBrowser(sharedHeadless, { kill: true });
 	});
@@ -376,7 +372,10 @@ describe("pickElectronTarget", () => {
 	test.skipIf(!CHROMIUM_AVAILABLE)(
 		"navigates a fresh attached tab and releases its handle without closing the target",
 		async () => {
-			const launched = sharedHeadless;
+			const launched = (sharedHeadless ??= await acquireBrowser(
+				{ kind: "headless", headless: true },
+				{ cwd: process.cwd() },
+			));
 			if (!launched || !("browser" in launched)) throw new Error("Expected a shared Puppeteer browser");
 			const endpoint = new URL(launched.browser.wsEndpoint());
 			const session = makeSession();
@@ -421,7 +420,10 @@ describe("pickElectronTarget", () => {
 			// attach adopts instead — the navigation fails deterministically on
 			// its first request, and a wrongly retried worker startup would
 			// navigate again and read 2.
-			const launched = sharedHeadless;
+			const launched = (sharedHeadless ??= await acquireBrowser(
+				{ kind: "headless", headless: true },
+				{ cwd: process.cwd() },
+			));
 			if (!launched || !("browser" in launched)) throw new Error("Expected a shared Puppeteer browser");
 			const endpoint = new URL(launched.browser.wsEndpoint());
 			const targetPage = (await launched.browser.pages())[0];
@@ -445,7 +447,11 @@ describe("pickElectronTarget", () => {
 					{ cwd: process.cwd() },
 				);
 				attempted = true;
-				await expect(
+				// Plain await, not `.rejects`: on Windows, once an earlier test has
+				// spawned a piped child, Bun's `.rejects` loop spin stops servicing
+				// this thread's CDP socket, so the paused request never reaches
+				// `onRequest` and worker init times out instead.
+				const error = await rejectionOf(
 					acquireTab(`attach-failure-${process.pid}-${Math.random().toString(36).slice(2)}`, attached, {
 						// Loopback keeps a hypothetical interception miss local and
 						// loud (instant connection refusal, count 0) instead of
@@ -454,7 +460,9 @@ describe("pickElectronTarget", () => {
 						waitUntil: "domcontentloaded",
 						timeoutMs: 15_000,
 					}),
-				).rejects.toThrow(/net::ERR_FAILED/);
+				);
+				expect(error).toBeInstanceOf(Error);
+				expect(error).toMatchObject({ message: expect.stringMatching(/net::ERR_FAILED/) });
 				expect(requestCount).toBe(1);
 			} finally {
 				targetPage.off("request", onRequest);
@@ -489,7 +497,7 @@ describe("resolveSpawnArgs", () => {
 		expect(owned).not.toContain("--password-store=basic");
 
 		const borrowed = resolveSpawnArgs("/usr/bin/google-chrome-stable", ["--user-data-dir=/home/me/.config/chrome"]);
-		expect(borrowed).toEqual(["--user-data-dir=/home/me/.config/chrome"]);
+		expect(borrowed).toEqual([`--user-data-dir=${path.resolve("/home/me/.config/chrome")}`]);
 	});
 });
 

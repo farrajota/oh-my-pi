@@ -17,5 +17,6 @@ export function createSessionDefaults() {
 		getPermissionSummary: () => undefined,
 		isAdvisorActive: () => false,
 		subscribeRunState: () => () => {},
+		addDisposer: () => {},
 	} satisfies Partial<AgentSession>;
 }

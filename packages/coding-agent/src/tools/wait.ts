@@ -13,7 +13,7 @@ import type { ToolSession } from ".";
 import { HubTool } from "./hub";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
 import { nothingToWaitForResult, snapshotJobs, undeliveredJobs } from "../async/job-control";
-import { hasLiveOwnedService, listServices, waitForOwnedServiceCompletion } from "../launch/services";
+import { hasLiveOwnedService, listServicesTolerant, waitForOwnedServiceCompletion } from "../launch/services";
 import { drainPendingInbox, messageResult } from "../irc/messaging";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
@@ -146,7 +146,9 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 
 		const pending = takeQueuedMessage(messaging);
 		if (pending && messaging) return messageResult(messaging.senderId, pending);
-		if (cfgLaunchEnabled.get(this.session.settings)) await listServices(this.session, signal);
+		// Refreshes owned-service tracking only; jobs and peers are in-process, so a
+		// hung broker must not turn every wait into an error.
+		if (cfgLaunchEnabled.get(this.session.settings)) await listServicesTolerant(this.session, signal);
 		const deadline = Date.now() + WAIT_MAX_MS;
 		// Opened by the first message-only block and kept across re-evaluations,
 		// so a peer stopping mid-window cannot restart it.

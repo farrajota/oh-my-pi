@@ -181,11 +181,12 @@ function citedLocationsOf(
 
 async function findUnresolvableLocation(
 	input: SecurityPublishParams["findings"][number],
+	repositoryRoot: string,
 	resolutionRoot: string,
 	lineCounts: Map<string, number | null>,
 ): Promise<DroppedSecurityFinding | undefined> {
 	for (const location of citedLocationsOf(input)) {
-		const normalizedPath = normalizePublishedPath(location.path, resolutionRoot);
+		const normalizedPath = normalizePublishedPath(location.path, repositoryRoot);
 		let lineCount = lineCounts.get(normalizedPath);
 		if (lineCount === undefined) {
 			lineCount = await countResolvedFileLines(path.join(resolutionRoot, normalizedPath));
@@ -357,7 +358,12 @@ export function createSecurityPublicationTool(
 				const droppedFindings: DroppedSecurityFinding[] = [];
 				const groundedInputs: SecurityPublishParams["findings"] = [];
 				for (const input of params.findings) {
-					const dropped = await findUnresolvableLocation(input, resolutionRoot, lineCounts);
+					const dropped = await findUnresolvableLocation(
+						input,
+						options.plan.repositoryRoot,
+						resolutionRoot,
+						lineCounts,
+					);
 					if (dropped) {
 						droppedFindings.push(dropped);
 						continue;

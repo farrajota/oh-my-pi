@@ -182,6 +182,7 @@ describe("W4 durable registry state", () => {
 		expect(Buffer.byteLength(mutated)).toBe(Buffer.byteLength(original));
 		const inode = syncFs.statSync(journal).ino;
 		const originalOpenSync = syncFs.openSync;
+		const writeSync = vi.spyOn(syncFs, "writeSync");
 		let injected = false;
 		const openSync = vi.spyOn(syncFs, "openSync").mockImplementation(((filePath, flags, mode) => {
 			if (!injected && String(filePath) === journal) {
@@ -196,8 +197,10 @@ describe("W4 durable registry state", () => {
 				DurableStateConflictError,
 			);
 			expect(injected).toBe(true);
+			expect(writeSync).not.toHaveBeenCalled();
 			expect(syncFs.readFileSync(journal, "utf8")).toBe(mutated);
 		} finally {
+			writeSync.mockRestore();
 			openSync.mockRestore();
 		}
 	});

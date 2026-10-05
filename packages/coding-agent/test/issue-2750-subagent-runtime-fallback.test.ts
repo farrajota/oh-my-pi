@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -8,23 +8,59 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import type { RetryFallbackRole, ServingModel } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
 
-import { runSubprocess, type RunSubprocessOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { runSubprocess, type ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../src/internal/agent-registry-bridge";
 
 import { createSessionDefaults } from "./helpers/session-defaults";
 
-function runWithAuthority(options: Omit<RunSubprocessOptions, "agentRegistry" | "createAuthoritySession">) {
-	const agentRegistry = new AgentRegistry();
-	return runSubprocess({
-		...options,
-		agentRegistry,
-		createAuthoritySession: createOptions => sdkModule.createAgentSession({ ...createOptions, agentRegistry }),
-	});
+const authoritySessions: AgentSession[] = [];
+
+type ScenarioAuthority = {
+	agentRegistry: AgentRegistry;
+	createAuthoritySession: NonNullable<ExecutorOptions["createAuthoritySession"]>;
+};
+
+let scenarioAuthority: ScenarioAuthority | undefined;
+
+function runWithAuthority(
+	options: Omit<ExecutorOptions, "agentRegistry" | "createAuthoritySession">,
+	agentRegistry: AgentRegistry,
+	createAuthoritySession: NonNullable<ExecutorOptions["createAuthoritySession"]>,
+) {
+	return runSubprocess({ ...options, agentRegistry, createAuthoritySession });
 }
 
 import { cfgRetry, cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
+
+async function createScenarioAuthority(): Promise<ScenarioAuthority> {
+	const agentRegistry = new AgentRegistry();
+	const root = await createAgentRootSession(agentRegistry, {
+		agentId: "Main",
+		agentDisplayName: "Main",
+		cwd: "/tmp",
+		agentDir: "/tmp",
+		settings: Settings.isolated({}),
+		disableExtensionDiscovery: true,
+		enableMCP: false,
+		enableLsp: false,
+		toolNames: [],
+		skipPythonPreflight: true,
+	});
+	authoritySessions.push(root.session);
+	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+	if (!authority) throw new Error("Test fixture requires a live parent-bound authority session.");
+	const createAuthoritySession: NonNullable<ExecutorOptions["createAuthoritySession"]> = (createOptions, reviveRef) =>
+		authority.create(createOptions, reviveRef);
+	return { agentRegistry, createAuthoritySession };
+}
+
+function getScenarioAuthority(): ScenarioAuthority {
+	if (!scenarioAuthority) throw new Error("Test fixture requires a scenario-owned authority session.");
+	return scenarioAuthority;
+}
 
 function model(provider: string, id: string): Model<Api> {
 	return buildModel({
@@ -107,8 +143,14 @@ function createYieldingSession(
 }
 
 describe("subagent runtime model resolution", () => {
-	afterEach(() => {
+	beforeEach(async () => {
+		scenarioAuthority = await createScenarioAuthority();
+	});
+
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await Promise.all(authoritySessions.splice(0).map(session => session.dispose()));
+		scenarioAuthority = undefined;
 	});
 
 	for (const { level, collide } of [
@@ -120,6 +162,7 @@ describe("subagent runtime model resolution", () => {
 			const literal = model("custom", "coding-router:max");
 			const base = model("custom", "coding-router");
 			const snapshots: AgentProgress[] = [];
+			const authority = getScenarioAuthority();
 			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 				if (!options?.model) throw new Error("Expected resolved model");
 				let activeModel = options.model;
@@ -159,22 +202,29 @@ describe("subagent runtime model resolution", () => {
 			});
 			const settings = Settings.isolated({});
 			settings.setModelRole("default", "custom/coding-router:max");
-			const result = await runWithAuthority({
-				cwd: "/tmp",
-				agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
-				task: "work",
-				index: 0,
-				id: "literal-model",
-				modelOverride: level ? `custom/coding-router:max:${level}` : "custom/coding-router:max",
-				settings,
-				modelRegistry: {
-					refresh: async () => {},
-					getAvailable: () => [literal, base],
-					getApiKey: async () => "test-key",
-				} as never,
-				onProgress: progress => snapshots.push({ ...progress }),
-				enableLsp: false,
-			});
+			const result = await runWithAuthority(
+				{
+					cwd: "/tmp",
+					agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+					task: "work",
+					index: 0,
+					id: "literal-model",
+					parentAgentId: "Main",
+					modelOverride: level ? `custom/coding-router:max:${level}` : "custom/coding-router:max",
+					settings,
+					modelRegistry: {
+						refresh: async () => {},
+						getAvailable: () => [literal, base],
+						getApiKey: async () => "test-key",
+					} as never,
+					onProgress: (progress: AgentProgress) => snapshots.push({ ...progress }),
+					enableLsp: false,
+					enableMCP: false,
+					enableIrc: false,
+				},
+				authority.agentRegistry,
+				authority.createAuthoritySession,
+			);
 			const expectedSelector = level ? `custom/coding-router:max:${level}` : "custom/coding-router:max";
 			const latest = snapshots.findLast(progress => progress.resolvedModel !== undefined);
 			expect(latest?.resolvedModelIdentity).toBe(collide ? "custom/coding-router" : "custom/coding-router:max");
@@ -187,6 +237,7 @@ describe("subagent runtime model resolution", () => {
 	}
 
 	it("keeps a subagent fallback reachable when default uses the same primary model", async () => {
+		const authority = getScenarioAuthority();
 		const primary = model("primary", "bad-runtime-model");
 		const fallback = model("fallback", "working-model");
 		let candidates: string[] = [];
@@ -218,28 +269,36 @@ describe("subagent runtime model resolution", () => {
 				setToolUIContext: () => {},
 			} as never;
 		});
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
-			task: "work",
-			index: 0,
-			id: "shared-primary",
-			modelOverride: ["primary/bad-runtime-model", "fallback/working-model"],
-			settings: Settings.isolated({
-				modelRoles: { default: "primary/bad-runtime-model" },
-				"retry.fallbackChains": { default: [] },
-			}),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary, fallback],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+				task: "work",
+				index: 0,
+				id: "shared-primary",
+				parentAgentId: "Main",
+				modelOverride: ["primary/bad-runtime-model", "fallback/working-model"],
+				settings: Settings.isolated({
+					modelRoles: { default: "primary/bad-runtime-model" },
+					"retry.fallbackChains": { default: [] },
+				}),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [primary, fallback],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 		expect(candidates).toEqual(["fallback/working-model"]);
 	});
 
 	it("passes ordered subagent candidates as a child retry fallback chain", async () => {
+		const authority = getScenarioAuthority();
 		const primary = model("primary", "bad-runtime-model");
 		const fallback = model("fallback", "working-model");
 		let childFallbackChains: Record<string, string[]> | undefined;
@@ -258,21 +317,28 @@ describe("subagent runtime model resolution", () => {
 			},
 		});
 		settings.setModelRole("default", "primary/bad-runtime-model");
-		const result = await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "issue-2750",
-			modelOverride: ["primary/bad-runtime-model", "fallback/working-model"],
-			settings,
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary, fallback],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		const result = await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "issue-2750",
+				parentAgentId: "Main",
+				modelOverride: ["primary/bad-runtime-model", "fallback/working-model"],
+				settings,
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [primary, fallback],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		let firstFallbackRole: string | undefined;
 		let subagentFallbackChain: string[] | undefined;
@@ -298,6 +364,7 @@ describe("subagent runtime model resolution", () => {
 	});
 
 	it("persists the installed subagent fallback role for cold revival (#13789)", async () => {
+		const authority = getScenarioAuthority();
 		const primary = model("primary", "bad-runtime-model");
 		const fallback = model("fallback", "working-model");
 		let persisted: RetryFallbackRole | undefined;
@@ -309,25 +376,33 @@ describe("subagent runtime model resolution", () => {
 			});
 			return { session, extensionsResult: {}, setToolUIContext: () => {} } as never;
 		});
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
-			task: "work",
-			index: 0,
-			id: "issue-13789",
-			modelOverride: ["primary/bad-runtime-model", "fallback/working-model"],
-			settings: Settings.isolated({}),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary, fallback],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+				task: "work",
+				index: 0,
+				id: "issue-13789",
+				parentAgentId: "Main",
+				modelOverride: ["primary/bad-runtime-model", "fallback/working-model"],
+				settings: Settings.isolated({}),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [primary, fallback],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 		expect(persisted).toEqual({ primary: "primary/bad-runtime-model", chain: ["fallback/working-model"] });
 	});
 
 	it("does not attribute the run to a fallback that never served a turn", async () => {
+		const authority = getScenarioAuthority();
 		// The incident shape: the primary does all the work, a transient error
 		// routes the child onto a chain candidate, and that candidate errors on its
 		// first request. Crediting the run to it reports 0 tokens of its output as
@@ -346,27 +421,35 @@ describe("subagent runtime model resolution", () => {
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
 		const settings = Settings.isolated({});
 		settings.setModelRole("default", "primary/bad-runtime-model");
-		const result = await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "unproven-fallback",
-			modelOverride: ["primary/bad-runtime-model"],
-			settings,
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary, fallback],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		const result = await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "unproven-fallback",
+				parentAgentId: "Main",
+				modelOverride: ["primary/bad-runtime-model"],
+				settings,
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [primary, fallback],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(result.resolvedModel).toBe("primary/bad-runtime-model");
 		expect(result.resolvedModelIsFallback).toBeFalsy();
 	});
 
 	it("removes configured fallback chains for exact model overrides while retaining retry settings", async () => {
+		const authority = getScenarioAuthority();
 		const primary = model("primary", "exact-model");
 		const fallback = model("fallback", "configured-fallback");
 		let childFallbackChains: Record<string, string[]> | undefined;
@@ -385,27 +468,34 @@ describe("subagent runtime model resolution", () => {
 			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
 		});
 
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
-			task: "work",
-			index: 0,
-			id: "exact-model-no-runtime-fallback",
-			modelOverride: "primary/exact-model",
-			requestedModel: "primary/exact-model",
-			exactModelOverride: true,
-			settings: Settings.isolated({
-				"retry.enabled": true,
-				"retry.maxRetries": 3,
-				"retry.fallbackChains": { default: ["fallback/configured-fallback"] },
-			}),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary, fallback],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+				task: "work",
+				index: 0,
+				id: "exact-model-no-runtime-fallback",
+				parentAgentId: "Main",
+				modelOverride: "primary/exact-model",
+				requestedModel: "primary/exact-model",
+				exactModelOverride: true,
+				settings: Settings.isolated({
+					"retry.enabled": true,
+					"retry.maxRetries": 3,
+					"retry.fallbackChains": { default: ["fallback/configured-fallback"] },
+				}),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [primary, fallback],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childModel).toBe("primary/exact-model");
 		expect(childModelFallback).toBe(false);
@@ -415,6 +505,7 @@ describe("subagent runtime model resolution", () => {
 	});
 
 	it("inherits an explicitly configured default fallback chain for a single subagent model", async () => {
+		const authority = getScenarioAuthority();
 		const primary = model("lm-studio", "local-reviewer");
 		const fallback = model("openai-codex", "gpt-5.6-sol");
 		let childFallbackChains: Record<string, string[]> | undefined;
@@ -431,27 +522,34 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "single-model-configured-fallback",
-			modelOverride: "lm-studio/local-reviewer",
-			settings: Settings.isolated({
-				modelRoles: { "existing-local-role": "lm-studio/local-reviewer" },
-				"retry.fallbackChains": {
-					default: ["openai-codex/gpt-5.6-sol"],
-					"existing-local-role": ["other-provider/other-model"],
-				},
-			}),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary, fallback],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "single-model-configured-fallback",
+				parentAgentId: "Main",
+				modelOverride: "lm-studio/local-reviewer",
+				settings: Settings.isolated({
+					modelRoles: { "existing-local-role": "lm-studio/local-reviewer" },
+					"retry.fallbackChains": {
+						default: ["openai-codex/gpt-5.6-sol"],
+						"existing-local-role": ["other-provider/other-model"],
+					},
+				}),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [primary, fallback],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childModelRole).toBe("lm-studio/local-reviewer");
 		expect(childFallbackChainKeys[0]).toBe("subagent:single-model-configured-fallback");
@@ -461,6 +559,7 @@ describe("subagent runtime model resolution", () => {
 	});
 
 	it("inherits the aliased role's chain, not the default chain, for a role-alias subagent model", async () => {
+		const authority = getScenarioAuthority();
 		const fast = model("fast", "hy3");
 		const slow = model("slow", "opus");
 		let childFallbackChains: Record<string, string[]> | undefined;
@@ -482,26 +581,33 @@ describe("subagent runtime model resolution", () => {
 			source: "bundled",
 			model: ["@smol"],
 		};
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "role-alias-chain",
-			settings: Settings.isolated({
-				modelRoles: { default: "slow/opus", smol: "fast/hy3" },
-				"retry.fallbackChains": {
-					default: ["slow/opus-backup"],
-					smol: ["fast/composer"],
-				},
-			}),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [fast, slow],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "role-alias-chain",
+				parentAgentId: "Main",
+				settings: Settings.isolated({
+					modelRoles: { default: "slow/opus", smol: "fast/hy3" },
+					"retry.fallbackChains": {
+						default: ["slow/opus-backup"],
+						smol: ["fast/composer"],
+					},
+				}),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [fast, slow],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childModelRole).toBe("fast/hy3");
 		expect(childFallbackChains?.["subagent:role-alias-chain"]).toEqual(["fast/composer"]);
@@ -509,6 +615,7 @@ describe("subagent runtime model resolution", () => {
 	});
 
 	it("inherits the aliased role's chain when the spawn path pre-expands the alias", async () => {
+		const authority = getScenarioAuthority();
 		// The real task flow (structured-subagent) resolves `@task` to a concrete
 		// selector before calling the executor and carries the role identity in
 		// `modelRole`. Re-deriving the role from the expanded patterns yields
@@ -531,33 +638,41 @@ describe("subagent runtime model resolution", () => {
 			source: "bundled",
 			model: ["@task"],
 		};
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "pre-expanded-role",
-			modelOverride: ["task-provider/sonnet"],
-			modelRole: "task",
-			settings: Settings.isolated({
-				modelRoles: { default: "default-provider/opus", task: "task-provider/sonnet" },
-				"retry.fallbackChains": {
-					default: ["task-provider/sonnet", "default-provider/sol"],
-					task: ["task-provider/sonnet"],
-				},
-			}),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [roleModel, defaultModel],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "pre-expanded-role",
+				parentAgentId: "Main",
+				modelOverride: ["task-provider/sonnet"],
+				modelRole: "task",
+				settings: Settings.isolated({
+					modelRoles: { default: "default-provider/opus", task: "task-provider/sonnet" },
+					"retry.fallbackChains": {
+						default: ["task-provider/sonnet", "default-provider/sol"],
+						task: ["task-provider/sonnet"],
+					},
+				}),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [roleModel, defaultModel],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childFallbackChains?.["subagent:pre-expanded-role"]).toEqual(["task-provider/sonnet"]);
 	});
 
 	it("inherits the default chain for a role alias whose role configures no chain", async () => {
+		const authority = getScenarioAuthority();
 		const fast = model("fast", "hy3");
 		const slow = model("slow", "opus");
 		let childFallbackChains: Record<string, string[]> | undefined;
@@ -576,28 +691,36 @@ describe("subagent runtime model resolution", () => {
 			source: "bundled",
 			model: ["@smol"],
 		};
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "role-alias-default-chain",
-			settings: Settings.isolated({
-				modelRoles: { default: "slow/opus", smol: "fast/hy3" },
-				"retry.fallbackChains": { default: ["slow/opus-backup"] },
-			}),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [fast, slow],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "role-alias-default-chain",
+				parentAgentId: "Main",
+				settings: Settings.isolated({
+					modelRoles: { default: "slow/opus", smol: "fast/hy3" },
+					"retry.fallbackChains": { default: ["slow/opus-backup"] },
+				}),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [fast, slow],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childFallbackChains?.["subagent:role-alias-default-chain"]).toEqual(["slow/opus-backup"]);
 	});
 
 	it("does not inherit the default chain when multiple requested models collapse to one candidate", async () => {
+		const authority = getScenarioAuthority();
 		const primary = model("lm-studio", "local-reviewer");
 		const fallback = model("openai-codex", "gpt-5.6-sol");
 		let childFallbackChains: unknown;
@@ -616,21 +739,28 @@ describe("subagent runtime model resolution", () => {
 		});
 		settings.setModelRole("default", "openai-codex/gpt-5.6-sol");
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "collapsed-multiple-models",
-			modelOverride: ["missing/provider", "lm-studio/local-reviewer"],
-			settings,
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary, fallback],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "collapsed-multiple-models",
+				parentAgentId: "Main",
+				modelOverride: ["missing/provider", "lm-studio/local-reviewer"],
+				settings,
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [primary, fallback],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childModelRole).toBeUndefined();
 		expect(childFallbackChains).toEqual({
@@ -639,6 +769,7 @@ describe("subagent runtime model resolution", () => {
 	});
 
 	it("keeps a single local subagent model pinned without a configured fallback chain", async () => {
+		const authority = getScenarioAuthority();
 		const primary = model("lm-studio", "local-reviewer");
 		const parent = model("openai-codex", "gpt-5.6-sol");
 		let childModelRole: string | undefined;
@@ -649,27 +780,35 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "single-model-no-fallback",
-			modelOverride: "lm-studio/local-reviewer",
-			parentActiveModelPattern: "openai-codex/gpt-5.6-sol",
-			settings: Settings.isolated(),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary, parent],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "single-model-no-fallback",
+				parentAgentId: "Main",
+				modelOverride: "lm-studio/local-reviewer",
+				parentActiveModelPattern: "openai-codex/gpt-5.6-sol",
+				settings: Settings.isolated(),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [primary, parent],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childModelRole).toBeUndefined();
 	});
 
 	it("preserves malformed fallback configuration for child validation", async () => {
+		const authority = getScenarioAuthority();
 		const primary = model("lm-studio", "local-reviewer");
 		let childFallbackChains: unknown;
 		let childModelRole: string | undefined;
@@ -681,29 +820,37 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "single-model-malformed-fallback",
-			modelOverride: "lm-studio/local-reviewer",
-			// Settings now rejects a non-record value and reads `null` as unset, so the
-			// malformed shape that still reaches the child is a non-array chain entry.
-			settings: Settings.isolated({ "retry.fallbackChains": { default: "fallback/not-a-list" } as never }),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "single-model-malformed-fallback",
+				parentAgentId: "Main",
+				modelOverride: "lm-studio/local-reviewer",
+				// Settings now rejects a non-record value and reads `null` as unset, so the
+				// malformed shape that still reaches the child is a non-array chain entry.
+				settings: Settings.isolated({ "retry.fallbackChains": { default: "fallback/not-a-list" } as never }),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [primary],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childFallbackChains).toEqual({ default: "fallback/not-a-list" });
 		expect(childModelRole).toBeUndefined();
 	});
 
 	it("leaves malformed default fallback entries for child validation", async () => {
+		const authority = getScenarioAuthority();
 		const primary = model("lm-studio", "local-reviewer");
 		let childFallbackChains: unknown;
 		let childModelRole: string | undefined;
@@ -715,27 +862,35 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "single-model-invalid-default-fallback",
-			modelOverride: "lm-studio/local-reviewer",
-			settings: Settings.isolated({ "retry.fallbackChains": { default: [123] } as never }),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [primary],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "single-model-invalid-default-fallback",
+				parentAgentId: "Main",
+				modelOverride: "lm-studio/local-reviewer",
+				settings: Settings.isolated({ "retry.fallbackChains": { default: [123] } as never }),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [primary],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childFallbackChains).toEqual({ default: [123] });
 		expect(childModelRole).toBeUndefined();
 	});
 
 	it("preserves upstream routing selectors in the child retry fallback chain", async () => {
+		const authority = getScenarioAuthority();
 		const routedModel = model("openrouter", "z-ai/glm-4.7");
 		let childFallbackChains: Record<string, string[]> | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
@@ -747,26 +902,34 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "issue-2750-routed",
-			modelOverride: ["openrouter/z-ai/glm-4.7@cerebras", "openrouter/z-ai/glm-4.7@fireworks"],
-			settings: Settings.isolated(),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [routedModel],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "issue-2750-routed",
+				parentAgentId: "Main",
+				modelOverride: ["openrouter/z-ai/glm-4.7@cerebras", "openrouter/z-ai/glm-4.7@fireworks"],
+				settings: Settings.isolated(),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [routedModel],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childFallbackChains?.["subagent:issue-2750-routed"]).toEqual(["openrouter/z-ai/glm-4.7@fireworks"]);
 	});
 
 	it("defers unresolved explicit subagent model selectors instead of picking an available default", async () => {
+		const authority = getScenarioAuthority();
 		const defaultModel = model("zai", "glm-5.2");
 		let childModel: Model | undefined;
 		let childModelPattern: unknown;
@@ -784,26 +947,33 @@ describe("subagent runtime model resolution", () => {
 		});
 
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
-		await runWithAuthority({
-			cwd: "/tmp",
-			agent,
-			task: "work",
-			index: 0,
-			id: "issue-4421",
-			modelOverride: ["openai-codex/gpt-5.5:auto"],
-			parentActiveModelPattern: "openai-codex/gpt-5.5",
-			settings: Settings.isolated({
-				"retry.fallbackChains": {
-					default: ["openai-codex/gpt-5.6-sol"],
-				},
-			}),
-			modelRegistry: {
-				refresh: async () => {},
-				getAvailable: () => [defaultModel],
-				getApiKey: async () => "test-key",
-			} as never,
-			enableLsp: false,
-		});
+		await runWithAuthority(
+			{
+				cwd: "/tmp",
+				agent,
+				task: "work",
+				index: 0,
+				id: "issue-4421",
+				parentAgentId: "Main",
+				modelOverride: ["openai-codex/gpt-5.5:auto"],
+				parentActiveModelPattern: "openai-codex/gpt-5.5",
+				settings: Settings.isolated({
+					"retry.fallbackChains": {
+						default: ["openai-codex/gpt-5.6-sol"],
+					},
+				}),
+				modelRegistry: {
+					refresh: async () => {},
+					getAvailable: () => [defaultModel],
+					getApiKey: async () => "test-key",
+				} as never,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			},
+			authority.agentRegistry,
+			authority.createAuthoritySession,
+		);
 
 		expect(childModel).toBeUndefined();
 		expect(childModelPattern).toEqual(["openai-codex/gpt-5.5:auto"]);

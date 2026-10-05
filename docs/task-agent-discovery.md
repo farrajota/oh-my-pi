@@ -105,7 +105,7 @@ Session definitions are appended after discovered agents, so an existing agent w
 
 ## Watch running agents
 
-After dispatch, press `Alt+A` to open [Agent Hub](./agent-hub.md). Its live roster shows each task agent's status, current activity, model, age, and usage. Select an agent to read its transcript and steer it directly; parked agents can be revived from the same view. Enable `tui.mouse` to click live task cards and jump-list rows instead, or watch the pinned `Subagents` block above the editor.
+After dispatch, press `Alt+A` to open [Agent Hub](./agent-hub.md). Its live roster shows each task agent's status, current activity, model, age, and usage. Select an agent to read its transcript; live agents can be steered directly, and lifecycle-adopted parked agents can be revived from the same view. Isolated parked sessions have no reviver. Enable `tui.mouse` to click live task cards and jump-list rows instead, or watch the pinned `Subagents` block above the editor.
 
 ### `vibe_spawn` tier routing
 
@@ -224,16 +224,14 @@ A missing name fails preflight with `Unknown agent "...". Available: ...`; no su
 
 TaskTool model precedence is:
 
-1. the request-local TaskTool `model`
+1. the request-local TaskTool `model` (one selector or ordered selector array)
 2. `task.agentModelOverrides[agentName]`
-3. agent frontmatter `model`
+3. agent frontmatter's prioritized `model` list
 4. the parent session's active/default model fallback
 
-An accepted request-local selector is exact for that invocation. Only that selector is resolved through `resolveAgentModelPatterns`; failure to resolve the role or selector fails the invocation instead of falling through to per-agent settings, frontmatter, or the parent model. The invocation also does not use parent-auth fallback, configured runtime model fallback chains, or a prewalk model handoff. Same-model provider transport retries remain allowed. The override does not mutate `task.agentModelOverrides`.
+Role aliases in those sources are expanded through `modelRoles`, except `@default`, which resolves to the parent's active model (rather than `modelRoles.default`). A request-local selector is exact: unresolved requested candidates fail rather than falling through to a lower-precedence source; request-local selection also suppresses parent-auth fallback, configured runtime model fallback chains, and prewalk handoff. Agent-definition and `task.agentModelOverrides` models keep the parent fallback, as does a selection containing `@default`. Same-model provider transport retries remain allowed. The override does not mutate `task.agentModelOverrides`.
 
-Approval details and streaming call presentation show the raw requested selector. Progress and result metadata expose both the requested selector and the resolved model so operators can distinguish intent from execution.
-
-These rules apply only to TaskTool routing. The eval `agent()` bridge retains its existing model-selection semantics: `task.allowModelOverride` does not add this field to eval calls, and eval does not inherit TaskTool's request-local precedence or exact-routing fallback suppression.
+Approval details and streaming call presentation show the raw requested selector. Progress and result metadata expose both the requested selector and resolved model. These rules apply only to TaskTool routing; eval `agent()` retains its existing model-selection semantics.
 
 After policy resolution, the `before_subagent_spawn` extension hook runs once for the actual dispatch. It can block the spawn or replace the resolved model patterns; a routing note is carried into progress metadata.
 

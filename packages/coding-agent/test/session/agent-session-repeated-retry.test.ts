@@ -42,7 +42,7 @@ type SpecializedRetryEvent = {
 
 class SpecializedRetryHookRunner {
 	readonly events: SpecializedRetryEvent[] = [];
-	readonly deliveryOrder: string[] = [];
+	readonly deliveryOrder: { type: string; mode?: "normal" | "repeated" }[] = [];
 
 	constructor(private readonly subscribeToGenericAutoRetryEnd = false) {}
 
@@ -58,9 +58,9 @@ class SpecializedRetryHookRunner {
 		return undefined;
 	}
 
-	async emit(event: { type: string }): Promise<void> {
+	async emit(event: { type: string; mode?: "normal" | "repeated" }): Promise<void> {
 		if (!this.hasHandlers(event.type)) return;
-		this.deliveryOrder.push(event.type);
+		this.deliveryOrder.push({ type: event.type, mode: event.mode });
 		if (event.type === "auto_retry_recovered" || event.type === "auto_retry_timeout") {
 			this.events.push(event as SpecializedRetryEvent);
 		}
@@ -479,7 +479,10 @@ describe("AgentSession repeated retry runtime", () => {
 		harness = await createHarness([errorResponse(SESSION_LIMIT), successResponse("recovered")], undefined, true);
 
 		expect(await harness.session.prompt("recover after a session limit")).toBe(true);
-		expect(harness.extensionRunner.deliveryOrder).toEqual(["auto_retry_end", "auto_retry_recovered"]);
+		const repeatedDeliveryOrder = harness.extensionRunner.deliveryOrder.filter(
+			event => event.mode === "repeated" || event.type === "auto_retry_recovered",
+		);
+		expect(repeatedDeliveryOrder.map(event => event.type)).toEqual(["auto_retry_end", "auto_retry_recovered"]);
 		expect(harness.extensionRunner.events).toHaveLength(1);
 	});
 	test("fails fast for ordinary per-minute 429 errors without repeated retry", async () => {

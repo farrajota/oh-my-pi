@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
+import { ArtifactManager, publishAllocatedArtifact } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import {
 	enforceInlineByteCap,
 	formatHeadTruncationNotice,
@@ -362,6 +362,64 @@ describe("OutputSink", () => {
 		expect(publishedPath).not.toBeNull();
 		expect(await fs.readFile(publishedPath as string, "utf8")).toBe("abcdef");
 	});
+	test("does not advertise a manager stream when final publication is obstructed", async () => {
+		const dir = await createTempDir();
+		const manager = new ArtifactManager(dir);
+		const allocated = await manager.allocatePath("bash");
+		const finalPath = path.join(dir, `${allocated.id}.bash.log`);
+		await fs.mkdir(finalPath);
+		const previewBudget = 5;
+		const childOutput = "captured child output";
+		const sink = new OutputSink({
+			artifactPath: allocated.path,
+			artifactId: allocated.id,
+			spillThreshold: previewBudget,
+		});
+		sink.push(childOutput);
+
+		const dumped = await sink.dump();
+		expect(dumped.output).toBe(childOutput.slice(-previewBudget));
+		expect(byteLength(dumped.output)).toBe(previewBudget);
+		expect(dumped.totalBytes).toBe(byteLength(childOutput));
+		expect(dumped.truncated).toBe(true);
+		expect(dumped.artifactError).toBeUndefined();
+		expect(dumped.artifactId).toBeUndefined();
+		expect(await manager.getPath(allocated.id)).toBeNull();
+		expect(await fs.readdir(path.join(dir, ".artifact-staging-v1"))).toEqual([]);
+		const abandoned = JSON.parse(
+			await fs.readFile(path.join(dir, ".artifact-state-v1", allocated.id, "99-abandoned.json"), "utf8"),
+		);
+		expect(abandoned.phase).toBe("abandoned");
+
+		await fs.rmdir(finalPath);
+		await publishAllocatedArtifact(allocated.path);
+		expect(await manager.getPath(allocated.id)).toBeNull();
+
+		const recovered = await manager.allocatePath("bash");
+		const recoveryPayload = "0123456789ABCDEFGHIJKLMN";
+		const recoverySink = new OutputSink({
+			artifactPath: recovered.path,
+			artifactId: recovered.id,
+			spillThreshold: previewBudget,
+			artifactMaxBytes: 16,
+			artifactHeadBytes: 8,
+		});
+		recoverySink.push(recoveryPayload);
+		const recoveredDump = await recoverySink.dump();
+		expect(recoveredDump.artifactId).toBe(recovered.id);
+		expect(recoveredDump.artifactElidedBytes).toBe(8);
+		expect(recoveredDump.artifactError).toBeUndefined();
+		const recoveredPath = await manager.getPath(recovered.id);
+		expect(recoveredPath).not.toBeNull();
+		const artifactText = await fs.readFile(recoveredPath as string, "utf8");
+		expect(artifactText.startsWith("01234567")).toBe(true);
+		expect(artifactText.endsWith("GHIJKLMN")).toBe(true);
+		expect(artifactText).toContain("[ARTIFACT TRUNCATED:");
+		const retainedPayload = artifactText.replace(/\n?\[ARTIFACT TRUNCATED:[^\]]+\]\n?/g, "");
+		expect(retainedPayload).toBe("01234567GHIJKLMN");
+		expect(byteLength(retainedPayload)).toBe(16);
+		expect(byteLength(recoveryPayload) - byteLength(retainedPayload)).toBe(8);
+	});
 
 	test("does not publish a manager-allocated stream when disposal bypasses dump", async () => {
 		const dir = await createTempDir();
@@ -597,6 +655,99 @@ describe("OutputSink", () => {
 
 		expect(artifactText).toBe(payload);
 		expect(artifactText).not.toContain("[ARTIFACT TRUNCATED:");
+	});
+
+	test("default sink caps an oversized artifact at 16 MiB with a truncation notice between head and tail", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "oversized.log");
+		const sink = new OutputSink({ artifactPath, artifactId: "art-oversized" });
+
+		const line = `${"x".repeat(1023)}\n`;
+		const block = line.repeat(64); // 64 KiB, a typical pipe read
+		sink.push("HEAD-START\n");
+		for (let i = 0; i < 320; i++) sink.push(block); // 20 MiB
+		sink.push("TAIL-END\n");
+		const summary = await sink.dump();
+		const artifactText = await Bun.file(artifactPath).text();
+
+		expect(summary.artifactId).toBe("art-oversized");
+		expect(artifactText.startsWith("HEAD-START\n")).toBe(true);
+		expect(artifactText.endsWith(`${line}TAIL-END\n`)).toBe(true);
+		const notices = artifactText.match(/\[ARTIFACT TRUNCATED:[^\]]+\]/g) ?? [];
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("elided from the middle");
+		const stripped = artifactText.replace(/\n?\[ARTIFACT TRUNCATED:[^\]]+\]\n?/g, "");
+		expect(byteLength(stripped)).toBe(16 * 1024 * 1024);
+		// The head window is the stream's first 3 MiB, verbatim.
+		expect(artifactText.indexOf("[ARTIFACT TRUNCATED:")).toBe(3 * 1024 * 1024 + 1);
+	});
+
+	test("default sink keeps a spilled artifact below the cap lossless", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "spilled-small.log");
+		const sink = new OutputSink({ artifactPath, artifactId: "art-small-default" });
+
+		const payload = Array.from({ length: 4096 }, (_, i) => `line ${i} ${"y".repeat(40)}`).join("\n");
+		sink.push(payload);
+		const summary = await sink.dump();
+
+		expect(summary.truncated).toBe(true);
+		expect(summary.artifactId).toBe("art-small-default");
+		expect(summary.artifactElidedBytes).toBeUndefined();
+		expect(await Bun.file(artifactPath).text()).toBe(payload);
+		const notice = formatOutputNotice(outputMeta().truncationFromSummary(summary, { direction: "tail" }).get());
+		expect(notice).toContain("Read artifact://art-small-default for full output");
+	});
+
+	test("a small cap without an explicit head budget still keeps the most recent output", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "small-cap.log");
+		const sink = new OutputSink({
+			artifactPath,
+			artifactId: "art-small-cap",
+			spillThreshold: 8,
+			artifactMaxBytes: 64,
+		});
+
+		const payload = Array.from({ length: 50 }, (_, i) => String(i).padStart(4, "0")).join(""); // 200 bytes
+		sink.push(payload);
+		await sink.dump();
+		const artifactText = await Bun.file(artifactPath).text();
+
+		expect(artifactText.startsWith(payload.slice(0, 32))).toBe(true);
+		expect(artifactText.endsWith(payload.slice(-32))).toBe(true);
+		const stripped = artifactText.replace(/\n?\[ARTIFACT TRUNCATED:[^\]]+\]\n?/g, "");
+		expect(stripped).toBe(payload.slice(0, 32) + payload.slice(-32));
+	});
+
+	test("a capped artifact is advertised as a head/tail sample, not as full output", async () => {
+		const dir = await createTempDir();
+		const sink = new OutputSink({
+			artifactPath: path.join(dir, "sampled.log"),
+			artifactId: "art-sampled",
+			spillThreshold: 16,
+			maxColumns: 8,
+			artifactMaxBytes: 32,
+			artifactHeadBytes: 16,
+		});
+
+		// 136 bytes of 17-byte lines: over the 32-byte artifact cap and the 8-byte column cap.
+		sink.push("0123456789ABCDEF\n".repeat(8));
+		const summary = await sink.dump();
+		expect(summary.artifactId).toBe("art-sampled");
+		expect(summary.artifactElidedBytes).toBe(136 - 32);
+
+		const meta = outputMeta().truncationFromSummary(summary, { direction: "tail" }).get();
+		expect(meta?.truncation?.artifactElidedBytes).toBe(104);
+		expect(meta?.limits?.columnTruncated?.artifactElidedBytes).toBe(104);
+		const notice = formatOutputNotice(meta);
+		// Both the truncation and the column-cap notices carry the reference.
+		expect(
+			notice.match(
+				/Read artifact:\/\/art-sampled for a head\/tail sample of the output; 104B from its middle was not saved/g,
+			),
+		).toHaveLength(2);
+		expect(notice).not.toContain("for full output");
 	});
 	test("createInput decodes streamed UTF-8 chunks correctly", async () => {
 		const sink = new OutputSink();

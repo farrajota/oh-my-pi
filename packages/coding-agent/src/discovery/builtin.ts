@@ -91,11 +91,15 @@ export function getAncestorDirs(cwd: string, stopAt?: string | null): Array<{ di
 	return ancestors;
 }
 
-async function findNearestProjectConfigDir(
-	cwd: string,
-	repoRoot?: string | null,
-): Promise<{ dir: string; depth: number } | null> {
-	for (const ancestor of getAncestorDirs(cwd, repoRoot)) {
+/**
+ * Nearest `.omp/` between cwd and the repo root. The home directory is never a
+ * project: `~/.omp` is the user config root, so a cwd under home (temp dirs on
+ * Windows, scratch folders) must not load its SYSTEM.md/RULES.md/AGENTS.md as
+ * project config — that also bypasses an overridden agent dir or profile.
+ */
+async function findNearestProjectConfigDir(ctx: LoadContext): Promise<{ dir: string; depth: number } | null> {
+	for (const ancestor of getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home)) {
+		if (ancestor.dir === ctx.home) continue;
 		const configDir = await ifNonEmptyDir(ancestor.dir, PATHS.projectDir);
 		if (configDir) return { dir: configDir, depth: ancestor.depth };
 	}
@@ -272,7 +276,9 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 	};
 
 	await loadFromDir(scopedAgentDir(ctx), "user");
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
+	// User config is loaded first to preserve the native provider's established
+	// precedence while project prompts remain scoped to the nearest project.
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx);
 	if (nearestProjectConfigDir) {
 		await loadFromDir(nearestProjectConfigDir.dir, "project");
 	}
@@ -290,8 +296,9 @@ registerProvider<SystemPrompt>(systemPromptCapability.id, {
 
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	// Walk up from cwd finding .omp/skills/ in ancestors (closest first)
-	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home);
+	// Walk up from cwd finding .omp/skills/ in ancestors (closest first). Home is
+	// the user config root, never a project (see findNearestProjectConfigDir).
+	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home).filter(({ dir }) => dir !== ctx.home);
 	const projectScans = ancestors.map(({ dir }) =>
 		scanSkillsFromDir(ctx, {
 			dir: path.join(dir, PATHS.projectDir, "skills"),
@@ -404,7 +411,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const userRule = await loadStickyRulesFile(userRulesFile, "user");
 	if (userRule) items.push(userRule);
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx);
 	if (nearestProjectConfigDir) {
 		const projectRulesFile = path.join(nearestProjectConfigDir.dir, "RULES.md");
 		const projectRule = await loadStickyRulesFile(projectRulesFile, "project");
@@ -931,7 +938,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 		});
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx);
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "AGENTS.md");
 		const projectContent = await readFile(projectPath);

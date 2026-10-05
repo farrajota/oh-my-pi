@@ -489,8 +489,9 @@ function (tc::OmpToolCallable)(args...; kwargs...)
     for (k, v) in kwargs
         args_dict[string(k)] = v
     end
+    get!(args_dict, "i", "jl prelude")
     
-    return __omp_call_bridge("tool:" * tc.name, args_dict)
+    return __omp_call_bridge(tc.name, args_dict)
 end
 
 function Base.getproperty(::OmpToolProxy, sym::Symbol)

@@ -85,14 +85,15 @@ describe("task permission schema", () => {
 	it("omits permissions when disabled", () => {
 		const schema = disabledSchema();
 
-		expect(accepts(schema, { agent: "task", task: "read" })).toBe(true);
+		expect(accepts(schema, { agent: "task", task: "read", solutionSpace: "focused" })).toBe(true);
 		expect(
 			parse(schema, {
 				agent: "task",
 				task: "read",
+				solutionSpace: "focused",
 				permissions: { profiles: ["read-only"] },
 			}),
-		).toEqual({ agent: "task", task: "read" });
+		).toEqual({ agent: "task", task: "read", solutionSpace: "focused" });
 	});
 
 	it("includes profiles, tool fields, and path fields when both dimensions are enabled", () => {
@@ -102,6 +103,7 @@ describe("task permission schema", () => {
 			accepts(schema, {
 				agent: "task",
 				task: "read",
+				solutionSpace: "focused",
 				permissions: {
 					profiles: ["focused-edit"],
 					tools: ["read"],
@@ -115,6 +117,7 @@ describe("task permission schema", () => {
 			accepts(schema, {
 				agent: "task",
 				task: "read",
+				solutionSpace: "focused",
 				permissions: { tools: "read" },
 			}),
 		).toBe(false);
@@ -127,6 +130,7 @@ describe("task permission schema", () => {
 			parse(schema, {
 				agent: "task",
 				task: "read",
+				solutionSpace: "focused",
 				permissions: {
 					profiles: ["focused-edit"],
 					tools: ["read"],
@@ -138,6 +142,7 @@ describe("task permission schema", () => {
 		).toEqual({
 			agent: "task",
 			task: "read",
+			solutionSpace: "focused",
 			permissions: {
 				profiles: ["focused-edit"],
 				tools: ["read"],
@@ -153,6 +158,7 @@ describe("task permission schema", () => {
 			parse(schema, {
 				agent: "task",
 				task: "read",
+				solutionSpace: "focused",
 				permissions: {
 					profiles: ["focused-edit"],
 					tools: ["read"],
@@ -164,6 +170,7 @@ describe("task permission schema", () => {
 		).toEqual({
 			agent: "task",
 			task: "read",
+			solutionSpace: "focused",
 			permissions: {
 				profiles: ["focused-edit"],
 				allowPaths: ["src/task/**"],

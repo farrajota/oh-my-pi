@@ -1,15 +1,25 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, type AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
+import {
+	bindInternalAgentAuthoritySession,
+	createAgentRootSession,
+	lookupAgentRef,
+	parkAgentRef,
+	setAgentHistory,
+	setAgentStatus,
+} from "../../src/internal/agent-registry-bridge";
 
 /**
  * Contract: when `task.maxRuntimeMs` is set, a subagent whose inference call
@@ -83,20 +93,39 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		source: "bundled",
 	};
 	let registry = new AgentRegistry();
-	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-		sdkModule.createAgentSession({ ...options, agentRegistry: registry });
+	const authorityRoots: AgentSession[] = [];
+	async function bindRootAuthority(agentRegistry: AgentRegistry) {
+		const root = await createAgentRootSession(agentRegistry, { agentId: "Main" });
+		authorityRoots.push(root.session);
+		const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+		if (!authority) throw new Error("Test fixture requires parent authority");
+		return authority.create;
+	}
+	let createAuthoritySession: AgentAuthoritySessionBinding["create"];
 	const baseOptions = {
 		cwd: "/tmp",
 		agent: baseAgent,
 		task: "do work",
 		index: 0,
 		id: "subagent-walltime",
+		parentAgentId: "Main",
 		modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 		enableLsp: false,
-		agentRegistry: registry,
-		createAuthoritySession,
+		get agentRegistry() {
+			return registry;
+		},
+		get createAuthoritySession() {
+			return createAuthoritySession;
+		},
 	};
 
+	beforeAll(async () => {
+		createAuthoritySession = await bindRootAuthority(registry);
+	});
+
+	afterAll(async () => {
+		for (const root of authorityRoots.splice(0)) await root.dispose();
+	});
 	it("aborts a stalled subagent and surfaces a runtime-limit reason", async () => {
 		const settings = Settings.isolated({ "task.maxRuntimeMs": 50 });
 		const handle = createHangingSession();
@@ -203,6 +232,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 
 	it("a cancelled late initializer cannot replace a newer same-id worker", async () => {
 		registry = new AgentRegistry();
+		createAuthoritySession = await bindRootAuthority(registry);
 		const creationGate = Promise.withResolvers<void>();
 		const creationStarted = Promise.withResolvers<CreateAgentSessionOptions>();
 		const lateDisposed = Promise.withResolvers<void>();
@@ -210,7 +240,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			...createSessionDefaults(),
 			dispose: async () => lateDisposed.resolve(),
 		} as unknown as AgentSession;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
+		const createSession = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
 			creationStarted.resolve(options);
 			await creationGate.promise;
 			return {
@@ -233,15 +263,21 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		const cancelled = await run;
 		expect(cancelled.aborted).toBe(true);
 
-		const replacementSession = createSessionDefaults() as unknown as AgentSession;
-		const replacement = registry.register({
-			id: "late-generation",
-			displayName: "replacement B",
-			kind: "sub",
-			parentId: "Main",
-			session: replacementSession,
-			status: "idle",
-		});
+		// Replacing the real root retires its outstanding child reservation. The
+		// new bound parent can then create the same id while the old SDK call waits.
+		createSession.mockRestore();
+		createAuthoritySession = await bindRootAuthority(registry);
+		const replacementManager = SessionManager.inMemory("/tmp");
+		installSessionOperationLedger(replacementManager);
+		const replacementSession = {
+			...createSessionDefaults(),
+			sessionManager: replacementManager,
+		} as unknown as AgentSession;
+		mockCreateAgentSession(replacementSession);
+		await createAuthoritySession({ agentId: "late-generation", agentDisplayName: "replacement B" });
+		expect(setAgentStatus(registry, "late-generation", "idle", replacementSession)).toBe(true);
+		const replacement = registry.get("late-generation");
+		if (!replacement) throw new Error("Expected replacement worker generation");
 		creationGate.resolve();
 		await lateDisposed.promise;
 
@@ -251,10 +287,12 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			status: "idle",
 		});
 		expect(replacement.status).toBe("idle");
+		expect(lookupAgentRef(registry, "late-generation")?.session).toBe(replacementSession);
 	});
 
 	it("does not let a delayed run write history after its exact ref is rebound to a revived session", async () => {
 		registry = new AgentRegistry();
+		createAuthoritySession = await bindRootAuthority(registry);
 		const setupPaused = Promise.withResolvers<void>();
 		const releaseSetup = Promise.withResolvers<void>();
 		let childSessionManager!: AgentSession["sessionManager"];
@@ -289,17 +327,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			},
 			prompt: async () => true,
 		} as unknown as AgentSession;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
+		const createSession = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
 			childSessionManager = options.sessionManager!;
-			registry.register({
-				id: "history-generation",
-				displayName: "original",
-				kind: "sub",
-				parentId: "Main",
-				session,
-				sessionFile: options.sessionManager?.getSessionFile() ?? null,
-				status: "running",
-			});
 			return {
 				session,
 				extensionsResult: {} as unknown as LoadExtensionsResult,
@@ -315,11 +344,31 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			workPoolYieldItems: [],
 		});
 		await setupPaused.promise;
-		const original = registry.get("history-generation");
+		const original = lookupAgentRef(registry, "history-generation");
 		if (!original) throw new Error("Expected original history generation");
-		const replacementSession = createSessionDefaults() as unknown as AgentSession;
-		expect(registry.attachSession("history-generation", replacementSession, null, original)).toBe(true);
-		expect(registry.setHistory("history-generation", { resolvedModel: "replacement/model" })).toBe(true);
+		expect(parkAgentRef(registry, original, session)).toBe(true);
+		await session.dispose();
+		const parked = registry.get("history-generation");
+		if (!parked) throw new Error("Expected parked history generation");
+		const replacementManager = SessionManager.inMemory("/tmp");
+		installSessionOperationLedger(replacementManager);
+		const replacementSession = {
+			...createSessionDefaults(),
+			sessionManager: replacementManager,
+		} as unknown as AgentSession;
+		createSession.mockResolvedValueOnce({
+			session: replacementSession,
+			extensionsResult: {} as unknown as LoadExtensionsResult,
+			setToolUIContext: () => {},
+			eventBus: new EventBus(),
+		});
+		const revived = await createAuthoritySession(
+			{ agentId: original.id, agentDisplayName: original.displayName },
+			parked,
+		);
+		expect(revived.session).toBe(replacementSession);
+		expect(lookupAgentRef(registry, "history-generation")).toBe(original);
+		expect(setAgentHistory(registry, revived.session, { resolvedModel: "replacement/model" })).toBe(true);
 		const replacement = registry.get("history-generation");
 		if (!replacement) throw new Error("Expected rebound history generation");
 		const metadataEvents: unknown[] = [];
@@ -335,6 +384,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			history: { resolvedModel: "replacement/model" },
 		});
 		expect(metadataEvents).toEqual([]);
+		expect(lookupAgentRef(registry, "history-generation")?.session).toBe(replacementSession);
 	});
 
 	it("a late successful yield does not flip a timed-out run to success", async () => {

@@ -179,6 +179,8 @@ describe("IRC", () => {
 			await session.dispose();
 		}
 		await authStorage.close();
+		IrcBus.resetGlobalForTests();
+		AgentRegistry.resetGlobalForTests();
 	});
 
 	describe("IrcBus", () => {

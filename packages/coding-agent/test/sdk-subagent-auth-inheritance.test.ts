@@ -101,7 +101,7 @@ describe("task subagent OAuth pin inheritance", () => {
 				"todo.enabled": false,
 			});
 			vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
-			const dispatched: executorModule.RunSubprocessOptions[] = [];
+			const dispatched: executorModule.ExecutorOptions[] = [];
 			vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 				dispatched.push(options);
 				return subprocessResult(options.id ?? "task");

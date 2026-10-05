@@ -18,6 +18,7 @@ import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-ent
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import * as sshFileTransfer from "@oh-my-pi/pi-coding-agent/ssh/file-transfer";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { ToolError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -717,8 +718,10 @@ describe("GrepTool internal URL resolution", () => {
 			enumerate,
 		});
 		const tool = new GrepTool(createSession());
-		await expect(tool.execute("dir-search", { pattern: "x", path: "dirstub://host/dir" })).rejects.toThrow(
-			/grep cannot recurse the directory listing at dirstub:\/\/host\/dir/,
+		const refusal = tool.execute("dir-search", { pattern: "x", path: "dirstub://host/dir" });
+		await expect(refusal).rejects.toBeInstanceOf(ToolError);
+		await expect(refusal).rejects.toThrow(
+			/(grep cannot recurse the directory listing at dirstub:\/\/host\/dir\b|dirstub:\/\/host\/dir(: Operation not supported| lists only through the read tool))/,
 		);
 		expect(enumerate).not.toHaveBeenCalled();
 	});
@@ -735,7 +738,7 @@ describe("GrepTool internal URL resolution", () => {
 		const listSpy = vi.spyOn(sshFileTransfer, "listRemoteDir").mockResolvedValue([]);
 		const tool = new GrepTool(createSession());
 		await expect(tool.execute("ssh-dir-search", { pattern: "x", path: "ssh://h/etc" })).rejects.toThrow(
-			/grep cannot recurse the directory listing at ssh:\/\/h\/etc/,
+			/(grep cannot recurse the directory listing at ssh:\/\/h\/etc|ssh:\/\/h\/etc(: Operation not supported| lists only through the read tool))/,
 		);
 		expect(listSpy).not.toHaveBeenCalled();
 	});

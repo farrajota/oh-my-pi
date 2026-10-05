@@ -148,6 +148,7 @@ const baseOptions = {
 	task: "do work",
 	index: 0,
 	id: "subagent-guards",
+	parentAgentId: "Main",
 	modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 	enableLsp: false,
 };
@@ -155,17 +156,16 @@ const baseOptions = {
 describe("runSubprocess request guards", () => {
 	beforeEach(async () => {
 		registry = new AgentRegistry();
-		rootSession = createFakeSession().session;
-		pendingSessionCreations.push(sessionCreationResult(rootSession));
+		const root = await createAgentRootSession(registry, { agentId: "Main", agentDisplayName: "main" });
+		rootSession = root.session;
+		const authority = bindInternalAgentAuthoritySession(registry, root.session);
+		if (!authority) throw new Error("Expected a manager-owned root authority fixture.");
+		createAuthoritySession = authority.create;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
 			const created = pendingSessionCreations.shift();
 			if (!created) throw new Error("Unexpected authority session creation.");
 			return created;
 		});
-		await createAgentRootSession(registry, { agentId: "Main", agentDisplayName: "main" });
-		const authority = bindInternalAgentAuthoritySession(registry, rootSession);
-		if (!authority) throw new Error("Expected a manager-owned root authority fixture.");
-		createAuthoritySession = authority.create;
 	});
 
 	afterEach(async () => {

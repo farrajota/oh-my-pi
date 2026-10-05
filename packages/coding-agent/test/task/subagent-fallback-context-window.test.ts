@@ -13,6 +13,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
@@ -43,8 +44,11 @@ describe("subagent context window after a model swap", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
-
 	it("follows the serving model's window", async () => {
+		const agentRegistry = new AgentRegistry();
+		const root = await createAgentRootSession(agentRegistry, { agentId: "Main" });
+		const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+		if (!authority) throw new Error("Test fixture requires parent authority");
 		const primary = model("sub-omp", "k3-256k", 256_000);
 		const fallback = model("openai-codex", "gpt-6-sol", 500_000);
 		const snapshots: AgentProgress[] = [];
@@ -103,11 +107,11 @@ describe("subagent context window after a model swap", () => {
 
 		const settings = Settings.isolated({});
 		settings.setModelRole("default", "sub-omp/k3-256k");
-		const agentRegistry = new AgentRegistry();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agentRegistry,
-			createAuthoritySession: createOptions => sdkModule.createAgentSession({ ...createOptions, agentRegistry }),
+			createAuthoritySession: authority.create,
+			parentAgentId: "Main",
 			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
 			task: "work",
 			index: 0,
@@ -124,6 +128,7 @@ describe("subagent context window after a model swap", () => {
 				snapshots.push({ ...progress });
 			},
 		});
+		await root.session.dispose();
 
 		expect(result.resolvedModelIdentity).toBe("openai-codex/gpt-6-sol");
 		expect(result.contextWindow).toBe(500_000);

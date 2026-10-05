@@ -175,9 +175,10 @@ async function probePythonKernelAvailability(
 }
 
 export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
+	readonly interpreter: string;
 	#installedPreludes = new Map<string, PythonPreludeSource>();
 
-	private constructor(id: string) {
+	private constructor(id: string, interpreter: string) {
 		super(id, {
 			languageName: "Python",
 			traceIpc: TRACE_IPC,
@@ -197,6 +198,7 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 					expectedShadowDigest: opts?.expectedShadowDigest,
 				}),
 		});
+		this.interpreter = interpreter;
 	}
 
 	/** Describe or invoke a tool defined in this retained Python kernel. */
@@ -303,7 +305,7 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 		spawnEnv.PYTHONIOENCODING = "utf-8";
 
 		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
-		const kernel = new PythonKernel(Snowflake.next());
+		const kernel = new PythonKernel(Snowflake.next(), runtime.pythonPath);
 
 		const proc = Bun.spawn([runtime.pythonPath, "-u", scriptPath], {
 			cwd: options.cwd,

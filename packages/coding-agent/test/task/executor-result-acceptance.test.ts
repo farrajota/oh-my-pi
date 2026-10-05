@@ -14,7 +14,7 @@ import {
 	resetAgentLifecycleForTests,
 } from "../../src/internal/agent-lifecycle-bridge";
 import { Settings } from "../../src/config/settings";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, type AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -28,6 +28,11 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, AgentProgress } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import {
+	bindInternalAgentAuthoritySession,
+	createAgentRootSession,
+	lookupAgentRef,
+} from "../../src/internal/agent-registry-bridge";
 
 const AGENT_ID = "accepted-result";
 
@@ -185,35 +190,40 @@ async function flushMicrotasks(): Promise<void> {
 	for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
 }
 
-async function createAuthoritySession(options: Parameters<typeof sdkModule.createAgentSession>[0]) {
-	const result = await sdkModule.createAgentSession(options);
-	return { session: result.session };
-}
+let createAuthoritySession: AgentAuthoritySessionBinding["create"];
+let authorityRoot: AgentSession | undefined;
 
 function authorityOptions() {
 	return {
 		agentRegistry: AgentRegistry.global(),
 		createAuthoritySession,
+		parentAgentId: "Main",
 	};
 }
 
 describe("runSubprocess result acceptance", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
+		const root = await createAgentRootSession(AgentRegistry.global(), { agentId: "Main" });
+		authorityRoot = root.session;
+		const authority = bindInternalAgentAuthoritySession(AgentRegistry.global(), root.session);
+		if (!authority) throw new Error("Test fixture requires parent authority");
+		createAuthoritySession = authority.create;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		AsyncJobManager.resetForTests();
 		resetAgentLifecycleForTests();
+		await authorityRoot?.dispose();
+		authorityRoot = undefined;
 		AgentRegistry.resetGlobalForTests();
 	});
 
 	it("terminalizes the ref and preserves the accepted result metadata", async () => {
 		const harness = createHarness();
 		const progress: AgentProgress[] = [];
-		const ref = registerRunning(harness.session);
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 			session: harness.session,
 			extensionsResult: {} as unknown as LoadExtensionsResult,
@@ -235,6 +245,10 @@ describe("runSubprocess result acceptance", () => {
 		expect(JSON.parse(result.output)).toEqual({ report: "do the work" });
 		expect(result.startedAtMs).toBeNumber();
 		expect(progress.some(snapshot => snapshot.startedAtMs === result.startedAtMs)).toBe(true);
+		await harness.promptEntered;
+		const ref = lookupAgentRef(AgentRegistry.global(), AGENT_ID);
+		if (!ref || ref.session !== harness.session)
+			throw new Error("Expected the committed child ref after prompt entry");
 		const settled = AgentRegistry.global().get(AGENT_ID);
 		expect(settled?.status).not.toBe("running");
 		expect(settled?.lifecycle?.responseAt).toBeNumber();
@@ -260,7 +274,6 @@ describe("runSubprocess result acceptance", () => {
 		second.usage.totalTokens = 72;
 		second.usage.cost.input = 0.002;
 		const harness = createHarness({ usageMessages: [first, second] });
-		registerRunning(harness.session);
 		const snapshots: AgentProgress[] = [];
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 			session: harness.session,
@@ -294,7 +307,6 @@ describe("runSubprocess result acceptance", () => {
 
 	it("settles the owning task job when Agent Hub tombstones a running subagent", async () => {
 		const harness = createHarness({ hangPrompt: true });
-		const ref = registerRunning(harness.session);
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 			session: harness.session,
 			extensionsResult: {} as unknown as LoadExtensionsResult,
@@ -321,6 +333,9 @@ describe("runSubprocess result acceptance", () => {
 
 		try {
 			await harness.promptEntered;
+			const ref = lookupAgentRef(AgentRegistry.global(), AGENT_ID);
+			if (!ref || ref.session !== harness.session)
+				throw new Error("Expected the committed child ref after prompt entry");
 			await harness.session.abort();
 			await releaseAgent(getAgentLifecycleManager(AgentRegistry.global()), AGENT_ID, ref, { tombstone: true });
 

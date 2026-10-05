@@ -15,6 +15,7 @@ import { getEnabledEvalPreludes } from "../preludes";
 import { attachSessionOwner, EvalKernelNotRunningError, type SessionOwners } from "../executor-base";
 import { shouldDetachKernel } from "../py/spawn-options";
 import { updateEvalState } from "../state";
+import { SECRET_KEY_PATTERN } from "../runtime-env";
 import type { EvalShadowCellSession } from "../speculation/cell-session";
 import { getActiveEvalShadowCell } from "../speculation/runtime-context";
 import type { ShadowPlan } from "../speculation/types";
@@ -1002,7 +1003,7 @@ function spawnBunWorker(): JsEvalWorkerHandle {
 function spawnJsProcess(): JsEvalWorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
 		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
-		env: workerEnvFromParent(),
+		env: jsEvalWorkerEnvFromParent(),
 		exitLabel: "JS eval worker",
 		detached: shouldDetachKernel(process.platform),
 		reportCleanExit: true,
@@ -1037,6 +1038,14 @@ function spawnJsProcess(): JsEvalWorkerHandle {
 		},
 		terminate: () => base.terminate(),
 	};
+}
+
+function jsEvalWorkerEnvFromParent(): Record<string, string> {
+	const env = workerEnvFromParent();
+	for (const key in env) {
+		if (SECRET_KEY_PATTERN.test(key)) delete env[key];
+	}
+	return env;
 }
 
 function wrapBunWorker(worker: Worker): JsEvalWorkerHandle {

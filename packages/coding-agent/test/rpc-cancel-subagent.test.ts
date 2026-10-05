@@ -8,7 +8,7 @@ import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-sub
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { resetAgentLifecycleForTests } from "@oh-my-pi/pi-coding-agent/internal/agent-lifecycle-bridge";
 import { lookupAgentRef } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, type AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -20,6 +20,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../src/internal/agent-registry-bridge";
 
 describe("handleRpcCancelSubagent", () => {
 	let registry: RpcSubagentRegistry;
@@ -29,21 +30,30 @@ describe("handleRpcCancelSubagent", () => {
 	/** Real directory: releasing a tombstone persists `<sessionFile>.tombstone`. */
 	let sessionDir: string;
 	let ownSessionFile: string;
+	let authorityRoot: AgentSession | undefined;
+	let createAuthoritySession: AgentAuthoritySessionBinding["create"];
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-cancel-"));
 		ownSessionFile = path.join(sessionDir, "SubagentA.jsonl");
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
+		const root = await createAgentRootSession(AgentRegistry.global(), { agentId: "Main" });
+		authorityRoot = root.session;
+		const authority = bindInternalAgentAuthoritySession(AgentRegistry.global(), root.session);
+		if (!authority) throw new Error("Test fixture requires parent authority");
+		createAuthoritySession = authority.create;
 		calls = [];
 		frames = [];
 		eventBus = new EventBus();
 		registry = new RpcSubagentRegistry(eventBus, frame => frames.push(frame));
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		registry.dispose();
 		vi.restoreAllMocks();
+		await authorityRoot?.dispose();
+		authorityRoot = undefined;
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		removeSyncWithRetries(sessionDir);
@@ -248,21 +258,24 @@ describe("handleRpcCancelSubagent", () => {
 			setIrcWakeTurnObserver: () => {},
 			trackIrcReply: () => {},
 			subscribeRunState: () => () => {},
+			addDisposer: () => {},
 		} as unknown as AgentSession;
-		AgentRegistry.global().register({
-			id,
-			displayName: id,
-			kind: "sub",
-			session,
-			sessionFile: path.join(artifactsDir, `${id}.jsonl`),
-			status: "running",
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (options?.sessionManager) {
+				Object.defineProperty(session, "sessionManager", {
+					configurable: true,
+					enumerable: true,
+					writable: true,
+					value: options.sessionManager,
+				});
+			}
+			return {
+				session,
+				extensionsResult: {} as unknown as LoadExtensionsResult,
+				setToolUIContext: () => {},
+				eventBus: new EventBus(),
+			} as CreateAgentSessionResult;
 		});
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
-			session,
-			extensionsResult: {} as unknown as LoadExtensionsResult,
-			setToolUIContext: () => {},
-			eventBus: new EventBus(),
-		} as CreateAgentSessionResult);
 		registry.setSubscriptionLevel("progress");
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
 
@@ -277,7 +290,8 @@ describe("handleRpcCancelSubagent", () => {
 			subagentEventBus: eventBus,
 			artifactsDir,
 			agentRegistry,
-			createAuthoritySession: createOptions => sdkModule.createAgentSession({ ...createOptions, agentRegistry }),
+			createAuthoritySession,
+			parentAgentId: "Main",
 		});
 		await promptEntered.promise;
 

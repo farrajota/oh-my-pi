@@ -7,17 +7,22 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
-function createAuthorityFixture() {
+async function createAuthorityFixture() {
 	const agentRegistry = new AgentRegistry();
-	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-		sdkModule.createAgentSession({ ...options, agentRegistry });
-	return { agentRegistry, createAuthoritySession };
+	const root = await createAgentRootSession(agentRegistry, { agentId: "Main" });
+	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	authorityRoots.push(root.session);
+	return { agentRegistry, createAuthoritySession: authority.create };
 }
+
+const authorityRoots: AgentSession[] = [];
 
 const authStorages: AuthStorage[] = [];
 const tempDirs: TempDir[] = [];
@@ -25,6 +30,7 @@ const tempDirs: TempDir[] = [];
 afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const authStorage of authStorages.splice(0)) await authStorage.close();
+	for (const root of authorityRoots.splice(0)) await root.dispose();
 	for (const tempDir of tempDirs.splice(0)) tempDir[Symbol.dispose]();
 });
 
@@ -34,6 +40,7 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 	authStorages.push(authStorage);
 
+	const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 	const refreshGate = Promise.withResolvers<void>();
 	vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(() => refreshGate.promise);
 
@@ -86,7 +93,6 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 		return result;
 	});
 
-	const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 	const run = runSubprocess({
 		cwd: tempDir.path(),
 		artifactsDir: tempDir.path(),
@@ -99,6 +105,7 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 		enableIrc: false,
 		agentRegistry,
 		createAuthoritySession,
+		parentAgentId: "Main",
 	});
 	await openStarted.promise;
 

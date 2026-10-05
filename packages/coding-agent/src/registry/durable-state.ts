@@ -534,6 +534,10 @@ function readJournalFile(journalPath: string): DurableJournalRecord[] {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
 		throw error;
 	}
+	return parseJournalText(text);
+}
+
+function parseJournalText(text: string): DurableJournalRecord[] {
 	if (!text) return [];
 	if (!text.endsWith("\n")) throw new Error("Durable journal ends with a partial record.");
 	const records: DurableJournalRecord[] = [];
@@ -647,7 +651,7 @@ export class RegistryDurableStateStore {
 			let handle: number;
 			try {
 				const flags =
-					fs.constants.O_WRONLY |
+					fs.constants.O_RDWR |
 					fs.constants.O_APPEND |
 					O_NOFOLLOW |
 					(expectedMetadata === undefined ? fs.constants.O_CREAT | fs.constants.O_EXCL : 0);
@@ -665,6 +669,24 @@ export class RegistryDurableStateStore {
 						? beforeWrite.size !== 0n
 						: !sameJournalMetadata(beforeWrite, expectedMetadata);
 				if (journalChanged) {
+					this.#validatedJournal = undefined;
+					throw new DurableStateConflictError();
+				}
+				const observedText = fs.readFileSync(handle, "utf8");
+				let observedRecords: DurableJournalRecord[];
+				try {
+					observedRecords = parseJournalText(observedText);
+				} catch {
+					this.#validatedJournal = undefined;
+					throw new DurableStateConflictError();
+				}
+				const afterValidation = journalMetadataFromStat(fs.fstatSync(handle, { bigint: true }));
+				const observedHead = currentCursor(observedRecords);
+				if (
+					!sameJournalMetadata(beforeWrite, afterValidation) ||
+					observedHead?.hash !== head?.hash ||
+					observedHead?.sequence !== head?.sequence
+				) {
 					this.#validatedJournal = undefined;
 					throw new DurableStateConflictError();
 				}

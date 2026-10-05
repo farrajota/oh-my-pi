@@ -4,6 +4,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import type { EffectivePermissionSummary, PermissionDenialDetails } from "@oh-my-pi/pi-wire";
 
 const tempDirs: TempDir[] = [];
 const LARGE_SESSION_BYTES = 9 * 1024 * 1024;
@@ -170,6 +171,111 @@ describe("SessionManager.peekSessionInit", () => {
 		const summary = (await SessionManager.peekSessionInit(sessionFile))?.init?.permissionSummary;
 		expect(summary?.recentDenials.items[0]?.code).toBe("tool-deny");
 		expect(Object.isFrozen(summary?.recentDenials.items)).toBe(true);
+	});
+
+	it("resolves typed permission summaries on the selected branch through durable reopen", async () => {
+		const cwd = makeTempDir("@pi-peek-permission-lineage-");
+		const sessionDir = path.join(cwd, "sessions");
+		const manager = SessionManager.create(cwd, sessionDir);
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file path");
+		const baseline: EffectivePermissionSummary = {
+			mode: "enforce",
+			profiles: { items: ["focused-edit"], omittedCount: 0 },
+			clauses: { items: [], omittedCount: 0 },
+			denyTools: { items: [], omittedCount: 0 },
+			denyPaths: { items: [], omittedCount: 0 },
+			guardrails: { noNetwork: false, secretsBlind: false },
+			intrinsicTools: { yield: true, reportToolIssue: false },
+			recentDenials: { items: [], omittedCount: 0 },
+		};
+		const initialId = manager.appendSessionInit({
+			systemPrompt: "summary",
+			task: "task",
+			tools: ["read"],
+			permissionSummary: baseline,
+		});
+
+		const siblingDenial: PermissionDenialDetails = {
+			kind: "subagent_permission_denial",
+			code: "tool-deny",
+			tool: "write",
+			targets: { items: [], omittedCount: 0 },
+			matched: "write",
+			reason: "abandoned branch",
+		};
+		const siblingSummary: EffectivePermissionSummary = {
+			...baseline,
+			recentDenials: { items: [siblingDenial], omittedCount: 0 },
+		};
+		const siblingId = manager.appendPermissionSummaryUpdate(siblingSummary);
+		expect(manager.getLeafId()).toBe(siblingId);
+		expect(manager.getLatestPermissionSummary()).toEqual(siblingSummary);
+		expect(manager.getEntries().find(entry => entry.id === siblingId)).toMatchObject({
+			id: siblingId,
+			parentId: initialId,
+			type: "custom",
+		});
+
+		manager.branch(initialId);
+		expect(manager.getLeafId()).toBe(initialId);
+		expect(manager.getLatestPermissionSummary()).toEqual(baseline);
+		expect(manager.getEntries().find(entry => entry.id === siblingId)).toMatchObject({
+			id: siblingId,
+			parentId: initialId,
+			type: "custom",
+		});
+
+		const activeDenial: PermissionDenialDetails = {
+			kind: "subagent_permission_denial",
+			code: "tool-not-allowed",
+			tool: "read",
+			targets: { items: [], omittedCount: 0 },
+			matched: "read",
+			reason: "active branch",
+		};
+		const activeSummary: EffectivePermissionSummary = {
+			...baseline,
+			recentDenials: { items: [activeDenial], omittedCount: 0 },
+		};
+		const activeId = manager.appendPermissionSummaryUpdate(activeSummary);
+		const activeEntry = manager.getEntries().find(entry => entry.id === activeId);
+		expect(manager.getLeafId()).toBe(activeId);
+		expect(activeEntry).toMatchObject({ id: activeId, parentId: initialId, type: "custom" });
+		expect(manager.getLatestPermissionSummary()).toEqual(activeSummary);
+
+		const sessionId = manager.getSessionId();
+		await manager.ensureOnDisk();
+		await manager.close();
+
+		const reopened = await SessionManager.open(sessionFile, sessionDir, undefined, { throwIfMissing: true });
+		expect(reopened.getSessionId()).toBe(sessionId);
+		expect(reopened.getLeafId()).toBe(activeId);
+		expect(reopened.getLeafEntry()).toMatchObject({ id: activeId, parentId: initialId });
+		expect(reopened.getEntries().find(entry => entry.id === siblingId)).toMatchObject({
+			id: siblingId,
+			parentId: initialId,
+			type: "custom",
+		});
+		expect(reopened.getLatestPermissionSummary()).toEqual(activeSummary);
+		await reopened.close();
+
+		const legacy = SessionManager.create(cwd, sessionDir);
+		const legacyFile = legacy.getSessionFile();
+		if (!legacyFile) throw new Error("Expected a persisted legacy session file path");
+		const legacySessionId = legacy.getSessionId();
+		const legacyInitId = legacy.appendSessionInit({ systemPrompt: "legacy", task: "task", tools: ["read"] });
+		await legacy.ensureOnDisk();
+		await legacy.close();
+
+		const reopenedLegacy = await SessionManager.open(legacyFile, sessionDir, undefined, { throwIfMissing: true });
+		expect(reopenedLegacy.getSessionId()).toBe(legacySessionId);
+		expect(reopenedLegacy.getLeafId()).toBe(legacyInitId);
+		const legacyInit = reopenedLegacy.getEntries().find(entry => entry.id === legacyInitId);
+		if (legacyInit?.type !== "session_init") throw new Error("Expected the persisted legacy session_init");
+		expect(Object.prototype.hasOwnProperty.call(legacyInit, "permissionSummary")).toBe(false);
+		expect(reopenedLegacy.getLatestPermissionSummary()).toBeUndefined();
+		await reopenedLegacy.close();
 	});
 
 	it("streams large file-backed sessions without a full read", async () => {

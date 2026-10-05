@@ -12,10 +12,12 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { bindOwnedAgentLifecycle, replaceOwnedAgentLifecycle } from "../internal/agent-lifecycle-bridge";
 import {
+	kRootCompactionThresholds,
 	registerAgentRegistryBridge,
 	type InternalAgentOwnershipToken,
 	type InternalAgentRef,
 	type InternalRegistryEvent,
+	type SubagentChainSettings,
 } from "../internal/agent-registry-bridge";
 import { deriveRestrictedStartupPolicy } from "../internal/restricted-startup-policy";
 import type { AgentSession } from "../session/agent-session";
@@ -28,6 +30,7 @@ import {
 	normalizeEffectivePermissionSummary,
 	type PermissionScopeSnapshot,
 } from "../task/permission-profiles";
+import { copyBrowserAuditSessionCapability } from "../internal/browser-audit-authority";
 import {
 	bindSessionOperationAuthority,
 	bindSessionOperationDurability,
@@ -49,13 +52,6 @@ import { type EffectivePermissionSummary, oneLineLabel } from "../task/types";
 import { MAIN_AGENT_ID } from "./agent-identity";
 
 export { MAIN_AGENT_ID };
-
-/** Sidecar marker retained beside a child transcript after an explicit kill. */
-const AGENT_TOMBSTONE_SUFFIX = ".tombstone";
-
-export function getAgentTombstonePath(sessionFile: string): string {
-	return `${sessionFile}${AGENT_TOMBSTONE_SUFFIX}`;
-}
 
 /**
  * - `running`: a turn is in flight.
@@ -243,7 +239,7 @@ export interface AgentReservation {
 interface PreparedAgentAuthoritySession {
 	readonly reservation: AgentReservation;
 	readonly descriptor: Readonly<Record<string, unknown>>;
-	readonly options: CreateAgentSessionOptions;
+	readonly options: Pick<CreateAgentSessionOptions, "agentDisplayName">;
 	readonly create: () => Promise<CreateAgentSessionResult>;
 	readonly activate: (session: AgentSession) => void;
 	readonly abandon: () => void;
@@ -397,6 +393,7 @@ export class AgentRegistry {
 			ownershipToken: expected => this.#ownershipToken(expected),
 			bindAuthoritySession: parent => this.#bindAuthoritySession(parent),
 			lookupAuthoritySession: parent => this.#lookupAuthoritySession(parent),
+			lookupAuthorityLineage: parentId => this.#lookupAuthorityLineage(parentId),
 			createRootSession: options => this.#createRootSession(options),
 			setHistory: (expected, history) => this.#setHistoryInternal(expected, history),
 			setStatus: (id, status, expected) => this.#setStatusInternal(id, status, expected),
@@ -591,16 +588,18 @@ export class AgentRegistry {
 		this.#claimedIds.delete(reservation.id);
 		let ref: RegistryAgentRef;
 		try {
-			ref = this.#register(input);
+			ref = this.#register(
+				input,
+				Object.freeze({
+					rootId: reservation.rootId,
+					parentId: reservation.parentId,
+					generation: reservation.generation,
+				}),
+			);
 		} catch (error) {
 			this.#claimedIds.set(reservation.id, reservation);
 			throw error;
 		}
-		(ref as { lineage?: AgentRef["lineage"] }).lineage = Object.freeze({
-			rootId: reservation.rootId,
-			parentId: reservation.parentId,
-			generation: reservation.generation,
-		});
 		this.#reservations.delete(reservation as object);
 		this.#reservationRefs.delete(reservation as object);
 		this.#authorityRefs.add(ref);
@@ -656,10 +655,21 @@ export class AgentRegistry {
 				(parentScope && !isScopeNoBroader(parentScope, permissionScope)))
 		)
 			throw new Error("Permission scope does not match the reserved actor and live parent authority.");
-		const requestedOptions: CreateAgentSessionOptions = options.settings
-			? { ...options, settings: options.settings.snapshot() }
+		const settingsSnapshot: SubagentChainSettings | undefined = options.settings?.snapshot();
+		const rootThresholds = (options.settings as SubagentChainSettings | undefined)?.[kRootCompactionThresholds];
+		if (settingsSnapshot && rootThresholds) {
+			settingsSnapshot[kRootCompactionThresholds] = Object.freeze({
+				thresholdPercent: rootThresholds.thresholdPercent,
+				thresholdTokens: rootThresholds.thresholdTokens,
+			});
+		}
+		const requestedOptions: CreateAgentSessionOptions = settingsSnapshot
+			? { ...options, settings: settingsSnapshot }
 			: options;
-		const { getApiKey, mcpManager, credentialSourceSessionId, ...authorityOptions } = requestedOptions;
+		const { getApiKey, mcpManager, credentialSourceSessionId, telemetry, ...authorityOptions } = requestedOptions;
+		// Tracers are live service handles, including plain-object implementations.
+		// Copy/freeze their configuration metadata without cloning or freezing the service.
+		const { tracer, ...telemetryMetadata } = telemetry ?? {};
 		const frozenAuthorityData = cloneAndFreezeAuthorityInput({
 			...authorityOptions,
 			agentId: reservation.id,
@@ -671,12 +681,22 @@ export class AgentRegistry {
 			agentRegistry: this,
 			permissionScope,
 		});
-		const creationOptions = Object.freeze({
+		let creationOptions = Object.freeze({
 			...frozenAuthorityData,
 			...(getApiKey === undefined ? {} : { getApiKey }),
 			...(credentialSourceSessionId === undefined ? {} : { credentialSourceSessionId }),
 			...(mcpManager === undefined ? {} : { mcpManager }),
+			...(telemetry === undefined
+				? {}
+				: {
+						telemetry: Object.freeze({
+							...cloneAndFreezeAuthorityInput(telemetryMetadata),
+							...(tracer === undefined ? {} : { tracer }),
+						}),
+					}),
 		}) satisfies CreateAgentSessionOptions;
+		const preparedOptions = Object.freeze({ agentDisplayName: creationOptions.agentDisplayName });
+		copyBrowserAuditSessionCapability(options, creationOptions);
 		if (deriveRestrictedStartupPolicy(creationOptions).restricted && !this.#durableState) {
 			throw new Error("Restricted authority session startup requires a durable registry state store.");
 		}
@@ -742,7 +762,7 @@ export class AgentRegistry {
 		const prepared: PreparedAgentAuthoritySession = Object.freeze({
 			reservation,
 			descriptor,
-			options: creationOptions,
+			options: preparedOptions,
 			startupHash,
 			provenanceHash,
 			...(scopeHash === undefined ? {} : { scopeHash }),
@@ -754,8 +774,12 @@ export class AgentRegistry {
 				if (!revival) this.#durableState?.append({ ...durableConstruction, at: Date.now(), phase: "constructing" });
 				let constructed: CreateAgentSessionResult | undefined;
 				try {
-					sdkModule ??= await import("../sdk");
-					constructed = await sdkModule.createAgentSession(creationOptions);
+					const optionsForCreation = creationOptions;
+					// The prepared reviver authority keeps only the immutable startup identity after creation;
+					// do not let its closure pin the settings snapshot that became the live session overlay.
+					creationOptions = Object.freeze({ ...creationOptions, settings: undefined });
+					const sdk = (sdkModule ??= await import("../sdk"));
+					constructed = await sdk.createAgentSession(optionsForCreation);
 					if (
 						parentAuthority &&
 						(this.#refs.get(reservation.parentId!) !== parentAuthority.ref ||
@@ -1280,6 +1304,19 @@ export class AgentRegistry {
 		return parentRef;
 	}
 
+	#lookupAuthorityLineage(parentId: string): { readonly rootId: string; readonly parentId: string } | undefined {
+		const parentRef = this.#refs.get(parentId);
+		if (
+			!parentRef ||
+			!this.#authorityRefs.has(parentRef) ||
+			!parentRef.session ||
+			this.#lookupAuthoritySession(parentRef.session) !== parentRef ||
+			!parentRef.lineage
+		)
+			return undefined;
+		return Object.freeze({ rootId: parentRef.lineage.rootId, parentId: parentRef.id });
+	}
+
 	#bindAuthoritySession(parent: AgentSession): AgentAuthoritySessionBinding | undefined {
 		const parentRef = this.#lookupAuthoritySession(parent);
 		if (!parentRef) return undefined;
@@ -1293,7 +1330,6 @@ export class AgentRegistry {
 					: this.#reviveSession(parent, boundParentRef, boundCapability, reviveObservation, options),
 		});
 	}
-
 	#operationAuthority(parent: AgentSession): BoundSessionOperationAuthority | undefined {
 		if (!this.#lookupAuthoritySession(parent)) return undefined;
 		const authority = this.#operationSessionAuthorities.get(parent);
@@ -1377,7 +1413,7 @@ export class AgentRegistry {
 		return false;
 	}
 
-	#register(input: RegisterInput): RegistryAgentRef {
+	#register(input: RegisterInput, finalLineage?: RegistryAgentRef["lineage"]): RegistryAgentRef {
 		if (this.#terminating.has(input.id)) throw new Error(`Agent "${input.id}" is being terminated.`);
 		const existing = this.#refs.get(input.id);
 		if (existing && this.#authorityRefs.has(existing)) throw new Error(`Agent "${input.id}" is already registered.`);
@@ -1404,6 +1440,7 @@ export class AgentRegistry {
 				: undefined;
 		const parent = input.parentId ? this.#refs.get(input.parentId) : undefined;
 		const lineage =
+			finalLineage ??
 			recoveredLineage ??
 			Object.freeze({
 				rootId: parent?.lineage?.rootId ?? input.id,

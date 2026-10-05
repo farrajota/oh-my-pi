@@ -77,7 +77,9 @@ export async function resolveSqliteReadPath(
 
 		try {
 			const stat = await Bun.file(absolutePath).stat();
-			if (stat.isDirectory() || !(await isSqliteFile(absolutePath))) continue;
+			// Sniffing a FIFO or device can block; leave it to the read tool's rejection.
+			if (!stat.isFile()) continue;
+			if (!(await isSqliteFile(absolutePath))) continue;
 			const authorized = await authorizeSqlitePath(session, absolutePath, true);
 			return {
 				absolutePath: authorized.absolutePath,
@@ -93,7 +95,8 @@ export async function resolveSqliteReadPath(
 			try {
 				const probe = await authorizeSqlitePath(session, suffixMatch.absolutePath, false);
 				const retryStat = await Bun.file(probe.absolutePath).stat();
-				if (retryStat.isDirectory() || !(await isSqliteFile(probe.absolutePath))) continue;
+				if (!retryStat.isFile()) continue;
+				if (!(await isSqliteFile(probe.absolutePath))) continue;
 				const authorized = await authorizeSqlitePath(session, probe.absolutePath, true);
 				return {
 					absolutePath: authorized.absolutePath,

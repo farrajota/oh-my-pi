@@ -181,9 +181,10 @@ describe("SessionManager seal()+close() recovers a sync-rewrite conflict against
 		const body = backend.files.get(sessionFile) ?? "";
 		expect(body).toContain("FINAL MESSAGE");
 		expect(body).toContain("session_exit");
-		// The fork leaves `#expectedDiskSize` unset for deferred-publish backends;
-		// its CAS reference is the storage's local index, which must agree with
-		// the durable body so the next rewrite does not conflict.
+		// The synchronous storage index supplies provisional CAS tokens so the
+		// immediately following shutdown rewrite cannot conflict with its own
+		// queued publish. The manager records the durable size only after the
+		// final publish confirms, and close() drains it before returning.
 		expect(storage.statSync(sessionFile).size).toBe(Buffer.byteLength(body, "utf8"));
 	});
 

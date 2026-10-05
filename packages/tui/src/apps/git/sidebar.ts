@@ -1010,7 +1010,7 @@ export class Sidebar {
 	 * text field being edited. False when not the sidebar's event.
 	 */
 	handleNativeEvent(event: NativeUiEvent): boolean {
-		if (event.type === "edit") {
+		if (event.type === "edit" || event.type === "undo") {
 			const editing = this.editing ? this.selected?.kind : undefined;
 			const field =
 				editing === "summary"
@@ -1020,7 +1020,7 @@ export class Sidebar {
 						: editing === "description"
 							? this.description
 							: undefined;
-			field?.applyHostEdit(event);
+			field?.handleNativeEvent(event);
 			return field !== undefined;
 		}
 		if (event.type === "select" || event.type === "activate") {

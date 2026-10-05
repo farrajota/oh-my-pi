@@ -728,6 +728,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				if (postflight) result = postflight as AgentToolResult<TDetails, TParameters>;
 			}
 
+			let resultHookError = false;
 			// Emit tool_result event - extensions can modify the result and error status.
 			if (hasRunnerHandlers(this.runner, "tool_result") && typeof runner.emitToolResult === "function") {
 				const resultResult = (await runner.emitToolResult.call(this.runner, {
@@ -743,6 +744,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					isError: !!executionError || result.isError === true,
 				})) as ToolResultEventResult | undefined;
 
+				resultHookError = resultResult?.isError === true;
 				// Handler context reports into this call's sink like tool-authored
 				// context: it is delivered even for a failed call (the handler saw
 				// `isError`), and precedes any pending `tool_call` context.
@@ -750,16 +752,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					context?.addAdditionalContext?.(resultResult.additionalContext);
 				}
 
-				// `content` is present only when a handler modified the result.
 				if (resultResult?.content !== undefined) {
 					const modifiedContent: (TextContent | ImageContent)[] = resultResult.content;
 					const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
-					// Effective error state: an explicit handler override wins; otherwise the
-					// original execution outcome (thrown or non-throwing error result) stands.
-					const effectiveError = resultResult.isError ?? (!!executionError || result.isError === true);
+					const effectiveError = !!executionError || result.isError === true || resultHookError;
 					if (!effectiveError && pendingAdditionalContext !== undefined) {
 						context?.addAdditionalContext?.(pendingAdditionalContext);
 					}
+					if (executionError) throw executionError;
 					return {
 						content: modifiedContent,
 						details: modifiedDetails,
@@ -769,9 +769,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				}
 			}
 
-			// No extension modification
+			// No replacement content
 			if (executionError) {
 				throw executionError;
+			}
+			if (result.isError !== true && resultHookError) {
+				return { ...result, isError: true };
 			}
 			if (result.isError !== true && pendingAdditionalContext !== undefined) {
 				context?.addAdditionalContext?.(pendingAdditionalContext);

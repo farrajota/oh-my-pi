@@ -231,6 +231,56 @@ export function normalizeConnectedCdpUrl(rawCdpUrl: string): string {
 	return cdpUrl;
 }
 
+async function closeAuditStartupBlankPages(browser: Browser): Promise<void> {
+	const pages = await browser.pages();
+	if (pages.some(page => page.url() !== "about:blank")) {
+		throw new ToolError("Dedicated audit browser started with an unexpected page");
+	}
+	for (const page of pages) await page.close();
+}
+
+async function openAuditBrowserHandle(
+	kind: Extract<BrowserKind, { kind: "audit" }>,
+	opts: AcquireBrowserOptions,
+): Promise<BrowserHandle> {
+	const launched = await launchHeadlessBrowser({
+		headless: true,
+		viewport: opts.viewport,
+		args: AUDIT_CHROMIUM_ARGS,
+	});
+	try {
+		// A fresh Puppeteer launch owns this startup blank page; remove it before the
+		// audit worker creates its sole tab and before target guards are armed.
+		await closeAuditStartupBlankPages(launched.browser);
+	} catch (error) {
+		const cleanupErrors: unknown[] = [];
+		try {
+			await launched.browser.close();
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
+		}
+		if (launched.userDataDir) {
+			try {
+				await removeUserDataDir(launched.userDataDir);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length) {
+			throw new AggregateError([error, ...cleanupErrors], "Failed to clean up dedicated audit browser startup");
+		}
+		throw error;
+	}
+	return {
+		key: browserKey(kind),
+		kind,
+		browser: launched.browser,
+		userDataDir: launched.userDataDir,
+		refCount: 0,
+		stealth: { browserSession: null, override: null },
+	};
+}
+
 async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
 	if (kind.kind === "cmux") {
 		const client = new CmuxSocketClient({ socketPath: kind.socketPath, password: kind.password });
@@ -248,18 +298,21 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		await tern.connect();
 		return { key: browserKey(kind), kind, tern, refCount: 0 };
 	}
-	if (kind.kind === "headless" || kind.kind === "audit") {
+	if (kind.kind === "audit") {
 		// Audit browsers deliberately bypass the process/project headless pool.
 		// Their unique registry key and separately launched temporary profile prevent
 		// cookies, storage, default context, and ownership from crossing an audit boundary.
-		if (kind.kind === "headless" && !kind.allowFileAccess && (isCompiledBinary() || workerHostEntry() !== null)) {
+		return await openAuditBrowserHandle(kind, opts);
+	}
+	if (kind.kind === "headless") {
+		if (!kind.allowFileAccess && (isCompiledBinary() || workerHostEntry() !== null)) {
 			return await openSharedHeadlessHandle(kind, opts);
 		}
 		const { browser, userDataDir } = await launchHeadlessBrowser({
-			headless: kind.kind === "audit" ? true : kind.headless,
-			allowFileAccess: kind.kind === "headless" && kind.allowFileAccess,
+			headless: kind.headless,
+			allowFileAccess: kind.allowFileAccess,
 			viewport: opts.viewport,
-			args: kind.kind === "audit" ? AUDIT_CHROMIUM_ARGS : opts.appArgs,
+			args: opts.appArgs,
 		});
 		return {
 			key: browserKey(kind),

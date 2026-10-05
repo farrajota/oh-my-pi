@@ -320,8 +320,9 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 	}
 
 	/**
-	 * Find the registry ref for `agentId` (exact, then case-insensitive),
-	 * skipping advisor transcripts.
+	 * The registry roster as the caller sees it: the caller root's persisted
+	 * roster is refreshed first, and its artifact dir leads every on-disk scan.
+	 * Both the bare index and `history://<id>` lookups read this one source.
 	 */
 	async #lookup(agentId: string, context: ResolveContext | undefined): Promise<RefLookup> {
 		const bound = isBoundResourceContext(context);
@@ -330,11 +331,9 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		if (bound && dirs.length === 0) throw new Error("No caller-owned history available");
 		// Refresh the caller root before resolving possibly parked agents; a
 		// same-named ref restored from another root must not shadow its transcript.
-		// The bare index never rehydrates the roster: listing must not register refs.
+		// The bare index refreshes this root too, preserving persisted parked status.
 		const rootSessionFile =
-			agentId && registry && context?.sessionFile
-				? await ensurePersistedRoster(registry, context.sessionFile)
-				: undefined;
+			registry && context?.sessionFile ? await ensurePersistedRoster(registry, context.sessionFile) : undefined;
 		const preferredArtifactDir = rootSessionFile?.slice(0, -".jsonl".length);
 		// Advisor transcripts are observability-only — surfaced in the Agent Hub,
 		// never in the agent-facing roster, lookup, or completions.

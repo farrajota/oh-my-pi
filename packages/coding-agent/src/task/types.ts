@@ -182,7 +182,7 @@ function createTaskItemSchema(options: {
 		"+": "delete",
 	};
 	if (options.effortEnabled) shape["effort?"] = effortRule;
-	if (options.modelEnabled) shape["model?"] = type("string").atLeastLength(1);
+	if (options.modelEnabled) shape["model?"] = "string | string[]";
 	if (options.evalToolsEnabled) shape["tools?"] = "string[]";
 	if (options.isolationEnabled) shape["isolated?"] = "boolean";
 	const permissionSchema = selectTaskPermissionSchema(options.permissions);
@@ -215,7 +215,7 @@ function createTaskSchema(options: {
 		"+": "delete",
 	};
 	if (options.effortEnabled) shape["effort?"] = effortRule;
-	if (options.modelEnabled) shape["model?"] = type("string").atLeastLength(1);
+	if (options.modelEnabled) shape["model?"] = "string | string[]";
 	if (options.evalToolsEnabled) shape["tools?"] = "string[]";
 	if (options.isolationEnabled) shape["isolated?"] = "boolean";
 	const permissionSchema = selectTaskPermissionSchema(options.permissions);
@@ -233,6 +233,7 @@ function createBatchTaskSchema(options: {
 }) {
 	return type.raw({
 		context: "string",
+		"model?": "never",
 		tasks: createTaskItemSchema(options).array(),
 		"+": "delete",
 	});
@@ -268,7 +269,7 @@ export interface TaskItem {
 	/** SHA-256 of the exact file-backed agent definition bytes required for this spawn. */
 	agentDefinitionSha256?: string;
 	/** Request-local model selector for this spawn. */
-	model?: string;
+	model?: string | string[];
 	/** Least-privilege guardrails for this spawn. */
 	permissions?: TaskPermissionRequest;
 	/** Least-privilege tool-profile shorthand for this spawn. */
@@ -289,11 +290,11 @@ export const taskSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	"effort?": effortRule,
-	"model?": type("string").atLeastLength(1),
 	task: "string",
 	solutionSpace: "string",
 	"agentSource?": agentSourceRule,
 	"agentDefinitionSha256?": sha256Rule,
+	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
@@ -307,6 +308,7 @@ const taskSchemaNoIsolation = type({
 	task: "string",
 	solutionSpace: "string",
 	"effort?": effortRule,
+	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"agentSource?": agentSourceRule,
 	"agentDefinitionSha256?": sha256Rule,
@@ -317,11 +319,13 @@ const taskSchemaNoIsolation = type({
 });
 const taskSchemaBatch = type({
 	context: "string",
+	"model?": "never",
 	tasks: taskItemSchemaIsolated.array(),
 	"+": "delete",
 });
 const taskSchemaBatchNoIsolation = type({
 	context: "string",
+	"model?": "never",
 	tasks: taskItemSchema.array(),
 	"+": "delete",
 });
@@ -353,11 +357,15 @@ export function getTaskSchema(options: {
 	const effortEnabled = options.effortEnabled ?? true;
 	const modelEnabled = options.modelEnabled ?? false;
 	const evalToolsEnabled = options.evalToolsEnabled ?? true;
-	if (!modelEnabled && effortEnabled && evalToolsEnabled && !permissions.enabled && defaultAgent === "task") {
-		if (options.batchEnabled) {
-			return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
-		}
-		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
+	if (
+		!modelEnabled &&
+		effortEnabled &&
+		evalToolsEnabled &&
+		!permissions.enabled &&
+		defaultAgent === "task" &&
+		options.batchEnabled
+	) {
+		return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 	}
 	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}:${permissions.enabled ? "perm" : "noperm"}:${permissions.toolsEnabled ? "tools" : "notools"}:${permissions.pathsEnabled ? "paths" : "nopaths"}:${effortEnabled ? "effort" : "noeffort"}:${modelEnabled ? "model" : "nomodel"}:${evalToolsEnabled ? "evaltools" : "noevaltools"}`;
 	const cached = taskSchemaCache.get(key);
@@ -399,7 +407,7 @@ export interface TaskParams {
 	/** How open-ended the work is (flat form); see {@link TaskItem.solutionSpace}. */
 	solutionSpace?: string;
 	/** Request-local model selector for this spawn (flat form). */
-	model?: string;
+	model?: string | string[];
 	/** Exact discovered source required for this spawn. */
 	agentSource?: AgentSource;
 	/** SHA-256 of the exact file-backed agent definition bytes required for this spawn. */
@@ -533,6 +541,7 @@ export interface AgentProgress {
 	assignment?: string;
 	description?: string;
 	lastIntent?: string;
+	completionPercent?: number;
 	/** Bounded display-only effective permission metadata. Never use it for authorization. */
 	permissionSummary?: EffectivePermissionSummary;
 	currentTool?: string;

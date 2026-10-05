@@ -7,8 +7,13 @@ import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "../session/credential-disabled-notice";
 import { isSilentAbort } from "../session/messages";
 import { flushTelemetryExport } from "../telemetry-export";
+
 import { initializeExtensions } from "./runtime-init";
-import { formatPersistenceFailure } from "./persistence-failure";
+import {
+	formatPersistenceDurabilityFailure,
+	formatPersistenceFailure,
+	formatPersistenceNotice,
+} from "./persistence-failure";
 
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 
@@ -124,8 +129,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	const unsubscribePersistenceError = session.sessionManager.onPersistenceError?.(error => {
 		if (persistenceError) return;
 		persistenceError = error;
-		if (!preexistingPersistenceError)
-			writeStderrLine(`${formatPersistenceFailure(error.message)} Writes are retried.`);
+		writeStderrLine(formatPersistenceFailure(error.message));
 	});
 	const unregisterSignalTeardown = postmortem.register("print-session-teardown", async reason => {
 		signalShutdown ||=
@@ -168,6 +172,9 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		);
 	}
 
+	const unsubscribePersistenceNotice = session.sessionManager.onPersistenceNotice?.(notice => {
+		writeStderrLine(`Warning: ${formatPersistenceNotice(notice)}`);
+	});
 	// Always subscribe to enable session persistence via _handleAgentEvent
 	session.subscribe(event => {
 		// In JSON mode, output all events
@@ -264,10 +271,11 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	// A turn-fatal exit cannot hold automation for the full normal drain budget.
 	if (!strictMCPFailure && !signalShutdown) {
 		// Print mode's drain budget covers a fallback-chain switch; the reviewer's
-		// verdict is the point of a headless advisor run, so wait through recovery.
+		// verdict is the point of a headless advisor run, so wait through recovery,
+		// and wait on `strict` reviewers past the budget like every primary boundary.
 		await session.waitForAdvisorCatchup(
 			terminalFailure ? PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS : PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS,
-			{ waitThroughRecovery: true },
+			{ waitThroughRecovery: true, strictWithoutDeadline: true },
 		);
 	}
 	// Error spans must reach the exporter; the postmortem `exit` handler can't await.
@@ -279,18 +287,16 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		if (!persistenceError || error !== persistenceError) throw error;
 	} finally {
 		unsubscribePersistenceError?.();
+		unsubscribePersistenceNotice?.();
 		unregisterSignalTeardown();
 	}
 	if (persistenceError) {
 		const currentFailure = session.sessionManager.getPersistenceError?.();
 		if (currentFailure) {
-			if (preexistingPersistenceError) writeStderrLine(formatPersistenceFailure(persistenceError.message));
-			else writeStderrLine("Session persistence failed: Session transcript is not durable.");
+			writeStderrLine(formatPersistenceDurabilityFailure(currentFailure.message));
 			durabilityFailure = true;
 		} else if (preexistingPersistenceError) {
-			writeStderrLine(
-				`${formatPersistenceFailure(persistenceError.message)} Writes are retried; transcript recovered.`,
-			);
+			writeStderrLine("Session persistence recovered.");
 		}
 	}
 

@@ -5,8 +5,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { resolveResumableSession } from "@oh-my-pi/pi-coding-agent/session/session-listing";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { stripOuterDoubleQuotes } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
@@ -74,6 +75,8 @@ describe("SessionManager.moveTo", () => {
 	});
 
 	afterEach(async () => {
+		// Title changes open history.db under testAgentDir; Windows cannot delete an open file.
+		resetSessionIndexForTests();
 		if (originalAgentDir) {
 			setAgentDir(originalAgentDir);
 		} else {
@@ -235,9 +238,12 @@ describe("SessionManager.moveTo", () => {
 					const replacement = fs.statSync(paused.destination);
 					replacementIdentity = { dev: replacement.dev, ino: replacement.ino };
 					paused.session.appendMessage({ role: "user", content: "must not reach replacement", timestamp: 2 });
+					const persistenceError = paused.session.getPersistenceError();
+					expect(persistenceError).toBeInstanceOf(Error);
 					expect(await fsp.readFile(paused.destination, "utf8")).toBe(unrelated);
 					paused.resume();
 					await expect(paused.move).rejects.toThrow("identity changed");
+					expect(paused.session.getPersistenceError()).toBe(persistenceError);
 				} finally {
 					paused.resume();
 					await paused.move.catch(() => {});
@@ -482,11 +488,13 @@ describe("SessionManager.moveTo", () => {
 		const destination = path.join(destinationDir, path.basename(source));
 		const unrelated = "x".repeat(fs.statSync(source).size);
 		await fsp.writeFile(destination, unrelated);
+		const destinationIdentity = fs.statSync(destination);
 		const link = fs.linkSync.bind(fs);
 		const publicationSpy = spyOn(fs, "linkSync").mockImplementation((from, to) => {
 			if (from.toString() === source && to.toString() === destination) {
 				fs.unlinkSync(source);
 				session.appendMessage({ role: "user", content: "must not reach destination", timestamp: 2 });
+				expect(session.getPersistenceError()).toBeInstanceOf(Error);
 				expect(fs.existsSync(source)).toBe(false);
 				expect(fs.readFileSync(destination, "utf8")).toBe(unrelated);
 			}
@@ -495,10 +503,16 @@ describe("SessionManager.moveTo", () => {
 		try {
 			await expect(session.moveTo(cwdB, destinationDir)).rejects.toMatchObject({ code: "ENOENT" });
 			expect(fs.existsSync(source)).toBe(false);
+			expect(session.getPersistenceError()).toBeInstanceOf(Error);
 		} finally {
 			publicationSpy.mockRestore();
 		}
 		expect(await fsp.readFile(destination, "utf8")).toBe(unrelated);
+		const current = fs.statSync(destination);
+		expect({ dev: current.dev, ino: current.ino }).toEqual({
+			dev: destinationIdentity.dev,
+			ino: destinationIdentity.ino,
+		});
 	});
 
 	for (const replaceDuringCopy of [false, true]) {

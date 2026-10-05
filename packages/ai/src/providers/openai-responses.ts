@@ -6,6 +6,7 @@ import type {
 	AssistantMessage,
 	CacheRetention,
 	Context,
+	FetchImpl,
 	Model,
 	OpenAICompat,
 	ProviderSessionState,
@@ -419,6 +420,10 @@ type OpenAIResponsesSamplingParams = ResponseCreateParamsStreaming & {
 	cache_ttl?: "5m" | "1h";
 };
 
+interface OpenAIResponsesProviderAttemptBudget {
+	attempts: number;
+}
+
 function maybeAddOpenRouterAnthropicCacheControl(
 	params: OpenAIResponsesSamplingParams,
 	model: Model<"openai-responses">,
@@ -435,6 +440,7 @@ function maybeAddOpenRouterAnthropicCacheControl(
 const streamOpenAIResponsesOnce = (
 	model: Model<"openai-responses">,
 	context: Context,
+	providerAttemptBudget: OpenAIResponsesProviderAttemptBudget,
 	options?: OpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
@@ -570,6 +576,10 @@ const streamOpenAIResponsesOnce = (
 				body: chained.params,
 			};
 			rawRequestDump = activeRawRequestDump;
+			const providerMaxAttempts =
+				typeof options?.providerMaxAttempts === "number" && Number.isFinite(options.providerMaxAttempts)
+					? Math.max(1, Math.floor(options.providerMaxAttempts))
+					: undefined;
 			const openResponsesStream = async (
 				requestParams: OpenAIResponsesSamplingParams,
 			): Promise<AsyncIterable<ResponseStreamEvent>> => {
@@ -580,6 +590,12 @@ const streamOpenAIResponsesOnce = (
 				);
 				activeRequestParams = requestParams;
 				lastSubmittedRequestWasFullReplay = requestParams.previous_response_id === undefined;
+				if (providerMaxAttempts !== undefined && providerAttemptBudget.attempts >= providerMaxAttempts) {
+					throw new AIError.ProviderResponseError("OpenAI Responses provider attempt limit reached", {
+						provider: model.provider,
+						kind: "runtime",
+					});
+				}
 				let requestTimeout: NodeJS.Timeout | undefined;
 				if (requestTimeoutMs !== undefined) {
 					requestTimeout = setTimeout(
@@ -598,13 +614,30 @@ const streamOpenAIResponsesOnce = (
 						body: requestParams,
 						signal: requestSignal,
 						fetch: wrapFetchForCopilotFallback(
-							options?.fetch,
+							providerMaxAttempts === undefined
+								? options?.fetch
+								: ((async (input, init) => {
+										if (providerAttemptBudget.attempts >= providerMaxAttempts) {
+											throw new AIError.ProviderResponseError(
+												"OpenAI Responses provider attempt limit reached",
+												{
+													provider: model.provider,
+													kind: "runtime",
+												},
+											);
+										}
+										providerAttemptBudget.attempts++;
+										return (options?.fetch ?? globalThis.fetch)(input, init);
+									}) satisfies FetchImpl),
 							model.provider === "github-copilot",
 							resolveCopilotRequestIdentity(options?.headers),
 							copilotCacheKey,
 							copilotCacheSnapshot,
 						),
-						maxAttempts: options?.providerMaxAttempts,
+						maxAttempts:
+							providerMaxAttempts === undefined
+								? undefined
+								: providerMaxAttempts - providerAttemptBudget.attempts,
 						shouldRetryResponse: (response, bodyText) =>
 							!AIError.isRequestBodyReadTimeout(response.status, bodyText) ||
 							lastSubmittedRequestWasFullReplay !== true,
@@ -987,10 +1020,17 @@ const streamOpenAIResponsesOnce = (
  * loop. Transient stream failures are retried inside the attempt so stateful
  * Responses request metadata remains stable.
  */
-export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (model, context, options) =>
-	withReplaySafeStreamRetry(model, context, options, streamOpenAIResponsesOnce, {
-		retryEmptyCompletion: true,
-	});
+export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (model, context, options) => {
+	const providerAttemptBudget = { attempts: 0 };
+	return withReplaySafeStreamRetry(
+		model,
+		context,
+		options,
+		(attemptModel, attemptContext, attemptOptions) =>
+			streamOpenAIResponsesOnce(attemptModel, attemptContext, providerAttemptBudget, attemptOptions),
+		{ retryEmptyCompletion: true },
+	);
+};
 
 function isResponsesPromptCacheableContentBlock(block: unknown): block is ResponseInputContent {
 	if (typeof block !== "object" || block === null || !("type" in block)) return false;

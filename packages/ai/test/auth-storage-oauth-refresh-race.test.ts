@@ -127,6 +127,9 @@ describe("AuthStorage OAuth refresh race", () => {
 		// refresh token to our snapshot will therefore see the SAME stale token
 		// and fall through to the disable. We then race a peer rotation into the
 		// window between the pre-check and the CAS, which the CAS must detect.
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockRejectedValue(
+			new Error('HTTP 400 invalid_grant {"error":"invalid_grant"}'),
+		);
 		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
 			const credential = creds[provider];
 			if (credential?.refresh === "stale-refresh") {
@@ -188,6 +191,9 @@ describe("AuthStorage OAuth refresh race", () => {
 			},
 		]);
 
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockRejectedValue(
+			new Error('HTTP 400 invalid_grant {"error":"invalid_grant"}'),
+		);
 		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async () => {
 			throw new Error('invalid_grant {"error":"invalid_grant"}');
 		});

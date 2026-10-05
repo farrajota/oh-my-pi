@@ -16,16 +16,21 @@ import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 const baseAgent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
 
-function createAuthorityFixture() {
+const authorityRoots: AgentSession[] = [];
+
+async function createAuthorityFixture() {
 	const agentRegistry = new AgentRegistry();
-	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-		sdkModule.createAgentSession({ ...options, agentRegistry });
-	return { agentRegistry, createAuthoritySession };
+	const root = await createAgentRootSession(agentRegistry, { agentId: "Main" });
+	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	authorityRoots.push(root.session);
+	return { agentRegistry, createAuthoritySession: authority.create };
 }
 
 function assistantStopMessage(text: string, totalTokens = 0): AssistantMessage {
@@ -185,8 +190,9 @@ function mockCreateAgentSession(session: AgentSession) {
 }
 
 describe("runSubprocess async quiescence fresh-yield contract", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const root of authorityRoots.splice(0)) await root.dispose();
 		AsyncJobManager.resetForTests();
 	});
 
@@ -206,9 +212,8 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			// submit the fresh yield that accounts for the job outcome.
 			h.emitTerminalYield({ report: "FRESH: build failed, see job-1" });
 		});
+		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 		mockCreateAgentSession(harness.session);
-
-		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -217,6 +222,7 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			id: "quiescence-fresh-yield",
 			agentRegistry,
 			createAuthoritySession,
+			parentAgentId: "Main",
 		});
 
 		// Run did not terminate on the parked yield: the barrier noticed, the
@@ -239,9 +245,8 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			}
 			h.emitTerminalYield({ report: "Build failed; job-1 delivered its result." });
 		});
+		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 		mockCreateAgentSession(harness.session);
-
-		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -250,6 +255,7 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			id: "quiescence-wait-before-yield",
 			agentRegistry,
 			createAuthoritySession,
+			parentAgentId: "Main",
 		});
 
 		expect(harness.settleCalls()).toBe(1);
@@ -265,9 +271,8 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			}
 			// Notice and every reminder: the model never yields again.
 		});
+		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 		mockCreateAgentSession(harness.session);
-
-		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -276,6 +281,7 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			id: "quiescence-stale-refusal",
 			agentRegistry,
 			createAuthoritySession,
+			parentAgentId: "Main",
 		});
 
 		// task + notice + full reminder ladder (3).
@@ -294,9 +300,8 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 				h.emitTerminalYield({ report: "done" });
 			}
 		});
+		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 		mockCreateAgentSession(harness.session);
-
-		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const result = await runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -305,6 +310,7 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			id: "quiescence-no-async",
 			agentRegistry,
 			createAuthoritySession,
+			parentAgentId: "Main",
 		});
 
 		expect(harness.prompts).toHaveLength(1);
@@ -327,9 +333,8 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			idleStarted.resolve();
 			await releaseIdle.promise;
 		};
+		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 		mockCreateAgentSession(harness.session);
-
-		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const run = runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -338,6 +343,7 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			id: "quiescence-no-second-idle",
 			agentRegistry,
 			createAuthoritySession,
+			parentAgentId: "Main",
 		});
 		const outcome = await Promise.race([
 			run.then(() => "completed" as const),
@@ -388,9 +394,8 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 				},
 			},
 		);
+		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 		mockCreateAgentSession(harness.session);
-
-		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		const run = runSubprocess({
 			cwd: "/tmp",
 			agent: baseAgent,
@@ -404,6 +409,7 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			},
 			agentRegistry,
 			createAuthoritySession,
+			parentAgentId: "Main",
 		});
 		await abortStarted.promise;
 		// abortStarted synchronizes with the in-flight cleanup; a zero grace

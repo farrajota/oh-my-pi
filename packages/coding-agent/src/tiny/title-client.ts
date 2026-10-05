@@ -14,20 +14,12 @@ import * as path from "node:path";
 import type { Subprocess } from "bun";
 import { $env, getTinyWorkerRuntimeDir, logger, prompt } from "@oh-my-pi/pi-utils";
 import packageJson from "../../package.json" with { type: "json" };
-import type { Setting } from "../config/registry";
-import { isSettingsInitialized, settings } from "../config/settings";
-
+import type { RefCountedWorkerHandle } from "../subprocess/worker-client";
 import { stageRunnerScript } from "../eval/runner-cache";
 import { ModelDownloadActivity } from "../downloads/model-downloads";
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
-import {
-	inferenceWorkerEnv,
-	type RefCountedWorkerHandle,
-	resolveWorkerSpawnCmd,
-	SMOKE_TEST_TIMEOUT_MS,
-} from "../subprocess/worker-client";
-import { MLX_DEVICE, resolveTinyModelDevicePreference, tinyMlxSupported, tinyModelDeviceSettingToEnv } from "./device";
-import { tinyModelDtypeSettingToEnv } from "./dtype";
+import { inferenceWorkerEnv, resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS } from "../subprocess/worker-client";
+import { MLX_DEVICE, resolveTinyModelDevicePreference, tinyMlxSupported } from "./device";
 import { connectJsonlSocket, LineParser, writeJsonLine } from "./jsonl-socket";
 import { formatTitleUserMessage } from "./message-preproc";
 import { ensureTinyMlxRuntime, getTinyMlxModelDir, MLX_LM_VERSION } from "./mlx-runtime";
@@ -48,7 +40,8 @@ import {
 	tinyWorkerEndpoint,
 	tinyWorkerLogPath,
 } from "./title-protocol";
-import { cfgProvidersTinyModelDevice, cfgProvidersTinyModelDtype } from "../session/settings";
+import { tinyModelEnv, tinyModelEnvKey } from "./model-worker-env";
+export { tinyModelEnvKey, tinyWorkerEnv, tinyWorkerEnvOverlay } from "./model-worker-env";
 
 const TITLE_PREFILL = "<title>";
 const TITLE_CLOSE = "</title>";
@@ -112,54 +105,6 @@ function normalizeTinyTitleGenerateOptions(
 }
 
 // ── Device / dtype resolution ────────────────────────────────────────
-
-/** Setting value (its env var included); only the env var when settings are uninitialized (e.g. `omp --smoke-test`). */
-function readTinyModelSetting(setting: Setting<string>): string | undefined {
-	return isSettingsInitialized() ? setting.get(settings) : setting.envValue();
-}
-
-/**
- * Map the resolved `providers.tinyModelDevice` / `providers.tinyModelDtype`
- * values onto the `PI_TINY_DEVICE` / `PI_TINY_DTYPE` vars a worker should run
- * with. Only resolved keys are returned — never the default sentinel — so the
- * worker's built-in defaults apply for anything absent. Pure for testability;
- * see {@link tinyModelEnv} for the settings glue.
- * @internal
- */
-export function tinyWorkerEnvOverlay(
-	deviceSetting: string | undefined,
-	dtypeSetting: string | undefined,
-): Record<string, string> {
-	const overlay: Record<string, string> = {};
-	const device = tinyModelDeviceSettingToEnv(deviceSetting);
-	if (device) overlay.PI_TINY_DEVICE = device;
-	const dtype = tinyModelDtypeSettingToEnv(dtypeSetting);
-	if (dtype) overlay.PI_TINY_DTYPE = dtype;
-	return overlay;
-}
-
-/** Resolved device/dtype vars for this process. */
-function tinyModelEnv(): Record<string, string> {
-	return tinyWorkerEnvOverlay(
-		readTinyModelSetting(cfgProvidersTinyModelDevice),
-		readTinyModelSetting(cfgProvidersTinyModelDtype),
-	);
-}
-
-/** Identity of the resolved device/dtype; a worker started under a different key is stale. */
-export function tinyModelEnvKey(): string {
-	const env = tinyModelEnv();
-	return `${env.PI_TINY_DEVICE ?? ""}|${env.PI_TINY_DTYPE ?? ""}`;
-}
-
-/**
- * Env for an ONNX inference subprocess with the resolved device/dtype —
- * used for the tiny worker and reused verbatim by the STT and TTS workers,
- * which share the same device/dtype resolution.
- */
-export function tinyWorkerEnv(): Record<string, string> {
-	return inferenceWorkerEnv(tinyModelEnv());
-}
 
 /** Set once the mlx-lm bootstrap fails in this process; later workers fall back to ONNX. */
 let mlxUnavailable = false;

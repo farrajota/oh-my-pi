@@ -1,3 +1,5 @@
+import { EventEmitter } from "node:events";
+import { persistentAuditFacadeSignal } from "../../src/tools/browser/tab-worker";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
@@ -136,6 +138,36 @@ describe("browser run cancellation", () => {
 		});
 
 		expect(reasons).toEqual([]);
+	});
+
+	it("keeps dedicated audit guard facades across cells but invalidates them on caller abort", () => {
+		const page = new EventEmitter();
+		const firstDeadline = new AbortController();
+		const firstCaller = new AbortController();
+		const firstRunEnd = new AbortController();
+		const auditSignal = persistentAuditFacadeSignal(page as never, [firstDeadline.signal, firstCaller.signal]);
+		let inspections = 0;
+		const persistentGuard = bindRunFacade({ inspect: () => ++inspections }, auditSignal);
+		const firstUserFacade = bindRunFacade({ inspect: () => ++inspections }, firstRunEnd.signal);
+
+		firstRunEnd.abort(new ToolAbortError("Browser run ended"));
+		expect(() => firstUserFacade.inspect()).toThrow("Browser run ended");
+		expect(persistentGuard.inspect()).toBe(1);
+
+		const secondDeadline = new AbortController();
+		const secondCaller = new AbortController();
+		const secondRunEnd = new AbortController();
+		expect(persistentAuditFacadeSignal(page as never, [secondDeadline.signal, secondCaller.signal])).toBe(
+			auditSignal,
+		);
+		const secondUserFacade = bindRunFacade({ inspect: () => ++inspections }, secondRunEnd.signal);
+		expect(persistentGuard.inspect()).toBe(2);
+		secondRunEnd.abort(new ToolAbortError("Browser run ended"));
+		expect(() => secondUserFacade.inspect()).toThrow("Browser run ended");
+
+		secondCaller.abort(new ToolAbortError("Browser audit caller aborted"));
+		expect(() => persistentGuard.inspect()).toThrow("Browser audit caller aborted");
+		expect(inspections).toBe(2);
 	});
 
 	it("scopes browser rejection markers to the owning run and direct reason", () => {

@@ -5,7 +5,7 @@
  * model it resolves to, and when the hand-off is skipped (override off,
  * target identical to the starting model).
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { AuthStorage, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -133,24 +133,6 @@ function createModelRegistry(models: Model[]): ModelRegistry {
 		hasConfiguredAuth: () => true,
 	} as unknown as ModelRegistry;
 }
-async function createAuthorityFixture(settings = Settings.isolated()) {
-	const agentRegistry = new AgentRegistry();
-	const root = await createAgentRootSession(agentRegistry, {
-		agentId: "Main",
-		agentDisplayName: "Main",
-		cwd: "/tmp",
-		agentDir: "/tmp",
-		settings,
-		disableExtensionDiscovery: true,
-		enableMCP: false,
-		enableLsp: false,
-		toolNames: [],
-		skipPythonPreflight: true,
-	});
-	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
-	if (!authority) throw new Error("Test fixture requires parent authority");
-	return { agentRegistry, createAuthoritySession: authority.create };
-}
 
 const baseAgent: AgentDefinition = {
 	name: "task",
@@ -160,28 +142,49 @@ const baseAgent: AgentDefinition = {
 };
 const authorityAuthStorages: AuthStorage[] = [];
 
+const authorityFixtureRoots: AgentSession[] = [];
+
+async function createAuthorityFixture() {
+	const agentRegistry = new AgentRegistry();
+	const root = await createAgentRootSession(agentRegistry, { agentId: "Main" });
+	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	authorityFixtureRoots.push(root.session);
+	return { agentRegistry, createAuthoritySession: authority.create };
+}
+
 describe("runSubprocess per-agent prewalk", () => {
 	const primary = modelOrThrow("claude-sonnet-4-5");
 	const target = modelOrThrow("claude-sonnet-4-6");
 	const registry = new AgentRegistry();
+	let authorityCreator: NonNullable<ToolSession["createAuthoritySession"]>;
+	let authorityRoot: AgentSession | undefined;
 
 	function baseOptions(id: string, settings: Settings) {
-		const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-			sdkModule.createAgentSession({ ...options, agentRegistry: registry });
-		const modelRegistry = createModelRegistry([primary, target]);
 		return {
 			cwd: "/tmp",
 			task: "do work",
 			index: 0,
 			id,
 			settings,
-			modelRegistry,
+			modelRegistry: createModelRegistry([primary, target]),
 			enableLsp: false,
 			agentRegistry: registry,
-			createAuthoritySession,
+			createAuthoritySession: authorityCreator,
+			parentAgentId: "Main",
 		};
 	}
+	beforeAll(async () => {
+		const root = await createAgentRootSession(registry, { agentId: "Main" });
+		authorityRoot = root.session;
+		const authority = bindInternalAgentAuthoritySession(registry, root.session);
+		if (!authority) throw new Error("Test fixture requires parent authority");
+		authorityCreator = authority.create;
+	});
 
+	afterAll(async () => {
+		await authorityRoot?.dispose();
+	});
 	beforeEach(() => {
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
@@ -189,6 +192,7 @@ describe("runSubprocess per-agent prewalk", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const session of authorityFixtureRoots.splice(0)) await session.dispose();
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		for (const authStorage of authorityAuthStorages.splice(0)) await authStorage.close();
@@ -465,7 +469,7 @@ describe("runSubprocess per-agent prewalk", () => {
 		settings.setModelRole("smol", `${target.provider}/${target.id}`);
 		const spy = vi
 			.spyOn(sdkModule, "createAgentSession")
-			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
+			.mockImplementation(async () => createSessionResult(yieldEmittingSession()));
 
 		const offByDefault = await runSubprocess({
 			...baseOptions("subagent-prewalk-setting-default", settings),
@@ -552,8 +556,9 @@ describe("task tool plan-mode prewalk guard", () => {
 		createAuthoritySession = authority.createAuthoritySession;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const session of authorityFixtureRoots.splice(0)) await session.dispose();
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 	});

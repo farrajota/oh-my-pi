@@ -17,6 +17,12 @@ function snapshotContent(block: AssistantContent): AssistantContent {
 /** Anything a stream watchdog can consult for in-flight consumer-side local work. */
 export interface LocalWorkSource {
 	readonly hasPendingLocalWork: boolean;
+	/**
+	 * Epoch ms at which tracked local work last drained to zero, or 0 if none
+	 * has completed. The provider cannot answer until it receives the local
+	 * result, so idle watchdogs measure provider silence from this instant.
+	 */
+	readonly localWorkSettledAt: number;
 }
 
 /** Consumed head slots tolerated before the backlog is compacted (see {@link EventStream.queue}). */
@@ -48,6 +54,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	 * not a provider stall; idle watchdogs consult {@link hasPendingLocalWork}.
 	 */
 	#pendingLocalWork = 0;
+	#localWorkSettledAt = 0;
 	/**
 	 * A downstream stream whose local work also counts as ours — set when this
 	 * stream forwards another stream's events (e.g. the Cursor discovered-id
@@ -191,6 +198,11 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		return this.#pendingLocalWork > 0 || (this.#localWorkDelegate?.hasPendingLocalWork ?? false);
 	}
 
+	/** Latest {@link LocalWorkSource.localWorkSettledAt} across this stream and a forwarded delegate. */
+	get localWorkSettledAt(): number {
+		return Math.max(this.#localWorkSettledAt, this.#localWorkDelegate?.localWorkSettledAt ?? 0);
+	}
+
 	/**
 	 * Count `source`'s pending local work as this stream's own. Used when this
 	 * stream forwards another's events (Cursor discovered-id retry) so the
@@ -211,6 +223,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 			return await work;
 		} finally {
 			this.#pendingLocalWork--;
+			if (this.#pendingLocalWork === 0) this.#localWorkSettledAt = Date.now();
 		}
 	}
 }

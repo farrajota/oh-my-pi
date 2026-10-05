@@ -119,6 +119,7 @@ export interface BrowserAuditEvidence {
 	readonly locator: string | null;
 	readonly sha256: string | null;
 	readonly description: string;
+	readonly captured_byte_length?: number;
 }
 
 export interface BrowserAuditObservation {
@@ -652,7 +653,11 @@ function projectEvidence(
 				item.kind,
 			) ||
 			(item.locator !== null && (typeof item.locator !== "string" || item.locator.length > 256)) ||
+			(item.kind === "screenshot" && (typeof item.sha256 !== "string" || !HASH_RE.test(item.sha256))) ||
 			(item.sha256 !== null && (typeof item.sha256 !== "string" || !HASH_RE.test(item.sha256))) ||
+			(item.kind === "screenshot"
+				? !Number.isSafeInteger(item.captured_byte_length) || (item.captured_byte_length as number) < 0
+				: item.captured_byte_length !== undefined) ||
 			typeof item.description !== "string" ||
 			item.description.length === 0 ||
 			item.description.length > 1_024
@@ -667,6 +672,7 @@ function projectEvidence(
 				locator: item.locator,
 				sha256: item.sha256,
 				description: item.description,
+				...(item.kind === "screenshot" ? { captured_byte_length: item.captured_byte_length as number } : {}),
 			}),
 		);
 	}

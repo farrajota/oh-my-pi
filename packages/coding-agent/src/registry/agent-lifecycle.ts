@@ -39,10 +39,10 @@ import {
 } from "../internal/agent-registry-bridge";
 import type { AgentSession } from "../session/agent-session";
 import { trackLateCleanup } from "../utils/late-cleanup";
-import { type AgentRef, AgentRegistry, getAgentTombstonePath, MAIN_AGENT_ID } from "./agent-registry";
+import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./agent-registry";
+import { getAgentTombstonePath } from "./agent-tombstone";
 
 const lifecycleCapability = getAgentLifecycleCapability();
-
 export type AgentReviver = (expected: AgentRef) => Promise<AgentSession>;
 
 const AGENT_RELEASE_GRACE_MS = 5000;

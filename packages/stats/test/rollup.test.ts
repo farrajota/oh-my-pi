@@ -129,7 +129,11 @@ describe("rollups", () => {
 		const start = Math.floor((Date.now() - 150 * HOUR) / HOUR) * HOUR;
 		insertMessageStats(
 			Array.from({ length: 97 }, (_, index) =>
-				message(`backlog-${index}`, start + index * HOUR, index === 96 ? { model: "model-y", provider: "prov-y" } : {}),
+				message(
+					`backlog-${index}`,
+					start + index * HOUR,
+					index === 96 ? { model: "model-y", provider: "prov-y" } : {},
+				),
 			),
 		);
 		expect(getRollupStatus().dirtyHours).toBeGreaterThan(96);
@@ -157,5 +161,4 @@ describe("rollups", () => {
 			totalTokens: 200,
 		});
 	});
-
 });

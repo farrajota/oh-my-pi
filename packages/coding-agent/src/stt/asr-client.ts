@@ -12,7 +12,7 @@ import {
 	type SpawnedSubprocess,
 	smokeTestWorker,
 } from "../subprocess/worker-client";
-import { tinyWorkerEnv } from "../tiny/title-client";
+import { tinyModelEnvKey, tinyWorkerEnv } from "../tiny/model-worker-env";
 import type { SttProgressEvent, SttWorkerInbound, SttWorkerOutbound } from "./asr-protocol";
 import { getSttModelSpec, type SttModelKey } from "./models";
 
@@ -97,6 +97,7 @@ export class SttClient {
 		this.#host = new ModelWorkerHost({
 			name: "stt",
 			spawnWorker,
+			getWorkerEnvKey: tinyModelEnvKey,
 			modelLabel: modelKey => getSttModelSpec(modelKey)?.label ?? modelKey,
 			handleMessage: message => this.#handleMessage(message),
 			failRequest: (request, error) => request.reject(error),

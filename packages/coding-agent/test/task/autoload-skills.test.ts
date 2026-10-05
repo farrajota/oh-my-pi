@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, type Mock, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import * as skillsModule from "@oh-my-pi/pi-coding-agent/extensibility/skills";
@@ -6,12 +6,14 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, type AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function createMockSession(
@@ -81,24 +83,39 @@ describe("child-discovered autoload skills in executor", () => {
 		systemPrompt: "test",
 		source: "bundled",
 	};
-	const registry = new AgentRegistry();
-	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-		sdkModule.createAgentSession({ ...options, agentRegistry: registry });
+	let registry: AgentRegistry;
+	let rootSession: AgentSession | undefined;
+	let createAuthoritySession: AgentAuthoritySessionBinding["create"];
 	const baseOptions = {
 		cwd: "/tmp",
 		agent: baseAgent,
 		task: "do work",
 		index: 0,
 		id: "subagent-1",
+		parentAgentId: "Main",
 		settings: Settings.isolated(),
-		modelRegistry: {
-			refresh: async () => {},
-		} as unknown as import("@oh-my-pi/pi-coding-agent/config/model-registry").ModelRegistry,
+		modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 		enableLsp: false,
-		agentRegistry: registry,
-		createAuthoritySession,
+		get agentRegistry() {
+			return registry;
+		},
+		get createAuthoritySession() {
+			return createAuthoritySession;
+		},
 	};
 
+	beforeEach(async () => {
+		registry = new AgentRegistry();
+		const root = await createAgentRootSession(registry, { agentId: "Main" });
+		rootSession = root.session;
+		const authority = bindInternalAgentAuthoritySession(registry, root.session);
+		if (!authority) throw new Error("Test fixture requires parent authority");
+		createAuthoritySession = authority.create;
+	});
+
+	afterEach(async () => {
+		await rootSession?.dispose();
+	});
 	it("calls sendCustomMessage for each autoloaded skill before prompt", async () => {
 		const session = createMockSession(({ emit }) => {
 			emit({

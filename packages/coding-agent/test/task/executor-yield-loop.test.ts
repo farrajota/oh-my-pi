@@ -4,7 +4,7 @@ import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-regis
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, type AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import {
@@ -18,6 +18,7 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createSessionDefaults } from "../helpers/session-defaults";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 
 /**
  * Contracts under test — a subagent that answers with nothing but incremental
@@ -123,12 +124,22 @@ function createMockSession(
 }
 
 function mockCreateAgentSession(session: AgentSession) {
-	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
-		session,
-		extensionsResult: {} as unknown as LoadExtensionsResult,
-		setToolUIContext: () => {},
-		eventBus: new EventBus(),
-	} satisfies CreateAgentSessionResult);
+	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		if (options?.sessionManager) {
+			Object.defineProperty(session, "sessionManager", {
+				configurable: true,
+				enumerable: true,
+				writable: true,
+				value: options.sessionManager,
+			});
+		}
+		return {
+			session,
+			extensionsResult: {} as unknown as LoadExtensionsResult,
+			setToolUIContext: () => {},
+			eventBus: new EventBus(),
+		} satisfies CreateAgentSessionResult;
+	});
 }
 
 const baseAgent: AgentDefinition = {
@@ -141,27 +152,33 @@ const baseAgent: AgentDefinition = {
 describe("runSubprocess incremental yield loops", () => {
 	let tempDir: TempDir;
 
-	beforeEach(() => {
+	let createAuthoritySession: AgentAuthoritySessionBinding["create"];
+	let authorityRoot: AgentSession | undefined;
+
+	beforeEach(async () => {
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		AsyncJobManager.resetForTests();
 		tempDir = TempDir.createSync("@pi-yield-loop-");
+		const root = await createAgentRootSession(AgentRegistry.global(), { agentId: "Main" });
+		authorityRoot = root.session;
+		const authority = bindInternalAgentAuthoritySession(AgentRegistry.global(), root.session);
+		if (!authority) throw new Error("Test fixture requires parent authority");
+		createAuthoritySession = authority.create;
 	});
-	afterEach(() => {
+
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await authorityRoot?.dispose();
+		authorityRoot = undefined;
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		AsyncJobManager.resetForTests();
 		tempDir[Symbol.dispose]();
 	});
 
-	async function createAuthoritySession(options: Parameters<typeof sdkModule.createAgentSession>[0]) {
-		const result = await sdkModule.createAgentSession(options);
-		return { session: result.session };
-	}
-
 	function authorityOptions() {
-		return { agentRegistry: AgentRegistry.global(), createAuthoritySession };
+		return { agentRegistry: AgentRegistry.global(), createAuthoritySession, parentAgentId: "Main" };
 	}
 
 	function baseOptions(id: string, softRequestBudget: number) {
@@ -177,17 +194,6 @@ describe("runSubprocess incremental yield loops", () => {
 			artifactsDir: tempDir.path(),
 			...authorityOptions(),
 		};
-	}
-
-	function registerRunning(id: string, session: AgentSession) {
-		AgentRegistry.global().register({
-			id,
-			displayName: id,
-			kind: "sub",
-			session,
-			sessionFile: null,
-			status: "running",
-		});
 	}
 
 	/** One assistant turn whose only content is a terminal `yield`. */
@@ -264,7 +270,6 @@ describe("runSubprocess incremental yield loops", () => {
 			emitTerminalYieldTurn("DELIVERED", emit, pushMessage);
 		});
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 0));
 
@@ -280,7 +285,6 @@ describe("runSubprocess incremental yield loops", () => {
 		const id = "LostScout";
 		const handle = createMockSession(() => "dropped");
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 0));
 
@@ -296,7 +300,6 @@ describe("runSubprocess incremental yield loops", () => {
 			emitTerminalYieldTurn("RECOVERED", emit, pushMessage);
 		});
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 0));
 
@@ -310,7 +313,6 @@ describe("runSubprocess incremental yield loops", () => {
 		const handle = createMockSession(() => "dropped");
 		handle.session.waitForIdle = () => Promise.withResolvers<void>().promise;
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 0));
 
@@ -336,7 +338,6 @@ describe("runSubprocess incremental yield loops", () => {
 			emitTerminalYieldTurn("REMINDER", emit, pushMessage);
 		});
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 0));
 
@@ -358,7 +359,6 @@ describe("runSubprocess incremental yield loops", () => {
 			emit({ type: "message_end", message } as AgentSessionEvent);
 		});
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 0));
 
@@ -398,7 +398,6 @@ describe("runSubprocess incremental yield loops", () => {
 			droppedFinal = undefined;
 		};
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 0));
 
@@ -422,7 +421,6 @@ describe("runSubprocess incremental yield loops", () => {
 			}
 		});
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 2));
 
@@ -453,7 +451,6 @@ describe("runSubprocess incremental yield loops", () => {
 			}
 		});
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 0));
 
@@ -498,7 +495,6 @@ describe("runSubprocess incremental yield loops", () => {
 			emitTerminalYieldTurn("FRESH", emit, pushMessage);
 		});
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 0));
 
@@ -517,7 +513,6 @@ describe("runSubprocess incremental yield loops", () => {
 		});
 		handle.asyncPending.value = true;
 		mockCreateAgentSession(handle.session);
-		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id, 0));
 

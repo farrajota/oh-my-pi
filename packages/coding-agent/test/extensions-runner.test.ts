@@ -1617,24 +1617,28 @@ describe("ExtensionRunner", () => {
 			return new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
 		};
 
-		it("surfaces replacement content while keeping the call an error", async () => {
+		it("keeps thrown failures after result hooks and never installs pending call context", async () => {
 			const runner = await runnerFor(`
 				export default function(pi) {
+					pi.on("tool_call", () => ({ additionalContext: "success-only context" }));
 					pi.on("tool_result", (event) => {
 						if (!event.isError) return;
 						return {
 							content: [{ type: "text", text: "Enriched recovery guidance" }],
-							details: { enriched: true },
-							isError: true,
+							isError: false,
+							additionalContext: "failure-specific context",
 						};
 					});
 				}
 			`);
+			const addAdditionalContext = vi.fn();
+			const context = { addAdditionalContext } as unknown as AgentToolContext;
 			const wrapper = new ExtensionToolWrapper(throwingTool, runner);
-			const res = await wrapper.execute("call-rewrite", {} as never, undefined, undefined, undefined);
-			expect(firstText(res)).toBe("Enriched recovery guidance");
-			expect(res.isError).toBe(true);
-			expect(res.details).toEqual({ enriched: true });
+			await expect(wrapper.execute("call-rewrite", {} as never, undefined, undefined, context)).rejects.toThrow(
+				"original explosion",
+			);
+			expect(addAdditionalContext).toHaveBeenCalledWith("failure-specific context");
+			expect(addAdditionalContext).not.toHaveBeenCalledWith("success-only context");
 		});
 
 		it("preserves the original exception when no handler modifies the result", async () => {
@@ -1649,34 +1653,44 @@ describe("ExtensionRunner", () => {
 			);
 		});
 
-		it("converts a failure to success when a handler clears isError", async () => {
+		it("does not let a successful hook resurrect a tool-reported failure", async () => {
 			const runner = await runnerFor(`
 				export default function(pi) {
+					pi.on("tool_call", () => ({ additionalContext: "success-only context" }));
 					pi.on("tool_result", (event) => {
 						if (!event.isError) return;
-						return { content: [{ type: "text", text: "recovered" }], isError: false };
+						return {
+							content: [{ type: "text", text: "rewritten failure" }],
+							isError: false,
+							additionalContext: "failure-specific context",
+						};
 					});
 				}
 			`);
-			const wrapper = new ExtensionToolWrapper(throwingTool, runner);
-			const res = await wrapper.execute("call-cleared", {} as never, undefined, undefined, undefined);
-			expect(firstText(res)).toBe("recovered");
-			expect(res.isError).toBeUndefined();
+			const addAdditionalContext = vi.fn();
+			const context = { addAdditionalContext } as unknown as AgentToolContext;
+			const wrapper = new ExtensionToolWrapper(flaggedTool, runner);
+			const res = await wrapper.execute("call-cleared", {} as never, undefined, undefined, context);
+			expect(firstText(res)).toBe("rewritten failure");
+			expect(res.isError).toBe(true);
+			expect(addAdditionalContext).toHaveBeenCalledWith("failure-specific context");
+			expect(addAdditionalContext).not.toHaveBeenCalledWith("success-only context");
 		});
 
 		it("marks a successful result as an error when a handler sets isError", async () => {
 			const runner = await runnerFor(`
 				export default function(pi) {
-					pi.on("tool_result", () => ({
-						content: [{ type: "text", text: "now failing" }],
-						isError: true,
-					}));
+					pi.on("tool_call", () => ({ additionalContext: "success-only context" }));
+					pi.on("tool_result", () => ({ isError: true }));
 				}
 			`);
+			const addAdditionalContext = vi.fn();
+			const context = { addAdditionalContext } as unknown as AgentToolContext;
 			const wrapper = new ExtensionToolWrapper(okTool, runner);
-			const res = await wrapper.execute("call-flagged", {} as never, undefined, undefined, undefined);
-			expect(firstText(res)).toBe("now failing");
+			const res = await wrapper.execute("call-flagged", {} as never, undefined, undefined, context);
+			expect(firstText(res)).toBe("success");
 			expect(res.isError).toBe(true);
+			expect(addAdditionalContext).not.toHaveBeenCalled();
 		});
 
 		it("preserves a tool-reported error through extension rewrites", async () => {
@@ -1691,6 +1705,22 @@ describe("ExtensionRunner", () => {
 			const res = await wrapper.execute("call-reported-failure", {} as never, undefined, undefined, undefined);
 			expect(firstText(res)).toBe("observed failure");
 			expect(res.isError).toBe(true);
+		});
+
+		it("preserves a successful hook replacement and installs pending call context", async () => {
+			const runner = await runnerFor(`
+				export default function(pi) {
+					pi.on("tool_call", () => ({ additionalContext: "success-only context" }));
+					pi.on("tool_result", () => ({ content: [{ type: "text", text: "rewritten success" }] }));
+				}
+			`);
+			const addAdditionalContext = vi.fn();
+			const context = { addAdditionalContext } as unknown as AgentToolContext;
+			const wrapper = new ExtensionToolWrapper(okTool, runner);
+			const res = await wrapper.execute("call-success-rewrite", {} as never, undefined, undefined, context);
+			expect(firstText(res)).toBe("rewritten success");
+			expect(res.isError).toBeUndefined();
+			expect(addAdditionalContext).toHaveBeenCalledWith("success-only context");
 		});
 	});
 

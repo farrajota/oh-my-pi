@@ -29,7 +29,7 @@ import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../..
 import { SessionManager } from "../../src/session/session-manager";
 import { ArtifactManager } from "../../src/session/artifacts";
 import * as taskDiscovery from "../../src/task/discovery";
-import type { RunSubprocessOptions } from "../../src/task/executor";
+import type { ExecutorOptions } from "../../src/task/executor";
 import * as taskExecutor from "../../src/task/executor";
 import * as isolationRunner from "../../src/task/isolation-runner";
 import { AgentOutputManager } from "../../src/task/output-manager";
@@ -185,7 +185,7 @@ function spyOverlapBarrier(count: number): { maxInFlight: () => number } {
 	return { maxInFlight: () => maxInFlight };
 }
 
-function singleResult(options: RunSubprocessOptions, overrides: Partial<SingleResult> = {}): SingleResult {
+function singleResult(options: ExecutorOptions, overrides: Partial<SingleResult> = {}): SingleResult {
 	return {
 		index: options.index,
 		id: options.id,
@@ -387,19 +387,33 @@ describe("runEvalAgent", () => {
 		expect(secondOptions.outputSchemaOverridesAgent).toBeUndefined();
 	});
 
-	it("drops a per-call model argument on agent() (removed, issue #6438)", async () => {
+	it("routes a per-call model on agent() above the selected agent's own model", async () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 
-		// The schema strips unknown keys; a legacy `model` argument is silently
-		// discarded so resolution is identical to omitting it — the agent's own
-		// frontmatter model applies (issue #6438).
-		await runEvalAgentAndWait({ prompt: "work", model: "default" }, { session: await makeSession() });
+		// An explicit per-call selector overrides the selected agent's own model.
+		await runEvalAgentAndWait({ prompt: "work", model: "p/requested:high" }, { session: await makeSession() });
 		await runEvalAgentAndWait({ prompt: "work" }, { session: await makeSession() });
+		await runEvalAgentAndWait(
+			{ prompt: "work", agent: "reviewer", model: "p/requested:high" },
+			{ session: await makeSession() },
+		);
 
-		const withModel = runSpy.mock.calls[0]?.[0];
-		const withoutModel = runSpy.mock.calls[1]?.[0];
-		expect(withModel?.modelOverride).toEqual(withoutModel?.modelOverride);
+		expect(runSpy.mock.calls[0]?.[0]?.modelOverride).toEqual(["p/requested:high"]);
+		expect(runSpy.mock.calls[2]?.[0]?.modelOverride).toEqual(["p/requested:high"]);
+	});
+
+	it("rejects an ambiguous or blank per-call model on agent() before dispatch", async () => {
+		mockAgents();
+		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
+
+		await expect(
+			runEvalAgent({ prompt: "work", model: "default" }, { session: await makeSession() }),
+		).rejects.toThrow(/"@default"/);
+		await expect(runEvalAgent({ prompt: "work", model: "   " }, { session: await makeSession() })).rejects.toThrow(
+			/invalid `model`/,
+		);
+		expect(runSpy).not.toHaveBeenCalled();
 	});
 	it("returns host-parsed data for caller, agent, and inherited schemas", async () => {
 		const agentSchema = { type: "object" };
@@ -784,7 +798,7 @@ describe("agent() through eval runtimes", () => {
 		mockAgents();
 		const releaseCompletion = Promise.withResolvers<void>();
 
-		const makeProgress = (options: RunSubprocessOptions, overrides: Partial<AgentProgress>): AgentProgress => ({
+		const makeProgress = (options: ExecutorOptions, overrides: Partial<AgentProgress>): AgentProgress => ({
 			index: options.index,
 			id: options.id,
 			agent: options.agent.name,
@@ -1113,13 +1127,7 @@ describe("runEvalAgent isolation", () => {
 
 	function mockIsolationContext(): { repoRoot: string } {
 		const repoRoot = "/repo-root";
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
-			repoRoot,
-			baseline: {
-				root: { repoRoot, headCommit: "HEAD", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
-				nested: [],
-			},
-		});
+		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot });
 		return { repoRoot };
 	}
 
@@ -1257,20 +1265,7 @@ describe("runEvalAgent isolation", () => {
 		const ops: string[] = [];
 		vi.spyOn(isolationRunner, "prepareIsolationContext").mockImplementation(async () => {
 			ops.push("prepare");
-			return {
-				repoRoot: "/repo-root",
-				baseline: {
-					root: {
-						repoRoot: "/repo-root",
-						headCommit: "HEAD",
-						staged: "",
-						unstaged: "",
-						untracked: [],
-						untrackedPatch: "",
-					},
-					nested: [],
-				},
-			};
+			return { repoRoot: "/repo-root" };
 		});
 		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts =>
 			singleResult(opts.baseOptions, { output: "done", patchPath: `/artifacts/${opts.agentId}.patch` }),
@@ -1613,5 +1608,24 @@ describe("runEvalAgent isolation", () => {
 			([target]) => typeof target === "string" && target.includes("omp-eval-agent-"),
 		);
 		expect(removedArtifactsDir).toBe(false);
+	});
+});
+
+describe("agent model arrays", () => {
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		AgentRegistry.resetGlobalForTests();
+		resetRegisteredArtifactDirsForTests();
+		await Promise.all([...jobManagers].map(manager => manager.dispose()));
+		jobManagers.clear();
+	});
+	it("routes an ordered model array without substituting the agent definition", async () => {
+		mockAgents();
+		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
+		await runEvalAgentAndWait(
+			{ prompt: "work", agent: "reviewer", model: ["p/preferred:high", "p/alternative"] },
+			{ session: await makeSession() },
+		);
+		expect(runSpy.mock.calls[0]?.[0]?.modelOverride).toEqual(["p/preferred:high", "p/alternative"]);
 	});
 });

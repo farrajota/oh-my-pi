@@ -26,6 +26,7 @@ import {
 	lookupAgentRef,
 } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { cfgContextPromotionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
@@ -33,10 +34,12 @@ import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const AGENT_ID = "ParkedRelease";
 const MOCK_API_SOURCE = "test/parked-subagent-session-release";
-// createAgentSession races its workspace scan against an uncancelled 5 s
-// startup deadline timer whose reaction keeps the new session reachable until
-// it fires; collection is polled past that window.
-const COLLECT_DEADLINE_MS = 8_000;
+// After earlier files warm the session code, JSC's optimizing-JIT worklist can
+// keep an object referenced by an in-flight compile reachable for a few seconds
+// (observed ~4 s locally, >8 s on loaded CI runners); collection is polled past
+// that window. A healthy release returns on the first poll that sees it collected,
+// so the deadline only bounds how long a real leak takes to fail.
+const COLLECT_DEADLINE_MS = 15_000;
 
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
 let savedEnv: Record<string, string | undefined> = {};
@@ -82,7 +85,7 @@ function weakRefToLiveSession(id: string): WeakRef<AgentSession> {
 	return new WeakRef(session);
 }
 
-async function collected(ref: WeakRef<AgentSession>, deadlineMs: number): Promise<boolean> {
+async function collected(ref: WeakRef<object>, deadlineMs: number): Promise<boolean> {
 	const deadline = Date.now() + deadlineMs;
 	for (;;) {
 		Bun.gc(true);
@@ -92,7 +95,16 @@ async function collected(ref: WeakRef<AgentSession>, deadlineMs: number): Promis
 	}
 }
 
-it("releases a parked keep-alive subagent's session while the agent stays revivable", async () => {
+/** Makes a settings write in the live session's own overlay, then observes the overlay weakly (outside the test body). */
+function writeAndObserveLiveSettings(id: string): WeakRef<Settings> {
+	const session = lookupAgentRef(agentRegistry, id)?.session;
+	if (!session) throw new Error(`subagent ${id} has no live session to observe`);
+	cfgContextPromotionEnabled.set(session, true);
+	return new WeakRef(session.settings);
+}
+
+/** Runs `AGENT_ID` to a finished keep-alive state; `release` drops the mock's session-bound recordings. */
+async function runKeptAliveSubagent(): Promise<{ release(): void; close(): Promise<void> }> {
 	const cwd = path.join(root, "work");
 	const artifactsDir = path.join(root, "artifacts");
 	await fs.mkdir(cwd, { recursive: true });
@@ -139,7 +151,6 @@ it("releases a parked keep-alive subagent's session while the agent stays reviva
 	});
 	const authorityBinding = bindInternalAgentAuthoritySession(agentRegistry, rootSession.session);
 	if (!authorityBinding) throw new Error("Test fixture requires a live parent-bound authority session.");
-
 	try {
 		const result = await runSubprocess({
 			cwd,
@@ -160,7 +171,27 @@ it("releases a parked keep-alive subagent's session while the agent stays reviva
 			enableIrc: false,
 		});
 		expect(result.exitCode).toBe(0);
+	} catch (error) {
+		await rootSession.session.dispose();
+		authStorage.close();
+		throw error;
+	}
+	return {
+		// Recorded mock calls carry stream options with closures bound to the session.
+		release: () => {
+			mock.reset();
+			availableSpy.mockRestore();
+		},
+		close: async () => {
+			await rootSession.session.dispose();
+			authStorage.close();
+		},
+	};
+}
 
+it("releases a parked keep-alive subagent's session while the agent stays revivable", async () => {
+	const run = await runKeptAliveSubagent();
+	try {
 		const sessionRef = weakRefToLiveSession(AGENT_ID);
 		const lifecycle = getAgentLifecycleManager(agentRegistry);
 		await parkAgent(lifecycle, AGENT_ID);
@@ -168,14 +199,31 @@ it("releases a parked keep-alive subagent's session while the agent stays reviva
 		expect(lookupAgentRef(agentRegistry, AGENT_ID)?.session).toBeNull();
 		expect(lifecycleHasAgent(lifecycle, AGENT_ID)).toBe(true);
 
-		// Recorded mock calls carry stream options with closures bound to the session.
-		mock.reset();
-		availableSpy.mockRestore();
+		run.release();
 		expect(await collected(sessionRef, COLLECT_DEADLINE_MS)).toBe(true);
 		// Still adopted after collection: the release did not come from dropping the reviver.
 		expect(lifecycleHasAgent(lifecycle, AGENT_ID)).toBe(true);
 	} finally {
-		await rootSession.session.dispose();
-		authStorage.close();
+		await run.close();
 	}
-}, 20_000);
+}, 30_000);
+
+it("parks without retaining the run's settings overlay and revives with the settings it wrote", async () => {
+	const run = await runKeptAliveSubagent();
+	try {
+		// A write the subagent made to its own settings during the run.
+		const settingsRef = writeAndObserveLiveSettings(AGENT_ID);
+
+		const lifecycle = getAgentLifecycleManager(agentRegistry);
+		await lifecycle.park(AGENT_ID);
+		run.release();
+		// The reviver held the run's whole overlay — merged view, memoized values, listener buckets —
+		// for as long as the parked agent stayed adopted.
+		expect(await collected(settingsRef, COLLECT_DEADLINE_MS)).toBe(true);
+
+		const revived = await lifecycle.ensureLive(AGENT_ID);
+		expect(cfgContextPromotionEnabled.get(revived)).toBe(true);
+	} finally {
+		await run.close();
+	}
+}, 30_000);

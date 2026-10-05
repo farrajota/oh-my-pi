@@ -15,15 +15,20 @@ import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
-function createAuthorityFixture() {
+const authorityRoots: AgentSession[] = [];
+
+async function createAuthorityFixture() {
 	const agentRegistry = new AgentRegistry();
-	const createAuthoritySession = (options: Parameters<typeof sdkModule.createAgentSession>[0]) =>
-		sdkModule.createAgentSession({ ...options, agentRegistry });
-	return { agentRegistry, createAuthoritySession };
+	const root = await createAgentRootSession(agentRegistry, { agentId: "Main" });
+	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	authorityRoots.push(root.session);
+	return { agentRegistry, createAuthoritySession: authority.create };
 }
 
 function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent) => void }) => void): AgentSession {
@@ -77,6 +82,20 @@ function yieldEmittingSession(data: unknown): AgentSession {
 	});
 }
 
+function mockCreateAgentSession(session: AgentSession) {
+	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		if (options?.sessionManager) {
+			Object.defineProperty(session, "sessionManager", {
+				configurable: true,
+				enumerable: true,
+				writable: true,
+				value: options.sessionManager,
+			});
+		}
+		return { session } as CreateAgentSessionResult;
+	});
+}
+
 const baseAgent: AgentDefinition = {
 	name: "task",
 	description: "test",
@@ -89,6 +108,7 @@ describe("structured output sidecar lifecycle", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const root of authorityRoots.splice(0)) await root.dispose();
 		if (artifactsDir) await fs.rm(artifactsDir, { recursive: true, force: true });
 		artifactsDir = undefined;
 	});
@@ -109,8 +129,8 @@ describe("structured output sidecar lifecycle", () => {
 		});
 
 		const session = yieldEmittingSession({ ok: true });
-		const authority = createAuthorityFixture();
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as CreateAgentSessionResult);
+		const authority = await createAuthorityFixture();
+		mockCreateAgentSession(session);
 
 		const result = await runSubprocess({
 			cwd: "/tmp",
@@ -123,6 +143,7 @@ describe("structured output sidecar lifecycle", () => {
 			createAuthoritySession: authority.createAuthoritySession,
 			enableLsp: false,
 			agentRegistry: authority.agentRegistry,
+			parentAgentId: "Main",
 			artifactsDir,
 			parentArtifactManager: manager,
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
@@ -150,8 +171,8 @@ describe("structured output sidecar lifecycle", () => {
 		await fs.writeFile(sidecarPath, JSON.stringify({ summary: "stale from an earlier turn" }));
 
 		const session = yieldEmittingSession({ ok: true });
-		const authority = createAuthorityFixture();
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as CreateAgentSessionResult);
+		const authority = await createAuthorityFixture();
+		mockCreateAgentSession(session);
 
 		const originalStringify = JSON.stringify.bind(JSON);
 		vi.spyOn(JSON, "stringify").mockImplementation(((value: unknown, ...rest: unknown[]) => {
@@ -180,7 +201,7 @@ describe("structured output sidecar lifecycle", () => {
 			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 			createAuthoritySession: authority.createAuthoritySession,
 			agentRegistry: authority.agentRegistry,
-			enableLsp: false,
+			parentAgentId: "Main",
 			artifactsDir,
 			parentArtifactManager: manager,
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
@@ -203,8 +224,8 @@ describe("structured output sidecar lifecycle", () => {
 		// `ok` is a string, not a boolean — violates the schema below, but the
 		// data still parses and must be preserved.
 		const session = yieldEmittingSession({ ok: "not-a-boolean" });
-		const authority = createAuthorityFixture();
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as CreateAgentSessionResult);
+		const authority = await createAuthorityFixture();
+		mockCreateAgentSession(session);
 
 		const result = await runSubprocess({
 			cwd: "/tmp",
@@ -214,9 +235,7 @@ describe("structured output sidecar lifecycle", () => {
 			id,
 			createAuthoritySession: authority.createAuthoritySession,
 			agentRegistry: authority.agentRegistry,
-			settings: Settings.isolated(),
-			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
-			enableLsp: false,
+			parentAgentId: "Main",
 			artifactsDir,
 			parentArtifactManager: manager,
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },

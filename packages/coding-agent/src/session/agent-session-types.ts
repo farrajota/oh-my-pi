@@ -77,6 +77,22 @@ export type CommandMetadataChangedListener = () => void | Promise<void>;
 /** Public summary of an asynchronous job. */
 export type { AsyncJobSnapshot, AsyncJobSnapshotItem } from "../async";
 
+/** One async job as a job inspector (the jobs sheet) shows it beyond its snapshot row. */
+export interface AsyncJobInspection {
+	/** Full command line of a job that runs a process. */
+	command?: string;
+	/** Directory that command started in. */
+	cwd?: string;
+	/** Live pids the job's command spawned. */
+	pids: readonly number[];
+	/** Exit status of a settled command. */
+	exitCode?: number;
+	/** Output tail while running; the final result or error text once settled. */
+	output?: string;
+	/** Artifact holding the full output when `output` is cut. */
+	artifactId?: string;
+}
+
 export type { ShakeMode, ShakeResult } from "./shake-types";
 
 /**

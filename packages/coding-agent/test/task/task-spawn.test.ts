@@ -193,7 +193,7 @@ describe("task spawn routing", () => {
 
 	it("preserves explicitly supplied credential, workspace, MCP, and discovery policy", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
-		let captured: executorModule.RunSubprocessOptions | undefined;
+		let captured: executorModule.ExecutorOptions | undefined;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			captured = options;
 			return makeResult(options.id);
@@ -306,13 +306,7 @@ describe("task spawn routing", () => {
 			projectAgentsDir: null,
 		});
 		const repoRoot = process.cwd();
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
-			repoRoot,
-			baseline: {
-				root: { repoRoot, headCommit: "HEAD", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
-				nested: [],
-			},
-		});
+		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot });
 		const runSpy = vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts => ({
 			...makeResult(opts.agentId),
 			isolated: true,
@@ -362,20 +356,7 @@ describe("task spawn routing", () => {
 			});
 			if (isolated) {
 				const repoRoot = process.cwd();
-				vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
-					repoRoot,
-					baseline: {
-						root: {
-							repoRoot,
-							headCommit: "HEAD",
-							staged: "",
-							unstaged: "",
-							untracked: [],
-							untrackedPatch: "",
-						},
-						nested: [],
-					},
-				});
+				vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot });
 			}
 			const runSpy = vi
 				.spyOn(executorModule, "runSubprocess")
@@ -459,13 +440,7 @@ describe("task spawn routing", () => {
 				projectAgentsDir: null,
 			});
 			const repoRoot = process.cwd();
-			vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({
-				repoRoot,
-				baseline: {
-					root: { repoRoot, headCommit: "HEAD", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
-					nested: [],
-				},
-			});
+			vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot });
 			vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts => ({
 				...makeResult(opts.agentId),
 				isolated: true,

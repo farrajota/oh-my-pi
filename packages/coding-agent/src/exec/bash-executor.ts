@@ -16,7 +16,11 @@ import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings } from "../config/settings";
 import { type OutputArtifactError, OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
+import {
+	resolveOutputMaxColumns,
+	resolveOutputSinkArtifactMaxBytes,
+	resolveOutputSinkHeadBytes,
+} from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { publishAllocatedArtifact } from "../session/artifacts";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
@@ -53,6 +57,10 @@ export interface BashExecutorOptions {
 	 */
 	filesystem?: ShellFilesystem;
 	outputSettings?: Settings;
+	/**
+	 * Invoked when the embedded shell starts the command; unavailable on user-shell paths.
+	 */
+	onStart?: (pids: () => readonly number[]) => void;
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
@@ -89,6 +97,8 @@ export interface BashResult {
 	outputLines: number;
 	outputBytes: number;
 	artifactId?: string;
+	/** Bytes the artifact cap dropped from the saved file's middle (the artifact is a head/tail sample). */
+	artifactElidedBytes?: number;
 	artifactError?: OutputArtifactError;
 	workingDir?: string;
 	/** Terminal graphics extracted from raw stdout before sanitization or truncation. */
@@ -255,6 +265,24 @@ function quarantineShellSession(
 			}
 		})
 		.catch(() => undefined);
+}
+
+/**
+ * Drops every persistent Shell owned by an agent session (keys built with
+ * `agentSessionKey` as the {@link BashExecutorOptions.sessionKey}). The map is
+ * process-global, so without this each disposed session keeps its native shell
+ * for the life of the process. A Shell with live background jobs is retained
+ * until they exit, matching the `:async:` teardown; an in-flight run keeps its
+ * own reference and drops the Shell when it settles.
+ */
+export function releaseShellSessions(agentSessionKey: string | undefined): void {
+	if (!agentSessionKey) return;
+	const prefix = `${agentSessionKey}\n`;
+	for (const [key, shell] of shellSessions) {
+		if (!key.startsWith(prefix)) continue;
+		shellSessions.delete(key);
+		if (!shellSessionsInUse.has(key)) void retainShellWithLiveBackgroundJobs(shell);
+	}
 }
 
 function resolveShellCwd(cwd: string | undefined): string | undefined {
@@ -544,6 +572,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
 		headBytes: resolveOutputSinkHeadBytes(outputSettings),
+		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(outputSettings),
 		maxColumns: resolveOutputMaxColumns(outputSettings),
 		chunkThrottleMs: !usePty && options?.onChunk ? (options.chunkThrottleMs ?? 50) : 0,
 	});
@@ -695,6 +724,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				}
 			},
 		);
+		options?.onStart?.(() => executionShell.pids());
 
 		const ey = new ExponentialYield();
 		const winner = await ey.race<

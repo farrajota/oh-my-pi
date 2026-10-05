@@ -14,9 +14,11 @@ import { afterEach, beforeEach, describe, expect, it, type Mock, spyOn, vi } fro
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { CollabController } from "@oh-my-pi/pi-coding-agent/collab/controller";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
+import { assertSessionSwitchPreflight } from "../../src/session/session-switch-preflight";
 import { CollabHost, CollabHostStoppedError } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import * as registry from "@oh-my-pi/pi-coding-agent/collab/registry";
@@ -33,7 +35,10 @@ import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mod
 import { beginStartupComposer, stopPendingStartupComposer } from "@oh-my-pi/pi-coding-agent/modes/startup-composer";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
+import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
 import * as utils from "@oh-my-pi/pi-utils";
@@ -50,7 +55,6 @@ import {
 	cfgStartupShowSplash,
 } from "@oh-my-pi/pi-coding-agent/modes/settings";
 
-const noRecentSessions = async () => [];
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const originalPiProfile = process.env.PI_PROFILE;
 const originalOmpProfile = process.env.OMP_PROFILE;
@@ -245,6 +249,12 @@ afterEach(async () => {
 	restoreEnv("PI_PROFILE", originalPiProfile);
 	restoreEnv("OMP_PROFILE", originalOmpProfile);
 	utils.__resetDirsFromEnvForTests();
+	// InteractiveMode and the CLI open process-wide agent.db, history.db (prompt history and
+	// session index), and models.db under tmp/agent; Windows cannot delete open files.
+	AgentStorage.close();
+	HistoryStorage.close();
+	resetSessionIndexForTests();
+	closeModelCache();
 	await fs.rm(tmp, { recursive: true, force: true });
 });
 
@@ -373,7 +383,7 @@ describe("interactive collaboration startup", () => {
 		const render = InteractiveMode.prototype.renderInitialMessages;
 		spyOn(InteractiveMode.prototype, "renderInitialMessages").mockImplementation(
 			async function (this: InteractiveMode, options) {
-				if (this.sessionManager.getSessionId() === remote.sessionId)
+				if (this.sessionManager.getHeader()?.parentSession === remote.sessionId)
 					throw new Error("dedicated replica rendering failed");
 				await render.call(this, options);
 			},
@@ -382,7 +392,6 @@ describe("interactive collaboration startup", () => {
 			terminal: new VirtualTerminal(),
 			version: "test",
 			cache: false,
-			recentSessions: noRecentSessions,
 		});
 		spyOn(InteractiveMode.prototype, "getUserInput").mockImplementation(async function (this: InteractiveMode) {
 			mode = this;
@@ -564,7 +573,7 @@ describe("interactive collaboration startup", () => {
 		expect(local.collabGuest).toBeUndefined();
 	});
 
-	it("allows a bound guest to activate and restore the same replica file", async () => {
+	it("allows authority to retain its exact session but refuses a fresh replica", async () => {
 		const { local, remote, localFile } = await prepareGuestMode();
 		const parsed = parseCollabLink(remote.link);
 		if ("error" in parsed) throw new Error(parsed.error);
@@ -575,11 +584,14 @@ describe("interactive collaboration startup", () => {
 		await local.collabController.idle();
 		await executeBuiltinSlashCommand("/collab stop", { ctx: local });
 		await bindRootAuthority(local);
+
+		// Authority may remain on its current session, but the guest's fresh
+		// replica has a per-guest ID and is necessarily a cross-session switch.
+		expect(() =>
+			assertSessionSwitchPreflight(local.sessionManager, { kind: "session", path: replicaPath }),
+		).not.toThrow();
 		const guest = new CollabGuestLink(local);
-		await guest.join(remote.link);
-		expect(local.collabGuest).toBe(guest);
-		expect(local.sessionManager.getSessionFile()).toBe(replicaPath);
-		await guest.leave("same-file restoration");
+		await expect(guest.join(remote.link)).rejects.toThrow("Cross-session resume");
 		expect(local.collabGuest).toBeUndefined();
 		expect(local.sessionManager.getSessionFile()).toBe(replicaPath);
 	});
@@ -849,7 +861,6 @@ describe("interactive collaboration startup", () => {
 				terminal: new StartupTerminal(),
 				version: "test",
 				cache: false,
-				recentSessions: noRecentSessions,
 			});
 			spyOn(InteractiveMode.prototype, "initHooksAndCustomTools").mockImplementation(
 				async function (this: InteractiveMode) {

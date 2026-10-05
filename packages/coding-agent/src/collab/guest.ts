@@ -5,16 +5,20 @@
  * drives it through the normal `/resume` machinery, then applies live frames:
  * entries → SessionManager + agent.replaceMessages, events →
  * EventController.handleEvent, state → status-line overrides plus real
- * model/thinking state applied to the replica agent. The host's subagent
- * ecosystem is mirrored too: agent snapshots populate a local AgentRegistry
- * (Agent Hub), EventBus traffic (observer HUD) is republished, and hub
- * actions (chat/kill/revive/transcript reads) round-trip over the wire.
- * Host ask dialogs (`ui-request` select/editor) present through the same
- * hook selector/editor seam and answer with `ui-response`; `ui-request-end`
- * dismisses a pending presentation without responding.
+ * model/thinking state applied to the replica agent. Lifecycle-relevant
+ * mirrored events additionally reach the local extension runner, so
+ * lifecycle integrations (Herdr pane state, RPC trackers, stats) observe host
+ * activity even though the guest's own agent loop never runs. The host's
+ * subagent ecosystem is mirrored too: agent snapshots populate a local
+ * AgentRegistry (Agent Hub), EventBus traffic (observer HUD) is republished,
+ * and hub actions (chat/kill/revive/transcript reads) round-trip over the
+ * wire. Host ask dialogs (`ui-request` select/editor) present through the
+ * same hook selector/editor seam and answer with `ui-response`;
+ * `ui-request-end` dismisses a pending presentation without responding.
  * Everything renders through the same components, so ctrl+o, theming, and
  * transcript behavior are native by construction.
  */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
@@ -26,8 +30,11 @@ import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 import { assertSessionSwitchPreflight } from "../session/session-switch-preflight";
 import { normalizeEffectivePermissionSummary } from "../task/permission-profiles";
+import { mintSessionId } from "../session/session-manager";
+import { FileSessionStorage } from "../session/session-storage";
 import { shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import { emitSubagentFrame } from "../utils/event-bus";
+import { GuestLifecycleEmitter } from "../extensibility/extensions/lifecycle-mirror";
 import { setSessionTerminalTitle } from "../utils/title-generator";
 import { importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
@@ -41,14 +48,17 @@ import {
 } from "./protocol";
 import { CollabSocket } from "./relay-client";
 
-function collabReplicaPath(roomId: string): string {
-	return path.join(getConfigRootDir(), "collab", `${roomId}.jsonl`);
+function collabReplicaPath(roomId: string, replicaId: string): string {
+	return path.join(getConfigRootDir(), "collab", `${roomId}-${replicaId}.jsonl`);
 }
 
 export function assertCollabJoinPreflight(ctx: InteractiveModeContext, link: string): void {
 	const parsed = parseCollabLink(link);
 	if ("error" in parsed) throw new Error(parsed.error);
-	assertSessionSwitchPreflight(ctx.sessionManager, { kind: "session", path: collabReplicaPath(parsed.roomId) });
+	assertSessionSwitchPreflight(ctx.sessionManager, {
+		kind: "session",
+		path: collabReplicaPath(parsed.roomId, mintSessionId()),
+	});
 }
 
 /** Commands a guest may run locally; everything else is host-only. */
@@ -174,6 +184,22 @@ export class CollabGuestLink {
 	#ctx: InteractiveModeContext;
 	#socket: CollabSocket | null = null;
 	#roomId = "";
+	/**
+	 * This guest's replica: its own session id and file for the guest's
+	 * lifetime. Ownership is keyed by session id, so the replica must not reuse
+	 * the host's id (a guest on the host's machine would contend with the
+	 * host), must not change on a resync (a lease handoff would leave the file
+	 * briefly unowned), and must not share a file with another local guest of
+	 * the same room.
+	 */
+	readonly #replicaId = mintSessionId();
+	/**
+	 * The replica's ownership lease, held from the first snapshot write until
+	 * the guest has left. Opening and reloading the replica never claims it, so
+	 * without this an idle guest would leave its live replica unowned (and
+	 * collectable by `omp gc`).
+	 */
+	#replicaLease: (() => void) | undefined;
 	/** Previous session file to restore on leave; null = previous session was unsaved. */
 	#returnSessionFile: string | null = null;
 	/** Frames apply strictly in arrival order through this chain. */
@@ -205,6 +231,8 @@ export class CollabGuestLink {
 	#readOnly = false;
 	/** False until the first assistant message_start (real or synthesized) since (re)sync. */
 	#assistantStreamSynced = false;
+	/** Mirrors host lifecycle events into the local extension runner while joined. */
+	#lifecycleEmitter = new GuestLifecycleEmitter();
 	state: CollabSessionState | null = null;
 	/** Local mirror of the host's agent ecosystem (refs carry `session: null`). */
 	readonly agentRegistry = new AgentRegistry();
@@ -272,7 +300,7 @@ export class CollabGuestLink {
 		const parsed = parseCollabLink(link);
 		if ("error" in parsed) throw new Error(parsed.error);
 		if (this.#ctx.collabGuest || this.#left) throw new Error("Already in a collab session (/leave first)");
-		const replicaPath = collabReplicaPath(parsed.roomId);
+		const replicaPath = collabReplicaPath(parsed.roomId, this.#replicaId);
 		assertSessionSwitchPreflight(this.#ctx.sessionManager, { kind: "session", path: replicaPath });
 		this.#roomId = parsed.roomId;
 		this.#writeToken = parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined;
@@ -460,10 +488,28 @@ export class CollabGuestLink {
 		this.#pendingSnapshot = null;
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
-		const replicaPath = collabReplicaPath(this.#roomId);
+		const replicaPath = collabReplicaPath(this.#roomId, this.#replicaId);
 		assertSessionSwitchPreflight(this.#ctx.sessionManager, { kind: "session", path: replicaPath });
-		const lines = [pending.header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
-		await Bun.write(replicaPath, `${lines}\n`);
+		// A child of the host's session, as a sibling move is.
+		const header = {
+			...pending.header,
+			id: this.#replicaId,
+			parentSession: pending.header.id,
+			providerPromptCacheKey: pending.header.providerPromptCacheKey ?? pending.header.id,
+		};
+		const lines = [header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
+		const storage = new FileSessionStorage();
+		this.#replicaLease ??= storage.claimSession(this.#replicaId, replicaPath) ?? undefined;
+		// Published atomically: `omp gc` reads the replica's header to find its
+		// lease, so a resync must never expose a truncated, headerless file.
+		const tempPath = `${replicaPath}.${mintSessionId()}.tmp`;
+		try {
+			await Bun.write(tempPath, `${lines}\n`);
+			await fs.rename(tempPath, replicaPath);
+		} catch (err) {
+			await fs.unlink(tempPath).catch(() => {});
+			throw err;
+		}
 		if (this.#left) return;
 		assertSessionSwitchPreflight(this.#ctx.sessionManager, { kind: "session", path: replicaPath });
 
@@ -478,6 +524,7 @@ export class CollabGuestLink {
 		this.#clearAgentMirror();
 		this.state = pending.state;
 		reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
+		this.#reconcileLifecycle(pending.state.isStreaming);
 		this.#applyHostState(pending.state);
 		this.#ctx.resetObserverRegistry();
 		this.#applyAgentSnapshots(pending.agents);
@@ -574,6 +621,7 @@ export class CollabGuestLink {
 				setSessionTerminalTitle(frame.state.sessionName, frame.state.cwd);
 				this.#updateStatusSegment();
 				reconcileGuestSnapshotHostState(this.#ctx, frame.state.isStreaming);
+				this.#reconcileLifecycle(frame.state.isStreaming);
 				this.#ctx.statusLine.invalidate();
 				this.#ctx.ui.requestRender();
 				break;
@@ -636,6 +684,32 @@ export class CollabGuestLink {
 		}
 		const replicatedRunStartedAt = event.type === "agent_start" ? Date.now() : undefined;
 		void this.#ctx.eventController.handleEvent(this.#ctx.session, event, replicatedRunStartedAt);
+		// Lifecycle mirror: the guest's own agent loop never runs, so the session's
+		// extension-event path stays silent. Route the mirrored wire event through
+		// the same mapping the session uses so extension-installed lifecycle
+		// integrations observe host working/idle transitions while joined.
+		const runner = this.#ctx.session.extensionRunner;
+		if (runner) this.#lifecycleEmitter.emit(runner, event);
+	}
+
+	/**
+	 * Reconcile the lifecycle mirror with a host activity snapshot. A guest that
+	 * joins (or resyncs) mid-run missed the host's `agent_start`.
+	 */
+	#reconcileLifecycle(isStreaming: boolean): void {
+		const runner = this.#ctx.session.extensionRunner;
+		if (!runner) return;
+		if (isStreaming) {
+			if (!this.#lifecycleEmitter.sawAgentStart) {
+				this.#lifecycleEmitter.emit(runner, { type: "agent_start" });
+			}
+		} else if (this.#lifecycleEmitter.sawAgentStart) {
+			this.#lifecycleEmitter.emit(runner, {
+				type: "agent_end",
+				messages: [...this.#ctx.session.messages],
+				isTerminal: true,
+			});
+		}
 	}
 
 	/**
@@ -821,6 +895,10 @@ export class CollabGuestLink {
 		this.#pendingSnapshot = null;
 		this.#socket?.close();
 		this.#socket = null;
+		// The host's terminal `agent_end` may never arrive (leave mid-run,
+		// disconnect, `bye`): unlatch the pane before the local session takes
+		// over so extensions do not stay stuck on the host's last `agent_start`.
+		this.#reconcileLifecycle(false);
 		this.#restoration = this.#runRestoreLocalSession();
 		this.#ctx.collabController?.resumeAfterGuest(this.#restoration);
 		return this.#restoration;
@@ -830,7 +908,12 @@ export class CollabGuestLink {
 		// An already-running switch cannot be cancelled halfway through. Drain
 		// it before rollback; no queued frame may reactivate the replica later.
 		await this.#applyChain;
-		if (this.#replicaActivated) await this.#resumeLocalSession();
+		try {
+			if (this.#replicaActivated) await this.#resumeLocalSession();
+		} finally {
+			this.#replicaLease?.();
+			this.#replicaLease = undefined;
+		}
 		if (this.#ctx.collabGuest !== this) return false;
 		this.#ctx.collabGuest = undefined;
 		this.#ctx.syncRunningSubagentBadge();

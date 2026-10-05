@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
@@ -9,7 +10,7 @@ import {
 	isBrowserRegistered,
 	settleAuditBrowserLaunch,
 } from "../tools/browser/registry";
-import { getTab, hasTab } from "../tools/browser/tab-supervisor";
+import { captureBrowserAuditScreenshot, getTab, hasTab } from "../tools/browser/tab-supervisor";
 import {
 	type BrowserAuditAction,
 	type BrowserAuditAuthorization,
@@ -43,11 +44,16 @@ const browserAuditSchema = type({
 	"action_id?": "string",
 });
 type BrowserAuditRuntimeParams = typeof browserAuditSchema.infer;
-const browserAuditAuthority = Symbol("browser-audit-prepared-authority");
+const browserAuditAuthority = Symbol("browser-audit-authority");
+const browserAuditActivationLiveness = Symbol("browser-audit-activation-liveness");
 
 interface BrowserAuditProductionOptions extends BrowserAuditBindingInput {
 	readonly [browserAuditAuthority]: true;
 }
+
+type LiveBrowserAuditProductionOptions = BrowserAuditProductionOptions & {
+	readonly [browserAuditActivationLiveness]: (capability: object) => boolean;
+};
 
 export type BrowserAuditToolCapability = object;
 
@@ -107,6 +113,15 @@ export function bindBrowserAuditSessionOptions(
 	if (capability === undefined) return;
 	if (sessionOptionCapabilities.has(options)) throw new Error("browser_audit: session capability is already bound");
 	sessionOptionCapabilities.set(options, capability);
+}
+/** Only live broker activations may cross a trusted clone boundary. */
+export function copyBrowserAuditSessionCapability(source: object, target: object): void {
+	const capability = sessionOptionCapabilities.get(source);
+	if (capability === undefined) return;
+	const isLive = (capability as Partial<LiveBrowserAuditProductionOptions>)[browserAuditActivationLiveness];
+	if (typeof isLive !== "function" || !isLive(capability)) return;
+	if (sessionOptionCapabilities.has(target)) throw new Error("browser_audit: session capability is already bound");
+	sessionOptionCapabilities.set(target, capability);
 }
 
 export function takeBrowserAuditSessionCapability(options: object): BrowserAuditToolCapability | undefined {
@@ -198,6 +213,7 @@ function observation(
 function createBrowserAuditAuthorityBroker(): BrowserAuditAuthorityBroker {
 	const preparedBindings = new WeakMap<object, BrowserAuditBindingInput>();
 	const activatedBindings = new WeakSet<object>();
+	const isActivationLive = (capability: object): boolean => activatedBindings.has(capability);
 	const install = (key: object, options: BrowserAuditBindingInput): void => {
 		if (preparedBindings.has(key)) throw new Error("browser_audit: prepared binding already exists");
 		preparedBindings.set(key, freezeBindingInput(options));
@@ -233,7 +249,11 @@ function createBrowserAuditAuthorityBroker(): BrowserAuditAuthorityBroker {
 		) {
 			return undefined;
 		}
-		const capability = Object.freeze({ ...candidate, [browserAuditAuthority]: true as const });
+		const capability: LiveBrowserAuditProductionOptions = Object.freeze({
+			...candidate,
+			[browserAuditAuthority]: true as const,
+			[browserAuditActivationLiveness]: isActivationLive,
+		});
 		activatedBindings.add(capability);
 		return capability;
 	};
@@ -261,6 +281,7 @@ function routeAndViewportCode(
 		deviceScaleFactor: viewport.device_scale_factor,
 	});
 	return `
+{
 const expectedLocator = ${locator};
 const expectedViewport = ${expectedViewport};
 const current = await tab.observe();
@@ -268,6 +289,7 @@ if (current.url !== expectedLocator) throw new Error("authorized route state doe
 if (current.viewport.width !== expectedViewport.width || current.viewport.height !== expectedViewport.height || current.viewport.deviceScaleFactor !== expectedViewport.deviceScaleFactor) throw new Error("authorized viewport does not match current viewport");
 for (const selector of ${assertions}) {
   if (!(await page.$(selector))) throw new Error("authorized route state assertion is not satisfied");
+}
 }
 `;
 }
@@ -278,6 +300,8 @@ class NativeBrowserAuditAdapter implements HostEffectExecutor {
 	readonly #tuples: ReadonlyMap<string, BrowserAuditTuple>;
 	readonly #sessionName: string;
 	readonly #auditId: string;
+	#capturedScreenshotCount = 0;
+	#capturedScreenshotBytes = 0;
 	#ownedBrowser: BrowserHandle | null = null;
 	#opened = false;
 	#closed = false;
@@ -400,7 +424,7 @@ class NativeBrowserAuditAdapter implements HostEffectExecutor {
 				signal,
 			);
 			if (signal?.aborted || this.#closed) throw new Error("browser audit invalidated while running");
-			return observation(
+			const inspected = observation(
 				"PASS",
 				request.kind === "open"
 					? "opened authorized document"
@@ -409,6 +433,51 @@ class NativeBrowserAuditAdapter implements HostEffectExecutor {
 						: "performed authorized interaction",
 				request.kind === "open" ? "navigation" : request.kind === "inspect" ? "accessibility" : "interaction",
 			);
+			if (
+				request.kind !== "inspect" ||
+				this.#authorization.screenshot_policy.mode !== "allow-listed" ||
+				!this.#authorization.screenshot_policy.allowed_check_ids.includes(tuple.check_id)
+			) {
+				return inspected;
+			}
+			const policy = this.#authorization.screenshot_policy;
+			if (this.#capturedScreenshotCount >= policy.max_count) {
+				return { ...inspected, status: "BLOCKED", error: "screenshot count limit exceeded" };
+			}
+			if (request.audit_id !== this.#auditId)
+				throw new Error("browser audit identity changed before screenshot capture");
+			let bytes: Uint8Array;
+			try {
+				bytes = await captureBrowserAuditScreenshot(this.#auditId, this.#sessionName, signal);
+			} catch (error) {
+				if (signal?.aborted || this.#closed) throw error;
+				return {
+					...inspected,
+					status: "BLOCKED",
+					error: error instanceof Error ? error.message : String(error),
+				};
+			}
+			this.#capturedScreenshotCount++;
+			if (this.#capturedScreenshotBytes + bytes.byteLength > policy.max_bytes) {
+				return { ...inspected, status: "BLOCKED", error: "screenshot byte limit exceeded" };
+			}
+			this.#capturedScreenshotBytes += bytes.byteLength;
+			const sha256 = createHash("sha256").update(bytes).digest("hex");
+			return {
+				...inspected,
+				evidence: [
+					...(inspected.evidence ?? []),
+					{
+						evidence_id: "host-screenshot",
+						tuple_id: tuple.tuple_id,
+						kind: "screenshot",
+						locator: route.locator,
+						sha256,
+						description: "Captured authorized browser screenshot",
+						captured_byte_length: bytes.byteLength,
+					},
+				],
+			};
 		} catch (error) {
 			const settled = await settleAuditBrowserLaunch(this.#auditId);
 			const tab = getTab(this.#sessionName, request.audit_id);

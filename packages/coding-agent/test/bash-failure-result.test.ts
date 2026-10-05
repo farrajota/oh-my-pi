@@ -53,7 +53,7 @@ function makeSession(asyncJobManager?: AsyncJobManager): ToolSession {
 }
 
 describe("BashTool execution results", () => {
-	it("executes async Bash unchanged without retaining the raw command as job metadata", async () => {
+	it("uses a stable display label for async Bash jobs", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		const secret = "ASYNC_BASH_SENTINEL_SECRET";
 		const command = `printf '%s' '${secret}'`;

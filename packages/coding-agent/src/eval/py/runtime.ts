@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $env, $which, getPythonEnvDir } from "@oh-my-pi/pi-utils";
+import { SECRET_KEY_PATTERN } from "../runtime-env";
 
 const DEFAULT_ENV_ALLOWLIST = new Set([
 	"PATH",
@@ -140,6 +141,7 @@ export function filterEnv(env: Record<string, string | undefined>): Record<strin
 			filtered[destKey] = value;
 			continue;
 		}
+		if (SECRET_KEY_PATTERN.test(normalizedKey)) continue;
 		if (NORMALIZED_ALLOW_PREFIXES.some(prefix => normalizedKey.startsWith(prefix))) {
 			filtered[key] = value;
 		}
@@ -211,7 +213,14 @@ export function resolveExplicitPythonRuntime(
 			: interpreter.startsWith("~/")
 				? path.join(os.homedir(), interpreter.slice(2))
 				: interpreter;
-	const pythonPath = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+	// Join (rather than resolve) onto an absolute cwd so the result stays anchored to
+	// exactly the cwd given — `path.resolve` would graft the process drive onto a
+	// rooted-but-driveless Windows cwd such as `\work`.
+	const pythonPath = path.isAbsolute(expanded)
+		? expanded
+		: path.isAbsolute(cwd)
+			? path.join(cwd, expanded)
+			: path.resolve(cwd, expanded);
 	const venv = detectExplicitVenv(pythonPath);
 	if (venv) {
 		return { pythonPath, env: applyVenvEnv(baseEnv, venv.venvPath, venv.binDir), venvPath: venv.venvPath };

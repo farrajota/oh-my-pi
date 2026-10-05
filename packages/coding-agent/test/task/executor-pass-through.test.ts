@@ -1,5 +1,5 @@
 /** Regression tests for the fresh child-session option boundary. */
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { resolveThresholdTokens, shouldCompact } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, ServiceTierByFamily } from "@oh-my-pi/pi-ai";
@@ -16,14 +16,19 @@ import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, EffectivePermissionSummary } from "@oh-my-pi/pi-coding-agent/task/types";
 import { resolveTaskEffortLevel } from "@oh-my-pi/pi-tui/thinking";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 import { cfgTierAnthropic, cfgTierGoogle, cfgTierOpenai } from "@oh-my-pi/pi-coding-agent/session/settings";
 
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 function createMockSession(
 	onPrompt: (params: { text: string; emit: (event: AgentSessionEvent) => void }) => void,
 ): AgentSession {
@@ -31,6 +36,8 @@ function createMockSession(
 	const emit = (event: AgentSessionEvent) => {
 		for (const listener of listeners) listener(event);
 	};
+	const sessionManager = SessionManager.inMemory("/tmp");
+	installSessionOperationLedger(sessionManager);
 	const session = {
 		...createSessionDefaults(),
 		state: { messages: [] },
@@ -42,7 +49,7 @@ function createMockSession(
 		},
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		sessionManager,
 		getActiveToolNames: () => ["read", "yield"],
 		getPermissionSummary: () => undefined,
 		getEnabledToolNames: () => ["read", "yield"],
@@ -92,9 +99,12 @@ const baseAgent: AgentDefinition = {
 	systemPrompt: "test",
 	source: "bundled",
 };
-const registry = new AgentRegistry();
-const createAuthoritySession = (options: CreateAgentSessionOptions & { agentId: string }) =>
-	sdkModule.createAgentSession({ ...options, agentRegistry: registry });
+let registry: AgentRegistry;
+let tempDir: TempDir;
+const authorityRoots: AgentSession[] = [];
+let createAuthoritySession: (
+	options: CreateAgentSessionOptions & { agentId: string },
+) => Promise<CreateAgentSessionResult>;
 
 const baseOptions = {
 	cwd: "/tmp",
@@ -102,11 +112,16 @@ const baseOptions = {
 	task: "do work",
 	index: 0,
 	id: "subagent-pass-through",
+	parentAgentId: "Main",
 	settings: Settings.isolated(),
 	modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 	enableLsp: false,
-	createAuthoritySession,
-	agentRegistry: registry,
+	get createAuthoritySession() {
+		return createAuthoritySession;
+	},
+	get agentRegistry() {
+		return registry;
+	},
 };
 
 function createModelRegistry(
@@ -122,6 +137,23 @@ function createModelRegistry(
 	} as unknown as ModelRegistry;
 }
 
+beforeEach(async () => {
+	tempDir = TempDir.createSync("@pi-pass-through-");
+	const rootSessionFile = tempDir.join("main.jsonl");
+	await Bun.write(rootSessionFile, "");
+	registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
+	const root = await createAgentRootSession(registry, { agentId: "Main" });
+	authorityRoots.push(root.session);
+	const authority = bindInternalAgentAuthoritySession(registry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	createAuthoritySession = authority.create;
+});
+
+afterEach(async () => {
+	vi.restoreAllMocks();
+	for (const root of authorityRoots.splice(0)) await root.dispose();
+	tempDir[Symbol.dispose]();
+});
 describe("runSubprocess fresh child-session boundary", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -205,8 +237,9 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(spy.mock.calls[0]?.[0]?.getApiKey).toBe(getApiKey);
 	});
 	it("preserves empty and absent agent tool declarations through session creation", async () => {
-		const session = yieldEmittingSession();
-		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const spy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockImplementation(async () => createSessionResult(yieldEmittingSession()));
 		const emptyFields = parseAgentFields({ name: "quiet", description: "desc", tools: [] });
 		const absentFields = parseAgentFields({ name: "default", description: "desc" });
 		if (!emptyFields || !absentFields) throw new Error("agent fields did not parse");
@@ -231,8 +264,9 @@ describe("runSubprocess fresh child-session boundary", () => {
 	});
 
 	it("grants wait only to unrestricted subagents that can start background work, and requires write for peers", async () => {
-		const session = yieldEmittingSession();
-		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const spy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockImplementation(async () => createSessionResult(yieldEmittingSession()));
 
 		const readOnlyResult = await runSubprocess({
 			...baseOptions,
@@ -279,6 +313,10 @@ describe("runSubprocess fresh child-session boundary", () => {
 	});
 
 	it("records the spawning agent as parentAgentId, distinct from the child's own id and prefix", async () => {
+		const root = await createAgentRootSession(registry, { agentId: "SpawnerAgent" });
+		authorityRoots.push(root.session);
+		const authority = bindInternalAgentAuthoritySession(registry, root.session);
+		if (!authority) throw new Error("Test fixture requires SpawnerAgent authority");
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 
@@ -286,6 +324,7 @@ describe("runSubprocess fresh child-session boundary", () => {
 			...baseOptions,
 			id: "ChildAgent",
 			parentAgentId: "SpawnerAgent",
+			createAuthoritySession: authority.create,
 		});
 
 		expect(result.exitCode).toBe(0);
@@ -623,6 +662,51 @@ describe("runSubprocess fresh child-session boundary", () => {
 		expect(spy).not.toHaveBeenCalled();
 	});
 
+	it("ranks the agent-definition thinking level above the parent's inherited live effort", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		// An agent that inherits the session model receives the parent's live selector, `:high` included.
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-inherited-live-effort",
+			modelOverride: [`${model.provider}/${model.id}:high`],
+			modelInheritsLiveThinkingLevel: true,
+			settings: Settings.isolated(),
+			modelRegistry: createModelRegistry(model),
+			thinkingLevel: ThinkingLevel.Low,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(spy.mock.calls[0]?.[0]?.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(result.resolvedModel).toBe(`${model.provider}/${model.id}:low`);
+	});
+
+	it("keeps the agent-definition thinking level when credentials fall back to the parent", async () => {
+		const requested = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const parentModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+		if (!requested || !parentModel) throw new Error("Expected bundled models to exist");
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			agent: { ...baseAgent, model: [`${requested.provider}/${requested.id}`] },
+			id: "subagent-auth-fallback-effort",
+			parentActiveModelPattern: `${parentModel.provider}/${parentModel.id}:high`,
+			settings: Settings.isolated(),
+			modelRegistry: createModelRegistry([requested, parentModel], async model =>
+				model.provider === parentModel.provider ? "test-key" : undefined,
+			),
+			thinkingLevel: ThinkingLevel.Low,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(spy.mock.calls[0]?.[0]?.model?.provider).toBe(parentModel.provider);
+		expect(spy.mock.calls[0]?.[0]?.thinkingLevel).toBe(ThinkingLevel.Low);
+	});
 	it("persists an explicit role from a caller model override", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");

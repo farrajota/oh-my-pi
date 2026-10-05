@@ -17,6 +17,7 @@ import {
 } from "../executor-base";
 import type { JsStatusEvent } from "../js/shared/types";
 import { getEnabledEvalPreludes } from "../preludes";
+import { updateEvalState } from "../state";
 import type { EvalToolDescriptor, EvalToolInvokeResult } from "../types";
 import {
 	createKernelSessionRegistry,
@@ -149,6 +150,8 @@ export interface PythonResult {
 	truncated: boolean;
 	/** Artifact ID if full output was saved to artifact storage */
 	artifactId?: string;
+	/** Bytes the artifact cap dropped from the saved file's middle (the artifact is a head/tail sample). */
+	artifactElidedBytes?: number;
 	artifactError?: OutputArtifactError;
 	/** Total number of lines in the output stream */
 	totalLines: number;
@@ -182,6 +185,19 @@ interface SessionKernelReplacement {
 interface PythonSession extends KernelSession<PythonKernel> {
 	generation: number;
 	replacement?: SessionKernelReplacement;
+	stateSessions: Set<ToolSession>;
+}
+
+function publishPythonKernelState(session: PythonSession, alive: boolean, loadedPath?: string): void {
+	for (const toolSession of session.stateSessions) {
+		updateEvalState(toolSession, {
+			language: "python",
+			kernelId: session.kernel.id,
+			alive,
+			interpreter: session.kernel.interpreter,
+			...(alive && loadedPath ? { loadedPath } : {}),
+		});
+	}
 }
 
 function normalizeExplicitInterpreter(cwd: string, interpreter: string | undefined): string {
@@ -279,6 +295,7 @@ async function replaceSessionKernel(
 			await kernel
 				.shutdown(remaining !== undefined ? { timeoutMs: Math.max(0, remaining) } : undefined)
 				.catch(() => undefined);
+			if (!kernel.isAlive()) publishPythonKernelState(session, false);
 			if (replacement.deadlineMs !== undefined && replacement.deadlineMs <= Date.now()) {
 				throw new PythonExecutionCancelledError(true);
 			}
@@ -317,7 +334,9 @@ async function replaceSessionKernel(
 async function shutdownInvalidatedSession(session: PythonSession): Promise<KernelShutdownResult> {
 	const replacement = session.replacement;
 	if (replacement) await replacement.promise.catch(() => undefined);
-	return await session.kernel.shutdown();
+	const result = await session.kernel.shutdown();
+	if (!session.kernel.isAlive()) publishPythonKernelState(session, false);
+	return result;
 }
 
 async function acquireLiveSessionKernel(
@@ -371,6 +390,29 @@ async function executeWithKernel(
 	});
 }
 
+async function executeInTrackedPythonSession(
+	kernel: PythonKernel,
+	code: string,
+	options: PythonExecutorOptions,
+): Promise<PythonResult> {
+	const session = sessionRegistry.getPresentSession(options.cwd ?? getProjectDir(), options);
+	if (session?.kernel !== kernel || !options.toolSession) return await executeWithKernel(kernel, code, options);
+	session.stateSessions.add(options.toolSession);
+	publishPythonKernelState(session, true);
+	try {
+		const result = await executeWithKernel(kernel, code, options);
+		if (kernel.isAlive()) {
+			publishPythonKernelState(session, true, result.exitCode === 0 ? options.filename : undefined);
+		} else {
+			publishPythonKernelState(session, false);
+		}
+		return result;
+	} catch (error) {
+		if (!kernel.isAlive()) publishPythonKernelState(session, false);
+		throw error;
+	}
+}
+
 async function ensureKernelAvailable(cwd: string, options: PythonExecutorOptions): Promise<void> {
 	const availability = await waitForPromiseWithCancellation(
 		checkPythonKernelAvailability(cwd, options.interpreter),
@@ -412,9 +454,9 @@ const sessionRegistry = createKernelSessionRegistry<PythonKernel, PythonExecutor
 		const normalizedCwd = normalizeKernelSessionCwd(cwd);
 		return `${sessionId}\0${normalizedCwd}\0${normalizeExplicitInterpreter(normalizedCwd, interpreter)}`;
 	},
-	createSession: session => ({ ...session, generation: 0 }),
+	createSession: session => ({ ...session, generation: 0, stateSessions: new Set() }),
 	startKernel,
-	executeWithKernel,
+	executeWithKernel: executeInTrackedPythonSession,
 	replaceSessionKernel,
 	acquireLiveSessionKernel,
 	invalidateSession: session => {

@@ -74,7 +74,7 @@ import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import { parseAgent } from "./agents";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled, listEvalTools } from "./eval-tools";
-import { type RunSubprocessOptions, runSubprocess } from "./executor";
+import { type ExecutorOptions, runSubprocess } from "./executor";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -106,9 +106,13 @@ import {
 	applySpawnHook,
 	describeSalvagedWork,
 	type EffectiveSubagentPolicy,
+	invalidModelSelectorReason,
 	resolveEffectiveSubagentPolicy,
+	runStructuredSubagent,
 	StructuredSubagentError,
 } from "./structured-subagent";
+import { SpawnRun, type SpawnPermit } from "./spawn-run";
+import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
 import { applyTaskToolProfile } from "./tool-profiles";
 import { type IsoBackendKind, parseIsolationBackend } from "./worktree";
 
@@ -418,6 +422,7 @@ function validateRawTaskArguments(args: unknown, modelEnabled: boolean): void {
 
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
 	return {
+		isError: true,
 		content: [{ type: "text", text }],
 		details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
 	};
@@ -433,6 +438,9 @@ function validateShapeParams(
 	permissionsEnabled: boolean,
 	params: TaskParams,
 ): string | undefined {
+	if (params.tasks !== undefined && Object.hasOwn(params, "model")) {
+		return "Put each model selector on its tasks[] item, not on the batch container.";
+	}
 	if (Object.hasOwn(params, "schema")) {
 		return "The task tool uses `outputSchema`; rename the stale `schema` field.";
 	}
@@ -476,8 +484,11 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			if (!item || typeof item.task !== "string" || item.task.trim() === "") {
 				return `Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""} is missing \`task\`. Every task needs complete, self-contained instructions.`;
 			}
-			const effortError = validateEffort(item.effort, `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`);
+			const label = `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`;
+			const effortError = validateEffort(item.effort, label);
 			if (effortError) return effortError;
+			const modelError = invalidModelSelectorReason(item.model, label);
+			if (modelError) return modelError;
 		}
 		const seen = new Map<string, string>();
 		for (const item of tasks) {
@@ -500,7 +511,7 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			? "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`."
 			: "Missing `task`. Provide complete, self-contained instructions for the agent.";
 	}
-	return validateEffort(params.effort, "The call");
+	return validateEffort(params.effort, "The call") ?? invalidModelSelectorReason(params.model, "The call");
 }
 
 /**
@@ -524,6 +535,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
 	if ("tools" in params) item.tools = params.tools;
 	if ("effort" in params) item.effort = params.effort;
+	if ("model" in params) item.model = params.model;
 	if ("isolated" in params) item.isolated = params.isolated;
 	return [item];
 }
@@ -552,6 +564,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
 	if ("tools" in item) spawn.tools = item.tools;
 	if ("effort" in item) spawn.effort = item.effort;
+	if ("model" in item) spawn.model = item.model;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -1083,6 +1096,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 			...(params.effort !== undefined ? { effort: params.effort } : {}),
+			...(params.model !== undefined ? { model: params.model } : {}),
 			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 			blockedAgent: this.#blockedAgent,
 			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(settings),
@@ -1376,7 +1390,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				: null,
 			agentDefinitionSha256: reservation?.effectiveAgent.definitionSha256 ?? null,
 			agentBlocking: reservation?.effectiveAgent.blocking === true,
-			requestedModel: reservation?.params.model ?? null,
+			requestedModel:
+				reservation?.params.model === undefined
+					? null
+					: Array.isArray(reservation.params.model)
+						? JSON.stringify(reservation.params.model)
+						: reservation.params.model,
 			toolProfile: reservation?.params.toolProfile ?? null,
 			toolCallFingerprint,
 		});
@@ -1559,7 +1578,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						task: renderSubagentUserPrompt(assignment),
 						assignment,
 						modelOverride: policy.modelOverride,
-						requestedModel: item.model,
+						requestedModel: Array.isArray(item.model) ? item.model.join(", ") : item.model,
 						recentTools: [],
 						recentOutput: [],
 						toolCount: 0,
@@ -2207,7 +2226,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		let modelOverride = preparedPolicy.modelOverride;
 		let modelRoute = preparedPolicy.modelRoute;
 		const modelRole = preparedPolicy.modelRole;
-		const requestedModel = params.model;
+		const requestedModel =
+			params.model === undefined ? undefined : Array.isArray(params.model) ? params.model.join(", ") : params.model;
 		const exactModelOverride = requestedModel !== undefined;
 		const effectiveOutputSchema = preparedPolicy.schema.schema;
 		const outputSchemaSource = preparedPolicy.schema.source;
@@ -2302,7 +2322,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				? createEvalCustomTools(this.session, await describeEvalTools(this.session, params.tools, signal))
 				: [];
 
-			const sharedRunOptions: RunSubprocessOptions = {
+			const sharedRunOptions: ExecutorOptions = {
 				settings: preparedSettings,
 				artifactsDir: this.session.getArtifactsDir?.() ?? effectiveArtifactsDir,
 
@@ -2320,12 +2340,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				context: sharedContext,
 				...(allowEffortOverride && params.effort !== undefined ? { effort: params.effort } : {}),
 				solutionSpace: params.solutionSpace,
+				...(params.model !== undefined ? { model: params.model } : {}),
 				planReference,
 				outputSchema: effectiveOutputSchema,
 				outputSchemaMode,
 				outputSchemaSource,
 				outputSchemaOverridesAgent,
 				customTools: evalCustomTools.length > 0 ? evalCustomTools : undefined,
+				// `name` is the spawn handle: keep it for id allocation when this
+				// path did not pre-reserve one. Do not treat it as a HUD description.
+				identity: { id: preAllocatedId, label: params.name },
 				index: spawnIndex,
 				parentToolCallId: toolCallId,
 				detached,
@@ -2384,7 +2408,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				permissionScope,
 				permissionSnapshot,
 				parentServiceTier,
-			} satisfies RunSubprocessOptions;
+			} satisfies ExecutorOptions;
 			bindBrowserAuditRunOptions(sharedRunOptions.agent, browserAudit);
 
 			const runTask = async (): Promise<SingleResult> => {

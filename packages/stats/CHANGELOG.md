@@ -6,6 +6,10 @@
 
 - Added exact per-model results during large rollup backlogs, so usage includes messages still awaiting rollup.
 
+### Fixed
+
+- Kept copied fork requests attributed to the parent transcript when parent and fork share a recency tier, regardless of parse completion order, including parallel worker pools. Parsing stays bounded and parallel while ingestion follows ranked input order; across tiers, the more-recent transcript wins, so a recent fork can own copies from an idle parent.
+
 ## [18.4.4] - 2026-09-29
 
 ### Added

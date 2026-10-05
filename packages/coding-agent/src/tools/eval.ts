@@ -38,7 +38,8 @@ import { truncateForPrompt } from "./approval";
 import { type EvalBackendsAllowance, resolveEvalBackends } from "./eval-backends";
 import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
 import { upsertStatusEvent } from "@oh-my-pi/pi-tui/tools/eval";
-import { formatOutputNotice, resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "./output-meta";
+import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { resolveOutputMaxColumns, resolveOutputSinkArtifactMaxBytes, resolveOutputSinkHeadBytes } from "./output-meta";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { hasWaitTool } from "./wait";
 import { toolResult } from "./tool-result";
@@ -845,6 +846,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				artifactPath,
 				artifactId,
 				headBytes: resolveOutputSinkHeadBytes(session.settings),
+				artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(session.settings),
 				maxColumns: resolveOutputMaxColumns(session.settings),
 				onChunk: chunk => {
 					if (suppressArtifactOnly) return;
@@ -1020,7 +1022,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						language: languages[0],
 						languages,
 						cells: cellResults,
-						jsonOutputs: summaryForMeta.artifactId ? undefined : jsonOutputs.length > 0 ? jsonOutputs : undefined,
+						jsonOutputs:
+							summaryForMeta.artifactId && !summaryForMeta.artifactElidedBytes
+								? undefined
+								: jsonOutputs.length > 0
+									? jsonOutputs
+									: undefined,
 						statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 						isError: true,
 					};
@@ -1053,7 +1060,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				language: languages[0],
 				languages,
 				cells: cellResults,
-				jsonOutputs: summaryForMeta.artifactId ? undefined : jsonOutputs.length > 0 ? jsonOutputs : undefined,
+				jsonOutputs:
+					summaryForMeta.artifactId && !summaryForMeta.artifactElidedBytes
+						? undefined
+						: jsonOutputs.length > 0
+							? jsonOutputs
+							: undefined,
 				statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 			};
 			if (notice) details.notice = notice;
@@ -1091,7 +1103,7 @@ async function summarizeFinal(
 	const missingBytes = Math.max(0, rawSummary.totalBytes - rawSummary.outputBytes);
 	return {
 		output: combinedOutput,
-		truncated: rawSummary.truncated,
+		truncated: rawSummary.truncated || (rawSummary.artifactElidedBytes ?? 0) > 0,
 		totalLines: outputLines + missingLines,
 		totalBytes: outputBytes + missingBytes,
 		outputLines,
@@ -1099,6 +1111,7 @@ async function summarizeFinal(
 		elidedBytes: rawSummary.elidedBytes,
 		elidedLines: rawSummary.elidedLines,
 		artifactId: rawSummary.artifactId,
+		artifactElidedBytes: rawSummary.artifactElidedBytes,
 		artifactError: rawSummary.artifactError,
 		columnDroppedBytes: rawSummary.columnDroppedBytes,
 		columnTruncatedLines: rawSummary.columnTruncatedLines,

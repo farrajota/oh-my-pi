@@ -13,7 +13,7 @@ import {
 	type SpawnedSubprocess,
 	smokeTestWorker,
 } from "../subprocess/worker-client";
-import { tinyWorkerEnv } from "../tiny/title-client";
+import { tinyModelEnvKey, tinyWorkerEnv } from "../tiny/model-worker-env";
 import { getTtsLocalModelSpec, isTtsLocalModelKey, type TtsLocalModelKey } from "./models";
 import type { TtsProgressEvent, TtsWorkerInbound, TtsWorkerOutbound } from "./tts-protocol";
 
@@ -156,6 +156,7 @@ export class TtsClient {
 		this.#host = new ModelWorkerHost({
 			name: "tts",
 			spawnWorker,
+			getWorkerEnvKey: tinyModelEnvKey,
 			modelLabel: modelKey => getTtsLocalModelSpec(modelKey)?.label ?? modelKey,
 			handleMessage: message => this.#handleMessage(message),
 			failRequest: (request, error, terminated) => {

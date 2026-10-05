@@ -7,6 +7,7 @@ import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-en
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { writeTerminalBreadcrumb } from "@oh-my-pi/pi-coding-agent/session/session-paths";
+import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getTerminalId } from "@oh-my-pi/pi-tui";
 import { getConfigRootDir, getTerminalSessionsDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
@@ -157,6 +158,34 @@ describe("SessionManager.continueRecent relocation", () => {
 			expect(getHeader(entries)?.cwd).toBe(path.resolve(cwdB));
 			const userMessages = entries.filter(e => e.type === "message" && e.message.role === "user");
 			expect(userMessages).toHaveLength(1);
+		} finally {
+			await resumed.close();
+		}
+	});
+
+	it("starts without re-rooting when another live process still writes the moved session", async () => {
+		const session = SessionManager.create(cwdA);
+		session.appendMessage({ role: "user", content: "before move", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const oldFile = session.getSessionFile();
+		const ownedId = session.getSessionId();
+		if (!oldFile) throw new Error("Expected persisted session file");
+		await session.close();
+		writeBreadcrumb(cwdA, oldFile);
+		await renameProjectDir(cwdA, cwdB);
+
+		// The omp that was running in the renamed directory still holds the session.
+		class OwnedElsewhereStorage extends FileSessionStorage {
+			override claimSession(sessionId: string, sessionPath: string): (() => void) | null {
+				return sessionId === ownedId ? null : super.claimSession(sessionId, sessionPath);
+			}
+		}
+		const resumed = await SessionManager.continueRecent(cwdB, undefined, new OwnedElsewhereStorage());
+		try {
+			// Startup goes on, and the owner's file is not moved out from under it.
+			expect(resumed.getSessionFile()).not.toBe(oldFile);
+			expect(fs.existsSync(oldFile)).toBe(true);
 		} finally {
 			await resumed.close();
 		}
@@ -333,6 +362,41 @@ describe("SessionManager.continueRecent relocation", () => {
 			// The empty stub must not shadow cwdB's latest answered transcript.
 			expect(resumed.getSessionFile()).toBe(path.resolve(localFile));
 			expect(fs.existsSync(movedFile)).toBe(true);
+		} finally {
+			await resumed.close();
+		}
+	});
+
+	it("prefers a nonempty current-cwd session even with positive relocation identity", async () => {
+		const explicitSessionDir = path.join(testAgentDir, "shared-positive-identity-sessions");
+		const local = SessionManager.create(cwdB, explicitSessionDir);
+		local.appendMessage({ role: "user", content: "local current cwd", timestamp: 1 });
+		local.appendMessage(makeAssistantMessage());
+		await local.flush();
+		const localFile = local.getSessionFile();
+		if (!localFile) throw new Error("Expected persisted local session file");
+		await local.close();
+
+		const moved = SessionManager.create(cwdA, explicitSessionDir);
+		moved.appendMessage({ role: "user", content: "moved project", timestamp: 2 });
+		moved.appendMessage(makeAssistantMessage());
+		await moved.flush();
+		const movedFile = moved.getSessionFile();
+		if (!movedFile) throw new Error("Expected persisted moved session file");
+		await moved.close();
+		const oldest = new Date("2026-02-01T00:00:00.000Z");
+		const newest = new Date("2026-02-03T00:00:00.000Z");
+		fs.utimesSync(localFile, oldest, oldest);
+		fs.utimesSync(movedFile, newest, newest);
+		const movedTranscript = await fsp.readFile(movedFile, "utf8");
+		writeBreadcrumb(cwdA, movedFile);
+		await renameProjectDir(cwdA, cwdB);
+
+		const resumed = await SessionManager.continueRecent(cwdB, explicitSessionDir);
+		try {
+			expect(resumed.getSessionFile()).toBe(localFile);
+			expect(resumed.getCwd()).toBe(path.resolve(cwdB));
+			expect(await fsp.readFile(movedFile, "utf8")).toBe(movedTranscript);
 		} finally {
 			await resumed.close();
 		}
