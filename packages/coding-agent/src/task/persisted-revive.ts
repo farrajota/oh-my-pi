@@ -74,6 +74,9 @@ type PersistedRevivalInit = Pick<
 	| "systemPrompt"
 	| "task"
 	| "tools"
+	| "startupToolNames"
+	| "enableLsp"
+	| "enableIrc"
 	| "agent"
 	| "modelRole"
 	| "resolvedModel"
@@ -95,6 +98,16 @@ type PersistedRevivalInit = Pick<
 	| "workPoolYieldItems"
 >;
 
+/** A transcript-supplied spawn tool list must be absent (legacy), `null`, or a string array. */
+function hasValidStartupToolNames(init: Pick<PersistedRevivalInit, "startupToolNames">): boolean {
+	const startupToolNames: unknown = init.startupToolNames;
+	return (
+		startupToolNames === undefined ||
+		startupToolNames === null ||
+		(Array.isArray(startupToolNames) && startupToolNames.every(name => typeof name === "string"))
+	);
+}
+
 async function validatePersistedRevivalContract(
 	init: PersistedRevivalInit,
 	cwd: string,
@@ -110,6 +123,7 @@ async function validatePersistedRevivalContract(
 > {
 	const persistedSnapshot = init.permissionSnapshot;
 	if (!persistedSnapshot) return undefined;
+	if (!hasValidStartupToolNames(init)) return undefined;
 	const permissionSnapshot = freezePermissionScope(persistedSnapshot.scope);
 	if (permissionSnapshot.canonicalSha256 !== persistedSnapshot.canonicalSha256) return undefined;
 	const permissionSummary = buildEffectivePermissionSummary(
@@ -207,6 +221,7 @@ export function createPersistedSubagentReviverFactory(
 			return undefined;
 		}
 		const init = peek.init;
+		if (!hasValidStartupToolNames(init)) return undefined;
 		const persistedSnapshot = init.permissionSnapshot;
 		if (!persistedSnapshot) return undefined;
 		const permissionSnapshot = freezePermissionScope(persistedSnapshot.scope);
@@ -357,12 +372,19 @@ export function createPersistedSubagentReviverFactory(
 					init.readOnly === true && init.tools.includes("write")
 						? init.tools.filter(name => name !== "write")
 						: init.tools;
+				// Session creation replays the spawn's own tool list so the durable startup identity
+				// matches; the active set is clamped to the persisted grant right after creation.
+				// Transcripts written before the list was kept fall back to the persisted grant.
+				const startupToolNames =
+					init.startupToolNames === undefined ? revivedToolNames : (init.startupToolNames ?? undefined);
 				const restrictToolNames = init.restrictToolNames === true;
 				const startupPolicy = deriveRestrictedStartupPolicy({
 					permissionScope: permissionSnapshot.scope,
 					restrictToolNames,
-					toolNames: revivedToolNames,
-					enableLsp: ctx.enableLsp,
+					toolNames: startupToolNames,
+					// Replay the spawn's LSP switch (the identity binds it); a root that has since
+					// disabled LSP still wins, which fails closed on the identity check.
+					enableLsp: init.enableLsp === undefined ? ctx.enableLsp : init.enableLsp && ctx.enableLsp,
 					enableMCP: (init.enableMCP ?? true) && ctx.enableMCP,
 				});
 				const ownerExtensionRoots = ctx.session.effectiveExtensionRoots;
@@ -415,7 +437,7 @@ export function createPersistedSubagentReviverFactory(
 								: ref.displayName,
 						parentTaskPrefix: ref.id,
 						taskDepth,
-						toolNames: revivedToolNames,
+						toolNames: startupToolNames,
 						outputSchema: init.outputSchema,
 						outputSchemaMode: init.outputSchemaMode,
 						restrictToolNames,
@@ -428,7 +450,9 @@ export function createPersistedSubagentReviverFactory(
 						spawns: init.spawns ?? "",
 						hasUI: false,
 						enableLsp: startupPolicy.enableLsp,
-						enableIrc: restrictToolNames ? false : undefined,
+						// The identity binds the spawn's IRC switch; session creation still disables IRC
+						// for tool-restricted sessions. Older transcripts keep the previous derivation.
+						enableIrc: init.enableIrc ?? (restrictToolNames ? false : undefined),
 						enableMCP,
 						...(mcpManager
 							? {
@@ -443,6 +467,8 @@ export function createPersistedSubagentReviverFactory(
 				// Clamp the active set to the persisted list: createAgentSession's
 				// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
 				// the original run didn't carry. Unknown/missing names are ignored.
+				// The persisted list is not itself identity-bound; it can only select
+				// within the tools the identity-bound spawn list registered.
 				await session.setActiveToolsByName([...revivedToolNames, ...session.getMountedXdevToolNames()]);
 				if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
 				// Wire the extension runtime exactly as the live executor does. Without

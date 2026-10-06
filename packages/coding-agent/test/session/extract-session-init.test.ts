@@ -74,6 +74,24 @@ describe("extractSessionInit", () => {
 		expect(peek?.init?.enableMCP).toBe(false);
 	});
 
+	it.each([
+		["no explicit list", null],
+		["an explicit list", ["read"]],
+	] as const)("keeps the spawn's tool list (%s) when a rebuilt session_init is re-appended", async (_label, list) => {
+		const { manager, sessionFile } = createManager();
+		const startupToolNames = list === null ? null : [...list];
+		manager.appendSessionInit({ systemPrompt: ["base"], task: "work", tools: ["read", "yield"], startupToolNames });
+		await manager.ensureOnDisk();
+		const extracted = extractSessionInit(manager.getEntries());
+		if (!extracted) throw new Error("Expected a persisted session_init");
+		manager.appendSessionInit({ ...extracted, systemPrompt: ["base", "rebuilt"] });
+		await manager.flush();
+
+		const peek = await SessionManager.peekSessionInit(sessionFile);
+		expect(peek?.init?.systemPrompt).toEqual(["base", "rebuilt"]);
+		expect(peek?.init?.startupToolNames).toEqual(startupToolNames);
+	});
+
 	it("carries the latest permission summary update into the rebuilt contract", () => {
 		const { manager } = createManager();
 		const permissions = childPermissions();

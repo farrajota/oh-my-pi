@@ -3557,6 +3557,9 @@ export class SessionManager {
 		systemPrompt: string[];
 		task: string;
 		tools: string[];
+		startupToolNames?: string[] | null;
+		enableLsp?: boolean;
+		enableIrc?: boolean;
 		toolDefinitions?: SessionInitToolDefinition[];
 		agent?: string;
 		modelRole?: string;
@@ -4328,6 +4331,9 @@ export interface PersistedSessionInit {
 	systemPrompt: string[];
 	task: string;
 	tools: string[];
+	startupToolNames?: string[] | null;
+	enableLsp?: boolean;
+	enableIrc?: boolean;
 	toolDefinitions?: SessionInitToolDefinition[];
 	agent?: string;
 	modelRole?: string;
@@ -4375,6 +4381,9 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			systemPrompt: typeof entry.systemPrompt === "string" ? [entry.systemPrompt] : entry.systemPrompt,
 			task: entry.task,
 			tools: entry.tools,
+			...(entry.startupToolNames !== undefined ? { startupToolNames: entry.startupToolNames } : undefined),
+			...(entry.enableLsp !== undefined ? { enableLsp: entry.enableLsp } : undefined),
+			...(entry.enableIrc !== undefined ? { enableIrc: entry.enableIrc } : undefined),
 			...(entry.toolDefinitions !== undefined ? { toolDefinitions: entry.toolDefinitions } : undefined),
 			agent: entry.agent,
 			modelRole: entry.modelRole,

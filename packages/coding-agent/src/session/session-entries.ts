@@ -252,6 +252,16 @@ export interface SessionInitEntry extends SessionEntryBase {
 	task: string;
 	/** Tools available to the agent */
 	tools: string[];
+	/**
+	 * Tool list the spawn passed to session creation (`null`: none, so the agent defaults applied).
+	 * The durable authority identity is bound to it, so cold revival must replay it rather than
+	 * `tools`, which records what the session enabled. Absent in files written before it was kept.
+	 */
+	startupToolNames?: string[] | null;
+	/** LSP switch the spawn passed to session creation; bound into the durable authority identity. */
+	enableLsp?: boolean;
+	/** Whether the spawn left IRC enabled (`enableIrc !== false`); bound into the durable authority identity. */
+	enableIrc?: boolean;
 	/** Sanitized definitions for the exact active tools. Never contains executable closures or credential runtime state. */
 	toolDefinitions?: SessionInitToolDefinition[];
 	/** Agent definition name (for example `scout` or `reviewer`). */

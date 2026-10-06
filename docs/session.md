@@ -426,6 +426,13 @@ The latest `session_init` is also the cold-subagent revival contract. Optional
 fields include `agent`, `modelRole`, `resolvedModel`, `retryFallback`, `readOnly`,
 `advisor`, and `compactionThreshold` (`thresholdPercent`/`thresholdTokens`).
 `isolated: true` marks an isolation-worktree child that cannot be cold-revived.
+`startupToolNames` is the tool list the spawn passed to session creation (`null` when it passed
+none); the durable authority identity is bound to it, so revival creates the session from it and
+then clamps the active tools to `tools`. Files without it revive from `tools` alone.
+`enableLsp` and `enableIrc` record the spawn's feature switches, which the identity also binds;
+revival replays them (a root that has since disabled LSP still turns it off and fails closed). Permission
+fields (`permissionSnapshot`, `permissionSummary`, permission profiles) and `enableMCP` are kept
+across re-appended contracts.
 `systemPrompt` holds the base prompt blocks a model call was built from (never a per-turn
 `before_agent_start` override), and revival replays them unchanged. A session appends a newer
 `session_init` when a model call runs on a different base prompt or work-pool yield items

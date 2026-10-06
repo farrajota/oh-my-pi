@@ -227,7 +227,8 @@ async function createRef(sessionFile: string, options: FixtureOptions = {}): Pro
 					: "Persisted Restricted",
 			parentTaskPrefix: id,
 			taskDepth: 1,
-			toolNames: revivedToolNames,
+			// The spawn created the child from its own tool list, which the durable identity binds.
+			toolNames: init.startupToolNames === undefined ? revivedToolNames : (init.startupToolNames ?? undefined),
 			outputSchema: init.outputSchema,
 			outputSchemaMode: init.outputSchemaMode,
 			restrictToolNames: restrictToolNames || undefined,
@@ -349,6 +350,7 @@ async function createPersistedSession(
 	advisor?: string,
 	contract?: {
 		tools?: string[];
+		startupToolNames?: string[] | null;
 		readOnly?: boolean;
 		agent?: string;
 		enableMCP?: boolean;
@@ -400,6 +402,7 @@ async function createPersistedSession(
 		systemPrompt: ["persisted prompt"],
 		task: "persisted task",
 		tools: contract?.tools ?? ["read", "yield"],
+		...(contract?.startupToolNames !== undefined ? { startupToolNames: contract.startupToolNames } : {}),
 		restrictToolNames,
 		modelRole,
 		resolvedModel: modelRole ? "anthropic/claude-sonnet-4-5" : undefined,
@@ -959,6 +962,38 @@ describe("persisted subagent revival", () => {
 		expect(activeToolNames).toEqual([["read", "yield"]]);
 	});
 
+	it.each([
+		["no explicit list", null],
+		["an explicit list", ["read"]],
+	] as const)(
+		"replays the spawn's tool list (%s) at revival and clamps the session to the persisted grant",
+		async (_label, startupToolNames) => {
+			const cwd = makeTempDir("@pi-startup-tools-revive-");
+			const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, {
+				tools: ["read", "write", "yield"],
+				startupToolNames: startupToolNames === null ? null : [...startupToolNames],
+				readOnly: true,
+			});
+			const activeToolNames: string[][] = [];
+			let capturedOptions: CreateAgentSessionOptions | undefined;
+			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+				capturedOptions = options;
+				return {
+					session: createRevivedSession(activeToolNames, undefined, options).session,
+				} as CreateAgentSessionResult;
+			});
+
+			const ref = await createRef(sessionFile);
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			await reviver(ref);
+
+			expect(capturedOptions?.toolNames).toEqual(startupToolNames === null ? undefined : [...startupToolNames]);
+			// Read-only revival still drops the synthetic write from the replayed grant.
+			expect(activeToolNames).toEqual([["read", "yield"]]);
+		},
+	);
+
 	it("preserves explicitly writable cold-revival contracts", async () => {
 		const cwd = makeTempDir("@pi-write-revive-");
 		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, {
@@ -1068,6 +1103,18 @@ describe("persisted subagent revival", () => {
 		expect(Object.hasOwn(capturedOptions ?? {}, "mcpManager")).toBe(false);
 		expect(capturedOptions?.customTools).toBeUndefined();
 		expect(getTools).not.toHaveBeenCalled();
+	});
+
+	it("leaves a transcript with a malformed spawn tool list transcript-only", async () => {
+		const cwd = makeTempDir("@pi-malformed-startup-tools-");
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, {
+			startupToolNames: ["read", "yield"],
+		});
+		const ref = await createRef(sessionFile);
+		const text = await Bun.file(sessionFile).text();
+		await Bun.write(sessionFile, text.replace('"startupToolNames":["read","yield"]', '"startupToolNames":"read"'));
+
+		expect(await createFactory(cwd)(ref)).toBeUndefined();
 	});
 
 	it("leaves isolated sessions transcript-only even when the workspace still exists", async () => {
@@ -1805,6 +1852,8 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		buildPrompt: (toolNames: string[]) => string[],
 		responses: MockResponseSource,
 		hooks?: ExtensionHooks,
+		agentTools?: string[],
+		spawnOptions: { enableLsp?: boolean; enableIrc?: boolean; restrictToolNames?: boolean } = {},
 	): Promise<RecordingSession> {
 		const settings = Settings.isolated({}, { cwd, agentDir: cwd });
 		const rootManager = SessionManager.create(cwd, path.join(cwd, "root-sessions"));
@@ -1850,18 +1899,18 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		});
 		const result = await executorModule.runSubprocess({
 			cwd,
-			// A restricted spawn binds its explicit tool grant into the durable startup identity, and cold
-			// revival replays the persisted grant; the recording session exposes exactly read + yield.
+			// Like the bundled task agent, the default fixture spawns without an explicit tool list.
 			agent: {
 				name: "task",
 				description: "test",
 				systemPrompt: "charter",
 				source: "bundled",
-				tools: ["read", "yield"],
+				...(agentTools ? { tools: agentTools } : {}),
 			},
 			task: "do work",
 			index: 0,
 			id: "prompt-blocks",
+			...spawnOptions,
 			settings,
 			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 			enableMCP: false,
@@ -1961,6 +2010,59 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		expect(extractSessionInit(manager.getEntries())?.systemPrompt).toEqual(["base", "batch 2", "tools: read,yield"]);
 		expect(manager.getLatestPermissionSummary()).toEqual(latest);
 		await parkPromptBlocks();
+	});
+
+	// The durable startup identity binds the tool list the spawn passed, while the transcript
+	// records the tools the session ended up enabling; revival must replay the former.
+	it("cold-revives a restricted spawn whose explicit grant omits the injected yield tool", async () => {
+		const cwd = makeTempDir("@pi-revive-explicit-grant-");
+		const buildPrompt = (toolNames: string[]) => ["base", `tools: ${toolNames.join(",")}`];
+		const spawned = await spawn(cwd, buildPrompt, spawnResponses(), undefined, ["read"]);
+		await parkPromptBlocks();
+
+		const revived = await reviveAndFollowUp(cwd);
+		expect(revived.system).toEqual(spawned.requests.at(-1)!);
+	});
+
+	it("cold-revives an lsp-capable spawn that started with LSP disabled", async () => {
+		const cwd = makeTempDir("@pi-revive-lsp-off-");
+		const buildPrompt = (toolNames: string[]) => ["base", `tools: ${toolNames.join(",")}`];
+		const spawned = await spawn(cwd, buildPrompt, spawnResponses(), undefined, ["read", "lsp"], {
+			enableLsp: false,
+		});
+		await parkPromptBlocks();
+
+		expect((await reviveAndFollowUp(cwd)).system).toEqual(spawned.requests.at(-1)!);
+	});
+
+	it("cold-revives a tool-restricted spawn that started with IRC enabled", async () => {
+		const cwd = makeTempDir("@pi-revive-restricted-irc-");
+		const buildPrompt = (toolNames: string[]) => ["base", `tools: ${toolNames.join(",")}`];
+		const spawned = await spawn(cwd, buildPrompt, spawnResponses(), undefined, ["read", "yield"], {
+			restrictToolNames: true,
+			enableIrc: true,
+		});
+		await parkPromptBlocks();
+
+		expect((await reviveAndFollowUp(cwd)).system).toEqual(spawned.requests.at(-1)!);
+	});
+
+	it("refuses revival when the persisted spawn tool list was edited", async () => {
+		const cwd = makeTempDir("@pi-revive-tampered-startup-tools-");
+		const buildPrompt = (toolNames: string[]) => ["base", `tools: ${toolNames.join(",")}`];
+		await spawn(cwd, buildPrompt, spawnResponses(), undefined, ["read"]);
+		await parkPromptBlocks();
+		const sessionFile = path.join(cwd, "prompt-blocks.jsonl");
+		const text = await Bun.file(sessionFile).text();
+		expect(text).toContain('"startupToolNames":["read"]');
+		await Bun.write(
+			sessionFile,
+			text.replaceAll('"startupToolNames":["read"]', '"startupToolNames":["read","bash"]'),
+		);
+
+		await expect(reviveAndFollowUp(cwd)).rejects.toThrow(
+			"Persisted authority identity does not match the recovered durable actor.",
+		);
 	});
 
 	it("replays the blocks after a later work-pool rebuild in the live session", async () => {
