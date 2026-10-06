@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed an absolute `PI_CONFIG_DIR` being nested under the home directory (e.g. `/home/node/home/node/.omp-amgr`); it is now used as the config root as-is, with the agent directory at `<PI_CONFIG_DIR>/agent` unless `PI_CODING_AGENT_DIR` overrides it.
+
 ## [18.5.1] - 2026-10-03
 
 ### Added

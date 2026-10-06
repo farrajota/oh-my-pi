@@ -1029,9 +1029,9 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
 }
 
 function isUserConfigRoot(root: string): boolean {
-	const configDir = normalizePathForComparison(path.join(root, getConfigDirName()));
+	const configDir = normalizePathForComparison(path.resolve(root, getConfigDirName()));
 	return (
-		configDir === normalizePathForComparison(path.join(os.homedir(), getConfigDirName())) ||
+		configDir === normalizePathForComparison(path.resolve(os.homedir(), getConfigDirName())) ||
 		configDir === normalizePathForComparison(path.dirname(getPluginsDir()))
 	);
 }

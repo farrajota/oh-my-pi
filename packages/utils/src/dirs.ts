@@ -1,8 +1,9 @@
 /**
  * Centralized path helpers for omp config directories.
  *
- * Uses PI_CONFIG_DIR (default ".omp") for the config root and
- * PI_CODING_AGENT_DIR to override the agent directory.
+ * Uses PI_CONFIG_DIR (default ".omp"; relative to the home directory unless
+ * absolute) for the config root and PI_CODING_AGENT_DIR to override the agent
+ * directory.
  *
  * On Linux, if XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME environment
  * variables are set, paths are redirected to XDG-compliant locations under
@@ -113,7 +114,7 @@ function readProfileFromEnvSafe(): string | undefined {
 
 /** Profile-independent config root (~/.omp), shared by every omp profile. */
 export function getBaseConfigRoot(): string {
-	return path.join(os.homedir(), getConfigDirName());
+	return path.resolve(os.homedir(), getConfigDirName());
 }
 
 function getProfileConfigRoot(profile: string | undefined): string {
@@ -303,12 +304,16 @@ export function getSafeProjectCwd(): string {
 	return os.homedir();
 }
 
-/** Get the config directory name relative to home (e.g. ".omp" or PI_CONFIG_DIR override). */
+/**
+ * Get the config directory name (e.g. ".omp" or the PI_CONFIG_DIR override).
+ * Relative values are relative to home; an absolute PI_CONFIG_DIR is returned
+ * as-is, so callers must combine it with `path.resolve(home, ...)`, not `path.join`.
+ */
 export function getConfigDirName(): string {
 	return process.env.PI_CONFIG_DIR || CONFIG_DIR_NAME;
 }
 
-/** Get the config agent directory name relative to home (e.g. ".omp/agent" or PI_CONFIG_DIR + "/agent"). */
+/** Get the config agent directory name (e.g. ".omp/agent" or PI_CONFIG_DIR + "/agent"); same home-relative rule as {@link getConfigDirName}. */
 export function getConfigAgentDirName(): string {
 	const profile = getActiveProfile();
 	return profile ? path.join(getConfigDirName(), "profiles", profile, "agent") : `${getConfigDirName()}/agent`;
@@ -668,7 +673,7 @@ export function getLogPath(date = new Date(), pid = process.pid): string {
  */
 export function getPluginsDir(home?: string): string {
 	if (home !== undefined && home !== RESOLVER_HOME) {
-		return path.join(home, getConfigDirName(), "plugins");
+		return path.resolve(home, getConfigDirName(), "plugins");
 	}
 	return dirs.rootSubdir("plugins", "data");
 }
