@@ -9,9 +9,10 @@ type SourceAwareController = {
 	rehydrateActiveRun(source: AgentSession): Promise<void>;
 };
 
+let eventControllerSettings: Settings;
 beforeAll(async () => {
 	resetSettingsForTest();
-	await Settings.init({ inMemory: true, overrides: { "completion.notify": "off" } });
+	eventControllerSettings = await Settings.init({ inMemory: true, overrides: { "completion.notify": "off" } });
 });
 
 afterAll(() => {
@@ -92,7 +93,7 @@ function createContext(viewSession = source()) {
 			requestComponentRender() {},
 			terminal: { setProgress: (active: boolean) => calls.terminalProgress.push(active) },
 		},
-		settings: { get: () => false },
+		settings: eventControllerSettings,
 		noteDisplayableThinkingContent: () => false,
 		effectiveHideThinkingBlock: false,
 		hideThinkingBlock: false,
@@ -176,7 +177,14 @@ describe("EventController source-aware working-message lifecycle", () => {
 		const completed = {
 			...assistantMessage(1),
 			stopReason: "stop",
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
 		} as AgentMessage;
 		const completionContext = ctx as unknown as {
 			streamingMessage: AgentMessage;
@@ -199,7 +207,14 @@ describe("EventController source-aware working-message lifecycle", () => {
 		const completed = {
 			...assistantMessage(0),
 			stopReason: "stop",
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
 		} as AgentMessage;
 		const mismatchContext = ctx as unknown as { streamingComponent: StreamingComponentDouble };
 		mismatchContext.streamingComponent = createStreamingComponent();

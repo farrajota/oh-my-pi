@@ -56,10 +56,16 @@ const reviewerAgent = {
 
 const jobManagers = new Set<AsyncJobManager>();
 const authoritySessions = new Set<AgentSession>();
+const authorityAgentDirs = new Set<TempDir>();
 async function disposeAuthoritySessions(): Promise<void> {
-	await Promise.all([...authoritySessions].map(session => session.dispose()));
-	authoritySessions.clear();
-	resetAgentLifecycleForTests();
+	try {
+		await Promise.all([...authoritySessions].map(session => session.dispose()));
+	} finally {
+		authoritySessions.clear();
+		resetAgentLifecycleForTests();
+		await Promise.all([...authorityAgentDirs].map(dir => dir.remove()));
+		authorityAgentDirs.clear();
+	}
 }
 
 function isEvalAgentResult(value: unknown): value is EvalAgentResult {
@@ -103,6 +109,12 @@ interface SessionOptions {
 }
 
 async function makeSession(options: SessionOptions = {}): Promise<ToolSession> {
+	let agentDir = options.cwd;
+	if (agentDir === undefined) {
+		const tempAgentDir = TempDir.createSync("@omp-agent-bridge-auth-");
+		authorityAgentDirs.add(tempAgentDir);
+		agentDir = tempAgentDir.path();
+	}
 	const settings =
 		options.settings ??
 		Settings.isolated({
@@ -121,7 +133,7 @@ async function makeSession(options: SessionOptions = {}): Promise<ToolSession> {
 		agentId: "Main",
 		agentDisplayName: "Main",
 		cwd: options.cwd ?? process.cwd(),
-		agentDir: options.cwd ?? process.cwd(),
+		agentDir,
 		settings,
 		disableExtensionDiscovery: true,
 		enableMCP: false,
@@ -1618,6 +1630,7 @@ describe("agent model arrays", () => {
 		resetRegisteredArtifactDirsForTests();
 		await Promise.all([...jobManagers].map(manager => manager.dispose()));
 		jobManagers.clear();
+		await disposeAuthoritySessions();
 	});
 	it("routes an ordered model array without substituting the agent definition", async () => {
 		mockAgents();

@@ -460,7 +460,7 @@ let sharedMnemopiFixture: MnemopiFixture | undefined;
 
 async function withMnemopiSession(fn: (fixture: MnemopiFixture) => Promise<void>): Promise<void> {
 	if (!sharedMnemopiFixture) {
-		const dbDir = TempDir.createSync("memory-protocol-mnemopi-");
+		const dbDir = TempDir.createSync("@memory-protocol-mnemopi-");
 		const config = {
 			dbPath: dbDir.join("mnemopi.db"),
 			bank: "test-bank",
@@ -620,7 +620,7 @@ describe("MemoryProtocolHandler — mnemopi bridge (issue #4443)", () => {
 
 	it("uses an unregistered caller projection without exposing a registered peer's bank", async () => {
 		await withMnemopiSession(async ({ state, dbDir }) => {
-			const directDbDir = TempDir.createSync("memory-protocol-mnemopi-direct-");
+			const directDbDir = TempDir.createSync("@memory-protocol-mnemopi-direct-");
 			let directState: MnemopiSessionState | undefined;
 			try {
 				const directSession = {
@@ -667,7 +667,7 @@ describe("MemoryProtocolHandler — mnemopi bridge (issue #4443)", () => {
 
 	it("binds memory://<id> to the calling session's own bank", async () => {
 		await withMnemopiSession(async ({ state, dbDir }) => {
-			const peerDbDir = TempDir.createSync("memory-protocol-mnemopi-peer-");
+			const peerDbDir = TempDir.createSync("@memory-protocol-mnemopi-peer-");
 			let peerState: MnemopiSessionState | undefined;
 			try {
 				const peerSession = {
@@ -718,7 +718,7 @@ describe("MemoryProtocolHandler — mnemopi bridge (issue #4443)", () => {
 
 	it("keeps peer banks unreachable when a cwd names two live sessions", async () => {
 		await withMnemopiSession(async ({ state, dbDir }) => {
-			const twinDir = TempDir.createSync("memory-protocol-mnemopi-twin-");
+			const twinDir = TempDir.createSync("@memory-protocol-mnemopi-twin-");
 			const previousAgentDir = getAgentDir();
 			let twinState: MnemopiSessionState | undefined;
 			try {
