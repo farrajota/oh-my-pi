@@ -109,11 +109,11 @@ describe("ReportPanel in text mode", () => {
 		h.composer.stop();
 	});
 
-	it("keeps the editor on the bottom row when rows reached scrollback while the report was open", async () => {
+	it("keeps the editor directly under the transcript when rows reached scrollback while the report was open", async () => {
 		// With the welcome header on screen, opening a tall report retires the
 		// header into scrollback, so the frame left after closing is shorter
-		// than the screen. The interactive mode notes the editor sat on the
-		// bottom row before opening and pins it there again on close.
+		// than the screen. The editor then sits under the transcript instead of
+		// being pinned to the bottom row below a blank band.
 		const terminal = new VirtualTerminal(100, ROWS);
 		const scheduler = new VirtualRenderScheduler();
 		const composer = new Composer({
@@ -158,12 +158,14 @@ describe("ReportPanel in text mode", () => {
 		composer.ui.requestRender();
 		await scheduler.settle(terminal);
 		dock.clear();
-		composer.pinInputToBottom();
 		composer.ui.requestRender();
 		await scheduler.settle(terminal);
 
-		expect(editorRow()).toBe(ROWS - 1);
-		expect(terminal.getViewport().some(row => row.includes(`Transcript ${transcriptRows - 1}`))).toBe(true);
+		const screen = terminal.getViewport().map(row => Bun.stripANSI(row).trimEnd());
+		const lastTranscript = screen.findIndex(row => row === `Transcript ${transcriptRows - 1}`);
+		expect(lastTranscript).toBeGreaterThanOrEqual(0);
+		// At most the single separator row may sit between the transcript and the editor.
+		expect(editorRow() - lastTranscript).toBeLessThanOrEqual(2);
 		composer.stop();
 	});
 

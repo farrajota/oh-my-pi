@@ -8116,15 +8116,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		return below === undefined ? undefined : this.ui.terminal.rows - below;
 	}
 
-	composerInputAtBottom(): boolean {
-		const viewport = this.ui.getMutableViewport();
-		return viewport.length > 0 && viewport.top + viewport.length >= this.ui.terminal.rows;
-	}
-
-	pinComposerToBottom(): void {
-		this.composer.pinInputToBottom();
-	}
-
 	cycleThinkingLevel(): void {
 		this.#inputController.cycleThinkingLevel();
 	}

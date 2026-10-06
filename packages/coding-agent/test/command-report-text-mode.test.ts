@@ -19,6 +19,19 @@ function screen(term: VirtualTerminal): string[] {
 	return term.getViewport().map(row => Bun.stripANSI(row).trimEnd());
 }
 
+/**
+ * After a report closes the input sits directly under the transcript: rows the report
+ * pushed into scrollback cannot come back, so any freed rows end up below the input
+ * instead of as a blank band above it. Only the block separator may follow `last`.
+ */
+function expectInputUnderTranscript(term: VirtualTerminal, last: string): void {
+	const rows = screen(term);
+	const lastRow = rows.indexOf(last);
+	expect(lastRow).toBeGreaterThanOrEqual(0);
+	const next = rows.findIndex((row, index) => index > lastRow && row.length > 0);
+	expect(next - lastRow).toBeLessThanOrEqual(2);
+}
+
 describe("text-mode command reports on a real terminal core", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -76,7 +89,7 @@ describe("text-mode command reports on a real terminal core", () => {
 	}
 
 	it.each([5, 40])(
-		"opens `/changelog full` as a scrollable full-screen page and Esc returns to the untouched screen (%i transcript rows)",
+		"opens `/changelog full` as a scrollable full-screen page and Esc returns with the input under the transcript (%i transcript rows)",
 		async rows => {
 			const last = await mountTranscript(rows);
 			const before = screen(term);
@@ -90,7 +103,8 @@ describe("text-mode command reports on a real terminal core", () => {
 
 			term.sendInput("\x1b");
 			await term.waitForRender(() => !screen(term).some(row => row.includes("Full Changelog")));
-			expect(screen(term).indexOf(last)).toBe(before.indexOf(last));
+			expectInputUnderTranscript(term, last);
+			expect(screen(term).indexOf(last)).toBeLessThanOrEqual(before.indexOf(last));
 			// Nothing of the page reached the main screen, and no transcript row was duplicated.
 			const buffer = term.getScrollBuffer().map(row => Bun.stripANSI(row).trimEnd());
 			expect(buffer.filter(row => row === last)).toHaveLength(1);
@@ -100,7 +114,6 @@ describe("text-mode command reports on a real terminal core", () => {
 
 	it("shows a report that fits above the editor like /btw and Esc takes it away", async () => {
 		const last = await mountTranscript(40);
-		const lastRow = screen(term).indexOf(last);
 		await runCommand("/tools", "Available Tools");
 		expect(screen(term).some(row => row.includes("to close"))).toBe(true);
 		// Inline: the transcript stays on the main screen, only covered from below.
@@ -108,7 +121,7 @@ describe("text-mode command reports on a real terminal core", () => {
 
 		term.sendInput("\x1b");
 		await term.waitForRender(() => !screen(term).some(row => row.includes("Available Tools")));
-		expect(screen(term).indexOf(last)).toBe(lastRow);
+		expectInputUnderTranscript(term, last);
 	});
 
 	it.each([
@@ -118,14 +131,13 @@ describe("text-mode command reports on a real terminal core", () => {
 		["/ssh list", "SSH Hosts"],
 	])("`%s` reports outside the transcript and Esc takes it away", async (command, title) => {
 		const last = await mountTranscript(40);
-		const lastRow = screen(term).indexOf(last);
 		const blocks = mode.chatContainer.children.length;
 		await runCommand(command, title);
 		expect(mode.chatContainer.children).toHaveLength(blocks);
 
 		term.sendInput("\x1b");
 		await term.waitForRender(() => !screen(term).some(row => row.includes(title)));
-		expect(screen(term).indexOf(last)).toBe(lastRow);
+		expectInputUnderTranscript(term, last);
 		const buffer = term.getScrollBuffer().map(row => Bun.stripANSI(row));
 		expect(buffer.some(row => row.includes(title))).toBe(false);
 	});

@@ -58,6 +58,20 @@ function makeHarness(columns = COLUMNS, rows = ROWS, transcriptRows = TRANSCRIPT
 	return { terminal, scheduler, composer, widget, hud, editor };
 }
 
+/** Longest run of blank rows between the first transcript row and the editor in scrollback plus screen. */
+function longestBlankRunBeforeEditor(terminal: VirtualTerminal): number {
+	const buffer = terminal.getScrollBuffer().map(row => Bun.stripANSI(row).trimEnd());
+	const first = buffer.findIndex(row => row.startsWith(TRANSCRIPT_PREFIX));
+	const editorRow = buffer.findIndex(row => row.includes("EDITOR"));
+	let run = 0;
+	let longest = 0;
+	for (const row of buffer.slice(first, editorRow)) {
+		run = row === "" ? run + 1 : 0;
+		longest = Math.max(longest, run);
+	}
+	return longest;
+}
+
 /** Settle, grow the inline chrome, settle, shrink it back, settle. */
 async function cycleWidget(h: Harness): Promise<void> {
 	await h.scheduler.settle(h.terminal);
@@ -112,7 +126,7 @@ describe("composer inline shrink (#11007)", () => {
 		await h.scheduler.settle(h.terminal);
 		expect(submitted).toBe(true);
 		expect(visibleRows()).toEqual(Array.from({ length: TRANSCRIPT_ROWS }, (_, i) => i));
-		expect(h.terminal.getViewport().findIndex(row => row.includes("EDITOR"))).toBe(53);
+		expect(longestBlankRunBeforeEditor(h.terminal)).toBeLessThanOrEqual(1);
 		dialog.dispose();
 		h.composer.stop();
 	});
@@ -136,7 +150,7 @@ describe("composer inline shrink (#11007)", () => {
 		h.composer.stop();
 	});
 
-	it("keeps settled transcript rows reachable while an inline ask panel is expanded (#12398)", async () => {
+	it("keeps settled transcript rows reachable while an inline ask panel is expanded and leaves no blank band after it closes (#12398)", async () => {
 		const h = makeHarness();
 		await h.scheduler.settle(h.terminal);
 		h.widget.retireDisplacedTranscript = true;
@@ -160,7 +174,7 @@ describe("composer inline shrink (#11007)", () => {
 		expect(
 			after.filter(row => row.startsWith(TRANSCRIPT_PREFIX)).map(row => Number(row.slice(TRANSCRIPT_PREFIX.length))),
 		).toEqual(Array.from({ length: TRANSCRIPT_ROWS }, (_, i) => i));
-		expect(h.terminal.getViewport().findIndex(row => row.includes("EDITOR"))).toBe(ROWS - 1);
+		expect(longestBlankRunBeforeEditor(h.terminal)).toBeLessThanOrEqual(1);
 		h.composer.stop();
 	});
 

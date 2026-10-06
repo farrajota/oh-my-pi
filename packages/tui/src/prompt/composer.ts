@@ -269,7 +269,6 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	// rediscovered from whatever chrome is expanded when the height changes.
 	#transientChrome: ReadonlySet<Component> = new Set();
 	#transientChromeFloor: number | undefined;
-	#anchorAfterInlineRetirement = false;
 	/** Rows the chrome below each below-transcript root took in the last frame (see {@link rowsBelow}). */
 	#rowsBelow = new Map<Component, number>();
 	#lastInterruptAt = 0;
@@ -349,18 +348,6 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		return this.#rowsBelow.get(root);
 	}
 
-	/**
-	 * Keep the input on the bottom row while the live rows cannot fill the
-	 * screen, as after an inline decision panel closes. A tall block that just
-	 * left the chrome above the editor (a command report) may have scrolled
-	 * rows into native history that cannot be pulled back; without the pin the
-	 * editor would jump up to where the shorter frame now ends. The pin lifts
-	 * once live rows fill the screen again.
-	 */
-	pinInputToBottom(): void {
-		this.#anchorAfterInlineRetirement = true;
-	}
-
 	/** Compose the bounded mutable viewport and the next ordered history append. */
 	renderFrame(viewport: ViewportSize): TerminalFramePlan {
 		if (!this.#started || this.#stopped) return { viewport: [] };
@@ -386,7 +373,6 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const afterSpans: ViewportClickSpan[] = [];
 		let transientRows = 0;
 		let displacingRows = 0;
-		let decisionPanelOpen = false;
 		const ends: { root: Component; end: number }[] = [];
 		for (const root of afterRoots) {
 			const chrome: Component = root;
@@ -394,13 +380,10 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 			this.#renderBelowRoot(root, width, after, afterSpans);
 			ends.push({ root, end: after.length });
 			if (this.#transientChrome.has(root)) transientRows += after.length - start;
-			if (
+			const retiresDisplaced =
 				chrome.retireDisplacedTranscript ||
-				(root instanceof Container && root.children.some(child => child.retireDisplacedTranscript))
-			) {
-				if (this.#transientChrome.has(root)) displacingRows += after.length - start;
-				decisionPanelOpen = true;
-			}
+				(root instanceof Container && root.children.some(child => child.retireDisplacedTranscript));
+			if (retiresDisplaced && this.#transientChrome.has(root)) displacingRows += after.length - start;
 		}
 		this.#rowsBelow = new Map(ends.map(({ root, end }) => [root, after.length - end]));
 		// Offer history under capacity pressure only: blocks stay live (and keep
@@ -424,7 +407,6 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// one open frame renders each of them once for both.
 		transcript.beginFrame(frame);
 		const history = this.#offerHistory(transcript, width, rows, preRoots.length + belowFloor);
-		if (decisionPanelOpen && history !== undefined) this.#anchorAfterInlineRetirement = true;
 		const headerVisible = !this.#headerRetired && this.#offeredHistory?.source !== "header";
 		const headerRows = headerVisible ? this.#header.render(width) : [];
 		const before = [...headerRows, ...preRoots];
@@ -433,15 +415,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// inter-block blanks) engages only when a block genuinely cannot retire.
 		// Rows the transient chrome peak displaces are clipped from the top by
 		// the `drop` slice below, which is what scrollback would have done.
-		const activeBudget = Math.max(0, rows - before.length - belowFloor);
-		const active = transcript.renderViewport(width, activeBudget, frame);
-		// Retirement moves whole blocks plus their separator, so it can leave the
-		// live tail a row short of its budget. A transient row (an autocomplete
-		// popup) may hide that gap in this frame; once it closes the input would
-		// jump up over a blank row, because retired rows never return from native
-		// history.
-		const retirementLeftGap =
-			history !== undefined && this.#offeredHistory?.source !== "header" && active.length < activeBudget;
+		const active = transcript.renderViewport(width, Math.max(0, rows - before.length - belowFloor), frame);
 		const activeSpans: ViewportClickSpan[] = [];
 		for (const span of transcript.getLastViewportSpans()) {
 			const ids = (span.component as Partial<{ getClickFocusAgentIds(): string[] }>).getClickFocusAgentIds?.();
@@ -449,17 +423,11 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 			activeSpans.push({ start: span.start, end: span.end, candidates: () => ids });
 		}
 		const drop = Math.max(0, before.length + active.length + after.length - rows);
+		// Rows retired while a decision panel was open cannot return from native
+		// history when it closes. The shorter frame then ends above the bottom row
+		// and the input stays directly under the transcript; padding the top to pin
+		// the input to the bottom row left a screen-tall blank band in the transcript.
 		const mutable = [...before, ...active, ...after].slice(drop);
-		// Once live rows fill the screen again, the retired gap is gone. Transient
-		// chrome counts only at its floor: rows it fills above that leave with it.
-		const liveFillsScreen = before.length + active.length + belowFloor >= rows;
-		if (!decisionPanelOpen && liveFillsScreen) this.#anchorAfterInlineRetirement = false;
-		if (retirementLeftGap) this.#anchorAfterInlineRetirement = true;
-		// Rows retired during a decision panel cannot be pulled back from native
-		// history when it closes. Keep the input pinned to the bottom without
-		// replaying those rows (which would duplicate them) or clearing history.
-		const topPadding = this.#anchorAfterInlineRetirement ? Math.max(0, rows - mutable.length) : 0;
-		if (topPadding > 0) mutable.unshift(...Array<string>(topPadding).fill(""));
 		const viewportLength = mutable.length;
 		const spans: ViewportClickSpan[] = [];
 		const shift = (span: ViewportClickSpan, base: number): void => {
@@ -473,8 +441,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 				spans.push({ start: clamped, end, candidates: (local: number) => span.candidates(local + skew) });
 			}
 		};
-		for (const span of activeSpans) shift(span, topPadding + before.length - drop);
-		for (const span of afterSpans) shift(span, topPadding + before.length + active.length - drop);
+		for (const span of activeSpans) shift(span, before.length - drop);
+		for (const span of afterSpans) shift(span, before.length + active.length - drop);
 		this.#lastClickSpans = spans;
 		if (history !== undefined && this.#offeredHistory?.source === "header") {
 			const visibleHeaderRows = Math.max(0, rows - (mutable.length + drop));
@@ -949,7 +917,6 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		if (this.#stopped) return;
 		this.#transientChrome = new Set(options.transient);
 		this.#transientChromeFloor = undefined;
-		this.#anchorAfterInlineRetirement = false;
 		this.#nativeDock = options.nativeDock;
 		this.ui.removeChild(this.#statusHost);
 		if (this.#runtimeMounted) {

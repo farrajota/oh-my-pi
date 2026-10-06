@@ -19,7 +19,7 @@
 
 ### Fixed
 
-- Fixed the input jumping up over a blank row when an autocomplete popup closes after older transcript rows moved into terminal scrollback
+- Fixed a screen-tall blank band between the finished transcript and the input after an ask panel or command report pushed rows into terminal scrollback: the input is no longer pinned to the bottom row by padding, so it sits directly under the transcript and the freed rows stay below it until new output fills them
 - Fixed hold-Space push-to-talk stopping the instant recording began (showing "No speech detected.") when opening the microphone briefly froze the UI ([#14463](https://github.com/can1357/oh-my-pi/pull/14463) by [@pgkt04](https://github.com/pgkt04))
 
 ## [18.6.1] - 2026-10-04
