@@ -11,6 +11,7 @@
 
 - Fixed the TUI freezing for seconds per tool call in long sessions: every authority-journal append re-parsed and re-hashed the whole session journal on the main thread (about 2 s per append at 30k records, with up to 8 appends per file read). Appends now replay only bytes this store has not already verified, still rejecting same-size in-place rewrites, and canonical hashing validates each record once.
 - Fixed persisted subagents becoming unrevivable after their base prompt changed: the re-appended `session_init` dropped the permission snapshot, permission profiles, permission summary and MCP grant. `peekSessionInit` now normalizes legacy string prompts like upstream.
+- Fixed stats session ingest blocking the TUI for seconds at a time when a stats view or extension (for example an activity dashboard) requested a sync: syncs now run in a one-shot worker subprocess, and batch commits wait for the write lock instead of failing with `SQLITE_BUSY`.
 - Fixed fresh subagent creation to obtain validated parent lineage before claiming the child slot, while preserving root-scoped IRC delivery and exact-generation cancellation cleanup.
 - Published capability-reserved agent rows with their reserved lineage before synchronous registered notifications, keeping later removal identity stable.
 - Removed TTS/STT model-worker host initialization cycles while preserving settings-sensitive worker identity and in-flight request retention.

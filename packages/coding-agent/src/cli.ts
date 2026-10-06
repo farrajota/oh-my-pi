@@ -42,6 +42,7 @@ import {
 } from "./cli/worker-selectors";
 import type * as JsProcessEntry from "./eval/js/process-entry";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
+import { installStatsSyncHost } from "./stats/sync-host";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -552,6 +553,11 @@ export async function runCli(argv: string[]): Promise<void> {
 		}
 		return;
 	}
+
+	// Stats session syncs write stats.db synchronously; outside worker
+	// subprocesses (which are the sync hosts) they must never run on this
+	// process's event loop, whoever requests them (dashboard, extensions).
+	if (isProcessEntry) installStatsSyncHost();
 
 	if (resolvedArgv[0] === "--license") {
 		// Command boundary: bundled notices are read only when requested.

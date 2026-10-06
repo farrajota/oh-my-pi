@@ -724,7 +724,12 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 } {
 	if (!db) return { processed: 0, files: 0, reconcile: false };
 	const database = db;
-	return database.transaction(() => {
+	// IMMEDIATE: the batch reads before it writes, and in WAL a deferred read
+	// transaction cannot upgrade while another connection (the dashboard's
+	// rollup refresh, another omp process) writes — it fails with SQLITE_BUSY
+	// without waiting. Taking the write lock up front lets busy_timeout
+	// serialize the writers.
+	const apply = database.transaction(() => {
 		let processed = 0;
 		let files = 0;
 		let reconcile = false;
@@ -855,7 +860,8 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 			database.query("INSERT OR REPLACE INTO meta (key, value) VALUES ('session_reconciliation', 'pending')").run();
 		}
 		return { processed, files, reconcile };
-	})();
+	});
+	return apply.immediate();
 }
 
 export function prepareSessionSync(): boolean {

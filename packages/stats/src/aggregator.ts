@@ -44,6 +44,7 @@ import {
 	getToolTimeSeries,
 	type RangeWindow,
 } from "./rollup";
+import { getSessionSyncHost } from "./sync-host";
 import type { SyncWorkerRequest, SyncWorkerResponse } from "./sync-worker";
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
 // hidden argv mode, so the compiled binary and npm bundle only need one
@@ -543,8 +544,11 @@ async function syncAllSessionsLocked(
 
 /**
  * Sync every known session file and complete global-scan backfills.
+ * Runs in the registered {@link getSessionSyncHost} process when one is set.
  */
 export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
+	const host = getSessionSyncHost();
+	if (host) return await host.syncAllSessions(opts);
 	try {
 		return await withStatsSyncLock(
 			getStatsDbPath(),
@@ -579,11 +583,14 @@ export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: 
 
 /**
  * Incrementally synchronize one persisted main session and its transcript tree.
+ * Runs in the registered {@link getSessionSyncHost} process when one is set.
  */
 export async function syncSessionTree(
 	sessionFile: string,
 	opts?: SyncOptions,
 ): Promise<{ processed: number; files: number }> {
+	const host = getSessionSyncHost();
+	if (host) return await host.syncSessionTree(sessionFile, opts);
 	await initDb();
 	if (path.extname(sessionFile) !== ".jsonl") return { processed: 0, files: 0 };
 
