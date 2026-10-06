@@ -221,12 +221,18 @@ function assertPlainJson(value: unknown, active = new Set<object>()): void {
 }
 
 function canonicalJson(value: unknown): string {
+	// Validate the whole tree once; re-validating every subtree while recursing made hashing
+	// quadratic in nesting depth on the journal's hot append and replay paths.
 	assertPlainJson(value);
+	return canonicalJsonOfValidated(value);
+}
+
+function canonicalJsonOfValidated(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (Array.isArray(value)) return `[${value.map(canonicalJsonOfValidated).join(",")}]`;
 	return `{${Object.keys(value as Record<string, unknown>)
 		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`)
+		.map(key => `${JSON.stringify(key)}:${canonicalJsonOfValidated((value as Record<string, unknown>)[key])}`)
 		.join(",")}}`;
 }
 
@@ -486,6 +492,35 @@ interface DurableJournalMetadata {
 interface ValidatedJournal {
 	readonly records: DurableJournalRecord[];
 	readonly metadata: DurableJournalMetadata | undefined;
+	/** Fingerprint of the exact bytes `records` were verified from; lets append skip a full replay. */
+	readonly verifiedBytes: VerifiedJournalBytes;
+}
+
+/**
+ * Bytes a store has fully verified: a hashed prefix plus the exact record bytes it appended
+ * after hashing. The hash only has to detect changes to already-verified bytes (the journal's
+ * unkeyed SHA-256 chain guards against corruption and racing writers, not against a writer
+ * able to rewrite the file), so a fast 64-bit hash with exact length and tail checks suffices
+ * where SHA-256 over a multi-megabyte journal would cost hundreds of milliseconds per append.
+ */
+interface VerifiedJournalBytes {
+	readonly prefixLength: number;
+	readonly prefixHash: bigint;
+	readonly tail: Buffer;
+}
+
+const EMPTY_BYTES = Buffer.alloc(0);
+
+function verifiedJournalBytes(bytes: Buffer, tail: Buffer = EMPTY_BYTES): VerifiedJournalBytes {
+	return Object.freeze({ prefixLength: bytes.byteLength, prefixHash: Bun.hash.xxHash3(bytes), tail });
+}
+
+function matchesVerifiedJournalBytes(bytes: Buffer, verified: VerifiedJournalBytes): boolean {
+	return (
+		bytes.byteLength === verified.prefixLength + verified.tail.byteLength &&
+		bytes.subarray(verified.prefixLength).equals(verified.tail) &&
+		Bun.hash.xxHash3(bytes.subarray(0, verified.prefixLength)) === verified.prefixHash
+	);
 }
 
 function journalMetadataFromStat(stat: fs.BigIntStats): DurableJournalMetadata {
@@ -527,14 +562,22 @@ function sameJournalMetadata(
 }
 
 function readJournalFile(journalPath: string): DurableJournalRecord[] {
-	let text: string;
+	return readVerifiedJournal(journalPath).records;
+}
+
+function readVerifiedJournal(journalPath: string): {
+	records: DurableJournalRecord[];
+	verifiedBytes: VerifiedJournalBytes;
+} {
+	let bytes: Buffer;
 	try {
-		text = fs.readFileSync(journalPath, "utf8");
+		bytes = fs.readFileSync(journalPath);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		if ((error as NodeJS.ErrnoException).code === "ENOENT")
+			return { records: [], verifiedBytes: verifiedJournalBytes(EMPTY_BYTES) };
 		throw error;
 	}
-	return parseJournalText(text);
+	return { records: parseJournalText(bytes.toString("utf8")), verifiedBytes: verifiedJournalBytes(bytes) };
 }
 
 function parseJournalText(text: string): DurableJournalRecord[] {
@@ -662,6 +705,7 @@ export class RegistryDurableStateStore {
 				throw error;
 			}
 			let afterWrite: DurableJournalMetadata;
+			let verifiedBytes: VerifiedJournalBytes;
 			try {
 				const beforeWrite = journalMetadataFromStat(fs.fstatSync(handle, { bigint: true }));
 				const journalChanged =
@@ -672,13 +716,26 @@ export class RegistryDurableStateStore {
 					this.#validatedJournal = undefined;
 					throw new DurableStateConflictError();
 				}
-				const observedText = fs.readFileSync(handle, "utf8");
+				// Re-verify the bytes actually opened: same-size in-place rewrites can keep size and
+				// coarse timestamps unchanged. Bytes identical to the ones this store already verified
+				// cannot change the replay result, so they only need a fingerprint check; anything else
+				// replays in full. Replaying and re-hashing every record per append made each append
+				// cost hundreds of milliseconds to seconds on long sessions, on the TUI thread.
+				const observedBytes = fs.readFileSync(handle);
 				let observedRecords: DurableJournalRecord[];
-				try {
-					observedRecords = parseJournalText(observedText);
-				} catch {
-					this.#validatedJournal = undefined;
-					throw new DurableStateConflictError();
+				if (
+					expectedMetadata !== undefined &&
+					validated !== undefined &&
+					matchesVerifiedJournalBytes(observedBytes, validated.verifiedBytes)
+				) {
+					observedRecords = records;
+				} else {
+					try {
+						observedRecords = parseJournalText(observedBytes.toString("utf8"));
+					} catch {
+						this.#validatedJournal = undefined;
+						throw new DurableStateConflictError();
+					}
 				}
 				const afterValidation = journalMetadataFromStat(fs.fstatSync(handle, { bigint: true }));
 				const observedHead = currentCursor(observedRecords);
@@ -697,6 +754,7 @@ export class RegistryDurableStateStore {
 					offset += written;
 				}
 				fs.fsyncSync(handle);
+				verifiedBytes = verifiedJournalBytes(observedBytes, encoded);
 				afterWrite = journalMetadataFromStat(fs.fstatSync(handle, { bigint: true }));
 				const current = journalMetadata(this.#journalPath);
 				if (
@@ -712,7 +770,11 @@ export class RegistryDurableStateStore {
 				fs.closeSync(handle);
 			}
 			records.push(entry);
-			this.#validatedJournal = Object.freeze({ records, metadata: afterWrite });
+			this.#validatedJournal = Object.freeze({
+				records,
+				metadata: afterWrite,
+				verifiedBytes,
+			});
 			return entry;
 		} finally {
 			lock.release();
@@ -802,10 +864,10 @@ export class RegistryDurableStateStore {
 			}
 			for (;;) {
 				const before = journalMetadata(this.#journalPath);
-				const records = readJournalFile(this.#journalPath);
+				const { records, verifiedBytes } = readVerifiedJournal(this.#journalPath);
 				const after = journalMetadata(this.#journalPath);
 				if (!sameJournalMetadata(before, after)) continue;
-				this.#validatedJournal = Object.freeze({ records, metadata: after });
+				this.#validatedJournal = Object.freeze({ records, metadata: after, verifiedBytes });
 				return records;
 			}
 		} catch (error) {
