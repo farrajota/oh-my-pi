@@ -13,7 +13,7 @@ import { AgentRegistry } from "../../registry/agent-registry";
 import type { AgentSession } from "../../session/agent-session";
 import { BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE } from "../../session/messages";
 import { SessionManager } from "../../session/session-manager";
-import { createMCPProxyTools, createSubagentSettings } from "../../task/executor";
+import { createMCPProxyTools, createSubagentSettings, followMCPTools } from "../../task/executor";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
 import { runJobOperation } from "../../registry/operation-lease";
 import type { InteractiveModeContext } from "../types";
@@ -115,7 +115,6 @@ export class TanCommandController {
 		// artifacts in place — no copy needed.
 		const sessionDir = parentFile.slice(0, -6);
 		const settings = await createSubagentSettings(this.ctx.settings);
-		const customTools = mcpManager ? createMCPProxyTools(mcpManager) : undefined;
 		const enableLsp = cfgTaskEnableLsp.get(this.ctx.settings) !== false;
 		const agentRegistry = AgentRegistry.global();
 		const authorityBinding = bindInternalAgentAuthoritySession(agentRegistry, session);
@@ -144,9 +143,14 @@ export class TanCommandController {
 				runJobOperation(
 					session.sessionManager,
 					`job:${registeredJobId}`,
-					async () => {
-						if (signal.aborted) throw new Error("Aborted before execution");
+					async leaseSignal => {
+						const operationSignal = leaseSignal ?? signal;
+						if (operationSignal.aborted) throw new Error("Aborted before execution");
 						let clone: AgentSession | undefined;
+						// Subscribe before taking the clone-time snapshot so MCP changes during
+						// creation are replayed after the child session is bound.
+						const mcpFollower = mcpManager ? followMCPTools(mcpManager) : undefined;
+						const mcpTools = mcpManager ? createMCPProxyTools(mcpManager) : undefined;
 						try {
 							const created = await authorityBinding.create({
 								cwd,
@@ -162,7 +166,7 @@ export class TanCommandController {
 								settings,
 								hasUI: false,
 								enableMCP: false,
-								customTools,
+								mcpTools,
 								enableLsp,
 								agentId: cloneId,
 								agentDisplayName: "tan",
@@ -179,17 +183,16 @@ export class TanCommandController {
 							});
 							const activeClone = created.session;
 							clone = activeClone;
+							mcpFollower?.bind(activeClone);
 							activeClone.sessionManager?.appendSessionInit?.({
-								systemPrompt: activeClone.systemPrompt
-									? activeClone.systemPrompt.join("\n\n")
-									: systemPrompt.join("\n\n"),
+								systemPrompt: activeClone.systemPrompt ?? systemPrompt,
 								task: trimmedWork,
 								tools: activeClone.getEnabledToolNames(),
 							});
 							const abortClone = () => {
 								void activeClone.abort();
 							};
-							signal.addEventListener("abort", abortClone, { once: true });
+							operationSignal.addEventListener("abort", abortClone, { once: true });
 							// The fork inherits the parent's todo list via session entries;
 							// its reminders would drag the tan back onto the parent's task.
 							// Clear runtime state and persist an empty edit so reloads agree.
@@ -203,22 +206,23 @@ export class TanCommandController {
 									timestamp: Date.now(),
 								});
 							};
-							// Compaction summarizes the fork notice away with the rest of the
-							// history, after which the clone re-adopts the parent's task as its
-							// own (the summary blends both). Re-inject after every successful
-							// compaction so the fork boundary survives summarization.
+							// Preserve the fork boundary if compaction drops it. Before the
+							// first prompt is dispatched the task is not in history yet, so
+							// restore only the notice; afterward restore the task only when
+							// compaction actually removed it to avoid duplicate instructions.
 							let requestDispatched = false;
 							const unsubscribeCompaction = activeClone.subscribe(event => {
 								if (event.type === "agent_start") requestDispatched = true;
 								if (event.type === "auto_compaction_end" && event.result && !event.aborted) {
 									const requestRetained =
 										requestDispatched &&
-										activeClone.agent.state.messages.some(
-											message =>
-												message.role === "user" &&
-												Array.isArray(message.content) &&
-												message.content.some(part => part.type === "text" && part.text === trimmedWork),
-										);
+										activeClone.agent.state.messages.some(message => {
+											if (message.role !== "user") return false;
+											const content = message.content;
+											return typeof content === "string"
+												? content === trimmedWork
+												: content.some(part => part.type === "text" && part.text === trimmedWork);
+										});
 									if (!requestRetained) {
 										injectContextSwitch();
 										if (requestDispatched) {
@@ -233,7 +237,7 @@ export class TanCommandController {
 								}
 							});
 							try {
-								if (signal.aborted) {
+								if (operationSignal.aborted) {
 									abortClone();
 									throw new Error("Aborted before execution");
 								}
@@ -243,37 +247,39 @@ export class TanCommandController {
 								injectContextSwitch();
 								await activeClone.prompt(trimmedWork, { attribution: "user" });
 								while (activeClone.hasPendingAsyncWork()) {
-									if (signal.aborted) throw new Error("Aborted during descendant settlement");
+									if (operationSignal.aborted) throw new Error("Aborted during descendant settlement");
 									let onAbort: (() => void) | undefined;
 									try {
 										await Promise.race([
 											activeClone.settleAsyncWork(),
 											new Promise<never>((_, reject) => {
 												onAbort = () => reject(new Error("Aborted during descendant settlement"));
-												signal.addEventListener("abort", onAbort, { once: true });
-												if (signal.aborted) onAbort();
+												operationSignal.addEventListener("abort", onAbort, { once: true });
+												if (operationSignal.aborted) onAbort();
 											}),
 										]);
 									} finally {
-										if (onAbort) signal.removeEventListener("abort", onAbort);
+										if (onAbort) operationSignal.removeEventListener("abort", onAbort);
 									}
 								}
 								await activeClone.waitForIdle();
 								return extractAssistantText(activeClone.getLastAssistantMessage()) || "(no output)";
 							} finally {
 								unsubscribeCompaction();
-								signal.removeEventListener("abort", abortClone);
+								operationSignal.removeEventListener("abort", abortClone);
 							}
 						} finally {
-							// Keep the finished tan in the Agent Hub instead of unregistering it:
-							// flip the ref to parked BEFORE dispose so the sdk dispose wrapper
-							// skips its unregister, then null the disposed session so the hub
-							// treats it as a transcript-only parked agent. An aborted tan is
-							// terminal — let dispose unregister it.
+							mcpFollower?.dispose();
+							// Keep successful tans as transcript-only parked rows. Aborted rows are also
+							// tombstones, so detach the exact child even if disposal rejects.
 							if (clone) {
-								if (signal.aborted) {
+								if (operationSignal.aborted) {
 									setAgentStatus(agentRegistry, cloneId, "aborted", clone);
-									await clone.dispose();
+									try {
+										await clone.dispose();
+									} finally {
+										detachAgentSession(agentRegistry, cloneId, clone);
+									}
 								} else {
 									setAgentStatus(agentRegistry, cloneId, "parked", clone);
 									await clone.dispose();

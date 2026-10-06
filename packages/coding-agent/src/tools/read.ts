@@ -56,7 +56,12 @@ import {
 	truncateHeadBytes,
 	truncateLine,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { buildLineEntriesWithBlockContext, lineEntriesToPlainText } from "../utils/block-context";
+import {
+	buildLineEntriesWithBlockContext,
+	lineEntriesToPlainText,
+	spansCoverEveryLine,
+	warmBlockContext,
+} from "../utils/block-context";
 import { isCpuProfilePath, renderCpuProfile } from "../utils/cpuprofile";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import {
@@ -1469,7 +1474,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (bridgePromise !== undefined) {
 			try {
 				const bridgeText = await bridgePromise;
-				const bridgeResult = buildInMemoryMultiRangeResult(this.session, bridgeText, ranges, {
+				const bridgeResult = await buildInMemoryMultiRangeResult(this.session, bridgeText, ranges, {
 					details: markMarkdownContentType(
 						this.session,
 						{ resolvedPath: absolutePath, suffixResolution },
@@ -1564,6 +1569,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		let outputText: string;
 		if (!rawSelector && fullLines && visibleSpans.length > 0) {
+			if (buffered && !spansCoverEveryLine(visibleSpans, fullLines.length)) {
+				await warmBlockContext({ path: absolutePath, text: buffered.normalizedText });
+			}
 			const entries = buildLineEntriesWithBlockContext(
 				fullLines,
 				visibleSpans,
@@ -1735,6 +1743,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// Protocol reads render Markdown regardless of `read.renderMarkdown`, as their resources always did.
 		if (!details.contentType && isMarkdownPath(located.path)) details.contentType = "text/markdown";
 		details.meta = { ...details.meta, source: { type: "internal", value: located.url } };
+		// Nested skill reads need their own provenance: the outer invocation may belong to another plugin.
+		if (extractUriScheme(located.url) === "skill" && !isRawSelector(parseSel(located.sel))) {
+			const provenance = `[Skill file: ${located.path}]`;
+			const firstText = result.content.find((block): block is TextContent => block.type === "text");
+			// The TUI falls back to this block when no structured display content exists.
+			if (firstText) firstText.text = `${provenance}\n${firstText.text}`;
+			else result.content.unshift({ type: "text", text: provenance });
+		}
 		return { ...result, details };
 	}
 
@@ -2245,7 +2261,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					if (bridgePromise !== undefined) {
 						try {
 							const bridgeText = await bridgePromise;
-							const bridgeResult = buildInMemoryTextResult(this.session, bridgeText, offset, limit, {
+							const bridgeResult = await buildInMemoryTextResult(this.session, bridgeText, offset, limit, {
 								details: markMarkdownContentType(
 									this.session,
 									{ resolvedPath: absolutePath, suffixResolution },
@@ -2370,6 +2386,17 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const totalSelectedLines = totalFileLines - startLine;
 					const wasTruncated = collectedLines.length < totalSelectedLines || stoppedByByteLimit;
 					const firstLineExceedsLimit = firstLineByteLength !== undefined && firstLineByteLength > maxBytesForRead;
+					if (
+						bracketContextFullLines &&
+						buffered &&
+						!firstLineExceedsLimit &&
+						!spansCoverEveryLine(
+							[{ startLine: startLineDisplay, endLine: displayedEndLine }],
+							bracketContextFullLines.length,
+						)
+					) {
+						await warmBlockContext({ path: absolutePath, text: buffered.normalizedText });
+					}
 					const omittedSelectedLine = omittedRequestedLine(
 						byteLimitLine,
 						requestedStart,

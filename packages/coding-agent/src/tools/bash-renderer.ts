@@ -1,9 +1,9 @@
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir } from "@oh-my-pi/pi-utils";
-import { formatBackgroundNotice } from "../async";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { truncateToVisualLines } from "@oh-my-pi/pi-tui/chrome";
+import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
 import { highlightCode, type Theme } from "@oh-my-pi/pi-tui/theme";
 import {
 	CachedOutputBlock,
@@ -143,9 +143,14 @@ function stripExitCodeNotice(text: string, exitCode: number | undefined): string
 	return stripTrailingNotice(text, formatExitCodeNotice(exitCode));
 }
 
-function stripBackgroundNotice(text: string, async: BashToolDetails["async"] | undefined): string {
+function stripBackgroundNotice(text: string, details: BashToolDetails | undefined): string {
+	const async = details?.async;
 	if (async?.state !== "running") return text;
-	return stripTrailingNotice(text, formatBackgroundNotice(async.jobId));
+	const timeoutSec = details?.timeoutDisabled ? undefined : details?.timeoutSeconds;
+	const stripped = stripTrailingNotice(text, formatBackgroundNotice(async.jobId, timeoutSec));
+	if (stripped !== text) return stripped;
+	// Transcripts persisted before the notice carried its deadline use the short form.
+	return stripTrailingNotice(text, `Backgrounded as job ${async.jobId}; result will be delivered automatically.`);
 }
 
 // =============================================================================
@@ -338,7 +343,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 					) {
 						return cachedLines;
 					}
-					const withoutBackground = stripBackgroundNotice(rawOutput, details?.async);
+					const withoutBackground = stripBackgroundNotice(rawOutput, details);
 					const strippedOutput = stripOutputNotice(withoutBackground, details?.meta);
 					const withoutExit = stripExitCodeNotice(strippedOutput, details?.exitCode);
 					const withoutWall = stripWallTimeNotice(withoutExit, details?.wallTimeMs);

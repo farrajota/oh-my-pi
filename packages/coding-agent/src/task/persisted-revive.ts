@@ -23,8 +23,7 @@ import type { RegistryDurableStateStore } from "../registry/durable-state";
 import type { AgentSession } from "../session/agent-session";
 import { installRetryFallbackRole } from "../session/retry-fallback-chains";
 import type { AuthStorage } from "../session/auth-storage";
-import { extractSessionInit, SessionManager } from "../session/session-manager";
-import type { SessionInitEntry } from "../session/session-entries";
+import { extractSessionInit, type PersistedSessionInit, SessionManager } from "../session/session-manager";
 import type { EventBus } from "../utils/event-bus";
 import { IrcBus } from "../irc/bus";
 import {
@@ -32,6 +31,7 @@ import {
 	compactionThresholdSettings,
 	createMCPProxyTools,
 	createSubagentSettings,
+	followMCPTools,
 	subagentRetryFallbackRole,
 } from "./executor";
 import type { EffectivePermissionSummary } from "./types";
@@ -70,7 +70,7 @@ export interface PersistedSubagentReviveContext {
 }
 
 type PersistedRevivalInit = Pick<
-	SessionInitEntry,
+	PersistedSessionInit,
 	| "systemPrompt"
 	| "task"
 	| "tools"
@@ -92,6 +92,7 @@ type PersistedRevivalInit = Pick<
 	| "compactionThreshold"
 	| "isolated"
 	| "retryFallback"
+	| "workPoolYieldItems"
 >;
 
 async function validatePersistedRevivalContract(
@@ -421,7 +422,7 @@ export function createPersistedSubagentReviverFactory(
 						allowRestrictedExtensions: startupPolicy.allowExtensions || allowOwnerExtensions,
 						permissionScope: permissionSnapshot?.scope,
 						requireYieldTool: true,
-						systemPrompt: () => [init.systemPrompt],
+						systemPrompt: () => [...init.systemPrompt],
 						// Old files predate persisted spawns: deny re-spawning rather than let
 						// createAgentSession default to wildcard ("*").
 						spawns: init.spawns ?? "",
@@ -443,6 +444,7 @@ export function createPersistedSubagentReviverFactory(
 				// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
 				// the original run didn't carry. Unknown/missing names are ignored.
 				await session.setActiveToolsByName([...revivedToolNames, ...session.getMountedXdevToolNames()]);
+				if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
 				// Wire the extension runtime exactly as the live executor does. Without
 				// this the runner stays pre-init, every action method throws
 				// `ExtensionRuntimeNotInitializedError`, and a `tool_call` handler that
@@ -466,7 +468,7 @@ export function createPersistedSubagentReviverFactory(
 				const wakeAgent: AgentDefinition = {
 					name: ref.displayName,
 					description: "",
-					systemPrompt: init.systemPrompt,
+					systemPrompt: init.systemPrompt.join("\n\n"),
 					source: "user",
 				};
 				const rootId = ref.lineage?.rootId;

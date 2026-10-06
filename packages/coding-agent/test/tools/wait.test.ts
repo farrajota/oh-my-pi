@@ -8,6 +8,7 @@ import type { DaemonBrokerClient } from "@oh-my-pi/pi-coding-agent/launch/client
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
+import { lookupAgentRef, setAgentStatus } from "../../src/internal/agent-registry-bridge";
 import { createHubAuthorityFixture, type HubAuthorityFixture } from "./hub-fixtures";
 
 let authorityFixture: HubAuthorityFixture;
@@ -82,19 +83,37 @@ describe("wait", () => {
 		expect(JSON.stringify(result)).not.toContain("private command output");
 	});
 
-	test("returns immediately when no job, running peer, or owned service can wake it", async () => {
+	test("errors for a subagent whose only running work is its parent's job on it", async () => {
 		const registry = AgentRegistry.global();
+		const streaming = { isStreaming: true } as never;
+		const parent = lookupAgentRef(registry, "Main")?.session;
+		if (!parent) throw new Error("Expected wait authority fixture root");
+		Object.defineProperty(parent, "isStreaming", { value: true, configurable: true });
+		expect(setAgentStatus(registry, "Main", "running", parent)).toBe(true);
 		registry.register({
-			id: "Idle",
-			displayName: "Idle",
+			id: "Child",
+			displayName: "Child",
 			kind: "sub",
 			parentId: "Main",
-			session: null,
-			status: "idle",
+			session: streaming,
+			status: "running",
 		});
-		const result = await new WaitTool(session()).execute("wait-2", {});
-		expect(result.details).toMatchObject({ op: "wait", jobs: [] });
-		expect(result.useless).toBe(true);
+		// Subagents share the process job manager with their owner.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const childRun = Promise.withResolvers<string>();
+		manager.register("task", "Child", async () => childRun.promise, {
+			id: "Child",
+			agentId: "Child",
+			ownerId: "Main",
+		});
+		try {
+			const waiting = new WaitTool(session(manager, "Child")).execute("child-wait", {});
+			await expect(waiting).rejects.toThrow("Nothing to wait for");
+		} finally {
+			Reflect.deleteProperty(parent, "isStreaming");
+			childRun.resolve("done");
+			await manager.waitForAll();
+		}
 	});
 
 	test("an interrupted wait leaves later job completion auto-deliverable", async () => {
@@ -155,6 +174,238 @@ describe("wait", () => {
 		expect(result.details?.jobs?.[0]).toMatchObject({ id, status: "completed", resultText: "received=kestrel42" });
 		expect(manager.isDeliverySuppressed(id)).toBe(true);
 		injected.resolve();
+	});
+
+	test("allows a child to wait for its own job while its parent task is still running", async () => {
+		await authorityFixture.createChild("Child");
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const parentRun = Promise.withResolvers<string>();
+		manager.register("task", "Child", async () => parentRun.promise, {
+			id: "Child",
+			agentId: "Child",
+			ownerId: "Main",
+		});
+		const childRun = Promise.withResolvers<string>();
+		const childJobId = manager.register("bash", "child-owned", async () => childRun.promise, {
+			ownerId: "Child",
+		});
+		const childSession = authorityFixture.createToolSession("Child") as ToolSession & {
+			asyncJobManager?: AsyncJobManager;
+		};
+		childSession.asyncJobManager = manager;
+		const waiting = new WaitTool(childSession).execute("child-own-job", {});
+		childRun.resolve("child work complete");
+		const result = await waiting;
+		expect(result.details?.jobs?.[0]).toMatchObject({
+			id: childJobId,
+			status: "completed",
+			resultText: "child work complete",
+		});
+		expect(manager.isJobResultConsumed(childJobId)).toBe(true);
+		parentRun.resolve("parent task complete");
+		await manager.waitForAll();
+	});
+
+	test("recovers one settled job while another remains running and consumes the parked delivery once", async () => {
+		vi.useFakeTimers();
+		const manager = new AsyncJobManager({});
+		const deliveryRelease = Promise.withResolvers<void>();
+		const deliveryStarted = Promise.withResolvers<string>();
+		const deliveries: string[] = [];
+		manager.registerDeliverySink("Main", async (_id, text) => {
+			deliveries.push(text);
+			deliveryStarted.resolve(text);
+			await deliveryRelease.promise;
+		});
+		const recoverable = Promise.withResolvers<string>();
+		const stillRunning = Promise.withResolvers<string>();
+		const recoveredId = manager.register("bash", "recoverable", async () => recoverable.promise, {
+			ownerId: "Main",
+		});
+		const runningId = manager.register("bash", "still running", async () => stillRunning.promise, {
+			ownerId: "Main",
+		});
+		recoverable.resolve("recovered exactly once");
+		expect(await deliveryStarted.promise).toBe("recovered exactly once");
+		const waiting = new WaitTool(session(manager)).execute("mixed-wait", {});
+		for (let turn = 0; turn < 10; turn++) await Promise.resolve();
+		vi.advanceTimersByTime(1);
+		const result = await waiting;
+		expect(result.details?.jobs).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: recoveredId,
+					status: "completed",
+					resultText: "recovered exactly once",
+				}),
+				expect.objectContaining({ id: runningId, status: "running" }),
+			]),
+		);
+		expect(manager.isJobResultConsumed(recoveredId)).toBe(true);
+		expect(manager.isDeliverySuppressed(recoveredId)).toBe(true);
+		deliveryRelease.resolve();
+		stillRunning.resolve("finished after wait");
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+		expect(deliveries.filter(text => text === "recovered exactly once")).toEqual(["recovered exactly once"]);
+	});
+
+	test("consumes a foreground completion without auto-delivery while another initially running job stays live", async () => {
+		vi.useFakeTimers();
+		const manager = new AsyncJobManager({});
+		const deliveries: string[] = [];
+		manager.registerDeliverySink("Main", (_id, text) => {
+			deliveries.push(text);
+		});
+		const completed = Promise.withResolvers<string>();
+		const stillRunning = Promise.withResolvers<string>();
+		const completedId = manager.register("bash", "foreground completion", async () => completed.promise, {
+			ownerId: "Main",
+		});
+		const runningId = manager.register("bash", "still running", async () => stillRunning.promise, {
+			ownerId: "Main",
+		});
+		const waiting = new WaitTool(session(manager)).execute("mixed-foreground-wait", {});
+		completed.resolve("consumed in foreground");
+		for (let turn = 0; turn < 10; turn++) await Promise.resolve();
+		vi.advanceTimersByTime(1);
+		const result = await waiting;
+		expect(result.details?.jobs).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: completedId,
+					status: "completed",
+					resultText: "consumed in foreground",
+				}),
+				expect.objectContaining({ id: runningId, status: "running" }),
+			]),
+		);
+		expect(manager.isJobResultConsumed(completedId)).toBe(true);
+		expect(manager.isDeliverySuppressed(completedId)).toBe(true);
+		expect(manager.getJob(runningId)?.status).toBe("running");
+		expect(deliveries).toEqual([]);
+		stillRunning.resolve("delivered after foreground wait");
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+		expect(deliveries).toEqual(["delivered after foreground wait"]);
+	});
+
+	test("rechecks late child-owned work when the last independent sibling stops while its blocked parent streams", async () => {
+		vi.useFakeTimers();
+		const registry = AgentRegistry.global();
+		const parent = await authorityFixture.createChild("Parent");
+		await authorityFixture.createChild("Child", "Parent");
+		Object.defineProperty(parent.session, "isStreaming", { value: true, configurable: true });
+		expect(setAgentStatus(registry, "Parent", "running", parent.session)).toBe(true);
+		registry.register({
+			id: "Sibling",
+			displayName: "Sibling",
+			kind: "sub",
+			parentId: "Parent",
+			session: { isStreaming: true } as never,
+			status: "running",
+		});
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const parentRun = Promise.withResolvers<string>();
+		manager.register("task", "Child", async () => parentRun.promise, {
+			id: "Child",
+			agentId: "Child",
+			ownerId: "Parent",
+		});
+		const childSession = authorityFixture.createToolSession("Child") as ToolSession & {
+			asyncJobManager?: AsyncJobManager;
+		};
+		childSession.settings = Settings.isolated({ "launch.enabled": false });
+		childSession.asyncJobManager = manager;
+		const finalized = Promise.withResolvers<string>();
+		const controller = new AbortController();
+		const messageWaitInstalled = Promise.withResolvers<void>();
+		const jobWaitInstalled = Promise.withResolvers<string[]>();
+		const bus = IrcBus.global();
+		const wait = bus.wait.bind(bus);
+		const waitSpy = vi.spyOn(bus, "wait").mockImplementation((...args) => {
+			const pending = wait(...args);
+			if (args[0] === "Child" && args[4]?.liveness) messageWaitInstalled.resolve();
+			return pending;
+		});
+		const waiting = new WaitTool(childSession).execute("child-late-job", {}, controller.signal, update => {
+			jobWaitInstalled.resolve(update.details?.jobs?.map(job => job.id) ?? []);
+		});
+		const settledWait = Promise.allSettled([waiting]);
+		try {
+			expect(waitSpy).toHaveBeenCalledTimes(1);
+			expect(waitSpy.mock.calls[0]?.[4]?.liveness?.senderId).toBe("Child");
+			await messageWaitInstalled.promise;
+			expect(manager.getRunningJobs({ ownerId: "Child" })).toEqual([]);
+			vi.advanceTimersByTime(1_000);
+			const id = manager.register("bash", "late child work", async () => finalized.promise, { ownerId: "Child" });
+			expect(registry.setStatus("Sibling", "idle")).toBe(true);
+			expect(await Promise.race([jobWaitInstalled.promise, waiting])).toEqual([id]);
+			vi.advanceTimersByTime(300_000);
+			finalized.resolve("child followup complete");
+			const result = await waiting;
+			expect(result.details?.jobs).toEqual([
+				expect.objectContaining({ id, status: "completed", resultText: "child followup complete" }),
+			]);
+			expect(manager.isJobResultConsumed(id)).toBe(true);
+			expect(manager.isDeliverySuppressed(id)).toBe(true);
+			expect(manager.getJob("Child")?.status).toBe("running");
+			expect(registry.isRunning(registry.get("Parent")!)).toBe(true);
+			expect(registry.get("Sibling")?.status).toBe("idle");
+		} finally {
+			controller.abort();
+			finalized.resolve("child followup complete");
+			parentRun.resolve("parent task complete");
+			await settledWait;
+			await manager.waitForAll();
+			waitSpy.mockRestore();
+			Reflect.deleteProperty(parent.session, "isStreaming");
+		}
+	});
+
+	test("rejects a child wait when its last independent sibling idles and only its streaming blocked parent remains", async () => {
+		vi.useFakeTimers();
+		const registry = AgentRegistry.global();
+		const parent = await authorityFixture.createChild("Parent");
+		await authorityFixture.createChild("Child", "Parent");
+		Object.defineProperty(parent.session, "isStreaming", { value: true, configurable: true });
+		expect(setAgentStatus(registry, "Parent", "running", parent.session)).toBe(true);
+		registry.register({
+			id: "Sibling",
+			displayName: "Sibling",
+			kind: "sub",
+			parentId: "Parent",
+			session: { isStreaming: true } as never,
+			status: "running",
+		});
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const parentRun = Promise.withResolvers<string>();
+		manager.register("task", "Child", async () => parentRun.promise, {
+			id: "Child",
+			agentId: "Child",
+			ownerId: "Parent",
+		});
+		try {
+			const waiting = new WaitTool(session(manager, "Child")).execute("child-peer-idle", {});
+			const stopped = waiting.then(
+				result => ({ result, error: undefined }),
+				error => ({ result: undefined, error }),
+			);
+			expect(registry.setStatus("Sibling", "idle")).toBe(true);
+			for (let turn = 0; turn < 10; turn++) await Promise.resolve();
+			vi.advanceTimersByTime(5_000);
+			const outcome = await stopped;
+			expect(outcome.result).toBeUndefined();
+			expect(outcome.error).toBeInstanceOf(Error);
+			expect(outcome.error.message).toContain("Nothing to wait for");
+			expect(manager.getJob("Child")?.status).toBe("running");
+			expect(registry.isRunning(registry.get("Parent")!)).toBe(true);
+			expect(registry.get("Sibling")?.status).toBe("idle");
+		} finally {
+			Reflect.deleteProperty(parent.session, "isStreaming");
+			parentRun.resolve("parent task complete");
+			await manager.waitForAll();
+		}
 	});
 
 	test("blocks on a peer's completion job registered after the wait started", async () => {
@@ -242,7 +493,7 @@ describe("wait", () => {
 			agentId: "EchoPeer",
 		});
 		registry.setStatus("EchoPeer", "idle");
-		await Promise.resolve();
+		for (let turn = 0; turn < 10; turn++) await Promise.resolve();
 		// Past the top message rung: only the job-wait cap may end this wait.
 		vi.advanceTimersByTime(300_000);
 		finalized.resolve("late result");
@@ -312,7 +563,6 @@ describe("wait", () => {
 		const result = await waiting;
 		expect(result.details?.waited).toMatchObject({ from: "Peer", body: "shared file released" });
 	});
-
 	test("returns an incoming peer message while the watched job remains live", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: "Peer", displayName: "Peer", kind: "sub", parentId: "Main", session: null });

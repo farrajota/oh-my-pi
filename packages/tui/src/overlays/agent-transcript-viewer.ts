@@ -75,6 +75,7 @@ export interface AgentTranscriptViewerDeps {
 	cwd: string;
 	hideThinkingBlock?: () => boolean;
 	proseOnlyThinking?: () => boolean;
+	expandThinkingBlocks?: () => boolean;
 	expandKeys: KeyId[];
 	/** Keys that toggle the whole hub closed (app.agents.hub + app.session.observe). */
 	hubKeys: KeyId[];
@@ -202,6 +203,7 @@ export class AgentTranscriptViewer implements Component {
 			cwd: deps.cwd,
 			hideThinkingBlock: deps.hideThinkingBlock,
 			proseOnlyThinking: deps.proseOnlyThinking,
+			expandThinkingBlocks: deps.expandThinkingBlocks,
 			requestRender: deps.requestRender,
 		});
 		this.#browser = new TranscriptBrowser({

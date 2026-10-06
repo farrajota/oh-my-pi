@@ -495,7 +495,6 @@ export function nothingToWaitForResult(session: ToolSession): AgentToolResult<Co
 		...(agents.length === 0 ? { useless: true } : {}),
 	});
 }
-
 /** `cancel`: kill the named jobs; returns immediately with outcomes + snapshots. */
 export async function executeCancel(
 	session: ToolSession,

@@ -305,7 +305,6 @@ describe("selector setting side effects", () => {
 			hub.handleInput("\x1b[A"); // All models → Roles.
 			hub.handleInput("\n"); // Enter the role rows.
 			hub.handleInput("\n"); // Assign DEFAULT.
-			hub.handleInput("\n"); // Sidebar → model list.
 			hub.handleInput("\n"); // Pick the scoped replacement model.
 			await assignmentApplied.promise;
 			await Promise.resolve();
@@ -483,7 +482,6 @@ describe("selector setting side effects", () => {
 			hub.handleInput("\x1b[A"); // All models → Roles.
 			hub.handleInput("\n"); // Enter the role rows.
 			hub.handleInput("\n"); // Assign DEFAULT.
-			hub.handleInput("\n"); // Sidebar → model list.
 			hub.handleInput("\n"); // Pick the scoped model.
 			hub.handleInput("\n"); // Save the assignment to the project.
 			await assignmentApplied.promise;
@@ -572,7 +570,6 @@ describe("selector setting side effects", () => {
 			hub.handleInput("\x1b[A"); // All models → Roles.
 			hub.handleInput("\n"); // Enter the role rows.
 			hub.handleInput("\n"); // Assign DEFAULT.
-			hub.handleInput("\t"); // Sidebar → model list.
 			hub.handleInput("\x1b[B"); // Effective project model → new global fallback.
 			hub.handleInput("\n"); // Pick the global fallback model.
 			hub.handleInput("\x1b[B"); // Project scope → global scope.
@@ -592,7 +589,6 @@ describe("selector setting side effects", () => {
 
 			hub.handleInput("\x1b"); // Thinking strip → Roles.
 			hub.handleInput("\n"); // Assign DEFAULT again.
-			hub.handleInput("\t"); // Sidebar → model list.
 			hub.handleInput("\x1b[B"); // Effective project model → new global fallback.
 			hub.handleInput("\n"); // Pick the global fallback model.
 			hub.handleInput("\x1b[B"); // Project scope → global scope.
@@ -673,7 +669,6 @@ describe("selector setting side effects", () => {
 			hub.handleInput("\x1b[A"); // All models → Roles.
 			hub.handleInput("\n"); // Enter the role rows.
 			hub.handleInput("\n"); // Assign DEFAULT.
-			hub.handleInput("\t"); // Sidebar → model list.
 			hub.handleInput("\x1b[B"); // Effective project model → new global fallback.
 			hub.handleInput("\n"); // Pick the global fallback model.
 			hub.handleInput("\x1b[B"); // Project scope → global scope.
@@ -775,7 +770,6 @@ describe("selector setting side effects", () => {
 				hub.handleInput("\x1b[A"); // All models → Roles.
 				hub.handleInput("\n"); // Enter the role rows.
 				hub.handleInput("\n"); // Assign DEFAULT.
-				hub.handleInput("\t"); // Sidebar → model list.
 				hub.handleInput("\x1b[B"); // Effective project model → new global default.
 				hub.handleInput("\n"); // Pick the global model.
 				hub.handleInput("\x1b[B"); // Project scope → global scope.
@@ -883,7 +877,6 @@ describe("selector setting side effects", () => {
 				hub.handleInput("\x1b[A"); // All models → Roles.
 				hub.handleInput("\n"); // Enter the role rows.
 				hub.handleInput("\n"); // Assign DEFAULT.
-				hub.handleInput("\t"); // Sidebar → model list.
 				hub.handleInput("\x1b[B"); // Overlay model → hidden project default.
 				hub.handleInput("\n"); // Pick the project model.
 				hub.handleInput("\n"); // Save to project scope.
@@ -908,7 +901,6 @@ describe("selector setting side effects", () => {
 
 				hub.handleInput("\x1b"); // Thinking strip → Roles.
 				hub.handleInput("\n"); // Assign DEFAULT again.
-				hub.handleInput("\t"); // Sidebar → model list.
 				hub.handleInput("\x1b[B"); // Overlay model → hidden project fallback.
 				hub.handleInput("\n"); // Pick the current project fallback.
 				hub.handleInput("\x1b[B"); // Project scope → global scope.
@@ -1409,7 +1401,6 @@ describe("selector setting side effects", () => {
 			expect(setModel).toHaveBeenCalledTimes(1);
 
 			hub.handleInput("\n"); // Start a later DEFAULT assignment.
-			hub.handleInput("\t"); // Sidebar → model list.
 			hub.handleInput("\x1b[A"); // Global fallback → project model.
 			hub.handleInput("\n"); // Pick the project model.
 			hub.handleInput("\n"); // Start the project-scoped default edit.

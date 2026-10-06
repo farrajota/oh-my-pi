@@ -14,6 +14,7 @@ export function createSessionDefaults() {
 		dispose: async () => {},
 		setIrcWakeTurnObserver: () => {},
 		setWorkPoolYieldItems: async () => {},
+		getWorkPoolYieldItems: () => [],
 		getPermissionSummary: () => undefined,
 		isAdvisorActive: () => false,
 		subscribeRunState: () => () => {},

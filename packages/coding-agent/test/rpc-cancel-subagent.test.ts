@@ -237,6 +237,7 @@ describe("handleRpcCancelSubagent", () => {
 			getToolByName: () => undefined,
 			setActiveToolsByName: async () => {},
 			setWorkPoolYieldItems: () => {},
+			getWorkPoolYieldItems: () => [],
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
 				listeners.push(listener);
 				return () => listeners.splice(listeners.indexOf(listener), 1);

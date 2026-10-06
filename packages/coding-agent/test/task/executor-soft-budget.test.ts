@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import {
+	disposeAgentLifecycle,
 	getAgentLifecycleManager,
 	lifecycleHasAgent,
 	parkAgent,
@@ -26,6 +27,7 @@ import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registr
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
@@ -218,25 +220,68 @@ describe("runSubprocess soft request budget", () => {
 	let registry: AgentRegistry;
 	let lifecycle: AgentLifecycleManager;
 	let authorityCreator: AgentAuthoritySessionBinding["create"];
+	let rootSession: AgentSession;
+	let settings: Settings;
+	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
 	beforeEach(async () => {
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		tempDir = TempDir.createSync("@pi-soft-budget-");
 		const rootSessionFile = `${tempDir.path()}/main.jsonl`;
 		await Bun.write(rootSessionFile, "");
+		// A hermetic root: the default root session reads the developer's real
+		// agent dir, auth, and model catalog, which is slow and machine-dependent.
+		settings = Settings.isolated({ "task.softRequestBudget": 2 }, { cwd: tempDir.path(), agentDir: tempDir.path() });
+		authStorage = await AuthStorage.create(":memory:");
+		modelRegistry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`, { settings });
+		modelRegistry.registerProvider("anthropic", {
+			api: "anthropic-messages",
+			baseUrl: "https://example.invalid",
+			apiKey: "test-key",
+			models: [
+				{
+					id: "claude-sonnet-4-5",
+					name: "Soft budget fixture",
+					reasoning: true,
+					input: ["text"],
+					supportsTools: true,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 200_000,
+					maxTokens: 8192,
+				},
+			],
+		});
 		registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
 		AgentRegistry.installGlobal(registry);
-		const { session: rootSession } = await createAgentRootSession(registry, { agentId: "Main" });
+		({ session: rootSession } = await createAgentRootSession(registry, {
+			agentId: "Main",
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			settings,
+			authStorage,
+			modelRegistry,
+			model: modelRegistry.find("anthropic", "claude-sonnet-4-5"),
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: [],
+			skipPythonPreflight: true,
+			hasUI: false,
+		}));
 		const authority = bindInternalAgentAuthoritySession(registry, rootSession);
 		if (!authority) throw new Error("Expected bound Main authority fixture");
 		authorityCreator = authority.create;
 		lifecycle = getAgentLifecycleManager(registry);
 	});
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await disposeAgentLifecycle(lifecycle);
+		await rootSession.dispose();
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		AsyncJobManager.resetForTests();
+		authStorage.close();
 		tempDir[Symbol.dispose]();
 	});
 
@@ -248,8 +293,9 @@ describe("runSubprocess soft request budget", () => {
 			task: "inventory the api surface",
 			index: 0,
 			id,
-			settings: Settings.isolated({ "task.softRequestBudget": 2 }),
-			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+			settings,
+			authStorage,
+			modelRegistry,
 			enableLsp: false,
 			artifactsDir: tempDir.path(),
 			subagentEventBus,
@@ -498,7 +544,7 @@ describe("runSubprocess soft request budget", () => {
 		mockCreateAgentSession(handle.session, options => {
 			if (!options.sessionManager)
 				throw new Error("Expected claimed child session manager before durable initialization.");
-			options.sessionManager.appendSessionInit({ systemPrompt: "test", task: "work", tools: ["read"] });
+			options.sessionManager.appendSessionInit({ systemPrompt: ["test"], task: "work", tools: ["read"] });
 		});
 
 		const result = await runSubprocess({
@@ -538,7 +584,7 @@ describe("runSubprocess soft request budget", () => {
 		mockCreateAgentSession(handle.session, options => {
 			if (!options.sessionManager)
 				throw new Error("Expected claimed child session manager before durable initialization.");
-			options.sessionManager.appendSessionInit({ systemPrompt: "test", task: "work", tools: ["read"] });
+			options.sessionManager.appendSessionInit({ systemPrompt: ["test"], task: "work", tools: ["read"] });
 		});
 		const manager = new AsyncJobManager({ maxRunningJobs: 1 });
 		AsyncJobManager.setInstance(manager);

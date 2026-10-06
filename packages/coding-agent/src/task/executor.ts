@@ -830,7 +830,9 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 				}
 			} else {
 				const { validator, error: schemaError, normalized } = buildOutputValidator(outputSchema);
-				const completeData = assembled.rawText ? assembled.data : parseStringifiedJson(assembled.data ?? null);
+				const submittedData = assembled.rawText ? assembled.data : parseStringifiedJson(assembled.data ?? null);
+				const completeData =
+					mode === "strict" ? (validator?.normalize(submittedData) ?? submittedData) : submittedData;
 				const validation = validator?.validate(completeData);
 				const failure =
 					validation && !validation.success
@@ -1080,6 +1082,69 @@ export function createMCPProxyTools(mcpManager: MCPManager, allowedToolNames?: r
 				},
 			};
 		});
+}
+
+/** Session surface {@link followMCPTools} drives: the child's MCP rebind plus its teardown hook. */
+export type MCPToolFollowerSession = Pick<AgentSession, "refreshMCPTools" | "addDisposer">;
+
+/** Subscription created by {@link followMCPTools}; bind it to the session the proxies went into. */
+export interface MCPToolFollower {
+	/** Attach the created session; replays any change seen since subscribing, then follows later ones. */
+	bind(session: MCPToolFollowerSession): void;
+	/** Drop the subscription when the session was never created. */
+	dispose(): void;
+}
+
+/**
+ * Keep a child session's MCP proxy tools in step with the parent's shared
+ * manager. A child gets a spawn-time {@link createMCPProxyTools} snapshot and
+ * never owns the manager's single-slot tool callback, so without this a
+ * `/mcp reload` — or a server added, removed, or reconnected later — only
+ * reaches the owning session and every live subagent keeps its stale set.
+ *
+ * Subscribe BEFORE building the child's proxies: a change landing while the
+ * session is still being created is recorded and replayed on {@link
+ * MCPToolFollower.bind}, so no window exists where an update is lost. Bursts
+ * (a reload re-placing every server) coalesce into one rebind per tick.
+ *
+ * `reservedNames` are the child's explicitly supplied tool names (e.g.
+ * kernel-defined `mcp__…` tools): `createAgentSession` drops same-named proxies
+ * so those tools win, and every rebind must keep dropping them, or the first
+ * reload would replace the child's own tool with the MCP capability.
+ */
+export function followMCPTools(mcpManager: MCPManager, reservedNames?: ReadonlySet<string>): MCPToolFollower {
+	let session: MCPToolFollowerSession | undefined;
+	let pending = false;
+	let scheduled = false;
+	const flush = (): void => {
+		scheduled = false;
+		if (!session || !pending) return;
+		pending = false;
+		const proxies = createMCPProxyTools(mcpManager);
+		const tools = reservedNames?.size ? proxies.filter(tool => !reservedNames.has(tool.name)) : proxies;
+		session.refreshMCPTools(tools).catch(error => {
+			logger.warn("Subagent MCP tool refresh failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	};
+	const schedule = (): void => {
+		if (scheduled) return;
+		scheduled = true;
+		queueMicrotask(flush);
+	};
+	const unsubscribe = mcpManager.addToolsChangedListener(() => {
+		pending = true;
+		if (session) schedule();
+	});
+	return {
+		bind(next) {
+			session = next;
+			next.addDisposer(unsubscribe);
+			if (pending) schedule();
+		},
+		dispose: unsubscribe,
+	};
 }
 
 /**
@@ -2910,8 +2975,12 @@ async function relayWakeTurnOutput(args: {
 	records: AgentMessage[];
 	turnStartTime: number;
 	yielded: boolean;
-	result?: SingleResult;
+	result: SingleResult | undefined;
 	turnText: string;
+	error: string | undefined;
+	aborted: boolean;
+	abortReason: string | undefined;
+	finalizeError: unknown;
 	/** Failure, cancellation, or empty output must reach the waker even after a progress message. */
 	force: boolean;
 	/** Skip peer already receiving the result through its owner-routed async job. */
@@ -2920,20 +2989,17 @@ async function relayWakeTurnOutput(args: {
 	ircBus: IrcBus;
 }): Promise<void> {
 	const bus = args.ircBus;
-	const pending = wakeSources(args.records, args.id).filter(
-		source =>
-			source.from !== args.jobOwnerId && (args.force || !bus.sentSince(args.id, source.from, args.turnStartTime)),
-	);
+
+	const pending = wakeSources(args.records, args.id).filter(source => {
+		if (source.from === args.jobOwnerId) return false;
+		const alreadyMessaged = bus.sentSince(args.id, source.from, args.turnStartTime);
+		return !alreadyMessaged || args.force;
+	});
 	if (pending.length === 0) return;
-	const body =
-		args.yielded && args.result?.outputPath
-			? formatTaskResultSummary(args.result, {
-					totalDurationMs: args.result.durationMs,
-					agentRegistry: args.agentRegistry,
-				})
-			: args.turnText.trim();
-	if (!body) return;
 	for (const source of pending) {
+		const alreadyMessaged = bus.sentSince(args.id, source.from, args.turnStartTime);
+		const body = buildWakeRelayBody({ ...args, alreadyMessaged });
+		if (!body) continue;
 		const receipt = await bus.send({
 			from: args.id,
 			to: source.from,
@@ -2947,19 +3013,59 @@ async function relayWakeTurnOutput(args: {
 	}
 }
 
+/** Whether a wake turn died on an error, a cancellation, or a finalization throw instead of completing. */
+function wakeTurnFailed(outcome: { error: string | undefined; aborted: boolean; finalizeError: unknown }): boolean {
+	return outcome.error !== undefined || outcome.aborted || outcome.finalizeError !== undefined;
+}
+
 /**
- * Bracket a kept-alive subagent's autonomous IRC wake turns with a task run
- * monitor so RPC/collab subscribers see the same `subagent_lifecycle` /
- * `subagent_progress` frames a first run emits. Shared by the live executor
- * reviver and the persisted cold-revive path so a resumed process's parked
- * subagents are not blind spots. The observer runs after the session has
- * flushed its post-prompt settle (see {@link AgentSession.setIrcWakeTurnObserver}).
- *
- * The turn's output is relayed to the waking peers via
- * {@link relayWakeTurnOutput}; the relay is registered as a pending reply on
- * the session up front so a `send await:true` waiter holds its "stopped
- * without replying" verdict until the relay has been delivered.
+ * Body for a wake-turn relay, distinguishing terminal outcomes a waiter
+ * would otherwise see as the same generic "stopped without replying" note:
+ * an answer, provider failure, cancellation, finalization throw, or empty turn.
+ * A yielded artifact is reported rather than contradicted with a no-output
+ * claim. Failure notices reach peers even after a progress message and include
+ * a history pointer. Exported for focused contract tests.
  */
+export function buildWakeRelayBody(args: {
+	id: string;
+	yielded: boolean;
+	result: SingleResult | undefined;
+	turnText: string;
+	error: string | undefined;
+	aborted: boolean;
+	abortReason: string | undefined;
+	finalizeError: unknown;
+	alreadyMessaged: boolean;
+	agentRegistry?: AgentRegistry;
+}): string {
+	const transcript = `See history://${args.id} for details.`;
+	const summary =
+		args.yielded && args.result?.outputPath
+			? formatTaskResultSummary(args.result, {
+					totalDurationMs: args.result.durationMs,
+					agentRegistry: args.agentRegistry,
+				})
+			: undefined;
+	const headline = args.error
+		? `Wake turn failed: ${args.error}.`
+		: args.aborted
+			? `Wake turn was cancelled${args.abortReason?.trim() ? `: ${args.abortReason.trim()}` : ""}.`
+			: undefined;
+	if (headline) {
+		if (summary) return `${headline} A result was recorded before the turn ended:\n\n${summary}\n\n${transcript}`;
+		const context = args.alreadyMessaged
+			? "You received a message earlier in this turn, but that was not the answer and nothing further was sent."
+			: "No answer was produced.";
+		return `${headline} ${context} ${transcript}`;
+	}
+	const answer = summary ?? args.turnText.trim();
+	if (answer) return answer;
+	if (args.finalizeError) {
+		const message = args.finalizeError instanceof Error ? args.finalizeError.message : String(args.finalizeError);
+		return `Wake turn failed to finalize: ${message}. No answer was produced. ${transcript}`;
+	}
+	return `Wake turn produced no output. ${transcript}`;
+}
 /** Extracts display text from an IRC/aside record's content, shared by the custom-role and
  *  user-role branches below (both fields share the same string | text-part-array shape). */
 function extractIrcRecordText(content: string | ReadonlyArray<{ type: string; text?: string }>): string {
@@ -2970,6 +3076,20 @@ function extractIrcRecordText(content: string | ReadonlyArray<{ type: string; te
 		.join("\n");
 }
 
+/**
+ * Bracket a kept-alive subagent's autonomous IRC wake turns with a task run
+ * monitor so RPC/collab subscribers see the same `subagent_lifecycle` /
+ * `subagent_progress` frames a first run emits. Shared by the live executor
+ * reviver and the persisted cold-revive path so a resumed process's parked
+ * subagents are not blind spots. The observer runs after the session has
+ * flushed its post-prompt settle (see {@link AgentSession.setIrcWakeTurnObserver}).
+ *
+ * The turn's output reaches the parent as an async job when the parent's
+ * message woke the turn or the turn yielded, and the other waking peers via
+ * {@link relayWakeTurnOutput}; the relay is registered as a pending reply on
+ * the session up front so a `send await:true` waiter holds its "stopped
+ * without replying" verdict until the relay has been delivered.
+ */
 export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWakeTurnMonitorOptions): void {
 	const { id, agent } = options;
 	const index = options.index ?? 0;
@@ -2997,10 +3117,12 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		session.trackIrcReply(relay.promise);
 		const registry = options.agentRegistry;
 		const ref = registry.get(id);
+		const currentRef = lookupAgentRef(registry, id);
+		const ownerId = currentRef?.parentId;
 		const sessionFile = ref?.sessionFile ?? options.sessionFile ?? undefined;
-		// A woken agent's yield is a completion its parent must receive exactly
-		// like the first run's. Register an owner-routed job when the yield is
-		// accepted so the parent's `wait` can block while this turn finalizes.
+		// The parent's own wake spans the full turn. Other wake jobs start when a
+		// yield is accepted, before the child transitions out of running.
+		const jobCancel = new AbortController();
 		let wakeJob: { ownerId: string; outcome: PromiseWithResolvers<AsyncJobRunResult> } | undefined;
 		const registerWakeJob = (): void => {
 			if (wakeJob) return;
@@ -3010,11 +3132,15 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			if (!ownerId || !manager || currentRef?.session !== session) return;
 			const outcome = Promise.withResolvers<AsyncJobRunResult>();
 			try {
-				manager.register("task", id, ({ signal }) => untilAborted(signal, () => outcome.promise), {
+				manager.register(
+					"task",
 					id,
-					agentId: id,
-					ownerId,
-				});
+					({ signal }) => {
+						signal.addEventListener("abort", () => jobCancel.abort(signal.reason), { once: true });
+						return untilAborted(signal, outcome.promise);
+					},
+					{ id, agentId: id, ownerId },
+				);
 				wakeJob = { ownerId, outcome };
 			} catch (error) {
 				logger.warn("IRC wake-turn job registration failed", {
@@ -3044,6 +3170,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			maxRuntimeMs,
 			startTime: turnStartTime,
 			completionProbe: false,
+			signal: jobCancel.signal,
 			onYieldAccepted: registerWakeJob,
 		});
 
@@ -3062,6 +3189,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 
 		turnMonitor.setActiveSession(session);
 		const unsubscribeTurn = turnMonitor.attach(session);
+		if (wakeSources(records, id).some(source => source.from === ownerId)) registerWakeJob();
 		return async turnError => {
 			unsubscribeTurn();
 			const activeSession = turnMonitor.takeActiveSession();
@@ -3133,7 +3261,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				});
 			} finally {
 				if (wakeJob) {
-					if (result) {
+					if (yielded && result) {
 						try {
 							const text = formatTaskResultSummary(result, {
 								totalDurationMs: result.durationMs,
@@ -3148,9 +3276,23 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 						} catch (settlementError) {
 							wakeJob.outcome.reject(settlementError);
 						}
-					} else {
+					} else if (yielded) {
 						const message = finalizeError instanceof Error ? finalizeError.message : String(finalizeError);
 						wakeJob.outcome.reject(new Error(`Wake turn of ${id} failed to finalize: ${message}`));
+					} else {
+						const outcome = { error, aborted, finalizeError };
+						const text = buildWakeRelayBody({
+							...outcome,
+							id,
+							yielded,
+							result,
+							turnText,
+							abortReason,
+							alreadyMessaged: options.ircBus.sentSince(id, wakeJob.ownerId, turnStartTime),
+							agentRegistry: registry,
+						});
+						if (wakeTurnFailed(outcome)) wakeJob.outcome.reject(new Error(text));
+						else wakeJob.outcome.resolve({ text });
 					}
 				}
 				const finalRelayText =
@@ -3165,6 +3307,10 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 						yielded,
 						result,
 						turnText: finalRelayText,
+						error,
+						aborted,
+						abortReason,
+						finalizeError,
 						force: Boolean(error) || aborted || finalizeError !== undefined || !turnText.trim(),
 						jobOwnerId: wakeJob?.ownerId,
 						agentRegistry: registry,
@@ -3400,7 +3546,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	// Revalidate until the worker survives an install round-trip unchanged: the
 	// waits/rebuild above can outlast the idle TTL, letting park() detach this
 	// instance mid-install. Each observed replacement means another full park
-	// cycle, so reinstall on the fresh session (revivals start empty) and check
+	// cycle, so reinstall on the fresh session (a revival restores only the last persisted contract) and check
 	// again; genuine churn fails fast instead of driving a stale instance, and
 	// a released worker throws instead of driving a corpse. A replacement may
 	// already be streaming a wake, so ownership is reacquired every round.
@@ -3588,6 +3734,11 @@ interface SubagentLaunchInputs {
 	onFirstChatDispatch?: () => void;
 }
 
+/** Names of the child's explicitly supplied tools; they win over same-named MCP proxies on every rebind. */
+function explicitSubagentToolNames(spec: SubagentSessionSpec): ReadonlySet<string> {
+	return new Set((spec.options.customTools ?? []).map(tool => tool.name));
+}
+
 function buildSubagentSessionOptions(
 	spec: SubagentSessionSpec,
 	settings: Settings,
@@ -3595,9 +3746,14 @@ function buildSubagentSessionOptions(
 	launch?: SubagentLaunchInputs,
 ): CreateAgentSessionOptions & { agentId: string } {
 	const inputs = spec.prompt;
+	// MCP proxies are recreated on each revive so a changed server set is observed.
+	const mcpTools = spec.options.mcpManager ? createMCPProxyTools(spec.options.mcpManager) : [];
+	const customTools = spec.options.customTools ?? [];
 	const sessionOptions: CreateAgentSessionOptions & { agentId: string } = {
 		agentId: inputs.id,
 		...spec.options,
+		mcpTools: mcpTools.length > 0 ? mcpTools : undefined,
+		customTools: customTools.length > 0 ? customTools : undefined,
 		settings,
 		sessionManager,
 		resolveServiceTierByFamily: launch?.resolveServiceTierByFamily,
@@ -3745,10 +3901,19 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 			reopened.adoptArtifactManager(capture.parentArtifactManager);
 		}
 		await refreshSubagentIrcRoot(capture.spec.prompt, reopened, capture.sessionFile);
-		const { session: revived } = await capture.createAuthoritySession(
-			buildSubagentSessionOptions(capture.spec, restoreSubagentSettings(capture.settings), reopened),
-			expectedAgentRef,
-		);
+		const mcpManager = capture.spec.options.mcpManager;
+		const mcpFollower = mcpManager ? followMCPTools(mcpManager, explicitSubagentToolNames(capture.spec)) : undefined;
+		let revived: AgentSession;
+		try {
+			({ session: revived } = await capture.createAuthoritySession(
+				buildSubagentSessionOptions(capture.spec, restoreSubagentSettings(capture.settings), reopened),
+				expectedAgentRef,
+			));
+		} catch (error) {
+			mcpFollower?.dispose();
+			throw error;
+		}
+		mcpFollower?.bind(revived);
 		trackSubagentSettings(revived, capture);
 		// Re-run the executor's extension wiring on the rebuilt session. Skipping it leaves the
 		// runner pre-init, so a `tool_call` handler touching a runtime action trips the
@@ -4298,8 +4463,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const restrictToolNames = options.restrictToolNames === true;
 			const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
 			const mcpManager = enableMCP ? options.mcpManager : undefined;
-			const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager, toolNames) : [];
-			const sessionCustomTools = [...mcpProxyTools, ...(options.customTools ?? [])];
 
 			// Derive subagent-scoped telemetry from the parent's config so the
 			// child loop's spans nest under the parent's active execute_tool span
@@ -4441,7 +4604,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					skipPythonPreflight,
 					enableMCP,
 					mcpManager,
-					customTools: sessionCustomTools.length > 0 ? sessionCustomTools : undefined,
+					// MCP proxies are minted per build as `mcpTools` in buildSubagentSessionOptions.
+					customTools: options.customTools,
 					localProtocolOptions: options.localProtocolOptions,
 					telemetry: subagentTelemetry,
 					permissionScope: options.permissionSnapshot?.scope ?? options.permissionScope,
@@ -4480,23 +4644,27 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			await refreshSubagentIrcRoot(sessionSpec.prompt, sessionManager, sessionFile);
 
 			const hasExistingModelRole = sessionManager.getLastModelChangeRole() !== undefined;
-			const sessionPromise = options.createAuthoritySession(
-				buildSubagentSessionOptions(sessionSpec, subagentSettings, sessionManager, {
-					workPoolYieldItems: options.workPoolYieldItems ?? [],
-					resolveServiceTierByFamily,
-					onFirstChatDispatch: () => {
-						firstChatDispatchAt ??= performance.now();
-					},
-				}),
-			);
+			// Subscribe before the builder mints proxies so manager changes during startup are replayed on bind.
+			const mcpFollower = mcpManager
+				? followMCPTools(mcpManager, explicitSubagentToolNames(sessionSpec))
+				: undefined;
 			let session: AgentSession;
+			let sessionPromise: Promise<{ session: AgentSession }> | undefined;
 			try {
+				sessionPromise = createSubagentSession(
+					buildSubagentSessionOptions(sessionSpec, subagentSettings, sessionManager, {
+						workPoolYieldItems: options.workPoolYieldItems ?? [],
+						resolveServiceTierByFamily,
+						onFirstChatDispatch: () => {
+							firstChatDispatchAt ??= performance.now();
+						},
+					}),
+				);
 				({ session } = await awaitAbortable(sessionPromise));
 			} catch (err) {
-				// Abort raced session startup. The session may still resolve later
-				// holding live LSP/MCP child processes — dispose it when it does so
-				// a cancelled subagent cannot leak them.
-				void sessionPromise.then(created => created.session.dispose()).catch(() => {});
+				mcpFollower?.dispose();
+				// Abort may race session startup; dispose any session that resolves afterward.
+				void sessionPromise?.then(created => created.session.dispose()).catch(() => {});
 				throw err;
 			}
 			monitor.setActiveSession(session);
@@ -4523,6 +4691,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			historyAuthority = session;
 			if (abortedDuringCreation) monitor.requestAbort("signal");
 			options.onHistoryAuthorityClaimed?.(session);
+			mcpFollower?.bind(session);
 			// The SDK records a new session's initial model as the default role.
 			// Pin the child's own chain so a parent default sharing that model
 			// cannot steal its fallback routing. Resumed history keeps its role.
@@ -4594,8 +4763,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings);
 			const permissionSummary = session.getPermissionSummary() ?? options.permissionSummary;
 			progress.permissionSummary = permissionSummary;
+			const workPoolYieldItems = session.getWorkPoolYieldItems();
 			session.sessionManager.appendSessionInit({
-				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
+				// Blocks as sent; the session appends a newer session_init whenever a model call's base changes.
+				systemPrompt: session.agent.state.systemPrompt,
 				task,
 				tools: persistedSubagentTools,
 				agent: agent.name,
@@ -4621,6 +4792,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: restrictToolNames || undefined,
 				enableMCP,
+				workPoolYieldItems: workPoolYieldItems.length > 0 ? [...workPoolYieldItems] : undefined,
 				// Isolated runs are never revivable after their worktree lifecycle ends.
 				isolated: worktree !== undefined || undefined,
 			});

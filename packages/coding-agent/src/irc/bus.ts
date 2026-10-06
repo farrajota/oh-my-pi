@@ -23,7 +23,7 @@ import {
 } from "../internal/agent-lifecycle-bridge";
 import { lookupAgentRef, onInternalRegistryChange } from "../internal/agent-registry-bridge";
 import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import type { HubAdmissionStateTransaction } from "../internal/hub-admission";
 import type { AgentSessionEvent } from "../session/agent-session-events";
@@ -582,7 +582,7 @@ export class IrcBus {
 		signal?: AbortSignal,
 		options?: {
 			drainPending?: boolean;
-			liveness?: { registry: AgentRegistry; senderId: string };
+			liveness?: { registry: AgentRegistry; senderId: string; eligiblePeer?: (ref: AgentRef) => boolean };
 			awaitTarget?: { registry: AgentRegistry; target: string };
 			transaction?: HubAdmissionStateTransaction;
 		},
@@ -738,11 +738,17 @@ export class IrcBus {
 		waiters.push(waiter);
 
 		if (liveness) {
-			const { registry, senderId } = liveness;
+			const { registry, senderId, eligiblePeer } = liveness;
 			const hasRunningSender = (from?: string): boolean =>
 				registry
 					.listVisibleTo(senderId)
-					.some(ref => this.#inScope(ref) && registry.isRunning(ref) && (!from || ref.id === from));
+					.some(
+						ref =>
+							this.#inScope(ref) &&
+							registry.isRunning(ref) &&
+							(!from || ref.id === from) &&
+							(eligiblePeer?.(ref) ?? true),
+					);
 			const check = filter.from ? () => hasRunningSender(filter.from) : () => hasRunningSender();
 			unsubscribeLiveness = registry.onChange(() => {
 				if (!check()) {
@@ -811,7 +817,6 @@ export class IrcBus {
 			};
 			sync();
 		}
-
 		return promise;
 	}
 

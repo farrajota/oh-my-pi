@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import * as fs from "node:fs/promises";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import { AuthStorage, type AssistantMessage, type Model } from "@oh-my-pi/pi-ai";
 import type { AsyncJobRegisterOptions } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -9,12 +10,21 @@ import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/
 import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { TanCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/tan-command-controller";
 import { createAgentRootSession, lookupAgentRef } from "../../../src/internal/agent-registry-bridge";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
+import type { MCPStdioServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import { type CreateAgentSessionOptions, type CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import { extractSessionInit, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { removeSyncWithRetries, TempDir } from "@oh-my-pi/pi-utils";
+
+const createRealAgentSession = sdkModule.createAgentSession;
 
 interface CapturedJobRunContext {
 	jobId: string;
@@ -26,6 +36,7 @@ type CapturedJobRun = (ctx: CapturedJobRunContext) => Promise<string>;
 
 const model = { provider: "anthropic", id: "claude-sonnet-4-5" } as Model;
 const rootSessions: Array<{ dispose: () => Promise<void> }> = [];
+const operationLedgerClosers: Array<() => Promise<void>> = [];
 
 function assistantText(text: string): AssistantMessage {
 	return {
@@ -112,10 +123,15 @@ function createCloneStub(overrides?: {
 	};
 }
 
-function mockTanSessionCreation(stub: TanCloneStub, onCreate?: (options: CreateAgentSessionOptions) => void) {
+function mockTanSessionCreation(
+	stub: TanCloneStub,
+	onCreate?: (options: CreateAgentSessionOptions) => void,
+	createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>,
+) {
 	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 		if (!options) throw new Error("Tan test session requires create options");
 		onCreate?.(options);
+		if (createSession) return createSession(options);
 		stub.attachSessionManager(options.sessionManager);
 		return { session: stub.clone } as unknown as CreateAgentSessionResult;
 	});
@@ -125,6 +141,7 @@ async function createContext(overrides?: {
 	isStreaming?: boolean;
 	model?: Model;
 	agentId?: string;
+	mcpManager?: MCPManager;
 	parentPromptCacheKey?: string;
 	register?: (run: CapturedJobRun, options?: AsyncJobRegisterOptions) => string;
 	activeToolNames?: string[];
@@ -132,6 +149,7 @@ async function createContext(overrides?: {
 	preparedExtensions?: unknown;
 	effectiveExtensionRoots?: unknown;
 	extensionPaths?: unknown;
+	settings?: Settings;
 }) {
 	const tempDir = TempDir.createSync("@omp-tan-controller-");
 	const parentFile = path.join(tempDir.path(), "parent.jsonl");
@@ -187,12 +205,14 @@ async function createContext(overrides?: {
 	const ctx = {
 		session,
 		sessionManager,
-		settings: Settings.isolated({ "task.enableLsp": true }),
+		settings: overrides?.settings ?? Settings.isolated({ "task.enableLsp": true }),
 		showStatus: vi.fn(),
 		showWarning: vi.fn(),
-		showError: vi.fn(),
 		rebuildChatFromMessages: vi.fn(),
+		showError: vi.fn(),
+		mcpManager: overrides?.mcpManager,
 	} as unknown as InteractiveModeContext;
+	const operationLedger = installSessionOperationLedger(sessionManager);
 	const rootCreate = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValueOnce({
 		session,
 	} as unknown as CreateAgentSessionResult);
@@ -205,6 +225,7 @@ async function createContext(overrides?: {
 		rootCreate.mockRestore();
 	}
 	rootSessions.push(session);
+	operationLedgerClosers.push(operationLedger.close);
 	return {
 		tempDir,
 		parentFile,
@@ -215,6 +236,7 @@ async function createContext(overrides?: {
 		getArtifactsDir,
 		getSessionId,
 		register,
+		operationLedger,
 		sequence,
 		get capturedRun() {
 			return capturedRun;
@@ -227,6 +249,7 @@ async function createContext(overrides?: {
 
 describe("TanCommandController", () => {
 	afterEach(async () => {
+		for (const closeLedger of operationLedgerClosers.splice(0)) await closeLedger();
 		for (const root of rootSessions.splice(0)) await root.dispose();
 		AgentRegistry.resetGlobalForTests();
 		vi.restoreAllMocks();
@@ -434,6 +457,195 @@ describe("TanCommandController", () => {
 			await result.catch(() => {});
 		}
 	});
+	it("quiesces the parent job ledger to cancel TAN and drain while the caller signal stays active", async () => {
+		const harness = await createContext();
+		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
+		const promptStarted = Promise.withResolvers<void>();
+		const modelIoAborted = Promise.withResolvers<void>();
+		const modelIo = new AbortController();
+		const lifecycle: string[] = [];
+		const stub = createCloneStub({
+			prompt: async () => {
+				const request = new Promise<never>((_, reject) => {
+					modelIo.signal.addEventListener(
+						"abort",
+						() => {
+							lifecycle.push("model-io-aborted");
+							modelIoAborted.resolve();
+							reject(new Error("Model request aborted"));
+						},
+						{ once: true },
+					);
+				});
+				promptStarted.resolve();
+				await request;
+			},
+			abort: () => {
+				lifecycle.push("clone-abort");
+				modelIo.abort();
+			},
+		});
+		stub.dispose.mockImplementation(async () => {
+			lifecycle.push("disposed");
+		});
+		mockTanSessionCreation(stub);
+		await new TanCommandController(harness.ctx).start("follow the tangent");
+		const run = harness.capturedRun;
+		if (!run) throw new Error("run function was not captured");
+		const caller = new AbortController();
+		const result = run({ jobId: "job-123", signal: caller.signal, reportProgress: async () => {} });
+		let drain: Promise<void> | undefined;
+		try {
+			const promptReached = await Promise.race([
+				promptStarted.promise.then(() => true),
+				result.then(
+					() => false,
+					() => false,
+				),
+			]);
+			expect(promptReached).toBe(true);
+			drain = harness.operationLedger.close().then(() => {
+				lifecycle.push("drained");
+			});
+			expect(caller.signal.aborted).toBe(false);
+			expect(stub.clone.abort).toHaveBeenCalledTimes(1);
+			expect(modelIo.signal.aborted).toBe(true);
+			await modelIoAborted.promise;
+			await expect(result).rejects.toThrow(/^Operation job cancelled:/);
+			await drain;
+			expect(caller.signal.aborted).toBe(false);
+			expect(stub.dispose).toHaveBeenCalledTimes(1);
+			expect(lifecycle).toEqual(["clone-abort", "model-io-aborted", "disposed", "drained"]);
+		} finally {
+			if (!modelIo.signal.aborted) modelIo.abort();
+			await result.catch(() => {});
+			if (drain) await drain;
+		}
+	});
+
+	it("tracks parent MCP removal and reconnect metadata in the live TAN tool catalog", async () => {
+		const localModel = getBundledModel("openai", "gpt-4o-mini");
+		const harness = await createContext({
+			model: localModel,
+			settings: Settings.isolated({ "task.enableLsp": false }),
+		});
+		await fs.writeFile(
+			harness.parentFile,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "parent-session",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: harness.tempDir.path(),
+			})}\n`,
+		);
+		const authStorage = await AuthStorage.create(path.join(harness.tempDir.path(), "auth.db"));
+		authStorage.keys.setRuntime("openai", "test-key");
+		Object.assign(harness.ctx.session, { modelRegistry: new ModelRegistry(authStorage) });
+		const manager = new MCPManager(harness.tempDir.path(), null, async () => ({
+			configs: {},
+			sources: {},
+			exaApiKeys: [],
+		}));
+		const serverProgram = `
+			const readline = require("node:readline");
+			const description = process.argv.at(-1);
+			readline.createInterface({ input: process.stdin }).on("line", line => {
+				const request = JSON.parse(line);
+				if (request.id === undefined) return;
+				let result = {};
+				if (request.method === "initialize") result = { protocolVersion: "2025-03-26", serverInfo: { name: "tan-catalog", version: "1" }, capabilities: { tools: {} } };
+				if (request.method === "tools/list") result = { tools: [{ name: "probe", description, inputSchema: { type: "object", properties: { revision: { type: "string", description } } } }] };
+				process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\\n");
+			});
+		`;
+		const server = (description: string): MCPStdioServerConfig => ({
+			type: "stdio",
+			command: process.execPath,
+			args: ["-e", serverProgram, description],
+		});
+		const childStarted = Promise.withResolvers<void>();
+		const finishPrompt = Promise.withResolvers<void>();
+		const stub = createCloneStub({ lastAssistantText: "done" });
+		let child: AgentSession | undefined;
+		let result: Promise<string> | undefined;
+		try {
+			await manager.connectServers({ alpha: server("alpha-v1") }, {});
+			Object.assign(harness.ctx, { mcpManager: manager });
+			let authoritySessionManager: CreateAgentSessionOptions["sessionManager"] | undefined;
+			let authoritySessionFile: string | undefined;
+			let childId: string | undefined;
+			mockTanSessionCreation(stub, undefined, async options => {
+				const selectedSessionManager = options.sessionManager;
+				if (!selectedSessionManager) throw new Error("Tan SDK options must retain the forked session manager");
+				authoritySessionManager = selectedSessionManager;
+				authoritySessionFile = selectedSessionManager.getSessionFile() ?? undefined;
+				childId = options.agentId;
+				const created = await createRealAgentSession({
+					...options,
+					agentDir: harness.tempDir.path(),
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					skipPythonPreflight: true,
+				});
+				child = created.session;
+				Object.assign(child, {
+					prompt: vi.fn(async () => {
+						childStarted.resolve();
+						await finishPrompt.promise;
+					}),
+					getLastAssistantMessage: () => assistantText("done"),
+				});
+				return created;
+			});
+			await new TanCommandController(harness.ctx).start("inspect changing MCP tools");
+			const run = harness.capturedRun;
+			if (!run) throw new Error("run function was not captured");
+			const activeResult = run({
+				jobId: "job-123",
+				signal: new AbortController().signal,
+				reportProgress: async () => {},
+			});
+			result = activeResult;
+			const promptStartedInTime = await Promise.race([
+				childStarted.promise.then(() => true),
+				activeResult.then(
+					() => false,
+					() => false,
+				),
+			]);
+			expect(promptStartedInTime).toBe(true);
+			expect(authoritySessionManager).toBeInstanceOf(SessionManager);
+			expect(child?.sessionManager).toBe(authoritySessionManager);
+			expect(authoritySessionFile).toBe(path.join(harness.parentArtifactsDir, `${childId}.jsonl`));
+			expect(child?.sessionManager?.getSessionFile()).toBe(authoritySessionFile);
+			const toolName = "mcp__alpha_probe";
+			const observed = [child?.getToolByName(toolName)?.description];
+			await manager.disconnectAll();
+			await manager.connectServers({ bravo: server("bravo") }, {});
+			await child?.runToolRegistryMutation(async () => undefined);
+			const replacementAvailable = child?.getEnabledToolNames().includes("mcp__bravo_probe");
+			observed.push(child?.getToolByName(toolName)?.description);
+			await manager.disconnectAll();
+			await manager.connectServers({ alpha: server("alpha-v2") }, {});
+			await child?.runToolRegistryMutation(async () => undefined);
+			observed.push(child?.getToolByName(toolName)?.description);
+			finishPrompt.resolve();
+			await result;
+			expect(observed[0]).toContain("alpha-v1");
+			expect(observed[1]).toBeUndefined();
+			expect(observed[2]).toContain("alpha-v2");
+			expect(replacementAvailable).toBe(true);
+		} finally {
+			finishPrompt.resolve();
+			await result?.catch(() => {});
+			await manager.disconnectAll();
+			authStorage.close();
+			removeSyncWithRetries(harness.tempDir.path());
+		}
+	});
 
 	it("forwards the parent's prepared extensions and root policy so the tan child rebinds runtime providers", async () => {
 		// Regression: the tan clone reuses the parent's shared ModelRegistry. If it
@@ -518,7 +730,13 @@ describe("TanCommandController", () => {
 			lastAssistantText: "finished",
 		});
 		const { clone } = stub;
-		const createAgentSessionSpy = mockTanSessionCreation(stub);
+		const registry = AgentRegistry.global();
+		const parentRef = lookupAgentRef(registry, MAIN_AGENT_ID);
+		if (!parentRef) throw new Error("Parent registry reference was not created");
+		let childId: string | undefined;
+		const createAgentSessionSpy = mockTanSessionCreation(stub, options => {
+			childId = options.agentId;
+		});
 		const controller = new TanCommandController(harness.ctx);
 		await controller.start("follow the tangent");
 		const capturedRun = harness.capturedRun;
@@ -536,7 +754,12 @@ describe("TanCommandController", () => {
 		await expect(resultPromise).rejects.toThrow(/^Operation job cancelled:/);
 
 		expect(clone.abort).toHaveBeenCalled();
-		expect(stub.dispose).toHaveBeenCalled();
+		expect(stub.dispose).toHaveBeenCalledTimes(1);
+		if (!childId) throw new Error("Tan child id was not passed to session creation");
+		expect(registry.get(childId)).toEqual(expect.objectContaining({ id: childId, status: "aborted" }));
+		expect(lookupAgentRef(registry, childId)?.session).toBeNull();
+		expect(lookupAgentRef(registry, MAIN_AGENT_ID)?.session).toBe(parentRef.session);
+		expect(parentRef.session).toBe(harness.ctx.session);
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]).toEqual(
 			expect.objectContaining({
 				providerPromptCacheKey: "parent-session",
@@ -587,56 +810,76 @@ describe("TanCommandController", () => {
 
 	it("parks the finished tan in the registry so it stays visible in the Agent Hub", async () => {
 		const harness = await createContext();
-		const registry = AgentRegistry.global();
-		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
-		const appendSessionInit = vi.fn();
-		const stub = createCloneStub({ sessionManager: { appendSessionInit } });
-		const { clone } = stub;
-		let childId: string | undefined;
-		let childBeforeDispose: AgentRef | undefined;
-		let childSessionBeforeDispose: unknown;
-		mockTanSessionCreation(stub, options => {
-			childId = options.agentId;
+		const cloneManager = await SessionManager.open(harness.cloneFile, harness.parentArtifactsDir, undefined, {
+			initialCwd: harness.tempDir.path(),
+			suppressBreadcrumb: true,
 		});
-		stub.dispose.mockImplementation(async () => {
+		try {
+			await cloneManager.ensureOnDisk();
+			const registry = AgentRegistry.global();
+			vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(cloneManager);
+			const stub = createCloneStub({
+				sessionManager: { appendSessionInit: cloneManager.appendSessionInit.bind(cloneManager) },
+			});
+			const { clone } = stub;
+			let childId: string | undefined;
+			let childBeforeDispose: AgentRef | undefined;
+			let childSessionBeforeDispose: unknown;
+			mockTanSessionCreation(stub, options => {
+				childId = options.agentId;
+			});
+			stub.dispose.mockImplementation(async () => {
+				if (!childId) throw new Error("Tan child id was not passed to session creation");
+				childBeforeDispose = registry.get(childId);
+				childSessionBeforeDispose = lookupAgentRef(registry, childId)?.session;
+			});
+			const controller = new TanCommandController(harness.ctx);
+
+			await controller.start("park me");
+			const run = harness.capturedRun;
+			if (!run) throw new Error("run function was not captured");
+			const result = await run({
+				jobId: "job-123",
+				signal: new AbortController().signal,
+				reportProgress: async () => {},
+			});
+
+			expect(result).toBe("done");
+			await cloneManager.flush();
+			// Reload the durable contract through the consumer that normalizes joined prompts.
+			expect(
+				extractSessionInit(await loadEntriesFromFile(harness.cloneFile, undefined, { throwIfMissing: true })),
+			).toEqual(
+				expect.objectContaining({
+					systemPrompt: ["system prompt"],
+					task: "park me",
+					tools: ["read", "bash"],
+				}),
+			);
 			if (!childId) throw new Error("Tan child id was not passed to session creation");
-			childBeforeDispose = registry.get(childId);
-			childSessionBeforeDispose = lookupAgentRef(registry, childId)?.session;
-		});
-		const controller = new TanCommandController(harness.ctx);
-
-		await controller.start("park me");
-		const run = harness.capturedRun;
-		if (!run) throw new Error("run function was not captured");
-		const result = await run({
-			jobId: "job-123",
-			signal: new AbortController().signal,
-			reportProgress: async () => {},
-		});
-
-		expect(result).toBe("done");
-		expect(appendSessionInit).toHaveBeenCalledWith({
-			systemPrompt: "system prompt",
-			task: "park me",
-			tools: ["read", "bash"],
-		});
-		if (!childId) throw new Error("Tan child id was not passed to session creation");
-		expect(childBeforeDispose).toEqual(
-			expect.objectContaining({
-				id: childId,
-				parentId: MAIN_AGENT_ID,
-				kind: "sub",
-				status: "parked",
-				sessionFile: harness.cloneFile,
-			}),
-		);
-		expect(childSessionBeforeDispose).toBe(clone);
-		const childAfterDispose = registry.get(childId);
-		expect(childAfterDispose).toEqual(
-			expect.objectContaining({ id: childId, status: "parked", sessionFile: harness.cloneFile }),
-		);
-		expect(lookupAgentRef(registry, childId)?.session).toBeNull();
-		expect(stub.dispose).toHaveBeenCalledTimes(1);
+			expect(childBeforeDispose).toEqual(
+				expect.objectContaining({
+					id: childId,
+					parentId: MAIN_AGENT_ID,
+					kind: "sub",
+					status: "parked",
+					sessionFile: harness.cloneFile,
+				}),
+			);
+			expect(childSessionBeforeDispose).toBe(clone);
+			const childAfterDispose = registry.get(childId);
+			expect(childAfterDispose).toEqual(
+				expect.objectContaining({ id: childId, status: "parked", sessionFile: harness.cloneFile }),
+			);
+			expect(lookupAgentRef(registry, childId)?.session).toBeNull();
+			expect(stub.dispose).toHaveBeenCalledTimes(1);
+		} finally {
+			try {
+				await cloneManager.close();
+			} finally {
+				removeSyncWithRetries(harness.tempDir.path());
+			}
+		}
 	});
 
 	it("copies and persists the full enabled tool set", async () => {

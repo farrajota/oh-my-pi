@@ -7,16 +7,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import {
 	getAgentLifecycleManager,
 	releaseAgent,
+	registerToolSessionLifecycleAuthority,
 	resetAgentLifecycleForTests,
 } from "../../src/internal/agent-lifecycle-bridge";
-import { Settings } from "../../src/config/settings";
 import { AgentRegistry, type AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 
-import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -27,7 +28,10 @@ import {
 	runSubprocess,
 } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, AgentProgress } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { createSessionDefaults } from "../helpers/session-defaults";
 import {
 	bindInternalAgentAuthoritySession,
 	createAgentRootSession,
@@ -69,6 +73,8 @@ interface SessionHarness {
 	promptEntered: Promise<void>;
 	/** Emit a successful terminal `yield` tool result through the session event stream. */
 	emitTerminalYield: (data: unknown) => void;
+	/** End an assistant message carrying `text` and no tool calls. */
+	emitAssistantText: (text: string) => void;
 	/** The observer factory installed by {@link attachIrcWakeTurnMonitor}, if any. */
 	wakeObserver: () =>
 		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
@@ -91,10 +97,16 @@ function createHarness(options?: {
 	const promptEntered = Promise.withResolvers<void>();
 	const hangingPrompt = Promise.withResolvers<void>();
 	let yieldSeq = 0;
+	let workPoolYieldItems: Parameters<AgentSession["setWorkPoolYieldItems"]>[0] = [];
 	let wakeObserver: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined;
 	const emit = (event: AgentSessionEvent) => {
 		// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
 		for (const listener of [...listeners]) listener(event);
+	};
+	const emitAssistantText = (text: string) => {
+		const message = assistantStopMessage(text);
+		messages.push(message);
+		emit({ type: "message_end", message } as AgentSessionEvent);
 	};
 	const emitTerminalYield = (data: unknown) => {
 		yieldSeq += 1;
@@ -109,6 +121,7 @@ function createHarness(options?: {
 		} as AgentSessionEvent);
 	};
 	const session = {
+		...createSessionDefaults(),
 		state: { messages },
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
@@ -117,10 +130,10 @@ function createHarness(options?: {
 		settings: Settings.isolated(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
-		getToolByName: () => undefined,
-		getPermissionSummary: () => undefined,
-		setActiveToolsByName: async () => {},
-		setWorkPoolYieldItems: () => {},
+		getWorkPoolYieldItems: () => workPoolYieldItems,
+		setWorkPoolYieldItems: async (items: Parameters<AgentSession["setWorkPoolYieldItems"]>[0]) => {
+			workPoolYieldItems = [...items];
+		},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {
@@ -141,36 +154,27 @@ function createHarness(options?: {
 					message.usage.input = -1;
 				}
 			} else {
-				const message = assistantStopMessage("submitting");
-				messages.push(message);
-				emit({ type: "message_end", message } as AgentSessionEvent);
+				emitAssistantText("submitting");
 			}
 			emitTerminalYield({ report: text });
 			return true;
 		},
-		waitForIdle: async () => {},
-		isAdvisorActive: () => false,
-		prepareForHeadlessAdvisorDrain: () => {},
-		waitForAdvisorCatchup: async () => true,
 		getLastAssistantMessage: () => messages[messages.length - 1],
-		hasPendingAsyncWork: () => false,
 		getAsyncJobSnapshot: () => ({ running: [], recent: [] }),
 		settleAsyncWork: async () => {},
-		abort: async () => {},
-		dispose: async () => {},
 		setIrcWakeTurnObserver: (
 			observer: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined,
 		) => {
 			wakeObserver = observer;
 		},
 		trackIrcReply: () => {},
-		subscribeRunState: () => () => {},
 		asyncJobManager: options?.asyncJobManager,
 	};
 	return {
 		session: session as unknown as AgentSession,
 		promptEntered: promptEntered.promise,
 		emitTerminalYield,
+		emitAssistantText,
 		wakeObserver: () => wakeObserver,
 	};
 }
@@ -201,6 +205,11 @@ function authorityOptions() {
 	};
 }
 
+function wakeTurnOptions() {
+	const agentRegistry = AgentRegistry.global();
+	return { agentRegistry, ircBus: IrcBus.forRoot(agentRegistry, "Main") };
+}
+
 describe("runSubprocess result acceptance", () => {
 	beforeEach(async () => {
 		resetAgentLifecycleForTests();
@@ -210,6 +219,7 @@ describe("runSubprocess result acceptance", () => {
 		const authority = bindInternalAgentAuthoritySession(AgentRegistry.global(), root.session);
 		if (!authority) throw new Error("Test fixture requires parent authority");
 		createAuthoritySession = authority.create;
+		IrcBus.resetGlobalForTests();
 	});
 
 	afterEach(async () => {
@@ -219,6 +229,7 @@ describe("runSubprocess result acceptance", () => {
 		await authorityRoot?.dispose();
 		authorityRoot = undefined;
 		AgentRegistry.resetGlobalForTests();
+		IrcBus.resetGlobalForTests();
 	});
 
 	it("terminalizes the ref and preserves the accepted result metadata", async () => {
@@ -406,12 +417,13 @@ describe("runSubprocess result acceptance", () => {
 	it("terminalizes the ref when an autonomous wake turn's yield is accepted", async () => {
 		const harness = createHarness();
 		registerRunning(harness.session);
+		const wakeOptions = wakeTurnOptions();
 		attachIrcWakeTurnMonitor(harness.session, {
 			id: AGENT_ID,
 			agent: baseAgent,
-			agentRegistry: AgentRegistry.global(),
-			ircBus: new IrcBus(),
+			...wakeOptions,
 		});
+		expect(wakeOptions.ircBus).toBe(IrcBus.forRoot(wakeOptions.agentRegistry, "Main"));
 		const observer = harness.wakeObserver();
 		expect(observer).toBeDefined();
 
@@ -439,7 +451,7 @@ describe("runSubprocess result acceptance", () => {
 	it("delivers every yield of a woken agent to its parent as a job completion", async () => {
 		const manager = new AsyncJobManager({});
 		const delivered: string[] = [];
-		manager.registerDeliverySink("Parent", (_jobId, text) => {
+		manager.registerDeliverySink("Main", (_jobId, text) => {
 			delivered.push(text);
 		});
 		const harness = createHarness({ asyncJobManager: manager });
@@ -447,15 +459,15 @@ describe("runSubprocess result acceptance", () => {
 			id: AGENT_ID,
 			displayName: AGENT_ID,
 			kind: "sub",
-			parentId: "Parent",
+			parentId: "Main",
 			session: harness.session,
 			status: "idle",
 		});
+		const wakeOptions = wakeTurnOptions();
 		attachIrcWakeTurnMonitor(harness.session, {
 			id: AGENT_ID,
 			agent: baseAgent,
-			agentRegistry: AgentRegistry.global(),
-			ircBus: new IrcBus(),
+			...wakeOptions,
 		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
@@ -468,16 +480,16 @@ describe("runSubprocess result acceptance", () => {
 						customType: "irc:incoming",
 						content: "follow up",
 						display: false,
-						details: { id: `msg-${report}`, from: "Parent", message: "follow up" },
+						details: { id: `msg-${report}`, from: "Main", message: "follow up" },
 						attribution: "agent",
 						timestamp: Date.now(),
 					} as unknown as AgentMessage,
 				]);
 				harness.emitTerminalYield({ report });
 				// Pending from acceptance until finalization: the parent's `wait` can block on it.
-				const [job] = manager.getRunningJobs({ ownerId: "Parent" });
-				expect(manager.getRunningJobs({ ownerId: "Parent" })).toHaveLength(1);
-				expect(job).toMatchObject({ type: "task", agentId: AGENT_ID, ownerId: "Parent", status: "running" });
+				const [job] = manager.getRunningJobs({ ownerId: "Main" });
+				expect(manager.getRunningJobs({ ownerId: "Main" })).toHaveLength(1);
+				expect(job).toMatchObject({ type: "task", agentId: AGENT_ID, ownerId: "Main", status: "running" });
 				await finish?.(undefined);
 				await manager.waitForAll();
 				expect(manager.getJob(job!.id)?.status).toBe("completed");
@@ -487,6 +499,63 @@ describe("runSubprocess result acceptance", () => {
 			expect(delivered).toHaveLength(2);
 			expect(delivered[0]).toContain("followup-done");
 			expect(delivered[1]).toContain("broadcast-ok");
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
+	});
+
+	it("blocks the parent's wait on a turn its message woke and returns the turn's answer once", async () => {
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager });
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Main",
+			session: harness.session,
+			status: "idle",
+		});
+		const wakeOptions = wakeTurnOptions();
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, ...wakeOptions });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const root = authorityRoot;
+		if (!root) throw new Error("Test fixture requires the existing parent authority root");
+		const parent = {
+			cwd: root.sessionManager.getCwd(),
+			settings: Settings.isolated({ "launch.enabled": false }),
+			agentRegistry: wakeOptions.agentRegistry,
+			asyncJobManager: manager,
+			getAgentId: () => "Main",
+			getSessionFile: () => root.sessionManager.getSessionFile(),
+		} as unknown as ToolSession;
+		registerToolSessionLifecycleAuthority(parent, wakeOptions.agentRegistry, root);
+
+		try {
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "fix the mask path too",
+					display: false,
+					details: { id: "msg-mask", from: "Main", message: "fix the mask path too" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			const waiting = new WaitTool(parent).execute("parent-wait", {});
+			// A conversational answer: the turn ends without a yield.
+			harness.emitAssistantText("mask path fixed too");
+			await finish?.(undefined);
+
+			const result = await waiting;
+			expect(result.details?.jobs?.[0]).toMatchObject({
+				id: AGENT_ID,
+				status: "completed",
+				resultText: "mask path fixed too",
+			});
+			// The job carries the answer; a relay message would deliver it twice.
+			expect(wakeOptions.ircBus.take("Main")).toBeUndefined();
 		} finally {
 			await manager.dispose({ timeoutMs: 1000 });
 		}

@@ -31,8 +31,14 @@ function fixtureConfig(): MCPStdioServerConfig {
 describe("MCP incremental connectServers", () => {
 	let workDir: string;
 	let manager: MCPManager;
+	const originalStartupWindow = Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS;
 
 	beforeEach(() => {
+		// These assertions read connection state right after connectServers returns. The default
+		// 250 ms startup window races the fixture's process spawn + handshake (~200 ms on a loaded
+		// host), so wait for initial loads to settle; the window itself is covered by
+		// mcp-print-readiness.test.ts.
+		Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS = "0";
 		workDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-mcp-incremental-"));
 		manager = new MCPManager(workDir);
 	});
@@ -40,6 +46,8 @@ describe("MCP incremental connectServers", () => {
 	afterEach(async () => {
 		await manager.disconnectAll();
 		removeSyncWithRetries(workDir);
+		if (originalStartupWindow === undefined) delete Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS;
+		else Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS = originalStartupWindow;
 	});
 
 	it("keeps server A tools after incrementally connecting server B", async () => {

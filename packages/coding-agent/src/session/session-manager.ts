@@ -40,6 +40,7 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
+import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
@@ -83,6 +84,7 @@ import {
 import {
 	loadEntriesFromFile,
 	loadSessionFile,
+	normalizeAssistantUsage,
 	parseSessionContent,
 	readSessionHeaderId,
 	resolveBlobRefsInEntries,
@@ -469,22 +471,15 @@ function entryUsage(entry: SessionEntry): Usage | undefined {
 	return undefined;
 }
 
-/**
- * Give a usage-less assistant message zero usage so renderers and totals never
- * dereference `undefined`. Persisted and imported transcripts can predate usage
- * metadata, so this is legitimate history, not a producer bug.
- */
-function repairMissingUsage(entry: SessionEntry): boolean {
-	if (entry.type !== "message" || entry.message.role !== "assistant" || entry.message.usage) return false;
-	entry.message.usage = {
-		input: 0,
-		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 0,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
-	return true;
+/** Complete incomplete assistant usage in loaded history; returns how many messages were repaired. */
+function normalizeLoadedUsage(entries: SessionEntry[]): number {
+	let repaired = 0;
+	for (const entry of entries) {
+		if (entry.type === "message" && entry.message.role === "assistant" && normalizeAssistantUsage(entry.message)) {
+			repaired++;
+		}
+	}
+	return repaired;
 }
 
 function addUsage(target: UsageStatistics, usage: Usage | undefined): void {
@@ -2050,6 +2045,8 @@ export class SessionManager {
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = header.timestamp;
+		const repairedUsage = normalizeLoadedUsage(entries);
+		if (repairedUsage > 0) logger.warn("Loaded assistant messages with incomplete usage", { count: repairedUsage });
 		this.#index.rebuild(entries);
 	}
 
@@ -2075,7 +2072,9 @@ export class SessionManager {
 			logger.warn("Dropped session entry appended after terminal release", { type: entry.type });
 			return;
 		}
-		if (repairMissingUsage(entry)) logger.warn("Assistant message recorded without usage", { id: entry.id });
+		if (entry.type === "message" && entry.message.role === "assistant" && normalizeAssistantUsage(entry.message)) {
+			logger.warn("Assistant message recorded with incomplete usage", { id: entry.id });
+		}
 		this.#entries.push(entry);
 		this.#index.insert(entry);
 		const batch = this.#atomicEntryBatch;
@@ -3007,6 +3006,7 @@ export class SessionManager {
 		this.seal();
 		this.#entries = [];
 		this.#index.clear();
+		this.#inMemoryArtifacts = null;
 		this.#closeWriterEventually();
 		this.#entriesReleased = true;
 	}
@@ -3211,10 +3211,12 @@ export class SessionManager {
 	}
 
 	async allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
+		if (this.#released) return {};
 		return (await this.#artifactManagerForSession()?.allocatePath(toolType)) ?? {};
 	}
 
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
+		if (this.#released) return undefined;
 		const manager = this.#artifactManagerForSession();
 		if (manager) return manager.save(content, toolType);
 
@@ -3552,7 +3554,7 @@ export class SessionManager {
 	}
 
 	appendSessionInit(init: {
-		systemPrompt: string;
+		systemPrompt: string[];
 		task: string;
 		tools: string[];
 		toolDefinitions?: SessionInitToolDefinition[];
@@ -3574,6 +3576,7 @@ export class SessionManager {
 		advisor?: string;
 		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 		isolated?: boolean;
+		workPoolYieldItems?: WorkPoolYieldItem[];
 	}): string {
 		const permissionSummary = normalizeEffectivePermissionSummary(init.permissionSummary);
 		const entry: SessionInitEntry = {
@@ -3801,25 +3804,16 @@ export class SessionManager {
 		});
 	}
 
-	/**
-	 * Repair loaded assistant entries: strip stale OpenAI Responses replay
-	 * metadata and give usage-less messages zero usage.
-	 */
+	/** Strip stale OpenAI Responses replay metadata from loaded assistant entries. */
 	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
 		let changed = false;
-		let missingUsage = 0;
 		for (const entry of this.#entries) {
 			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-			if (repairMissingUsage(entry)) missingUsage++;
-
 			const sanitized = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
 			if (sanitized === entry.message) continue;
 
 			entry.message = sanitized;
 			changed = true;
-		}
-		if (missingUsage > 0) {
-			logger.warn("Loaded assistant messages without usage; treating as zero", { count: missingUsage });
 		}
 
 		return changed;
@@ -4059,9 +4053,7 @@ export class SessionManager {
 
 		let sourceEntries: FileEntry[];
 		try {
-			sourceEntries = structuredClone(
-				await loadEntriesFromFile(sourcePath, storage, { throwIfMissing: true }),
-			) as FileEntry[];
+			sourceEntries = await loadEntriesFromFile(sourcePath, storage, { throwIfMissing: true });
 		} catch (err) {
 			if (isEnoent(err) || isEnotdir(err)) throw new ForkSourceNotFoundError(sourcePath);
 			throw err;
@@ -4071,6 +4063,7 @@ export class SessionManager {
 
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		normalizeLoadedUsage(history);
 		if (options?.resetInheritedCost) SessionManager.#resetInheritedUsageCost(history);
 		manager.#resetToNewSession(
 			{
@@ -4172,95 +4165,29 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<{
 		cwd: string;
-		init: {
-			systemPrompt: string;
-			task: string;
-			tools: string[];
-			agent?: string;
-			modelRole?: string;
-			resolvedModel?: string;
-			retryFallback?: RetryFallbackRole;
-			requestedPermissionProfiles?: string[];
-			effectivePermissionProfiles?: string[];
-			permissionSnapshot?: PermissionScopeSnapshot;
-			permissionSummary?: EffectivePermissionSummary;
-			readOnly?: boolean;
-			outputSchema?: unknown;
-			outputSchemaMode?: StructuredSubagentSchemaMode;
-			restrictToolNames?: boolean;
-			enableMCP?: boolean;
-			spawns?: string;
-			readSummarize?: boolean;
-			advisor?: string;
-			isolated?: boolean;
-		} | null;
+		init: PersistedSessionInit | null;
 	} | null> {
 		let header: SessionHeader | undefined;
-		let init: {
-			systemPrompt: string;
-			task: string;
-			tools: string[];
-			agent?: string;
-			modelRole?: string;
-			resolvedModel?: string;
-			retryFallback?: RetryFallbackRole;
-			requestedPermissionProfiles?: string[];
-			effectivePermissionProfiles?: string[];
-			permissionSnapshot?: PermissionScopeSnapshot;
-			permissionSummary?: EffectivePermissionSummary;
-			readOnly?: boolean;
-			outputSchema?: unknown;
-			outputSchemaMode?: StructuredSubagentSchemaMode;
-			restrictToolNames?: boolean;
-			enableMCP?: boolean;
-			spawns?: string;
-			readSummarize?: boolean;
-			advisor?: string;
-			isolated?: boolean;
-		} | null = null;
+		const initEntries: FileEntry[] = [];
 		const visit = (entry: FileEntry): void => {
 			if (entry.type === "session") {
 				header ??= entry;
 				return;
 			}
-			if (entry.type === "custom" && entry.customType === PERMISSION_SUMMARY_UPDATE_CUSTOM_TYPE) {
-				const permissionSummary = normalizeEffectivePermissionSummary(entry.data);
-				if (permissionSummary && init) init = { ...init, permissionSummary };
-				return;
-			}
-			if (entry.type === "session_init") {
-				init = {
-					systemPrompt: entry.systemPrompt,
-					task: entry.task,
-					tools: entry.tools,
-					agent: entry.agent,
-					modelRole: entry.modelRole,
-					resolvedModel: entry.resolvedModel,
-					// Revival reinstalls the spawn's `subagent:<id>` fallback chain from this contract.
-					retryFallback: entry.retryFallback,
-					requestedPermissionProfiles: entry.requestedPermissionProfiles,
-					effectivePermissionProfiles: entry.effectivePermissionProfiles,
-					permissionSnapshot: entry.permissionSnapshot,
-					permissionSummary: normalizeEffectivePermissionSummary(entry.permissionSummary),
-					readOnly: entry.readOnly,
-					outputSchema: entry.outputSchema,
-					outputSchemaMode: entry.outputSchemaMode,
-					restrictToolNames: entry.restrictToolNames,
-					enableMCP: entry.enableMCP,
-					readSummarize: entry.readSummarize,
-					spawns: entry.spawns,
-					advisor: entry.advisor,
-					isolated: entry.isolated,
-				};
-			}
+			if (
+				entry.type === "session_init" ||
+				(entry.type === "custom" && entry.customType === PERMISSION_SUMMARY_UPDATE_CUSTOM_TYPE)
+			)
+				initEntries.push(entry);
 		};
 		try {
 			await visitEntriesFromFile(filePath, visit, storage);
 		} catch {
 			return null;
 		}
+		// A missing, empty, or invalid file has no usable session.
 		if (!header) return null;
-		return { cwd: header.cwd ?? getProjectDir(), init };
+		return { cwd: header.cwd ?? getProjectDir(), init: extractSessionInit(initEntries) };
 	}
 
 	/** Continue the most recent session, or create a new one if none exists. */
@@ -4398,52 +4325,83 @@ export function hasConversationalHistory(entries: readonly FileEntry[]): boolean
  * the {@link SessionInitEntry} payload without its tree bookkeeping fields.
  */
 export interface PersistedSessionInit {
-	systemPrompt: string;
+	systemPrompt: string[];
 	task: string;
 	tools: string[];
+	toolDefinitions?: SessionInitToolDefinition[];
 	agent?: string;
 	modelRole?: string;
 	resolvedModel?: string;
 	retryFallback?: RetryFallbackRole;
+	requestedPermissionProfiles?: string[];
+	effectivePermissionProfiles?: string[];
+	permissionSnapshot?: PermissionScopeSnapshot;
+	permissionSummary?: EffectivePermissionSummary;
 	readOnly?: boolean;
 	outputSchema?: unknown;
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	restrictToolNames?: boolean;
+	enableMCP?: boolean;
 	spawns?: string;
 	readSummarize?: boolean;
 	advisor?: string;
 	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	isolated?: boolean;
+	workPoolYieldItems?: WorkPoolYieldItem[];
 }
 
 /**
  * Latest persisted `session_init` contract among already-loaded entries, or
  * null when the transcript carries none.
+ *
+ * AgentSession re-appends this contract whenever a model call's base prompt
+ * changes, so it must carry every revival field (permission snapshot, profiles,
+ * MCP grant): a dropped field makes the newest `session_init` unrevivable.
+ * Later permission-summary updates are folded in so a re-appended contract does
+ * not shadow them on the lineage.
  */
 export function extractSessionInit(entries: readonly FileEntry[]): PersistedSessionInit | null {
 	let init: PersistedSessionInit | null = null;
+	let summaryUpdate: EffectivePermissionSummary | undefined;
 	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === PERMISSION_SUMMARY_UPDATE_CUSTOM_TYPE) {
+			summaryUpdate = normalizeEffectivePermissionSummary(entry.data) ?? summaryUpdate;
+			continue;
+		}
 		if (entry.type !== "session_init") continue;
+		summaryUpdate = undefined;
+		const permissionSummary = normalizeEffectivePermissionSummary(entry.permissionSummary);
 		init = {
-			systemPrompt: entry.systemPrompt,
+			systemPrompt: typeof entry.systemPrompt === "string" ? [entry.systemPrompt] : entry.systemPrompt,
 			task: entry.task,
 			tools: entry.tools,
+			...(entry.toolDefinitions !== undefined ? { toolDefinitions: entry.toolDefinitions } : undefined),
 			agent: entry.agent,
 			modelRole: entry.modelRole,
 			resolvedModel: entry.resolvedModel,
 			retryFallback: entry.retryFallback,
+			...(entry.requestedPermissionProfiles !== undefined
+				? { requestedPermissionProfiles: entry.requestedPermissionProfiles }
+				: undefined),
+			...(entry.effectivePermissionProfiles !== undefined
+				? { effectivePermissionProfiles: entry.effectivePermissionProfiles }
+				: undefined),
+			...(entry.permissionSnapshot !== undefined ? { permissionSnapshot: entry.permissionSnapshot } : undefined),
+			...(permissionSummary !== undefined ? { permissionSummary } : undefined),
 			readOnly: entry.readOnly,
 			outputSchema: entry.outputSchema,
 			outputSchemaMode: entry.outputSchemaMode,
 			restrictToolNames: entry.restrictToolNames,
+			...(entry.enableMCP !== undefined ? { enableMCP: entry.enableMCP } : undefined),
 			readSummarize: entry.readSummarize,
 			spawns: entry.spawns,
 			advisor: entry.advisor,
 			isolated: entry.isolated,
 			...(entry.compactionThreshold !== undefined ? { compactionThreshold: entry.compactionThreshold } : undefined),
+			...(entry.workPoolYieldItems !== undefined ? { workPoolYieldItems: entry.workPoolYieldItems } : undefined),
 		};
 	}
-	return init;
+	return init && summaryUpdate ? { ...init, permissionSummary: summaryUpdate } : init;
 }
 /**
  * If the current session was created by `/move` and contains no real

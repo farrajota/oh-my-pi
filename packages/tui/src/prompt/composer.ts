@@ -433,7 +433,15 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// inter-block blanks) engages only when a block genuinely cannot retire.
 		// Rows the transient chrome peak displaces are clipped from the top by
 		// the `drop` slice below, which is what scrollback would have done.
-		const active = transcript.renderViewport(width, Math.max(0, rows - before.length - belowFloor), frame);
+		const activeBudget = Math.max(0, rows - before.length - belowFloor);
+		const active = transcript.renderViewport(width, activeBudget, frame);
+		// Retirement moves whole blocks plus their separator, so it can leave the
+		// live tail a row short of its budget. A transient row (an autocomplete
+		// popup) may hide that gap in this frame; once it closes the input would
+		// jump up over a blank row, because retired rows never return from native
+		// history.
+		const retirementLeftGap =
+			history !== undefined && this.#offeredHistory?.source !== "header" && active.length < activeBudget;
 		const activeSpans: ViewportClickSpan[] = [];
 		for (const span of transcript.getLastViewportSpans()) {
 			const ids = (span.component as Partial<{ getClickFocusAgentIds(): string[] }>).getClickFocusAgentIds?.();
@@ -442,8 +450,11 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		}
 		const drop = Math.max(0, before.length + active.length + after.length - rows);
 		const mutable = [...before, ...active, ...after].slice(drop);
-		// Once live rows fill the screen again, the retired gap is gone.
-		if (!decisionPanelOpen && mutable.length >= rows) this.#anchorAfterInlineRetirement = false;
+		// Once live rows fill the screen again, the retired gap is gone. Transient
+		// chrome counts only at its floor: rows it fills above that leave with it.
+		const liveFillsScreen = before.length + active.length + belowFloor >= rows;
+		if (!decisionPanelOpen && liveFillsScreen) this.#anchorAfterInlineRetirement = false;
+		if (retirementLeftGap) this.#anchorAfterInlineRetirement = true;
 		// Rows retired during a decision panel cannot be pulled back from native
 		// history when it closes. Keep the input pinned to the bottom without
 		// replaying those rows (which would duplicate them) or clearing history.

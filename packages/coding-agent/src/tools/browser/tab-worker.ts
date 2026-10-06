@@ -5,14 +5,17 @@ import * as path from "node:path";
 import { postmortem, Snowflake, untilAborted, withTimeout } from "@oh-my-pi/pi-utils";
 import type { HTMLElement } from "@oh-my-pi/pi-utils/dom";
 import type {
+	Accessibility,
 	Browser,
 	CDPSession,
 	ElementHandle,
+	Frame,
 	HTTPResponse,
 	JSHandle,
 	KeyboardTypeOptions,
 	KeyInput,
 	Page,
+	Protocol,
 	Realm,
 	SerializedAXNode,
 	Target,
@@ -53,6 +56,7 @@ import {
 	loadPuppeteerInWorker,
 	loadedKnownDevices,
 	loadedNetworkConditions,
+	readPageViewport,
 } from "./launch";
 import { extractReadableFromHtml, type ReadableExtractOptions, type ReadableFormat } from "./readable";
 import { assertTabPressArgs } from "./tab-arguments";
@@ -152,10 +156,13 @@ import {
 	diffAriaSnapshot,
 } from "./snapshot-plus";
 import {
+	ClickRefusedError,
 	clickAt,
 	clickElement,
+	composedContains,
 	clickQueryHandlerText,
 	fillViaHandle,
+	focusTextEntryTarget,
 	highlightElement,
 	type HighlightOptions,
 	type InteractionHandle,
@@ -164,6 +171,8 @@ import {
 	mouseDown,
 	mouseMove,
 	mouseUp,
+	pressKey,
+	selectElementOptions,
 	setElementChecked,
 	type ScrollOptions,
 	uploadFilesToElement,
@@ -194,7 +203,7 @@ import {
 	listFrames,
 	resolveFrame,
 } from "./frames";
-import { pushState, reloadPage, traverseHistory, type NavigationWaitUntil } from "./navigation";
+import { navigateMainFrame, pushState, reloadPage, traverseHistory, type NavigationWaitUntil } from "./navigation";
 import {
 	BrowserEmulationController,
 	type BrowserEmulateOptions,
@@ -221,14 +230,31 @@ declare module "puppeteer-core" {
 	interface Frame {
 		/** Puppeteer's main JavaScript realm, retained by our pinned runtime patch. */
 		mainRealm(): Realm;
+		/** This frame's accessibility tree (`@internal` upstream, stripped from published types). */
+		readonly accessibility: Accessibility;
+		/**
+		 * Loader of the document the frame shows (`@internal` upstream). Changes on every navigation that
+		 * loads a document; a back/forward cache restore keeps the previous document's value.
+		 */
+		readonly _loaderId: string;
+		/** CDP session that drives this frame (`@internal` upstream, stripped from published types). */
+		readonly client: CDPSession;
 	}
 	interface Realm {
 		/** Re-home a DOM handle into this realm (`@internal` upstream, stripped from published types). */
 		adoptHandle<T extends JSHandle>(handle: T): Promise<T>;
+		/** Resolve a CDP backend node id in this realm (`@internal` upstream, stripped from published types). */
+		adoptBackendNode(backendNodeId: number): Promise<JSHandle>;
 	}
 	interface JSHandle {
 		/** Realm that created this handle (`@internal` upstream, stripped from published types). */
 		readonly realm: Realm;
+	}
+	interface SerializedAXNode {
+		/** DOM node behind this AX node (`@internal` upstream, stripped from published types). */
+		readonly backendNodeId?: number;
+		/** Loader of the frame's document when the snapshot was taken (`@internal` upstream, stripped from published types). */
+		readonly loaderId: string;
 	}
 }
 
@@ -290,6 +316,8 @@ const SCROLL_ACK_TIMEOUT_MS = 2_000;
 const REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS = 500;
 /** Bound cleanup window after a timed-out raw handle action. */
 const HANDLE_ACTION_INVALIDATION_TIMEOUT_MS = 500;
+/** Bound on reading every iframe in one observation; a frame whose renderer is stuck in script never answers. */
+const FRAME_SNAPSHOT_TIMEOUT_MS = 5_000;
 
 /** Queue a wheel event without treating a delayed renderer acknowledgement as dispatch failure. */
 export async function dispatchScroll(
@@ -342,7 +370,7 @@ interface TabApi {
 	click(selector: string): Promise<void>;
 	type(selector: string, text: string): Promise<void>;
 	fill(selector: string, value: string): Promise<void>;
-	press(key: KeyInput, opts?: { selector?: string }): Promise<void>;
+	press(key: string, opts?: { selector?: string }): Promise<void>;
 	scroll(deltaX: number, deltaY: number, opts?: ScrollOptions): Promise<void>;
 	drag(from: DragTarget, to: DragTarget): Promise<void>;
 	waitFor(selector: string, opts?: { timeout?: number }): Promise<ActionableHandle>;
@@ -569,13 +597,23 @@ async function runGuardedHandleAction<T>(
 	} catch (error) {
 		if (!signal.aborted) throw error;
 		state.invalidatedBy = label;
-		void pending.catch(() => undefined);
+		let actionError: unknown;
 		await withTimeout(
-			Promise.all([handle.dispose().catch(() => undefined), invalidate?.().catch(() => undefined)]),
+			Promise.all([
+				pending.then(
+					() => undefined,
+					(err: unknown) => {
+						actionError = err;
+					},
+				),
+				handle.dispose().catch(() => undefined),
+				invalidate?.().catch(() => undefined),
+			]),
 			HANDLE_ACTION_INVALIDATION_TIMEOUT_MS,
 			`Timed out invalidating ${label}`,
 		).catch(() => undefined);
-		throw error;
+		// A click still refused when the deadline hit carries the reason on its own abort error.
+		throw actionError instanceof ClickRefusedError ? actionError : error;
 	}
 }
 
@@ -656,7 +694,18 @@ export function toActionableHandle(
 			}
 		}
 		enriched.fill = value => fillViaHandle(enriched, value, undefined, preserved?.type);
-		return enriched;
+		enriched.click = options =>
+			clickElement(enriched, "handle.click()", undefined, {
+				button: options?.button,
+				clickCount: options?.count,
+			});
+		enriched.dblclick = () => clickElement(enriched, "handle.dblclick()", undefined, { clickCount: 2 });
+		enriched.check = () => setElementChecked(enriched, true, "handle.check()");
+		enriched.uncheck = () => setElementChecked(enriched, false, "handle.uncheck()");
+		enriched.select = (...values) => selectElementOptions(enriched, values, "handle.select()");
+		enriched.highlight = options => highlightElement(enriched, options);
+		const controller = new AbortController();
+		return enrichElementQueries(enriched, (_label, fn) => fn(controller.signal));
 	}
 
 	let originals = preserved;
@@ -665,6 +714,16 @@ export function toActionableHandle(
 		for (const method of GUARDED_HANDLE_METHODS) {
 			const original = methods[method];
 			if (typeof original === "function") interactive[method] = original.bind(enriched);
+		}
+		// Puppeteer's `ElementHandle.press` takes a single key name; focus and press
+		// through `pressKey` so combos and the macOS editing commands work on handles too.
+		const focus = interactive.focus;
+		if (focus) {
+			const press: ElementHandle["press"] = async (key, options) => {
+				await focus();
+				await pressKey(enriched.frame.page(), key, options);
+			};
+			interactive.press = press as RawHandleMethod;
 		}
 		originals = { interactive, type: enriched.type.bind(enriched) };
 		enriched[RAW_HANDLE_METHODS] = originals;
@@ -686,25 +745,6 @@ export function toActionableHandle(
 				),
 			);
 	}
-	enriched.click = () =>
-		guard("handle.click()", signal =>
-			runGuardedHandleAction(
-				enriched,
-				originals,
-				"handle.click()",
-				signal,
-				() => clickElement(enriched, "handle.click()", signal),
-				invalidate,
-			),
-		);
-	enriched.dblclick = () =>
-		guard("handle.dblclick()", signal => clickElement(enriched, "handle.dblclick()", signal, { clickCount: 2 }));
-	enriched.check = () =>
-		guard("handle.check()", signal => setElementChecked(enriched, true, "handle.check()", signal));
-	enriched.uncheck = () =>
-		guard("handle.uncheck()", signal => setElementChecked(enriched, false, "handle.uncheck()", signal));
-	enriched.highlight = options => guard("handle.highlight()", signal => highlightElement(enriched, options, signal));
-	enrichElementQueries(enriched, guard);
 	enriched.type = (text, options) =>
 		guard<void>("handle.type()", signal =>
 			runGuardedHandleAction(
@@ -727,7 +767,77 @@ export function toActionableHandle(
 				invalidate,
 			),
 		);
-	return enriched;
+	enriched.click = options =>
+		guard<void>("handle.click()", signal =>
+			runGuardedHandleAction(
+				enriched,
+				originals,
+				"handle.click()",
+				signal,
+				() =>
+					clickElement(enriched, "handle.click()", signal, {
+						button: options?.button,
+						clickCount: options?.count,
+					}),
+				invalidate,
+			),
+		);
+	enriched.dblclick = () =>
+		guard<void>("handle.dblclick()", signal =>
+			runGuardedHandleAction(
+				enriched,
+				originals,
+				"handle.dblclick()",
+				signal,
+				() => clickElement(enriched, "handle.dblclick()", signal, { clickCount: 2 }),
+				invalidate,
+			),
+		);
+	enriched.check = () =>
+		guard<void>("handle.check()", signal =>
+			runGuardedHandleAction(
+				enriched,
+				originals,
+				"handle.check()",
+				signal,
+				() => setElementChecked(enriched, true, "handle.check()", signal),
+				invalidate,
+			),
+		);
+	enriched.uncheck = () =>
+		guard<void>("handle.uncheck()", signal =>
+			runGuardedHandleAction(
+				enriched,
+				originals,
+				"handle.uncheck()",
+				signal,
+				() => setElementChecked(enriched, false, "handle.uncheck()", signal),
+				invalidate,
+			),
+		);
+	enriched.select = (...values) =>
+		guard<string[]>("handle.select()", signal =>
+			runGuardedHandleAction(
+				enriched,
+				originals,
+				"handle.select()",
+				signal,
+				() => selectElementOptions(enriched, values, "handle.select()", signal),
+				invalidate,
+			),
+		);
+	enriched.highlight = (options?: HighlightOptions) =>
+		guard<void>("handle.highlight()", signal =>
+			runGuardedHandleAction(
+				enriched,
+				originals,
+				"handle.highlight()",
+				signal,
+				() => highlightElement(enriched, options, signal),
+				invalidate,
+			),
+		);
+	return enrichElementQueries(enriched, guard);
 }
 
 /** Focus once, then type one code point at a time so abort stops before the next key dispatch. */
@@ -737,12 +847,7 @@ async function typeViaHandle(
 	options: Readonly<KeyboardTypeOptions> | undefined,
 	signal: AbortSignal,
 ): Promise<void> {
-	await untilAborted(signal, () =>
-		handle.evaluate(el => {
-			const node = el as unknown as { focus?: () => void };
-			node.focus?.();
-		}),
-	);
+	await focusTextEntryTarget(handle, "type into", signal);
 	for (const character of text) {
 		throwIfAborted(signal);
 		await untilAborted(signal, () => handle.frame.page().keyboard.type(character, options));
@@ -769,6 +874,14 @@ function redactUrlCredentials(url: string): string {
 }
 
 class RequestInterceptionCleanupError extends ToolError {}
+
+/** Page events installed as persistent guards by the dedicated audit bootstrap. */
+const PERSISTENT_AUDIT_GUARD_EVENTS: Readonly<Record<string, true>> = {
+	request: true,
+	popup: true,
+	workercreated: true,
+	download: true,
+};
 
 interface PersistentAuditFacadeLifetime {
 	controller: AbortController;
@@ -823,108 +936,160 @@ export function persistentAuditFacadeSignal(page: Page, callerSignals: readonly 
 
 export interface RunPageScope {
 	page: Page;
-	cleanup(): Promise<void>;
+	/** Remove ordinary cell listeners registered through this run's page facade. */
+	detach(): void;
+	/** Restore the tab's host-owned interception state after a run changes it. */
+	restoreInterception(): Promise<void>;
 }
 
+/** `tab.goto` outlasted its budget; the page stays on what loaded. */
+class NavigationTimeoutError extends ToolError {}
+
 /**
- * Expose the tab page while retaining the request handlers created by this run.
- * Puppeteer's Page wraps an internal emitter, so `removeAllListeners("request")`
- * would also remove its forwarding listener; the facade removes only user handlers.
+ * Expose a cell-local page facade while preserving host-owned audit guards and worker handlers.
+ * Ordinary listeners receive the facade and use distinct registrations so cleanup cannot remove host listeners.
  */
+
 export function createRunPageScope(
 	page: Page,
 	preserveRequestInterception = false,
 	restoreInterception?: () => Promise<void>,
 ): RunPageScope {
-	const requestHandlers: unknown[] = [];
+	type ScopedListener = ((...args: unknown[]) => unknown) & { listener: Function };
+	const handlers = new Map<unknown, ScopedListener[]>();
+	const track = (type: unknown, handler: ScopedListener): void => {
+		const owned = handlers.get(type) ?? [];
+		owned.push(handler);
+		handlers.set(type, owned);
+	};
+	const untrack = (type: unknown, handler: ScopedListener): void => {
+		const owned = handlers.get(type);
+		if (!owned) return;
+		const index = owned.lastIndexOf(handler);
+		if (index >= 0) owned.splice(index, 1);
+		if (owned.length === 0) handlers.delete(type);
+	};
 	const on = page.on;
 	const off = page.off;
 	const once = page.once;
-	const removeAllListeners = page.removeAllListeners;
-	const onDescriptor = Object.getOwnPropertyDescriptor(page, "on");
-	const offDescriptor = Object.getOwnPropertyDescriptor(page, "off");
-	const onceDescriptor = Object.getOwnPropertyDescriptor(page, "once");
-	const removeAllDescriptor = Object.getOwnPropertyDescriptor(page, "removeAllListeners");
+	const setRequestInterception = page.setRequestInterception;
+	const boundMethods = new Map<PropertyKey, { source: Function; bound: (...args: unknown[]) => unknown }>();
+	let interceptionChanged = false;
 
-	Object.defineProperties(page, {
-		on: {
-			configurable: true,
-			value: (type: unknown, handler: unknown): Page => {
-				Reflect.apply(on, page, [type, handler]);
-				if (type === "request") requestHandlers.push(handler);
-				return page;
-			},
-		},
-		once: {
-			configurable: true,
-			value: (type: unknown, handler: unknown): Page => {
-				if (type !== "request" || typeof handler !== "function") {
-					Reflect.apply(once, page, [type, handler]);
-					return page;
-				}
-				const wrapper = (event: unknown): void => {
-					const index = requestHandlers.lastIndexOf(wrapper);
-					if (index >= 0) requestHandlers.splice(index, 1);
-					Reflect.apply(off, page, ["request", wrapper]);
-					Reflect.apply(handler, page, [event]);
-				};
-				requestHandlers.push(wrapper);
-				Reflect.apply(on, page, [type, wrapper]);
-				return page;
-			},
-		},
-		off: {
-			configurable: true,
-			value: (type: unknown, handler?: unknown): Page => {
-				Reflect.apply(off, page, [type, handler]);
-				if (type === "request") {
-					if (handler === undefined) requestHandlers.length = 0;
-					else {
-						const index = requestHandlers.lastIndexOf(handler);
-						if (index >= 0) requestHandlers.splice(index, 1);
+	// The audit bootstrap installs these guards before marking installation complete; later cell listeners stay scoped.
+	const isPersistentAuditGuard = (type: unknown): boolean => {
+		if (!preserveRequestInterception || typeof type !== "string") return false;
+		const auditState = (page as Page & { __browserAuditState?: { guardsInstalled?: boolean } }).__browserAuditState;
+		return auditState?.guardsInstalled === false && PERSISTENT_AUDIT_GUARD_EVENTS[type] === true;
+	};
+
+	// Proxy the page instead of patching it: host services retain the raw page, so
+	// listeners they install during a run are not mistaken for cell-owned handlers.
+	const scopedPage: Page = new Proxy(page, {
+		get(target, prop) {
+			if (prop === "on") {
+				return (type: unknown, handler: unknown): Page => {
+					if (isPersistentAuditGuard(type) || typeof handler !== "function") {
+						Reflect.apply(on, page, [type, handler]);
+						return scopedPage;
 					}
-				}
-				return page;
-			},
-		},
-		removeAllListeners: {
-			configurable: true,
-			value: (type?: unknown): Page => {
-				Reflect.apply(removeAllListeners, page, [type]);
-				if (type === undefined || type === "request") requestHandlers.length = 0;
-				return page;
-			},
+					const wrapper = (...args: unknown[]): unknown => Reflect.apply(handler, scopedPage, args);
+					wrapper.listener = handler;
+					Reflect.apply(on, page, [type, wrapper]);
+					track(type, wrapper);
+					return scopedPage;
+				};
+			}
+			if (prop === "once") {
+				return (type: unknown, handler: unknown): Page => {
+					if (typeof handler !== "function") {
+						Reflect.apply(once, page, [type, handler]);
+						return scopedPage;
+					}
+					const wrapper = (...args: unknown[]): unknown => {
+						untrack(type, wrapper);
+						Reflect.apply(off, page, [type, wrapper]);
+						return Reflect.apply(handler, scopedPage, args);
+					};
+					wrapper.listener = handler;
+					track(type, wrapper);
+					Reflect.apply(on, page, [type, wrapper]);
+					return scopedPage;
+				};
+			}
+			if (prop === "off") {
+				return (type: unknown, handler?: unknown): Page => {
+					if (handler === undefined) {
+						for (const owned of handlers.get(type) ?? []) Reflect.apply(off, page, [type, owned]);
+						handlers.delete(type);
+					} else {
+						const owned = handlers.get(type);
+						if (owned) {
+							for (let index = owned.length - 1; index >= 0; index--) {
+								const wrapper = owned[index];
+								if (wrapper.listener !== handler) continue;
+								Reflect.apply(off, page, [type, wrapper]);
+								untrack(type, wrapper);
+								break;
+							}
+						}
+					}
+					return scopedPage;
+				};
+			}
+			if (prop === "removeAllListeners") {
+				return (type?: unknown): Page => {
+					const types = type === undefined ? [...handlers.keys()] : [type];
+					for (const event of types) {
+						for (const handler of handlers.get(event) ?? []) Reflect.apply(off, page, [event, handler]);
+						handlers.delete(event);
+					}
+					return scopedPage;
+				};
+			}
+			if (prop === "setRequestInterception") {
+				return (value: boolean): Promise<void> => {
+					interceptionChanged = true;
+					return Reflect.apply(setRequestInterception, page, [value]);
+				};
+			}
+			const value = Reflect.get(target, prop, target);
+			if (typeof value !== "function") return value;
+			const cached = boundMethods.get(prop);
+			if (cached && cached.source === value) return cached.bound;
+			const bound = (...args: unknown[]): unknown => Reflect.apply(value, target, args);
+			boundMethods.set(prop, { source: value, bound });
+			return bound;
 		},
 	});
 
 	return {
-		page,
-		async cleanup() {
-			if (onDescriptor) Object.defineProperty(page, "on", onDescriptor);
-			else Reflect.deleteProperty(page, "on");
-			if (offDescriptor) Object.defineProperty(page, "off", offDescriptor);
-			else Reflect.deleteProperty(page, "off");
-			if (onceDescriptor) Object.defineProperty(page, "once", onceDescriptor);
-			else Reflect.deleteProperty(page, "once");
-			if (removeAllDescriptor) Object.defineProperty(page, "removeAllListeners", removeAllDescriptor);
-			else Reflect.deleteProperty(page, "removeAllListeners");
-			if (!preserveRequestInterception) {
-				for (const handler of requestHandlers) Reflect.apply(off, page, ["request", handler]);
-				requestHandlers.length = 0;
-				try {
-					await withTimeout(
-						restoreInterception ? restoreInterception() : page.setRequestInterception(false),
-						REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS,
-						"Timed out clearing browser request interception",
-					);
-				} catch (error) {
-					throw new RequestInterceptionCleanupError(
-						"Failed to clear browser request interception after browser.run",
-						{
-							error: error instanceof Error ? error.message : String(error),
-						},
-					);
-				}
+		page: scopedPage,
+		detach() {
+			for (const [type, owned] of handlers) {
+				for (const handler of owned) Reflect.apply(off, page, [type, handler]);
+			}
+			handlers.clear();
+		},
+		async restoreInterception() {
+			if (!interceptionChanged) return;
+			try {
+				await withTimeout(
+					preserveRequestInterception
+						? page.setRequestInterception(true)
+						: restoreInterception
+							? restoreInterception()
+							: page.setRequestInterception(false),
+					REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS,
+					"Timed out restoring browser request interception",
+				);
+			} catch (error) {
+				throw new RequestInterceptionCleanupError(
+					"Failed to restore browser request interception after browser.run",
+					{
+						error: error instanceof Error ? error.message : String(error),
+					},
+				);
 			}
 		},
 	};
@@ -932,6 +1097,7 @@ export function createRunPageScope(
 
 function errorPayload(error: unknown): RunErrorPayload {
 	const recoverTab = error instanceof RequestInterceptionCleanupError || undefined;
+	const navigationTimeout = error instanceof NavigationTimeoutError || undefined;
 	if (error instanceof ToolAbortError) {
 		return { name: error.name, message: error.message, stack: error.stack, isToolError: false, isAbort: true };
 	}
@@ -943,6 +1109,7 @@ function errorPayload(error: unknown): RunErrorPayload {
 			isToolError: true,
 			isAbort: false,
 			recoverTab,
+			navigationTimeout,
 		};
 	}
 	if (error instanceof Error) {
@@ -1006,60 +1173,189 @@ async function createTrackedHeadlessPage(browser: Browser, reportTarget: (target
 	return page;
 }
 
+/**
+ * Frames that missed an observation deadline, mapped to the document they showed then. Observe skips
+ * them until they navigate, so a frame stuck in script costs only the first observation its wait.
+ */
+const unresponsiveFrames = new WeakMap<Frame, string>();
+
+function frameDocumentKey(frame: Frame): string {
+	return `${frame._loaderId} ${frame.url()}`;
+}
+
+/** One frame's accessibility tree; ids observed in it resolve in that frame. */
+interface FrameSnapshot {
+	frame: Frame;
+	snapshot: SerializedAXNode;
+}
+
+/**
+ * Accessibility snapshots of `frames` and their descendants, each with its frame, in frame-tree
+ * order. A frame that does not answer by `deadline` is left out with its descendants, and skipped
+ * by later observations until it navigates, so one dead iframe never costs the page its
+ * observation. With `root`, only frames inside it are read.
+ */
+async function snapshotFrames(
+	frames: Frame[],
+	options: { interestingOnly: boolean; root: ElementHandle | null; deadline: number; signal?: AbortSignal },
+): Promise<FrameSnapshot[]> {
+	const snapshots = await Promise.all(
+		frames.map(async (frame): Promise<FrameSnapshot[]> => {
+			if (unresponsiveFrames.get(frame) === frameDocumentKey(frame)) return [];
+			const timeout = new Error(`Frame ${frame.url()} did not answer`);
+			let snapshot: SerializedAXNode | null;
+			try {
+				snapshot = await withTimeout(
+					snapshotFrame(frame, options),
+					Math.max(0, options.deadline - Date.now()),
+					timeout,
+					options.signal,
+				);
+			} catch (error) {
+				if (options.signal?.aborted) throw error;
+				if (error === timeout) unresponsiveFrames.set(frame, frameDocumentKey(frame));
+				return [];
+			}
+			if (!snapshot) return [];
+			return [{ frame, snapshot }, ...(await snapshotFrames(frame.childFrames(), { ...options, root: null }))];
+		}),
+	);
+	return snapshots.flat();
+}
+
+async function snapshotFrame(
+	frame: Frame,
+	options: { interestingOnly: boolean; root: ElementHandle | null },
+): Promise<SerializedAXNode | null> {
+	if (options.root) {
+		const owner = await frame.frameElement();
+		if (!owner) return null;
+		const scoped = await options.root.realm.adoptHandle(owner).finally(() => owner.dispose().catch(() => undefined));
+		try {
+			// The owner may sit in a web component's shadow root under `root`, where `Node.contains` stops.
+			if (!(await options.root.evaluate(composedContains, scoped))) return null;
+		} finally {
+			await scoped.dispose().catch(() => undefined);
+		}
+	}
+	return await frame.accessibility.snapshot({ interestingOnly: options.interestingOnly });
+}
+
+function collectInteractiveObservationAncestors(node: SerializedAXNode, ancestors: Set<SerializedAXNode>): boolean {
+	let found = false;
+	for (const child of node.children ?? []) {
+		const descendantInteractive = collectInteractiveObservationAncestors(child, ancestors);
+		if (isInteractiveNode(child) || descendantInteractive) found = true;
+	}
+	if (found) ancestors.add(node);
+	return found;
+}
+
+/** Where an observed element lives; `tab.id(n)` resolves it to a handle on first use. */
+interface ObservedElement {
+	frame: Frame;
+	backendNodeId: number;
+	/**
+	 * Loader of the document `frame` showed when observed. Backend node ids are unique only within
+	 * one renderer process, so once the frame shows another document the id may name an unrelated node.
+	 */
+	loaderId: string;
+}
+
+/** Whether the frame has loaded another document since `element` was observed. */
+function isObservedDocumentGone(element: ObservedElement): boolean {
+	return element.frame._loaderId !== element.loaderId;
+}
+
+/**
+ * Resolve an observed element to a handle in its frame's main world, or null when the node is
+ * gone, has left the document, or the frame no longer shows the document it was observed in (any
+ * resolution failure counts as gone). Text nodes resolve to their parent.
+ */
+async function resolveObservedElement(observed: ObservedElement): Promise<ElementHandle | null> {
+	if (isObservedDocumentGone(observed)) return null;
+	let node: JSHandle;
+	try {
+		node = await observed.frame.mainRealm().adoptBackendNode(observed.backendNodeId);
+	} catch {
+		return null;
+	}
+	try {
+		const resolved = await node.evaluateHandle(value => {
+			const candidate = value as unknown as { nodeType: number; parentElement: Element | null };
+			const element = (candidate.nodeType === 3 ? candidate.parentElement : value) as unknown as Element | null;
+			if (!element?.isConnected) return null;
+			// The document itself (the root `includeAll` lists) has no owner document.
+			const owner: unknown = candidate.nodeType === 9 ? value : element.ownerDocument;
+			return owner === document ? element : null;
+		});
+		const element = resolved.asElement();
+		// The frame may have committed another document while the node resolved.
+		if (element && !isObservedDocumentGone(observed)) return element as ElementHandle;
+		await resolved.dispose().catch(() => undefined);
+		return null;
+	} catch {
+		return null;
+	} finally {
+		await node.dispose().catch(() => undefined);
+	}
+}
 async function collectObservationEntries(
 	core: WorkerCore,
+	frame: Frame,
 	node: SerializedAXNode,
 	entries: ObservationEntry[],
-	options: { viewportOnly: boolean; includeAll: boolean; compact?: boolean; signal?: AbortSignal },
+	options: {
+		viewportOnly: boolean;
+		includeAll: boolean;
+		compact: boolean;
+		interactiveAncestors: Set<SerializedAXNode>;
+		signal?: AbortSignal;
+	},
 ): Promise<void> {
 	throwIfAborted(options.signal);
-	const emptyStructural =
-		options.compact &&
-		!node.name &&
-		!node.value &&
-		(node.role === "generic" || node.role === "none" || node.role === "group");
-	if (!emptyStructural && (options.includeAll || isInteractiveNode(node))) {
-		const handle = await untilAborted(options.signal, () => node.elementHandle());
-		if (handle) {
-			let inViewport = true;
-			if (options.viewportOnly) {
-				try {
-					inViewport = await handle.isIntersectingViewport();
-				} catch {
-					inViewport = false;
-				}
-			}
-			if (inViewport) {
-				const id = core.nextElementId();
-				const states: string[] = [];
-				if (node.disabled) states.push("disabled");
-				if (node.checked !== undefined) states.push(`checked=${String(node.checked)}`);
-				if (node.pressed !== undefined) states.push(`pressed=${String(node.pressed)}`);
-				if (node.selected !== undefined) states.push(`selected=${String(node.selected)}`);
-				if (node.expanded !== undefined) states.push(`expanded=${String(node.expanded)}`);
-				if (node.required) states.push("required");
-				if (node.readonly) states.push("readonly");
-				if (node.multiselectable) states.push("multiselectable");
-				if (node.multiline) states.push("multiline");
-				if (node.modal) states.push("modal");
-				if (node.focused) states.push("focused");
-				core.cacheElement(id, handle as ElementHandle);
-				entries.push({
-					id,
-					role: node.role,
-					name: node.name,
-					value: node.value,
-					description: node.description,
-					keyshortcuts: node.keyshortcuts,
-					states,
-				});
-			} else {
-				await handle.dispose();
-			}
+	const emptyStructural = options.compact && !node.name && !node.value && !options.interactiveAncestors.has(node);
+	if (
+		node.backendNodeId !== undefined &&
+		(options.includeAll || isInteractiveNode(node)) &&
+		!(options.compact && emptyStructural)
+	) {
+		const observed: ObservedElement = { frame, backendNodeId: node.backendNodeId, loaderId: node.loaderId };
+		let handle: ElementHandle | null = null;
+		let inViewport = true;
+		if (options.viewportOnly) {
+			handle = await resolveObservedElement(observed);
+			inViewport = (await handle?.isIntersectingViewport().catch(() => false)) ?? false;
+		}
+		if (inViewport) {
+			const id = core.observeElement(observed, handle ?? undefined);
+			const states: string[] = [];
+			if (node.disabled) states.push("disabled");
+			if (node.checked !== undefined) states.push(`checked=${String(node.checked)}`);
+			if (node.pressed !== undefined) states.push(`pressed=${String(node.pressed)}`);
+			if (node.selected !== undefined) states.push(`selected=${String(node.selected)}`);
+			if (node.expanded !== undefined) states.push(`expanded=${String(node.expanded)}`);
+			if (node.required) states.push("required");
+			if (node.readonly) states.push("readonly");
+			if (node.multiselectable) states.push("multiselectable");
+			if (node.multiline) states.push("multiline");
+			if (node.modal) states.push("modal");
+			if (node.focused) states.push("focused");
+			entries.push({
+				id,
+				role: node.role,
+				name: node.name,
+				value: node.value,
+				description: node.description,
+				keyshortcuts: node.keyshortcuts,
+				states,
+			});
+		} else {
+			await handle?.dispose().catch(() => undefined);
 		}
 	}
 	for (const child of node.children ?? []) {
-		await collectObservationEntries(core, child, entries, options);
+		await collectObservationEntries(core, frame, child, entries, options);
 	}
 }
 
@@ -1131,7 +1427,10 @@ export class WorkerCore {
 	#browser?: Browser;
 	#page?: Page;
 	#targetId?: string;
+	/** Last viewport read from the page; reported while a dialog or failure blocks a fresh read. */
+	#lastViewport?: ReadyInfo["viewport"];
 	#elementCache = new Map<number, ElementHandle>();
+	#observedElements = new Map<number, ObservedElement>();
 	#elementCounter = 0;
 	#screenshotHistory = new Map<string, ScreenshotHistory>();
 	#active: ActiveRun | null = null;
@@ -1151,6 +1450,10 @@ export class WorkerCore {
 	#webmcp?: WebMcpController;
 	#recording = new RecordingController();
 	#ariaBaselines = new Map<string, AriaSnapshotBaseline>();
+	#frameClient?: CDPSession;
+	readonly #onFrameNavigated = (event: Protocol.Page.FrameNavigatedEvent): void => {
+		if (event.type === "BackForwardCacheRestore") this.#clearElementCache();
+	};
 
 	constructor(transport: Transport, isolated: boolean) {
 		this.#transport = transport;
@@ -1215,13 +1518,12 @@ export class WorkerCore {
 		return failure;
 	}
 
-	nextElementId(): number {
+	/** Number an observed element; keeps `handle` when the observation already resolved it. */
+	observeElement(element: ObservedElement, handle?: ElementHandle): number {
 		this.#elementCounter += 1;
+		this.#observedElements.set(this.#elementCounter, element);
+		if (handle) this.#elementCache.set(this.#elementCounter, handle);
 		return this.#elementCounter;
-	}
-
-	cacheElement(id: number, handle: ElementHandle): void {
-		this.#elementCache.set(id, handle);
 	}
 
 	async #handleMessage(msg: WorkerInbound): Promise<void> {
@@ -1263,8 +1565,7 @@ export class WorkerCore {
 
 			// Realm setup is done: puppeteer loaded and browser connected. Sent before
 			// page acquisition so the supervisor's cold-start budget bounds only the
-			// realm setup; page creation and the first navigation run under the ready
-			// wait.
+			// realm setup; page creation runs under the ready wait.
 			this.#transport.send({ type: "setup" });
 			if (payload.mode === "headless") {
 				// Create the target directly so its id is reportable before
@@ -1286,7 +1587,9 @@ export class WorkerCore {
 				this.#page = page;
 				await this.#claimRelayTarget(page);
 			}
-			const page = this.#page;
+			const page = this.#requirePage();
+			this.#frameClient = page.mainFrame().client;
+			this.#frameClient.on("Page.frameNavigated", this.#onFrameNavigated);
 			this.#dialogs = new RuntimeDialogController(page, (message, details) => this.#log("debug", message, details));
 			this.#dialogs.observe();
 			if (payload.dialogs) await this.#dialogs.setPolicy(payload.dialogs);
@@ -1312,16 +1615,9 @@ export class WorkerCore {
 				// Background Chromium tabs stop producing frames, stalling rAF,
 				// IntersectionObserver, and input acknowledgements. Keep owned tabs
 				// interactive without raising a window; explicit settle-freeze still applies.
-				await this.#page.emulateFocusedPage(true);
+				await page.emulateFocusedPage(true);
 			}
-			if (payload.url) {
-				await this.#page.goto(payload.url, {
-					// Default to "load" because dev servers with HMR/WS never reach networkidle.
-					waitUntil: payload.waitUntil ?? "load",
-					timeout: payload.timeoutMs,
-				});
-			}
-			this.#targetId = await targetIdForPage(this.#page);
+			this.#targetId = await targetIdForPage(page);
 			this.#transport.send({ type: "ready", info: await this.#currentReadyInfo() });
 		} catch (error) {
 			// A failed headless init leaves the worker's page orphaned in the shared
@@ -1392,12 +1688,20 @@ export class WorkerCore {
 		const page = this.#requirePage();
 		const targetId = this.#targetId ?? (await targetIdForPage(page));
 		this.#targetId = targetId;
+		const dialogPending = this.#dialogs?.state().open ?? false;
 		return {
 			url: redactUrlCredentials(page.url()),
-			title: this.#dialogs?.state().open ? undefined : await page.title().catch(() => undefined),
-			viewport: page.viewport() ?? DEFAULT_VIEWPORT,
+			title: dialogPending ? undefined : await page.title().catch(() => undefined),
+			viewport: dialogPending
+				? (page.viewport() ?? this.#lastViewport ?? DEFAULT_VIEWPORT)
+				: await this.#viewport().catch(() => this.#lastViewport ?? DEFAULT_VIEWPORT),
 			targetId,
 		};
+	}
+
+	async #viewport(signal?: AbortSignal): Promise<ReadyInfo["viewport"]> {
+		this.#lastViewport = await readPageViewport(this.#requirePage(), signal);
+		return this.#lastViewport;
 	}
 
 	async #postReadyInfo(): Promise<void> {
@@ -1445,6 +1749,7 @@ export class WorkerCore {
 		let completed = false;
 		let returnValue: unknown;
 		let failure: { error: unknown } | undefined;
+		let recoverTab = false;
 		let runPage: RunPageScope | undefined;
 		try {
 			throwIfAborted(signal);
@@ -1546,10 +1851,26 @@ export class WorkerCore {
 		} finally {
 			runAc.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Browser run ended")));
 			await Bun.sleep(0);
+			// Detach first: the stop below fails the cancelled requests, and run handlers that see
+			// those events would touch the aborted run's facade.
+			runPage?.detach();
+			// A cancelled run abandons its main-frame navigation: left loading, it still replaces the
+			// page later and holds up any interception restore below. Stopping is gated on
+			// that navigation because Page.stopLoading also cancels every fetch and subresource
+			// load in flight. A run that merely ended keeps an unawaited goto going.
+			if (ac.signal.aborted && this.#network?.hasPendingMainFrameNavigation()) await this.#stopLoading();
 			try {
-				await runPage?.cleanup();
+				await runPage?.restoreInterception();
 			} catch (error) {
-				failure = { error };
+				// A finished run keeps its result; the supervisor still recycles the tab.
+				if (completed && active.floatingRejections.length === 0) {
+					recoverTab = true;
+					this.#log("warn", "Browser tab state could not be restored after a completed run", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				} else {
+					failure = { error };
+				}
 			}
 			failure = this.#foldFloatingRejections(active, failure);
 			if (this.#active?.id === msg.id) this.#active = null;
@@ -1564,7 +1885,12 @@ export class WorkerCore {
 				type: "result",
 				id: msg.id,
 				ok: true,
-				payload: { displays: output.finish(), returnValue: cloneSafe(returnValue), screenshots },
+				payload: {
+					displays: output.finish(),
+					returnValue: cloneSafe(returnValue),
+					screenshots,
+					recoverTab: recoverTab || undefined,
+				},
 			});
 		}
 	}
@@ -1649,6 +1975,15 @@ export class WorkerCore {
 		// the finally (stops the watchdog's polling once the op settles either way).
 		const earlyAc = new AbortController();
 		try {
+			// A download this op starts before a pending `waitForDownload()` has enabled
+			// tracking would bypass it, so hold the op until tracking applies — within
+			// the op's own deadline, so a stalled enable surfaces as this op's timeout.
+			const arming = this.#downloads?.arming;
+			if (arming)
+				await untilAborted(
+					opSignal,
+					arming.catch(() => undefined),
+				);
 			if (!watchdog) return await fn(opSignal);
 			const racedSignal = AbortSignal.any([opSignal, earlyAc.signal]);
 			return await Promise.race([
@@ -1665,7 +2000,13 @@ export class WorkerCore {
 				!cellSignal.aborted &&
 				(opTimeout?.aborted || (err instanceof Error && err.name === "TimeoutError"))
 			) {
-				const hint = selector ? await this.#selectorTimeoutHint(selector) : "";
+				const refusal = err instanceof ClickRefusedError ? err.refusal : undefined;
+				const count = selector ? await this.#selectorMatchCount(selector) : undefined;
+				const hint = refusal
+					? `; the element never became clickable (last check: ${refusal}${count === undefined ? "" : `; selector matches ${count} element(s)`})`
+					: count === undefined
+						? ""
+						: formatSelectorMatchHint(count);
 				throw markBrowserRunRejection(
 					new ToolError(`${label} timed out after ${perOpTimeoutMs}ms${hint}`),
 					active.rejectionOwner,
@@ -1713,22 +2054,21 @@ export class WorkerCore {
 	}
 
 	/**
-	 * Best-effort match-count probe for a timed-out selector op. Never throws;
-	 * empty string when the probe fails, stalls, or the selector is an aria-ref.
+	 * Best-effort match count for a timed-out selector op. Never throws;
+	 * undefined when the probe fails, stalls, or the selector is an aria-ref.
 	 */
-	async #selectorTimeoutHint(selector: string): Promise<string> {
-		if (parseAriaRefSelector(selector) !== null) return "";
+	async #selectorMatchCount(selector: string): Promise<number | undefined> {
+		if (parseAriaRefSelector(selector) !== null) return undefined;
 		try {
 			const handles = await Promise.race([
 				this.#requirePage().$$(normalizeSelector(selector)),
 				Bun.sleep(1_000).then(() => null),
 			]);
-			if (!handles) return "";
-			const count = handles.length;
+			if (!handles) return undefined;
 			for (const handle of handles) void handle.dispose().catch(() => undefined);
-			return formatSelectorMatchHint(count);
+			return handles.length;
 		} catch {
-			return "";
+			return undefined;
 		}
 	}
 
@@ -1989,15 +2329,15 @@ export class WorkerCore {
 						// Default to "load" because dev servers with HMR/WS never reach networkidle.
 						// budgetBound (not the full cell) so a hung navigation fails named and
 						// catchable inside the run instead of dying with the whole cell.
-						await untilAborted(sig, () =>
-							page.goto(url, { waitUntil: opts?.waitUntil ?? "load", timeout: budgetBound }),
+						await navigateMainFrame(page, opts?.waitUntil ?? "load", budgetBound, sig, options =>
+							page.goto(url, options),
 						);
 					} catch (err) {
 						if (err instanceof Error && err.name === "TimeoutError") {
 							// Abandon the hung navigation NOW — a still-pending load stalls every
 							// later op on this page and cascades into more opaque timeouts.
 							await this.#stopLoading();
-							throw new ToolError(
+							throw new NavigationTimeoutError(
 								`tab.goto(${JSON.stringify(url)}) timed out after ${budgetBound}ms; pending navigation stopped — retry with a longer tool timeout or waitUntil:"domcontentloaded"`,
 							);
 						}
@@ -2118,8 +2458,10 @@ export class WorkerCore {
 					async sig => {
 						const label = `tab.click(${JSON.stringify(selector)})`;
 						const resolved = normalizeSelector(selector);
-						if (resolved.startsWith("text/"))
-							return await clickQueryHandlerText(page, resolved, label, actionOpMs, sig);
+						if (resolved.startsWith("text/") && parseAriaRefSelector(selector) === null) {
+							await clickQueryHandlerText(page, resolved, label, actionOpMs, sig);
+							return;
+						}
 						const handle = await this.#resolveActionHandle(selector, actionOpMs, sig);
 						try {
 							await clickElement(handle, label, sig);
@@ -2171,7 +2513,7 @@ export class WorkerCore {
 							}
 						} else await untilAborted(sig, () => page.focus(normalizeSelector(selector)));
 					}
-					await untilAborted(sig, () => page.keyboard.press(key));
+					await untilAborted(sig, () => pressKey(page, key));
 				}),
 			scroll: (deltaX, deltaY, opts) =>
 				op("tab.scroll()", actionOpMs, async sig => {
@@ -2312,26 +2654,38 @@ export class WorkerCore {
 		const viewportOnly = options.viewportOnly ?? false;
 		let root: ElementHandle | null = null;
 		let snapshot: SerializedAXNode | null;
+		let frameSnapshots: FrameSnapshot[];
 		try {
 			if (options.selector) {
 				root = await untilAborted(options.signal, () => page.$(normalizeSelector(options.selector!)));
 				if (!root)
 					throw new ToolError(`tab.observe: selector ${JSON.stringify(options.selector)} matched no element`);
 			}
-			snapshot = await untilAborted(options.signal, () =>
+			snapshot = (await untilAborted(options.signal, () =>
 				page.accessibility.snapshot({ interestingOnly: !includeAll, root: root ?? undefined }),
-			);
+			)) as SerializedAXNode | null;
+			frameSnapshots = await snapshotFrames(page.mainFrame().childFrames(), {
+				interestingOnly: !includeAll,
+				root,
+				deadline: Date.now() + FRAME_SNAPSHOT_TIMEOUT_MS,
+				signal: options.signal,
+			});
 		} finally {
 			await root?.dispose().catch(() => undefined);
 		}
 		if (!snapshot) throw new ToolError("Accessibility snapshot unavailable");
 		const entries: ObservationEntry[] = [];
-		await collectObservationEntries(this, snapshot, entries, {
-			includeAll,
-			viewportOnly,
-			compact: options.compact,
-			signal: options.signal,
-		});
+		const interactiveAncestors = new Set<SerializedAXNode>();
+		const trees: FrameSnapshot[] = [{ frame: page.mainFrame(), snapshot }, ...frameSnapshots];
+		for (const tree of trees) {
+			if (options.compact) collectInteractiveObservationAncestors(tree.snapshot, interactiveAncestors);
+			await collectObservationEntries(this, tree.frame, tree.snapshot, entries, {
+				includeAll,
+				viewportOnly,
+				compact: options.compact ?? false,
+				interactiveAncestors,
+			});
+		}
 		const scroll = (await untilAborted(options.signal, () =>
 			page.evaluate(() => {
 				const win = globalThis as unknown as {
@@ -2355,7 +2709,7 @@ export class WorkerCore {
 		return {
 			url: page.url(),
 			title: (await untilAborted(options.signal, () => page.title())) as string,
-			viewport: page.viewport() ?? DEFAULT_VIEWPORT,
+			viewport: await this.#viewport(options.signal),
 			scroll,
 			elements: entries,
 		};
@@ -2388,8 +2742,8 @@ export class WorkerCore {
 				}),
 			);
 			for (const entry of observation.elements) {
-				const handle = this.#elementCache.get(entry.id);
-				const box = handle ? await untilAborted(signal, () => handle.boundingBox()) : null;
+				const handle = await this.#resolveCachedHandle(entry.id);
+				const box = await untilAborted(signal, () => handle.boundingBox());
 				if (box && box.width > 0 && box.height > 0) {
 					targets.push({
 						id: entry.id,
@@ -2524,41 +2878,7 @@ export class WorkerCore {
 	async #select(selector: string, values: string[], timeoutMs: number, signal: AbortSignal): Promise<string[]> {
 		const handle = await this.#resolveActionHandle(selector, timeoutMs, signal);
 		try {
-			return (await untilAborted(signal, () =>
-				handle.evaluate((el, vals) => {
-					interface SelectOption {
-						value: string;
-						selected: boolean;
-					}
-					interface SelectLike {
-						tagName: string;
-						options: ArrayLike<SelectOption>;
-						dispatchEvent: (event: unknown) => boolean;
-					}
-					const select = el as unknown as SelectLike;
-					if (select?.tagName !== "SELECT") throw new Error("tab.select() requires a <select> element");
-					const EventCtor = (
-						globalThis as unknown as { Event: new (type: string, init?: { bubbles: boolean }) => unknown }
-					).Event;
-					const wanted = new Set(vals as string[]);
-					// Assign the full selection first, then read back: on a single
-					// <select>, un-selecting the current option mid-loop leaves the
-					// browser reporting it selected until another option takes over,
-					// which double-counted the old value in the returned list.
-					for (let i = 0; i < select.options.length; i++) {
-						const opt = select.options[i] as SelectOption;
-						opt.selected = wanted.has(opt.value);
-					}
-					const selected: string[] = [];
-					for (let i = 0; i < select.options.length; i++) {
-						const opt = select.options[i] as SelectOption;
-						if (opt.selected) selected.push(opt.value);
-					}
-					select.dispatchEvent(new EventCtor("input", { bubbles: true }));
-					select.dispatchEvent(new EventCtor("change", { bubbles: true }));
-					return selected;
-				}, values),
-			)) as string[];
+			return await selectElementOptions(handle, values, "tab.select()", signal);
 		} finally {
 			await handle.dispose().catch(() => undefined);
 		}
@@ -2623,8 +2943,29 @@ export class WorkerCore {
 	}
 
 	async #resolveCachedHandle(id: number): Promise<ElementHandle> {
+		const element = this.#observedElements.get(id);
+		if (!element) throw new ToolError(`Unknown element id ${id}. Run tab.observe() to refresh the element list.`);
+		if (isObservedDocumentGone(element)) {
+			this.#clearElementCache();
+			throw new ToolError(`Element id ${id} is stale. Run tab.observe() again.`);
+		}
 		const handle = this.#elementCache.get(id);
-		if (!handle) throw new ToolError(`Unknown element id ${id}. Run tab.observe() to refresh the element list.`);
+		if (!handle) {
+			const resolved = await resolveObservedElement(element);
+			// An observe() during the await renumbers ids, so the id may now name another element.
+			if (!resolved || this.#observedElements.get(id) !== element) {
+				await resolved?.dispose().catch(() => undefined);
+				if (this.#observedElements.get(id) === element) this.#clearElementCache();
+				throw new ToolError(`Element id ${id} is stale. Run tab.observe() again.`);
+			}
+			const cached = this.#elementCache.get(id);
+			if (cached) {
+				await resolved.dispose().catch(() => undefined);
+				return cached;
+			}
+			this.#elementCache.set(id, resolved);
+			return resolved;
+		}
 		try {
 			const isConnected = (await handle.evaluate(el => el.isConnected)) as boolean;
 			if (!isConnected) {
@@ -2664,6 +3005,7 @@ export class WorkerCore {
 		return handle;
 	}
 	#clearElementCache(): void {
+		this.#observedElements.clear();
 		if (this.#elementCache.size === 0) {
 			this.#elementCounter = 0;
 			return;
@@ -2691,6 +3033,8 @@ export class WorkerCore {
 	}
 
 	async #disposePageResources(): Promise<void> {
+		this.#frameClient?.off("Page.frameNavigated", this.#onFrameNavigated);
+		this.#frameClient = undefined;
 		this.#dialogs?.dispose();
 		this.#emulation?.dispose();
 		const results = await Promise.allSettled([

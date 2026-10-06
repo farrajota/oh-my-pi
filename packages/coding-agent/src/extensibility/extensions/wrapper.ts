@@ -42,7 +42,7 @@ import {
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { withLspSessionPolicy } from "../../lsp/client";
 import type { ExtensionRunner } from "./runner";
-import type { RegisteredTool, ToolCallEventResult, ToolResultEventResult } from "./types";
+import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult, ToolResultEventResult } from "./types";
 type ClassFixedOperationRunner = typeof runMcpOperation;
 
 let descriptorSequence = 0;
@@ -312,8 +312,8 @@ function recordParams(value: unknown): Record<string, unknown> {
 type OptionalRunnerCapabilities = {
 	hasHandlers?: (eventType: string) => boolean;
 	consumeToolCallEmitted?: (toolCallId: string, toolName: string) => boolean;
-	emitToolCall?: (event: unknown, signal?: AbortSignal) => Promise<unknown>;
-	emitToolResult?: (event: unknown) => Promise<unknown>;
+	emitToolCall?: (event: unknown, signal?: AbortSignal, agent?: ExtensionAgentIdentity) => Promise<unknown>;
+	emitToolResult?: (event: unknown, agent?: ExtensionAgentIdentity) => Promise<unknown>;
 	emit?: ExtensionRunner["emit"];
 	getPermissionScope?: () => EffectiveSubagentPermissions | undefined;
 	getToolExecutionAuthority?: () => ToolExecutionAuthority | undefined;
@@ -360,6 +360,11 @@ function safetyCheckLines(checks: readonly ComputerSafetyCheck[]): string[] {
  * Wraps a tool with extension callbacks for interception.
  * - Emits tool_call event before execution (can block)
  * - Emits tool_result event after execution (can modify result)
+ *
+ * `agent` overrides the runner's own `ctx.agent` for those events when the tool
+ * runs on behalf of a different agent than the runner's session — the advisor's
+ * toolset shares the primary session's runner (for approval enforcement) but
+ * must not be reported as the primary agent.
  */
 export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetails = unknown> implements AgentTool<
 	TParameters,
@@ -370,11 +375,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	declare parameters: TParameters;
 	declare label: string;
 	declare strict: boolean;
+	readonly #agent: ExtensionAgentIdentity | undefined;
 
 	constructor(
 		private tool: AgentTool<TParameters, TDetails>,
 		private runner: ExtensionRunner,
+		agent?: ExtensionAgentIdentity,
 	) {
+		this.#agent = agent;
 		applyToolProxy(tool, this);
 	}
 
@@ -469,6 +477,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						),
 					},
 					signal,
+					this.#agent,
 				)) as ToolCallEventResult | undefined;
 
 				if (callResult?.block) {
@@ -731,18 +740,22 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			let resultHookError = false;
 			// Emit tool_result event - extensions can modify the result and error status.
 			if (hasRunnerHandlers(this.runner, "tool_result") && typeof runner.emitToolResult === "function") {
-				const resultResult = (await runner.emitToolResult.call(this.runner, {
-					type: "tool_result",
-					toolName: this.tool.name,
-					toolCallId,
-					input: normalizeToolEventInput(
-						this.tool.name,
-						resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
-					),
-					content: result.content,
-					details: result.details,
-					isError: !!executionError || result.isError === true,
-				})) as ToolResultEventResult | undefined;
+				const resultResult = (await runner.emitToolResult.call(
+					this.runner,
+					{
+						type: "tool_result",
+						toolName: this.tool.name,
+						toolCallId,
+						input: normalizeToolEventInput(
+							this.tool.name,
+							resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
+						),
+						content: result.content,
+						details: result.details,
+						isError: !!executionError || result.isError === true,
+					},
+					this.#agent,
+				)) as ToolResultEventResult | undefined;
 
 				resultHookError = resultResult?.isError === true;
 				// Handler context reports into this call's sink like tool-authored

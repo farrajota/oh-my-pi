@@ -1158,7 +1158,8 @@ describe("Browser Audit request interception", () => {
 		let calls = 0;
 		const scope = createRunPageScope(page as never, true);
 		page.on("request", () => calls++);
-		await scope.cleanup();
+		scope.detach();
+		await scope.restoreInterception();
 		await page.emit("request", new HarnessRequest("https://example.test/delayed", false, "fetch"));
 		expect(calls).toBe(1);
 		expect(page.setRequestInterceptionCalls).toBe(0);
