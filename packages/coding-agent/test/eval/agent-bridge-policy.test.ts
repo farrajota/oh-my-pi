@@ -1,9 +1,10 @@
-import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
+import { ModelRegistry } from "../../src/config/model-registry";
 import { runEvalAgent, type EvalAgentBridgeOptions, type EvalAgentResult } from "../../src/eval/agent-bridge";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../../src/eval/bridge-timeout";
 import { runEvalWait } from "../../src/eval/handle-bridge";
@@ -25,6 +26,7 @@ import {
 	markUnregisteredSessionOperationProjection,
 } from "../../src/registry/operation-lease";
 import type { AgentSession } from "../../src/session/agent-session";
+import { AuthStorage } from "../../src/session/auth-storage";
 import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import { SessionManager } from "../../src/session/session-manager";
 import { ArtifactManager } from "../../src/session/artifacts";
@@ -37,6 +39,17 @@ import type { AgentDefinition } from "../../src/task/types";
 import type { AgentProgress, SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../../src/tools";
 
+let fixtureAuthStorage!: AuthStorage;
+let fixtureModelRegistry!: ModelRegistry;
+
+beforeAll(async () => {
+	fixtureAuthStorage = await AuthStorage.create(":memory:");
+	fixtureModelRegistry = new ModelRegistry(fixtureAuthStorage);
+});
+
+afterAll(() => {
+	fixtureAuthStorage.close();
+});
 const taskAgent = {
 	name: "task",
 	description: "Task agent",
@@ -135,6 +148,8 @@ async function makeSession(options: SessionOptions = {}): Promise<ToolSession> {
 		cwd: options.cwd ?? process.cwd(),
 		agentDir,
 		settings,
+		modelRegistry: fixtureModelRegistry,
+		authStorage: fixtureAuthStorage,
 		disableExtensionDiscovery: true,
 		enableMCP: false,
 		enableLsp: false,
@@ -399,7 +414,7 @@ describe("runEvalAgent", () => {
 		expect(secondOptions.outputSchemaOverridesAgent).toBeUndefined();
 	});
 
-	it("routes a per-call model on agent() above the selected agent's own model", async () => {
+	it("forwards a per-call model argument on agent() (issue #6438)", async () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 
@@ -415,16 +430,27 @@ describe("runEvalAgent", () => {
 		expect(runSpy.mock.calls[2]?.[0]?.modelOverride).toEqual(["p/requested:high"]);
 	});
 
-	it("rejects an ambiguous or blank per-call model on agent() before dispatch", async () => {
+	it("rejects ambiguous or blank per-call model selectors before registering a job", async () => {
 		mockAgents();
+		const outputManager = new AgentOutputManager(() => null);
+		const allocateSpy = vi.spyOn(outputManager, "allocate");
+		const session = await makeSession({ outputManager });
+		const registerSpy = vi.spyOn(session.asyncJobManager!, "register");
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
+		const invalidModels: Array<{ model: string | string[]; expected: RegExp }> = [
+			{ model: "default", expected: /"@default"/ },
+			{ model: "", expected: /invalid `model`/ },
+			{ model: "   ", expected: /invalid `model`/ },
+			{ model: [], expected: /invalid `model`/ },
+			{ model: ["", "p/requested:high"], expected: /invalid `model`/ },
+		];
 
-		await expect(
-			runEvalAgent({ prompt: "work", model: "default" }, { session: await makeSession() }),
-		).rejects.toThrow(/"@default"/);
-		await expect(runEvalAgent({ prompt: "work", model: "   " }, { session: await makeSession() })).rejects.toThrow(
-			/invalid `model`/,
-		);
+		for (const { model, expected } of invalidModels) {
+			await expect(runEvalAgent({ prompt: "work", model }, { session })).rejects.toThrow(expected);
+		}
+
+		expect(allocateSpy).not.toHaveBeenCalled();
+		expect(registerSpy).not.toHaveBeenCalled();
 		expect(runSpy).not.toHaveBeenCalled();
 	});
 	it("returns host-parsed data for caller, agent, and inherited schemas", async () => {
@@ -448,18 +474,13 @@ describe("runEvalAgent", () => {
 			return singleResult(options, { output: "not JSON", structuredOutput });
 		});
 
+		const session = await makeSession({ outputSchema: sessionSchema });
 		const caller = await runEvalAgentAndWait(
 			{ prompt: "caller", schema: callerSchema, schemaMode: "strict" },
-			{ session: await makeSession({ outputSchema: sessionSchema }) },
+			{ session },
 		);
-		const frontmatter = await runEvalAgentAndWait(
-			{ prompt: "agent", agent: "structured" },
-			{ session: await makeSession({ outputSchema: sessionSchema }) },
-		);
-		const inherited = await runEvalAgentAndWait(
-			{ prompt: "session" },
-			{ session: await makeSession({ outputSchema: sessionSchema }) },
-		);
+		const frontmatter = await runEvalAgentAndWait({ prompt: "agent", agent: "structured" }, { session });
+		const inherited = await runEvalAgentAndWait({ prompt: "session" }, { session });
 
 		expect(caller.data).toEqual({ source: "caller" });
 		expect(caller.details).toMatchObject({ schemaSource: "caller", schemaMode: "strict", schemaStatus: "valid" });

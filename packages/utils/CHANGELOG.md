@@ -5,6 +5,34 @@
 ### Fixed
 
 - Fixed an absolute `PI_CONFIG_DIR` being nested under the home directory (e.g. `/home/node/home/node/.omp-amgr`); it is now used as the config root as-is, with the agent directory at `<PI_CONFIG_DIR>/agent` unless `PI_CODING_AGENT_DIR` overrides it.
+## [18.8.1] - 2026-10-07
+
+### Added
+
+- Added `PI_NATIVES_DIR` support to `getNativesDir()` for configuring the native addon directory.
+- Added `ZipPackage` for lazily reading ZIP-based document packages with a total decompressed-size limit, along with `DocxImage.readBytes()` for accessing raw DOCX image data.
+
+## [18.8.0] - 2026-10-07
+
+### Added
+
+- Added `ZipPackage` to `@oh-my-pi/pi-utils/ar` for lazily reading ZIP-based document packages with a configurable total-inflation limit, plus `DocxImage.readBytes()` for accessing raw DOCX image data.
+
+### Changed
+
+- Improved DOCX conversion to inflate only the package contents it needs, reducing unnecessary work and memory use.
+- Improved performance across HTML-to-Markdown conversion, Readability extraction, Markdown lexing, terminal emulation, terminal styling, streaming tool-argument parsing, and log writing. Large-page processing and terminal workloads now use substantially less time and memory.
+
+### Fixed
+
+- Fixed memory growth in long-lived child processes, streaming readers, prompt template compilation, and retried HTTP requests by releasing buffers, cache entries, and discarded response bodies promptly.
+- Fixed prompt templates rejecting `{{else if …}}` chains as unclosed blocks; a chain now closes with its opening block's single closing tag, as in Handlebars.
+
+## [18.6.3] - 2026-10-06
+
+### Breaking Changes
+
+- Replaced the `cursorPosition` option of `TerminalQueryResponder` with `hostCursorHandshake`, which leaves only the PTY host's own session-start cursor query unanswered instead of every cursor-position query
 
 ## [18.5.1] - 2026-10-03
 

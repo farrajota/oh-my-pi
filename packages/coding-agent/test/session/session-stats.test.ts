@@ -24,7 +24,7 @@ test("uses provider totals once while retaining cache and reasoning breakdowns",
 	const tracker = new SessionStatsTracker({
 		agent: { state: { messages: [assistant] }, tokenizer },
 		sessionManager: {
-			getBranch: () => [{ type: "model_usage", usage: usage(3, 1, 1, 0, 0) }],
+			getBranchView: () => [{ type: "model_usage", usage: usage(3, 1, 1, 0, 0) }],
 			getSessionFile: () => "/tmp/session.jsonl",
 		},
 		session: {},
@@ -56,8 +56,13 @@ test("does not add nested task-result usage to canonical session totals", () => 
 		details: { usage: usage(10_000, 5_000, 2_000, 2_000, 1_000) },
 	};
 	const tracker = new SessionStatsTracker({
-		agent: { state: { messages: [assistant, taskResult] }, tokenizer },
-		sessionManager: { getBranch: () => [], getSessionFile: () => "/tmp/session.jsonl" },
+		agent: {
+			state: {
+				messages: [{ role: "user", content: [{ type: "text", text: "continue" }] }, assistant, taskResult],
+			},
+			tokenizer,
+		},
+		sessionManager: { getBranchView: () => [], getSessionFile: () => "/tmp/session.jsonl" },
 		session: {},
 		sessionId: () => "session",
 		modelRegistry: {},

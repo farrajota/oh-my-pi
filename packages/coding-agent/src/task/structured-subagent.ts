@@ -19,11 +19,14 @@ import {
 	resolveModelOverride,
 	splitRoleAliasThinkingSuffix,
 } from "../config/model-resolver";
+import { type OAuthAccountPools, validateAgentAccountPools } from "../config/account-pools";
 import {
 	type CompactionThresholdPair,
 	validateAgentCompactionThresholdOverrides,
 } from "../config/compaction-threshold";
 import { type ServiceTierInheritSettingValue, validateAgentServiceTierOverrides } from "../config/service-tier";
+import { isProviderEnabled, isUserSourceEnabled } from "../capability";
+import type { EffectiveExtensionRoots } from "../capability/types";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
@@ -66,6 +69,7 @@ import { parseIsolationBackend } from "./worktree";
 
 import {
 	cfgIsolationBackend,
+	cfgTaskAgentAccountPools,
 	cfgTaskAgentCompactionThresholdOverrides,
 	cfgTaskAgentModelOverrides,
 	cfgTaskAgentServiceTierOverrides,
@@ -183,14 +187,10 @@ export interface EffectiveSubagentPolicy {
 	serviceTierOverride?: ServiceTierInheritSettingValue;
 	/** Exact-name entry normalized to both child compaction threshold fields. */
 	compactionThresholdOverride?: CompactionThresholdPair;
-	/**
-	 * Parent model the child falls back to when its own candidates have no
-	 * working credentials. Absent for an explicit per-call `model` (other than
-	 * `@default`): a requested model that cannot run fails instead of being
-	 * replaced by the parent's.
-	 */
+	/** Exact-name `task.agentAccountPools` entry: the only OAuth accounts the child may use, per listed provider. */
+	oauthAccountPools?: OAuthAccountPools;
 	parentActiveModelPattern?: string;
-	/** The selected patterns carry the parent's live effort, which the agent's own `thinking-level` outranks. */
+	/** An inherited live thinking level stays below the agent definition's own level. */
 	modelInheritsLiveThinkingLevel?: boolean;
 	schema: StructuredSubagentSchemaResolution;
 	planMode: boolean;
@@ -315,6 +315,39 @@ function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentNam
 }
 
 /**
+ * In-flight agent discovery, keyed by resolved cwd, the effective extension
+ * roots and the provider/source toggles `discoverAgents` consults. Concurrent
+ * preflights (task batch items, eval `agent()` fan-out) share one disk scan;
+ * the entry is dropped when the scan settles, so any later call rescans and
+ * policy resolution stays as fresh as before. A toggle flipped mid-scan changes
+ * the key, so later callers rescan under the new policy. The live
+ * `discoverAgents` binding is part of the entry so spies swapped mid-flight
+ * never receive a stale result.
+ */
+const inflightDiscovery = new Map<string, { fn: typeof discoverAgents; promise: Promise<DiscoveryResult> }>();
+
+function discoverAgentsShared(cwd: string, extensionRoots?: EffectiveExtensionRoots): Promise<DiscoveryResult> {
+	const fn = discoverAgents;
+	const policy = [
+		isProviderEnabled("omp-plugins"),
+		isProviderEnabled("claude-plugins"),
+		isUserSourceEnabled("claude-plugins"),
+		isUserSourceEnabled("claude"),
+	].join(",");
+	const key = `${path.resolve(cwd)}\0${policy}\0${JSON.stringify(extensionRoots ?? null)}`;
+	const existing = inflightDiscovery.get(key);
+	if (existing && existing.fn === fn) return existing.promise;
+	const promise = fn(cwd, undefined, extensionRoots);
+	const entry = { fn, promise };
+	inflightDiscovery.set(key, entry);
+	const clear = () => {
+		if (inflightDiscovery.get(key) === entry) inflightDiscovery.delete(key);
+	};
+	promise.then(clear, clear);
+	return promise;
+}
+
+/**
  * Reason a per-spawn `model` selector cannot mean anything useful, or
  * `undefined` when it is usable. The literal `"default"` (with or without a
  * `:level` suffix) is singled out because it reads as "leave the agent's
@@ -364,7 +397,7 @@ export async function resolveEffectiveSubagentPolicy(
 
 	const discovered =
 		request.discovery ??
-		(await discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.()));
+		(await discoverAgentsShared(request.session.cwd, request.session.effectiveExtensionRoots?.()));
 	const sessionAgents = request.session.getSessionAgents?.() ?? [];
 	const knownNames = new Set(discovered.agents.map(candidate => candidate.name));
 	const discovery = sessionAgents.length
@@ -414,6 +447,8 @@ export async function resolveEffectiveSubagentPolicy(
 	const compactionThresholdOverride = Object.hasOwn(compactionThresholdOverrides, agentName)
 		? compactionThresholdOverrides[agentName]
 		: undefined;
+	const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(request.session.settings));
+	const oauthAccountPools = Object.hasOwn(agentAccountPools, agentName) ? agentAccountPools[agentName] : undefined;
 	const parentActiveModelPattern = request.session.getActiveModelString?.();
 	const modelResolution = {
 		requestModel: request.model,
@@ -489,6 +524,7 @@ export async function resolveEffectiveSubagentPolicy(
 			}
 		}
 	}
+
 	const isolationEnabled = cfgTaskIsolationEnabled.get(request.session.settings);
 	const isIsolated = request.isolation?.requested === true;
 	if (isIsolated && !isolationEnabled) {
@@ -506,6 +542,7 @@ export async function resolveEffectiveSubagentPolicy(
 		modelRole,
 		serviceTierOverride,
 		compactionThresholdOverride,
+		oauthAccountPools,
 		parentActiveModelPattern:
 			requestPatterns.length > 0 && !modelSelectionInheritsSessionModel(request.model)
 				? undefined
@@ -564,12 +601,7 @@ export async function applySpawnHook(
 	const settings = request.settings ?? request.session.settings;
 	const replacement = resolveConfiguredModelPatterns(spawnResult.model, settings);
 	if (replacement.length === 0) return policy;
-	return {
-		...policy,
-		modelOverride: replacement,
-		modelRoute: spawnResult.note,
-		modelInheritsLiveThinkingLevel: undefined,
-	};
+	return { ...policy, modelOverride: replacement, modelRoute: spawnResult.note };
 }
 
 /** Reserve a session-global agent id only after preflight has succeeded. */
@@ -668,6 +700,7 @@ function buildRunSubprocessOptions(
 		modelRoute: policy.modelRoute,
 		serviceTierOverride: policy.serviceTierOverride,
 		compactionThresholdOverride: policy.compactionThresholdOverride,
+		oauthAccountPools: policy.oauthAccountPools,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		modelInheritsLiveThinkingLevel: policy.modelInheritsLiveThinkingLevel,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,

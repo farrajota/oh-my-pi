@@ -51,6 +51,7 @@ import type {
 	AssistantMessage,
 	Context,
 	Model,
+	ServiceTier,
 	SimpleStreamOptions,
 	StopDetails,
 	StopReason,
@@ -97,6 +98,8 @@ export interface MockResponse {
 	errorCode?: string;
 	/** Usage stats. Missing fields default to 0; missing `cost.total` is recomputed from components. */
 	usage?: Partial<Omit<Usage, "cost">> & { cost?: Partial<Usage["cost"]> };
+	/** Service tier the mock reports serving the turn, as a real provider's response echo would. */
+	serviceTier?: ServiceTier;
 	/** Pre-set responseId. */
 	responseId?: string;
 	/** If set, the stream emits a terminal error event instead of completing. */
@@ -424,6 +427,7 @@ async function runMock(
 	partial.errorStatus = response.errorStatus;
 	partial.errorCode = response.errorCode;
 	partial.usage = mergeUsage(response.usage);
+	partial.serviceTier = response.serviceTier;
 	partial.duration = performance.now() - perfStart;
 
 	if (reason === "aborted" || reason === "error") {

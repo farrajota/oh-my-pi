@@ -384,6 +384,8 @@ const SCRUBBED_ENV_NAMES = new Set([
 	"GOOGLE_APPLICATION_CREDENTIALS",
 	"ANTHROPIC_OAUTH_TOKEN",
 	"XAI_OAUTH_TOKEN",
+	"PI_CODING_AGENT_DIR",
+	"PI_CONFIG_DIR",
 ]);
 
 function isScrubbedEnvVar(key: string): boolean {

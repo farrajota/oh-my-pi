@@ -521,6 +521,11 @@ export class CollabGuestLink {
 		}
 		this.#replicaActivated = true;
 		if (this.#left) return;
+		const orphanedLiveBlocks = [
+			...this.#ctx.pendingTools.values(),
+			...this.#ctx.eventController.takeDisplaceableComponents(),
+		];
+		this.#ctx.eventController.resetTranscriptAnchors();
 		this.#clearTransientUi(true);
 		this.#clearAgentMirror();
 		this.state = pending.state;
@@ -540,10 +545,6 @@ export class CollabGuestLink {
 			// EventController. A failed initial render restores the previous tree,
 			// so these rows are still visible; seal them without disposing their
 			// renderer children.
-			const orphanedLiveBlocks = [
-				...this.#ctx.pendingTools.values(),
-				...this.#ctx.eventController.takeDisplaceableComponents(),
-			];
 			for (const handle of orphanedLiveBlocks) {
 				handle.seal();
 			}
@@ -678,19 +679,27 @@ export class CollabGuestLink {
 			!this.#assistantStreamSynced
 		) {
 			this.#assistantStreamSynced = true;
-			void this.#ctx.eventController.handleEvent(this.#ctx.session, {
-				type: "message_start",
-				message: event.message,
-			});
+			this.#dispatchEvent({ type: "message_start", message: event.message });
 		}
-		const replicatedRunStartedAt = event.type === "agent_start" ? Date.now() : undefined;
-		void this.#ctx.eventController.handleEvent(this.#ctx.session, event, replicatedRunStartedAt);
+		this.#dispatchEvent(event);
 		// Lifecycle mirror: the guest's own agent loop never runs, so the session's
 		// extension-event path stays silent. Route the mirrored wire event through
 		// the same mapping the session uses so extension-installed lifecycle
 		// integrations observe host working/idle transitions while joined.
 		const runner = this.#ctx.session.extensionRunner;
 		if (runner) this.#lifecycleEmitter.emit(runner, event);
+	}
+
+	/**
+	 * Feed a mirrored event through the same pipeline as a local session:
+	 * `message_update` joins the controller's coalesced streaming rebuild and
+	 * every other event runs serialized behind it, so a mirrored stream tail
+	 * cannot reorder (message_update → message_end → agent_end).
+	 */
+	#dispatchEvent(event: AgentSessionEvent): void {
+		this.#ctx.eventController.dispatchSessionEvent(event).catch(err => {
+			logger.warn("collab guest event dispatch failed", { type: event.type, error: String(err) });
+		});
 	}
 
 	/**
@@ -930,6 +939,8 @@ export class CollabGuestLink {
 		}
 		this.#ctx.statusLine.setCollabStatus(null);
 		this.#flushPendingTranscripts();
+		// A pending coalesced mirror message_update must not flush after leave.
+		this.#ctx.eventController.resetTranscriptAnchors();
 		this.#clearAgentMirror();
 		this.#ctx.syncRunningSubagentBadge();
 		this.#ctx.resetObserverRegistry();

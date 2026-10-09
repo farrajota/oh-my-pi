@@ -9,8 +9,12 @@
  *
  * Pagination is handled by the read tool via offset/limit parameters.
  */
-import { artifactsDirsForContext, isBoundResourceContext } from "./registry-helpers";
+import { artifactsDirsForContext, artifactsDirsFromRegistry, isBoundResourceContext } from "./registry-helpers";
 import { ArtifactManager } from "../session/artifacts";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { isEnoent } from "@oh-my-pi/pi-utils";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import artifactDoc from "../prompts/internal-urls/artifact.md" with { type: "text" };
 import type {
 	InternalResource,
@@ -22,6 +26,45 @@ import type {
 } from "./types";
 
 const MAX_INLINE_ARTIFACT_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Sorted artifact ids for `complete()`, keyed by the scanned dir set.
+ * Completion runs per keystroke; a short reuse window avoids re-reading every
+ * artifacts dir on each key.
+ */
+const completionIds = new LRUCache<string, Promise<string[]>>({ max: 8, ttl: 2000 });
+
+async function scanArtifactIds(dirs: string[]): Promise<string[]> {
+	const listings = await Promise.all(
+		dirs.map(async dir => {
+			try {
+				return await fs.readdir(dir);
+			} catch (err) {
+				if (isEnoent(err)) return [];
+				throw err;
+			}
+		}),
+	);
+	const ids = new Set<string>();
+	for (const files of listings) {
+		for (const f of files) {
+			const m = f.match(/^(\d+)\./);
+			if (m) ids.add(m[1]!);
+		}
+	}
+	return [...ids].sort((a, b) => Number(a) - Number(b));
+}
+
+function artifactIdsForCompletion(): Promise<string[]> {
+	const dirs = artifactsDirsFromRegistry();
+	const key = dirs.join("\0");
+	const cached = completionIds.get(key);
+	if (cached) return cached;
+	const ids = scanArtifactIds(dirs);
+	completionIds.set(key, ids);
+	ids.catch(() => completionIds.delete(key));
+	return ids;
+}
 
 /** Filesystem location for a session artifact, resolved without materializing its content. */
 interface ResolvedArtifactFile {
@@ -128,6 +171,9 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 	}
 
 	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {
-		return (await listArtifactIds(artifactsDirsForContext(context))).map(value => ({ value }));
+		const ids = isBoundResourceContext(context)
+			? await listArtifactIds(artifactsDirsForContext(context))
+			: await artifactIdsForCompletion();
+		return ids.map(value => ({ value }));
 	}
 }

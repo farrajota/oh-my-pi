@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { TspKind } from "@oh-my-pi/pi-wire";
-import { describeWorkingRow } from "@oh-my-pi/pi-tui/components/loader";
+import { describeWorkingRow, type WorkingRowSpec } from "@oh-my-pi/pi-tui/components/loader";
 import { SelectList } from "@oh-my-pi/pi-tui/components/select-list";
 import type { DescribeContext, NativeChild, NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import { setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
@@ -109,6 +109,19 @@ describe("native composer", () => {
 		editor.handleNativeEvent({ type: "action", key: "bar/stop", act: "interrupt", mods: [] });
 		expect(editor.onCycleThinkingLevel).toHaveBeenCalledTimes(1);
 		expect(editor.onEscape).toHaveBeenCalledTimes(1);
+	});
+
+	it("quotes the session title in italics as the placeholder; a viewed subagent's name wins", () => {
+		const placeholder = (state: ComposerNativeState) =>
+			nodes(composer(state).describe(cx)).find(n => n.k === "editor")?.p;
+		expect(placeholder({ running: false })).toMatchObject({ placeholder: "What are we cooking?" });
+		expect(placeholder({ running: false, title: "" })).toMatchObject({ placeholder: "What are we cooking?" });
+		expect(placeholder({ running: false, title: "Fix login" })).toMatchObject({
+			placeholder: [{ t: "“Fix login”", s: "em" }],
+		});
+		expect(placeholder({ running: false, title: "Fix login", viewing: ["Scout"] })).toMatchObject({
+			placeholder: "Message Scout",
+		});
 	});
 
 	it("names the viewed subagent over the draft and routes its links to the focus handler", () => {
@@ -279,7 +292,7 @@ describe("native composer thinking level in the model chip", () => {
 
 describe("native working row", () => {
 	it("counts a retry down in a ring and offers Cancel; without meter support it spins", () => {
-		const spec = {
+		const spec: WorkingRowSpec = {
 			label: "Retrying · attempt 1 of 3",
 			startedAt: 1_000,
 			variant: { kind: "retry", attempt: 1, max: 3, delayMs: 4_000 } as const,

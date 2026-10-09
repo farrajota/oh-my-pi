@@ -199,7 +199,6 @@ describe("model mentions", () => {
 		expect(mentions.expandMentions("^c/w")).toBe('<model agent="m3" name="W Three"/>');
 		expect(mentions.mentions.map(mention => mention.agent)).toEqual(["m1", "m2", "m3"]);
 		session.branch(first);
-		mentions.syncFromBranch();
 		expect(mentions.expandMentions("^c/w")).toBe('<model agent="m2" name="W Three"/>');
 		session.resetLeaf();
 		mentions.syncFromBranch();

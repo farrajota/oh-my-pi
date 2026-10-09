@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type {
 	AuthorizedFilesystemTarget,
 	FilesystemOperation,
@@ -68,7 +69,7 @@ const LOCAL_WRITE_NOTE = "local:// resources are writable files in the active se
 function safeSessionId(options: LocalProtocolOptions): string {
 	const raw = options.getSessionId?.() ?? "session";
 	const safe = raw.replace(/[^a-zA-Z0-9_.-]/g, "_");
-	return safe.length > 0 ? safe : "session";
+	return safe && safe !== "." && safe !== ".." ? safe : "session";
 }
 
 function shortLocalRoot(options: LocalProtocolOptions): string {
@@ -279,10 +280,19 @@ async function listFilesRecursively(rootPath: string, options?: LocalProtocolOpt
 			await directoryHandle?.close();
 		}
 	}
-
 	return files.sort((a, b) => a.localeCompare(b));
 }
 
+/** Reuse unbound listings only; authority-bound reads must reauthorize. */
+const completionListings = new LRUCache<string, Promise<string[]>>({ max: 16, ttl: 2000 });
+function listCompletionFiles(localRoot: string): Promise<string[]> {
+	const cached = completionListings.get(localRoot);
+	if (cached) return cached;
+	const listing = listFilesRecursively(localRoot);
+	completionListings.set(localRoot, listing);
+	listing.catch(() => completionListings.delete(localRoot));
+	return listing;
+}
 async function buildListing(
 	url: InternalUrl,
 	localRoot: string,
@@ -715,7 +725,10 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		if (!opts) return [];
 		const localRoot = path.resolve(resolveLocalRoot(opts));
 		try {
-			const files = await listFilesRecursively(localRoot, opts);
+			const files =
+				opts.getPathScope || opts.getDurableLocalState
+					? await listFilesRecursively(localRoot, opts)
+					: await listCompletionFiles(localRoot);
 			return files.map(value => ({ value }));
 		} catch (err) {
 			if (isEnoent(err)) return [];

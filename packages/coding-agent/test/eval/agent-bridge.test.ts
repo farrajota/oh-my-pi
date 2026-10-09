@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import {
 	runEvalAgent,
 	type EvalAgentBridgeOptions,
@@ -23,6 +24,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import * as taskDiscovery from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as taskExecutor from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
@@ -39,6 +41,18 @@ interface SessionOperationLedgerControl {
 const jobManagers = new Set<AsyncJobManager>();
 const operationLedgers = new Set<SessionOperationLedgerControl>();
 const lifecycleManagers = new Set<AgentLifecycleManager>();
+
+let fixtureAuthStorage!: AuthStorage;
+let fixtureModelRegistry!: ModelRegistry;
+
+beforeAll(async () => {
+	fixtureAuthStorage = await AuthStorage.create(":memory:");
+	fixtureModelRegistry = new ModelRegistry(fixtureAuthStorage);
+});
+
+afterAll(() => {
+	fixtureAuthStorage.close();
+});
 
 function isEvalAgentResult(value: unknown): value is EvalAgentResult {
 	return (
@@ -93,6 +107,8 @@ async function createFixtureSession(
 		cwd: "/tmp",
 		agentDir: "/tmp",
 		settings,
+		modelRegistry: fixtureModelRegistry,
+		authStorage: fixtureAuthStorage,
 		disableExtensionDiscovery: true,
 		enableMCP: false,
 		enableLsp: false,

@@ -20,6 +20,7 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { lookupAgentRef } from "../internal/agent-registry-bridge";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { AgentRef } from "../registry/agent-registry";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
@@ -40,11 +41,13 @@ import type { SessionEntry } from "../session/session-entries";
 import {
 	agentRefsForContext,
 	artifactsDirsForContext,
+	artifactsDirsFromRegistry,
 	isBoundResourceContext,
 	sessionFilesFromContext,
 	sessionFilesFromDisk,
 } from "./registry-helpers";
 import historyPromptDoc from "../prompts/internal-urls/history.md" with { type: "text" };
+
 import type {
 	InternalResource,
 	InternalUrl,
@@ -53,6 +56,23 @@ import type {
 	SchemeSpec,
 	UrlCompletion,
 } from "./types";
+
+/**
+ * On-disk transcript ids for `complete()`, keyed by the scanned dir set.
+ * Completion runs per keystroke and the scan is recursive, so a short reuse
+ * window replaces a full rescan on every key.
+ */
+const completionDiskIds = new LRUCache<string, Promise<string[]>>({ max: 8, ttl: 2000 });
+
+function diskIdsForCompletion(): Promise<string[]> {
+	const key = artifactsDirsFromRegistry().join("\0");
+	const cached = completionDiskIds.get(key);
+	if (cached) return cached;
+	const ids = sessionFilesFromDisk().then(files => [...files.keys()]);
+	completionDiskIds.set(key, ids);
+	ids.catch(() => completionDiskIds.delete(key));
+	return ids;
+}
 
 /** Registry lookup for a `history://<id>` URL, bound to the caller's root. */
 interface RefLookup {
@@ -499,10 +519,10 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 				description: `${ref.status} · ${ref.kind}${ref.parentId ? ` · parent ${ref.parentId}` : ""}`,
 			});
 		}
-		const disk = isBoundResourceContext(context)
-			? await sessionFilesFromContext(context)
-			: await sessionFilesFromDisk();
-		for (const id of disk.keys()) {
+		const ids = isBoundResourceContext(context)
+			? (await sessionFilesFromContext(context)).keys()
+			: await diskIdsForCompletion();
+		for (const id of ids) {
 			if (seen.has(id)) continue;
 			seen.add(id);
 			completions.push({ value: id, description: "on disk" });

@@ -61,6 +61,8 @@ function makeCtx(session: InteractiveModeContext["session"], btwContainer = new 
 	let leafId: string | null = "leaf-1";
 	let sessionId = "session-1";
 	return {
+		btwContainer,
+		session,
 		ui: {
 			requestRender: vi.fn(),
 			requestComponentRender: vi.fn(),
@@ -68,8 +70,6 @@ function makeCtx(session: InteractiveModeContext["session"], btwContainer = new 
 			setFocus: vi.fn(),
 			terminal: { rows: 30 },
 		} as unknown as TUI,
-		btwContainer,
-		session,
 		keybindings: {
 			getKeys: (action: string) => (action === "app.stt.pushToTalk" ? ["space"] : []),
 		},

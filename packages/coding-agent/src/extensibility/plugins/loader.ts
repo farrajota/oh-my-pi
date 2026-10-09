@@ -167,31 +167,48 @@ async function collectPluginsAtRoot(
 			continue;
 		}
 		const pluginPkgPath = path.join(nodeModulesPath, name, "package.json");
-		let pluginPkg: { version: string; omp?: PluginManifest; pi?: PluginManifest };
+		const runtimeState = runtimeConfig.plugins[name];
+		let pluginPkg: { version?: string; omp?: PluginManifest; pi?: PluginManifest };
 		try {
 			pluginPkg = await Bun.file(pluginPkgPath).json();
 		} catch (err) {
-			// Lockfile entry without a corresponding node_modules tree means the
-			// link was deleted out from under us; skip silently.
-			if (isEnoent(err)) continue;
-			// One unreadable plugin does not invalidate its siblings, so skip
-			// just this one — loudly, because unlike a deleted link it is a
-			// plugin the user still expects to load.
-			if (isUnreadableRoot(err)) {
+			if (isEnoent(err) && runtimeState && (await isSymlink(path.join(nodeModulesPath, name)))) {
+				pluginPkg = { version: runtimeState.version };
+			} else if (isEnoent(err)) {
+				// Lockfile entry without a corresponding node_modules tree means the
+				// link was deleted out from under us; skip silently.
+				continue;
+			} else if (isUnreadableRoot(err)) {
 				logger.warn("plugins: skipping unreadable plugin", { name, root, path: pluginPkgPath });
 				continue;
+			} else {
+				throw err;
 			}
-			throw err;
 		}
 
-		const manifest: PluginManifest | undefined = pluginPkg.omp || pluginPkg.pi;
+		let manifest: PluginManifest | undefined = pluginPkg.omp || pluginPkg.pi;
+		if (!manifest && runtimeState && (await isSymlink(path.join(nodeModulesPath, name)))) {
+			try {
+				const marketplaceManifest = (await Bun.file(
+					path.join(nodeModulesPath, name, ".claude-plugin", "plugin.json"),
+				).json()) as { name?: unknown; version?: unknown };
+				manifest = {
+					name: typeof marketplaceManifest.name === "string" ? marketplaceManifest.name : name,
+					version:
+						pluginPkg.version ??
+						(typeof marketplaceManifest.version === "string"
+							? marketplaceManifest.version
+							: runtimeState.version),
+				};
+			} catch (manifestErr) {
+				if (!isEnoent(manifestErr)) throw manifestErr;
+			}
+		}
 		if (!manifest) {
-			// Not an omp plugin, skip
+			// Not an omp plugin or an installed Claude marketplace plugin, skip.
 			continue;
 		}
-		manifest.version = pluginPkg.version;
-
-		const runtimeState = runtimeConfig.plugins[name];
+		manifest.version = pluginPkg.version ?? manifest.version;
 
 		// Check if disabled globally
 		if (runtimeState && !runtimeState.enabled) {
@@ -207,7 +224,7 @@ async function collectPluginsAtRoot(
 		const enabledFeatures = projectOverrides.features?.[name] ?? runtimeState?.enabledFeatures ?? null;
 		plugins.push({
 			name,
-			version: pluginPkg.version,
+			version: manifest.version,
 			path: path.join(nodeModulesPath, name),
 			scope,
 			manifest,

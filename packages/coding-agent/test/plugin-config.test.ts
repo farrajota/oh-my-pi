@@ -19,7 +19,8 @@ describe("plugin config", () => {
 
 	beforeEach(async () => {
 		tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-plugin-config-"));
-		pluginsDir = path.join(tmpRoot, "plugins");
+		await fs.mkdir(path.join(tmpRoot, ".git"), { recursive: true });
+		pluginsDir = path.join(tmpRoot, "user", "plugins");
 		lockfile = path.join(pluginsDir, "omp-plugins.lock.json");
 
 		spyOn(piUtils, "getPluginsDir").mockReturnValue(pluginsDir);

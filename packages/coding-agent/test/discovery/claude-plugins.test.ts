@@ -8,6 +8,8 @@ import {
 	clearClaudePluginRootsCache,
 	listClaudePluginRoots,
 	parseClaudePluginsRegistry,
+	resolveActiveProjectRegistryPath,
+	resolveOrDefaultProjectRegistryPath,
 } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/capability/skill";
 import { loadSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
@@ -54,6 +56,7 @@ describe("listClaudePluginRoots", () => {
 	let originalOmpProfileEnv: string | undefined;
 	let originalPiProfileEnv: string | undefined;
 	let originalClaudeConfigDir: string | undefined;
+	let originalPiConfigDir: string | undefined;
 
 	beforeEach(async () => {
 		clearClaudePluginRootsCache();
@@ -63,6 +66,8 @@ describe("listClaudePluginRoots", () => {
 		originalOmpProfileEnv = process.env.OMP_PROFILE;
 		originalPiProfileEnv = process.env.PI_PROFILE;
 		originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+		originalPiConfigDir = process.env.PI_CONFIG_DIR;
+		delete process.env.PI_CONFIG_DIR;
 		delete process.env.CLAUDE_CONFIG_DIR;
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-plugins-test-"));
 		testAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-plugins-test-agent-"));
@@ -87,6 +92,7 @@ describe("listClaudePluginRoots", () => {
 		restoreEnvValue("PI_PROFILE", originalPiProfileEnv);
 		restoreEnvValue("PI_CODING_AGENT_DIR", originalAgentDirEnv);
 		restoreEnvValue("CLAUDE_CONFIG_DIR", originalClaudeConfigDir);
+		restoreEnvValue("PI_CONFIG_DIR", originalPiConfigDir);
 		enableProvider("claude-plugins");
 		disableUserSource("claude-plugins");
 		disableUserSource("claude");
@@ -99,6 +105,48 @@ describe("listClaudePluginRoots", () => {
 		const result = await listClaudePluginRoots(tempDir);
 		expect(result.roots).toEqual([]);
 		expect(result.warnings).toEqual([]);
+	});
+	test("keeps project registry paths local with an absolute user config override", async () => {
+		const globalConfigRoot = path.join(tempDir, "global-config");
+		process.env.PI_CONFIG_DIR = globalConfigRoot;
+		const ompProject = path.join(tempDir, "omp-project");
+		const gitProject = path.join(tempDir, "git-project");
+		await Promise.all([
+			fs.mkdir(path.join(ompProject, ".omp"), { recursive: true }),
+			fs.mkdir(path.join(gitProject, ".git"), { recursive: true }),
+			fs.mkdir(globalConfigRoot, { recursive: true }),
+		]);
+
+		expect(await resolveActiveProjectRegistryPath(ompProject)).toBe(
+			path.join(ompProject, ".omp", "plugins", "installed_plugins.json"),
+		);
+		expect(await resolveActiveProjectRegistryPath(gitProject)).toBe(
+			path.join(gitProject, ".omp", "plugins", "installed_plugins.json"),
+		);
+		expect(await resolveOrDefaultProjectRegistryPath(path.join(tempDir, "unanchored"))).toBe(
+			path.join(tempDir, "unanchored", ".omp", "plugins", "installed_plugins.json"),
+		);
+		expect(await resolveActiveProjectRegistryPath(tempDir)).toBeNull();
+		expect(await resolveOrDefaultProjectRegistryPath(tempDir)).toBeUndefined();
+		expect(await resolveActiveProjectRegistryPath(globalConfigRoot)).toBeNull();
+		expect(await resolveOrDefaultProjectRegistryPath(globalConfigRoot)).toBeUndefined();
+		const globalConfigAlias = path.join(tempDir, "global-config-alias");
+		await fs.symlink(globalConfigRoot, globalConfigAlias, "dir");
+		expect(await resolveActiveProjectRegistryPath(globalConfigAlias)).toBeNull();
+		expect(await resolveOrDefaultProjectRegistryPath(globalConfigAlias)).toBeUndefined();
+	});
+
+	test("preserves relative project config overrides", async () => {
+		process.env.PI_CONFIG_DIR = ".custom-omp";
+		const project = path.join(tempDir, "relative-project");
+		await fs.mkdir(path.join(project, ".custom-omp"), { recursive: true });
+
+		expect(await resolveActiveProjectRegistryPath(project)).toBe(
+			path.join(project, ".custom-omp", "plugins", "installed_plugins.json"),
+		);
+		expect(await resolveOrDefaultProjectRegistryPath(path.join(tempDir, "relative-unanchored"))).toBe(
+			path.join(tempDir, "relative-unanchored", ".custom-omp", "plugins", "installed_plugins.json"),
+		);
 	});
 
 	test("parses plugin with user scope", async () => {

@@ -8,6 +8,7 @@ import type { CmuxKind } from "./cmux/rpc";
 import { CmuxSocketClient } from "./cmux/socket-client";
 import {
 	BROWSER_PROTOCOL_TIMEOUT_MS,
+	connectPuppeteer,
 	DEFAULT_VIEWPORT,
 	launchHeadlessBrowser,
 	loadPuppeteer,
@@ -322,7 +323,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		const cdpUrl = normalizeConnectedCdpUrl(kind.cdpUrl);
 		await waitForCdp(cdpUrl, 5_000, opts.signal);
 		const puppeteer = await loadPuppeteer();
-		const browser = await puppeteer.connect({
+		const browser = await connectPuppeteer(puppeteer, {
 			browserURL: cdpUrl,
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
@@ -375,7 +376,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			);
 		}
 		const puppeteer = await loadPuppeteer();
-		const browser = await puppeteer.connect({
+		const browser = await connectPuppeteer(puppeteer, {
 			browserURL: cdpUrl,
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
@@ -431,7 +432,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 	const puppeteer = await loadPuppeteer();
 	let browser: Browser;
 	try {
-		browser = await puppeteer.connect({
+		browser = await connectPuppeteer(puppeteer, {
 			browserURL: cdpUrl,
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
@@ -567,7 +568,7 @@ async function openSharedHeadlessHandle(
 			);
 		}
 		const puppeteer = await loadPuppeteer();
-		const browser = await puppeteer.connect({
+		const browser = await connectPuppeteer(puppeteer, {
 			browserWSEndpoint: shared.wsEndpoint,
 			defaultViewport: kind.headless
 				? {

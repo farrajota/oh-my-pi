@@ -12,6 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -26,6 +27,7 @@ import {
 	lookupAgentRef,
 } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { cfgContextPromotionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -75,6 +77,9 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const key of ENV_KEYS) restoreEnvValue(key, savedEnv[key]);
 	__resetDirsFromEnvForTests();
+	// The subagent session opened agent.db and models.db under root; Windows cannot delete open files.
+	AgentStorage.close();
+	closeModelCache();
 	await removeWithRetries(root);
 });
 
@@ -105,7 +110,8 @@ function writeAndObserveLiveSettings(id: string): WeakRef<Settings> {
 
 /** Runs `AGENT_ID` to a finished keep-alive state; `release` drops the mock's session-bound recordings. */
 async function runKeptAliveSubagent(): Promise<{ release(): void; close(): Promise<void> }> {
-	const cwd = path.join(root, "work");
+	// Keep discovery beneath the isolated HOME, including on Windows.
+	const cwd = path.join(root, "home", "work");
 	const artifactsDir = path.join(root, "artifacts");
 	await fs.mkdir(cwd, { recursive: true });
 	await fs.mkdir(artifactsDir, { recursive: true });

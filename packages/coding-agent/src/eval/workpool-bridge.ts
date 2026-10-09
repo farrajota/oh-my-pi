@@ -55,6 +55,14 @@ function optionalTools(args: Record<string, unknown>): string[] | undefined {
 	return args.tools;
 }
 
+function optionalModel(args: Record<string, unknown>): string | string[] | undefined {
+	const model = args.model;
+	if (model === undefined) return undefined;
+	const reason = invalidModelSelectorReason(model, "workpool()");
+	if (reason) throw new ToolError(reason);
+	return model as string | string[];
+}
+
 function getPool(options: EvalWorkpoolBridgeOptions, name: string) {
 	const ownerId = options.session.getAgentId?.() ?? MAIN_AGENT_ID;
 	const pool = WorkPoolRegistry.global().get(ownerId, name);
@@ -69,17 +77,11 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 	if (typeof op !== "string") throw new ToolError("workpool() requires an op");
 
 	if (op === "create") {
+		const model = optionalModel(record);
 		const agent = optionalString(record, "agent");
 		const requestedName = optionalString(record, "name");
 		const context = optionalString(record, "context");
 		const tools = optionalTools(record);
-		const modelProblem = invalidModelSelectorReason(record.model, "workpool()");
-		if (modelProblem) throw new ToolError(modelProblem);
-		// The shared validator rejects non-string elements and empty selectors.
-		const model = record.model as string | string[] | undefined;
-		if (tools?.length && options.session.getPlanModeState?.()?.enabled === true) {
-			throw new ToolError("Eval-defined tools are unavailable in plan mode.");
-		}
 		const policy = await resolveEffectiveSubagentPolicy({
 			session: options.session,
 			invocationKind: "eval",
@@ -87,6 +89,9 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 			...(agent ? { agent } : {}),
 			...(model !== undefined ? { model } : {}),
 		});
+		if (tools?.length && options.session.getPlanModeState?.()?.enabled === true) {
+			throw new ToolError("Eval-defined tools are unavailable in plan mode.");
+		}
 		const customTools = tools?.length
 			? createEvalCustomTools(options.session, await describeEvalTools(options.session, tools, options.signal))
 			: [];
@@ -103,7 +108,6 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 		const pool = registry.create(options.session, {
 			name,
 			policy,
-			...(model !== undefined ? { model } : {}),
 			...(context ? { context } : {}),
 			customTools,
 		});

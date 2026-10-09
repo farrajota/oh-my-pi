@@ -57,7 +57,7 @@ import {
 } from "./conflict-detect";
 import { invalidateFsScanAfterWrite } from "./fs-cache-invalidation";
 import { outputMeta } from "./output-meta";
-import { formatPathRelativeToCwd, probeLiteralPathExists, splitPathAndSel } from "./path-utils";
+import { formatPathRelativeToCwd, probeLiteralPathExists, specialFileKind, splitPathAndSel } from "./path-utils";
 import {
 	enforcePlanModeWrite,
 	resolvePlanPath,
@@ -253,8 +253,27 @@ function lfNormalizedLength(text: string): number {
 	return length;
 }
 
+/**
+ * `readTruncationNoticeStart(normalizeToLF(content)) !== -1` without normalizing the
+ * payload: only the last non-blank line is inspected, bounded in the raw text by CR or LF
+ * (exactly the line normalization would produce).
+ */
 function endsWithReadTruncationNotice(content: string): boolean {
-	return readTruncationNoticeStart(normalizeToLF(content)) !== -1;
+	const contentEnd = content.trimEnd().length;
+	if (contentEnd === 0) return false;
+	let start = contentEnd;
+	while (start > 0) {
+		const ch = content.charCodeAt(start - 1);
+		if (ch === 0x0a || ch === 0x0d) break;
+		start--;
+	}
+	let end = contentEnd;
+	while (end < content.length) {
+		const ch = content.charCodeAt(end);
+		if (ch === 0x0a || ch === 0x0d) break;
+		end++;
+	}
+	return isReadTruncationNotice(content.slice(start, end));
 }
 
 /**
@@ -352,7 +371,7 @@ function appendNoteToResult(result: AgentToolResult<WriteToolDetails>, note: str
 
 function emitWriteProgress(
 	onUpdate: AgentToolUpdateCallback<WriteToolDetails> | undefined,
-	content: string,
+	byteLength: number,
 	displayPath: string,
 	resolvedPath?: string,
 ): void {
@@ -360,7 +379,7 @@ function emitWriteProgress(
 		content: [
 			{
 				type: "text",
-				text: `Writing ${Buffer.byteLength(content, "utf8")} bytes to ${shortenPath(displayPath)}...`,
+				text: `Writing ${byteLength} bytes to ${shortenPath(displayPath)}...`,
 			},
 		],
 		details: resolvedPath ? { resolvedPath } : {},
@@ -573,6 +592,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 	async #writeArchiveEntry(
 		content: string,
+		contentBytes: number,
 		rawContent: string,
 		resolvedArchivePath: ResolvedArchiveWritePath,
 	): Promise<AgentToolResult<WriteToolDetails>> {
@@ -678,9 +698,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			resolvedArchivePath.archiveSubPath
 		}`;
 		return {
-			content: [
-				{ type: "text", text: `Successfully wrote ${Buffer.byteLength(content, "utf8")} bytes to ${outputPath}` },
-			],
+			content: [{ type: "text", text: `Successfully wrote ${contentBytes} bytes to ${outputPath}` }],
 			details: { resolvedPath: resolvedArchivePath.absolutePath },
 		};
 	}
@@ -713,6 +731,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				const stat = await Bun.file(absolutePath).stat();
 				if (stat.isDirectory()) {
 					continue;
+				}
+				const kind = specialFileKind(stat);
+				if (kind) {
+					throw new ToolError(
+						`Cannot write '${candidate.sqlitePath}': it is a ${kind}, not a regular file or directory.`,
+					);
 				}
 				if (!(await isSqliteFile(absolutePath))) {
 					sawExistingNonSqlite = true;
@@ -899,6 +923,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const { text: cleanContent, stripped } = verbatim
 				? { text: content, stripped: false }
 				: stripWriteContent(this.session, content);
+			// One UTF-8 scan per call, shared by the progress and result lines.
+			const cleanBytes = Buffer.byteLength(cleanContent, "utf8");
 			assertWriteTargetAddressable(path, router);
 			if (target) {
 				if (policy?.via === "handler") {
@@ -915,7 +941,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						if (!coordination) {
 							await enforcePlanModeWrite(this.session, path, { op: "update", signal });
 						}
-						emitWriteProgress(onUpdate, cleanContent, path);
+						emitWriteProgress(onUpdate, cleanBytes, path);
 					}
 					const handlerResult = await router.write(
 						path,
@@ -935,7 +961,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						if (recovered.note) appendNoteToResult(result, recovered.note);
 						return result;
 					}
-					let resultText = `Successfully wrote ${Buffer.byteLength(cleanContent, "utf8")} bytes to ${path}`;
+					let resultText = `Successfully wrote ${cleanBytes} bytes to ${path}`;
 					if (stripped) {
 						resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
 					}
@@ -956,13 +982,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 				emitWriteProgress(
 					onUpdate,
-					cleanContent,
+					cleanBytes,
 					`${formatPathRelativeToCwd(resolvedArchivePath.absolutePath, this.session.cwd)}:${
 						resolvedArchivePath.archiveSubPath
 					}`,
 					resolvedArchivePath.absolutePath,
 				);
-				const archiveResult = await this.#writeArchiveEntry(cleanContent, content, resolvedArchivePath);
+				const archiveResult = await this.#writeArchiveEntry(cleanContent, cleanBytes, content, resolvedArchivePath);
 				if (stripped) {
 					const firstText = archiveResult.content.find(
 						(block): block is { type: "text"; text: string } =>
@@ -979,7 +1005,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (resolvedSqlitePath) {
 				await enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update", signal });
 
-				emitWriteProgress(onUpdate, cleanContent, path, resolvedSqlitePath.absolutePath);
+				emitWriteProgress(onUpdate, cleanBytes, path, resolvedSqlitePath.absolutePath);
 				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath);
 				if (stripped) {
 					const firstText = sqliteResult.content.find(
@@ -1021,6 +1047,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (target && existing?.isDirectory()) {
 				throw new ToolError(`${target.url.protocol}// URL must resolve to a file: ${path}`);
 			}
+			const kind = existing && specialFileKind(existing);
+			if (kind) {
+				throw new ToolError(`Cannot write '${path}': it is a ${kind}, not a regular file or directory.`);
+			}
 			// Check if file exists and is auto-generated before overwriting.
 			if (existing) {
 				await assertEditableFile(absolutePath, path, this.session.settings);
@@ -1034,7 +1064,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				cleanContent,
 			);
 
-			emitWriteProgress(onUpdate, cleanContent, displayPath, absolutePath);
+			emitWriteProgress(onUpdate, cleanBytes, displayPath, absolutePath);
 
 			// Try ACP bridge first for editor-visible filesystem paths. Internal
 			// artifacts such as local:// plans are owned by OMP, not the editor.
@@ -1051,7 +1081,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				if (authorizedTarget) await this.session.pathScope!.currentOperation().verifyPostWrite(authorizedTarget);
 				const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, bridgeWrite.text);
 				const header = maybeWriteSnapshotHeader(this.session, absolutePath, bridgeWrite.text, displayPath);
-				const writeLine = `Successfully wrote ${Buffer.byteLength(cleanContent, "utf8")} bytes to ${displayPath}`;
+				const writeLine = `Successfully wrote ${cleanBytes} bytes to ${displayPath}`;
 				let resultText = header ? `${header}\n${writeLine}` : writeLine;
 				if (stripped) {
 					resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
@@ -1084,7 +1114,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, finalContent);
 
 			const header = maybeWriteSnapshotHeader(this.session, absolutePath, finalContent, displayPath);
-			const writeLine = `Successfully wrote ${Buffer.byteLength(finalContent, "utf8")} bytes to ${displayPath}`;
+			const finalBytes = finalContent === cleanContent ? cleanBytes : Buffer.byteLength(finalContent, "utf8");
+			const writeLine = `Successfully wrote ${finalBytes} bytes to ${displayPath}`;
 			let resultText = header ? `${header}\n${writeLine}` : writeLine;
 			if (stripped) {
 				resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;

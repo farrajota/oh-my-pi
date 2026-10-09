@@ -549,21 +549,46 @@ describe("lsp regressions", () => {
 			expect(server.killed).toBe(false);
 
 			const clientModule = new URL("../../src/lsp/client.ts", import.meta.url).href;
+			const lspServerScript = `
+				let input = Buffer.alloc(0);
+				process.stdin.on("data", chunk => {
+					input = Buffer.concat([input, chunk]);
+					while (true) {
+						const headerEnd = input.indexOf("\\r\\n\\r\\n");
+						if (headerEnd < 0) return;
+						const header = input.subarray(0, headerEnd).toString();
+						const contentLength = Number(header.match(/Content-Length: (\\d+)/i)?.[1]);
+						const messageEnd = headerEnd + 4 + contentLength;
+						if (input.length < messageEnd) return;
+						const message = JSON.parse(input.subarray(headerEnd + 4, messageEnd).toString());
+						input = input.subarray(messageEnd);
+						if (message.method === "initialize" || message.method === "shutdown") {
+							const result = message.method === "initialize" ? { capabilities: {} } : null;
+						const response = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+						process.stdout.write(Buffer.concat([Buffer.from("Content-Length: " + response.length + "\\r\\n\\r\\n"), response]));
+						} else if (message.method === "exit") {
+							process.stdin.pause();
+							process.stdout.end();
+							return;
+						}
+					}
+				});
+			`;
 			const shutdownProbe = Bun.spawn(
 				[
 					process.execPath,
 					"-e",
-					`import { setIdleTimeout, shutdownAll } from ${JSON.stringify(clientModule)}; setIdleTimeout(60_000); await shutdownAll();`,
+					`import { getOrCreateClient, setIdleTimeout, shutdownAll } from ${JSON.stringify(clientModule)}; const config = { command: process.execPath, args: ["-e", ${JSON.stringify(lspServerScript)}], fileTypes: ["ts"], rootMarkers: [] }; setIdleTimeout(60_000); await getOrCreateClient(config, process.cwd()); process.stdout.write("client-ready\\n"); await shutdownAll();`,
 				],
-				{ stdout: "ignore", stderr: "inherit" },
+				{ stdout: "pipe", stderr: "inherit" },
 			);
-			// Real time is required because fake timers cannot advance a separate Bun process.
-			// The process exit itself proves shutdown released the event loop.
-			const probeExit = await Promise.race([shutdownProbe.exited, Bun.sleep(5_000).then(() => null)]);
-			if (probeExit === null) {
-				shutdownProbe.kill();
-				await shutdownProbe.exited;
-			}
+			const startup = await shutdownProbe.stdout.getReader().read();
+			expect(startup.done).toBe(false);
+			expect(new TextDecoder().decode(startup.value)).toContain("client-ready");
+			// Startup completes before the bounded real-process liveness probe begins.
+			// Fake timers cannot advance the separate Bun process; its natural exit
+			// proves the LSP `exit` notification was sent and the idle checker released.
+			const probeExit = await shutdownProbe.exited;
 			expect(probeExit).toBe(0);
 		} finally {
 			await lspClient.shutdownAll();
@@ -2140,7 +2165,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 1,
 				openFiles: new Map([[targetUri, { version: 1, languageId: "typescript" }]]),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -2742,7 +2766,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -2851,7 +2874,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -2934,7 +2956,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -3007,7 +3028,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -3068,7 +3088,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -3129,7 +3148,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -3199,7 +3217,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -3269,7 +3286,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -3327,7 +3343,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -3630,7 +3645,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -4481,7 +4495,6 @@ describe("lsp regressions", () => {
 			diagnosticsVersion: 0,
 			openFiles: new Map(),
 			pendingRequests: new Map(),
-			messageBuffer: new Uint8Array(),
 			isReading: false,
 			status: "ready",
 			lastActivity: Date.now(),
@@ -4511,7 +4524,6 @@ describe("lsp regressions", () => {
 			diagnosticsVersion: 0,
 			openFiles: new Map(),
 			pendingRequests: new Map(),
-			messageBuffer: new Uint8Array(),
 			isReading: false,
 			status: "ready",
 			lastActivity: Date.now(),
@@ -5565,7 +5577,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(0),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),
@@ -5617,7 +5628,6 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
-				messageBuffer: new Uint8Array(0),
 				isReading: false,
 				status: "ready",
 				lastActivity: Date.now(),

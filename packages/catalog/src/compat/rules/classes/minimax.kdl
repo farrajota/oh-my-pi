@@ -71,10 +71,58 @@ class "minimax" {
 			thinking-efforts "low" "medium" "high"
 		}
 	}
-	on "minimax-code" "minimax-code-cn" {
-		supports-reasoning-effort #false
-		supports-store #false
+	// MiniMax-M3.1-Flash-Preview on the adaptive endpoints always thinks and
+	// tunes depth through output_config.effort.
+	on "minimax" "minimax-cn" {
+		models "MiniMax-M3.1-Flash-Preview" {
+			thinking-requires-effort #true
+			thinking-efforts "low" "medium" "high" "xhigh" "max"
+			thinking-effort-map {
+				low "low"
+				medium "medium"
+				high "high"
+			}
+		}
 	}
+	// Token Plan's legacy Code rows use OpenAI-only wire axes. Keep them on
+	// their original completion route instead of imposing them on Messages.
+	on "minimax-code" "minimax-code-cn" {
+		on-api "openai-completions" {
+			supports-reasoning-effort #false
+			supports-store #false
+		}
+	}
+	// Code's Anthropic descriptor uses MiniMax's adaptive effort mapping.
+	// Keep its contract separate from legacy OpenAI-compatible Code rows.
+	on "minimax-code" "minimax-code-cn" {
+		on-api "anthropic-messages" {
+			family "m2" {
+				thinking-effort-map {
+					low "adaptive"
+					medium "adaptive"
+					high "adaptive"
+				}
+			}
+			family "m3" {
+				thinking-efforts "low" "medium" "high"
+				thinking-effort-map {
+					low "adaptive"
+					medium "adaptive"
+					high "adaptive"
+				}
+			}
+			models "MiniMax-M3.1-Flash-Preview" {
+				thinking-requires-effort #true
+				thinking-efforts "low" "medium" "high" "xhigh" "max"
+				thinking-effort-map {
+					low "low"
+					medium "medium"
+					high "high"
+				}
+			}
+		}
+	}
+
 	on "minimax-code" "minimax-code-cn" "wafer-serverless" {
 		reasoning-content-field "reasoning_content"
 	}

@@ -622,15 +622,27 @@ describe("TanCommandController", () => {
 			expect(authoritySessionFile).toBe(path.join(harness.parentArtifactsDir, `${childId}.jsonl`));
 			expect(child?.sessionManager?.getSessionFile()).toBe(authoritySessionFile);
 			const toolName = "mcp__alpha_probe";
+			const bravoToolsRefreshed = Promise.withResolvers<void>();
+			const alphaV2ToolsRefreshed = Promise.withResolvers<void>();
+			const refreshMcpTools = child!.refreshMCPTools.bind(child);
+			vi.spyOn(child!, "refreshMCPTools").mockImplementation(async tools => {
+				await refreshMcpTools(tools);
+				if (tools.some(tool => tool.name === "mcp__bravo_probe")) bravoToolsRefreshed.resolve();
+				if (tools.some(tool => tool.description?.includes("alpha-v2"))) alphaV2ToolsRefreshed.resolve();
+			});
 			const observed = [child?.getToolByName(toolName)?.description];
 			await manager.disconnectAll();
 			await manager.connectServers({ bravo: server("bravo") }, {});
 			await child?.runToolRegistryMutation(async () => undefined);
+			// MCP catalog refreshes run asynchronously from the manager's change event;
+			// the registry mutation queue is not a completion signal for that refresh.
+			await bravoToolsRefreshed.promise;
 			const replacementAvailable = child?.getEnabledToolNames().includes("mcp__bravo_probe");
 			observed.push(child?.getToolByName(toolName)?.description);
 			await manager.disconnectAll();
 			await manager.connectServers({ alpha: server("alpha-v2") }, {});
 			await child?.runToolRegistryMutation(async () => undefined);
+			await alphaV2ToolsRefreshed.promise;
 			observed.push(child?.getToolByName(toolName)?.description);
 			finishPrompt.resolve();
 			await result;

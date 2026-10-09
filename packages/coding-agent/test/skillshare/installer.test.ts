@@ -150,6 +150,7 @@ describe("skills manifest and lock", () => {
 });
 
 describe("installer", () => {
+	let tempRoot: string;
 	let tempHome: string;
 	let project: string;
 	let originalAgentDir: string;
@@ -166,9 +167,11 @@ describe("installer", () => {
 
 	beforeEach(async () => {
 		originalAgentDir = getAgentDir();
-		tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skillshare-install-"));
+		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skillshare-install-"));
+		tempHome = path.join(tempRoot, "home");
 		project = path.join(tempHome, "work", "proj");
 		await fs.mkdir(path.join(project, ".git"), { recursive: true });
+		await fs.mkdir(tempHome, { recursive: true });
 		vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 		setAgentDir(path.join(tempHome, ".omp", "agent"));
 		client = await SkillshareClient.create({ registryUrl: "https://skills.test" });
@@ -198,7 +201,7 @@ describe("installer", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		setAgentDir(originalAgentDir);
-		await removeWithRetries(tempHome);
+		await removeWithRetries(tempRoot);
 	});
 
 	it("installs latest with a caret range, locks it, and unpacks with exec bits", async () => {
@@ -303,6 +306,31 @@ describe("installer", () => {
 		expect((await readSkillsLock(path.join(getAgentDir(), "skills.lock.json"))).skills).toEqual({});
 		expect(await Bun.file(path.join(getSkillStorePath(SCOPE, NAME, "1.0.0"), "SKILL.md")).exists()).toBe(false);
 		await expect(uninstallSkillPackages({ names: [ID], global: true, cwd: project })).rejects.toThrow(
+			/not installed/,
+		);
+	});
+
+	it("uninstall removes project-scoped manifest and lock entries and prunes the store", async () => {
+		const tgz = skillTgz("1.0.0");
+		registry = { pk: packument([summary("1.0.0", tgz)], { latest: "1.0.0" }), tarballs: { "1.0.0": tgz }, files: [] };
+		await installSkillPackages(client, { specs: [ID], global: false, yes: false, cwd: project }, hooks);
+
+		const projectManifest = path.join(project, ".omp", "skills.json");
+		const projectLock = path.join(project, ".omp", "skills.lock.json");
+		expect(await readSkillsManifest(projectManifest)).toEqual({ skills: { [ID]: "^1.0.0" } });
+		expect((await readSkillsLock(projectLock)).skills[ID]).toEqual({
+			version: "1.0.0",
+			integrity: computeIntegrity(tgz),
+			resolved: `/api/v1/skills/${ID}/versions/1.0.0/tarball`,
+		});
+
+		expect(await uninstallSkillPackages({ names: [ID], global: false, cwd: project })).toEqual([ID]);
+		expect((await readSkillsManifest(projectManifest)).skills).toEqual({});
+		expect((await readSkillsLock(projectLock)).skills).toEqual({});
+		expect(await Bun.file(path.join(getSkillStorePath(SCOPE, NAME, "1.0.0"), "SKILL.md")).exists()).toBe(false);
+		expect((await readSkillsManifest(path.join(getAgentDir(), "skills.json"))).skills).toEqual({});
+		expect((await readSkillsLock(path.join(getAgentDir(), "skills.lock.json"))).skills).toEqual({});
+		await expect(uninstallSkillPackages({ names: [ID], global: false, cwd: project })).rejects.toThrow(
 			/not installed/,
 		);
 	});

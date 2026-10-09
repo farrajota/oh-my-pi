@@ -17,8 +17,9 @@ import {
 	urlHyperlink,
 	urlHyperlinkAlways,
 } from "@oh-my-pi/pi-tui/render";
-import { resolveMarkdownLinkTargets } from "@oh-my-pi/pi-coding-agent/internal-urls/hyperlink-targets";
+import { resolveMarkdownLinkHrefs } from "@oh-my-pi/pi-coding-agent/internal-urls/hyperlink-targets";
 import { lookup as lookupSetting } from "@oh-my-pi/pi-coding-agent/config/registry";
+import { getMarkdownLinkUrls } from "@oh-my-pi/pi-tui/components/markdown";
 import * as terminalCaps from "@oh-my-pi/pi-tui";
 
 // OSC 8 sequence markers
@@ -290,7 +291,7 @@ describe("urlHyperlinkAlways", () => {
 	});
 });
 
-describe("resolveMarkdownLinkTargets fallback", () => {
+describe("resolveMarkdownLinkHrefs fallback", () => {
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
 		LocalProtocolHandler.resetOverrideForTests();
@@ -305,8 +306,8 @@ describe("resolveMarkdownLinkTargets fallback", () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-hyperlink-fallback-"));
 		try {
 			const missingFile = url.pathToFileURL(path.join(cwd, "missing", "file.ts")).href;
-			const targets = await resolveMarkdownLinkTargets(
-				[`[absolute](${missingFile})`, "[relative](missing-relative/file.ts)", "[remote](https://example.com/foo)"],
+			const targets = await resolveMarkdownLinkHrefs(
+				[missingFile, "missing-relative/file.ts", "https://example.com/foo"],
 				{ cwd },
 			);
 			expect([...targets]).toEqual([]);
@@ -316,12 +317,12 @@ describe("resolveMarkdownLinkTargets fallback", () => {
 	});
 
 	it("returns no target for local URLs without session options", async () => {
-		const targets = await resolveMarkdownLinkTargets(["[local](local://foo.md)"]);
+		const targets = await resolveMarkdownLinkHrefs(["local://foo.md"]);
 		expect([...targets]).toEqual([]);
 	});
 
 	it("does not throw or resolve malformed internal URLs", async () => {
-		const targets = await resolveMarkdownLinkTargets(["[malformed](local://%ZZ)"]);
+		const targets = await resolveMarkdownLinkHrefs(["local://%ZZ"]);
 		expect([...targets]).toEqual([]);
 	});
 });
@@ -422,7 +423,7 @@ describe("resource links in chat markdown", () => {
 			"",
 			`[output]: artifact://${artifactId}`,
 		].join("\n");
-		const targets = await resolveMarkdownLinkTargets([text], {
+		const targets = await resolveMarkdownLinkHrefs(getMarkdownLinkUrls(text), {
 			localProtocolOptions: { getArtifactsDir: () => tempDir },
 		});
 		const localUri = url.pathToFileURL(await fs.realpath(localFile)).href;
@@ -446,7 +447,7 @@ describe("resource links in chat markdown", () => {
 		const relative = "src/my%20file.ts#L7";
 		const absolute = file.replaceAll("\\", "/").replaceAll(" ", "%20");
 		const text = `[Source](${relative}) and [Absolute](${absolute}) and [Missing](src/missing.ts) and [Heading](#heading)`;
-		const targets = await resolveMarkdownLinkTargets([text], { cwd: tempDir });
+		const targets = await resolveMarkdownLinkHrefs(getMarkdownLinkUrls(text), { cwd: tempDir });
 		const fileUri = url.pathToFileURL(file).href;
 		const output = new terminalCaps.Markdown(text, 0, 0, {
 			...getMarkdownTheme(),
@@ -479,7 +480,7 @@ describe("resource links in chat markdown", () => {
 			"[remote](mcp://server/resource)",
 			"[web](https://example.com/report)",
 		].join("\n\n");
-		const targets = await resolveMarkdownLinkTargets([text], {
+		const targets = await resolveMarkdownLinkHrefs(getMarkdownLinkUrls(text), {
 			localProtocolOptions: { getArtifactsDir: () => tempDir },
 		});
 		expect([...targets]).toEqual([]);
@@ -500,7 +501,7 @@ describe("resource links in chat markdown", () => {
 			const artifactsDir = path.join(tempDir, session);
 			const file = path.join(artifactsDir, "local", "report.json");
 			await Bun.write(file, session);
-			const targets = await resolveMarkdownLinkTargets([text], {
+			const targets = await resolveMarkdownLinkHrefs(getMarkdownLinkUrls(text), {
 				localProtocolOptions: { getArtifactsDir: () => artifactsDir },
 			});
 			const output = new terminalCaps.Markdown(text, 0, 0, {

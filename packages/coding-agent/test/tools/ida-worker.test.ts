@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { watch } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -68,6 +69,49 @@ interface ExecResult {
 	error: string | null;
 }
 
+function watchForFile(file: string): { promise: Promise<void>; close(): void } {
+	let resolve!: () => void;
+	let reject!: (error: Error) => void;
+	let settled = false;
+	const promise = new Promise<void>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	const watcher = watch(path.dirname(file), (_event, name) => {
+		if (name?.toString() !== path.basename(file)) return;
+		void fs.access(file).then(
+			() => {
+				if (settled) return;
+				settled = true;
+				watcher.close();
+				resolve();
+			},
+			() => {},
+		);
+	});
+	watcher.on("error", error => {
+		if (settled) return;
+		settled = true;
+		watcher.close();
+		reject(error);
+	});
+	void fs.access(file).then(
+		() => {
+			if (settled) return;
+			settled = true;
+			watcher.close();
+			resolve();
+		},
+		() => {},
+	);
+	return {
+		promise,
+		close: () => {
+			watcher.close();
+		},
+	};
+}
+
 describe("IDA worker protocol", () => {
 	let dir: string;
 	let worker: IdaWorker;
@@ -116,13 +160,32 @@ describe("IDA worker protocol", () => {
 
 	it("contains an interrupt that arrives while uninterruptible native code runs", async () => {
 		const pid = worker.pid;
-		// `sum` over a range runs in C with no bytecode boundary, so the interrupt can only fire after it returns.
-		const late = await worker.request<ExecResult>(
-			"exec",
-			{ code: "x = sum(range(60_000_000))\nx" },
-			{ timeoutMs: 100 },
-		);
-		expect(late.value === "1799999970000000" || late.error?.includes("KeyboardInterrupt")).toBe(true);
+		const marker = path.join(dir, "native-expression-dispatched");
+		const temporaryMarker = `${marker}.tmp`;
+		const nativeDispatched = watchForFile(marker);
+		const interrupt = new AbortController();
+		const nativeExec = [
+			"import os",
+			`with open(${JSON.stringify(temporaryMarker)}, "w") as marker_file: marker_file.write("dispatched")`,
+			`os.replace(${JSON.stringify(temporaryMarker)}, ${JSON.stringify(marker)})`,
+			"x = sum(range(60_000_000))",
+			"x",
+		].join("\n");
+		try {
+			const pending = worker.request<ExecResult>("exec", { code: nativeExec }, { signal: interrupt.signal });
+			await Promise.race([
+				nativeDispatched.promise,
+				pending.then(() => {
+					throw new Error("IDA exec completed before its native-work handshake");
+				}),
+			]);
+			// Abort only after the worker has dispatched the native expression, rather than relying on a fixed 100 ms race.
+			interrupt.abort();
+			const late = await pending;
+			expect(late.value === "1799999970000000" || late.error?.includes("KeyboardInterrupt")).toBe(true);
+		} finally {
+			nativeDispatched.close();
+		}
 
 		for (let i = 0; i < 5; i++) {
 			const next = await worker.request<ExecResult>("exec", { code: `${i} + 1` });

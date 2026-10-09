@@ -79,9 +79,9 @@ describe("resolveActiveProjectRegistryPath", () => {
 		expect(result).toBe(path.join(tmpDir, "sub", ".omp", "plugins", "installed_plugins.json"));
 	});
 
-	it("falls back to .git root when no .omp/ exists", async () => {
-		// Layout: tmpDir/.git/   +   tmpDir/sub/  (cwd)
-		// No .omp/ anywhere → second pass finds .git/ at tmpDir.
+	it("uses the git root instead of an unrelated ancestor .omp/ directory", async () => {
+		// Layout: tmpDir/.git/   +   tmpDir/sub/  (cwd).
+		// The project git root anchors the fallback even if an unrelated .omp/ exists above it.
 		// Returned path is relative to the .git root, not .git itself.
 		fs.mkdirSync(path.join(tmpDir, ".git"), { recursive: true });
 		const cwd = path.join(tmpDir, "sub");

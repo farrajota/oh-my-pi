@@ -94,7 +94,7 @@ describe("createReadOnlyAgentTranscriptViewer", () => {
 		}
 	});
 
-	test("decodes split UTF-8 transcript bytes across polls and resets after a full reload", () => {
+	test("decodes split UTF-8 transcript bytes across polls and resets after a full reload", async () => {
 		using tempDir = TempDir.createSync("@omp-agent-transcript-utf8-");
 		vi.useFakeTimers();
 		const sessionFile = path.join(tempDir.path(), "worker.jsonl");
@@ -109,6 +109,15 @@ describe("createReadOnlyAgentTranscriptViewer", () => {
 			status: "parked",
 			sessionFile,
 		});
+		let resolveNextRender: (() => void) | undefined;
+		const requestRender = () => {
+			resolveNextRender?.();
+			resolveNextRender = undefined;
+		};
+		const nextRender = () =>
+			new Promise<void>(resolve => {
+				resolveNextRender = resolve;
+			});
 		const viewer = createReadOnlyAgentTranscriptViewer({
 			agentId: "Worker",
 			registry,
@@ -116,7 +125,7 @@ describe("createReadOnlyAgentTranscriptViewer", () => {
 			cwd: "/workspace",
 			expandKeys: ["ctrl+o"],
 			hubKeys: ["alt+d"],
-			requestRender: () => {},
+			requestRender,
 			onClose: () => {},
 			onHubClose: () => {},
 		});
@@ -145,12 +154,14 @@ describe("createReadOnlyAgentTranscriptViewer", () => {
 			appendFileSync(sessionFile, Buffer.from([0xe2]));
 			vi.advanceTimersByTime(250);
 			writeFileSync(sessionFile, entry("rotated"));
+			const reloaded = nextRender();
 			vi.advanceTimersByTime(250);
+			await reloaded;
 
-			const reloaded = Bun.stripANSI(viewer.render(80).join("\n"));
-			expect(reloaded).toContain("rotated");
-			expect(reloaded).not.toContain("界");
-			expect(reloaded).not.toContain("\uFFFD");
+			const renderedReload = Bun.stripANSI(viewer.render(80).join("\n"));
+			expect(renderedReload).toContain("rotated");
+			expect(renderedReload).not.toContain("界");
+			expect(renderedReload).not.toContain("\uFFFD");
 		} finally {
 			viewer.dispose();
 		}

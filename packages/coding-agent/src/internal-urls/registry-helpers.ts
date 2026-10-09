@@ -12,6 +12,8 @@ import { AgentRegistry } from "../registry/agent-registry";
 import type { ResolveContext } from "./types";
 
 const extraArtifactsDirs = new Set<string>();
+/** Deepest nesting `sessionFilesFromDisk` descends below an artifacts dir. */
+const MAX_SCAN_DEPTH = 8;
 
 export function registerArtifactsDir(dir: string): () => void {
 	extraArtifactsDirs.add(dir);
@@ -129,7 +131,9 @@ export function isBoundResourceContext(context?: ResolveContext): boolean {
  * transcripts (`__advisor*.jsonl`) are observability-only and excluded;
  * EPERM-rewrite backups (`.bak`) are skipped. When the same id appears in
  * multiple dirs, the first hit wins (registry dirs are scanned first; a
- * `preferredDir` from the caller root is scanned before them).
+ * `preferredDir` from the caller root is scanned before them). Directory
+ * listings are prefetched in parallel; the walk itself stays a sequential
+ * depth-first pass so first-hit order is unaffected.
  */
 export async function sessionFilesFromDisk(preferredDir?: string): Promise<Map<string, string>> {
 	const dirs = preferredDir ? [preferredDir, ...artifactsDirsFromRegistry()] : artifactsDirsFromRegistry();
@@ -141,18 +145,33 @@ export async function sessionFilesFromContext(context?: ResolveContext): Promise
 }
 
 async function sessionFilesFromDirs(dirs: readonly string[]): Promise<Map<string, string>> {
+	const listings = new Map<string, Promise<Dirent[] | null>>();
+	const list = (dir: string, depth: number): Promise<Dirent[] | null> => {
+		let listing = listings.get(dir);
+		if (listing) return listing;
+		listing = readDirEntries(dir);
+		listings.set(dir, listing);
+		// Fan out to subdirectories as soon as this listing lands. Rejections
+		// are surfaced (in walk order) by the awaiting scan below.
+		listing.then(
+			entries => {
+				if (!entries || depth >= MAX_SCAN_DEPTH) return;
+				for (const entry of entries) {
+					if (entry.isDirectory()) list(path.join(dir, entry.name), depth + 1);
+				}
+			},
+			() => {},
+		);
+		return listing;
+	};
+	for (const dir of dirs) list(dir, 0);
 	const found = new Map<string, string>();
 	const seenDirs = new Set<string>();
 	const scan = async (dir: string, depth: number): Promise<void> => {
-		if (depth > 8 || seenDirs.has(dir)) return;
+		if (depth > MAX_SCAN_DEPTH || seenDirs.has(dir)) return;
 		seenDirs.add(dir);
-		let entries: Dirent[];
-		try {
-			entries = await fs.readdir(dir, { withFileTypes: true });
-		} catch (err) {
-			if (isEnoent(err) || (err as NodeJS.ErrnoException).code === "ENOTDIR") return;
-			throw err;
-		}
+		const entries = await list(dir, depth);
+		if (!entries) return;
 		for (const entry of entries) {
 			if (entry.isDirectory()) {
 				await scan(path.join(dir, entry.name), depth + 1);
@@ -167,6 +186,16 @@ async function sessionFilesFromDirs(dirs: readonly string[]): Promise<Map<string
 	};
 	for (const dir of dirs) await scan(dir, 0);
 	return found;
+}
+
+/** Directory entries of `dir`, or null when it is missing or not a directory. */
+async function readDirEntries(dir: string): Promise<Dirent[] | null> {
+	try {
+		return await fs.readdir(dir, { withFileTypes: true });
+	} catch (err) {
+		if (isEnoent(err) || (err as NodeJS.ErrnoException).code === "ENOTDIR") return null;
+		throw err;
+	}
 }
 
 /**

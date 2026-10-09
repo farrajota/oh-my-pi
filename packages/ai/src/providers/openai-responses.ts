@@ -1,13 +1,14 @@
 import { scheduler } from "node:timers/promises";
 import {
 	$flag,
+	cloneJsonTree,
 	isUnexpectedSocketCloseMessage,
 	logger,
 	type ServerSentEvent,
 	structuredCloneJSON,
 } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
-import { getEnvApiKey } from "../stream";
+import { getEnvApiKey } from "../env-api-key";
 import type {
 	AssistantMessage,
 	CacheRetention,
@@ -1271,13 +1272,13 @@ const streamOpenAIResponsesOnce = (
 
 			output.providerPayload = createOpenAIResponsesHistoryPayload(model.provider, nativeOutputItems);
 			const replayableResponseItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
-				structuredCloneJSON(nativeOutputItems),
+				cloneJsonTree(nativeOutputItems),
 				{ supportsImageDetailOriginal: model.compat.supportsImageDetailOriginal },
 			);
 			if (replayableResponseItems) {
 				if (providerSessionState) providerSessionState.nativeHistoryReplayWarmed = true;
 				if (chainState) {
-					chainState.lastParams = structuredCloneJSON(
+					chainState.lastParams = cloneJsonTree(
 						activeTrailingScaffoldingItems > 0 && Array.isArray(activeParams.input)
 							? {
 									...activeParams,
@@ -1310,7 +1311,7 @@ const streamOpenAIResponsesOnce = (
 				// baseline, but `lastParams` still records the successful wire controls
 				// without re-enabling `previous_response_id` chaining.
 				chainState.canAppend = false;
-				chainState.lastParams = structuredCloneJSON(
+				chainState.lastParams = cloneJsonTree(
 					activeTrailingScaffoldingItems > 0 && Array.isArray(activeParams.input)
 						? {
 								...activeParams,

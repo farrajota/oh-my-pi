@@ -1028,55 +1028,53 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
 	return data;
 }
 
-function isUserConfigRoot(root: string): boolean {
-	const configDir = normalizePathForComparison(path.resolve(root, getConfigDirName()));
-	return (
-		configDir === normalizePathForComparison(path.resolve(os.homedir(), getConfigDirName())) ||
-		configDir === normalizePathForComparison(path.dirname(getPluginsDir()))
-	);
+function isUserConfigRoot(root: string, projectConfigDirName: string): boolean {
+	const normalizedRoot = normalizePathForComparison(root);
+	const projectConfigRoot = normalizePathForComparison(path.resolve(root, projectConfigDirName));
+	const userConfigRoots = [
+		normalizePathForComparison(path.resolve(os.homedir(), getConfigDirName())),
+		normalizePathForComparison(path.dirname(getPluginsDir())),
+	];
+	return userConfigRoots.some(configRoot => normalizedRoot === configRoot || projectConfigRoot === configRoot);
 }
-
 /**
  * Resolve the active project registry path by walking up from `cwd`.
  *
- * Walk order:
- * 1. Walk up from `cwd` looking for the nearest directory containing `.omp/`.
- *    The first match returns `<dir>/.omp/plugins/installed_plugins.json`.
- * 2. If no `.omp/` is found, rescan from `cwd` upward looking for `.git`.
- *    The git root is used as an anchor: `<gitRoot>/.omp/plugins/installed_plugins.json`.
- * 3. If neither is found, return `null` — no project context is active.
+ * Walk upward from `cwd`, preferring the nearest project marker:
+ * 1. A `.omp/` directory anchors the project at its containing directory.
+ * 2. A `.git` marker anchors the project at its containing directory when no
+ *    nearer `.omp/` exists.
+ *
+ * Stop before `os.homedir()` so the user-level config directory is never a
+ * project root. A `.omp/` above a nearer git root belongs to an unrelated
+ * ancestor and must not redirect the project's marketplace registry.
  *
  * This is the single source of truth for "active project root" used by install,
  * uninstall, list, upgrade, discovery, and doctor. Deterministic for a given `cwd`.
  */
 export async function resolveActiveProjectRegistryPath(cwd: string): Promise<string | null> {
-	// Pass 1: walk up looking for an existing .omp/ directory (nearest wins).
-	// Stop before os.homedir() — ~/.omp/ is the user-level config dir, not a project root.
+	const projectConfigDirName = path.isAbsolute(getConfigDirName()) ? CONFIG_DIR_NAME : getConfigDirName();
 	const homeDir = normalizePathForComparison(os.homedir());
 	let dir = path.resolve(cwd);
 	while (normalizePathForComparison(dir) !== homeDir) {
 		try {
-			const stat = await fs.promises.stat(path.join(dir, getConfigDirName()));
-			if (stat.isDirectory() && !isUserConfigRoot(dir)) {
-				return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
+			const stat = await fs.promises.stat(path.join(dir, projectConfigDirName));
+			if (stat.isDirectory() && !isUserConfigRoot(dir, projectConfigDirName)) {
+				return path.join(dir, projectConfigDirName, "plugins", "installed_plugins.json");
 			}
 		} catch {
 			// not found at this level — continue up
 		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break; // filesystem root
-		dir = parent;
-	}
 
-	// Pass 2: walk up looking for .git as a fallback anchor.
-	dir = path.resolve(cwd);
-	while (normalizePathForComparison(dir) !== homeDir) {
 		try {
 			await fs.promises.stat(path.join(dir, ".git"));
-			if (!isUserConfigRoot(dir)) return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
+			if (!isUserConfigRoot(dir, projectConfigDirName)) {
+				return path.join(dir, projectConfigDirName, "plugins", "installed_plugins.json");
+			}
 		} catch {
 			// not found at this level — continue up
 		}
+
 		const parent = path.dirname(dir);
 		if (parent === dir) break; // filesystem root
 		dir = parent;
@@ -1102,9 +1100,13 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 	// Home directory must not be treated as a project root: the fallback path would alias
 	// getInstalledPluginsRegistryPath(), causing MarketplaceManager to load the same file
 	// as both user and project registry and producing duplicates / disambiguation errors.
-	if (normalizePathForComparison(cwd) === normalizePathForComparison(os.homedir()) || isUserConfigRoot(cwd))
+	const projectConfigDirName = path.isAbsolute(getConfigDirName()) ? CONFIG_DIR_NAME : getConfigDirName();
+	if (
+		normalizePathForComparison(cwd) === normalizePathForComparison(os.homedir()) ||
+		isUserConfigRoot(cwd, projectConfigDirName)
+	)
 		return undefined;
-	return path.join(cwd, getConfigDirName(), "plugins", "installed_plugins.json");
+	return path.join(cwd, projectConfigDirName, "plugins", "installed_plugins.json");
 }
 
 async function canonicalClaudeProjectPath(projectPath: string): Promise<string | null> {

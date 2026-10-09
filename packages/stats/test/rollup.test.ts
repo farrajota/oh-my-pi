@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { initDb, insertMessageStats, insertToolCalls } from "@oh-my-pi/omp-stats/db";
 import {
+	getDailyActivityFromRollup,
 	getOverallStats,
 	getRollupStatus,
 	getSessionRollups,
@@ -160,5 +161,20 @@ describe("rollups", () => {
 			totalCacheWriteTokens: 0,
 			totalTokens: 200,
 		});
+	});
+
+	it("leaves daily activity to the exact query in half-hour-offset timezones", async () => {
+		await initDb();
+		insertMessageStats([message("a", BASE + 10 * 60_000)]);
+		await refreshRollups();
+		const previousTz = process.env.TZ;
+		process.env.TZ = "Asia/Kolkata";
+		try {
+			expect(new Date().getTimezoneOffset()).toBe(-330);
+			expect(getDailyActivityFromRollup(BASE - 24 * HOUR)).toBeNull();
+		} finally {
+			if (previousTz === undefined) delete process.env.TZ;
+			else process.env.TZ = previousTz;
+		}
 	});
 });

@@ -115,7 +115,7 @@ function registerState(client: HindsightApi, settings?: Settings, opts: Register
 			getHindsightSessionState: () => registeredState,
 			...opts.sessionOverrides,
 		} as never,
-		banksSet: new Set(),
+		banksSet: new Set(["test-bank"]),
 		lastRetainedTurn: 0,
 		hasRecalledForFirstTurn: false,
 	});

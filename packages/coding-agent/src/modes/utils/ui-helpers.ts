@@ -1107,13 +1107,12 @@ export class UiHelpers {
 		const queuedMessages = this.ctx.viewSession.getQueuedMessages() as QueuedMessages;
 
 		const steeringMessages = [...queuedMessages.steering];
-		for (const entry of this.ctx.compactionQueuedMessages as CompactionQueuedMessage[]) {
-			if (entry.mode === "steer") steeringMessages.push(entry.text);
-		}
-
 		const followUpMessages = [...queuedMessages.followUp];
-		for (const entry of this.ctx.compactionQueuedMessages as CompactionQueuedMessage[]) {
-			if (entry.mode === "followUp") followUpMessages.push(entry.text);
+		if (!this.ctx.focusedAgentId) {
+			for (const entry of this.ctx.compactionQueuedMessages as CompactionQueuedMessage[]) {
+				if (entry.mode === "steer") steeringMessages.push(entry.text);
+				else followUpMessages.push(entry.text);
+			}
 		}
 
 		const groups = [

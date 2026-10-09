@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import subagentSystemPrompt from "../../src/prompts/system/subagent-system-prompt.md" with { type: "text" };
@@ -13,6 +15,10 @@ import {
 	lookupAgentRef,
 } from "../../src/internal/agent-registry-bridge";
 import type { AgentSession } from "../../src/session/agent-session";
+import { resetRegisteredArtifactDirsForTests } from "../../src/internal-urls/registry-helpers";
+import type { ModelRegistry } from "../../src/config/model-registry";
+import * as discovery from "../../src/task/discovery";
+import { cfgTaskAgentModelOverrides } from "../../src/task/settings";
 import { HubTool } from "../../src/tools/hub";
 import type { CustomMessage } from "../../src/session/messages";
 import * as executor from "../../src/task/executor";
@@ -21,6 +27,7 @@ import * as structured from "../../src/task/structured-subagent";
 import type { AgentDefinition } from "../../src/task/types";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { WorkPool, WorkPoolRegistry } from "../../src/task/workpool";
+import { runEvalWorkpool } from "../../src/eval/workpool-bridge";
 import type { ToolSession } from "../../src/tools";
 import { prompt } from "@oh-my-pi/pi-utils";
 
@@ -47,6 +54,7 @@ const POLICY = {
 
 const managers = new Set<AsyncJobManager>();
 const authoritySessions = new Set<AgentSession>();
+const retainedArtifactDirs = new Set<string>();
 let activeRegistry: AgentRegistry | undefined;
 
 async function makeSession(
@@ -169,9 +177,12 @@ afterEach(async () => {
 	managers.clear();
 	await Promise.all([...authoritySessions].map(session => session.dispose()));
 	authoritySessions.clear();
+	await Promise.all([...retainedArtifactDirs].map(directory => fs.rm(directory, { recursive: true, force: true })));
+	retainedArtifactDirs.clear();
 	activeRegistry = undefined;
 	vi.restoreAllMocks();
 	resetAgentLifecycleForTests();
+	resetRegisteredArtifactDirsForTests();
 	WorkPoolRegistry.resetForTests();
 });
 
@@ -453,49 +464,52 @@ describe("WorkPool dispatch", () => {
 });
 
 describe("WorkPool model selection", () => {
-	it("selects each worker on the first turn and reuses its session on subsequent turns", async () => {
-		const session = await makeSession([], 1);
-		const first = Promise.withResolvers<void>();
-		const selected = ["@reviewer:high", "p/alternative"];
-		const initial = vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
-			await first.promise;
-			const id = request.identity?.id ?? "missing";
-			markIdle(id);
-			return execution(id);
-		});
-		const follow = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async options => {
-			markIdle(options.id);
-			return singleResult(options.id);
-		});
-		const workpool = new WorkPool(session, { name: "models", policy: POLICY, model: selected });
-		workpool.push(["one", "two"]);
-		await until(() => workpool.agents[0]?.queue.length === 1);
-		first.resolve();
-		await finishPool(session, workpool);
-		expect(initial.mock.calls).toHaveLength(1);
-		expect(initial.mock.calls[0]?.[0].model).toEqual(selected);
-		expect(follow.mock.calls).toHaveLength(1);
-		const workerId = initial.mock.calls[0]?.[0].identity?.id;
-		if (!workerId) throw new Error("First turn did not receive a worker id");
-		expect(follow.mock.calls[0]?.[0].id).toBe(workerId);
-		expect(follow.mock.calls[0]?.[0]).not.toHaveProperty("model");
-	});
+	for (const fallbackSource of ["settings", "agent", "parent"] as const) {
+		it(`dispatches explicit selections instead of the ${fallbackSource} fallback across worker turns`, async () => {
+			const requested = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const alternative = getBundledModel("openai-codex", "gpt-5.6-sol");
+			if (!requested || !alternative) throw new Error("Expected routed models to exist");
 
-	it("keeps independent selections for separate pools", async () => {
-		const session = await makeSession();
-		const selections = new Map<string, string | string[] | undefined>();
-		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
-			const id = request.identity?.id ?? "missing";
-			selections.set(id, request.model);
-			markIdle(id);
-			return execution(id);
+			const selected = [`${requested.provider}/${requested.id}`, `${alternative.provider}/${alternative.id}`];
+			const fallbackPattern = `provider/${fallbackSource}-default`;
+			const agent = fallbackSource === "agent" ? { ...AGENT, model: [fallbackPattern] } : AGENT;
+			vi.spyOn(discovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
+
+			const session = await makeSession([], 1);
+			session.modelRegistry = {
+				getAvailable: () => [requested, alternative],
+			} as unknown as ModelRegistry;
+			session.getActiveModelString = () => fallbackPattern;
+			session.getModelString = () => fallbackPattern;
+			if (fallbackSource === "settings") {
+				cfgTaskAgentModelOverrides.override(session.settings, { scout: fallbackPattern });
+			}
+
+			const dispatched: executor.ExecutorOptions[] = [];
+			vi.spyOn(executor, "runSubprocess").mockImplementation(async options => {
+				dispatched.push(options);
+				if (options.artifactsDir) retainedArtifactDirs.add(options.artifactsDir);
+				markIdle(options.id);
+				return singleResult(options.id);
+			});
+			const follow = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async options => {
+				markIdle(options.id);
+				return singleResult(options.id);
+			});
+			const name = `models-${fallbackSource}`;
+			await runEvalWorkpool({ op: "create", name, agent: "scout", model: selected }, { session });
+			const workpool = WorkPoolRegistry.global().get("Main", name);
+			if (!workpool) throw new Error(`Expected workpool ${name} to be registered`);
+			await runEvalWorkpool({ op: "push", name, items: ["first batch", "follow-up batch"] }, { session });
+			await finishPool(session, workpool);
+
+			expect(dispatched).toHaveLength(1);
+			expect(dispatched[0]?.modelOverride).toEqual(selected);
+			expect(dispatched[0]?.requestedModel).toBe(selected.join(", "));
+			expect(dispatched[0]?.parentActiveModelPattern).toBeUndefined();
+			expect(follow).toHaveBeenCalledTimes(1);
+			expect(follow.mock.calls[0]?.[0].id).toBe(dispatched[0]?.id);
+			expect(follow.mock.calls[0]?.[0]).not.toHaveProperty("model");
 		});
-		const first = new WorkPool(session, { name: "first", policy: POLICY, model: "p/first" });
-		const second = new WorkPool(session, { name: "second", policy: POLICY, model: ["p/second", "p/third"] });
-		first.push(["one"]);
-		second.push(["two"]);
-		await Promise.all([finishPool(session, first), finishPool(session, second)]);
-		expect(selections.get(first.agents[0]!.id)).toBe("p/first");
-		expect(selections.get(second.agents[0]!.id)).toEqual(["p/second", "p/third"]);
-	});
+	}
 });

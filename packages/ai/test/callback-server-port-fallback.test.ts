@@ -31,11 +31,11 @@ class TestCallbackFlow extends OAuthCallbackFlow {
  * specific-address bind coexist with a wildcard one. Returns the bound port
  * plus a `release` callback for teardown.
  */
-function occupyLoopbackPort(): { port: number; release: () => void } {
+async function occupyLoopbackPort(): Promise<{ port: number; release: () => Promise<void> }> {
 	const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("blocker") });
 	const port = server.port;
 	if (typeof port !== "number") {
-		server.stop(true);
+		await server.stop(true);
 		throw new Error("Bun.serve({ port: 0 }) did not assign a numeric port");
 	}
 	return { port, release: () => server.stop(true) };
@@ -47,7 +47,7 @@ afterEach(() => {
 
 describe("OAuthCallbackFlow port fallback policy", () => {
 	it("falls back to a random port by default so historical AI-provider flows keep working", async () => {
-		const blocker = occupyLoopbackPort();
+		const blocker = await occupyLoopbackPort();
 		const progress: string[] = [];
 		const controller = new AbortController();
 		const flow = new TestCallbackFlow(
@@ -71,7 +71,7 @@ describe("OAuthCallbackFlow port fallback policy", () => {
 			expect(flow.lastRedirectUri).toMatch(/^http:\/\/localhost:\d+\/callback$/);
 			expect(flow.lastRedirectUri).not.toContain(`:${blocker.port}/`);
 		} finally {
-			blocker.release();
+			await blocker.release();
 		}
 	});
 

@@ -2,6 +2,7 @@ import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { logger } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
+import { validateAgentAccountPools } from "../config/account-pools";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelRoleAlias } from "../config/model-roles";
 import type { Settings } from "../config/settings";
@@ -35,6 +36,7 @@ import {
 	subagentRetryFallbackRole,
 } from "./executor";
 import type { EffectivePermissionSummary } from "./types";
+import { cfgTaskAgentAccountPools } from "./settings";
 import type { AgentDefinition } from "./types";
 import {
 	buildEffectivePermissionSummary,
@@ -364,6 +366,10 @@ export function createPersistedSubagentReviverFactory(
 				if (init.retryFallback) {
 					installRetryFallbackRole(subagentSettings, subagentRetryFallbackRole(ref.id), init.retryFallback);
 				}
+				// Account pools are live owner policy, not a persisted credential grant.
+				const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(ctx.settings));
+				const oauthAccountPools =
+					init.agent && Object.hasOwn(agentAccountPools, init.agent) ? agentAccountPools[init.agent] : undefined;
 				const persistedModelPattern =
 					init.modelRole && init.modelRole !== "default"
 						? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]
@@ -436,6 +442,7 @@ export function createPersistedSubagentReviverFactory(
 								? init.agent
 								: ref.displayName,
 						parentTaskPrefix: ref.id,
+						oauthAccountPools,
 						taskDepth,
 						toolNames: startupToolNames,
 						outputSchema: init.outputSchema,

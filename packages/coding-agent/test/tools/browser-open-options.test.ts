@@ -201,8 +201,13 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 				});
 			},
 		});
+		const invoke = browserHost();
+		const startupName = `startup-${crypto.randomUUID()}`;
+		let startupTabCreated = false;
 		try {
-			const invoke = browserHost();
+			// Warm a different tab so both timed opens still exercise the fresh/reused target paths.
+			await invoke({ action: "open", name: startupName, url: "about:blank" });
+			startupTabCreated = true;
 			const name = `slow-${crypto.randomUUID()}`;
 			const open = () => rejectionOf(invoke({ action: "open", name, url: server.url.href, timeout: 3 }));
 			const keptTab = { message: expect.stringContaining(`browser.tab(${JSON.stringify(name)})`) };
@@ -219,13 +224,17 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 				),
 			).toEqual({ url: server.url.href, text: "partial" });
 		} finally {
-			server.stop(true);
+			try {
+				if (startupTabCreated) await invoke({ action: "close", name: startupName });
+			} finally {
+				await server.stop(true);
+			}
 		}
 	}, 20_000);
 
 	it("closes the tab its open created when the navigation fails outright, but keeps a reused one", async () => {
-		const refused = Bun.serve({ port: 0, fetch: () => new Response("") });
-		const url = refused.url.href;
+		const refused = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
+		const url = `http://127.0.0.1:${refused.port}/`;
 		refused.stop(true);
 		const invoke = browserHost();
 		const tabNames = async () =>

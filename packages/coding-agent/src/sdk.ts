@@ -53,6 +53,7 @@ import { loadCapability, reset as resetCapabilities } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
 import { snapshotEffectiveExtensionRoots, type EffectiveExtensionRoots } from "./capability/types";
+import { type OAuthAccountPools, SessionAccountPoolScope } from "./config/account-pools";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
@@ -213,7 +214,11 @@ import {
 	USER_INTERRUPT_LABEL,
 	wrapSteeringForModel,
 } from "./session/messages";
-import { clampProviderContextImages, dropUnreadableContextImages } from "./session/provider-image-budget";
+import {
+	clampProviderContextImageBytes,
+	clampProviderContextImages,
+	dropUnreadableContextImages,
+} from "./session/provider-image-budget";
 import {
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
@@ -375,7 +380,14 @@ import { cfgTtsr } from "./export/ttsr-settings";
 import { cfgDisabledProviders, cfgEnabledModels, cfgEnabledProviders, cfgModelRoles } from "./config/model-settings";
 import { cfgEditRecoverInlineEdits } from "./edit/settings";
 import { cfgGoalEnabled } from "./goals/settings";
-import { cfgImagesBlockImages, cfgStartupQuiet, cfgTuiReactions, cfgTuiRenderMermaid } from "./modes/settings";
+import {
+	cfgImagesBlockImages,
+	cfgStartupQuiet,
+	cfgTuiReactions,
+	cfgTuiAutoGraph,
+	cfgTuiRenderMermaid,
+	cfgTuiRenderSvg,
+} from "./modes/settings";
 import { cfgLspEnabled, cfgLspLazy, cfgLspShared } from "./lsp/settings";
 import {
 	cfgMcpEnableProjectConfig,
@@ -556,6 +568,17 @@ export interface CreateAgentSessionOptions {
 	getApiKey?: AgentOptions["getApiKey"];
 	/** Session whose OAuth account affinity should be used when resolving credentials. */
 	credentialSourceSessionId?: string;
+	/**
+	 * OAuth account pools for this session: provider id → identity keys (see
+	 * `AuthStorage.sessions.restrict`). A listed provider authenticates only with
+	 * those accounts, never another account or an API key, and requests fail
+	 * when none of them can serve. Applied after {@link credentialSourceSessionId}
+	 * affinity is copied, and enforced on every key lookup through the session's
+	 * model registry, whatever provider session id it carries (title generation,
+	 * advisors, subagents this session spawns). A custom {@link getApiKey}
+	 * bypasses it.
+	 */
+	oauthAccountPools?: OAuthAccountPools;
 
 	/** Model to use. Default: from settings, else first available */
 	model?: Model;
@@ -839,6 +862,12 @@ export interface CreateAgentSessionOptions {
 	 * other session gets no `cfg://` in its prompt and has writes refused. Default: false.
 	 */
 	settingsApproval?: boolean;
+	/**
+	 * Replies render in omp's own TUI transcript, which draws Mermaid, ```svg
+	 * figures and table charts; only then does the system prompt mention them.
+	 * Print, RPC, ACP and subagent sessions read replies as text. Default: false.
+	 */
+	tuiTranscript?: boolean;
 	/**
 	 * Defer `confirm` reserve-policy fallback until AgentSession prompt-time UI is configured.
 	 * ACP uses this while capabilities are negotiated without enabling UI-only tools.
@@ -1747,6 +1776,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			"Agent reservation and expected-ref hints are assertion-only and cannot register a public SDK session.",
 		);
 	}
+	if (options.systemPromptTemplate !== undefined && options.customSystemPrompt !== undefined) {
+		throw new Error("systemPromptTemplate cannot be combined with a literal custom system prompt");
+	}
 	const startup = snapshotCreateAgentSessionOptions(options);
 	const extensionRoots = startup.policy.allowExtensions
 		? snapshotEffectiveExtensionRoots(startup.options.extensionRoots?.())
@@ -1809,7 +1841,7 @@ async function createAgentSessionScoped(
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
 	// / session would silently miss credential_disabled events.
-	const modelRegistry =
+	let modelRegistry =
 		options.modelRegistry ??
 		new ModelRegistry(
 			options.authStorage ?? (await logger.time("discoverModels", discoverAuthStorage, agentDir, { settings, cwd })),
@@ -1958,6 +1990,15 @@ async function createAgentSessionScoped(
 	if (options.credentialSourceSessionId && options.credentialSourceSessionId !== providerSessionId) {
 		modelRegistry.authStorage.sessions.inherit(options.credentialSourceSessionId, providerSessionId);
 	}
+	// From here on the session resolves every key through its pools; see
+	// SessionAccountPoolScope. A startup failure leaves no session to lift them.
+	const accountPoolScope = options.oauthAccountPools
+		? new SessionAccountPoolScope(modelRegistry.authStorage, options.oauthAccountPools, providerSessionId)
+		: undefined;
+	if (accountPoolScope) {
+		modelRegistry = accountPoolScope.registry(modelRegistry);
+		startupCleanup.defer(() => accountPoolScope.release());
+	}
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
 		options.modelPattern !== undefined ||
@@ -2101,6 +2142,7 @@ async function createAgentSessionScoped(
 
 	const taskDepth = options.taskDepth ?? 0;
 	const resolvedAgentName = options.agentName ?? (taskDepth > 0 || options.parentTaskPrefix ? undefined : "main");
+	const tuiTranscript = options.tuiTranscript === true && taskDepth === 0 && !options.parentTaskPrefix;
 
 	// Resolves the session/agent thinking level using the same precedence we
 	// apply at startup: explicit option → persisted session entry → restored
@@ -2317,12 +2359,10 @@ async function createAgentSessionScoped(
 
 	try {
 		const getActiveModelString = (): string | undefined => {
-			const activeModel = agent?.state.model ?? model;
-			if (!activeModel) return undefined;
-			// Inherit the live route and effective effort, not just the model identity.
-			// A later effort change must not reuse the startup selector or restart auto triage.
-			const effort = agent?.state.model ? agent.state.thinkingLevel : effectiveThinkingLevel;
-			return formatModelSelectorValue(formatModelStringWithRouting(activeModel), effort);
+			const activeModel = agent?.state.model;
+			if (activeModel) return formatModelString(activeModel);
+			if (model) return formatModelString(model);
+			return undefined;
 		};
 		// Per-path mutation counter shared across edit/write tools. Late-diagnostics
 		// entries capture it at fetch time and are dropped at injection if a newer
@@ -3368,7 +3408,7 @@ async function createAgentSessionScoped(
 				modelFallbackMessage =
 					patterns && patterns.length > 0
 						? `No model available matching enabledModels (${patterns.join(", ")}) with usable credentials. Configure auth for an allowed provider or adjust enabledModels.`
-						: "No models available. Use /login or set an API key environment variable. Then use /model to select a model.";
+						: "No default model selected. Use /login, set an API key environment variable, or select a local model with /model or --model.";
 			}
 		}
 
@@ -3924,13 +3964,12 @@ async function createAgentSessionScoped(
 					toolSession.deviceOnlyWrite !== true),
 		});
 
-		// Resolve the live inline-descriptors setting against the session-start model.
-		// `auto` enforces the per-model policy (inline for Gemini, off otherwise); a
-		// mid-session model switch keeps the start-time model's decision. Prompt and
-		// agent (description pruning) must agree on it.
-		const inlineToolDescriptorsModelId = model?.id;
+		// Resolve the live inline-descriptors setting against the active model.
+		// `auto` enforces the per-model policy (inline for Gemini, off otherwise), so
+		// a mid-session model switch re-decides it. Prompt and agent (description
+		// pruning) must agree: every prompt rebuild re-syncs the agent's pruning.
 		const resolveInlineToolDescriptors = (): boolean =>
-			shouldInlineToolDescriptors(cfgInlineToolDescriptors.get(settings), inlineToolDescriptorsModelId);
+			shouldInlineToolDescriptors(cfgInlineToolDescriptors.get(settings), (agent?.state.model ?? model)?.id);
 		// Latest memory backend instructions rendered for advisor system prompts.
 		// Populated by the initial rebuildSystemPrompt below (before the session is
 		// constructed) and refreshed on every later rebuild via
@@ -4021,6 +4060,17 @@ async function createAgentSessionScoped(
 			// tool-availability caveat lives in the wrapper template.
 			advisorMemoryPrompt = formatAdvisorMemoryPrompt(memoryInstructions);
 			if (hasSession) session.setAdvisorMemoryPrompt(advisorMemoryPrompt);
+			const inlineToolDescriptors = resolveInlineToolDescriptors();
+			// Unset only during the initial build; the agent is constructed with it.
+			if (agent) agent.pruneToolDescriptions = inlineToolDescriptors;
+			// A fixed string or array in systemPrompt replaces all generated blocks.
+			// Preserve the bookkeeping above, but skip discovering or rendering a
+			// template whose output would be discarded.
+			if (options.systemPrompt !== undefined && typeof options.systemPrompt !== "function") {
+				return {
+					systemPrompt: typeof options.systemPrompt === "string" ? [options.systemPrompt] : options.systemPrompt,
+				};
+			}
 
 			// Build combined append prompt: memory instructions + auto-learn guidance
 			// + mounted MCP route guidance + optional MCP server instructions. For UI
@@ -4094,7 +4144,6 @@ async function createAgentSessionScoped(
 			// Owned/in-band tool dialects (non-native) require the full functions-
 			// namespace catalog; native tool calling lets the compact name list suffice.
 			const nativeTools = resolveDialect(cfgToolsFormat.get(settings), agent?.state.model ?? model) === undefined;
-			const inlineToolDescriptors = resolveInlineToolDescriptors();
 			const includeWorkspaceTree = cfgIncludeWorkspaceTree.get(settings);
 			if (includeWorkspaceTree && !workspaceTreePromise) {
 				const scan = scanWorkspaceTree();
@@ -4157,7 +4206,9 @@ async function createAgentSessionScoped(
 				includeModelInPrompt: cfgIncludeModelInPrompt.get(settings),
 				personality: agentKind === "sub" ? "none" : cfgPersonality.get(settings),
 				subagent: agentKind === "sub",
-				renderMermaid: cfgTuiRenderMermaid.get(settings),
+				renderMermaid: tuiTranscript && cfgTuiRenderMermaid.get(settings),
+				renderSvg: tuiTranscript && cfgTuiRenderSvg.get(settings),
+				autoGraph: tuiTranscript && cfgTuiAutoGraph.get(settings) !== "off",
 				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(settings),
 				activeRepoContext,
 			});
@@ -4371,6 +4422,8 @@ async function createAgentSessionScoped(
 			// else, and it runs before the blob broker uploads any of these bytes.
 			transformed = await dropUnreadableContextImages(transformed, transformModel);
 			transformed = await blobBroker.decorateContext(transformed, transformModel);
+			// Byte budget after decoration: URL/file-referenced images carry no inline bytes.
+			transformed = clampProviderContextImageBytes(transformed, transformModel);
 			// Keep per-request volatility out of the system prompt: the date/cwd
 			// reminder rides on the first user turn so open-weight providers keep
 			// their tool-schema prefix cache (#7404).
@@ -4825,6 +4878,7 @@ async function createAgentSessionScoped(
 			agentId: resolvedAgentId,
 			agentKind,
 			providerSessionId: options.providerSessionId,
+			accountPoolScope,
 			providerPromptCacheKeySource,
 			advisorTools,
 			// Same per-call `grep` seam the primary bridge gets, built against the
@@ -4897,11 +4951,6 @@ async function createAgentSessionScoped(
 		cfgToolCallSwitches.listen(session, ({ intentTracing, abortOnFabricatedResult }) => {
 			agent.intentTracing = intentTracing;
 			agent.abortOnFabricatedToolResult = abortOnFabricatedResult;
-		});
-		// Description pruning mirrors the prompt's inline catalog; the prompt listener
-		// above republishes the prompt for the same change.
-		cfgInlineToolDescriptors.listen(session, () => {
-			agent.pruneToolDescriptions = resolveInlineToolDescriptors();
 		});
 		// Tool-gating settings add or remove the tools they gate and refresh the
 		// prompt once per coalesced change. Restricted (structured) sessions keep the
@@ -5318,6 +5367,7 @@ async function createAgentSessionScoped(
 						transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
 						transformed = await dropUnreadableContextImages(transformed, transformModel);
 						transformed = await blobBroker.decorateContext(transformed, transformModel);
+						transformed = clampProviderContextImageBytes(transformed, transformModel);
 						return captureDateCwdReminder.transform(
 							transformed,
 							formatLocalCalendarDate(),

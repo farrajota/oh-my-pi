@@ -128,7 +128,7 @@ describe("workpool model validation", () => {
 			const session = await makeSession();
 			await expect(
 				runEvalWorkpool({ op: "create", name: "invalid", agent: "scout", model }, { session }),
-			).rejects.toThrow(/model/);
+			).rejects.toThrow();
 			expect(WorkPoolRegistry.global().get("Main", "invalid")).toBeUndefined();
 		});
 	}

@@ -95,7 +95,6 @@ describe("task wire schema", () => {
 		const items = parsedItems(batch({ context: "ctx", tasks: [{ task: "x", solutionSpace: "c", model: "@smol" }] }));
 		expect(items[0]?.model).toBe("@smol");
 	});
-
 	it("defaults batch item agents to 'task' on the fast path and keeps names", () => {
 		const batch = getTaskSchema({ isolationEnabled: false, batchEnabled: true, defaultAgent: "task" });
 		const items = parsedItems(

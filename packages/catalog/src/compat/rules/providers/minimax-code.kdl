@@ -4,13 +4,15 @@ provider "minimax-code" priority=1 {
 	default-model "MiniMax-M3"
 	env "MINIMAX_CODE_API_KEY"
 
-	// Replaces the provider-id regex in both OpenAI baselines.
-	reasoning-deltas-may-be-cumulative #true
-	class "minimax" {
+	on-api "openai-completions" {
+		// Baked Code rows still use the legacy OpenAI-compatible route.
 		thinking-mode "effort"
-	}
-	// residue: taxonomy ranks and exact globs do not isolate these models.
-	models "MiniMax-M3" {
-		thinking-efforts "minimal" "low" "medium" "high"
+		models "MiniMax-M2.1-lightning" "MiniMax-M2.5-lightning" {
+			thinking-mode "effort"
+		}
+		// Legacy completion rows keep the original four-tier Code ladder.
+		models "MiniMax-M3" "MiniMax-M3.1-Flash-Preview" {
+			thinking-efforts "minimal" "low" "medium" "high"
+		}
 	}
 }

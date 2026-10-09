@@ -93,10 +93,6 @@ function parseAgentArgs(args: unknown): EvalAgentArgs {
 	if (result instanceof type.errors) {
 		throw new ToolError(`agent() received invalid arguments: ${result.summary}`);
 	}
-	// The wire layer owns blank and malformed-array rejection so
-	// the shared preflight's empty-selector carve-out stays internal-only.
-	const selectorProblem = invalidModelSelectorReason(result.model, "agent()");
-	if (selectorProblem) throw new ToolError(selectorProblem);
 	return result;
 }
 
@@ -176,6 +172,9 @@ async function buildEvalAgentResult(execution: StructuredSubagentResult): Promis
 /** Register a background subagent and return its handle immediately. */
 export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOptions): Promise<EvalAgentHandleResult> {
 	const parsed = parseAgentArgs(args);
+	// Preserve the caller's raw selector: normalization can turn a blank value into an absent override.
+	const invalidModelReason = invalidModelSelectorReason(parsed.model, "The call");
+	if (invalidModelReason) throw new ToolError(invalidModelReason);
 	const turnBudget = options.session.getTurnBudget?.();
 	if (turnBudget?.hard && turnBudget.total !== null && turnBudget.spent >= turnBudget.total) {
 		throw new ToolError(

@@ -22,13 +22,15 @@ class CallbackProbeFlow extends OAuthCallbackFlow {
  * production probe fails loudly instead of skipping into a false green (same
  * guard as `callback-server-dual-stack.test.ts`).
  */
-const ipv6Loopback = (() => {
+const ipv6Loopback = await (async () => {
+	let probe: Bun.Server<unknown>;
 	try {
-		Bun.serve({ hostname: "::1", port: 0, fetch: () => new Response("probe") }).stop(true);
-		return true;
+		probe = Bun.serve({ hostname: "::1", port: 0, fetch: () => new Response("probe") });
 	} catch {
 		return false;
 	}
+	await probe.stop(true);
+	return true;
 })();
 
 async function startFlow(): Promise<{

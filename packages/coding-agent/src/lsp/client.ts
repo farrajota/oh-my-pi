@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as path from "node:path";
 import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
-import { MessageFramer } from "../jsonrpc/message-framing";
+import { encodeMessageFrame, MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { getConfig } from "./config";
 import { applyWorkspaceEdit, type ExecutedWorkspaceChange, type WorkspaceEditAuthorization } from "./edits";
@@ -324,10 +324,7 @@ async function writeMessage(
 	if (signal?.aborted) {
 		throw abortReason(signal);
 	}
-	const content = JSON.stringify(message);
-	const write = Promise.resolve(
-		sink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`),
-	);
+	const write = Promise.resolve(sink.write(encodeMessageFrame(message)));
 	// Attach before flush(): it may throw synchronously after write() returned a
 	// rejected Promise, and leaving that rejection unobserved kills the host.
 	void write.catch(() => {});
@@ -414,7 +411,7 @@ async function startMessageReader(client: LspClient): Promise<void> {
 
 	const reader = (client.proc.stdout as ReadableStream<Uint8Array>).getReader();
 
-	const framer = new MessageFramer(Buffer.from(client.messageBuffer));
+	const framer = new MessageFramer(Buffer.alloc(0));
 
 	let readerFailed = false;
 	try {
@@ -422,7 +419,7 @@ async function startMessageReader(client: LspClient): Promise<void> {
 			const { done, value } = await reader.read();
 			if (done) break;
 
-			framer.push(Buffer.from(value));
+			framer.push(value);
 
 			// Drain every complete message currently buffered.
 			for (const messageText of framer.drain(headerText => {
@@ -512,8 +509,6 @@ async function startMessageReader(client: LspClient): Promise<void> {
 		}
 		client.pendingRequests.clear();
 	} finally {
-		// Persist any unparsed remainder so a restarted reader resumes mid-message.
-		client.messageBuffer = framer.remainder();
 		reader.releaseLock();
 		client.isReading = false;
 		if (!readerFailed && client.proc.exitCode === null) {
@@ -1119,7 +1114,6 @@ export async function getOrCreateClient(
 			dynamicCapabilityRegistrations: new Map(),
 			openFiles: new Map(),
 			pendingRequests: new Map(),
-			messageBuffer: new Uint8Array(0),
 			isReading: false,
 			status: "connecting",
 			lastActivity: Date.now(),
@@ -1530,8 +1524,19 @@ export async function syncContent(
 }
 
 /**
+ * Whether the server opted into full text on `didSave`
+ * (`textDocumentSync.save.includeText`); otherwise it already has the text from didChange.
+ */
+function saveIncludesText(client: LspClient): boolean {
+	const sync = client.serverCapabilities?.textDocumentSync;
+	const save = typeof sync === "object" && sync !== null && "save" in sync ? sync.save : undefined;
+	return typeof save === "object" && save !== null && "includeText" in save && save.includeText === true;
+}
+
+/**
  * Notify LSP that a file was saved.
- * Assumes content was already synced via syncContent - just sends didSave.
+ * Assumes content was already synced via syncContent; the saved text is read
+ * back only for servers that asked for it.
  */
 export async function notifySaved(client: LspClient, filePath: string, signal?: AbortSignal): Promise<void> {
 	const uri = fileToUri(filePath);
@@ -1539,12 +1544,12 @@ export async function notifySaved(client: LspClient, filePath: string, signal?: 
 	if (!info) return; // File not open, nothing to notify
 
 	throwIfAborted(signal);
+	const text = saveIncludesText(client) ? await Bun.file(filePath).text() : undefined;
+	throwIfAborted(signal);
 	await sendNotification(
 		client,
 		"textDocument/didSave",
-		{
-			textDocument: { uri },
-		},
+		text === undefined ? { textDocument: { uri } } : { textDocument: { uri }, text },
 		signal,
 	);
 	client.lastActivity = Date.now();
@@ -1663,10 +1668,7 @@ export async function refreshFile(client: LspClient, filePath: string, signal?: 
 		await sendNotification(
 			client,
 			"textDocument/didSave",
-			{
-				textDocument: { uri },
-				text: content,
-			},
+			saveIncludesText(client) ? { textDocument: { uri }, text: content } : { textDocument: { uri } },
 			signal,
 		);
 
@@ -1938,9 +1940,12 @@ export function getActiveClients(): LspServerStatus[] {
 // extensions, orphan background bash/task jobs, and skip the editor draft
 // save (issue #4080). `beforeExit` stays as-is: it fires only when the event
 // loop drains with no more work, distinct from signal delivery.
+// A no-op async cleanup would itself reschedule `beforeExit`; only start cleanup while work remains.
 if (typeof process !== "undefined") {
 	process.on("beforeExit", () => {
-		void shutdownAll();
+		if (clients.size > 0 || clientLocks.size > 0 || idleCheckInterval !== null) {
+			void shutdownAll();
+		}
 	});
 	postmortem.register("lsp-shutdown", () => shutdownAll());
 }

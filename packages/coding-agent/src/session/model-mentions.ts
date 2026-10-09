@@ -90,6 +90,7 @@ export class ModelMentionRegistry {
 
 	/** Register user-tagged models and replace their tokens with persisted agent tags. */
 	expandMentions(text: string): string {
+		this.syncFromBranch();
 		if (!text.includes("^")) return text;
 		return text.replace(MODEL_MENTION_RE, (token, delimiter: string, selector: string) => {
 			let mention = this.#bySelector.get(selector);

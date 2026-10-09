@@ -100,7 +100,7 @@ import {
 	resolveManagedSessionRoot,
 	writeTerminalBreadcrumb,
 } from "./session-paths";
-import { prepareEntryForPersistence } from "./session-persistence";
+import { forgetExternalizedImages, prepareEntryForPersistence } from "./session-persistence";
 import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
@@ -549,6 +549,15 @@ class SessionEntryIndex {
 	#labels = new Map<string, string>();
 	#leaf: string | null = null;
 	#usage = emptyUsageStatistics();
+	// Branch memo: getBranch() walks leaf-to-root per call (array + Set +
+	// reverse) on per-frame/per-turn paths. The branch only changes on
+	// insert/rebuild/setLeaf, so cache the array keyed on (leaf, generation).
+	// An insert that extends the current leaf appends to the memo in place
+	// (O(1)) instead of discarding it. `branchView()` hands the memo out
+	// read-only and live: it grows when such an insert lands, while a leaf
+	// change or rebuild starts a fresh array (the old one is never mutated).
+	#generation = 0;
+	#branchCache: { leaf: string | null | undefined; generation: number; branch: SessionEntry[] } | undefined;
 
 	clear(): void {
 		this.#entriesById.clear();
@@ -564,8 +573,26 @@ class SessionEntryIndex {
 	}
 
 	insert(entry: SessionEntry): void {
+		const previousLeaf = this.#leaf;
+		const isNew = !this.#entriesById.has(entry.id);
 		this.#entriesById.set(entry.id, entry);
 		this.#leaf = entry.id;
+		this.#generation++;
+		const cache = this.#branchCache;
+		if (
+			isNew &&
+			cache !== undefined &&
+			cache.generation === this.#generation - 1 &&
+			cache.leaf === previousLeaf &&
+			entry.parentId === previousLeaf &&
+			entry.parentId !== null
+		) {
+			cache.branch.push(entry);
+			cache.leaf = entry.id;
+			cache.generation = this.#generation;
+		} else {
+			this.#branchCache = undefined;
+		}
 
 		const bucket = this.#children.get(entry.parentId);
 		if (bucket) bucket.push(entry);
@@ -613,6 +640,15 @@ class SessionEntryIndex {
 		this.#leaf = id;
 	}
 
+	/**
+	 * Stop extending the issued branch view in place: the next insert starts a
+	 * fresh memo. For inserts whose leaf move is undone right after, which must
+	 * not grow a view held by callers.
+	 */
+	detachBranchView(): void {
+		this.#branchCache = undefined;
+	}
+
 	childrenOf(parentId: string): SessionEntry[] {
 		return [...(this.#children.get(parentId) ?? [])];
 	}
@@ -630,9 +666,31 @@ class SessionEntryIndex {
 	}
 
 	pathTo(id: string | null | undefined = this.#leaf): SessionEntry[] {
+		// The memoized default-leaf branch stays private — callers may
+		// sort/reverse/splice the result (the return type is SessionEntry[]),
+		// so hand out a copy. Explicit fromId walks (rare) bypass the cache.
+		if (id === undefined || id === this.#leaf) return this.branchView().slice();
+		return this.#walk(id);
+	}
+
+	/** The memoized active-leaf branch, without copying. Callers MUST NOT mutate it. */
+	branchView(): readonly SessionEntry[] {
+		const cache = this.#branchCache;
+		if (cache !== undefined && cache.generation === this.#generation && cache.leaf === this.#leaf)
+			return cache.branch;
+		const branch = this.#walk(this.#leaf);
+		this.#branchCache = { leaf: this.#leaf, generation: this.#generation, branch };
+		return branch;
+	}
+
+	#walk(leaf: string | null): SessionEntry[] {
 		const branch: SessionEntry[] = [];
+		// Per-path visited set: a corrupt cyclic parentId chain must stop at
+		// the FIRST repeated id (a bare depth cap of `size` still duplicates
+		// entries when unrelated entries inflate the index — e.g. a self-cycle
+		// plus one unrelated entry yields [entry, entry]).
 		const seen = new Set<string>();
-		let cursor = id ? this.#entriesById.get(id) : undefined;
+		let cursor = leaf ? this.#entriesById.get(leaf) : undefined;
 
 		while (cursor && !seen.has(cursor.id)) {
 			seen.add(cursor.id);
@@ -734,6 +792,42 @@ interface AtomicEntryBatch {
 }
 
 /**
+ * The state a full-file body was serialized from, cheap to compare against
+ * the live state. Entries change only by append, array replacement, or an
+ * in-place update announced through `rewriteEntries()` (which bumps the
+ * revision); the title slot and header are small and compared by value.
+ */
+interface SessionBodyStamp {
+	entries: readonly SessionEntry[];
+	entryCount: number;
+	lastEntry: SessionEntry | undefined;
+	revision: number;
+	/** Serialized title slot and header lines. */
+	prefix: string;
+}
+
+/**
+ * One full-file serialization: title slot, header, and entry lines in file
+ * order plus their total UTF-8 byte length. Kept as lines so the file backend
+ * streams them instead of materializing one string the size of the session.
+ */
+interface SessionFileBody {
+	lines: string[];
+	bytes: number;
+	stamp: SessionBodyStamp;
+}
+
+/** Whether `text` is exactly the concatenation of `lines`, compared without building it. */
+function textMatchesLines(text: string, lines: readonly string[]): boolean {
+	let offset = 0;
+	for (const line of lines) {
+		if (!text.startsWith(line, offset)) return false;
+		offset += line.length;
+	}
+	return offset === text.length;
+}
+
+/**
  * The storage may have published a write that rejected, and an authoritative
  * repair could not be proven durable. Callers must fail closed until recovery.
  */
@@ -820,6 +914,8 @@ export class SessionManager {
 	#sessionName: string | undefined;
 	#titleSource: SessionTitleSource | undefined;
 	#titleRevision = 0;
+	/** Bumped by in-place entry updates, which a {@link SessionBodyStamp} cannot otherwise see. */
+	#bodyRevision = 0;
 	#sessionFile: string | undefined;
 	#sessionFileSwitchGeneration = 0;
 	#sessionFileSwitching = false;
@@ -861,7 +957,7 @@ export class SessionManager {
 	#writer: SessionStorageWriter | undefined;
 	/** Sealed by {@link releaseRetainedEntries}: every later append/title/rewrite is a dropped no-op. */
 	#released = false;
-	/** Set by {@link releaseRetainedEntries}: `#entries` was cleared, so `#fileBody()` is no longer authoritative. */
+	/** Set by {@link releaseRetainedEntries}: `#entries` was cleared, so `#serializeBody()` is no longer authoritative. */
 	#entriesReleased = false;
 	/** Serializes async disk work (flush/close/atomic rewrite). Appends are synchronous and bypass it. */
 	#diskTail: Promise<void> = Promise.resolve();
@@ -985,6 +1081,9 @@ export class SessionManager {
 	#noteDiskFailure(errorLike: unknown): Error {
 		const error = toError(errorLike);
 		if (!this.#diskFailure) this.#diskFailure = error;
+		// A line that failed to land leaves its blob refs unreferenced on disk,
+		// so the next persist must re-check those blobs instead of trusting the memo.
+		forgetExternalizedImages(this.#blobs);
 
 		if (!this.#diskFailureLogged) {
 			this.#diskFailureLogged = true;
@@ -1267,6 +1366,7 @@ export class SessionManager {
 	#latchIndeterminate(operationError: Error, recoveryErrors: readonly Error[]): SessionPersistenceIndeterminateError {
 		const error = new SessionPersistenceIndeterminateError(operationError, recoveryErrors);
 		this.#diskFailure = error;
+		forgetExternalizedImages(this.#blobs);
 		if (!this.#diskFailureLogged) {
 			this.#diskFailureLogged = true;
 			logger.error("Session persistence became indeterminate.", {
@@ -1291,7 +1391,7 @@ export class SessionManager {
 	async #authoritativelyRewriteCurrentStateLocked(operationError: Error): Promise<void> {
 		if (this.#released) {
 			// Terminal seal: repair would reset the disk tail (escaping the
-			// close() serialization) and atomically publish #fileBody() — after
+			// close() serialization) and atomically publish #serializeBody() — after
 			// release that truncates, and a revival may already own the file.
 			// The original operation error still propagates to the caller.
 			logger.warn("Skipped authoritative session repair after terminal release", {
@@ -1383,11 +1483,10 @@ export class SessionManager {
 			sessionFile === this.#sessionFile && this.#sessionOwnedElsewhere()
 				? this.#moveOffSessionFile("open-elsewhere")
 				: sessionFile;
-		const body = this.#fileBody();
+		const body = this.#serializeBody();
 		try {
-			// Authoritative repair replaces whatever is on disk, so it does not
-			// CAS against `#expectedDiskSize` (which may be stale after the failure).
-			await this.#storage.writeTextAtomic(target, body, {
+			// Authoritative repair must not compare against a stale size, but keeps identity and commit guards.
+			const writeOptions = {
 				expectedIdentity: this.#sessionFileRelocating
 					? target === this.#sessionFileRelocating.source
 						? this.#sessionFileRelocating.sourceIdentity
@@ -1396,7 +1495,10 @@ export class SessionManager {
 							: undefined
 					: undefined,
 				commitGuard,
-			});
+			};
+			await (this.#storage.writeLinesAtomic
+				? this.#storage.writeLinesAtomic(target, body.lines, writeOptions)
+				: this.#storage.writeTextAtomic(target, body.lines.join(""), writeOptions));
 		} catch (error) {
 			if (commitGuard && !commitGuard()) throw error;
 			const retryPath = await this.#recoverFromWriteConflict(error, recoveries);
@@ -1417,13 +1519,13 @@ export class SessionManager {
 				throw this.#latchIndeterminate(operationError, recoveryErrors);
 			}
 			if (commitGuard && !commitGuard()) throw error;
-			if (actual !== body) {
+			if (!textMatchesLines(actual, body.lines)) {
 				recoveryErrors.push(new Error("Authoritative session repair did not match durable storage."));
 				throw this.#latchIndeterminate(operationError, recoveryErrors);
 			}
 		}
 		if (commitGuard && !commitGuard()) return;
-		this.#recordFullRewrite(body);
+		this.#recordFullRewrite(body.bytes);
 		if (!this.#storage.defersSyncPublish && this.#sessionFileRelocating) {
 			const identity = this.#relocationIdentity(target);
 			if (target === this.#sessionFileRelocating.source) {
@@ -1452,8 +1554,12 @@ export class SessionManager {
 	#lineFor(entry: FileEntry): string {
 		return `${stringifyJson(prepareEntryForPersistence(entry, this.#blobs)) ?? "null"}\n`;
 	}
-	#recordFullRewrite(body: string): void {
-		this.#expectedDiskSize = Buffer.byteLength(body, "utf8");
+	#recordDurableAppend(line: string): void {
+		this.#expectedDiskSize = (this.#expectedDiskSize ?? 0) + Buffer.byteLength(line, "utf8");
+	}
+
+	#recordFullRewrite(bytes: number): void {
+		this.#expectedDiskSize = bytes;
 	}
 
 	/**
@@ -1511,11 +1617,26 @@ export class SessionManager {
 		});
 	}
 
-	#fileBody(): string {
-		let body = this.#titleSlotLine();
-		body += this.#lineFor(this.#header);
-		for (const entry of this.#entries) body += this.#lineFor(entry);
-		return body;
+	/** Serialize the whole file — title slot, header, entries — as lines, stamped with the state they came from. */
+	#serializeBody(): SessionFileBody {
+		const titleLine = this.#titleSlotLine();
+		const headerLine = this.#lineFor(this.#header);
+		const entries = this.#entries;
+		const lines = [titleLine, headerLine];
+		let bytes = Buffer.byteLength(titleLine, "utf8") + Buffer.byteLength(headerLine, "utf8");
+		for (const entry of entries) {
+			const line = this.#lineFor(entry);
+			bytes += Buffer.byteLength(line, "utf8");
+			lines.push(line);
+		}
+		const stamp: SessionBodyStamp = {
+			entries,
+			entryCount: entries.length,
+			lastEntry: entries.at(-1),
+			revision: this.#bodyRevision,
+			prefix: titleLine + headerLine,
+		};
+		return { lines, bytes, stamp };
 	}
 
 	#historyContainsAssistantMessage(): boolean {
@@ -1580,7 +1701,7 @@ export class SessionManager {
 			let targetPath = this.#liveRelocationWritePath() ?? this.#sessionFile;
 			if (!targetPath) return;
 			if (this.#sessionOwnedElsewhere()) targetPath = this.#moveOffSessionFile("open-elsewhere");
-			let body = this.#fileBody();
+			let body = this.#serializeBody();
 			this.#diskEpoch++;
 			this.#diskTail = Promise.resolve();
 			this.#closeWriterEventually();
@@ -1592,20 +1713,22 @@ export class SessionManager {
 						: null
 					: this.#expectedDiskSize;
 				try {
-					this.#storage.writeTextSync(targetPath, body, {
+					const options = {
 						expectedSize,
 						expectedIdentity: this.#sessionFileRelocating
 							? targetPath === this.#sessionFileRelocating.dest
 								? this.#sessionFileRelocating.destIdentity
 								: this.#sessionFileRelocating.sourceIdentity
 							: undefined,
-					});
+					};
+					if (this.#storage.writeLinesSync) this.#storage.writeLinesSync(targetPath, body.lines, options);
+					else this.#storage.writeTextSync(targetPath, body.lines.join(""), options);
 					break;
 				} catch (err) {
 					const retryPath = this.#recoverFromWriteConflictSync(err, recoveries);
 					if (!retryPath) throw err;
 					targetPath = retryPath;
-					body = this.#fileBody();
+					body = this.#serializeBody();
 				}
 			}
 			this.#clearDiskError();
@@ -1615,11 +1738,18 @@ export class SessionManager {
 				// The local storage index is the provisional CAS token. Durable-size
 				// bookkeeping and current-state marking wait for confirmation.
 				const generation = ++this.#deferredPublishGen;
+				const { bytes, stamp } = body;
 				this.#confirmDeferredPublish(targetPath, generation, () => {
-					this.#recordFullRewrite(body);
-					if (this.#fileBody() !== body) {
-						// A confirmed body predates entries that raced this publish.
-						// Re-publish the complete transcript rather than marking it current.
+					if (generation !== this.#deferredPublishGen) return;
+					this.#recordFullRewrite(bytes);
+					const entries = this.#entries;
+					const bodyIsCurrent =
+						stamp.entries === entries &&
+						stamp.entryCount === entries.length &&
+						stamp.lastEntry === entries.at(-1) &&
+						stamp.revision === this.#bodyRevision &&
+						stamp.prefix === this.#titleSlotLine() + this.#lineFor(this.#header);
+					if (!bodyIsCurrent) {
 						this.#fileIsCurrent = false;
 						this.#rewriteRequired = true;
 						this.#rewriteSynchronously();
@@ -1634,7 +1764,7 @@ export class SessionManager {
 				});
 				return;
 			}
-			this.#recordFullRewrite(body);
+			this.#recordFullRewrite(body.bytes);
 			if (this.#expectedDiskSize !== null)
 				this.#sessionFileRelocating?.sourceSizesDuringCopy?.add(this.#expectedDiskSize);
 			if (this.#sessionFileRelocating) {
@@ -1698,7 +1828,7 @@ export class SessionManager {
 		if (this.#storage.defersSyncPublish) {
 			await this.#storage.drain();
 			if (this.#diskFailure) throw this.#diskFailure;
-			const bodySize = Buffer.byteLength(this.#fileBody(), "utf8");
+			const bodySize = this.#serializeBody().bytes;
 			if (
 				this.#storage.existsSync(this.#sessionFile) &&
 				this.#storage.statSync(this.#sessionFile).size === bodySize
@@ -1731,22 +1861,25 @@ export class SessionManager {
 				const sessionFile = this.#sessionFile;
 				if (!sessionFile) return false;
 				if (this.#diskEpoch !== epoch) return false;
-				const body = this.#fileBody();
+				const body = this.#serializeBody();
 				const expectedSize = this.#storage.defersSyncPublish
 					? this.#storage.existsSync(sessionFile)
 						? this.#storage.statSync(sessionFile).size
 						: null
 					: this.#expectedDiskSize;
+				const options = {
+					expectedSize,
+					expectedIdentity: this.#sessionFileRelocating
+						? sessionFile === this.#sessionFileRelocating.source
+							? this.#sessionFileRelocating.sourceIdentity
+							: this.#sessionFileRelocating.destIdentity
+						: undefined,
+					commitGuard: () => !this.#released && this.#diskEpoch === epoch,
+				};
 				try {
-					await this.#storage.writeTextAtomic(sessionFile, body, {
-						expectedSize,
-						expectedIdentity: this.#sessionFileRelocating
-							? sessionFile === this.#sessionFileRelocating.source
-								? this.#sessionFileRelocating.sourceIdentity
-								: this.#sessionFileRelocating.destIdentity
-							: undefined,
-						commitGuard: () => !this.#released && this.#diskEpoch === epoch,
-					});
+					await (this.#storage.writeLinesAtomic
+						? this.#storage.writeLinesAtomic(sessionFile, body.lines, options)
+						: this.#storage.writeTextAtomic(sessionFile, body.lines.join(""), options));
 				} catch (error) {
 					if (this.#released) throw error;
 					if (this.#diskEpoch !== epoch || this.#sessionFile !== sessionFile) return false;
@@ -1760,12 +1893,12 @@ export class SessionManager {
 					if (this.#diskEpoch !== epoch || this.#sessionFile !== sessionFile) return false;
 					try {
 						if (
-							(await this.#storage.readText(sessionFile)) === body &&
+							textMatchesLines(await this.#storage.readText(sessionFile), body.lines) &&
 							!this.#released &&
 							this.#diskEpoch === epoch &&
 							this.#sessionFile === sessionFile
 						) {
-							this.#recordFullRewrite(body);
+							this.#recordFullRewrite(body.bytes);
 							if (this.#sessionFileRelocating && !this.#storage.defersSyncPublish) {
 								const identity = this.#relocationIdentity(sessionFile);
 								if (sessionFile === this.#sessionFileRelocating.source) {
@@ -1786,7 +1919,7 @@ export class SessionManager {
 					throw error;
 				}
 				if (this.#released || this.#diskEpoch !== epoch || this.#sessionFile !== sessionFile) return false;
-				this.#recordFullRewrite(body);
+				this.#recordFullRewrite(body.bytes);
 				if (this.#sessionFileRelocating && !this.#storage.defersSyncPublish) {
 					const identity = this.#relocationIdentity(sessionFile);
 					if (sessionFile === this.#sessionFileRelocating.source) {
@@ -2836,7 +2969,7 @@ export class SessionManager {
 		});
 		await this.#pendingArtifactCopy?.done;
 		if (this.#diskFailure) throw this.#diskFailure;
-		const bodySize = Buffer.byteLength(this.#fileBody(), "utf8");
+		const bodySize = this.#serializeBody().bytes;
 		const publishedSize = this.#storage.existsSync(this.#sessionFile)
 			? this.#storage.statSync(this.#sessionFile).size
 			: null;
@@ -3451,6 +3584,9 @@ export class SessionManager {
 			timestamp: nowIso(),
 			message,
 		};
+		// The leaf is restored below, so the entry never joins the active branch;
+		// keep it out of any branch view already handed out.
+		this.#index.detachBranchView();
 		this.#recordEntry(entry);
 		this.#index.setLeaf(activeLeafId);
 		return entry.id;
@@ -3647,6 +3783,7 @@ export class SessionManager {
 	 * outputs). Use sparingly.
 	 */
 	async rewriteEntries(): Promise<void> {
+		this.#bodyRevision++;
 		if (!this.#persist || !this.#sessionFile) return;
 		await this.#rewriteAtomically();
 	}
@@ -3797,6 +3934,16 @@ export class SessionManager {
 	}
 
 	/**
+	 * The active-leaf branch (same entries as `getBranch()`) without the
+	 * defensive copy. The array is the manager's memo: never mutate it. It is
+	 * live — an entry appended to the current leaf is pushed onto it — so use
+	 * `getBranch()` when you need a snapshot that survives appends.
+	 */
+	getBranchView(): readonly SessionEntry[] {
+		return this.#index.branchView();
+	}
+
+	/**
 	 * Build the session context (LLM messages), or — with `{ transcript: true }` —
 	 * the full-history display transcript, from the current leaf path.
 	 */
@@ -3818,7 +3965,7 @@ export class SessionManager {
 			entry.message = sanitized;
 			changed = true;
 		}
-
+		if (changed) this.#bodyRevision++;
 		return changed;
 	}
 

@@ -23,13 +23,15 @@ class TestCallbackFlow extends OAuthCallbackFlow {
 }
 
 /** Whether this host can bind the IPv6 loopback at all. */
-const ipv6Loopback = (() => {
+const ipv6Loopback = await (async () => {
+	let probe: Bun.Server<unknown>;
 	try {
-		Bun.serve({ hostname: "::1", port: 0, fetch: () => new Response("probe") }).stop(true);
-		return true;
+		probe = Bun.serve({ hostname: "::1", port: 0, fetch: () => new Response("probe") });
 	} catch {
 		return false;
 	}
+	await probe.stop(true);
+	return true;
 })();
 
 /**
@@ -37,21 +39,21 @@ const ipv6Loopback = (() => {
  * process holding that exact loopback address. The squatter answers 500 so a
  * response from it is unmistakable in an assertion.
  */
-function occupy(hostname: string): { port: number; release: () => void } {
+async function occupy(hostname: string): Promise<{ port: number; release: () => Promise<void> }> {
 	const server = Bun.serve({ hostname, port: 0, fetch: () => new Response("squatter", { status: 500 }) });
 	const port = server.port;
 	if (typeof port !== "number") {
-		server.stop(true);
+		await server.stop(true);
 		throw new Error("Bun.serve({ port: 0 }) did not assign a numeric port");
 	}
 	return { port, release: () => server.stop(true) };
 }
 
 /** Claim and immediately release a port, so a test can pin a known-free one. */
-function freeLoopbackPort(): number {
+async function freeLoopbackPort(): Promise<number> {
 	const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("probe") });
 	const port = probe.port;
-	probe.stop(true);
+	await probe.stop(true);
 	if (typeof port !== "number") {
 		throw new Error("Bun.serve({ port: 0 }) did not assign a numeric port");
 	}
@@ -64,7 +66,7 @@ afterEach(() => {
 
 describe("OAuthCallbackFlow loopback address families", () => {
 	it.skipIf(!ipv6Loopback)("falls back when the IPv6 loopback address itself is taken", async () => {
-		const squatter = occupy("::1");
+		const squatter = await occupy("::1");
 		const progress: string[] = [];
 		// Cancel as soon as the flow publishes its redirect URI: the port it
 		// advertised is the whole assertion, and aborting on that signal keeps this
@@ -87,7 +89,7 @@ describe("OAuthCallbackFlow loopback address families", () => {
 			expect(flow.lastRedirectUri).not.toContain(`:${squatter.port}/`);
 			expect(progress.some(msg => msg.startsWith(`Preferred port ${squatter.port} unavailable`))).toBe(true);
 		} finally {
-			squatter.release();
+			await squatter.release();
 		}
 	});
 
@@ -100,7 +102,7 @@ describe("OAuthCallbackFlow loopback address families", () => {
 			return realServe(options as Parameters<typeof Bun.serve>[0]);
 		}) as typeof Bun.serve);
 
-		const port = freeLoopbackPort();
+		const port = await freeLoopbackPort();
 		const progress: string[] = [];
 		const cancel = new AbortController();
 		const flow = new TestCallbackFlow(
@@ -147,7 +149,7 @@ describe("OAuthCallbackFlow loopback address families", () => {
 			return realServe(options as Parameters<typeof Bun.serve>[0]);
 		}) as typeof Bun.serve);
 
-		const port = freeLoopbackPort();
+		const port = await freeLoopbackPort();
 		const progress: string[] = [];
 		const cancel = new AbortController();
 		const flow = new TestCallbackFlow(
