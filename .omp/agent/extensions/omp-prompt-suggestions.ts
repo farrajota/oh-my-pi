@@ -11,7 +11,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
-import { completeSimple, type AssistantMessage, type Effort, type Message, type Model } from "@oh-my-pi/pi-ai";
+import { completeSimple, Effort, type ApiKey, type AssistantMessage, type Message, type Model, type SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { Key, matchesKey, truncateToWidth, type AutocompleteProvider, type EditorTheme, type TUI } from "@oh-my-pi/pi-tui";
 
 const WIDGET_KEY = "next-prompt-suggestion";
@@ -68,7 +68,15 @@ let cachedSuggestion: string | undefined;
 let visibleSuggestion: string | undefined;
 let suggestionHiddenByUserEdit = false;
 let generationId = 0;
-let lastCtx: ExtensionContext | undefined;
+type SuggestionContext = Pick<ExtensionContext, "cwd" | "hasUI" | "hasPendingMessages" | "model" | "models"> & {
+	modelRegistry: {
+		getApiKey: (model: Model) => Promise<string | undefined>;
+		resolver: (model: Model) => ApiKey;
+	};
+	ui: Pick<ExtensionContext["ui"], "getEditorText" | "notify" | "setEditorComponent" | "setStatus" | "setWidget">;
+};
+
+let lastCtx: SuggestionContext | undefined;
 let currentConfig: PromptSuggestionsConfig = mergeConfigInputs();
 let currentEditor: SuggestionEditor | undefined;
 
@@ -78,14 +86,14 @@ class SuggestionEditor extends CustomEditor {
 	}
 
 	requestRender(): void {
-		this.tui.requestRender(true);
+		this.tui?.requestRender(true);
 	}
 
-	setAutocompleteProvider(provider: AutocompleteProvider): void {
+	override setAutocompleteProvider(provider: AutocompleteProvider): void {
 		super.setAutocompleteProvider(wrapSuggestionAutocompleteProvider(provider));
 	}
 
-	handleInput(data: string): void {
+	override handleInput(data: string): void {
 		if (!isPromptSuggestionsEnabled()) {
 			super.handleInput(data);
 			return;
@@ -112,7 +120,7 @@ class SuggestionEditor extends CustomEditor {
 	}
 }
 
-export default function ompPromptSuggestions(pi: ExtensionAPI): void {
+export default function ompPromptSuggestions(pi: Pick<ExtensionAPI, "on" | "setLabel">): void {
 	pi.setLabel("OMP prompt suggestions");
 
 	pi.on("session_start", (_event, ctx) => {
@@ -260,16 +268,16 @@ function renderSuggestion(ctx = lastCtx): void {
 
 
 
-function getSuggestionReasoningEffort(model: Model<any>): Effort | undefined {
+function getSuggestionReasoningEffort(model: Model): Effort | undefined {
 	if (!model.reasoning) return undefined;
 	const efforts = model.thinking?.efforts;
-	if (Array.isArray(efforts) && efforts.length > 0) return efforts.includes("minimal" as Effort) ? ("minimal" as Effort) : efforts[0];
-	return "minimal" as Effort;
+	if (efforts && efforts.length > 0) return efforts.includes(Effort.Minimal) ? Effort.Minimal : efforts[0];
+	return Effort.Minimal;
 }
 async function generateSuggestion(
 	messages: AgentEndEvent["messages"],
-	ctx: ExtensionContext,
-	model: Model<any>,
+	ctx: SuggestionContext,
+	model: Model,
 	config: PromptSuggestionsConfig,
 ): Promise<string> {
 	const apiKey = await ctx.modelRegistry.getApiKey(model);
@@ -281,7 +289,7 @@ async function generateSuggestion(
 	const llmMessages = convertToLlm(messages);
 	const context = buildSuggestionContext(llmMessages);
 	debug(ctx, `context: ${JSON.stringify(truncatePlain(context, 240))}`);
-	const options = {
+	const options: SimpleStreamOptions = {
 		apiKey: ctx.modelRegistry.resolver(model),
 		maxTokens: config.maxTokens,
 		reasoning: getSuggestionReasoningEffort(model),
@@ -290,7 +298,7 @@ async function generateSuggestion(
 	const response = await completeSimple(
 		model,
 		{
-			systemPrompt: loadSuggestionSystemPrompt(ctx.cwd, (message) => debug(ctx, message)),
+			systemPrompt: [loadSuggestionSystemPrompt(ctx.cwd, (message) => debug(ctx, message))],
 			messages: [
 				{
 					role: "user",
@@ -306,9 +314,6 @@ async function generateSuggestion(
 		ctx,
 		`response: ${response.stopReason}; ${response.content.map((part) => part.type).join(",")}; ${response.errorMessage ?? ""}`,
 	);
-	if (response.diagnostics?.length) {
-		debug(ctx, `diagnostics: ${JSON.stringify(response.diagnostics).slice(0, 500)}`);
-	}
 	return extractAssistantText(response);
 }
 
@@ -622,7 +627,7 @@ function normalizeSuggestionModelSpec(spec: string): string {
 	return PROMPT_SUGGESTION_MODEL_ROLE_ALIASES[trimmed] ?? trimmed;
 }
 
-function resolveSuggestionModel(ctx: ExtensionContext, configuredModel: string | undefined): Model<any> | undefined {
+function resolveSuggestionModel(ctx: SuggestionContext, configuredModel: string | undefined): Model | undefined {
 	if (!configuredModel) return ctx.model;
 	const modelSpec = normalizeSuggestionModelSpec(configuredModel);
 	const model = ctx.models.resolve(modelSpec);
@@ -657,7 +662,7 @@ function isPositiveInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 
-function debug(ctx: ExtensionContext, message: string): void {
+function debug(ctx: SuggestionContext, message: string): void {
 	if (process.env.PI_PROMPT_SUGGESTIONS_DEBUG !== "1") return;
 	ctx.ui.setStatus("next-suggestion", `suggestion: ${message}`);
 	ctx.ui.notify(`next-suggestion: ${message}`, "info");

@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- Updated the fork prompt-suggestions extension and its existing fixtures to current typed message, effort, credential resolver, editor, and model-query APIs while preserving suggestion rendering and Tab acceptance without submission.
 - Fixed revived SDK children resolving credentials through the parent's affinity-copy identity instead of their own provider session, preserving warm transcript pins, explicit-parent precedence, and account-pool restrictions.
 - Fixed browser open timeout diagnostics losing acquisition-stage context, sibling tabs redirecting downloads, and renderer crashes leaving worker calls pending after startup.
 - Fixed internal-URL grep hiding late matches after multibyte and astral Unicode prefixes by retaining native character columns while clipping output in UTF-8 bytes.

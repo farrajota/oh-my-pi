@@ -2,26 +2,80 @@ import { describe, expect, mock, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Context, Message, Model, SimpleStreamOptions, UserMessage } from "@oh-my-pi/pi-ai";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { AutocompleteItem, EditorTheme } from "@oh-my-pi/pi-tui";
 
 const testAgentDir = join(tmpdir(), `omp-prompt-suggestions-${process.pid}`);
 mkdirSync(join(testAgentDir, "extensions"), { recursive: true });
 
 const settingsValues = new Map<string, unknown>();
 const settingsGetMock = mock((path: string) => settingsValues.get(path));
-const completeSimpleMock = mock(async () => ({
-	stopReason: "stop",
+const completeSimpleMock = mock(async (_model: Model, _context: Context, _options?: SimpleStreamOptions): Promise<AssistantMessage> => ({
+	role: "assistant",
 	content: [{ type: "text", text: "run the tests" }],
+	api: "openai-completions",
+	provider: "openai",
+	model: "test-model",
+	usage: {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	},
+	stopReason: "stop",
+	timestamp: 0,
 }));
 
 const visibleWidth = (text: string) => text.replace(/\u001b\[[0-9;]*m/g, "").length;
 
+function createTestModel(id: string, reasoning = false, efforts?: readonly Effort[]): Model {
+	return buildModel({
+		id,
+		name: id,
+		api: "openai-completions",
+		provider: "openai",
+		baseUrl: "https://api.openai.com/v1",
+		reasoning,
+		thinking: efforts ? { mode: "effort", efforts } : undefined,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 32_000,
+	});
+}
+
+function createAssistantMessage(content: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: content }],
+		api: "openai-completions",
+		provider: "openai",
+		model: "test-model",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: 0,
+	};
+}
+
 interface AutocompleteProviderMock {
-	getSuggestions: (lines: string[], cursorLine: number, cursorCol: number) => unknown;
+	getSuggestions: (lines: string[], cursorLine: number, cursorCol: number) => Promise<{ items: AutocompleteItem[]; prefix: string } | null>;
 	applyCompletion: (
 		lines: string[],
 		cursorLine: number,
 		cursorCol: number,
-		item: unknown,
+		item: AutocompleteItem,
 		prefix: string,
 	) => { lines: string[]; cursorLine: number; cursorCol: number };
 	getInlineHint?: (lines: string[], cursorLine: number, cursorCol: number) => string | null | undefined;
@@ -50,7 +104,7 @@ mock.module("@oh-my-pi/pi-coding-agent", () => ({
 		protected tui: { requestRender: (force?: boolean) => void };
 		private value = "";
 		private autocompleteProvider?: AutocompleteProviderMock;
-		constructor(tui: { requestRender: (force?: boolean) => void }, private theme: any) {
+		constructor(tui: { requestRender: (force?: boolean) => void }, private theme: EditorTheme) {
 			this.tui = tui;
 		}
 
@@ -91,7 +145,7 @@ mock.module("@oh-my-pi/pi-coding-agent", () => ({
 	},
 	cfgPromptSuggestionsEnabled: { get: () => settingsGetMock("promptSuggestions.enabled") },
 	cfgPromptSuggestionsModel: { get: () => settingsGetMock("promptSuggestions.model") },
-	convertToLlm: (messages: unknown[]) => messages,
+	convertToLlm: (messages: Message[]): Message[] => messages,
 	getAgentDir: () => testAgentDir,
 	settings: {},
 }));
@@ -145,16 +199,16 @@ function createHarness(options: { cwd?: string; editorTheme?: unknown } = {}) {
 		cwd: options.cwd ?? "/workspace",
 		hasUI: true,
 		hasPendingMessages: mock(() => false),
-		model: { provider: "test", id: "model", reasoning: false },
+		model: createTestModel("model"),
 		models: {
-			resolve: mock(() => undefined),
-			list: mock(() => []),
-			current: mock(() => undefined),
-			family: mock(() => undefined),
+			resolve: mock((_spec: string): Model | undefined => undefined),
+			list: mock((): Model[] => []),
+			current: mock((): Model | undefined => undefined),
+			family: mock((_model: Model): string => "test-family"),
 		},
 		modelRegistry: {
-			getApiKey: mock(async () => "test"),
-			resolver: mock(() => "test-resolver"),
+			getApiKey: mock(async (_model: Model) => "test"),
+			resolver: mock((_model: Model) => "test-resolver"),
 		},
 		ui: {
 			setEditorComponent: mock((factory?: Function) => {
@@ -171,14 +225,16 @@ function createHarness(options: { cwd?: string; editorTheme?: unknown } = {}) {
 			notify: mock(() => {}),
 		},
 	};
-	const fakePi = {
+	const fakePi: Pick<ExtensionAPI, "on" | "setLabel"> = {
 		setLabel: mock(() => {}),
-		on: mock((event: string, handler: Function) => handlers.set(event, handler)),
+		on(event: string, handler: Function): void {
+			handlers.set(event, handler);
+		},
 	};
-	ompPromptSuggestions(fakePi as never);
+	ompPromptSuggestions(fakePi);
 	handlers.get("session_start")?.({}, ctx);
 	editor?.setAutocompleteProvider({
-		getSuggestions: () => null,
+		getSuggestions: async () => ({ items: [], prefix: "" }),
 		applyCompletion: (lines: string[], cursorLine: number, cursorCol: number) => ({ lines, cursorLine, cursorCol }),
 	});
 	return { ctx, editor: () => editor!, fakePi, handlers, requestRender, submit, widgets };
@@ -188,12 +244,14 @@ describe("omp prompt suggestions", () => {
 	test("default export registers OMP extension handlers", () => {
 		resetTestState();
 		const handlers: string[] = [];
-		const fakePi = {
+		const fakePi: Pick<ExtensionAPI, "on" | "setLabel"> = {
 			setLabel: mock(() => {}),
-			on: mock((event: string) => handlers.push(event)),
+			on(event: string): void {
+				handlers.push(event);
+			},
 		};
 
-		ompPromptSuggestions(fakePi as never);
+		ompPromptSuggestions(fakePi);
 
 		expect(fakePi.setLabel).toHaveBeenCalledWith("OMP prompt suggestions");
 		expect(handlers.sort()).toEqual(["agent_end", "agent_start", "input", "session_shutdown", "session_start"].sort());
@@ -231,11 +289,11 @@ describe("omp prompt suggestions", () => {
 
 	test("agent_end resolves configured role model through ctx models", async () => {
 		const harness = createHarness();
-		const slowModel = { provider: "test", id: "slow", reasoning: false };
+		const slowModel = createTestModel("slow");
 		settingsValues.set("promptSuggestions.model", "slow");
 		harness.ctx.models.resolve.mockImplementation((spec: string) => (spec === "pi/slow" ? slowModel : undefined));
 
-		await harness.handlers.get("agent_end")?.({ messages: [{ role: "assistant", content: "done" }] }, harness.ctx);
+		await harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
 
 		expect(harness.ctx.models.resolve).toHaveBeenCalledWith("pi/slow");
 		expect(completeSimpleMock.mock.calls[0]?.[0]).toBe(slowModel);
@@ -243,13 +301,13 @@ describe("omp prompt suggestions", () => {
 
 	test("agent_end authenticates suggestions through model registry resolver", async () => {
 		const harness = createHarness();
-		const selectedModel = { provider: "cliproxy-codex", id: "gpt-5.4-mini", reasoning: false };
+		const selectedModel = createTestModel("gpt-5.4-mini");
 		settingsValues.set("promptSuggestions.model", "cliproxy-codex/gpt-5.4-mini");
 		harness.ctx.models.resolve.mockImplementation((spec: string) =>
 			spec === "cliproxy-codex/gpt-5.4-mini" ? selectedModel : undefined,
 		);
 
-		await harness.handlers.get("agent_end")?.({ messages: [{ role: "assistant", content: "done" }] }, harness.ctx);
+		await harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
 
 		expect(harness.ctx.models.resolve).toHaveBeenCalledWith("cliproxy-codex/gpt-5.4-mini");
 		expect(harness.ctx.modelRegistry.getApiKey).toHaveBeenCalledWith(selectedModel);
@@ -259,21 +317,16 @@ describe("omp prompt suggestions", () => {
 
 	test("agent_end uses the lowest supported reasoning effort for suggestion model", async () => {
 		const harness = createHarness();
-		const selectedModel = {
-			provider: "cliproxy-codex",
-			id: "gpt-5.4-mini",
-			reasoning: true,
-			thinking: { mode: "anthropic-adaptive", efforts: ["low", "medium", "high", "xhigh"] },
-		};
+		const selectedModel = createTestModel("gpt-5.4-mini", true, [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh]);
 		settingsValues.set("promptSuggestions.model", "cliproxy-codex/gpt-5.4-mini");
 		harness.ctx.models.resolve.mockImplementation((spec: string) =>
 			spec === "cliproxy-codex/gpt-5.4-mini" ? selectedModel : undefined,
 		);
 
-		await harness.handlers.get("agent_end")?.({ messages: [{ role: "assistant", content: "done" }] }, harness.ctx);
+		await harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
 
-		expect(__test__.getSuggestionReasoningEffort(selectedModel)).toBe("low");
-		expect(completeSimpleMock.mock.calls[0]?.[2]?.reasoning).toBe("low");
+		expect(__test__.getSuggestionReasoningEffort(selectedModel)).toBe(Effort.Low);
+		expect(completeSimpleMock.mock.calls[0]?.[2]?.reasoning).toBe(Effort.Low);
 	});
 
 	test("agent_end falls back to session model when configured model cannot resolve", async () => {
@@ -281,7 +334,7 @@ describe("omp prompt suggestions", () => {
 		settingsValues.set("promptSuggestions.model", "missing-role");
 		harness.ctx.models.resolve.mockImplementation(() => undefined);
 
-		await harness.handlers.get("agent_end")?.({ messages: [{ role: "assistant", content: "done" }] }, harness.ctx);
+		await harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
 
 		expect(harness.ctx.models.resolve).toHaveBeenCalledWith("missing-role");
 		expect(completeSimpleMock.mock.calls[0]?.[0]).toBe(harness.ctx.model);
@@ -425,9 +478,13 @@ describe("omp prompt suggestions", () => {
 
 	test("context uses last eight messages", () => {
 		resetTestState();
-		const messages = Array.from({ length: 10 }, (_value, index) => ({ role: "user", content: `message ${index}` }));
-		const context = __test__.buildSuggestionContext(messages);
+		const messages: UserMessage[] = Array.from({ length: 10 }, (_value, index) => ({
+			role: "user",
+			content: `message ${index}`,
+			timestamp: index,
+		}));
 
+		const context = __test__.buildSuggestionContext(messages);
 		expect(context).not.toContain("message 0");
 		expect(context).not.toContain("message 1");
 		for (let index = 2; index < 10; index++) expect(context).toContain(`message ${index}`);
