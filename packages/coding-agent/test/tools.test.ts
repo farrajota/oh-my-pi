@@ -536,6 +536,7 @@ function createTestToolContext(toolNames: string[]): AgentToolContext {
 			find: () => undefined,
 			getAll: () => [],
 			getApiKey: async () => undefined,
+			fitContextWindow: <T>(model: T) => model,
 		} as unknown as AgentToolContext["modelRegistry"],
 		model: undefined,
 		isIdle: () => true,
@@ -563,6 +564,7 @@ function createAuthorityModelRegistry() {
 		refreshSelectedModelMetadata: async <T>(model: T) => model,
 		find: () => undefined,
 		getApiKey: async () => undefined,
+		fitContextWindow: <T>(model: T) => model,
 	};
 }
 
@@ -710,6 +712,22 @@ describe("Coding Agent Tools", () => {
 			expect(output).not.toContain(wideLine); // verbatim wide line is gone
 			expect(output).toContain("…"); // ellipsis marker
 			expect(output).toContain("Some lines truncated to 768 chars");
+		});
+
+		it("names a raw selector per cut line that returns it whole", async () => {
+			const wideLine = "w".repeat(1500);
+			const testFile = path.join(testDir, "wide-hint.txt");
+			fs.writeFileSync(testFile, `one\n${wideLine}\nthree\n${wideLine}z\nfive`);
+
+			const output = getTextOutput(await readTool.execute("test-call-column-hint", { path: testFile }));
+			expect(output).toContain(
+				"Some lines truncated to 768 chars. Use :raw:2-2 to read line 2 whole; cut lines run to line 4, each read the same way",
+			);
+
+			const line2 = await readTool.execute("test-call-column-hint-raw-2", { path: `${testFile}:raw:2-2` });
+			const line4 = await readTool.execute("test-call-column-hint-raw-4", { path: `${testFile}:raw:4-4` });
+			expect(getTextOutput(line2).split("\n")[0]).toBe(wideLine);
+			expect(getTextOutput(line4).split("\n")[0]).toBe(`${wideLine}z`);
 		});
 
 		it("returns wide lines verbatim with the :raw selector", async () => {

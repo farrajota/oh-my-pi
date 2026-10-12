@@ -10,8 +10,14 @@ import type {
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as mcpConfig from "@oh-my-pi/pi-coding-agent/mcp/config-writer";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins";
 import { MarketplaceManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace";
+import type {
+	AsyncJobSnapshot,
+	AsyncJobSnapshotOptions,
+	BackgroundControlResult,
+} from "@oh-my-pi/pi-coding-agent/async";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionDumpArchive } from "@oh-my-pi/pi-coding-agent/session/session-dump-format";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -32,6 +38,7 @@ interface FakeAcpBuiltinSession {
 	sessionId: string;
 	sessionName: string;
 	titleGenerationSignal: AbortSignal;
+	renameTitle(title?: string): Promise<string | null | undefined>;
 	_todoPhases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	_switchedTo: string | undefined;
 	_movedFromEmptySessionFile: string | undefined;
@@ -41,7 +48,8 @@ interface FakeAcpBuiltinSession {
 	isUltrafastModeEnabled(): boolean;
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
-	getAsyncJobSnapshot: (opts?: { recentLimit?: number }) => { running: unknown[]; recent: unknown[] } | null;
+	getAsyncJobSnapshot: (opts?: AsyncJobSnapshotOptions) => AsyncJobSnapshot | null;
+	cancelAsyncJob: (id: string) => Promise<BackgroundControlResult>;
 	formatSessionAsText: () => string;
 	dumpLlmRequestToTmpDir: () => Promise<string | undefined>;
 	dumpSessionArchiveToTmpDir: () => Promise<SessionDumpArchive | undefined>;
@@ -94,6 +102,10 @@ function createRuntime() {
 		sessionId: "fake-session-id",
 		sessionName: "Fake Session",
 		titleGenerationSignal: new AbortController().signal,
+		// A typed title passes through uncarded; a bare /rename has nothing to generate from.
+		async renameTitle(title?: string) {
+			return title || null;
+		},
 		_todoPhases: [],
 		_switchedTo: undefined,
 		_movedFromEmptySessionFile: undefined,
@@ -165,6 +177,11 @@ function createRuntime() {
 		async applyMemoryBackend() {},
 		async settleMemoryBackend() {},
 		getAsyncJobSnapshot: () => null,
+		cancelAsyncJob: async (id: string) => ({
+			id,
+			status: "not_found",
+			message: "Background job not found.",
+		}),
 		formatSessionAsText: () => "",
 		dumpLlmRequestToTmpDir: async () => undefined,
 		dumpSessionArchiveToTmpDir: async () => undefined,
@@ -664,7 +681,60 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).not.toContain(command);
 		expect(output[1]).toContain(command);
 		expect(output[1]).toContain("build done");
-		expect(output[2]).toContain("Usage: /jobs [full]");
+		expect(output[2]).toContain("Usage: /jobs [full|kill <id>|kill all]");
+	});
+
+	it("jobs kill: collapses tabs/newlines and bounds the echoed id", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.session.getAsyncJobSnapshot = () => ({
+			running: [],
+			recent: [],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+		});
+
+		await executeAcpBuiltinSlashCommand(`/jobs kill "a\tb\nc${"x".repeat(200)}"`, runtime);
+
+		const line = output[0] as string;
+		expect(line).not.toMatch(/[\t\n]/);
+		expect(line).toContain("a b c");
+		expect(line).not.toContain("x".repeat(70));
+	});
+
+	it("jobs kill <id>: cancels the running job and reports it", async () => {
+		const { output, runtime } = createRuntime();
+		const cancelled: string[] = [];
+		runtime.session.getAsyncJobSnapshot = () => ({
+			running: [
+				{
+					id: "j1",
+					type: "bash",
+					status: "running",
+					queued: false,
+					label: "npm install",
+					startTime: Date.now(),
+				},
+			],
+			recent: [],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+		});
+		runtime.session.cancelAsyncJob = async (id: string) => {
+			cancelled.push(id);
+			return { id, status: "cancelled", message: "Background job cancelled." };
+		};
+
+		const result = await executeAcpBuiltinSlashCommand("/jobs kill j1", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(cancelled).toEqual(["j1"]);
+		expect(output[0]).toContain("Cancelled background job j1");
+	});
+
+	it("jobs kill: missing id prints usage", async () => {
+		const { output, runtime } = createRuntime();
+
+		await executeAcpBuiltinSlashCommand("/jobs kill", runtime);
+
+		expect(output[0]).toBe("Usage: /jobs kill <id>|all");
 	});
 
 	it("jobs full: strips control sequences and fences the command", async () => {
@@ -746,7 +816,7 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("  subagents/Scout.md");
 		expect(output[0]).toContain("Subagent transcripts unavailable: EACCES: permission denied");
 		expect(output[1]).toBe("Session content here");
-		expect(output[2]).toContain("Usage: /dump [all]");
+		expect(output[2]).toContain("Usage: /dump [all|anon]");
 	});
 
 	// /model
@@ -1433,11 +1503,17 @@ describe("wave 4 commands", () => {
 	});
 
 	it("/mcp resources: outputs server list or no-server message", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/mcp resources", runtime);
-		expect(result).toEqual({ consumed: true });
-		// No servers configured in tmp project dir — should report that
-		expect(output[0]).toMatch(/No MCP servers configured|No resources/);
+		// Both user and project discovery must see this fixture's empty configuration.
+		const readConfig = spyOn(mcpConfig, "readMCPConfigFile").mockResolvedValue({ mcpServers: {} });
+		try {
+			const { output, runtime } = createRuntime();
+			const result = await executeAcpBuiltinSlashCommand("/mcp resources", runtime);
+			expect(result).toEqual({ consumed: true });
+			expect(output[0]).toMatch(/No MCP servers configured|No resources/);
+			expect(readConfig).toHaveBeenCalledTimes(2);
+		} finally {
+			readConfig.mockRestore();
+		}
 	});
 
 	it("/mcp unknown-verb: returns usage pointing to help", async () => {

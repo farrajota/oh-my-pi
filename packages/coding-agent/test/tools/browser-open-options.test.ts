@@ -1,16 +1,19 @@
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it, spyOn } from "bun:test";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { applyIgnoreHttpsErrors, resolveInitScriptSources } from "@oh-my-pi/pi-coding-agent/tools/browser/open-options";
+import { DownloadManager } from "@oh-my-pi/pi-coding-agent/tools/browser/downloads";
 import { buildHeadlessLaunchArgs } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { getTab, releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
-import type { Page } from "puppeteer-core";
+import type { Browser, Page } from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
@@ -92,6 +95,209 @@ describe("browser open options CDP helpers", () => {
 			"globalThis.inline = true;",
 		]);
 	});
+
+	async function fakeDownloads(
+		send: (method: string, params: unknown) => Promise<unknown> = async () => undefined,
+		perTab = true,
+	) {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-download-test-"));
+		const elsewhere = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-download-test-"));
+		tempDirs.push(directory, elsewhere);
+		const listeners = new Map<string, (event: unknown) => void>();
+		const session = {
+			on: (event: string, listener: (event: unknown) => void) => listeners.set(event, listener),
+			off: () => undefined,
+			send,
+			detach: async () => undefined,
+		};
+		const browser = {
+			target: () => ({ createCDPSession: async () => session }),
+			wsEndpoint: () => "ws://browser-download-test",
+		} as unknown as Browser;
+		const page = { frames: () => [{ _id: "frame" }], browserContext: () => ({}) } as unknown as Page;
+		const downloads = new DownloadManager(browser, page, "tab", { perTab });
+		const complete = async (
+			guid: unknown,
+			filePath: string | undefined,
+			suggestedFilename: unknown = "../../report.txt",
+		) => {
+			await downloads.enable(directory);
+			const waiting = downloads.wait();
+			await downloads.arming;
+			const started = { guid, url: "https://example.com/", suggestedFilename, frameId: "frame" };
+			listeners.get("Browser.downloadWillBegin")!(started);
+			listeners.get("Browser.downloadProgress")!({ guid, state: "completed", receivedBytes: 5, filePath });
+			return (await waiting).path;
+		};
+		return { directory, elsewhere, downloads, complete };
+	}
+
+	it("moves only a file saved under its download GUID, under the last segment of the suggested name", async () => {
+		const { directory, elsewhere, complete } = await fakeDownloads();
+
+		const unrelated = path.join(elsewhere, "notes.txt");
+		await Bun.write(unrelated, "notes");
+		expect(await complete(crypto.randomUUID(), unrelated)).toBe(unrelated);
+		expect(await Bun.file(unrelated).text()).toBe("notes");
+
+		const guid = crypto.randomUUID();
+		const saved = path.join(elsewhere, guid);
+		await Bun.write(saved, "bytes");
+		expect(await complete(guid, saved)).toBe(path.join(directory, "report.txt"));
+		expect(await Bun.file(path.join(directory, "report.txt")).text()).toBe("bytes");
+		expect(await Bun.file(saved).exists()).toBe(false);
+	});
+
+	it("leaves a file in place when the peer names it by a GUID that is not a UUID", async () => {
+		const { directory, elsewhere, complete } = await fakeDownloads();
+		const key = path.join(elsewhere, "id_ed25519");
+		await Bun.write(key, "private key");
+
+		expect(await complete("id_ed25519", key)).toBe(key);
+		expect(await Bun.file(key).text()).toBe("private key");
+		expect(await Bun.file(path.join(directory, "report.txt")).exists()).toBe(false);
+	});
+
+	it("leaves a symlink named by a UUID GUID in place", async () => {
+		const { directory, elsewhere, complete } = await fakeDownloads();
+		const guid = crypto.randomUUID();
+		const link = path.join(elsewhere, guid);
+		await Bun.write(path.join(elsewhere, "notes.txt"), "notes");
+		await fs.symlink(path.join(elsewhere, "notes.txt"), link);
+
+		expect(await complete(guid, link)).toBe(link);
+		expect(await fs.readlink(link)).toBe(path.join(elsewhere, "notes.txt"));
+		expect(await Bun.file(path.join(directory, "report.txt")).exists()).toBe(false);
+	});
+
+	it("leaves a directory named by a UUID GUID in place", async () => {
+		const { directory, elsewhere, complete } = await fakeDownloads();
+		const guid = crypto.randomUUID();
+		const folder = path.join(elsewhere, guid);
+		await Bun.write(path.join(folder, "notes.txt"), "notes");
+
+		expect(await complete(guid, folder)).toBe(folder);
+		expect(await Bun.file(path.join(folder, "notes.txt")).text()).toBe("notes");
+		expect(await Bun.file(path.join(directory, "report.txt")).exists()).toBe(false);
+	});
+
+	it("keeps a directory named like the download when the rename takes the Windows replacement path", async () => {
+		const { directory, elsewhere, complete } = await fakeDownloads();
+		const guid = crypto.randomUUID();
+		const saved = path.join(elsewhere, guid);
+		await Bun.write(saved, "bytes");
+		await Bun.write(path.join(directory, "report.txt", "notes.txt"), "notes");
+		const rename = spyOn(nodeFs.promises, "rename").mockImplementationOnce(async () => {
+			throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+		});
+		try {
+			expect(await complete(guid, saved)).toBe(saved);
+		} finally {
+			rename.mockRestore();
+		}
+		expect(await Bun.file(path.join(directory, "report.txt", "notes.txt")).text()).toBe("notes");
+		expect(await Bun.file(saved).text()).toBe("bytes");
+	});
+
+	it("keeps the same-named file when a cross-device move fails to copy", async () => {
+		const { directory, elsewhere, complete } = await fakeDownloads();
+		const guid = crypto.randomUUID();
+		const saved = path.join(elsewhere, guid);
+		await Bun.write(saved, "bytes");
+		await Bun.write(path.join(directory, "report.txt"), "earlier report");
+		const rename = spyOn(nodeFs.promises, "rename").mockImplementationOnce(async () => {
+			throw Object.assign(new Error("cross-device link not permitted"), { code: "EXDEV" });
+		});
+		const copyFile = spyOn(nodeFs.promises, "copyFile").mockImplementationOnce(async () => {
+			throw Object.assign(new Error("i/o error"), { code: "EIO" });
+		});
+		try {
+			expect(await complete(guid, saved)).toBe(saved);
+		} finally {
+			rename.mockRestore();
+			copyFile.mockRestore();
+		}
+		expect(await Bun.file(path.join(directory, "report.txt")).text()).toBe("earlier report");
+		expect(await fs.readdir(directory)).toEqual(["report.txt"]);
+	});
+
+	it("reports the moved file when a cross-device move cannot remove the source", async () => {
+		const { directory, elsewhere, complete } = await fakeDownloads();
+		const guid = crypto.randomUUID();
+		const saved = path.join(elsewhere, guid);
+		await Bun.write(saved, "bytes");
+		await Bun.write(path.join(directory, "report.txt"), "earlier report");
+		const rename = spyOn(nodeFs.promises, "rename").mockImplementationOnce(async () => {
+			throw Object.assign(new Error("cross-device link not permitted"), { code: "EXDEV" });
+		});
+		const unlink = spyOn(nodeFs.promises, "unlink").mockImplementationOnce(async () => {
+			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+		});
+		try {
+			expect(await complete(guid, saved)).toBe(path.join(directory, "report.txt"));
+		} finally {
+			rename.mockRestore();
+			unlink.mockRestore();
+		}
+		expect(await Bun.file(path.join(directory, "report.txt")).text()).toBe("bytes");
+		expect(await fs.readdir(directory)).toEqual(["report.txt"]);
+	});
+
+	it("keeps real file names and leaves files in place in a browser the user drives", async () => {
+		const behaviors: unknown[] = [];
+		const { elsewhere, complete } = await fakeDownloads(async (method, params) => {
+			if (method === "Browser.setDownloadBehavior") behaviors.push(params);
+		}, false);
+		const guid = crypto.randomUUID();
+		const saved = path.join(elsewhere, "report.txt");
+		await Bun.write(saved, "bytes");
+
+		expect(await complete(guid, saved)).toBe(saved);
+		expect(await Bun.file(saved).text()).toBe("bytes");
+		expect(behaviors.length).toBeGreaterThan(0);
+		for (const params of behaviors) expect(params).toMatchObject({ behavior: "allow" });
+	});
+
+	it("reports a download whose suggested name is not a string where Chromium saved it", async () => {
+		const { elsewhere, complete } = await fakeDownloads();
+		const guid = crypto.randomUUID();
+		const saved = path.join(elsewhere, guid);
+		await Bun.write(saved, "bytes");
+
+		expect(await complete(guid, saved, null)).toBe(saved);
+		expect(await Bun.file(saved).text()).toBe("bytes");
+	});
+
+	it("rejects the wait when a completed download cannot be read", async () => {
+		const { complete } = await fakeDownloads();
+
+		const error = await rejectionOf(complete(42, undefined));
+		expect(error).toBeInstanceOf(ToolError);
+		expect((error as ToolError).message).toStartWith("Download failed: https://example.com/");
+	});
+
+	it("rejects a wait whose signal is already aborted without leaving the enable failure unhandled", async () => {
+		const { downloads } = await fakeDownloads(async () => {
+			throw new Error("setDownloadBehavior failed");
+		});
+		const controller = new AbortController();
+		controller.abort(new Error("cancelled"));
+		expect(await rejectionOf(downloads.wait(controller.signal))).toBe(controller.signal.reason);
+		// A second enable runs the same steps, so an enable the wait started has failed by now, inside this test, where
+		// Bun fails it if nothing handled the rejection.
+		expect(await rejectionOf(downloads.enable())).toBeInstanceOf(Error);
+	});
+
+	it("rejects a wait aborted while downloads are being enabled with the caller's reason", async () => {
+		const enabling = Promise.withResolvers<void>();
+		const { downloads } = await fakeDownloads(() => enabling.promise);
+		const controller = new AbortController();
+		const waiting = rejectionOf(downloads.wait(controller.signal));
+		const reason = new Error("cancelled");
+		controller.abort(reason);
+		expect(await waiting).toBe(reason);
+		enabling.resolve();
+	});
 });
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
@@ -160,6 +366,36 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 				}),
 			),
 		).toBeUndefined();
+	});
+
+	it("reuses a worker only when an explicit allowed-domain policy is equivalent", async () => {
+		const invoke = browserHost();
+		const name = `domains-${crypto.randomUUID()}`;
+		await invoke({
+			action: "open",
+			name,
+			url: "about:blank",
+			allowed_domains: ["Example.test.", "other.test"],
+		});
+		const firstTab = getTab(name);
+		expect(firstTab).toBeDefined();
+		expect(
+			returnedValue(await invoke({ action: "call", name, chain: [{ method: "allowedDomains", args: [] }] })),
+		).toEqual(["example.test", "other.test"]);
+
+		await invoke({
+			action: "open",
+			name,
+			url: "about:blank",
+			allowed_domains: ["OTHER.test", "example.test"],
+		});
+		expect(getTab(name)).toBe(firstTab);
+
+		await invoke({ action: "open", name, url: "about:blank", allowed_domains: ["different.test"] });
+		expect(getTab(name)).not.toBe(firstTab);
+		expect(
+			returnedValue(await invoke({ action: "call", name, chain: [{ method: "allowedDomains", args: [] }] })),
+		).toEqual(["different.test"]);
 	});
 
 	it("overrides navigator and request user agents", async () => {
@@ -290,20 +526,33 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 		}
 	}, 20_000);
 
-	it("reports where a download was saved when another tab set a different downloads directory", async () => {
-		const payload = new TextEncoder().encode("download payload\n");
+	it("saves each tab's downloads into its own downloads directory, also after another tab closes", async () => {
+		let served = 0;
+		const firstGateReached = Promise.withResolvers<void>();
+		const firstGateOpened = Promise.withResolvers<void>();
+		const secondGateReached = Promise.withResolvers<void>();
+		const secondGateOpened = Promise.withResolvers<void>();
 		const server = Bun.serve({
 			port: 0,
-			fetch(request) {
-				if (new URL(request.url).pathname === "/file") {
-					return new Response(payload, {
+			async fetch(request) {
+				const url = new URL(request.url);
+				const tab = url.searchParams.get("tab");
+				if (url.pathname === "/gate") {
+					const reached = tab === "first" ? firstGateReached : secondGateReached;
+					const opened = tab === "first" ? firstGateOpened : secondGateOpened;
+					reached.resolve();
+					await opened.promise;
+					return new Response("open");
+				}
+				if (url.pathname === "/file") {
+					return new Response(`tab ${tab}, download ${++served}\n`, {
 						headers: {
 							"content-type": "application/octet-stream",
 							"content-disposition": 'attachment; filename="fixture.bin"',
 						},
 					});
 				}
-				return new Response('<a id="download" href="/file">download</a>', {
+				return new Response(`<a id="download" href="/file?tab=${tab}">download</a>`, {
 					headers: { "content-type": "text/html" },
 				});
 			},
@@ -311,27 +560,102 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 		const first = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-download-test-"));
 		const second = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-download-test-"));
 		tempDirs.push(first, second);
+		let firstDownload: Promise<{ path: string }> | undefined;
+		let secondDownload: Promise<{ path: string }> | undefined;
+		try {
+			const invoke = browserHost();
+			const download = async (name: string, beforeClick = "") =>
+				returnedValue(
+					await invoke({
+						action: "run",
+						name,
+						code: [
+							"const pending = tab.waitForDownload({ timeout: 5000 });",
+							// Observe the timed wait while the click is gated, so either branch's failure rejects the run.
+							"const [download] = await Promise.all([pending, (async () => {",
+							beforeClick,
+							"await tab.evaluate(() => document.querySelector('#download').click());",
+							"})()]);",
+							"return download;",
+						].join("\n"),
+					}),
+				) as { path: string };
+			const firstTab = `download-${crypto.randomUUID()}`;
+			const secondTab = `download-${crypto.randomUUID()}`;
+			await invoke({ action: "open", name: firstTab, url: `${server.url.href}?tab=first`, downloads: first });
+
+			await invoke({ action: "open", name: secondTab, url: `${server.url.href}?tab=second`, downloads: second });
+
+			// Acquire both tabs before either timed wait. Each title barrier and gate proves that tab's wait has
+			// enabled downloads; B must enable after A but before A clicks to expose browser-wide folder redirection.
+			const firstGate = JSON.stringify(`${server.url.href}gate?tab=first`);
+			const secondGate = JSON.stringify(`${server.url.href}gate?tab=second`);
+			firstDownload = download(firstTab, `await tab.title(); await fetch(${firstGate});`);
+			await Promise.race([firstGateReached.promise, firstDownload]);
+			secondDownload = download(secondTab, `await tab.title(); await fetch(${secondGate});`);
+			await Promise.race([secondGateReached.promise, secondDownload]);
+			firstGateOpened.resolve();
+			expect((await firstDownload).path).toBe(path.join(first, "fixture.bin"));
+			expect(await Bun.file(path.join(first, "fixture.bin")).text()).toBe("tab first, download 1\n");
+			expect(await fs.readdir(second)).toEqual([]);
+
+			// B cannot hide a misplaced A download before the empty-directory assertion above.
+			secondGateOpened.resolve();
+			expect((await secondDownload).path).toBe(path.join(second, "fixture.bin"));
+			expect(await Bun.file(path.join(second, "fixture.bin")).text()).toBe("tab second, download 2\n");
+
+			await invoke({ action: "close", name: secondTab });
+			expect((await download(firstTab)).path).toBe(path.join(first, "fixture.bin"));
+			expect(await Bun.file(path.join(first, "fixture.bin")).text()).toBe("tab first, download 3\n");
+		} finally {
+			firstGateOpened.resolve();
+			secondGateOpened.resolve();
+			try {
+				// Observe both consumers even if setup or an assertion fails; download failures still reject the test.
+				await Promise.all([firstDownload, secondDownload]);
+			} finally {
+				server.stop(true);
+			}
+		}
+	}, 20_000);
+
+	it("saves a download started inside the tab's iframe into the tab's downloads directory", async () => {
+		const payload = new TextEncoder().encode("download payload\n");
+		const server = Bun.serve({
+			port: 0,
+			fetch(request) {
+				const { pathname } = new URL(request.url);
+				if (pathname === "/file") {
+					return new Response(payload, {
+						headers: {
+							"content-type": "application/octet-stream",
+							"content-disposition": 'attachment; filename="fixture.bin"',
+						},
+					});
+				}
+				const body =
+					pathname === "/frame" ? '<a id="download" href="/file">download</a>' : '<iframe src="/frame"></iframe>';
+				return new Response(body, { headers: { "content-type": "text/html" } });
+			},
+		});
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-download-test-"));
+		tempDirs.push(directory);
 		try {
 			const invoke = browserHost();
 			const name = `download-${crypto.randomUUID()}`;
-			await invoke({ action: "open", name, url: server.url.href, downloads: first });
-			await invoke({
-				action: "open",
-				name: `download-${crypto.randomUUID()}`,
-				url: server.url.href,
-				downloads: second,
-			});
+			await invoke({ action: "open", name, url: server.url.href, wait_until: "load", downloads: directory });
 			const download = returnedValue(
 				await invoke({
 					action: "run",
 					name,
 					code: [
-						"const pending = tab.waitForDownload({ timeout: 5000 });",
-						"await tab.evaluate(() => document.querySelector('#download').click());",
+						"const pending = tab.waitForDownload({ timeout: 3000 });",
+						"await tab.evaluate(() => document.querySelector('iframe').contentDocument.querySelector('#download').click());",
 						"return await pending;",
 					].join("\n"),
 				}),
 			) as { path: string };
+			expect(download.path).toBe(path.join(directory, "fixture.bin"));
 			expect(new Uint8Array(await Bun.file(download.path).arrayBuffer())).toEqual(payload);
 		} finally {
 			server.stop(true);

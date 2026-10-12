@@ -8,6 +8,7 @@ import {
 	disposeAgentLifecycle,
 	getAgentLifecycleManager,
 	lifecycleHasAgent,
+	parkAgent,
 	releaseAgent,
 	resetAgentLifecycleForTests,
 } from "../../src/internal/agent-lifecycle-bridge";
@@ -17,6 +18,7 @@ import {
 	detachAgentSession,
 	lookupAgentRef,
 	resolveAgentSessionOperationAuthority,
+	setAgentHistory,
 	setAgentStatus,
 } from "../../src/internal/agent-registry-bridge";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
@@ -206,6 +208,102 @@ describe("W2 registry capabilities", () => {
 			await child.session.dispose();
 		} finally {
 			createSession.mockRestore();
+		}
+	});
+
+	it("parks an authority-created child with its final own lifetime cost before detaching", async () => {
+		const root = realSession();
+		const child = realSession();
+		const registry = new AgentRegistry();
+		const lifecycle = createAgentLifecycleManager(registry);
+		const createSession = vi
+			.spyOn(sdk, "createAgentSession")
+			.mockResolvedValueOnce({ session: root.session } as sdk.CreateAgentSessionResult)
+			.mockResolvedValueOnce({ session: child.session } as sdk.CreateAgentSessionResult);
+		try {
+			await createAgentRootSession(registry, { agentId: "Main" });
+			await authority(registry, root.session).create({ agentId: "Worker" });
+			const original = registry.get("Worker");
+			if (!original) throw new Error("Expected authority-created worker");
+			const metrics = { tokens: 42, requests: 2, tools: 1, cost: 0.25, durationMs: 100 };
+			expect(setAgentHistory(registry, child.session, { directCost: 0.25, metrics })).toBe(true);
+			expect(registry.setHistory("Worker", { directCost: 99 })).toBe(false);
+			const usage = (cost: number) => ({
+				input: 10,
+				output: 2,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 12,
+				cost: { input: cost, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+			});
+			const manager = child.session.sessionManager;
+			const start = manager.appendMessage({ role: "user", content: "Work", timestamp: 1 });
+			manager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "Done" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: usage(0.25),
+				stopReason: "stop",
+				timestamp: 2,
+			});
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "nested-task",
+				toolName: "task",
+				content: [{ type: "text", text: "Child done" }],
+				details: { usage: usage(0.5) },
+				isError: false,
+				timestamp: 3,
+			});
+			const leaf = manager.getLeafId();
+			const finalUsage = manager.appendModelUsage(
+				{
+					purpose: "task-completion-probe",
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-sonnet-4-5",
+					usage: usage(0.75),
+					stopReason: "stop",
+				},
+				{ sessionId: manager.getSessionId(), parentId: start },
+			);
+			expect(finalUsage).toBeDefined();
+			expect(manager.getLeafId()).toBe(leaf);
+			expect(manager.getBranch().some(entry => entry.id === finalUsage)).toBe(false);
+			expect(manager.getUsageStatistics()).toMatchObject({ cost: 1.5, subagentCost: 0.5 });
+			expect(setAgentStatus(registry, "Worker", "idle", child.session)).toBe(true);
+			adoptAgent(lifecycle, "Worker", { idleTtlMs: 0 }, child.session);
+			const parkedEvents: Array<{ directCost: number | undefined; detached: boolean }> = [];
+			const unsubscribe = registry.onChange(event => {
+				if (event.type === "status_changed" && event.ref.id === "Worker" && event.ref.status === "parked") {
+					parkedEvents.push({
+						directCost: event.ref.history?.directCost,
+						detached: lookupAgentRef(registry, "Worker")?.session === null,
+					});
+				}
+			});
+			try {
+				await parkAgent(lifecycle, "Worker");
+			} finally {
+				unsubscribe();
+			}
+			expect(parkedEvents).toEqual([{ directCost: 1, detached: true }]);
+			expect(registry.get("Worker")).toMatchObject({
+				status: "parked",
+				lineage: original.lineage,
+				history: { directCost: 1, metrics },
+			});
+			expect(lookupAgentRef(registry, "Worker")?.session).toBeNull();
+			expect(child.session.isDisposed).toBe(true);
+		} finally {
+			await disposeAgentLifecycle(lifecycle);
+			await child.session.dispose();
+			await root.session.dispose();
+			createSession.mockRestore();
+			child.auth.close();
+			root.auth.close();
 		}
 	});
 	it("keeps concurrent roots and same-name actors in exact independent slots", async () => {

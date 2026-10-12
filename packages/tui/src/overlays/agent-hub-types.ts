@@ -33,6 +33,10 @@ export interface AgentHubSession {
 	readonly model: Model | undefined;
 	readonly servingModel?: { selector: string; isFallback: boolean };
 	readonly agent?: { state: { messages: AgentMessage[] } };
+	/** Existing session ledger includes off-transcript model usage and nested-task attribution. */
+	readonly sessionManager?: {
+		getUsageStatistics(): { cost: number; subagentCost: number };
+	};
 	getSessionStats(): {
 		tokens: { input: number; output: number; cacheWrite: number };
 		assistantMessages: number;
@@ -62,6 +66,8 @@ export interface AgentRecordLike {
 		resolvedModelIsFallback?: boolean;
 		metrics?: AgentMetricsSummary;
 		permissionSummary?: unknown;
+		/** Cumulative own-session assistant and model_usage cost, excluding nested task results. */
+		directCost?: number;
 		readOnly?: boolean;
 		outputPath?: string;
 		patchPath?: string;

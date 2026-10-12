@@ -21,6 +21,7 @@ import {
 	resolveOutputSinkArtifactMaxBytes,
 	resolveOutputSinkHeadBytes,
 } from "../tools/output-meta";
+import { quotePosixArgv } from "../utils/shell-quote";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { publishAllocatedArtifact } from "../session/artifacts";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
@@ -56,6 +57,11 @@ export interface BashExecutorOptions {
 	useUserShell?: boolean;
 	/** Run supported user shells (zsh/fish) on a headless PTY; requires `useUserShell`. */
 	pty?: BashPtyOptions;
+	/**
+	 * Refuse git commands that discard or move shared work (`bash.gitGuard`),
+	 * enforced by the embedded shell's `git` builtin.
+	 */
+	gitGuard?: boolean;
 	/**
 	 * Filesystem for `scheme://` paths in this run of the embedded shell (a URL
 	 * `cwd` included: it exists only in the embedded shell's injected filesystem.
@@ -409,12 +415,8 @@ function ensureInteractiveShellArgs(shell: string, args: string[]): string[] {
 	return [...effectiveArgs, "-i"];
 }
 
-function quoteShellArg(value: string): string {
-	return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
 function buildUserShellCommand(shell: string, args: string[], command: string): string {
-	return [shell, ...ensureInteractiveShellArgs(shell, args), command].map(quoteShellArg).join(" ");
+	return quotePosixArgv([shell, ...ensureInteractiveShellArgs(shell, args), command]);
 }
 
 function resolveUserShellConfig(settings: Settings, baseConfig: ShellConfig): ShellConfig {
@@ -652,12 +654,15 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 	}
 
+	// The embedded shell reads its builtin switches from the session env; a
+	// different env also keys a separate persistent session.
+	const sessionEnv = options?.gitGuard ? { ...shellEnv, PI_GIT_GUARD: "1" } : shellEnv;
 	const shellOptions = {
-		sessionEnv: shellEnv,
+		sessionEnv,
 		snapshotPath: snapshotPath ?? undefined,
 		minimizer,
 	};
-	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
+	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, sessionEnv, options?.sessionKey, minimizer);
 	const persistentSessionBroken = brokenShellSessions.has(sessionKey);
 	if (persistentSessionBroken) {
 		shellSessions.delete(sessionKey);

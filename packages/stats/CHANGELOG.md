@@ -9,6 +9,12 @@
 ### Fixed
 
 - Kept copied fork requests attributed to the parent transcript when parent and fork share a recency tier, regardless of parse completion order, including parallel worker pools. Parsing stays bounded and parallel while ingestion follows ranked input order; across tiers, the more-recent transcript wins, so a recent fork can own copies from an idle parent.
+## [18.9.0] - 2026-10-11
+
+### Fixed
+
+- Fixed the stats dashboard favicon so dashboard tabs and bookmarks display the OMP icon correctly.
+
 ## [18.8.0] - 2026-10-07
 
 ### Changed

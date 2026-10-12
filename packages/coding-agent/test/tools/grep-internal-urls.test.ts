@@ -42,14 +42,14 @@ function virtualDocName(url: InternalUrl): string {
 	return host ? (pathname && pathname !== "/" ? host + pathname : host) : "";
 }
 
-function registerVirtualDocs(docs: ReadonlyMap<string, string>): void {
+function registerVirtualDocs(docs: Readonly<Record<string, string>>): void {
 	const handler: ProtocolHandler = {
 		scheme: "virtual",
 		spec: { backing: "virtual", selectors: "lines", immutable: true },
 		async resolve(url: InternalUrl): Promise<InternalResource> {
 			const name = virtualDocName(url);
 			if (!name) {
-				const content = Array.from(docs.keys())
+				const content = Object.keys(docs)
 					.map(key => `- virtual://${key}`)
 					.join("\n");
 				return {
@@ -59,7 +59,7 @@ function registerVirtualDocs(docs: ReadonlyMap<string, string>): void {
 					size: Buffer.byteLength(content, "utf-8"),
 				};
 			}
-			const content = docs.get(name);
+			const content = Object.hasOwn(docs, name) ? docs[name] : undefined;
 			if (content === undefined) {
 				throw new Error(`Virtual doc not found: ${name}`);
 			}
@@ -265,7 +265,7 @@ describe("GrepTool internal URL resolution", () => {
 	});
 
 	it("searches virtual internal URL content without a backing file", async () => {
-		registerVirtualDocs(new Map([["doc.md", "alpha line\nneedle in virtual content\ngamma line\n"]]));
+		registerVirtualDocs({ "doc.md": "alpha line\nneedle in virtual content\ngamma line\n" });
 
 		const session = createSession();
 		const tool = new GrepTool(session);
@@ -281,7 +281,7 @@ describe("GrepTool internal URL resolution", () => {
 	});
 
 	it("applies line ranges when searching virtual internal URL content", async () => {
-		registerVirtualDocs(new Map([["doc.md", "needle outside range\nmiddle line\nneedle inside range\n"]]));
+		registerVirtualDocs({ "doc.md": "needle outside range\nmiddle line\nneedle inside range\n" });
 
 		const session = createSession();
 		const tool = new GrepTool(session);
@@ -300,7 +300,7 @@ describe("GrepTool internal URL resolution", () => {
 		// >INTERNAL_TOTAL_CAP (2000) matching lines precede the selected range; the
 		// native probe must not stop at the cap before range filtering.
 		const content = `${Array.from({ length: 2100 }, (_, i) => `needle ${i + 1}`).join("\n")}\n`;
-		registerVirtualDocs(new Map([["big.md", content]]));
+		registerVirtualDocs({ "big.md": content });
 		const tool = new GrepTool(createSession());
 		const result = await tool.execute("ranged-cap", { pattern: "needle", path: "virtual://big.md:2090-2100" });
 		expect(getResultText(result)).toContain("needle 2095");
@@ -312,7 +312,7 @@ describe("GrepTool internal URL resolution", () => {
 		// "needle " + "é"*300 is 307 chars but 607 bytes; a char cap of 512 would
 		// leave it whole, the byte cap trims it.
 		const line = `needle ${"é".repeat(300)}`;
-		registerVirtualDocs(new Map([["mb.md", `${line}\n`]]));
+		registerVirtualDocs({ "mb.md": `${line}\n` });
 		const result = await new GrepTool(createSession()).execute("mb-virtual", {
 			pattern: "needle",
 			path: "virtual://mb.md",
@@ -321,6 +321,42 @@ describe("GrepTool internal URL resolution", () => {
 		expect((text.match(/é/g) ?? []).length).toBeLessThan(300);
 		expect(result.details?.meta?.limits?.columnTruncated).toEqual({ maxColumn: 512, unit: "bytes" });
 		expect(formatOutputNotice(result.details?.meta)).toContain("Some lines truncated to 512 bytes");
+	});
+
+	it("shows a match far into a long line instead of only the line's start", async () => {
+		const line = `${"a".repeat(12_000)}deadline [s120]${"b".repeat(2_400)}`;
+		registerVirtualDocs({ "long.md": `${line}\n` });
+		const result = await new GrepTool(createSession()).execute("long-line", {
+			pattern: "deadline \\[s120\\]",
+			path: "virtual://long.md",
+		});
+		const text = getResultText(result);
+		expect(text).toMatch(/\.\.\.a+deadline \[s120\]b+\.\.\. \[col 12001\]/);
+		expect(result.details?.meta?.limits?.columnTruncated).toEqual({ maxColumn: 512, unit: "bytes" });
+	});
+
+	it("windows a long line around a cross-line look-ahead match", async () => {
+		registerVirtualDocs({ "ahead.md": `${"a".repeat(12_000)}needle\nend\n` });
+		const result = await new GrepTool(createSession()).execute("long-line-ahead", {
+			pattern: "needle(?=\\nend)",
+			path: "virtual://ahead.md",
+		});
+		expect(getResultText(result)).toMatch(/\.\.\.a+needle \[col 12001\]/);
+	});
+
+	it("keeps late matches visible after multibyte and astral Unicode prefixes", async () => {
+		const utf8Line = `${"é".repeat(6_000)}needle utf8`;
+		const astralLine = `${"💡".repeat(6_000)}needle astral`;
+		registerVirtualDocs({ "unicode.md": `${utf8Line}\n${astralLine}\n` });
+		const result = await new GrepTool(createSession()).execute("late-unicode-matches", {
+			pattern: "needle",
+			path: "virtual://unicode.md",
+		});
+		const text = getResultText(result);
+		expect(text).toContain("needle utf8");
+		expect(text).toContain("needle astral");
+		expect((text.match(/\[col 6001\]/g) ?? []).length).toBe(2);
+		expect(result.details?.meta?.limits?.columnTruncated).toEqual({ maxColumn: 512, unit: "bytes" });
 	});
 
 	it("rejects a malformed selector on a selector-capable internal URL instead of widening the search", async () => {
@@ -642,7 +678,7 @@ describe("GrepTool internal URL resolution", () => {
 	});
 
 	it("emits forward-only, deduplicated context lines for adjacent virtual matches", async () => {
-		registerVirtualDocs(new Map([["doc.md", "l1\nneedle a\nl3\nneedle b\nl5\nl6\nl7\nl8\n"]]));
+		registerVirtualDocs({ "doc.md": "l1\nneedle a\nl3\nneedle b\nl5\nl6\nl7\nl8\n" });
 
 		const session = createSession({
 			settings: Settings.isolated({ "grep.contextBefore": 1, "grep.contextAfter": 3 }),
@@ -669,7 +705,7 @@ describe("GrepTool internal URL resolution", () => {
 	});
 
 	it("matches an RE2 inline-flag pattern on a virtual resource (native dialect, not JS RegExp)", async () => {
-		registerVirtualDocs(new Map([["doc.md", "needle here\n"]]));
+		registerVirtualDocs({ "doc.md": "needle here\n" });
 		const tool = new GrepTool(createSession());
 		const result = await tool.execute("re2-virtual", { pattern: "(?i)NEEDLE", path: "virtual://doc.md" });
 		expect(getResultText(result)).toContain("needle");
@@ -677,7 +713,7 @@ describe("GrepTool internal URL resolution", () => {
 
 	it("applies an RE2 inline-flag pattern across mixed local and virtual scopes", async () => {
 		await Bun.write(path.join(tmpDir, "local.txt"), "needle local\n");
-		registerVirtualDocs(new Map([["doc.md", "needle virtual\n"]]));
+		registerVirtualDocs({ "doc.md": "needle virtual\n" });
 		const tool = new GrepTool(createSession());
 		const result = await tool.execute("re2-mixed", {
 			pattern: "(?i)NEEDLE",

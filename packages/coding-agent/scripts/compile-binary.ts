@@ -59,6 +59,9 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 			// Keep import.meta.resolve in bundled dependencies valid under bytecode.
 			format: "esm",
 			bytecode: true,
+			splitting: true,
+			// Source directories disambiguate same-named entry chunks with matching hashes.
+			naming: { chunk: "chunks/[dir]/[name]-[hash].[ext]" },
 			minify: {
 				identifiers: options.minifyIdentifiers ?? false,
 				keepNames: true,

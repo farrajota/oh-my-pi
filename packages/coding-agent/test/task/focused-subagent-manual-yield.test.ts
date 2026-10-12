@@ -189,6 +189,7 @@ async function spawnKeptAliveChild() {
 			parentArtifactManager,
 			agentRegistry: registry,
 			createAuthoritySession: authority.create,
+			asyncJobManager: manager,
 			modelOverride: "mock/mock-model",
 			authStorage,
 			modelRegistry,

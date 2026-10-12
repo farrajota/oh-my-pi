@@ -26,6 +26,7 @@ import { Ellipsis, fileHyperlink, renderStatusLine, truncateToWidth } from "@oh-
 import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { AuthorizedFilesystemTarget, FilesystemOperation } from "../internal/session-path-scope";
+import { missingGrammarsNote, rerunWithGrammars } from "../utils/grammars";
 import type { ToolSession } from ".";
 import { resolveToolTier, strictestApproval, truncateForPrompt } from "./approval";
 import { parseReadUrlTarget } from "./fetch";
@@ -89,6 +90,7 @@ interface AstEditAggregatedResult {
 	applied: boolean;
 	limitReached: boolean;
 	parseErrors?: string[];
+	missingGrammars?: string[];
 }
 
 async function runAstEditTargets(
@@ -99,6 +101,7 @@ async function runAstEditTargets(
 	const aggregatedChanges: AstReplaceChange[] = [];
 	const fileCounts = new Map<string, number>();
 	const parseErrors: string[] = [];
+	const missingGrammars = new Set<string>();
 	let totalReplacements = 0;
 	let filesSearched = 0;
 	let limitReached = false;
@@ -119,6 +122,7 @@ async function runAstEditTargets(
 		limitReached = limitReached || targetResult.limitReached;
 		applied = applied && targetResult.applied;
 		if (targetResult.parseErrors) parseErrors.push(...targetResult.parseErrors);
+		for (const language of targetResult.missingGrammars ?? []) missingGrammars.add(language);
 		for (const change of targetResult.changes) {
 			const absolute = resolveSearchResultPath(target.basePath, change.path);
 			aggregatedChanges.push({ ...change, path: relativeSearchResultPath(commonBasePath, absolute) });
@@ -142,6 +146,7 @@ async function runAstEditTargets(
 		applied,
 		limitReached,
 		parseErrors: parseErrors.length > 0 ? parseErrors : undefined,
+		missingGrammars: missingGrammars.size > 0 ? [...missingGrammars] : undefined,
 	};
 }
 
@@ -222,6 +227,7 @@ async function runScopedAstEdit(
 	const writes: ScopedAstEditWrite[] = [];
 	const parseErrors: string[] = [];
 	const seenPaths = new Set<string>();
+	const missingGrammars = new Set<string>();
 	let totalReplacements = 0;
 	let filesSearched = 0;
 	let limitReached = false;
@@ -274,6 +280,7 @@ async function runScopedAstEdit(
 					for (const error of rewritten.parseErrors ?? []) {
 						parseErrors.push(error.replaceAll(scratchFile, entry.path));
 					}
+					for (const language of rewritten.missingGrammars ?? []) missingGrammars.add(language);
 					limitReached = limitReached || rewritten.limitReached;
 					if (rewritten.totalReplacements === 0) return;
 					if (targetFilesTouched >= options.maxFiles) {
@@ -327,6 +334,7 @@ async function runScopedAstEdit(
 			applied: !options.dryRun,
 			limitReached,
 			parseErrors: parseErrors.length > 0 ? parseErrors : undefined,
+			missingGrammars: missingGrammars.size > 0 ? [...missingGrammars] : undefined,
 		},
 		snapshots,
 		writes,
@@ -506,38 +514,45 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			const assertAstEditPermission = (canonicalTarget: string): void => {
 				this.session.pathScope!.assertPermission("ast_edit", canonicalTarget);
 			};
-			let scopedRun: ScopedAstEditRun | undefined;
 			const filesystem = urlFilesystem.shellFilesystem();
+			let scopedRun: ScopedAstEditRun | undefined;
 			if (this.session.pathScope?.isRestricted) {
 				const operation = this.session.pathScope.currentOperation();
 				const roots = astTargets.map(target => target.basePath);
 				const rootTargets = await operation.preflight(roots.map(root => ({ path: root, kind: "search" as const })));
 				for (const target of rootTargets) assertAstEditPermission(target.canonicalTarget);
-				scopedRun = await runScopedAstEdit(
-					astTargets,
-					resolvedSearchPath,
-					{
-						rewrites: normalizedRewrites,
-						dryRun: true,
-						maxFiles,
-						failOnParseError: false,
-						signal,
-						filesystem,
-					},
-					operation,
-					assertAstEditPermission,
-				);
 			}
-			const result =
-				scopedRun?.result ??
-				(await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+			// This remains a dry run even when grammars are installed and the scan is retried.
+			const result = await rerunWithGrammars(async () => {
+				if (this.session.pathScope?.isRestricted) {
+					const operation = this.session.pathScope.currentOperation();
+					scopedRun = await runScopedAstEdit(
+						astTargets,
+						resolvedSearchPath,
+						{
+							rewrites: normalizedRewrites,
+							dryRun: true,
+							maxFiles,
+							failOnParseError: false,
+							signal,
+							filesystem,
+						},
+						operation,
+						assertAstEditPermission,
+					);
+					return scopedRun.result;
+				}
+				scopedRun = undefined;
+				return runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 					rewrites: normalizedRewrites,
 					dryRun: true,
 					maxFiles,
 					failOnParseError: false,
 					signal,
 					filesystem,
-				}));
+				});
+			});
+			const grammarNote = result.missingGrammars?.length ? missingGrammarsNote(result.missingGrammars) : undefined;
 			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(result.parseErrors);
 			const formatPath = (filePath: string): string =>
 				formatResultPath(filePath, isDirectory, resolvedSearchPath, this.session.cwd);
@@ -577,7 +592,8 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				const parseMessage = cappedParseErrors.length
 					? `\n${formatParseErrors(cappedParseErrors, parseErrorsTotal).join("\n")}`
 					: "";
-				return toolResult(baseDetails).text(`No replacements made${parseMessage}`).done();
+				const grammarMessage = grammarNote ? `\n${grammarNote}` : "";
+				return toolResult(baseDetails).text(`No replacements made${parseMessage}${grammarMessage}`).done();
 			}
 
 			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
@@ -680,6 +696,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			}
 			if (cappedParseErrors.length) {
 				outputLines.push("", ...formatParseErrors(cappedParseErrors, parseErrorsTotal));
+			}
+			if (grammarNote) {
+				outputLines.push("", grammarNote);
 			}
 
 			// Register pending action so `resolve` can apply or discard these previewed changes

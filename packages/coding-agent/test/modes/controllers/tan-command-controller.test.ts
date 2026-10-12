@@ -3,7 +3,11 @@ import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { AuthStorage, type AssistantMessage, type Model } from "@oh-my-pi/pi-ai";
-import type { AsyncJobRegisterOptions } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import {
+	AsyncJobManager,
+	type AsyncJobRegisterOptions,
+	type AsyncJobRunResult,
+} from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -32,7 +36,7 @@ interface CapturedJobRunContext {
 	reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
 }
 
-type CapturedJobRun = (ctx: CapturedJobRunContext) => Promise<string>;
+type CapturedJobRun = (ctx: CapturedJobRunContext) => Promise<string | AsyncJobRunResult>;
 
 const model = { provider: "anthropic", id: "claude-sonnet-4-5" } as Model;
 const rootSessions: Array<{ dispose: () => Promise<void> }> = [];
@@ -158,19 +162,20 @@ async function createContext(overrides?: {
 	let capturedRun: CapturedJobRun | undefined;
 	let capturedOptions: AsyncJobRegisterOptions | undefined;
 	const sequence: string[] = [];
-	const register = vi.fn(
-		(_type: "bash" | "task", _label: string, run: CapturedJobRun, options?: AsyncJobRegisterOptions): string => {
-			sequence.push("register");
-			capturedRun = run;
-			capturedOptions = options;
-			return overrides?.register ? overrides.register(run, options) : "job-123";
-		},
-	);
+	const asyncJobManager = new AsyncJobManager({});
+	// Defer the job through the existing registration seam, but retain the real borrowed delivery service.
+	const register = vi.spyOn(asyncJobManager, "register").mockImplementation((_type, _label, run, options) => {
+		sequence.push("register");
+		const controlledRun: CapturedJobRun = ctx => run({ ...ctx, markRunning: vi.fn() });
+		capturedRun = controlledRun;
+		capturedOptions = options;
+		return overrides?.register ? overrides.register(controlledRun, options) : "job-123";
+	});
 	const session = {
 		isStreaming: overrides?.isStreaming ?? false,
 		agent: { promptCacheKey: overrides?.parentPromptCacheKey },
 		model: overrides?.model ?? model,
-		asyncJobManager: { register },
+		asyncJobManager,
 		sessionId: "parent-session",
 		configuredThinkingLevel: vi.fn(() => undefined),
 		systemPrompt: ["system prompt"],
@@ -197,7 +202,12 @@ async function createContext(overrides?: {
 		ensureOnDisk: vi.fn(async () => {}),
 		flush: vi.fn(async () => {}),
 	} as unknown as InteractiveModeContext["sessionManager"];
-	Object.assign(session, { sessionManager, dispose: vi.fn(async () => {}) });
+	Object.assign(session, {
+		sessionManager,
+		dispose: vi.fn(async () => {
+			await asyncJobManager.dispose();
+		}),
+	});
 	const cloneManager = {
 		getSessionFile: vi.fn(() => cloneFile),
 		appendCustomEntry: vi.fn(),
@@ -316,6 +326,8 @@ describe("TanCommandController", () => {
 		if (!run) throw new Error("run function was not captured");
 		await run({ jobId: "job-123", signal: new AbortController().signal, reportProgress: async () => {} });
 		const agentId = creationOptions?.agentId;
+		expect(creationOptions?.parentAgentId).toBe(MAIN_AGENT_ID);
+		expect(creationOptions?.asyncJobManager).toBe(harness.ctx.session.asyncJobManager);
 		if (!agentId) throw new Error("Tan child agent id was not passed to session creation");
 		expect(AgentRegistry.global().get(agentId)).toEqual(
 			expect.objectContaining({
@@ -339,7 +351,30 @@ describe("TanCommandController", () => {
 			{ triggerTurn: false, deliverAs: "nextTurn" },
 		);
 		expect(harness.ctx.rebuildChatFromMessages).toHaveBeenCalled();
+
 		expect(harness.ctx.showStatus).toHaveBeenCalledWith("Dispatched background tan job-123");
+	});
+
+	it("uses the live parent identity and borrows its async job manager", async () => {
+		const parentId = "nested-parent";
+		const harness = await createContext({ agentId: parentId });
+		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
+		let creationOptions: CreateAgentSessionOptions | undefined;
+		mockTanSessionCreation(createCloneStub(), options => {
+			creationOptions = options;
+		});
+
+		await new TanCommandController(harness.ctx).start("run under the parent");
+
+		const run = harness.capturedRun;
+		if (!run) throw new Error("Tan job run function was not captured");
+		await run({ jobId: "job-123", signal: new AbortController().signal, reportProgress: async () => {} });
+
+		expect(creationOptions?.parentAgentId).toBe(parentId);
+		expect(creationOptions?.asyncJobManager).toBe(harness.ctx.session.asyncJobManager);
+		const childId = creationOptions?.agentId;
+		if (!childId) throw new Error("Tan child agent id was not passed to session creation");
+		expect(AgentRegistry.global().get(childId)).toMatchObject({ parentId });
 	});
 
 	it("keeps the dispatching session's local:// root after the interactive session switches", async () => {
@@ -568,7 +603,7 @@ describe("TanCommandController", () => {
 		const finishPrompt = Promise.withResolvers<void>();
 		const stub = createCloneStub({ lastAssistantText: "done" });
 		let child: AgentSession | undefined;
-		let result: Promise<string> | undefined;
+		let result: Promise<string | AsyncJobRunResult> | undefined;
 		try {
 			await manager.connectServers({ alpha: server("alpha-v1") }, {});
 			Object.assign(harness.ctx, { mcpManager: manager });
@@ -611,10 +646,7 @@ describe("TanCommandController", () => {
 			result = activeResult;
 			const promptStartedInTime = await Promise.race([
 				childStarted.promise.then(() => true),
-				activeResult.then(
-					() => false,
-					() => false,
-				),
+				activeResult.then(() => false),
 			]);
 			expect(promptStartedInTime).toBe(true);
 			expect(authoritySessionManager).toBeInstanceOf(SessionManager);

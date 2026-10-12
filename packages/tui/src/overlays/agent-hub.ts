@@ -1039,12 +1039,16 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			return { ...item, depth, open: this.#childrenByParent.has(ref.id) ? true : undefined };
 		}
 		if (!metrics) return item;
+		// A running agent's active time ticks terminal-side from the age at send; a settled one
+		// is frozen text. Progress `durationMs` was current when its frame arrived, so age it to now
+		// — re-sending the stale value on every repaint rewinds Tern's clock. A first frame can
+		// report 0 ms, so a progress timestamp alone makes the row clockable.
+		const progressAt = observed?.progress ? observed.progressAt : undefined;
 		const facts: Record<string, string | number> = {
 			cost: formatCost(metrics.cost),
-			// A running agent's active time ticks terminal-side; a settled one is frozen text.
 			time:
-				ref.status === "running" && metrics.durationMs > 0
-					? metrics.durationMs
+				ref.status === "running" && (metrics.durationMs > 0 || progressAt !== undefined)
+					? metrics.durationMs + (progressAt === undefined ? 0 : Math.max(0, Date.now() - progressAt))
 					: formatDuration(metrics.durationMs),
 			req: metrics.requests,
 			tools: metrics.tools,
@@ -1778,14 +1782,24 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		else this.#selectedActivityRow = Math.min(this.#selectedActivityRow, rows.length - 1);
 	}
 
-	#metricsFor(ref: TRecord, observed: ObservableSession | undefined): AgentMetrics | undefined {
+	#metricsFor(
+		ref: TRecord,
+		observed: ObservableSession | undefined,
+		aggregateLive?: AgentHubLiveMetrics,
+		sampledInAggregate = false,
+	): AgentMetrics | undefined {
 		// Host-sampled live metrics replace the transcript-derived fallback; only the
 		// generation sampled on the age cadence is shown, so a reused id never leaks stale usage.
-		if (!observed?.progress && !ref.history?.metrics && this.#getLiveMetrics) {
-			const current = this.#getLiveMetrics(ref.id, false);
-			return current?.generation === this.#liveMetrics.get(ref.id)?.generation ? current?.metrics : undefined;
-		}
-		return hubRowMetrics(ref, observed, this.#sessionMetrics);
+		const hasHostMetrics = observed?.progress || !ref.history?.metrics;
+		const current = sampledInAggregate
+			? aggregateLive
+			: hasHostMetrics
+				? this.#getLiveMetrics?.(ref.id, false)
+				: undefined;
+		const sampled = this.#liveMetrics.get(ref.id);
+		const live = current?.generation === sampled?.generation ? current : undefined;
+		if (!observed?.progress && !ref.history?.metrics && this.#getLiveMetrics) return live?.metrics;
+		return hubRowMetrics(ref, observed, this.#sessionMetrics, live, sampled?.generation);
 	}
 
 	// ========================================================================
@@ -2120,7 +2134,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		const result = aggregateMetrics({
 			rows: this.#rows,
 			observedById: this.#observedById,
-			metricsFor: (ref, observed) => this.#metricsFor(ref, observed),
+			metricsFor: (ref, observed, live) => this.#metricsFor(ref, observed, live, true),
 			fallbackStatsSession: hubFallbackStatsSession,
 			sessionMetrics: this.#sessionMetrics,
 			getLiveMetrics: this.#getLiveMetrics,

@@ -349,6 +349,12 @@ describe("SessionManager legacy session migration persistence", () => {
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
 		expect(header.version).toBe(3);
 		expect(persistedEntries).toHaveLength(4);
+		expect(persistedEntries[1]?.type).toBe("message");
+		if (persistedEntries[1]?.type !== "message") throw new Error("Expected migrated user message");
+		expect(persistedEntries[1].message).toMatchObject({ role: "user", content: "hello" });
+		expect(persistedEntries[2]?.type).toBe("message");
+		if (persistedEntries[2]?.type !== "message") throw new Error("Expected migrated assistant message");
+		expect(persistedEntries[2].message).toMatchObject({ role: "assistant" });
 		for (const entry of persistedEntries.filter(entry => entry.type !== "session")) {
 			expect(entry.id).toBeDefined();
 		}

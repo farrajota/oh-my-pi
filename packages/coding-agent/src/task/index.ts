@@ -2327,6 +2327,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				: [];
 
 			const sharedRunOptions: ExecutorOptions = {
+				asyncJobManager: this.session.asyncJobManager,
 				settings: preparedSettings,
 				artifactsDir: this.session.getArtifactsDir?.() ?? effectiveArtifactsDir,
 

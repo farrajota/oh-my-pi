@@ -8,6 +8,7 @@ import {
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
+	logger,
 	normalizePathForComparison,
 	parseFrontmatter,
 	tryParseJson,
@@ -1151,7 +1152,9 @@ async function readClaudeEnabledPlugins(
 	return { enabled, sources };
 }
 
-const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
+type PluginRootsResult = { roots: ClaudePluginRoot[]; warnings: string[] };
+
+const pluginRootsCache = new Map<string, Promise<PluginRootsResult>>();
 
 const pluginCacheInvalidators = new Set<() => void>();
 
@@ -1186,6 +1189,36 @@ export async function listClaudePluginRoots(
 	const cached = pluginRootsCache.get(cacheKey);
 	if (cached) return cached;
 
+	// Cache the in-flight promise so concurrent callers share one computation.
+	const pending = loadClaudePluginRoots({
+		claudeConfigDir,
+		ompRegistryPath,
+		resolvedProjectPath,
+		activeClaudeProjectPath,
+		enabledOverrides,
+	});
+	pluginRootsCache.set(cacheKey, pending);
+	try {
+		return await pending;
+	} catch (error) {
+		if (pluginRootsCache.get(cacheKey) === pending) pluginRootsCache.delete(cacheKey);
+		throw error;
+	}
+}
+
+async function loadClaudePluginRoots({
+	claudeConfigDir,
+	ompRegistryPath,
+	resolvedProjectPath,
+	activeClaudeProjectPath,
+	enabledOverrides,
+}: {
+	claudeConfigDir: string;
+	ompRegistryPath: string;
+	resolvedProjectPath: string | null;
+	activeClaudeProjectPath: string | null;
+	enabledOverrides: { enabled: Map<string, boolean>; sources: string[] };
+}): Promise<PluginRootsResult> {
 	const roots: ClaudePluginRoot[] = [];
 	const warnings: string[] = [];
 	const projectRoots: ClaudePluginRoot[] = [];
@@ -1358,9 +1391,9 @@ export async function listClaudePluginRoots(
 		roots.push(...injectedPluginDirRoots, ...filtered);
 	}
 
-	const result = { roots, warnings };
-	pluginRootsCache.set(cacheKey, result);
-	return result;
+	// Runs once per cached promise, so each warning is logged once per computation.
+	for (const warning of warnings) logger.warn(warning);
+	return { roots, warnings };
 }
 
 /**

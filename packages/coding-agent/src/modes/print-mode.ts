@@ -79,6 +79,14 @@ export function printableEvent(event: AgentSessionEvent): unknown {
 
 export async function runPrintMode(session: AgentSession, options: PrintModeOptions): Promise<number> {
 	const { mode, messages = [], initialMessage, initialImages, printThoughts, planYolo = false } = options;
+	session.disableStopTimeTodoReminders();
+
+	// process.stdout.write is fire-and-forget: a large final record (e.g. a
+	// multi-MB agent_end) can be dropped when the process exits before the pipe
+	// drains, truncating the record mid-line while the process still exits 0.
+	// Serialize every stdout write on the previous write's completion callback so
+	// records stay ordered and honor backpressure, then block shutdown on the
+	// tail before dispose/exit. Same truncation class as issue #5309 (issue #7635).
 	let stdoutTail: Promise<void> = Promise.resolve();
 	let stderrTail: Promise<void> = Promise.resolve();
 	let durabilityFailure = false;

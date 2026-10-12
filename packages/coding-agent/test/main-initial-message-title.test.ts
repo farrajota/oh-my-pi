@@ -19,8 +19,8 @@ describe.skipIf(!hasPtyHarness)("CLI initial-message title generation", () => {
 		const outputPath = path.join(root, "probe.json");
 		try {
 			await fs.mkdir(agentDir, { recursive: true });
-			// `title.generator: tiny` routes straight to the stubbed title model; the default `fork` waits for a
-			// reply the stubbed `prompt` never starts (fork titling is covered by agent-session-title-fork.test.ts).
+			// The preload drives a real message/reply lifecycle through a deterministic provider so event-driven
+			// title generation starts for this positional initial message.
 			await Bun.write(
 				path.join(agentDir, "config.yml"),
 				"setupVersion: 1\nstartup:\n  setupWizard: false\n  showSplash: false\n  checkUpdate: false\nproviders:\n  tinyModel: online\ntitle:\n  generator: tiny\n",

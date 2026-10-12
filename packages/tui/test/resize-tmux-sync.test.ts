@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { PtySession } from "@oh-my-pi/pi-natives";
 import { CURSOR_MARKER, Text, TUI, type TerminalFramePlan, type ViewportSize } from "@oh-my-pi/pi-tui";
+import { tmuxMultiplexer } from "@oh-my-pi/pi-tui/multiplexers/tmux";
 import type { PrivateModeReportHandler } from "@oh-my-pi/pi-tui/terminal";
 import * as capabilities from "@oh-my-pi/pi-tui/terminal-capabilities";
 import * as multiplexer from "@oh-my-pi/pi-tui/terminal-multiplexer";
@@ -97,14 +98,22 @@ function replayWriteIndex(written: readonly string[]): number {
 	return written.findIndex(data => data.includes("\x1b[2J\x1b[3J"));
 }
 
+let previousResizeInPlace: string | undefined;
+
 describe("tmux synchronized rebuild", () => {
 	beforeEach(() => {
-		spyOn(multiplexer, "classifyTerminalMultiplexer").mockReturnValue("tmux");
+		previousResizeInPlace = Bun.env.PI_TUI_RESIZE_IN_PLACE;
+		delete Bun.env.PI_TUI_RESIZE_IN_PLACE;
+		spyOn(multiplexer, "classifyTerminalMultiplexerModule").mockReturnValue(tmuxMultiplexer);
 		spyOn(capabilities, "isInsideTerminalMultiplexer").mockReturnValue(true);
 		spyOn(capabilities, "shouldEnableSynchronizedOutputByDefault").mockReturnValue(false);
 		spyOn(capabilities, "synchronizedOutputUserOverride").mockReturnValue(null);
 	});
-	afterEach(() => vi.restoreAllMocks());
+	afterEach(() => {
+		vi.restoreAllMocks();
+		if (previousResizeInPlace === undefined) delete Bun.env.PI_TUI_RESIZE_IN_PLACE;
+		else Bun.env.PI_TUI_RESIZE_IN_PLACE = previousResizeInPlace;
+	});
 
 	it("keeps the screen untouched through the drag, then rebuilds once without flashing a notice", async () => {
 		const { terminal, scheduler, provider, tui } = await startRig(1000);

@@ -8,9 +8,9 @@ import type {
 	TextContent,
 	Usage,
 } from "@oh-my-pi/pi-ai";
-import { createSyntheticToolResultMessage } from "@oh-my-pi/pi-agent-core";
 import {
 	directoryIsEnterable,
+	directoryIsMissing,
 	getBlobsDir,
 	getProjectDir,
 	getSessionsDir,
@@ -25,7 +25,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { normalizeEffectivePermissionSummary, type PermissionScopeSnapshot } from "../task/permission-profiles";
 import type { EffectivePermissionSummary } from "../task/types";
-import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
+import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
@@ -41,6 +41,7 @@ import {
 	stripInternalDetailsFields,
 } from "./messages";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
+import { createInterruptedToolResults, sessionExitFollowsLastMessage } from "./exit-diagnostics";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
@@ -98,6 +99,7 @@ import {
 	hasPositiveMovedProjectEvidence,
 	readTerminalBreadcrumbEntry,
 	resolveManagedSessionRoot,
+	worktreeSessionDirs,
 	writeTerminalBreadcrumb,
 } from "./session-paths";
 import { forgetExternalizedImages, prepareEntryForPersistence } from "./session-persistence";
@@ -509,6 +511,33 @@ function resetUsageCost(usage: Usage | undefined): void {
 	usage.premiumRequests = undefined;
 }
 
+/** Clear child billing kept in task results without discarding their token counts. */
+function resetTaskResultBilling(details: unknown): void {
+	if (!isTaskToolDetails(details)) return;
+	resetUsageCost(taskUsageFrom(details));
+	for (const result of details.results) {
+		if (result === null || typeof result !== "object") continue;
+		resetUsageCost(taskUsageFrom(result));
+		resetNestedTaskBilling(result.extractedToolData);
+	}
+	const progress = details.progress;
+	if (Array.isArray(progress)) {
+		for (const item of progress) {
+			if (item === null || typeof item !== "object") continue;
+			if (typeof item.cost === "number") item.cost = 0;
+			resetTaskResultBilling(item.inflightTaskDetails);
+			resetNestedTaskBilling(item.extractedToolData);
+		}
+	}
+}
+
+/** Recurse only through task snapshots extracted from the task subprocess tool. */
+function resetNestedTaskBilling(extractedToolData: Record<string, unknown[]> | undefined): void {
+	const tasks = extractedToolData?.task;
+	if (!Array.isArray(tasks)) return;
+	for (const task of tasks) resetTaskResultBilling(task);
+}
+
 function isAssistantEntry(entry: SessionEntry): boolean {
 	return entry.type === "message" && entry.message.role === "assistant";
 }
@@ -565,6 +594,7 @@ class SessionEntryIndex {
 		this.#labels.clear();
 		this.#leaf = null;
 		this.#usage = emptyUsageStatistics();
+		this.#branchCache = undefined;
 	}
 
 	rebuild(entries: readonly SessionEntry[]): void {
@@ -933,6 +963,8 @@ export class SessionManager {
 	#fileIsCurrent = false;
 	/** In-memory entries diverged from disk (load-migration/sanitize) → next persist must full-rewrite. */
 	#rewriteRequired = false;
+	/** Malformed records the loader skipped for the current session file; reported by `/dump anon`. */
+	#loadedMalformedRecords = 0;
 	/** Lazy gate crossed (ensureOnDisk / loaded file): every entry must persist from now on. */
 	#forceFileCreation = false;
 	/**
@@ -2147,6 +2179,7 @@ export class SessionManager {
 		this.#expectedDiskSize = null;
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = false;
+		this.#loadedMalformedRecords = 0;
 		this.#forceFileCreation = false;
 		this.#draftOnlySessionCleanupArmed = false;
 		this.#turnBudgetTotal = null;
@@ -2466,7 +2499,7 @@ export class SessionManager {
 				return;
 			}
 
-			const migrated = migrateToCurrentVersion(fileEntries);
+			if (migrateToCurrentVersion(fileEntries)) this.#rewriteRequired = true;
 			await resolveBlobRefsInEntries(fileEntries, this.#blobs);
 			// loadEntriesFromFile guarantees entries[0] is a valid session header.
 			const header = fileEntries[0] as SessionHeader;
@@ -2500,7 +2533,9 @@ export class SessionManager {
 			this.#hasTitleSlot = titleSlot !== undefined;
 			this.#expectedDiskSize = sourceSize;
 			this.#fileIsCurrent = true;
-			this.#rewriteRequired = migrated || loaded.malformedRecords > 0;
+			this.#loadedMalformedRecords = loaded.malformedRecords;
+			// The loader omits malformed records; force the next persisted append to publish its valid snapshot.
+			if (loaded.malformedRecords > 0) this.#rewriteRequired = true;
 			this.#forceFileCreation = true;
 			this.#artifactManager = null;
 			this.#artifactManagerSessionFile = null;
@@ -3424,6 +3459,11 @@ export class SessionManager {
 		return this.#titleRevision;
 	}
 
+	/** Malformed JSONL records skipped when this session file was loaded (0 for new sessions). */
+	get loadedMalformedRecords(): number {
+		return this.#loadedMalformedRecords;
+	}
+
 	/** Invalidate older generated renames before starting a new request. */
 	reserveTitleRevision(): number {
 		return ++this.#titleRevision;
@@ -4228,20 +4268,8 @@ export class SessionManager {
 		manager.#entries = history;
 		manager.#index.rebuild(history);
 		if (options?.repairInterruptedTail) {
-			const pendingToolCalls = new Map<string, Extract<Message["content"][number], { type: "toolCall" }>>();
-			for (const entry of manager.getBranch()) {
-				if (entry.type !== "message") continue;
-				if (entry.message.role === "assistant") {
-					for (const part of entry.message.content) {
-						if (part.type === "toolCall") pendingToolCalls.set(part.id, part);
-					}
-				} else if (entry.message.role === "toolResult") {
-					pendingToolCalls.delete(entry.message.toolCallId);
-				}
-			}
-			for (const toolCall of pendingToolCalls.values()) {
-				manager.appendMessage(createSyntheticToolResultMessage(toolCall, "aborted"));
-			}
+			SessionManager.#repairForkedInterruptedTail(history, manager.getBranch());
+			manager.#index.rebuild(history);
 		}
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		manager.#forceFileCreation = true;
@@ -4264,8 +4292,50 @@ export class SessionManager {
 	 * on them — since only billing attribution is inherited, not context size.
 	 */
 	static #resetInheritedUsageCost(history: SessionEntry[]): void {
-		for (const entry of history) resetUsageCost(entryUsage(entry));
+		for (const entry of history) {
+			resetUsageCost(entryUsage(entry));
+			if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "task") {
+				resetTaskResultBilling(entry.message.details);
+			}
+		}
 	}
+	/**
+	 * Pair unresolved calls on the fork's active branch with diagnostic results.
+	 *
+	 * Forks can be taken while the source parent is still running. A result that
+	 * arrives later is only present in that parent's history, so the child must
+	 * preserve an unknown outcome instead of asserting the tool never ran.
+	 *
+	 * A source whose process exit follows its last message is no longer running;
+	 * it keeps the resume recovery instead: startup warns about the pending
+	 * calls, then pairs them with process-exit results and the interrupted-turn
+	 * abort record.
+	 *
+	 * Sibling branches are excluded: only the root-to-active-leaf path is copied.
+	 */
+	static #repairForkedInterruptedTail(history: SessionEntry[], branch: readonly SessionEntry[]): void {
+		const leaf = branch.at(-1);
+		if (!leaf || sessionExitFollowsLastMessage(branch)) return;
+		const results = createInterruptedToolResults(branch, "fork");
+		if (results.length === 0) return;
+		const usedIds = new Set(history.map(entry => entry.id));
+		let parentId = leaf.id;
+		for (const result of results) {
+			const id = generateId(usedIds);
+			usedIds.add(id);
+			const entry: SessionMessageEntry = { type: "message", id, parentId, timestamp: nowIso(), message: result };
+			history.push(entry);
+			parentId = id;
+		}
+	}
+
+	/**
+	 * Open a specific session file.
+	 * @param sessionDir Optional dir for /new or /branch; defaults to the file's parent.
+	 * @param options.initialCwd Cwd to use when the file is empty or missing.
+	 * @param options.throwIfMissing Propagate ENOENT instead of creating a new session at a missing path.
+	 * @param options.parentSession Parent session file recorded when the file is empty or missing.
+	 */
 	static async open(
 		filePath: string,
 		sessionDir?: string,
@@ -4299,6 +4369,49 @@ export class SessionManager {
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		await manager.#setSessionFile(filePath, loaded, { parentSession: options?.parentSession });
+		return manager;
+	}
+
+	/**
+	 * Whether `session` was recorded in a worktree of `cwd`'s repository that no
+	 * longer exists, e.g. a `/wt` worktree removed since. Resume such a session
+	 * through {@link openRelocated} into `cwd`: its own directory cannot be entered.
+	 * @param sessionDir `cwd`'s session directory; defaults to the cwd-derived one.
+	 */
+	static async isFromRemovedWorktree(
+		session: Pick<SessionInfo, "path" | "cwd">,
+		cwd: string,
+		sessionDir?: string,
+	): Promise<boolean> {
+		if (!session.cwd || !(await directoryIsMissing(session.cwd))) return false;
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd);
+		const home = path.resolve(path.dirname(session.path));
+		return (await worktreeSessionDirs(cwd, dir)).some(sibling => path.resolve(sibling) === home);
+	}
+
+	/**
+	 * Open a session whose recorded directory `recordedCwd` is gone and move it,
+	 * artifacts included, into `cwd` so it resumes from there.
+	 * @param sessionDir Target session directory; defaults to `cwd`'s.
+	 * @throws {SessionMoveRefusedError} when another live omp process writes the session.
+	 */
+	static async openRelocated(
+		sessionPath: string,
+		recordedCwd: string,
+		cwd: string,
+		sessionDir?: string,
+	): Promise<SessionManager> {
+		// Anchor at the missing recorded cwd: `open` otherwise falls back to the
+		// launch cwd, which would make the `moveTo` below a no-op whenever the move
+		// target equals it. moveTo never chdirs, so the stale cwd is only the
+		// relocation source, not a directory we enter.
+		const manager = await SessionManager.open(sessionPath, sessionDir, undefined, { initialCwd: recordedCwd });
+		try {
+			await manager.moveTo(cwd, sessionDir);
+		} catch (error) {
+			await manager.close();
+			throw error;
+		}
 		return manager;
 	}
 
@@ -4445,13 +4558,20 @@ export class SessionManager {
 		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
 	}
 
+	/**
+	 * Picker-facing project list: pinned sessions first, untitled empties
+	 * dropped. Titled empties stay — a title is user intent worth resuming.
+	 * Includes the same folder in the repository's other git worktrees, so a
+	 * session `/wt` moved stays reachable from the checkout it left.
+	 */
 	static async listForPicker(
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionInfo[]> {
-		const pinnedIds = await loadPinnedSessionIds();
-		return filterSessionsForPicker(await SessionManager.list(cwd, sessionDir, storage), pinnedIds);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
+		const [pinned, siblingDirs] = await Promise.all([loadPinnedSessionIds(), worktreeSessionDirs(cwd, dir)]);
+		return sortPinnedFirst(filterSessionsForPicker(await listSessions(dir, storage, siblingDirs), pinned), pinned);
 	}
 
 	/** List all sessions across all project directories, pinned sessions first. */

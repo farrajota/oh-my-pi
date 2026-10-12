@@ -22,6 +22,7 @@ import { toAgentHubRegistry } from "../registry/agent-hub-registry-adapter";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { registerPersistedSubagents, sessionFileBelongsToRoot } from "../registry/persisted-agents";
+import type { SessionStats } from "../session/agent-session-types";
 import { normalizeAssistantUsage, parseSessionEntries } from "../session/session-loader";
 
 /** Filesystem and parser used by local and host-backed transcript viewers. */
@@ -93,24 +94,87 @@ export function createAgentHubRuntime(
 			const session = ref?.session;
 			if (!ref || !session || typeof session.getSessionStats !== "function") return undefined;
 			const cached = samples.get(session);
-			if (cached && !sample) return cached;
-			let metrics: AgentHubLiveMetrics["metrics"];
+			const cachedMetrics = cached?.metrics;
+			let directCost: number | undefined;
 			try {
-				const stats = session.getSessionStats();
-				metrics = {
-					tokens: stats.tokens.input + stats.tokens.output + stats.tokens.cacheWrite,
-					requests: stats.assistantMessages,
-					tools: stats.toolCalls,
-					cost: stats.cost,
-					durationMs: Math.max(0, Date.now() - ref.createdAt),
-					durationKind: "span",
-					contextTokens: stats.contextUsage?.tokens,
-					contextWindow: stats.contextUsage?.contextWindow,
-				};
+				const usage = session.sessionManager?.getUsageStatistics();
+				if (
+					usage &&
+					Number.isFinite(usage.cost) &&
+					Number.isFinite(usage.subagentCost) &&
+					usage.cost >= usage.subagentCost
+				) {
+					const ownCost = usage.cost - usage.subagentCost;
+					if (Number.isFinite(ownCost)) directCost = ownCost;
+				}
 			} catch {
-				metrics = undefined;
+				// A session stopping during render may have already closed its stats host.
 			}
-			const snapshot = { generation: cached?.generation ?? ++nextGeneration, metrics };
+			if (cached && !sample) {
+				if (directCost === undefined || (cachedMetrics && Object.is(cachedMetrics.cost, directCost))) return cached;
+				if (cachedMetrics) {
+					const snapshot = { generation: ++nextGeneration, metrics: { ...cachedMetrics, cost: directCost } };
+					samples.set(session, snapshot);
+					return snapshot;
+				}
+			}
+			let stats: SessionStats;
+			try {
+				stats = session.getSessionStats();
+			} catch {
+				if (cached) {
+					if (!cachedMetrics || directCost === undefined || Object.is(cachedMetrics.cost, directCost))
+						return cached;
+					const snapshot = { generation: ++nextGeneration, metrics: { ...cachedMetrics, cost: directCost } };
+					samples.set(session, snapshot);
+					return snapshot;
+				}
+				const snapshot = { generation: ++nextGeneration, metrics: undefined };
+				samples.set(session, snapshot);
+				return snapshot;
+			}
+			const cost = directCost ?? cachedMetrics?.cost;
+			if (cost === undefined) {
+				if (cached) return cached;
+				const snapshot = { generation: ++nextGeneration, metrics: undefined };
+				samples.set(session, snapshot);
+				return snapshot;
+			}
+			const tokens = stats.tokens.input + stats.tokens.output + stats.tokens.cacheWrite;
+			const requests = stats.assistantMessages;
+			const tools = stats.toolCalls;
+			const durationMs = Math.max(0, Date.now() - ref.createdAt);
+			const contextTokens = stats.contextUsage?.tokens;
+			const contextWindow = stats.contextUsage?.contextWindow;
+			const costChanged = !cachedMetrics || !Object.is(cachedMetrics.cost, cost);
+			if (
+				cached &&
+				cachedMetrics &&
+				!costChanged &&
+				Object.is(cachedMetrics.tokens, tokens) &&
+				Object.is(cachedMetrics.requests, requests) &&
+				Object.is(cachedMetrics.tools, tools) &&
+				Object.is(cachedMetrics.durationMs, durationMs) &&
+				cachedMetrics.durationKind === "span" &&
+				Object.is(cachedMetrics.contextTokens, contextTokens) &&
+				Object.is(cachedMetrics.contextWindow, contextWindow)
+			) {
+				return cached;
+			}
+			const metrics: NonNullable<AgentHubLiveMetrics["metrics"]> = {
+				tokens,
+				requests,
+				tools,
+				cost,
+				durationMs,
+				durationKind: "span",
+				contextTokens,
+				contextWindow,
+			};
+			const snapshot = {
+				generation: cached ? (costChanged ? ++nextGeneration : cached.generation) : ++nextGeneration,
+				metrics,
+			};
 			samples.set(session, snapshot);
 			return snapshot;
 		},

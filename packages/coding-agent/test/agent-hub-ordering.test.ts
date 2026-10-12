@@ -707,7 +707,10 @@ describe("Agent hub row ordering", () => {
 			toolCalls: 2,
 			cost: 0.42,
 		};
-		const first = { getSessionStats: () => stats } as unknown as AgentSession;
+		const first = {
+			getSessionStats: () => stats,
+			sessionManager: { getUsageStatistics: () => ({ cost: stats.cost, subagentCost: 0 }) },
+		} as unknown as AgentSession;
 		agents.register({ id: "LiveUsage", displayName: "Live Usage", kind: "sub", session: first, createdAt: 5_000 });
 		const runtime = createAgentHubRuntime({ registry: agents });
 		const hub = makeHub(agents, { ...runtime });
@@ -727,6 +730,7 @@ describe("Agent hub row ordering", () => {
 			expect(rendered).toContain("255 tok");
 			agents.unregister("LiveUsage", first);
 			const second = {
+				sessionManager: { getUsageStatistics: () => ({ cost: 0.01, subagentCost: 0 }) },
 				getSessionStats: () => ({
 					...stats,
 					tokens: { input: 1, output: 2, cacheWrite: 0 },
@@ -1050,7 +1054,9 @@ describe("Agent hub row ordering", () => {
 			expect(rendered).toContain("0/2 measured");
 			expect(renderedRosterEntry(hub, "Incomplete", 160)).toMatch(/usage\s+·/);
 			expect(renderedRosterEntry(hub, "NonFinite", 160)).toMatch(/usage\s+·/);
-			expect(getSessionStats).not.toHaveBeenCalled();
+			// The live session is read for cumulative cost, but its stats must not
+			// backfill usage for a row whose observer progress is incomplete.
+			expect(getSessionStats).toHaveBeenCalled();
 		} finally {
 			hub.dispose();
 		}

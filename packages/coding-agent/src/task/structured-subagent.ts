@@ -729,6 +729,7 @@ function buildRunSubprocessOptions(
 		modelRegistry: session.modelRegistry,
 		settings: request.settings ?? session.settings,
 		skillsSettings: session.skillsSettings,
+		asyncJobManager: session.asyncJobManager,
 		inheritedSessionAgents: session.getSessionAgents?.(),
 		mcpManager: enableMCP ? session.mcpManager : undefined,
 		enableMCP,

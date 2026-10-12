@@ -42,8 +42,10 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import { evaluateRestrictedToolGuardrails } from "../../internal/restricted-startup-policy";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
+import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import { MAIN_AGENT_ID } from "../../registry/agent-identity";
 import type { SessionManager } from "../../session/session-manager";
+import type { SendUserMessageOptions } from "../../session/agent-session";
 import { evaluateSubagentPermission, type EffectiveSubagentPermissions } from "../../task/permission-profiles";
 import type { SessionPathScope } from "../../internal/session-path-scope";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
@@ -63,7 +65,6 @@ import type {
 	BeforeSubagentSpawnEvent,
 	BeforeSubagentSpawnEventResult,
 	CompactOptions,
-	ComposerShapeDefinition,
 	ContextEvent,
 	ContextEventResult,
 	ContextUsage,
@@ -71,6 +72,8 @@ import type {
 	ExtensionActions,
 	ExtensionActorIdentity,
 	ExtensionAgentIdentity,
+	ExtensionAnnotationsAPI,
+	ExtensionAnnotationsFactory,
 	ExtensionCommandContext,
 	ExtensionCommandContextActions,
 	ExtensionContext,
@@ -511,6 +514,12 @@ export const TOP_LEVEL_AGENT: ExtensionAgentIdentity = Object.freeze({
 	depth: 0,
 });
 
+/** `ctx.annotations` for hosts that inject no implementation: every call rejects. */
+export const UNAVAILABLE_ANNOTATIONS: ExtensionAnnotationsAPI = Object.freeze({
+	submit: () => Promise.reject(new Error("ctx.annotations is not available in this host.")),
+	open: () => Promise.reject(new Error("ctx.annotations is not available in this host.")),
+});
+
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
@@ -552,6 +561,7 @@ export class ExtensionRunner {
 	#reloadHandler: () => Promise<void> = async () => {};
 	#shutdownHandler: ShutdownHandler = () => {};
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
+	#createAnnotations?: ExtensionAnnotationsFactory;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
 	#failedWorkingMessageSuffixRenderers: Set<string> = new Set();
 	#toolRegistrationScope = new AsyncLocalStorage<ToolRegistrationScope>();
@@ -761,11 +771,14 @@ export class ExtensionRunner {
 		getAsyncJobSnapshot?: (options?: AsyncJobSnapshotOptions) => AsyncJobSnapshot | null,
 		/** Identity of the agent this runner's session runs; defaults to the top-level agent. */
 		private readonly agent: ExtensionAgentIdentity = TOP_LEVEL_AGENT,
+		/** Builds `ctx.annotations`; supplied by the host that wires the bundled `/annotate` command. */
+		createAnnotations?: ExtensionAnnotationsFactory,
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
 		this.sessionScope =
 			typeof sessionScopeOrGetAsyncJobSnapshot === "function" ? undefined : sessionScopeOrGetAsyncJobSnapshot;
+		this.#createAnnotations = createAnnotations;
 		this.#getAsyncJobSnapshotFn =
 			getAsyncJobSnapshot ??
 			(typeof sessionScopeOrGetAsyncJobSnapshot === "function" ? sessionScopeOrGetAsyncJobSnapshot : () => null);
@@ -1470,6 +1483,9 @@ export class ExtensionRunner {
 	): ExtensionContext {
 		const getModel = model ? () => model : this.#getModel;
 		const runEphemeralTurn = this.#runEphemeralTurnFn;
+		const createAnnotations = this.#createAnnotations;
+		const sendUserMessage = (text: string, options?: SendUserMessageOptions): void =>
+			this.runtime.sendUserMessage(text, options);
 		return {
 			ui: this.#uiContext,
 			mode: this.#mode,
@@ -1525,6 +1541,11 @@ export class ExtensionRunner {
 				: undefined,
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
+			// A getter, not a value: `createHandlerContext` scopes a handler via `Object.create(ctx)`, and
+			// `this` here is that receiver, so the overlay mounts through the handler's timeout-aware `ui`.
+			get annotations(): ExtensionAnnotationsAPI {
+				return createAnnotations ? createAnnotations(() => this, sendUserMessage) : UNAVAILABLE_ANNOTATIONS;
+			},
 			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),
 			setTimeout: (callback, ms, ...args) => this.#managedTimers.setTimeout(callback, ms, ...args),
 			clearTimer: timer => this.#managedTimers.clear(timer),

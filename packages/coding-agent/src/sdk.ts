@@ -99,6 +99,7 @@ import {
 	type LoadedCustomCommand,
 	loadCustomCommands as loadCustomCommandsInternal,
 } from "./extensibility/custom-commands";
+import { createAnnotationsAPI } from "./extensibility/custom-commands/bundled/annotate/api";
 import { discoverCustomToolPaths, loadCustomTools, type ToolPathWithSource } from "./extensibility/custom-tools";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "./extensibility/custom-tools/types";
 import {
@@ -191,7 +192,13 @@ import {
 	obfuscateProviderContext,
 	type SecretObfuscator,
 } from "./secrets";
-import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
+import {
+	AgentSession,
+	type InitialRetryFallbackState,
+	MCP_DISCOVERY_TURN_WAIT_MS,
+	type PlanYolo,
+	type Prewalk,
+} from "./session/agent-session";
 import {
 	createAuthStorageSettingsSync,
 	discoverAuthStorage as discoverAuthStorageFromConfig,
@@ -199,6 +206,7 @@ import {
 	loadEffectiveAuthAccountPolicyConfig,
 } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
+import { credentialPinHash } from "./session/credential-pin";
 import {
 	CREDENTIAL_DISABLED_NOTICE_SOURCE,
 	formatCredentialDisabledNotice,
@@ -320,6 +328,8 @@ import { formatLocalCalendarDate } from "@oh-my-pi/pi-tui/chrome/local-date";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { buildNamedToolChoice } from "./utils/tool-choice";
 import { VibeSessionRegistry } from "./vibe/runtime";
+import { shutdownTinyTitleClient } from "./tiny/title-client";
+import { registerLocalInferenceApi } from "./tiny/local-inference-api";
 import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
 import {
@@ -566,7 +576,12 @@ export interface CreateAgentSessionOptions {
 	 * provider routing.
 	 */
 	getApiKey?: AgentOptions["getApiKey"];
-	/** Session whose OAuth account affinity should be used when resolving credentials. */
+	/**
+	 * Session whose stored credential affinities are copied into this session
+	 * before any child credential operation: explicit pins always, automatic
+	 * affinity only for providers this session's own transcript has not pinned.
+	 * @internal
+	 */
 	credentialSourceSessionId?: string;
 	/**
 	 * OAuth account pools for this session: provider id → identity keys (see
@@ -812,6 +827,8 @@ export interface CreateAgentSessionOptions {
 	parentTaskPrefix?: string;
 	/** Registry owning this session tree. Defaults to the process-global registry. */
 	agentRegistry?: AgentRegistry;
+	/** Parent's async jobs and delivery sinks; child sessions never resolve a process-global manager. */
+	asyncJobManager?: AsyncJobManager;
 	/**
 	 * Registry id of the spawning agent, recorded as this subagent's parent in
 	 * the agent registry. Distinct from `parentTaskPrefix`, which is this agent's
@@ -853,7 +870,8 @@ export interface CreateAgentSessionOptions {
 	/**
 	 * A human can answer synchronous prompts even without a terminal UI (e.g. an
 	 * ACP client rendering elicitation forms). Enables `ask` without enabling
-	 * TUI-only session behavior such as eager LSP warmup. Default: `hasUI`.
+	 * TUI-only session behavior such as eager LSP warmup. An explicit `false` also
+	 * keeps saved-reset consent off the extension UI context. Default: `hasUI`.
 	 */
 	interactivePrompts?: boolean;
 	/**
@@ -868,6 +886,11 @@ export interface CreateAgentSessionOptions {
 	 * Print, RPC, ACP and subagent sessions read replies as text. Default: false.
 	 */
 	tuiTranscript?: boolean;
+	/**
+	 * Name the unnamed session from the operator's messages once each reply begins
+	 * (see `title.generator`). Only the interactive TUI sets this; ignored for subagents. Default: false.
+	 */
+	autoTitle?: boolean;
 	/**
 	 * Defer `confirm` reserve-policy fallback until AgentSession prompt-time UI is configured.
 	 * ACP uses this while capabilities are negotiated without enabling UI-only tools.
@@ -1779,6 +1802,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	if (options.systemPromptTemplate !== undefined && options.customSystemPrompt !== undefined) {
 		throw new Error("systemPromptTemplate cannot be combined with a literal custom system prompt");
 	}
+	registerLocalInferenceApi();
 	const startup = snapshotCreateAgentSessionOptions(options);
 	const extensionRoots = startup.policy.allowExtensions
 		? snapshotEffectiveExtensionRoots(startup.options.extensionRoots?.())
@@ -1987,8 +2011,30 @@ async function createAgentSessionScoped(
 		await sessionManager.setAdditionalDirectories(merged);
 	}
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
-	if (options.credentialSourceSessionId && options.credentialSourceSessionId !== providerSessionId) {
-		modelRegistry.authStorage.sessions.inherit(options.credentialSourceSessionId, providerSessionId);
+	if (options.credentialSourceSessionId) {
+		// Restore the child's last-used OAuth account before copying parent affinity.
+		// Parent automatic affinity is skipped below when the transcript has its own pin;
+		// parent explicit pins still override this warm restoration through inheritance.
+		const ownPins = sessionManager.getCredentialPins();
+		for (const [provider, pin] of ownPins) {
+			const account = modelRegistry.authStorage.oauth.accounts(provider, providerSessionId).find(
+				candidate =>
+					credentialPinHash(provider, {
+						accountId: candidate.accountId,
+						email: candidate.email,
+					}) === pin.hash,
+			);
+			if (account) {
+				modelRegistry.authStorage.sessions.pin(provider, providerSessionId, account.credentialId, {
+					restoredAtMs: pin.lastUsedAt,
+				});
+			}
+		}
+		modelRegistry.authStorage.sessions.inherit(
+			options.credentialSourceSessionId,
+			providerSessionId,
+			(provider, explicit) => explicit || !ownPins.has(provider),
+		);
 	}
 	// From here on the session resolves every key through its pools; see
 	// SessionAccountPoolScope. A startup failure leaves no session to lift them.
@@ -2313,26 +2359,11 @@ async function createAgentSessionScoped(
 	const enableLsp = startupPolicy.enableLsp;
 	const lspReadOnly = startupPolicy.lspReadOnly;
 	const lspShared = enableLsp && cfgLspShared.get(settings);
-	// Only the first top-level session in a process owns an AsyncJobManager.
-	// Subagents inherit the parent's manager via `AsyncJobManager.instance()`
-	// (set below), and any additional top-level session spun up in-process
-	// (e.g. the agent-creation architect in `agents-hub.ts`) must share
-	// the live singleton — otherwise its dispose path would clobber the
-	// owning session's manager and break the `task`/`bash` async paths
-	// (issue #1923). The `instance()` guard means later sessions also skip
-	// constructing an orphaned manager that nothing would ever route to.
-	// Delivery is owner-routed: every AgentSession registers its own sink
-	// (see session/async-job-delivery.ts), so the manager takes no default
-	// onJobComplete here.
-	const asyncJobManager =
-		!options.parentTaskPrefix && !AsyncJobManager.instance()
-			? new AsyncJobManager({
-					// Re-read per capacity check so `async.maxJobs` resizes the cap live.
-					maxRunningJobs: () => Math.min(100, cfgAsyncMaxJobs.get(settings)),
-				})
-			: undefined;
-
-	const scopedAsyncJobManager = asyncJobManager ?? (options.parentTaskPrefix ? AsyncJobManager.instance() : undefined);
+	// Roots own their job managers; children use the exact manager supplied by their parent.
+	const asyncJobManager = !options.parentTaskPrefix
+		? new AsyncJobManager({ maxRunningJobs: () => Math.min(100, cfgAsyncMaxJobs.get(settings)) })
+		: undefined;
+	const scopedAsyncJobManager = asyncJobManager ?? options.asyncJobManager;
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
@@ -2578,12 +2609,7 @@ async function createAgentSessionScoped(
 			authStorage,
 			modelRegistry,
 			getTelemetry: () => agent?.telemetry,
-			// Subagents inherit the singleton (the parent's manager) so their bash/task
-			// completions still flow into the spawning conversation's yieldQueue.
-			// Secondary in-process top-level sessions (no parentTaskPrefix, no
-			// constructed manager because the singleton was already installed) leave
-			// this undefined so tools and session job snapshots refuse async work
-			// instead of silently routing into the owning session (issue #1923).
+			// Tools and nested subagents use this root's manager, never another root's singleton.
 			asyncJobManager: scopedAsyncJobManager,
 		};
 		let browserPrelude: EvalPreludeDefinition | undefined;
@@ -2630,7 +2656,7 @@ async function createAgentSessionScoped(
 			// so without this a TTSR-only rule (e.g. a triggered builtin) is not
 			// addressable and `rule://` reports "Available: none".
 			setActiveRules([...rulebookRules, ...alwaysApplyRules, ...ttsrManager.getRules()]);
-			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
+			if (asyncJobManager && !AsyncJobManager.instance()) AsyncJobManager.setInstance(asyncJobManager);
 		}
 		const localProtocolOptions: LocalProtocolOptions = Object.freeze({
 			...(options.localProtocolOptions ?? {
@@ -2717,7 +2743,7 @@ async function createAgentSessionScoped(
 
 				const deferredMCPManager = mcpManager;
 				startDeferredMCPDiscovery = liveSession => {
-					void (async () => {
+					const discovery = (async () => {
 						try {
 							const mcpResult = await logger.time("discoverAndLoadMCPTools", () =>
 								deferredMCPManager.discoverAndConnect({
@@ -2734,8 +2760,16 @@ async function createAgentSessionScoped(
 							}
 							applyMCPEnvironment(mcpResult);
 							logMCPLoadErrors(mcpResult.errors);
-							// Connected MCP tools are enabled and mounted under xd:// devices.
+							// Connected MCP tools (and cached routes of servers still connecting) are
+							// enabled and mounted under xd:// devices right away, so a turn whose
+							// wait runs out still carries them.
 							await liveSession.refreshMCPTools(mcpResult.tools);
+							// Discovery returns after the startup window while slower servers keep
+							// connecting. Give them the first turn's wait budget, then publish the
+							// final snapshot so that turn's prompt carries their instructions too.
+							await deferredMCPManager.waitForStartup(MCP_DISCOVERY_TURN_WAIT_MS);
+							if (liveSession.isDisposed) return;
+							await liveSession.refreshMCPTools(deferredMCPManager.getTools());
 						} catch (error) {
 							logger.error("MCP tool load failed", {
 								path: ".mcp.json",
@@ -2743,6 +2777,7 @@ async function createAgentSessionScoped(
 							});
 						}
 					})();
+					liveSession.setPendingMCPDiscovery(discovery);
 				};
 			} else {
 				const mcpResult = await logger.time("discoverAndLoadMCPTools", discoverAndLoadMCPTools, cwd, {
@@ -3506,6 +3541,7 @@ async function createAgentSessionScoped(
 				depth: taskDepth,
 				...(options.parentAgentId ? { parentId: options.parentAgentId } : {}),
 			}),
+			createAnnotationsAPI,
 		);
 		(
 			extensionRunner as unknown as { getToolExecutionAuthority: () => EffectiveToolRegistry }
@@ -4568,10 +4604,7 @@ async function createAgentSessionScoped(
 			followUpMode: cfgFollowUpMode.get(settings),
 			interruptMode: cfgInterruptMode.get(settings),
 			...cfgSampling.get(settings),
-			getApiKey:
-				options.getApiKey ??
-				(requestModel =>
-					modelRegistry.resolver(requestModel, options.credentialSourceSessionId ?? agent.sessionId)),
+			getApiKey: options.getApiKey ?? (requestModel => modelRegistry.resolver(requestModel, agent.sessionId)),
 			getToolContext: tc => toolContextStore.getContext(tc),
 			streamFn: (streamModel, context, streamOptions) => {
 				if (notifyFirstChatDispatch) {
@@ -4650,6 +4683,10 @@ async function createAgentSessionScoped(
 					: undefined
 				: undefined,
 		});
+		// Catalog rows carry the registry settings' extended-window opt-ins; this
+		// session adopts every model with the window its own settings select (a
+		// subagent with a compaction override must not inherit the parent's).
+		agent.setModelResolver(next => modelRegistry.fitContextWindow(next, settings));
 
 		cursorEventEmitter = event => agent.emitExternalEvent(event);
 
@@ -4790,10 +4827,7 @@ async function createAgentSessionScoped(
 			autoApprove: options.autoApprove,
 			scoutAllowedBySpawnPolicy: isScoutSpawnable(undefined, options.spawns ?? "*"),
 			evalKernelOwnerId,
-			// Defined only for top-level sessions (creation is gated above).
-			// AgentSession uses this to decide whether it may dispose the global
-			// AsyncJobManager on teardown; subagents inherit the parent's and
-			// **MUST NOT** tear it down.
+			// Children borrow their parent's manager but never dispose it.
 			ownedAsyncJobManager: asyncJobManager,
 			asyncJobManager: scopedAsyncJobManager,
 			scopedModels: options.scopedModels,
@@ -4809,6 +4843,7 @@ async function createAgentSessionScoped(
 			skillsSettings,
 			modelRegistry,
 			allowSessionModelFallback: options.hasUI === true && options.allowSessionModelFallback !== false,
+			interactivePrompts: options.interactivePrompts,
 			rebindModelAfterDiscovery: options.model === undefined || options.rebindModelAfterDiscovery === true,
 			toolRegistry,
 			memoryAgentDir: restrictToolNames ? undefined : agentDir,
@@ -4896,6 +4931,7 @@ async function createAgentSessionScoped(
 			// resource frame would otherwise report every server as empty.
 			advisorMcpResources: cursorMcpResources,
 			titleSystemPrompt: options.titleSystemPrompt,
+			autoTitle: options.autoTitle === true && agentKind === "main",
 		});
 		registerToolSessionLifecycleAuthority(toolSession, agentRegistry, session);
 		const unregisterToolSessionChangeCallbacks = session.registerSessionChangeCallback(
@@ -5196,20 +5232,14 @@ async function createAgentSessionScoped(
 					? getAgentLifecycleManager(agentRegistry)
 					: undefined;
 			let disposePromise: Promise<void> | undefined;
+			let tinyClientReleased = false;
 			session.dispose = disposeOptions => {
 				disposePromise ??= (async () => {
 					try {
 						const ownedLifecycle = unregisteredLifecycle ?? lookupOwnedAgentLifecycle(session);
-						// Reject new session work (eval starts) the moment disposal
-						// begins — the lifecycle await below opens an async gap before
-						// AgentSession.dispose() would otherwise set its guards.
 						session.beginDispose();
 						await drainDisposeCallbacks();
 						if (ownedLifecycle) {
-							// This session owns either the unregistered manager captured at
-							// construction or the exact manager assigned after its root claim.
-							// The bridge refuses disposal after that manager is reset or superseded,
-							// so stale sessions cannot reach a later registry generation.
 							const vibeRegistry = VibeSessionRegistry.global();
 							const vibeParentSession = {
 								agentRegistry,
@@ -5226,14 +5256,20 @@ async function createAgentSessionScoped(
 						}
 						await originalDispose(disposeOptions);
 					} finally {
+						if (bindsProcessState && !tinyClientReleased) {
+							tinyClientReleased = true;
+							try {
+								await shutdownTinyTitleClient();
+							} catch (error) {
+								logger.warn("Session dispose: tiny-model client shutdown failed", { error: String(error) });
+							}
+						}
 						unsubscribeCredentialDisabled?.();
 						unbindSessionEffects?.();
 						restoreProviderToggles?.();
 						unsubscribeMcpNotifications?.();
 						unregisterMcpPostmortem?.();
 						await drainDisposeCallbacks();
-						// Drop refs so the process-global postmortem list doesn't retain
-						// the bridge closure past explicit dispose.
 						unsubscribeMcpNotifications = undefined;
 						unregisterMcpPostmortem = undefined;
 					}
@@ -5256,6 +5292,7 @@ async function createAgentSessionScoped(
 							sessionId: providerSessionId,
 							preferWebsockets: session.preferWebsockets,
 							providerSessionState: session.providerSessionState,
+							serviceTier: session.effectiveServiceTier(codexModel),
 						});
 					} catch (error) {
 						const errorMessage = error instanceof Error ? error.message : String(error);
@@ -5271,7 +5308,6 @@ async function createAgentSessionScoped(
 
 		// Broker/private selection is carried by AsyncLocalStorage for this session;
 		// concurrent sessions never mutate process-wide LSP enablement.
-		// Start LSP warmup in the background so startup does not block on language server initialization.
 		// With `lsp.lazy` (the default) the warmup is skipped: recognized servers are still discovered and
 		// surfaced in the UI as "available", but cold-start on first use — the lsp tool or an edit/write
 		// touching a matching file type — through `getOrCreateClient`.
@@ -5522,6 +5558,17 @@ async function createAgentSessionScoped(
 				if (owningSession.isDisposed) return;
 				await owningSession.refreshMCPTools(ownedMCPManager.getTools());
 			});
+		}
+
+		if (ownedMcpManager && !deferMCPDiscoveryForUI) {
+			const currentMcpManagerTools = ownedMcpManager.getTools();
+			let sameMcpManagerTools = currentMcpManagerTools.length === initialMcpManagerTools.length;
+			for (let i = 0; sameMcpManagerTools && i < currentMcpManagerTools.length; i++) {
+				sameMcpManagerTools = currentMcpManagerTools[i] === initialMcpManagerTools[i];
+			}
+			if (!sameMcpManagerTools) {
+				await session.refreshMCPTools(currentMcpManagerTools);
+			}
 		}
 
 		startDeferredMCPDiscovery?.(session);

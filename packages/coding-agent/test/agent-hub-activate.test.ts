@@ -7,6 +7,8 @@ import { createAgentHubRuntime } from "@oh-my-pi/pi-coding-agent/modes/agent-hub
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage, Model, Usage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentHubOverlayComponent } from "@oh-my-pi/pi-tui/overlays/agent-hub";
@@ -15,11 +17,33 @@ import { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-obser
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { visitEntriesFromFileStream } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import {
+	bindInternalAgentAuthoritySession,
+	resolveAgentObservation,
+	setAgentHistory,
+	setAgentStatus,
+} from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
+import {
+	adoptAgent,
+	lookupOwnedAgentLifecycle,
+	disposeAgentLifecycle,
+	parkAgent,
+} from "@oh-my-pi/pi-coding-agent/internal/agent-lifecycle-bridge";
+import {
+	aggregateMetrics,
+	hubFallbackStatsSession,
+	hubRowMetrics,
+	type AgentMetrics,
+} from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
 
 const AGENT_ID = "Worker";
 const TEST_CWD = path.resolve("agent-hub-cwd");
@@ -37,6 +61,46 @@ function persistedChildJsonl(id: string): string {
 			tools: ["read"],
 		}),
 	].join("\n");
+}
+
+function billedUsage(cost: number): Usage {
+	return {
+		input: 10,
+		output: 5,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 15,
+		cost: { input: 0, output: cost, cacheRead: 0, cacheWrite: 0, total: cost },
+	};
+}
+
+function assistantTurn(model: Model, cost: number, timestamp: number): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: "work completed" }],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: billedUsage(cost),
+		stopReason: "stop",
+		timestamp,
+	};
+}
+
+function liveAgentSession(manager: SessionManager, model: Model, modelRegistry: ModelRegistry): AgentSession {
+	return new AgentSession({
+		agent: new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: manager.buildSessionContext().messages,
+			},
+		}),
+		sessionManager: manager,
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry,
+	});
 }
 
 function makeHub(focusAgent: (id: string) => Promise<void>) {
@@ -851,7 +915,11 @@ describe("Agent hub data refresh coalescing", () => {
 			displayName: "SDK agent",
 			kind: "sub",
 			parentId: "Main",
-			session: { getSessionStats, subscribe: () => () => {} } as unknown as AgentSession,
+			session: {
+				getSessionStats,
+				sessionManager: { getUsageStatistics: () => ({ cost: 0.1, subagentCost: 0 }) },
+				subscribe: () => () => {},
+			} as unknown as AgentSession,
 			status: "running",
 		});
 		const hub = new AgentHubOverlayComponent({
@@ -905,7 +973,10 @@ describe("Agent hub data refresh coalescing", () => {
 			cost: 0.1,
 			contextUsage: undefined,
 		}));
-		const session = { getSessionStats } as unknown as AgentSession;
+		const session = {
+			getSessionStats,
+			sessionManager: { getUsageStatistics: () => ({ cost: 0.1, subagentCost: 0 }) },
+		} as unknown as AgentSession;
 		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", session, status: "idle" });
 		agents.register({
 			id: "Child",
@@ -933,6 +1004,283 @@ describe("Agent hub data refresh coalescing", () => {
 			expect(getSessionStats).toHaveBeenCalledTimes(1);
 		} finally {
 			hub.dispose();
+		}
+	});
+	it("keeps cumulative direct billing through compaction without charging nested task results twice", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		let parentSession: AgentSession | undefined;
+		let childSession: AgentSession | undefined;
+		try {
+			const modelRegistry = new ModelRegistry(authStorage);
+			const model = modelRegistry.getAll().find(candidate => candidate.contextWindow && candidate.contextWindow > 0);
+			if (!model) throw new Error("Expected a bundled model");
+
+			const parentManager = SessionManager.inMemory();
+			parentManager.appendMessage({ role: "user", content: "parent task", timestamp: 1 });
+			parentManager.appendMessage(assistantTurn(model, 0.6, 2));
+			parentSession = liveAgentSession(parentManager, model, modelRegistry);
+
+			const childManager = SessionManager.inMemory();
+			childManager.appendMessage({ role: "user", content: "child task", timestamp: 1 });
+			childManager.appendMessage(assistantTurn(model, 0.2, 2));
+			childSession = liveAgentSession(childManager, model, modelRegistry);
+
+			const agents = new AgentRegistry();
+			const parentRef = agents.register({
+				id: "UsageParent",
+				displayName: "Parent",
+				kind: "sub",
+				parentId: "Main",
+				session: parentSession,
+			});
+			const childRef = agents.register({
+				id: "UsageParent/UsageChild",
+				displayName: "Child",
+				kind: "sub",
+				parentId: "UsageParent",
+				session: childSession,
+			});
+			const rows = [parentRef, childRef].map(ref => ({
+				...ref,
+				session: resolveAgentObservation(agents, ref)?.session ?? null,
+			}));
+			const sessionMetrics = new WeakMap<object, { metrics: AgentMetrics | undefined }>();
+			const aggregate = () =>
+				aggregateMetrics({
+					rows,
+					observedById: new Map(),
+					metricsFor: (ref, observed) => hubRowMetrics(ref, observed, sessionMetrics),
+					fallbackStatsSession: hubFallbackStatsSession,
+					sessionMetrics,
+					refreshFallback: true,
+				}).metrics;
+
+			expect(aggregate().cost).toBeCloseTo(0.8);
+
+			const taskCallId = "nested-task";
+			parentManager.appendMessage({
+				...assistantTurn(model, 0, 3),
+				content: [{ type: "toolCall", id: taskCallId, name: "task", arguments: {} }],
+				stopReason: "toolUse",
+			});
+			parentManager.appendMessage({
+				role: "toolResult",
+				toolCallId: taskCallId,
+				toolName: "task",
+				content: [{ type: "text", text: "child result" }],
+				details: { usage: billedUsage(99) },
+				isError: false,
+				timestamp: 4,
+			});
+			const finalAssistantEntryId = parentManager.appendMessage(assistantTurn(model, 0.4, 5));
+			parentManager.appendModelUsage(
+				{
+					purpose: "task-completion-probe",
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: billedUsage(0.05),
+					stopReason: "stop",
+				},
+				{ sessionId: parentManager.getSessionId(), parentId: parentManager.getLeafId() },
+			);
+			parentManager.appendCompaction("Work before the retained turn", undefined, finalAssistantEntryId, 100, {
+				tokensAfter: 15,
+			});
+			parentSession.agent.replaceMessages(parentManager.buildSessionContext().messages);
+
+			expect(parentManager.getUsageStatistics().cost).toBeCloseTo(100.05);
+			expect(parentManager.getUsageStatistics().subagentCost).toBeCloseTo(99);
+			expect(aggregate().cost).toBeCloseTo(1.25);
+		} finally {
+			await parentSession?.dispose();
+			await childSession?.dispose();
+			authStorage.close();
+		}
+	});
+	it("captures the final assistant charge before parking without replacing history metrics", async () => {
+		using tempDir = TempDir.createSync("@pi-hub-parking-");
+		const authStorage = await AuthStorage.create(":memory:");
+		let parentSession: AgentSession | undefined;
+		let session: AgentSession | undefined;
+		let lifecycle: AgentLifecycleManager | undefined;
+		try {
+			const rootSessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "root-sessions"));
+			await rootSessionManager.ensureOnDisk();
+			const rootSessionFile = rootSessionManager.getSessionFile();
+			if (!rootSessionFile) throw new Error("Test fixture requires a persisted root transcript");
+			const registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
+			const settings = Settings.isolated(
+				{ "compaction.enabled": false, "advisor.enabled": false },
+				{ cwd: tempDir.path(), agentDir: tempDir.path() },
+			);
+			const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"), { settings });
+			const model = modelRegistry.getAll().find(candidate => candidate.contextWindow && candidate.contextWindow > 0);
+			if (!model) throw new Error("Expected a bundled model");
+			const options = {
+				cwd: tempDir.path(),
+				agentDir: tempDir.path(),
+				authStorage,
+				modelRegistry,
+				model,
+				settings,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				rules: [],
+				toolNames: [],
+				restrictToolNames: true,
+				enableMCP: false,
+				enableLsp: false,
+				enableIrc: false,
+				bindProcessState: false,
+				skipPythonPreflight: true,
+			};
+			({ session: parentSession } = await registry.createIsolatedRootSession({
+				...options,
+				sessionManager: rootSessionManager,
+			}));
+			lifecycle = lookupOwnedAgentLifecycle(parentSession);
+			if (!lifecycle) throw new Error("Expected the root's owned lifecycle");
+			const authority = bindInternalAgentAuthoritySession(registry, parentSession);
+			if (!authority) throw new Error("Expected the root's child-session authority");
+			const manager = SessionManager.inMemory(tempDir.path());
+			manager.appendMessage({ role: "user", content: "work", timestamp: 1 });
+			manager.appendMessage(assistantTurn(model, 0.6, 2));
+			({ session } = await authority.create({
+				...options,
+				agentId: "ParkingWorker",
+				agentDisplayName: "Parking worker",
+				sessionManager: manager,
+			}));
+			expect(
+				setAgentHistory(registry, session, {
+					metrics: {
+						tokens: 52,
+						requests: 4,
+						tools: 2,
+						cost: 0.6,
+						durationMs: 1200,
+						durationKind: "span",
+					},
+				}),
+			).toBe(true);
+			expect(setAgentStatus(registry, "ParkingWorker", "idle", session)).toBe(true);
+			const ref = registry.get("ParkingWorker");
+			if (!ref) throw new Error("Expected the authority-created child observation");
+			const registeredGeneration = resolveAgentObservation(registry, ref);
+			if (!registeredGeneration) throw new Error("Expected the registered agent observation");
+			const row = () => {
+				const observation = registry.get(ref.id);
+				if (!observation) throw new Error("Expected the registered agent observation");
+				const resolved = resolveAgentObservation(registry, observation);
+				if (!resolved || resolved !== registeredGeneration) {
+					throw new Error("Parking metrics observation belongs to a different agent generation");
+				}
+				return { ...observation, session: resolved.session ?? null };
+			};
+			const sessionMetrics = new WeakMap<object, { metrics: AgentMetrics | undefined }>();
+			const aggregate = (refreshFallback: boolean) =>
+				aggregateMetrics({
+					rows: [row()],
+					observedById: new Map(),
+					metricsFor: (observedRow, observed) => hubRowMetrics(observedRow, observed, sessionMetrics),
+					fallbackStatsSession: hubFallbackStatsSession,
+					sessionMetrics,
+					refreshFallback,
+				}).metrics;
+
+			expect(aggregate(true).cost).toBeCloseTo(0.6);
+
+			manager.appendMessage(assistantTurn(model, 0.4, 3));
+			session.agent.replaceMessages(manager.buildSessionContext().messages);
+			adoptAgent(lifecycle, ref.id, { idleTtlMs: 0 }, ref);
+			// No Hub aggregation occurs between the final .40 assistant message and
+			// detach; parking itself must snapshot the authoritative cumulative 1.00.
+			await parkAgent(lifecycle, ref.id);
+			session = undefined;
+
+			const parkedRow = row();
+			expect(resolveAgentObservation(registry, ref)?.session).toBeNull();
+			expect(parkedRow.session).toBeNull();
+			expect(parkedRow.history?.directCost).toBeCloseTo(1);
+			expect(hubRowMetrics(parkedRow, undefined, sessionMetrics)).toMatchObject({
+				tokens: 52,
+				requests: 4,
+				tools: 2,
+				cost: 1,
+				durationMs: 1200,
+				durationKind: "span",
+			});
+			expect(aggregate(false)).toMatchObject({
+				tokens: 52,
+				requests: 4,
+				tools: 2,
+				cost: 1,
+			});
+		} finally {
+			if (lifecycle) await disposeAgentLifecycle(lifecycle);
+			await session?.dispose();
+			await parentSession?.dispose();
+			authStorage.close();
+		}
+	});
+	it("refreshes live cost for a late off-branch model_usage entry without a message change", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		const registry = new AgentRegistry();
+		let session: AgentSession | undefined;
+		try {
+			const modelRegistry = new ModelRegistry(authStorage);
+			const model = modelRegistry.getAll().find(candidate => candidate.contextWindow && candidate.contextWindow > 0);
+			if (!model) throw new Error("Expected a bundled model");
+
+			const manager = SessionManager.inMemory();
+			manager.appendMessage({ role: "user", content: "initial turn", timestamp: 1 });
+			const ownerParent = manager.appendMessage(assistantTurn(model, 0.6, 2));
+			const activeLeaf = manager.appendMessage({ role: "user", content: "successor turn", timestamp: 3 });
+			session = liveAgentSession(manager, model, modelRegistry);
+			const ref = registry.register({
+				id: "LateProbe",
+				displayName: "Late probe",
+				kind: "sub",
+				parentId: "Main",
+				session,
+				status: "running",
+			});
+			const row = { ...ref, session: resolveAgentObservation(registry, ref)?.session ?? null };
+			const sessionMetrics = new WeakMap<object, { metrics: AgentMetrics | undefined }>();
+			const run = () =>
+				aggregateMetrics({
+					rows: [row],
+					observedById: new Map(),
+					metricsFor: (row, observed) => hubRowMetrics(row, observed, sessionMetrics),
+					fallbackStatsSession: hubFallbackStatsSession,
+					sessionMetrics,
+					refreshFallback: false,
+				}).metrics.cost;
+
+			expect(run()).toBeCloseTo(0.6);
+			manager.appendModelUsage(
+				{
+					purpose: "task-completion-probe",
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: billedUsage(0.05),
+					stopReason: "stop",
+				},
+				{ sessionId: manager.getSessionId(), parentId: ownerParent },
+			);
+
+			expect(manager.getLeafId()).toBe(activeLeaf);
+			expect(manager.getBranch().some(entry => entry.type === "model_usage")).toBe(false);
+			expect(manager.getUsageStatistics().cost).toBeCloseTo(0.65);
+			expect(run()).toBeCloseTo(0.65);
+		} finally {
+			await session?.dispose();
+			authStorage.close();
 		}
 	});
 });

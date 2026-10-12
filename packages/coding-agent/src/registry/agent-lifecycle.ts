@@ -33,6 +33,7 @@ import {
 	parkAgentRef,
 	removeAgentRef,
 	resolveAgentObservation,
+	setAgentHistory,
 	setAgentStatus,
 	type InternalAgentRef,
 	type InternalRegistryEvent,
@@ -333,6 +334,19 @@ export class AgentLifecycleManager {
 				const live = lookupAgentRef(this.#registry, id);
 				if (live !== ref || !live.session || live.session !== session) return;
 				if (this.#adopted.get(id)?.ref !== ref) return;
+
+				// Preserve cost before detaching the only live source. The session usage
+				// index includes off-transcript model calls; remove completed task-result
+				// billing so child rows remain the sole owners of nested spend.
+				try {
+					const usage = session.sessionManager.getUsageStatistics();
+					const directCost = usage.cost - usage.subagentCost;
+					if (Number.isFinite(directCost) && directCost >= 0) {
+						if (!setAgentHistory(this.#registry, session, { directCost })) return;
+					}
+				} catch (error) {
+					logger.debug("AgentLifecycleManager.park: cost snapshot failed", { id, error: String(error) });
+				}
 
 				// Commit atomically: detach + parked before dispose so callers never
 				if (!parkAgentRef(this.#registry, ref, session)) return;

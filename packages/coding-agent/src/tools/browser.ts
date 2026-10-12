@@ -14,16 +14,10 @@ import type { ToolSession } from "../sdk";
 import { enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { truncateForPrompt } from "./approval";
 import { resolveCmuxKind } from "./browser/cmux/rpc";
-import { resolveSpawnArgs } from "./browser/attach";
-import {
-	acquireBrowser,
-	type BrowserHandle,
-	type BrowserKind,
-	type BrowserKindTag,
-	holdBrowser,
-	releaseBrowser,
-} from "./browser/registry";
+import { describeRelayTargets, listRelayTargets, type RelayTarget, resolveSpawnArgs } from "./browser/attach";
+import { acquireBrowser, type BrowserKind, type BrowserKindTag, holdBrowser, releaseBrowser } from "./browser/registry";
 import { resolveRelayKind } from "./browser/relay/kind";
+import { describeTernTargets, listTernBlocks, type TernTarget, ternTargets } from "./browser/tern/blocks";
 import { resolveTernKind } from "./browser/tern/kind";
 import { isTernUnavailable } from "./browser/tern/wire";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
@@ -38,6 +32,9 @@ import {
 	releaseIdleTabsForOwner,
 	releaseTab,
 	runInTab,
+	type TabSession,
+	type TernTabSession,
+	ternBlocksTaken,
 } from "./browser/tab-supervisor";
 import { renderTabCall } from "./browser/tab-call";
 import { renderFunctionRun } from "./run-code";
@@ -89,7 +86,9 @@ const appSchema = type({
 	"relay?": type("boolean").describe("drive the user's own tabs via the omp browser relay"),
 	"tern?": type("boolean").describe("inside Tern: true forces a Tern picture-in-picture, false opts out"),
 	"args?": type("string[]").describe("extra cli args"),
-	"target?": type("string").describe("substring to pick a window"),
+	"target?": type("string").describe(
+		"URL/title substring picking the page to drive; inside Tern, adopts the user's browser block (or its id)",
+	),
 });
 
 const tabCallStepSchema = type({
@@ -98,7 +97,7 @@ const tabCallStepSchema = type({
 });
 
 const browserSchema = type({
-	action: type("'open' | 'close' | 'run' | 'call' | 'tabs'").describe("operation"),
+	action: type("'open' | 'close' | 'run' | 'call' | 'tabs' | 'targets'").describe("operation"),
 	"name?": type("string").describe("tab id (default 'main')"),
 	"url?": type("string").describe("url to open"),
 	"app?": appSchema,
@@ -190,7 +189,6 @@ function sweepIdleOwnedTabs(session: ToolSession): Promise<number> {
 /** Input schema for the browser tool. */
 export type BrowserParams = typeof browserSchema.infer;
 
-/** Details describing a browser tool execution result (for renderers + transcript). */
 export interface BrowserToolDetails {
 	action: BrowserParams["action"];
 	name?: string;
@@ -204,11 +202,14 @@ export interface BrowserToolDetails {
 	meta?: OutputMeta;
 }
 
+type BrowserPreludeDetails = BrowserToolDetails & { name: string };
+
 /**
  * The browser an open drives, by precedence: explicit `app.*` options, the
- * relay, `browser.cdpUrl`, a Tern PiP (inside a Tern pane, unless
- * `app.tern: false`; `app.tern: true` forces it; `headed` does not opt out),
- * a cmux surface, then Chromium.
+ * relay, `browser.cdpUrl`, Tern (inside a Tern pane, unless `app.tern: false`;
+ * `app.tern: true` forces it, `app.target` selects it over the `browser.tern`
+ * setting to adopt a block; `headed` does not opt out), a cmux surface, then
+ * Chromium.
  */
 export function resolveBrowserKind(
 	params: BrowserParams,
@@ -258,7 +259,11 @@ export function resolveBrowserKind(
 		return { kind: "connected", cdpUrl: configuredCdpUrl.replace(/\/+$/, "") };
 	}
 	if (app?.tern !== false) {
-		const ternKind = resolveTernKind({ settingEnabled: cfgBrowserTern.get(session.settings) }, env);
+		// `app.target` inside Tern names a browser block to adopt: an explicit request, like `app.tern: true`.
+		const ternKind = resolveTernKind(
+			{ settingEnabled: app?.target !== undefined || cfgBrowserTern.get(session.settings) },
+			env,
+		);
 		if (ternKind) return ternKind;
 	}
 	const cmuxKind = resolveCmuxKind(
@@ -364,7 +369,6 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			call: { action: "close", all: true, kill: true },
 		},
 	];
-
 	constructor(
 		private readonly session: ToolSession,
 		private readonly options: BrowserToolOptions = {},
@@ -373,11 +377,6 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 	get description(): string {
 		this.#description ??= prompt.render(browserDescription, {});
 		return this.#description;
-	}
-
-	/** Restart browser to apply mode changes (e.g. headless toggle). Drops only headless browsers. */
-	async restartForModeChange(): Promise<void> {
-		await dropHeadlessTabs();
 	}
 
 	async execute(
@@ -392,196 +391,32 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			const timeoutSeconds = clampTimeout("browser", params.timeout, cfgToolsMaxTimeout.get(this.session.settings));
 			const timeoutMs = timeoutSeconds * 1000;
 			const name = params.name ?? DEFAULT_TAB_NAME;
-			const details: BrowserToolDetails = { action: params.action, name };
-
+			const details: BrowserPreludeDetails = { action: params.action, name };
 			switch (params.action) {
 				case "tabs": {
 					const value = listTabs(this.options.dedicatedAuditId, this.session.getSessionId?.() ?? undefined);
 					details.value = value;
-					return toolResult(details).text(JSON.stringify(value)).done();
+					return toolResult<BrowserToolDetails>(details).text(JSON.stringify(value)).done();
 				}
 				case "open":
 					return await this.#open(name, params, details, timeoutMs, signal);
 				case "close":
 					return await this.#close(name, params, details, timeoutMs, signal);
+				case "targets":
+					if (this.options.dedicatedAuditId) {
+						throw new ToolError("Browser audit sessions cannot enumerate user browser targets.");
+					}
+					return listTargets(this.session, params, details, timeoutMs, signal);
 				case "run":
 				case "call":
-					return await this.#run(name, params, details, timeoutMs, signal);
-				default:
-					throw new ToolError(`Unsupported action: ${(params as BrowserParams).action}`);
+					return this.#run(name, params, details, timeoutMs, signal);
 			}
 		} catch (error) {
 			if (error instanceof ToolAbortError) throw error;
-			if (error instanceof Error && error.name === "AbortError") {
-				throw new ToolAbortError();
-			}
+			if (error instanceof Error && error.name === "AbortError") throw new ToolAbortError();
 			throw error;
 		}
 	}
-
-	/**
-	 * Open (or reuse) a tab. A Tern PiP chosen automatically (not forced with
-	 * `app.tern: true`) falls back to Chromium when Tern cannot host it — no
-	 * window, an unsupported platform, a refused or failed connection — and the
-	 * result says so; a tab that already fell back keeps its browser.
-	 */
-	async #open(
-		name: string,
-		params: BrowserParams,
-		details: BrowserToolDetails,
-		timeoutMs: number,
-		signal?: AbortSignal,
-	): Promise<AgentToolResult<BrowserToolDetails>> {
-		const resolved = this.options.dedicatedAuditId
-			? ({ kind: "audit", auditId: this.options.dedicatedAuditId } satisfies BrowserKind)
-			: this.options.isolatedHeadless
-				? ({ kind: "headless", headless: true } satisfies BrowserKind)
-				: resolveBrowserKind(params, this.session);
-		const autoTern = resolved.kind === "tern" && params.app?.tern !== true;
-		const existing = getTab(name, this.options.dedicatedAuditId);
-		const kind = autoTern && existing && existing.kindTag !== "tern" ? existing.browser.kind : resolved;
-		const startedAt = performance.now();
-		try {
-			return await this.#openOnKind(name, params, details, kind, timeoutMs, [], signal);
-		} catch (error) {
-			if (kind.kind !== "tern" || !autoTern || !isTernUnavailable(error) || signal?.aborted) throw error;
-			// A Tern tab under this name whose window went away still holds the name: release
-			// that one (and only that one) so the Chromium tab can take it.
-			if (getTab(name, this.options.dedicatedAuditId)?.kindTag === "tern") {
-				await releaseTab(name, { kill: false, timeoutMs, auditId: this.options.dedicatedAuditId }).catch(
-					() => false,
-				);
-			}
-			const note = `Tern cannot show a browser here (${error.message}); opened Chromium instead. Pass app.tern:false to skip Tern, or app.tern:true to require it.`;
-			logger.debug("Tern browser unavailable; falling back to Chromium", { error: error.message });
-			const remainingMs = Math.max(1, timeoutMs - (performance.now() - startedAt));
-			return await this.#openOnKind(
-				name,
-				params,
-				details,
-				chromiumKind(params, this.session),
-				remainingMs,
-				[note],
-				signal,
-			);
-		}
-	}
-
-	async #openOnKind(
-		name: string,
-		params: BrowserParams,
-		details: BrowserToolDetails,
-		kind: BrowserKind,
-		timeoutMs: number,
-		notes: readonly string[],
-		signal?: AbortSignal,
-	): Promise<AgentToolResult<BrowserToolDetails>> {
-		details.browser = kind.kind;
-
-		// If a tab with this name already exists on a different browser kind, fail fast — caller must close first.
-		const existing = getTab(name, this.options.dedicatedAuditId);
-		if (existing && !sameBrowserKind(existing.browser.kind, kind)) {
-			throw new ToolError(
-				`Tab ${JSON.stringify(name)} is bound to a different browser (${describeKind(existing.browser.kind)}). Close it first.`,
-			);
-		}
-
-		// The requested timeout must cover the *entire* open — browser
-		// acquisition (CDP discovery/connect), queued tab acquisition, worker
-		// creation, and navigation — not only `acquireTab`. Compose one deadline
-		// from the caller signal and `params.timeout` and thread it through both
-		// stages so a stalled acquisition rejects at the requested boundary.
-		// Capture the deadline start as well: `acquireTab` counts its
-		// worker-init time against this same budget via `deadlineStartMs`
-		// instead of restarting the clock after acquisition.
-		const deadlineStart = performance.now();
-		const timeoutSignal = AbortSignal.timeout(timeoutMs);
-		const openSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-		try {
-			const browser = await untilAborted(openSignal, () =>
-				acquireBrowser(kind, {
-					cwd: this.session.cwd,
-					viewport: params.viewport
-						? {
-								width: params.viewport.width,
-								height: params.viewport.height,
-								deviceScaleFactor: params.viewport.scale,
-							}
-						: undefined,
-					appArgs: params.app?.args,
-					signal: openSignal,
-				}),
-			);
-
-			// Hold one open-acquisition lease across the whole tab acquisition.
-			// A freshly-created browser sits in the registry at refCount 0 until a
-			// tab takes a hold; without this lease an abort/timeout mid-acquisition
-			// (or a sibling open of a different tab name on the same browser that
-			// fails) could dispose it out from under this operation. The lease is
-			// released exactly once — the success and failure paths are mutually
-			// exclusive — transferring ownership to the published tab on success or
-			// rolling the fresh browser back on failure.
-			holdBrowser(browser);
-			let result: AcquireTabResult;
-			try {
-				result = await untilAborted(openSignal, async () =>
-					acquireTab(name, browser, {
-						url: params.url,
-						waitUntil: params.wait_until,
-						viewport: params.viewport
-							? {
-									width: params.viewport.width,
-									height: params.viewport.height,
-									deviceScaleFactor: params.viewport.scale,
-								}
-							: undefined,
-						target: params.app?.target,
-						timeoutMs,
-						deadlineStartMs: deadlineStart,
-						dialogs: params.dialogs,
-						allowedDomains: params.allowed_domains,
-						initScripts: await resolveInitScriptSources(params.init_scripts, this.session.cwd),
-						downloadsPath: params.downloads ? resolveToCwd(params.downloads, this.session.cwd) : undefined,
-						userAgent: params.user_agent,
-						ignoreHttpsErrors: params.ignore_https_errors,
-						signal: openSignal,
-						ownerSessionId: this.session.getSessionId?.() ?? undefined,
-						persist: params.persist,
-						auditId: this.options.dedicatedAuditId,
-					}),
-				);
-			} catch (error) {
-				await releaseBrowser(browser, {
-					kill: "subprocess" in browser && browser.subprocess !== undefined,
-				});
-				throw error;
-			}
-			await releaseBrowser(browser, { kill: false });
-			void sweepIdleOwnedTabs(this.session);
-
-			const tab = result.tab;
-			const url = tab.info.url;
-			const title = tab.info.title ?? "";
-			details.url = url;
-			details.viewport = tab.info.viewport;
-			const verb = result.created ? "Opened" : "Reused";
-			const lines = [
-				`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(browser)}`,
-				`URL: ${url}`,
-				title ? `Title: ${title}` : null,
-				...notes,
-			].filter((l): l is string => typeof l === "string");
-			details.result = lines.join("\n");
-			return toolResult(details).text(lines.join("\n")).done();
-		} catch (error) {
-			// Caller cancellation stays a ToolAbortError; the requested timeout
-			// becomes a timeout ToolError; anything else passes through unchanged.
-			if (signal?.aborted) throw error instanceof ToolAbortError ? error : new ToolAbortError();
-			if (timeoutSignal.aborted) throw new ToolError(`Browser open timed out after ${timeoutMs}ms`);
-			throw error;
-		}
-	}
-
 	async #close(
 		name: string,
 		params: BrowserParams,
@@ -680,6 +515,225 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		}
 		return toolResult(details).content(content).done();
 	}
+	/**
+	 * Open (or reuse) a tab. A Tern PiP chosen automatically (not forced with
+	 * `app.tern: true`) falls back to Chromium when Tern cannot host it — no
+	 * window, an unsupported platform, a refused or failed connection — and the
+	 * result says so; a tab that already fell back keeps its browser.
+	 */
+	async #open(
+		name: string,
+		params: BrowserParams,
+		details: BrowserToolDetails,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<AgentToolResult<BrowserToolDetails>> {
+		const resolved = this.options.dedicatedAuditId
+			? ({ kind: "audit", auditId: this.options.dedicatedAuditId } satisfies BrowserKind)
+			: this.options.isolatedHeadless
+				? ({ kind: "headless", headless: true } satisfies BrowserKind)
+				: resolveBrowserKind(params, this.session);
+		const autoTern = resolved.kind === "tern" && params.app?.tern !== true && params.app?.target === undefined;
+		const existing = getTab(name, this.options.dedicatedAuditId);
+		const kind = autoTern && existing && existing.kindTag !== "tern" ? existing.browser.kind : resolved;
+		const startedAt = performance.now();
+		try {
+			return await this.#openOnKind(name, params, details, kind, timeoutMs, [], signal);
+		} catch (error) {
+			if (kind.kind !== "tern" || !autoTern || !isTernUnavailable(error) || signal?.aborted) throw error;
+			// A Tern tab under this name whose window went away still holds the name: release
+			// that one (and only that one) so the Chromium tab can take it.
+			if (getTab(name, this.options.dedicatedAuditId)?.kindTag === "tern") {
+				await releaseTab(name, { kill: false, timeoutMs, auditId: this.options.dedicatedAuditId }).catch(
+					() => false,
+				);
+			}
+			const note = `Tern cannot show a browser here (${error.message}); opened Chromium instead. Pass app.tern:false to skip Tern, or app.tern:true to require it.`;
+			logger.debug("Tern browser unavailable; falling back to Chromium", { error: error.message });
+			const remainingMs = Math.max(1, timeoutMs - (performance.now() - startedAt));
+			return await this.#openOnKind(
+				name,
+				params,
+				details,
+				chromiumKind(params, this.session),
+				remainingMs,
+				[note],
+				signal,
+			);
+		}
+	}
+
+	async #openOnKind(
+		name: string,
+		params: BrowserParams,
+		details: BrowserToolDetails,
+		kind: BrowserKind,
+		timeoutMs: number,
+		notes: readonly string[],
+		signal?: AbortSignal,
+	): Promise<AgentToolResult<BrowserToolDetails>> {
+		details.browser = kind.kind;
+
+		// If a tab with this name already exists on a different browser kind, fail fast — caller must close first.
+		const existing = getTab(name, this.options.dedicatedAuditId);
+		if (existing && !sameBrowserKind(existing.browser.kind, kind)) {
+			throw new ToolError(
+				`Tab ${JSON.stringify(name)} is bound to a different browser (${describeKind(existing.browser.kind)}). Close it first.`,
+			);
+		}
+
+		// The requested timeout must cover the *entire* open — browser
+		// acquisition (CDP discovery/connect), queued tab acquisition, worker
+		// creation, and navigation — not only `acquireTab`. Compose one deadline
+		// from the caller signal and `params.timeout` and thread it through both
+		// stages so a stalled acquisition rejects at the requested boundary.
+		// Capture the deadline start as well: `acquireTab` counts its
+		// worker-init time against this same budget via `deadlineStartMs`
+		// instead of restarting the clock after acquisition.
+		const deadlineStart = performance.now();
+		const timeoutSignal = AbortSignal.timeout(timeoutMs);
+		const openSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+		let timeoutStage = `while launching or connecting to the browser (${describeKind(kind)})`;
+		try {
+			const browser = await untilAborted(openSignal, () =>
+				acquireBrowser(kind, {
+					cwd: this.session.cwd,
+					viewport: params.viewport
+						? {
+								width: params.viewport.width,
+								height: params.viewport.height,
+								deviceScaleFactor: params.viewport.scale,
+							}
+						: undefined,
+					appArgs: params.app?.args,
+					signal: openSignal,
+				}),
+			);
+
+			// Hold one open-acquisition lease across the whole tab acquisition.
+			// A freshly-created browser sits in the registry at refCount 0 until a
+			// tab takes a hold; without this lease an abort/timeout mid-acquisition
+			// (or a sibling open of a different tab name on the same browser that
+			// fails) could dispose it out from under this operation. The lease is
+			// released exactly once — the success and failure paths are mutually
+			// exclusive — transferring ownership to the published tab on success or
+			// rolling the fresh browser back on failure.
+			holdBrowser(browser);
+			timeoutStage = `while opening tab ${JSON.stringify(name)}`;
+			let result: AcquireTabResult;
+			try {
+				result = await untilAborted(openSignal, async () =>
+					acquireTab(name, browser, {
+						url: params.url,
+						waitUntil: params.wait_until,
+						viewport: params.viewport
+							? {
+									width: params.viewport.width,
+									height: params.viewport.height,
+									deviceScaleFactor: params.viewport.scale,
+								}
+							: undefined,
+						target: params.app?.target,
+						timeoutMs,
+						deadlineStartMs: deadlineStart,
+						dialogs: params.dialogs,
+						allowedDomains: params.allowed_domains,
+						initScripts: await resolveInitScriptSources(params.init_scripts, this.session.cwd),
+						downloadsPath: params.downloads ? resolveToCwd(params.downloads, this.session.cwd) : undefined,
+						userAgent: params.user_agent,
+						ignoreHttpsErrors: params.ignore_https_errors,
+						signal: openSignal,
+						ownerSessionId: this.session.getSessionId?.() ?? undefined,
+						persist: params.persist,
+						auditId: this.options.dedicatedAuditId,
+					}),
+				);
+			} catch (error) {
+				await releaseBrowser(browser, {
+					kill: "subprocess" in browser && browser.subprocess !== undefined,
+				});
+				throw error;
+			}
+			await releaseBrowser(browser, { kill: false });
+			void sweepIdleOwnedTabs(this.session);
+
+			const tab = result.tab;
+			const url = tab.info.url;
+			const title = tab.info.title ?? "";
+			details.url = url;
+			details.viewport = tab.info.viewport;
+			const verb = result.created ? "Opened" : "Reused";
+			const lines = [
+				`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(result.tab)}`,
+				`URL: ${url}`,
+				title ? `Title: ${title}` : null,
+				...(result.tab.backend === "tern" ? ternNotes(result.tab) : []),
+				...notes,
+			].filter((l): l is string => typeof l === "string");
+			details.result = lines.join("\n");
+			return toolResult(details).text(lines.join("\n")).done();
+		} catch (error) {
+			// Caller cancellation stays a ToolAbortError; the requested timeout
+			// becomes a timeout ToolError; anything else passes through unchanged.
+			if (signal?.aborted) throw error instanceof ToolAbortError ? error : new ToolAbortError();
+			if (timeoutSignal.aborted) throw new ToolError(`Browser open timed out after ${timeoutMs}ms ${timeoutStage}`);
+			throw error;
+		}
+	}
+}
+
+/**
+ * The user's own pages `app.target` can adopt, from the browser an open with
+ * `app.target` would drive: a Tern window's browser blocks, or the relay's
+ * Chrome pages. The browser is acquired as an open does (the loopback relay
+ * starts on demand) and released again.
+ */
+async function listTargets(
+	session: ToolSession,
+	params: BrowserParams,
+	details: BrowserPreludeDetails,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<AgentToolResult<BrowserToolDetails>> {
+	// Resolve as an open naming a target: inside Tern that selects Tern even when the `browser.tern` setting is off.
+	const kind = resolveBrowserKind({ ...params, app: { ...params.app, target: params.app?.target ?? "" } }, session);
+	if (kind.kind !== "tern" && kind.kind !== "relay") {
+		throw new ToolError(
+			`No pages to adopt here (the browser would be ${describeKind(kind)}): targets exist only inside a Tern pane (its browser blocks) or with the omp relay (app.relay: true or the browser.relay setting).`,
+		);
+	}
+	details.browser = kind.kind;
+	const timeoutSignal = AbortSignal.timeout(timeoutMs);
+	const listSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	try {
+		const browser = await untilAborted(listSignal, () =>
+			acquireBrowser(kind, { cwd: session.cwd, signal: listSignal }),
+		);
+		holdBrowser(browser);
+		try {
+			let targets: TernTarget[] | RelayTarget[];
+			let text: string;
+			if (kind.kind === "relay") {
+				targets = await untilAborted(listSignal, () => listRelayTargets(kind.cdpUrl, listSignal));
+				text = describeRelayTargets(targets);
+			} else if ("tern" in browser) {
+				const blocks = await listTernBlocks(browser.tern, { timeoutMs, signal: listSignal });
+				const taken = ternBlocksTaken();
+				targets = ternTargets(blocks, taken);
+				text = describeTernTargets(blocks, taken);
+			} else {
+				throw new ToolError(`${describeKind(kind)} has no pages to adopt.`);
+			}
+			details.value = targets;
+			return toolResult<BrowserToolDetails>(details).text(text).done();
+		} finally {
+			await releaseBrowser(browser, { kill: false });
+		}
+	} catch (error) {
+		if (signal?.aborted) throw error instanceof ToolAbortError ? error : new ToolAbortError();
+		if (timeoutSignal.aborted) throw new ToolError(`Listing browser targets timed out after ${timeoutMs}ms`);
+		throw error;
+	}
 }
 
 /** Persist over-cap browser run output as a session artifact; mirrors the bash minimizer's save path. */
@@ -694,10 +748,13 @@ async function saveBrowserOutputArtifact(session: ToolSession, fullText: string)
 	}
 }
 
-function describeBrowser(handle: BrowserHandle): string {
-	if ("tern" in handle) {
-		return `Tern browser picture-in-picture (pane ${handle.kind.pane})`;
+function describeBrowser(tab: TabSession): string {
+	if (tab.backend === "tern") {
+		const adopted = tab.ternTab.adopted;
+		if (!adopted) return `Tern browser picture-in-picture (pane ${tab.browser.kind.pane})`;
+		return `the user's Tern browser block ${adopted.block} (${adopted.owner === null ? "docked" : "picture-in-picture"})`;
 	}
+	const handle = tab.browser;
 	if (!("browser" in handle)) {
 		return `cmux browser (${handle.kind.surface ?? "split"})`;
 	}
@@ -713,6 +770,25 @@ function describeBrowser(handle: BrowserHandle): string {
 		case "relay":
 			return `relay ${handle.cdpUrl ?? handle.kind.cdpUrl}`;
 	}
+}
+
+/** Where a Tern tab's page is for the user: whose block it is, and whether it is on screen. */
+function ternNotes(tab: TernTabSession): string[] {
+	const notes: string[] = [];
+	const adopted = tab.ternTab.adopted;
+	if (adopted) {
+		notes.push(
+			`This is the user's own Tern browser block ${adopted.block} (${JSON.stringify(tab.info.title ?? "")} at ${tab.info.url}); closing the tab releases it to the user without closing it.`,
+		);
+	}
+	if (tab.ternTab.shown === false) {
+		notes.push(
+			adopted
+				? `Not on screen: the user is viewing another Tern tab or session. Block ${adopted.block} shows once they switch to the tab holding it; tell them where it is.`
+				: `Not on screen: the user hid pictures in picture (⌃⌥⌘P), or this Tern shows them only in the tab holding this omp pane (block ${tab.browser.kind.pane}); tell them where it is.`,
+		);
+	}
+	return notes;
 }
 
 function describeKind(kind: BrowserKind): string {

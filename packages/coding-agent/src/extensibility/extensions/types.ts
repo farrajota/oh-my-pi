@@ -45,7 +45,6 @@ import type {
 	AutocompleteItem,
 	AutocompleteProvider,
 	Component,
-	ComposerStyle,
 	EditorTheme,
 	KeyId,
 	OverlayHandle,
@@ -60,6 +59,9 @@ import type {
 	BackgroundControlResult,
 } from "../../async";
 import type { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
+import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
+import type { CodeReviewAnnotation, TextReviewAnnotation } from "@oh-my-pi/pi-tui/overlays/annotation-types";
+export type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
@@ -133,6 +135,7 @@ import type {
 	TurnStartEvent,
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
+import type { TerminalLaunchRequest, TerminalLaunchResult } from "../../subprocess/terminal-launch";
 
 export type { OverlayHandle, OverlayOptions } from "@oh-my-pi/pi-tui";
 export type {
@@ -276,6 +279,8 @@ export type AutocompleteProviderFactory = (current: AutocompleteProvider) => Aut
 export interface ExtensionUIContext {
 	/** True when selector timeouts start only after the dialog is presented. */
 	timeoutStartsOnPresentation?: boolean;
+	/** True when pasteToEditor updates a local or remote composer; absent means unsupported. */
+	supportsEditor?: boolean;
 	/** Show a selector and return the selected label, even when an option also includes a description. */
 	select(
 		title: string,
@@ -285,6 +290,8 @@ export interface ExtensionUIContext {
 
 	/** Show a confirmation dialog. */
 	confirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean>;
+	/** Create a pane or multiplexer group and run an argv command when the TUI host supports it. */
+	openTerminal?(request: TerminalLaunchRequest): Promise<TerminalLaunchResult>;
 
 	/** Show a text input dialog. */
 	input(title: string, placeholder?: string, dialogOptions?: ExtensionUIDialogOptions): Promise<string | undefined>;
@@ -390,16 +397,6 @@ export interface ExtensionUIContext {
 	setToolsExpanded(expanded: boolean): void;
 }
 
-/** Visual composer style and selector copy registered by an extension. */
-export interface ComposerShapeDefinition {
-	/** User-facing name shown in composer-shape selectors. */
-	label: string;
-	/** Optional detail shown under the selector label. */
-	description?: string;
-	/** Renderer contract; its id becomes the persisted `composer.shape` value. */
-	style: ComposerStyle;
-}
-
 // ============================================================================
 // Extension Context
 // ============================================================================
@@ -503,6 +500,138 @@ export interface ExtensionAgentIdentity {
 	parentId?: string;
 }
 
+/** Text an annotation run targets; `file` paths resolve against the live session cwd. */
+export type AnnotationTextSource =
+	| { kind: "text"; text: string; label?: string }
+	| { kind: "file"; path: string }
+	/** The latest non-empty assistant reply on the active branch. */
+	| { kind: "last" };
+
+/** A diff an annotation run targets, frozen once before notes are matched or the overlay opens. */
+export type AnnotationDiffSource =
+	/** A git-format patch supplied by the caller. */
+	| { kind: "diff"; diff: string; label?: string }
+	/** Staged + unstaged (or jj working-copy) changes in the live session cwd. */
+	| { kind: "uncommitted" }
+	/** A GitHub PR: `https://github.com/owner/repo/pull/N` or `pr://owner/repo/N`. */
+	| { kind: "pr"; ref: string };
+
+export type AnnotationSource = AnnotationTextSource | AnnotationDiffSource;
+
+/**
+ * A note on a text source: whole-source when `line` is omitted, else one 1-based source line.
+ * `quote` pins the expected line text; when it differs from the current line, the note rejects.
+ */
+export interface AnnotationTextNote {
+	note: string;
+	line?: number;
+	quote?: string;
+}
+
+/**
+ * A note on a diff source: whole-file when `line` is omitted. `line` is a line number on
+ * `side` (default `"new"`; use `"old"` for removed lines); `occurrence` picks among repeated
+ * sections for the same path (default 1). `rawLine` pins the expected diff row including its
+ * `+`/`-`/space prefix; when it differs from the matched row, the note rejects.
+ */
+export interface AnnotationDiffNote {
+	path: string;
+	note: string;
+	line?: number;
+	side?: "old" | "new";
+	occurrence?: number;
+	rawLine?: string;
+}
+
+/**
+ * Where the built feedback goes. `"auto"` pastes into the composer when the interactive TUI
+ * editor is available and the text is not an LLM review request; otherwise it sends.
+ * `"paste"` and `"send"` force one channel (`"send"` uses `pi.sendUserMessage` semantics and
+ * queues as a follow-up while the agent is streaming); `"none"` only returns the text.
+ */
+export type AnnotationDelivery = "auto" | "paste" | "send" | "none";
+
+interface AnnotationRequestBase {
+	deliver?: AnnotationDelivery;
+}
+
+/** Diff-only options: `review` builds the full `/review` request; `focus` adds review focus text. */
+interface AnnotationDiffRequestOptions {
+	review?: boolean;
+	focus?: string;
+}
+
+/** Text sources never build an LLM review request, so the diff-only options are rejected. */
+interface AnnotationTextRequestOptions {
+	review?: never;
+	focus?: never;
+}
+
+export type AnnotationSubmitRequest =
+	| (AnnotationRequestBase &
+			AnnotationTextRequestOptions & { source: AnnotationTextSource; notes: AnnotationTextNote[] })
+	| (AnnotationRequestBase &
+			AnnotationDiffRequestOptions & {
+				source: AnnotationDiffSource;
+				notes: AnnotationDiffNote[];
+			});
+
+export type AnnotationOpenRequest =
+	| (AnnotationRequestBase & AnnotationTextRequestOptions & { source: AnnotationTextSource })
+	| (AnnotationRequestBase & Pick<AnnotationDiffRequestOptions, "focus"> & { source: AnnotationDiffSource });
+
+interface AnnotationResultBase {
+	/** Feedback exactly as `/annotate` renders it; undefined when there was nothing to report. */
+	text: string | undefined;
+	/** Channel the text went to; `"none"` when it was only returned. */
+	delivered: "paste" | "send" | "none";
+}
+
+/** Result for a text source (`text`, `file`, `last`). */
+export interface AnnotationTextResult extends AnnotationResultBase {
+	kind: "text";
+	review: false;
+	/** Normalized notes: line notes carry the quoted source line. */
+	annotations: TextReviewAnnotation[];
+	/**
+	 * Set only by `open` when the operator replaced the source through the external editor
+	 * inside the overlay; `text` and `annotations` refer to this edited text, not the original.
+	 */
+	editedText?: string;
+}
+
+/** Result for a diff source (`diff`, `uncommitted`, `pr`). */
+export interface AnnotationDiffResult extends AnnotationResultBase {
+	kind: "diff";
+	/** Whether `text` is an LLM review request rather than pasteable notes. */
+	review: boolean;
+	/** Normalized notes: line notes carry the matched diff row. */
+	annotations: CodeReviewAnnotation[];
+}
+
+/** Discriminated by `kind`, which follows the request source. */
+export type AnnotationResult = AnnotationTextResult | AnnotationDiffResult;
+
+/**
+ * `/annotate` as an API. `submit` turns caller-supplied notes into the same feedback without UI;
+ * `open` mounts the annotation overlay on a caller-chosen source (`mode === "tui"` only) and
+ * resolves with the operator's notes, or undefined when dismissed.
+ * Both reject when a source cannot be read or a note does not match its source.
+ */
+export interface ExtensionAnnotationsAPI {
+	submit(request: AnnotationSubmitRequest): Promise<AnnotationResult>;
+	open(request: AnnotationOpenRequest): Promise<AnnotationResult | undefined>;
+}
+
+/**
+ * Builds `ctx.annotations` for one context. `getContext` is read per call so the API sees the
+ * receiving context's live cwd and UI; the host injects the implementation.
+ */
+export type ExtensionAnnotationsFactory = (
+	getContext: () => ExtensionContext,
+	sendUserMessage: (text: string, options?: SendUserMessageOptions) => void,
+) => ExtensionAnnotationsAPI;
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -568,6 +697,8 @@ export interface ExtensionContext {
 	runEphemeralTurn?(options: EphemeralTurnOptions): Promise<EphemeralTurnResult>;
 	/** Structured memory runtime for status/search/save across the configured backend. */
 	memory?: MemoryRuntimeContext;
+	/** `/annotate` as an API: build or collect annotation feedback on text and diffs. */
+	annotations: ExtensionAnnotationsAPI;
 	/**
 	 * Schedule a repeating callback whose throws are contained. Unlike raw
 	 * `setInterval`, a synchronous throw or rejected promise from `callback` is
@@ -1676,12 +1807,8 @@ export interface ExtensionAPI {
 
 	/** Send a user prompt: idle starts a turn; streaming queues as steer unless deliverAs is set.
 	 *  `deliverAs: "aside"` injects at the next step boundary without interrupting the in-flight tool
-	 *  batch while streaming; idle still starts a turn. */
-	sendUserMessage(
-		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp" | "aside" },
-	): void;
-
+	 *  batch while streaming, except that it ends a running interruptible `wait`; idle still starts a turn. */
+	sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): void;
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
 
@@ -1903,13 +2030,13 @@ export type SendMessageHandler = <T = unknown>(
 	 * When paired with `triggerTurn: true` during prompt teardown, the session schedules
 	 * an internal continuation without surfacing the message in the editable pending queue.
 	 * `deliverAs: "aside"` injects at the next step boundary without interrupting the in-flight
-	 * tool batch; idle starts a turn regardless of `triggerTurn` (plan mode folds into context).
+	 * tool batch, except that it ends a running interruptible `wait`; idle starts a turn regardless of `triggerTurn` (plan mode folds into context).
 	 */
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
 ) => void;
 
 /** `deliverAs: "aside"` injects at the next step boundary without interrupting the in-flight tool
- *  batch while streaming; idle still starts a turn. */
+ *  batch while streaming, except that it ends a running interruptible `wait`; idle still starts a turn. */
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
 	options?: { deliverAs?: "steer" | "followUp" | "aside" },

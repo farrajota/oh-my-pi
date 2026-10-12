@@ -76,6 +76,8 @@ function isKnownProvider(provider: string): provider is KnownProvider {
 
 /**
  * Pick the first auto-selectable provider-default model in availability order.
+ * A provider's default is the model its discovery marks as the account default
+ * (`isProviderDefault`), else its bundled `default-model`.
  *
  * When `hasConcreteCredential` is supplied and at least one available model
  * belongs to a provider with a concrete credential, the candidate pool is
@@ -111,18 +113,18 @@ export function pickDefaultAvailableModel(
 					});
 					return concrete.length > 0 ? concrete : autoSelectable;
 				})();
-	const firstDefault = models.find(
-		model => isKnownProvider(model.provider) && DEFAULT_MODEL_PER_PROVIDER[model.provider] === model.id,
+	const accountDefaultProviders = new Set(
+		models.filter(model => model.isProviderDefault).map(model => model.provider),
 	);
+	const isDefaultForProvider = (model: Model<Api>): boolean =>
+		accountDefaultProviders.has(model.provider)
+			? model.isProviderDefault === true
+			: isKnownProvider(model.provider) && DEFAULT_MODEL_PER_PROVIDER[model.provider] === model.id;
+	const firstDefault = models.find(isDefaultForProvider);
 	if (!firstDefault) return models[0];
 
 	const providerPriority = buildModelProviderPriorityRank();
-	const sharedDefaultMatches = models.filter(
-		model =>
-			model.id === firstDefault.id &&
-			isKnownProvider(model.provider) &&
-			DEFAULT_MODEL_PER_PROVIDER[model.provider] === model.id,
-	);
+	const sharedDefaultMatches = models.filter(model => model.id === firstDefault.id && isDefaultForProvider(model));
 	return [...sharedDefaultMatches].sort((a, b) => {
 		const aRank = providerPriority.get(a.provider.toLowerCase()) ?? Number.POSITIVE_INFINITY;
 		const bRank = providerPriority.get(b.provider.toLowerCase()) ?? Number.POSITIVE_INFINITY;
@@ -1204,7 +1206,7 @@ export function rolePriorityDefaults(role: string): string[] {
 
 /** Resolve aliases inside a configured pattern list without leaking cycles to model matching. */
 function resolveNestedRolePatterns(
-	value: string,
+	value: string | string[],
 	roleDefaults: string[],
 	settings: ModelRoleLookup | undefined,
 	visited: Set<string>,
@@ -1267,7 +1269,11 @@ function resolveConfiguredRolePattern(
 
 	const configured = settings?.getModelRole(role)?.trim();
 	const configuredDefault = settings?.getModelRole(DEFAULT_MODEL_ROLE)?.trim();
-	const roleDefaults = isModelRole(role) ? rolePriorityDefaults(role) : [];
+	// Built-in defaults chain to other roles (judge: `@tiny`, `@smol`, `@default`). Left unexpanded, the
+	// matcher reads them as literal ids and `@default` fuzzy-matches Vertex ids like `claude-opus-4-8@default`.
+	const roleDefaults = isModelRole(role)
+		? resolveNestedRolePatterns(rolePriorityDefaults(role), [], settings, visited)
+		: [];
 	const configuredFallback = isModelRole(role) ? ROLE_CONFIGURED_FALLBACK[role] : undefined;
 	const fallbackPatterns =
 		configured ||
@@ -1460,8 +1466,9 @@ export interface AgentAdvisorSelection {
  * runs unadvised. The settings override decides enablement first ("off" wins,
  * "on" enables with the agent's own model pattern or the `advisor` role, any
  * other value is a custom model pattern); otherwise the agent definition's
- * `advisor` field applies. A returned pattern lands on the spawned session's
- * `modelRoles.advisor`, so role aliases and `:level` suffixes resolve there.
+ * `advisor` field applies. Callers expand a returned pattern against the
+ * owner's roles (`resolveAgentAdvisorRolePattern`) before it lands on the
+ * spawned session's `modelRoles.advisor`, so `@advisor` cannot point at itself.
  */
 export function resolveAgentAdvisorSelection(
 	options: AgentAdvisorResolutionOptions,
@@ -1477,6 +1484,17 @@ export function resolveAgentAdvisorSelection(
 	}
 	if (options.agentAdvisor === true) return {};
 	return agentPattern ? { model: agentPattern } : undefined;
+}
+
+/**
+ * Expand an agent advisor pattern against the owner's role lookup before it is
+ * stamped onto a spawned session's `modelRoles.advisor`. Without this, a
+ * self-referential `@advisor` lands as the child's own advisor role, trips the
+ * cycle guard, and silently degrades to the built-in `slow` priority list.
+ */
+export function resolveAgentAdvisorRolePattern(pattern: string, settings?: ModelRoleLookup): string {
+	const expanded = resolveConfiguredModelPatterns(pattern, settings);
+	return expanded.length > 0 ? expanded.join(",") : pattern;
 }
 
 /**
@@ -1545,12 +1563,14 @@ export function resolveModelRoleValue(
 }
 
 interface ExplicitThinkingSelectorOptions {
-	isLiteralModelId?: (provider: string, id: string) => boolean;
+	/** Exact ID lookup; an undefined provider checks unqualified IDs across the caller's model set. */
+	isLiteralModelId?: (provider: string | undefined, id: string) => boolean;
 }
 
 function isLiteralModelSelector(value: string, options?: ExplicitThinkingSelectorOptions): boolean {
 	const parsed = parseModelString(value);
-	return parsed !== undefined && options?.isLiteralModelId?.(parsed.provider, parsed.id) === true;
+	if (parsed) return options?.isLiteralModelId?.(parsed.provider, parsed.id) === true;
+	return options?.isLiteralModelId?.(undefined, value) === true;
 }
 
 export function extractExplicitThinkingSelector(
@@ -1566,7 +1586,7 @@ export function extractExplicitThinkingSelector(
 	let current = normalized;
 	while (!visited.has(current)) {
 		visited.add(current);
-		const rolePrefixLength = modelRoleAliasPrefixLength(current) ?? LEGACY_MODEL_ROLE_ALIAS_PREFIX.length;
+		const rolePrefixLength = modelRoleAliasPrefixLength(current) ?? 0;
 		const strictSelector = splitThinkingSuffix(current, rolePrefixLength).level;
 		if (strictSelector) {
 			return strictSelector;

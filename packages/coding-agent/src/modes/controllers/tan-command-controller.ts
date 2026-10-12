@@ -9,7 +9,7 @@ import {
 	detachAgentSession,
 	setAgentStatus,
 } from "../../internal/agent-registry-bridge";
-import { AgentRegistry } from "../../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { AgentSession } from "../../session/agent-session";
 import { BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE } from "../../session/messages";
 import { SessionManager } from "../../session/session-manager";
@@ -119,6 +119,7 @@ export class TanCommandController {
 		const agentRegistry = AgentRegistry.global();
 		const authorityBinding = bindInternalAgentAuthoritySession(agentRegistry, session);
 		if (!authorityBinding) throw new Error("Invalid live parent session authority.");
+		const ownerId = session.getAgentId() ?? MAIN_AGENT_ID;
 		const cloneId = `Tan-${Snowflake.next()}`;
 		const cloneFile = path.join(sessionDir, `${cloneId}.jsonl`);
 		const label = `/tan ${previewWork(trimmedWork)}`;
@@ -136,6 +137,10 @@ export class TanCommandController {
 				// context; its cost must reflect its own work, not the parent's
 				// accumulated spend that session cost is otherwise derived from.
 				resetInheritedCost: true,
+				// The parent may be mid-turn: pair any tool call it left unresolved
+				// with an unknown-outcome result (the parent may still be running it)
+				// so the clone inherits a terminal transcript instead of rendering the
+				// parent's in-flight call as its own pending work (issue #11118).
 				repairInterruptedTail: true,
 			});
 
@@ -171,6 +176,9 @@ export class TanCommandController {
 								agentId: cloneId,
 								agentDisplayName: "tan",
 								parentTaskPrefix: cloneId,
+								asyncJobManager: manager,
+								parentAgentId: ownerId,
+								agentRegistry,
 								disableExtensionDiscovery: true,
 								// `[]` is truthy and would make the child pick bindPreparedExtensions([])
 								// over a populated path fallback, so collapse an empty list to undefined.

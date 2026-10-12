@@ -58,6 +58,10 @@ export interface LimitsInput {
 	columnMax?: number;
 	columnUnit?: "bytes" | "chars";
 	artifactId?: string;
+	/** First and last lines the column cap cut, for the `:raw` recovery selector. */
+	columnLines?: { first: number; last: number };
+	/** Target the `:raw:<first>-<last>` recovery selector is appended to. */
+	columnSelectorBase?: string;
 }
 // =============================================================================
 // OutputMetaBuilder - Fluent API for building OutputMeta
@@ -204,7 +208,9 @@ export class OutputMetaBuilder {
 	truncationFromSummary(summary: OutputSummary, options: TruncationSummaryOptions): this {
 		const artifactId = summary.artifactError ? undefined : summary.artifactId;
 		if (summary.columnMax != null && summary.columnMax > 0 && (summary.columnTruncatedLines ?? 0) > 0) {
-			this.columnTruncated(summary.columnMax, "bytes", artifactId, summary.artifactElidedBytes);
+			this.columnTruncated(summary.columnMax, "bytes", summary.artifactId, summary.artifactElidedBytes, {
+				lines: summary.columnTruncatedRange,
+			});
 		}
 		if (summary.artifactError) {
 			this.artifactError(summary.artifactError);
@@ -341,7 +347,10 @@ export class OutputMetaBuilder {
 			this.headLimit(limits.headLimit);
 		}
 		if (limits.columnMax !== undefined) {
-			this.columnTruncated(limits.columnMax, limits.columnUnit, limits.artifactId);
+			this.columnTruncated(limits.columnMax, limits.columnUnit, limits.artifactId, undefined, {
+				lines: limits.columnLines,
+				selectorBase: limits.columnSelectorBase,
+			});
 		}
 		return this;
 	}
@@ -364,14 +373,25 @@ export class OutputMetaBuilder {
 		return this;
 	}
 
-	/** Add column truncation notice. No-op if maxColumn <= 0. `unit` names the unit the producer enforced the cap in. */
+	/**
+	 * Add column truncation notice. No-op if maxColumn <= 0. `unit` names the
+	 * unit the producer enforced the cap in — `bytes` for streaming sink and grep,
+	 * `chars` (UTF-16 code units) for the read path.
+	 *
+	 * `artifactId` references the uncapped output artifact, and `artifactElidedBytes`
+	 * marks a size-capped artifact. Recovery line ranges can point at the :raw
+	 * selector, using `selectorBase` or the artifact URL by default.
+	 */
 	columnTruncated(
 		maxColumn: number,
 		unit: "bytes" | "chars" = "chars",
 		artifactId?: string,
 		artifactElidedBytes?: number,
+		recovery?: { lines?: { first: number; last: number }; selectorBase?: string },
 	): this {
 		if (maxColumn <= 0) return this;
+		// Lines matter only with a target the recovery selector can read them from.
+		const lines = artifactId || recovery?.selectorBase !== undefined ? recovery?.lines : undefined;
 		this.#meta.limits = {
 			...this.#meta.limits,
 			columnTruncated: {
@@ -379,6 +399,8 @@ export class OutputMetaBuilder {
 				unit,
 				...(artifactId ? { artifactId } : {}),
 				...(artifactId && artifactElidedBytes ? { artifactElidedBytes } : {}),
+				...(lines ? { lines } : {}),
+				...(lines && recovery?.selectorBase !== undefined ? { selectorBase: recovery.selectorBase } : {}),
 			},
 		};
 		return this;

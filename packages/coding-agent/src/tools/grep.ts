@@ -681,6 +681,49 @@ async function nativeChunkedLineIndexes(
 	return indexes;
 }
 
+function stringIndexAtUtf8Byte(line: string, target: number, roundUp: boolean): number {
+	let byteOffset = 0;
+	for (let index = 0; index < line.length;) {
+		if (byteOffset >= target) return index;
+		const codePoint = line.codePointAt(index) ?? 0;
+		const charWidth = codePoint > 0xffff ? 2 : 1;
+		const byteWidth = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+		if (byteOffset + byteWidth > target) return roundUp ? index + charWidth : index;
+		byteOffset += byteWidth;
+		index += charWidth;
+	}
+	return line.length;
+}
+
+/** Native columns count Unicode scalar values, unlike JavaScript UTF-16 indices. */
+function utf8ByteOffsetAtCodePoint(line: string, target: number): number {
+	let byteOffset = 0;
+	let remaining = target;
+	for (let index = 0; index < line.length && remaining > 0; remaining--) {
+		const codePoint = line.codePointAt(index) ?? 0;
+		byteOffset += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+		index += codePoint > 0xffff ? 2 : 1;
+	}
+	return byteOffset;
+}
+
+function truncateMatchLineBytes(line: string, column: number | undefined): { text: string; wasTruncated: boolean } {
+	const totalBytes = Buffer.byteLength(line, "utf8");
+	if (totalBytes <= DEFAULT_MAX_COLUMN) return { text: line, wasTruncated: false };
+	const markerBytes = 3;
+	const contentBytes = DEFAULT_MAX_COLUMN - markerBytes * 2;
+	const matchStart = utf8ByteOffsetAtCodePoint(line, Math.max(0, (column ?? 1) - 1));
+	let startByte = Math.max(0, matchStart - Math.floor(contentBytes / 2));
+	const endByte = Math.min(totalBytes, startByte + contentBytes);
+	startByte = Math.max(0, endByte - contentBytes);
+	const start = stringIndexAtUtf8Byte(line, startByte, true);
+	const end = stringIndexAtUtf8Byte(line, endByte, false);
+	return {
+		text: `${start > 0 ? "..." : ""}${line.slice(start, end)}${end < line.length ? "..." : ""}`,
+		wasTruncated: true,
+	};
+}
+
 function makeContextLine(lines: readonly string[], lineIndex: number): { lineNumber: number; line: string } {
 	const { text } = truncateLineBytes(lines[lineIndex] ?? "", DEFAULT_MAX_COLUMN);
 	return { lineNumber: lineIndex + 1, line: text };
@@ -690,17 +733,19 @@ function makeVirtualMatch(
 	resource: VirtualSearchResource,
 	lines: readonly string[],
 	lineIndex: number,
+	column: number | undefined,
 	contextBefore: number,
 	contextAfter: number,
 	lastEmittedLine: number,
 	nextMatchLine: number,
 ): GrepMatch {
 	const lineNumber = lineIndex + 1;
-	const { text, wasTruncated } = truncateLineBytes(lines[lineIndex] ?? "", DEFAULT_MAX_COLUMN);
+	const { text, wasTruncated } = truncateMatchLineBytes(lines[lineIndex] ?? "", column);
 	const match: GrepMatch = {
 		path: resource.path,
 		lineNumber,
 		line: text,
+		...(column === undefined ? {} : { column }),
 	};
 	if (wasTruncated) match.truncated = true;
 
@@ -741,6 +786,7 @@ function buildVirtualMatches(
 	resource: VirtualSearchResource,
 	lines: readonly string[],
 	matchedIndexes: readonly number[],
+	columnsByLine: ReadonlyMap<number, number>,
 	contextBefore: number,
 	contextAfter: number,
 	maxCount: number,
@@ -757,6 +803,7 @@ function buildVirtualMatches(
 			resource,
 			lines,
 			lineIndex,
+			columnsByLine.get(lineIndex),
 			contextBefore,
 			contextAfter,
 			lastEmittedLine,
@@ -794,6 +841,7 @@ async function searchVirtualResources(
 		linesByResource.push(multiline ? indexSearchLines(resource.content).lines : splitSearchLines(resource.content));
 	}
 	const matchedIndexesByResource = resources.map(() => [] as number[]);
+	const columnsByResourceLine = resources.map(() => new Map<number, number>());
 	let totalMatches = 0;
 	let limitReached = false;
 	checkSearchDeadline(deadline, signal);
@@ -854,6 +902,14 @@ async function searchVirtualResources(
 					undefined,
 				);
 				checkSearchDeadline(deadline, signal);
+				for (const match of probe.matches) {
+					if (match.column !== undefined) {
+						const lineIndex = match.lineNumber - 1;
+						if (!columnsByResourceLine[idx].has(lineIndex)) {
+							columnsByResourceLine[idx].set(lineIndex, match.column);
+						}
+					}
+				}
 				matchedIndexesByResource[idx] = [...new Set(probe.matches.map(match => match.lineNumber - 1))]
 					.filter(lineIndex => lineAllowed(lineIndex + 1, resource.ranges))
 					.sort((a, b) => a - b);
@@ -898,6 +954,9 @@ async function searchVirtualResources(
 				const index = Number(relative);
 				if (Number.isInteger(index) && batchedIndexSet.has(index)) {
 					matchedIndexesByResource[index].push(match.lineNumber - 1);
+					if (match.column !== undefined && !columnsByResourceLine[index].has(match.lineNumber - 1)) {
+						columnsByResourceLine[index].set(match.lineNumber - 1, match.column);
+					}
 				}
 			}
 			for (const index of batchedIndexes) {
@@ -918,6 +977,7 @@ async function searchVirtualResources(
 				resources[idx],
 				linesByResource[idx],
 				matchedIndexes,
+				columnsByResourceLine[idx],
 				contextBefore,
 				contextAfter,
 				Math.min(remaining, maxCountPerFile),
@@ -1863,7 +1923,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 								pushLine(ctx.lineNumber, ctx.line, false);
 							}
 						}
-						pushLine(match.lineNumber, match.line, true);
+						// A cut line shows a window around its first match; name where that match sits.
+						const matchLine = match.column === undefined ? match.line : `${match.line} [col ${match.column}]`;
+						pushLine(match.lineNumber, matchLine, true);
 						if (match.truncated) linesTruncated = true;
 						if (match.contextAfter) {
 							for (const ctx of match.contextAfter) {

@@ -181,6 +181,8 @@ async function readPersistedAgentHistory(
 	let permissionSummary: AgentHistorySummary["permissionSummary"];
 	let leafId: string | undefined;
 	let leafTimestamp: number | undefined;
+	let directCost = 0;
+	// Direct cost mirrors lifetime SessionManager usage; legacy metrics below stay leaf-scoped.
 	try {
 		await visitEntriesFromFileStream(
 			transcript.sessionFile,
@@ -203,6 +205,20 @@ async function readPersistedAgentHistory(
 					sessionInitModelRole ??= record.modelRole;
 					return;
 				}
+				if (record.type === "model_usage") {
+					const usage = recordOf(record.usage);
+					const cost = recordOf(usage?.cost);
+					directCost += finiteNumber(cost?.total);
+					if (usage) {
+						directUsageById.set(id, {
+							tokens: usageTokens(usage),
+							tools: 0,
+							cost: finiteNumber(cost?.total),
+							served: false,
+						});
+					}
+					return;
+				}
 				if (record.type === "model_change" && typeof record.model === "string") {
 					modelChangeById.set(id, {
 						model: record.model,
@@ -217,16 +233,7 @@ async function readPersistedAgentHistory(
 						const metrics = assistantMetrics(message);
 						assistantById.set(id, metrics);
 						directUsageById.set(id, metrics);
-					}
-				} else if (record.type === "model_usage") {
-					const usage = recordOf(record.usage);
-					if (usage) {
-						directUsageById.set(id, {
-							tokens: usageTokens(usage),
-							tools: 0,
-							cost: finiteNumber(recordOf(usage.cost)?.total),
-							served: false,
-						});
+						directCost += metrics.cost;
 					}
 				}
 			},
@@ -294,6 +301,7 @@ async function readPersistedAgentHistory(
 	}
 	if (contextTokens !== undefined) metrics.contextTokens = contextTokens;
 	return {
+		directCost,
 		...(metrics.requests > 0 ? { metrics } : {}),
 		...(resolvedModel ? { resolvedModel, resolvedModelIsFallback } : {}),
 		...(modelRole ? { modelRole } : {}),

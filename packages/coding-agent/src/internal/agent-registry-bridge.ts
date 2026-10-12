@@ -21,7 +21,7 @@ import type {
 export const kRootCompactionThresholds = Symbol("task.rootCompactionThresholds");
 
 export interface SubagentChainSettings extends Settings {
-	[kRootCompactionThresholds]?: Readonly<CompactionThresholdPair>;
+	[kRootCompactionThresholds]?: Readonly<CompactionThresholdPair> & { modelThresholdsEnabled: boolean };
 }
 
 /** Exact mutable registry row. This type is confined to non-package-exported code. */

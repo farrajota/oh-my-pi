@@ -191,6 +191,8 @@ import {
 	type ScreenshotAnnotationTarget,
 	type ScreenshotChangeResult,
 	type ScreenshotHistory,
+	type ScreenshotOptions,
+	screenshotArea,
 	screenshotQuality,
 	screenshotScope,
 	screenshotThreshold,
@@ -319,6 +321,8 @@ const REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS = 500;
 const HANDLE_ACTION_INVALIDATION_TIMEOUT_MS = 500;
 /** Bound on reading every iframe in one observation; a frame whose renderer is stuck in script never answers. */
 const FRAME_SNAPSHOT_TIMEOUT_MS = 5_000;
+/** Bound on Puppeteer exposing a page Chromium still has; the supervisor's init budget caps the whole attach anyway. */
+const ATTACHED_TARGET_EXPOSE_TIMEOUT_MS = 5_000;
 
 /** Queue a wheel event without treating a delayed renderer acknowledgement as dispatch failure. */
 export async function dispatchScroll(
@@ -333,17 +337,6 @@ export async function dispatchScroll(
 	} finally {
 		clearTimeout(timer);
 	}
-}
-
-interface ScreenshotOptions {
-	selector?: string;
-	fullPage?: boolean;
-	silent?: boolean;
-	annotate?: boolean;
-	format?: "png" | "jpeg";
-	quality?: number;
-	ifChanged?: boolean;
-	threshold?: number;
 }
 
 interface TabApi {
@@ -935,6 +928,9 @@ export function persistentAuditFacadeSignal(page: Page, callerSignals: readonly 
 	return lifetime.controller.signal;
 }
 
+/** The page's renderer crashed; every later call on the page stalls until its timeout. */
+class RendererCrashedError extends ToolError {}
+
 export interface RunPageScope {
 	page: Page;
 	/** Remove ordinary cell listeners registered through this run's page facade. */
@@ -1099,6 +1095,7 @@ export function createRunPageScope(
 function errorPayload(error: unknown): RunErrorPayload {
 	const recoverTab = error instanceof RequestInterceptionCleanupError || undefined;
 	const navigationTimeout = error instanceof NavigationTimeoutError || undefined;
+	const rendererCrashed = error instanceof RendererCrashedError || undefined;
 	if (error instanceof ToolAbortError) {
 		return { name: error.name, message: error.message, stack: error.stack, isToolError: false, isAbort: true };
 	}
@@ -1111,6 +1108,7 @@ function errorPayload(error: unknown): RunErrorPayload {
 			isAbort: false,
 			recoverTab,
 			navigationTimeout,
+			rendererCrashed,
 		};
 	}
 	if (error instanceof Error) {
@@ -1456,6 +1454,33 @@ export class WorkerCore {
 		if (event.type === "BackForwardCacheRestore") this.#clearElementCache();
 	};
 
+	/** The renderer crashed; the supervisor recycles this worker, so it runs nothing more. */
+	#crashed = false;
+	/** `ready` was sent; a crash before it fails the start instead. */
+	#started = false;
+	/** The run whose result is not sent yet; it outlives `#active` while the result is being put together. */
+	#unanswered: ActiveRun | null = null;
+	/**
+	 * Puppeteer's page `error` event is Chromium's `Inspector.targetCrashed`: the renderer is gone and every
+	 * later page call stalls. The unanswered run is answered now rather than after steps that wait on the
+	 * dead page, and cancelled so its code does not go on after its caller was told it failed.
+	 */
+	readonly #onPageCrashed = (): void => {
+		if (this.#crashed) return;
+		this.#crashed = true;
+		if (!this.#started) {
+			const error = new RendererCrashedError("Browser tab's renderer crashed while the tab was starting");
+			this.#transport.send({ type: "init-failed", error: errorPayload(error) });
+			return;
+		}
+		const run = this.#unanswered;
+		if (!run) return;
+		this.#unanswered = null;
+		run.ac.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Browser tab's renderer crashed")));
+		const error = new RendererCrashedError("Browser tab's renderer crashed during this run");
+		this.#transport.send({ type: "result", id: run.id, ok: false, error: errorPayload(error) });
+	};
+
 	constructor(transport: Transport, isolated: boolean) {
 		this.#transport = transport;
 		this.#isolated = isolated;
@@ -1589,6 +1614,7 @@ export class WorkerCore {
 				await this.#claimRelayTarget(page);
 			}
 			const page = this.#requirePage();
+			page.on("error", this.#onPageCrashed);
 			this.#frameClient = page.mainFrame().client;
 			this.#frameClient.on("Page.frameNavigated", this.#onFrameNavigated);
 			this.#dialogs = new RuntimeDialogController(page, (message, details) => this.#log("debug", message, details));
@@ -1607,7 +1633,9 @@ export class WorkerCore {
 			for (const source of payload.initScripts ?? []) await this.#initScripts.add(source);
 			if (payload.userAgent) await this.#emulation.emulate({ userAgent: payload.userAgent });
 			if (payload.ignoreHttpsErrors) await applyIgnoreHttpsErrors(page);
-			this.#downloads = new DownloadManager(this.#browser, page, await targetIdForPage(page));
+			this.#downloads = new DownloadManager(this.#browser, page, await targetIdForPage(page), {
+				perTab: payload.mode === "headless" || payload.userDriven !== true,
+			});
 			if (payload.downloadsPath) await this.#downloads.enable(payload.downloadsPath);
 			await this.#console.install(page);
 			this.#webmcp = await installWebMcp(page);
@@ -1619,7 +1647,9 @@ export class WorkerCore {
 				await page.emulateFocusedPage(true);
 			}
 			this.#targetId = await targetIdForPage(page);
-			this.#transport.send({ type: "ready", info: await this.#currentReadyInfo() });
+			const info = await this.#currentReadyInfo();
+			this.#started = true;
+			this.#transport.send({ type: "ready", info });
 		} catch (error) {
 			// A failed headless init leaves the worker's page orphaned in the shared
 			// browser (the supervisor retries with a fresh worker), so close it before
@@ -1639,7 +1669,30 @@ export class WorkerCore {
 			if ((await targetIdForTarget(target).catch(() => "")) !== targetId) continue;
 			return target;
 		}
+		// Puppeteer lists a page only once its URL is non-empty, and a crashed page revived by this attach reloads
+		// with an empty URL for a moment. Wait for it while Chromium still has the target; fail at once when not.
+		if (await this.#browserHasTarget(this.#browser, targetId)) {
+			const target = await this.#browser
+				.waitForTarget(async candidate => (await targetIdForTarget(candidate).catch(() => "")) === targetId, {
+					timeout: ATTACHED_TARGET_EXPOSE_TIMEOUT_MS,
+				})
+				.catch(() => undefined);
+			if (target) return target;
+		}
 		throw new ToolError(`Target ${targetId} is no longer available on the attached browser`);
+	}
+
+	async #browserHasTarget(browser: Browser, targetId: string): Promise<boolean> {
+		let session: CDPSession | undefined;
+		try {
+			session = await browser.target().createCDPSession();
+			await session.send("Target.getTargetInfo", { targetId });
+			return true;
+		} catch {
+			return false;
+		} finally {
+			await session?.detach().catch(() => undefined);
+		}
 	}
 
 	/**
@@ -1672,6 +1725,10 @@ export class WorkerCore {
 		let session: CDPSession | undefined;
 		try {
 			session = await target.createCDPSession();
+			// A crashed page answers none of the steps below. `Inspector.enable` reports a renderer
+			// still dead (a relay attach leaves it so), the listener one that dies again as it reloads.
+			session.on("Inspector.targetCrashed", this.#onPageCrashed);
+			await session.send("Inspector.enable").catch(() => undefined);
 			await session.send("Page.enable").catch(() => undefined);
 			await session.send("Page.handleJavaScriptDialog", { accept: false }).catch(() => undefined);
 			await session.send("Page.stopLoading").catch(() => undefined);
@@ -1716,6 +1773,13 @@ export class WorkerCore {
 	}
 
 	async #run(msg: Extract<WorkerInbound, { type: "run" }>): Promise<void> {
+		if (this.#crashed) {
+			const error = new RendererCrashedError(
+				"Browser tab's renderer had crashed before this run, so its code did not run",
+			);
+			this.#transport.send({ type: "result", id: msg.id, ok: false, error: errorPayload(error) });
+			return;
+		}
 		if (this.#active) {
 			this.#transport.send({
 				type: "result",
@@ -1747,6 +1811,7 @@ export class WorkerCore {
 			opCounter: 0,
 		};
 		this.#active = active;
+		this.#unanswered = active;
 		let completed = false;
 		let returnValue: unknown;
 		let failure: { error: unknown } | undefined;
@@ -1876,12 +1941,17 @@ export class WorkerCore {
 			failure = this.#foldFloatingRejections(active, failure);
 			if (this.#active?.id === msg.id) this.#active = null;
 		}
+		// A renderer crash answers the run itself.
+		if (this.#unanswered !== active) return;
 		if (failure) {
+			this.#unanswered = null;
 			this.#transport.send({ type: "result", id: msg.id, ok: false, error: errorPayload(failure.error) });
 			return;
 		}
 		if (completed) {
 			await this.#postReadyInfo();
+			if (this.#unanswered !== active) return;
+			this.#unanswered = null;
 			this.#transport.send({
 				type: "result",
 				id: msg.id,
@@ -2727,6 +2797,11 @@ export class WorkerCore {
 		// A shared Chromium captures the active target's compositor surface. An attached
 		// user tab must remain visible rather than stealing focus from the user.
 		await preparePageForScreenshot(page, signal, this.#activateForScreenshot);
+		const configuredScale = page.viewport()?.deviceScaleFactor;
+		const captureScale =
+			configuredScale !== undefined && configuredScale !== 0
+				? configuredScale
+				: (await this.#viewport(signal)).deviceScaleFactor;
 		const format = opts.format ?? "png";
 		screenshotQuality(opts);
 		const threshold = screenshotThreshold(opts.threshold);
@@ -2815,6 +2890,7 @@ export class WorkerCore {
 					savedByteLength: savedBuffer.length,
 					dest,
 					resized,
+					capture: { area: screenshotArea(opts), scale: captureScale },
 				});
 				output.push({ type: "text", text: lines.join("\n") });
 				output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
@@ -3034,6 +3110,7 @@ export class WorkerCore {
 	}
 
 	async #disposePageResources(): Promise<void> {
+		this.#page?.off("error", this.#onPageCrashed);
 		this.#frameClient?.off("Page.frameNavigated", this.#onFrameNavigated);
 		this.#frameClient = undefined;
 		this.#dialogs?.dispose();

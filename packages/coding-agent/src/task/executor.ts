@@ -22,6 +22,7 @@ import { type EditMode, getEditInputPaths } from "@oh-my-pi/pi-tui/tools/edit";
 import {
 	formatModelSelectorValue,
 	formatModelStringWithRouting,
+	resolveAgentAdvisorRolePattern,
 	resolveAgentAdvisorSelection,
 	resolveAgentPrewalkPattern,
 	resolveConfiguredModelPatterns,
@@ -170,7 +171,11 @@ import {
 } from "../session/settings";
 import { cfgDisabledProviders } from "../config/model-settings";
 import { getRetryFallbackRole, installRetryFallbackRole } from "../session/retry-fallback-chains";
-import { cfgCompactionThresholdPercent, cfgCompactionThresholdTokens } from "../session/context-settings";
+import {
+	cfgCompactionModelThresholdsEnabled,
+	cfgCompactionThresholdPercent,
+	cfgCompactionThresholdTokens,
+} from "../session/context-settings";
 
 function shouldGenerateTaskLabel(settings: Settings | undefined): boolean {
 	if (!settings) return false;
@@ -492,7 +497,9 @@ export interface ExecutorOptions {
 	additionalDirectories?: string[];
 	/** Exact provider credential resolver inherited from the parent session. */
 	getApiKey?: CreateAgentSessionOptions["getApiKey"];
-	/** Parent session identity whose credential affinity is inherited by this run. */
+	/** Parent session's manager; the child and its revived turns use this exact delivery scope. */
+	asyncJobManager?: AsyncJobManager;
+	/** Parent session whose stored credential affinities seed the child session. */
 	credentialSourceSessionId?: string;
 	worktree?: string;
 	agent: AgentDefinition;
@@ -1171,6 +1178,15 @@ function inheritedSubagentServiceTiers(
 	return tiers;
 }
 
+/**
+ * Compaction thresholds of the root (non-subagent) settings a subagent chain
+ * started from. Per-agent `task.agentCompactionThresholdOverrides` entries
+ * replace `compaction.threshold*` and switch off `compaction.modelThresholds`
+ * only for the agent they name; every other descendant resolves against these
+ * root values, not an ancestor's override.
+ */
+type RootCompactionThresholds = NonNullable<SubagentChainSettings[typeof kRootCompactionThresholds]>;
+
 /** Settings overrides applying an exact-name compaction threshold entry to one subagent. */
 export function compactionThresholdSettings(
 	threshold: CompactionThresholdPair | undefined,
@@ -1180,6 +1196,7 @@ export function compactionThresholdSettings(
 		: {
 				"compaction.thresholdPercent": threshold.thresholdPercent,
 				"compaction.thresholdTokens": threshold.thresholdTokens,
+				"compaction.modelThresholdsEnabled": false,
 			};
 }
 
@@ -1204,11 +1221,17 @@ export async function createSubagentSettings(
 	const rootThresholds = inheritedRootThresholds ?? {
 		thresholdPercent: cfgCompactionThresholdPercent.get(baseSettings),
 		thresholdTokens: cfgCompactionThresholdTokens.get(baseSettings),
+		modelThresholdsEnabled: cfgCompactionModelThresholdsEnabled.get(baseSettings),
 	};
-	const subagentSettings = scopedBaseSettings.overlay({
-		...compactionThresholdSettings(inheritedRootThresholds),
-		// A subagent's thinking level is chosen at spawn and must not be re-steered
-		// by a later parent default edit.
+	// Every other setting reads through to the parent live; writes on the overlay stay local.
+	const subagentSettings: SubagentChainSettings = scopedBaseSettings.overlay({
+		...(inheritedRootThresholds && {
+			"compaction.thresholdPercent": inheritedRootThresholds.thresholdPercent,
+			"compaction.thresholdTokens": inheritedRootThresholds.thresholdTokens,
+			"compaction.modelThresholdsEnabled": inheritedRootThresholds.modelThresholdsEnabled,
+		}),
+		// A subagent's thinking level is chosen at spawn (agent definition, `effort`, or this
+		// snapshot of the parent default); a later parent default edit must not re-steer it.
 		defaultThinkingLevel: cfgDefaultThinkingLevel.get(baseSettings),
 		"tier.openai": subagentTiers.openai ?? "none",
 		"tier.anthropic": subagentTiers.anthropic ?? "none",
@@ -3870,7 +3893,7 @@ interface SubagentSettingsRecipe {
 		storage: AgentStorage | null;
 	};
 	layers: OverlayLayers;
-	rootThresholds: CompactionThresholdPair | undefined;
+	rootThresholds: RootCompactionThresholds | undefined;
 }
 
 function captureSubagentSettings(parent: Settings, settings: SubagentChainSettings): SubagentSettingsRecipe {
@@ -4078,12 +4101,17 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// `task.agentAdvisor` settings override (agent name → "on"/"off"/model
 	// pattern) pairs the spawned session with an advisor. Subagents default to
 	// no advisor (createSubagentSettings forces `advisor.enabled` off); an
-	// explicit model pattern lands on the child's `modelRoles.advisor` so role
-	// aliases and `:level` suffixes resolve inside the spawned session.
+	// explicit model pattern is expanded against this owner's roles (a nested
+	// spawn's owner is its parent subagent) and lands on the child's
+	// `modelRoles.advisor`. The expanded pattern is also what the session
+	// contract persists, so cold revival under root settings reuses it.
 	const advisorSelection = resolveAgentAdvisorSelection({
 		settingsOverride: cfgTaskAgentAdvisor.get(settings)[agent.name],
 		agentAdvisor: agent.advisor,
 	});
+	const advisorRolePattern = advisorSelection?.model
+		? resolveAgentAdvisorRolePattern(advisorSelection.model, settings)
+		: undefined;
 	const subagentSettings = await createSubagentSettings(
 		settings,
 		{
@@ -4096,8 +4124,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// chain; `null` tombstones the record so the child reads the empty default.
 			...(exactModelOverride ? { "retry.modelFallback": false, "retry.fallbackChains": null } : undefined),
 			...(advisorSelection ? { "advisor.enabled": true } : undefined),
-			...(advisorSelection?.model
-				? { modelRoles: { ...settings.getModelRoles(), advisor: advisorSelection.model } }
+			...(advisorRolePattern
+				? { modelRoles: { ...settings.getModelRoles(), advisor: advisorRolePattern } }
 				: undefined),
 		},
 		options.parentServiceTier,
@@ -4655,6 +4683,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					parentHindsightSessionState: options.parentHindsightSessionState,
 					parentMnemopiSessionState: options.parentMnemopiSessionState,
 					parentTaskPrefix: id,
+					asyncJobManager: options.asyncJobManager,
 					parentAgentId: options.parentAgentId,
 					agentId: id,
 					agentDisplayName: agent.name,
@@ -4851,7 +4880,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				readOnly: isReadOnlyAgent(agent),
 				spawns: spawnsEnv,
 				readSummarize: agent.readSummarize,
-				advisor: advisorSelection ? (advisorSelection.model ?? "on") : undefined,
+				advisor: advisorSelection ? (advisorRolePattern ?? "on") : undefined,
 				compactionThreshold: options.compactionThresholdOverride,
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
@@ -5012,7 +5041,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 				unsubscribe = null;
 			}
-			const jobManager = AsyncJobManager.instance();
+			const jobManager = options.asyncJobManager;
 			if (jobManager) {
 				const reap = await jobManager.cancelAndReapOwnerJobs(id, cleanupDeadlineAt);
 				if (!reap.settled) {

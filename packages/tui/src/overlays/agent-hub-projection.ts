@@ -179,7 +179,28 @@ function contentToolCalls(content: unknown): number {
 		: 0;
 }
 
-function readSessionMetrics(session: NonNullable<AgentRecordLike["session"]>): AgentMetrics | undefined {
+/** Lifetime cost from the authoritative session index, excluding task-result child billing. */
+function readSessionDirectCost(session: NonNullable<AgentRecordLike["session"]>): number | undefined {
+	try {
+		const usage = session.sessionManager?.getUsageStatistics();
+		if (
+			usage &&
+			Number.isFinite(usage.cost) &&
+			Number.isFinite(usage.subagentCost) &&
+			usage.cost >= usage.subagentCost
+		) {
+			return usage.cost - usage.subagentCost;
+		}
+	} catch {
+		// A session stopping during render may have already closed its stats host.
+	}
+	return undefined;
+}
+
+function readSessionMetrics(
+	session: NonNullable<AgentRecordLike["session"]>,
+	directCost: number | undefined,
+): AgentMetrics | undefined {
 	try {
 		const stats = session.getSessionStats();
 		const entries = (
@@ -227,7 +248,7 @@ function readSessionMetrics(session: NonNullable<AgentRecordLike["session"]>): A
 			tokens,
 			requests,
 			tools,
-			cost,
+			cost: directCost ?? cost,
 			durationMs: 0,
 			durationKind: "unknown",
 			contextTokens: stats.contextUsage?.tokens,
@@ -238,35 +259,51 @@ function readSessionMetrics(session: NonNullable<AgentRecordLike["session"]>): A
 	}
 }
 
-/** Live session whose own messages back a row's metrics when no observer progress exists. */
+/** Live session used to cache a row's direct assistant usage, including with observer progress. */
 export function hubFallbackStatsSession<TRecord extends AgentRecordLike>(
 	ref: TRecord,
 	observed: ObservableSession | undefined,
 ): NonNullable<TRecord["session"]> | undefined {
-	if (observed?.progress) return undefined;
+	void observed;
 	const session = ref.session;
 	return session && typeof session.getSessionStats === "function" ? session : undefined;
 }
 
-/**
- * One roster row's usage: live observer progress, then persisted history, then
- * the cached fallback read of a live session (populated by {@link aggregateMetrics}).
- */
+function withDirectCost(metrics: AgentMetrics | undefined, cost: number | undefined): AgentMetrics | undefined {
+	return metrics && cost !== undefined ? { ...metrics, cost } : metrics;
+}
+
+/** Preserve progress/history non-cost metrics and overlay current direct cost on live progress. */
 export function hubRowMetrics<TRecord extends AgentRecordLike>(
 	ref: TRecord,
 	observed: ObservableSession | undefined,
 	sessionMetrics: WeakMap<object, { metrics: AgentMetrics | undefined }>,
+	liveMetrics?: AgentHubLiveMetrics,
+	expectedGeneration?: number,
 ): AgentMetrics | undefined {
-	if (observed?.progress) return progressMetrics(observed);
-	if (ref.history?.metrics) return ref.history.metrics;
 	const session = hubFallbackStatsSession(ref, observed);
-	return session ? sessionMetrics.get(session)?.metrics : undefined;
+	const liveEntry = session ? sessionMetrics.get(session) : undefined;
+	const retainedEntry = sessionMetrics.get(ref);
+	const historyMetrics = ref.history?.metrics;
+	const hostDirectCost =
+		observed?.progress && liveMetrics && liveMetrics.generation === expectedGeneration
+			? liveMetrics.metrics?.cost
+			: undefined;
+	const cost = hostDirectCost ?? liveEntry?.metrics?.cost ?? ref.history?.directCost ?? retainedEntry?.metrics?.cost;
+	if (observed?.progress) return withDirectCost(progressMetrics(observed), cost);
+	if (historyMetrics) return withDirectCost(historyMetrics, cost);
+	if (!session && retainedEntry?.metrics) return withDirectCost(retainedEntry.metrics, cost);
+	return withDirectCost(liveEntry?.metrics, cost);
 }
 
 export function aggregateMetrics<TRecord extends AgentRecordLike>(args: {
 	rows: readonly TRecord[];
 	observedById: ReadonlyMap<string, ObservableSession>;
-	metricsFor: (ref: TRecord, observed: ObservableSession | undefined) => AgentMetrics | undefined;
+	metricsFor: (
+		ref: TRecord,
+		observed: ObservableSession | undefined,
+		live?: AgentHubLiveMetrics,
+	) => AgentMetrics | undefined;
 	fallbackStatsSession: (
 		ref: TRecord,
 		observed: ObservableSession | undefined,
@@ -290,8 +327,8 @@ export function aggregateMetrics<TRecord extends AgentRecordLike>(args: {
 	const countedFallbackSessions = new Set<NonNullable<AgentRecordLike["session"]> | number>();
 	for (const ref of args.rows) {
 		const observed = args.observedById.get(ref.id);
-		const live =
-			!observed?.progress && !ref.history?.metrics ? args.getLiveMetrics?.(ref.id, args.refreshFallback) : undefined;
+		const hasHostMetrics = observed?.progress || !ref.history?.metrics;
+		const live = hasHostMetrics ? args.getLiveMetrics?.(ref.id, args.refreshFallback) : undefined;
 		if (live) {
 			hasFallbackLiveSessions = true;
 			args.liveMetrics?.set(ref.id, live);
@@ -301,21 +338,28 @@ export function aggregateMetrics<TRecord extends AgentRecordLike>(args: {
 		const fallbackSession = args.fallbackStatsSession(ref, observed);
 		if (fallbackSession) {
 			hasFallbackLiveSessions = true;
-			const cached = args.sessionMetrics.get(fallbackSession);
-			// A refresh rescans every assistant message (plus the host's stats);
-			// skip it while the message list is provably the one already read.
+			let cached = args.sessionMetrics.get(fallbackSession);
+			const directCost = readSessionDirectCost(fallbackSession);
+			// Refresh cost independently from the message scan: model_usage entries
+			// are cumulative but do not alter the agent's live message list.
 			if (!cached || (args.refreshFallback && !fallbackReadCurrent(cached, fallbackSession))) {
 				const stamp = fallbackReadStamp(fallbackSession);
-				const entry = { metrics: readSessionMetrics(fallbackSession) };
+				const entry = { metrics: readSessionMetrics(fallbackSession, directCost) };
 				if (stamp) fallbackReadStamps.set(entry, stamp);
 				args.sessionMetrics.set(fallbackSession, entry);
+				cached = entry;
+			} else if (cached.metrics && directCost !== undefined) {
+				cached.metrics.cost = directCost;
 			}
+			// Preserve valid direct-session snapshots through parking or a failed teardown read.
+			if (cached.metrics) args.sessionMetrics.set(ref, cached);
 		}
+		const fallbackLive = !observed?.progress && !ref.history?.metrics ? live : undefined;
 		const metrics =
-			args.metricsFor(ref, observed) ??
-			live?.metrics ??
+			args.metricsFor(ref, observed, live) ??
+			fallbackLive?.metrics ??
 			(fallbackSession ? args.sessionMetrics.get(fallbackSession)?.metrics : undefined);
-		const fallbackIdentity = live?.generation ?? fallbackSession;
+		const fallbackIdentity = fallbackLive?.generation ?? fallbackSession;
 		if (!metrics || (fallbackIdentity !== undefined && countedFallbackSessions.has(fallbackIdentity))) continue;
 		if (fallbackIdentity !== undefined) countedFallbackSessions.add(fallbackIdentity);
 		total.reportedAgents++;
