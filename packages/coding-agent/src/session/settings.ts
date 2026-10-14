@@ -1,6 +1,6 @@
-import { combine, effect, register, type SettingValueOf } from "../config/registry";
 import { cfgEditMode } from "../edit/settings";
 import { cfgEvalJs } from "../eval/settings";
+import { combine, effect, register, type SettingValueOf } from "../config/registry";
 import {
 	SERVICE_TIER_ANTHROPIC_OPTIONS,
 	SERVICE_TIER_ANTHROPIC_VALUES,
@@ -29,7 +29,6 @@ import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import { AUTO_THINKING, getConfiguredThinkingLevelMetadata, getThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
 
-const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const EMPTY_STRING_ARRAYS_RECORD: Record<string, string[]> = {};
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["wait"];
@@ -138,6 +137,8 @@ effect(cfgProvidersMaxInFlightRequests, limits =>
 	configureProviderMaxInFlightRequests(normalizeProviderMaxInFlightRequests(limits)),
 );
 
+const EMPTY_STRING_ARRAY: string[] = [];
+
 export const cfgProvidersOpenaiCodexCodeMode = register({
 	id: "providers.openai-codex.codeMode",
 	type: "enum",
@@ -148,7 +149,7 @@ export const cfgProvidersOpenaiCodexCodeMode = register({
 		group: "Services",
 		label: "Codex Code Mode",
 		description:
-			"Route Codex code_mode_only models (GPT-5.6) through eval. The direct tools are eval, ask, todo, yield, think, checkpoint, and rewind. Use eval cells for other session tools. Mirrors codex-rs Code Mode. 'auto' follows the model catalog flag.",
+			"Route Codex code_mode_only models through eval. Keep eval, ask, todo, yield, think, checkpoint, rewind, and session control tools directly visible; invoke other tools from eval cells. 'auto' follows the model catalog flag.",
 	},
 });
 
@@ -160,22 +161,16 @@ export const cfgProvidersOpenaiCodexCodeModeDirectTools = register({
 		tab: "providers",
 		group: "Services",
 		label: "Codex Code Mode Direct Tools",
-		description:
-			"Extra direct tools for Codex Code Mode. The standard direct tools are eval, ask, todo, yield, think, checkpoint, and rewind.",
+		description: "Extra tool names to keep directly callable when Codex Code Mode is active.",
 	},
 });
-
-/**
- * Settings that change the Code Mode tool partition. `edit.mode` belongs here because it renames
- * `EditTool` on the wire (`apply_patch` vs `edit`), which the namespace metadata is keyed by.
- */
+/** Inputs that alter Code Mode's tool partition or wire-name snapshot. */
 export const cfgCodeModeInputs = combine({
 	codeMode: cfgProvidersOpenaiCodexCodeMode,
 	directTools: cfgProvidersOpenaiCodexCodeModeDirectTools,
 	evalJs: cfgEvalJs,
 	editMode: cfgEditMode,
 });
-
 export const cfgImagesDescribeForTextModels = register({
 	id: "images.describeForTextModels",
 	type: "boolean",

@@ -116,9 +116,7 @@ describe("codex code mode tool_namespaces_info metadata", () => {
 		expect(captured.turnMetadataHeader).toBe(JSON.stringify(captured.turnMetadata));
 	});
 
-	// Regression: the Codex backend rejects requests whose HTTP headers exceed
-	// 100KB, and a real session's snapshot (409 tools) serializes to ~100KB on
-	// its own. The snapshot must stay in the body envelope only.
+	// The backend caps request headers at 100KB; the snapshot belongs in the body only.
 	it("keeps a large Code Mode snapshot out of the size-capped header", async () => {
 		const namespacesInfo = createLargeNamespacesInfo(409);
 		const captured = await captureRequest({ toolNamespacesInfo: namespacesInfo });

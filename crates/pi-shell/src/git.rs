@@ -975,7 +975,8 @@ mod tests {
 		let wt = repo.parent().expect("parent").join("bare-wt");
 		assert!(!wt.join("tracked.txt").exists(), "--no-checkout handled by git");
 
-		// A checked-out branch must be rejected without creating another worktree.
+		// A checked-out branch must be rejected without creating another
+		// worktree.
 		let (code, output) = run(&repo, "git worktree add ../again main").await;
 		assert_eq!(code, Some(128));
 		let control = std::process::Command::new("git")

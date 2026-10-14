@@ -14,11 +14,11 @@ import {
 	archiveSession,
 	archiveSessions,
 } from "./archive";
-// @ts-expect-error Bun imports this declaration source as text instead of a TypeScript module.
-import archiveDeclarations from "./declarations.d.ts" with { type: "text" };
 // @ts-expect-error Bun imports this JavaScript source as text instead of evaluating its module shape.
 import archiveJavascript from "./prelude.js" with { type: "text" };
 import archivePython from "./prelude.py" with { type: "text" };
+// @ts-expect-error Bun imports this declaration source as text instead of a TypeScript module.
+import archiveDeclarations from "./declarations.d.ts" with { type: "text" };
 
 /** Listing size when a call omits `limit`. */
 const DEFAULT_LIMIT = 20;

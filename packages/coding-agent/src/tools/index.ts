@@ -365,6 +365,8 @@ export interface ToolSession {
 	getPermissionScope?: () => EffectiveSubagentPermissions | undefined;
 	/** Get active tool names in this session when available. */
 	getActiveToolNames?: () => string[];
+	/** Parent cache identity for sibling sharing, only when the parent model opts in. */
+	getPromptCacheKey?: () => string | undefined;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Look up an enabled tool through the eval bridge's normal permission pipeline. */
@@ -373,7 +375,7 @@ export interface ToolSession {
 	getToolContext?: () => AgentToolContext | undefined;
 	/** Names currently authorized for invocation through the eval bridge. */
 	getEvalBridgeToolNames?: () => readonly string[];
-	/** Direct partition of the active Code Mode surface; undefined when Code Mode is inactive. */
+	/** Direct model-visible tool names while Code Mode is active; undefined otherwise. */
 	getCodeModeDirectToolNames?: () => readonly string[] | undefined;
 	/** Return whether a built-in tool is active in this turn's tool set. */
 	isToolActive?: (name: string) => boolean;

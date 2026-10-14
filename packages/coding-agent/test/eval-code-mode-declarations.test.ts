@@ -1,13 +1,49 @@
 import { describe, expect, test } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
-import { Settings } from "../src/config/settings";
-import type { ToolSession } from "../src/tools";
-import { EvalTool } from "../src/tools/eval";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
+import { EvalTool, getEvalToolDescription } from "@oh-my-pi/pi-coding-agent/tools/eval";
+import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
+import { createArchivePrelude } from "../src/archive/prelude-definition";
+import { computerPreludeAssets } from "../src/tools/computer/prelude-definition";
+
+const prelude: EvalPreludeDefinition = {
+	name: "fixture",
+	documentation: "Fixture prelude.",
+	javascript: "",
+	python: "",
+	exports: [],
+	codeModeDeclarations: "declare const fixture: { run(): Promise<void> };",
+	async invoke() {
+		return { content: [] };
+	},
+};
+
+function makeSession(overrides: Partial<ToolSession> = {}): ToolSession {
+	const read = { name: "read", parameters: type({ path: "string" }) };
+	const write = { name: "write", parameters: type({ path: "string", content: "string" }) };
+	return {
+		cwd: "/tmp/eval-code-mode-test",
+		hasUI: false,
+		settings: Settings.isolated(),
+		getSessionSpawns: () => "",
+		toolRegistry: new Map([
+			["read", read],
+			["write", write],
+		]),
+		getCodeModeDirectToolNames: () => ["eval"],
+		getEvalBridgeToolNames: () => ["eval", "read"],
+		getEvalPreludes: () => [prelude],
+		getAdvertisedEvalPreludes: () => [prelude],
+		...overrides,
+	} as unknown as ToolSession;
+}
 
 describe("generateCodeModeDeclarations", () => {
-	test("emits a declare-const block with typed signatures", () => {
-		const out = generateCodeModeDeclarations([
+	test("emits typed signatures from tool schemas", () => {
+		const declarations = generateCodeModeDeclarations([
 			{
 				name: "read",
 				parameters: {
@@ -25,22 +61,28 @@ describe("generateCodeModeDeclarations", () => {
 				},
 			},
 		]);
-		expect(out.split("\n")).toEqual([
+		expect(declarations.split("\n")).toEqual([
 			"  read(args: { path: string; limit?: number }): Promise<unknown>;",
 			"  grep(args: { pattern: string; case?: boolean }): Promise<unknown>;",
 		]);
 	});
-	test("enums become literal unions", () => {
-		const out = generateCodeModeDeclarations([
+
+	test("preserves enum unions, quoted keys, and quoted tool names", () => {
+		const declarations = generateCodeModeDeclarations([
 			{
-				name: "todo",
-				parameters: { type: "object", properties: { op: { enum: ["init", "done"] } }, required: ["op"] },
+				name: "my-tool",
+				parameters: {
+					type: "object",
+					properties: { "some-flag": { enum: ["on", "off"] } },
+					required: ["some-flag"],
+				},
 			},
 		]);
-		expect(out).toContain('op: "init" | "done"');
+		expect(declarations).toContain('"my-tool"(args: { "some-flag": "on" | "off" }): Promise<unknown>;');
 	});
-	test("union item types are parenthesized inside arrays", () => {
-		const out = generateCodeModeDeclarations([
+
+	test("parenthesizes union item types and degrades unsupported schemas to unknown", () => {
+		const declarations = generateCodeModeDeclarations([
 			{
 				name: "chmod",
 				parameters: {
@@ -49,128 +91,73 @@ describe("generateCodeModeDeclarations", () => {
 					required: ["modes"],
 				},
 			},
+			{ name: "weird", parameters: { allOf: [{ type: "string" }] } },
 		]);
-		expect(out).toContain('modes: ("read" | "write")[]');
-	});
-	test("non-identifier property keys stay quoted", () => {
-		const out = generateCodeModeDeclarations([
-			{
-				name: "cfg",
-				parameters: { type: "object", properties: { "some-flag": { type: "string" } }, required: ["some-flag"] },
-			},
-		]);
-		expect(out).toContain('"some-flag": string');
-	});
-	test("quotes non-identifier tool names", () => {
-		const out = generateCodeModeDeclarations([{ name: "my-tool", parameters: { type: "object" } }]);
-		expect(out).toContain('"my-tool"(args: unknown): Promise<unknown>;');
-	});
-	test("exotic schemas degrade to unknown without throwing", () => {
-		const out = generateCodeModeDeclarations([{ name: "weird", parameters: { allOf: [{ type: "string" }] } }]);
-		expect(out).toContain("weird(args: unknown): Promise<unknown>;");
+		expect(declarations).toContain('modes: ("read" | "write")[]');
+		expect(declarations).toContain("weird(args: unknown): Promise<unknown>;");
 	});
 });
 
-test("EvalTool advertises only tools authorized for its bridge", () => {
-	const read = { name: "read", parameters: type({ path: "string" }) };
-	const write = { name: "write", parameters: type({ path: "string", content: "string" }) };
-	const session = {
-		cwd: "/tmp",
-		hasUI: false,
-		getSessionFile: () => null,
-		settings: Settings.isolated({ "providers.openai-codex.codeMode": "auto" }),
-		toolRegistry: new Map<string, { name: string; parameters: object }>([
-			["read", read],
-			["write", write],
-		]),
-		getEvalBridgeToolNames: () => ["eval", "read"],
-		getCodeModeDirectToolNames: () => ["eval"],
-	} as unknown as ToolSession;
+describe("EvalTool Code Mode description", () => {
+	test("advertises only authorized bridged tools and their schema signatures", () => {
+		const description = new EvalTool(makeSession()).description;
+		expect(description).toContain("read(args: { path: string })");
+		expect(description).not.toContain("write(args:");
+		expect(description).toContain("declare const fixture: { run(): Promise<void> };");
+		expect(getEvalToolDescription({ preludes: [prelude] })).not.toContain("declare const fixture");
+	});
 
-	const description = new EvalTool(session).description;
+	test("omits tools that remain directly callable", () => {
+		const description = new EvalTool(
+			makeSession({
+				getEvalBridgeToolNames: () => ["eval", "read", "write"],
+				getCodeModeDirectToolNames: () => ["eval", "write"],
+			}),
+		).description;
+		expect(description).toContain("read(args:");
+		expect(description).not.toContain("write(args:");
+	});
 
-	expect(description).toContain("read(args:");
-	expect(description).not.toContain("write(args:");
-});
+	test("uses the advertised prelude snapshot for declarations", () => {
+		const description = new EvalTool(
+			makeSession({ getAdvertisedEvalPreludes: () => [], getEvalPreludes: () => [prelude] }),
+		).description;
+		expect(description).not.toContain("declare const fixture");
+	});
+	test("removes prelude declarations after a non-snapshot prelude is disabled", () => {
+		let enabled = true;
+		const enabledPrelude: EvalPreludeDefinition = { ...prelude, enabled: () => enabled };
+		const session = makeSession({
+			getAdvertisedEvalPreludes: undefined,
+			getEvalPreludes: () => [enabledPrelude],
+		});
+		const tool = new EvalTool(session);
+		expect(tool.description).toContain("declare const fixture");
+		enabled = false;
+		expect(tool.description).not.toContain("declare const fixture");
+	});
 
-test("EvalTool omits tools the model can still call directly", () => {
-	// Plan mode keeps `write` direct as the xd://propose transport; advertising it
-	// as bridged would nest plan approval inside an eval result.
-	const read = { name: "read", parameters: type({ path: "string" }) };
-	const write = { name: "write", parameters: type({ path: "string", content: "string" }) };
-	const session = {
-		cwd: "/tmp",
-		hasUI: false,
-		getSessionFile: () => null,
-		settings: Settings.isolated(),
-		toolRegistry: new Map<string, typeof read | typeof write>([
-			["read", read],
-			["write", write],
-		]),
-		getEvalBridgeToolNames: () => ["eval", "read", "write"],
-		getCodeModeDirectToolNames: () => ["eval", "write"],
-	} as unknown as ToolSession;
+	test("withholds Code Mode transport support when JavaScript is disabled", () => {
+		const session = makeSession({ settings: Settings.isolated({ "eval.js": false, "eval.py": true }) });
+		expect(new EvalTool(session).supportsCodeModeTransport()).toBe(false);
+	});
 
-	const description = new EvalTool(session).description;
-
-	expect(description).toContain("read(args:");
-	expect(description).not.toContain("write(args:");
-});
-
-test("EvalTool advertises bridged tool declarations only while Code Mode is active", () => {
-	const read = { name: "read", parameters: type({ path: "string" }) };
-	let preludeEnabled = true;
-	const prelude = {
-		name: "fixture",
-		documentation: "fixture docs",
-		javascript: "",
-		python: "",
-		exports: [],
-		codeModeDeclarations: "declare const fixturePreludeDeclaration: true;",
-		enabled: () => preludeEnabled,
-		async invoke() {
-			return { content: [] };
-		},
-	};
-	const baseSession = {
-		cwd: "/tmp",
-		hasUI: false,
-		getSessionFile: () => null,
-		settings: Settings.isolated(),
-		toolRegistry: new Map([["read", read]]),
-		getEvalBridgeToolNames: () => ["eval", "read"],
-		getEvalPreludes: () => [prelude],
-	};
-	const activeTool = new EvalTool({
-		...baseSession,
-		getCodeModeDirectToolNames: () => ["eval"],
-	} as unknown as ToolSession);
-	const active = activeTool.description;
-	expect(active).toContain("declare const tool: {");
-	expect(active).toContain("read(args:");
-	expect(active).toContain("declare const fixturePreludeDeclaration: true;");
-
-	preludeEnabled = false;
-	expect(activeTool.description).not.toContain("fixturePreludeDeclaration");
-
-	const inactive = new EvalTool({
-		...baseSession,
-		getCodeModeDirectToolNames: () => undefined,
-	} as unknown as ToolSession).description;
-	expect(inactive).not.toContain("declare const tool");
-	expect(inactive).not.toContain("read(args:");
-	expect(inactive).not.toContain("fixturePreludeDeclaration");
-});
-
-test("EvalTool withholds Code Mode transport support when the JS backend is disabled", () => {
-	const session = {
-		cwd: "/tmp",
-		hasUI: false,
-		getSessionFile: () => null,
-		settings: Settings.isolated({ "eval.js": false, "eval.py": true }),
-		toolRegistry: new Map(),
-		getEvalBridgeToolNames: () => ["eval"],
-	} as unknown as ToolSession;
-
-	expect(new EvalTool(session).supportsCodeModeTransport()).toBe(false);
+	test("advertises browser API declarations in active Code Mode", () => {
+		const browser = createBrowserPrelude(makeSession());
+		const description = new EvalTool(
+			makeSession({ getEvalPreludes: () => [browser], getAdvertisedEvalPreludes: () => [browser] }),
+		).description;
+		expect(description).toContain("Codex Code Mode is active");
+		expect(description).toContain("open(options?: BrowserOpenOptions): Promise<BrowserTab>");
+		expect(description).toContain("tab(name?: string): BrowserTab");
+	});
+	test("retains computer and archive declaration assets", () => {
+		expect(computerPreludeAssets.codeModeDeclarations).toContain("declare const computer");
+		const archive = createArchivePrelude(makeSession());
+		expect(archive.codeModeDeclarations).toContain("declare const archive");
+		const description = new EvalTool(
+			makeSession({ getEvalPreludes: () => [archive], getAdvertisedEvalPreludes: () => [archive] }),
+		).description;
+		expect(description).toContain("projects(options?: ArchiveOptions)");
+	});
 });

@@ -89,6 +89,8 @@ const create = async (
 			"task.maxConcurrency": 1,
 			"task.agentIdleTtlMs": 0,
 			"task.completionProbe": false,
+			// The correction reaches the parent through a wake-turn re-`yield`.
+			"task.structured": true,
 			"compaction.enabled": false,
 			"retry.enabled": false,
 			"todo.enabled": false,

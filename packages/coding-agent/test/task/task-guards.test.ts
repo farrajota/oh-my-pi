@@ -8,7 +8,7 @@ import { AgentRegistry, type AgentAuthoritySessionBinding } from "@oh-my-pi/pi-c
 import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { formatResultOutputFallback } from "@oh-my-pi/pi-coding-agent/task";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { runSubprocess, type ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
@@ -142,17 +142,8 @@ let registry: AgentRegistry;
 let createAuthoritySession: AgentAuthoritySessionBinding["create"];
 let rootSession: AgentSession | undefined;
 const pendingSessionCreations: CreateAgentSessionResult[] = [];
-const baseOptions = {
-	cwd: "/tmp",
-	agent: baseAgent,
-	task: "do work",
-	index: 0,
-	id: "subagent-guards",
-	parentAgentId: "Main",
-	modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
-	enableLsp: false,
-};
 
+let baseOptions: ExecutorOptions;
 describe("runSubprocess request guards", () => {
 	beforeEach(async () => {
 		registry = new AgentRegistry();
@@ -161,6 +152,18 @@ describe("runSubprocess request guards", () => {
 		const authority = bindInternalAgentAuthoritySession(registry, root.session);
 		if (!authority) throw new Error("Expected a manager-owned root authority fixture.");
 		createAuthoritySession = authority.create;
+		baseOptions = {
+			cwd: "/tmp",
+			agent: baseAgent,
+			task: "do work",
+			index: 0,
+			id: "subagent-guards",
+			parentAgentId: "Main",
+			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+			enableLsp: false,
+			agentRegistry: registry,
+			createAuthoritySession,
+		};
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
 			const created = pendingSessionCreations.shift();
 			if (!created) throw new Error("Unexpected authority session creation.");
@@ -267,6 +270,35 @@ describe("runSubprocess request guards", () => {
 		expect(result.aborted).toBe(false);
 		expect(handle.steerCalls.length).toBe(1);
 		expect(handle.steerCalls[0].content).toContain("[budget notice]");
+	});
+
+	it("uses the agent's own task.agentSoftRequestBudget entry instead of the global budget", async () => {
+		// The global budget 2 would stop this run at request 3; the agent's
+		// entry of 4 moves the notice to request 4 and the stop to 6.
+		const settings = Settings.isolated({
+			"task.maxRuntimeMs": 0,
+			"task.softRequestBudget": 2,
+			"task.agentSoftRequestBudget": { task: 4 },
+		});
+		const handle = createFakeSession({
+			events: [
+				assistantMessageEnd("1"),
+				assistantMessageEnd("2"),
+				assistantMessageEnd("3"),
+				assistantMessageEnd("4"),
+				assistantMessageEnd("5"),
+				yieldToolEnd(),
+			],
+		});
+		mockCreateAgentSession(handle.session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-agent-budget", settings });
+
+		expect(result.requests).toBe(5);
+		expect(result.aborted).toBe(false);
+		expect(handle.steerCalls.length).toBe(1);
+		expect(handle.steerCalls[0].content).toContain("used 4 requests");
+		expect(handle.steerCalls[0].content).toContain("soft budget: 4");
 	});
 
 	it("still force-stops at 1.5x the soft budget when budget notices are disabled", async () => {

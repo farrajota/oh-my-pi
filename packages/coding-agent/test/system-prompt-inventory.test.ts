@@ -621,10 +621,8 @@ describe("system prompt tool inventory", () => {
 			inlineToolDescriptors: true,
 		});
 		const text = systemPrompt.join("\n\n");
-		// Only the direct keep-set renders as provider-callable functions.
 		expect(text).toContain("Runs code cells.");
 		expect(text).not.toContain("Reads files from disk.");
-		// Guidance still ships for enabled Eval preludes.
 		expect(text).toContain("COMPUTER-GUIDANCE");
 	});
 

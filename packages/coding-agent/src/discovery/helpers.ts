@@ -335,11 +335,6 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	}
 	if (tools !== undefined) tools = normalizeToolNames(tools);
 
-	// Explicit tool lists always need yield; an empty list intentionally denies every other tool.
-	if (tools !== undefined && !tools.includes("yield")) {
-		tools = [...tools, "yield"];
-	}
-
 	// Parse spawns field (array, "*", or CSV)
 	let spawns: string[] | "*" | undefined;
 	if (frontmatter.spawns === "*") {

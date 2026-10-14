@@ -41,11 +41,11 @@ import { resolveSpawnPolicy } from "../task/spawn-policy";
 import { webpExclusionForModel } from "../utils/image-loading";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import type { ToolSession } from ".";
-import { truncateForPrompt } from "./approval";
+import { type ApprovalDetailsOptions, truncateApprovalDetail } from "./approval";
 import { type EvalBackendsAllowance, resolveEvalBackends } from "./eval-backends";
-import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
 import { recordStatusEvent, type StatusEventLog } from "@oh-my-pi/pi-tui/tools/eval";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
 import { resolveOutputMaxColumns, resolveOutputSinkArtifactMaxBytes, resolveOutputSinkHeadBytes } from "./output-meta";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { hasWaitTool } from "./wait";
@@ -195,7 +195,7 @@ export interface EvalToolDescriptionOptions {
 	/** Point blocked callers at the `wait` tool; false when the session lacks it (subagents). Default: true. */
 	waitTool?: boolean;
 	/** Enabled preludes; each becomes an `xd://eval/<name>` doc topic. */
-	preludes?: readonly Pick<EvalPreludeDefinition, "name" | "documentation">[];
+	preludes?: readonly Pick<EvalPreludeDefinition, "name" | "documentation" | "codeModeDeclarations">[];
 	/**
 	 * Inline every doc topic instead of linking `xd://eval/<topic>`. Required
 	 * when the session cannot `read` (the only transport for topic docs).
@@ -328,20 +328,20 @@ function formatEvalInputLanguage(value: string): string {
 export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly name = "eval";
 	readonly approval = "exec" as const;
-	readonly formatApprovalDetails = (args: unknown): string[] => {
+	readonly formatApprovalDetails = (args: unknown, options?: ApprovalDetailsOptions): string[] => {
 		const params = isRecord(args) ? args : {};
 		const language =
 			typeof params.language === "string" ? formatEvalInputLanguage(params.language) : "javascript (default)";
 		const code = typeof params.code === "string" ? params.code : "";
-		return [`Language: ${language}`, `Code:\n${truncateForPrompt(code)}`];
+		return [`Language: ${language}`, `Code:\n${truncateApprovalDetail(code, options)}`];
 	};
 	get summary(): string {
 		return summarizeEvalLanguages(this.#enabledLanguages());
 	}
-
 	supportsCodeModeTransport(): boolean {
 		return this.#enabledLanguages().includes("js");
 	}
+
 	readonly loadMode = "essential";
 	readonly label = "Eval";
 	get description(): string {
@@ -385,28 +385,22 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			autoProvision: cfgEvalAutoProvision.get(session.settings),
 		};
 	}
-
-	/** Frozen advertised snapshot; sessions without a snapshot owner advertise the live set. */
-	#advertisedPreludes(session: ToolSession): readonly EvalPreludeDefinition[] {
-		return session.getAdvertisedEvalPreludes?.() ?? getEnabledEvalPreludes(session.getEvalPreludes?.() ?? []);
-	}
-
-	/**
-	 * Codex Code Mode advertisement, pulled from the session's applied direct
-	 * partition on every read so the declarations can never advertise a tool the
-	 * model can already call directly (a plan-mode transport `write`), nor drift
-	 * from the active model or tool registry.
-	 */
 	#codeModeDescription(baseDescription: string): string | undefined {
 		const session = this.session;
-		const directToolNames = session?.getCodeModeDirectToolNames?.();
-		if (!session || !directToolNames) return undefined;
+		if (!session) return undefined;
+		let directToolNames: readonly string[] | undefined;
+		if ("getCodeModeDirectToolNames" in session) {
+			const getter = session.getCodeModeDirectToolNames;
+			if (typeof getter === "function") directToolNames = getter.call(session);
+		}
+		if (!directToolNames) return undefined;
 		const direct = new Set(directToolNames);
 		const declarations = generateCodeModeDeclarations(
 			(session.getEvalBridgeToolNames?.() ?? [...(session.toolRegistry?.keys() ?? [])]).flatMap(name => {
 				if (direct.has(name)) return [];
 				const tool = session.toolRegistry?.get(name);
-				return tool ? [{ name, parameters: (tool as { parameters?: unknown }).parameters }] : [];
+				if (!tool || typeof tool !== "object" || !("parameters" in tool)) return [];
+				return [{ name, parameters: tool.parameters }];
 			}),
 		);
 		const preludeDeclarations = this.#advertisedPreludes(session)
@@ -415,6 +409,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			.join("\n\n");
 		return prompt.render(evalCodeModeDescription, { baseDescription, declarations, preludeDeclarations });
 	}
+
+	/** Frozen advertised snapshot; sessions without a snapshot owner advertise the live set. */
+	#advertisedPreludes(session: ToolSession): readonly EvalPreludeDefinition[] {
+		return session.getAdvertisedEvalPreludes?.() ?? getEnabledEvalPreludes(session.getEvalPreludes?.() ?? []);
+	}
+
 	/** Only syntax not obvious from the field schema; filtered by enabled language. */
 	static readonly #examples: readonly ToolExample<typeof evalSchema.infer>[] = [
 		{
@@ -615,7 +615,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 		let latestText = "";
 		let latestDetails: EvalToolDetails | undefined;
-		let forwardUpdates = !startBackgrounded;
+		let backgrounded = startBackgrounded;
 		const completion = Promise.withResolvers<ManagedEvalJobCompletion>();
 
 		const jobId = autoBgManager.register(
@@ -626,20 +626,38 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					session.sessionManager,
 					`job:${jobId}`,
 					async () => {
+						// Once backgrounded, the job's frames carry `details.async` so the call's
+						// card keeps filling and settles with the job.
+						const showJobFrame = (
+							text: string,
+							details: EvalToolDetails | undefined,
+							state: "running" | "completed" | "failed" | "cancelled",
+						): void => {
+							if (backgrounded) emitToolUpdate?.(text, { ...details, async: { state, jobId, type: "eval" } });
+						};
 						try {
 							const result = await run(runSignal, (text, details) => {
 								latestText = text;
 								latestDetails = details;
 								void reportProgress(text, { async: { state: "running", jobId, type: "eval" } });
-								if (forwardUpdates) emitToolUpdate?.(text, details);
+								if (backgrounded) showJobFrame(text, details, "running");
+								else emitToolUpdate?.(text, details);
 							});
 							const finalText =
 								(result.content.find(block => block.type === "text")?.text ?? "") +
 								formatOutputNotice(result.details?.meta);
 							latestText = finalText;
 							latestDetails = result.details;
+							// Hand the full result (images included) to the foreground waiter
+							// before deciding the job's terminal state.
 							completion.resolve({ kind: "completed", result });
-							if (result.isError === true) throw new ToolError(finalText || "Eval cell failed");
+							if (result.isError === true) {
+								// A failed, cancelled, or timed-out cell is a completed execution
+								// that errored. Re-enter the failure path so the job manager
+								// records it as failed and delivers the error text.
+								throw new ToolError(finalText || "Eval cell failed");
+							}
+							showJobFrame(finalText, result.details, "completed");
 							await reportProgress(finalText, {
 								...result.details,
 								async: { state: "completed", jobId, type: "eval" },
@@ -649,6 +667,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							const message = error instanceof Error ? error.message : String(error);
 							latestText = message;
 							completion.resolve({ kind: "failed", error });
+							showJobFrame(message, latestDetails, runSignal.aborted ? "cancelled" : "failed");
 							await reportProgress(message, {
 								...latestDetails,
 								async: { state: "failed", jobId, type: "eval" },
@@ -697,7 +716,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			autoBgManager.releaseForegroundJob(jobId);
 			throw new ToolAbortError(latestText || "Eval cell aborted");
 		}
-		forwardUpdates = false;
+		backgrounded = true;
 		autoBgManager.backgroundJob(jobId);
 		// "steer": a queued user/peer message arrived mid-wait — background the
 		// cell (it keeps running) so the message injects promptly.

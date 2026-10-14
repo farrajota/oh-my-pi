@@ -90,6 +90,7 @@ interface SessionHarness {
 function createHarness(options?: {
 	hangPrompt?: boolean;
 	usageMessages?: AssistantMessage[];
+	noYieldReport?: boolean;
 	asyncJobManager?: AsyncJobManager;
 }): SessionHarness {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
@@ -153,10 +154,14 @@ function createHarness(options?: {
 					emit({ type: "message_end", message } as AgentSessionEvent);
 					message.usage.input = -1;
 				}
+				emitTerminalYield({ report: text });
+			} else if (options?.noYieldReport) {
+				emitAssistantText("earlier assistant narration");
+				emitAssistantText("final assistant report");
 			} else {
 				emitAssistantText("submitting");
+				emitTerminalYield({ report: text });
 			}
-			emitTerminalYield({ report: text });
 			return true;
 		},
 		getLastAssistantMessage: () => messages[messages.length - 1],
@@ -267,6 +272,37 @@ describe("runSubprocess result acceptance", () => {
 		expect(settled?.lifecycle?.terminalAt).toBeNumber();
 		expect(AgentRegistry.global().staleAcceptedRuns()).toEqual([]);
 		expect(settled?.createdAt).toBe(ref.createdAt);
+	});
+
+	it("returns only the final assistant report and terminalizes non-structured runs", async () => {
+		const harness = createHarness({ noYieldReport: true });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
+			session: harness.session,
+			extensionsResult: {} as unknown as LoadExtensionsResult,
+			setToolUIContext: () => {},
+			eventBus: new EventBus(),
+		} as CreateAgentSessionResult);
+
+		const result = await runSubprocess({
+			cwd: "/tmp",
+			agent: baseAgent,
+			task: "do the work",
+			index: 0,
+			id: AGENT_ID,
+			structured: false,
+			...authorityOptions(),
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toBe("final assistant report");
+		await harness.promptEntered;
+		const ref = lookupAgentRef(AgentRegistry.global(), AGENT_ID);
+		if (!ref || ref.session !== harness.session)
+			throw new Error("Expected the committed child ref after prompt entry");
+		const settled = AgentRegistry.global().get(AGENT_ID);
+		expect(settled?.status).not.toBe("running");
+		expect(settled?.lifecycle?.acceptedAt).toBeNumber();
+		expect(settled?.lifecycle?.terminalAt).toBeNumber();
 	});
 
 	it("keeps usage snapshots immutable across progress updates", async () => {

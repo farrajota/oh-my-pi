@@ -1,4 +1,5 @@
 import { runJobOperation } from "../registry/operation-lease";
+import { WALL_TIME_NOTICE_MIN_MS } from "@oh-my-pi/pi-tui/tools/bash";
 import * as fs from "node:fs";
 import { type } from "@oh-my-pi/omptype";
 import type {
@@ -29,7 +30,7 @@ import { DEFAULT_MAX_BYTES, enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/
 import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import type { ToolSession } from ".";
-import { truncateForPrompt } from "./approval";
+import { type ApprovalDetailsOptions, truncateApprovalDetail } from "./approval";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import { checkBashInterception } from "./bash-interceptor";
 import { rewriteGitWorktreeAdd } from "./bash-worktree-rewrite";
@@ -391,6 +392,8 @@ export interface BashToolDetails {
 	requestedTimeoutSeconds?: number;
 	timeoutDisabled?: boolean;
 	wallTimeMs?: number;
+	/** Whether the LLM-facing wall-time notice was appended to result text. */
+	wallTimeNoticeEmitted?: boolean;
 	/** Exit code of a command that ran to completion but failed (non-zero). */
 	exitCode?: number;
 	/** True when the command was killed by its timeout deadline (not a failure). */
@@ -398,7 +401,7 @@ export interface BashToolDetails {
 	/** Live ACP update only; completed results refer to released terminals. */
 	terminalId?: string;
 	async?: {
-		state: "running" | "completed" | "failed";
+		state: "running" | "completed" | "failed" | "cancelled";
 		jobId: string;
 		type: "bash";
 	};
@@ -454,11 +457,14 @@ interface ManagedBashJobHandle {
 	jobId: string;
 	completion: Promise<ManagedBashJobCompletion>;
 	getLatestText: () => string;
-	stopUpdates: () => void;
+	/** Hand the call's card to the job: later frames carry `details.async` and the last one settles it. */
+	background: () => void;
 }
 
 interface BashProgressDetails extends BashToolDetails {
 	images?: ImageContent[];
+	/** A running job's output so far (`proc://` shows it). */
+	output?: string;
 }
 
 /** Pid probe of a background job with no command in flight. */
@@ -620,10 +626,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		return "exec";
 	};
-	readonly formatApprovalDetails = (args: unknown): string[] => {
+	readonly formatApprovalDetails = (args: unknown, options?: ApprovalDetailsOptions): string[] => {
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "(missing)";
-		return [`Command: ${truncateForPrompt(command)}`];
+		return [`Command: ${truncateApprovalDetail(command, options)}`];
 	};
 	readonly label = "Bash";
 	readonly loadMode = "essential";
@@ -737,8 +743,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		const outputLines = [this.#formatResultOutput(result)];
 		const notices: string[] = [];
-		if (options.wallTimeMs !== undefined) {
-			notices.push(formatWallTimeNotice(options.wallTimeMs));
+		const wallTimeMs = options.wallTimeMs;
+		const wallTimeNoticeEmitted = wallTimeMs !== undefined && wallTimeMs >= WALL_TIME_NOTICE_MIN_MS;
+		if (wallTimeNoticeEmitted) {
+			notices.push(formatWallTimeNotice(wallTimeMs));
 		}
 		if (options.notices) {
 			for (const notice of options.notices) {
@@ -765,9 +773,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (options.requestedTimeoutSec !== undefined && options.requestedTimeoutSec !== timeoutSec) {
 			details.requestedTimeoutSeconds = options.requestedTimeoutSec;
 		}
-		if (options.wallTimeMs !== undefined) {
-			details.wallTimeMs = options.wallTimeMs;
+		if (wallTimeMs !== undefined) {
+			details.wallTimeMs = wallTimeMs;
 		}
+		details.wallTimeNoticeEmitted = wallTimeNoticeEmitted;
 		if (failedExit) {
 			details.exitCode = exitCode;
 		}
@@ -876,7 +885,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		let pids: () => readonly number[] = NO_PIDS;
 		let latestText = "";
 		let latestProgressDetails: BashProgressDetails | undefined;
-		let forwardUpdates = options.foreground;
+		let backgrounded = !options.foreground;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
 
 		const jobId = manager.register(
@@ -887,10 +896,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					this.session.sessionManager,
 					`job:${jobId}`,
 					async () => {
-						const { path: artifactPath, id: artifactId } =
-							(await this.session.allocateOutputArtifact?.("bash")) ?? {};
-						const wallTimeStart = performance.now();
+						// Records the job's progress and shows it on the call's card: plain output
+						// while the call still waits on it, the job frame (`details.async`) once
+						// backgrounded, so the card keeps filling and settles with the job.
+						const report = async (text: string, details: BashProgressDetails): Promise<void> => {
+							latestText = text;
+							const reported = reportProgress(text, { ...details });
+							// `output` feeds job listings; the card already shows `text`.
+							const { output: _output, ...frame } = details;
+							options.onUpdate?.({
+								content: [{ type: "text", text }],
+								details: backgrounded ? frame : (latestProgressDetails ?? {}),
+							});
+							await reported;
+						};
 						try {
+							const { path: artifactPath, id: artifactId } =
+								(await this.session.allocateOutputArtifact?.("bash")) ?? {};
+							const wallTimeStart = performance.now();
 							const result = await executeBash(options.command, {
 								cwd: options.commandCwd,
 								sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
@@ -899,15 +922,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								env: options.resolvedEnv,
 								gitGuard: cfgBashGitGuard.get(this.session.settings),
 								outputSettings: this.session.settings,
+								// Bound to the job's own signal: the job outlives the call that started it.
 								filesystem: this.#urlFilesystem(runSignal, options.approvalTier).shellFilesystem(),
 								artifactPath,
 								artifactId,
 								onPreview: text => {
-									latestText = text;
-									void reportProgress(text, {
-										output: text,
-										async: { state: "running", jobId, type: "bash" },
-									});
+									void report(text, { output: text, async: { state: "running", jobId, type: "bash" } });
 								},
 								onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 								onStart: probe => {
@@ -916,9 +936,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							}).finally(() => {
 								pids = NO_PIDS;
 							});
-							if (result.artifactError) {
+							if (result.artifactError)
 								latestProgressDetails = { meta: { artifactError: result.artifactError } };
-							}
 							const wallTimeMs = performance.now() - wallTimeStart;
 							const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 								requestedTimeoutSec: options.requestedTimeoutSec,
@@ -948,7 +967,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								// delivers the error text, matching prior throw-based behavior.
 								throw new ToolError(finalText);
 							}
-							await reportProgress(finalText, {
+							await report(finalText, {
 								...latestProgressDetails,
 								async: { state: "completed", jobId, type: "bash" },
 							});
@@ -957,9 +976,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							const message = error instanceof Error ? error.message : String(error);
 							latestText = message;
 							completion.resolve({ kind: "failed", error });
-							await reportProgress(message, {
+							// Only a cancel aborts the job's own signal (deadlines end in a timed-out result).
+							await report(message, {
 								...latestProgressDetails,
-								async: { state: "failed", jobId, type: "bash" },
+								async: { state: runSignal.aborted ? "cancelled" : "failed", jobId, type: "bash" },
 							});
 							throw error;
 						}
@@ -970,14 +990,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				ownerId: this.session.getAgentId?.() ?? undefined,
 				foreground: options.foreground,
 				process: { command: options.command, cwd: options.commandCwd, pids: () => pids() },
-				onProgress: async text => {
-					latestText = text;
-					if (!forwardUpdates) return;
-					await options.onUpdate?.({
-						content: [{ type: "text", text }],
-						details: latestProgressDetails ?? {},
-					});
-				},
 			},
 		);
 
@@ -985,8 +997,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			jobId,
 			completion: completion.promise,
 			getLatestText: () => latestText,
-			stopUpdates: () => {
-				forwardUpdates = false;
+			background: () => {
+				backgrounded = true;
 			},
 		};
 	}
@@ -1253,7 +1265,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				autoBgManager.releaseForegroundJob(job.jobId);
 				throw new ToolAbortError(job.getLatestText() || "Command aborted");
 			}
-			job.stopUpdates();
+			job.background();
 			autoBgManager.backgroundJob(job.jobId);
 			// "steer": a queued user/peer message arrived mid-wait — background
 			// the command (it keeps running) so the message injects promptly.

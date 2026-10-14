@@ -1369,6 +1369,7 @@ export class VibeSessionRegistry {
 			parentArtifactManager: session.getArtifactManager?.() ?? undefined,
 			parentTelemetry: session.getTelemetry?.(),
 			parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
+			parentPromptCacheKey: session.getPromptCacheKey?.(),
 			parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 			oauthAccountPools: Object.hasOwn(agentAccountPools, record.agent.name)
 				? agentAccountPools[record.agent.name]

@@ -25,7 +25,12 @@ import type { RegistryDurableStateStore } from "../registry/durable-state";
 import type { AgentSession } from "../session/agent-session";
 import { installRetryFallbackRole } from "../session/retry-fallback-chains";
 import type { AuthStorage } from "../session/auth-storage";
-import { extractSessionInit, type PersistedSessionInit, SessionManager } from "../session/session-manager";
+import {
+	extractSessionInit,
+	hasConversationalHistory,
+	type PersistedSessionInit,
+	SessionManager,
+} from "../session/session-manager";
 import type { EventBus } from "../utils/event-bus";
 import { IrcBus } from "../irc/bus";
 import {
@@ -179,6 +184,20 @@ async function validatePersistedRevivalContract(
 }
 
 /**
+ * The agent definition a cold-revived subagent's monitored turns report (IRC wakes,
+ * `omp --restore`): persisted files predate an agent-source field, so frames carry
+ * the runtime-neutral `user` source; the name is the registry ref's.
+ */
+export function persistedAgentDefinition(displayName: string, init: PersistedSessionInit): AgentDefinition {
+	return {
+		name: displayName,
+		description: "",
+		systemPrompt: init.systemPrompt.join("\n\n"),
+		source: "user",
+	};
+}
+
+/**
  * Build the factory the {@link AgentLifecycleManager} uses to cold-revive a
  * `parked` subagent ref restored from disk (Agent Hub scan, collab mirror, or a
  * resumed process). Such a ref carries a sessionFile but no in-memory adoption —
@@ -318,8 +337,8 @@ export function createPersistedSubagentReviverFactory(
 				const currentPeek = await SessionManager.peekSessionInit(sessionFile);
 				if (!currentPeek?.init) throw new Error("Persisted subagent transcript has no persisted session contract.");
 				await fs.stat(currentPeek.cwd);
-				const hasMessageHistory = reopened.getEntries().some(entry => entry.type === "message");
-				if (!hasMessageHistory) throw new Error("Persisted subagent transcript has no message history.");
+				if (!hasConversationalHistory(reopened.getEntries()))
+					throw new Error("Persisted subagent transcript has no message history.");
 				if (currentPeek.init.isolated) throw new Error("Persisted isolated subagent cannot be revived.");
 				const currentContract = await validatePersistedRevivalContract(
 					currentPeek.init,
@@ -384,6 +403,7 @@ export function createPersistedSubagentReviverFactory(
 					init.readOnly === true && init.tools.includes("write")
 						? init.tools.filter(name => name !== "write")
 						: init.tools;
+				const structured = revivedToolNames.includes("yield");
 				// Session creation replays the spawn's own tool list so the durable startup identity
 				// matches; the active set is clamped to the persisted grant right after creation.
 				// Transcripts written before the list was kept fall back to the persisted grant.
@@ -453,12 +473,12 @@ export function createPersistedSubagentReviverFactory(
 						oauthAccountPools,
 						taskDepth,
 						toolNames: startupToolNames,
-						outputSchema: init.outputSchema,
-						outputSchemaMode: init.outputSchemaMode,
+						outputSchema: structured ? init.outputSchema : undefined,
+						outputSchemaMode: structured ? init.outputSchemaMode : undefined,
 						restrictToolNames,
 						allowRestrictedExtensions: startupPolicy.allowExtensions || allowOwnerExtensions,
 						permissionScope: permissionSnapshot?.scope,
-						requireYieldTool: true,
+						requireYieldTool: structured,
 						systemPrompt: () => [...init.systemPrompt],
 						// Old files predate persisted spawns: deny re-spawning rather than let
 						// createAgentSession default to wildcard ("*").
@@ -526,8 +546,9 @@ export function createPersistedSubagentReviverFactory(
 					ircBus: IrcBus.forRoot(registry, rootId),
 					subagentEventBus: ctx.subagentEventBus,
 					sessionFile,
-					outputSchema: init.outputSchema,
-					outputSchemaMode: init.outputSchemaMode,
+					outputSchema: structured ? init.outputSchema : undefined,
+					outputSchemaMode: structured ? init.outputSchemaMode : undefined,
+					structured,
 				});
 				return session;
 			} catch (error) {

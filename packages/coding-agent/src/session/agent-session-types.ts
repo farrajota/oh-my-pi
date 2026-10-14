@@ -144,9 +144,9 @@ export interface InitialRetryFallbackState {
 /** Dependencies and initial state used to construct an AgentSession. */
 export interface AgentSessionConfig {
 	agent: Agent;
-	/** Shared with the provider stream wrapper: current Codex Code Mode tool exposure snapshot for turn metadata. */
-	codeModeState?: { namespacesInfo?: unknown };
 	sessionManager: SessionManager;
+	/** Shared with the provider stream wrapper: current Codex Code Mode exposure snapshot. */
+	codeModeState?: { namespacesInfo?: unknown };
 	settings: Settings;
 	/**
 	 * Live extension-root policy inherited from the owning session. Subagents use

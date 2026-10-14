@@ -168,6 +168,7 @@ function createTaskItemSchema(options: {
 	effortEnabled: boolean;
 	modelEnabled: boolean;
 	evalToolsEnabled?: boolean;
+	structured?: boolean;
 }) {
 	const shape: Record<string, unknown> = {
 		"name?": "string",
@@ -176,11 +177,13 @@ function createTaskItemSchema(options: {
 		solutionSpace: "string",
 		"agentSource?": agentSourceRule,
 		"agentDefinitionSha256?": sha256Rule,
-		"outputSchema?": outputSchemaInputSchema,
-		"schemaMode?": '"permissive" | "strict"',
 		"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
 		"+": "delete",
 	};
+	if (options.structured !== false) {
+		shape["outputSchema?"] = outputSchemaInputSchema;
+		shape["schemaMode?"] = '"permissive" | "strict"';
+	}
 	if (options.effortEnabled) shape["effort?"] = effortRule;
 	if (options.modelEnabled) shape["model?"] = "string | string[]";
 	if (options.evalToolsEnabled) shape["tools?"] = "string[]";
@@ -201,6 +204,7 @@ function createTaskSchema(options: {
 	effortEnabled: boolean;
 	modelEnabled: boolean;
 	evalToolsEnabled?: boolean;
+	structured?: boolean;
 }) {
 	const shape: Record<string, unknown> = {
 		"name?": "string",
@@ -209,11 +213,13 @@ function createTaskSchema(options: {
 		solutionSpace: "string",
 		"agentSource?": agentSourceRule,
 		"agentDefinitionSha256?": sha256Rule,
-		"outputSchema?": outputSchemaInputSchema,
-		"schemaMode?": '"permissive" | "strict"',
 		"toolProfile?": TASK_TOOL_PROFILE_SCHEMA,
 		"+": "delete",
 	};
+	if (options.structured !== false) {
+		shape["outputSchema?"] = outputSchemaInputSchema;
+		shape["schemaMode?"] = '"permissive" | "strict"';
+	}
 	if (options.effortEnabled) shape["effort?"] = effortRule;
 	if (options.modelEnabled) shape["model?"] = "string | string[]";
 	if (options.evalToolsEnabled) shape["tools?"] = "string[]";
@@ -230,6 +236,7 @@ function createBatchTaskSchema(options: {
 	effortEnabled: boolean;
 	modelEnabled: boolean;
 	evalToolsEnabled?: boolean;
+	structured?: boolean;
 }) {
 	return type.raw({
 		context: "string",
@@ -349,6 +356,8 @@ export function getTaskSchema(options: {
 	modelEnabled?: boolean;
 	/** Advertise the `tools` field for eval-defined tools (`eval.tools.enabled`, default on). */
 	evalToolsEnabled?: boolean;
+	/** Advertise `outputSchema`/`schemaMode` (`task.structured`); default on. */
+	structured?: boolean;
 	defaultAgent?: string;
 	permissions?: { enabled: boolean; toolsEnabled: boolean; pathsEnabled: boolean };
 }): TaskToolSchemaInstance {
@@ -357,17 +366,19 @@ export function getTaskSchema(options: {
 	const effortEnabled = options.effortEnabled ?? true;
 	const modelEnabled = options.modelEnabled ?? false;
 	const evalToolsEnabled = options.evalToolsEnabled ?? true;
+	const structured = options.structured ?? true;
 	if (
 		!modelEnabled &&
 		effortEnabled &&
 		evalToolsEnabled &&
 		!permissions.enabled &&
 		defaultAgent === "task" &&
+		structured &&
 		options.batchEnabled
 	) {
 		return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}:${permissions.enabled ? "perm" : "noperm"}:${permissions.toolsEnabled ? "tools" : "notools"}:${permissions.pathsEnabled ? "paths" : "nopaths"}:${effortEnabled ? "effort" : "noeffort"}:${modelEnabled ? "model" : "nomodel"}:${evalToolsEnabled ? "evaltools" : "noevaltools"}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}:${permissions.enabled ? "perm" : "noperm"}:${permissions.toolsEnabled ? "tools" : "notools"}:${permissions.pathsEnabled ? "paths" : "nopaths"}:${effortEnabled ? "effort" : "noeffort"}:${modelEnabled ? "model" : "nomodel"}:${evalToolsEnabled ? "evaltools" : "noevaltools"}:${structured ? "structured" : "prose"}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
 	const schema = options.batchEnabled
@@ -378,6 +389,7 @@ export function getTaskSchema(options: {
 				evalToolsEnabled,
 				permissions,
 				defaultAgent,
+				structured,
 			})
 		: createTaskSchema({
 				isolationEnabled: options.isolationEnabled,
@@ -386,6 +398,7 @@ export function getTaskSchema(options: {
 				evalToolsEnabled,
 				permissions,
 				defaultAgent,
+				structured,
 			});
 	taskSchemaCache.set(key, schema);
 	return schema;

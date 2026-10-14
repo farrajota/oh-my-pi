@@ -41,6 +41,7 @@ describe("formatTaskResultSummary", () => {
 		});
 
 		expect(summary).toContain('<preview full-output="agent://Scout">');
+		expect(summary).toContain('<meta lines="');
 		const preview = /<preview[^>]*>\n([\s\S]*?)\n<\/preview>/.exec(summary)?.[1] ?? "";
 		expect(preview).toContain('"summary": "Audit of 37 tools"');
 		expect(preview.length).toBeGreaterThan(2000);
@@ -58,13 +59,14 @@ describe("formatTaskResultSummary", () => {
 		expect(lines).toContain(preview.split("\n").at(-1) ?? "");
 	});
 
-	it("inlines short output without an artifact pointer", () => {
+	it("inlines short output without an artifact pointer or redundant size metadata", () => {
 		const summary = formatTaskResultSummary(settledResult("done"), {
 			totalDurationMs: 5,
 			agentRegistry: registry,
 		});
 		expect(summary).toContain("<output>\ndone\n</output>");
 		expect(summary).not.toContain("<preview");
+		expect(summary).not.toContain("<meta");
 	});
 
 	it("names the failure when the preview is the text streamed before it", () => {

@@ -48,7 +48,7 @@ import taskSpawnFeedbackTemplate from "../prompts/tools/task-spawn-feedback.md" 
 import taskSpecializationAdvisoryTemplate from "../prompts/tools/task-specialization-advisory.md" with { type: "text" };
 import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { type: "text" };
 import { TASK_EFFORTS, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
-import { truncateForPrompt } from "../tools/approval";
+import { type ApprovalDetailsOptions, truncateApprovalDetail, truncateForPrompt } from "../tools/approval";
 import { canonicalBytes } from "../tools/browser-audit";
 import { hasWaitTool } from "../tools/wait";
 import { isIrcEnabled } from "../irc/messaging";
@@ -110,9 +110,8 @@ import {
 	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
 	StructuredSubagentError,
+	type StructuredSubagentRequest,
 } from "./structured-subagent";
-import { SpawnRun, type SpawnPermit } from "./spawn-run";
-import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
 import { applyTaskToolProfile } from "./tool-profiles";
 import { type IsoBackendKind, parseIsolationBackend } from "./worktree";
 
@@ -150,6 +149,7 @@ import {
 	cfgTaskMaxConcurrency,
 	cfgTaskMaxRecursionDepth,
 	cfgTaskMaxRuntimeMs,
+	cfgTaskStructured,
 } from "./settings";
 
 function settingValue<T>(id: string, settings: Settings): T {
@@ -273,6 +273,7 @@ interface TaskDescriptionOptions {
 	effortEnabled: boolean;
 	modelEnabled: boolean;
 	evalToolsEnabled: boolean;
+	structured: boolean;
 	asyncEnabled: boolean;
 	ircEnabled: boolean;
 	parentSpawns: string;
@@ -315,6 +316,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		effortEnabled: options.effortEnabled,
 		modelEnabled: options.modelEnabled,
 		evalToolsEnabled: options.evalToolsEnabled,
+		structured: options.structured,
 		asyncEnabled: options.asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
 		hasModelMentions: options.sessionAgents.length > 0,
@@ -885,7 +887,7 @@ async function freezeDiscoveredAgent(discovery: DiscoveryResult, params: TaskPar
 export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetails, Theme> {
 	readonly name = "task";
 	readonly approval = "exec" as const;
-	readonly formatApprovalDetails = (args: unknown): string[] => {
+	readonly formatApprovalDetails = (args: unknown, options?: ApprovalDetailsOptions): string[] => {
 		const params = args as Partial<TaskParams>;
 		const lines: string[] = [];
 		if (typeof params.agent === "string") {
@@ -904,10 +906,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			lines.push(`Name: ${truncateForPrompt(params.name)}`);
 		}
 		if (typeof params.task === "string") {
-			lines.push(`Task:\n${truncateForPrompt(params.task)}`);
+			lines.push(`Task:\n${truncateApprovalDetail(params.task, options)}`);
 		}
 		if (typeof params.context === "string" && params.context.trim()) {
-			lines.push(`Context:\n${truncateForPrompt(params.context)}`);
+			lines.push(`Context:\n${truncateApprovalDetail(params.context, options)}`);
 		}
 		appendPermissionDetails(lines, params.permissions);
 		const tasks: TaskItem[] = Array.isArray(params.tasks)
@@ -943,7 +945,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					lines.push(`Agent SHA-256: ${firstTask.agentDefinitionSha256}`);
 				}
 				if ("task" in firstTask && typeof firstTask.task === "string") {
-					lines.push(`Task:\n${truncateForPrompt(firstTask.task)}`);
+					lines.push(`Task:\n${truncateApprovalDetail(firstTask.task, options)}`);
 				}
 			}
 			appendPermissionDetails(lines, firstTask?.permissions);
@@ -1009,6 +1011,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				toolsEnabled: settingValue<boolean>("task.permissions.tools.enabled", this.session.settings),
 				pathsEnabled: settingValue<boolean>("task.permissions.paths.enabled", this.session.settings),
 			},
+			structured: this.#isStructured(),
 		});
 	}
 
@@ -1034,6 +1037,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			effortEnabled: settingValue<boolean>("task.allowEffortOverride", this.session.settings),
 			modelEnabled: settingValue<boolean>("task.allowModelOverride", this.session.settings),
 			evalToolsEnabled: evalToolsEnabled(this.session),
+			structured: this.#isStructured(),
 			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
 			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
@@ -1061,6 +1065,23 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 	#isBatchEnabled(): boolean {
 		return cfgTaskBatch.get(this.session.settings);
+	}
+
+	#isStructured(): boolean {
+		return cfgTaskStructured.get(this.session.settings);
+	}
+
+	/**
+	 * Result contract for a spawn: with `task.structured` the caller's
+	 * `outputSchema`/`schemaMode` pass through; without it the child gets no
+	 * schema or `yield` tool and returns its final message.
+	 */
+	#resultParams(params: TaskParams): Pick<StructuredSubagentRequest, "outputSchema" | "schemaMode" | "structured"> {
+		if (!this.#isStructured()) return { structured: false };
+		return {
+			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
+			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
+		};
 	}
 
 	#getSpawnSemaphore(): Semaphore {
@@ -1095,8 +1116,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			context: batchEnabled ? params.context?.trim() || undefined : undefined,
 			agent: params.agent,
 			...(params.model !== undefined ? { model: params.model } : {}),
-			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
-			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
+			...this.#resultParams(params),
 			...(params.effort !== undefined ? { effort: params.effort } : {}),
 			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 			blockedAgent: this.#blockedAgent,
@@ -2233,10 +2253,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const requestedModel =
 			params.model === undefined ? undefined : Array.isArray(params.model) ? params.model.join(", ") : params.model;
 		const exactModelOverride = requestedModel !== undefined;
-		const effectiveOutputSchema = preparedPolicy.schema.schema;
-		const outputSchemaSource = preparedPolicy.schema.source;
+		const structured = this.#isStructured();
+		const effectiveOutputSchema = structured ? preparedPolicy.schema.schema : undefined;
+		const outputSchemaSource = structured ? preparedPolicy.schema.source : "none";
 		const outputSchemaMode = preparedPolicy.schema.mode;
-		const outputSchemaOverridesAgent = preparedPolicy.schema.outputSchemaOverridesAgent;
+		const outputSchemaOverridesAgent = structured && preparedPolicy.schema.outputSchemaOverridesAgent;
 		const planReference = preparedReservation.planReference;
 		const browserAudit = preparedReservation.browserAudit;
 		const auditConstrained = browserAudit !== undefined;
@@ -2335,6 +2356,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				additionalDirectories: this.session.additionalDirectories,
 				getApiKey: this.session.getApiKey,
 				credentialSourceSessionId: this.session.providerSessionId ?? this.session.getSessionId?.() ?? undefined,
+				parentPromptCacheKey: this.session.getPromptCacheKey?.(),
 				id: agentId,
 				agentRegistry,
 				createAuthoritySession,
@@ -2343,6 +2365,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				task: renderSubagentUserPrompt(assignment),
 				assignment,
 				context: sharedContext,
+				...this.#resultParams(params),
 				...(allowEffortOverride && params.effort !== undefined ? { effort: params.effort } : {}),
 				solutionSpace: params.solutionSpace,
 				...(params.model !== undefined ? { model: params.model } : {}),

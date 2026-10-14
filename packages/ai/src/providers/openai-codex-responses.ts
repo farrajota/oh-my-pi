@@ -7,6 +7,7 @@ import {
 	CODEX_CLIENT_VERSION,
 	codexRoutingHint,
 	getCodexAccountId,
+	isOfficialCodexApiUrl,
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
@@ -25,7 +26,6 @@ import {
 import * as AIError from "../error";
 import { parseToolCallArguments, replayableToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey } from "../env-api-key";
-import { isOfficialCodexApiUrl } from "../stream";
 import type {
 	Api,
 	AssistantMessage,
@@ -519,15 +519,15 @@ const CODEX_RESERVED_METADATA_KEYS: Record<string, true> = {
 	window_id: true,
 	[OPENAI_HEADERS.WINDOW_ID]: true,
 	[OPENAI_HEADERS.TURN_METADATA]: true,
-	[OPENAI_HEADERS.PARENT_THREAD_ID]: true,
-	[OPENAI_HEADERS.SUBAGENT]: true,
-	request_kind: true,
-	compaction: true,
 	// codex-rs retired `code_mode_tool_names` in favor of `tool_namespaces_info`
 	// for its Responses Lite Code Mode mapping; both stay reserved so callers
 	// cannot smuggle them in as extras.
 	code_mode_tool_names: true,
 	tool_namespaces_info: true,
+	[OPENAI_HEADERS.PARENT_THREAD_ID]: true,
+	[OPENAI_HEADERS.SUBAGENT]: true,
+	request_kind: true,
+	compaction: true,
 	turn_started_at_unix_ms: true,
 	forked_from_thread_id: true,
 	parent_thread_id: true,
@@ -674,17 +674,11 @@ function createCodexRequestMetadata(
 		turnMetadata.turn_started_at_unix_ms = session.turnStartedAtUnixMs;
 	}
 	for (const key in extra) turnMetadata[key] = extra[key];
-	// The `x-codex-turn-metadata` header is capped at 100KB by the Codex
-	// backend, while `tool_namespaces_info` grows with the session's tool count
-	// (409 tools ~ 100KB on its own). The body's `client_metadata` is the
-	// canonical envelope, so the snapshot rides there only and the header keeps
-	// the fixed-size identity projection.
+	// Keep the size-capped identity header independent of the potentially large
+	// Code Mode snapshot; client_metadata is the canonical body envelope.
 	const turnMetadataHeaderJson = toAsciiJsonString(turnMetadata);
-	let turnMetadataJson = turnMetadataHeaderJson;
-	if (options.toolNamespacesInfo !== undefined) {
-		turnMetadata.tool_namespaces_info = options.toolNamespacesInfo;
-		turnMetadataJson = toAsciiJsonString(turnMetadata);
-	}
+	if (options.toolNamespacesInfo !== undefined) turnMetadata.tool_namespaces_info = options.toolNamespacesInfo;
+	const turnMetadataJson = toAsciiJsonString(turnMetadata);
 	const clientMetadata: Record<string, string> = {
 		[OPENAI_HEADERS.INSTALLATION_ID]: identity.installationId,
 		session_id: identity.sessionId,

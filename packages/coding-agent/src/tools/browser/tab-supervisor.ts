@@ -1888,7 +1888,16 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 	killedTabs.set(name, reason);
 	tab.state = "dead";
 	const error = postmortem.markExpectedCleanupError(new ToolError(reason));
-	for (const pending of tab.pending.values()) pending.reject(error);
+	for (const [id, pending] of tab.pending) {
+		if (tab.backend === "worker") {
+			try {
+				tab.worker.send({ type: "abort", id, expectedCleanup: true });
+			} catch {}
+		}
+		for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
+		pending.closeAc?.abort(error);
+		pending.reject(error);
+	}
 	tab.pending.clear();
 	// Published before the first await so a release landing during the close
 	// below joins instead of tearing the same tab down a second time. The

@@ -35,6 +35,7 @@ import { logger, removeSyncWithRetries, Snowflake, untilAborted } from "@oh-my-p
 import { cfgExternalThinking } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
 import { cfgToolsXdev } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import type { ToolNamespacesInfo } from "@oh-my-pi/pi-coding-agent/session/code-mode";
 
 const toolActivationExtension: ExtensionFactory = pi => {
 	pi.registerTool({
@@ -160,8 +161,8 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.systemPrompt.join("\n")).toContain("default_active_tool");
 			expect(session.systemPrompt.join("\n")).not.toContain("default_inactive_tool");
 
-			// Presentation lookup must survive Code Mode clearing the live mount set
-			// so historical prefixed calls retain their canonical renderer.
+			// Presentation lookup must survive clearing the live mount set so
+			// historical prefixed calls retain their canonical renderer.
 			await session.setActiveToolPresentation(session.getActiveToolNames(), []);
 			expect(session.getMountedXdevToolNames()).not.toContain("default_active_tool");
 			expect(session.getToolByName("xd://default_active_tool")?.name).toBe("default_active_tool");
@@ -2818,6 +2819,56 @@ describe("createAgentSession defaultInactive tool activation", () => {
 				);
 				expect(result.isError).toBeUndefined();
 				expect(fs.readFileSync(target, "utf8")).toBe("written\n");
+			} finally {
+				await session.dispose();
+			}
+		});
+	});
+	describe("Codex Code Mode startup", () => {
+		it("restricts the SDK session before it can make its first provider request", async () => {
+			const tempDir = makeTempDir();
+			const codeModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+			if (!codeModel) throw new Error("Expected the bundled GPT-5.6 Sol Codex model");
+			const settings = Settings.isolated({
+				"providers.openai-codex.codeMode": "auto",
+				"eval.js": true,
+			});
+			const { session } = await createAgentSession({
+				...baseOptions(tempDir),
+				model: codeModel,
+				settings,
+			});
+			try {
+				expect(session.getActiveToolNames()).toContain("eval");
+				expect(session.getActiveToolNames()).not.toContain("read");
+				expect(session.getActiveToolNames()).not.toContain("bash");
+				expect(session.getEnabledToolNames()).toContain("read");
+				expect(session.getEnabledToolNames()).toContain("bash");
+				expect(session.getToolForEvalBridge("read")?.name).toBe("read");
+				const info = session.codeModeNamespacesInfo as ToolNamespacesInfo;
+				expect(info.functions.functions.eval.direct).toBe(true);
+				expect(info.functions.functions.read.direct).toBe(false);
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("keeps the direct tool surface and omits namespaces info when Code Mode is off", async () => {
+			const tempDir = makeTempDir();
+			const codeModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+			if (!codeModel) throw new Error("Expected the bundled GPT-5.6 Sol Codex model");
+			const { session } = await createAgentSession({
+				...baseOptions(tempDir),
+				model: codeModel,
+				settings: Settings.isolated({
+					"providers.openai-codex.codeMode": "off",
+					"eval.js": true,
+				}),
+			});
+			try {
+				expect(session.getActiveToolNames()).toContain("read");
+				expect(session.getActiveToolNames()).toContain("bash");
+				expect(session.codeModeNamespacesInfo).toBeUndefined();
 			} finally {
 				await session.dispose();
 			}

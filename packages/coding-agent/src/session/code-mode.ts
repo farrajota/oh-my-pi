@@ -1,9 +1,3 @@
-/**
- * Codex Code Mode: collapse the direct tool surface for code_mode_only models
- * to a small keep-set and expose every other session tool through the eval
- * bridge, mirroring codex-rs ToolMode::CodeModeOnly.
- */
-
 import { logger } from "@oh-my-pi/pi-utils";
 
 /**
@@ -56,14 +50,14 @@ export function resolveCodeMode(args: {
 		args.evalTransportAvailable &&
 		(args.setting === "on" || (args.setting === "auto" && args.toolMode === "code_mode_only"));
 	if (!active) return { active: false, directToolNames: new Set(args.enabledToolNames) };
-	const direct = new Set<string>();
+	const directToolNames = new Set<string>();
 	for (const name of args.enabledToolNames) {
-		if (CODE_MODE_KEEP_TOOLS[name] === true) direct.add(name);
+		if (CODE_MODE_KEEP_TOOLS[name] === true) directToolNames.add(name);
 	}
 	for (const name of args.extraDirectTools ?? []) {
-		if (args.enabledToolNames.includes(name)) direct.add(name);
+		if (args.enabledToolNames.includes(name)) directToolNames.add(name);
 	}
-	return { active: true, directToolNames: direct };
+	return { active: true, directToolNames };
 }
 
 /** codex-rs TurnToolFunctionInfo shape (snake_case on the wire). */

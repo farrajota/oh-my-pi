@@ -3,11 +3,6 @@ import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
-// @ts-expect-error Bun imports this declaration source as text instead of a TypeScript module.
-import browserDeclarations from "./browser/declarations.d.ts" with { type: "text" };
-// @ts-expect-error Bun imports this JavaScript source as text instead of evaluating its module shape.
-import browserJavascript from "./browser/prelude.js" with { type: "text" };
-import browserPython from "./browser/prelude.py" with { type: "text" };
 import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
@@ -129,17 +124,9 @@ const browserSchema = type({
 
 /** Create the enabled-only browser host prelude for one tool session. */
 export function createBrowserPrelude(session: ToolSession): EvalPreludeDefinition {
-	return {
-		name: "browser",
-		documentation: browserDescription,
-		javascript: browserJavascript,
-		python: browserPython,
-		exports: ["browser"],
-		codeModeDeclarations: browserDeclarations,
-		approval: "exec",
-		enabled: () => cfgBrowserEnabled.get(session.settings),
-		invoke: (parameters, context) => invokeBrowser(session, parameters, context),
-	};
+	return require("./browser/prelude-definition").createBrowserPreludeDefinition(session, {
+		invoke: (parameters: unknown, context: EvalPreludeContext) => invokeBrowser(session, parameters, context),
+	});
 }
 
 async function invokeBrowser(

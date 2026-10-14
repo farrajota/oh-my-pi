@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn, vi } from "bun:test";
 
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import {
@@ -14,6 +14,8 @@ import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { Shell } from "@oh-my-pi/pi-natives";
+import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
+import { bashToolRenderer } from "@oh-my-pi/pi-tui/tools/bash";
 
 const sessionManagers = new Set<SessionManager>();
 
@@ -23,7 +25,7 @@ afterEach(async () => {
 	sessionManagers.clear();
 });
 
-function makeSession(asyncJobManager?: AsyncJobManager): ToolSession {
+function makeSession(asyncJobManager?: AsyncJobManager, settingsOverrides: Record<string, unknown> = {}): ToolSession {
 	const sessionManager = SessionManager.inMemory("/tmp");
 	installSessionOperationLedger(sessionManager);
 	markUnregisteredSessionOperationProjection(sessionManager, false);
@@ -47,6 +49,7 @@ function makeSession(asyncJobManager?: AsyncJobManager): ToolSession {
 			"astEdit.enabled": false,
 			"grep.enabled": false,
 			"glob.enabled": false,
+			...settingsOverrides,
 		}),
 		getClientBridge: () => undefined,
 	} as unknown as ToolSession;
@@ -71,6 +74,73 @@ describe("BashTool execution results", () => {
 			expect(manager.getOutput(jobId!)?.text).toContain(secret);
 		} finally {
 			await manager.dispose();
+		}
+	});
+
+	it("surfaces output-artifact allocation failures during foreground auto-backgrounding", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const session = makeSession(manager, {
+			"bash.autoBackground.enabled": true,
+			"bash.autoBackground.thresholdMs": 5_000,
+		});
+		const allocationStarted = Promise.withResolvers<void>();
+		session.allocateOutputArtifact = async () => {
+			allocationStarted.resolve();
+			throw new Error("artifact allocation failed");
+		};
+		const tool = new BashTool(session);
+		vi.useFakeTimers();
+		try {
+			const execution = tool.execute("call-artifact-allocation-failure", { command: "true" }).then(
+				result => ({ kind: "result" as const, result }),
+				error => ({ kind: "error" as const, error }),
+			);
+			await allocationStarted.promise;
+			await manager.waitForAll();
+			const outcome = await execution;
+			if (outcome.kind !== "error") {
+				throw new Error(`Expected the foreground Bash call to reject; got ${outcome.kind}`);
+			}
+			expect(outcome.error).toBeInstanceOf(Error);
+			expect((outcome.error as Error).message).toContain("artifact allocation failed");
+		} finally {
+			vi.useRealTimers();
+			await manager.dispose();
+		}
+	});
+
+	it.each([
+		{ wallTimeMs: 0, noticeCount: 1 },
+		{ wallTimeMs: 1000, noticeCount: 2 },
+	])("preserves timing-like stdout in shell views at $wallTimeMs ms", async ({ wallTimeMs, noticeCount }) => {
+		let now = 0;
+		spyOn(performance, "now").mockImplementation(() => now);
+		const realRun = Shell.prototype.run;
+		spyOn(Shell.prototype, "run").mockImplementation(async function (this: Shell, options, onChunk) {
+			const result = await realRun.call(this, options, onChunk);
+			now = wallTimeMs;
+			return result;
+		});
+		const tool = new BashTool(makeSession());
+		const args = { command: `printf 'Wall time: %.2f seconds\\n' ${wallTimeMs / 1000}` };
+		const result = await tool.execute("call-timing-output", args);
+		const timingOutput = `Wall time: ${(wallTimeMs / 1000).toFixed(2)} seconds`;
+		const text = result.content.find(c => c.type === "text")?.text ?? "";
+		expect(result.details?.wallTimeMs).toBe(wallTimeMs);
+		expect(text.match(/Wall time: \d+\.\d{2} seconds/gu)).toHaveLength(noticeCount);
+		const theme = await getThemeByName("dark");
+		if (!theme) throw new Error("Expected dark theme");
+
+		for (const expanded of [false, true]) {
+			const options = { expanded, isPartial: false };
+			const component = bashToolRenderer.renderResult(result, options, theme, args);
+			const rendered = Bun.stripANSI(component.render(120).join("\n"));
+			expect(rendered.match(/Wall time: \d+\.\d{2} seconds/gu)).toEqual([timingOutput]);
+			const view = bashToolRenderer.describeResult(result, options, args);
+			const output = (view.body ?? [])
+				.flatMap(node => ("k" in node ? (node.c ?? []) : []))
+				.find(node => "k" in node && node.k === "ansi");
+			expect(output).toMatchObject({ p: { role: "omp.tool.bash.output", text: timingOutput } });
 		}
 	});
 

@@ -3,7 +3,7 @@ import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { truncateToVisualLines } from "@oh-my-pi/pi-tui/chrome";
-import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
+import { formatBackgroundNotice, WALL_TIME_NOTICE_MIN_MS } from "@oh-my-pi/pi-tui/tools/bash";
 import { highlightCode, type Theme } from "@oh-my-pi/pi-tui/theme";
 import {
 	CachedOutputBlock,
@@ -134,7 +134,7 @@ function stripTrailingNotice(text: string, notice: string): string {
 }
 
 function stripWallTimeNotice(text: string, wallTimeMs: number | undefined): string {
-	if (wallTimeMs === undefined) return text;
+	if (wallTimeMs === undefined || wallTimeMs < WALL_TIME_NOTICE_MIN_MS) return text;
 	return stripTrailingNotice(text, formatWallTimeNotice(wallTimeMs));
 }
 

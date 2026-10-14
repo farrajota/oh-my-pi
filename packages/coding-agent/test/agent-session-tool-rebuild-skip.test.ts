@@ -1732,11 +1732,16 @@ These tools became available:
 		const oldTool = createMcpCustomTool("mcp__nucleus_old", "nucleus", "old", "Old tool");
 		const newTool = createMcpCustomTool("mcp__nucleus_new", "nucleus", "new", "New tool");
 		await session.refreshMCPTools([oldTool]);
+		const activeBefore = session.getActiveToolNames();
+		const mountedBefore = session.getMountedXdevToolNames();
 		failRebuild = true;
 
 		await expect(session.refreshMCPTools([newTool])).rejects.toThrow("rebuild failed");
 		expect(session.getToolByName(oldTool.name)).toBeDefined();
 		expect(session.getToolByName(newTool.name)).toBeUndefined();
+		expect(session.getMountedXdevToolNames()).not.toContain(newTool.name);
+		expect(session.getMountedXdevToolNames()).toEqual(mountedBefore);
+		expect(session.getActiveToolNames()).toEqual(activeBefore);
 		expect(session.getMountedXdevToolNames()).toContain(oldTool.name);
 
 		failRebuild = false;

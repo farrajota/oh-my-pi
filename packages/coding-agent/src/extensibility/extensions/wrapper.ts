@@ -12,9 +12,9 @@ import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } 
 import type { PermissionDenialDetails } from "@oh-my-pi/pi-wire";
 import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import {
+	formatApprovalPrompt,
 	truncateForPrompt,
 	denyError,
-	formatApprovalPrompt,
 	resolveApproval,
 	resolveApprovalFromContext,
 } from "../../tools/approval";

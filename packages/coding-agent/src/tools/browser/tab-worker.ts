@@ -1616,6 +1616,10 @@ export class WorkerCore {
 			const page = this.#requirePage();
 			page.on("error", this.#onPageCrashed);
 			this.#frameClient = page.mainFrame().client;
+			// A run may be suspended in host-side work with no Puppeteer command pending.
+			// Listen for the target crash directly so that suspension is still cancelled.
+			this.#frameClient.on("Inspector.targetCrashed", this.#onPageCrashed);
+			await this.#frameClient.send("Inspector.enable");
 			this.#frameClient.on("Page.frameNavigated", this.#onFrameNavigated);
 			this.#dialogs = new RuntimeDialogController(page, (message, details) => this.#log("debug", message, details));
 			this.#dialogs.observe();
@@ -3112,6 +3116,7 @@ export class WorkerCore {
 	async #disposePageResources(): Promise<void> {
 		this.#page?.off("error", this.#onPageCrashed);
 		this.#frameClient?.off("Page.frameNavigated", this.#onFrameNavigated);
+		this.#frameClient?.off("Inspector.targetCrashed", this.#onPageCrashed);
 		this.#frameClient = undefined;
 		this.#dialogs?.dispose();
 		this.#emulation?.dispose();

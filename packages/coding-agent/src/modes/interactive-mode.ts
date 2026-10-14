@@ -91,7 +91,13 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
-import type { CompactOptions, WorkingMessageSuffixContext } from "../extensibility/extensions/types";
+import type {
+	CompactOptions,
+	WorkingMessageSuffixContext,
+	PlanReviewChoice,
+	PlanReviewOption,
+	PlanReviewRequestedEvent,
+} from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import { loadSlashCommands } from "../extensibility/slash-commands";
@@ -725,10 +731,11 @@ class TodoHudContainer extends AnchoredLiveContainer {
 }
 
 /**
- * Native-only dock row of HUD pills (§8.1), right-aligned above the activity
- * line: the agents pill and the background-jobs pill. ANSI renders the pinned
- * agent list in its own container and the agent and job counts in the status
- * line, so this row renders nothing.
+ * Native-only dock row (§8.1), right-aligned above the activity line, holding
+ * the running-work counter: one pill with an agents segment and a
+ * background-jobs segment. ANSI renders the pinned agent list in its own
+ * container and the agent and job counts in the status line, so this row
+ * renders nothing.
  */
 class HudPillsRow implements Component {
 	constructor(private readonly mode: InteractiveMode) {}
@@ -741,7 +748,7 @@ class HudPillsRow implements Component {
 		return this.mode.describeHudPills();
 	}
 
-	/** A click on the agents pill opens the agent hub; one on the jobs pill, the jobs sheet. */
+	/** A click on the agents segment opens the agent hub; one on the jobs segment, the jobs sheet. */
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (event.type !== "action") return;
 		if (event.act === "agents.open") this.mode.showAgentHub();
@@ -749,47 +756,61 @@ class HudPillsRow implements Component {
 	}
 }
 
-/** A described running-work pill with the count it shows, so an unchanged count reuses the node. */
-interface RunningPill {
+/** A described counter segment with the count it shows, so an unchanged count reuses the node. */
+interface RunningSegment {
 	readonly running: number;
 	readonly node: NativeNode;
 }
 
-/** `prev` while it still shows `running`, else a fresh pill from `describe`; undefined when nothing runs. */
-function runningPill(
-	prev: RunningPill | undefined,
-	running: number,
-	describe: (running: number) => NativeNode,
-): RunningPill | undefined {
-	if (running === 0) return undefined;
-	return prev?.running === running ? prev : { running, node: describe(running) };
-}
-
-/** What a running-work pill shows and the action a click on it sends to {@link HudPillsRow}. */
-interface RunningPillSpec {
-	/** Sibling key in the HUD row: the pill keeps its id, and skips its entrance, as the count changes. */
+/** What a counter segment shows and the action a click on it sends to {@link HudPillsRow}. */
+interface RunningSegmentSpec {
+	/** Sibling key in the counter: the segment keeps its id, and skips its entrance, as the count changes. */
 	readonly key: string;
 	readonly icon: string;
-	/** Singular noun the count reads with (`1 job running`, `2 jobs running`). */
+	readonly tone: "accent" | "warning";
+	/** Singular noun the hover label reads with (`1 job running`, `2 jobs running`). */
 	readonly noun: string;
-	readonly title: string;
+	/** Keyboard route to the same sheet, appended to the hover label. */
+	readonly shortcut: string;
 	readonly act: string;
 }
 
-/** Native dock pill (§8.1) counting running work, with a spinner. */
-function describeRunningPill(spec: RunningPillSpec, running: number): NativeNode {
+/** `prev` while it still shows `running`, else a fresh segment for `spec`; undefined when nothing runs. */
+function runningSegment(
+	prev: RunningSegment | undefined,
+	running: number,
+	spec: RunningSegmentSpec,
+): RunningSegment | undefined {
+	if (running === 0) return undefined;
+	return prev?.running === running ? prev : { running, node: describeRunningSegment(spec, running) };
+}
+
+/** The background-jobs segment of the running-work counter. */
+const JOBS_SEGMENT: RunningSegmentSpec = {
+	key: "jobs",
+	icon: "job",
+	tone: "warning",
+	noun: "job",
+	shortcut: "/jobs",
+	act: "jobs.open",
+};
+
+/** One counter segment: a tinted icon and the bare count; the words live in the hover label. */
+function describeRunningSegment(spec: RunningSegmentSpec, running: number): NativeNode {
+	const label = `${running} ${spec.noun}${running === 1 ? "" : "s"} running`;
 	return node(
 		"row",
-		{ role: "omp.hud.pill", gap: "xs", align: "center", title: spec.title, actions: { click: spec.act } },
+		{
+			role: "omp.hud.seg",
+			gap: "xs",
+			align: "center",
+			title: `${label}  ${spec.shortcut}`,
+			aria: label,
+			actions: { click: spec.act },
+		},
 		[
-			node("icon", { name: spec.icon }, undefined, "icon"),
-			node("spinner", { style: "dots", tone: "accent" }, undefined, "spinner"),
-			node(
-				"text",
-				{ text: `${running} ${spec.noun}${running === 1 ? "" : "s"} running`, wrap: "none" },
-				undefined,
-				"label",
-			),
+			node("icon", { name: spec.icon, tone: spec.tone }, undefined, "icon"),
+			node("text", { spans: [span(String(running), "num")], wrap: "none" }, undefined, "count"),
 		],
 		spec.key,
 	);
@@ -1356,8 +1377,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	#todoHudNative: { checklist: NativeNode; fallback: NativeNode } | undefined;
 	#hudPillsNative: { children: readonly NativeChild[]; node: NativeNode } | undefined;
-	#agentsPill: RunningPill | undefined;
-	#jobsPill: RunningPill | undefined;
+	#agentsSegment: RunningSegment | undefined;
+	#jobsSegment: RunningSegment | undefined;
 	/** Gen tok/s for the native composer bar, one decimal (a steadier `rate` target): live while running, else the last reading. */
 	#nativeTokenRate(): number | undefined {
 		if (!cfgComposerTokenRate.get(settings)) return undefined;
@@ -1383,42 +1404,38 @@ export class InteractiveMode implements InteractiveModeContext {
 	interruptFromPointer(): void {
 		this.editor.onEscape?.();
 	}
-	/** The native HUD pills row: the agents pill, then the jobs pill; hidden while both are absent. */
+	/**
+	 * The native HUD pills row: one running-work counter (`omp.hud.pill`) with
+	 * an agents segment, then a jobs segment, each present only while its
+	 * count is non-zero; the row is hidden while both are absent.
+	 */
 	describeHudPills(): NativeNode {
 		// Agents count as the status-line badge counts them, from the agent
 		// registry: the observer registry only hears task-executor lifecycles,
-		// so an agent a peer message woke or revived would run without a pill.
+		// so an agent a peer message woke or revived would run without a segment.
 		const agents = cfgDisplayPinnedAgents.get(settings) === "off" ? 0 : this.#runningSubagentCount;
-		this.#agentsPill = runningPill(this.#agentsPill, agents, count =>
-			describeRunningPill(
-				{
-					key: "agents",
-					icon: "users",
-					noun: "agent",
-					title: `Agents  ${formatDoubleTap("left")}`,
-					act: "agents.open",
-				},
-				count,
-			),
-		);
-		this.#jobsPill = runningPill(this.#jobsPill, this.statusLine.runningBackgroundJobCount(), count =>
-			describeRunningPill(
-				{ key: "jobs", icon: "job", noun: "job", title: "Background jobs  /jobs", act: "jobs.open" },
-				count,
-			),
-		);
-		const children: NativeChild[] = [];
-		if (this.#agentsPill) children.push(this.#agentsPill.node);
-		if (this.#jobsPill) children.push(this.#jobsPill.node);
+		this.#agentsSegment = runningSegment(this.#agentsSegment, agents, {
+			key: "agents",
+			icon: "users",
+			tone: "accent",
+			noun: "agent",
+			shortcut: formatDoubleTap("left"),
+			act: "agents.open",
+		});
+		this.#jobsSegment = runningSegment(this.#jobsSegment, this.statusLine.runningBackgroundJobCount(), JOBS_SEGMENT);
+		const segments: NativeChild[] = [];
+		if (this.#agentsSegment) segments.push(this.#agentsSegment.node);
+		if (this.#jobsSegment) segments.push(this.#jobsSegment.node);
 		const memo = this.#hudPillsNative;
-		if (memo && sameItems(memo.children, children)) return memo.node;
-		const described = row(children, {
+		if (memo && sameItems(memo.children, segments)) return memo.node;
+		const counter =
+			segments.length > 0 ? [node("row", { role: "omp.hud.pill", align: "center" }, segments, "running")] : [];
+		const described = row(counter, {
 			role: "omp.hud",
 			justify: "end",
-			gap: "sm",
-			hidden: children.length === 0 || undefined,
+			hidden: counter.length === 0 || undefined,
 		});
-		this.#hudPillsNative = { children, node: described };
+		this.#hudPillsNative = { children: segments, node: described };
 		return described;
 	}
 	/**
@@ -1558,7 +1575,18 @@ export class InteractiveMode implements InteractiveModeContext {
 	#jobsSheetHandle: OverlayHandle | undefined;
 	/** Re-renders the open jobs sheet so output tails and pids stay live. */
 	#jobsSheetTimer: NodeJS.Timeout | undefined;
+	#planReviewOwner: object | undefined;
 	#planReviewCancel: (() => void) | undefined;
+	#planReviewPick: ((choice: string) => void) | undefined;
+	/** Runs once when the open review's overlay is hidden; set by `showPlanReview`'s `onClose`. */
+	#planReviewOnHide: (() => void) | undefined;
+	/** The open review awaiting an answer; cleared as soon as a local or remote pick settles it. */
+	#pendingPlanReview:
+		| {
+				request: PlanReviewRequestedEvent;
+				remote?: { choice: PlanReviewChoice; feedback?: string };
+		  }
+		| undefined;
 	/** Serializable review annotations keyed by the resolved plan file path. */
 	#planReviewAnnotationState = new Map<string, PlanReviewAnnotationState>();
 	/** Annotation state held until the associated queued refinement actually starts. */
@@ -2174,12 +2202,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.hookWidgetContainerBelow,
 			],
 			{
-				// Inline dialogs and a tall multi-line draft swap into the editor
-				// container and collapse again, as a command report above it closes
-				// on Esc: they clip the transcript instead of retiring it to
-				// scrollback, so the editor returns to the bottom when they go.
-				// Everything else is turn-scoped.
-				transient: [this.editorContainer, this.reportContainer],
+				transient: [this.statusContainer, this.editorContainer],
 				// Natively the HUD pills lead the dock, queued messages sit between
 				// the working row and the composer, and the attachment chips live
 				// inside the composer.
@@ -3912,7 +3935,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (message.role !== "toolResult") continue;
 			const resolved = livePendingTools.get(message.toolCallId);
 			if (!resolved) continue;
-			// A background task's initial `async.state === "running"` result is
+			// A background job call's initial `async.state === "running"` result is
 			// persisted while `EventController#handleToolExecutionEnd` deliberately
 			// keeps its component in `pendingTools` so a later
 			// `tool_execution_update`/`_end` settles it. Such a handle is still
@@ -5007,9 +5030,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		// prompt, which predictably invalidates the cache.
 		this.lastAssistantUsage = undefined;
 
-		// Plan mode state must land before the tool partition: under Code Mode the
-		// direct surface keeps `write` only while a transport needs it, and plan
-		// approval is a top-level `write` to `xd://propose`.
+		// Plan mode state must land before the tool partition: it keeps `write`
+		// active as the staging transport, and plan approval is a top-level
+		// `write` to `xd://propose`.
 		const previousPlanModeState = this.session.getPlanModeState();
 		this.session.setPlanModeState({
 			enabled: true,
@@ -5327,18 +5350,33 @@ export class InteractiveMode implements InteractiveModeContext {
 			annotationState?: PlanReviewAnnotationState;
 			onAnnotationStateChange?: (state: PlanReviewAnnotationState) => void;
 			initialIndex?: number;
+			/** Called once, with the settled choice, when the review overlay is hidden. */
+			onClose?: (choice: string | undefined) => void;
 		},
 		extra?: { slider?: HookSelectorSlider },
 	): Promise<string | undefined> {
 		this.#hidePlanReview();
+		const pending = this.#pendingPlanReview;
+		const owner = pending ?? {};
 		const { promise, resolve } = Promise.withResolvers<string | undefined>();
 		let settled = false;
+		let picked: string | undefined;
 		const finish = (choice: string | undefined): void => {
 			if (settled) return;
 			settled = true;
+			picked = choice;
+			if (this.#planReviewOwner === owner) {
+				this.#planReviewCancel = undefined;
+				this.#planReviewPick = undefined;
+			}
+			if (pending && this.#pendingPlanReview === pending) this.#pendingPlanReview = undefined;
 			resolve(choice);
 		};
+		this.#planReviewOwner = owner;
 		this.#planReviewCancel = () => finish(undefined);
+		this.#planReviewPick = choice => finish(choice);
+		const onClose = dialogOptions?.onClose;
+		this.#planReviewOnHide = onClose ? () => onClose(picked) : undefined;
 		const overlay = new PlanReviewOverlay(
 			planContent,
 			{
@@ -5375,18 +5413,41 @@ export class InteractiveMode implements InteractiveModeContext {
 		return promise;
 	}
 
-	#hidePlanReview(): void {
+	#hidePlanReview(owner?: object): void {
+		if (owner !== undefined && this.#planReviewOwner !== owner) return;
+		this.#planReviewCancel?.();
+		const onHide = this.#planReviewOnHide;
 		this.#planReviewCancel = undefined;
+		this.#planReviewPick = undefined;
+		this.#planReviewOnHide = undefined;
 		this.#planReviewOverlayHandle?.hide();
 		this.#planReviewOverlayHandle = undefined;
 		this.#planReviewOverlay = undefined;
+		this.#planReviewOwner = undefined;
+		onHide?.();
 	}
 
-	#dismissPlanReview(): void {
-		const cancel = this.#planReviewCancel;
-		this.#planReviewCancel = undefined;
-		cancel?.();
-		this.#hidePlanReview();
+	/** The open plan review awaiting an answer, as `plan_review_requested` reported it: backs `ctx.getPendingPlanReview`. */
+	getPendingPlanReview(): PlanReviewRequestedEvent | undefined {
+		const request = this.#pendingPlanReview?.request;
+		return request ? structuredClone(request) : undefined;
+	}
+
+	/**
+	 * Answers the open plan review as if the operator picked `choice`: backs `ctx.resolvePlanReview`.
+	 * Refine feedback is sent verbatim; it only has to be non-blank.
+	 */
+	resolvePlanReview(reviewId: string, choice: PlanReviewChoice, input?: { feedback?: string }): boolean {
+		const pending = this.#pendingPlanReview;
+		const pick = this.#planReviewPick;
+		if (!pending || pending.request.reviewId !== reviewId || !pick) return false;
+		const option = pending.request.options.find(item => item.id === choice);
+		if (!option || option.disabled) return false;
+		const feedback = input?.feedback;
+		if (choice === "refine" && !feedback?.trim()) return false;
+		pending.remote = { choice, feedback };
+		pick(option.label);
+		return true;
 	}
 
 	#getPlanApprovalContextUsage(): ContextUsage | undefined {
@@ -5516,8 +5577,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async #savePlanAndQuit(planContent: string, title: string, annotationStateKey: string): Promise<void> {
-		const selectedPath = await this.#promptPlanSavePath(planContent, title);
+	async #savePlanAndQuit(
+		planContent: string,
+		title: string,
+		annotationStateKey: string,
+		presetPath?: string,
+	): Promise<void> {
+		const selectedPath = presetPath ?? (await this.#promptPlanSavePath(planContent, title));
 		if (!selectedPath) return;
 
 		let destination: string;
@@ -5650,6 +5716,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			preserveContext?: boolean;
 			compactBeforeExecute?: boolean;
 			executionModel?: ResolvedRoleModel;
+			reviewOwner: object;
 		},
 	): Promise<boolean> {
 		const previousPresentation = this.#planModePreviousToolPresentation ?? {
@@ -5803,9 +5870,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// stays intact. Deferring the hide past the awaited `setSessionName` also
 		// prevents restored editor focus from letting operator keystrokes submit a
 		// normal turn ahead of the approved execution turn (PR #5689 review).
-		// `#hidePlanReview` is idempotent, so the caller's trailing `closePlanReview()`
-		// — and the cancelled/error early returns above — stay safe no-ops.
-		this.#hidePlanReview();
+		// The ownership-bound hide is idempotent, so the caller's trailing
+		// `closePlanReview()` — and a stale continuation after a replacement review
+		// opened — stay safe no-ops.
+		this.#hidePlanReview(options.reviewOwner);
 		this.ui.requestRender();
 		// A user turn queued during compaction was already fired by
 		// `flushCompactionQueue` before we returned from `handleCompactCommand`; the
@@ -6539,6 +6607,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		const contextUsage = this.#getPlanApprovalContextUsage();
 		const keepContextLabel = this.#formatKeepContextLabel(contextUsage);
 		const keepContextDisabled = this.#isKeepContextDisabled(contextUsage);
+		const reviewOptions: PlanReviewOption[] = [
+			{ id: "execute", label: "Approve and execute", disabled: false },
+			{ id: "compact", label: "Approve and compact context", disabled: false },
+			{ id: "keep", label: keepContextLabel, disabled: keepContextDisabled },
+			{ id: "refine", label: "Refine plan", disabled: false },
+			{ id: "save", label: PLAN_SAVE_AND_QUIT_OPTION, disabled: false },
+		];
 
 		// Model-tier slider: let the operator pick which configured role model
 		// (smol/default/slow/…) executes the approved plan. The slider always starts
@@ -6574,16 +6649,28 @@ export class InteractiveMode implements InteractiveModeContext {
 		let feedback = "";
 		const annotationStateKey = this.#resolvePlanFilePath(planFilePath);
 
-		const choice = await this.showPlanReview(
+		const reviewSessionId = this.sessionManager.getSessionId();
+		const request: PlanReviewRequestedEvent = {
+			type: "plan_review_requested",
+			reviewId: crypto.randomUUID(),
+			sessionId: reviewSessionId,
+			title: details.title,
+			planFilePath,
+			planContent,
+			options: reviewOptions,
+		};
+		const reviewId = request.reviewId;
+		this.#pendingPlanReview = { request };
+		const pending = this.#pendingPlanReview;
+		const extensionRunner = this.session.extensionRunner;
+		// `plan_review_resolved` reports the overlay closing, not the pick: a pick can
+		// leave it up (compaction runs behind it), and it only fires once every
+		// extension has been handed `plan_review_requested`.
+		const requestDelivered = Promise.withResolvers<void>();
+		const choicePromise = this.showPlanReview(
 			planContent,
 			"Plan mode - next step",
-			[
-				"Approve and execute",
-				"Approve and compact context",
-				keepContextLabel,
-				"Refine plan",
-				PLAN_SAVE_AND_QUIT_OPTION,
-			],
+			reviewOptions.map(option => option.label),
 			{
 				helpText,
 				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
@@ -6600,11 +6687,31 @@ export class InteractiveMode implements InteractiveModeContext {
 					else this.#planReviewAnnotationState.delete(annotationStateKey);
 				},
 				disabledIndices: keepContextDisabled ? [PLAN_KEEP_CONTEXT_OPTION_INDEX] : undefined,
+				onClose: closedWith => {
+					if (!extensionRunner) return;
+					const resolved = {
+						type: "plan_review_resolved",
+						reviewId,
+						sessionId: reviewSessionId,
+						choice: reviewOptions.find(option => option.label === closedWith)?.id,
+						by: pending.remote ? "extension" : "local",
+					} as const;
+					void requestDelivered.promise.then(() => extensionRunner.emit(resolved));
+				},
 			},
 			{ slider },
 		);
+		// Handlers get their own copy so mutating the event cannot re-enable a refused choice.
+		const requestedDelivery = extensionRunner?.emit(structuredClone(request));
+		void requestedDelivery?.then(
+			() => requestDelivered.resolve(),
+			() => requestDelivered.resolve(),
+		);
+		const choice = await choicePromise;
+		if (this.#pendingPlanReview === pending) this.#pendingPlanReview = undefined;
+		const remote = pending.remote;
 		const closePlanReview = (): void => {
-			this.#hidePlanReview();
+			this.#hidePlanReview(pending);
 			this.ui.requestRender();
 		};
 
@@ -6616,7 +6723,12 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.showError(`Plan file not found at ${planFilePath}`);
 					return;
 				}
-				await this.#savePlanAndQuit(latestPlanContent, details.title, annotationStateKey);
+				await this.#savePlanAndQuit(
+					latestPlanContent,
+					details.title,
+					annotationStateKey,
+					remote?.choice === "save" ? planSaveFileName(details.title) : undefined,
+				);
 			} catch (error) {
 				this.showError(`Failed to save plan: ${error instanceof Error ? error.message : String(error)}`);
 			}
@@ -6671,6 +6783,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					preserveContext: choice !== "Approve and execute",
 					compactBeforeExecute: choice === "Approve and compact context",
 					executionModel,
+					reviewOwner: pending,
 				});
 				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
 			} catch (error) {
@@ -6683,15 +6796,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		if (choice === "Refine plan") {
-			const refinement = feedback.trim();
+			const refinement = remote?.choice === "refine" ? (remote.feedback ?? "") : feedback;
 			try {
-				if (refinement) {
+				if (refinement.trim()) {
 					if (this.onInputCallback) {
-						const input = this.startPendingSubmission({ text: feedback });
+						const input = this.startPendingSubmission({ text: refinement });
 						this.#planReviewAnnotationStateBySubmission.set(input, annotationStateKey);
 						this.onInputCallback(input);
 					} else {
-						await this.session.prompt(feedback);
+						await this.session.prompt(refinement);
 						this.#planReviewAnnotationState.delete(annotationStateKey);
 					}
 				} else {
@@ -6812,6 +6925,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	stop(): void {
+		this.#hidePlanReview();
 		this.#appearanceRefreshRequest = undefined;
 		// Settle any pending approval prompt as dismissed (deny). The
 		// controller stays aborted: approvals still queued behind the approval
@@ -7369,7 +7483,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	showPinnedError(message: string): void {
-		this.#dismissPlanReview();
+		this.#hidePlanReview();
 		this.errorBannerContainer.clear();
 		this.errorBannerContainer.addChild(new ErrorBannerComponent(message, () => this.clearPinnedError()));
 		this.ui.requestRender();

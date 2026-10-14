@@ -13,33 +13,22 @@ const agentDir = path.join(work, "agent");
 const extensionPath = path.join(work, "probe.mjs");
 const resultPath = path.join(work, "result.json");
 
-// A local OpenAI-compatible fixture supplies the model registry entries used to
-// verify task model resolution through authority-owned root sessions.
+// A local OpenAI-compatible fixture supplies model registry entries and exercises
+// native task model resolution through authority-owned root sessions. It uses no
+// credentials or network services; unstructured subagents return the fixture's
+// model-named reply verbatim, while the tiny role keeps labels out of model logs.
 const requestedModels: string[] = [];
 const server = Bun.serve({
 	hostname: "127.0.0.1",
 	port: 0,
 	async fetch(request) {
-		const body = (await request.json()) as { model: string; tools?: { function: { name: string } }[] };
-		const canYield = body.tools?.some(tool => tool.function.name === "yield");
-		if (canYield) requestedModels.push(body.model);
-		const delta = canYield
-			? {
-					role: "assistant",
-					tool_calls: [
-						{
-							index: 0,
-							id: `yield-${requestedModels.length}`,
-							type: "function",
-							function: { name: "yield", arguments: JSON.stringify({ data: { model: body.model } }) },
-						},
-					],
-				}
-			: { role: "assistant", content: "Fixture task" };
+		const body = (await request.json()) as { model: string };
+		if (body.model !== "tiny") requestedModels.push(body.model);
+		const delta = { role: "assistant", content: `Fixture result from ${body.model}` };
 		const chunk = { id: "fixture", object: "chat.completion.chunk", model: body.model, created: 1 };
 		return new Response(
 			`data: ${JSON.stringify({ ...chunk, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n` +
-				`data: ${JSON.stringify({ ...chunk, choices: [{ index: 0, delta: {}, finish_reason: canYield ? "tool_calls" : "stop" }] })}\n\n` +
+				`data: ${JSON.stringify({ ...chunk, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n` +
 				"data: [DONE]\n\n",
 			{ headers: { "content-type": "text/event-stream" } },
 		);
@@ -71,7 +60,7 @@ function registerFixtureProvider(api) {
 		baseUrl: fixture.baseUrl,
 		apiKey: "offline-fixture-key",
 		api: "openai-completions",
-		models: ["fallback", "model-a", "model-b"].map(id => ({
+		models: ["fallback", "tiny", "model-a", "model-b"].map(id => ({
 			id, name: id, reasoning: false, input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 128000, maxTokens: 1024,
@@ -98,7 +87,7 @@ export default function (api) {
 						overrides: {
 							"async.enabled": false, "task.batch": false,
 							"task.isolation.enabled": false, "task.enableLsp": false,
-							"modelRoles": { default: "fixture/fallback", tiny: "fixture/fallback" },
+							"modelRoles": { default: "fixture/fallback", tiny: "fixture/tiny" },
 						},
 					});
 					const sessionManager = SessionManager.create(fixture.cwd, fixture.work + "/sessions-" + name);

@@ -88,7 +88,7 @@ describe("daemon broker idle shutdown", () => {
 		const token = (await fs.readFile(path.join(runtimeDir, "broker.token"), "utf8")).trim();
 		const broker = startBroker(projectDir, runtimeDir, 100);
 		await client.request({ op: "ping" });
-		const socket = net.createConnection({ path: daemonBrokerEndpoint(projectDir, runtimeDir) });
+		const socket = net.createConnection({ path: daemonBrokerEndpoint(runtimeDir) });
 		try {
 			const connected = Promise.withResolvers<void>();
 			socket.once("connect", connected.resolve);

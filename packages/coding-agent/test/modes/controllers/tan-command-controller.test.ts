@@ -194,6 +194,7 @@ async function createContext(overrides?: {
 	const getArtifactsDir = vi.fn(() => parentArtifactsDir);
 	const getSessionId = vi.fn(() => "parent-local-session");
 	const sessionManager = {
+		getHeader: vi.fn(() => undefined),
 		getSessionFile: vi.fn(() => parentFile),
 		getCwd: vi.fn(() => tempDir.path()),
 		getSessionDir: vi.fn(() => tempDir.path()),

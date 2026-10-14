@@ -32,6 +32,8 @@ describe("CLI command help metadata", () => {
 			metadata.set(entry.name, entry.help);
 			constructors.set(entry.name, await entry.load());
 		}
+		const sessionDescription = metadata.get("session")?.description;
+		expect(sessionDescription).toMatch(/repair.*dry-run by default.*pack.*unpack.*moved/i);
 
 		const base = { bin: "omp", version: "test" };
 		const metadataConfig: CliConfig<CommandMetadata> = { ...base, commands: metadata };

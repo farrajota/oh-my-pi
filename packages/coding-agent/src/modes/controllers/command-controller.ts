@@ -179,8 +179,6 @@ function hasForkApiKeyOverride(argv: string[]): boolean {
 export class CommandController {
 	/** The open native report sheet. */
 	#reportSheet: OverlayHandle | undefined;
-	/** The editor sat on the bottom row when the text-mode report above it opened. */
-	#reportOpenedAtBottom = false;
 	#forkTerminalDependencies: ForkTerminalDependencies;
 
 	constructor(
@@ -1363,6 +1361,11 @@ export class CommandController {
 			return;
 		}
 
+		// A Tern pane fork leaves this session untouched, so it may run mid-turn.
+		if (await this.#forkIntoTernPane()) return;
+
+		// An in-place fork moves this process onto the new file; a running turn
+		// would finish there and leave the original transcript cut mid-turn.
 		if (this.ctx.session.isStreaming) {
 			this.ctx.showWarning("Wait for the current response to finish or abort it before forking.");
 			return;
@@ -1372,8 +1375,6 @@ export class CommandController {
 			this.ctx.loadingAnimation = undefined;
 		}
 		this.ctx.statusContainer.disposeChildren();
-
-		if (await this.#forkIntoTernPane()) return;
 
 		// After a `/fork`, the current session ID is changed to the forked one,
 		// so the session ID before the fork is the one we want to show in the hint.
@@ -1477,8 +1478,14 @@ export class CommandController {
 			const activeThinkingLevel = this.ctx.session.configuredThinkingLevel();
 			if (activeThinkingLevel !== undefined) childArgs.push("--thinking", activeThinkingLevel);
 			// Forcing --model/--thinking marks the fork's cache shape as changed, which would
-			// drop the inherited key; pin what the parent's requests populated the cache under.
-			childArgs.push("--prompt-cache-key", this.ctx.session.agent.promptCacheKey ?? this.ctx.session.sessionId);
+			// drop the inherited key. Automatic candidates travel in the source header;
+			// forwarding them as --prompt-cache-key would bypass their model gate.
+			if (
+				this.ctx.session.agent.promptCacheKey !== undefined ||
+				this.ctx.sessionManager.getHeader()?.taskPromptCacheKey === undefined
+			) {
+				childArgs.push("--prompt-cache-key", this.ctx.session.agent.promptCacheKey ?? this.ctx.session.sessionId);
+			}
 			childArgs.push("--fork", sourceSessionFile);
 			// Pin only non-secret scope variables.
 			const command = [
@@ -1567,9 +1574,10 @@ export class CommandController {
 		} finally {
 			client.close();
 		}
+		const note = this.ctx.session.isStreaming ? " · the running response continues here, not in the fork" : "";
 		this.ctx.present([
 			new Spacer(1),
-			new Text(theme.fg("accent", `${theme.status.success} Session forked into a new pane`), 1, 1),
+			new Text(theme.fg("accent", `${theme.status.success} Session forked into a new pane${note}`), 1, 1),
 		]);
 		return true;
 	}

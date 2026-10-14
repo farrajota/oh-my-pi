@@ -1,9 +1,9 @@
 {{#if asyncEnabled}}{{#if batchEnabled}}Spawn `tasks[]` concurrently; IDs return immediately.{{else}}Spawn one agent; ID returns immediately.{{/if}}{{#if hasBlockingAgents}} BLOCKING agents return inline.{{/if}}{{else}}{{#if batchEnabled}}Run `tasks[]` synchronously.{{else}}Run one agent synchronously.{{/if}}{{/if}}
-{{#if asyncEnabled}}
+{{#if asyncEnabled}}{{#if structured}}
 
 # Results
 `outputSchema` parsed payload, even invalid: `agent://<id>`; JSON field paths such as `/<field>` and `/reports/0/data` fall back to extraction only when no matching nested-child artifact exists. Nested outputs use `agent://<id>.<child>` or `agent://<id>/<child>`; invalid preview inline.
-{{/if}}
+{{/if}}{{/if}}
 
 # Delegation
 Use most specific agent.{{#if scoutAvailable}} Read-only research MUST use `scout` only when files are unknown.{{/if}} Prefer one agent to investigate + edit. Omit `agent` when the spawn-policy default is the best fit (`{{defaultAgent}}`); NEVER specify the default explicitly. Check the available agents below before choosing a specialist. User-tagged model agents such as `m<N>` are not specialists; use one only when the user names it.
@@ -27,8 +27,10 @@ Name one integration owner. Shared edits are not guaranteed to merge in the same
 {{/if}}
 {{#if effortEnabled}}  - `effort`: Scale w/ how open-ended this task's problem is: `"lo"`|`"med"`|`"hi"`
 {{/if}}
+{{#if structured}}
   - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
   - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
+{{/if}}
 {{#if isolationEnabled}}
 {{#if applyIsolatedChanges}}
   - `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
@@ -51,8 +53,10 @@ Name one integration owner. Shared edits are not guaranteed to merge in the same
 {{/if}}
 {{#if effortEnabled}}- `effort`: Scale w/ how open-ended this task's problem is: `"lo"`|`"med"`|`"hi"`
 {{/if}}
+{{#if structured}}
 - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
 - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
+{{/if}}
 {{#if isolationEnabled}}
 {{#if applyIsolatedChanges}}
 - `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
