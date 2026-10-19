@@ -27,6 +27,7 @@ import type {
 	ResolvedBedrockCompat,
 	ResolvedDevinCompat,
 	ResolvedGoogleCompat,
+	ResolvedOllamaCompat,
 	ResolvedOpenAICompat,
 	ResolvedOpenAIResponsesCompat,
 	ResolvedOpenAISharedCompat,
@@ -119,11 +120,24 @@ class IdentityFacts {
 	}
 }
 
+/**
+ * The id a spec resolves identity and rules under: its own, unless that names
+ * no model and the row sends a model that does on the wire. A Devin Fusion
+ * pairing runs only its lead, so the lead's reviewed rules (cache-write rate,
+ * long-context tier) apply to it at build time.
+ */
+function policyModelId<TApi extends Api>(spec: ModelSpec<TApi>): string {
+	const wireId = spec.requestModelId;
+	if (wireId === undefined || wireId === spec.id) return spec.id;
+	if (classifyModel(spec.provider, spec.id).class !== "unknown") return spec.id;
+	return classifyModel(spec.provider, wireId).class === "unknown" ? spec.id : wireId;
+}
+
 function resolveIdentity<TApi extends Api>(spec: ModelSpec<TApi>): ModelIdentity {
 	// Strict on purpose: ambiguous identity is a rule-authoring defect surfaced
 	// at build/CI time, never silently degraded to `unknown`. Discovery
 	// normalization opts into leniency through `classifyModel` directly.
-	return classifyModel(spec.provider, spec.id);
+	return classifyModel(spec.provider, policyModelId(spec));
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +277,7 @@ function hasLocalLoopbackBaseUrl(baseUrl: string | undefined): boolean {
 	let hostname: string;
 	try {
 		hostname = new URL(baseUrl).hostname.toLowerCase();
+		if (hostname.endsWith(".")) hostname = hostname.slice(0, -1);
 	} catch {
 		return false;
 	}
@@ -960,6 +975,13 @@ function resolveBedrockPolicy(spec: ModelSpec<"bedrock-converse-stream">, axes: 
 	return compat;
 }
 
+function resolveOllamaPolicy(spec: ModelSpec<"ollama-chat">, axes: ResolvedAxes): ResolvedOllamaCompat {
+	const compat: ResolvedOllamaCompat = { stripThinkingHistory: false };
+	applyWireAxes(compat, axes.wire, "ollama-chat");
+	applyCompatOverrides(compat, spec.compat);
+	return compat;
+}
+
 function resolveDevinPolicy(spec: ModelSpec<"devin-agent">, axes: ResolvedAxes): ResolvedDevinCompat {
 	const compat: ResolvedDevinCompat = {
 		trustExplicitThinkingOnly: true,
@@ -1026,7 +1048,8 @@ function defaultThinkingMode<TApi extends Api>(spec: ModelSpec<TApi>, facts: Ide
 		case "google-generative-ai":
 		case "google-gemini-cli":
 		case "google-vertex":
-			return facts.is("gemini") && facts.revMajor() === 3 ? "google-level" : "budget";
+			// Gemini 3+ `google-level` is a `thinking-mode` rule in classes/gemini.kdl.
+			return "budget";
 		case "anthropic-messages":
 			if (facts.is("minimax") && facts.family("m2", "m3")) return "anthropic-adaptive";
 			if (facts.is("glm") && facts.revGte("5.2") && (spec.provider === "umans" || spec.provider === "zai")) {
@@ -1305,7 +1328,7 @@ function buildResolveTarget<TApi extends Api>(
 		provider: providerType,
 		api: spec.api,
 		class: identity.class,
-		model: spec.id,
+		model: policyModelId(spec),
 		reasoning: Boolean(spec.reasoning),
 	};
 	if (identity.family !== undefined) target.family = identity.family;
@@ -1365,6 +1388,8 @@ export function resolveModelPolicy(input: ModelSpec<Api>, route?: ResolveRoute):
 		compat = resolveAnthropicPolicy(spec, facts, axes);
 	} else if (specUsesApi(spec, "bedrock-converse-stream")) {
 		compat = resolveBedrockPolicy(spec, axes);
+	} else if (specUsesApi(spec, "ollama-chat")) {
+		compat = resolveOllamaPolicy(spec, axes);
 	} else if (specUsesApi(spec, "devin-agent")) {
 		compat = resolveDevinPolicy(spec, axes);
 	} else if (

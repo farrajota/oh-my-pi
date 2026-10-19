@@ -20,7 +20,15 @@ export type AxisShape = "scalar" | "array" | "object";
 export type AxisSet = "wire" | "thinking" | "catalog";
 
 /** Resolved compat record families a wire axis may be assigned onto. */
-export type CompatRecordName = "openai" | "openai-responses" | "anthropic" | "bedrock" | "devin" | "google" | "request";
+export type CompatRecordName =
+	| "openai"
+	| "openai-responses"
+	| "anthropic"
+	| "bedrock"
+	| "devin"
+	| "google"
+	| "request"
+	| "ollama";
 
 /** One axis definition: resolved key, namespace, shape, and applicability. */
 export interface AxisDef {
@@ -251,7 +259,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"requires-thinking-enabled": wire("requiresThinkingEnabled", ["anthropic"]),
 	"requires-tool-result-id": wire("requiresToolResultId", ["anthropic"]),
 	"signing-endpoint": wire("signingEndpoint", ["anthropic"]),
-	"strip-thinking-history": wire("stripThinkingHistory", ["anthropic"]),
+	"strip-thinking-history": wire("stripThinkingHistory", ["anthropic", "ollama"]),
 	"supports-context-management": wire("supportsContextManagement", ["anthropic"]),
 	"supports-output-effort": wire("supportsOutputEffort", ["anthropic"]),
 	"supports-eager-tool-input-streaming": wire("supportsEagerToolInputStreaming", ["anthropic"]),
@@ -340,6 +348,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 		values: ["freeform", "function"],
 	},
 	"requires-native-tools": { key: "requiresNativeTools", set: "catalog", shape: "scalar", values: [true, false] },
+	"tool-schemas-in-context": { key: "toolSchemasInContext", set: "catalog", shape: "scalar", values: [true, false] },
 	"requires-tool-free-history-for-tool-opt-out": {
 		key: "requiresToolFreeHistoryForToolOptOut",
 		set: "catalog",
@@ -404,6 +413,14 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 		shape: "scalar",
 		values: [true, false],
 	},
+	/**
+	 * The host bills cache writes at this multiple of the row's live `input`
+	 * price, for hosts whose discovery reports cache-write tokens but no
+	 * cache-write rate. It replaces any `cacheWrite` the row carries, including
+	 * a `cost-patch`/`cost-fallback` value and an absolute long-context tier's
+	 * `cacheWrite` (rebased on the tier's `input`).
+	 */
+	"cache-write-rate": { key: "cacheWriteRate", set: "catalog", shape: "scalar" },
 	/**
 	 * How the model line bills a replayed signed thinking block as input:
 	 * `output` bills the reasoning its signature carries, at the size the turn
@@ -587,6 +604,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 
 /** Records applicable to each API family; used by `resolve.ts` when applying wire axes. */
 export const API_COMPAT_RECORDS: Readonly<Record<string, readonly CompatRecordName[]>> = {
+	"ollama-chat": ["ollama"],
 	"openai-completions": ["openai"],
 	openrouter: ["openai", "openai-responses"],
 	"openai-responses": ["openai-responses"],

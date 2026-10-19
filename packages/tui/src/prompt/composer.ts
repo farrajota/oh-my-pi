@@ -8,6 +8,7 @@ import { ProcessTerminal, type Terminal } from "../terminal";
 import {
 	type Component,
 	Container,
+	type RenderTimer,
 	type ResizeScrollbackMode,
 	type TerminalFramePlan,
 	type TerminalFrameProvider,
@@ -26,6 +27,8 @@ import { WelcomeComponent } from "./welcome";
 import { ensureThemeSync, getEditorTheme, theme } from "../theme/theme";
 
 const DOUBLE_INTERRUPT_MS = 500;
+// How long idle chrome must hold its height after a turn before it is treated as permanent.
+const IDLE_CHROME_SETTLE_MS = 250;
 
 /** Live settings that affect the composer before and after session adoption. */
 export interface ComposerPreferences {
@@ -95,8 +98,20 @@ export interface RuntimeChildrenOptions {
 	 * to the roots below the transcript in render order.
 	 */
 	readonly nativeDock?: readonly Component[];
-	/** Roots whose rendered height may shrink after transient interaction. */
-	readonly transient?: readonly Component[];
+	/**
+	 * Below-transcript roots the user opens and closes (the editor surface that
+	 * drafts and dialogs swap into, docked reports). Their rows never become
+	 * part of the post-run chrome floor, so collapsing them refills the screen.
+	 */
+	readonly transientChrome?: readonly Component[];
+	/**
+	 * Transient roots that clear themselves (todo and subagent HUDs, progress).
+	 * Their first paint can be their tallest, e.g. a restored todo list on a
+	 * resumed session, so unlike {@link transientChrome} it is never treated as
+	 * their resting height: all of their rows stay out of the floor. Roots listed
+	 * here are transient and need not also appear in `transientChrome`.
+	 */
+	readonly selfClearingChrome?: readonly Component[];
 }
 
 /** Controls the first terminal paint for a composer that does not already own the terminal. */
@@ -205,6 +220,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	#headerBefore: readonly Component[] = [];
 	#headerAfter: readonly Component[] = [];
 	#runtimeChildren: readonly Component[] = [];
+
 	#nativeDock: readonly Component[] | undefined;
 	/** Cache-driven status line shown until {@link setStatusComponent} mounts the session's. */
 	#startupStatus: StatusLineComponent | undefined;
@@ -249,12 +265,44 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	#retiredHeaderStart = 0;
 	#resizeRetiredHeaderStart: number | undefined;
 	#lastNormalRows = 0;
-	// Transient chrome (dialogs and temporary editor content) is billed at its
-	// smallest rendered height since mount, so growing and shrinking it cannot
-	// retire transcript rows that the live viewport needs to reclaim. Persistent
-	// roots are billed at their current height because they remain for the turn.
+	// Retirement bills below-transcript chrome at this floor, not its current
+	// height. It follows contractions immediately and promotes stable eligible
+	// growth only while idle. Transient roots count at their minimum painted
+	// height: a growing dialog or draft clips the live tail without committing
+	// displaced rows, so those rows refill the screen when it shrinks (#11007).
+	// Displaced rows reach history when newer output pushes them past the floor
+	// or persistent idle chrome settles and raises it.
+	// The floor is terminal-height independent — chrome heights do not scale
+	// with rows — so it is retained across resizes rather than rediscovered
+	// from whatever chrome is expanded when the height changes.
+	#chromeFloor: number | undefined;
+	// Settled idle chrome has retired rows; contraction must preserve native history.
+	#chromeFloorPromoted = false;
+	// Keep the live tail compactable after transient growth over a contracted promoted floor.
+	#compactTailRetained = false;
+	#runActive = false;
 	#transientChrome: ReadonlySet<Component> = new Set();
-	#transientChromeFloor: number | undefined;
+	#selfClearingChrome: ReadonlySet<Component> = new Set();
+	// Fewest rows the user-driven transient roots have painted since mount; only rows above it are excluded from the floor.
+	#transientFloor: number | undefined;
+	// Editor and shape the transient floor was measured under, plus the last frame's transient rows.
+	// A shape swap (band → pi) changes the editor's resting height; a minimum carried over from the
+	// shorter shape would exclude the taller shape's fixed rows forever and clip that many transcript rows.
+	#transientEditor: Component | undefined;
+	#transientEditorStyle: string | undefined;
+	#lastTransientRows = 0;
+	// Fewest rows the bare editor painted before the runtime mounted, and the shape it was painted in.
+	// A draft replayed from the startup keystroke buffer can already be present on the first runtime
+	// frame, so that frame is not the editor's resting height; this is, because the bootstrap frame
+	// paints before replay. Only valid while the shape is unchanged.
+	#bootstrapEditorRows: number | undefined;
+	#bootstrapEditorStyle: string | undefined;
+	// Idle chrome height awaiting the settle window, and whether it has elapsed.
+	// Turn-scoped HUDs can close a few frames after the last block finalizes;
+	// billing them first would commit rows they cover and strand a band.
+	#idleChrome: number | undefined;
+	#idleChromeSettled = false;
+	#idleChromeTimer: RenderTimer | undefined;
 	/** Rows the chrome below each below-transcript root took in the last frame (see {@link rowsBelow}). */
 	#rowsBelow = new Map<Component, number>();
 	#lastInterruptAt = 0;
@@ -324,6 +372,9 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		this.ui.addChild(this.editor);
 		this.ui.addChild(this.#statusHost);
 		this.ui.setFocus(this.editor);
+		// A settle timer that fires while the TUI is stopped (external editor, suspend) is dropped;
+		// forget it on restart so the next frame re-arms instead of waiting on it forever.
+		this.ui.addStartListener(() => this.#resetIdleChrome());
 	}
 	/**
 	 * Rows the below-transcript chrome under `root` (editor, status line, …)
@@ -350,7 +401,13 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
 		if (transcriptIndex < 0) {
 			this.#lastClickSpans = [];
-			return { viewport: this.#renderRoots(roots, width).slice(-rows) };
+			const viewport: string[] = [];
+			for (const root of roots) {
+				const rendered = root.render(width);
+				if (!this.#runtimeMounted && root === this.editor) this.#recordBootstrapEditorRows(rendered.length);
+				viewport.push(...rendered);
+			}
+			return { viewport: viewport.slice(-rows) };
 		}
 		const transcript = roots[transcriptIndex] as TranscriptContainer;
 		const preRoots = this.#renderRoots(roots.slice(0, transcriptIndex), width);
@@ -359,25 +416,49 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const afterSpans: ViewportClickSpan[] = [];
 		let transientRows = 0;
 		const ends: { root: Component; end: number }[] = [];
+		let selfClearingRows = 0;
 		for (const root of afterRoots) {
 			const start = after.length;
 			this.#renderBelowRoot(root, width, after, afterSpans);
+			const rootRows = after.length - start;
+			if (this.#selfClearingChrome.has(root)) selfClearingRows += rootRows;
+			else if (this.#transientChrome.has(root)) transientRows += rootRows;
 			ends.push({ root, end: after.length });
-			if (this.#transientChrome.has(root)) transientRows += after.length - start;
 		}
 		this.#rowsBelow = new Map(ends.map(({ root, end }) => [root, after.length - end]));
+		const transientChromeContracted = this.#transientFloor !== undefined && transientRows < this.#lastTransientRows;
+		const transientFloor = this.#syncTransientFloor(transientRows);
+		// Eligible chrome excludes user-driven transient rows above their resting height and every
+		// self-clearing row; contraction, floor and rebaseline all use it.
+		const eligibleChrome = after.length - (transientRows - transientFloor) - selfClearingRows;
+		const promotedChromeContracted = this.#chromeFloorPromoted && eligibleChrome < (this.#chromeFloor ?? 0);
+		this.#chromeFloor = Math.min(this.#chromeFloor ?? eligibleChrome, eligibleChrome);
+		this.#rebaselineChromeFloor(this.#runActive || transcript.hasActiveBlock(), eligibleChrome);
+		const belowFloor = this.#chromeFloor;
+		// Preserve compactable transcript rows after a run overlaps expanded transient chrome
+		// with a promoted floor that has already contracted to the editor's resting height.
+		if (!this.#chromeFloorPromoted || belowFloor !== transientFloor) {
+			this.#compactTailRetained = false;
+		}
+		if (
+			this.#runActive &&
+			this.#chromeFloorPromoted &&
+			belowFloor === transientFloor &&
+			transientRows > transientFloor
+		) {
+			this.#compactTailRetained = true;
+		}
+		const compactTail = this.#compactTailRetained;
 		// Offer history under capacity pressure only: blocks stay live (and keep
 		// reflowing to the current width) while the screen has room. A batch
 		// leaves the mutable viewport in the same frame it is appended, so its
 		// rows are never painted twice.
-		this.#transientChromeFloor = Math.min(this.#transientChromeFloor ?? transientRows, transientRows);
-		const belowFloor = after.length - transientRows + this.#transientChromeFloor;
 		const now = performance.now();
 		const frame: AnimationFrame = { now, tick: Math.floor(now / 80) };
 		// Retirement measures the same live blocks the viewport lays out below;
 		// one open frame renders each of them once for both.
 		transcript.beginFrame(frame);
-		const history = this.#offerHistory(transcript, width, rows, preRoots.length + belowFloor);
+		const history = this.#offerHistory(transcript, width, rows, preRoots.length + belowFloor, compactTail);
 		const headerVisible = !this.#headerRetired && this.#offeredHistory?.source !== "header";
 		const headerRows = headerVisible ? this.#header.render(width) : [];
 		const before = [...headerRows, ...preRoots];
@@ -397,22 +478,37 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const mutable = [...before, ...active, ...after].slice(drop);
 		// Once a paint reaches the bottom row over committed history, rows above
 		// it may already be in native scrollback, which no later frame can pull
-		// back down. Keep the input on the bottom row instead of stranding a
-		// band of blank rows under it whenever the frame shrinks — a closing
-		// dialog, report or HUD, or a live block collapsing. The band sits
-		// between the history still on screen and the live rows; replaying
-		// those rows would duplicate them, clearing history would lose them.
-		// Replays position themselves. Without native history the live viewport
-		// is the whole document and shrinks in place.
+		// back down. Keep the input on the bottom row whenever the frame shrinks
+		// — a closing dialog, report or HUD, or a live block collapsing. The
+		// slack that leaves has to sit somewhere: rows above the live area hold
+		// committed history still on screen, so the live rows cannot move up into
+		// them, and replaying those rows would duplicate them while clearing
+		// history would lose them. Replays position themselves. Without native
+		// history the live viewport is the whole document and shrinks in place.
 		const filledHistoryRows =
 			history?.kind === "replay" || !(history !== undefined || this.ui.hasProviderHistory())
 				? undefined
 				: this.ui.getFilledHistoryRows();
-		const topPadding =
-			filledHistoryRows === undefined
+		// Once settled or transient chrome has retired rows, shrinking it cannot pull
+		// them back out of native scrollback. Let the editor move up instead of
+		// inserting a seam band; subsequent frames retain that natural anchor
+		// until new output fills the screen again. Shell history stays untouched.
+		const slack =
+			filledHistoryRows === undefined || promotedChromeContracted || transientChromeContracted
 				? 0
 				: Math.max(0, rows - Math.min(rows, filledHistoryRows + (history?.rows.length ?? 0)) - mutable.length);
-		if (topPadding > 0) mutable.unshift(...Array<string>(topPadding).fill(""));
+		// Park the slack below the live rows rather than above them. Above, it
+		// splits the on-screen history from the live tail and reads as a hole
+		// punched into whatever was streaming — a table's rows included — and
+		// each slack row is written with no cells, so no repaint, mark or
+		// selection can cover it until something scrolls it away. Below, the
+		// transcript stays contiguous with the history, the slack reads as the
+		// empty tail of a short document, and growth consumes it before any row
+		// can scroll.
+		if (slack > 0) {
+			const at = Math.max(0, Math.min(mutable.length, before.length + active.length - drop));
+			mutable.splice(at, 0, ...Array<string>(slack).fill(""));
+		}
 		const viewportLength = mutable.length;
 		const spans: ViewportClickSpan[] = [];
 		const shift = (span: ViewportClickSpan, base: number): void => {
@@ -427,7 +523,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 			}
 		};
 		for (const span of activeSpans) shift(span, before.length - drop);
-		for (const span of afterSpans) shift(span, before.length + active.length - drop);
+		for (const span of afterSpans) shift(span, slack + before.length + active.length - drop);
 		this.#lastClickSpans = spans;
 		if (history !== undefined && this.#offeredHistory?.source === "header") {
 			const visibleHeaderRows = Math.max(0, rows - (mutable.length + drop));
@@ -636,12 +732,78 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		}
 	}
 
+	/** Raise the floor to eligible idle chrome that survives the settle window, even if it appeared after the run. */
+	#rebaselineChromeFloor(busy: boolean, chrome: number): void {
+		if (busy || chrome <= (this.#chromeFloor ?? chrome)) {
+			this.#resetIdleChrome();
+			return;
+		}
+		if (this.#idleChromeSettled && this.#idleChrome === chrome) {
+			this.#chromeFloorPromoted = true;
+			this.#chromeFloor = chrome;
+			this.#resetIdleChrome();
+			return;
+		}
+		if (this.#idleChrome === chrome && this.#idleChromeTimer !== undefined) return;
+		this.#resetIdleChrome();
+		this.#idleChrome = chrome;
+		this.#idleChromeTimer = this.ui.scheduleAfter(IDLE_CHROME_SETTLE_MS, () => {
+			this.#idleChromeTimer = undefined;
+			this.#idleChromeSettled = true;
+			this.ui.requestRender();
+		});
+	}
+
+	#resetIdleChrome(): void {
+		this.#idleChromeTimer?.cancel();
+		this.#idleChromeTimer = undefined;
+		this.#idleChrome = undefined;
+		this.#idleChromeSettled = false;
+	}
+
+	/** Track the empty editor's pre-mount height per shape; a shape change restarts the measurement. */
+	#recordBootstrapEditorRows(rows: number): void {
+		const style = this.editor.getBorderStyle();
+		this.#bootstrapEditorRows =
+			style === this.#bootstrapEditorStyle ? Math.min(this.#bootstrapEditorRows ?? rows, rows) : rows;
+		this.#bootstrapEditorStyle = style;
+	}
+
+	/**
+	 * Follow the transient roots' resting height. Normally a running minimum; when the editor or its
+	 * shape changes, the floor shifts by that frame's height change instead, so draft growth stays
+	 * excluded while the new shape's fixed rows are billed.
+	 */
+	#syncTransientFloor(transientRows: number): number {
+		const editor = this.editor;
+		const style = editor.getBorderStyle();
+		let floor: number;
+		if (this.#transientFloor === undefined) {
+			// The first runtime frame may already carry a replayed startup draft; seed from the empty
+			// editor's pre-mount height when it was painted in the same shape.
+			const bootstrap = this.#bootstrapEditorStyle === style ? this.#bootstrapEditorRows : undefined;
+			floor = bootstrap === undefined ? transientRows : Math.min(transientRows, bootstrap);
+		} else if (editor !== this.#transientEditor || style !== this.#transientEditorStyle) {
+			floor = Math.max(0, Math.min(transientRows, this.#transientFloor + transientRows - this.#lastTransientRows));
+		} else {
+			floor = Math.min(this.#transientFloor, transientRows);
+		}
+		this.#transientFloor = floor;
+		this.#bootstrapEditorRows = undefined;
+		this.#bootstrapEditorStyle = undefined;
+		this.#transientEditor = editor;
+		this.#transientEditorStyle = style;
+		this.#lastTransientRows = transientRows;
+		return floor;
+	}
+
 	/** Header retires first; replay coalesces it with the complete transcript ledger. */
 	#offerHistory(
 		transcript: TranscriptContainer,
 		width: number,
 		rows: number,
 		chromeRows: number,
+		compactTail: boolean,
 	): { id: number; rows: readonly string[]; kind: "append" | "replay" } | undefined {
 		if (this.#offeredHistory !== undefined) {
 			this.#rerenderOfferedHistory(width);
@@ -704,7 +866,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		}
 		const batch = this.#historyFlush
 			? transcript.peekFlushBatch(width)
-			: transcript.peekFinalizedBatch(width, Math.max(0, rows - chromeRows));
+			: transcript.peekFinalizedBatch(width, Math.max(0, rows - chromeRows), { compactTail });
 		if (batch === undefined) return undefined;
 		this.#offeredHistory = {
 			id: this.#nextHistoryId++,
@@ -852,6 +1014,17 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		this.ui.requestRender();
 	}
 
+	/**
+	 * Mark whether a host agent run is in flight. Mid-run gaps with no streaming
+	 * block (tool arguments not yet parseable, between tool calls) then do not
+	 * count as the run ending when the post-run chrome floor is decided.
+	 */
+	setRunActive(active: boolean): void {
+		if (this.#runActive === active) return;
+		this.#runActive = active;
+		this.ui.requestRender();
+	}
+
 	/** Replace optional header content around the stable welcome scene. */
 	setHeaderExtras(before: readonly Component[], after: readonly Component[]): void {
 		if (this.#stopped) return;
@@ -889,9 +1062,14 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	/** Mount or replace session-aware root children while preserving the header and status hosts. */
 	setRuntimeChildren(children: readonly Component[], options: RuntimeChildrenOptions = {}): void {
 		if (this.#stopped) return;
-		this.#transientChrome = new Set(options.transient ?? []);
-		this.#transientChromeFloor = undefined;
+		this.#chromeFloor = undefined;
+		this.#chromeFloorPromoted = false;
+		this.#compactTailRetained = false;
+		this.#resetIdleChrome();
 		this.#nativeDock = options.nativeDock;
+		this.#transientChrome = new Set(options.transientChrome);
+		this.#selfClearingChrome = new Set(options.selfClearingChrome);
+		this.#transientFloor = undefined;
 		this.ui.removeChild(this.#statusHost);
 		if (this.#runtimeMounted) {
 			for (const child of this.#runtimeChildren) this.ui.removeChild(child);

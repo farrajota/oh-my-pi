@@ -14,6 +14,7 @@ import type {
 	LspJsonRpcRequest,
 	LspJsonRpcResponse,
 	LspTransport,
+	LspStdoutReader,
 	LspWriteSink,
 	PublishDiagnosticsParams,
 	ServerConfig,
@@ -60,7 +61,18 @@ export interface LspSessionPolicy {
 	readonly shared: boolean;
 }
 
-const lspSessionPolicy = new AsyncLocalStorage<LspSessionPolicy>();
+interface StoredLspSessionPolicy extends LspSessionPolicy {
+	readonly identity: string;
+}
+
+const lspSessionPolicy = new AsyncLocalStorage<StoredLspSessionPolicy>();
+const lspSessionIdentities = new WeakMap<LspSessionPolicy, string>();
+let nextLspSessionIdentity = 0;
+
+function policyIdentity(policy: StoredLspSessionPolicy | undefined): string {
+	if (policy?.shared === true) return "shared";
+	return policy?.identity ?? "private:legacy";
+}
 
 // Legacy default for direct library consumers that do not enter a session
 // policy. SDK sessions always install an AsyncLocalStorage policy, so changing
@@ -71,9 +83,13 @@ export function setSharedLspEnabled(_enabled: boolean): void {
 	void _enabled;
 }
 
-/** Run LSP discovery, warmup, and tool work under one immutable session policy. */
 export function withLspSessionPolicy<T>(policy: LspSessionPolicy, run: () => T): T {
-	return lspSessionPolicy.run(Object.freeze({ ...policy }), run);
+	let identity = lspSessionIdentities.get(policy);
+	if (!identity) {
+		identity = `private:${++nextLspSessionIdentity}`;
+		lspSessionIdentities.set(policy, identity);
+	}
+	return lspSessionPolicy.run(Object.freeze({ ...policy, identity }), run);
 }
 
 /**
@@ -405,12 +421,14 @@ function queueWriteMessage(
  * Start background message reader for a client.
  * Routes responses to pending requests and handles notifications.
  */
-async function startMessageReader(client: LspClient): Promise<void> {
+function startMessageReader(client: LspClient): void {
 	if (client.isReading) return;
-	client.isReading = true;
-
 	const reader = (client.proc.stdout as ReadableStream<Uint8Array>).getReader();
+	client.isReading = true;
+	void readMessageStream(client, reader);
+}
 
+async function readMessageStream(client: LspClient, reader: LspStdoutReader): Promise<void> {
 	const framer = new MessageFramer(Buffer.alloc(0));
 
 	let readerFailed = false;
@@ -902,16 +920,17 @@ const SHUTDOWN_TIMEOUT_MS = 5_000;
 const EXIT_TIMEOUT_MS = 1_000;
 
 /**
- * Identity of a server process *and* its initialization: everything that makes
- * two configs unsafe to share one client. `command` + `cwd` alone handed a
- * config with different args/settings the client another config had spawned
- * (#8382), and left a changed config resolving to the stale client after
- * `reload *` (#8384). The command component mirrors the spawn site
+ * Identity of a server process, its initialization, and its transport policy:
+ * everything that makes two configs unsafe to share one client. `command` +
+ * `cwd` alone handed a config with different args/settings the client another
+ * config had spawned (#8382), and left a changed config resolving to the stale
+ * client after `reload *` (#8384). The command component mirrors the spawn site
  * (`resolvedCommand ?? command`), so two configs naming the same binary
  * differently still share, while the same name resolving to different binaries
- * does not. JSON-encoded so no value can forge the separator.
+ * does not. Shared-policy clients intentionally cross session boundaries;
+ * private-policy clients use the identity assigned to their session.
  */
-function clientKey(config: ServerConfig, cwd: string): string {
+function clientKey(config: ServerConfig, cwd: string, policy = lspSessionPolicy.getStore()): string {
 	const spawnCommand = config.resolvedCommand ?? config.command;
 	const identity = stableStringifyJson([
 		config.args ?? [],
@@ -919,7 +938,7 @@ function clientKey(config: ServerConfig, cwd: string): string {
 		config.settings ?? null,
 		config.languageId ?? null,
 	]);
-	return `${spawnCommand}:${cwd}:${identity}`;
+	return `${policyIdentity(policy)}:${spawnCommand}:${cwd}:${identity}`;
 }
 
 /**
@@ -949,16 +968,22 @@ export function shutdownStaleClients(
 				// failed; ordinary client creation remains blocked in between.
 			}
 		}
+		const scopePrefix = `${policyIdentity(lspSessionPolicy.getStore())}:`;
 		for (const key of fresh) invalidatedClientKeys.delete(key);
 		// Tombstone stale identities before awaiting initialization. Existing
 		// callers keep sharing their in-flight promise; later callers cannot spawn
 		// another stale process while reload is blocked on teardown.
 		const stalePending = Array.from(clientLocks.entries()).filter(
-			([key, pending]) => path.resolve(pending.cwd) === resolvedCwd && !fresh.has(key),
+			([key, pending]) =>
+				key.startsWith(scopePrefix) && path.resolve(pending.cwd) === resolvedCwd && !fresh.has(key),
 		);
 		for (const [key] of stalePending) invalidatedClientKeys.add(key);
 		for (const client of clients.values()) {
-			if (path.resolve(client.cwd) === resolvedCwd && !fresh.has(client.name)) {
+			if (
+				client.name.startsWith(scopePrefix) &&
+				path.resolve(client.cwd) === resolvedCwd &&
+				!fresh.has(client.name)
+			) {
 				invalidatedClientKeys.add(client.name);
 			}
 		}
@@ -973,7 +998,8 @@ export function shutdownStaleClients(
 		);
 
 		const stale = Array.from(clients.values()).filter(
-			client => path.resolve(client.cwd) === resolvedCwd && !fresh.has(client.name),
+			client =>
+				client.name.startsWith(scopePrefix) && path.resolve(client.cwd) === resolvedCwd && !fresh.has(client.name),
 		);
 		const results = await Promise.all(stale.map(client => shutdownClientInstance(client)));
 		const failed = stale.filter((_client, index) => results[index] !== true);
@@ -1072,6 +1098,9 @@ export async function getOrCreateClient(
 	const clientPromise = (async () => {
 		const baseCommand = config.resolvedCommand ?? config.command;
 		const baseArgs = config.args ?? [];
+		// Sent in both the mux handshake and `initialize`: a reused shared server
+		// answers `initialize` from cache, so the mux keys servers on these options.
+		const initializationOptions = config.initOptions ?? {};
 
 		// Wrap with lspmux if available and supported
 		const { command, args, env } = isLspmuxSupported(baseCommand)
@@ -1083,7 +1112,7 @@ export async function getOrCreateClient(
 		// to a private spawn so LSP never regresses on broker trouble.
 		let proc: LspTransport | null = null;
 		if (sessionPolicy?.shared === true && command === baseCommand) {
-			proc = await connectSharedLspTransport({ command, args, cwd, env, signal });
+			proc = await connectSharedLspTransport({ command, args, cwd, env, initializationOptions, signal });
 		}
 		proc ??= ptree.spawn([command, ...args], {
 			cwd,
@@ -1152,10 +1181,10 @@ export async function getOrCreateClient(
 			}
 		});
 
-		// Start background message reader
-		startMessageReader(client);
-
 		try {
+			// Start the reader synchronously so an already-owned stdout stream fails
+			// initialization through its normal cleanup path, not an unhandled promise.
+			startMessageReader(client);
 			// Send initialize request
 			const initResult = (await sendRequest(
 				client,
@@ -1165,7 +1194,7 @@ export async function getOrCreateClient(
 					rootUri: fileToUri(cwd),
 					rootPath: cwd,
 					capabilities: CLIENT_CAPABILITIES,
-					initializationOptions: config.initOptions ?? {},
+					initializationOptions,
 					workspaceFolders: currentWorkspaceFolders(client),
 				},
 				signal,

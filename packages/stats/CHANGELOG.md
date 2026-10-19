@@ -9,6 +9,18 @@
 ### Fixed
 
 - Kept copied fork requests attributed to the parent transcript when parent and fork share a recency tier, regardless of parse completion order, including parallel worker pools. Parsing stays bounded and parallel while ingestion follows ranked input order; across tiers, the more-recent transcript wins, so a recent fork can own copies from an idle parent.
+## [18.11.0] - 2026-10-14
+
+### Fixed
+
+- Providers → Subscription windows no longer mixes Codex 5-hour and 7-day quotas across plans: Team and weekly-only (ProLite) accounts now share the 7-day row, the 5-hour row counts only accounts that have one, and labels no longer flip with whichever account reported last ([#15664](https://github.com/can1357/oh-my-pi/issues/15664))
+
+## [18.10.4] - 2026-10-13
+
+### Fixed
+
+- Usage recorded at $0 for a model whose catalog price changes on a date (Gemini 4 Argon, Devin SWE-2) is now priced at the rate in force on the request's date, instead of staying $0 like peak/off-peak tariff usage ([#15620](https://github.com/can1357/oh-my-pi/pull/15620) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.9.0] - 2026-10-11
 
 ### Fixed

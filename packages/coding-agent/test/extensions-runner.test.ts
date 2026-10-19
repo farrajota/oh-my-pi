@@ -2692,6 +2692,7 @@ describe("ExtensionRunner", () => {
 					editor: async () => undefined,
 					addAutocompleteProvider: () => {},
 					setEditorComponent: () => {},
+					getEditorComponent: () => undefined,
 					get theme() {
 						return {} as never;
 					},
@@ -2761,26 +2762,68 @@ describe("ExtensionRunner", () => {
 			]);
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Allow tool: dangerous_tool"), [
 				"Approve",
+				"Approve dangerous_tool for this session",
 				"Deny",
 			]);
 			delete globalState.__approvalEvents;
 		});
-		it("runs bridged preflight before approval and cancels denied state", async () => {
+
+		it("approving for this session skips later mode prompts of that tool and tier, until the session changes", async () => {
 			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
-			const order: string[] = [];
-			initializeRunner(runner, async () => {
-				order.push("ui_select");
-				return "Approve";
+			const select = vi.fn(async (_title: string, options: string[]) => options[1]);
+			initializeRunner(runner, select);
+			const context = () => ({
+				sessionManager,
+				modelRegistry,
+				model: undefined,
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 			});
+			const run = (tool: typeof approvalTool | AgentTool, id: string) =>
+				(new ExtensionToolWrapper(tool, runner) as ExtensionToolWrapper<any>).execute(
+					id,
+					{},
+					undefined,
+					undefined,
+					context(),
+				);
+			await run(approvalTool, "call-grant");
+			await run(approvalTool, "call-granted");
+			expect(select).toHaveBeenCalledTimes(1);
+			// The grant covers that tool at that tier only: its write-tier calls and other tools still ask.
+			await run({ ...approvalTool, approval: "write" as const }, "call-write-tier");
+			await run({ ...approvalTool, name: "other_tool" }, "call-other");
+			expect(select).toHaveBeenCalledTimes(3);
+			// A critical override asks every time and never offers the session choice.
+			const critical = { ...approvalTool, approval: () => ({ tier: "exec" as const, override: true }) };
+			select.mockImplementationOnce(async () => "Approve");
+			await run(critical, "call-critical");
+			expect(select).toHaveBeenLastCalledWith(expect.any(String), ["Approve", "Deny"]);
+			// A new session starts without the grant.
+			await sessionManager.newSession();
+			await run(approvalTool, "call-new-session");
+			expect(select).toHaveBeenCalledTimes(5);
+		});
+		it("cancels a preflight reservation when preflight blocks", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			initializeRunner(runner, async () => "Approve");
+			let reserved = false;
+			let cancelled = 0;
 			runner.setToolCallPreflight({
 				before: async () => {
-					order.push("preflight");
+					reserved = true;
 					return { block: true, reason: "rule blocked" };
+				},
+				cancel: () => {
+					reserved = false;
+					cancelled++;
 				},
 			});
 			const wrapper = new ExtensionToolWrapper(approvalTool, runner);
 			await expect(
-				(wrapper as ExtensionToolWrapper<any>).execute("call-preflight-order", {}, undefined, undefined, {
+				(wrapper as ExtensionToolWrapper<any>).execute("call-preflight-blocked", {}, undefined, undefined, {
 					sessionManager,
 					modelRegistry,
 					model: undefined,
@@ -2790,8 +2833,64 @@ describe("ExtensionRunner", () => {
 					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 				}),
 			).rejects.toThrow("rule blocked");
-			expect(order).toEqual(["preflight"]);
+			expect(cancelled).toBe(1);
+			expect(reserved).toBe(false);
+		});
 
+		it("cancels a preflight reservation when preflight throws", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			let reserved = false;
+			let cancelled = 0;
+			runner.setToolCallPreflight({
+				before: async () => {
+					reserved = true;
+					throw new Error("preflight failed");
+				},
+				cancel: () => {
+					reserved = false;
+					cancelled++;
+				},
+			});
+			const wrapper = new ExtensionToolWrapper(approvalTool, runner);
+			await expect(
+				(wrapper as ExtensionToolWrapper<any>).execute("call-preflight-threw", {}, undefined, undefined, {
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+				}),
+			).rejects.toThrow("preflight failed");
+			expect(cancelled).toBe(1);
+			expect(reserved).toBe(false);
+		});
+
+		it("does not cancel preflight after execution and postflight complete", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			initializeRunner(runner, async () => "Approve");
+			let cancelled = 0;
+			runner.setToolCallPreflight({
+				before: async () => undefined,
+				cancel: () => {
+					cancelled++;
+				},
+			});
+			const wrapper = new ExtensionToolWrapper(approvalTool, runner);
+			await (wrapper as ExtensionToolWrapper<any>).execute("call-preflight-success", {}, undefined, undefined, {
+				sessionManager,
+				modelRegistry,
+				model: undefined,
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+			});
+			expect(cancelled).toBe(0);
+		});
+
+		it("cancels preflight state when approval is denied", async () => {
 			const deniedRunner = new ExtensionRunner(
 				[],
 				new ExtensionRuntime(),

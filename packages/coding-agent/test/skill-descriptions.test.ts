@@ -1,6 +1,10 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { SkillDescriptionCatalog, SkillDescriptionStore } from "../src/extensibility/skill-descriptions";
+import {
+	SkillDescriptionCatalog,
+	SkillDescriptionStore,
+	type SkillDescriptionCompressor,
+} from "../src/extensibility/skill-descriptions";
 import type { Skill } from "../src/extensibility/skills";
 import { buildSystemPrompt } from "../src/system-prompt";
 
@@ -12,6 +16,10 @@ const original: Skill = {
 	baseDir: "/skills/browser-research",
 	source: "test",
 };
+
+function testCompressor(compress: SkillDescriptionCompressor["compress"]): SkillDescriptionCompressor {
+	return { modelKey: () => "mock/smol", compress };
+}
 
 describe("system prompt skill descriptions", () => {
 	it("renders an immediate bounded preview, deduplicates in-flight work, and holds a session snapshot", async () => {
@@ -26,7 +34,7 @@ describe("system prompt skill descriptions", () => {
 			expect(request).toContain(original.description);
 			return promise;
 		};
-		const session = new SkillDescriptionCatalog({ store, compress });
+		const session = new SkillDescriptionCatalog({ store, compress: testCompressor(compress) });
 		const preview = session.render([original, original])[0]?.description;
 		expect(preview).toBeDefined();
 		expect(preview!.length).toBeLessThanOrEqual(100);
@@ -35,7 +43,7 @@ describe("system prompt skill descriptions", () => {
 		expect(calls).toBe(0);
 		await started.promise;
 		expect(calls).toBe(1);
-		const concurrent = new SkillDescriptionCatalog({ store, compress });
+		const concurrent = new SkillDescriptionCatalog({ store, compress: testCompressor(compress) });
 		expect(concurrent.render([original])[0]?.description).toBe(preview);
 		await Promise.resolve();
 		expect(calls).toBe(1);
@@ -69,41 +77,38 @@ describe("system prompt skill descriptions", () => {
 		let calls = 0;
 		const first = new SkillDescriptionCatalog({
 			store,
-			compress: async () => {
+			compress: testCompressor(async () => {
 				calls++;
 				return "Use for interactive browser tasks.";
-			},
+			}),
 		});
 		first.render([original]);
 		await first.waitForPending();
 		const changed = { ...original, description: `${original.description} Also inspect accessibility trees.` };
 		const next = new SkillDescriptionCatalog({
 			store,
-			compress: async () => {
+			compress: testCompressor(async () => {
 				calls++;
 				return "Use for interactive browser and accessibility tasks.";
-			},
+			}),
 		});
 		expect(next.render([changed])[0]?.description).not.toBe("Use for interactive browser tasks.");
 		await next.waitForPending();
 		expect(calls).toBe(2);
 	});
 
-	it("does not cache malformed output and retries in a later session", async () => {
+	it("keeps the preview after malformed output from the same model", async () => {
 		using temp = TempDir.createSync("omp-skill-description-invalid-");
 		using store = SkillDescriptionStore.open(temp.join("skills.db"));
-		const failed = new SkillDescriptionCatalog({ store, compress: async () => "line one\nline two" });
+		const failed = new SkillDescriptionCatalog({ store, compress: testCompressor(async () => "line one\nline two") });
 		const preview = failed.render([original])[0]?.description;
 		await failed.waitForPending();
 
-		const retry = new SkillDescriptionCatalog({
-			store,
-			compress: async () => "Use for interactive sites; not static pages.",
-		});
-		expect(retry.render([original])[0]?.description).toBe(preview);
-		await retry.waitForPending();
-		expect(new SkillDescriptionCatalog({ store }).render([original])[0]?.description).toBe(
-			"Use for interactive sites; not static pages.",
-		);
+		const retry = vi.fn(async () => "Use for interactive sites; not static pages.");
+		const later = new SkillDescriptionCatalog({ store, compress: testCompressor(retry) });
+		expect(later.render([original])[0]?.description).toBe(preview);
+		await later.waitForPending();
+		expect(retry).not.toHaveBeenCalled();
+		expect(new SkillDescriptionCatalog({ store }).render([original])[0]?.description).toBe(preview);
 	});
 });

@@ -11,6 +11,8 @@ import {
 	SUPPORTED_IMAGE_MIME_TYPES,
 } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
+import { InvalidImageDataError } from "@oh-my-pi/pi-tui/chat/image-loading";
+export { InvalidImageDataError };
 import { resolveReadPath } from "../tools/path-utils";
 import { formatDimensionNote, type ImageResizeOptions, resizeImage } from "./image-resize";
 import { MAX_IMAGE_INPUT_BYTES } from "./image-limits";
@@ -216,23 +218,6 @@ export class ImageInputTooLargeError extends Error {
 }
 
 /**
- * Raised when image bytes cannot be decoded — a truncated stream, a payload
- * with a hole in the middle, or bytes that are not the container they claim.
- * Failing at ingress keeps them out of the transcript, where they would
- * otherwise be persisted and rejected by the provider on every later request,
- * with no way to resume the session.
- */
-export class InvalidImageDataError extends Error {
-	readonly reason: string;
-
-	constructor(label: string, mimeType: string, reason: string) {
-		super(`${label} is not a decodable ${mimeType} image: ${reason}`);
-		this.name = "InvalidImageDataError";
-		this.reason = reason;
-	}
-}
-
-/**
  * Smallest raster the decode probe terminates into. The decode is the oracle,
  * so the output size cannot change the verdict — a 1x1 sink keeps the check
  * from allocating a full-size pixel buffer, a full-size PNG, and a base64
@@ -251,11 +236,18 @@ const DECODE_PROBE_EDGE_PX = 1;
  * truth on both sides. Callers on hot paths must cache the verdict.
  */
 export async function imageDecodeFailureReason(image: ImageContent): Promise<string | null> {
-	if (!/^[A-Za-z0-9+/]*={0,2}$/.test(image.data)) return "invalid base64 image data";
-	const normalizedData = image.data.replace(/=+$/, "");
+	const base64Match = /^([A-Za-z0-9+/]*)(={0,2})$/.exec(image.data);
+	if (!base64Match) return "invalid base64 image data";
+	const encodedData = base64Match[1]!;
+	const padding = base64Match[2]!;
+	const expectedPadding = encodedData.length % 4 === 2 ? 2 : encodedData.length % 4 === 3 ? 1 : 0;
+	if (padding.length > 0 && (image.data.length % 4 !== 0 || padding.length !== expectedPadding)) {
+		return "invalid base64 image data";
+	}
+	if (padding.length === 0 && encodedData.length % 4 === 1) return "invalid base64 image data";
 	const bytes = Buffer.from(image.data, "base64");
 	if (bytes.length === 0) return "empty image data";
-	if (bytes.toString("base64").replace(/=+$/, "") !== normalizedData) return "invalid base64 image data";
+	if (bytes.toString("base64").replace(/=+$/, "") !== encodedData) return "invalid base64 image data";
 	const detected = parseImageMetadata(bytes);
 	if (detected && detected.mimeType !== image.mimeType.toLowerCase()) {
 		return `declared ${image.mimeType} but contains ${detected.mimeType}`;
@@ -277,6 +269,8 @@ interface LoadInMemoryImageInputOptions {
 	bytes?: Uint8Array;
 	resolvedPath: string;
 	textNotePrefix: string;
+	/** Original file type when the display image was rasterized before loading. */
+	sourceMimeType?: string;
 	autoResize: boolean;
 	maxBytes: number;
 	excludeWebP: boolean | undefined;
@@ -319,7 +313,11 @@ async function loadInMemoryImageInput(options: LoadInMemoryImageInputOptions): P
 		}
 	}
 
-	let textNote = `${options.textNotePrefix} [${outputMimeType}]`;
+	const sourceMimeType = options.sourceMimeType ?? options.image.mimeType;
+	let textNote = `${options.textNotePrefix} [${sourceMimeType}]`;
+	if (outputMimeType !== sourceMimeType) {
+		textNote += ` (displayed as ${outputMimeType})`;
+	}
 	if (dimensionNote) {
 		textNote += `\n${dimensionNote}`;
 	}
@@ -504,6 +502,7 @@ export async function loadSvgImageInput(options: LoadImageInputOptions): Promise
 		bytes: png,
 		resolvedPath,
 		textNotePrefix: "Read SVG file",
+		sourceMimeType: "image/svg+xml",
 		autoResize: options.autoResize,
 		maxBytes,
 		excludeWebP: options.excludeWebP,
@@ -514,12 +513,13 @@ export async function loadSvgImageInput(options: LoadImageInputOptions): Promise
 export async function loadImageAttachmentInput(
 	options: LoadImageAttachmentInputOptions,
 ): Promise<LoadedImageInput | null> {
-	if (!SUPPORTED_INPUT_IMAGE_MIME_TYPES.has(options.image.mimeType)) {
+	const image = { ...options.image, mimeType: options.image.mimeType.toLowerCase() };
+	if (!SUPPORTED_INPUT_IMAGE_MIME_TYPES.has(image.mimeType)) {
 		return null;
 	}
 
 	return loadInMemoryImageInput({
-		image: options.image,
+		image,
 		resolvedPath: options.uri,
 		textNotePrefix: `Read image attachment ${options.label}`,
 		autoResize: options.autoResize,

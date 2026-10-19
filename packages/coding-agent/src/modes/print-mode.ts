@@ -7,6 +7,8 @@ import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "../session/credential-disabled-notice";
 import { isSilentAbort } from "../session/messages";
 import { flushTelemetryExport } from "../telemetry-export";
+// Populate the shared builtin reservation set before extension command discovery.
+import "../slash-commands/builtin-registry";
 
 import { initializeExtensions } from "./runtime-init";
 import {
@@ -248,6 +250,12 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	}
 
 	session.prepareForHeadlessAdvisorDrain();
+	await session.waitForIdle();
+
+	// Read via the session accessor, not the raw state tail: a classifier
+	// refusal is pruned from active context at settle, and an aborted turn
+	// can trail synthetic tool results — both would hide the terminal
+	// assistant message (and its error) from a last-element read.
 	const assistantMsg = session.getLastAssistantMessage();
 	const terminalFailure =
 		!strictMCPFailure &&

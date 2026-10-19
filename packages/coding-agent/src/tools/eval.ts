@@ -41,7 +41,7 @@ import { resolveSpawnPolicy } from "../task/spawn-policy";
 import { webpExclusionForModel } from "../utils/image-loading";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import type { ToolSession } from ".";
-import { type ApprovalDetailsOptions, truncateApprovalDetail } from "./approval";
+import { truncateForPrompt } from "./approval";
 import { type EvalBackendsAllowance, resolveEvalBackends } from "./eval-backends";
 import { recordStatusEvent, type StatusEventLog } from "@oh-my-pi/pi-tui/tools/eval";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -328,12 +328,12 @@ function formatEvalInputLanguage(value: string): string {
 export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly name = "eval";
 	readonly approval = "exec" as const;
-	readonly formatApprovalDetails = (args: unknown, options?: ApprovalDetailsOptions): string[] => {
+	readonly formatApprovalDetails = (args: unknown): string[] => {
 		const params = isRecord(args) ? args : {};
 		const language =
 			typeof params.language === "string" ? formatEvalInputLanguage(params.language) : "javascript (default)";
 		const code = typeof params.code === "string" ? params.code : "";
-		return [`Language: ${language}`, `Code:\n${truncateApprovalDetail(code, options)}`];
+		return [`Language: ${language}`, `Code:\n${truncateForPrompt(code)}`];
 	};
 	get summary(): string {
 		return summarizeEvalLanguages(this.#enabledLanguages());
@@ -1049,13 +1049,10 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						: runtimeOutput;
 				const imageText = cellImageNotes.join("\n");
 				const displayText = cellDisplayTexts.join("\n\n");
-				const visibleDisplayText =
-					displayText && imageText ? `${displayText}\n\n${imageText}` : displayText || imageText;
-				const cellOutput =
-					stdoutTrimmed && visibleDisplayText
-						? `${stdoutTrimmed}\n\n${visibleDisplayText}`
-						: stdoutTrimmed || visibleDisplayText;
+				const cellOutput = [stdoutTrimmed, displayText, imageText].filter(Boolean).join("\n\n");
 				cellResult.output = cellOutput;
+				// Renderers show JSON displays from `jsonOutputs`; without them the cell box repeats each one (#10778).
+				cellResult.textOutput = displayText ? [stdoutTrimmed, imageText].filter(Boolean).join("\n\n") : undefined;
 				cellResult.exitCode = result.exitCode;
 				cellResult.durationMs = durationMs;
 				cellResult.statusEvents = cellStatus.statusEvents;

@@ -19,7 +19,13 @@ export const eventDefs = {
 	AutoRetryEndReason:
 		"'success' | 'cancelled' | 'timeout' | 'manual-input' | 'generation-superseded' | 'not-recoverable' | 'max-retries' | 'max-delay'",
 
-	AgentStartEvent: { type: "'agent_start'" },
+	AgentStartEvent: {
+		type: "'agent_start'",
+		"resumedToolCallIds?": doc(
+			"string[]",
+			"Calls of an unpaired assistant tail a continued run executes before its first model request.",
+		),
+	},
 	AgentEndEvent: {
 		type: "'agent_end'",
 		messages: doc(

@@ -83,6 +83,8 @@ export class TanCommandController {
 		const thinkingLevel = session.configuredThinkingLevel();
 		const systemPrompt = [...session.systemPrompt];
 		const toolNames = session.getEnabledToolNames();
+		const activeToolNames = session.getActiveToolNames();
+		const mountedToolNames = session.getMountedXdevToolNames();
 		const modelRegistry = session.modelRegistry;
 		// Snapshot the parent's rebindable extensions and root policy at dispatch.
 		// The child rebinds these (skipping discovery) so it re-registers the
@@ -143,20 +145,20 @@ export class TanCommandController {
 				// parent's in-flight call as its own pending work (issue #11118).
 				repairInterruptedTail: true,
 			});
-
-			jobId = manager.register("task", label, async ({ signal, jobId: registeredJobId }) =>
+			let childCreated = false;
+			jobId = manager.register("task", label, ({ signal, jobId: registeredJobId }) =>
 				runJobOperation(
 					session.sessionManager,
 					`job:${registeredJobId}`,
 					async leaseSignal => {
 						const operationSignal = leaseSignal ?? signal;
-						if (operationSignal.aborted) throw new Error("Aborted before execution");
 						let clone: AgentSession | undefined;
 						// Subscribe before taking the clone-time snapshot so MCP changes during
 						// creation are replayed after the child session is bound.
 						const mcpFollower = mcpManager ? followMCPTools(mcpManager) : undefined;
 						const mcpTools = mcpManager ? createMCPProxyTools(mcpManager) : undefined;
 						try {
+							if (operationSignal.aborted) throw new Error("Aborted before execution");
 							const created = await authorityBinding.create({
 								cwd,
 								sessionManager: cloneManager,
@@ -164,6 +166,8 @@ export class TanCommandController {
 								thinkingLevel,
 								systemPrompt,
 								toolNames,
+								mountedToolNames,
+								advertiseHeadlessAsk: activeToolNames.includes("ask"),
 								providerSessionId: `${parentSessionId}:tan:${Snowflake.next()}`,
 								providerPromptCacheKey: parentPromptCacheKey,
 								taskPromptCacheKey,
@@ -190,8 +194,10 @@ export class TanCommandController {
 								extensionRoots: () => parentExtensionRoots,
 								localProtocolOptions,
 							});
-							const activeClone = created.session;
-							clone = activeClone;
+							clone = created.session;
+							childCreated = true;
+							await clone.setActiveToolPresentation(toolNames, mountedToolNames);
+							const activeClone = clone as AgentSession;
 							mcpFollower?.bind(activeClone);
 							activeClone.sessionManager?.appendSessionInit?.({
 								systemPrompt: activeClone.systemPrompt ?? systemPrompt,
@@ -291,14 +297,22 @@ export class TanCommandController {
 									}
 								} else {
 									setAgentStatus(agentRegistry, cloneId, "parked", clone);
-									await clone.dispose();
-									detachAgentSession(agentRegistry, cloneId, clone);
+									try {
+										await clone.dispose();
+									} finally {
+										detachAgentSession(agentRegistry, cloneId, clone);
+									}
 								}
+							} else {
+								await removeCloneSession(cloneFile);
 							}
 						}
 					},
 					signal,
-				),
+				).catch(async error => {
+					if (!childCreated) await removeCloneSession(cloneFile);
+					throw error;
+				}),
 			);
 		} catch (error) {
 			if (cloneFile) await removeCloneSession(cloneFile);

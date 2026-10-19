@@ -289,8 +289,8 @@ export function snapshotJobs(
 			type: latest.type,
 			status: latest.status as JobSnapshot["status"],
 			label: latest.label,
-			durationMs: Math.max(0, (latest.endTime ?? now) - latest.startTime),
 			...(exitCode !== undefined ? { exitCode } : {}),
+			durationMs: Math.max(0, (latest.endTime ?? now) - latest.startTime),
 			...(resolvedModel ? { resolvedModel } : {}),
 			...(resolvedModelIdentity ? { resolvedModelIdentity } : {}),
 			...(resolvedThinkingLevel !== undefined ? { resolvedThinkingLevel } : {}),
@@ -331,11 +331,14 @@ export function buildJobResult(
 		seen.add(j.id);
 		return true;
 	});
-	const observation = manager.observeJobResults(
-		transaction,
-		uniqueJobs.filter(job => job.status !== "running").map(job => job.id),
-		ownerId ? { ownerId } : undefined,
-	);
+	const observation =
+		op === "jobs"
+			? undefined
+			: manager.observeJobResults(
+					transaction,
+					uniqueJobs.filter(job => job.status !== "running").map(job => job.id),
+					ownerId ? { ownerId } : undefined,
+				);
 	const jobResults = transaction.select(() =>
 		snapshotJobs(session, uniqueJobs, { includeResults: op !== "jobs", observation }),
 	);
@@ -344,12 +347,13 @@ export function buildJobResult(
 			.filter(
 				job =>
 					job.status !== "running" &&
-					(manager.isJobResultConsumed(job.id) || !manager.ownsObservedJobResult(observation, job.id)),
+					(manager.isJobResultConsumed(job.id) ||
+						(observation !== undefined && !manager.ownsObservedJobResult(observation, job.id))),
 			)
 			.map(job => job.id),
 	);
 
-	if (op !== "jobs") {
+	if (observation !== undefined) {
 		const consumable = jobResults
 			.filter(job => job.status !== "running" && manager.ownsObservedJobResult(observation, job.id))
 			.map(job => job.id);
@@ -772,11 +776,8 @@ export function jobsRenderResult(
 		cancelled: 2,
 		completed: 3,
 	};
-	const sortedJobs = [...jobs].sort((a, b) => {
-		const diff = statusOrder[a.status] - statusOrder[b.status];
-		if (diff !== 0) return diff;
-		return b.durationMs - a.durationMs;
-	});
+	// Keep the snapshot's tree order within each status group; duration is not a hierarchy key.
+	const sortedJobs = [...jobs].sort((a, b) => statusOrder[a.status] - statusOrder[b.status]);
 
 	let cached: RenderCache | undefined;
 	return {

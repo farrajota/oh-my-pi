@@ -24,7 +24,7 @@ import {
 	type ToolSpeculationAssessmentContext,
 	type ToolSpeculationStreamSession,
 } from "@oh-my-pi/pi-agent-core";
-import type { TaskParams } from "@oh-my-pi/pi-tui/tools/task";
+import type { TaskParams } from "./types";
 import type { SpawnRun } from "./spawn-run";
 
 /**
@@ -174,8 +174,8 @@ export interface TaskLaunchSessionOptions {
 	sink: SpeculativeOperationSink;
 	tool: SpeculativeToolReference;
 	launcher: TaskLauncher;
-	/** Called once when the session stops owning launches (adopted or discarded). */
-	onClose: () => void;
+	/** Called once when the session stops owning launches, with adopted runs if dispatched. */
+	onClose: (adopted?: ReadonlyMap<number, SpawnRun>) => void;
 }
 
 /** One streamed `task` call's speculative launches; see the module docs. */
@@ -248,13 +248,13 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 		await this.#queue;
 		const adopted = new Map<number, SpawnRun>();
 		if (this.#closed) return adopted;
-		this.#close();
 		for (const [index, run] of this.#runs) {
 			const spawn = spawns[index];
 			if (spawn && canonicalJson(spawn) === this.#planned.get(index)) adopted.set(index, run);
 			else run.discard("task call changed after speculative launch");
 		}
 		this.#runs.clear();
+		this.#close(adopted);
 		return adopted;
 	}
 
@@ -270,10 +270,10 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 		this.#runs.clear();
 	}
 
-	#close(): void {
+	#close(adopted?: ReadonlyMap<number, SpawnRun>): void {
 		this.#closed = true;
 		this.#controller.abort();
-		this.#options.onClose();
+		this.#options.onClose(adopted);
 	}
 
 	#matches(spawns: readonly TaskParams[]): boolean {

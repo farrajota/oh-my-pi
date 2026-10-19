@@ -1,11 +1,6 @@
 import * as fs from "node:fs";
 import type { AgentHubDeps, AgentHubRemote } from "@oh-my-pi/pi-tui/overlays/agent-hub";
-import {
-	type AgentMetrics,
-	aggregateMetrics,
-	hubFallbackStatsSession,
-	hubRowMetrics,
-} from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
+import { type AgentCostSnapshot, aggregateCost } from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
 import type {
 	AgentHubLiveMetrics,
 	AgentHubSessionFacts,
@@ -207,9 +202,9 @@ export function sumSubagentTreeCost(args: {
 	registry?: AgentRegistry;
 	observers: SessionObserverRegistry;
 	rootSessionFile: string | undefined;
-	sessionMetrics: WeakMap<object, { metrics: AgentMetrics | undefined }>;
+	sessionCosts: WeakMap<object, AgentCostSnapshot>;
 }): number {
-	const { observers, rootSessionFile, sessionMetrics } = args;
+	const { observers, rootSessionFile, sessionCosts } = args;
 	const registry = args.registry ?? AgentRegistry.global();
 	const rows: AgentRecordLike[] = [];
 	const observedById = new Map<string, ObservableSession>();
@@ -226,12 +221,13 @@ export function sumSubagentTreeCost(args: {
 		rows.push({ ...ref, session: lookupAgentRef(registry, ref.id)?.session ?? null });
 		if (observed) observedById.set(ref.id, observed);
 	}
-	return aggregateMetrics({
-		rows,
-		observedById,
-		metricsFor: (ref, observed) => hubRowMetrics(ref, observed, sessionMetrics),
-		fallbackStatsSession: hubFallbackStatsSession,
-		sessionMetrics,
-		refreshFallback: true,
-	}).metrics.cost;
+	let total = aggregateCost({ rows, observedById, sessionCosts });
+	// Parked direct cost remains part of the tree total even when no row metrics were retained.
+	for (const row of rows) {
+		const observed = observedById.get(row.id);
+		if (row.status !== "parked" || row.session || row.history?.metrics || observed?.progress) continue;
+		const directCost = row.history?.directCost;
+		if (directCost !== undefined) total += Number.isFinite(directCost) ? Math.max(0, directCost) : 0;
+	}
+	return total;
 }

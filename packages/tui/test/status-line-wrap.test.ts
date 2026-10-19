@@ -64,7 +64,7 @@ function createStatusLine(
 			leftSegments,
 			rightSegments,
 			separator: "dot" as const,
-			segmentOptions: { path: { maxLength: getProjectDir().length + 1 } },
+			segmentOptions: { path: { maxLength: getProjectDir().length + 1, stripWorkPrefix: false } },
 		}),
 		gitEnabled: () => false,
 		codexResetFireworksEnabled: () => false,

@@ -93,6 +93,7 @@ function createCloneStub(overrides?: {
 		setTodoPhases: vi.fn(),
 		getActiveToolNames: vi.fn(() => overrides?.activeToolNames ?? ["read", "bash"]),
 		getEnabledToolNames: vi.fn(() => overrides?.enabledToolNames ?? overrides?.activeToolNames ?? ["read", "bash"]),
+		setActiveToolPresentation: vi.fn(async () => {}),
 		subscribe: vi.fn((l: (event: TanSessionEvent) => void) => {
 			listener = l;
 			return () => {
@@ -181,6 +182,7 @@ async function createContext(overrides?: {
 		systemPrompt: ["system prompt"],
 		getActiveToolNames: vi.fn(() => overrides?.activeToolNames ?? ["read", "bash"]),
 		getEnabledToolNames: vi.fn(() => overrides?.enabledToolNames ?? overrides?.activeToolNames ?? ["read", "bash"]),
+		getMountedXdevToolNames: vi.fn(() => []),
 		modelRegistry: { authStorage: { marker: "auth" } },
 		preparedExtensions: overrides?.preparedExtensions,
 		effectiveExtensionRoots: overrides?.effectiveExtensionRoots,
@@ -294,6 +296,36 @@ describe("TanCommandController", () => {
 		);
 		expect(harness.ctx.rebuildChatFromMessages).not.toHaveBeenCalled();
 		expect(harness.ctx.showStatus).toHaveBeenCalledWith("Dispatched background tan job-123");
+	});
+
+	it("removes a fork when the job is aborted before child-session creation", async () => {
+		const harness = await createContext();
+		let forkFile: string | undefined;
+		const forkSpy = vi
+			.spyOn(SessionManager, "forkFrom")
+			.mockImplementation(async (_parent, _cwd, _dir, _header, options) => {
+				if (!options?.sessionFile) throw new Error("Fork session file was not provided");
+				const sessionFile = options.sessionFile;
+				forkFile = sessionFile;
+				await fs.mkdir(path.dirname(sessionFile), { recursive: true });
+				await fs.writeFile(sessionFile, "forked transcript");
+				return harness.cloneManager;
+			});
+		const createSessionSpy = mockTanSessionCreation(createCloneStub());
+		const controller = new TanCommandController(harness.ctx);
+
+		await controller.start("work that will be cancelled");
+		const run = harness.capturedRun;
+		if (!run) throw new Error("Tan job run function was not captured");
+		const abort = new AbortController();
+		abort.abort();
+		await expect(run({ jobId: "job-123", signal: abort.signal, reportProgress: async () => {} })).rejects.toThrow();
+
+		expect(forkSpy).toHaveBeenCalledTimes(1);
+		if (!forkFile) throw new Error("Forked transcript path was not captured");
+		expect(createSessionSpy).not.toHaveBeenCalled();
+		await expect(fs.access(forkFile)).rejects.toThrow();
+		expect(AgentRegistry.global().get(MAIN_AGENT_ID)).toEqual(expect.objectContaining({ id: MAIN_AGENT_ID }));
 	});
 
 	it("forks with breadcrumb suppression, registers under Main, and dispatches after receiving the job id", async () => {
@@ -914,6 +946,48 @@ describe("TanCommandController", () => {
 			expect(childSessionBeforeDispose).toBe(clone);
 			const childAfterDispose = registry.get(childId);
 			expect(childAfterDispose).toEqual(
+				expect.objectContaining({ id: childId, status: "parked", sessionFile: harness.cloneFile }),
+			);
+			expect(lookupAgentRef(registry, childId)?.session).toBeNull();
+			expect(stub.dispose).toHaveBeenCalledTimes(1);
+		} finally {
+			try {
+				await cloneManager.close();
+			} finally {
+				removeSyncWithRetries(harness.tempDir.path());
+			}
+		}
+	});
+
+	it("detaches a successful tan when clone disposal rejects", async () => {
+		const harness = await createContext();
+		const cloneManager = await SessionManager.open(harness.cloneFile, harness.parentArtifactsDir, undefined, {
+			initialCwd: harness.tempDir.path(),
+			suppressBreadcrumb: true,
+		});
+		try {
+			await cloneManager.ensureOnDisk();
+			const registry = AgentRegistry.global();
+			vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(cloneManager);
+			const stub = createCloneStub({
+				sessionManager: { appendSessionInit: cloneManager.appendSessionInit.bind(cloneManager) },
+			});
+			const disposalError = new Error("clone disposal failed");
+			stub.dispose.mockRejectedValue(disposalError);
+			let childId: string | undefined;
+			mockTanSessionCreation(stub, options => {
+				childId = options.agentId;
+			});
+
+			await new TanCommandController(harness.ctx).start("park despite disposal failure");
+			const run = harness.capturedRun;
+			if (!run) throw new Error("run function was not captured");
+			await expect(
+				run({ jobId: "job-123", signal: new AbortController().signal, reportProgress: async () => {} }),
+			).rejects.toBe(disposalError);
+
+			if (!childId) throw new Error("Tan child id was not passed to session creation");
+			expect(registry.get(childId)).toEqual(
 				expect.objectContaining({ id: childId, status: "parked", sessionFile: harness.cloneFile }),
 			);
 			expect(lookupAgentRef(registry, childId)?.session).toBeNull();

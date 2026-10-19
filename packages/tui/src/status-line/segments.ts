@@ -7,6 +7,7 @@ import {
 	VERSION,
 	formatDuration,
 	formatNumber,
+	getActiveProfile,
 	getProjectDir,
 	normalizePathForComparison,
 	relativePathWithinNormalizedRoot,
@@ -232,22 +233,22 @@ const piSegment: StatusLineSegment = {
 		// Brand fg fades between dim gray (idle) and the accent (working) across
 		// turn edges; the component samples the tween into `brandFgAnsi`.
 		const fgAnsi = ctx.brandFgAnsi ?? theme.getFgAnsi("dim");
+		const profile = getActiveProfile();
 		// While a turn runs the brand icon becomes a braille spinner plus a
 		// whole-unit turn timer (port of rust omp's status-band active brand).
 		// No trailing pad: the group renderer owns inter-segment spacing, so a
 		// trailing space here would double the gap at the first separator (#11103).
 		const content =
 			ctx.turnElapsedMs != null
-				? `${brandSpinnerFrame(ctx.now?.getTime())} ${brandTimer(ctx.turnElapsedMs)}`
-				: theme.icon.omp
-					? theme.icon.omp
-					: "";
+				? `${brandMark(brandSpinnerFrame(ctx.now?.getTime()), profile)} ${brandTimer(ctx.turnElapsedMs)}`
+				: brandMark(theme.icon.omp, profile);
 		return { content: `${fgAnsi}${content}\x1b[39m`, visible: true };
 	},
 	describe(ctx) {
 		if (ctx.focusedAgentId) return segView([span(ctx.focusedAgentId, "warning")], "ghost", "warning");
 		// The dock's working row owns activity natively: the brand stays still.
-		return segView([], "omp", "muted");
+		const profile = getActiveProfile();
+		return segView(profile ? [span(profile, "muted")] : [], "omp", "muted");
 	},
 };
 
@@ -277,6 +278,15 @@ function dockerContainerName(): string {
 	return sanitizeStatusText(process.env.DOCKER_CONTAINER_NAME || process.env.HOSTNAME || os.hostname());
 }
 
+/**
+ * Brand glyph tagged with the active named profile (`π-work`) so sessions from
+ * different profiles are distinguishable at a glance; the bare glyph for the
+ * default profile. The tag stays put while the glyph slot animates.
+ */
+function brandMark(glyph: string, profile: string | undefined): string {
+	if (!profile) return glyph;
+	return glyph ? `${glyph}-${profile}` : profile;
+}
 /** Current braille-spinner glyph on the shared clock, at the Loader's 80ms cadence. */
 function brandSpinnerFrame(nowMs = Date.now()): string {
 	const frames = theme.getSpinnerFrames("activity");

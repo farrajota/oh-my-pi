@@ -179,10 +179,12 @@ async function readPersistedAgentHistory(
 	const modelChangeById = new Map<string, { model: string; role?: string; resolvedModelIsFallback: boolean }>();
 	let sessionInitModelRole: string | undefined;
 	let permissionSummary: AgentHistorySummary["permissionSummary"];
+	// Raw-record copy of `sessionEntryLeafId`/`resolveSessionLeafId` (session-entries.ts); keep them in sync.
 	let leafId: string | undefined;
+	let selfSelectedLeafId: string | undefined;
 	let leafTimestamp: number | undefined;
 	let directCost = 0;
-	// Direct cost mirrors lifetime SessionManager usage; legacy metrics below stay leaf-scoped.
+	// Direct metrics mirror lifetime SessionManager usage; model and context attribution stays leaf-scoped.
 	try {
 		await visitEntriesFromFileStream(
 			transcript.sessionFile,
@@ -217,8 +219,16 @@ async function readPersistedAgentHistory(
 							served: false,
 						});
 					}
+					if (typeof record.activeLeafId === "string") {
+						leafId = record.activeLeafId;
+					} else if (record.activeLeafId === null) {
+						leafId = undefined;
+					} else {
+						selfSelectedLeafId = id;
+					}
 					return;
 				}
+				selfSelectedLeafId = id;
 				if (record.type === "model_change" && typeof record.model === "string") {
 					modelChangeById.set(id, {
 						model: record.model,
@@ -249,6 +259,7 @@ async function readPersistedAgentHistory(
 		return {};
 	}
 
+	if (leafId !== undefined && !parents.has(leafId)) leafId = selfSelectedLeafId;
 	const metrics: AgentMetricsSummary = {
 		tokens: 0,
 		requests: 0,
@@ -261,18 +272,18 @@ async function readPersistedAgentHistory(
 		),
 		durationKind: "span",
 	};
-	for (const direct of directUsageById.values()) {
-		metrics.requests++;
-		metrics.tokens += direct.tokens;
-		metrics.tools += direct.tools;
-		metrics.cost += direct.cost;
-	}
 	let resolvedModel: string | undefined;
 	let resolvedModelIsFallback: boolean | undefined;
 	let modelRole: string | undefined = sessionInitModelRole;
 	let contextTokens: number | undefined;
 	let servedModel: string | undefined;
 	let latestModelChange: { model: string; resolvedModelIsFallback: boolean } | undefined;
+	for (const direct of directUsageById.values()) {
+		metrics.requests++;
+		metrics.tokens += direct.tokens;
+		metrics.tools += direct.tools;
+		metrics.cost += direct.cost;
+	}
 	const visited = new Set<string>();
 	for (let id = leafId; id && !visited.has(id); id = parents.get(id)) {
 		visited.add(id);
@@ -303,7 +314,8 @@ async function readPersistedAgentHistory(
 	return {
 		directCost,
 		...(metrics.requests > 0 ? { metrics } : {}),
-		...(resolvedModel ? { resolvedModel, resolvedModelIsFallback } : {}),
+		resolvedModel,
+		resolvedModelIsFallback,
 		...(modelRole ? { modelRole } : {}),
 		...(permissionSummary ? { permissionSummary } : {}),
 	};
@@ -721,7 +733,7 @@ export async function registerPersistedSubagents(
 			if (!transcript) return;
 			const history = await readPersistedAgentHistory(transcript, shouldContinue);
 			if (!shouldContinue()) return;
-			setAgentHistory(registry, transcript.ref, history);
+			setAgentHistory(registry, transcript.ref, history, transcript.sessionFile);
 		}
 	});
 	await Promise.all(workers);

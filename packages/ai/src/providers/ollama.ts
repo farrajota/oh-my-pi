@@ -252,7 +252,12 @@ function convertMessages(model: Model<"ollama-chat">, context: Context): OllamaM
 		timestamp: Date.now(),
 	}));
 	const messages: Message[] = [...systemMessages, ...context.messages];
-	const isCloud = model.provider === "ollama-cloud";
+	// Model rows may retain stale provider policy; an authored compat override takes precedence.
+	const stripThinkingHistory =
+		model.compatConfig?.stripThinkingHistory ??
+		(model.provider === "ollama-cloud" && /^(?:glm-5\.2(?::cloud)?|deepseek-v4-flash)$/i.test(model.id)
+			? model.id.toLowerCase().startsWith("deepseek-")
+			: (model.compat?.stripThinkingHistory ?? true));
 	const supportsImages = model.input.includes("image");
 	const converted = transformMessages(messages, model).map((msg, index) => {
 		// Real `systemPrompt` entries (always emitted first) stay on Ollama's
@@ -266,10 +271,9 @@ function convertMessages(model: Model<"ollama-chat">, context: Context): OllamaM
 		const developerRole =
 			msg.role === "developer" && (index < systemPrompts.length || msg.attribution !== "user") ? "system" : "user";
 		const converted = convertMessage(msg, supportsImages, developerRole);
-		// Ollama cloud rejects requests when assistant history messages contain the `thinking`
-		// field — it's valid in model responses but not accepted as a history input. Strip it
-		// to prevent HTTP 400 errors. Local Ollama instances are unaffected.
-		if (isCloud && converted.role === "assistant" && converted.thinking) {
+		// Some Ollama Cloud models historically rejected thinking in history (#1000).
+		// Preserve reasoning for the verified model without weakening that guard everywhere.
+		if (stripThinkingHistory && converted.role === "assistant" && converted.thinking) {
 			const { thinking: _t, ...rest } = converted;
 			return rest;
 		}
@@ -313,14 +317,14 @@ function createChatBody(model: Model<"ollama-chat">, context: Context, options: 
 	const tools = convertTools(selectedTools);
 	const runtimeOptions: { num_predict?: number; temperature?: number; top_p?: number } = {};
 	let hasRuntimeOptions = false;
-	if (options?.maxTokens !== undefined && !model.omitMaxOutputTokens) {
+	const maxTokens = options?.maxTokens ?? model.maxTokens;
+	if (maxTokens != null && !model.omitMaxOutputTokens) {
 		// Ollama Cloud rejects `num_predict` above 65536 with HTTP 400 uniformly
 		// across cloud-served models (confirmed empirically, #3392). Deliberately
 		// keyed on the provider id, not catalog policy: this is a wire-level
 		// safety net that must hold even for stale `models.db` rows and custom
 		// `modelOverrides` that never passed through catalog resolution.
-		runtimeOptions.num_predict =
-			model.provider === "ollama-cloud" ? Math.min(options.maxTokens, 65_536) : options.maxTokens;
+		runtimeOptions.num_predict = model.provider === "ollama-cloud" ? Math.min(maxTokens, 65_536) : maxTokens;
 		hasRuntimeOptions = true;
 	}
 	if (options?.temperature !== undefined) {

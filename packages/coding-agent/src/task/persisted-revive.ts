@@ -40,9 +40,12 @@ import {
 	createSubagentSettings,
 	followMCPTools,
 	subagentRetryFallbackRole,
+	type MCPToolFollower,
 } from "./executor";
 import type { EffectivePermissionSummary } from "./types";
 import { cfgTaskAgentAccountPools } from "./settings";
+import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
+import { seanceIsolationOptions } from "./seance-policy";
 import type { AgentDefinition } from "./types";
 import {
 	buildEffectivePermissionSummary,
@@ -230,6 +233,23 @@ export function createPersistedSubagentReviverFactory(
 		// is gone (isolated/merged worktree, moved dir): leave it transcript-only
 		// (history://) rather than resurrect a wrong or broken session.
 		if (!peek?.init) return undefined;
+		let restoredSeance: RestoredSeanceSession | undefined;
+		if (peek.seanceSource !== undefined) {
+			try {
+				restoredSeance = await restoreSeanceSession({
+					init: peek.init,
+					cwd: peek.cwd,
+					modelRegistry: ctx.modelRegistry,
+				});
+			} catch (error) {
+				logger.warn("Unable to restore persisted seance session", {
+					sessionFile,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return undefined;
+			}
+			if (!restoredSeance) return undefined;
+		}
 		// Isolated runs are never resumable: their worktree is merged + cleaned,
 		// and the parent was told messaging is impossible. A retained workspace
 		// (capture/persist failure) still exists on disk and would pass the cwd
@@ -238,7 +258,7 @@ export function createPersistedSubagentReviverFactory(
 		// parent cwd, contradicting the delivery notice.
 		if (peek.init.isolated) return undefined;
 		try {
-			await fs.stat(peek.cwd);
+			await fs.stat(restoredSeance?.cwd ?? peek.cwd);
 		} catch {
 			return undefined;
 		}
@@ -325,11 +345,13 @@ export function createPersistedSubagentReviverFactory(
 				(currentParentScope !== undefined && !isScopeNoBroader(currentParentScope, permissionSnapshot.scope))
 			)
 				throw new Error("Persisted subagent parent authority changed before revival.");
+			let reopened: SessionManager | undefined;
 			let revivedSession: AgentSession | undefined;
+			let mcpFollower: MCPToolFollower | undefined;
 			try {
 				// Re-open fresh on every revive: park closes the writer, so this takes
 				// the single-writer lock cleanly and restores the full message history.
-				const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
+				reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 					suppressBreadcrumb: true,
 					throwIfMissing: true,
 				});
@@ -359,6 +381,7 @@ export function createPersistedSubagentReviverFactory(
 				const currentInheritedScopeRequired =
 					permissionSnapshot.scope.clauses?.some(clause => clause.source === "inherited") === true;
 				if (
+					lookupAgentRef(registry, ref.parentId ?? "")?.session !== parentSession ||
 					(currentInheritedScopeRequired && currentParentScope === undefined) ||
 					(currentParentScope !== undefined && !isScopeNoBroader(currentParentScope, permissionSnapshot.scope))
 				)
@@ -383,7 +406,7 @@ export function createPersistedSubagentReviverFactory(
 							: undefined),
 					},
 					undefined,
-					{ cwd: currentPeek.cwd },
+					{ cwd: restoredSeance?.cwd ?? currentPeek.cwd },
 				);
 				// Restore the `subagent:<id>` fallback chain the spawn installed; the
 				// transcript alone cannot rebuild it (multi-model agent patterns and
@@ -395,12 +418,14 @@ export function createPersistedSubagentReviverFactory(
 				const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(ctx.settings));
 				const oauthAccountPools =
 					init.agent && Object.hasOwn(agentAccountPools, init.agent) ? agentAccountPools[init.agent] : undefined;
-				const persistedModelPattern =
-					init.modelRole && init.modelRole !== "default"
+				const persistedModelPattern = restoredSeance
+					? restoredSeance.modelPattern
+					: init.modelRole && init.modelRole !== "default"
 						? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]
 						: init.resolvedModel;
-				const revivedToolNames =
-					init.readOnly === true && init.tools.includes("write")
+				const revivedToolNames = restoredSeance
+					? restoredSeance.toolNames
+					: init.readOnly === true && init.tools.includes("write")
 						? init.tools.filter(name => name !== "write")
 						: init.tools;
 				const structured = revivedToolNames.includes("yield");
@@ -409,7 +434,7 @@ export function createPersistedSubagentReviverFactory(
 				// Transcripts written before the list was kept fall back to the persisted grant.
 				const startupToolNames =
 					init.startupToolNames === undefined ? revivedToolNames : (init.startupToolNames ?? undefined);
-				const restrictToolNames = init.restrictToolNames === true;
+				const restrictToolNames = restoredSeance !== undefined || init.restrictToolNames === true;
 				const startupPolicy = deriveRestrictedStartupPolicy({
 					permissionScope: permissionSnapshot.scope,
 					restrictToolNames,
@@ -419,33 +444,36 @@ export function createPersistedSubagentReviverFactory(
 					enableLsp: init.enableLsp === undefined ? ctx.enableLsp : init.enableLsp && ctx.enableLsp,
 					enableMCP: (init.enableMCP ?? true) && ctx.enableMCP,
 				});
-				const ownerExtensionRoots = ctx.session.effectiveExtensionRoots;
-				const ownerPreparedExtensions = ctx.session.preparedExtensions;
+				const ownerExtensionRoots = restoredSeance ? undefined : ctx.session.effectiveExtensionRoots;
+				const ownerPreparedExtensions = restoredSeance ? undefined : ctx.session.preparedExtensions;
 				const hasOwnerExtensionRoots = ownerExtensionRoots !== undefined;
-				const allowOwnerExtensions = hasOwnerExtensionRoots || (ownerPreparedExtensions?.length ?? 0) > 0;
+				const allowOwnerExtensions =
+					!restoredSeance && (hasOwnerExtensionRoots || (ownerPreparedExtensions?.length ?? 0) > 0);
 				const artifactManager = ctx.session.sessionManager.getArtifactManager();
-				if (artifactManager) reopened.adoptArtifactManager(artifactManager);
-				const enableMCP = startupPolicy.enableMCP;
+				if (artifactManager && !restoredSeance) reopened.adoptArtifactManager(artifactManager);
+				const enableMCP = !restoredSeance && startupPolicy.enableMCP;
 				const mcpManager = enableMCP ? ctx.mcpManager : undefined;
 				const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
+				mcpFollower = mcpManager ? followMCPTools(mcpManager) : undefined;
 				const { session } = await authorityBinding.create(
 					{
-						cwd: currentPeek.cwd,
+						// Replay the original startup cwd for durable authority identity.
+						cwd: restoredSeance?.cwd ?? currentPeek.cwd,
 						agentDir: subagentSettings.getAgentDir(),
+						sessionManager: reopened,
 						// Revived agents join the root session tree, so their observability
 						// frames ride the same bus the RPC/collab surfaces subscribed to.
 						subagentEventBus: ctx.subagentEventBus,
 						authStorage: ctx.authStorage,
 						modelRegistry: ctx.modelRegistry,
 						...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
-						modelPatternAuthFallback: init.resolvedModel,
+						modelPatternAuthFallback: restoredSeance ? undefined : init.resolvedModel,
 						settings: subagentSettings,
 						skillsSettings: parentSession.skillsSettings,
-						extensionRoots: () => ownerExtensionRoots,
-						...(ownerPreparedExtensions?.length
+						...(ownerExtensionRoots ? { extensionRoots: () => ownerExtensionRoots } : {}),
+						...(!restoredSeance && ownerPreparedExtensions?.length
 							? { preloadedPreparedExtensions: ownerPreparedExtensions }
 							: undefined),
-						sessionManager: reopened,
 						localProtocolOptions: getSessionLocalProtocolOptions(parentSession.sessionManager),
 						agentId: ref.id,
 						agentDisplayName: ref.displayName,
@@ -476,7 +504,7 @@ export function createPersistedSubagentReviverFactory(
 						outputSchema: structured ? init.outputSchema : undefined,
 						outputSchemaMode: structured ? init.outputSchemaMode : undefined,
 						restrictToolNames,
-						allowRestrictedExtensions: startupPolicy.allowExtensions || allowOwnerExtensions,
+						allowRestrictedExtensions: !restoredSeance && (startupPolicy.allowExtensions || allowOwnerExtensions),
 						permissionScope: permissionSnapshot?.scope,
 						requireYieldTool: structured,
 						systemPrompt: () => [...init.systemPrompt],
@@ -495,17 +523,20 @@ export function createPersistedSubagentReviverFactory(
 									customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
 								}
 							: {}),
+						...(restoredSeance ? seanceIsolationOptions(restoredSeance.cwd) : {}),
 					},
 					expectedRef,
 				);
 				revivedSession = session;
-				// Clamp the active set to the persisted list: createAgentSession's
+				mcpFollower?.bind(session);
 				// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
 				// the original run didn't carry. Unknown/missing names are ignored.
 				// The persisted list is not itself identity-bound; it can only select
 				// within the tools the identity-bound spawn list registered.
-				await session.setActiveToolsByName([...revivedToolNames, ...session.getMountedXdevToolNames()]);
-				if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
+				await session.setActiveToolsByName(
+					restoredSeance ? revivedToolNames : [...revivedToolNames, ...session.getMountedXdevToolNames()],
+				);
+				session.setWorkPoolYieldItems(init.workPoolYieldItems ?? []);
 				// Wire the extension runtime exactly as the live executor does. Without
 				// this the runner stays pre-init, every action method throws
 				// `ExtensionRuntimeNotInitializedError`, and a `tool_call` handler that
@@ -532,30 +563,51 @@ export function createPersistedSubagentReviverFactory(
 					systemPrompt: init.systemPrompt.join("\n\n"),
 					source: "user",
 				};
-				const rootId = ref.lineage?.rootId;
-				if (!rootId)
-					throw new Error(
-						`Cannot install IRC wake monitor for persisted subagent "${ref.id}" without a lineage root.`,
-					);
-				attachIrcWakeTurnMonitor(session, {
-					id: ref.id,
-					agent: wakeAgent,
-					permissionSummary,
-					artifactsDir: path.dirname(sessionFile),
-					agentRegistry: registry,
-					ircBus: IrcBus.forRoot(registry, rootId),
-					subagentEventBus: ctx.subagentEventBus,
-					sessionFile,
-					outputSchema: structured ? init.outputSchema : undefined,
-					outputSchemaMode: structured ? init.outputSchemaMode : undefined,
-					structured,
-				});
+				if (!restoredSeance) {
+					const rootId = ref.lineage?.rootId;
+					if (!rootId)
+						throw new Error(
+							`Cannot install IRC wake monitor for persisted subagent "${ref.id}" without a lineage root.`,
+						);
+					attachIrcWakeTurnMonitor(session, {
+						id: ref.id,
+						agent: wakeAgent,
+						permissionSummary,
+						artifactsDir: path.dirname(sessionFile),
+						agentRegistry: registry,
+						ircBus: IrcBus.forRoot(registry, rootId),
+						subagentEventBus: ctx.subagentEventBus,
+						sessionFile,
+						outputSchema: structured ? init.outputSchema : undefined,
+						outputSchemaMode: structured ? init.outputSchemaMode : undefined,
+						structured,
+					});
+				}
 				return session;
 			} catch (error) {
+				try {
+					mcpFollower?.dispose();
+				} catch {
+					// Continue releasing the session even if its MCP follower failed to stop.
+				}
 				if (revivedSession) {
-					setAgentStatus(registry, ref.id, "parked", revivedSession);
-					detachAgentSession(registry, ref.id, revivedSession);
-					await revivedSession.dispose();
+					try {
+						setAgentStatus(registry, ref.id, "parked", revivedSession);
+						detachAgentSession(registry, ref.id, revivedSession);
+					} catch {
+						// Session disposal below still owns and closes the reopened manager.
+					}
+					try {
+						await revivedSession.dispose();
+					} catch {
+						// Preserve the revival failure when session teardown also fails.
+					}
+				} else if (reopened) {
+					try {
+						await reopened.close();
+					} catch {
+						// Preserve the revival failure when manager teardown also fails.
+					}
 				}
 				throw error;
 			}

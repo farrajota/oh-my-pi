@@ -230,6 +230,7 @@ export class SessionFocusController {
 			else {
 				setRunStatus({ state: "idle" });
 				setTerminalTitleState("idle");
+				this.ctx.eventController.markViewIdle();
 			}
 			if (generation !== this.#attachGeneration) return false;
 			await this.ctx.renderInitialMessages({ clearTerminalHistory: true });

@@ -36,6 +36,12 @@ import {
 	readPinnedBrowserAuditFile,
 } from "../tools/browser-audit-production";
 import type { ToolSession } from "../tools/index";
+import { browserAuditActivationLiveness } from "./browser-audit-session-capabilities";
+export {
+	bindBrowserAuditSessionOptions,
+	copyBrowserAuditSessionCapability,
+	takeBrowserAuditSessionCapability,
+} from "./browser-audit-session-capabilities";
 
 const browserAuditSchema = type({
 	operation: "'open' | 'inspect' | 'act' | 'close'",
@@ -45,7 +51,6 @@ const browserAuditSchema = type({
 });
 type BrowserAuditRuntimeParams = typeof browserAuditSchema.infer;
 const browserAuditAuthority = Symbol("browser-audit-authority");
-const browserAuditActivationLiveness = Symbol("browser-audit-activation-liveness");
 
 interface BrowserAuditProductionOptions extends BrowserAuditBindingInput {
 	readonly [browserAuditAuthority]: true;
@@ -80,7 +85,6 @@ interface BrowserAuditAuthorityBroker {
 
 const taskAuthorities = new WeakMap<object, BrowserAuditTaskAuthority>();
 const runCapabilities = new WeakMap<object, BrowserAuditToolCapability>();
-const sessionOptionCapabilities = new WeakMap<object, BrowserAuditToolCapability>();
 const toolSessionCapabilities = new WeakMap<object, BrowserAuditToolCapability>();
 
 export function bindBrowserAuditTaskAuthority(session: ToolSession, authority: BrowserAuditTaskAuthority): void {
@@ -103,30 +107,6 @@ export function bindBrowserAuditRunOptions(options: object, capability: BrowserA
 export function takeBrowserAuditRunCapability(options: object): BrowserAuditToolCapability | undefined {
 	const capability = runCapabilities.get(options);
 	runCapabilities.delete(options);
-	return capability;
-}
-
-export function bindBrowserAuditSessionOptions(
-	options: object,
-	capability: BrowserAuditToolCapability | undefined,
-): void {
-	if (capability === undefined) return;
-	if (sessionOptionCapabilities.has(options)) throw new Error("browser_audit: session capability is already bound");
-	sessionOptionCapabilities.set(options, capability);
-}
-/** Only live broker activations may cross a trusted clone boundary. */
-export function copyBrowserAuditSessionCapability(source: object, target: object): void {
-	const capability = sessionOptionCapabilities.get(source);
-	if (capability === undefined) return;
-	const isLive = (capability as Partial<LiveBrowserAuditProductionOptions>)[browserAuditActivationLiveness];
-	if (typeof isLive !== "function" || !isLive(capability)) return;
-	if (sessionOptionCapabilities.has(target)) throw new Error("browser_audit: session capability is already bound");
-	sessionOptionCapabilities.set(target, capability);
-}
-
-export function takeBrowserAuditSessionCapability(options: object): BrowserAuditToolCapability | undefined {
-	const capability = sessionOptionCapabilities.get(options);
-	sessionOptionCapabilities.delete(options);
 	return capability;
 }
 

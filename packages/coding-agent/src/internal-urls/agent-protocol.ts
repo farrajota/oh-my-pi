@@ -162,7 +162,8 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		const outputId = url.rawHost || url.hostname;
 		if (!outputId) throw new Error("agent:// URL requires an output ID: agent://<id>");
 		if (outputId === "all" || isPathExtraction(url)) return null;
-		const registry = context?.agentRegistry ?? AgentRegistry.global();
+		const seance = !!(context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir);
+		const registry = seance ? undefined : (context?.agentRegistry ?? AgentRegistry.global());
 		if (isSuperseded(registry, outputId, context)) return null;
 		const dirs = await this.#outputDirs(context);
 		if (dirs.length === 0) return null;
@@ -219,9 +220,10 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			throw new Error("agent:// URL cannot combine path extraction with ?q=");
 		}
 
+		const seance = !!(context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir);
 		const bound = isBoundResourceContext(context);
 		const dirs = await this.#outputDirs(context);
-		const registry = context?.agentRegistry ?? AgentRegistry.global();
+		const registry = seance ? undefined : (context?.agentRegistry ?? AgentRegistry.global());
 
 		// A subagent allocates its own children as dot-qualified ids
 		// (`Parent.Child`), so the slash path form is first tried as a hierarchy
@@ -244,8 +246,11 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		const scan = await this.#findOutput(dirs, nestedId ? [nestedId, outputId] : [outputId]);
 		const extract = hasQueryExtraction || (hasPathExtraction && (!nestedId || scan.matchedId !== nestedId));
 		if (!scan.foundPath) {
-			const ref = registry && agentRefsForContext(registry, context).find(candidate => candidate.id === outputId);
-			if (ref) return this.#resolveProgress(url, ref, registry, extract);
+			const ref =
+				!seance && registry
+					? agentRefsForContext(registry, context).find(candidate => candidate.id === outputId)
+					: undefined;
+			if (ref && registry) return this.#resolveProgress(url, ref, registry, extract);
 			if (!scan.anyDirExists) {
 				if (bound) throw new Error("No caller-owned agent outputs available");
 				throw new Error("No artifacts directory found");
@@ -385,6 +390,9 @@ export class AgentProtocolHandler implements ProtocolHandler {
 	 * The caller root directory is preferred ahead of other registered roots.
 	 */
 	async #outputDirs(context: ResolveContext | undefined): Promise<string[]> {
+		// A seance reads the consulted source's agent outputs in place, nothing else.
+		const seanceDir = context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir;
+		if (seanceDir) return [seanceDir];
 		const bound = isBoundResourceContext(context);
 		const rootSessionFile =
 			context?.sessionFile && context.agentRegistry
@@ -445,6 +453,15 @@ export class AgentProtocolHandler implements ProtocolHandler {
 	}
 
 	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {
+		if (context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir) {
+			const dirs = await this.#outputDirs(context);
+			const { availableIds } = await this.#artifactManagers(dirs);
+			const outputIds: string[] = [];
+			for (const id of availableIds) {
+				if ((await this.#findOutput(dirs, [id])).foundPath) outputIds.push(id);
+			}
+			return outputIds.sort().map(value => ({ value }));
+		}
 		const registry = context?.agentRegistry ?? (isBoundResourceContext(context) ? undefined : AgentRegistry.global());
 		const refs = registry ? agentRefsForContext(registry, context) : [];
 		return refs

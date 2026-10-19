@@ -23,7 +23,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import type { postmortem } from "@oh-my-pi/pi-utils";
 import type { AdvisorConfig } from "../advisor";
-import type { AsyncJobManager } from "../async";
+import type { AsyncJobManager, AsyncJobSnapshotItem } from "../async";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import type { AgentDefinition } from "../task/types";
 import type { SessionAccountPoolScope } from "../config/account-pools";
@@ -75,8 +75,9 @@ export interface AgentSessionDisposeOptions {
 
 /** Listener notified when command metadata changes. */
 export type CommandMetadataChangedListener = () => void | Promise<void>;
-/** Public summary of an asynchronous job. */
+/** Public async job snapshot types are shared with AsyncJobManager. */
 export type { AsyncJobSnapshot, AsyncJobSnapshotItem } from "../async";
+type AsyncJobTreeItem = AsyncJobSnapshotItem & { readonly ownerId?: string };
 
 /** One async job as a job inspector (the jobs sheet) shows it beyond its snapshot row. */
 export interface AsyncJobInspection {
@@ -94,6 +95,15 @@ export interface AsyncJobInspection {
 	artifactId?: string;
 }
 
+/** Jobs of an agent and every subagent below it, with the lineage that nests them (see `AgentSession.getAsyncJobTree`). */
+export interface AsyncJobTree {
+	running: AsyncJobTreeItem[];
+	recent: AsyncJobTreeItem[];
+	/** The agent the tree is for; its own jobs are the top level. */
+	rootId?: string;
+	/** Subagents owning listed jobs, with the ancestors linking them to the root. */
+	agents: { id: string; parentId?: string }[];
+}
 export type { ShakeMode, ShakeResult } from "./shake-types";
 
 /**
@@ -195,6 +205,8 @@ export interface AgentSessionConfig {
 	unexpectedStopJudgeTimeoutMs?: number;
 	/** Prewalk from the starting model to a fast/cheap target after implementation begins. */
 	prewalk?: Prewalk;
+	/** Keep `prewalk.auto` away from this session until `/new` (`--no-prewalk`). */
+	suppressAutoPrewalk?: boolean;
 	/** Force read-only plan mode at start, auto-approve, then switch to the target. */
 	planYolo?: PlanYolo;
 	/** Initial per-family service tiers for the live session. */

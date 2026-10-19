@@ -10,13 +10,15 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import type { PermissionDenialDetails } from "@oh-my-pi/pi-wire";
-import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import { prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import {
-	formatApprovalPrompt,
+	requestApproval,
 	truncateForPrompt,
 	denyError,
 	resolveApproval,
 	resolveApprovalFromContext,
+	sessionApprovalScope,
 } from "../../tools/approval";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
@@ -168,7 +170,13 @@ function renderOptionsWithTheme<T extends object>(options: T, theme: Theme): T &
  */
 export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	declare name: string;
-	declare description: string;
+	get description(): string {
+		const description = this.registeredTool.definition.description;
+		const guidance = this.runner.getNativeDelegationGuidance(this.name);
+		return guidance
+			? prompt.render(nativeDelegationTemplate, { description, name: this.name, guidance })
+			: description;
+	}
 	declare parameters: any;
 	declare label: string;
 	declare strict: boolean;
@@ -457,8 +465,6 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// matches the loop's rule for context prepared at arg-prep time.
 		let pendingAdditionalContext: string | undefined;
 		let effectiveParams = params;
-		// Keep this separate from path authorization: canonicalization is not an extension mutation.
-		let extensionInputChanged = false;
 		if (
 			!loopEmittedToolCall &&
 			hasRunnerHandlers(this.runner, "tool_call") &&
@@ -492,7 +498,6 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				// tool calls, whose event input is a synthetic {actions,pendingSafetyChecks} view
 				// (see toolEventArgs) rather than the real execution params.
 				if (callResult?.input !== undefined && context?.toolCall?.providerMetadata?.type !== "computer") {
-					extensionInputChanged = true;
 					effectiveParams = callResult.input as typeof params;
 				}
 			} catch (err) {
@@ -503,8 +508,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 		assertAuthorized(effectiveParams);
-		const acpBypass =
-			!extensionInputChanged && isAcpApprovedInvocation(context, this.tool.name, toolCallId, effectiveParams);
+		// Preserve handler revision state before the path scope applies trusted canonicalization.
+		const extensionRevisedParams = effectiveParams !== params;
 		const pathScope = runner.getPathScope?.call(this.runner);
 		const pathInput = recordParams(effectiveParams);
 		if (pathScope && Object.keys(pathInput).length > 0) {
@@ -514,32 +519,32 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const rewrittenParams = rewriteAuthorizedInput(pathInput, replacements) as typeof effectiveParams;
 			if (rewrittenParams !== pathInput) effectiveParams = rewrittenParams;
 		}
-		if (!loopDispatchedToolCall) {
-			const preflight = await runner.runToolCallPreflightBefore?.call(
-				this.runner,
-				toolCallId,
-				this.tool,
-				effectiveParams,
-				context,
-			);
-			if (preflight?.block) {
-				throw new Error(preflight.reason || "Tool execution was blocked by a preflight rule");
-			}
-		}
-		// Every exit between a passed preflight and tool execution must release the
-		// preflight reservation; the finally below handles it for all throw paths.
+		const acpBypass = isAcpApprovedInvocation(context, this.tool.name, toolCallId, effectiveParams);
+		// Cancel any reservation unless execution and its postflight complete normally.
 		let preflightSettled = loopDispatchedToolCall;
-		const { approvalMode, userPolicies } =
-			context === undefined
-				? { approvalMode: "yolo" as const, userPolicies: {} }
-				: resolveApprovalFromContext(context);
-		const scope = runner.getPermissionScope?.call(this.runner);
-		const enforcePreparation = scope?.mode === "enforce";
-		const authority = runner.getToolExecutionAuthority?.call(this.runner);
 		const ownsPreparation = preparedExecution === undefined;
 		const executionKey = ownsPreparation ? Object.freeze({}) : undefined;
 		let effectivePreparedExecution = preparedExecution;
 		try {
+			if (!loopDispatchedToolCall) {
+				const preflight = await runner.runToolCallPreflightBefore?.call(
+					this.runner,
+					toolCallId,
+					this.tool,
+					effectiveParams,
+					context,
+				);
+				if (preflight?.block) {
+					throw new Error(preflight.reason || "Tool execution was blocked by a preflight rule");
+				}
+			}
+			const { approvalMode, userPolicies } =
+				context === undefined
+					? { approvalMode: "yolo" as const, userPolicies: {} }
+					: resolveApprovalFromContext(context);
+			const scope = runner.getPermissionScope?.call(this.runner);
+			const enforcePreparation = scope?.mode === "enforce";
+			const authority = runner.getToolExecutionAuthority?.call(this.runner);
 			if (enforcePreparation) {
 				if (!authority) throw new Error(`Tool "${this.tool.name}" has no registry execution authority.`);
 				if (effectivePreparedExecution !== undefined) {
@@ -590,18 +595,24 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const pendingSafetyChecks = computerSafetyChecks(context);
 			// An xd:// device dispatch already cleared the write tool's outer gate at
 			// this tool's tier — re-prompting would double-ask for one action. The
-			// bypass only holds while the input is exactly what that outer gate
-			// approved: a handler revision here may have raised the tier, so revised
-			// input always faces the full gate. Explicit per-tool "prompt" policies
-			// and tool-demanded overrides still prompt. Provider safety checks are
-			// stronger: yolo, per-tool allow, and xdev approval never acknowledge
+			// bypass holds when extension handlers leave the approved input unchanged;
+			// trusted path-scope canonicalization does not count as a handler revision.
+			// A handler revision may raise the tier and always faces the full gate.
+			// Explicit per-tool "prompt" policies and tool-demanded overrides still prompt.
+			// Provider safety checks are stronger: yolo, per-tool allow, and xdev approval never acknowledge
 			// them on the user's behalf.
 			const configuredPrompt = Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
-			const xdevBypass = context?.xdevApproved === true && !extensionInputChanged;
+			const sessionScope =
+				pendingSafetyChecks.length === 0 ? sessionApprovalScope(resolved, this.tool.name) : undefined;
+			const sessionApproved = sessionScope !== undefined && this.runner.hasSessionApproval(sessionScope.key);
+			const xdevBypass = context?.xdevApproved === true && !extensionRevisedParams;
 			const approvalCheck = {
 				required:
 					pendingSafetyChecks.length > 0 ||
-					(resolved.policy === "prompt" && !acpBypass && (resolved.override || configuredPrompt || !xdevBypass)),
+					(resolved.policy === "prompt" &&
+						!acpBypass &&
+						!sessionApproved &&
+						(resolved.override || configuredPrompt || !xdevBypass)),
 				reason: resolved.reason,
 			};
 
@@ -660,22 +671,26 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				}
 
 				const uiContext = this.runner.getUIContext();
-				const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-				const safetyPrompt =
-					pendingSafetyChecks.length > 0
-						? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-						: basePrompt;
-				let choice: string | undefined;
+				let answer: "once" | "session" | "deny";
 				try {
-					choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+					answer = await requestApproval(uiContext, this.tool, resolvedArgs, {
+						reason: approvalCheck.reason,
+						...(pendingSafetyChecks.length > 0
+							? { appendix: [`Provider safety checks:`, ...safetyCheckLines(pendingSafetyChecks)] }
+							: {}),
+						...(sessionScope === undefined ? {} : { sessionSubject: sessionScope.subject }),
+					});
 				} catch (err) {
 					await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 					throw err;
 				}
-				const approved = choice === "Approve";
+				const approved = answer !== "deny";
 				await emitApprovalResolved(approved, approved ? undefined : "denied by user");
 				if (!approved) {
 					throw new Error(`Tool call denied by user: ${this.tool.name}`);
+				}
+				if (answer === "session" && sessionScope !== undefined) {
+					this.runner.grantSessionApproval(sessionScope.key);
 				}
 				if (pendingSafetyChecks.length > 0) {
 					if (!context) throw new Error("Provider safety approval context is unavailable");
@@ -687,7 +702,6 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			let result: AgentToolResult<TDetails, TParameters>;
 			let executionError: Error | undefined;
 
-			preflightSettled = true;
 			try {
 				const executeTool = (executionSignal?: AbortSignal) => {
 					const runTool = () =>
@@ -736,6 +750,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				const postflight = await runner.runToolCallPreflightAfter?.call(this.runner, toolCallId, result, context);
 				if (postflight) result = postflight as AgentToolResult<TDetails, TParameters>;
 			}
+			preflightSettled = true;
 
 			let resultHookError = false;
 			// Emit tool_result event - extensions can modify the result and error status.

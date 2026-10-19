@@ -2188,7 +2188,9 @@ export interface TaskItem {
 	name?: string;
 	/** Agent type to run this item (e.g. "scout"). Defaults to the spawn policy's default agent. */
 	agent?: string;
-	/** Exact request-local selector shown alongside the selected agent. */
+	/** Historical source session selected by the bundled consult agent. */
+	sourceSession?: string;
+	/** Exact request-local model selector; may override model for the historical source session. */
 	model?: string | string[];
 	/** The work; required by the schema. */
 	task?: string;
@@ -2224,7 +2226,9 @@ export interface TaskParams {
 	name?: string;
 	/** Agent type to spawn (flat form); omitted values resolve from the session spawn policy. */
 	agent?: string;
-	/** Exact request-local selector on the flat task shape. */
+	/** Historical source session selected by the bundled consult agent. */
+	sourceSession?: string;
+	/** Exact request-local model selector; may override model for the historical source session. */
 	model?: string | string[];
 	/** The work (flat form). */
 	task?: string;
@@ -2367,6 +2371,8 @@ export interface AgentProgress {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	/** Raw request-local model selector, when supplied by the caller. */
+	requestedModel?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Undefined when the model could not be resolved. */
 	resolvedModel?: string;
 	/** Provider/id including routing, with no added thinking suffix. */
@@ -2458,6 +2464,8 @@ export interface SingleResult {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	/** Raw request-local model selector, when supplied by the caller. */
+	requestedModel?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Omitted from tool-result JSON when undefined to keep wire payloads small. */
 	resolvedModel?: string;
 	/** Retains the unambiguous identity from {@link AgentProgress.resolvedModelIdentity}. */

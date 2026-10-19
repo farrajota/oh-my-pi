@@ -698,8 +698,20 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		void abortShell();
 	};
 	const abortDeferred = Promise.withResolvers<"abort">();
+	let gracefulAbort = false;
 	const abortHandler = () => {
-		abortCurrentExecution();
+		if (options?.sessionKey?.includes(":async:")) {
+			gracefulAbort = true;
+			for (const pid of executionShell.pids()) {
+				try {
+					process.kill(pid, "SIGTERM");
+				} catch {
+					// The command may have exited between collecting and signaling its pid.
+				}
+			}
+		} else {
+			abortCurrentExecution();
+		}
 		abortDeferred.resolve("abort");
 	};
 	if (userSignal) {
@@ -757,8 +769,29 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		]);
 
 		if (winner.kind === "timeout" || winner.kind === "abort") {
+			let cleanupPromise: Promise<void>;
+			if (winner.kind === "abort" && gracefulAbort) {
+				let graceTimer: NodeJS.Timeout | undefined;
+				const cleanupFinished = await Promise.race([
+					runPromise.then(
+						() => true,
+						() => true,
+					),
+					new Promise<false>(resolve => {
+						graceTimer = setTimeout(() => resolve(false), NATIVE_TIMEOUT_FALLBACK_GRACE_MS);
+					}),
+				]);
+				clearTimeout(graceTimer);
+				if (cleanupFinished) {
+					cleanupPromise = Promise.resolve();
+				} else {
+					abortCurrentExecution();
+					cleanupPromise = abortShell();
+				}
+			} else {
+				cleanupPromise = abortShell();
+			}
 			acceptingChunks = false;
-			const cleanupPromise = abortShell();
 			if (shellSession) {
 				resetSession = true;
 				quarantineShellSession(sessionKey, runPromise, cleanupPromise);

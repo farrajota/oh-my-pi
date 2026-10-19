@@ -1,13 +1,16 @@
 {{#if asyncEnabled}}{{#if batchEnabled}}Spawn `tasks[]` concurrently; IDs return immediately.{{else}}Spawn one agent; ID returns immediately.{{/if}}{{#if hasBlockingAgents}} BLOCKING agents return inline.{{/if}}{{else}}{{#if batchEnabled}}Run `tasks[]` synchronously.{{else}}Run one agent synchronously.{{/if}}{{/if}}
-{{#if asyncEnabled}}{{#if structured}}
+{{#if asyncEnabled}}{{#ifAny structured hasStructuredAgents}}
 
 # Results
-`outputSchema` parsed payload, even invalid: `agent://<id>`; JSON field paths such as `/<field>` and `/reports/0/data` fall back to extraction only when no matching nested-child artifact exists. Nested outputs use `agent://<id>.<child>` or `agent://<id>/<child>`; invalid preview inline.
-{{/if}}{{/if}}
+`{{#if structured}}outputSchema{{else}}STRUCTURED agents'{{/if}}` parsed payload, even invalid: `agent://<id>`;{{#if structured}} invalid preview inline.{{else}} structured JSON results support nested `/reports/0/data` paths and other `/<field>` paths, falling back to extraction only when no matching nested-child artifact exists. Nested outputs use `agent://<id>.<child>` or `agent://<id>/<child>`; invalid preview inline.{{/if}}
+{{/ifAny}}
+
+{{asyncGuidance}}
+{{/if}}
 
 # Delegation
 Use most specific agent.{{#if scoutAvailable}} Read-only research MUST use `scout` only when files are unknown.{{/if}} Prefer one agent to investigate + edit. Omit `agent` when the spawn-policy default is the best fit (`{{defaultAgent}}`); NEVER specify the default explicitly. Check the available agents below before choosing a specialist. User-tagged model agents such as `m<N>` are not specialists; use one only when the user names it.
-Name one integration owner. Shared edits are not guaranteed to merge in the same file; coordinate through `write agent://<id>` before editing shared files{{#if ircEnabled}} (or broadcast to `agent://all`){{/if}}. Set interfaces in {{#if batchEnabled}}`context`{{else}}the task{{/if}}. Every task MUST skip build/lint/tests/formatters mid-flight; run once afterward.
+Name one integration owner. Shared edits are not guaranteed to merge in the same file;{{#if ircEnabled}} coordinate through `write agent://<id>` before editing shared files (or broadcast to `agent://all`){{else}} assign shared-file edits to one integration owner{{/if}}. Set interfaces in {{#if batchEnabled}}`context`{{else}}the task{{/if}}. Every task MUST skip build/lint/tests/formatters mid-flight; run once afterward.
 
 # Inputs
 {{#if batchEnabled}}
@@ -80,6 +83,8 @@ Name one integration owner. Shared edits are not guaranteed to merge in the same
 {{/if}}
 <permission-scoping>
 Mode: {{permissionMode}}. Profiles are guardrails, not a security sandbox. Do not ask subagents to bypass them with bash/eval. If work needs access outside scope, the subagent should report the missing permission.
+{{#if seanceGuidance}}{{seanceGuidance}}{{/if}}
+Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
 
 In enforce mode, select at least one permission profile that defines `tools`, or specify `permissions.tools` explicitly. Modifier-only profiles add restrictions and do not grant tools. Path allows and denies accumulate; denies win. When both a `toolProfile` and permissions apply, the effective tool set is their intersection.
 </permission-scoping>
@@ -119,9 +124,10 @@ Pass large payloads via `local://<path>` URIs, NEVER inline text.
 {{#if spawningDisabled}}
 Agent spawning is currently disabled.
 {{else}}
-Pick the most specific agent. Omit `agent` only when the spawn-policy default is that agent.
+{{#if hasModelMentions}}`m<N>` = user-tagged model (`<model agent="m<N>" name="…"/>`), not specialist; spawn only when user names it.
+{{/if}}Pick the most specific agent. Omit `agent` only when the spawn-policy default is that agent.
 {{#list agents join="\n"}}
-### {{name}}{{#if readOnly}} (READ-ONLY){{/if}}{{#if blocking}} (BLOCKING: inline result){{/if}}
+### {{name}}{{#if readOnly}} (READ-ONLY; investigation only, no edits){{/if}}{{#if blocking}} (BLOCKING: inline result){{/if}}{{#if structured}} (STRUCTURED: schema result){{/if}}
 {{description}}
 {{#if readOnly}}Use ONLY for investigation; do edits yourself or assign to a writing agent.{{/if}}
 {{/list}}

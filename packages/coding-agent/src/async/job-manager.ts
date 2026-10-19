@@ -508,11 +508,8 @@ export class AsyncJobManager {
 		}
 
 		const incarnationId = crypto.randomUUID();
-		const id = this.#resolveJobId(options?.id, incarnationId);
+		const id = this.#claimJobId(options?.id, incarnationId);
 		this.#jobIncarnations.set(id, incarnationId);
-		this.#suppressedDeliveries.delete(id);
-		this.#consumedJobResults.delete(id);
-		this.#releasedForegroundJobs.delete(id);
 		if (options?.foreground && !options?.id?.trim()) this.#foregroundAutoJobIds.add(id);
 		if (options?.foreground) this.#suppressedDeliveries.add(id);
 		const abortController = new AbortController();
@@ -595,6 +592,41 @@ export class AsyncJobManager {
 			else this.#scheduleEviction(id);
 		})();
 
+		return id;
+	}
+
+	/**
+	 * Deliver an already-completed result through the normal owner-scoped job
+	 * queue without consuming a running-job slot.
+	 */
+	publishCompleted(
+		type: AsyncJobType,
+		label: string,
+		result: AsyncJobRunResult,
+		options: { id?: string; ownerId?: string; agentId?: string },
+	): string {
+		if (this.#disposed) throw new Error("Async job manager is disposed");
+		const incarnationId = crypto.randomUUID();
+		const id = this.#claimJobId(options.id, incarnationId);
+		this.#jobIncarnations.set(id, incarnationId);
+		const now = Date.now();
+		const job: AsyncJob = {
+			id,
+			type,
+			status: "completed",
+			startTime: now,
+			endTime: now,
+			label,
+			abortController: new AbortController(),
+			promise: Promise.resolve(),
+			ownerId: options.ownerId,
+			agentId: options.agentId,
+			resultText: result.text,
+			structured: result.structured,
+		};
+		this.#jobs.set(id, job);
+		this.#enqueueDelivery(id, result.text);
+		this.#scheduleEviction(id);
 		return id;
 	}
 
@@ -1468,6 +1500,8 @@ export class AsyncJobManager {
 		if (job.resultText === undefined && job.errorText === undefined) return false;
 		this.#consumedJobResults.add(jobId);
 		if (persist) this.#persistEvent("consumption", jobId, { state: "committed" });
+		// Keep the row and suppression marker until queued or in-flight delivery drains.
+		// Otherwise eviction makes a parked async-result appear deliverable again.
 		this.#scheduleConsumedResultEviction(jobId);
 		return true;
 	}
@@ -1480,6 +1514,14 @@ export class AsyncJobManager {
 		this.#releasedForegroundJobs.delete(jobId);
 		const reusableAutoId = this.#foregroundAutoJobIds.has(jobId);
 		if (this.#evictJob(jobId) && reusableAutoId) this.#reusableForegroundAutoIds.add(jobId);
+	}
+
+	#claimJobId(preferredId: string | undefined, incarnationId: string): string {
+		const id = this.#resolveJobId(preferredId, incarnationId);
+		this.#suppressedDeliveries.delete(id);
+		this.#consumedJobResults.delete(id);
+		this.#releasedForegroundJobs.delete(id);
+		return id;
 	}
 
 	#resolveJobId(preferredId: string | undefined, incarnationId: string): string {
@@ -1624,16 +1666,35 @@ export class AsyncJobManager {
 		return this.#jobs.delete(jobId);
 	}
 
-	#scheduleEviction(jobId: string, delayMs = this.#retentionMs): void {
+	/**
+	 * Arm (or re-arm) this job's eviction timer. Consumed results use the shorter
+	 * grace period, clamped to the configured retention. A suppressed in-flight
+	 * delivery must settle before eviction clears its suppression marker; otherwise
+	 * a parked async-result can be injected again after a foreground snapshot.
+	 */
+	#scheduleEviction(jobId: string, delayMs: number = this.#retentionMs): void {
 		if (this.#disposed) return;
 		if (delayMs <= 0) {
 			this.#evictJob(jobId);
 			return;
 		}
 		clearTimeout(this.#evictionTimers.get(jobId));
-		const timer = setTimeout(() => {
-			this.#evictJob(jobId);
-		}, delayMs);
+		const timer = setTimeout(
+			() => {
+				const inFlight = this.#inFlightDeliveries.find(delivery => delivery.jobId === jobId)?.promise;
+				if (!inFlight || !this.isDeliverySuppressed(jobId)) {
+					this.#evictJob(jobId);
+					return;
+				}
+				void inFlight.then(() => {
+					const stillPending =
+						this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId) ||
+						this.#deliveries.some(delivery => delivery.jobId === jobId);
+					if (!stillPending && this.#evictionTimers.get(jobId) === timer) this.#evictJob(jobId);
+				});
+			},
+			Math.min(delayMs, this.#retentionMs),
+		);
 		timer.unref();
 		this.#evictionTimers.set(jobId, timer);
 	}

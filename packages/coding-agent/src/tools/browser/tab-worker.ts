@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { postmortem, Snowflake, untilAborted, withTimeout } from "@oh-my-pi/pi-utils";
+import { formatBytes, isRecord, postmortem, Snowflake, untilAborted, withTimeout } from "@oh-my-pi/pi-utils";
 import type { HTMLElement } from "@oh-my-pi/pi-utils/dom";
 import type {
 	Accessibility,
@@ -10,6 +10,7 @@ import type {
 	CDPSession,
 	ElementHandle,
 	Frame,
+	HTTPRequest,
 	HTTPResponse,
 	JSHandle,
 	KeyboardTypeOptions,
@@ -175,8 +176,9 @@ import {
 	pressKey,
 	selectElementOptions,
 	setElementChecked,
+	type PreparedUpload,
+	prepareElementUpload,
 	type ScrollOptions,
-	uploadFilesToElement,
 	wheel,
 } from "./interactions";
 import {
@@ -216,6 +218,7 @@ import {
 import type { ClickAtOptions, MouseMoveOptions, MouseButtonOptions } from "./interactions";
 
 import { cloneSafe, RunOutput } from "./run-output";
+import { type UploadRoute, UploadStaging } from "./upload-files";
 import type {
 	Observation,
 	ObservationEntry,
@@ -423,8 +426,10 @@ interface TabApi {
 	clipboardWrite(text: string): Promise<ClipboardActionResult>;
 	clipboardCopy(): Promise<ClipboardActionResult>;
 	clipboardPaste(): Promise<ClipboardActionResult>;
-	text(selector: string): Promise<string | null>;
-	html(selector: string): Promise<string | null>;
+	/** Without a selector, reads the page `<body>`. */
+	text(selector?: string): Promise<string | null>;
+	/** Without a selector, reads the page `<body>`. */
+	html(selector?: string): Promise<string | null>;
 	value(selector: string): Promise<string | null>;
 	attr(selector: string, name: string): Promise<string | null>;
 	count(selector: string): Promise<number>;
@@ -612,6 +617,47 @@ async function runGuardedHandleAction<T>(
 }
 
 /**
+ * How an actionable handle uploads files: the route check and `prepare` each run under their own action deadline,
+ * delivery under `deliverGuard`.
+ */
+export interface HandleUploads {
+	/** How the browser takes files; see {@link UploadStaging.route}. */
+	route(signal: AbortSignal): Promise<UploadRoute>;
+	/** Find what takes the files through the handle: its file input, the chooser its click opens, or a drop zone. */
+	prepare(filePaths: string[], label: string, route: UploadRoute, signal: AbortSignal): Promise<PreparedUpload>;
+	/** A guard with a deadline long enough to stream a large file. */
+	deliverGuard: HandleOpGuard;
+}
+
+async function uploadThroughHandle(
+	handle: ElementHandle,
+	state: RawHandleMethods,
+	filePaths: string[],
+	guard: HandleOpGuard,
+	uploads: HandleUploads,
+	invalidate?: () => Promise<void>,
+): Promise<void> {
+	const label = "handle.uploadFile()";
+	// Its own deadline, as for `tab.uploadFile`: the first upload's check must not eat into the action's.
+	const route = await guard(`${label} checking how the browser takes files`, signal => uploads.route(signal));
+	const prepared = await guard(label, signal =>
+		runGuardedHandleAction(
+			handle,
+			state,
+			label,
+			signal,
+			() => uploads.prepare(filePaths, label, route, signal),
+			invalidate,
+		),
+	);
+	try {
+		await uploads.deliverGuard(`${label} sending ${formatBytes(prepared.bytes)}`, signal => prepared.deliver(signal));
+	} finally {
+		await prepared.dispose();
+	}
+}
+
+/**
  * Re-home element handles in `args` into `realm` so they can be passed to an
  * evaluation there. The stealth patch resolves selectors (`tab.waitForSelector`,
  * `tab.$`, …) in Puppeteer's isolated world while `tab.evaluate` runs in the main
@@ -670,12 +716,14 @@ async function adoptElementArgs(
  * and disposes its handle before surfacing the named error, so catching it cannot
  * dispatch a duplicate retry through the stale handle. Puppeteer handles expose
  * `type()` but no `fill()`; the `fill()` semantics mirror the selector-based
- * `tab.fill()`: focus, clear any existing value, then type.
+ * `tab.fill()`: focus, clear any existing value, then type, or set the value of a
+ * colour, date, time or range input directly.
  */
 export function toActionableHandle(
 	handle: ElementHandle,
 	guard?: HandleOpGuard,
 	invalidate?: () => Promise<void>,
+	uploads?: HandleUploads,
 ): ActionableHandle {
 	const enriched = handle as HandleWithRawMethods;
 	const methods = enriched as unknown as Partial<Record<GuardedHandleMethod, RawHandleMethod>>;
@@ -831,6 +879,17 @@ export function toActionableHandle(
 				invalidate,
 			),
 		);
+	const clearFiles = methods.uploadFile;
+	if (uploads) {
+		enriched.uploadFile = async (...filePaths: string[]) => {
+			// With no paths Puppeteer's own method clears the input; there is nothing to route.
+			if (!filePaths.length && clearFiles) {
+				await clearFiles();
+				return;
+			}
+			await uploadThroughHandle(enriched, originals, filePaths, guard, uploads, invalidate);
+		};
+	}
 	return enrichElementQueries(enriched, guard);
 }
 
@@ -931,6 +990,19 @@ export function persistentAuditFacadeSignal(page: Page, callerSignals: readonly 
 /** The page's renderer crashed; every later call on the page stalls until its timeout. */
 class RendererCrashedError extends ToolError {}
 
+/** Chrome ended the debugger attachment the page is driven through (omp browser relay); the page itself lives on. */
+class DebuggerDetachedError extends ToolError {
+	constructor(
+		readonly reason: string,
+		/** `during`: the run's code had started, so its input may already have landed. */
+		readonly when: "during" | "before",
+	) {
+		super(
+			`Chrome detached omp from this tab (${reason}) ${when === "during" ? "during this call" : "before this call, so its code did not run"}`,
+		);
+	}
+}
+
 export interface RunPageScope {
 	page: Page;
 	/** Remove ordinary cell listeners registered through this run's page facade. */
@@ -943,128 +1015,163 @@ export interface RunPageScope {
 class NavigationTimeoutError extends ToolError {}
 
 /**
- * Expose a cell-local page facade while preserving host-owned audit guards and worker handlers.
- * Ordinary listeners receive the facade and use distinct registrations so cleanup cannot remove host listeners.
+ * Expose the tab page while retaining every event handler created by this run.
+ * The facade removes only run-owned listeners, preserving worker-level routing,
+ * request logging, dialogs, console capture, and dedicated audit guards. Raw
+ * interception is restored to the tab's persistent route/allowlist state after a run.
+ *
+ * A listener added while the page delivers an event to a handler the run did not add
+ * remains host-owned; this avoids removing Puppeteer's in-flight request tracking.
  */
-
 export function createRunPageScope(
 	page: Page,
 	preserveRequestInterception = false,
 	restoreInterception?: () => Promise<void>,
 ): RunPageScope {
-	type ScopedListener = ((...args: unknown[]) => unknown) & { listener: Function };
-	const handlers = new Map<unknown, ScopedListener[]>();
-	const track = (type: unknown, handler: ScopedListener): void => {
-		const owned = handlers.get(type) ?? [];
-		owned.push(handler);
-		handlers.set(type, owned);
-	};
-	const untrack = (type: unknown, handler: ScopedListener): void => {
-		const owned = handlers.get(type);
-		if (!owned) return;
-		const index = owned.lastIndexOf(handler);
-		if (index >= 0) owned.splice(index, 1);
-		if (owned.length === 0) handlers.delete(type);
-	};
+	const handlers = new Map<unknown, Array<{ handler: Function; listener: (...args: unknown[]) => unknown }>>();
 	const on = page.on;
 	const off = page.off;
 	const once = page.once;
+	const emit = page.emit;
 	const setRequestInterception = page.setRequestInterception;
-	const boundMethods = new Map<PropertyKey, { source: Function; bound: (...args: unknown[]) => unknown }>();
+	const boundMethods = new WeakMap<Function, Function>();
 	let interceptionChanged = false;
-
-	// The audit bootstrap installs these guards before marking installation complete; later cell listeners stay scoped.
-	const isPersistentAuditGuard = (type: unknown): boolean => {
-		if (!preserveRequestInterception || typeof type !== "string") return false;
-		const auditState = (page as Page & { __browserAuditState?: { guardsInstalled?: boolean } }).__browserAuditState;
-		return auditState?.guardsInstalled === false && PERSISTENT_AUDIT_GUARD_EVENTS[type] === true;
+	// Frame.page() would otherwise escape a run-scoped mainFrame() back to the host Page.
+	const frameFacades = new WeakMap<object, ReturnType<Page["mainFrame"]>>();
+	const scopedFrame = (frame: ReturnType<Page["mainFrame"]>): ReturnType<Page["mainFrame"]> => {
+		const existing = frameFacades.get(frame);
+		if (existing) return existing;
+		const methods = new WeakMap<Function, Function>();
+		const facade = new Proxy(frame, {
+			get(target, property) {
+				if (property === "page") return () => scopedPage;
+				const value = Reflect.get(target, property, target);
+				if (typeof value !== "function") return value;
+				const cached = methods.get(value);
+				if (cached) return cached;
+				const bound = value.bind(target);
+				methods.set(value, bound);
+				return bound;
+			},
+		}) as ReturnType<Page["mainFrame"]>;
+		frameFacades.set(frame, facade);
+		return facade;
 	};
-
-	// Proxy the page instead of patching it: host services retain the raw page, so
-	// listeners they install during a run are not mistaken for cell-owned handlers.
-	const scopedPage: Page = new Proxy(page, {
-		get(target, prop) {
-			if (prop === "on") {
-				return (type: unknown, handler: unknown): Page => {
-					if (isPersistentAuditGuard(type) || typeof handler !== "function") {
-						Reflect.apply(on, page, [type, handler]);
-						return scopedPage;
-					}
-					const wrapper = (...args: unknown[]): unknown => Reflect.apply(handler, scopedPage, args);
-					wrapper.listener = handler;
-					Reflect.apply(on, page, [type, wrapper]);
-					track(type, wrapper);
-					return scopedPage;
-				};
+	const listenerFor =
+		(handler: Function): ((...args: unknown[]) => unknown) =>
+		(...args: unknown[]): unknown =>
+			Reflect.apply(handler, scopedPage, args);
+	const remember = (type: unknown, handler: Function): void => {
+		const listener = listenerFor(handler);
+		const owned = handlers.get(type);
+		const registration = { handler, listener };
+		if (owned) owned.push(registration);
+		else handlers.set(type, [registration]);
+		Reflect.apply(on, page, [type, listener]);
+	};
+	/** Remove run-owned registrations; reports whether any matched. */
+	const forget = (type: unknown, handler?: unknown): boolean => {
+		const owned = handlers.get(type);
+		if (!owned) return false;
+		if (handler === undefined) {
+			for (const registered of owned) Reflect.apply(off, page, [type, registered.listener]);
+			handlers.delete(type);
+			return true;
+		}
+		const index = owned.findIndex(registered => registered.handler === handler);
+		if (index < 0) return false;
+		Reflect.apply(off, page, [type, owned[index].listener]);
+		owned.splice(index, 1);
+		if (owned.length === 0) handlers.delete(type);
+		return true;
+	};
+	const isPersistentAuditGuard = (type: unknown): boolean =>
+		preserveRequestInterception && typeof type === "string" && PERSISTENT_AUDIT_GUARD_EVENTS[type] === true;
+	const scopedOn = (type: unknown, handler: unknown): Page => {
+		if (typeof handler === "function" && !isPersistentAuditGuard(type)) remember(type, handler);
+		else Reflect.apply(on, page, [type, handler]);
+		return scopedPage;
+	};
+	const scopedOnce = (type: unknown, handler: unknown): Page => {
+		if (typeof handler !== "function" || isPersistentAuditGuard(type)) {
+			Reflect.apply(once, page, [type, handler]);
+			return scopedPage;
+		}
+		const wrapper = (...args: unknown[]): unknown => {
+			forget(type, wrapper);
+			return Reflect.apply(handler, scopedPage, args);
+		};
+		remember(type, wrapper);
+		return scopedPage;
+	};
+	const scopedOff = (type: unknown, handler?: unknown): Page => {
+		forget(type, handler);
+		return scopedPage;
+	};
+	const scopedEmit = (type: unknown, event?: unknown): boolean => {
+		// Puppeteer defers every `request` listener to an interception action that runs after
+		// `emit` returns, so retain the event's enqueue method only for this synchronous dispatch.
+		const request = type === "request" && typeof event === "object" ? (event as HTTPRequest | null) : null;
+		const enqueue = request?.enqueueInterceptAction;
+		if (!request || typeof enqueue !== "function") return Reflect.apply(emit, page, [type, event]);
+		const enqueueDescriptor = Object.getOwnPropertyDescriptor(request, "enqueueInterceptAction");
+		Object.defineProperty(request, "enqueueInterceptAction", {
+			configurable: true,
+			value: (action: () => unknown): void => Reflect.apply(enqueue, request, [action]),
+		});
+		try {
+			return Reflect.apply(emit, page, [type, event]);
+		} finally {
+			// The tab's request log keeps requests well after the run; do not let them hold this scope.
+			if (enqueueDescriptor) Object.defineProperty(request, "enqueueInterceptAction", enqueueDescriptor);
+			else Reflect.deleteProperty(request, "enqueueInterceptAction");
+		}
+	};
+	const scopedRemoveAllListeners = (type?: unknown): Page => {
+		if (type !== undefined) forget(type);
+		else {
+			// Map iteration tolerates deletion of the current key by forget().
+			for (const ownedType of handlers.keys()) forget(ownedType);
+		}
+		return scopedPage;
+	};
+	const scopedSetRequestInterception = (value: boolean): Promise<void> => {
+		interceptionChanged = true;
+		return Reflect.apply(setRequestInterception, page, [value]);
+	};
+	const scopedPage = new Proxy(page, {
+		get(target, property) {
+			switch (property) {
+				case "on":
+					return scopedOn;
+				case "once":
+					return scopedOnce;
+				case "off":
+					return scopedOff;
+				case "emit":
+					return scopedEmit;
+				case "removeAllListeners":
+					return scopedRemoveAllListeners;
+				case "setRequestInterception":
+					return scopedSetRequestInterception;
+				case "mainFrame":
+					return () => scopedFrame(Reflect.apply(Reflect.get(target, property, target), target, []));
 			}
-			if (prop === "once") {
-				return (type: unknown, handler: unknown): Page => {
-					if (typeof handler !== "function") {
-						Reflect.apply(once, page, [type, handler]);
-						return scopedPage;
-					}
-					const wrapper = (...args: unknown[]): unknown => {
-						untrack(type, wrapper);
-						Reflect.apply(off, page, [type, wrapper]);
-						return Reflect.apply(handler, scopedPage, args);
-					};
-					wrapper.listener = handler;
-					track(type, wrapper);
-					Reflect.apply(on, page, [type, wrapper]);
-					return scopedPage;
-				};
-			}
-			if (prop === "off") {
-				return (type: unknown, handler?: unknown): Page => {
-					if (handler === undefined) {
-						for (const owned of handlers.get(type) ?? []) Reflect.apply(off, page, [type, owned]);
-						handlers.delete(type);
-					} else {
-						const owned = handlers.get(type);
-						if (owned) {
-							for (let index = owned.length - 1; index >= 0; index--) {
-								const wrapper = owned[index];
-								if (wrapper.listener !== handler) continue;
-								Reflect.apply(off, page, [type, wrapper]);
-								untrack(type, wrapper);
-								break;
-							}
-						}
-					}
-					return scopedPage;
-				};
-			}
-			if (prop === "removeAllListeners") {
-				return (type?: unknown): Page => {
-					const types = type === undefined ? [...handlers.keys()] : [type];
-					for (const event of types) {
-						for (const handler of handlers.get(event) ?? []) Reflect.apply(off, page, [event, handler]);
-						handlers.delete(event);
-					}
-					return scopedPage;
-				};
-			}
-			if (prop === "setRequestInterception") {
-				return (value: boolean): Promise<void> => {
-					interceptionChanged = true;
-					return Reflect.apply(setRequestInterception, page, [value]);
-				};
-			}
-			const value = Reflect.get(target, prop, target);
+			const value = Reflect.get(target, property, target);
 			if (typeof value !== "function") return value;
-			const cached = boundMethods.get(prop);
-			if (cached && cached.source === value) return cached.bound;
-			const bound = (...args: unknown[]): unknown => Reflect.apply(value, target, args);
-			boundMethods.set(prop, { source: value, bound });
+			const cached = boundMethods.get(value);
+			if (cached) return cached;
+			const bound = value.bind(target);
+			boundMethods.set(value, bound);
 			return bound;
 		},
-	});
+	}) as Page;
 
 	return {
 		page: scopedPage,
 		detach() {
 			for (const [type, owned] of handlers) {
-				for (const handler of owned) Reflect.apply(off, page, [type, handler]);
+				for (const registered of owned) Reflect.apply(off, page, [type, registered.listener]);
 			}
 			handlers.clear();
 		},
@@ -1073,10 +1180,10 @@ export function createRunPageScope(
 			try {
 				await withTimeout(
 					preserveRequestInterception
-						? page.setRequestInterception(true)
+						? Reflect.apply(setRequestInterception, page, [true])
 						: restoreInterception
 							? restoreInterception()
-							: page.setRequestInterception(false),
+							: Reflect.apply(setRequestInterception, page, [false]),
 					REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS,
 					"Timed out restoring browser request interception",
 				);
@@ -1096,6 +1203,8 @@ function errorPayload(error: unknown): RunErrorPayload {
 	const recoverTab = error instanceof RequestInterceptionCleanupError || undefined;
 	const navigationTimeout = error instanceof NavigationTimeoutError || undefined;
 	const rendererCrashed = error instanceof RendererCrashedError || undefined;
+	const debuggerDetached =
+		error instanceof DebuggerDetachedError ? { when: error.when, reason: error.reason } : undefined;
 	if (error instanceof ToolAbortError) {
 		return { name: error.name, message: error.message, stack: error.stack, isToolError: false, isAbort: true };
 	}
@@ -1109,6 +1218,7 @@ function errorPayload(error: unknown): RunErrorPayload {
 			recoverTab,
 			navigationTimeout,
 			rendererCrashed,
+			debuggerDetached,
 		};
 	}
 	if (error instanceof Error) {
@@ -1387,6 +1497,8 @@ interface ActiveRun {
 	/** Helper invocations currently awaiting the page/network, keyed by op id. */
 	inflight: Map<number, InflightOp>;
 	opCounter: number;
+	/** The run's code started, so input it sent may have reached the page. */
+	codeStarted: boolean;
 }
 
 /** Human-readable label for a screenshot op, used in op tracking + timeout errors. */
@@ -1439,6 +1551,8 @@ export class WorkerCore {
 	#uninstallRejectionGuard: () => void;
 	#mode?: WorkerInitPayload["mode"];
 	#activateForScreenshot = true;
+	/** The upload route this worker's browser connection takes, and the tab's staging folder. */
+	#uploads?: UploadStaging;
 	#dialogs?: RuntimeDialogController;
 	#console = new PageConsoleCapture();
 	#tracing?: BrowserTracingController;
@@ -1478,6 +1592,25 @@ export class WorkerCore {
 		this.#unanswered = null;
 		run.ac.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Browser tab's renderer crashed")));
 		const error = new RendererCrashedError("Browser tab's renderer crashed during this run");
+		this.#transport.send({ type: "result", id: run.id, ok: false, error: errorPayload(error) });
+	};
+
+	/**
+	 * The reason Chrome gave for ending the relay's debugger attachment on this tab (another extension's frame
+	 * loaded in it, or the user cancelled the debugging bar); `undefined` while attached. Every later page call
+	 * fails or stalls, so this worker runs nothing more and the supervisor re-adopts the tab on a new one.
+	 */
+	#debuggerDetached: string | undefined;
+	/** The omp browser relay's `OMP.debuggerDetached` event, sent to the page's sessions ahead of their detach. */
+	readonly #onDebuggerDetached = (params: unknown): void => {
+		if (this.#debuggerDetached !== undefined) return;
+		const reason = isRecord(params) && typeof params.reason === "string" ? params.reason : "no reason given";
+		this.#debuggerDetached = reason;
+		const run = this.#started ? this.#unanswered : null;
+		if (!run) return;
+		this.#unanswered = null;
+		run.ac.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Chrome detached omp from this tab")));
+		const error = new DebuggerDetachedError(reason, run.codeStarted ? "during" : "before");
 		this.#transport.send({ type: "result", id: run.id, ok: false, error: errorPayload(error) });
 	};
 
@@ -1581,6 +1714,7 @@ export class WorkerCore {
 		try {
 			this.#mode = payload.mode === "attach" && payload.emulateFocus ? "headless" : payload.mode;
 			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
+			this.#uploads = new UploadStaging(payload.uploadDir);
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			registerSemanticQueryHandlers(puppeteer);
 			this.#browser = await connectPuppeteer(puppeteer, {
@@ -1621,6 +1755,7 @@ export class WorkerCore {
 			this.#frameClient.on("Inspector.targetCrashed", this.#onPageCrashed);
 			await this.#frameClient.send("Inspector.enable");
 			this.#frameClient.on("Page.frameNavigated", this.#onFrameNavigated);
+			this.#frameClient.on("OMP.debuggerDetached", this.#onDebuggerDetached);
 			this.#dialogs = new RuntimeDialogController(page, (message, details) => this.#log("debug", message, details));
 			this.#dialogs.observe();
 			if (payload.dialogs) await this.#dialogs.setPolicy(payload.dialogs);
@@ -1784,6 +1919,11 @@ export class WorkerCore {
 			this.#transport.send({ type: "result", id: msg.id, ok: false, error: errorPayload(error) });
 			return;
 		}
+		if (this.#debuggerDetached !== undefined) {
+			const error = new DebuggerDetachedError(this.#debuggerDetached, "before");
+			this.#transport.send({ type: "result", id: msg.id, ok: false, error: errorPayload(error) });
+			return;
+		}
 		if (this.#active) {
 			this.#transport.send({
 				type: "result",
@@ -1813,6 +1953,7 @@ export class WorkerCore {
 			floatingFailure,
 			inflight: new Map(),
 			opCounter: 0,
+			codeStarted: false,
 		};
 		this.#active = active;
 		this.#unanswered = active;
@@ -1823,13 +1964,23 @@ export class WorkerCore {
 		let runPage: RunPageScope | undefined;
 		try {
 			throwIfAborted(signal);
+			await this.#requireEmulation().reapply();
 			runPage = createRunPageScope(
 				this.#requirePage(),
 				msg.preserveRequestInterception === true,
 				this.#network ? () => this.#network!.restoreInterception() : undefined,
 			);
 			const browser = this.#requireBrowser();
-			const tabApi = this.#createTabApi(msg.name, msg.timeoutMs, signal, msg.session, output, screenshots, active);
+			const tabApi = this.#createTabApi(
+				msg.name,
+				msg.timeoutMs,
+				signal,
+				msg.session,
+				output,
+				screenshots,
+				active,
+				runPage.page,
+			);
 			const runtime = this.#ensureRuntime(msg.session);
 			runtime.setCwd(msg.session.cwd);
 			const onFloatingRejection = (reason: unknown): void => this.#recordFloatingRejection(active, reason);
@@ -1945,7 +2096,7 @@ export class WorkerCore {
 			failure = this.#foldFloatingRejections(active, failure);
 			if (this.#active?.id === msg.id) this.#active = null;
 		}
-		// A renderer crash answers the run itself.
+		// A renderer crash or a debugger detach answers the run itself.
 		if (this.#unanswered !== active) return;
 		if (failure) {
 			this.#unanswered = null;
@@ -1995,6 +2146,12 @@ export class WorkerCore {
 			callTool: (name, args) => {
 				throwIfAborted(active.signal);
 				return this.#callTool(active, name, args);
+			},
+			// Compiling the cell can wait (the first run loads Babel); a detach (or any abort) then still ran nothing,
+			// and the cell must not run late either.
+			onEvaluate: () => {
+				throwIfAborted(active.signal);
+				active.codeStarted = true;
 			},
 		};
 	}
@@ -2155,6 +2312,7 @@ export class WorkerCore {
 		output: RunOutput,
 		screenshots: ScreenshotResult[],
 		active: ActiveRun,
+		pageFacade: Page,
 	): TabApi {
 		const page = this.#requirePage();
 		const dialogs = this.#dialogs;
@@ -2188,6 +2346,20 @@ export class WorkerCore {
 					this.#clearElementCache();
 					await this.#stopLoading();
 				},
+				{
+					route: sig => this.#requireUploads().route(page, sig),
+					prepare: (filePaths, label, route, sig) =>
+						prepareElementUpload(
+							page,
+							handle,
+							filePaths.map(filePath => resolveToCwd(filePath, session.cwd)),
+							label,
+							route,
+							this.#requireUploads(),
+							sig,
+						),
+					deliverGuard: (label, fn) => op(label, budgetBound, fn),
+				},
 			);
 		const action = <T>(
 			method: string,
@@ -2209,57 +2381,10 @@ export class WorkerCore {
 				{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
 			);
 		};
-		const navigate = (
-			method: "back" | "forward" | "reload",
-			opts?: { waitUntil?: NavigationWaitUntil },
-		): Promise<string> =>
-			op(`tab.${method}()`, budgetBound, async sig => {
-				this.#clearElementCache();
-				try {
-					return method === "reload"
-						? await reloadPage(page, opts?.waitUntil ?? "load", budgetBound, sig)
-						: await traverseHistory(page, method, opts?.waitUntil ?? "load", budgetBound, sig);
-				} catch (error) {
-					if (sig.aborted || (error instanceof Error && error.name === "TimeoutError")) await this.#stopLoading();
-					throw error;
-				}
-			});
 		return {
 			name,
-			page,
+			page: pageFacade,
 			signal,
-			back: opts => navigate("back", opts),
-			forward: opts => navigate("forward", opts),
-			reload: opts => navigate("reload", opts),
-			pushState: url => op("tab.pushState()", budgetBound, sig => pushState(page, url, sig)),
-			frames: () => op("tab.frames()", quickOpMs, sig => listFrames(page, sig)),
-			frame: selector =>
-				op("tab.frame()", quickOpMs, async sig =>
-					createFrameApi(await resolveFrame(page, selector, normalizeSelector, sig), {
-						quickOpMs,
-						actionOpMs,
-						zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS,
-						normalizeSelector,
-						waitMs,
-						// Page-level selector watchdogs cannot inspect a child document.
-						op: (label, deadline, fn) => op(label, deadline, fn),
-						captureScreenshot: (frame, target, frameSignal) =>
-							captureFrameScreenshot(
-								frame,
-								target,
-								frameSignal,
-								normalizeSelector,
-								session,
-								output,
-								screenshots,
-							),
-					}),
-				),
-			dialog: () => op("tab.dialog()", quickOpMs, async () => dialogs.state()),
-			handleDialog: opts =>
-				op("tab.handleDialog()", quickOpMs, sig => untilAborted(sig, () => dialogs.handle(opts))),
-			setDialogs: policy =>
-				op("tab.setDialogs()", quickOpMs, sig => untilAborted(sig, () => dialogs.setPolicy(policy))),
 			console: opts => op("tab.console()", quickOpMs, sig => untilAborted(sig, () => this.#console.console(opts))),
 			errors: opts => op("tab.errors()", quickOpMs, sig => untilAborted(sig, () => this.#console.errors(opts))),
 			clearConsole: () => op("tab.clearConsole()", quickOpMs, async () => this.#console.clear()),
@@ -2301,8 +2426,10 @@ export class WorkerCore {
 			mouseUp: opts => op("tab.mouseUp()", actionOpMs, sig => mouseUp(page, opts, sig)),
 			clickAt: (x, y, opts) => op("tab.clickAt()", actionOpMs, sig => clickAt(page, x, y, opts, sig)),
 			wheel: (x, y) => op("tab.wheel()", actionOpMs, sig => wheel(page, x, y, sig)),
-			text: selector => op("tab.text()", quickOpMs, sig => queryText(page, normalizeSelector(selector), sig)),
-			html: selector => op("tab.html()", quickOpMs, sig => queryHtml(page, normalizeSelector(selector), sig)),
+			text: selector =>
+				op("tab.text()", quickOpMs, sig => queryText(page, normalizeSelector(selector ?? "body"), sig)),
+			html: selector =>
+				op("tab.html()", quickOpMs, sig => queryHtml(page, normalizeSelector(selector ?? "body"), sig)),
 			value: selector => op("tab.value()", quickOpMs, sig => queryValue(page, normalizeSelector(selector), sig)),
 			attr: (selector, name) =>
 				op("tab.attr()", quickOpMs, sig => queryAttribute(page, normalizeSelector(selector), name, sig)),
@@ -2332,69 +2459,6 @@ export class WorkerCore {
 			initScripts: () => op("tab.initScripts()", quickOpMs, async () => initScripts.list()),
 			waitForDownload: opts => op("tab.waitForDownload()", waitMs(opts?.timeout), sig => downloads.wait(sig)),
 			downloads: () => op("tab.downloads()", quickOpMs, async () => downloads.list()),
-			cookies: opts => op("tab.cookies()", quickOpMs, sig => readCookies(page, opts, sig)),
-			setCookies: (...cookies) => op("tab.setCookies()", quickOpMs, sig => setPageCookies(page, cookies, sig)),
-			clearCookies: opts => op("tab.clearCookies()", quickOpMs, sig => clearPageCookies(page, opts, sig)),
-			storage: (kind, opts) => op("tab.storage()", quickOpMs, sig => readStorage(page, kind, opts, sig)),
-			setStorage: (kind, keyOrEntries, value) =>
-				op("tab.setStorage()", quickOpMs, sig => setPageStorage(page, kind, keyOrEntries, value, sig)),
-			clearStorage: kind => op("tab.clearStorage()", quickOpMs, sig => clearPageStorage(page, kind, sig)),
-			saveState: dest =>
-				op("tab.saveState()", quickOpMs, sig => saveStorageState(page, name, dest, session.cwd, sig)),
-			loadState: source =>
-				op("tab.loadState()", budgetBound, sig =>
-					loadStorageState(page, source, session.cwd, {
-						allowOtherOrigins: this.#mode === "headless",
-						navigationTimeoutMs: budgetBound,
-						signal: sig,
-					}),
-				),
-			route: (pattern, opts) => op("tab.route()", quickOpMs, sig => network.route(pattern, opts, sig)),
-			unroute: pattern => op("tab.unroute()", quickOpMs, sig => network.unroute(pattern, sig)),
-			routes: () => op("tab.routes()", quickOpMs, async () => network.routes()),
-			requests: opts => op("tab.requests()", quickOpMs, async () => network.requests(opts)),
-			request: id => op("tab.request()", quickOpMs, sig => network.request(id, sig)),
-			clearRequests: () => op("tab.clearRequests()", quickOpMs, async () => network.clearRequests()),
-			harStart: opts => op("tab.harStart()", quickOpMs, async () => network.harStart(opts?.content)),
-			harStop: opts =>
-				op("tab.harStop()", budgetBound, sig =>
-					network.harStop(
-						opts?.path
-							? resolveToCwd(opts.path, session.cwd)
-							: path.join(os.tmpdir(), `omp-browser-${Snowflake.next()}.har`),
-						sig,
-					),
-				),
-			allowedDomains: () => op("tab.allowedDomains()", quickOpMs, async () => network.allowedDomains()),
-			recordStart: (dest, opts) =>
-				op("tab.recordStart()", budgetBound, sig =>
-					this.#recording.start(createCdpRecordingSource(page), dest, session.cwd, opts, sig),
-				),
-			recordStop: () =>
-				op("tab.recordStop()", budgetBound, sig =>
-					this.#recording.stop({ signal: sig, output, excludeWebP: session.excludeWebP }),
-				),
-			recordRestart: (dest, opts) =>
-				op("tab.recordRestart()", budgetBound, sig =>
-					this.#recording.restart(createCdpRecordingSource(page), dest, session.cwd, opts, {
-						signal: sig,
-						output,
-						excludeWebP: session.excludeWebP,
-					}),
-				),
-			recording: () => op("tab.recording()", quickOpMs, async () => this.#recording.status()),
-			webmcpList: opts => op("tab.webmcpList()", quickOpMs, sig => untilAborted(sig, () => webmcp.list(opts))),
-			webmcpInvoke: (name, params, opts) =>
-				op("tab.webmcpInvoke()", waitMs(opts?.timeout), sig =>
-					untilAborted(sig, () => webmcp.invoke(name, params, { ...opts, timeout: waitMs(opts?.timeout) })),
-				),
-			webmcpEvents: opts => op("tab.webmcpEvents()", quickOpMs, sig => untilAborted(sig, () => webmcp.events(opts))),
-			vitals: opts => op("tab.vitals()", budgetBound, sig => collectVitals(puppeteerReactHost(page), opts, sig)),
-			reactEnable: () => op("tab.reactEnable()", budgetBound, sig => enableReact(puppeteerReactHost(page), sig)),
-			reactTree: opts => op("tab.reactTree()", quickOpMs, sig => readReactTree(page, opts, sig)),
-			reactInspect: id => op("tab.reactInspect()", quickOpMs, sig => inspectReactFiber(page, id, sig)),
-			reactRenders: opts => op("tab.reactRenders()", quickOpMs, sig => collectReactRenders(page, opts, sig)),
-			reactSuspense: opts => op("tab.reactSuspense()", quickOpMs, sig => readReactSuspense(page, opts, sig)),
 			url: () => page.url(),
 			title: () => op("tab.title()", INF, sig => untilAborted(sig, () => page.title())),
 			goto: (url, opts) =>
@@ -2450,12 +2514,6 @@ export class WorkerCore {
 						}
 					},
 				),
-			a11y: (options = {}) =>
-				op("tab.a11y()", budgetBound, async sig => {
-					const result = await untilAborted(sig, () => runA11yAudit(page, options));
-					output.push({ type: "text", text: formatA11ySummary(result) });
-					return result;
-				}),
 			screenshot: opts =>
 				op(describeScreenshot(opts), quickOpMs, sig =>
 					this.#captureScreenshot(session, output, screenshots, sig, opts),
@@ -2696,13 +2754,31 @@ export class WorkerCore {
 					sig => this.#select(selector, values, actionOpMs, sig),
 					{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
 				),
-			uploadFile: (selector, ...filePaths) =>
-				op(
-					`tab.uploadFile(${JSON.stringify(selector)})`,
-					actionOpMs,
-					sig => this.#uploadFile(selector, filePaths, actionOpMs, sig, session),
-					{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
-				),
+			uploadFile: (selector, ...filePaths) => {
+				const label = `tab.uploadFile(${JSON.stringify(selector)})`;
+				return markHandled(
+					(async () => {
+						if (!filePaths.length) throw new ToolError("tab.uploadFile() requires at least one file path");
+						// Its own deadline: the first upload's check must not eat into the wait for the selector.
+						const route = await op(`${label} checking how the browser takes files`, actionOpMs, sig =>
+							this.#requireUploads().route(page, sig),
+						);
+						const prepared = await op(
+							label,
+							actionOpMs,
+							sig => this.#prepareTabUpload(selector, filePaths, label, route, actionOpMs, sig, session),
+							{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
+						);
+						try {
+							await op(`${label} sending ${formatBytes(prepared.bytes)}`, budgetBound, sig =>
+								prepared.deliver(sig),
+							);
+						} finally {
+							await prepared.dispose();
+						}
+					})(),
+				);
+			},
 			waitForUrl: (pattern, opts) => {
 				const w = waitMs(opts?.timeout);
 				return op("tab.waitForUrl()", w, sig => this.#waitForUrl(pattern, w, sig));
@@ -2713,6 +2789,156 @@ export class WorkerCore {
 			},
 			id: async id => enrich(await this.#resolveCachedHandle(id)),
 			ref: async id => enrich(await this.#resolveAriaRef(id)),
+			cookies: opts => op("tab.cookies()", quickOpMs, sig => readCookies(page, opts, sig)),
+			setCookies: (...cookies) => op("tab.setCookies()", actionOpMs, sig => setPageCookies(page, cookies, sig)),
+			clearCookies: opts => op("tab.clearCookies()", actionOpMs, sig => clearPageCookies(page, opts, sig)),
+			storage: (kind, opts) => op("tab.storage()", quickOpMs, sig => readStorage(page, kind, opts, sig)),
+			setStorage: (kind, keyOrEntries, value) =>
+				op("tab.setStorage()", actionOpMs, sig => setPageStorage(page, kind, keyOrEntries, value, sig)),
+			clearStorage: kind => op("tab.clearStorage()", actionOpMs, sig => clearPageStorage(page, kind, sig)),
+			saveState: filePath =>
+				op("tab.saveState()", actionOpMs, sig => saveStorageState(page, name, filePath, session.cwd, sig)),
+			loadState: filePath =>
+				op("tab.loadState()", actionOpMs, sig =>
+					loadStorageState(page, filePath, session.cwd, {
+						allowOtherOrigins: this.#mode === "headless",
+						navigationTimeoutMs: actionOpMs,
+						signal: sig,
+					}),
+				),
+			recordStart: (destination, opts) =>
+				op(`tab.recordStart(${JSON.stringify(destination)})`, quickOpMs, sig =>
+					this.#recording.start(createCdpRecordingSource(page), destination, session.cwd, opts, sig),
+				),
+			recordStop: () =>
+				op("tab.recordStop()", budgetBound, sig =>
+					this.#recording.stop({ signal: sig, output, excludeWebP: session.excludeWebP }),
+				),
+			recordRestart: (destination, opts) =>
+				op("tab.recordRestart()", budgetBound, sig =>
+					this.#recording.restart(createCdpRecordingSource(page), destination, session.cwd, opts, {
+						signal: sig,
+						output,
+						excludeWebP: session.excludeWebP,
+					}),
+				),
+			recording: () => op("tab.recording()", quickOpMs, () => Promise.resolve(this.#recording.status())),
+			webmcpList: opts => op("tab.webmcpList()", quickOpMs, sig => untilAborted(sig, () => webmcp.list(opts))),
+			webmcpInvoke: (toolName, params, opts) => {
+				const w = waitMs(opts?.timeout);
+				return op(`tab.webmcpInvoke(${JSON.stringify(toolName)})`, w, sig =>
+					untilAborted(sig, () => webmcp.invoke(toolName, params, opts)),
+				);
+			},
+			webmcpEvents: opts => op("tab.webmcpEvents()", quickOpMs, sig => untilAborted(sig, () => webmcp.events(opts))),
+			a11y: opts =>
+				op("tab.a11y()", budgetBound, async sig => {
+					const result = await untilAborted(sig, () => runA11yAudit(page, opts));
+					output.push({ type: "text", text: formatA11ySummary(result) });
+					return result;
+				}),
+			vitals: opts => op("tab.vitals()", INF, sig => collectVitals(puppeteerReactHost(page), opts, sig)),
+			reactEnable: () => op("tab.reactEnable()", INF, sig => enableReact(puppeteerReactHost(page), sig)),
+			reactTree: opts => op("tab.reactTree()", quickOpMs, sig => readReactTree(page, opts, sig)),
+			reactInspect: id => op(`tab.reactInspect(${id})`, quickOpMs, sig => inspectReactFiber(page, id, sig)),
+			reactRenders: opts => op("tab.reactRenders()", quickOpMs, sig => collectReactRenders(page, opts, sig)),
+			reactSuspense: opts => op("tab.reactSuspense()", quickOpMs, sig => readReactSuspense(page, opts, sig)),
+			back: opts =>
+				op("tab.back()", INF, async sig => {
+					this.#clearElementCache();
+					return await traverseHistory(page, "back", opts?.waitUntil ?? "load", budgetBound, sig);
+				}),
+			forward: opts =>
+				op("tab.forward()", INF, async sig => {
+					this.#clearElementCache();
+					return await traverseHistory(page, "forward", opts?.waitUntil ?? "load", budgetBound, sig);
+				}),
+			reload: opts =>
+				op("tab.reload()", INF, async sig => {
+					this.#clearElementCache();
+					return await reloadPage(page, opts?.waitUntil ?? "load", budgetBound, sig);
+				}),
+			pushState: url =>
+				op(`tab.pushState(${JSON.stringify(url)})`, actionOpMs, async sig => {
+					this.#clearElementCache();
+					return await pushState(page, url, sig);
+				}),
+			frames: () => op("tab.frames()", quickOpMs, sig => listFrames(page, sig)),
+			frame: selectorOrNameOrUrl =>
+				op(`tab.frame(${JSON.stringify(selectorOrNameOrUrl)})`, quickOpMs, async sig => {
+					const frame = await resolveFrame(page, selectorOrNameOrUrl, normalizeSelector, sig);
+					return createFrameApi(frame, {
+						quickOpMs,
+						actionOpMs,
+						zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS,
+						normalizeSelector,
+						waitMs,
+						op,
+						captureScreenshot: (target, selector, screenshotSignal) =>
+							captureFrameScreenshot(
+								target,
+								selector,
+								screenshotSignal,
+								normalizeSelector,
+								session,
+								output,
+								screenshots,
+							),
+					});
+				}),
+			dialog: () =>
+				op("tab.dialog()", quickOpMs, async sig => {
+					throwIfAborted(sig);
+					return this.#requireDialogs().state();
+				}),
+			handleDialog: opts =>
+				op("tab.handleDialog()", actionOpMs, sig => untilAborted(sig, () => this.#requireDialogs().handle(opts))),
+			setDialogs: policy =>
+				op("tab.setDialogs()", actionOpMs, sig =>
+					untilAborted(sig, () => this.#requireDialogs().setPolicy(policy)),
+				),
+			route: (pattern, opts) =>
+				op("tab.route()", actionOpMs, sig =>
+					untilAborted(sig, () => this.#requireNetwork().route(pattern, opts, sig)),
+				),
+			unroute: pattern =>
+				op("tab.unroute()", actionOpMs, sig =>
+					untilAborted(sig, () => this.#requireNetwork().unroute(pattern, sig)),
+				),
+			routes: () =>
+				op("tab.routes()", quickOpMs, async sig => {
+					throwIfAborted(sig);
+					return this.#requireNetwork().routes();
+				}),
+			requests: opts =>
+				op("tab.requests()", quickOpMs, async sig => {
+					throwIfAborted(sig);
+					return this.#requireNetwork().requests(opts);
+				}),
+			request: id =>
+				op("tab.request()", quickOpMs, sig => untilAborted(sig, () => this.#requireNetwork().request(id, sig))),
+			clearRequests: () =>
+				op("tab.clearRequests()", quickOpMs, async sig => {
+					throwIfAborted(sig);
+					this.#requireNetwork().clearRequests();
+				}),
+			harStart: opts =>
+				op("tab.harStart()", quickOpMs, async sig => {
+					throwIfAborted(sig);
+					this.#requireNetwork().harStart(opts?.content);
+				}),
+			harStop: opts =>
+				op("tab.harStop()", INF, sig => {
+					const destination = opts?.path
+						? resolveToCwd(opts.path, session.cwd)
+						: path.join(session.cwd, `browser-${name.replace(/[^a-z0-9_-]+/gi, "-")}-${Snowflake.next()}.har`);
+					return untilAborted(sig, () => this.#requireNetwork().harStop(destination, sig));
+				}),
+			allowedDomains: () =>
+				op("tab.allowedDomains()", quickOpMs, async sig => {
+					throwIfAborted(sig);
+					return this.#requireNetwork().allowedDomains();
+				}),
 		};
 	}
 
@@ -2965,26 +3191,39 @@ export class WorkerCore {
 		}
 	}
 
-	async #uploadFile(
+	/** Find what takes a `tab.uploadFile` under the action deadline; the result owns the resolved handle. */
+	async #prepareTabUpload(
 		selector: string,
 		filePaths: string[],
+		label: string,
+		route: UploadRoute,
 		timeoutMs: number,
 		signal: AbortSignal,
 		session: SessionSnapshot,
-	): Promise<void> {
-		if (!filePaths.length) throw new ToolError("tab.uploadFile() requires at least one file path");
+	): Promise<PreparedUpload> {
+		const page = this.#requirePage();
 		const handle = await this.#resolveActionHandle(selector, timeoutMs, signal);
 		try {
 			const absolute = filePaths.map(filePath => resolveToCwd(filePath, session.cwd));
-			await uploadFilesToElement(
-				this.#requirePage(),
+			const prepared = await prepareElementUpload(
+				page,
 				handle,
 				absolute,
-				`tab.uploadFile(${JSON.stringify(selector)})`,
+				label,
+				route,
+				this.#requireUploads(),
 				signal,
 			);
-		} finally {
+			return {
+				...prepared,
+				dispose: async () => {
+					await prepared.dispose();
+					await handle.dispose().catch(() => undefined);
+				},
+			};
+		} catch (error) {
 			await handle.dispose().catch(() => undefined);
+			throw error;
 		}
 	}
 
@@ -3150,6 +3389,41 @@ export class WorkerCore {
 	#requirePage(): Page {
 		if (!this.#page) throw new ToolError("Tab worker is not initialized");
 		return this.#page;
+	}
+
+	#requireUploads(): UploadStaging {
+		if (!this.#uploads) throw new ToolError("Tab worker is not initialized");
+		return this.#uploads;
+	}
+
+	#requireDialogs(): RuntimeDialogController {
+		if (!this.#dialogs) throw new ToolError("Tab worker dialog handling is not initialized");
+		return this.#dialogs;
+	}
+
+	#requireNetwork(): BrowserNetworkManager {
+		if (!this.#network) throw new ToolError("Tab worker network manager is not initialized");
+		return this.#network;
+	}
+
+	#requireTracing(): BrowserTracingController {
+		if (!this.#tracing) throw new ToolError("Tab worker tracing is not initialized");
+		return this.#tracing;
+	}
+
+	#requireInitScripts(): InitScriptManager {
+		if (!this.#initScripts) throw new ToolError("Tab worker init scripts are not initialized");
+		return this.#initScripts;
+	}
+
+	#requireDownloads(): DownloadManager {
+		if (!this.#downloads) throw new ToolError("Tab worker downloads are not initialized");
+		return this.#downloads;
+	}
+
+	#requireEmulation(): BrowserEmulationController {
+		if (!this.#emulation) throw new ToolError("Tab worker emulation is not initialized");
+		return this.#emulation;
 	}
 
 	#requireBrowser(): Browser {

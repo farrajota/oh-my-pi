@@ -412,6 +412,16 @@ export class TranscriptContainer extends Container {
 		return this.#entries.map(entry => entry.emitted);
 	}
 
+	/** Whether any block is still streaming or otherwise unfinalized. */
+	hasActiveBlock(): boolean {
+		this.#syncEntries();
+		this.#settleFinalized();
+		for (let index = this.#frontier; index < this.#entries.length; index++) {
+			if (this.#entries[index]!.state === "active") return true;
+		}
+		return false;
+	}
+
 	/** Whether visible active capacity and live-block memory permit another admission. */
 	canAdmit(rows: number): boolean {
 		const active = this.#entries.filter(entry => entry.state === "active").length;
@@ -643,9 +653,13 @@ export class TranscriptContainer extends Container {
 		return drop > 0 ? output.slice(drop) : output;
 	}
 
-	/** Offers stable-head emission or the shortest finalized prefix needed under pressure. */
-	peekFinalizedBatch(width: number, capacity: number): HistoryBatch | undefined {
-		return this.#peekBatch(width, capacity, "pressure");
+	/** Offers retirement under pressure; `compactTail` opts into compact-layout capacity. */
+	peekFinalizedBatch(
+		width: number,
+		capacity: number,
+		options?: { readonly compactTail?: boolean },
+	): HistoryBatch | undefined {
+		return this.#peekBatch(width, capacity, "pressure", options?.compactTail === true);
 	}
 
 	/** Returns only a prepared complete replay, never a normal retirement offer. */
@@ -718,7 +732,12 @@ export class TranscriptContainer extends Container {
 		return offered.batch;
 	}
 
-	#peekBatch(width: number, capacity: number, policy: RetirementPolicy): HistoryBatch | undefined {
+	#peekBatch(
+		width: number,
+		capacity: number,
+		policy: RetirementPolicy,
+		compactTail = false,
+	): HistoryBatch | undefined {
 		this.#syncEntries();
 		this.#settleFinalized();
 		if (this.#offered !== undefined) return this.#offered.batch;
@@ -744,14 +763,14 @@ export class TranscriptContainer extends Container {
 				? head
 				: undefined;
 
-		// Measure the live tail newest-first and stop at the first block that
-		// does not fit: `keep` counts the leading blocks bound for scrollback,
-		// and everything behind them stays unmeasured. Measuring the whole live
-		// region costs one full render per block, which on a resumed session's
-		// first paint is every message it ever had (#12933). The progressive
-		// append path below needs the exact live height to size its emission,
-		// and only runs while a streaming head pins retirement.
+		// Measure the live tail newest-first. `keep` counts the leading blocks
+		// bound for scrollback; progressive append scans all blocks for exact
+		// physical height. Opt-in compact-tail pressure uses the compositor's
+		// budget (one row per nonempty block), not natural separators; all other
+		// callers retain the physical-height budget. Avoiding a full walk on
+		// ordinary pressure limits first-paint cost on resumed sessions (#12933).
 		let tailRows = 0;
+		let tailBlocks = 0;
 		let liveRows = 0;
 		let keep = 0;
 		let fits = true;
@@ -760,12 +779,15 @@ export class TranscriptContainer extends Container {
 			const height = this.#liveBlockRows(candidate.entry, candidate.index, width).length;
 			if (height > 0) liveRows += height + (liveRows > 0 ? 1 : 0);
 			if (fits) {
-				const next = height > 0 ? tailRows + height + (tailRows > 0 ? 1 : 0) : tailRows;
+				const compactPressure = compactTail && policy === "pressure" && appendHead === undefined;
+				const nextRows = tailRows + (height > 0 ? height + (tailRows > 0 ? 1 : 0) : 0);
+				const next = compactPressure ? tailBlocks + (height > 0 ? 1 : 0) : nextRows;
 				if (next > room) {
 					fits = false;
 					keep = cursor + 1;
 				} else {
-					tailRows = next;
+					if (height > 0) tailBlocks++;
+					tailRows = nextRows;
 				}
 			}
 			if (!fits && appendHead === undefined) break;

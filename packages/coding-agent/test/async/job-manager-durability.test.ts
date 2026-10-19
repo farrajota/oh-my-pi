@@ -56,6 +56,39 @@ describe("AsyncJobManager durable custody", () => {
 		expect(recovered.getOutput(id)?.source).toBe("none");
 	});
 
+	test("publishes a completed durable incarnation with reserved identity and delivery", async () => {
+		const store = new DurableHubStore(journalPath());
+		const delivered: Array<{ jobId: string; text: string }> = [];
+		const manager = new AsyncJobManager({ durableStore: store });
+		manager.registerDeliverySink("owner", async (jobId, text) => {
+			delivered.push({ jobId, text });
+		});
+		const id = manager.publishCompleted(
+			"task",
+			"published",
+			{ text: "finished" },
+			{
+				id: "published-job",
+				ownerId: "owner",
+				agentId: "agent",
+			},
+		);
+
+		expect(id).toBe("published-job");
+		expect(manager.getJob(id, { ownerId: "owner" })).toMatchObject({
+			id,
+			status: "completed",
+			ownerId: "owner",
+			agentId: "agent",
+			resultText: "finished",
+		});
+		expect(manager.getJob(id, { ownerId: "other" })).toBeUndefined();
+		expect(store.reserve("job", id, crypto.randomUUID())).toBe(false);
+
+		expect(await manager.drainDeliveries({ timeoutMs: 1_000 })).toBe(true);
+		expect(delivered).toEqual([{ jobId: id, text: "finished" }]);
+	});
+
 	test("quarantines a delivery whose external effect threw instead of retrying it", async () => {
 		const journal = journalPath();
 		const attempted = Promise.withResolvers<void>();

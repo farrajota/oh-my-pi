@@ -12,7 +12,6 @@
 import { artifactsDirsForContext, artifactsDirsFromRegistry, isBoundResourceContext } from "./registry-helpers";
 import { ArtifactManager } from "../session/artifacts";
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import artifactDoc from "../prompts/internal-urls/artifact.md" with { type: "text" };
@@ -103,9 +102,18 @@ async function listArtifactIds(dirs: readonly string[]): Promise<string[]> {
 async function resolveArtifactFile(url: InternalUrl, context?: ResolveContext): Promise<ResolvedArtifactFile> {
 	const id = parseArtifactId(url);
 
-	const dirs = artifactsDirsForContext(context);
-	if (isBoundResourceContext(context) && dirs.length === 0) {
+	// Seance artifact reads are limited to the consulted source tree.
+	const seanceDir = context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir;
+	const bound = isBoundResourceContext(context);
+	const pinnedDir = context?.localProtocolOptions?.getArtifactsDir?.() ?? null;
+	const dirs = seanceDir ? [seanceDir] : bound ? artifactsDirsForContext(context) : artifactsDirsFromRegistry();
+	if (bound && dirs.length === 0) {
 		throw new Error("No caller-owned artifacts available");
+	}
+	// Artifact ids are per-session counters; resolve the caller's own id first.
+	if (!seanceDir && pinnedDir && dirs.includes(pinnedDir)) {
+		dirs.splice(dirs.indexOf(pinnedDir), 1);
+		dirs.unshift(pinnedDir);
 	}
 	if (dirs.length === 0) throw new MissingArtifactError("No session - artifacts unavailable");
 
@@ -115,7 +123,6 @@ async function resolveArtifactFile(url: InternalUrl, context?: ResolveContext): 
 		foundPath = await manager.getPath(id);
 		if (foundPath) break;
 	}
-
 	if (!foundPath) {
 		const available = await listArtifactIds(dirs);
 		const detail = available.length > 0 ? `. Available: ${available.join(", ")}` : "";
@@ -171,9 +178,10 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 	}
 
 	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {
-		const ids = isBoundResourceContext(context)
-			? await listArtifactIds(artifactsDirsForContext(context))
-			: await artifactIdsForCompletion();
+		const seanceDir = context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir;
+		const dirs = seanceDir ? [seanceDir] : artifactsDirsForContext(context);
+		const ids =
+			isBoundResourceContext(context) || seanceDir ? await listArtifactIds(dirs) : await artifactIdsForCompletion();
 		return ids.map(value => ({ value }));
 	}
 }

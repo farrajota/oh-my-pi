@@ -102,7 +102,8 @@ function isModelRole(role: string): role is ModelRole {
 
 /** Available models eligible for a role, including keyless runner models. */
 export function roleCandidatePool(role: string, settings: Settings, registry: ModelBrowserRegistry): Model[] {
-	return registry.getAvailable("all").filter(getRoleInfo(role, settings).accepts);
+	const accepts = getRoleInfo(role, settings).accepts;
+	return registry.getAvailable("all").filter((model): model is Model => model !== undefined && accepts(model));
 }
 
 /**

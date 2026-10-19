@@ -141,6 +141,7 @@ function createContext(viewSession = source()) {
 		flushPendingCommandOutput() {},
 		syncRetryHintRow() {},
 		editor: { getText: () => "" },
+		composer: { setRunActive() {} },
 		viewSession,
 		session: viewSession,
 	};

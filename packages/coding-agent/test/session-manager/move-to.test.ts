@@ -677,6 +677,41 @@ describe("SessionManager.moveTo", () => {
 		await session.close();
 	});
 
+	it("rolls back only source artifacts after a later failure in an existing destination", async () => {
+		const session = SessionManager.create(cwdA, path.join(testAgentDir, "custom"));
+		await session.ensureOnDisk();
+		const oldFile = session.getSessionFile()!;
+		const oldArtifacts = oldFile.slice(0, -6);
+		await fsp.mkdir(oldArtifacts);
+		await Bun.write(path.join(oldArtifacts, "owned.log"), "source-owned");
+
+		const destinationDir = path.join(testAgentDir, "destination");
+		await fsp.mkdir(destinationDir);
+		const destinationFile = path.join(destinationDir, path.basename(oldFile));
+		const destinationArtifacts = destinationFile.slice(0, -6);
+		await fsp.mkdir(destinationArtifacts);
+		await Bun.write(path.join(destinationArtifacts, "preexisting.log"), "destination-owned");
+
+		const link = fs.promises.link.bind(fs.promises);
+		const linkSpy = spyOn(fs.promises, "link").mockImplementation(async (from, to) => {
+			await link(from, to);
+			if (from.toString() === path.join(oldArtifacts, "owned.log")) {
+				await fsp.unlink(destinationFile);
+				await fsp.writeFile(destinationFile, "replacement session");
+			}
+		});
+		try {
+			await expect(session.moveTo(cwdB, destinationDir)).rejects.toThrow("destination identity changed");
+		} finally {
+			linkSpy.mockRestore();
+		}
+
+		expect(await fsp.readFile(path.join(oldArtifacts, "owned.log"), "utf8")).toBe("source-owned");
+		expect(await fsp.readFile(path.join(destinationArtifacts, "preexisting.log"), "utf8")).toBe("destination-owned");
+		expect(fs.existsSync(path.join(destinationArtifacts, "owned.log"))).toBe(false);
+		await session.close();
+	});
+
 	it("retains the source when cross-device source cleanup fails", async () => {
 		const session = SessionManager.create(cwdA, path.join(testAgentDir, "custom"));
 		await session.ensureOnDisk();

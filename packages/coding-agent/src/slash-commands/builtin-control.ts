@@ -1,6 +1,6 @@
 import { runPauseScreen } from "@oh-my-pi/pi-tui/overlays/pause-screen";
 import { clearSubmittedText } from "./helpers/draft";
-import { shutdownHandlerTui } from "./builtin-lifecycle";
+import { shutdownHandlerTui } from "./helpers/shutdown";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
 import type { SlashCommandSpec } from "./types";
 

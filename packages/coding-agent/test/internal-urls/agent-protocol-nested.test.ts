@@ -284,6 +284,37 @@ it("agent:// completion is registry-bounded and independent of raw filenames", a
 		{ value: "Tampered" },
 	]);
 });
+
+it("agent:// seance resolution and completion stay inside the consulted source tree", async () => {
+	const root = path.join(tempDir.path(), "seance-source");
+	const sourceArtifactsDir = path.join(root, "artifacts");
+	const sourceManager = new ArtifactManager(sourceArtifactsDir);
+	await sourceManager.publishAgentArtifacts("SourceOutput", "source output content");
+
+	const unrelatedArtifactsDir = path.join(tempDir.path(), "unrelated-artifacts");
+	const unrelatedManager = new ArtifactManager(unrelatedArtifactsDir);
+	const unrelatedSession = {
+		sessionManager: { getArtifactsDir: () => unrelatedManager.dir },
+	} as unknown as AgentSession;
+	const registry = AgentRegistry.global();
+	registry.register({
+		id: "UnrelatedRegisteredAgent",
+		displayName: "UnrelatedRegisteredAgent",
+		kind: "sub",
+		parentId: "Main",
+		session: unrelatedSession,
+	});
+	const context = { seanceSourceArtifactsDir: sourceArtifactsDir, agentRegistry: registry } as never;
+	const handler = new AgentProtocolHandler();
+
+	await expect(handler.resolve(new URL("agent://SourceOutput") as never, context)).resolves.toMatchObject({
+		content: "source output content",
+	});
+	await expect(handler.resolve(new URL("agent://UnrelatedRegisteredAgent") as never, context)).rejects.toThrow(
+		"Not found: UnrelatedRegisteredAgent",
+	);
+	await expect(handler.complete(undefined, context)).resolves.toEqual([{ value: "SourceOutput" }]);
+});
 it("agent:// marks a published output as the previous run while the agent streams a newer turn", async () => {
 	const root = tempDir.path();
 	const rootSessionFile = path.join(root, "superseded-session.jsonl");

@@ -1816,6 +1816,7 @@ function mapOptionsForApi<TApi extends Api>(
 		repetitionPenalty: options?.repetitionPenalty,
 		maxTokens: options?.maxTokens ?? model.maxTokens ?? undefined,
 		signal: options?.signal,
+		maxHttpAttempts: options?.maxHttpAttempts,
 		apiKey: apiKey ?? (typeof options?.apiKey === "string" ? options.apiKey : undefined),
 		credentialId: options?.credentialId,
 		oauthIdentity: options?.oauthIdentity,
@@ -2111,6 +2112,7 @@ function mapOptionsForApi<TApi extends Api>(
 				codexCompaction: options?.codexCompaction,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
 				textVerbosity: options?.textVerbosity,
+				disableReasoning: options?.disableReasoning,
 				forceReasoningOff: options?.forceReasoningOff,
 			});
 
@@ -2162,11 +2164,13 @@ function mapOptionsForApi<TApi extends Api>(
 		case "google-gemini-cli": {
 			const reasoning = options?.reasoning;
 			const toolChoice = mapGoogleToolChoice(options?.toolChoice);
+			const usesGoogleThinkingLevel =
+				model.thinking?.mode === "google-level" || /^gemini-(?:3|4)(?:-|$)/i.test(model.id);
 			if (reasoning && model.reasoning && !options?.disableReasoning && !options?.forceReasoningOff) {
 				const effort = requireSupportedEffort(model, reasoning);
 
 				// Gemini 3+ models use thinkingLevel instead of thinkingBudget
-				if (model.thinking?.mode === "google-level") {
+				if (usesGoogleThinkingLevel) {
 					return castApi<"google-gemini-cli">({
 						...base,
 						requestModelId: resolveWireModelId(model, effort),
@@ -2209,7 +2213,7 @@ function mapOptionsForApi<TApi extends Api>(
 			if (model.reasoning && model.thinking?.suppressWhenOff) {
 				// CCA re-applies the per-id baked server default when the config
 				// is omitted; suppression must be explicit on the wire.
-				thinking.suppress = model.thinking.mode === "google-level" ? { level: "MINIMAL" } : { budget: 0 };
+				thinking.suppress = usesGoogleThinkingLevel ? { level: "MINIMAL" } : { budget: 0 };
 			}
 			return castApi<"google-gemini-cli">({
 				...base,

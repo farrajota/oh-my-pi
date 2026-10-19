@@ -37,6 +37,18 @@ const enum ToolCallStatus {
  */
 export const MAX_TOOL_CALL_ID_LENGTH = 64;
 
+/** Replace unsupported tool-call ID characters and cap the result for strict replay providers. */
+export function normalizeToolCallId(id: string, maxLength = MAX_TOOL_CALL_ID_LENGTH): string {
+	return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, maxLength);
+}
+
+const TOOL_CALL_ID_PATTERN = new RegExp(`^[a-zA-Z0-9_-]{1,${MAX_TOOL_CALL_ID_LENGTH}}$`);
+
+/** Whether `id` already satisfies the strict 1–64 `[a-zA-Z0-9_-]` tool-call ID contract. */
+export function isValidToolCallId(id: string): boolean {
+	return TOOL_CALL_ID_PATTERN.test(id);
+}
+
 /**
  * OpenAI Responses-family APIs mint composite tool ids (`call_id|item_id`);
  * opaque Chat Completions ids do not (openai-completions preserves same-model
@@ -452,10 +464,25 @@ export function shouldDropTruncatedThinkingOnlyAssistant(msg: AssistantMessage):
 	return isTruncatedStop && !msg.content.some(block => block.type === "toolCall" || block.type === "text");
 }
 
+/**
+ * Whether `msg` reaches a replay as an assistant turn, so it can be the latest
+ * surviving one: {@link sanitizeMalformedToolCalls} drops its malformed tool
+ * calls, then {@link shouldDropTruncatedThinkingOnlyAssistant} a truncated
+ * turn left with no text and no tool call. On an already sanitized list this
+ * is `!shouldDropTruncatedThinkingOnlyAssistant(msg)`.
+ */
+export function isSurvivingAssistant(msg: AssistantMessage): boolean {
+	const isTruncatedStop = msg.stopReason === "length" || msg.stopReason === "error" || msg.stopReason === "aborted";
+	if (msg.content.length === 0) return !isTruncatedStop;
+	return msg.content.some(block =>
+		block.type === "toolCall" ? !isMalformedToolCall(block) : !isTruncatedStop || block.type === "text",
+	);
+}
+
 function getLatestSurvivingAssistantIndex(messages: readonly Message[]): number {
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
 		const msg = messages[index]!;
-		if (msg.role === "assistant" && !shouldDropTruncatedThinkingOnlyAssistant(msg)) {
+		if (msg.role === "assistant" && isSurvivingAssistant(msg)) {
 			return index;
 		}
 	}
@@ -524,12 +551,6 @@ function targetReplaysPlaintextReasoning(model: Model, compat: Model["compat"]):
 	}
 }
 
-const ANTHROPIC_TOOL_CALL_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
-
-function isValidAnthropicToolCallId(id: string): boolean {
-	return ANTHROPIC_TOOL_CALL_ID_PATTERN.test(id);
-}
-
 function fallbackAnthropicToolCallId(originalId: string): string {
 	return `toolu_${Bun.hash(originalId).toString(36)}`;
 }
@@ -538,12 +559,11 @@ function normalizeAnthropicTargetToolCallId<TApi extends Api>(
 	id: string,
 	model: Model<TApi>,
 	source: AssistantMessage,
-	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
+	normalizeId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
 ): string {
-	if (isValidAnthropicToolCallId(id)) return id;
-	const normalized =
-		normalizeToolCallId?.(id, model, source) ?? id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, MAX_TOOL_CALL_ID_LENGTH);
-	if (isValidAnthropicToolCallId(normalized)) return normalized;
+	if (isValidToolCallId(id)) return id;
+	const normalized = normalizeId?.(id, model, source) ?? normalizeToolCallId(id);
+	if (isValidToolCallId(normalized)) return normalized;
 	return fallbackAnthropicToolCallId(id);
 }
 
@@ -1121,17 +1141,13 @@ export function transformMessages<TApi extends Api>(
 
 				if (block.type === "fallback") {
 					// Server-side-fallback boundary marker (Anthropic beta
-					// `server-side-fallback-2026-06-01`). Only the official
-					// Anthropic endpoint accepts this block on replay: every
-					// other target either rejects unknown content blocks with a
-					// 400 (anthropic-compatible endpoints like Umans/Z.AI/MiniMax,
-					// and older omp gateways whose schema pre-dates this feature)
-					// or throws in its converter (Bedrock). Even the official
-					// replay path only accepts the block when the current request
-					// itself opts into the beta — but we don't know that here, so
-					// keep it and let `convertAnthropicMessages` re-check the
-					// per-request opt-in before serializing.
-					if (isAnthropicTarget && model.compat.officialEndpoint) return block;
+					// `server-side-fallback-2026-06-01`). Keep it for every
+					// Anthropic-messages target: `convertAnthropicMessages` decides
+					// per request whether the marker can go on the wire (official
+					// endpoint + beta opt-in), and when it cannot, the boundary is
+					// what tells it which model's signed reasoning to keep. Every
+					// other API rejects the block or throws in its converter.
+					if (isAnthropicTarget) return block;
 					return [];
 				}
 

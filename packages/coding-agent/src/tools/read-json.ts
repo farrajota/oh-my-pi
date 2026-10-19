@@ -21,7 +21,7 @@ import { parseSel } from "./read-selector";
 import { throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-const JSON_FILE_PATTERN = /\.(?:jsonl?|ndjson)$/i;
+const JSON_FILE_PATTERN = /(?:\.(?:jsonl?|ndjson)|\.json\.log)$/i;
 const DEFAULT_JSON_QUERY_LIMIT = 100;
 const MAX_JSON_QUERY_LIMIT = 1000;
 const MAX_QUERY_CAPTURE_CHARS = 5 * 1024 * 1024;

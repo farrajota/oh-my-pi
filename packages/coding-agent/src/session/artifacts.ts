@@ -278,19 +278,24 @@ export class ArtifactManager {
 	#initPromise: Promise<void> | null = null;
 	#existingIds = new Set<string>();
 	readonly #ready: Promise<void> | undefined;
+	readonly #reservedIdsDir: string | undefined;
 
 	/**
 	 * @param dir Directory that will hold artifact files. Created lazily on first save.
 	 * @param ready Settles once `dir` is seeded (a session move copying the previous
 	 *   session's artifacts in the background). Id scans and lookups wait for it,
 	 *   so new ids never collide with copied ones. Must not reject.
+	 * @param reservedIdsDir Read-only directory whose ids stay reserved: a seance
+	 *   fork allocates past its source's ids so `artifact://<n>` from the inherited
+	 *   transcript keeps naming the source artifact.
 	 */
-	constructor(dir: string, ready?: Promise<void>) {
+	constructor(dir: string, ready?: Promise<void>, reservedIdsDir?: string) {
 		this.#dir = dir;
 		this.#stateDir = path.join(dir, ".artifact-state-v1");
 		this.#stagingDir = path.join(dir, ".artifact-staging-v1");
 		this.#namedStateDir = path.join(dir, ".artifact-named-state-v1");
 		this.#ready = ready;
+		this.#reservedIdsDir = reservedIdsDir;
 	}
 
 	get dir(): string {
@@ -320,6 +325,16 @@ export class ArtifactManager {
 		for (const entry of entries) {
 			const match = /^(\d+)\..*\.log$/.exec(entry.name);
 			if (match) this.#existingIds.add(match[1]);
+		}
+		if (this.#reservedIdsDir) {
+			try {
+				for (const name of await fs.readdir(this.#reservedIdsDir)) {
+					const match = /^(\d+)\..*\.log$/.exec(name);
+					if (match) this.#existingIds.add(match[1]);
+				}
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
 		}
 	}
 

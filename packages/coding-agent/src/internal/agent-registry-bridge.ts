@@ -47,7 +47,11 @@ interface AgentRegistryBridge {
 	lookupAuthorityLineage(parentId: string): { readonly rootId: string; readonly parentId: string } | undefined;
 	operationAuthority(parent: AgentSession): BoundSessionOperationAuthority | undefined;
 	createRootSession(options?: CreateAgentSessionOptions): Promise<CreateAgentSessionResult>;
-	setHistory(expected: InternalAgentRef | AgentSession, history: AgentHistorySummary): boolean;
+	setHistory(
+		expected: InternalAgentRef | AgentSession,
+		history: AgentHistorySummary,
+		expectedSessionFile?: string,
+	): boolean;
 	setStatus(id: string, status: AgentStatus, expected: InternalAgentRef | AgentSession): boolean;
 	attachSession(
 		id: string,
@@ -145,8 +149,9 @@ export function setAgentHistory(
 	registry: AgentRegistry,
 	expected: InternalAgentRef | AgentSession,
 	history: AgentHistorySummary,
+	expectedSessionFile?: string,
 ): boolean {
-	return bridgeFor(registry).setHistory(expected, history);
+	return bridgeFor(registry).setHistory(expected, history, expectedSessionFile);
 }
 
 export function setAgentStatus(

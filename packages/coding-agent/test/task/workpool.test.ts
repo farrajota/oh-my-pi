@@ -43,6 +43,7 @@ const POLICY = {
 	agentName: "scout",
 	agent: AGENT,
 	effectiveAgent: AGENT,
+	structured: true,
 	schema: { schema: undefined, source: "none", mode: "permissive", outputSchemaOverridesAgent: false },
 	planMode: false,
 	isIsolated: false,
@@ -261,6 +262,46 @@ describe("WorkPool dispatch", () => {
 		await finishPool(session, workpool);
 	});
 
+	it("marks only the submitted error item failed after a mixed-result batch", async () => {
+		const session = await makeSession([], 1);
+		const first = Promise.withResolvers<void>();
+		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
+			await first.promise;
+			const id = request.identity?.id ?? "missing";
+			markIdle(id);
+			return execution(id);
+		});
+		vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async options => {
+			markIdle(options.id);
+			return {
+				...singleResult(
+					options.id,
+					JSON.stringify({ "mixed#2": { error: "review unavailable" }, "mixed#3": { ok: true } }),
+				),
+				extractedToolData: {
+					yield: [
+						{
+							status: "success",
+							type: ["mixed#2"],
+							error: "review unavailable",
+							data: { error: "review unavailable" },
+						},
+						{ status: "success", type: ["mixed#3"], data: { ok: true }, complete: true },
+					],
+				},
+			};
+		});
+		const workpool = pool(session, "mixed");
+		workpool.push(["warmup"]);
+		await until(() => workpool.agents[0]?.state === "running");
+		workpool.push(["failed review", "independent review"]);
+		await until(() => workpool.agents[0]?.queue.length === 2);
+		first.resolve();
+		await finishPool(session, workpool);
+		expect(workpool.batches[1]?.status).toBe("completed");
+		expect(workpool.items.map(item => item.status)).toEqual(["completed", "failed", "completed"]);
+		expect(workpool.batches[1]?.output).toContain("review unavailable");
+	});
 	it("tombstones the worker session when clearing the yield contract fails", async () => {
 		const session = await makeSession([], 1);
 		const registry = session.agentRegistry;

@@ -1,4 +1,6 @@
+import { SEANCE_SLASH_COMMAND } from "./seance";
 import { clearSubmittedText } from "./helpers/draft";
+import { shutdownHandlerTui } from "./helpers/shutdown";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
@@ -23,27 +25,12 @@ import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-pro
 import { resolveToCwd } from "../tools/path-utils";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
 import { handleSshAcp } from "./helpers/ssh";
-import type {
-	ParsedSlashCommand,
-	SlashCommandResult,
-	SlashCommandRuntime,
-	SlashCommandSpec,
-	TuiSlashCommandRuntime,
-} from "./types";
+import type { SlashCommandResult, SlashCommandRuntime, SlashCommandSpec } from "./types";
 
 function formatFreshSessionResult(result: FreshSessionResult): string {
 	const stateLabel = result.closedProviderSessions === 1 ? "provider state" : "provider states";
 	return `Fresh provider session started (${result.closedProviderSessions} ${stateLabel} pruned).`;
 }
-
-export const shutdownHandlerTui = (
-	_command: ParsedSlashCommand,
-	runtime: TuiSlashCommandRuntime,
-): SlashCommandResult => {
-	clearSubmittedText(runtime);
-	void runtime.ctx.shutdown();
-	return commandConsumed();
-};
 
 /** Parse the `/shake` subcommand into a {@link ShakeMode}; empty defaults to elide. */
 function parseShakeMode(args: string): ShakeMode | { error: string } {
@@ -161,7 +148,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		description: "Start a new session",
 		handleTui: async (_command, runtime) => {
 			clearSubmittedText(runtime);
-			await runtime.ctx.handleClearCommand();
+			await runtime.ctx.handleNewCommand();
 		},
 	},
 	{
@@ -368,6 +355,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			await runtime.ctx.handleHandoffCommand(customInstructions);
 		},
 	},
+	SEANCE_SLASH_COMMAND,
 	{
 		name: "resume",
 		icon: "history",
@@ -562,6 +550,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				case "view": {
 					const payload = await backend.buildDeveloperInstructions(
 						runtime.settings.getAgentDir(),
+						runtime.cwd,
 						runtime.settings,
 						runtime.session,
 					);

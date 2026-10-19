@@ -47,6 +47,7 @@ import {
 	installRegisteredBrowserAuditBinding,
 	takeBrowserAuditRunCapability,
 } from "../../src/internal/browser-audit-authority";
+import { cfgTaskDisabledAgents, cfgTaskEnableEffort, cfgTaskStructured } from "@oh-my-pi/pi-coding-agent/task/settings";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -61,6 +62,13 @@ const scoutAgent: AgentDefinition = {
 	systemPrompt: "Inspect the repository without editing files.",
 	source: "bundled",
 	tools: ["read"],
+};
+
+const seanceAgent: AgentDefinition = {
+	name: "seance",
+	description: "Consult a saved session",
+	systemPrompt: "Consult the source session.",
+	source: "bundled",
 };
 
 function settingHandle(id: string) {
@@ -165,6 +173,7 @@ describe("task.batch schema gating", () => {
 		const onProperties = getSchemaProperties(on);
 		expect(onProperties.tasks).toBeDefined();
 		expect(onProperties.context).toBeDefined();
+		expect(onProperties.model).toBeUndefined();
 		// The batch shape is { context, tasks[] } — the per-spawn fields live
 		// only inside the task items.
 		expect(onProperties.task).toBeUndefined();
@@ -199,7 +208,7 @@ describe("task.batch schema gating", () => {
 		expect(tool.description).not.toContain("general-purpose worker");
 		expect(tool.description).not.toContain("default worker");
 		expect(tool.description).toContain("Omit `agent` when the spawn-policy default is the best fit");
-		expect(tool.description).toContain("### scout (READ-ONLY)");
+		expect(tool.description).toMatch(/^### scout \(READ-ONLY(?:;[^)]*)?\)$/m);
 	});
 
 	it("hides effort by default and exposes it when task.allowEffortOverride is enabled", async () => {
@@ -265,6 +274,25 @@ describe("task.batch schema gating", () => {
 					expect(tool.description).not.toContain("- `model`:");
 				}
 			}
+		}
+	});
+	it("keeps seance sourceSession available while gating its model field", async () => {
+		mockDiscovery(seanceAgent);
+
+		for (const allowModelOverride of [false, true]) {
+			const tool = await TaskTool.create(
+				createSession({
+					settings: { "task.batch": true, "task.allowModelOverride": allowModelOverride },
+				}),
+			);
+			const properties = getSchemaProperties(tool);
+			expect(properties.context).toBeDefined();
+			expect(properties.tasks).toBeDefined();
+			expect(properties.model).toBeUndefined();
+			const itemProperties = getBatchItemProperties(tool);
+
+			expect(itemProperties.sourceSession).toBeDefined();
+			expect(itemProperties.model !== undefined).toBe(allowModelOverride);
 		}
 	});
 
@@ -359,6 +387,31 @@ describe("task.batch schema gating", () => {
 		expect(getBatchItemProperties(batch).schemaMode).toBeUndefined();
 		expect(batch.description).not.toContain("outputSchema");
 	});
+
+	it("explains structured result navigation with task.structured off only while a visible agent opts in", async () => {
+		mockDiscovery([
+			taskAgent,
+			{ ...taskAgent, name: "reporter", description: "Reports a verdict", structured: true },
+		]);
+		const session = createSession({ settings: { "task.batch": true, "async.enabled": true } });
+		const tool = await TaskTool.create(session);
+		const navigation = "nested `/reports/0/data`";
+
+		const optedIn = tool.description;
+		expect(optedIn).toContain(navigation);
+		expect(optedIn).toContain("### reporter (STRUCTURED: schema result)\nReports a verdict");
+		expect(optedIn).not.toContain("outputSchema");
+		expect(optedIn).not.toContain("schemaMode");
+
+		cfgTaskDisabledAgents.override(session.settings, ["reporter"]);
+		expect(tool.description).not.toContain(navigation);
+
+		cfgTaskDisabledAgents.override(session.settings, []);
+		cfgTaskStructured.override(session.settings, true);
+		const settingOn = tool.description;
+		expect(settingOn).toContain("`outputSchema` parsed payload, even invalid");
+		expect(settingOn).not.toContain("STRUCTURED");
+	});
 });
 
 describe("task.batch validation", () => {
@@ -372,6 +425,17 @@ describe("task.batch validation", () => {
 		const result = await tool.execute("tool-call", params);
 		return getFirstText(result);
 	}
+
+	it("reports missing tasks as a failed tool result instead of a successful refusal", async () => {
+		mockDiscovery();
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
+		const result = await tool.execute("missing-tasks", {
+			context: "<tasks><task>Inspect the project</task></tasks>",
+		});
+
+		expect(getFirstText(result)).toContain("Missing `tasks`");
+		expect(result.isError).toBe(true);
+	});
 
 	it("rejects the stale schema argument regardless of batch mode", async () => {
 		for (const batch of [false, true]) {
@@ -1418,9 +1482,8 @@ describe("task exact preparation", () => {
 			expect(capturedOptions?.restrictToolNames).toBe(true);
 			expect(capturedOptions?.enableIrc).toBe(false);
 			expect(capturedOptions?.enableLsp).toBe(false);
-			for (const channel of ["preloadedExtensionPaths", "preloadedCustomToolPaths"] as const) {
-				expect(Object.hasOwn(capturedOptions ?? {}, channel)).toBe(false);
-			}
+			expect(capturedOptions?.preloadedExtensionPaths).toEqual([]);
+			expect(capturedOptions?.preloadedCustomToolPaths).toEqual([]);
 		} finally {
 			temp.removeSync();
 		}

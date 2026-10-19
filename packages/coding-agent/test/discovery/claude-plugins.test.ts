@@ -116,6 +116,8 @@ describe("listClaudePluginRoots", () => {
 			fs.mkdir(path.join(gitProject, ".git"), { recursive: true }),
 			fs.mkdir(globalConfigRoot, { recursive: true }),
 		]);
+		const nestedProject = path.join(gitProject, "packages", "app");
+		await fs.mkdir(path.join(nestedProject, ".omp", "agent"), { recursive: true });
 
 		expect(await resolveActiveProjectRegistryPath(ompProject)).toBe(
 			path.join(ompProject, ".omp", "plugins", "installed_plugins.json"),
@@ -123,9 +125,10 @@ describe("listClaudePluginRoots", () => {
 		expect(await resolveActiveProjectRegistryPath(gitProject)).toBe(
 			path.join(gitProject, ".omp", "plugins", "installed_plugins.json"),
 		);
-		expect(await resolveOrDefaultProjectRegistryPath(path.join(tempDir, "unanchored"))).toBe(
-			path.join(tempDir, "unanchored", ".omp", "plugins", "installed_plugins.json"),
+		expect(await resolveActiveProjectRegistryPath(path.join(nestedProject, "src"))).toBe(
+			path.join(nestedProject, ".omp", "plugins", "installed_plugins.json"),
 		);
+		expect(await resolveOrDefaultProjectRegistryPath(path.join(tempDir, "unanchored"))).toBeUndefined();
 		expect(await resolveActiveProjectRegistryPath(tempDir)).toBeNull();
 		expect(await resolveOrDefaultProjectRegistryPath(tempDir)).toBeUndefined();
 		expect(await resolveActiveProjectRegistryPath(globalConfigRoot)).toBeNull();
@@ -144,8 +147,25 @@ describe("listClaudePluginRoots", () => {
 		expect(await resolveActiveProjectRegistryPath(project)).toBe(
 			path.join(project, ".custom-omp", "plugins", "installed_plugins.json"),
 		);
-		expect(await resolveOrDefaultProjectRegistryPath(path.join(tempDir, "relative-unanchored"))).toBe(
-			path.join(tempDir, "relative-unanchored", ".custom-omp", "plugins", "installed_plugins.json"),
+		expect(await resolveOrDefaultProjectRegistryPath(path.join(tempDir, "relative-unanchored"))).toBeUndefined();
+		expect(
+			await resolveOrDefaultProjectRegistryPath(path.relative(process.cwd(), path.join(tempDir, "relative-cwd"))),
+		).toBeUndefined();
+	});
+
+	test("falls back for an unanchored path outside shared discovery ceilings", async () => {
+		const project = path.join(path.parse(tempDir).root, `omp-project-fallback-${path.basename(tempDir)}`);
+		const relativeProject = path.join(project, "relative-cwd");
+		expect(await fs.stat(project).catch(() => null)).toBeNull();
+		expect(await resolveOrDefaultProjectRegistryPath(project)).toBe(
+			path.join(project, ".omp", "plugins", "installed_plugins.json"),
+		);
+
+		process.env.PI_CONFIG_DIR = ".custom-omp";
+		const relativeCwd = path.relative(process.cwd(), relativeProject);
+		expect(await fs.stat(relativeProject).catch(() => null)).toBeNull();
+		expect(await resolveOrDefaultProjectRegistryPath(relativeCwd)).toBe(
+			path.join(relativeProject, ".custom-omp", "plugins", "installed_plugins.json"),
 		);
 	});
 

@@ -30,7 +30,7 @@ import {
 	normalizeEffectivePermissionSummary,
 	type PermissionScopeSnapshot,
 } from "../task/permission-profiles";
-import { copyBrowserAuditSessionCapability } from "../internal/browser-audit-authority";
+import { copyBrowserAuditSessionCapability } from "../internal/browser-audit-session-capabilities";
 import {
 	bindSessionOperationAuthority,
 	bindSessionOperationDurability,
@@ -397,7 +397,8 @@ export class AgentRegistry {
 			lookupAuthoritySession: parent => this.#lookupAuthoritySession(parent),
 			lookupAuthorityLineage: parentId => this.#lookupAuthorityLineage(parentId),
 			createRootSession: options => this.#createRootSession(options),
-			setHistory: (expected, history) => this.#setHistoryInternal(expected, history),
+			setHistory: (expected, history, expectedSessionFile) =>
+				this.#setHistoryInternal(expected, history, expectedSessionFile),
 			setStatus: (id, status, expected) => this.#setStatusInternal(id, status, expected),
 			attachSession: (id, session, sessionFile, expected) =>
 				this.#attachSessionInternal(id, session, sessionFile, expected),
@@ -1502,23 +1503,53 @@ export class AgentRegistry {
 		return ref ? this.#observe(ref) : undefined;
 	}
 
-	#mergeHistory(ref: RegistryAgentRef, history: AgentHistorySummary): true {
+	#mergeHistory(ref: RegistryAgentRef, history: AgentHistorySummary, expectedSessionFile?: string): true {
 		const permissionSummary = normalizeEffectivePermissionSummary(history.permissionSummary);
 		const definedHistory = Object.fromEntries(
 			Object.entries({ ...history, permissionSummary }).filter(([, value]) => value !== undefined),
 		) as AgentHistorySummary;
+		// A complete transcript scan owns these attribution fields, including an explicit clear when no leaf is selected.
+		if (Object.hasOwn(history, "resolvedModel")) definedHistory.resolvedModel = history.resolvedModel;
+		if (Object.hasOwn(history, "resolvedModelIsFallback")) {
+			definedHistory.resolvedModelIsFallback = history.resolvedModelIsFallback;
+		}
+		const previousDirectCost = ref.history?.directCost;
+		const incomingDirectCost = definedHistory.directCost;
+		// Both writes are cumulative snapshots of this exact transcript. A delayed
+		// scan must not replace a newer park-time snapshot; unscoped updates retain
+		// their normal last-write semantics.
+		if (
+			expectedSessionFile !== undefined &&
+			typeof previousDirectCost === "number" &&
+			Number.isFinite(previousDirectCost) &&
+			previousDirectCost >= 0 &&
+			typeof incomingDirectCost === "number" &&
+			Number.isFinite(incomingDirectCost) &&
+			incomingDirectCost >= 0
+		) {
+			definedHistory.directCost = Math.max(previousDirectCost, incomingDirectCost);
+		}
 		ref.history = { ...ref.history, ...definedHistory };
 		this.#emit({ type: "metadata_changed", ref });
 		return true;
 	}
 
-	#setHistoryInternal(expected: RegistryAgentRef | AgentSession, history: AgentHistorySummary): boolean {
+	#setHistoryInternal(
+		expected: RegistryAgentRef | AgentSession,
+		history: AgentHistorySummary,
+		expectedSessionFile?: string,
+	): boolean {
 		const capability = this.#sessionCapabilities.get(expected as AgentSession);
 		const actorId = capability ? this.#assertCapability(capability).actorId : (expected as RegistryAgentRef).id;
 		if (typeof actorId !== "string") return false;
 		const ref = this.#refs.get(actorId);
 		if (!ref || !this.#matchesInternalExpected(ref, expected)) return false;
-		return this.#mergeHistory(ref, history);
+		if (expectedSessionFile !== undefined && ref.sessionFile !== expectedSessionFile) return false;
+		return this.#mergeHistory(
+			ref,
+			history,
+			expectedSessionFile ?? (capability ? (ref.sessionFile ?? undefined) : undefined),
+		);
 	}
 
 	/** Publish display metadata only from the exact live authority session that owns the registry row. */
@@ -1536,7 +1567,7 @@ export class AgentRegistry {
 			(expectedSessionFile !== undefined && ref.sessionFile !== expectedSessionFile)
 		)
 			return false;
-		return this.#mergeHistory(ref, history);
+		return this.#mergeHistory(ref, history, expectedSessionFile);
 	}
 
 	/** Merge history only when the frozen observation still names the exact current legacy row. */
@@ -1674,7 +1705,12 @@ export class AgentRegistry {
 	#attachSession(ref: RegistryAgentRef, session: AgentSession, sessionFile?: string | null): boolean {
 		if (ref.status === "aborted") return false;
 		ref.session = session;
-		if (sessionFile !== undefined) ref.sessionFile = sessionFile;
+		if (sessionFile !== undefined) {
+			if (ref.sessionFile !== sessionFile && ref.history?.directCost !== undefined) {
+				ref.history = { ...ref.history, directCost: undefined };
+			}
+			ref.sessionFile = sessionFile;
+		}
 		ref.lastActivity = Date.now();
 		return true;
 	}
@@ -1698,9 +1734,8 @@ export class AgentRegistry {
 		expected?: AgentRefExpectation,
 	): boolean {
 		const ref = this.#refs.get(id);
-		return Boolean(
-			ref && this.#matchesPublicExpected(ref, expected) && this.#attachSession(ref, session, sessionFile),
-		);
+		if (!ref || !this.#matchesPublicExpected(ref, expected)) return false;
+		return this.#attachSession(ref, session, sessionFile);
 	}
 
 	#detachSessionInternal(id: string, expected: RegistryAgentRef | AgentSession): boolean {

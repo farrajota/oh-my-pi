@@ -11,6 +11,7 @@ import { restoreEnvValue } from "../helpers/settings-test-state";
 import { createLspWritethrough, LspTool } from "@oh-my-pi/pi-coding-agent/lsp";
 import * as lspClient from "@oh-my-pi/pi-coding-agent/lsp/client";
 import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
+import * as lspMuxDaemon from "../../src/lsp/mux/daemon";
 import {
 	configCache,
 	getConfig,
@@ -171,7 +172,7 @@ function installFakeLsp(handler: FakeLspHandler, options?: FakeLspOptions): Fake
 	let killed = false;
 	let spawnCount = 0;
 	let stdoutStopped = false;
-	let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+	const stdoutControllers: ReadableStreamDefaultController<Uint8Array>[] = [];
 	const { promise: exited, resolve: resolveExited } = Promise.withResolvers<number>();
 
 	const frame = (message: RpcMessage): Uint8Array => {
@@ -179,22 +180,21 @@ function installFakeLsp(handler: FakeLspHandler, options?: FakeLspOptions): Fake
 		return encoder.encode(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`);
 	};
 
-	const stdout = new ReadableStream<Uint8Array>({
-		start(c) {
-			controller = c;
-		},
-	});
-
 	const server: FakeLspServer = {
 		received,
 		send(message) {
-			if (controller && exitCode === null && !stdoutStopped) controller.enqueue(frame(message));
+			if (exitCode === null) {
+				for (const controller of stdoutControllers) controller.enqueue(frame(message));
+			}
 		},
 		exit(code = 0) {
 			if (exitCode !== null) return;
-			if (!stdoutStopped) {
-				stdoutStopped = true;
-				controller?.close();
+			for (const controller of stdoutControllers) {
+				try {
+					controller.close();
+				} catch {
+					// A process may already have closed its own output stream.
+				}
 			}
 			if (options?.stdoutClosesBeforeExit) {
 				queueMicrotask(() => {
@@ -209,7 +209,7 @@ function installFakeLsp(handler: FakeLspHandler, options?: FakeLspOptions): Fake
 		failStdout(error) {
 			if (stdoutStopped) return;
 			stdoutStopped = true;
-			controller?.error(error);
+			for (const controller of stdoutControllers) controller.error(error);
 		},
 		get killed() {
 			return killed;
@@ -265,32 +265,34 @@ function installFakeLsp(handler: FakeLspHandler, options?: FakeLspOptions): Fake
 		});
 	};
 
-	const proc = {
-		get exited() {
-			return exited;
-		},
-		get exitCode() {
-			return exitCode;
-		},
-		stdin: {
-			write(chunk: string | Uint8Array) {
-				feed(chunk);
-				return typeof chunk === "string" ? Buffer.byteLength(chunk, "utf-8") : chunk.byteLength;
-			},
-			flush: async () => 0,
-			end: async () => 0,
-		},
-		stdout,
-		peekStderr: () => options?.stderr ?? "",
-		kill() {
-			killed = true;
-			if (options?.killResolvesExit !== false) server.exit(0);
-		},
-	} as unknown as LspClient["proc"];
-
 	vi.spyOn(piUtils.ptree, "spawn").mockImplementation((() => {
 		spawnCount++;
-		return proc as unknown as piUtils.ptree.ChildProcess<"pipe">;
+		return {
+			get exited() {
+				return exited;
+			},
+			get exitCode() {
+				return exitCode;
+			},
+			stdin: {
+				write(chunk: string | Uint8Array) {
+					feed(chunk);
+					return typeof chunk === "string" ? Buffer.byteLength(chunk, "utf-8") : chunk.byteLength;
+				},
+				flush: async () => 0,
+				end: async () => 0,
+			},
+			stdout: new ReadableStream<Uint8Array>({
+				start(controller) {
+					stdoutControllers.push(controller);
+				},
+			}),
+			peekStderr: () => options?.stderr ?? "",
+			kill() {
+				killed = true;
+				if (options?.killResolvesExit !== false) server.exit(0);
+			},
+		} as unknown as piUtils.ptree.ChildProcess<"pipe">;
 	}) as typeof piUtils.ptree.spawn);
 	return server;
 }
@@ -413,7 +415,7 @@ describe("lsp regressions", () => {
 		expect(arkToWireSchema(lspSchema)).toMatchObject({
 			properties: {
 				timeout: {
-					description: "Timeout in seconds (default 20; range 5–300).",
+					description: "Timeout in seconds; raises or lowers the default (range 5–300).",
 					maximum: 300,
 					minimum: 5,
 				},
@@ -488,7 +490,7 @@ describe("lsp regressions", () => {
 		}
 	});
 
-	it("reuses one client when concurrent sessions use opposite shared-LSP policies", async () => {
+	it("isolates private LSP clients by session while reusing shared clients across sessions", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-session-policy-");
 		try {
 			const server = installHandshakeLsp();
@@ -498,16 +500,28 @@ describe("lsp regressions", () => {
 				fileTypes: [".ts"],
 				rootMarkers: [],
 			};
-			const privateClientPromise = lspClient.withLspSessionPolicy({ shared: false }, () =>
+			const privatePolicyA = { shared: false };
+			const privateClientA = await lspClient.withLspSessionPolicy(privatePolicyA, () =>
 				lspClient.getOrCreateClient(config, tempDir.path(), 1_000),
 			);
-			const sharedClientPromise = lspClient.withLspSessionPolicy({ shared: true }, () =>
+			const privateClientAAgain = await lspClient.withLspSessionPolicy(privatePolicyA, () =>
 				lspClient.getOrCreateClient(config, tempDir.path(), 1_000),
 			);
-			const [privateClient, sharedClient] = await Promise.all([privateClientPromise, sharedClientPromise]);
-			expect(privateClient).toBe(sharedClient);
-			expect(privateClient.proc).toBe(sharedClient.proc);
-			expect(server.spawnCount).toBe(1);
+			const privateClientB = await lspClient.withLspSessionPolicy({ shared: false }, () =>
+				lspClient.getOrCreateClient(config, tempDir.path(), 1_000),
+			);
+			const sharedClientA = await lspClient.withLspSessionPolicy({ shared: true }, () =>
+				lspClient.getOrCreateClient(config, tempDir.path(), 1_000),
+			);
+			const sharedClientB = await lspClient.withLspSessionPolicy({ shared: true }, () =>
+				lspClient.getOrCreateClient(config, tempDir.path(), 1_000),
+			);
+
+			expect(privateClientA).toBe(privateClientAAgain);
+			expect(privateClientB).not.toBe(privateClientA);
+			expect(sharedClientA).not.toBe(privateClientA);
+			expect(sharedClientB).toBe(sharedClientA);
+			expect(server.spawnCount).toBe(3);
 		} finally {
 			await lspClient.shutdownAll();
 			tempDir.removeSync();
@@ -4861,7 +4875,9 @@ describe("lsp regressions", () => {
 				initOptions: { generation: 1 },
 				settings: { diagnostics: false },
 			};
-			const oldClient = await lspClient.getOrCreateClient(oldConfig, tempDir.path(), 1_000);
+			const oldClient = await lspClient.withLspSessionPolicy({ shared: true }, () =>
+				lspClient.getOrCreateClient(oldConfig, tempDir.path(), 1_000),
+			);
 
 			const newServer = installHandshakeLsp();
 			const newConfig: ServerConfig = {
@@ -4875,9 +4891,11 @@ describe("lsp regressions", () => {
 				idleTimeoutMs: undefined,
 			});
 
-			const tool = new LspTool(makeLspSession(tempDir.path()));
+			const tool = new LspTool({ ...makeLspSession(tempDir.path()), lspShared: true } as ToolSession);
 			const result = await tool.execute("reload-client-identity", { action: "reload", file: "*" });
-			const newClient = await lspClient.getActiveOrPendingClient(newConfig, tempDir.path());
+			const newClient = await lspClient.withLspSessionPolicy({ shared: true }, () =>
+				lspClient.getActiveOrPendingClient(newConfig, tempDir.path()),
+			);
 
 			expect(newClient).toBeDefined();
 			expect(newClient).not.toBe(oldClient);
@@ -4915,7 +4933,9 @@ describe("lsp regressions", () => {
 				fileTypes: [".ts"],
 				rootMarkers: [],
 			};
-			await lspClient.getOrCreateClient(oldConfig, tempDir.path(), 1_000);
+			await lspClient.withLspSessionPolicy({ shared: true }, () =>
+				lspClient.getOrCreateClient(oldConfig, tempDir.path(), 1_000),
+			);
 
 			const newServer = installHandshakeLsp();
 			const newConfig: ServerConfig = { ...oldConfig, args: ["--mode", "new"] };
@@ -4923,13 +4943,15 @@ describe("lsp regressions", () => {
 				servers: { "fake-lsp": newConfig },
 				idleTimeoutMs: undefined,
 			});
-			const reload = new LspTool(makeLspSession(tempDir.path())).execute("reload-fresh-race", {
-				action: "reload",
-				file: "*",
-			});
+			const reload = new LspTool({ ...makeLspSession(tempDir.path()), lspShared: true } as ToolSession).execute(
+				"reload-fresh-race",
+				{ action: "reload", file: "*" },
+			);
 			const shutdown = await oldServer.waitFor(message => message.method === "shutdown");
 			const spawnCountBefore = newServer.spawnCount;
-			const concurrentFresh = lspClient.getOrCreateClient(newConfig, tempDir.path(), 1_000);
+			const concurrentFresh = lspClient.withLspSessionPolicy({ shared: true }, () =>
+				lspClient.getOrCreateClient(newConfig, tempDir.path(), 1_000),
+			);
 			expect(newServer.spawnCount).toBe(spawnCountBefore);
 			expect(newServer.received.some(message => message.method === "initialize")).toBe(false);
 
@@ -4984,6 +5006,7 @@ describe("lsp regressions", () => {
 	it("workspace reload waits for a stale pending client before starting its replacement", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-reload-pending-");
 		try {
+			vi.spyOn(lspMuxDaemon, "connectSharedLspTransport").mockResolvedValue(null);
 			const oldServer = installFakeLsp((message, server) => {
 				if (message.method === "shutdown") {
 					server.send({ jsonrpc: "2.0", id: message.id, result: null });
@@ -4997,7 +5020,9 @@ describe("lsp regressions", () => {
 				fileTypes: [".ts"],
 				rootMarkers: [],
 			};
-			const oldClientPromise = lspClient.getOrCreateClient(oldConfig, tempDir.path(), 1_000);
+			const oldClientPromise = lspClient.withLspSessionPolicy({ shared: true }, () =>
+				lspClient.getOrCreateClient(oldConfig, tempDir.path(), 1_000),
+			);
 			const oldOutcome = oldClientPromise.then(
 				() => "resolved",
 				error => String(error),
@@ -5010,12 +5035,14 @@ describe("lsp regressions", () => {
 				servers: { "fake-lsp": newConfig },
 				idleTimeoutMs: undefined,
 			});
-			const tool = new LspTool(makeLspSession(tempDir.path()));
+			const tool = new LspTool({ ...makeLspSession(tempDir.path()), lspShared: true } as ToolSession);
 			const reload = tool.execute("reload-pending-client", { action: "reload", file: "*" });
-			const concurrentOldOutcome = lspClient.getOrCreateClient(oldConfig, tempDir.path(), 1_000).then(
-				() => "resolved",
-				error => String(error),
-			);
+			const concurrentOldOutcome = lspClient
+				.withLspSessionPolicy({ shared: true }, () => lspClient.getOrCreateClient(oldConfig, tempDir.path(), 1_000))
+				.then(
+					() => "resolved",
+					error => String(error),
+				);
 			await Bun.sleep(0);
 			expect(newServer.received.some(message => message.method === "initialize")).toBe(false);
 			oldServer.send({ jsonrpc: "2.0", id: initialize.id, result: { capabilities: {} } });
@@ -5269,16 +5296,18 @@ describe("lsp regressions", () => {
 					servers: { "fake-lsp": config },
 					idleTimeoutMs: undefined,
 				});
-				const client = await lspClient.getOrCreateClient(config, tempDir.path());
+				const client = await lspClient.withLspSessionPolicy({ shared: true }, () =>
+					lspClient.getOrCreateClient(config, tempDir.path()),
+				);
 				await lspClient.ensureFileOpen(client, sourcePath);
 				expect(await waitForDiagnostics(client, sourceUri, { timeoutMs: 1_000, settleMs: 0 })).toEqual([
 					missingModuleDiagnostic,
 				]);
 
-				const result = await new LspTool(makeLspSession(tempDir.path())).execute("reload-diagnostics", {
-					action: "reload",
-					file: "*",
-				});
+				const result = await new LspTool({
+					...makeLspSession(tempDir.path()),
+					lspShared: true,
+				} as ToolSession).execute("reload-diagnostics", { action: "reload", file: "*" });
 
 				expect(textResult(result)).toContain("Reloaded fake-lsp");
 				expect(await waitForDiagnostics(client, sourceUri, { timeoutMs: 1_000, settleMs: 0 })).toEqual([]);

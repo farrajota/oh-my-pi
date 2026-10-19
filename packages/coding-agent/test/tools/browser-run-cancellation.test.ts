@@ -221,6 +221,47 @@ describe("browser run cancellation", () => {
 		expect(inspections).toBe(2);
 	});
 
+	it("keeps raw page listener methods separate from scoped ownership", () => {
+		const page = new RunPageScopeFixture();
+		const descriptors = ["on", "off", "once", "removeAllListeners"].map(method =>
+			Object.getOwnPropertyDescriptor(page, method),
+		);
+		const scope = createRunPageScope(page as never);
+		expect(scope.page).not.toBe(page);
+		expect(
+			["on", "off", "once", "removeAllListeners"].map(method => Object.getOwnPropertyDescriptor(page, method)),
+		).toEqual(descriptors);
+
+		let hostCalls = 0;
+		let scopedCalls = 0;
+		const shared = function (this: unknown): void {
+			if (this === scope.page) scopedCalls++;
+			else hostCalls++;
+		};
+		page.on("ownership", shared);
+		scope.page.on("ownership", shared);
+		expect(page.listenerCount("ownership")).toBe(2);
+		page.off("ownership", shared);
+		expect(page.listenerCount("ownership")).toBe(1);
+		page.emit("ownership", undefined);
+		expect(scopedCalls).toBe(1);
+		expect(hostCalls).toBe(0);
+		scope.page.off("ownership", shared);
+		expect(page.listenerCount("ownership")).toBe(0);
+
+		let rawClearCalls = 0;
+		scope.page.on("raw-clear", () => rawClearCalls++);
+		page.on("raw-clear", shared);
+		page.removeAllListeners("raw-clear");
+		expect(page.listenerCount("raw-clear")).toBe(0);
+		scope.detach();
+		page.emit("raw-clear", undefined);
+		expect(rawClearCalls).toBe(0);
+		expect(
+			["on", "off", "once", "removeAllListeners"].map(method => Object.getOwnPropertyDescriptor(page, method)),
+		).toEqual(descriptors);
+	});
+
 	it("scoped off preserves host-only and shared callback registrations", () => {
 		const page = new RunPageScopeFixture();
 		const scope = createRunPageScope(page as never);
