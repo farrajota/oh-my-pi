@@ -1,4 +1,4 @@
-import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent, RunCompletion, TextContent } from "@oh-my-pi/pi-ai";
 import { type Component, Container } from "../tui";
 import { Image, type ImageBudget } from "../components/image";
 import { ImageProtocol, TERMINAL } from "../terminal-capabilities";
@@ -50,6 +50,18 @@ import { chartFence, hasChartTable, lookupTableChart, splitTableCharts } from ".
  */
 const MAX_TRANSCRIPT_ERROR_ROWS = 8;
 const EMPTY_STABLE_RENDER: readonly string[] = [];
+
+function completionLabel(completion: RunCompletion): string {
+	const elapsed = formatDuration(Math.max(0, completion.stoppedAt - completion.startedAt));
+	const outcome =
+		completion.outcome === "failed" ? "Failed" : completion.outcome === "interrupted" ? "Interrupted" : "Completed";
+	const stoppedAt = new Date(completion.stoppedAt).toLocaleString(undefined, { timeZoneName: "short" });
+	return `${outcome} in ${elapsed} · Stopped at ${stoppedAt}`;
+}
+
+function responseDurationLabel(elapsedMs: number): string {
+	return `Response took ${formatDuration(elapsedMs)}`;
+}
 
 /** The native head of a finished thinking block: "Thought for 12s", or "Thought" when it was never seen streaming. */
 function thoughtLabel(clock: { start: number; end?: number } | undefined): string {
@@ -261,7 +273,8 @@ export class AssistantMessageComponent extends Container {
 	#servedModelMarker?: ServedModelMarkerComponent;
 	#lastMessage?: AssistantMessage;
 	#emergencyText?: ProseBlock;
-	#completionFooter: string | undefined;
+	#runCompletion: RunCompletion | undefined;
+	#responseElapsedMs: number | undefined;
 	#toolImagesByCallId = new Map<string, ImageContent[]>();
 	/** File each grouped read showed that Tern's media viewer shows, for native `media` nodes. */
 	#toolMediaPathByCallId = new Map<string, string>();
@@ -312,6 +325,7 @@ export class AssistantMessageComponent extends Container {
 	#rewound = false;
 	/** The turn's totals when this answer ends it; a TSP terminal shows them under the answer. */
 	#turnUsage: TurnUsageSummary | undefined;
+	#turnUsageElapsedVisible = true;
 	/**
 	 * True when the current {@link updateContent} message carries a truncatable
 	 * inline provider error (the `#appendErrorBlock` path) — set whether or not
@@ -541,6 +555,7 @@ export class AssistantMessageComponent extends Container {
 		expandThinkingBlocks = false,
 	) {
 		super();
+		this.#runCompletion = message?.runCompletion;
 		this.#hideThinkingBlock = hideThinkingBlock;
 		this.#onImageUpdate = onImageUpdate;
 		this.#thinkingRenderers = thinkingRenderers;
@@ -577,9 +592,10 @@ export class AssistantMessageComponent extends Container {
 		this.#refreshMarkers();
 	}
 
-	/** Mark this answer as the end of a turn with the turn's totals (native only: ANSI keeps them in the status line). */
-	setTurnUsage(summary: TurnUsageSummary | undefined): void {
+	/** Set turn totals; callers may withhold elapsed time until logical run settlement. */
+	setTurnUsage(summary: TurnUsageSummary | undefined, elapsedVisible = true): void {
 		this.#turnUsage = summary;
+		this.#turnUsageElapsedVisible = elapsedVisible;
 		this.#nativeViewVersion++;
 	}
 
@@ -600,13 +616,21 @@ export class AssistantMessageComponent extends Container {
 		this.#blockVersion++;
 	}
 
-	setCompletionFooter(text: string | undefined): void {
-		this.#completionFooter = text;
+	setRunCompletion(completion: RunCompletion | undefined): void {
+		this.#runCompletion = completion;
+		if (completion) this.#responseElapsedMs = undefined;
 		this.#fastPathKey = undefined;
 		this.#fastPathItems = undefined;
-		if (this.#lastMessage) {
-			this.updateContent(this.#lastMessage);
-		}
+		if (this.#lastMessage) this.updateContent(this.#lastMessage);
+		this.#nativeViewVersion++;
+	}
+
+	setResponseDuration(elapsedMs: number | undefined): void {
+		this.#responseElapsedMs = this.#runCompletion ? undefined : elapsedMs;
+		this.#fastPathKey = undefined;
+		this.#fastPathItems = undefined;
+		if (this.#lastMessage) this.updateContent(this.#lastMessage);
+		this.#nativeViewVersion++;
 	}
 
 	override invalidate(): void {
@@ -1022,6 +1046,14 @@ export class AssistantMessageComponent extends Container {
 			const errorNode = this.#describeError(message);
 			if (errorNode) children.push(errorNode);
 		}
+		if (this.#runCompletion || this.#responseElapsedMs !== undefined) {
+			const label = this.#runCompletion
+				? completionLabel(this.#runCompletion)
+				: responseDurationLabel(this.#responseElapsedMs!);
+			children.push(
+				node("text", { spans: [span(label, "dim")], role: "omp.run.completion" }, undefined, "completion"),
+			);
+		}
 		this.#nativeParts = parts;
 		children.push(...this.#markerSlot.children);
 		if (this.#rewound) {
@@ -1035,7 +1067,10 @@ export class AssistantMessageComponent extends Container {
 			);
 		}
 		if (this.#turnUsage) {
-			const usage = formatTurnUsage(this.#turnUsage);
+			const usage = formatTurnUsage(
+				this.#turnUsage,
+				this.#turnUsageElapsedVisible && !this.#runCompletion && this.#responseElapsedMs === undefined,
+			);
 			const line: NativeChild[] = [];
 			// Led by Copy and a dot: `⧉ · 12.4s · 19K tok this turn`.
 			if (answered && hasTranscriptActions()) {
@@ -1968,9 +2003,12 @@ export class AssistantMessageComponent extends Container {
 				}
 			}
 		}
-		if (this.#completionFooter) {
+		if (this.#runCompletion || this.#responseElapsedMs !== undefined) {
+			const label = this.#runCompletion
+				? completionLabel(this.#runCompletion)
+				: responseDurationLabel(this.#responseElapsedMs!);
 			this.#contentContainer.addChild(new Spacer(1));
-			this.#contentContainer.addChild(new Text(theme.fg("dim", this.#completionFooter), 1, 0));
+			this.#contentContainer.addChild(new Text(theme.fg("dim", label), 1, 0));
 		}
 		// Store fast-path state for next call
 		if (shouldCapture) {
@@ -1995,5 +2033,20 @@ export class AssistantMessageComponent extends Container {
 		for (let i = 0; i < items.length; i++) {
 			items[i]!.md.transientRenderCache = transient && i === items.length - 1;
 		}
+	}
+}
+
+/** Explicit transcript-only completion row for settled runs without a response component. */
+export class RunCompletionComponent extends Container {
+	readonly #label: string;
+
+	constructor(completion: RunCompletion) {
+		super();
+		this.#label = completionLabel(completion);
+		this.addChild(new Text(theme.fg("dim", this.#label), 1, 0));
+	}
+
+	override describe(): NativeNode {
+		return node("text", { spans: [span(this.#label, "dim")], role: "omp.run.completion" });
 	}
 }

@@ -916,6 +916,55 @@ impl<'de> Deserialize<'de> for DeveloperMessage {
 /// Open record: declared fields are decoded leniently (a value that does not fit stays
 /// in `extra`) and every other key is kept in `extra`.
 #[derive(Debug, Clone, PartialEq, Default)]
+pub struct RunCompletion {
+	pub started_at: Option<f64>,
+	pub stopped_at: Option<f64>,
+	pub outcome: Option<RunCompletionOutcome>,
+	/// Every key not decoded into a declared field.
+	pub extra: Map<String, Value>,
+}
+
+impl Serialize for RunCompletion {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		let mut map = serializer.serialize_map(None)?;
+		if let Some(value) = &self.started_at {
+			map.serialize_entry("startedAt", value)?;
+		}
+		if let Some(value) = &self.stopped_at {
+			map.serialize_entry("stoppedAt", value)?;
+		}
+		if let Some(value) = &self.outcome {
+			map.serialize_entry("outcome", value)?;
+		}
+		for (key, value) in &self.extra {
+			match key.as_str() {
+				"startedAt" if self.started_at.is_some() => continue,
+				"stoppedAt" if self.stopped_at.is_some() => continue,
+				"outcome" if self.outcome.is_some() => continue,
+				_ => {}
+			}
+			map.serialize_entry(key, value)?;
+		}
+		map.end()
+	}
+}
+
+impl<'de> Deserialize<'de> for RunCompletion {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let mut extra = Map::<String, Value>::deserialize(deserializer)?;
+		Ok(Self {
+			started_at: take(&mut extra, "startedAt"),
+			stopped_at: take(&mut extra, "stoppedAt"),
+			outcome: take(&mut extra, "outcome"),
+			extra,
+		})
+	}
+}
+
+///
+/// Open record: declared fields are decoded leniently (a value that does not fit stays
+/// in `extra`) and every other key is kept in `extra`.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AssistantMessage {
 	pub role: Option<LitAssistant>,
 	pub content: Option<Vec<AssistantContent>>,
@@ -935,6 +984,7 @@ pub struct AssistantMessage {
 	pub duration: Option<f64>,
 	pub ttft: Option<f64>,
 	pub completed_at: Option<f64>,
+	pub run_completion: Option<RunCompletion>,
 	/// Every key not decoded into a declared field.
 	pub extra: Map<String, Value>,
 }
@@ -996,6 +1046,9 @@ impl Serialize for AssistantMessage {
 		if let Some(value) = &self.completed_at {
 			map.serialize_entry("completedAt", value)?;
 		}
+		if let Some(value) = &self.run_completion {
+			map.serialize_entry("runCompletion", value)?;
+		}
 		for (key, value) in &self.extra {
 			match key.as_str() {
 				"role" if self.role.is_some() => continue,
@@ -1016,6 +1069,7 @@ impl Serialize for AssistantMessage {
 				"duration" if self.duration.is_some() => continue,
 				"ttft" if self.ttft.is_some() => continue,
 				"completedAt" if self.completed_at.is_some() => continue,
+				"runCompletion" if self.run_completion.is_some() => continue,
 				_ => {}
 			}
 			map.serialize_entry(key, value)?;
@@ -1046,6 +1100,7 @@ impl<'de> Deserialize<'de> for AssistantMessage {
 			duration: take(&mut extra, "duration"),
 			ttft: take(&mut extra, "ttft"),
 			completed_at: take(&mut extra, "completedAt"),
+			run_completion: take(&mut extra, "runCompletion"),
 			extra,
 		})
 	}
@@ -3694,6 +3749,13 @@ pub struct AgentEndEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunCompletionEvent {
+	pub completion: RunCompletion,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub message: Option<AssistantMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnStartEvent {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3985,6 +4047,7 @@ pub struct QueueUpdateEvent {
 pub enum RpcAgentEvent {
 	AgentStart(AgentStartEvent),
 	AgentEnd(AgentEndEvent),
+	RunCompletion(RunCompletionEvent),
 	TurnStart(TurnStartEvent),
 	TurnEnd(TurnEndEvent),
 	MessageStart(MessageStartEvent),
@@ -4027,6 +4090,7 @@ impl RpcAgentEvent {
 		let decode: fn(Value) -> Result<Self, serde_json::Error> = match value.get("type").and_then(Value::as_str) {
 			Some("agent_start") => |value| serde_json::from_value(value).map(Self::AgentStart),
 			Some("agent_end") => |value| serde_json::from_value(value).map(Self::AgentEnd),
+			Some("run_completion") => |value| serde_json::from_value(value).map(Self::RunCompletion),
 			Some("turn_start") => |value| serde_json::from_value(value).map(Self::TurnStart),
 			Some("turn_end") => |value| serde_json::from_value(value).map(Self::TurnEnd),
 			Some("message_start") => |value| serde_json::from_value(value).map(Self::MessageStart),
@@ -4069,6 +4133,7 @@ impl Serialize for RpcAgentEvent {
 		match self {
 			Self::AgentStart(member) => serialize_tagged(member, &[("type", "agent_start")], serializer),
 			Self::AgentEnd(member) => serialize_tagged(member, &[("type", "agent_end")], serializer),
+			Self::RunCompletion(member) => serialize_tagged(member, &[("type", "run_completion")], serializer),
 			Self::TurnStart(member) => serialize_tagged(member, &[("type", "turn_start")], serializer),
 			Self::TurnEnd(member) => serialize_tagged(member, &[("type", "turn_end")], serializer),
 			Self::MessageStart(member) => serialize_tagged(member, &[("type", "message_start")], serializer),
@@ -5063,7 +5128,7 @@ impl RpcNotification {
 			Some("session_info_update") => |value| serde_json::from_value(value).map(Self::SessionInfoUpdate),
 			Some("config_update") => |value| serde_json::from_value(value).map(Self::ConfigUpdate),
 			Some("rpc_frame_error") => |value| serde_json::from_value(value).map(Self::RpcFrameError),
-			Some("agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcAgentEvent),
+			Some("agent_start" | "agent_end" | "run_completion" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcAgentEvent),
 			_ => |value| Ok(Self::Unknown(value)),
 		};
 		decode(value)
@@ -5123,7 +5188,7 @@ impl RpcServerFrame {
 		let decode: fn(Value) -> Result<Self, serde_json::Error> = match value.get("type").and_then(Value::as_str) {
 			Some("response") => |value| serde_json::from_value(value).map(Self::Response),
 			Some("host_tool_call" | "host_tool_cancel" | "host_uri_request" | "host_uri_cancel") => |value| serde_json::from_value(value).map(Self::RpcHostRequest),
-			Some("ready" | "prompt_result" | "session_settled" | "extension_error" | "extension_ui_request" | "available_commands_update" | "subagent_lifecycle" | "subagent_progress" | "subagent_event" | "live_phase" | "live_levels" | "live_transcript" | "live_end" | "btw_delta" | "btw_record" | "command_output" | "session_info_update" | "config_update" | "rpc_frame_error" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcNotification),
+			Some("ready" | "prompt_result" | "session_settled" | "extension_error" | "extension_ui_request" | "available_commands_update" | "subagent_lifecycle" | "subagent_progress" | "subagent_event" | "live_phase" | "live_levels" | "live_transcript" | "live_end" | "btw_delta" | "btw_record" | "command_output" | "session_info_update" | "config_update" | "rpc_frame_error" | "agent_start" | "agent_end" | "run_completion" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcNotification),
 			_ => |value| Ok(Self::Unknown(value)),
 		};
 		decode(value)
@@ -5668,6 +5733,27 @@ impl<'de> Deserialize<'de> for LitToolCall {
 			Ok(Self)
 		} else {
 			Err(D::Error::custom(format!("expected \"toolCall\", got {value}")))
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RunCompletionOutcome {
+	#[serde(rename = "completed")]
+	Completed,
+	#[serde(rename = "interrupted")]
+	Interrupted,
+	#[serde(rename = "failed")]
+	Failed,
+}
+
+impl RunCompletionOutcome {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Completed => "completed",
+			Self::Interrupted => "interrupted",
+			Self::Failed => "failed",
 		}
 	}
 }

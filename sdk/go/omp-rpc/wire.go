@@ -614,6 +614,59 @@ func (v DeveloperMessage) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"role":"developer"`, v.Extra)
 }
 
+type RunCompletion struct {
+	StartedAt float64              `json:"startedAt"`
+	StoppedAt float64              `json:"stoppedAt"`
+	Outcome   RunCompletionOutcome `json:"outcome"`
+	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
+	// Encoding writes them back, over a declared field with the same key.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+func (v *RunCompletion) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "RunCompletion", v.decodeFrom)
+}
+
+func (v *RunCompletion) decodeFrom(raw map[string]json.RawMessage) error {
+	var out RunCompletion
+	d := fieldDecoder{raw: raw, owner: "RunCompletion", open: true}
+	d.required("startedAt", &out.StartedAt)
+	d.required("stoppedAt", &out.StoppedAt)
+	d.required("outcome", &out.Outcome)
+	out.Extra = d.rest()
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v RunCompletion) MarshalJSON() ([]byte, error) {
+	type plain RunCompletion
+	return encodeObject(plain(v), "", v.Extra)
+}
+
+type RunCompletionOutcome string
+
+const (
+	RunCompletionOutcomeCompleted   RunCompletionOutcome = "completed"
+	RunCompletionOutcomeInterrupted RunCompletionOutcome = "interrupted"
+	RunCompletionOutcomeFailed      RunCompletionOutcome = "failed"
+)
+
+func (v *RunCompletionOutcome) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "RunCompletionOutcome")
+	if err != nil {
+		return err
+	}
+	switch value := RunCompletionOutcome(s); value {
+	case RunCompletionOutcomeCompleted, RunCompletionOutcomeInterrupted, RunCompletionOutcomeFailed:
+		*v = value
+		return nil
+	}
+	return unknownValue("RunCompletionOutcome", s)
+}
+
 type AssistantMessage struct {
 	Content          []AssistantContent         `json:"content"`
 	API              string                     `json:"api"`
@@ -632,6 +685,7 @@ type AssistantMessage struct {
 	Duration         *float64                   `json:"duration,omitempty"`
 	Ttft             *float64                   `json:"ttft,omitempty"`
 	CompletedAt      *float64                   `json:"completedAt,omitempty"`
+	RunCompletion    *RunCompletion             `json:"runCompletion,omitempty"`
 	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
 	// Encoding writes them back, over a declared field with the same key.
 	Extra map[string]json.RawMessage `json:"-"`
@@ -662,6 +716,7 @@ func (v *AssistantMessage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("duration", &out.Duration)
 	d.optional("ttft", &out.Ttft)
 	d.optional("completedAt", &out.CompletedAt)
+	d.optional("runCompletion", &out.RunCompletion)
 	out.Extra = d.rest()
 	if d.err != nil {
 		return d.err
@@ -3652,6 +3707,33 @@ func (v AgentEndEvent) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"agent_end"`, nil)
 }
 
+type RunCompletionEvent struct {
+	Completion RunCompletion     `json:"completion"`
+	Message    *AssistantMessage `json:"message,omitempty"`
+}
+
+func (v *RunCompletionEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "RunCompletionEvent", v.decodeFrom)
+}
+
+func (v *RunCompletionEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out RunCompletionEvent
+	d := fieldDecoder{raw: raw, owner: "RunCompletionEvent"}
+	d.constant("type", "run_completion")
+	d.required("completion", &out.Completion)
+	d.optional("message", &out.Message)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v RunCompletionEvent) MarshalJSON() ([]byte, error) {
+	type plain RunCompletionEvent
+	return encodeObject(plain(v), `"type":"run_completion"`, nil)
+}
+
 type TurnStartEvent struct{}
 
 func (v *TurnStartEvent) UnmarshalJSON(data []byte) error {
@@ -4534,6 +4616,7 @@ type RpcAgentEventVariant interface {
 
 func (AgentStartEvent) isRpcAgentEvent()             {}
 func (AgentEndEvent) isRpcAgentEvent()               {}
+func (RunCompletionEvent) isRpcAgentEvent()          {}
 func (TurnStartEvent) isRpcAgentEvent()              {}
 func (TurnEndEvent) isRpcAgentEvent()                {}
 func (MessageStartEvent) isRpcAgentEvent()           {}
@@ -4588,6 +4671,8 @@ func (v *RpcAgentEvent) decodeFrom(raw map[string]json.RawMessage) error {
 		value, err = decodeVariant[AgentStartEvent](raw)
 	case "agent_end":
 		value, err = decodeVariant[AgentEndEvent](raw)
+	case "run_completion":
+		value, err = decodeVariant[RunCompletionEvent](raw)
 	case "turn_start":
 		value, err = decodeVariant[TurnStartEvent](raw)
 	case "turn_end":
@@ -6570,6 +6655,7 @@ func (ConfigUpdateEvent) isRpcNotification()            {}
 func (RpcFrameErrorEvent) isRpcNotification()           {}
 func (AgentStartEvent) isRpcNotification()              {}
 func (AgentEndEvent) isRpcNotification()                {}
+func (RunCompletionEvent) isRpcNotification()           {}
 func (TurnStartEvent) isRpcNotification()               {}
 func (TurnEndEvent) isRpcNotification()                 {}
 func (MessageStartEvent) isRpcNotification()            {}
@@ -6655,6 +6741,8 @@ func (v *RpcNotification) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[AgentStartEvent](raw)
 	case "agent_end":
 		value, err = decodeVariant[AgentEndEvent](raw)
+	case "run_completion":
+		value, err = decodeVariant[RunCompletionEvent](raw)
 	case "turn_start":
 		value, err = decodeVariant[TurnStartEvent](raw)
 	case "turn_end":
@@ -6760,6 +6848,7 @@ func (ConfigUpdateEvent) isRpcServerFrame()            {}
 func (RpcFrameErrorEvent) isRpcServerFrame()           {}
 func (AgentStartEvent) isRpcServerFrame()              {}
 func (AgentEndEvent) isRpcServerFrame()                {}
+func (RunCompletionEvent) isRpcServerFrame()           {}
 func (TurnStartEvent) isRpcServerFrame()               {}
 func (TurnEndEvent) isRpcServerFrame()                 {}
 func (MessageStartEvent) isRpcServerFrame()            {}
@@ -6855,6 +6944,8 @@ func (v *RpcServerFrame) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[AgentStartEvent](raw)
 	case "agent_end":
 		value, err = decodeVariant[AgentEndEvent](raw)
+	case "run_completion":
+		value, err = decodeVariant[RunCompletionEvent](raw)
 	case "turn_start":
 		value, err = decodeVariant[TurnStartEvent](raw)
 	case "turn_end":

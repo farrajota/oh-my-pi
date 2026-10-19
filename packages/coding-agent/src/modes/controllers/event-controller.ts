@@ -7,7 +7,7 @@ import { formatDuration, isRecord, logger, prompt, sanitizeText } from "@oh-my-p
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { extractTextContent } from "../../commit/utils";
 import { settings } from "../../config/settings";
-import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { AssistantMessageComponent, RunCompletionComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { detectCacheInvalidation } from "@oh-my-pi/pi-tui/chat/cache-invalidation-marker";
 import {
 	groupedReadUsageCallIds,
@@ -101,11 +101,6 @@ const MAX_LIVE_IRC_CARDS = 4;
 const IDLE_RECAP_MIN_SECONDS = 1;
 const IDLE_RECAP_MAX_SECONDS = 3600;
 
-function formatCompactTokens(tokens: number): string {
-	if (tokens < 1000) return String(tokens);
-	const thousands = tokens / 1000;
-	return `${thousands >= 10 ? thousands.toFixed(0) : thousands.toFixed(1)}K`;
-}
 function formatElapsedDuration(ms: number): string {
 	const totalSeconds = Math.max(0, Math.round(ms / 1000));
 	const hours = Math.floor(totalSeconds / 3600);
@@ -123,12 +118,6 @@ function isIntentionalRepeatedRetryEnd(event: Extract<AgentSessionEvent, { type:
 		event.mode === "repeated" &&
 		(event.reason === "manual-input" || event.reason === "cancelled" || event.reason === "generation-superseded")
 	);
-}
-
-function formatCompletionFooter(elapsedMs: number, runTokenDelta?: number): string {
-	const base = `Completed in ${formatElapsedDuration(elapsedMs)}`;
-	if (runTokenDelta === undefined) return base;
-	return `${base} · +${formatCompactTokens(runTokenDelta)} tokens`;
 }
 
 function estimateMessageTokens(source: AgentSession, message: AgentMessage): number {
@@ -161,18 +150,6 @@ function lastAssistantMessage(messages: AgentMessage[]): AssistantMessage | unde
 
 function isSameAssistantTurnEnd(a: AssistantMessage | undefined, b: AssistantMessage | undefined): boolean {
 	return a !== undefined && b !== undefined && (a === b || (a.timestamp === b.timestamp && a.content === b.content));
-}
-
-function hasVisibleAssistantContent(message: AssistantMessage): boolean {
-	return message.content.some(
-		content =>
-			(content.type === "text" && canonicalizeMessage(content.text)) ||
-			(content.type === "thinking" && canonicalizeMessage(content.thinking)),
-	);
-}
-
-function hasToolCallContent(message: AssistantMessage): boolean {
-	return message.content.some(content => content.type === "toolCall");
 }
 
 const RAW_PARTIAL_JSON_RENDERERS: Record<string, true> = { bash: true, edit: true, apply_patch: true };
@@ -342,6 +319,8 @@ export class EventController {
 	// (never deferred) can tell them apart.
 	#retryPending = false;
 	#idleCompactionTimer?: NodeJS.Timeout;
+	/** Kept past `agent_end`, which clears the live pointer before run settlement is emitted. */
+	#lastCompletedAssistantComponent: AssistantMessageComponent | undefined = undefined;
 	#idleRecapTimer?: NodeJS.Timeout;
 	// True from `agent_end` until this idle window's recap timer fires, so a live
 	// `recap.*` change can rearm without re-delivering a recap already shown.
@@ -453,6 +432,7 @@ export class EventController {
 			message_start: (source, e) => this.#handleMessageStart(source, e),
 			message_update: (source, e) => this.#handleMessageUpdate(source, e),
 			message_end: (source, e) => this.#handleMessageEnd(source, e),
+			run_completion: (_source, e) => this.#handleRunCompletion(e),
 			tool_execution_start: (source, e) => this.#handleToolExecutionStart(source, e),
 			tool_execution_update: (source, e) => this.#handleToolExecutionUpdate(source, e),
 			tool_stream_update: async (_source, event) => {
@@ -1042,6 +1022,7 @@ export class EventController {
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
+		this.#lastCompletedAssistantComponent = undefined;
 		this.#turnStartedAt = undefined;
 		this.#turnUsage.reset();
 		this.#lastAgentEndAt = undefined;
@@ -1211,6 +1192,7 @@ export class EventController {
 		this.#resolveDisplaceableTodo();
 		this.#lastAssistantComponent = undefined;
 		this.#lastCompletedAssistantMessage = undefined;
+		this.#lastCompletedAssistantComponent = undefined;
 		// Restore terminal errors in transcript history when their banner clears.
 		// Recoverable empty-output attempts are discarded by session recovery and
 		// must stay hidden rather than resurfacing as a stale inline error.
@@ -1794,6 +1776,39 @@ export class EventController {
 		}
 	}
 
+	/** Replay can remount the final assistant segment before the logical run settles. */
+	associateMountedAssistantCompletion(message: AssistantMessage, component: AssistantMessageComponent): void {
+		if (!isSameAssistantTurnEnd(this.#lastCompletedAssistantMessage, message)) return;
+		if (!this.ctx.chatContainer.children.includes(component)) return;
+		this.#lastCompletedAssistantComponent = component;
+	}
+
+	async #handleRunCompletion(event: Extract<AgentSessionEvent, { type: "run_completion" }>): Promise<void> {
+		const message = event.message;
+		const sameLastResponse =
+			message !== undefined &&
+			assistantHasVisibleContent(message) &&
+			isSameAssistantTurnEnd(this.#lastCompletedAssistantMessage, message);
+		const mountedLastComponent = sameLastResponse ? this.#lastCompletedAssistantComponent : undefined;
+		const mappedComponent =
+			message && assistantHasVisibleContent(message) && !message.content.some(block => block.type === "toolCall")
+				? this.ctx.transcriptMessageComponents.get(message)
+				: undefined;
+		const component =
+			mountedLastComponent && this.ctx.chatContainer.children.includes(mountedLastComponent)
+				? mountedLastComponent
+				: mappedComponent instanceof AssistantMessageComponent &&
+					  this.ctx.chatContainer.children.includes(mappedComponent)
+					? mappedComponent
+					: undefined;
+		if (component) {
+			component.setRunCompletion(event.completion);
+		} else {
+			this.ctx.chatContainer.addChild(new RunCompletionComponent(event.completion));
+		}
+		this.ctx.ui.requestRender();
+	}
+
 	async #handleMessageEnd(
 		source: AgentSession,
 		event: Extract<AgentSessionEvent, { type: "message_end" }>,
@@ -1949,17 +1964,6 @@ export class EventController {
 			}
 			this.#currentAssistantMessageTokenEstimate = 0;
 			this.#updateWorkingMessageRunTokenDelta(source);
-			const elapsedMs = this.ctx.getWorkingMessageRunElapsedMs(source);
-			if (
-				successfulAssistant &&
-				elapsedMs !== undefined &&
-				hasVisibleAssistantContent(event.message) &&
-				!hasToolCallContent(event.message)
-			) {
-				this.#lastAssistantComponent.setCompletionFooter(
-					formatCompletionFooter(elapsedMs, this.#currentRunTokenDelta),
-				);
-			}
 			this.ctx.streamingComponent.setServedModelMismatch(this.ctx.servedModelTracker.check(event.message));
 			this.ctx.streamingComponent.markTranscriptBlockFinalized();
 			let lastPostToolAssistantComponent: AssistantMessageComponent | undefined;
@@ -1973,8 +1977,9 @@ export class EventController {
 				if (component) lastPostToolAssistantComponent = component;
 			}
 			this.#lastAssistantComponent = lastPostToolAssistantComponent ?? this.ctx.streamingComponent;
+			this.#lastCompletedAssistantComponent = this.#lastAssistantComponent;
 			const turnUsage = this.#turnUsage.add(event.message, this.#turnStartedAt);
-			if (turnUsage) this.#lastAssistantComponent.setTurnUsage(turnUsage);
+			if (turnUsage) this.#lastAssistantComponent.setTurnUsage(turnUsage, false);
 			if (cfgDisplayShowTokenUsage.get(settings) && assistantUsageIsBilled(event.message.usage)) {
 				const readCallIds = groupedReadUsageCallIds(event.message);
 				const turnElapsed = cfgDisplayShowTurnTime.get(settings)

@@ -1163,6 +1163,31 @@
 			],
 			"x-open": true
 		},
+		"RunCompletion": {
+			"type": "object",
+			"properties": {
+				"startedAt": {
+					"type": "number"
+				},
+				"stoppedAt": {
+					"type": "number"
+				},
+				"outcome": {
+					"enum": [
+						"completed",
+						"interrupted",
+						"failed"
+					],
+					"type": "string"
+				}
+			},
+			"required": [
+				"startedAt",
+				"stoppedAt",
+				"outcome"
+			],
+			"x-open": true
+		},
 		"AssistantMessage": {
 			"type": "object",
 			"properties": {
@@ -1224,6 +1249,9 @@
 				},
 				"completedAt": {
 					"type": "number"
+				},
+				"runCompletion": {
+					"$ref": "#/$defs/RunCompletion"
 				}
 			},
 			"required": [
@@ -3596,6 +3624,24 @@
 				"messages"
 			]
 		},
+		"RunCompletionEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "run_completion"
+				},
+				"completion": {
+					"$ref": "#/$defs/RunCompletion"
+				},
+				"message": {
+					"$ref": "#/$defs/AssistantMessage"
+				}
+			},
+			"required": [
+				"type",
+				"completion"
+			]
+		},
 		"TurnStartEvent": {
 			"type": "object",
 			"properties": {
@@ -4290,6 +4336,9 @@
 				},
 				{
 					"$ref": "#/$defs/AgentEndEvent"
+				},
+				{
+					"$ref": "#/$defs/RunCompletionEvent"
 				},
 				{
 					"$ref": "#/$defs/TurnStartEvent"

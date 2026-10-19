@@ -42,6 +42,11 @@ export const eventDefs = {
 		"telemetry?": JSON_OBJECT,
 		"coverage?": JSON_OBJECT,
 	},
+	RunCompletionEvent: {
+		type: "'run_completion'",
+		"message?": "AssistantMessage",
+		completion: "RunCompletion",
+	},
 	TurnStartEvent: { type: "'turn_start'" },
 	TurnEndEvent: { type: "'turn_end'", message: "AgentMessage", toolResults: "ToolResultMessage[]" },
 	MessageStartEvent: { type: "'message_start'", message: "AgentMessage", "messageId?": MESSAGE_ID },
@@ -198,6 +203,7 @@ export const eventDefs = {
 		[
 			"AgentStartEvent",
 			"AgentEndEvent",
+			"RunCompletionEvent",
 			"TurnStartEvent",
 			"TurnEndEvent",
 			"MessageStartEvent",

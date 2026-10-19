@@ -56,6 +56,7 @@ import {
 import type {
 	AnthropicFallbackCreditHandle,
 	AssistantMessage,
+	RunCompletion,
 	CodexCompactionContext,
 	Context,
 	ImageContent,
@@ -459,7 +460,12 @@ import {
 	type SessionDumpLiveState,
 } from "./session-dump-format";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
-import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
+import {
+	RUN_COMPLETION_CUSTOM_TYPE,
+	type BranchSummaryEntry,
+	type NewSessionOptions,
+	type RunCompletionEntryData,
+} from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
 	COMPACTION_CHECK_NONE,
@@ -695,6 +701,16 @@ type AgentEndEvent = Extract<AgentEvent, { type: "agent_end" }>;
 
 /** How a settle describes what happens next; see {@link AgentSession} `#settleAgentEnd`. */
 type AgentEndSettleOptions = { willContinue?: boolean; awaitingAsyncWork?: boolean };
+
+type LogicalRunCompletion = {
+	startedAt: number;
+	sessionId: string;
+	userMessage?: AgentMessage;
+	latestAssistant?: AssistantMessage;
+	waitingForAsyncWork?: boolean;
+	waitingForContinuation?: boolean;
+	completionStarted?: boolean;
+};
 
 type PostPromptSkipReason = "aborted" | "stale-generation";
 
@@ -1225,6 +1241,7 @@ export class AgentSession implements SettingsScope {
 	#skippedPostTurnSpeculationCompletion: Promise<void> | undefined;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#activeRunStartedAt: number | undefined;
+	#logicalRunCompletion: LogicalRunCompletion | undefined;
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
@@ -1794,9 +1811,88 @@ export class AgentSession implements SettingsScope {
 		const pending = this.#pendingAgentEndEmit;
 		if (!pending) return;
 		this.#pendingAgentEndEmit = undefined;
-		this.#emitLifecycleAwareSessionEvent(this.#classifyTerminalAgentEnd(pending));
+		const emittedEvent = this.#classifyTerminalAgentEnd(pending);
+		this.#emitLifecycleAwareSessionEvent(emittedEvent);
+		if (emittedEvent.type === "agent_end" && emittedEvent.isTerminal !== false) {
+			void this.#finishLogicalRunCompletion().catch(error => {
+				logger.error("Failed to persist run completion", { error });
+			});
+		}
 	}
 
+	async #finishLogicalRunCompletion(
+		forcedOutcome?: RunCompletion["outcome"],
+		targetRun?: LogicalRunCompletion,
+	): Promise<void> {
+		const run = targetRun ?? this.#logicalRunCompletion;
+		if (!run || run.completionStarted) return;
+		run.completionStarted = true;
+		if (this.#logicalRunCompletion === run) this.#logicalRunCompletion = undefined;
+		const manager = this.sessionManager;
+		if (manager.getSessionId() !== run.sessionId) return;
+		const branch = manager.getBranch();
+		const response = run.latestAssistant;
+		let responseEntryId = response ? (response as PersistedAssistantMessage)[kPersistedSessionEntryId] : undefined;
+		if (responseEntryId && !branch.some(candidate => candidate.id === responseEntryId)) responseEntryId = undefined;
+		if (!responseEntryId && response) {
+			const responseKey = sessionMessagePersistenceKey(response);
+			let matchingEntryId: string | undefined;
+			let ambiguous = false;
+			if (responseKey) {
+				for (const candidate of branch) {
+					if (
+						candidate.type !== "message" ||
+						candidate.message.role !== "assistant" ||
+						sessionMessagePersistenceKey(candidate.message) !== responseKey ||
+						!sameMessageContent(candidate.message, response)
+					) {
+						continue;
+					}
+					if (matchingEntryId) {
+						ambiguous = true;
+						break;
+					}
+					matchingEntryId = candidate.id;
+				}
+			}
+			if (!ambiguous) responseEntryId = matchingEntryId;
+		}
+		const entry = responseEntryId ? branch.find(candidate => candidate.id === responseEntryId) : undefined;
+		const hasPersistedResponse = entry?.type === "message" && entry.message.role === "assistant";
+		const outcome =
+			forcedOutcome ??
+			(response?.stopReason === "aborted"
+				? "interrupted"
+				: response?.stopReason === "error" || !hasPersistedResponse
+					? "failed"
+					: "completed");
+		const completion: RunCompletion = {
+			startedAt: run.startedAt,
+			stoppedAt: Math.max(run.startedAt, Date.now()),
+			outcome,
+		};
+		const data: RunCompletionEntryData = {
+			...(hasPersistedResponse && responseEntryId ? { messageId: responseEntryId } : {}),
+			completion,
+		};
+		try {
+			manager.appendCustomEntry(RUN_COMPLETION_CUSTOM_TYPE, data);
+			// Standalone metadata must cross the lazy persistence gate without an assistant message.
+			if (!hasPersistedResponse) await manager.ensureOnDisk();
+		} catch (error) {
+			logger.error("Failed to persist run completion", { error });
+		}
+		this.#emit({
+			type: "run_completion",
+			...(hasPersistedResponse && response ? { message: { ...response, runCompletion: completion } } : {}),
+			completion,
+		});
+		try {
+			await manager.flush();
+		} catch (error) {
+			logger.error("Failed to flush run completion", { error });
+		}
+	}
 	/**
 	 * Arm prewalk outside the normal startup path so an explicit slash command starts immediately.
 	 */
@@ -2078,7 +2174,7 @@ export class AgentSession implements SettingsScope {
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			waitForSessionMessagePersistence: message => this.#waitForSessionMessagePersistence(message),
-			appendSessionMessage: message => this.#appendSessionMessage(message),
+			appendSessionMessage: (message, sourceMessage) => this.#appendSessionMessage(message, sourceMessage),
 			persistedAssistantEntryId: message => (message as PersistedAssistantMessage)[kPersistedSessionEntryId],
 			sessionMessageAlreadyPersisted: message => this.#sessionMessageAlreadyPersisted(message),
 			setModelWithProviderSessionReset: model => this.#setModelWithProviderSessionReset(model),
@@ -3164,7 +3260,18 @@ export class AgentSession implements SettingsScope {
 		if (job.status !== "running") {
 			return { id, status: "already_completed", message: "Background job is already complete." };
 		}
+		const runAtCancellation = this.#logicalRunCompletion;
 		if (manager.cancel(id, ownerFilter)) {
+			await job.promise;
+			if (
+				runAtCancellation &&
+				this.#logicalRunCompletion === runAtCancellation &&
+				runAtCancellation.waitingForAsyncWork &&
+				!runAtCancellation.waitingForContinuation &&
+				!this.#hasPendingAsyncWake()
+			) {
+				await this.#finishLogicalRunCompletion("interrupted", runAtCancellation);
+			}
 			return { id, status: "cancelled", message: "Background job cancelled." };
 		}
 		const current = manager.getJob(id, ownerFilter);
@@ -3339,11 +3446,24 @@ export class AgentSession implements SettingsScope {
 			manager.cancelAll(ownerFilter, reason);
 			manager.evictCompletedJobs(ownerFilter);
 		}
-		// Invalidate this owner's in-flight/drained deliveries against the new
-		// generation, then drop any async-result follow-up already queued, so a
-		// prior session's background result cannot inject into the next transcript.
 		this.#asyncDeliveryEpoch += 1;
 		this.yieldQueue.clear("async-result");
+	}
+
+	async #cancelAndSettleOwnedAsyncJobs(reason?: unknown): Promise<void> {
+		const manager = this.#asyncJobManager;
+		const ownerId = this.#agentId;
+		const runAtCancellation = this.#logicalRunCompletion;
+		this.#cancelOwnAsyncJobs(reason);
+		if (manager && ownerId) await manager.waitForOwnerJobs(ownerId);
+		if (
+			runAtCancellation &&
+			this.#logicalRunCompletion === runAtCancellation &&
+			runAtCancellation.waitingForAsyncWork &&
+			!runAtCancellation.waitingForContinuation
+		) {
+			await this.#finishLogicalRunCompletion("interrupted", runAtCancellation);
+		}
 	}
 
 	/**
@@ -3562,6 +3682,10 @@ export class AgentSession implements SettingsScope {
 			this.#activeRunStartedAt = agentStartRunStartedAt;
 		} else if (event.type === "agent_end") {
 			this.#activeRunStartedAt = undefined;
+			// Owner-only pauses may never emit another core end after cancellation.
+			if (event.isTerminal === false && event.awaitingAsyncWork !== true && this.#logicalRunCompletion) {
+				this.#logicalRunCompletion.waitingForContinuation = true;
+			}
 		}
 		this.#emit(event);
 	}
@@ -3753,10 +3877,15 @@ export class AgentSession implements SettingsScope {
 				this.#pendingAgentEndEmit = event;
 				return;
 			}
-			this.#emitLifecycleAwareSessionEvent(
-				event.type === "agent_end" ? this.#classifyTerminalAgentEnd(event) : event,
-				agentStartRunStartedAt,
-			);
+			const emittedEvent = event.type === "agent_end" ? this.#classifyTerminalAgentEnd(event) : event;
+			this.#emitLifecycleAwareSessionEvent(emittedEvent, agentStartRunStartedAt);
+			if (
+				emittedEvent.type === "agent_end" &&
+				emittedEvent.isTerminal !== false &&
+				this.#promptInFlightCount === 0
+			) {
+				await this.#finishLogicalRunCompletion();
+			}
 		} finally {
 			releaseGate();
 		}
@@ -4018,6 +4147,7 @@ export class AgentSession implements SettingsScope {
 			| BashExecutionMessage
 			| PythonExecutionMessage
 			| FileMentionMessage,
+		sourceAssistant?: AssistantMessage,
 	): string {
 		const cache = this.#persistedMessageKeys;
 		const wasFresh = cache !== undefined && cache.anchor === this.#persistedMessageKeysAnchor();
@@ -4027,6 +4157,7 @@ export class AgentSession implements SettingsScope {
 		if (message.role === "assistant") {
 			(message as PersistedAssistantMessage)[kPersistedSessionEntryId] = entryId;
 		}
+		if (sourceAssistant) (sourceAssistant as PersistedAssistantMessage)[kPersistedSessionEntryId] = entryId;
 		const key = sessionMessagePersistenceKey(message);
 		if (wasFresh && cache && key) {
 			cache.keys.add(key);
@@ -4222,6 +4353,21 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "message_start" && event.message.role === "user" && event.message.attribution !== "agent") {
+			const previousRun = this.#logicalRunCompletion;
+			if (previousRun?.userMessage !== event.message) {
+				this.#logicalRunCompletion = {
+					startedAt: event.message.timestamp,
+					sessionId: this.sessionManager.getSessionId(),
+					userMessage: event.message,
+				};
+				if (previousRun) {
+					const interrupted =
+						previousRun.waitingForAsyncWork || previousRun.waitingForContinuation || !previousRun.latestAssistant;
+					await this.#finishLogicalRunCompletion(interrupted ? "interrupted" : undefined, previousRun);
+				}
+			}
+		}
 		const runStartedAt = event.type === "agent_start" ? Date.now() : undefined;
 		const eventPromptGeneration = this.#promptGeneration;
 		const agentRunPromptGeneration = event.type === "agent_end" ? this.#agentRunPromptGeneration : undefined;
@@ -4229,6 +4375,12 @@ export class AgentSession implements SettingsScope {
 			this.#advisors.onPrimaryAgentStart();
 			this.#maintenance.noteTurnStarted();
 			this.#agentRunPromptGeneration = eventPromptGeneration;
+			const logicalRun = (this.#logicalRunCompletion ??= {
+				startedAt: runStartedAt ?? Date.now(),
+				sessionId: this.sessionManager.getSessionId(),
+			});
+			logicalRun.waitingForAsyncWork = false;
+			logicalRun.waitingForContinuation = false;
 		} else if (event.type === "agent_end") {
 			this.#agentRunPromptGeneration = undefined;
 			if (this.#activeAgentContinue) {
@@ -4242,6 +4394,10 @@ export class AgentSession implements SettingsScope {
 			// A run resumed from an unpaired assistant tail executes its calls without a new message_end.
 			this.#runToolCallIds = new Set(event.resumedToolCallIds);
 			this.#emitRunState("running");
+			if (this.#logicalRunCompletion) {
+				this.#logicalRunCompletion.waitingForContinuation = false;
+				if (!this.#hasPendingAsyncWake()) this.#logicalRunCompletion.waitingForAsyncWork = false;
+			}
 		}
 		// This must happen before event fan-out awaits: streamed tool-call deltas
 		// can otherwise queue validation that a delayed turn-start reset erases.
@@ -4267,6 +4423,7 @@ export class AgentSession implements SettingsScope {
 		// toolUse) assistant message and skipping settle-only work.
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
+			if (this.#logicalRunCompletion) this.#logicalRunCompletion.latestAssistant = event.message;
 			for (const block of event.message.content) {
 				if (block.type === "toolCall") this.#runToolCallIds.add(block.id);
 			}
@@ -4649,8 +4806,16 @@ export class AgentSession implements SettingsScope {
 			// TTSR retry work runs concurrently and clears the live flag before
 			// maintenance can emit agent_end, so preserve the state at settle entry.
 			const ttsrAbortPendingAtAgentEnd = this.#ttsr.abortPending;
-			const emitAgentEndNotification = (options?: AgentEndSettleOptions) =>
-				this.#settleAgentEnd(event, activeMessages, options);
+			const emitAgentEndNotification = async (options?: AgentEndSettleOptions) => {
+				const run = this.#logicalRunCompletion;
+				const hasPendingAsyncWork = this.#hasPendingAsyncWake();
+				if (hasPendingAsyncWork && run) run.waitingForAsyncWork = true;
+				const settleOptions =
+					hasPendingAsyncWork && options?.willContinue !== true
+						? { willContinue: true, awaitingAsyncWork: true }
+						: options;
+				await this.#settleAgentEnd(event, activeMessages, settleOptions);
+			};
 			await this.#goalRuntime.onAgentEnd({ currentUsage: () => this.#goalUsage() });
 			const fallbackAssistant = settledMessages.findLast(
 				(message): message is AssistantMessage => message.role === "assistant",
@@ -4759,6 +4924,7 @@ export class AgentSession implements SettingsScope {
 			// the executor consumed the yield as the terminal result, so a trailing
 			// empty/aborted assistant stop must NOT revive the agent loop. The
 			// `#yieldTerminationPending` sticky flag clears on the next `prompt()`.
+			let continuationScheduled = false;
 			if (successfulYieldMessage || this.#yieldTerminationPending) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				if (successfulYieldMessage && activeGoal) {
@@ -4769,13 +4935,14 @@ export class AgentSession implements SettingsScope {
 					);
 					const compactionTask = this.#maintenance.checkCompaction(successfulYieldMessage);
 					this.#trackPostPromptTask(compactionTask);
-					await compactionTask;
+					const compactionResult = await compactionTask;
+					continuationScheduled = compactionResult.continuationScheduled;
 				} else if (successfulYieldMessage) {
 					maintenanceRoute("successful-yield-no-active-goal");
 				} else {
 					maintenanceRoute("post-yield-trailing-stop-suppressed");
 				}
-				await emitAgentEndNotification();
+				await emitAgentEndNotification(continuationScheduled ? { willContinue: true } : undefined);
 				return;
 			}
 			this.#lastSuccessfulYieldToolCallId = undefined;
@@ -5537,11 +5704,20 @@ export class AgentSession implements SettingsScope {
 		// background work resumes. `awaitingAsyncWork` singles out that last case:
 		// `yielded` alone also covers queued steer/follow-up and IRC continuations,
 		// which `#flushPendingAgentEnd` re-tags non-terminal.
-		const awaitingAsyncWork = options?.willContinue === true && options.awaitingAsyncWork === true;
+		const pendingAsyncWork = this.#hasPendingAsyncWake();
+		const willContinue = options?.willContinue === true || pendingAsyncWork;
+		const awaitingAsyncWork =
+			options?.awaitingAsyncWork === true || (pendingAsyncWork && options?.willContinue !== true);
+		if (this.#logicalRunCompletion) {
+			if (options?.willContinue === true && options.awaitingAsyncWork !== true) {
+				this.#logicalRunCompletion.waitingForContinuation = true;
+			}
+			if (pendingAsyncWork) this.#logicalRunCompletion.waitingForAsyncWork = true;
+		}
 		await this.#emitSessionEvent({
 			...event,
-			isTerminal: !options?.willContinue,
-			yielded: !options?.willContinue || awaitingAsyncWork,
+			isTerminal: !willContinue,
+			yielded: !willContinue || awaitingAsyncWork,
 			...(awaitingAsyncWork ? { awaitingAsyncWork } : {}),
 		});
 		void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
@@ -6564,7 +6740,8 @@ export class AgentSession implements SettingsScope {
 		//     (mirrors newSession()).
 		this.#promptGeneration++;
 		await this.#cancelPostPromptTasks();
-		this.#cancelOwnAsyncJobs();
+		await this.#cancelAndSettleOwnedAsyncJobs();
+		await this.#finishLogicalRunCompletion("interrupted");
 
 		// Drop the conversation: messages, queued steers/follow-ups, pending tool
 		// calls, and error state. agent.reset() keeps the model and system prompt.
@@ -8562,6 +8739,23 @@ export class AgentSession implements SettingsScope {
 		// every pre-dispatch bail (generation bump from abort, disposal, usage
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
 		// the typed text back to the host instead of losing it.
+		const previousRun = this.#logicalRunCompletion;
+		if (message.role === "user" && previousRun && previousRun.userMessage !== message) {
+			const interrupted =
+				previousRun.waitingForAsyncWork || previousRun.waitingForContinuation || !previousRun.latestAssistant;
+			await this.#finishLogicalRunCompletion(interrupted ? "interrupted" : undefined, previousRun);
+		}
+		if (!this.#logicalRunCompletion) {
+			this.#logicalRunCompletion = {
+				startedAt: message.role === "user" ? message.timestamp : Date.now(),
+				sessionId: this.sessionManager.getSessionId(),
+				...(message.role === "user" ? { userMessage: message } : {}),
+			};
+		} else if (message.role === "user") {
+			this.#logicalRunCompletion.userMessage ??= message;
+		}
+		const promptRun = this.#logicalRunCompletion;
+		let turnStarted = false;
 		const inFlightEpoch = this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		this.#promptSequence++;
@@ -8792,7 +8986,10 @@ export class AgentSession implements SettingsScope {
 				this.#planReferenceSent = true;
 			}
 			try {
-				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, options?.onTurnStarted);
+				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, () => {
+					turnStarted = true;
+					options?.onTurnStarted?.();
+				});
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
 			}
@@ -8804,7 +9001,18 @@ export class AgentSession implements SettingsScope {
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
 			this.#usagePreflightReadyForNextModelCall = false;
-			this.#endInFlight(inFlightEpoch);
+			const run = promptRun;
+			this.#endInFlight(
+				inFlightEpoch,
+				!turnStarted && run
+					? () => {
+							if (this.#logicalRunCompletion !== run) return;
+							return this.#finishLogicalRunCompletion(
+								generation !== this.#promptGeneration || this.#abortInProgress ? "interrupted" : "failed",
+							);
+						}
+					: undefined,
+			);
 			if (this.#promptSetupAbortController === setupAbort) this.#promptSetupAbortController = undefined;
 		}
 	}
@@ -10427,6 +10635,7 @@ export class AgentSession implements SettingsScope {
 		// Session switch/compact paths disconnect first; explicit aborts should
 		// leave any queued steer/follow-up visible for the user rather than
 		// auto-starting a fresh turn during cleanup.
+		const logicalRunAtAbort = this.#logicalRunCompletion;
 		this.#abortInProgress = true;
 		try {
 			this.#titleGenerationAbortController.abort();
@@ -10484,6 +10693,15 @@ export class AgentSession implements SettingsScope {
 			// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
 			// a subsequent prompt() can incorrectly observe the session as busy after an abort.
 			this.#resetInFlight();
+			// Admitted setup can be cancelled without a core end. Internal compaction instead
+			// preserves its logical run for the continuation after this abort barrier.
+			if (
+				logicalRunAtAbort &&
+				this.#logicalRunCompletion === logicalRunAtAbort &&
+				options?.goalReason !== "internal"
+			) {
+				await this.#finishLogicalRunCompletion("interrupted", logicalRunAtAbort);
+			}
 			this.#resetSessionStopContinuationState();
 			this.#clearPendingSessionStopContinuations();
 			// Safety net: if the agent loop aborted without producing an assistant
@@ -10539,7 +10757,8 @@ export class AgentSession implements SettingsScope {
 		this.#disconnectFromAgent();
 		let advisorRecordersDetached = false;
 		await this.abort();
-		this.#cancelOwnAsyncJobs();
+		await this.#cancelAndSettleOwnedAsyncJobs();
+		await this.#finishLogicalRunCompletion("interrupted");
 		this.#closeAllProviderSessions("new session");
 		await this.#bash.flushPending();
 		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
@@ -12198,6 +12417,8 @@ export class AgentSession implements SettingsScope {
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
+		await this.#cancelAndSettleOwnedAsyncJobs();
+		await this.#finishLogicalRunCompletion("interrupted");
 		await this.#sessionBeforeSwitchReconciler?.();
 
 		await this.#bash.flushPending();
@@ -12654,7 +12875,7 @@ export class AgentSession implements SettingsScope {
 		this.#usagePreflightReadyForNextModelCall = false;
 
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
+		await this.#cancelAndSettleOwnedAsyncJobs();
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
@@ -12770,7 +12991,7 @@ export class AgentSession implements SettingsScope {
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
+		await this.#cancelAndSettleOwnedAsyncJobs();
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 

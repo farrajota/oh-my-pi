@@ -111,6 +111,12 @@ export interface DeveloperMessage {
 	providerPayload?: Record<string, unknown>;
 }
 
+export interface RunCompletion {
+	startedAt: number;
+	stoppedAt: number;
+	outcome: "completed" | "interrupted" | "failed";
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: AssistantContent[];
@@ -130,6 +136,7 @@ export interface AssistantMessage {
 	duration?: number;
 	ttft?: number;
 	completedAt?: number;
+	runCompletion?: RunCompletion;
 }
 
 export interface ToolResultMessage {
@@ -797,6 +804,12 @@ export interface AgentEndEvent {
 	coverage?: Record<string, unknown>;
 }
 
+export interface RunCompletionEvent {
+	type: "run_completion";
+	completion: RunCompletion;
+	message?: AssistantMessage;
+}
+
 export interface TurnStartEvent {
 	type: "turn_start";
 }
@@ -1033,7 +1046,7 @@ export interface QueueUpdateEvent {
 }
 
 /** A session event, discriminated by `type`; `set_event_filter` selects which are sent. */
-export type RpcAgentEvent = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent;
+export type RpcAgentEvent = AgentStartEvent | AgentEndEvent | RunCompletionEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent;
 
 /** First frame after startup; transport fields are absent on servers without protocol v2. */
 export interface ReadyEvent {

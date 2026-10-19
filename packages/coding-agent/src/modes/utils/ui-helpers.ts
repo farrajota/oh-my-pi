@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, ImageContent, Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent, RunCompletion, Usage } from "@oh-my-pi/pi-ai";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { StatusNotice } from "@oh-my-pi/pi-tui/chrome/status-notice";
@@ -12,7 +12,7 @@ import { InternalUrlRouter } from "../../internal-urls";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
 import { settings } from "../../config/settings";
 import { createAdvisorMessageCard } from "@oh-my-pi/pi-tui/chat/advisor-message";
-import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { AssistantMessageComponent, RunCompletionComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { readMediaPath } from "@oh-my-pi/pi-tui/native/blobs";
 import { createBackgroundTanDispatchBlock } from "@oh-my-pi/pi-tui/chat/background-tan-message";
 import { BashExecutionComponent } from "@oh-my-pi/pi-tui/chat/bash-execution";
@@ -285,6 +285,13 @@ export class UiHelpers {
 			}
 			case "hookMessage":
 			case "custom": {
+				if (message.role === "custom" && message.customType === "run_completion") {
+					const completion = (message as CustomMessage<{ completion?: RunCompletion }>).details?.completion;
+					if (!completion) break;
+					const component = new RunCompletionComponent(completion);
+					this.ctx.chatContainer.addChild(component);
+					return [component];
+				}
 				if (message.display) {
 					if (message.customType === "async-result") {
 						const component = buildAsyncResultBlock(message);
@@ -596,6 +603,7 @@ export class UiHelpers {
 				this.ctx.addMessageToChat(message, { reuseSettledComponent: options.reuseSettledComponents });
 				const lastChild = this.ctx.chatContainer.children[this.ctx.chatContainer.children.length - 1];
 				const assistantComponent = lastChild instanceof AssistantMessageComponent ? lastChild : undefined;
+				let lastVisibleAssistantComponent = assistantComponent;
 				if (assistantComponent) {
 					const usage = message.usage;
 					const explained = sessionContext.cacheMissExplainedAt?.[i] ?? false;
@@ -622,10 +630,11 @@ export class UiHelpers {
 					if (!segment || !assistantHasVisibleContent(segment)) return;
 					const component = createAssistantMessageComponent(
 						this.ctx,
-						segment,
+						{ ...segment, runCompletion: undefined },
 						getAssistantMessageLinkTargets(this.ctx),
 					);
 					this.ctx.chatContainer.addChild(component);
+					lastVisibleAssistantComponent = component;
 				};
 
 				// Render tool call components
@@ -736,6 +745,19 @@ export class UiHelpers {
 					this.ctx.chatContainer.addChild(
 						new StrippedToolCallsPlaceholder(strippedToolCalls, !this.ctx.hideToolActivity),
 					);
+				}
+				if (!assistantHasVisibleContent(message) && message.runCompletion) {
+					assistantComponent?.setRunCompletion(undefined);
+					assistantComponent?.setResponseDuration(undefined);
+					this.ctx.chatContainer.addChild(new RunCompletionComponent(message.runCompletion));
+				} else if (lastVisibleAssistantComponent) {
+					if (assistantComponent !== lastVisibleAssistantComponent) {
+						assistantComponent?.setRunCompletion(undefined);
+						assistantComponent?.setResponseDuration(undefined);
+					}
+					this.ctx.eventController?.associateMountedAssistantCompletion(message, lastVisibleAssistantComponent);
+					lastVisibleAssistantComponent.setRunCompletion(message.runCompletion);
+					lastVisibleAssistantComponent.setResponseDuration(turnElapsedMs(turnStartedAt, message));
 				}
 				pendingUsage =
 					cfgDisplayShowTokenUsage.get(this.ctx.settings) && assistantUsageIsBilled(message.usage)

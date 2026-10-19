@@ -1,6 +1,7 @@
 import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, RunCompletion } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
 import type { AutoRetryEndEvent, AutoRetryStartEvent } from "../extensibility/shared-events";
 import type { Goal, GoalModeState } from "../goals/state";
@@ -28,6 +29,11 @@ export type AgentSessionEvent =
 			 */
 			awaitingAsyncWork?: boolean;
 	  })
+	| {
+			type: "run_completion";
+			message?: AssistantMessage;
+			completion: RunCompletion;
+	  }
 	| {
 			type: "auto_compaction_start";
 			reason: "threshold" | "overflow" | "idle" | "incomplete";

@@ -94,10 +94,10 @@ export class TurnUsageTally {
  * out when unknown, the cost when nothing was billed), and its tooltip with
  * exact counts.
  */
-export function formatTurnUsage(summary: TurnUsageSummary): { text: string; title: string } {
+export function formatTurnUsage(summary: TurnUsageSummary, elapsedVisible = true): { text: string; title: string } {
 	const tokens = summary.input + summary.output;
 	const cost = summary.cost > 0 ? (summary.cost < 0.005 ? "<$0.01" : `$${summary.cost.toFixed(2)}`) : undefined;
-	const time = summary.elapsedMs === undefined ? undefined : formatDuration(summary.elapsedMs);
+	const time = elapsedVisible && summary.elapsedMs !== undefined ? formatDuration(summary.elapsedMs) : undefined;
 	const text = [time, `${formatNumber(tokens)} tok`, cost].filter(part => part !== undefined).join(" · ");
 	const exact = `${tokens.toLocaleString("en-US")} tokens (${summary.input.toLocaleString("en-US")} in · ${summary.output.toLocaleString("en-US")} out)`;
 	const title = [time, exact, cost].filter(part => part !== undefined).join(" · ");

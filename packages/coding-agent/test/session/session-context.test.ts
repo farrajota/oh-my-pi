@@ -286,6 +286,38 @@ describe("buildSessionContext failed replay tails", () => {
 			"from A",
 		]);
 	});
+	it("replays post-reset response timing from chronological branch metadata", () => {
+		const completion = { startedAt: 1, stoppedAt: 2, outcome: "completed" as const };
+		const entries: SessionEntry[] = [
+			userEntry("old-user", null, "before reset", 1),
+			assistantEntry("old-assistant", "old-user", "stop", "old response", 2),
+			{ type: "reset_boundary", id: "reset", parentId: "old-assistant", timestamp },
+			userEntry("new-user", "reset", "after reset", 3),
+			assistantEntry("new-assistant", "new-user", "stop", "new response", 4),
+			{
+				type: "custom",
+				id: "completion",
+				parentId: "new-assistant",
+				timestamp,
+				customType: "run_completion",
+				data: { messageId: "new-assistant", completion },
+			},
+		];
+
+		const context = buildSessionContext(entries, "completion", undefined, {
+			transcript: true,
+			collapseCompactedHistory: true,
+		});
+
+		expect(context.messages.map(message => (message.role === "user" ? message.content : message.role))).toEqual([
+			"after reset",
+			"assistant",
+		]);
+		const response = context.messages.find(message => message.role === "assistant");
+		expect(response?.role).toBe("assistant");
+		if (response?.role !== "assistant") throw new Error("Expected the post-reset assistant response");
+		expect(response.runCompletion).toEqual(completion);
+	});
 
 	it("omits a terminal aborted assistant from normal context", () => {
 		const context = buildSessionContext([

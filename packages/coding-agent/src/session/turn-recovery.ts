@@ -260,7 +260,7 @@ export interface TurnRecoveryHost {
 		onError?: (error: unknown) => void;
 	}): void;
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
-	appendSessionMessage(message: AssistantMessage): void;
+	appendSessionMessage(message: AssistantMessage, sourceMessage?: AssistantMessage): void;
 	persistedAssistantEntryId(message: AssistantMessage): string | undefined;
 	sessionMessageAlreadyPersisted(message: AssistantMessage): boolean;
 	setModelWithProviderSessionReset(model: Model): Promise<void>;
@@ -928,7 +928,8 @@ export class TurnRecovery {
 		await this.#host.waitForSessionMessagePersistence(message);
 		if (!isEmptyErrorTurn(message)) return;
 		if (!force && this.#host.sessionMessageAlreadyPersisted(message)) return;
-		this.#host.appendSessionMessage(structuredClone(message));
+		const persistedMessage = structuredClone(message);
+		this.#host.appendSessionMessage(persistedMessage, message);
 	}
 
 	#retryRecoveryKind(

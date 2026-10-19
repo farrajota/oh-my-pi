@@ -6,6 +6,7 @@ import type {
 	StopReason,
 	TextContent,
 	Usage,
+	RunCompletion,
 } from "@oh-my-pi/pi-ai";
 import type { PermissionScopeSnapshot } from "../task/permission-profiles";
 import type { EffectivePermissionSummary, StructuredSubagentSchemaMode } from "../task/types";
@@ -20,6 +21,12 @@ export const SESSION_TITLE_SLOT_BYTES = 256;
 
 export const SESSION_TITLE_SLOT_ENTRY_TYPE = "title";
 
+export const RUN_COMPLETION_CUSTOM_TYPE = "run_completion";
+
+export interface RunCompletionEntryData {
+	messageId?: string;
+	completion: RunCompletion;
+}
 export const TITLE_CHANGE_ENTRY_TYPE = "title_change";
 
 export type SessionTitleSource = "auto" | "user";

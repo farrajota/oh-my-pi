@@ -10,6 +10,7 @@ import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/eve
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { type Component, TERMINAL } from "@oh-my-pi/pi-tui";
 import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 
@@ -227,7 +228,154 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(middleLine).toBeLessThan(toolResultBLine);
 		expect(toolResultBLine).toBeLessThan(finalLine);
 	});
+	it("waits for run settlement and marks the final post-tool assistant segment", async () => {
+		const { controller, chatContainer } = createFixture();
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "toolu_completion_surface",
+			name: "contract_probe",
+			arguments: {},
+		};
+		const started = assistantMessage([]);
+		const completed = assistantMessage([
+			{ type: "text", text: "Before tool" },
+			toolCall,
+			{ type: "text", text: "Final post-tool answer" },
+		]);
 
+		await controller.handleEvent({ type: "message_start", message: started } as Extract<
+			AgentSessionEvent,
+			{ type: "message_start" }
+		>);
+		await controller.handleEvent({
+			type: "message_update",
+			message: completed,
+			assistantMessageEvent: {
+				type: "toolcall_end",
+				contentIndex: 1,
+				toolCall,
+				partial: completed,
+			},
+		} as Extract<AgentSessionEvent, { type: "message_update" }>);
+		await controller.handleEvent({
+			type: "tool_execution_start",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			args: {},
+		} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
+		await controller.handleEvent({
+			type: "tool_execution_end",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			result: { content: [{ type: "text", text: "Tool finished" }] },
+			isError: false,
+		} as Extract<AgentSessionEvent, { type: "tool_execution_end" }>);
+		await controller.handleEvent({ type: "message_end", message: completed } as Extract<
+			AgentSessionEvent,
+			{ type: "message_end" }
+		>);
+
+		const beforeSettle = chatContainer
+			.render(120)
+			.map(line => Bun.stripANSI(line))
+			.join("\n");
+		expect(beforeSettle).not.toContain("Stopped at");
+		expect(beforeSettle).not.toContain("Interrupted in");
+		expect(beforeSettle).not.toContain("Completed in");
+
+		const completion = {
+			startedAt: 1_000,
+			stoppedAt: 61_000,
+			outcome: "interrupted" as const,
+		};
+		await controller.handleEvent({
+			type: "run_completion",
+			message: completed,
+			completion,
+		} as unknown as AgentSessionEvent);
+		const lines = chatContainer.render(120).map(line => Bun.stripANSI(line));
+		const finalLine = lineContaining(lines, "Final post-tool answer");
+		const completionLine = lineContaining(lines, "Interrupted");
+		expect(finalLine).toBeLessThan(completionLine);
+		expect(lines.filter(line => line.includes("Interrupted"))).toHaveLength(1);
+		expect(lines.join("\n")).toContain("1m");
+		expect(lines.join("\n")).toContain(
+			new Date(completion.stoppedAt).toLocaleString(undefined, { timeZoneName: "short" }),
+		);
+	});
+
+	it("updates the mounted final segment after UiHelpers reconstructs the transcript", async () => {
+		const { controller, chatContainer, ctx } = createFixture();
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "toolu_completion_remount",
+			name: "contract_probe",
+			arguments: {},
+		};
+		const started = assistantMessage([]);
+		const completed = assistantMessage([
+			{ type: "text", text: "Before redraw" },
+			toolCall,
+			{ type: "text", text: "Remounted final answer" },
+		]);
+		await controller.handleEvent({ type: "message_start", message: started } as Extract<
+			AgentSessionEvent,
+			{ type: "message_start" }
+		>);
+		await controller.handleEvent({
+			type: "message_update",
+			message: completed,
+			assistantMessageEvent: { type: "toolcall_end", contentIndex: 1, toolCall, partial: completed },
+		} as Extract<AgentSessionEvent, { type: "message_update" }>);
+		await controller.handleEvent({ type: "message_end", message: completed } as Extract<
+			AgentSessionEvent,
+			{ type: "message_end" }
+		>);
+
+		const beforeSettle = chatContainer
+			.render(120)
+			.map(line => Bun.stripANSI(line))
+			.join("\n");
+		expect(beforeSettle).not.toContain("Stopped at");
+		expect(beforeSettle).not.toContain("Completed");
+		expect(beforeSettle).not.toContain("Interrupted");
+
+		chatContainer.clear();
+		const helpers = new UiHelpers(ctx);
+		ctx.addMessageToChat = (message, options) => helpers.addMessageToChat(message, options);
+		ctx.eventController = controller;
+		helpers.renderSessionContext({ messages: [completed] } as SessionContext);
+
+		const completion = { startedAt: 1_000, stoppedAt: 61_000, outcome: "completed" as const };
+		await controller.handleEvent({
+			type: "run_completion",
+			message: completed,
+			completion,
+		} as unknown as AgentSessionEvent);
+		const lines = chatContainer.render(120).map(line => Bun.stripANSI(line));
+		const finalLine = lineContaining(lines, "Remounted final answer");
+		const completionLine = lineContaining(lines, "Completed");
+		expect(finalLine).toBeLessThan(completionLine);
+		expect(lines.join("\n")).toContain("1m");
+		expect(lines.filter(line => line.includes("Completed")).length).toBe(1);
+		expect(lines.join("\n")).toContain(
+			new Date(completion.stoppedAt).toLocaleString(undefined, { timeZoneName: "short" }),
+		);
+	});
+
+	it("renders a standalone completion row when no assistant response is renderable", async () => {
+		const { controller, chatContainer } = createFixture();
+		const completion = { startedAt: 1_000, stoppedAt: 61_000, outcome: "failed" as const };
+		await controller.handleEvent({ type: "run_completion", completion } as unknown as AgentSessionEvent);
+		const rendered = chatContainer
+			.render(120)
+			.map(line => Bun.stripANSI(line))
+			.join("\n");
+		expect(rendered).toContain("Failed");
+		expect(rendered).toContain("1m");
+		expect(rendered).toContain("Stopped at");
+		expect(rendered).toContain(new Date(completion.stoppedAt).toLocaleString(undefined, { timeZoneName: "short" }));
+	});
 	it("uses the canonical mounted-tool renderer for prefixed calls live and after transcript rebuild", async () => {
 		const githubTool: AgentTool = {
 			name: "github",

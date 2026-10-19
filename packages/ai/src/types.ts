@@ -1261,6 +1261,12 @@ export interface ContextSnapshot {
 	lastMessageTimestamp?: number;
 }
 
+export interface RunCompletion {
+	startedAt: number;
+	stoppedAt: number;
+	outcome: "completed" | "interrupted" | "failed";
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (
@@ -1351,6 +1357,8 @@ export interface AssistantMessage {
 	ttft?: number; // Time to first token in milliseconds
 	/** Local wall-clock time the response finished streaming (ms since epoch); stamped by the session at message_end so prompt→yield timing never depends on provider-reported duration. */
 	completedAt?: number;
+	/** Whole logical run completion, added by the session lifecycle and absent on historical responses. */
+	runCompletion?: RunCompletion;
 }
 
 export interface ToolResultMessage<TDetails = unknown> {

@@ -312,6 +312,12 @@ class DeveloperMessage(TypedDict):
     providerPayload: NotRequired[JsonObject]
 
 
+class RunCompletion(TypedDict):
+    startedAt: float
+    stoppedAt: float
+    outcome: Literal["completed", "interrupted", "failed"]
+
+
 class AssistantMessage(TypedDict):
     role: Literal["assistant"]
     content: list[AssistantContent]
@@ -331,6 +337,7 @@ class AssistantMessage(TypedDict):
     duration: NotRequired[float]
     ttft: NotRequired[float]
     completedAt: NotRequired[float]
+    runCompletion: NotRequired[RunCompletion]
 
 
 class ToolResultMessage(TypedDict):
@@ -980,6 +987,13 @@ class AgentEndEvent:
     """Non-terminal end whose only possible resume is a background-job result."""
     telemetry: JsonObject | None = None
     coverage: JsonObject | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class RunCompletionEvent:
+    type: Literal["run_completion"] = "run_completion"
+    completion: RunCompletion
+    message: AssistantMessage | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1650,7 +1664,7 @@ UsageLimitState: TypeAlias = UsageLimitLowPriority | UsageLimitWrapUp
 """Provider-neutral state of an account past its usage limit, discriminated by `stage`."""
 
 
-RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent
+RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | RunCompletionEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent
 """A session event, discriminated by `type`; `set_event_filter` selects which are sent."""
 
 
@@ -1704,6 +1718,10 @@ parse_user_message = cast("Decoder[UserMessage]", open_record("role", frozenset(
 
 parse_developer_message = cast("Decoder[DeveloperMessage]", open_record("role", frozenset({"developer"})))
 """Decodes a `DeveloperMessage` open record: checks the discriminator and keeps every key."""
+
+
+parse_run_completion = cast("Decoder[RunCompletion]", open_record(None, None))
+"""Decodes a `RunCompletion` open record: checks the discriminator and keeps every key."""
 
 
 parse_assistant_message = cast("Decoder[AssistantMessage]", open_record("role", frozenset({"assistant"})))
@@ -2327,6 +2345,15 @@ def parse_agent_end_event(value: object, path: str = "AgentEndEvent") -> AgentEn
         awaiting_async_work=optional(payload, "awaitingAsyncWork", decode_bool, path),
         telemetry=optional(payload, "telemetry", decode_json_object, path),
         coverage=optional(payload, "coverage", decode_json_object, path),
+    )
+
+
+def parse_run_completion_event(value: object, path: str = "RunCompletionEvent") -> RunCompletionEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["run_completion"]]', literal(frozenset({"run_completion"}))), path)
+    return RunCompletionEvent(
+        completion=required(payload, "completion", parse_run_completion, path),
+        message=optional(payload, "message", parse_assistant_message, path),
     )
 
 
@@ -3088,6 +3115,7 @@ _USAGE_LIMIT_STATE_CASES: Final[dict[str, Decoder[UsageLimitState]]] = {
 _RPC_AGENT_EVENT_CASES: Final[dict[str, Decoder[RpcAgentEvent]]] = {
         "agent_start": parse_agent_start_event,
         "agent_end": parse_agent_end_event,
+        "run_completion": parse_run_completion_event,
         "turn_start": parse_turn_start_event,
         "turn_end": parse_turn_end_event,
         "message_start": parse_message_start_event,
@@ -3142,6 +3170,7 @@ _RPC_NOTIFICATION_CASES: Final[dict[str, Decoder[RpcNotification]]] = {
         "rpc_frame_error": parse_rpc_frame_error_event,
         "agent_start": parse_rpc_agent_event,
         "agent_end": parse_rpc_agent_event,
+        "run_completion": parse_rpc_agent_event,
         "turn_start": parse_rpc_agent_event,
         "turn_end": parse_rpc_agent_event,
         "message_start": parse_rpc_agent_event,
@@ -3659,6 +3688,10 @@ class WireClient:
         """Subscribe to `agent_end` frames."""
         return self._listen("agent_end", listener)
 
+    def on_run_completion(self, listener: Callable[[RunCompletionEvent], None]) -> Callable[[], None]:
+        """Subscribe to `run_completion` frames."""
+        return self._listen("run_completion", listener)
+
     def on_turn_start(self, listener: Callable[[TurnStartEvent], None]) -> Callable[[], None]:
         """Subscribe to `turn_start` frames."""
         return self._listen("turn_start", listener)
@@ -3911,6 +3944,8 @@ __all__ = [
     "RpcAgentEvent",
     "RpcFrameErrorEvent",
     "RpcNotification",
+    "RunCompletion",
+    "RunCompletionEvent",
     "SelectOptionDetail",
     "SelectUiRequest",
     "SessionCredits",
@@ -4081,6 +4116,8 @@ __all__ = [
     "parse_retry_fallback_succeeded_event",
     "parse_rpc_agent_event",
     "parse_rpc_frame_error_event",
+    "parse_run_completion",
+    "parse_run_completion_event",
     "parse_select_option_detail",
     "parse_select_ui_request",
     "parse_session_credits",

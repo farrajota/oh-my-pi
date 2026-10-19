@@ -27,7 +27,7 @@ import { editorKey } from "../chrome/keybinding-hints";
 import type { MessageRenderer } from "../chat/extension-types";
 import type { AgentLifecycleLike } from "./agent-hub-types";
 import type { AgentHubRegistry, AgentStatus } from "./agent-hub-types";
-import type { SessionMessageEntryLike } from "../chat/transcript-entry";
+import type { RunCompletionEntryLike, SessionMessageEntryLike, TranscriptEntryLike } from "../chat/transcript-entry";
 import type { ObservableSession, SessionObserverRegistry } from "./session-observer-registry";
 import { getEditorTheme, theme } from "../theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../keybinding-matchers";
@@ -47,7 +47,10 @@ import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "..
 import { actionHint, escCloseButton, hintsRow, overlayCard } from "../native/overlay";
 
 /** Parsed message and model metadata relevant to a transcript viewer. */
-export type AgentTranscriptEntry = SessionMessageEntryLike | { type: "model_change"; model: string };
+export type AgentTranscriptEntry =
+	| SessionMessageEntryLike
+	| RunCompletionEntryLike
+	| { type: "model_change"; model: string };
 
 /** Local filesystem and session parsing capabilities supplied by the host. */
 export interface AgentTranscriptSource {
@@ -504,26 +507,28 @@ export class AgentTranscriptViewer implements Component {
 			});
 	}
 
-	/** Filter to message entries, tracking the model from the first assistant / a model_change. */
-	#extractMessages(entries: AgentTranscriptEntry[]): SessionMessageEntryLike[] {
-		const messages: SessionMessageEntryLike[] = [];
+	/** Filter to renderable transcript messages and completion metadata, tracking the assistant model. */
+	#extractMessages(entries: AgentTranscriptEntry[]): TranscriptEntryLike[] {
+		const messages: TranscriptEntryLike[] = [];
 		for (const entry of entries) {
 			if (entry.type === "message") {
 				messages.push(entry);
 				if (!this.#model && entry.message.role === "assistant") this.#model = entry.message.model;
 			} else if (entry.type === "model_change") {
 				this.#model = entry.model;
+			} else if (entry.type === "custom" && entry.customType === "run_completion") {
+				messages.push(entry);
 			}
 		}
 		return messages;
 	}
 
-	#rebuild(entries: SessionMessageEntryLike[]): void {
+	#rebuild(entries: TranscriptEntryLike[]): void {
 		this.#builder.rebuild(entries);
 		this.#deps.requestRender();
 	}
 
-	#append(entries: SessionMessageEntryLike[]): void {
+	#append(entries: TranscriptEntryLike[]): void {
 		this.#builder.append(entries);
 		this.#deps.requestRender();
 	}

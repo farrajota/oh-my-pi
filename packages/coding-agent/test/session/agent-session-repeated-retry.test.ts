@@ -9,7 +9,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -652,6 +652,32 @@ describe("AgentSession repeated retry runtime", () => {
 		expect(repeatedEnds(harness.events)).toHaveLength(1);
 		expect(repeatedEnds(harness.events)[0]).toMatchObject({ success: false, reason: "cancelled" });
 		expect(harness.extensionRunner.events).toEqual([]);
+	});
+
+	test("public abort settles a run whose scheduled retry continuation is cancelled", async () => {
+		harness = await createHarness([errorResponse(SESSION_LIMIT), successResponse()]);
+		harness.agent.providerMaxAttempts = 4;
+		holdDeferredContinues = true;
+		const completions: Array<Extract<AgentSessionEvent, { type: "run_completion" }>> = [];
+		harness.session.subscribe(event => {
+			if (event.type === "run_completion") completions.push(event);
+		});
+
+		const prompt = harness.session.prompt("wait for the session limit");
+		await waitForRepeatedStart(harness);
+		await advance(TIMER_MS);
+		const deferred = scheduledWaits.find(wait => wait.delayMs === 1);
+		expect(deferred).toBeDefined();
+		if (!deferred) throw new Error("Retry continuation was not scheduled");
+		expect(completions).toHaveLength(0);
+
+		await harness.session.abort();
+		await flushAsync();
+
+		expect(await prompt).toBe(true);
+		expect(harness.providerCallCount()).toBe(1);
+		expect(completions).toHaveLength(1);
+		expect(completions[0]?.completion.outcome).toBe("interrupted");
 	});
 
 	test("success after an immediate repeated wait emits terminal success and clears repeated state for a later chain", async () => {

@@ -27,7 +27,7 @@ import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
 	convertToLlm,
@@ -136,10 +136,14 @@ describe("AgentSession concurrent prompt guard", () => {
 				return Promise.resolve(undefined);
 			}),
 		} as unknown as ExtensionRunner;
-		const sessionManager = SessionManager.inMemory();
+		const sessionManager = SessionManager.create(tempDir, tempDir);
 		const settings = Settings.isolated();
 		const modelRegistry = sharedModelRegistry;
+		const completionEvents: Array<Extract<AgentSessionEvent, { type: "run_completion" }>> = [];
 		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session.subscribe(event => {
+			if (event.type === "run_completion") completionEvents.push(event);
+		});
 
 		await session.prompt("First message");
 		await session.waitForIdle();
@@ -162,6 +166,54 @@ describe("AgentSession concurrent prompt guard", () => {
 			"agent_end",
 		]);
 		expect(stopEvents.map(event => event.stop_hook_active)).toEqual([false, true]);
+		expect(completionEvents).toHaveLength(1);
+		const completionEvent = completionEvents[0];
+		if (!completionEvent) throw new Error("Expected one completion event");
+		expect(completionEvent.completion).toMatchObject({ outcome: "completed" });
+		expect(completionEvent.completion.stoppedAt).toBeGreaterThanOrEqual(completionEvent.completion.startedAt);
+		if (!completionEvent.message) throw new Error("Expected an attached completion response");
+		expect(completionEvent.message.role).toBe("assistant");
+		const completionEntry = sessionManager
+			.getEntries()
+			.find(entry => entry.type === "custom" && entry.customType === "run_completion");
+		if (completionEntry?.type !== "custom") throw new Error("Expected persisted completion metadata");
+		const messageId =
+			completionEntry.data &&
+			typeof completionEntry.data === "object" &&
+			"messageId" in completionEntry.data &&
+			typeof completionEntry.data.messageId === "string"
+				? completionEntry.data.messageId
+				: undefined;
+		expect(typeof messageId).toBe("string");
+		expect(completionEntry.data).toEqual({ messageId, completion: completionEvent.completion });
+		const responseEntry = sessionManager
+			.getBranch()
+			.find(entry => entry.type === "message" && entry.id === messageId);
+		expect(responseEntry).toMatchObject({ type: "message", message: { role: "assistant" } });
+		if (responseEntry?.type !== "message" || responseEntry.message.role !== "assistant") {
+			throw new Error("Expected completion to reference the real branch response");
+		}
+		expect(responseEntry.message.content).toEqual(completionEvent.message.content);
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		const reloaded = await SessionManager.open(sessionFile, tempDir, undefined, { suppressBreadcrumb: true });
+		const reloadedCompletion = reloaded
+			.getBranch()
+			.find(entry => entry.type === "custom" && entry.customType === "run_completion");
+		expect(reloadedCompletion).toEqual(completionEntry);
+		const transcriptResponse = reloaded
+			.buildSessionContext({ transcript: true })
+			.messages.find(message => message.role === "assistant" && message.runCompletion !== undefined);
+		if (transcriptResponse?.role !== "assistant") throw new Error("Expected a stamped transcript response");
+		expect(transcriptResponse.runCompletion).toEqual(completionEvent.completion);
+		expect(
+			reloaded.buildSessionContext().messages.some(message => message.role === "assistant" && message.runCompletion),
+		).toBe(false);
+		await reloaded.close();
+		expect(
+			agent.state.messages.some(message => message.role === "custom" && message.customType === "run_completion"),
+		).toBe(false);
 		expect(stopEvents.map(event => event.turn_id)).toEqual([0, 0]);
 		expect(stopEvents[0]?.session_id).toBe(session.sessionId);
 		expect(stopEvents[0]?.last_assistant_message?.role).toBe("assistant");
@@ -247,23 +299,513 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 			convertToLlm,
 		});
+		let assistantMessageEnded = false;
+		agent.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "assistant") assistantMessageEnded = true;
+		});
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
 			modelRegistry: sharedModelRegistry,
 		});
-
+		const completionEvents: Array<Extract<AgentSessionEvent, { type: "run_completion" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "run_completion") completionEvents.push(event);
+		});
 		const prompt = session.prompt("Run the blocking tool");
 		await started.promise;
-
+		expect(assistantMessageEnded).toBe(true);
+		expect(completionEvents).toHaveLength(0);
 		// `UiHelpers.renderInitialMessages` uses this exact predicate to retain
 		// dangling toolCalls in pendingTools during a focus rebuild.
 		expect(session.isStreaming).toBe(true);
 
 		release.resolve();
 		await prompt;
+		expect(completionEvents).toHaveLength(1);
 		expect(session.isStreaming).toBe(false);
+	});
+	it("records failed outcome for a terminal provider error", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ throw: "provider failed" }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "retry.enabled": false, "compaction.enabled": false }),
+			modelRegistry: sharedModelRegistry,
+		});
+		const completions: Array<Extract<AgentSessionEvent, { type: "run_completion" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "run_completion") completions.push(event);
+		});
+
+		await session.prompt("Fail the provider call");
+		await session.waitForIdle();
+
+		expect(completions).toHaveLength(1);
+		const completionEvent = completions[0];
+		if (!completionEvent) throw new Error("Expected a failed completion event");
+		expect(completionEvent.completion.outcome).toBe("failed");
+		expect(completionEvent.completion.stoppedAt).toBeGreaterThanOrEqual(completionEvent.completion.startedAt);
+		expect(completionEvent.message).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			runCompletion: completionEvent.completion,
+		});
+		const completionEntry = sessionManager
+			.getBranch()
+			.find(entry => entry.type === "custom" && entry.customType === "run_completion");
+		if (completionEntry?.type !== "custom") throw new Error("Expected persisted completion metadata");
+		const completionData = completionEntry?.type === "custom" ? completionEntry.data : undefined;
+		const responseEntryId =
+			completionData && typeof completionData === "object" && "messageId" in completionData
+				? completionData.messageId
+				: undefined;
+		expect(typeof responseEntryId).toBe("string");
+		expect(completionData).toEqual({ messageId: responseEntryId, completion: completionEvent.completion });
+		const responseEntry = sessionManager.getBranch().find(entry => entry.id === responseEntryId);
+		expect(responseEntry).toMatchObject({ type: "message", message: { role: "assistant", stopReason: "error" } });
+		if (responseEntry?.type !== "message" || responseEntry.message.role !== "assistant") {
+			throw new Error("Expected completion to reference the failed branch response");
+		}
+		const transcript = sessionManager.buildSessionContext({ transcript: true });
+		expect(transcript.messages.find(message => message.role === "assistant" && message.runCompletion)).toMatchObject({
+			runCompletion: completionEvent.completion,
+		});
+		expect(
+			transcript.messages.some(message => message.role === "custom" && message.customType === "run_completion"),
+		).toBe(false);
+		expect(
+			sessionManager
+				.buildSessionContext()
+				.messages.some(message => message.role === "custom" && message.customType === "run_completion"),
+		).toBe(false);
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		const reloaded = await SessionManager.open(sessionFile, tempDir, undefined, { suppressBreadcrumb: true });
+		expect(reloaded.getBranch().find(entry => entry.id === completionEntry.id)).toEqual(completionEntry);
+		const reloadedResponse = reloaded.getBranch().find(entry => entry.id === responseEntryId);
+		if (reloadedResponse?.type !== "message" || reloadedResponse.message.role !== "assistant") {
+			throw new Error("Expected the same failed response after reload");
+		}
+		expect(reloadedResponse.id).toBe(responseEntry.id);
+		expect(reloadedResponse.parentId).toBe(responseEntry.parentId);
+		expect(reloadedResponse.timestamp).toBe(responseEntry.timestamp);
+		expect(reloadedResponse.message.stopReason).toBe("error");
+		expect(reloadedResponse.message.errorMessage).toBe(responseEntry.message.errorMessage);
+		expect(reloadedResponse.message.content).toEqual(responseEntry.message.content);
+		expect(reloadedResponse.message.timestamp).toBe(responseEntry.message.timestamp);
+		expect(reloadedResponse.message.completedAt).toBe(responseEntry.message.completedAt);
+		const reloadedTranscript = reloaded.buildSessionContext({ transcript: true });
+		expect(
+			reloadedTranscript.messages.find(message => message.role === "assistant" && message.runCompletion),
+		).toMatchObject({
+			runCompletion: completionEvent.completion,
+		});
+		expect(
+			reloadedTranscript.messages.some(
+				message => message.role === "custom" && message.customType === "run_completion",
+			),
+		).toBe(false);
+		expect(
+			reloaded
+				.buildSessionContext()
+				.messages.some(
+					message =>
+						(message.role === "custom" && message.customType === "run_completion") ||
+						(message.role === "assistant" && message.runCompletion !== undefined),
+				),
+		).toBe(false);
+		await reloaded.close();
+	});
+
+	it("persists a standalone failed completion when dispatch fails before a response", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => new AssistantMessageEventStream(),
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "retry.enabled": false, "compaction.enabled": false }),
+			modelRegistry: sharedModelRegistry,
+		});
+		const completions: Array<Extract<AgentSessionEvent, { type: "run_completion" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "run_completion") completions.push(event);
+		});
+		vi.spyOn(agent, "prompt").mockRejectedValue(new Error("dispatch failed before response"));
+
+		await expect(session.prompt("Fail before the first response")).rejects.toThrow("dispatch failed before response");
+		await waitFor(() => completions.length === 1);
+
+		const completionEvent = completions[0];
+		if (!completionEvent) throw new Error("Expected a standalone failed completion");
+		expect(completionEvent.completion.outcome).toBe("failed");
+		expect(completionEvent.completion.stoppedAt).toBeGreaterThanOrEqual(completionEvent.completion.startedAt);
+		expect(completionEvent.message).toBeUndefined();
+		const completionEntry = sessionManager
+			.getBranch()
+			.find(entry => entry.type === "custom" && entry.customType === "run_completion");
+		if (completionEntry?.type !== "custom") throw new Error("Expected standalone completion metadata");
+		expect(completionEntry.data).toEqual({ completion: completionEvent.completion });
+		expect(
+			sessionManager.getBranch().some(entry => entry.type === "message" && entry.message.role === "assistant"),
+		).toBe(false);
+		const transcript = sessionManager.buildSessionContext({ transcript: true });
+		expect(transcript.messages).toContainEqual(
+			expect.objectContaining({
+				role: "custom",
+				customType: "run_completion",
+				details: { completion: completionEvent.completion },
+			}),
+		);
+		expect(sessionManager.buildSessionContext().messages).toEqual([]);
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		const reloaded = await SessionManager.open(sessionFile, tempDir, undefined, { suppressBreadcrumb: true });
+		expect(reloaded.getBranch().find(entry => entry.id === completionEntry.id)).toEqual(completionEntry);
+		expect(reloaded.getBranch().some(entry => entry.type === "message" && entry.message.role === "assistant")).toBe(
+			false,
+		);
+		const reloadedTranscript = reloaded.buildSessionContext({ transcript: true });
+		expect(reloadedTranscript.messages).toEqual(transcript.messages);
+		expect(reloadedTranscript.messages.some(message => message.role === "assistant")).toBe(false);
+		expect(reloaded.buildSessionContext().messages).toEqual([]);
+		await reloaded.close();
+	});
+
+	it("starts a distinct queued user run at its own submission time", async () => {
+		let now = 1_000;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const firstResponseStarted = Promise.withResolvers<void>();
+		const releaseFirstResponse = Promise.withResolvers<void>();
+		let streamCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				const call = ++streamCalls;
+				queueMicrotask(async () => {
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: [{ type: "text", text: `response ${call}` }],
+						api: "anthropic-messages",
+						provider: "anthropic",
+						model: model.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: message });
+					if (call === 1) {
+						firstResponseStarted.resolve();
+						await releaseFirstResponse.promise;
+					}
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "retry.enabled": false, "compaction.enabled": false }),
+			modelRegistry: sharedModelRegistry,
+		});
+		const firstSubmittedAt = Date.now();
+		const completions: Array<Extract<AgentSessionEvent, { type: "run_completion" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "run_completion") completions.push(event);
+		});
+
+		const firstPrompt = session.prompt("First request");
+		await firstResponseStarted.promise;
+		now = 2_000;
+		const queuedSubmittedAt = Date.now();
+		await session.prompt("Queued follow-up", { streamingBehavior: "followUp" });
+		releaseFirstResponse.resolve();
+		await firstPrompt;
+		await session.waitForIdle();
+
+		expect(completions.map(event => event.completion.startedAt)).toEqual([firstSubmittedAt, queuedSubmittedAt]);
+		expect(completions.map(event => event.completion.outcome)).toEqual(["completed", "completed"]);
+	});
+
+	it("settles reasonless abort during admitted setup before a late finalizer can affect a newer run", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const setupEntered = Promise.withResolvers<void>();
+		const releaseSetup = Promise.withResolvers<void>();
+		const providerEntered = Promise.withResolvers<void>();
+		const releaseProvider = Promise.withResolvers<void>();
+		vi.spyOn(sharedModelRegistry, "getApiKey").mockImplementationOnce(async () => {
+			setupEntered.resolve();
+			await releaseSetup.promise;
+			return "test-key";
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				providerEntered.resolve();
+				void releaseProvider.promise.then(() => {
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: [{ type: "text", text: "Successor completed" }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "retry.enabled": false, "compaction.enabled": false }),
+			modelRegistry: sharedModelRegistry,
+		});
+		const completions: Array<Extract<AgentSessionEvent, { type: "run_completion" }>> = [];
+		let agentEnds = 0;
+		session.subscribe(event => {
+			if (event.type === "run_completion") completions.push(event);
+			if (event.type === "agent_end") agentEnds++;
+		});
+		const firstPrompt = session.prompt("Cancel admitted setup");
+		try {
+			await setupEntered.promise;
+			expect(session.isStreaming).toBe(true);
+			await session.abort();
+			expect(agentEnds).toBe(0);
+			expect(completions).toHaveLength(1);
+			expect(completions[0]?.completion.outcome).toBe("interrupted");
+			expect(completions[0]?.message).toBeUndefined();
+			const completionEntry = sessionManager
+				.getBranch()
+				.find(entry => entry.type === "custom" && entry.customType === "run_completion");
+			if (completionEntry?.type !== "custom") throw new Error("Expected standalone cancellation metadata");
+			expect(completionEntry.data).toEqual({ completion: completions[0]?.completion });
+			expect(sessionManager.buildSessionContext().messages).toEqual([]);
+
+			const successorPrompt = session.prompt("Newer request");
+			await providerEntered.promise;
+			releaseSetup.resolve();
+			await firstPrompt;
+			expect(completions).toHaveLength(1);
+			expect(agentEnds).toBe(0);
+			releaseProvider.resolve();
+			await successorPrompt;
+			await session.waitForIdle();
+			expect(completions).toHaveLength(2);
+			expect(completions[1]?.completion.outcome).toBe("completed");
+			expect(agentEnds).toBe(1);
+		} finally {
+			releaseSetup.resolve();
+			releaseProvider.resolve();
+			await firstPrompt;
+		}
+	});
+
+	it("records interrupted outcome when the active run is aborted", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const providerEntered = Promise.withResolvers<void>();
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				const signal = options?.signal;
+				if (!signal) throw new Error("Expected an abortable provider stream");
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: "Will be interrupted" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				stream.push({ type: "start", partial: message });
+				signal.addEventListener(
+					"abort",
+					() => {
+						stream.push({ type: "error", reason: "aborted", error: { ...message, stopReason: "aborted" } });
+					},
+					{ once: true },
+				);
+				providerEntered.resolve();
+				return stream;
+			},
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "retry.enabled": false, "compaction.enabled": false }),
+			modelRegistry: sharedModelRegistry,
+		});
+		const completions: Array<Extract<AgentSessionEvent, { type: "run_completion" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "run_completion") completions.push(event);
+		});
+
+		const prompt = session.prompt("Interrupt this run");
+		await providerEntered.promise;
+		await session.abort();
+		await prompt;
+		await session.waitForIdle();
+
+		expect(completions).toHaveLength(1);
+		expect(completions[0]?.completion.outcome).toBe("interrupted");
+	});
+	it("interrupts a logical run when its awaited owner job is cancelled", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const yieldTool: AgentTool = {
+			name: "yield",
+			label: "Yield",
+			description: "Finish the current task",
+			parameters: type({}),
+			execute: async () => ({ content: [{ type: "text", text: "yielded" }] }),
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [yieldTool] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: [{ type: "toolCall", id: "yield-call", name: "yield", arguments: {} }],
+						api: "anthropic-messages",
+						provider: "anthropic",
+						model: model.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "toolUse",
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "toolUse", message });
+				});
+				return stream;
+			},
+			convertToLlm,
+		});
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const jobStarted = Promise.withResolvers<void>();
+		const cancellationStarted = Promise.withResolvers<void>();
+		const releaseCancellation = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"bash",
+			"wait for cancellation",
+			async ({ signal }) => {
+				jobStarted.resolve();
+				await new Promise<void>(resolve => {
+					if (signal.aborted) {
+						resolve();
+						return;
+					}
+					signal.addEventListener("abort", () => resolve(), { once: true });
+				});
+				cancellationStarted.resolve();
+				await releaseCancellation.promise;
+				return "cancelled";
+			},
+			{ ownerId: "completion-owner" },
+		);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+			agentId: "completion-owner",
+			asyncJobManager: manager,
+		});
+		const completions: Array<Extract<AgentSessionEvent, { type: "run_completion" }>> = [];
+		let agentEnds = 0;
+		session.subscribe(event => {
+			if (event.type === "run_completion") completions.push(event);
+			if (event.type === "agent_end") agentEnds++;
+		});
+
+		let cancellation: Promise<unknown> | undefined;
+		try {
+			await jobStarted.promise;
+			await session.prompt("Wait for the background job");
+			await session.waitForIdle();
+			expect(completions).toHaveLength(0);
+
+			const endsBeforeCancellation = agentEnds;
+			cancellation = session.cancelAsyncJob(jobId);
+			await cancellationStarted.promise;
+			expect(completions).toHaveLength(0);
+			releaseCancellation.resolve();
+			await cancellation;
+			await manager.waitForAll();
+			expect(completions).toHaveLength(1);
+			expect(completions[0]?.completion.outcome).toBe("interrupted");
+			expect(agentEnds).toBe(endsBeforeCancellation);
+			await session.cancelAsyncJob(jobId);
+			expect(completions).toHaveLength(1);
+		} finally {
+			releaseCancellation.resolve();
+			await cancellation;
+			await manager.dispose();
+		}
 	});
 
 	it("uses non-empty session_stop reason when additional context is empty", async () => {

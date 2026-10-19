@@ -3,7 +3,7 @@ import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { createCompactionSummaryMessage, createCustomMessage } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { createAdvisorMessageCard } from "@oh-my-pi/pi-tui/chat/advisor-message";
-import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { AssistantMessageComponent, RunCompletionComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { BashExecutionComponent } from "@oh-my-pi/pi-tui/chat/bash-execution";
 import { ChatTranscriptBuilder } from "@oh-my-pi/pi-tui/chat/chat-transcript-builder";
 import { CompactionSummaryMessageComponent } from "@oh-my-pi/pi-tui/chat/compaction-summary-message";
@@ -445,5 +445,65 @@ describe("native transcript", () => {
 			]),
 		);
 		expect(h.errors).toEqual([]);
+	});
+	it("renders every durable outcome on ANSI and native surfaces with zero usage", async () => {
+		const startedAt = new Date(2026, 0, 2, 3, 4, 5).getTime();
+		const stoppedAt = startedAt + 60_000;
+		const stopLabel = new Date(stoppedAt).toLocaleString(undefined, { timeZoneName: "short" });
+		const cases = [
+			{ outcome: "completed", label: "Completed" },
+			{ outcome: "failed", label: "Failed" },
+			{ outcome: "interrupted", label: "Interrupted" },
+		] as const;
+		const components = cases.map(({ outcome, label }) => {
+			const message = {
+				...assistant([{ type: "text", text: `${label} answer` }]),
+				runCompletion: { startedAt, stoppedAt, outcome },
+			} as AssistantMessage;
+			const component = new AssistantMessageComponent(message);
+			const ansi = Bun.stripANSI(component.render(120).join("\n"));
+			expect(ansi).toContain(label);
+			expect(ansi).toContain("1m");
+			expect(ansi).toContain(stopLabel);
+			return component;
+		});
+
+		const h = await startWith(h => components.forEach(component => h.tui.addChild(component)));
+		const nativeText = JSON.stringify(h.doc());
+		for (const { label } of cases) {
+			expect(nativeText).toContain(label);
+			expect(nativeText).toContain("1m");
+		}
+		expect(nativeText.match(/1m/g)).toHaveLength(cases.length);
+		expect(nativeText.match(/Stopped at/g)).toHaveLength(cases.length);
+		expect(nativeText.split(stopLabel)).toHaveLength(cases.length + 1);
+	});
+	it("keeps native token and cost totals beside one run duration", async () => {
+		const startedAt = new Date(2026, 0, 2, 3, 4, 5).getTime();
+		const completion = { startedAt, stoppedAt: startedAt + 60_000, outcome: "completed" as const };
+		const component = new AssistantMessageComponent({
+			...assistant([{ type: "text", text: "Billed answer" }]),
+			runCompletion: completion,
+		});
+		component.setTurnUsage({ elapsedMs: 60_000, input: 7, output: 3, cost: 0.02 });
+		const h = await startWith(h => h.tui.addChild(component));
+		const nativeText = JSON.stringify(h.doc());
+		expect(nativeText).toContain("10 tok");
+		expect(nativeText).toContain("$0.02");
+		expect(nativeText.match(/1m/g)).toHaveLength(1);
+	});
+
+	it("describes a no-response completion row natively and in ANSI", async () => {
+		const completion = {
+			startedAt: new Date(2026, 0, 2, 3, 4, 5).getTime(),
+			stoppedAt: new Date(2026, 0, 2, 3, 5, 5).getTime(),
+			outcome: "failed" as const,
+		};
+		const component = new RunCompletionComponent(completion);
+		const ansi = Bun.stripANSI(component.render(120).join("\n"));
+		expect(ansi).toContain("Failed");
+		expect(ansi).toContain("1m");
+		const h = await startWith(h => h.tui.addChild(component));
+		expect(JSON.stringify(h.doc())).toContain("omp.run.completion");
 	});
 });

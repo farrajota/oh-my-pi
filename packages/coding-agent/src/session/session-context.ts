@@ -5,11 +5,14 @@ import {
 	coerceServiceTierByFamily,
 	type OpenAIResponsesHistoryPayload,
 	type ServiceTierByFamily,
+	type RunCompletion,
 } from "@oh-my-pi/pi-ai";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { isRecord } from "@oh-my-pi/pi-utils";
+import { CONTEXT_NOTES_ENTRY_TYPE, getContextNotes, renderContextNotes } from "./context-notes";
 import {
 	createBranchSummaryMessage,
+	type CustomMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
 	INTERRUPTED_THINKING_MESSAGE_TYPE,
@@ -17,8 +20,9 @@ import {
 	PREWALK_PLAN_MESSAGE_TYPE,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
-import { CONTEXT_NOTES_ENTRY_TYPE, getContextNotes, renderContextNotes } from "./context-notes";
 import {
+	RUN_COMPLETION_CUSTOM_TYPE,
+	type RunCompletionEntryData,
 	type CompactionEntry,
 	type CustomMessageEntry,
 	EPHEMERAL_MODEL_CHANGE_ROLE,
@@ -230,6 +234,27 @@ export function getOpenAiRemoteCompactionPayload(
 }
 
 /** Session entries that replay as transcript messages: persisted messages and custom messages. */
+
+function decodeRunCompletion(value: unknown): RunCompletionEntryData | undefined {
+	if (!isRecord(value) || !isRecord(value.completion)) return undefined;
+	const { startedAt, stoppedAt, outcome } = value.completion;
+	if (
+		typeof startedAt !== "number" ||
+		!Number.isFinite(startedAt) ||
+		typeof stoppedAt !== "number" ||
+		!Number.isFinite(stoppedAt) ||
+		stoppedAt < startedAt ||
+		(outcome !== "completed" && outcome !== "interrupted" && outcome !== "failed")
+	) {
+		return undefined;
+	}
+	if (value.messageId !== undefined && typeof value.messageId !== "string") return undefined;
+	return {
+		...(typeof value.messageId === "string" ? { messageId: value.messageId } : {}),
+		completion: { startedAt, stoppedAt, outcome },
+	};
+}
+
 export type TranscriptEntry = SessionMessageEntry | CustomMessageEntry;
 
 export function isTranscriptEntry(entry: SessionEntry): entry is TranscriptEntry {
@@ -289,7 +314,16 @@ export function buildSessionContext(
 		path.push(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
+	// Replay indexes, reset boundaries, settings and response metadata all use branch chronology.
 	path.reverse();
+	const runCompletionByMessageId = options?.transcript ? new Map<string, RunCompletion>() : undefined;
+	if (runCompletionByMessageId) {
+		for (const entry of path) {
+			if (entry.type !== "custom" || entry.customType !== RUN_COMPLETION_CUSTOM_TYPE) continue;
+			const data = decodeRunCompletion(entry.data);
+			if (data?.messageId) runCompletionByMessageId.set(data.messageId, data.completion);
+		}
+	}
 
 	// Extract settings and find compaction
 	let thinkingLevel: string | undefined = "off";
@@ -394,7 +428,6 @@ export function buildSessionContext(
 		if (!options?.transcript) return;
 		cacheMissExplainedAt.push(trackMessageCacheState(msg));
 	};
-
 	const appendMessage = (entry: SessionEntry) => {
 		handleEntryResetTracking(entry);
 		if (entry.type === "message") {
@@ -405,7 +438,12 @@ export function buildSessionContext(
 			) {
 				return;
 			}
-			pushMessage(entry.message);
+			if (entry.message.role === "assistant") {
+				const completion = runCompletionByMessageId?.get(entry.id);
+				pushMessage(completion ? { ...entry.message, runCompletion: completion } : entry.message);
+			} else {
+				pushMessage(entry.message);
+			}
 		} else if (entry.type === "custom_message") {
 			if (
 				!options?.transcript &&
@@ -415,6 +453,20 @@ export function buildSessionContext(
 			}
 			const message = customMessageEntryMessage(entry);
 			if (message) pushMessage(message);
+		} else if (entry.type === "custom" && options?.transcript && entry.customType === RUN_COMPLETION_CUSTOM_TYPE) {
+			const data = decodeRunCompletion(entry.data);
+			if (data && !data.messageId) {
+				const row: CustomMessage<{ completion: RunCompletion }> = {
+					role: "custom",
+					customType: RUN_COMPLETION_CUSTOM_TYPE,
+					content: `Run ${data.completion.outcome}`,
+					display: true,
+					details: { completion: data.completion },
+					attribution: "agent",
+					timestamp: Date.parse(entry.timestamp),
+				};
+				pushMessage(row);
+			}
 		} else if (entry.type === "branch_summary" && entry.summary) {
 			pushMessage(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
 		}

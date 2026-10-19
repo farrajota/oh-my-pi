@@ -15,6 +15,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { ChatTranscriptBuilder } from "@oh-my-pi/pi-tui/chat/chat-transcript-builder";
 import { formatUsageRow } from "@oh-my-pi/pi-tui/overlays/usage-row";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
@@ -40,6 +41,15 @@ const RESPONSE_CREATED_AT = PROMPT_AT + 30_000;
 const REQUEST_DURATION_MS = 30_000;
 const USAGE_LABEL = "4.2K";
 const TURN_ELAPSED_LABEL = "Δ 1m";
+
+const ZERO_USAGE: Usage = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
 
 type AssistantFixture = Extract<AgentMessage, { role: "assistant" }>;
 
@@ -84,6 +94,32 @@ function toEntries(
 
 function renderedText(container: Container): string {
 	return Bun.stripANSI(container.children.map(child => child.render(120).join("\n")).join("\n"));
+}
+function makeHarness(turnTimeOn: boolean, showTokenUsage = true): { ctx: InteractiveModeContext; helpers: UiHelpers } {
+	const ctx = {
+		chatContainer: new Container(),
+		transcriptMessageComponents: new WeakMap(),
+		pendingTools: new Map(),
+		ui: { requestRender: vi.fn() },
+		statusLine: { invalidate: vi.fn() },
+		updateEditorBorderColor: vi.fn(),
+		settings: Settings.isolated({ "display.showTokenUsage": showTokenUsage, "display.showTurnTime": turnTimeOn }),
+		addMessageToChat: (message: AgentMessage, options?: Parameters<UiHelpers["addMessageToChat"]>[1]) =>
+			helpers.addMessageToChat(message, options),
+		session: {
+			retryAttempt: 0,
+			getToolByName: () => undefined,
+			sessionManager: { getCwd: () => process.cwd(), putBlobSync: () => undefined },
+		},
+		get viewSession() {
+			return (this as typeof ctx).session;
+		},
+		toolOutputExpanded: false,
+		hideThinkingBlock: false,
+		clearTransientSessionUi: () => {},
+	} as unknown as InteractiveModeContext;
+	const helpers = new UiHelpers(ctx);
+	return { ctx, helpers };
 }
 
 describe("formatUsageRow turn elapsed", () => {
@@ -272,32 +308,6 @@ describe("UiHelpers.renderSessionContext turn elapsed", () => {
 		await initTheme();
 	});
 
-	function makeHarness(turnTimeOn: boolean): { ctx: InteractiveModeContext; helpers: UiHelpers } {
-		const ctx = {
-			chatContainer: new Container(),
-			transcriptMessageComponents: new WeakMap(),
-			pendingTools: new Map(),
-			ui: { requestRender: vi.fn() },
-			statusLine: { invalidate: vi.fn() },
-			updateEditorBorderColor: vi.fn(),
-			settings: Settings.isolated({ "display.showTokenUsage": true, "display.showTurnTime": turnTimeOn }),
-			addMessageToChat: (message: AgentMessage) => helpers.addMessageToChat(message),
-			session: {
-				retryAttempt: 0,
-				getToolByName: () => undefined,
-				sessionManager: { getCwd: () => process.cwd(), putBlobSync: () => undefined },
-			},
-			get viewSession() {
-				return (this as typeof ctx).session;
-			},
-			toolOutputExpanded: false,
-			hideThinkingBlock: false,
-			clearTransientSessionUi: () => {},
-		} as unknown as InteractiveModeContext;
-		const helpers = new UiHelpers(ctx);
-		return { ctx, helpers };
-	}
-
 	it("renders the delta on the rebuilt usage row after the turn timestamp", () => {
 		const { ctx, helpers } = makeHarness(true);
 		helpers.renderSessionContext({ messages: [userMessage(), assistantMessage()] } as SessionContext);
@@ -310,6 +320,231 @@ describe("UiHelpers.renderSessionContext turn elapsed", () => {
 		const { ctx, helpers } = makeHarness(false);
 		helpers.renderSessionContext({ messages: [userMessage(), assistantMessage()] } as SessionContext);
 		expect(renderedText(ctx.chatContainer)).not.toContain(TURN_ELAPSED_LABEL);
+	});
+});
+describe("durable run completion replay", () => {
+	beforeAll(async () => {
+		await initTheme();
+	});
+
+	const completion = {
+		startedAt: PROMPT_AT,
+		stoppedAt: PROMPT_AT + 60_000,
+		outcome: "completed" as const,
+	};
+	const stopLabel = new Date(completion.stoppedAt).toLocaleString(undefined, { timeZoneName: "short" });
+
+	it("restores elapsed and exact stopped-at time from a cold UiHelpers session context", () => {
+		const { ctx, helpers } = makeHarness(false, false);
+		const answer = assistantMessage({ runCompletion: completion } as unknown as Partial<AssistantFixture>);
+		helpers.renderSessionContext({ messages: [userMessage(), answer] } as SessionContext);
+		const rendered = renderedText(ctx.chatContainer);
+		expect(rendered).toContain("Completed");
+		expect(rendered).toContain("1m");
+		expect(rendered).toContain(stopLabel);
+	});
+	it("reapplies persisted completion during a settled-component redraw", () => {
+		const { ctx, helpers } = makeHarness(false, false);
+		const cachedAnswer = assistantMessage();
+		helpers.addMessageToChat(cachedAnswer);
+		const reused = ctx.chatContainer.children.at(-1)!;
+		const answer = assistantMessage({ runCompletion: completion } as unknown as Partial<AssistantFixture>);
+		ctx.transcriptMessageComponents.set(answer, reused);
+		ctx.chatContainer.clear();
+		helpers.renderSessionContext({ messages: [userMessage(), answer] } as SessionContext, {
+			reuseSettledComponents: true,
+		});
+		const rendered = renderedText(ctx.chatContainer);
+		expect(rendered).toContain("Completed");
+		expect(rendered).toContain("1m");
+		expect(rendered).toContain(stopLabel);
+	});
+
+	it("restores run completion custom metadata in ChatTranscriptBuilder cold replay", () => {
+		const transcript = new ChatTranscriptBuilder({
+			ui: { requestRender: () => {}, requestComponentRender: () => {} } as unknown as TUI,
+			cwd: process.cwd(),
+			requestRender: () => {},
+		});
+		const record = {
+			type: "custom",
+			id: "completion-entry",
+			parentId: "answer-entry",
+			timestamp: new Date(completion.stoppedAt).toISOString(),
+			customType: "run_completion",
+			data: { messageId: "answer-entry", completion },
+		} as unknown as Parameters<typeof transcript.rebuild>[0][number];
+		transcript.rebuild([
+			{
+				type: "message",
+				id: "answer-entry",
+				parentId: null,
+				timestamp: new Date(PROMPT_AT).toISOString(),
+				message: assistantMessage(),
+			},
+			record,
+		]);
+		const rendered = renderedText(transcript.container);
+		expect(rendered).toContain("Completed");
+		expect(rendered).toContain("1m");
+		expect(rendered).toContain(stopLabel);
+	});
+	it("renders a standalone row for raw completion metadata without a message id", () => {
+		const transcript = new ChatTranscriptBuilder({
+			ui: { requestRender: () => {}, requestComponentRender: () => {} } as unknown as TUI,
+			cwd: process.cwd(),
+			requestRender: () => {},
+		});
+		const record = {
+			type: "custom",
+			id: "completion-entry",
+			parentId: null,
+			timestamp: new Date(completion.stoppedAt).toISOString(),
+			customType: "run_completion",
+			data: { completion: { ...completion, outcome: "interrupted" as const } },
+		} as unknown as Parameters<typeof transcript.rebuild>[0][number];
+		transcript.rebuild([record]);
+		const rendered = renderedText(transcript.container);
+		expect(rendered).toContain("Interrupted");
+		expect(rendered).toContain("1m");
+		expect(rendered).toContain(stopLabel);
+	});
+	it("renders the persisted fallback completion row when no response exists", () => {
+		const { ctx, helpers } = makeHarness(false, false);
+		const fallback = {
+			role: "custom",
+			customType: "run_completion",
+			content: "Run failed",
+			details: { completion: { ...completion, outcome: "failed" as const } },
+			display: true,
+			timestamp: completion.stoppedAt,
+		} as unknown as AgentMessage;
+		helpers.renderSessionContext({ messages: [fallback] } as SessionContext);
+		const rendered = renderedText(ctx.chatContainer);
+		expect(rendered).toContain("Failed");
+		expect(rendered).toContain("1m");
+		expect(rendered).toContain(stopLabel);
+	});
+
+	it("attaches raw completion metadata to the final tool-separated assistant segment", () => {
+		const transcript = new ChatTranscriptBuilder({
+			ui: { requestRender: () => {}, requestComponentRender: () => {} } as unknown as TUI,
+			cwd: process.cwd(),
+			requestRender: () => {},
+		});
+		const answer = assistantMessage({
+			content: [
+				{ type: "text", text: "Before tool" },
+				{ type: "toolCall", id: "call-completion", name: "probe", arguments: {} },
+				{ type: "text", text: "Final answer after tool" },
+			],
+		});
+		const record = {
+			type: "custom",
+			id: "completion-entry",
+			parentId: "answer-entry",
+			timestamp: new Date(completion.stoppedAt).toISOString(),
+			customType: "run_completion",
+			data: { messageId: "answer-entry", completion },
+		} as unknown as Parameters<typeof transcript.rebuild>[0][number];
+		transcript.rebuild([
+			{
+				type: "message",
+				id: "answer-entry",
+				parentId: null,
+				timestamp: new Date(PROMPT_AT).toISOString(),
+				message: answer,
+			},
+			record,
+		]);
+		const rendered = renderedText(transcript.container);
+		expect(rendered).toContain("Final answer after tool");
+		expect(rendered).toContain("Completed");
+		expect(rendered).toContain("1m");
+		expect(rendered.match(/Completed/g)).toHaveLength(1);
+	});
+	it("attaches completion metadata appended after the response", () => {
+		const transcript = new ChatTranscriptBuilder({
+			ui: { requestRender: () => {}, requestComponentRender: () => {} } as unknown as TUI,
+			cwd: process.cwd(),
+			requestRender: () => {},
+		});
+		transcript.append([
+			{
+				type: "message",
+				id: "answer-entry",
+				parentId: null,
+				timestamp: new Date(PROMPT_AT).toISOString(),
+				message: assistantMessage(),
+			},
+		]);
+		transcript.append([
+			{
+				type: "custom",
+				id: "completion-entry",
+				parentId: "answer-entry",
+				timestamp: new Date(completion.stoppedAt).toISOString(),
+				customType: "run_completion",
+				data: { messageId: "answer-entry", completion },
+			} as unknown as Parameters<typeof transcript.append>[0][number],
+		]);
+
+		const rendered = renderedText(transcript.container);
+		expect(rendered).toContain("Completed");
+		expect(rendered).toContain("1m");
+		expect(rendered).toContain(stopLabel);
+	});
+
+	it("renders a failed zero-usage run on ANSI and native surfaces", () => {
+		const runCompletion = { ...completion, outcome: "failed" as const };
+		const component = new AssistantMessageComponent(
+			assistantMessage({ runCompletion, usage: ZERO_USAGE } as unknown as Partial<AssistantFixture>),
+		);
+		const ansi = renderedText(component);
+		const native = JSON.stringify(component.describe());
+
+		expect(ansi).toContain("Failed");
+		expect(ansi).toContain("1m");
+		expect(ansi).toContain(stopLabel);
+		expect(native).toContain("Failed");
+		expect(native).toContain("1m");
+		expect(native).toContain(stopLabel);
+	});
+
+	it("renders an interrupted zero-usage run on ANSI and native surfaces", () => {
+		const runCompletion = { ...completion, outcome: "interrupted" as const };
+		const component = new AssistantMessageComponent(
+			assistantMessage({ runCompletion, usage: ZERO_USAGE } as unknown as Partial<AssistantFixture>),
+		);
+		const ansi = renderedText(component);
+		const native = JSON.stringify(component.describe());
+
+		expect(ansi).toContain("Interrupted");
+		expect(ansi).toContain("1m");
+		expect(ansi).toContain(stopLabel);
+		expect(native).toContain("Interrupted");
+		expect(native).toContain("1m");
+		expect(native).toContain(stopLabel);
+	});
+
+	it("keeps legacy response duration without inventing a stopped-at timestamp", () => {
+		const { ctx, helpers } = makeHarness(false, false);
+		const legacy = assistantMessage({ completedAt: PROMPT_AT + 60_000 } as Partial<AssistantFixture>);
+		helpers.renderSessionContext({ messages: [userMessage(), legacy] } as SessionContext);
+		const rendered = renderedText(ctx.chatContainer);
+		expect(rendered).toContain("Response took 1m");
+		expect(rendered).not.toContain(stopLabel);
+	});
+	it("omits stop and elapsed labels when neither completion nor response endpoints exist", () => {
+		const { ctx, helpers } = makeHarness(false, false);
+		const unstamped = assistantMessage({ completedAt: undefined, duration: undefined });
+		helpers.renderSessionContext({ messages: [userMessage(), unstamped] } as SessionContext);
+		const rendered = renderedText(ctx.chatContainer);
+		expect(rendered).not.toContain("Stopped at");
+		expect(rendered).not.toContain("Response took");
+		expect(rendered).not.toContain("Completed");
+		expect(rendered).not.toContain("Failed");
+		expect(rendered).not.toContain("Interrupted");
 	});
 });
 

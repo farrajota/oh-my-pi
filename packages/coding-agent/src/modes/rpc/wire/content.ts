@@ -100,6 +100,11 @@ export const messageDefs = {
 		"providerPayload?": JSON_OBJECT,
 		timestamp: "number",
 	},
+	RunCompletion: {
+		startedAt: "number",
+		stoppedAt: "number",
+		outcome: "'completed' | 'interrupted' | 'failed'",
+	},
 	AssistantMessage: {
 		role: "'assistant'",
 		content: "AssistantContent[]",
@@ -119,6 +124,7 @@ export const messageDefs = {
 		"duration?": "number",
 		"ttft?": "number",
 		"completedAt?": "number",
+		"runCompletion?": "RunCompletion",
 	},
 	ToolResultMessage: {
 		role: "'toolResult'",

@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added persisted logical-run completion metadata and `run_completion` RPC events with local start/stop timestamps and completed, failed, or interrupted outcomes; generated TypeScript, Python, Rust, and Go clients expose the same data.
+
 ### Fixed
 
+- Restored elapsed prompt time after completion, transcript redraw, and reopening sessions on ANSI and native interfaces, with the local stop date, time, and timezone. Historical sessions without run-completion metadata show only known response-level timing rather than an inferred stop timestamp.
 - Fixed task spawns handling structured-output schemas and prompts consistently, and honoring IRC delivery only when enabled for the spawned agent.
 - Fixed task spawns dropping an autoloaded skill discovered after the parent session's skill index was loaded.
 - Fixed internal `history://` and `artifact://` reads enforcing the right authorization and honoring selectors.

@@ -44,7 +44,6 @@ type StreamingComponentDouble = {
 	setLinkTargets(): void;
 	updateContent(): void;
 	markTranscriptBlockFinalized(): void;
-	setCompletionFooter(): void;
 	setServedModelMismatch(): void;
 };
 
@@ -57,7 +56,6 @@ function createStreamingComponent() {
 		markTranscriptBlockFinalized: () => {
 			transcriptBlockFinalized = true;
 		},
-		setCompletionFooter() {},
 		setServedModelMismatch() {},
 	};
 }
@@ -67,7 +65,6 @@ function createContext(viewSession = source()) {
 		activityEnd: 0,
 		activityStart: 0,
 		beginRun: [] as AgentSession[],
-		elapsedLookups: [] as AgentSession[],
 		endRun: [] as AgentSession[],
 		ensureLoader: 0,
 		flushModelSwitch: 0,
@@ -111,10 +108,6 @@ function createContext(viewSession = source()) {
 			return startedAt !== undefined;
 		},
 		endWorkingMessageRun: (session: AgentSession) => calls.endRun.push(session),
-		getWorkingMessageRunElapsedMs: (session: AgentSession) => {
-			calls.elapsedLookups.push(session);
-			return 500;
-		},
 		setWorkingMessageRunTokenDelta: (session: AgentSession, tokenDelta: number) =>
 			calls.tokenUpdates.push([session, tokenDelta]),
 		ensureLoadingAnimation: () => {
@@ -165,38 +158,6 @@ describe("EventController source-aware working-message lifecycle", () => {
 		expect(calls.rehydrateRun).toEqual([[active, 1_000]]);
 		expect(calls.activityStart).toBe(2);
 		expect(calls.ensureLoader).toBe(2);
-	});
-
-	test("looks up completion elapsed time against the emitting session", async () => {
-		const main = source(false, 1_000);
-		const { ctx, calls } = createContext(main);
-		const controller = new EventController(ctx) as unknown as SourceAwareController;
-
-		// Completion processing must see the emitting session as the current view;
-		// source guards reject detached events before elapsed lookup.
-		await controller.handleEvent(main, { type: "agent_start" });
-		const completed = {
-			...assistantMessage(1),
-			stopReason: "stop",
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-		} as AgentMessage;
-		const completionContext = ctx as unknown as {
-			streamingMessage: AgentMessage;
-			streamingComponent: StreamingComponentDouble;
-			noteDisplayableThinkingContent(): boolean;
-		};
-		completionContext.noteDisplayableThinkingContent = () => false;
-		completionContext.streamingMessage = completed;
-		completionContext.streamingComponent = createStreamingComponent();
-		await controller.handleEvent(main, { type: "message_end", message: completed } as AgentSessionEvent);
-		expect(calls.elapsedLookups).toEqual([main]);
 	});
 
 	test("uses the emitting source streaming flag for a mismatched end", async () => {

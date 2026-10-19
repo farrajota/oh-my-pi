@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { createCustomMessage } from "@oh-my-pi/pi-agent-core/compaction/messages";
-import type { ImageContent, MessageAttribution, TextContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, MessageAttribution, RunCompletion, TextContent } from "@oh-my-pi/pi-ai";
 import {
 	type CustomMessage,
 	type CustomMessageContent,
@@ -32,8 +32,18 @@ export interface CustomMessageEntryLike {
 	attribution?: MessageAttribution;
 }
 
+/** Persisted completion metadata; it is rendered but never becomes model context. */
+export interface RunCompletionEntryLike {
+	type: "custom";
+	id: string;
+	parentId: string | null;
+	timestamp: string;
+	customType: "run_completion";
+	data: { messageId?: string; completion: RunCompletion };
+}
+
 /** Entries that replay as visible or hidden transcript messages. */
-export type TranscriptEntryLike = SessionMessageEntryLike | CustomMessageEntryLike;
+export type TranscriptEntryLike = SessionMessageEntryLike | CustomMessageEntryLike | RunCompletionEntryLike;
 
 /** Restore a persisted custom message, rejecting unsendable content. */
 export function customMessageEntryMessage(entry: CustomMessageEntryLike): CustomMessage | undefined {
@@ -52,7 +62,9 @@ export function customMessageEntryMessage(entry: CustomMessageEntryLike): Custom
 
 /** Restore the message represented by a transcript entry. */
 export function transcriptEntryMessage(entry: TranscriptEntryLike): AgentMessage | undefined {
-	return entry.type === "message" ? entry.message : customMessageEntryMessage(entry);
+	if (entry.type === "message") return entry.message;
+	if (entry.type === "custom") return undefined;
+	return customMessageEntryMessage(entry);
 }
 
 /** Identify user-authored requests among transcript and metadata entries. */

@@ -12,7 +12,7 @@
  * component reuse could.
  */
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { Usage } from "@oh-my-pi/pi-ai";
+import type { RunCompletion, Usage } from "@oh-my-pi/pi-ai";
 import { type Component, type TUI } from "../tui";
 import type { AdvisorMessageDetails } from "./messages";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "./messages";
@@ -30,8 +30,9 @@ import {
 import {
 	imageContent,
 	textContent,
-	type TranscriptEntryLike as TranscriptEntry,
 	transcriptEntryMessage,
+	type RunCompletionEntryLike,
+	type TranscriptEntryLike,
 } from "./transcript-entry";
 import { theme } from "../theme";
 import {
@@ -45,13 +46,13 @@ import {
 	resolveAssistantErrorPresentation,
 	splitAssistantMessageToolTimeline,
 } from "./transcript-render-helpers";
-import { createAdvisorMessageCard } from "./advisor-message";
-import { AssistantMessageComponent } from "./assistant-message";
-import { createBackgroundTanDispatchBlock } from "./background-tan-message";
+import { AssistantMessageComponent, RunCompletionComponent } from "./assistant-message";
 import { BashExecutionComponent } from "./bash-execution";
 import { detectCacheInvalidation } from "./cache-invalidation-marker";
 import { ServedModelTracker } from "./served-model-marker";
 import { CollabPromptMessageComponent } from "./collab-prompt-message";
+import { createAdvisorMessageCard } from "./advisor-message";
+import { createBackgroundTanDispatchBlock } from "./background-tan-message";
 import {
 	BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent,
@@ -108,6 +109,7 @@ export class ChatTranscriptBuilder {
 	#expandables: Array<{ setExpanded(expanded: boolean): void }> = [];
 	#expanded = false;
 	#entryComponents = new Map<string, Component[]>();
+	#pendingCompletions = new Map<string, RunCompletion>();
 
 	readonly #deps: ChatTranscriptBuilderDeps;
 
@@ -122,17 +124,16 @@ export class ChatTranscriptBuilder {
 	}
 
 	/** Discard all components and rebuild the whole transcript from `entries`. */
-	rebuild(entries: TranscriptEntry[]): void {
+	rebuild(entries: TranscriptEntryLike[]): void {
 		this.reset();
 		for (const entry of entries) this.#appendEntry(entry);
-		// Flush the trailing turn's usage row only once its tools are materialized
-		// (a read whose result has not arrived stays pending); otherwise the row
-		// would sit above its tools. The drain happens here at the end of the pass.
+		// Flush trailing usage after its tool results have materialized.
 		if (this.#readArgs.size === 0 && this.#pendingTools.size === 0) this.#flushPendingUsage();
+		this.#flushPendingCompletions();
 	}
 
 	/** Append newly persisted entries without rebuilding already rendered rows. */
-	append(entries: TranscriptEntry[]): void {
+	append(entries: TranscriptEntryLike[]): void {
 		for (const entry of entries) this.#appendEntry(entry);
 		if (this.#readArgs.size === 0 && this.#pendingTools.size === 0) this.#flushPendingUsage();
 	}
@@ -180,6 +181,7 @@ export class ChatTranscriptBuilder {
 		this.#waitingPoll = null;
 		this.#todoSnapshot = null;
 		this.#expandables = [];
+		this.#pendingCompletions.clear();
 		this.#entryComponents.clear();
 		this.container.dispose();
 		this.container.clear();
@@ -189,13 +191,55 @@ export class ChatTranscriptBuilder {
 		this.reset();
 	}
 
-	#appendEntry(entry: TranscriptEntry): void {
+	#appendEntry(entry: TranscriptEntryLike): void {
+		if (entry.type === "custom") {
+			this.#appendCompletionEntry(entry);
+			return;
+		}
 		const message = transcriptEntryMessage(entry);
 		if (!message) return;
 		const before = this.container.children.length;
 		this.#appendChatMessage(message);
 		const components = this.container.children.slice(before);
 		if (components.length > 0) this.#entryComponents.set(entry.id, components);
+		const pending = this.#pendingCompletions.get(entry.id);
+		if (pending) {
+			this.#pendingCompletions.delete(entry.id);
+			if (!this.#attachCompletion(components, pending)) this.container.addChild(new RunCompletionComponent(pending));
+		}
+	}
+
+	#appendCompletionEntry(entry: RunCompletionEntryLike): void {
+		const { messageId, completion } = entry.data;
+		if (!messageId) {
+			this.container.addChild(new RunCompletionComponent(completion));
+			return;
+		}
+		const components = this.#entryComponents.get(messageId);
+		if (components) {
+			if (!this.#attachCompletion(components, completion)) {
+				this.container.addChild(new RunCompletionComponent(completion));
+			}
+			return;
+		}
+		this.#pendingCompletions.set(messageId, completion);
+	}
+
+	#attachCompletion(components: Component[], completion: RunCompletion): boolean {
+		for (let index = components.length - 1; index >= 0; index--) {
+			const component = components[index];
+			if (!(component instanceof AssistantMessageComponent)) continue;
+			component.setRunCompletion(completion);
+			return true;
+		}
+		return false;
+	}
+
+	#flushPendingCompletions(): void {
+		for (const completion of this.#pendingCompletions.values()) {
+			this.container.addChild(new RunCompletionComponent(completion));
+		}
+		this.#pendingCompletions.clear();
 	}
 
 	#trackExpandable(component: { setExpanded(expanded: boolean): void }): void {
@@ -417,6 +461,7 @@ export class ChatTranscriptBuilder {
 			this.#deps.linkTargets,
 			expandThinkingBlocks,
 		);
+		if (timeline.hasToolCalls) assistantComponent.setRunCompletion(undefined);
 		assistantComponent.setImagesVisible(displayPreferences.showImages);
 		assistantComponent.setToolResultImagesVisible(!displayPreferences.hideToolActivity);
 		assistantComponent.setTableChartsVisible(this.#deps.tableCharts !== false);
@@ -447,7 +492,7 @@ export class ChatTranscriptBuilder {
 		const appendAssistantSegment = (segment: Extract<AgentMessage, { role: "assistant" }> | undefined) => {
 			if (!segment || !assistantHasVisibleContent(segment)) return;
 			const component = new AssistantMessageComponent(
-				segment,
+				{ ...segment, runCompletion: undefined },
 				hideThinkingBlock,
 				() => this.#deps.requestRender(),
 				this.#deps.getMessageRenderer ? undefined : [],
@@ -519,6 +564,14 @@ export class ChatTranscriptBuilder {
 				this.#pendingTools.set(content.id, component);
 			}
 			appendAssistantSegment(afterToolSegment);
+		}
+		if (!assistantHasVisibleContent(message) && message.runCompletion) {
+			assistantComponent.setRunCompletion(undefined);
+			this.container.addChild(new RunCompletionComponent(message.runCompletion));
+		} else {
+			if (lastAssistantComponent !== assistantComponent) assistantComponent.setRunCompletion(undefined);
+			lastAssistantComponent.setRunCompletion(message.runCompletion);
+			lastAssistantComponent.setResponseDuration(this.#turnElapsedMs(message));
 		}
 		const turnUsage = this.#turnUsage.add(message, this.#turnStartedAt);
 		if (turnUsage) lastAssistantComponent.setTurnUsage(turnUsage);
