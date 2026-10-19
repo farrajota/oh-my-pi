@@ -903,6 +903,8 @@ The `cost` segment shows recorded session costs. For an active provider/model wi
 | `startup.changelogMode` | enum | `summary` | `summary`, `expanded`, `hidden`: choose startup release-note presentation. |
 | `startup.setupWizard` | boolean | `true` | Show newly added onboarding steps once per setup version. |
 
+With `ask.timeout: 0`, waiting for an answer does not consume the active-work lease of the question or any enclosing tool operation. This includes untimed extension UI dialogs and approvals, including questions dispatched through `write xd://…`. The session must remain running; cancellation and session disposal still stop the operation. Dialogs with an explicit positive timeout retain their timed behavior.
+
 ### Providers and services
 
 Model/backend ordering for image generation, web search, speech, dictation, and judgments is configured through the corresponding `modelRoles` and `retry.fallbackChains` entries in [Models](#models). This section contains transport and service behavior that remains independent of model selection.

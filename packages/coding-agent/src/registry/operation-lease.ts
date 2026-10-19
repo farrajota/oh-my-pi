@@ -41,7 +41,13 @@ const quiescedRegistries = new WeakMap<OperationLeaseRegistry, MigrationFenceCon
 const operationDurableStores = new WeakMap<OperationLeaseRegistry, RegistryDurableStateStore>();
 const sessionDurableStores = new WeakMap<object, RegistryDurableStateStore>();
 let nextOperationOwnerId = 1;
-const operationLeaseContext = new AsyncLocalStorage<{ registry: OperationLeaseRegistry; lease: OperationLease }>();
+interface OperationLeaseContext {
+	readonly registry: OperationLeaseRegistry;
+	readonly lease: OperationLease;
+	readonly parent?: OperationLeaseContext;
+}
+
+const operationLeaseContext = new AsyncLocalStorage<OperationLeaseContext>();
 
 const boundSessionOperationAuthorityBrand: unique symbol = Symbol("boundSessionOperationAuthority");
 
@@ -82,6 +88,9 @@ interface ActiveOperation {
 	readonly controller: AbortController;
 	settled: boolean;
 	abandonReason?: string;
+	userWaitDepth: number;
+	userWaitStartedAt?: number;
+	userWaitDuration: number;
 }
 
 class OperationLeaseRegistry {
@@ -143,7 +152,7 @@ class OperationLeaseRegistry {
 		if (!Number.isFinite(leaseMs) || leaseMs <= 0) return { ok: false, reason: "invalid-lease" };
 		const active = this.#active.get(operationId);
 		if (active) {
-			if (active.lease.expiresAt > now) return { ok: false, reason: "already-active" };
+			if (this.#effectiveExpiresAt(active, now) > now) return { ok: false, reason: "already-active" };
 			active.abandonReason = "Operation lease expired";
 			active.controller.abort(new Error("Operation lease expired"));
 			this.#recordTerminal(active.lease, "abandoned", active.abandonReason, now);
@@ -161,7 +170,13 @@ class OperationLeaseRegistry {
 			expiresAt: now + leaseMs,
 		});
 		this.#recordDurable(lease, "intent", now);
-		this.#active.set(operationId, { lease, controller: new AbortController(), settled: false });
+		this.#active.set(operationId, {
+			lease,
+			controller: new AbortController(),
+			settled: false,
+			userWaitDepth: 0,
+			userWaitDuration: 0,
+		});
 		return { ok: true, lease };
 	}
 
@@ -215,11 +230,46 @@ class OperationLeaseRegistry {
 			operation.abandonReason = "Operation cancelled";
 			throw new Error(`Operation ${operation.lease.effectClass} cancelled.`);
 		}
-		if (Date.now() >= operation.lease.expiresAt) {
+		if (this.#effectiveExpiresAt(operation) <= Date.now()) {
 			operation.abandonReason = "Operation lease expired";
 			operation.controller.abort(new Error(operation.abandonReason));
 			this.#recordTerminal(operation.lease, "abandoned", operation.abandonReason);
 			throw new Error(`Operation ${operation.lease.effectClass} lease expired.`);
+		}
+	}
+
+	#effectiveExpiresAt(operation: ActiveOperation, now = Date.now()): number {
+		return (
+			operation.lease.expiresAt +
+			operation.userWaitDuration +
+			(operation.userWaitStartedAt === undefined ? 0 : now - operation.userWaitStartedAt)
+		);
+	}
+
+	pauseForUserWait(lease: OperationLease): void {
+		const operation = this.#active.get(lease.operationId);
+		if (!operation || operation.lease !== lease || operation.settled)
+			throw new Error("Operation lease is no longer active.");
+		this.#throwIfStale(operation);
+		if (operation.userWaitDepth++ === 0) operation.userWaitStartedAt = Date.now();
+	}
+
+	resumeFromUserWait(lease: OperationLease): void {
+		const operation = this.#active.get(lease.operationId);
+		if (!operation || operation.lease !== lease || operation.userWaitDepth === 0)
+			throw new Error("Operation user wait is no longer active.");
+		if (--operation.userWaitDepth === 0) {
+			operation.userWaitDuration += Date.now() - (operation.userWaitStartedAt ?? Date.now());
+			operation.userWaitStartedAt = undefined;
+		}
+		this.#throwIfStale(operation);
+		try {
+			this.#authority(lease.effectClass);
+		} catch (error) {
+			operation.abandonReason = error instanceof Error ? error.message : String(error);
+			operation.controller.abort(error);
+			this.#recordTerminal(lease, "abandoned", operation.abandonReason);
+			throw error;
 		}
 	}
 
@@ -239,8 +289,10 @@ class OperationLeaseRegistry {
 		try {
 			this.#recordDurable(operation.lease, "effect");
 			operation.controller.signal.throwIfAborted();
-			const value = await operationLeaseContext.run({ registry: this, lease: operation.lease }, () =>
-				run(operation.controller.signal),
+			const parent = operationLeaseContext.getStore();
+			const value = await operationLeaseContext.run(
+				{ registry: this, lease: operation.lease, ...(parent ? { parent } : {}) },
+				() => run(operation.controller.signal),
 			);
 			this.#throwIfStale(operation);
 			this.#terminal(operation, "completed");
@@ -485,6 +537,37 @@ export function getActiveOperationDurability(
 	const lease = getActiveOperationLease(manager, operationId, effectClass);
 	const store = operationDurableStores.get(registry);
 	return lease && store ? Object.freeze({ store, lease }) : undefined;
+}
+
+/** @internal Excludes the union of a user's wait from every active enclosing operation lease. */
+export async function withOperationUserWait<T>(wait: () => Promise<T>): Promise<T> {
+	const context = operationLeaseContext.getStore();
+	if (!context) return wait();
+	const paused: OperationLeaseContext[] = [];
+	let outcome: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
+	try {
+		for (let current: OperationLeaseContext | undefined = context; current; current = current.parent) {
+			current.registry.pauseForUserWait(current.lease);
+			paused.push(current);
+		}
+		outcome = { ok: true, value: await wait() };
+	} catch (error) {
+		outcome = { ok: false, error };
+	}
+	let resumeFailed = false;
+	let resumeError: unknown;
+	for (let index = paused.length - 1; index >= 0; index--) {
+		const current = paused[index]!;
+		try {
+			current.registry.resumeFromUserWait(current.lease);
+		} catch (error) {
+			if (!resumeFailed) resumeError = error;
+			resumeFailed = true;
+		}
+	}
+	if (resumeFailed) throw resumeError;
+	if (!outcome.ok) throw outcome.error;
+	return outcome.value;
 }
 
 /** @internal */

@@ -111,6 +111,162 @@ describe("W2 non-Hub operation ownership", () => {
 		}
 	});
 
+	it("counts overlapping user waits once and resumes the active lease budget afterward", async () => {
+		vi.useFakeTimers();
+		setSystemTime(1_000);
+		const { session, auth } = createSession();
+		const first = Promise.withResolvers<string>();
+		const second = Promise.withResolvers<string>();
+		const waitsEnded = Promise.withResolvers<void>();
+		const activeWork = Promise.withResolvers<string>();
+		const manager = session.sessionManager;
+		let operation: Promise<string> | undefined;
+		try {
+			operation = runFilesystemOperation(manager, "filesystem:overlap-waits", async () => {
+				const waits = [session.waitForUser(() => first.promise), session.waitForUser(() => second.promise)];
+				await Promise.all(waits);
+				waitsEnded.resolve();
+				return activeWork.promise;
+			});
+			await Promise.resolve();
+			setSystemTime(1_000 + 60_000);
+			first.resolve("first");
+			await Promise.resolve();
+			setSystemTime(1_000 + 2 * 60_000);
+			second.resolve("second");
+			await waitsEnded.promise;
+			setSystemTime(1_000 + 7 * 60_000);
+			activeWork.resolve("active work ran out of lease");
+			await expect(operation).rejects.toThrow("lease expired");
+			expect(getOperationTerminal(manager, "filesystem:overlap-waits")).toMatchObject({
+				status: "abandoned",
+				detail: "Operation lease expired",
+			});
+		} finally {
+			first.resolve("first");
+			second.resolve("second");
+			activeWork.resolve("active work ran out of lease");
+			waitsEnded.resolve();
+			await operation?.catch(() => undefined);
+			await session.dispose();
+			auth.close();
+		}
+	});
+
+	it("preserves nested filesystem and extension leases during an explicit user wait", async () => {
+		vi.useFakeTimers();
+		setSystemTime(1_000);
+		const { session, auth } = createSession();
+		const answer = Promise.withResolvers<string>();
+		const manager = session.sessionManager;
+		let operation: Promise<string> | undefined;
+		try {
+			operation = runFilesystemOperation(manager, "filesystem:user-wait", () =>
+				runExtensionOperation(manager, "extension:user-wait", () => session.waitForUser(() => answer.promise)),
+			);
+			await Promise.resolve();
+			setSystemTime(1_000 + 5 * 60_000 + 1);
+			await expect(runFilesystemOperation(manager, "filesystem:user-wait", async () => "duplicate")).rejects.toThrow(
+				"already-active",
+			);
+			answer.resolve("selected answer");
+			await expect(operation).resolves.toBe("selected answer");
+			expect(getOperationTerminal(manager, "filesystem:user-wait")).toMatchObject({ status: "completed" });
+			expect(getOperationTerminal(manager, "extension:user-wait")).toMatchObject({ status: "completed" });
+		} finally {
+			answer.resolve("selected answer");
+			await operation?.catch(() => undefined);
+			await session.dispose();
+			auth.close();
+		}
+	});
+
+	it("does not pause an active operation or revive pre-expired work", async () => {
+		vi.useFakeTimers();
+		setSystemTime(1_000);
+		const { session, auth } = createSession();
+		const completion = Promise.withResolvers<string>();
+		const manager = session.sessionManager;
+		let active: Promise<string> | undefined;
+		try {
+			active = runFilesystemOperation(manager, "filesystem:active-work", () => completion.promise);
+			await Promise.resolve();
+			setSystemTime(1_000 + 5 * 60_000 + 1);
+			completion.resolve("late result");
+			await expect(active).rejects.toThrow("lease expired");
+			expect(getOperationTerminal(manager, "filesystem:active-work")).toMatchObject({
+				status: "abandoned",
+				detail: "Operation lease expired",
+			});
+		} finally {
+			completion.resolve("late result");
+			await active?.catch(() => undefined);
+			await session.dispose();
+			auth.close();
+		}
+	});
+
+	it("does not enter a user wait after the operation lease has expired", async () => {
+		vi.useFakeTimers();
+		setSystemTime(1_000);
+		const { session, auth } = createSession();
+		const startWait = Promise.withResolvers<void>();
+		const manager = session.sessionManager;
+		let dialogStarted = false;
+		let operation: Promise<string> | undefined;
+		try {
+			operation = runFilesystemOperation(manager, "filesystem:pre-expired-wait", async () => {
+				await startWait.promise;
+				return session.waitForUser(async () => {
+					dialogStarted = true;
+					return "too late";
+				});
+			});
+			await Promise.resolve();
+			setSystemTime(1_000 + 5 * 60_000 + 1);
+			startWait.resolve();
+			await expect(operation).rejects.toThrow("lease expired");
+			expect(dialogStarted).toBe(false);
+			expect(getOperationTerminal(manager, "filesystem:pre-expired-wait")).toMatchObject({
+				status: "abandoned",
+				detail: "Operation lease expired",
+			});
+		} finally {
+			startWait.resolve();
+			await operation?.catch(() => undefined);
+			await session.dispose();
+			auth.close();
+		}
+	});
+
+	it("rejects late user consent after cancellation while waiting", async () => {
+		vi.useFakeTimers();
+		setSystemTime(1_000);
+		const { session, auth } = createSession();
+		const answer = Promise.withResolvers<string>();
+		const controller = new AbortController();
+		const manager = session.sessionManager;
+		let operation: Promise<string> | undefined;
+		try {
+			operation = runFilesystemOperation(
+				manager,
+				"filesystem:cancelled-wait",
+				() => session.waitForUser(() => answer.promise),
+				controller.signal,
+			);
+			await Promise.resolve();
+			controller.abort(new Error("cancelled"));
+			answer.resolve("late consent");
+			await expect(operation).rejects.toThrow("cancelled");
+			expect(getOperationTerminal(manager, "filesystem:cancelled-wait")).toMatchObject({ status: "abandoned" });
+		} finally {
+			answer.resolve("late consent");
+			await operation?.catch(() => undefined);
+			await session.dispose();
+			auth.close();
+		}
+	});
+
 	it("fails an expired active lease closed and ignores its late completion deterministically", async () => {
 		vi.useFakeTimers();
 		setSystemTime(1_000);

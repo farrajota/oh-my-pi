@@ -223,7 +223,7 @@ import { getAgentLifecycleManager } from "../internal/agent-lifecycle-bridge";
 import { listAgentRefs, type InternalAgentRef } from "../internal/agent-registry-bridge";
 import { terminateSubagent as terminateRegisteredSubagent } from "../registry/agent-control";
 import { AgentRegistry } from "../registry/agent-registry";
-import { installSessionOperationLedger } from "../registry/operation-lease";
+import { installSessionOperationLedger, withOperationUserWait } from "../registry/operation-lease";
 import { assertSessionSwitchPreflight } from "./session-switch-preflight";
 import {
 	deobfuscateAssistantContent,
@@ -1416,7 +1416,7 @@ export class AgentSession implements SettingsScope {
 			this.#endComputerTurn();
 		}
 		try {
-			return await dialog();
+			return await withOperationUserWait(dialog);
 		} finally {
 			if (--this.#userWaitCount === 0 && this.#promptInFlightCount > 0) {
 				if (!this.#userWaitEndedTurn) this.#beginComputerTurn();
