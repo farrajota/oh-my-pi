@@ -719,6 +719,28 @@ describe("runSubprocess soft request budget", () => {
 		const receipt = await new IrcBus().send({ from: "Main", to: id, body: "resume" });
 		expect(receipt.outcome).toBe("woken");
 	});
+	it("TaskTool caller-signal cancellation disposes its attached child session", async () => {
+		const id = "TaskCallerCancelledChild";
+		const controller = new AbortController();
+		const handle = createMockSession(({ promptIndex, emit, pushMessage }) => {
+			if (promptIndex !== 1) return;
+			const message = assistantText("working");
+			pushMessage(message);
+			emit({ type: "message_end", message } as unknown as AgentSessionEvent);
+			controller.abort();
+		});
+		mockCreateAgentSession(handle.session);
+
+		const result = await runSubprocess({
+			...baseOptions(id),
+			disposeOnCallerAbort: true,
+			signal: controller.signal,
+		});
+
+		expect(result.aborted).toBe(true);
+		expect(handle.disposeCalls()).toBe(1);
+		expect(lookupAgentRef(AgentRegistry.global(), id)?.session ?? null).toBeNull();
+	});
 });
 
 describe("resolveSoftRequestBudget", () => {

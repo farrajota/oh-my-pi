@@ -665,12 +665,18 @@ describe("browser tabs whose renderer crashed", () => {
 		"cancels an inline worker's run whose renderer crashed instead of letting it go on after its caller was told",
 		async () => {
 			let requests = 0;
-			const started = Promise.withResolvers<void>();
+			const predicateEntered = Promise.withResolvers<void>();
+			const releasePredicate = Promise.withResolvers<void>();
 			const server = Bun.serve({
 				port: 0,
-				fetch: request => {
-					if (new URL(request.url).pathname === "/started") started.resolve();
-					else requests++;
+				fetch: async request => {
+					const path = new URL(request.url).pathname;
+					if (path === "/predicate") {
+						predicateEntered.resolve();
+						await releasePredicate.promise;
+					} else {
+						requests++;
+					}
 					return new Response("ok");
 				},
 			});
@@ -696,19 +702,21 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(getTab(name)).toMatchObject({ worker: { mode: "inline" } });
 				const { client, crashed } = await watchRenderer(browser, url);
 				const run = runInTab(name, {
-					code: `await fetch("http://127.0.0.1:${server.port}/started"); await wait(2_000); await fetch("http://127.0.0.1:${server.port}/after-crash");`,
+					code: `await wait(async () => { await fetch("http://127.0.0.1:${server.port}/predicate"); return true; }); await fetch("http://127.0.0.1:${server.port}/after-crash");`,
 					timeoutMs: 10_000,
 					session,
 				}).catch((error: unknown) => error);
-				await started.promise;
+				await predicateEntered.promise;
 				// Page.crash never answers: the renderer it would answer from is gone.
 				void client.send("Page.crash").catch(() => undefined);
 				await crashed;
 				expect(String(await run)).toContain("the tab could not be reattached and was closed");
-				// A run left going reaches the second fetch two seconds after it started; nothing marks that it did not.
+				releasePredicate.resolve();
+				// Give an uncancelled predicate time to continue; this bounds cleanup after the explicit crash/error barrier.
 				await Bun.sleep(2_500);
 				expect(requests).toBe(0);
 			} finally {
+				releasePredicate.resolve();
 				await releaseTab(name, { kill: true });
 				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
 				server.stop(true);

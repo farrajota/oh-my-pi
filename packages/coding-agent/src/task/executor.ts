@@ -712,6 +712,8 @@ export interface ExecutorOptions {
 	 * set this false so disposal unregisters them instead of leaving idle peers.
 	 */
 	keepAlive?: boolean;
+	/** Dispose TaskTool-owned child sessions when this caller's signal aborts; generic executor callers stay resumable. */
+	disposeOnCallerAbort?: boolean;
 	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
 	onCleanupDeferred?: (completion: Promise<void>) => void;
 	/** Internal exact-authority capture for post-run work that may outlive this executor. */
@@ -3679,6 +3681,8 @@ export async function finalizeSubagentLifecycle(args: {
 	id: string;
 	session: AgentSession;
 	aborted: boolean;
+	/** TaskTool's caller cancellation is terminal for the attached child, unlike generic executor signal interruption. */
+	callerCancelled?: boolean;
 	/** Which watchdog (if any) requested the abort; `shutdown` releases instead of adopting. */
 	abortKind?: AbortReason;
 	keepAlive: boolean;
@@ -3729,10 +3733,14 @@ export async function finalizeSubagentLifecycle(args: {
 	// Hub, RPC `cancel_subagent`, collab, vibe) publishes the `aborted` tombstone
 	// before the run observes its abort, and stays terminal.
 	const resumableAbort =
-		args.abortKind !== "shutdown" && args.keepAlive && args.reviveSession !== null && ref?.status !== "aborted";
+		!args.callerCancelled &&
+		args.abortKind !== "shutdown" &&
+		args.keepAlive &&
+		args.reviveSession !== null &&
+		ref?.status !== "aborted";
 	if (args.aborted && !resumableAbort) {
 		if (ref && ownsRef) {
-			if (args.abortKind === "shutdown") {
+			if (args.abortKind === "shutdown" || args.callerCancelled) {
 				try {
 					if (managesAgentRegistry) await releaseAgent(lifecycle, args.id, ref);
 					else {
@@ -3740,7 +3748,7 @@ export async function finalizeSubagentLifecycle(args: {
 						unregisterAgentRef(registry, args.id, args.session);
 					}
 				} catch (error) {
-					logger.warn("runSubagent: failed to release session during manager shutdown", {
+					logger.warn("runSubagent: failed to release session during shutdown or caller cancellation", {
 						id: args.id,
 						error: String(error),
 					});
@@ -5412,9 +5420,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const session = monitor.takeActiveSession();
 			if (session) {
 				// Rejected sessions are disposed below, never retained or attached to another generation's wake bus.
+				const callerCancelled =
+					aborted &&
+					sessionAuthorityValidated &&
+					options.disposeOnCallerAbort === true &&
+					monitor.abortKind() === "signal" &&
+					worktree === undefined;
 				if (sessionAuthorityValidated) {
 					monitor.captureSalvage(session);
-					if (options.keepAlive !== false && worktree === undefined) {
+					if (options.keepAlive !== false && worktree === undefined && !callerCancelled) {
 						installIrcWakeTurnMonitor(session);
 					}
 					const resumableAbort =
@@ -5439,6 +5453,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					id,
 					session,
 					aborted: sessionAuthorityValidated ? aborted : false,
+					callerCancelled,
 					abortKind: sessionAuthorityValidated ? monitor.abortKind() : undefined,
 					keepAlive: sessionAuthorityValidated && options.keepAlive !== false,
 					isolated: sessionAuthorityValidated && worktree !== undefined,

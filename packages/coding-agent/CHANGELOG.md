@@ -16,6 +16,7 @@
 - Fixed delayed question answers being discarded as filesystem or extension lease expiration, including questions dispatched through `write xd://…`. Untimed human-input waits now pause all enclosing operation lease budgets while active-work limits and cancellation remain enforced.
 - Restored elapsed prompt time after completion, transcript redraw, and reopening sessions on ANSI and native interfaces, with the local stop date, time, and timezone. Historical sessions without run-completion metadata show only known response-level timing rather than an inferred stop timestamp.
 - Fixed task spawns handling structured-output schemas and prompts consistently, and honoring IRC delivery only when enabled for the spawned agent.
+- Fixed TaskTool caller cancellation leaving its aborted child session attached; TaskTool cancellation now disposes that session, while generic executor signal interruptions remain resumable.
 - Fixed task spawns dropping an autoloaded skill discovered after the parent session's skill index was loaded.
 - Fixed internal `history://` and `artifact://` reads enforcing the right authorization and honoring selectors.
 - Fixed extension approval cancellation boundaries so cancelled approvals do not proceed as approved.

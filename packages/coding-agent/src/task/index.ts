@@ -2844,8 +2844,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				enableIrc: auditConstrained ? false : planModeEnabled ? false : ircEnabled,
 				restrictToolNames: restrictToolNames || undefined,
 				maxRuntimeMs,
+				disposeOnCallerAbort: true,
 				signal,
-				...(tools ? { onToolResult: (result: SubagentToolResult) => appendToolResult(tools, result) } : {}),
+				onToolResult: tools ? result => appendToolResult(tools, result) : undefined,
 				onProgress: (progress: AgentProgress) => {
 					const nextProgress = {
 						...progress,
