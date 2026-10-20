@@ -49,6 +49,7 @@ import {
 } from "../utils/idle-iterator";
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
 import { notifyProviderResponse } from "../utils/provider-response";
+import { wrapFetchForRequestCompression } from "../utils/request-compression";
 import {
 	adaptSchemaForStrict,
 	findStrictToolSchemaViolation,
@@ -952,9 +953,10 @@ const streamOpenAICompletionsOnce = (
 								? maxHttpAttempts
 								: Math.min(maxHttpAttempts, remainingProviderAttempts)
 							: remainingProviderAttempts;
+					const compressedFetch = wrapFetchForRequestCompression(options?.fetch ?? fetch, model);
 					const fetchWithAttemptBudget = wrapFetchForCopilotFallback(
 						providerMaxAttempts === undefined
-							? options?.fetch
+							? compressedFetch
 							: ((async (input, init) => {
 									if (providerAttempts >= providerMaxAttempts) {
 										throw new AIError.ProviderResponseError(
@@ -963,7 +965,7 @@ const streamOpenAICompletionsOnce = (
 										);
 									}
 									providerAttempts++;
-									return (options?.fetch ?? globalThis.fetch)(input, init);
+									return compressedFetch(input, init);
 								}) satisfies FetchImpl),
 						model.provider === "github-copilot",
 						resolveCopilotRequestIdentity(options?.headers),

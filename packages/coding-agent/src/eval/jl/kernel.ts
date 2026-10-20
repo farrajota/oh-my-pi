@@ -10,7 +10,7 @@ import { $flag, Snowflake } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../config/settings";
 import { BaseKernel, getRemainingTimeMs, type KernelStartOptions } from "../kernel-base";
 import { type BackendProbeOptions, probeCandidates } from "../probe";
-import type { KernelDisplayOutput } from "../py/display";
+import type { EvalDisplayOutput } from "../types";
 import { hostHasInheritableConsole, shouldDetachKernel, shouldHideKernelWindow } from "../py/spawn-options";
 import { stageRunnerScript } from "../runner-cache";
 import { JULIA_PRELUDE } from "./prelude";
@@ -24,8 +24,7 @@ import {
 } from "./runtime";
 
 export type { KernelExecuteResult, KernelRuntimeEnv } from "../kernel-base";
-export { renderKernelDisplay } from "../py/display";
-export type { KernelDisplayOutput };
+export type { EvalDisplayOutput } from "../types";
 
 const TRACE_IPC = $flag("PI_JULIA_IPC_TRACE");
 
@@ -42,7 +41,7 @@ export interface KernelExecuteOptions {
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	onChunk?: (text: string) => void | Promise<void>;
-	onDisplay?: (output: KernelDisplayOutput) => void | Promise<void>;
+	onDisplay?: (output: EvalDisplayOutput) => void | Promise<void>;
 }
 
 export interface JuliaKernelAvailability {

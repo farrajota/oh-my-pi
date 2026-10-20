@@ -45,8 +45,8 @@ describe("system prompt workstation block", () => {
 			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
 		});
 
-		const rendered = systemPrompt.join("\n\n");
-		expect(rendered).toContain("OS: darwin 25.5.0");
-		expect(rendered).not.toContain("unknown");
+		const workstation = systemPrompt.join("\n\n").match(/<workstation>[\s\S]*?<\/workstation>/)?.[0];
+		expect(workstation).toContain("OS: darwin 25.5.0");
+		expect(workstation).not.toContain("unknown");
 	});
 });

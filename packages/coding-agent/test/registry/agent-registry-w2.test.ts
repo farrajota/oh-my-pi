@@ -19,6 +19,7 @@ import {
 	lookupAgentRef,
 	resolveAgentSessionOperationAuthority,
 	setAgentHistory,
+	setAgentActivity,
 	setAgentStatus,
 } from "../../src/internal/agent-registry-bridge";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
@@ -63,6 +64,43 @@ function authority(registry: AgentRegistry, parent: AgentSession) {
 }
 
 describe("W2 registry capabilities", () => {
+	it("updates activity only for the exact running generation", () => {
+		const registry = new AgentRegistry();
+		const currentSession = fakeSession("/worker.jsonl");
+		const current = registry.register({
+			id: "Worker",
+			displayName: "worker",
+			kind: "sub",
+			session: currentSession,
+			status: "running",
+		});
+
+		expect(setAgentActivity(registry, "Worker", "working", currentSession)).toBe(true);
+		expect(registry.get("Worker")?.activity).toBe("working");
+		const attachedSession = fakeSession("/worker-attached.jsonl");
+		expect(registry.attachSession("Worker", attachedSession, undefined, current)).toBe(true);
+		expect(setAgentActivity(registry, "Worker", "stale-session", currentSession)).toBe(false);
+		expect(registry.get("Worker")?.activity).toBe("working");
+		expect(setAgentActivity(registry, "Worker", "attached", attachedSession)).toBe(true);
+		expect(registry.get("Worker")?.activity).toBe("attached");
+		expect(registry.unregister("Worker", current)).toBe(true);
+
+		const replacementSession = fakeSession("/worker-replacement.jsonl");
+		const replacement = registry.register({
+			id: "Worker",
+			displayName: "worker",
+			kind: "sub",
+			session: replacementSession,
+			status: "running",
+		});
+		expect(setAgentActivity(registry, "Worker", "stale", currentSession)).toBe(false);
+		expect(registry.get("Worker")?.activity).toBeUndefined();
+		expect(setAgentActivity(registry, "Worker", "current", replacementSession)).toBe(true);
+		expect(registry.get("Worker")?.activity).toBe("current");
+		expect(registry.setStatus("Worker", "idle", replacement)).toBe(true);
+		expect(setAgentActivity(registry, "Worker", "late", replacementSession)).toBe(false);
+	});
+
 	it("rejects a child whose parent retires while SDK construction is pending", async () => {
 		const rootSession = fakeSession("/root.jsonl");
 		const childSession = fakeSession("/child.jsonl");

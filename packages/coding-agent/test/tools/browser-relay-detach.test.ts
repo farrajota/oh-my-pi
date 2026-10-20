@@ -16,6 +16,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -445,22 +446,31 @@ describe("relay tabs Chrome detaches omp from", () => {
 			const fixturePage = page;
 			if (!fixturePage) throw new Error("expected a Puppeteer page");
 			const budgetMs = 10_000;
+			const originalWorker = tab.worker;
 			const now = performance.now.bind(performance);
 			const clock = spyOn(performance, "now").mockImplementation(() => {
 				const current = now();
-				// Keep recovery initialization on the real clock; exhaust the call budget only after re-adoption.
-				return tab.reattached ? current + budgetMs + 1 : current;
+				// The replacement is published only after initialization; exhaust the call budget afterward.
+				return tab.worker === originalWorker ? current : current + budgetMs + 1;
 			});
 			try {
 				const reapplying = ext.nextSend("Network.setUserAgentOverride");
-				const next = runInTab(name, {
-					code: "await page.evaluate(() => { Reflect.set(globalThis, '__ompDetachedBudgetRun', true); });",
-					timeoutMs: budgetMs,
-					session: tool,
-				}).catch((error: unknown) => error);
+				const next = rejectionOf(
+					runInTab(name, {
+						code: "await page.evaluate(() => { Reflect.set(globalThis, '__ompDetachedBudgetRun', true); });",
+						timeoutMs: budgetMs,
+						session: tool,
+					}),
+				);
 				await reapplying;
 				await ext.chromeDetach("target_closed");
-				const failure = String(await next);
+				const outcome = await next;
+				const failure =
+					outcome instanceof Error
+						? outcome.message
+						: isRecord(outcome) && typeof outcome.message === "string"
+							? outcome.message
+							: String(outcome);
 				expect(failure).toContain("before this call, so its code did not run");
 				expect(failure).toContain(`used up this call's ${budgetMs}ms budget, so the call was not run again`);
 			} finally {

@@ -6,7 +6,7 @@
 # ({id, code, cwd?, env?, silent?}) and the runner replies with frames:
 #   {type:"started", id}
 #   {type:"stdout"|"stderr", id, data}
-#   {type:"display"|"result", id, bundle}   # bundle = Jupyter-style MIME hash
+#   {type:"view"|"image"|"status"|"json", id, ...}   # shared typed display frames
 #   {type:"error", id, ename, evalue, traceback:[...]}
 #   {type:"done", id, status, executionCount, cancelled}
 # A {type:"exit"} request (or stdin EOF) shuts the runner down.
@@ -117,16 +117,48 @@ def __omp_emit_stream(kind, text)
   __omp_emit("type" => kind, "id" => rid, "data" => __omp_scrub(text))
 end
 
-def __omp_emit_display(bundle, kind = "display")
+def __omp_emit_display(bundle)
   rid = $__omp_current_rid
   return if rid.nil?
-  __omp_emit("type" => kind, "id" => rid, "bundle" => bundle)
+
+  status = bundle["application/x-omp-status"]
+  if status.is_a?(Hash)
+    __omp_emit("type" => "status", "id" => rid, "event" => status)
+    return
+  end
+
+  OMP_IMAGE_MIMES.each do |mime_type|
+    data = bundle[mime_type]
+    next unless data.is_a?(String) && !data.empty?
+    __omp_emit("type" => "image", "id" => rid, "image" => { "mimeType" => mime_type, "data" => data })
+  end
+
+  if bundle.key?("application/json")
+    __omp_emit("type" => "json", "id" => rid, "value" => bundle["application/json"])
+    return
+  end
+
+  markdown = bundle["text/markdown"]
+  if markdown.is_a?(String)
+    __omp_emit_stream("stdout", markdown)
+    __omp_emit(
+      "type" => "view",
+      "id" => rid,
+      "text" => markdown,
+      "view" => { "kind" => "markdown", "text" => markdown },
+    )
+    return
+  end
+
+  text = bundle["text/plain"]
+  __omp_emit_stream("stdout", text) if text.is_a?(String) && !text.empty?
 end
 
 def __omp_emit_status(op, data = {})
   status = { "op" => op.to_s }
   data.each { |k, v| status[k.to_s] = v }
-  __omp_emit_display({ "application/x-omp-status" => status }, "display")
+  rid = $__omp_current_rid
+  __omp_emit("type" => "status", "id" => rid, "event" => status) unless rid.nil?
 end
 
 OMP_IMAGE_MIMES = %w[image/png image/jpeg].freeze
@@ -267,8 +299,8 @@ def __omp_mime_bundle(value)
   end
 end
 
-def __omp_present(value, kind = "display")
-  __omp_emit_display(__omp_mime_bundle(value), kind)
+def __omp_present(value)
+  __omp_emit_display(__omp_mime_bundle(value))
 end
 
 # ---------------------------------------------------------------------------
@@ -522,7 +554,7 @@ def __omp_handle_request(req)
     begin
       value = TOPLEVEL_BINDING.eval(src, "(eval)")
       unless $__omp_silent || value.nil? || !__omp_should_display_result?(src)
-        __omp_present(value, "result")
+        __omp_present(value)
       end
     rescue Interrupt => e
       cancelled = true

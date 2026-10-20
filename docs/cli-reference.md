@@ -78,6 +78,15 @@ Argument handling:
 | `--config <file>` | Load an extra `config.yml`-style overlay for this run (repeatable). |
 | `--session-dir <dir>` | Directory for session storage and lookup. |
 | `--no-session` | Don't save the session (ephemeral). |
+| `--single-request` | Opt into a fresh ephemeral, zero-tool launch bounded to one request using the configured approved model and destination. It rejects model/session/extension overrides and unsupported adapters; it never selects a model or endpoint for you. |
+
+`--single-request` is intended for tightly bounded CLI smoke requests. It disables
+session persistence, tools, extension/skill/rule loading, retries, model fallback,
+prewarming, and background model discovery for that launch. It accepts at most one
+text prompt (or no prompt for an interactive TUI) and prints a non-secret effective
+guard report before any prompt dispatch. The report includes only the adapter,
+fixed request budgets, and approved selector/destination match booleans.
+
 
 #### Session history
 
@@ -142,7 +151,7 @@ See [providers](./providers.md) and [models](./models.md) for model resolution.
 | `--no-tools` | Disable all built-in tools. |
 | `--no-lsp` | Disable LSP tools, formatting, and diagnostics. |
 | `--no-pty` | Disable PTY-based interactive bash execution. |
-| `--approval-mode <mode>` | Override `tools.approvalMode` for this session (`always-ask`, `write`, or `yolo`). See [approval mode](./approval-mode.md). |
+| `--approval-mode <mode>` | Override `tools.approvalMode` for this session (`always-ask`, `always-ask-cached`, `write`, or `yolo`). See [approval mode](./approval-mode.md). |
 | `--auto-approve`, `--yolo` | Force yolo tier approval; explicit tool/user policies and provider safety checks still apply. |
 | `--advisor` | Enable the advisor runtime (passively reviews each turn and injects notes). See [advisor / watchdog](./advisor-watchdog.md). |
 | `--max-time <duration>` | Stop the session after this duration (e.g. `600`, `10m`, `1h`). |

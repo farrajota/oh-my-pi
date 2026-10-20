@@ -250,6 +250,7 @@ export function snapshotJobs(
 		let resolvedThinkingLevel: JobSnapshot["resolvedThinkingLevel"];
 		let advisor = false;
 		let completionPercent: number | undefined;
+		let stage: string | undefined;
 		if (latest.type === "task") {
 			const progressValue = latest.latestDetails?.progress;
 			if (Array.isArray(progressValue)) {
@@ -282,8 +283,14 @@ export function snapshotJobs(
 				if (typeof completionValue === "number" && Number.isFinite(completionValue)) {
 					completionPercent = completionValue;
 				}
+				const stageValue = progressRecord?.stage;
+				if (typeof stageValue === "string") {
+					const trimmed = stageValue.trim();
+					if (trimmed) stage = trimmed;
+				}
 			}
 		}
+		const widget = current ? session.asyncJobManager?.widgets?.view(current) : undefined;
 		return {
 			id: latest.id,
 			type: latest.type,
@@ -296,6 +303,8 @@ export function snapshotJobs(
 			...(resolvedThinkingLevel !== undefined ? { resolvedThinkingLevel } : {}),
 			...(advisor ? { advisor: true } : {}),
 			...(completionPercent !== undefined && latest.status === "running" ? { completionPercent } : {}),
+			...(stage ? { stage } : {}),
+			...(widget ? { widget } : {}),
 			...(!resultWithheld && !resultConsumed && options.includeResults !== false && latest.resultText
 				? { resultText: latest.resultText }
 				: {}),

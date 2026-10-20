@@ -1136,6 +1136,12 @@ describe("selector setting side effects", () => {
 				applyRoleModel,
 				setModelTemporary,
 			},
+			get viewSession() {
+				if (typeof this !== "object" || this === null || !("session" in this)) {
+					throw new Error("Selector fixture must expose its session");
+				}
+				return this.session;
+			},
 			statusLine: { invalidate: vi.fn() },
 			updateEditorBorderColor: vi.fn(),
 			keybindings: { getKeys: () => [], getDisplayString: () => "" },

@@ -13,8 +13,8 @@ import { $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../config/settings";
 import { BaseKernel, getRemainingTimeMs, type KernelRuntimeEnv, type KernelStartOptions } from "../kernel-base";
 import { type BackendProbeOptions, probeCandidates } from "../probe";
-import type { KernelDisplayOutput } from "../py/display";
 import { hostHasInheritableConsole, shouldDetachKernel, shouldHideKernelWindow } from "../py/spawn-options";
+import type { EvalDisplayOutput } from "../types";
 import { stageRunnerScript } from "../runner-cache";
 import { RUBY_PRELUDE } from "./prelude";
 import RUNNER_SCRIPT from "./runner.rb" with { type: "text" };
@@ -27,8 +27,7 @@ import {
 } from "./runtime";
 
 export type { KernelExecuteResult, KernelRuntimeEnv, KernelShutdownResult } from "../kernel-base";
-export type { KernelDisplayOutput, PythonStatusEvent } from "../py/display";
-export { renderKernelDisplay } from "../py/display";
+export type { EvalDisplayOutput } from "../types";
 
 const TRACE_IPC = $flag("PI_RUBY_IPC_TRACE");
 
@@ -46,7 +45,7 @@ export interface KernelExecuteOptions {
 	env?: KernelRuntimeEnv;
 	signal?: AbortSignal;
 	onChunk?: (text: string) => Promise<void> | void;
-	onDisplay?: (output: KernelDisplayOutput) => Promise<void> | void;
+	onDisplay?: (output: EvalDisplayOutput) => void | Promise<void>;
 	timeoutMs?: number;
 	silent?: boolean;
 	storeHistory?: boolean;

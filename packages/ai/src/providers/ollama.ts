@@ -68,6 +68,7 @@ type OllamaMessage = {
 };
 
 type OllamaChatChunk = {
+	error?: string;
 	message?: {
 		role?: string;
 		content?: string;
@@ -244,6 +245,17 @@ function convertMessage(
 	};
 }
 
+/** Whether Ollama chat removes assistant thinking from replayed history. */
+export function ollamaChatDropsOwnThinking(
+	model: { api?: string; compat?: Model["compat"] } | null | undefined,
+): boolean {
+	if (model?.api !== "ollama-chat") return false;
+	const compat = model.compat;
+	// Cached model rows without compat predate this guard; strip for safe replay.
+	if (!compat || !("stripThinkingHistory" in compat)) return true;
+	return compat.stripThinkingHistory ?? true;
+}
+
 function convertMessages(model: Model<"ollama-chat">, context: Context): OllamaMessage[] {
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
 	const systemMessages: Message[] = systemPrompts.map(systemPrompt => ({
@@ -257,7 +269,7 @@ function convertMessages(model: Model<"ollama-chat">, context: Context): OllamaM
 		model.compatConfig?.stripThinkingHistory ??
 		(model.provider === "ollama-cloud" && /^(?:glm-5\.2(?::cloud)?|deepseek-v4-flash)$/i.test(model.id)
 			? model.id.toLowerCase().startsWith("deepseek-")
-			: (model.compat?.stripThinkingHistory ?? true));
+			: ollamaChatDropsOwnThinking(model));
 	const supportsImages = model.input.includes("image");
 	const converted = transformMessages(messages, model).map((msg, index) => {
 		// Real `systemPrompt` entries (always emitted first) stay on Ollama's
@@ -623,6 +635,13 @@ const streamOllamaOnce = (
 			}
 			stream.push({ type: "start", partial: output });
 			for await (const chunk of readJsonl<OllamaChatChunk>(response.body)) {
+				// Once HTTP 200 has started, Ollama reports failures as NDJSON error records.
+				if (chunk.error) {
+					throw new AIError.ProviderResponseError(`Ollama stream error: ${chunk.error}`, {
+						provider: model.provider,
+						kind: "runtime",
+					});
+				}
 				if (chunk.message?.thinking) {
 					suppressHealedThinking = true;
 					endActiveTextBlock();

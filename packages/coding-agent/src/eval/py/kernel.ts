@@ -40,9 +40,6 @@ export type {
 	KernelShutdownResult,
 } from "../kernel-base";
 
-export type { KernelDisplayOutput, PythonStatusEvent } from "./display";
-export { renderKernelDisplay } from "./display";
-
 const TRACE_IPC = $flag("PI_PYTHON_IPC_TRACE");
 
 const SHUTDOWN_GRACE_MS = 1_000;
@@ -178,7 +175,11 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 	readonly interpreter: string;
 	#installedPreludes = new Map<string, PythonPreludeSource>();
 
-	private constructor(id: string, interpreter: string) {
+	/** @param pythonPath Interpreter executable this kernel runs on; reported as the runtime in eval state. */
+	private constructor(
+		id: string,
+		readonly pythonPath: string,
+	) {
 		super(id, {
 			languageName: "Python",
 			traceIpc: TRACE_IPC,
@@ -198,7 +199,7 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 					expectedShadowDigest: opts?.expectedShadowDigest,
 				}),
 		});
-		this.interpreter = interpreter;
+		this.interpreter = this.pythonPath;
 	}
 
 	/** Describe or invoke a tool defined in this retained Python kernel. */

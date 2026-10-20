@@ -3,7 +3,7 @@
  *
  * Replaces the old auto-reply model: a `send` never blocks on the recipient
  * generating anything. Delivery resolves the recipient via the global
- * AgentRegistry — parked agents are revived through the
+ * AgentRegistry — parked and killed agents are revived through the
  * AgentLifecycleManager, idle agents are woken with a real turn, and busy
  * agents receive the message as a non-interrupting aside at the next step
  * boundary (see AgentSession.deliverIrcMessage).
@@ -378,14 +378,6 @@ export class IrcBus {
 				});
 				continue;
 			}
-			if (ref.status === "aborted") {
-				failures.push({
-					to: message.to,
-					outcome: "failed",
-					error: `Agent "${message.to}" was hard-aborted and cannot be messaged or revived. Its transcript remains readable at history://${message.to}.`,
-				});
-				continue;
-			}
 			if (ref.kind === "advisor") {
 				failures.push({
 					to: message.to,
@@ -485,13 +477,6 @@ export class IrcBus {
 					: `Unknown agent "${message.to}" — check \`irc list\` for live peers.`,
 			};
 		}
-		if (ref.status === "aborted") {
-			return {
-				to: message.to,
-				outcome: "failed",
-				error: `Agent "${message.to}" was hard-aborted and cannot be messaged or revived. Its transcript remains readable at history://${message.to}.`,
-			};
-		}
 		// Advisor refs are observability-only transcripts, never messageable peers.
 		if (ref.kind === "advisor") {
 			return {
@@ -506,18 +491,19 @@ export class IrcBus {
 			return { to: message.to, outcome: "injected" };
 		}
 
-		// A `parked` recipient always needs the lifecycle to revive it — this is
-		// read from *this* bus's registry, so it holds for any registry. The
-		// mid-park / adopted checks below query the lifecycle's own state, which
-		// only describes the registry it manages: consult them only when the
-		// lifecycle owns this bus's registry, otherwise a custom-registry bus
-		// (fallen back to the global manager) would gate a live recipient on
-		// unrelated global park state. Main/non-adopted live peers skip the gate,
-		// and pending waiters still win without a session.
+		// A `parked` or killed (`aborted`) recipient always needs the lifecycle to
+		// revive it from its transcript — this is read from *this* bus's registry,
+		// so it holds for any registry. The mid-park / adopted checks below query
+		// the lifecycle's own state, which only describes the registry it manages:
+		// consult them only when the lifecycle owns this bus's registry, otherwise
+		// a custom-registry bus (fallen back to the global manager) would gate a
+		// live recipient on unrelated global park state. Main/non-adopted live
+		// peers skip the gate, and pending waiters still win without a session.
 		const lifecycle = this.#lifecycle();
 		const lifecycleOwnsRegistry = lifecycleManagesRegistry(lifecycle, this.#registry);
 		const needsLifecycleGate =
 			ref.status === "parked" ||
+			ref.status === "aborted" ||
 			(lifecycleOwnsRegistry && (isAgentParking(lifecycle, message.to) || lifecycleHasAgent(lifecycle, message.to)));
 
 		const priorSession = ref.session;
@@ -793,19 +779,20 @@ export class IrcBus {
 					settle({ kind: "abort", error: new IrcAwaitTargetStopped(target) });
 				});
 			};
+			let observedLiveSession = false;
 			const sync = (): void => {
 				const ref = lookupAgentRef(registry, target);
-				// Gone or hard-aborted: no reply will ever come.
-				if (!ref || ref.status === "aborted") {
+				// A recipient already observed running and then aborted is terminal; a
+				// detached abort at send start may still reopen from its transcript.
+				if (!ref || (ref.status === "aborted" && observedLiveSession)) {
 					settle({ kind: "abort", error: new IrcAwaitTargetStopped(target) });
 					return;
 				}
-				// Follow the live session across a park→revive rebuild; tolerate a
-				// parked peer with no session yet (the send is about to revive it).
 				const session = ref.session;
 				if (session && session !== subscribedSession) {
 					unsubscribeSession?.();
 					subscribedSession = session;
+					observedLiveSession = true;
 					unsubscribeSession = session.subscribe(onSessionEvent);
 				}
 			};

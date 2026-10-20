@@ -31,6 +31,7 @@ import type { WriteToolDetails as PiTuiWriteToolDetails } from "@oh-my-pi/pi-tui
 
 import { couldBecomeXdUrl, parseXdUrl } from "../internal-urls/xd-protocol";
 import { prepareLocalFileWrite } from "../internal-urls/local-protocol";
+import { extractUriScheme } from "../internal-urls";
 import { createLspWritethrough, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
@@ -41,7 +42,8 @@ import type { ToolSession } from "../sdk";
 import { fileHyperlink, renderStatusLine } from "@oh-my-pi/pi-tui/render";
 import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
 import { routeWriteThroughBridge, shouldRouteWriteThroughBridge } from "./acp-bridge";
-import { truncateForPrompt } from "./approval";
+import { formatApprovalArguments, truncateForPrompt } from "./approval";
+import { approvalTargetKey } from "./approval-targets";
 import { assertEditableFile } from "./auto-generated-guard";
 
 import { formatHashlineHeader, isReadTruncationNotice } from "@oh-my-pi/pi-tui/tools/hashline-format";
@@ -511,7 +513,27 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const params = args as Partial<WriteParams>;
 		const targetPath = typeof params.path === "string" ? params.path : "(missing)";
 		const content = typeof params.content === "string" ? params.content : "";
+		const unwrapped = unwrapHashlineHeaderPath(targetPath);
+		if (extractUriScheme(unwrapped) === "xd") {
+			try {
+				const parsed: unknown = JSON.parse(content);
+				return [`Path: ${truncateForPrompt(targetPath)}`, ...formatApprovalArguments(parsed, { showEmpty: true })];
+			} catch {
+				// Non-JSON payload falls back to raw content
+			}
+		}
 		return [`Path: ${truncateForPrompt(targetPath)}`, `Content:\n${truncateForPrompt(content)}`];
+	};
+	/**
+	 * `always-ask-cached` key: the path this write targets, unwrapped from a
+	 * hashline `[path#TAG]` header exactly like the approval tier above, so all
+	 * writes to one file share a single grant.
+	 */
+	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
+		const rawPath = (args as Partial<WriteParams> | null | undefined)?.path;
+		if (typeof rawPath !== "string" || rawPath.length === 0) return undefined;
+		const key = approvalTargetKey(this.session.cwd, unwrapHashlineHeaderPath(rawPath));
+		return key === undefined ? undefined : [key];
 	};
 	readonly label = "Write";
 	get description(): string {

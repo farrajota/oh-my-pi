@@ -28,6 +28,7 @@ import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import type { DiscoverAuthStorageOptions } from "@oh-my-pi/pi-ai/auth-broker/discover";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { prewarmOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
@@ -151,6 +152,7 @@ import {
 	deriveRestrictedStartupPolicy,
 	type RestrictedStartupPolicy,
 } from "./internal/restricted-startup-policy";
+import { createSingleRequestGuard, type SingleRequestGuardVerification } from "./internal/single-request-guard";
 import {
 	bindSessionLocalProtocolOptions,
 	LocalProtocolHandler,
@@ -313,6 +315,7 @@ import {
 	xdevEntries,
 } from "./tools";
 import { resolveYieldReportText } from "./tools/yield";
+import { createModelJobWidgetAuthor, type JobWidgetAuthor, JobWidgets, resolveToolCallIntent } from "./job-widgets";
 import { createBrowserPrelude } from "./tools/browser";
 import { createComputerPrelude } from "./tools/computer";
 import { assertToolNameNotReserved, isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
@@ -341,6 +344,7 @@ import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 import {
 	cfgArchiveEnabled,
 	cfgAsyncMaxJobs,
+	cfgAsyncWidgets,
 	cfgComputerEnabled,
 	cfgRatchetEnabled,
 	cfgGenerateImageEnabled,
@@ -420,6 +424,20 @@ import {
 	cfgWorkspaceAdditionalDirectories,
 } from "./session/context-settings";
 import { cfgTaskBatch, cfgTaskDisabledAgents, cfgTaskEager, cfgTaskMaxConcurrency } from "./task/settings";
+
+const SINGLE_REQUEST_SETTINGS_OVERRIDES: Readonly<Record<string, unknown>> = Object.freeze({
+	"retry.enabled": false,
+	"retry.maxRetries": 0,
+	"retry.repeated.enabled": false,
+	"retry.waitForUsageReset": false,
+	"retry.modelFallback": false,
+	"retry.usageAwareFallback": false,
+	"features.unexpectedStopDetection": "none",
+	"providers.cacheWarming": "off",
+	"providers.openaiWebsockets": "off",
+	"advisor.enabled": false,
+	"autolearn.enabled": false,
+});
 
 /** Agent-level tool-call switches, snapshotted by the agent loop per prompt run. */
 const cfgToolCallSwitches = combine({
@@ -639,6 +657,8 @@ export interface CreateAgentSessionOptions {
 	 * schedule background warm requests.
 	 */
 	cacheWarming?: boolean;
+	/** Enforce one nonpersistent approved-model dispatch for a fresh CLI smoke case. */
+	singleRequest?: boolean;
 	/**
 	 * Per-family service tiers for this session, replacing the `tier.*` settings
 	 * and any persisted tier history. Called once the initial model is final —
@@ -826,7 +846,7 @@ export interface CreateAgentSessionOptions {
 	taskDepth?: number;
 	/** Parent Hindsight state to alias for subagent memory tools. */
 	parentHindsightSessionState?: HindsightSessionState;
-	/** Parent Mnemopi state to alias for subagent memory tools. */
+	/** Parent Mnemopi state: subagents alias it; a top-level fork (`/tan`) inherits its delivered recall. */
 	parentMnemopiSessionState?: MnemopiSessionState;
 	/** Pre-allocated agent identity for IRC routing. Default: "Main" for top-level, parentTaskPrefix-derived for sub. */
 	agentId?: string;
@@ -841,6 +861,12 @@ export interface CreateAgentSessionOptions {
 	agentRegistry?: AgentRegistry;
 	/** Parent's async jobs and delivery sinks; child sessions never resolve a process-global manager. */
 	asyncJobManager?: AsyncJobManager;
+	/**
+	 * Writes the specs of the root session's live job widgets. Defaults to the
+	 * `widget` model role; tests inject a fake. Ignored for child sessions,
+	 * which share their root's widgets.
+	 */
+	jobWidgetAuthor?: JobWidgetAuthor;
 	/**
 	 * Registry id of the spawning agent, recorded as this subagent's parent in
 	 * the agent registry. Distinct from `parentTaskPrefix`, which is this agent's
@@ -948,6 +974,8 @@ export interface CreateAgentSessionResult {
 	mcpManager?: MCPManager;
 	/** Warning if session was restored with a different model than saved */
 	modelFallbackMessage?: string;
+	/** Non-secret effective guard controls, present only for guarded sessions. */
+	singleRequestVerification?: SingleRequestGuardVerification;
 	/** LSP servers detected for startup; warmup may continue in the background */
 	lspServers?: LspStartupServerInfo[];
 	/** Start cache-aware online runtime model discovery after the first UI paint. */
@@ -1448,6 +1476,11 @@ export function customToolToDefinition(
 		deferrable: tool.deferrable,
 		legacyName: tool.legacyName,
 		approval: typeof tool.approval === "function" ? tool.approval.bind(tool) : tool.approval,
+		// Extension tools take part in Ask-and-remember grants through the same bridge.
+		approvalCacheTargets:
+			typeof tool.approvalCacheTargets === "function"
+				? tool.approvalCacheTargets.bind(tool)
+				: tool.approvalCacheTargets,
 		// Preserved through RegisteredToolAdapter so MCP-backed tools' explicit
 		// `strict: false` (#4336/#4340) survives the custom-tool → definition bridge.
 		strict: tool.strict,
@@ -1836,9 +1869,58 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	if (options.systemPromptTemplate !== undefined && options.customSystemPrompt !== undefined) {
 		throw new Error("systemPromptTemplate cannot be combined with a literal custom system prompt");
 	}
+	if (
+		options.singleRequest &&
+		(options.modelPattern !== undefined ||
+			options.modelPatternAuthFallback !== undefined ||
+			options.modelPatternFallbackRole !== undefined ||
+			options.modelPatternDefaultFallbackChain !== undefined)
+	) {
+		throw new Error("Single-request guard requires configured default-model resolution without fallback selectors.");
+	}
 	registerLocalInferenceApi();
 	await loadRuntimeIdentity();
-	const startup = snapshotCreateAgentSessionOptions(options);
+	const startupOptions = options.singleRequest
+		? {
+				...options,
+				sessionManager: SessionManager.inMemory(),
+				restrictToolNames: true,
+				toolNames: [],
+				allowRestrictedCustomTools: false,
+				allowRestrictedExtensions: false,
+				enableMCP: false,
+				mcpManager: undefined,
+				mcpTools: undefined,
+				enableLsp: false,
+				disableExtensionDiscovery: true,
+				extensions: undefined,
+				additionalExtensionPaths: undefined,
+				preloadedExtensions: undefined,
+				preloadedExtensionPaths: undefined,
+				preloadedPreparedExtensions: undefined,
+				preloadedCustomToolPaths: undefined,
+				customTools: undefined,
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				prewalk: undefined,
+				deferredPrewalk: undefined,
+				suppressAutoPrewalk: true,
+				scopedModels: undefined,
+				planYolo: undefined,
+				autoTitle: false,
+				cacheWarming: false,
+				telemetry: undefined,
+				onFirstChatDispatch: undefined,
+				providerSessionId: undefined,
+				providerPromptCacheKey: undefined,
+				providerPromptCacheKeySource: undefined,
+				deferRetryFallbackValidation: true,
+			}
+		: options;
+	const startup = snapshotCreateAgentSessionOptions(startupOptions);
 	const extensionRoots = startup.policy.allowExtensions
 		? snapshotEffectiveExtensionRoots(startup.options.extensionRoots?.())
 		: undefined;
@@ -1868,9 +1950,12 @@ async function createAgentSessionScoped(
 	registerSshCleanup();
 	registerEvalCleanup();
 
-	const settings = await (options.settings ??
+	const configuredSettings = await (options.settings ??
 		options.settingsManager ??
 		logger.time("settings", Settings.init, { cwd, agentDir }));
+	const settings = options.singleRequest
+		? configuredSettings.overlay(SINGLE_REQUEST_SETTINGS_OVERRIDES)
+		: configuredSettings;
 	// Discovery provider toggles and process-wide setting effects (theme, request limits, …)
 	// follow the newest holder: each top-level session holds both on its settings until disposed,
 	// then hands them back to the previous holder. Subagents and helper sessions never take them,
@@ -2273,13 +2358,12 @@ async function createAgentSessionScoped(
 				? resolveProvisionalAutoLevel(resolvedModel)
 				: resolveThinkingLevelForModel(resolvedModel, effectiveThinkingLevel),
 		);
-		// Fire-and-forget TLS+H2 handshake to the model's host so it overlaps
-		// with the rest of session setup (extension/skill load, tool registry,
-		// system prompt build). Without this, the first `fetch(...)` pays the
-		// full handshake serially — 100–300 ms transcontinental for
-		// api.anthropic.com from a residential IP. Every mode benefits
-		// (interactive, print, rpc, acp).
-		preconnectModelHost(model.baseUrl);
+		// Fire-and-forget connection warm-up so the handshake overlaps the rest
+		// of session setup (extension/skill load, tool registry, system prompt
+		// build). Effective for endpoints known before any request (official
+		// Anthropic); others warm once a request has revealed their real origin.
+		// Every mode benefits (interactive, print, rpc, acp).
+		if (!options.singleRequest) void prewarmModelConnection(model);
 	}
 
 	// Re-derives the thinking level whenever startup settles on a different
@@ -2406,6 +2490,34 @@ async function createAgentSessionScoped(
 	const asyncJobManager = !options.parentTaskPrefix
 		? new AsyncJobManager({ maxRunningJobs: () => Math.min(100, cfgAsyncMaxJobs.get(settings)) })
 		: undefined;
+	if (asyncJobManager) {
+		asyncJobManager.widgets = new JobWidgets({
+			enabled: () => cfgAsyncWidgets.get(settings),
+			author:
+				options.jobWidgetAuthor ??
+				createModelJobWidgetAuthor({
+					settings,
+					modelRegistry,
+					sessionId: () => sessionManager.getSessionId(),
+					telemetry: () => agent?.telemetry,
+					obfuscate: () => (obfuscator?.hasSecrets() ? text => obfuscator?.obfuscate(text) ?? text : undefined),
+					onUsage: message => {
+						if (!message.usage) return;
+						sessionManager.appendModelUsage(
+							{
+								purpose: "job-widget",
+								api: message.api,
+								provider: message.provider,
+								model: message.model,
+								usage: message.usage,
+								stopReason: message.stopReason,
+							},
+							{ sessionId: sessionManager.getSessionId(), parentId: sessionManager.getLeafId() },
+						);
+					},
+				}),
+		});
+	}
 	const scopedAsyncJobManager = asyncJobManager ?? options.asyncJobManager;
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
@@ -2626,6 +2738,7 @@ async function createAgentSessionScoped(
 			persistTodoPhases: phases => sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases }),
 			getLastAssistantText: () => session?.getLastAssistantText(),
 			getYieldReportText: toolCallId => resolveYieldReportText(session?.messages ?? [], toolCallId),
+			getToolCallIntent: toolCallId => resolveToolCallIntent(session?.messages ?? [], toolCallId),
 			setWorkPoolYieldItems: items => session.setWorkPoolYieldItems(items),
 			getCheckpointState: () => session.getCheckpointState(),
 			setCheckpointState: state => session.setCheckpointState(state ?? undefined),
@@ -3067,7 +3180,7 @@ async function createAgentSessionScoped(
 						// model: any value derived from the earlier fallback model's
 						// `thinking.defaultLevel` must not become sticky.
 						adoptThinkingForModel(restoredModel);
-						preconnectModelHost(restoredModel.baseUrl);
+						void prewarmModelConnection(restoredModel);
 						return true;
 					}
 				}
@@ -3393,7 +3506,7 @@ async function createAgentSessionScoped(
 					);
 					modelFallbackMessage = `Fallback: ${usageFallbackReason.from} -> ${target}\n${usageFallbackReason.reason}`;
 				}
-				preconnectModelHost(selectedModel.baseUrl);
+				void prewarmModelConnection(selectedModel);
 				break;
 			}
 			if (!model) {
@@ -3408,7 +3521,7 @@ async function createAgentSessionScoped(
 		// Fall back to first available model with a valid API key, honoring the
 		// path-scoped `enabledModels` allow-list when configured. Skip when the
 		// user explicitly requested a model via --model that wasn't found.
-		if (!model && deferredModelPatterns.length === 0) {
+		if (!options.singleRequest && !model && deferredModelPatterns.length === 0) {
 			// Retry the configured default role against the current catalog,
 			// setting `model` (+ thinking level) when it resolves. Extension
 			// factories register providers AFTER the early `defaultRoleSpec`
@@ -3438,7 +3551,7 @@ async function createAgentSessionScoped(
 				// `pickInitialThinkingLevel` closes over `defaultRoleSpec`,
 				// so the role's explicit selector (e.g. `:max`) now applies.
 				adoptThinkingForModel(resolvedDefaultModel);
-				preconnectModelHost(resolvedDefaultModel.baseUrl);
+				void prewarmModelConnection(resolvedDefaultModel);
 				return true;
 			};
 
@@ -3512,7 +3625,7 @@ async function createAgentSessionScoped(
 						restoredSessionThinkingLevel = retryFallback.originalThinkingLevel;
 					}
 					adoptThinkingForModel(resolved.model);
-					preconnectModelHost(resolved.model.baseUrl);
+					void prewarmModelConnection(resolved.model);
 					return true;
 				}
 				return false;
@@ -3585,12 +3698,31 @@ async function createAgentSessionScoped(
 				options.onPrewalkWarning?.(warning);
 			}
 		}
+		if (options.singleRequest && model && defaultRoleSpec.model) {
+			const configuredModel = defaultRoleSpec.model;
+			if (
+				model.api !== configuredModel.api ||
+				model.provider !== configuredModel.provider ||
+				model.id !== configuredModel.id ||
+				model.baseUrl !== configuredModel.baseUrl
+			) {
+				throw new Error("Single-request guard refused a model that differs from the configured default.");
+			}
+		}
+		const singleRequestGuard = options.singleRequest
+			? createSingleRequestGuard(model, {
+					configuredSelector: defaultRoleValue,
+					effectiveThinkingLevel,
+				})
+			: undefined;
 
 		if (model) {
 			const selectedModel = model;
-			const refreshedModel = await logger.time("refreshInitialModelMetadata", () =>
-				modelRegistry.refreshSelectedModelMetadata(selectedModel),
-			);
+			const refreshedModel = options.singleRequest
+				? selectedModel
+				: await logger.time("refreshInitialModelMetadata", () =>
+						modelRegistry.refreshSelectedModelMetadata(selectedModel),
+					);
 			if (refreshedModel !== selectedModel) {
 				model = refreshedModel;
 				adoptThinkingForModel(refreshedModel);
@@ -4660,10 +4792,14 @@ async function createAgentSessionScoped(
 		// Outbound credential-pattern redaction follows THIS session's `secrets.enabled` per
 		// request, not the process-wide switch (the newest effect holder's): concurrent ACP/SDK
 		// sessions in one process each keep their own policy.
-		const settingsAwareStreamFn: StreamFn = (streamModel, context, streamOptions) =>
-			withCredentialRedaction(cfgSecretsEnabled.get(settings), () =>
-				settingsBoundStreamFn(streamModel, context, streamOptions),
+		const settingsAwareStreamFn: StreamFn = (streamModel, context, streamOptions) => {
+			const guardedOptions = singleRequestGuard
+				? singleRequestGuard.streamOptions(streamModel, streamOptions)
+				: streamOptions;
+			return withCredentialRedaction(cfgSecretsEnabled.get(settings), () =>
+				settingsBoundStreamFn(streamModel, context, guardedOptions),
 			);
+		};
 		// Primary-agent (and its auto-learn capture twin) provider options read per
 		// request, so `/settings` changes to budgets, Kimi format, or the Codex
 		// websocket policy reach the next call without a session recreate.
@@ -4728,6 +4864,7 @@ async function createAgentSessionScoped(
 			sessionId: providerSessionId,
 			promptCacheKey: providerPromptCacheKey,
 			deadline: options.deadline,
+			...(singleRequestGuard ? { providerMaxAttempts: 1 } : {}),
 			transformContext,
 			transformProviderContext,
 			steeringMode: cfgSteeringMode.get(settings),
@@ -4769,7 +4906,7 @@ async function createAgentSessionScoped(
 				// loop (side-channel, advisor, and maintenance requests use
 				// dedicated wrappers), so it owns the warmer. The replay omits the
 				// one-shot fallback-credit redemption.
-				session.startCacheWarming(streamModel, context, merged);
+				if (!singleRequestGuard) session.startCacheWarming(streamModel, context, merged);
 				return stream;
 			},
 			cursorExecHandlers,
@@ -5742,6 +5879,7 @@ async function createAgentSessionScoped(
 			setToolUIContext,
 			mcpManager,
 			modelFallbackMessage,
+			singleRequestVerification: singleRequestGuard?.verification,
 			lspServers,
 			startBackgroundModelDiscovery: startupPolicy.allowProviderDiscovery ? startRuntimeDiscovery : undefined,
 			eventBus,
@@ -5771,22 +5909,5 @@ async function createAgentSessionScoped(
 			});
 		}
 		throw error;
-	}
-}
-
-/**
- * Best-effort preconnect to the model's API host. Bun's `fetch.preconnect`
- * primes DNS + TCP + TLS + H2 so the first real request reuses the warm
- * connection. Errors are swallowed: preconnect is an optimization, never a
- * hard dependency.
- */
-function preconnectModelHost(baseUrl: string | undefined): void {
-	if (!baseUrl) return;
-	const preconnect = (globalThis.fetch as typeof fetch & { preconnect?: (url: string) => void }).preconnect;
-	if (typeof preconnect !== "function") return;
-	try {
-		preconnect(baseUrl);
-	} catch {
-		// Best effort.
 	}
 }

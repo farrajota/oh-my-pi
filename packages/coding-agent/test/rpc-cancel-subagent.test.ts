@@ -7,7 +7,7 @@ import { handleRpcCancelSubagent } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { resetAgentLifecycleForTests } from "@oh-my-pi/pi-coding-agent/internal/agent-lifecycle-bridge";
-import { lookupAgentRef } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
+import { lookupAgentRef, markAgentResultAccepted } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
 import { AgentRegistry, type AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -123,13 +123,14 @@ describe("handleRpcCancelSubagent", () => {
 			session: {
 				// The executor may accept a yield that lands while the abort is in flight.
 				abort: async () => {
-					acceptedDuringAbort = AgentRegistry.global().markResultAccepted("SubagentA");
+					acceptedDuringAbort = markAgentResultAccepted(AgentRegistry.global(), "SubagentA", acceptedRef);
 				},
 				dispose: async () => {},
 			} as never,
 			sessionFile: ownSessionFile,
 			status: "running",
 		});
+		const acceptedRef = lookupAgentRef(AgentRegistry.global(), "SubagentA")!;
 
 		await expect(handleRpcCancelSubagent(registry, "SubagentA")).resolves.toBe(true);
 
@@ -193,7 +194,11 @@ describe("handleRpcCancelSubagent", () => {
 		emitLifecycle("SubagentA", "started");
 		registerLiveAgent("SubagentA");
 		// Yield acceptance flips the ref to idle while the roster still lists it.
-		AgentRegistry.global().markResultAccepted("SubagentA");
+		markAgentResultAccepted(
+			AgentRegistry.global(),
+			"SubagentA",
+			lookupAgentRef(AgentRegistry.global(), "SubagentA")!,
+		);
 
 		await expect(handleRpcCancelSubagent(registry, "SubagentA")).resolves.toBe(false);
 

@@ -3,7 +3,7 @@ import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { prompt } from "@oh-my-pi/pi-utils";
 import parentIrcSteerTemplate from "../prompts/steering/parent-irc.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "./agent-session-events";
 import { escapeHarnessTags } from "./harness-tags";
 import type { CustomMessage } from "./messages";
@@ -14,6 +14,7 @@ export interface IrcBridgeHost {
 	agent: Agent;
 	sessionManager: SessionManager;
 	isDisposed(): boolean;
+	isParentSender(recipientId: string, senderId: string): boolean;
 	isStreaming(): boolean;
 	planModeEnabled(): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
@@ -24,6 +25,9 @@ export interface IrcBridgeHost {
 
 /** Owns incoming IRC queues and the session's non-interrupting aside queue. */
 export class IrcBridge {
+	/** Tracks parent IRC steers by object identity without trusting prompt text or publication on receipt. */
+	readonly #parentSteers = new WeakSet<AgentMessage>();
+
 	readonly #host: IrcBridgeHost;
 	#interrupts: AgentMessage[] = [];
 	#asides: AgentMessage[] = [];
@@ -36,6 +40,11 @@ export class IrcBridge {
 
 	constructor(host: IrcBridgeHost) {
 		this.#host = host;
+	}
+
+	/** Identifies a consumed user-role steer as an actual parent IRC request, not another agent-authored steer. */
+	isParentSteer(message: AgentMessage): boolean {
+		return this.#parentSteers.has(message);
 	}
 
 	/** Whether an incoming peer message can interrupt a wait. */
@@ -152,6 +161,7 @@ export class IrcBridge {
 				const from = Reflect.get(details, "from");
 				const body = Reflect.get(details, "message");
 				const replyTo = Reflect.get(details, "replyTo");
+				const broadcast = Reflect.get(details, "broadcast") === true;
 				if (typeof id !== "string" || typeof from !== "string" || typeof body !== "string") {
 					queue.remaining.push(record);
 					continue;
@@ -171,6 +181,7 @@ export class IrcBridge {
 					body,
 					ts: record.timestamp,
 					...(typeof replyTo === "string" ? { replyTo } : {}),
+					...(broadcast ? { broadcast: true } : {}),
 				});
 			}
 		}
@@ -184,11 +195,12 @@ export class IrcBridge {
 		if (this.#host.isDisposed()) throw new Error("Recipient session is disposed.");
 		const streaming = this.#host.isStreaming();
 		const planModeIdle = !streaming && this.#host.planModeEnabled();
-		const fromParent = AgentRegistry.global().get(msg.to)?.parentId === msg.from;
+		const fromParent = this.#host.isParentSender(msg.to, msg.from);
 		// An idle subagent runs a monitored wake turn whose output is relayed
 		// back to the sender (task executor `relayWakeTurnOutput`); the main
-		// agent and mid-turn asides have no such relay.
-		const relayOnStop = !streaming && !planModeIdle && msg.to !== MAIN_AGENT_ID && msg.wakeRelay !== true;
+		// Agents, mid-turn asides, relays and broadcast legs have no stop relay.
+		const relayOnStop =
+			!streaming && !planModeIdle && msg.to !== MAIN_AGENT_ID && msg.wakeRelay !== true && msg.broadcast !== true;
 		const autoReply = streaming && context !== undefined && this.#host.autoReplyIrcEnabled();
 		// The body is agent-authored (a peer's message, or a wake relay's
 		// `<task-result>` around a subagent's output), so it must not close the
@@ -213,6 +225,7 @@ export class IrcBridge {
 				message: msg.body,
 				...(msg.replyTo ? { replyTo: msg.replyTo } : {}),
 				...(msg.wakeRelay ? { wakeRelay: true } : {}),
+				...(msg.broadcast ? { broadcast: true } : {}),
 				...(fromParent ? { fromParent: true } : {}),
 			},
 			attribution: "agent",
@@ -221,13 +234,16 @@ export class IrcBridge {
 		void this.#host.emitSessionEvent({ type: "irc_message", message: record });
 		if (streaming) {
 			if (fromParent) {
-				this.#host.agent.steer({
+				const steer: AgentMessage = {
 					role: "user",
 					content: prompt.render(parentIrcSteerTemplate, { from: msg.from, message: envelopeBody }),
 					attribution: "agent",
 					timestamp: msg.ts,
 					steering: true,
-				});
+				};
+				// A broadcast leg asks no one in particular: consuming it never makes the turn the parent's.
+				if (msg.broadcast !== true) this.#parentSteers.add(steer);
+				this.#host.agent.steer(steer);
 			} else {
 				this.#interrupts.push(record);
 			}

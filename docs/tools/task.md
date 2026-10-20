@@ -81,7 +81,9 @@ Background response (`async.enabled=true`):
 
 - `content`: `` Spawned agent `<id>` (job `<jobId>`). `` A batch call instead returns `` Spawned N background agents using <agent types>. ... `` (the deduped per-item agent types, comma-joined) with a per-agent `- `<id>` (job `<jobId>`)` listing.
 - `details`: `{ projectAgentsDir, results, totalDurationMs, progress: [<AgentProgress per spawn>], async: { state, jobId, type: "task" } }`. The call keeps one shared `progress[]` snapshot; `async.jobId` is the first started job and `async.state` aggregates over the async spawns ("running" until every job settles, "failed" if any spawn failed) — jobs that settled before the call returned are already reflected. A mixed call's `results` carries the blocking spawns' inline `SingleResult`s (pure background calls return `results: []`).
-- Live progress streams into the same tool block via `onUpdate(...)`; final results arrive as async-result injections. Non-isolated completions get an idle/follow-up hint when messaging is enabled. Budget-stopped resumable non-isolated agents get a resume hint; hard aborts point at the transcript. Isolated runs are not revivable, so their non-resumable follow-up label reflects the lifecycle: the parked session is not adopted and retains no reviver.
+- Live progress streams into the same tool block via `onUpdate(...)`; final results arrive as async-result injections. Non-isolated completions get an idle/follow-up hint when messaging is enabled. Aborted agents that can be resumed get a resume hint; isolated runs point at the transcript. The current `task-follow-up.md` template still labels isolated runs non-resumable, despite the retained-workspace lifecycle described below.
+- When completion estimates are enabled, live progress also carries optional `stage` and `watch` hints. A late estimate cannot replace the accepted yield's 99% completion or finished stage; its watch hint may still update.
+- Wake replies use the final assistant report, not narration preceding tool work. A completed wake without an answer reports that it produced no output and links to `history://<id>`; failures and cancellation retain their distinct outcomes.
 
 Settled response (`async.enabled=false`, no job manager, every item's agent `blocking: true`, or async job body):
 - `content`: summary rendered from `packages/coding-agent/src/prompts/tools/task-summary.md` with a preview capped at 5000 chars; `agent://<id>` holds the full output. A sync batch concatenates the per-spawn summaries.
@@ -127,9 +129,9 @@ Artifacts and side channels:
 13. Child tool availability starts from explicit `agent.tools` when provided; auto-add `task` for declared spawns below the depth limit. Explicit lists containing `task`/`bash` gain `wait` unless restricted, and the registry still requires an async/IRC/service wake source. `exec` expands to `bash` plus `eval` when a backend is enabled. Outbound messaging requires explicit `write`, while inbound steering does not. Parent-owned `todo` is stripped unless prewalk is armed.
 14. The child must finish through the hidden `yield` tool; up to 3 reminder prompts, the last forcing `toolChoice = yield` when supported. `finalizeSubprocessOutput(...)` reconciles raw text, `yield` payloads, structured schemas, and abort states.
 15. End-of-run lifecycle (keep-alive, in the run finalizer):
-    - caller signal, wall-clock timeout, or internal hard abort → registry status `aborted`, session disposed — terminal;
-    - soft-request-budget abort on a kept-alive, non-isolated agent with a reviver → treated as resumable: the agent becomes `idle` and may receive a follow-up/revival;
-    - manager shutdown → dispose/unregister the process-local session without a hard-kill tombstone;
+    - caller signal, wall-clock timeout, or soft-request-budget abort on a kept-alive agent with a reviver → only the run stops: the agent becomes `idle` and may receive a follow-up/revival;
+    - explicit kill (Agent Hub, RPC `cancel_subagent`, collab, vibe), or an aborted agent without a reviver → registry status `aborted`, session disposed, kill tombstone written; a later message or Hub revive reopens the transcript as a fresh `parked` generation only when lifecycle authority permits revival; a hard-killed actor is never revived;
+    - manager shutdown → dispose/unregister the process-local session without a kill tombstone;
     - isolated kept-alive run → status `parked` with its session disposed, but without lifecycle adoption or a reviver; its transcript remains available, but the session cannot resume through `write agent://<id>` or Agent Hub;
     - non-isolated kept-alive runs (success and failure alike) → status `idle` with the live session attached; the lifecycle manager bound to the owning `AgentRegistry` adopts the ref with `task.agentIdleTtlMs` and its reviver when a persisted session file is available. The reviver reopens the session JSONL.
 16. Lifecycle thereafter: adopted non-isolated idle agents are parked after `task.agentIdleTtlMs` (session disposed; `AgentRef` + session file retained); `write agent://<id>` or the Agent Hub revives parked refs with a lifecycle reviver. Isolated refs are parked without adoption or a reviver; their transcripts remain readable, but they cannot be revived. `"Main"` is never parked.
@@ -167,7 +169,7 @@ Artifacts and side channels:
   - Allocates session-scoped output ids through `AgentOutputManager` so `agent://` stays unique across invocations.
   - Shares the parent `local://` root and `ArtifactManager` with subagents.
 - Background work / cancellation
-  - `write proc://<jobId>/kill` (no `content` needed) or parent tool-call abort cancels background jobs; parent tool-call abort cancels sync runs through the call signal. A hard-aborted run lands `aborted` and is torn down. An owned running subagent without a job can be cancelled through `proc://<agentId>/kill`, which aborts and releases its session.
+  - `write proc://<jobId>/kill` (no `content` needed) or parent tool-call abort cancels background jobs; parent tool-call abort cancels sync runs through the call signal. A cancelled run stops but its agent stays `idle` and resumable. An owned running subagent without a job can be cancelled through `proc://<agentId>/kill`, which aborts and releases its session.
   - Missing-`yield` recovery sends up to three internal reminder prompts to the child session.
 
 ## Limits & Caps
@@ -222,6 +224,6 @@ Only the transcript is forked; artifacts stay in the source. In the consult, `hi
 
 The consult excludes additional roots, workspace tree, context files, skills, rules, inherited agents, extensions, MCP, IRC, and LSP. It is limited to `read`, `grep`, and `glob` as enabled; `task.structured` (default off) adds hidden `yield`, otherwise the final assistant message completes the report. Cold revival requires the `seanceSource` header and `read` in the persisted tools, restores the persisted prompt, and keeps only seance tools.
 
-Warm or revived IRC follow-ups preserve this completion contract. A yielded follow-up republishes canonical `agent://<id>` output; successful, nonempty unstructured follow-ups also republish their final report when parent-woken or user-prompted, removing a stale `<id>.json` sidecar; peer-only unstructured replies and cancelled or empty follow-ups do not publish.
+Warm or revived IRC follow-ups preserve this completion contract. A yielded follow-up republishes canonical `agent://<id>` output; successful, nonempty unstructured follow-ups also republish their final report when woken by a direct parent message (not an `agent://all` broadcast) or user-prompted, removing a stale `<id>.json` sidecar; peer-only unstructured replies and cancelled or empty follow-ups do not publish.
 
 Inherited source charges are zeroed; new consultation turns use existing task/Agent Hub usage tracking.

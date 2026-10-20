@@ -42,7 +42,7 @@ import { isIrcEnabled } from "../irc/messaging";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
-import { type ExecutorOptions, runSubprocess } from "./executor";
+import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "./executor";
 import { composeEffectivePermissions, freezePermissionScope } from "./permission-profiles";
 import {
 	applyEligibleNestedPatches,
@@ -181,6 +181,8 @@ export interface StructuredSubagentRequest {
 	workPoolYieldItems?: WorkPoolYieldItem[];
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
+	/** See {@link ExecutorOptions.onToolResult}. */
+	onToolResult?: (result: SubagentToolResult) => void;
 }
 
 /** A normalized preflight result, reusable by tests and adapters. */
@@ -798,6 +800,7 @@ function buildRunSubprocessOptions(
 		signal: request.signal,
 		subagentEventBus: session.subagentEventBus,
 		onProgress: request.onProgress,
+		onToolResult: request.onToolResult,
 		authStorage: session.authStorage,
 		modelRegistry: session.modelRegistry,
 		settings: request.settings ?? session.settings,

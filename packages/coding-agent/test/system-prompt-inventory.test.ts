@@ -518,7 +518,7 @@ describe("system prompt tool inventory", () => {
 		expect(text).not.toContain("`lsp`");
 	});
 
-	it("renders exactly one of the map-unknown-code and inline-first delegation rules per bias", async () => {
+	it("preserves policy-gated eager and inline-first delegation rules per bias", async () => {
 		const renderDelegation = async (delegationBias: "eager" | "restrained" | "gated", eagerTasks: boolean) => {
 			const { systemPrompt } = await buildSystemPrompt({
 				cwd: tempDir,
@@ -531,13 +531,22 @@ describe("system prompt tool inventory", () => {
 				eagerTasks,
 			});
 			const count = (needle: string) => systemPrompt[0].split(needle).length - 1;
-			return [count("Map unknown code via `task`"), count("Inline first.")];
+			return [
+				count(
+					"Delegate genuinely independent useful slices or specialist input only when permitted by the governing policy and materially improving speed or quality; do not manufacture slices.",
+				),
+				count("Inline first applies only to discretionary delegation."),
+				count("Proactive multi-agent delegation is active only when authorized"),
+				count("No subagents for discretionary delegation unless"),
+				count("Map unknown code via `task`"),
+			];
 		};
-		expect(await renderDelegation("eager", false)).toEqual([1, 0]);
-		expect(await renderDelegation("eager", true)).toEqual([1, 0]);
-		expect(await renderDelegation("restrained", true)).toEqual([1, 0]);
-		expect(await renderDelegation("restrained", false)).toEqual([0, 1]);
-		expect(await renderDelegation("gated", true)).toEqual([0, 0]);
+		expect(await renderDelegation("eager", false)).toEqual([1, 0, 0, 0, 0]);
+		expect(await renderDelegation("eager", true)).toEqual([2, 0, 0, 0, 0]);
+		expect(await renderDelegation("restrained", true)).toEqual([2, 0, 0, 0, 0]);
+		expect(await renderDelegation("restrained", false)).toEqual([1, 1, 0, 0, 0]);
+		expect(await renderDelegation("gated", true)).toEqual([1, 0, 1, 0, 0]);
+		expect(await renderDelegation("gated", false)).toEqual([1, 0, 0, 1, 0]);
 	});
 
 	it("appends each advertised prelude's guidance as its own block", async () => {

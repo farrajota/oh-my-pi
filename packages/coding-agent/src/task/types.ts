@@ -595,6 +595,9 @@ export interface AgentProgress {
 	description?: string;
 	lastIntent?: string;
 	completionPercent?: number;
+	/** Display-only completion-probe stage and next observable milestone. */
+	stage?: string;
+	watch?: string;
 	/** Bounded display-only effective permission metadata. Never use it for authorization. */
 	permissionSummary?: EffectivePermissionSummary;
 	currentTool?: string;

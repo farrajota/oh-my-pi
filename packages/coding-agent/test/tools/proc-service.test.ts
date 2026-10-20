@@ -2,15 +2,18 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { procmgr, setProcessName, TempDir } from "@oh-my-pi/pi-utils";
+import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "../../src/config/settings";
+import { ModelRegistry } from "../../src/config/model-registry";
 import { AsyncJobManager } from "../../src/async/job-manager";
 import { runningAgentsOutsideJobs } from "../../src/async/job-control";
 import { ProcProtocolHandler } from "../../src/internal-urls/proc-protocol";
 import { parseInternalUrl } from "../../src/internal-urls/parse";
-import { lookupAgentRef } from "../../src/internal/agent-registry-bridge";
+import { createAgentRootSession, lookupAgentRef } from "../../src/internal/agent-registry-bridge";
 import { AgentRegistry } from "../../src/registry/agent-registry";
 import { SessionManager } from "../../src/session/session-manager";
+import * as sdk from "../../src/sdk";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
 import * as daemonClient from "../../src/launch/client";
@@ -25,8 +28,9 @@ import { BashTool } from "../../src/tools/bash";
 import { WriteTool } from "../../src/tools/write";
 import { sharedBrowserDaemonName } from "../../src/tools/browser/shared-daemon";
 import type { ToolSession } from "../../src/tools";
-import type { AgentSession } from "../../src/session/agent-session";
+import { AgentSession } from "../../src/session/agent-session";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
+import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 function startBroker(projectDir: string, runtimeDir: string): Promise<void> {
 	const previous = [
@@ -63,17 +67,28 @@ async function rejectionMessage(promise: Promise<unknown>): Promise<string> {
 	throw new Error("Expected the promise to reject");
 }
 
-function toolSession(cwd: string, manager?: AsyncJobManager, options: { launch?: boolean } = {}): ToolSession {
+function toolSession(
+	cwd: string,
+	manager?: AsyncJobManager,
+	options: {
+		launch?: boolean;
+		async?: boolean;
+		sessionManager?: SessionManager;
+		agentRegistry?: AgentRegistry;
+	} = {},
+): ToolSession {
 	return {
 		cwd,
 		hasUI: false,
 		getAgentId: () => "Main",
 		getSessionId: () => "Main",
+		sessionManager: options.sessionManager,
+		agentRegistry: options.agentRegistry,
 		getSessionFile: () => null,
 		asyncJobManager: manager,
 		settings: Settings.isolated({
 			"launch.enabled": options.launch ?? true,
-			"async.enabled": false,
+			"async.enabled": options.async ?? false,
 			"bash.autoBackground.enabled": false,
 			"bash.autoBackground.thresholdMs": 60_000,
 			"bashInterceptor.enabled": false,
@@ -103,6 +118,66 @@ function steeringContext(steeringSignal: AbortSignal): AgentToolContext {
 }
 
 describe("proc:// background jobs", () => {
+	it("reads what a pipeline stage wrote while a later stage still holds it back", async () => {
+		const manager = new AsyncJobManager({});
+		const auth = createInMemoryAuthStorage();
+		const mainSession = new AgentSession({
+			agent: new Agent({ initialState: { systemPrompt: [], tools: [], messages: [] } }),
+			sessionManager: SessionManager.inMemory(process.cwd()),
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(auth),
+		});
+		const registry = new AgentRegistry();
+		const createSession = vi
+			.spyOn(sdk, "createAgentSession")
+			.mockResolvedValue({ session: mainSession } as sdk.CreateAgentSessionResult);
+		const session = toolSession(process.cwd(), manager, {
+			launch: false,
+			async: true,
+			sessionManager: mainSession.sessionManager,
+			agentRegistry: registry,
+		});
+		const proc = new ProcProtocolHandler();
+		try {
+			await createAgentRootSession(registry, { agentId: "Main" });
+			expect(lookupAgentRef(registry, "Main")?.session).toBe(mainSession);
+			await new BashTool(session).execute("piped", {
+				command: "{ printf 'one\\r\\ntwo\\rthree\\n'; sleep 30; } | tail -n 1",
+				async: true,
+				pty: false,
+			});
+			const [job] = manager.getAllJobs({ ownerId: "Main" });
+			if (!job) throw new Error("no bash job started");
+			const read = (url: string) => proc.resolve(parseInternalUrl(url), { session });
+
+			// The stream listing appears as soon as the pipe is registered, before its relay has copied bytes.
+			// Wait for its byte count to match the producer's complete write before reading it.
+			let stream = "";
+			for (let waited = 0; stream !== "one\ntwo\nthree\n" && waited < 10_000; waited += 20) {
+				const listing = (await read(`proc://${job.id}/streams`)).content;
+				if (listing.startsWith(`proc://${job.id}/streams/1 open 15B `)) {
+					stream = (await read(`proc://${job.id}/streams/1`)).content;
+				}
+				if (stream !== "one\ntwo\nthree\n") await Bun.sleep(20);
+			}
+			// CRLF and bare-CR progress both read as lines.
+			expect(stream).toBe("one\ntwo\nthree\n");
+			// The job's own output is still empty: `tail` prints only at EOF.
+			expect((await read(`proc://${job.id}`)).details).toMatchObject({ proc: { log: "" } });
+			const listing = await read(`proc://${job.id}/streams`);
+			expect(listing.isDirectory).toBeTrue();
+			expect(listing.content).toMatch(new RegExp(`^proc://${job.id}/streams/1 open 15B — .*printf.* → tail -n 1$`));
+			expect(await rejectionMessage(read(`proc://${job.id}/streams/2`))).toContain(
+				`List them with proc://${job.id}/streams`,
+			);
+		} finally {
+			createSession.mockRestore();
+			await manager.dispose({ timeoutMs: 2_000 });
+			await mainSession.dispose();
+			auth.close();
+		}
+	}, 20_000);
+
 	it("lists owned jobs, preserves delivery on read, and scopes kill to the owner", async () => {
 		const manager = new AsyncJobManager({});
 		const pending = Promise.withResolvers<string>();

@@ -223,6 +223,8 @@ export async function readSqlite(
 								limit: selector.limit,
 								table: selector.table,
 								dbPath: resolvedSqlitePath.absolutePath,
+								where: selector.where,
+								order: selector.order,
 							}),
 							resolvedSqlitePath.suffixResolution,
 						),

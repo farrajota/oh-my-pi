@@ -45,6 +45,7 @@ import type { Skill, SkillWarning } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import type { JobWidgetView } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { XdevState } from "../tools/xdev";
 import type { ToolSession } from "../tools";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
@@ -93,6 +94,8 @@ export interface AsyncJobInspection {
 	output?: string;
 	/** Artifact holding the full output when `output` is cut. */
 	artifactId?: string;
+	/** The job's live widget (frozen once it settles). */
+	widget?: JobWidgetView;
 }
 
 /** Jobs of an agent and every subagent below it, with the lineage that nests them (see `AgentSession.getAsyncJobTree`). */

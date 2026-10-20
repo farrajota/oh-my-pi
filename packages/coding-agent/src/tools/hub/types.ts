@@ -5,6 +5,7 @@
  */
 
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { JobWidgetView } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { AsyncJobType } from "../../async";
 import type { HubAdmissionStateTransaction } from "../../internal/hub-admission";
 import type { IrcDeliveryReceipt, IrcMessage } from "../../irc/bus";
@@ -161,6 +162,8 @@ export interface JobSnapshot {
 	resolvedThinkingLevel?: ConfiguredThinkingLevel;
 	/** True when the task progress reports an attached live advisor. */
 	advisor?: boolean;
+	stage?: string;
+	widget?: JobWidgetView;
 	resultText?: string;
 	errorText?: string;
 	artifactError?: OutputMeta["artifactError"];

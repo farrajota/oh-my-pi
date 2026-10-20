@@ -7,6 +7,46 @@
 - Rebuilt bundled Ollama Cloud model rows from current local policy, added the missing SambaNova GPT OSS 120B seed row, and corrected TypeSafe and OpenRouter Jev rows to advertise their KDL-declared text-and-image input modalities.
 - Fixed MiniMax Code compatibility to keep baked legacy OpenAI-compatible rows separate from the intended Anthropic adaptive-effort and mandatory-Flash contract, while retaining NVIDIA and Fireworks wire behavior.
 
+## [18.12.3] - 2026-10-19
+
+### Changed
+
+- MiniMax `MiniMax-M3.1-Flash` (the launch id) now gets the always-on `low`–`max` thinking the bundled `MiniMax-M3.1-Flash-Preview` rows have, and omits sampling params (`temperature`, `top_p`, `top_k`) it rejects ([#16315](https://github.com/can1357/oh-my-pi/pull/16315) by [@SaladDay](https://github.com/SaladDay))
+
+### Fixed
+
+- Gemma 4 models on Google AI Studio (`google/gemma-4-31b-it`, `google/gemma-4-26b-a4b-it`, …) no longer fail every request with `Thinking budget is not supported for this model`; thinking is now toggled with `thinkingLevel` (on = `high`, off = `minimal`) ([#16350](https://github.com/can1357/oh-my-pi/issues/16350))
+
+## [18.12.2] - 2026-10-18
+
+### Changed
+
+- Seeded TypeSafe `jev-1.14.0` and OpenRouter `typesafe/jev-1.14`, and made them the `judge` role defaults and TypeSafe's default model; TypeSafe discovery keeps seeded ids its alias-only `/v1/models` listing omits
+
+## [18.12.1] - 2026-10-17
+
+### Fixed
+
+- Anthropic's `request-encoding-rejection` now also matches the API's "request body is not valid JSON" 400, which a gzip body gets when a proxy drops its `Content-Encoding` header ([#16108](https://github.com/can1357/oh-my-pi/pull/16108) by [@alphastorm](https://github.com/alphastorm))
+
+## [18.12.0] - 2026-10-17
+
+### Added
+
+- Added the `request-encodings`, `request-encoding-rejection`, and `endpoint-hosts` rule axes, `resolveRequestCompression(model, url)`, and `isCatalogEndpointUrl(model, url)`, declaring which providers' own endpoints decode compressed request bodies: official Anthropic API (gzip), Codex backend (zstd), and GitHub Copilot's API hosts (zstd, then gzip); Moonshot's China host counts as its own endpoint ([#16086](https://github.com/can1357/oh-my-pi/pull/16086) by [@H4vC](https://github.com/H4vC))
+
+### Changed
+
+- Bundled GPT-5.4 rows on OpenAI, Azure, OpenCode Zen, and Command Code report a 1M context window, the window the coding agent already applied at runtime; GitHub Copilot and Factory Droid keep their own windows ([#16094](https://github.com/can1357/oh-my-pi/pull/16094) by [@H4vC](https://github.com/H4vC))
+
+### Fixed
+
+- Fixed custom providers that declare a built-in `providerType` (Azure, GitHub Copilot, OpenCode, ClinePass, DeepSeek, NVIDIA) missing that provider's wire quirks, such as strict Responses pairing and the ClinePass reasoning field: they now follow the same catalog rules as the built-in provider ([#16093](https://github.com/can1357/oh-my-pi/pull/16093) by [@H4vC](https://github.com/H4vC))
+- Fixed OpenCode Zen bringing back its retired bundled models after a failed refresh: the retry-backoff write no longer drops the cached snapshot's retention, so the pruned catalog survives the retry window and offline launches. ([#16054](https://github.com/can1357/oh-my-pi/pull/16054) by [@adi-IL](https://github.com/adi-IL))
+- Fixed `providers.cacheWarming` never arming for Claude on Google Antigravity: Claude models there now declare Vertex Anthropic's five-minute prompt-cache lifetime; Gemini models stay unwarmed because Google's implicit cache has no fixed lifetime ([#15764](https://github.com/can1357/oh-my-pi/issues/15764), [#16025](https://github.com/can1357/oh-my-pi/pull/16025) by [@harshaygadekar](https://github.com/harshaygadekar))
+- Scoped Jev image bounds to the selected models instead of applying them to unrelated native judges ([#16002](https://github.com/can1357/oh-my-pi/pull/16002) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
+- Fixed Bedrock sessions rejecting replayed tool names over 64 characters after a model switch ([#15839](https://github.com/can1357/oh-my-pi/issues/15839))
+
 ## [18.11.3] - 2026-10-16
 
 ### Changed

@@ -8,7 +8,7 @@ import {
 	getAgentLifecycleManager,
 	resetAgentLifecycleForTests,
 } from "@oh-my-pi/pi-coding-agent/internal/agent-lifecycle-bridge";
-import { lookupAgentRef } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
+import { lookupAgentRef, markAgentResultAccepted } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { PromptDroppedError } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { type SubagentLifecyclePayload, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
@@ -169,7 +169,11 @@ describe("handleRpcSteerSubagent", () => {
 		emitLifecycle("SubagentA", "started");
 		registerLiveAgent("SubagentA");
 		// Yield acceptance flips the ref to idle while the roster still lists it.
-		AgentRegistry.global().markResultAccepted("SubagentA");
+		markAgentResultAccepted(
+			AgentRegistry.global(),
+			"SubagentA",
+			lookupAgentRef(AgentRegistry.global(), "SubagentA")!,
+		);
 
 		await expect(handleRpcSteerSubagent(registry, "SubagentA", "hello")).resolves.toBe(
 			"Subagent not running: SubagentA",

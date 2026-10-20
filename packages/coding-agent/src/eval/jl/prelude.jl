@@ -71,8 +71,11 @@ end
 
 
 function display_image(base64_str::String, mime_type::String = "image/png")
-    bundle = Dict(mime_type => base64_str)
-    Main.emit_frame(Dict("type" => "display", "id" => Main.current_rid, "bundle" => bundle))
+    Main.emit_frame(Dict(
+        "type" => "image",
+        "id" => Main.current_rid,
+        "image" => Dict("mimeType" => mime_type, "data" => base64_str),
+    ))
     return nothing
 end
 
@@ -81,11 +84,7 @@ function __omp_emit_status(op::String, fields::AbstractDict=Dict{String, Any}())
     for (k, v) in fields
         status[string(k)] = v
     end
-    Main.emit_frame(Dict(
-        "type" => "display",
-        "id" => Main.current_rid,
-        "bundle" => Dict("application/x-omp-status" => status)
-    ))
+    Main.emit_frame(Dict("type" => "status", "id" => Main.current_rid, "event" => status))
     return nothing
 end
 
@@ -108,22 +107,16 @@ function Base.read(path::AbstractString, offset::Integer=1, limit::Union{Integer
             content = ""
         end
     end
-    
+
     preview = length(content) > 500 ? content[1:500] : content
-    Main.emit_frame(Dict(
-        "type" => "display",
-        "id" => Main.current_rid,
-        "bundle" => Dict(
-            "application/x-omp-status" => Dict(
-                "op" => "read",
-                "path" => resolved,
-                "chars" => length(content),
-                "preview" => preview
-            )
-        )
+    __omp_emit_status("read", Dict{String, Any}(
+        "path" => resolved,
+        "chars" => length(content),
+        "preview" => preview,
     ))
     return content
 end
+
 
 function Base.write(path::AbstractString, content::Any)
     resolved = __omp_resolve_path(string(path))
@@ -132,16 +125,9 @@ function Base.write(path::AbstractString, content::Any)
         Base.write(io, string(content))
     end
     
-    Main.emit_frame(Dict(
-        "type" => "display",
-        "id" => Main.current_rid,
-        "bundle" => Dict(
-            "application/x-omp-status" => Dict(
-                "op" => "write",
-                "path" => resolved,
-                "chars" => length(string(content))
-            )
-        )
+    __omp_emit_status("write", Dict{String, Any}(
+        "path" => resolved,
+        "chars" => length(string(content)),
     ))
     return resolved
 end
@@ -366,51 +352,30 @@ function env(key=nothing, value=nothing)
             items[k] = v
         end
         keys_list = sort(collect(keys(items)))
-        Main.emit_frame(Dict(
-            "type" => "display",
-            "id" => Main.current_rid,
-            "bundle" => Dict(
-                "application/x-omp-status" => Dict(
-                    "op" => "env",
-                    "count" => length(items),
-                    "keys" => keys_list[1:min(20, length(keys_list))]
-                )
-            )
+        __omp_emit_status("env", Dict{String, Any}(
+            "count" => length(items),
+            "keys" => keys_list[1:min(20, length(keys_list))],
         ))
         return items
     end
-    
+
     k = string(key)
     if value !== nothing
         v = string(value)
         ENV[k] = v
-        Main.emit_frame(Dict(
-            "type" => "display",
-            "id" => Main.current_rid,
-            "bundle" => Dict(
-                "application/x-omp-status" => Dict(
-                    "op" => "env",
-                    "key" => k,
-                    "value" => v,
-                    "action" => "set"
-                )
-            )
+        __omp_emit_status("env", Dict{String, Any}(
+            "key" => k,
+            "value" => v,
+            "action" => "set",
         ))
         return v
     end
-    
+
     v = get(ENV, k, nothing)
-    Main.emit_frame(Dict(
-        "type" => "display",
-        "id" => Main.current_rid,
-        "bundle" => Dict(
-            "application/x-omp-status" => Dict(
-                "op" => "env",
-                "key" => k,
-                "value" => v,
-                "action" => "get"
-            )
-        )
+    __omp_emit_status("env", Dict{String, Any}(
+        "key" => k,
+        "value" => v,
+        "action" => "get",
     ))
     return v
 end
@@ -590,30 +555,12 @@ function agent(prompt::String; agent="task", label=nothing, schema=nothing, sche
 end
 
 function Base.log(message::AbstractString)
-    Main.emit_frame(Dict(
-        "type" => "display",
-        "id" => Main.current_rid,
-        "bundle" => Dict(
-            "application/x-omp-status" => Dict(
-                "op" => "log",
-                "message" => message
-            )
-        )
-    ))
+    __omp_emit_status("log", Dict{String, Any}("message" => message))
     return nothing
 end
 
 function phase(title::String)
-    Main.emit_frame(Dict(
-        "type" => "display",
-        "id" => Main.current_rid,
-        "bundle" => Dict(
-            "application/x-omp-status" => Dict(
-                "op" => "phase",
-                "title" => title
-            )
-        )
-    ))
+    __omp_emit_status("phase", Dict{String, Any}("title" => title))
     return nothing
 end
 

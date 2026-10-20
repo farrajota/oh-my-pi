@@ -34,6 +34,7 @@ import {
 	normalizeToolNames,
 } from "../tools/builtin-names";
 import { denyError, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
+import { getApprovalGrants } from "../tools/approval-cache";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { isFilesystemSourcePath } from "../tools/path-utils";
 import { supportsExternalThinking } from "../tools/think";
@@ -1041,7 +1042,13 @@ export class SessionTools {
 							settings: this.#host.settings,
 						});
 						const mode = approvalMode === "yolo" && !explicitAutoApprove ? "always-ask" : approvalMode;
-						const resolved = resolveApproval(target, args, mode, userPolicies);
+						const resolved = resolveApproval(
+							target,
+							args,
+							mode,
+							userPolicies,
+							getApprovalGrants(this.#host.settings.getAgentDir(), this.#host.sessionManager.getSessionId()),
+						);
 						if (resolved.policy === "deny") throw denyError(resolved, target.name);
 						if (resolved.policy === "allow") {
 							return await target.execute(toolCallId, args as never, signal, onUpdate, ctx as never);

@@ -7,7 +7,8 @@
  * parks it on expiry (disposes the live session, keeps the AgentRef +
  * sessionFile), and revives it on demand through
  * {@link AgentLifecycleManager.ensureLive}. Only this manager flips
- * `parked` ↔ `idle`.
+ * `parked` ↔ `idle`. An ordinary detached `aborted` agent may be reopened from
+ * its transcript; explicit tombstones remain terminal hard kills.
  *
  * Park/dispose is gated against concurrent ensureLive/peer sends:
  * - A disposing session is never handed out.
@@ -32,6 +33,7 @@ import {
 	observeAgentRef,
 	parkAgentRef,
 	removeAgentRef,
+	replaceInternalAgentIfAvailable,
 	resolveAgentObservation,
 	setAgentHistory,
 	setAgentStatus,
@@ -54,6 +56,15 @@ async function persistAgentTombstone(sessionFile: string): Promise<boolean> {
 		return true;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+		throw error;
+	}
+}
+async function hasAgentTombstone(sessionFile: string): Promise<boolean> {
+	try {
+		await fs.access(getAgentTombstonePath(sessionFile));
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
 		throw error;
 	}
 }
@@ -111,6 +122,12 @@ function matchesExpected(
 	return "id" in expected && resolveAgentObservation(registry, expected) === ref;
 }
 
+interface ReopeningAgent {
+	/** The killed ref being reopened. */
+	ref: InternalAgentRef;
+	/** Resolves to the fresh `parked` generation. */
+	promise: Promise<InternalAgentRef>;
+}
 export class AgentLifecycleManager {
 	static global(): never {
 		throw new Error("AgentLifecycleManager.global() is not a public authority surface.");
@@ -130,6 +147,9 @@ export class AgentLifecycleManager {
 	/** In-flight revives, bound to the parked ref that initiated them, so concurrent {@link ensureLive} calls coalesce. */
 	readonly #revivals = new Map<string, RevivingAgent>();
 	readonly #persistedObservations = new Map<string, { ref: InternalAgentRef; observation: AgentRef }>();
+	/** In-flight reopens of killed refs, bound to the killed ref, so concurrent {@link ensureLive} calls coalesce. */
+	readonly #reopens = new Map<string, ReopeningAgent>();
+	readonly #hardKilledRefs = new WeakSet<InternalAgentRef>();
 	#unsubscribe: (() => void) | undefined;
 	#persistedReviverFactory: PersistedSubagentReviverFactory | undefined;
 	/** Resolves the TTL applied when a cold-revived ref is adopted on demand (read per revive). */
@@ -151,6 +171,7 @@ export class AgentLifecycleManager {
 		this.#adopted.clear();
 		this.#revivals.clear();
 		this.#persistedObservations.clear();
+		this.#reopens.clear();
 		this.#parks.clear();
 		this.#persistedReviverFactory = undefined;
 	}
@@ -368,8 +389,9 @@ export class AgentLifecycleManager {
 	}
 
 	/**
-	 * Return the live session, reviving from the sessionFile if parked.
-	 * Throws a plain Error if the id is unknown or parked without a reviver.
+	 * Return the live session, reviving from the sessionFile if parked or
+	 * killed. Throws a plain Error if the id is unknown, or its transcript
+	 * cannot be revived (no reviver, no session contract, workspace gone).
 	 * Concurrent calls share one in-flight revive.
 	 *
 	 * Never returns a session that is mid-dispose: an in-flight park is either
@@ -397,12 +419,13 @@ export class AgentLifecycleManager {
 			}
 		}
 
-		const ref = lookupAgentRef(this.#registry, id);
+		let ref = lookupAgentRef(this.#registry, id);
 		if (!ref) {
 			throw new Error(
 				`Unknown agent "${id}" — it was never registered or has been released. If a transcript exists, read history://${id}.`,
 			);
 		}
+		if (ref.status === "aborted") ref = await this.#reopen(id, ref);
 		if (ref.session) return ref.session;
 		const inflight = this.#revivals.get(id);
 		if (inflight?.ref === ref) return inflight.promise;
@@ -414,6 +437,67 @@ export class AgentLifecycleManager {
 		} finally {
 			if (this.#revivals.get(id) === pending) this.#revivals.delete(id);
 		}
+	}
+
+	/** Reopens only ordinary aborted refs; explicit tombstones remain terminal hard kills. */
+	async #reopen(id: string, killed: InternalAgentRef): Promise<InternalAgentRef> {
+		const inflight = this.#reopens.get(id);
+		if (inflight?.ref === killed) return inflight.promise;
+		const pending: ReopeningAgent = { ref: killed, promise: this.#reopenKilled(id, killed) };
+		this.#reopens.set(id, pending);
+		try {
+			return await pending.promise;
+		} finally {
+			if (this.#reopens.get(id) === pending) this.#reopens.delete(id);
+		}
+	}
+
+	async #reopenKilled(id: string, killed: InternalAgentRef): Promise<InternalAgentRef> {
+		const sessionFile = killed.sessionFile;
+		if (!sessionFile) throw new Error(`Agent "${id}" was killed and has no transcript to resume from.`);
+		if (this.#hardKilledRefs.has(killed) || (await hasAgentTombstone(sessionFile))) {
+			throw new Error(`Agent "${id}" was hard-killed and cannot be revived. Read history://${id} for what it did.`);
+		}
+		const factory = this.#persistedReviverFactory;
+		if (!factory) {
+			throw new Error(
+				`Agent "${id}" was killed and cannot be revived (no reviver registered). Read history://${id} for what it did.`,
+			);
+		}
+		if (killed.session) {
+			throw new Error(`Agent "${id}" is still shutting down after its kill; retry once it has stopped.`);
+		}
+		const reviver = await factory(observeAgentRef(this.#registry, killed));
+		if (this.#disposed) {
+			throw new Error(
+				`Agent "${id}" revival aborted: its lifecycle was disposed while its transcript was being checked.`,
+			);
+		}
+		if (!reviver) {
+			throw new Error(
+				`Agent "${id}" was killed and its transcript cannot be resumed (no session contract, isolated run, or its workspace is gone). Read history://${id} for what it did.`,
+			);
+		}
+		if (this.#hardKilledRefs.has(killed) || (await hasAgentTombstone(sessionFile))) {
+			throw new Error(`Agent "${id}" was hard-killed and cannot be revived. Read history://${id} for what it did.`);
+		}
+		const reopened = replaceInternalAgentIfAvailable(
+			this.#registry,
+			{
+				id,
+				displayName: killed.displayName,
+				kind: killed.kind,
+				parentId: killed.parentId,
+				session: null,
+				sessionFile,
+				status: "parked",
+				createdAt: killed.createdAt,
+				history: killed.history,
+			},
+			killed,
+		);
+		if (!reopened) throw new Error(`Agent "${id}" changed while its transcript was being checked.`);
+		return reopened;
 	}
 
 	/**
@@ -480,7 +564,8 @@ export class AgentLifecycleManager {
 	 * later persisted-subagent scan (e.g. Agent Hub reopen) skips it via its
 	 * `if (!registry.get(id))` guard rather than re-adopting the surviving
 	 * on-disk transcript as a fresh `parked` row. Mirrors
-	 * `finalizeSubagentLifecycle`'s genuine-kill path.
+	 * `finalizeSubagentLifecycle`'s explicit-kill path. An explicit kill is terminal;
+	 * only ordinary aborted refs without a persisted hard-kill marker may reopen.
 	 */
 	async release(
 		id: string,
@@ -519,7 +604,9 @@ export class AgentLifecycleManager {
 		const live = ref.session;
 
 		if (options?.tombstone) {
-			if (!abortAgentRef(this.#registry, ref, live ?? undefined)) return false;
+			const alreadyAborted = ref.status === "aborted" && !live;
+			if (!alreadyAborted && !abortAgentRef(this.#registry, ref, live ?? undefined)) return false;
+			this.#hardKilledRefs.add(ref);
 			try {
 				try {
 					if (ref.sessionFile) await persistAgentTombstone(ref.sessionFile);
@@ -536,7 +623,7 @@ export class AgentLifecycleManager {
 					}
 				}
 			} finally {
-				endAgentTermination(this.#registry, ref);
+				if (!alreadyAborted) endAgentTermination(this.#registry, ref);
 			}
 		} else {
 			// Remove before awaiting disposal. A replacement generation can claim
@@ -591,6 +678,7 @@ export class AgentLifecycleManager {
 			}),
 		);
 		this.#revivals.clear();
+		this.#reopens.clear();
 		this.#parks.clear();
 		this.#persistedReviverFactory = undefined;
 	}

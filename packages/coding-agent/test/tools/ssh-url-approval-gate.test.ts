@@ -10,7 +10,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake } from "@oh-my-pi/pi-utils";
 
-// Exercises the real per-tool approval gate (ExtensionToolWrapper) for read/grep/write,
+// Exercises the real per-tool approval gate (ExtensionToolWrapper) for read/grep/glob/write,
 // proving an `ssh://` target is exec-tier (prompts / is denied without a UI) while the
 // equivalent local-path call runs. ssh:// calls are rejected at the approval gate before any
 // connection, so this suite needs no live ssh.
@@ -47,7 +47,7 @@ describe("ssh:// tools are exec-gated through the production approval wrapper", 
 			slashCommands: [],
 			enableMCP: false,
 			enableLsp: false,
-			toolNames: ["read", "grep", "write"],
+			toolNames: ["read", "grep", "glob", "write"],
 		});
 		session = created.session;
 	});
@@ -61,7 +61,7 @@ describe("ssh:// tools are exec-gated through the production approval wrapper", 
 		}
 	});
 
-	function tool(name: "read" | "grep" | "write") {
+	function tool(name: "read" | "grep" | "glob" | "write") {
 		const found = session.getToolByName(name);
 		if (!found) throw new Error(`Expected ${name} tool`);
 		return found;
@@ -94,7 +94,7 @@ describe("ssh:// tools are exec-gated through the production approval wrapper", 
 	});
 
 	it("grep: a delimited ssh:// entry requires approval before path expansion", async () => {
-		// The wrapper sees `paths` verbatim (pre-expansion), so the substring scan must trip exec here.
+		// The wrapper sees `path` verbatim (pre-expansion), so the substring scan must trip exec here.
 		await expect(
 			tool("grep").execute(
 				"s-ssh",
@@ -112,6 +112,14 @@ describe("ssh:// tools are exec-gated through the production approval wrapper", 
 			ctx("always-ask"),
 		);
 		expect(ok).toBeDefined();
+	});
+
+	it("glob: an ssh:// path requires approval (exec), a local glob runs (read)", async () => {
+		await expect(
+			tool("glob").execute("g-ssh", { path: "ssh://localhost/etc" }, undefined, undefined, ctx("always-ask")),
+		).rejects.toThrow(APPROVAL_RE);
+		const ok = await tool("glob").execute("g-local", { path: "*.txt" }, undefined, undefined, ctx("always-ask"));
+		expect(JSON.stringify(ok.content)).toContain("local.txt");
 	});
 
 	it("write: ssh:// requires approval (exec), a local write runs (write tier, write mode)", async () => {

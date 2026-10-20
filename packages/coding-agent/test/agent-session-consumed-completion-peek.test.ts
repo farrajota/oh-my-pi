@@ -5,6 +5,8 @@ import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as daemonClient from "@oh-my-pi/pi-coding-agent/launch/client";
+import type { DaemonBrokerClient } from "@oh-my-pi/pi-coding-agent/launch/client";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -59,7 +61,10 @@ describe("AgentSession peek at consumed background completions", () => {
 		return gate;
 	}
 
-	async function createLiveRootSession(beforeToolResponse?: () => Promise<void>): Promise<AgentSession> {
+	async function createLiveRootSession(
+		beforeToolResponse?: () => Promise<void>,
+		options: { launch?: boolean } = {},
+	): Promise<AgentSession> {
 		// The SDK dispatches by model.api, rather than calling the model's stream handle.
 		registerMockApi(mockApiSource);
 		const model = createMockModel({
@@ -84,7 +89,7 @@ describe("AgentSession peek at consumed background completions", () => {
 			modelRegistry: new ModelRegistry(authStorage),
 			settings: Settings.isolated({
 				"compaction.enabled": false,
-				"launch.enabled": false,
+				"launch.enabled": options.launch ?? false,
 				"todo.enabled": false,
 			}),
 			sessionManager: SessionManager.inMemory(tempDir.path()),
@@ -165,5 +170,48 @@ describe("AgentSession peek at consumed background completions", () => {
 		jobs.consumeJobResults(["subagent"]);
 
 		expect(active.hasPendingAsyncWork()).toBe(false);
+	});
+
+	it("returns a job's queued completion from a wait whose service refresh the completion cut short", async () => {
+		// A broker request in flight until the wait's signal aborts, as the real
+		// client's does: the queued completion aborts it.
+		const broker = {
+			request: (_operation: unknown, signal?: AbortSignal) => {
+				const { promise, reject } = Promise.withResolvers<never>();
+				const abort = () => reject(new Error("Daemon broker request aborted"));
+				if (signal?.aborted) abort();
+				else signal?.addEventListener("abort", abort, { once: true });
+				return promise;
+			},
+			onCompletion: () => () => {},
+		} as unknown as DaemonBrokerClient;
+		vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker);
+		const queued = Promise.withResolvers<void>();
+		const active = await createLiveRootSession(
+			async () => {
+				if (!build) throw new Error("Expected the build job to be registered before the wait starts");
+				// The job finishes and its notice queues while the model streams the wait.
+				build.resolve("build output");
+				await queued.promise;
+			},
+			{ launch: true },
+		);
+		const build = gatedJob("build", "bash");
+		observeAsyncResultQueued(active, queued);
+
+		await active.prompt("wait for the build");
+		await active.waitForIdle();
+
+		const waitResult = active.agent.state.messages.find(
+			(message): message is ToolResultMessage => message.role === "toolResult" && message.toolName === "wait",
+		);
+		expect(waitResult?.isError, JSON.stringify(waitResult)).toBe(false);
+		expect(JSON.stringify(waitResult?.content)).toContain("build output");
+		// The wait consumed the result, so the queued notice is dropped rather than repeated.
+		expect(
+			active.agent.state.messages.some(
+				message => message.role === "custom" && message.customType === "async-result",
+			),
+		).toBe(false);
 	});
 });

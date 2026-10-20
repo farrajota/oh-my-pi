@@ -40,6 +40,7 @@ import {
 	toPathList,
 	resolveSearchBase,
 	resolveSearchResultPath,
+	searchPathTier,
 } from "./path-utils";
 import {
 	createCachedComponent,
@@ -49,6 +50,7 @@ import {
 } from "@oh-my-pi/pi-tui/render/render-utils";
 import { PREVIEW_LIMITS } from "./preview-limits";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
+import { searchApprovalCacheTargets } from "./search-approval-targets";
 import { toolResult } from "./tool-result";
 
 import { cfgTaskDisabledAgents } from "../task/settings";
@@ -159,7 +161,28 @@ interface NativePreparedTarget {
 
 export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 	readonly name = "glob";
-	readonly approval = "read" as const;
+	readonly approval = searchPathTier;
+	/**
+	 * `always-ask-cached` keys: the folders and files this glob searches, so a
+	 * folder grant recorded by a `read` (or by a grep) covers a search inside it
+	 * and a search rooted at one file shares that file's read grant. Roots report
+	 * the walkable base `parseFindPattern` finds — no glob is expanded — and each
+	 * costs a single stat; see {@link searchApprovalCacheTargets}.
+	 */
+	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
+		const a = args as { path?: string | string[] } | null | undefined;
+		return searchApprovalCacheTargets(
+			toPathList(a?.path),
+			this.session.cwd,
+			entry => parseFindPattern(entry).basePath,
+			entry => {
+				const { globPattern } = parseFindPattern(entry);
+				// A bare pattern recurses (`*.ts` matches at any depth); only a one-segment pattern
+				// under an explicit base (`dir/*.ts`) stays inside the folder's own entries.
+				return globPattern === "" || globPattern.includes("**");
+			},
+		);
+	};
 	readonly loadMode = "essential";
 	readonly label = "Glob";
 	get description(): string {

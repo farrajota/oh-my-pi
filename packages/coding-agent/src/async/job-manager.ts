@@ -1,9 +1,12 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { PipeStreams } from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { HubAdmissionStateTransaction } from "../internal/hub-admission";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { StructuredSubagentOutput } from "../task/types";
 import { DurableHubStore, type HubDurableRecord } from "../internal/hub-durable-state";
+import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import type { JobWidgetInputs, JobWidgetRegistry } from "../job-widgets/types";
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -131,6 +134,8 @@ export interface AsyncJob {
 	agentId?: string;
 	/** The process the job runs, when it spawns one. */
 	process?: AsyncJobProcess;
+	/** What the job's live widget reads; set by bash and task jobs. */
+	widgetInputs?: JobWidgetInputs;
 	/**
 	 * Job is registered but parked behind a caller-managed gate (e.g. a task
 	 * batch semaphore). Queued jobs do not count toward the running-job limit
@@ -219,6 +224,8 @@ export interface AsyncJobProcess {
 	readonly cwd: string;
 	/** Live pids the command spawned, in spawn order; empty before it starts and after it ends. */
 	pids(): readonly number[];
+	/** Copies of the bytes crossing the command's pipes, kept with the job row (`proc://<id>/streams`). */
+	readonly streams?: PipeStreams;
 }
 /** Delivery callback for a settled job's result text. */
 export type AsyncJobDeliverySink = (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
@@ -314,6 +321,8 @@ export interface AsyncJobRegisterOptions {
 	foreground?: boolean;
 	/** The process the job runs; see {@link AsyncJob.process}. */
 	process?: AsyncJobProcess;
+	/** See {@link AsyncJob.widgetInputs}. */
+	widgetInputs?: JobWidgetInputs;
 }
 
 export interface AsyncJobRecoveryBatch {
@@ -413,6 +422,8 @@ export class AsyncJobManager {
 	#deliveryLoop: Promise<void> | undefined;
 	#deliveryQueueChanged = Promise.withResolvers<void>();
 	#disposed = false;
+	/** Live widgets of this root's jobs; set by the root session when widgets are available. */
+	widgets: JobWidgetRegistry | undefined;
 
 	#hasOwnerFilter(filter: AsyncJobFilter | undefined): filter is AsyncJobFilter {
 		return filter !== undefined;
@@ -484,6 +495,8 @@ export class AsyncJobManager {
 		label: string,
 		run: (ctx: {
 			jobId: string;
+			/** Stable execution identity even when an unpublished foreground display ID is reused. */
+			incarnationId: string;
 			signal: AbortSignal;
 			reportProgress: (text: string, details?: AsyncJobDetails) => Promise<void>;
 			/** Clear the queued flag once the job actually starts executing. */
@@ -526,6 +539,7 @@ export class AsyncJobManager {
 			ownerId: options?.ownerId,
 			agentId: options?.agentId,
 			process: options?.process,
+			widgetInputs: options?.widgetInputs,
 			queued: options?.queued === true,
 			...(options?.foreground ? { foreground: true } : {}),
 		};
@@ -552,6 +566,7 @@ export class AsyncJobManager {
 			try {
 				const outcome = await run({
 					jobId: id,
+					incarnationId,
 					signal: abortController.signal,
 					reportProgress,
 					markRunning: () => {
@@ -1401,6 +1416,8 @@ export class AsyncJobManager {
 		this.#foregroundAutoJobIds.clear();
 		this.#reusableForegroundAutoIds.clear();
 		this.#deliverySinks.clear();
+		this.widgets?.dispose();
+		this.widgets = undefined;
 		return jobsSettled && drained;
 	}
 
@@ -1507,8 +1524,8 @@ export class AsyncJobManager {
 	}
 
 	/**
-	 * Drop a released foreground row after its work settles. The durable journal
-	 * retains its incarnation, so this id must never be recycled.
+	 * Drop a released foreground row after its work settles. Durable reservations
+	 * prevent ID reuse; unpublished in-memory foreground display IDs may be recycled.
 	 */
 	#discardForegroundJob(jobId: string): void {
 		this.#releasedForegroundJobs.delete(jobId);
@@ -1663,6 +1680,7 @@ export class AsyncJobManager {
 		this.#consumedJobResults.delete(jobId);
 		const job = this.#jobs.get(jobId);
 		if (job) this.#runRetainedArtifactsCleanup(job);
+		this.widgets?.forget(jobId);
 		return this.#jobs.delete(jobId);
 	}
 

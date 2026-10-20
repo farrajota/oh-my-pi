@@ -28,6 +28,10 @@ pub struct SessionConfig {
 	pub allow_fuzzy:        bool,
 	pub fuzzy_threshold:    f64,
 	pub enforce_seen_lines: bool,
+	/// Narrowest per-line display cap any tool applies, in UTF-8 bytes (0: no
+	/// tool cuts lines). Without recorded read provenance, hashline anchors on
+	/// longer lines are rejected because their display may have been cut.
+	pub max_columns:        usize,
 	/// The payload is not JSON (custom-format tool): the buffer is `input`.
 	pub raw_input:          bool,
 	/// Closed-world, immutable source view captured by the host before session
@@ -144,6 +148,7 @@ impl Session {
 			config.allow_fuzzy,
 			config.fuzzy_threshold,
 			config.enforce_seen_lines,
+			config.max_columns,
 		);
 		let files = match &config.source_snapshots {
 			Some(snapshots) => FileCache::with_snapshots(config.policy.clone(), Arc::clone(snapshots)),

@@ -4,24 +4,35 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { evalToolRenderer } from "@oh-my-pi/pi-tui/tools/eval";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import * as evalIndex from "@oh-my-pi/pi-coding-agent/eval";
+import type { EvalDisplayOutput } from "@oh-my-pi/pi-coding-agent/eval/types";
+import { disposeAllKernelSessions } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import * as pyKernel from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 
-function makeSession(): ToolSession {
+function makeSession(cwd = "/tmp/eval-test"): ToolSession {
+	const sessionId = `eval-display-${crypto.randomUUID()}`;
 	return {
-		cwd: "/tmp/eval-test",
+		cwd,
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
+		getEvalSessionId: () => sessionId,
+		getEvalKernelOwnerId: () => sessionId,
 		settings: Settings.isolated(),
 	};
 }
 
-function baseResult(overrides: Record<string, unknown> = {}) {
+function baseResult(
+	outputOrDisplay: string | { displayOutputs: EvalDisplayOutput[] } = "",
+	displayOutputs: EvalDisplayOutput[] = [],
+) {
+	const output = typeof outputOrDisplay === "string" ? outputOrDisplay : "";
+	const outputs = typeof outputOrDisplay === "string" ? displayOutputs : outputOrDisplay.displayOutputs;
 	return {
-		output: "",
+		output,
 		exitCode: 0,
 		cancelled: false,
 		truncated: false,
@@ -30,9 +41,12 @@ function baseResult(overrides: Record<string, unknown> = {}) {
 		totalBytes: 0,
 		outputLines: 0,
 		outputBytes: 0,
-		displayOutputs: [] as unknown[],
-		...overrides,
+		displayOutputs: outputs,
 	};
+}
+
+function modelText(result: { content: Array<{ type: string; text?: string }> }): string {
+	return result.content.map(c => (c.type === "text" ? (c.text ?? "") : "")).join("\n");
 }
 
 const RED_1X1_PNG_BASE64 =
@@ -44,48 +58,158 @@ async function makeRedPng(width: number, height: number): Promise<string> {
 	return Buffer.from(upscaled).toString("base64");
 }
 
-describe("EvalTool display() text surfacing", () => {
-	afterEach(() => {
+describe("EvalTool printed views", () => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await Promise.all([disposeAllVmContexts(), disposeAllKernelSessions()]);
+	});
+
+	it("gives the model exactly the printed text and puts the view on the cell", async () => {
+		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+		const printed = "  a  b\n0  1  2";
+		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
+			baseResult(`before\n${printed}\n`, [
+				{
+					type: "view",
+					text: `${printed}\n`,
+					view: {
+						kind: "table",
+						columns: [{ head: "" }, { head: "a", numeric: true }, { head: "b", numeric: true }],
+						rows: [["0", "1", "2"]],
+					},
+				},
+			]) as never,
+		);
+
+		const result = await new EvalTool(makeSession()).execute("call-view", { language: "js", code: "print(df)" });
+
+		expect(modelText(result)).toBe(`before\n${printed}`);
+		const cell = result.details?.cells?.[0];
+		expect(cell?.output).toBe(`before\n${printed}`);
+		expect(cell?.views).toEqual([
+			{
+				// Stored text is trimmed; the renderer still finds it inside `output`.
+				text: printed.trim(),
+				view: {
+					kind: "table",
+					columns: [{ head: "" }, { head: "a", numeric: true }, { head: "b", numeric: true }],
+					rows: [["0", "1", "2"]],
+				},
+			},
+		]);
+	});
+
+	it("caps views at 16 per cell, drops oversized and empty ones, and leaves cells without views bare", async () => {
+		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+		const views: EvalDisplayOutput[] = [
+			{ type: "view", text: "huge", view: { kind: "markdown", text: "x".repeat(33 * 1024) } },
+			{ type: "view", text: "  \n", view: { kind: "markdown", text: "blank" } },
+		];
+		for (let i = 0; i < 20; i++) views.push({ type: "view", text: `v${i}`, view: { kind: "json", value: [i] } });
+		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(baseResult("text\n", views) as never);
+
+		const result = await new EvalTool(makeSession()).execute("call-caps", { language: "js", code: "print(x)" });
+
+		const kept = result.details?.cells?.[0]?.views ?? [];
+		expect(kept).toHaveLength(16);
+		expect(kept.map(entry => entry.text)).toEqual(Array.from({ length: 16 }, (_, i) => `v${i}`));
+		expect(modelText(result)).toBe("text");
+	});
+
+	it("omits views when nothing qualified", async () => {
+		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(baseResult("plain\n") as never);
+
+		const result = await new EvalTool(makeSession()).execute("call-plain", { language: "js", code: "print(1)" });
+
+		expect(result.details?.cells?.[0]?.views).toBeUndefined();
+	});
+
+	it("surfaces printed images to the model as ImageContent blocks, not inlined base64", async () => {
+		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+		const base64 = Buffer.from([0, 1, 2, 3]).toString("base64");
+		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
+			baseResult("", [{ type: "image", data: base64, mimeType: "image/png" }]) as never,
+		);
+
+		const result = await new EvalTool(makeSession()).execute("call-image", { language: "js", code: "print(img)" });
+
+		const imageBlocks = result.content.filter(c => c.type === "image");
+		expect(imageBlocks).toHaveLength(1);
+		expect(imageBlocks[0]).toMatchObject({ type: "image", data: base64, mimeType: "image/png" });
+		const text = modelText(result);
+		expect(text).not.toContain(base64);
+		expect(text).toMatch(/\(1 image; no text output\)/);
+		expect(result.details?.images).toBeUndefined();
+	});
+
+	it("downscales printed images before returning ImageContent", async () => {
+		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+		const base64 = await makeRedPng(2400, 1200);
+		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
+			baseResult("", [{ type: "image", data: base64, mimeType: "image/png" }]) as never,
+		);
+
+		const result = await new EvalTool(makeSession()).execute("call-large-image", {
+			language: "js",
+			code: "print(largePng)",
+		});
+
+		const image = result.content.find(c => c.type === "image");
+		if (image?.type !== "image") throw new Error("Expected image content");
+		expect(image.data).not.toBe(base64);
+		const { width, height } = await new Bun.Image(Buffer.from(image.data, "base64")).metadata();
+		expect(width).toBeLessThanOrEqual(1568);
+		expect(height).toBeLessThanOrEqual(1568);
+		const text = modelText(result);
+		expect(text).toContain("original 2400x1200");
+		expect(text).not.toContain(base64);
+	});
+
+	it("still reports (no text output) when nothing was printed or displayed", async () => {
+		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(baseResult() as never);
+
+		const tool = new EvalTool(makeSession());
+		const result = await tool.execute("call-empty", {
+			language: "js",
+			code: "```js\nconst x = 1;\n```\n",
+		});
+
+		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
+		expect(text).toContain("(no output)");
 	});
 
 	it("includes display() JSON values in the text content the model sees", async () => {
 		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
-			baseResult({
-				displayOutputs: [{ type: "json", data: { stdout: "hi", exit_code: 0 } }],
-			}) as never,
+			baseResult("", [{ type: "json", data: { stdout: "hi", exit_code: 0 } }]) as never,
 		);
 
-		const tool = new EvalTool(makeSession());
-		const result = await tool.execute("call-display-json", {
+		const result = await new EvalTool(makeSession()).execute("call-display-json", {
 			language: "js",
-			code: "```js\ndisplay({ stdout: 'hi', exit_code: 0 });\n```\n",
+			code: "display({ stdout: 'hi', exit_code: 0 });",
 		});
 
-		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
+		const text = modelText(result);
 		expect(text).toContain("display[1]");
 		expect(text).toContain('"stdout": "hi"');
 		expect(text).toContain('"exit_code": 0');
 		expect(text).not.toBe("(no text output)");
 	});
 
-	it("renders a display() value once in the TUI while the model text and jsonOutputs keep it (issue #10778)", async () => {
+	it("renders display() once in the TUI while model text and jsonOutputs keep it (issue #10778)", async () => {
 		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
-			baseResult({
-				output: "before\n",
-				displayOutputs: [{ type: "json", data: { marker: "ZZUNIQUE" } }],
-			}) as never,
+			baseResult("before\n", [{ type: "json", data: { marker: "ZZUNIQUE" } }]) as never,
 		);
 
-		const tool = new EvalTool(makeSession());
-		const result = await tool.execute("call-small-display", {
+		const result = await new EvalTool(makeSession()).execute("call-small-display", {
 			language: "js",
 			code: "print('before'); display(value);",
 		});
 
-		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
+		const text = modelText(result);
 		expect(text).toContain('"marker": "ZZUNIQUE"');
 		expect(result.details?.jsonOutputs).toEqual([{ marker: "ZZUNIQUE" }]);
 
@@ -103,94 +227,38 @@ describe("EvalTool display() text surfacing", () => {
 	it("interleaves stdout text and display() JSON values", async () => {
 		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
-			baseResult({
-				output: "before\n",
-				displayOutputs: [{ type: "json", data: [1, 2, 3] }],
-			}) as never,
+			baseResult("before\n", [{ type: "json", data: [1, 2, 3] }]) as never,
 		);
 
-		const tool = new EvalTool(makeSession());
-		const result = await tool.execute("call-mixed", {
+		const result = await new EvalTool(makeSession()).execute("call-mixed", {
 			language: "js",
-			code: "```js\nprint('before'); display([1,2,3]);\n```\n",
+			code: "print('before'); display([1,2,3]);",
 		});
 
-		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
+		const text = modelText(result);
 		expect(text).toContain("before");
 		expect(text.indexOf("before")).toBeLessThan(text.indexOf("display[1]"));
 		expect(text).toContain("[\n  1,\n  2,\n  3\n]");
 	});
 
-	it("surfaces displayed images to the model as ImageContent blocks, not inlined base64", async () => {
-		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
-		const base64 = Buffer.from([0, 1, 2, 3]).toString("base64");
-		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
-			baseResult({
-				displayOutputs: [{ type: "image", data: base64, mimeType: "image/png" }],
-			}) as never,
-		);
-
-		const tool = new EvalTool(makeSession());
-		const result = await tool.execute("call-image", {
+	it("routes JavaScript display() values from the real runtime to model text and jsonOutputs", async () => {
+		const result = await new EvalTool(makeSession(process.cwd())).execute("call-real-js-display", {
 			language: "js",
-			code: "```js\ndisplay({ type: 'image', data: '...', mimeType: 'image/png' });\n```\n",
+			code: "print('before'); display({ source: 'javascript' });",
 		});
 
-		const imageBlocks = result.content.filter(c => c.type === "image");
-		expect(imageBlocks).toHaveLength(1);
-		expect(imageBlocks[0]).toMatchObject({ type: "image", data: base64, mimeType: "image/png" });
-
-		const textBlocks = result.content.filter(c => c.type === "text");
-		const text = textBlocks.map(c => (c.type === "text" ? c.text : "")).join("\n");
-		expect(text).not.toContain(base64); // base64 must not leak into text channel
-		expect(text).toMatch(/displayed 1 image/);
-
-		// Image is in content, so details.images must be empty to avoid double-rendering.
-		expect(result.details?.images).toBeUndefined();
+		expect(modelText(result)).toContain('"source": "javascript"');
+		expect(result.details?.jsonOutputs).toEqual([{ source: "javascript" }]);
 	});
 
-	it("downscales displayed images before returning ImageContent", async () => {
-		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
-		const base64 = await makeRedPng(2400, 1200);
-		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
-			baseResult({
-				displayOutputs: [{ type: "image", data: base64, mimeType: "image/png" }],
-			}) as never,
-		);
-
-		const tool = new EvalTool(makeSession());
-		const result = await tool.execute("call-large-image", {
-			language: "js",
-			code: "```js\ndisplay({ type: 'image', data: largePng, mimeType: 'image/png' });\n```\n",
+	it("routes Python display() values from the real kernel to model text and jsonOutputs", async () => {
+		const result = await new EvalTool(makeSession(process.cwd())).execute("call-real-python-display", {
+			language: "py",
+			code: "print('before')\ndisplay({'source': 'python'})",
 		});
 
-		const image = result.content.find(c => c.type === "image");
-		expect(image).toBeDefined();
-		if (image?.type !== "image") throw new Error("Expected image content");
-		expect(image.data).not.toBe(base64);
-
-		const { width, height } = await new Bun.Image(Buffer.from(image.data, "base64")).metadata();
-		expect(width).toBeLessThanOrEqual(1568);
-		expect(height).toBeLessThanOrEqual(1568);
-
-		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
-		expect(text).toContain("display image 1:");
-		expect(text).toContain("original 2400x1200");
-		expect(text).not.toContain(base64);
-	});
-
-	it("still reports (no text output) when nothing was printed or displayed", async () => {
-		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
-		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(baseResult() as never);
-
-		const tool = new EvalTool(makeSession());
-		const result = await tool.execute("call-empty", {
-			language: "js",
-			code: "```js\nconst x = 1;\n```\n",
-		});
-
-		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
-		expect(text).toContain("(no output)");
+		expect(modelText(result)).toContain('"source": "python"');
+		expect(result.details?.jsonOutputs).toEqual([{ source: "python" }]);
 	});
 
 	it("truncates oversized display values rather than blasting the context", async () => {

@@ -14,7 +14,7 @@ import {
 	resetAgentLifecycleForTests,
 	setPersistedAgentReviverFactory,
 } from "../../src/internal/agent-lifecycle-bridge";
-import { lookupAgentRef } from "../../src/internal/agent-registry-bridge";
+import { lookupAgentRef, registerInternalAgentIfAvailable } from "../../src/internal/agent-registry-bridge";
 import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
@@ -99,9 +99,10 @@ describe("AgentLifecycleManager", () => {
 	const setReviverFactory = (factory: Parameters<typeof setPersistedAgentReviverFactory>[1], idleTtlMs: number) =>
 		setPersistedAgentReviverFactory(lifecycle, factory, idleTtlMs);
 
-	it("registerIfAvailable never replaces a collision and reuses only the exact expected ref", () => {
+	it("registerInternalAgentIfAvailable never replaces a collision and reuses only the exact expected ref", () => {
 		const parked = registerIdleSub("generation-Sub", null);
 		registry.setStatus("generation-Sub", "parked", parked);
+		const parkedInternal = exact("generation-Sub");
 		const next = {
 			id: "generation-Sub",
 			displayName: "replacement",
@@ -110,24 +111,20 @@ describe("AgentLifecycleManager", () => {
 			status: "running" as const,
 		};
 
-		expect(registry.registerIfAvailable(next, null)).toBeUndefined();
+		expect(registerInternalAgentIfAvailable(registry, next, null)).toBeUndefined();
 		expect(registry.get("generation-Sub")).toMatchObject({ id: parked.id, lineage: parked.lineage });
-		expect(registry.registerIfAvailable(next, parked)).toMatchObject({
-			id: parked.id,
-			lineage: parked.lineage,
-			status: "parked",
-		});
+		expect(registerInternalAgentIfAvailable(registry, next, parkedInternal)).toBe(parkedInternal);
 		expect(registry.get("generation-Sub")).toMatchObject({ id: parked.id, lineage: parked.lineage });
 
 		registry.setStatus("generation-Sub", "aborted", parked);
-		expect(registry.registerIfAvailable(next, parked)).toBeUndefined();
+		expect(registerInternalAgentIfAvailable(registry, next, parkedInternal)).toBeUndefined();
 		const staleSession = makeSessionStub().session;
 		expect(registry.attachSession("generation-Sub", staleSession, undefined, parked)).toBe(false);
 		expect(registry.setStatus("generation-Sub", "idle", parked)).toBe(false);
 		expect(registry.get("generation-Sub")).toMatchObject({ status: "aborted" });
 
 		registry.unregister("generation-Sub", parked);
-		expect(registry.registerIfAvailable(next, parked)).toBeUndefined();
+		expect(registerInternalAgentIfAvailable(registry, next, parkedInternal)).toBeUndefined();
 		expect(registry.get("generation-Sub")).toBeUndefined();
 	});
 
@@ -270,7 +267,8 @@ describe("AgentLifecycleManager", () => {
 		// The corpse is reclaimed, and its id becomes registerable again.
 		expect(await reclaim("Corpse-Sub", corpse)).toBe(true);
 		expect(registry.get("Corpse-Sub")).toBeUndefined();
-		const respawn = registry.registerIfAvailable(
+		const respawn = registerInternalAgentIfAvailable(
+			registry,
 			{ id: "Corpse-Sub", displayName: "task", kind: "sub", session: null, status: "running" },
 			null,
 		);
@@ -799,9 +797,9 @@ describe("AgentLifecycleManager", () => {
 		expect(disposeCalls).toBe(1);
 		expect(registry.get(workerId)?.status).toBe("aborted");
 		expect(lookupAgentRef(registry, workerId)?.session).toBeNull();
-		// The tombstone is terminal: ensureLive must not hand back the disposed
-		// session (the ref carries session === null), it treats it as unrevivable.
-		await expect(ensureLive(workerId)).rejects.toThrow(/aborted/);
+		// Without a reviver the kill stands: ensureLive must not hand back the
+		// disposed session (the ref carries session === null).
+		await expect(ensureLive(workerId)).rejects.toThrow(/was hard-killed and cannot be revived/);
 
 		// Reopening after the original registry is gone must preserve the terminal
 		// decision from the sidecar, not infer a fresh parked agent from the JSONL.
@@ -855,6 +853,103 @@ describe("AgentLifecycleManager", () => {
 		expect(parent.disposeCalls()).toBe(1);
 		expect(child.disposeCalls()).toBe(1);
 		expect(grandchild.disposeCalls()).toBe(1);
+	});
+
+	it("ensureLive revives an ordinary aborted agent from its transcript as a fresh generation", async () => {
+		using tempDir = TempDir.createSync("@omp-lifecycle-reopen-");
+		const rootSessionFile = path.join(tempDir.path(), "main.jsonl");
+		const workerId = "Reopen-Sub";
+		const workerSessionFile = path.join(tempDir.path(), "main", `${workerId}.jsonl`);
+		await Bun.write(rootSessionFile, "");
+		await Bun.write(
+			workerSessionFile,
+			[
+				JSON.stringify({
+					type: "session",
+					version: 3,
+					id: workerId,
+					timestamp: "2026-08-13T17:14:48.000Z",
+					cwd: "/tmp",
+				}),
+				JSON.stringify({
+					type: "session_init",
+					id: "si",
+					parentId: null,
+					timestamp: "2026-08-13T17:14:48.000Z",
+					systemPrompt: "system",
+					task: "work",
+					tools: ["read"],
+				}),
+			].join("\n"),
+		);
+		const killed = registry.register({
+			id: workerId,
+			displayName: "task",
+			kind: "sub",
+			parentId: MAIN_AGENT_ID,
+			session: makeSessionStub().session,
+			sessionFile: workerSessionFile,
+			status: "running",
+		});
+		const killedInternal = exact(workerId);
+		expect(registry.detachSession(workerId, killed)).toBe(true);
+		expect(registry.setStatus(workerId, "aborted", killed)).toBe(true);
+		expect(await Bun.file(`${workerSessionFile}.tombstone`).exists()).toBe(false);
+
+		const revived = makeSessionStub();
+		let reviverRuns = 0;
+		setReviverFactory(
+			async () => async () => {
+				reviverRuns++;
+				return revived.session;
+			},
+			0,
+		);
+
+		const [a, b] = await Promise.all([ensureLive(workerId), ensureLive(workerId)]);
+		expect(reviverRuns).toBe(1);
+		expect(a).toBe(revived.session);
+		expect(b).toBe(revived.session);
+		const live = registry.get(workerId);
+		const liveInternal = exact(workerId);
+		expect(live).not.toBe(killed);
+		expect(liveInternal).not.toBe(killedInternal);
+		expect(live).toMatchObject({ status: "idle", parentId: MAIN_AGENT_ID });
+		expect(live).not.toHaveProperty("session");
+		expect(liveInternal.session).toBe(revived.session);
+		expect(registry.setStatus(workerId, "running", killed)).toBe(false);
+		const restoredRegistry = new AgentRegistry();
+		await registerPersistedSubagents(restoredRegistry, rootSessionFile);
+		expect(restoredRegistry.get(workerId)?.status).toBe("parked");
+	});
+
+	it("a hard-killed transcript remains terminal even when a reviver exists", async () => {
+		using tempDir = TempDir.createSync("@omp-lifecycle-reopen-refused-");
+		const workerSessionFile = path.join(tempDir.path(), "Refused-Sub.jsonl");
+		await Bun.write(workerSessionFile, "");
+		const killed = registry.register({
+			id: "Refused-Sub",
+			displayName: "task",
+			kind: "sub",
+			session: makeSessionStub().session,
+			sessionFile: workerSessionFile,
+			status: "running",
+		});
+		const killedInternal = exact("Refused-Sub");
+		expect(await releaseAgent(lifecycle, "Refused-Sub", killed, { tombstone: true })).toBe(true);
+		let factoryCalls = 0;
+		setReviverFactory(async () => {
+			factoryCalls++;
+			return async () => makeSessionStub().session;
+		}, 0);
+
+		await expect(ensureLive("Refused-Sub")).rejects.toThrow(/hard-killed/);
+		expect(factoryCalls).toBe(0);
+		expect(lookupAgentRef(registry, "Refused-Sub")).toBe(killedInternal);
+		const afterKill = registry.get("Refused-Sub");
+		expect(afterKill).not.toBe(killed);
+		expect(afterKill).toMatchObject({ status: "aborted", lineage: killed.lineage });
+		expect(await Bun.file(`${workerSessionFile}.tombstone`).exists()).toBe(true);
 	});
 
 	it("publishes an aborted status only after the session is detached", async () => {

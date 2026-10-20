@@ -44,6 +44,7 @@ interface AgentRegistryBridge {
 	ownershipToken(expected: InternalAgentRef | AgentRef): InternalAgentOwnershipToken | undefined;
 	bindAuthoritySession(parent: AgentSession): AgentAuthoritySessionBinding | undefined;
 	lookupAuthoritySession(parent: AgentSession): InternalAgentRef | undefined;
+	isSessionParentIrcSender(session: AgentSession, recipientId: string, senderId: string): boolean;
 	lookupAuthorityLineage(parentId: string): { readonly rootId: string; readonly parentId: string } | undefined;
 	operationAuthority(parent: AgentSession): BoundSessionOperationAuthority | undefined;
 	createRootSession(options?: CreateAgentSessionOptions): Promise<CreateAgentSessionResult>;
@@ -53,6 +54,8 @@ interface AgentRegistryBridge {
 		expectedSessionFile?: string,
 	): boolean;
 	setStatus(id: string, status: AgentStatus, expected: InternalAgentRef | AgentSession): boolean;
+	setActivity(id: string, activity: string, expected: InternalAgentRef | AgentSession): boolean;
+	markResultAccepted(id: string, expected: InternalAgentRef | AgentSession, responseAt?: number): boolean;
 	attachSession(
 		id: string,
 		session: AgentSession,
@@ -74,6 +77,16 @@ interface AgentRegistryBridge {
 }
 
 const registryBridges = new WeakMap<AgentRegistry, AgentRegistryBridge>();
+interface AgentSessionRegistryBinding {
+	readonly registry: AgentRegistry;
+	readonly ref: InternalAgentRef;
+	readonly rootRef: InternalAgentRef;
+	readonly rootId: string;
+	readonly actorGeneration: number;
+	readonly rootGeneration: number;
+}
+
+const sessionRegistryBindings = new WeakMap<AgentSession, AgentSessionRegistryBinding>();
 
 export function registerAgentRegistryBridge(registry: AgentRegistry, bridge: AgentRegistryBridge): void {
 	if (registryBridges.has(registry)) throw new Error("Agent registry bridge is already registered.");
@@ -123,6 +136,53 @@ export function lookupAgentAuthoritySession(
 	return bridgeFor(registry).lookupAuthoritySession(parent);
 }
 
+/** Bind only a live authority session; each parent lookup revalidates its exact registry lineage. */
+export function bindAgentSessionRegistry(registry: AgentRegistry, session: AgentSession): boolean {
+	const ref = lookupAgentAuthoritySession(registry, session);
+	const lineage = ref?.lineage;
+	if (!ref || !lineage) return false;
+	const rootId = lineage.rootId;
+	const rootRef = lookupAgentRef(registry, rootId);
+	const rootSession = rootRef?.session;
+	const rootLineage = rootRef?.lineage;
+	if (
+		!rootRef ||
+		!rootSession ||
+		!rootLineage ||
+		rootRef.id !== rootId ||
+		rootRef.kind !== "main" ||
+		rootLineage.rootId !== rootId ||
+		lookupAgentAuthoritySession(registry, rootSession) !== rootRef
+	)
+		return false;
+	sessionRegistryBindings.set(session, {
+		registry,
+		ref,
+		rootRef,
+		rootId,
+		actorGeneration: lineage.generation,
+		rootGeneration: rootLineage.generation,
+	});
+	return true;
+}
+
+export function isSessionParentIrcSender(session: AgentSession, recipientId: string, senderId: string): boolean {
+	const binding = sessionRegistryBindings.get(session);
+	if (
+		!binding ||
+		lookupAgentRef(binding.registry, binding.ref.id) !== binding.ref ||
+		binding.ref.session !== session ||
+		binding.ref.lineage?.rootId !== binding.rootId ||
+		binding.ref.lineage?.generation !== binding.actorGeneration ||
+		lookupAgentRef(binding.registry, binding.rootId) !== binding.rootRef ||
+		binding.rootRef.id !== binding.rootId ||
+		binding.rootRef.lineage?.rootId !== binding.rootId ||
+		binding.rootRef.lineage?.generation !== binding.rootGeneration
+	)
+		return false;
+	return bridgeFor(binding.registry).isSessionParentIrcSender(session, recipientId, senderId);
+}
+
 export function lookupAgentAuthorityLineage(
 	registry: AgentRegistry,
 	parentId: string,
@@ -152,6 +212,26 @@ export function setAgentHistory(
 	expectedSessionFile?: string,
 ): boolean {
 	return bridgeFor(registry).setHistory(expected, history, expectedSessionFile);
+}
+
+/** Accept a settled task result only while its exact session/ref still owns this registry generation. */
+export function markAgentResultAccepted(
+	registry: AgentRegistry,
+	id: string,
+	expected: InternalAgentRef | AgentSession,
+	responseAt?: number,
+): boolean {
+	return bridgeFor(registry).markResultAccepted(id, expected, responseAt);
+}
+
+/** Update display-only activity only while the exact session/ref owns this generation. */
+export function setAgentActivity(
+	registry: AgentRegistry,
+	id: string,
+	activity: string,
+	expected: InternalAgentRef | AgentSession,
+): boolean {
+	return bridgeFor(registry).setActivity(id, activity, expected);
 }
 
 export function setAgentStatus(

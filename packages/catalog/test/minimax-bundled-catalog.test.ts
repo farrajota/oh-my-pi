@@ -6,7 +6,7 @@ import { MODELS_DEV_PROVIDER_DESCRIPTORS, mapModelsDevToModels } from "../src/pr
 import modelsJson from "../src/models.json";
 
 const CODE_PROVIDERS = ["minimax-code", "minimax-code-cn"] as const;
-const CODE_API_MODELS = ["MiniMax-M2", "MiniMax-M3", "MiniMax-M3.1-Flash-Preview"] as const;
+const CODE_API_MODELS = ["MiniMax-M2", "MiniMax-M3", "MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview"] as const;
 
 function buildAnthropicCodeModels(provider: (typeof CODE_PROVIDERS)[number]) {
 	const descriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(
@@ -50,6 +50,18 @@ describe("minimax bundled catalog", () => {
 				}
 			}
 
+			for (const id of ["MiniMax-M3", "MiniMax-M3.1-Flash-Preview"] as const) {
+				const model = modelsJson[provider][id];
+				expect(model.thinking?.efforts).toEqual([Effort.Minimal, Effort.Low, Effort.Medium, Effort.High]);
+				expect(
+					model.thinking !== undefined && "requiresEffort" in model.thinking
+						? model.thinking.requiresEffort
+						: undefined,
+				).toBeUndefined();
+				expect(model.compat.supportsReasoningEffort).toBe(false);
+				expect(model.compat.supportsStore).toBe(false);
+			}
+
 			const anthropicModels = buildAnthropicCodeModels(provider);
 			const modelFor = (id: string) => {
 				const model = anthropicModels.find(candidate => candidate.id === id);
@@ -80,14 +92,26 @@ describe("minimax bundled catalog", () => {
 				}
 			}
 
-			const flash = modelFor("MiniMax-M3.1-Flash-Preview");
-			expect(flash.api).toBe("anthropic-messages");
-			expect(flash.baseUrl).toBe(expectedBaseUrl);
-			expect(flash.thinking?.mode).toBe("anthropic-adaptive");
-			expect(getSupportedEfforts(flash)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
-			expect(flash.thinking?.requiresEffort).toBe(true);
-			expect(minimumSupportedEffort(flash)).toBe(Effort.Low);
-			expect(mapEffortToAnthropicAdaptiveEffort(flash, Effort.Max)).toBe("max");
+			for (const id of ["MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview"]) {
+				const flash = modelFor(id);
+				expect(flash.api).toBe("anthropic-messages");
+				expect(flash.baseUrl).toBe(expectedBaseUrl);
+				expect(flash.thinking?.mode).toBe("anthropic-adaptive");
+				expect(getSupportedEfforts(flash)).toEqual([
+					Effort.Low,
+					Effort.Medium,
+					Effort.High,
+					Effort.XHigh,
+					Effort.Max,
+				]);
+				expect(flash.thinking?.requiresEffort).toBe(true);
+				expect(minimumSupportedEffort(flash)).toBe(Effort.Low);
+				for (const effort of [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max] as const) {
+					expect(mapEffortToAnthropicAdaptiveEffort(flash, effort)).toBe(effort);
+				}
+			}
+			const compat = modelFor("MiniMax-M3.1-Flash").compat;
+			expect(compat && "supportsSamplingParams" in compat ? compat.supportsSamplingParams : undefined).toBe(false);
 		}
 	});
 });

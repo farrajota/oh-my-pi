@@ -43,6 +43,7 @@ import {
 	type MCPToolFollower,
 } from "./executor";
 import type { EffectivePermissionSummary } from "./types";
+import { isCompletionProbeEnabled } from "./completion-probe";
 import { cfgTaskAgentAccountPools } from "./settings";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
 import { seanceIsolationOptions } from "./seance-policy";
@@ -572,6 +573,7 @@ export function createPersistedSubagentReviverFactory(
 					attachIrcWakeTurnMonitor(session, {
 						id: ref.id,
 						agent: wakeAgent,
+						completionProbe: isCompletionProbeEnabled(ctx.settings, taskDepth - 1),
 						permissionSummary,
 						artifactsDir: path.dirname(sessionFile),
 						agentRegistry: registry,

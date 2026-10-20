@@ -258,9 +258,11 @@ it.each([false, true])("keeps tan's copied candidate model-gated (explicit=%s)",
 	if (!manager) throw new Error("Missing async job manager");
 	let runJob: (() => Promise<unknown>) | undefined;
 	vi.spyOn(manager, "register").mockImplementation((_type, _label, run) => {
+		const incarnationId = crypto.randomUUID();
 		runJob = () =>
 			run({
 				jobId: "tan-test",
+				incarnationId,
 				signal: new AbortController().signal,
 				reportProgress: async () => {},
 				markRunning: () => {},

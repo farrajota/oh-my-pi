@@ -399,16 +399,20 @@ describe("AgentSession empty stop guard", () => {
 			.map(entry => entry.message as AgentMessage);
 		expect(emptyAssistantStops(activeBranchMessages)).toHaveLength(0);
 
-		// The loader reconstructs the active branch from the last physical journal
-		// entry. The empty stop is removed from history and a marker durably
-		// selects its parent, so reload cannot reactivate the discarded turn.
+		// The discard marker durably selects the surviving parent before the run
+		// completion record extends that branch, so reload cannot reactivate the
+		// discarded empty turn.
 		const journalMessages = session.sessionManager
 			.getEntries()
 			.filter(entry => entry.type === "message")
 			.map(entry => entry.message as AgentMessage);
 		expect(emptyAssistantStops(journalMessages)).toHaveLength(0);
-		const lastJournalEntry = session.sessionManager.getEntries().at(-1);
-		expect(lastJournalEntry).toMatchObject({
+		expect(session.sessionManager.getEntries().at(-1)).toMatchObject({
+			type: "custom",
+			customType: "run_completion",
+			data: { completion: { outcome: "failed" } },
+		});
+		expect(session.sessionManager.getEntries().at(-2)).toMatchObject({
 			type: "branch_summary",
 			summary: "",
 			details: { kind: "discarded-entry-branch" },
@@ -482,6 +486,11 @@ describe("AgentSession empty stop guard", () => {
 			.map(entry => entry.message as AgentMessage);
 		expect(emptyAssistantStops(activeBranchMessages)).toHaveLength(0);
 		expect(session.sessionManager.getEntries().at(-1)).toMatchObject({
+			type: "custom",
+			customType: "run_completion",
+			data: { completion: { outcome: "failed" } },
+		});
+		expect(session.sessionManager.getEntries().at(-2)).toMatchObject({
 			type: "branch_summary",
 			details: { kind: "discarded-entry-branch" },
 		});

@@ -1,15 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import * as path from "node:path";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { lookup } from "../../src/config/registry";
 
 import { IrcBus, type IrcDeliveryContext, type IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { executeSend } from "@oh-my-pi/pi-coding-agent/irc/messaging";
 import {
 	adoptAgent,
 	getAgentLifecycleManager,
 	lifecycleHasAgent,
 	parkAgent,
 	resetAgentLifecycleForTests,
+	setPersistedAgentReviverFactory,
 } from "../../src/internal/agent-lifecycle-bridge";
 import { lookupAgentRef, setAgentStatus } from "../../src/internal/agent-registry-bridge";
 import { createHubAuthorityFixture, type HubAuthorityFixture, installHubIrcControls } from "./hub-fixtures";
@@ -22,9 +25,17 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { IrcBridge } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
+import { IrcBridge, type IrcBridgeHost } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
 import { convertToLlm, type CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { attachIrcWakeTurnMonitor } from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { createSessionDefaults } from "../helpers/session-defaults";
+import { TempDir } from "@oh-my-pi/pi-utils";
+
+type IrcWakeObserver = (records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined;
+
+const wakeAgent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
 
 interface FakeSession {
 	session: AgentSession;
@@ -253,7 +264,7 @@ describe("IRC", () => {
 			expect(main.relayed[0]?.details).toEqual({ from: "0-A", to: "0-B", body: "sibling note" });
 		});
 
-		it("send to an unknown or aborted agent fails", async () => {
+		it("send to an unknown agent or a killed one without a transcript fails", async () => {
 			const unknown = await bus.send({ from: "0-Main", to: "0-Ghost", body: "hello?" });
 			expect(unknown.outcome).toBe("failed");
 
@@ -262,6 +273,31 @@ describe("IRC", () => {
 			registry.setStatus("0-Dead", "aborted");
 			const aborted = await bus.send({ from: "0-Main", to: "0-Dead", body: "hello?" });
 			expect(aborted.outcome).toBe("failed");
+			expect(sub.delivered).toEqual([]);
+		});
+
+		it("send revives an ordinary detached aborted recipient through the lifecycle bridge", async () => {
+			using tempDir = TempDir.createSync("@omp-irc-revive-");
+			const sessionFile = path.join(tempDir.path(), "0-Aborted.jsonl");
+			await Bun.write(sessionFile, "");
+			const sub = makeFakeSession();
+			sub.setOutcome("woken");
+			registry.register({
+				id: "0-Aborted",
+				displayName: "task",
+				kind: "sub",
+				session: null,
+				sessionFile,
+				status: "aborted",
+			});
+			setPersistedAgentReviverFactory(getAgentLifecycleManager(registry), async () => async () => sub.session, 0);
+
+			const receipt = await bus.send({ from: "0-Main", to: "0-Aborted", body: "continue where you stopped" });
+
+			expect(receipt.outcome).toBe("revived");
+			expect(sub.delivered.map(msg => msg.body)).toEqual(["continue where you stopped"]);
+			expect(registry.get("0-Aborted")?.status).toBe("idle");
+			expect(lookupAgentRef(registry, "0-Aborted")?.session).toBe(sub.session);
 		});
 
 		it("send surfaces recipient delivery errors as failed", async () => {
@@ -920,6 +956,45 @@ describe("IRC", () => {
 			expect(text).toContain("pong");
 		});
 
+		it("op=send await=true keeps its reply waiter attached while an ordinary aborted peer reopens", async () => {
+			const mainOwner = lookupAgentRef(registry, "0-Main")?.session;
+			if (!mainOwner) throw new Error("Expected exact 0-Main authority session.");
+			const main = installHubIrcControls(mainOwner);
+			using tempDir = TempDir.createSync("@omp-irc-await-revive-");
+			const sessionFile = path.join(tempDir.path(), "0-Aborted.jsonl");
+			await Bun.write(sessionFile, "");
+			const sub = makeFakeSession();
+			sub.onDeliver((_message, context) => {
+				if (!context) throw new Error("Expected awaited delivery context.");
+				void context.sendReply("I am back");
+			});
+			registry.register({
+				id: "0-Aborted",
+				displayName: "task",
+				kind: "sub",
+				parentId: "0-Main",
+				session: null,
+				sessionFile,
+				status: "aborted",
+			});
+			setPersistedAgentReviverFactory(getAgentLifecycleManager(registry), async () => async () => sub.session, 0);
+
+			const tool = new HubTool(makeToolSession(registry, "0-Main"));
+			const result = await tool.execute("call-reopen", {
+				op: "send",
+				to: "0-Aborted",
+				message: "continue",
+				await: true,
+			});
+			const details = result.details as CoordinationDetails | undefined;
+			expect(details?.receipts?.[0]?.outcome).toBe("revived");
+			expect(details?.waited?.body).toBe("I am back");
+			expect(main.delivered).toEqual([]);
+			expect(lookupAgentRef(registry, "0-Aborted")?.session).toBe(sub.session);
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+			expect(text).not.toContain("stopped without replying");
+		});
+
 		it("op=send await=true ignores buffered stale mail and waits for a future reply", async () => {
 			const mainOwner = lookupAgentRef(registry, "0-Main")?.session;
 			if (!mainOwner) throw new Error("Expected exact 0-Main authority session.");
@@ -1345,6 +1420,257 @@ describe("IRC", () => {
 		});
 	});
 
+	describe("wake-turn replies to broadcasts", () => {
+		let fixture: HubAuthorityFixture;
+		let parent: AgentSession;
+		let main: { delivered: IrcMessage[] };
+
+		beforeEach(async () => {
+			fixture = await createHubAuthorityFixture(registry, "Main");
+			const owner = lookupAgentRef(registry, "Main")?.session;
+			if (!owner) throw new Error("Expected the authorized Main root session.");
+			parent = owner;
+			main = installHubIrcControls(parent);
+		});
+		afterEach(async () => {
+			await fixture.dispose();
+		});
+
+		/**
+		 * An idle subagent wired like a real one: deliveries go through the real
+		 * IrcBridge, a wake runs the executor's wake-turn monitor, and every turn
+		 * ends with the stop text "Not for me." (after a `yield` when `yields`).
+		 * Children share their parent's async job manager when present, as spawned subagents do.
+		 */
+		function registerIdleSubagent(
+			id: string,
+			opts: { parentId?: string; yields?: boolean; streaming?: boolean } = {},
+		) {
+			const parentId = opts.parentId ?? "Main";
+			const owner = lookupAgentRef(registry, parentId)?.session;
+			if (!owner) throw new Error(`Expected the owning parent session for ${id}.`);
+			// Follow-up finalization publishes through the owning parent's session manager.
+			const sessionManager = owner.sessionManager;
+			const jobManager = owner.asyncJobManager;
+			if (!sessionManager) throw new Error(`Expected the parent's session manager for ${id}.`);
+			let observer: IrcWakeObserver | undefined;
+			const listeners: ((event: AgentSessionEvent) => void)[] = [];
+			const turns: Promise<void>[] = [];
+			const relays: Promise<void>[] = [];
+			const wakeMessages: AgentMessage[] = [];
+			const steered: AgentMessage[] = [];
+			const wake = (records: AgentMessage[]): void => {
+				wakeMessages.push(...records);
+				const finish = observer?.(records);
+				if (opts.yields) {
+					const event = {
+						type: "tool_execution_end",
+						toolCallId: `yield-${turns.length}`,
+						toolName: "yield",
+						result: {
+							content: [{ type: "text", text: "Result submitted." }],
+							details: { status: "success", data: "Not for me." },
+						},
+						isError: false,
+					} as AgentSessionEvent;
+					for (const listener of listeners) listener(event);
+				}
+				turns.push(Promise.resolve(finish?.()));
+			};
+			const bridge = new IrcBridge({
+				agent: { steer: (message: AgentMessage) => steered.push(message) } as unknown as Agent,
+				sessionManager,
+				isDisposed: () => false,
+				isParentSender: (recipientId: string, senderId: string) => recipientId === id && senderId === parentId,
+				isStreaming: () => opts.streaming ?? false,
+				planModeEnabled: () => false,
+				emitSessionEvent: async () => {},
+				wakeForIrc: wake,
+			} as unknown as IrcBridgeHost);
+			const session = {
+				...createSessionDefaults(),
+				subscribe: (listener: (event: AgentSessionEvent) => void) => {
+					listeners.push(listener);
+					return () => listeners.splice(listeners.indexOf(listener), 1);
+				},
+				setIrcWakeTurnObserver: (next: IrcWakeObserver | undefined) => {
+					observer = next;
+				},
+				trackIrcReply: (pending: Promise<void>) => {
+					relays.push(pending);
+				},
+				getLastAssistantMessage: () => ({
+					role: "assistant",
+					content: [{ type: "text", text: "Not for me." }],
+					stopReason: "stop",
+				}),
+				deliverIrcMessage: (msg: IrcMessage) => bridge.deliver(msg),
+				sessionManager,
+				asyncJobManager: jobManager,
+			} as unknown as AgentSession;
+			const ref = registry.register({ id, displayName: "task", kind: "sub", status: "idle", session, parentId });
+			if (!ref.lineage) throw new Error(`Expected registered lineage for ${id}.`);
+			attachIrcWakeTurnMonitor(session, {
+				id,
+				agent: wakeAgent,
+				agentRegistry: registry,
+				ircBus: IrcBus.forRoot(registry, ref.lineage.rootId),
+			});
+			return {
+				bridge,
+				steered,
+				wake,
+				wakeMessages,
+				settled: async () => {
+					await Promise.all(turns);
+					await Promise.all(relays);
+					if (jobManager) {
+						await jobManager.waitForOwnerJobs(parentId);
+						await jobManager.drainDeliveries({ filter: { ownerId: parentId }, timeoutMs: 1000 });
+					}
+				},
+			};
+		}
+
+		const incoming = (id: string, from: string, extra: Record<string, unknown> = {}): CustomMessage => ({
+			role: "custom",
+			customType: "irc:incoming",
+			content: "status?",
+			display: true,
+			details: { id, from, message: "status?", ...extra },
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+
+		/** Capture result delivery through Main's owned job manager. */
+		function parentJobs() {
+			const jobManager = parent.asyncJobManager;
+			if (!jobManager) throw new Error("Expected Main's owned job manager.");
+			const delivered: string[] = [];
+			const unregisterSink = jobManager.registerDeliverySink("Main", (_jobId, text) => {
+				delivered.push(text);
+			});
+			parent.addDisposer(unregisterSink);
+			return { delivered };
+		}
+
+		it("Hub broadcasts reach IrcBridge without auto-stop relays or parent-request ownership", async () => {
+			const senderSession = (await fixture.createChild("0-C", "Main")).session;
+			const sender = installHubIrcControls(senderSession);
+			const a = registerIdleSubagent("0-A", { parentId: "0-C" });
+			const b = registerIdleSubagent("0-B", { parentId: "0-C" });
+			const streaming = registerIdleSubagent("0-Streaming", { parentId: "0-C", streaming: true });
+
+			const tool = new HubTool(fixture.createToolSession("0-C"));
+			const sent = await tool.execute("broadcast-through-hub", {
+				op: "send",
+				to: "all",
+				message: "everyone: status",
+			});
+			const details = sent.details as CoordinationDetails | undefined;
+			expect(details?.receipts?.find(receipt => receipt.to === "0-A")?.outcome).toBe("woken");
+			expect(details?.receipts?.find(receipt => receipt.to === "0-B")?.outcome).toBe("woken");
+			expect(details?.receipts?.find(receipt => receipt.to === "0-Streaming")?.outcome).toBe("injected");
+
+			await a.settled();
+			await b.settled();
+			const incoming = a.wakeMessages[0];
+			if (incoming?.role !== "custom" || typeof incoming.content !== "string") {
+				throw new Error("Expected the broadcast to reach the idle recipient's IRC bridge.");
+			}
+			expect(incoming.content).toContain("No one replies on your behalf.");
+			expect(main.delivered.map(message => message.body)).toEqual(["everyone: status"]);
+			expect(sender.delivered).toEqual([]);
+			const parentSteer = streaming.steered[0];
+			if (!parentSteer) throw new Error("Expected the broadcast to reach the streaming recipient.");
+			expect(streaming.bridge.isParentSteer(parentSteer)).toBe(false);
+		});
+
+		it("does not relay woken peers' turns back to a subagent broadcaster", async () => {
+			const broadcaster = makeFakeSession();
+			registry.register({
+				id: "0-C",
+				displayName: "task",
+				kind: "sub",
+				parentId: "Main",
+				status: "idle",
+				session: broadcaster.session,
+			});
+			const a = registerIdleSubagent("0-A");
+			const b = registerIdleSubagent("0-B");
+
+			const sent = await executeSend({ registry, senderId: "0-C" }, { to: "all", message: "fixers: rebase now" });
+			expect(sent.details?.receipts?.map(receipt => [receipt.to, receipt.outcome])).toEqual([
+				["Main", "injected"],
+				["0-A", "woken"],
+				["0-B", "woken"],
+			]);
+			await a.settled();
+			await b.settled();
+			expect(broadcaster.delivered).toEqual([]);
+			expect(main.delivered.map(message => message.body)).toEqual(["fixers: rebase now"]);
+
+			// A direct message still gets the woken peer's turn back.
+			await executeSend({ registry, senderId: "0-C" }, { to: "0-A", message: "status?" });
+			await a.settled();
+			expect(broadcaster.delivered).toMatchObject([
+				{ from: "0-A", to: "0-C", body: "Not for me.", wakeRelay: true },
+			]);
+		});
+
+		it("does not deliver woken children's turns to a main-agent broadcaster", async () => {
+			const { delivered } = parentJobs();
+			const a = registerIdleSubagent("0-A", { parentId: "Main" });
+			const b = registerIdleSubagent("0-B", { parentId: "Main" });
+
+			await executeSend({ registry, senderId: "Main" }, { to: "all", message: "everyone: status" });
+			await a.settled();
+			await b.settled();
+			expect(main.delivered).toEqual([]);
+			expect(delivered).toEqual([]);
+
+			// The parent's direct message still delivers the woken turn to the parent.
+			await executeSend({ registry, senderId: "Main" }, { to: "0-A", message: "status?" });
+			await a.settled();
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]).toContain("Not for me.");
+		});
+
+		it("still delivers a child's own yield from a broadcast-woken turn to its parent", async () => {
+			const { delivered } = parentJobs();
+			const child = registerIdleSubagent("0-A", { parentId: "Main", yields: true });
+
+			await executeSend({ registry, senderId: "Main" }, { to: "all", message: "everyone: status" });
+			await child.settled();
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]).toContain("Not for me.");
+			expect(main.delivered).toEqual([]);
+		});
+
+		it("relays once to a sender whose direct message shares the wake with its broadcast", async () => {
+			const sender = makeFakeSession();
+			registry.register({
+				id: "0-C",
+				displayName: "task",
+				kind: "sub",
+				parentId: "Main",
+				status: "idle",
+				session: sender.session,
+			});
+			// One peer per order: a second relay from the same peer within the same
+			// millisecond would be deduped by `sentSince`, not by the broadcast skip.
+			const first = registerIdleSubagent("0-A");
+			const second = registerIdleSubagent("0-B");
+			first.wake([incoming("b-1", "0-C", { broadcast: true }), incoming("d-1", "0-C")]);
+			second.wake([incoming("d-2", "0-C"), incoming("b-2", "0-C", { broadcast: true })]);
+			await first.settled();
+			await second.settled();
+			expect(sender.delivered.map(msg => [msg.from, msg.replyTo])).toEqual([
+				["0-A", "d-1"],
+				["0-B", "d-2"],
+			]);
+		});
+	});
 	describe("AgentSession.deliverIrcMessage", () => {
 		it("wakes an idle session with a real turn and emits the irc_message event", async () => {
 			const { session } = createRealSession();
@@ -1445,6 +1771,32 @@ describe("IRC", () => {
 		});
 
 		it("queues parent IRC as steering while a subagent turn is streaming", async () => {
+			const fixture = await createHubAuthorityFixture(registry, "Main");
+			try {
+				const { session } = await fixture.createChild("0-Child");
+				const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+				Object.defineProperty(session, "isStreaming", { value: true, configurable: true });
+				const outcome = await session.deliverIrcMessage({
+					id: "msg-parent",
+					from: "Main",
+					to: "0-Child",
+					body: "change approach",
+					ts: Date.now(),
+				});
+				const queued = session.agent.peekSteeringQueue();
+				expect(outcome).toBe("injected");
+				expect(promptSpy).not.toHaveBeenCalled();
+				expect(session.agent.hasIrcInterrupts?.()).toBe(false);
+				expect(queued).toHaveLength(1);
+				const parentSteer = queued[0];
+				expect(parentSteer?.role).toBe("user");
+				if (parentSteer?.role !== "user") throw new Error("expected queued parent IRC steer");
+				expect(parentSteer.content).toContain("change approach");
+			} finally {
+				await fixture.dispose();
+			}
+		});
+		it("does not trust legacy global registration for parent steering", async () => {
 			const { session } = createRealSession();
 			sessions.push(session);
 			const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
@@ -1452,22 +1804,19 @@ describe("IRC", () => {
 			registry.register({ id: "0-Child", displayName: "task", kind: "sub", parentId: "Main", session });
 
 			const outcome = await session.deliverIrcMessage({
-				id: "msg-parent",
+				id: "msg-untrusted-parent",
 				from: "Main",
 				to: "0-Child",
 				body: "change approach",
 				ts: Date.now(),
 			});
-			const queued = session.agent.peekSteeringQueue();
+
 			expect(outcome).toBe("injected");
 			expect(promptSpy).not.toHaveBeenCalled();
-			expect(session.agent.hasIrcInterrupts?.()).toBe(false);
-			expect(queued).toHaveLength(1);
-			const parentSteer = queued[0];
-			expect(parentSteer?.role).toBe("user");
-			if (parentSteer?.role !== "user") throw new Error("expected queued parent IRC steer");
-			expect(parentSteer.content).toContain("change approach");
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.hasIrcInterrupts?.()).toBe(true);
 		});
+
 		it("auto-replies via a recipient side turn when the sender awaits and async execution is disabled", async () => {
 			const sender = makeFakeSession();
 			registry.register({

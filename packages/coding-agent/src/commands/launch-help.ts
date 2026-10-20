@@ -72,6 +72,10 @@ export const launchHelp = {
 		"from-codex": Flags.boolean({ description: "Import a Codex session into OMP" }),
 		"session-dir": Flags.string({ description: "Directory for session storage and lookup" }),
 		"no-session": Flags.boolean({ description: "Don't save session (ephemeral)" }),
+		"single-request": Flags.boolean({
+			description:
+				"Run one nonpersistent request with the configured approved model; disables tools and auxiliary startup work, and fails closed if the selection or transport is unsupported",
+		}),
 		models: Flags.string({ description: `Comma-separated model patterns for ${formatKeyHint("ctrl+p")} cycling` }),
 		"no-tools": Flags.boolean({ description: "Disable all built-in tools" }),
 		"no-lsp": Flags.boolean({ description: "Disable LSP tools, formatting, and diagnostics" }),
@@ -119,8 +123,8 @@ export const launchHelp = {
 			description: "Auto-approve all tool calls (skip approval prompts)",
 		}),
 		"approval-mode": Flags.string({
-			options: ["always-ask", "write", "yolo"],
-			description: "Override tools.approvalMode for this session (always-ask|write|yolo)",
+			options: ["always-ask", "always-ask-cached", "write", "yolo"],
+			description: "Override tools.approvalMode for this session (always-ask|always-ask-cached|write|yolo)",
 		}),
 	},
 	examples: [

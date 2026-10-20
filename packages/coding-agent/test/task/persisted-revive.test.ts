@@ -16,7 +16,6 @@ import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-setting
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import {
 	adoptAgent,
@@ -1774,7 +1773,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 
 	afterEach(async () => {
 		await Promise.all(sessions.splice(0).map(session => session.dispose()));
-		AgentLifecycleManager.resetGlobalForTests();
+		resetAgentLifecycleForTests();
 		AgentRegistry.global().unregister("prompt-blocks");
 	});
 
@@ -1815,6 +1814,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		buildPrompt: (toolNames: string[]) => string[],
 		responses: MockResponseSource,
 		hooks: ExtensionHooks = {},
+		toolNames: string[] = ["read"],
 	): RecordingSession {
 		const mock = createMockModel({ responses, handler: { content: ["done"] } });
 		const requests: string[][] = [];
@@ -1828,7 +1828,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 				return `yield tool${items.map(item => ` ${item.id}#${item.index}`).join("")}`;
 			},
 		};
-		const tools = [createTool("read"), yieldTool];
+		const tools = [...toolNames.map(createTool), yieldTool];
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: {
@@ -1900,6 +1900,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		hooks?: ExtensionHooks,
 		agentTools?: string[],
 		spawnOptions: { enableLsp?: boolean; enableIrc?: boolean; restrictToolNames?: boolean } = {},
+		toolNames?: string[],
 	): Promise<RecordingSession> {
 		const settings = Settings.isolated({}, { cwd, agentDir: cwd });
 		const rootManager = SessionManager.create(cwd, path.join(cwd, "root-sessions"));
@@ -1940,7 +1941,13 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		const permissionSnapshot = freezePermissionScope(composedPermissions.value);
 		let spawned: RecordingSession | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
-			spawned = createRecordingSession(options!.sessionManager!, buildPrompt, responses, hooks);
+			spawned = createRecordingSession(
+				options!.sessionManager!,
+				buildPrompt,
+				responses,
+				hooks,
+				toolNames ?? agentTools,
+			);
 			return { session: spawned.session } as CreateAgentSessionResult;
 		});
 		const result = await executorModule.runSubprocess({
@@ -1970,7 +1977,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 			parentAgentId: MAIN_AGENT_ID,
 			createAuthoritySession: authority.create,
 		});
-		expect(result.exitCode).toBe(0);
+		expect(result.exitCode, result.stderr).toBe(0);
 		if (!spawned) throw new Error("Expected the spawn to create a session");
 		return spawned;
 	}
@@ -2157,6 +2164,33 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		const revived = await reviveAndFollowUp(cwd);
 		expect(revived.system).toEqual(warm.requests.at(-1)!);
 		expect(revived.tools).not.toContain("item#0");
+	});
+
+	it("warm-revives with the tools its spawn enabled, without the parent-owned todo", async () => {
+		const cwd = makeTempDir("@pi-revive-warm-tools-");
+		const buildPrompt = (toolNames: string[]) => ["base", `tools: ${toolNames.join(",")}`];
+		const spawned = await spawn(cwd, buildPrompt, spawnResponses(), {}, ["read", "todo"]);
+		const spawnedTools = spawned.session.getEnabledToolNames();
+		expect(spawnedTools).not.toContain("todo");
+		const registry = fixtureRegistry;
+		if (!registry) throw new Error("Expected the prompt test authority registry");
+		const lifecycle = getAgentLifecycleManager(registry);
+		await parkAgent(lifecycle, "prompt-blocks");
+		let warm: RecordingSession | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
+			warm = createRecordingSession(options!.sessionManager!, buildPrompt, [{ content: ["next"] }], {}, [
+				"read",
+				"todo",
+			]);
+			return { session: warm.session } as CreateAgentSessionResult;
+		});
+		const live = await ensureAgentLive(lifecycle, "prompt-blocks");
+		if (!warm || live !== warm.session) throw new Error("Expected a warm revive through the lifecycle");
+		expect(live.getEnabledToolNames()).toEqual(spawnedTools);
+		await live.prompt("next");
+		await live.waitForIdle();
+		expect(warm.requests.at(-1)).toEqual(spawned.requests.at(-1)!);
+		expect(warm.toolRequests.at(-1)).toBe(spawned.toolRequests.at(-1)!);
 	});
 
 	it("replays the base a before_agent_start override was built from when the base rebuilds in the request window", async () => {

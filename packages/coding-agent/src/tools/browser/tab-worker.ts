@@ -52,9 +52,11 @@ import {
 	applyStealthPatches,
 	applyViewport,
 	BROWSER_PROTOCOL_TIMEOUT_MS,
+	browserConnection,
 	connectPuppeteer,
 	DEFAULT_VIEWPORT,
 	isPuppeteerHandle,
+	isPuppeteerTimeout,
 	loadPuppeteerInWorker,
 	loadedKnownDevices,
 	loadedNetworkConditions,
@@ -198,6 +200,7 @@ import {
 	screenshotQuality,
 	screenshotScope,
 	screenshotThreshold,
+	whileDrawing,
 } from "./screenshot";
 import { RuntimeDialogController, type DialogPolicy, type DialogState } from "./dialogs";
 import {
@@ -219,17 +222,18 @@ import type { ClickAtOptions, MouseMoveOptions, MouseButtonOptions } from "./int
 
 import { cloneSafe, RunOutput } from "./run-output";
 import { type UploadRoute, UploadStaging } from "./upload-files";
-import type {
-	Observation,
-	ObservationEntry,
-	ReadyInfo,
-	RunErrorPayload,
-	ScreenshotResult,
-	SessionSnapshot,
-	ToolReply,
-	Transport,
-	WorkerInbound,
-	WorkerInitPayload,
+import {
+	type Observation,
+	type ObservationEntry,
+	ownsPage,
+	type ReadyInfo,
+	type RunErrorPayload,
+	type ScreenshotResult,
+	type SessionSnapshot,
+	type ToolReply,
+	type Transport,
+	type WorkerInbound,
+	type WorkerInitPayload,
 } from "./tab-protocol";
 
 declare module "puppeteer-core" {
@@ -1262,14 +1266,30 @@ async function targetIdForPage(page: Page): Promise<string> {
 	return await targetIdForTarget(page.target());
 }
 
-async function createTrackedHeadlessPage(browser: Browser, reportTarget: (targetId: string) => void): Promise<Page> {
-	const session = await browser.target().createCDPSession();
+async function createTrackedPage(
+	browser: Browser,
+	relay: { nearTargetId?: string } | undefined,
+	reportTarget: (targetId: string) => void,
+): Promise<Page> {
 	let targetId: string;
-	try {
-		({ targetId } = await session.send("Target.createTarget", { url: "about:blank" }));
+	if (relay) {
+		// The omp relay has no attachable browser target, so its tab is created over the root connection:
+		// unselected, in the browser of `nearTargetId` (the relay's own parameter) when given.
+		const params: Protocol.Target.CreateTargetRequest & { nearTargetId?: string } = {
+			url: "about:blank",
+			background: true,
+			nearTargetId: relay.nearTargetId,
+		};
+		({ targetId } = await browserConnection(browser).send("Target.createTarget", params));
 		reportTarget(targetId);
-	} finally {
-		await session.detach().catch(() => undefined);
+	} else {
+		const session = await browser.target().createCDPSession();
+		try {
+			({ targetId } = await session.send("Target.createTarget", { url: "about:blank" }));
+			reportTarget(targetId);
+		} finally {
+			await session.detach().catch(() => undefined);
+		}
 	}
 	const existing = browser.targets().find(target => privateTargetId(target) === targetId);
 	const target =
@@ -1278,7 +1298,7 @@ async function createTrackedHeadlessPage(browser: Browser, reportTarget: (target
 			timeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		}));
 	const page = await target.page();
-	if (!page) throw new ToolError(`Created headless target ${targetId} did not expose a page`);
+	if (!page) throw new ToolError(`Created target ${targetId} did not expose a page`);
 	return page;
 }
 
@@ -1507,22 +1527,6 @@ export function describeScreenshot(opts?: ScreenshotOptions): string {
 	if (opts?.fullPage) return "tab.screenshot({ fullPage: true })";
 	return "tab.screenshot()";
 }
-export async function preparePageForScreenshot(
-	page: Pick<Page, "bringToFront" | "evaluate">,
-	signal: AbortSignal | undefined,
-	activate: boolean,
-): Promise<void> {
-	if (activate) {
-		await untilAborted(signal, () => page.bringToFront()).catch(() => undefined);
-		return;
-	}
-	const visible = await untilAborted(signal, () => page.evaluate(() => document.visibilityState === "visible")).catch(
-		() => false,
-	);
-	if (!visible) {
-		throw new ToolError("The attached browser tab is not visible; switch to it before taking a screenshot");
-	}
-}
 
 /** Summarize still-running helpers (oldest first) so a cell timeout names what stalled. */
 export function describeInflight(inflight: Map<number, InflightOp>): string {
@@ -1550,7 +1554,7 @@ export class WorkerCore {
 	#isolated: boolean;
 	#uninstallRejectionGuard: () => void;
 	#mode?: WorkerInitPayload["mode"];
-	#activateForScreenshot = true;
+	#ownsPage = false;
 	/** The upload route this worker's browser connection takes, and the tab's staging folder. */
 	#uploads?: UploadStaging;
 	#dialogs?: RuntimeDialogController;
@@ -1711,9 +1715,11 @@ export class WorkerCore {
 	}
 
 	async #init(payload: WorkerInitPayload): Promise<void> {
+		const pageCreatedByThisAttempt =
+			payload.mode === "headless" || (payload.mode === "attach" && payload.page.kind === "create");
 		try {
-			this.#mode = payload.mode === "attach" && payload.emulateFocus ? "headless" : payload.mode;
-			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
+			this.#mode = payload.mode === "attach" && payload.headlessMode ? "headless" : payload.mode;
+			this.#ownsPage = ownsPage(payload);
 			this.#uploads = new UploadStaging(payload.uploadDir);
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			registerSemanticQueryHandlers(puppeteer);
@@ -1727,23 +1733,30 @@ export class WorkerCore {
 			// page acquisition so the supervisor's cold-start budget bounds only the
 			// realm setup; page creation runs under the ready wait.
 			this.#transport.send({ type: "setup" });
-			if (payload.mode === "headless") {
+			if (payload.mode === "headless" || payload.page.kind === "create") {
 				// Create the target directly so its id is reportable before
 				// Puppeteer waits for target/page initialization. If that wait
 				// wedges, the supervisor can still close the created target.
-				this.#page = await createTrackedHeadlessPage(this.#browser, targetId => {
+				const relay =
+					payload.mode === "attach" && payload.page.kind === "create"
+						? { nearTargetId: payload.page.nearTargetId }
+						: undefined;
+				this.#page = await createTrackedPage(this.#browser, relay, targetId => {
 					this.#transport.send({ type: "page-created", targetId });
 				});
-				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
-				if (payload.emulateViewport !== false) await applyViewport(this.#page, payload.viewport);
+				if (payload.mode === "headless") {
+					await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
+					if (payload.emulateViewport !== false) await applyViewport(this.#page, payload.viewport);
+				}
 			} else {
-				const target = await this.#findAttachedTarget(payload.targetId);
+				const target = await this.#findAttachedTarget(payload.page.targetId);
 				// Post-timeout recycle: unblock the target BEFORE adopting the page — an open
 				// modal dialog or hung navigation can stall `target.page()` / ready info, and a
 				// stalled init used to time out and force-kill the tab.
 				if (payload.recover) await this.#recoverAttachedTarget(target);
 				const page = await target.page();
-				if (!page) throw new ToolError(`Target ${payload.targetId} is no longer available on the attached browser`);
+				if (!page)
+					throw new ToolError(`Target ${payload.page.targetId} is no longer available on the attached browser`);
 				this.#page = page;
 				await this.#claimRelayTarget(page);
 			}
@@ -1779,7 +1792,7 @@ export class WorkerCore {
 			await this.#console.install(page);
 			this.#webmcp = await installWebMcp(page);
 			await installVitalsObservers(page);
-			if (payload.mode === "headless" || payload.emulateFocus) {
+			if (this.#ownsPage) {
 				// Background Chromium tabs stop producing frames, stalling rAF,
 				// IntersectionObserver, and input acknowledgements. Keep owned tabs
 				// interactive without raising a window; explicit settle-freeze still applies.
@@ -1790,14 +1803,12 @@ export class WorkerCore {
 			this.#started = true;
 			this.#transport.send({ type: "ready", info });
 		} catch (error) {
-			// A failed headless init leaves the worker's page orphaned in the shared
-			// browser (the supervisor retries with a fresh worker), so close it before
-			// reporting. Attach mode adopts an existing target — never close it.
+			// A page this attempt created would be orphaned (the supervisor retries
+			// with a fresh worker), so close it before reporting. An adopted target —
+			// a borrowed page, or an owned one a recycle retries — is never closed here.
 			const page = this.#page;
 			await this.#disposePageResources();
-			if (payload.mode === "headless" && page && !page.isClosed()) {
-				await page.close().catch(() => undefined);
-			}
+			if (pageCreatedByThisAttempt && page && !page.isClosed()) await page.close().catch(() => undefined);
 			this.#transport.send({ type: "init-failed", error: errorPayload(error) });
 		}
 	}
@@ -2227,11 +2238,7 @@ export class WorkerCore {
 			// our per-op deadline fired, or puppeteer's own (equal) timeout fired first — having
 			// already torn down the CDP action via the op signal, so no work is left dangling.
 			// Cell-budget aborts and uncapped helpers (goto/evaluate) keep their native errors.
-			if (
-				capped &&
-				!cellSignal.aborted &&
-				(opTimeout?.aborted || (err instanceof Error && err.name === "TimeoutError"))
-			) {
+			if (capped && !cellSignal.aborted && (opTimeout?.aborted || isPuppeteerTimeout(err))) {
 				const refusal = err instanceof ClickRefusedError ? err.refusal : undefined;
 				const count = selector ? await this.#selectorMatchCount(selector) : undefined;
 				const hint = refusal
@@ -2472,7 +2479,7 @@ export class WorkerCore {
 							page.goto(url, options),
 						);
 					} catch (err) {
-						if (err instanceof Error && err.name === "TimeoutError") {
+						if (isPuppeteerTimeout(err)) {
 							// Abandon the hung navigation NOW — a still-pending load stalls every
 							// later op on this page and cascades into more opaque timeouts.
 							await this.#stopLoading();
@@ -2519,43 +2526,9 @@ export class WorkerCore {
 					this.#captureScreenshot(session, output, screenshots, sig, opts),
 				),
 			diffScreenshot: (baselinePath, opts = {}) =>
-				op("tab.diffScreenshot()", quickOpMs, async sig => {
-					const baseline = await untilAborted(sig, () =>
-						fs.promises.readFile(resolveToCwd(baselinePath, session.cwd)),
-					);
-					await preparePageForScreenshot(page, sig, this.#activateForScreenshot);
-					const current = await captureScreenshotBuffer(page, {}, sig, async () => null);
-					const diff = createPngDiff(baseline, current);
-					const changed = diff.pixelChangeRatio > screenshotThreshold(opts.threshold);
-					const diffPath = opts.output
-						? resolveToCwd(opts.output, session.cwd)
-						: path.join(os.tmpdir(), `omp-screenshot-diff-${Snowflake.next()}.png`);
-					await fs.promises.mkdir(path.dirname(diffPath), { recursive: true });
-					await Bun.write(diffPath, diff.png);
-					const resized = await resizeImage(
-						{ type: "image", data: diff.png.toString("base64"), mimeType: "image/png" },
-						{
-							maxWidth: 1024,
-							maxHeight: 1024,
-							maxBytes: 150 * 1024,
-							jpegQuality: 70,
-							excludeWebP: session.excludeWebP,
-						},
-					);
-					screenshots.push({
-						dest: diffPath,
-						mimeType: "image/png",
-						bytes: diff.png.length,
-						width: resized.width,
-						height: resized.height,
-					});
-					output.push({
-						type: "text",
-						text: `Screenshot diff: ${diff.pixelChangeRatio.toFixed(6)} changed-pixel ratio (${changed ? "changed" : "unchanged"}); saved to ${diffPath}`,
-					});
-					output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
-					return { pixelChangeRatio: diff.pixelChangeRatio, changed, diffPath };
-				}),
+				op("tab.diffScreenshot()", quickOpMs, sig =>
+					this.#diffScreenshot(session, output, screenshots, sig, baselinePath, opts),
+				),
 			pdf: (opts = {}) =>
 				op("tab.pdf()", quickOpMs, async sig => {
 					const pdfPath = opts.path
@@ -3024,9 +2997,7 @@ export class WorkerCore {
 		opts: ScreenshotOptions = {},
 	): Promise<string | ScreenshotChangeResult> {
 		const page = this.#requirePage();
-		// A shared Chromium captures the active target's compositor surface. An attached
-		// user tab must remain visible rather than stealing focus from the user.
-		await preparePageForScreenshot(page, signal, this.#activateForScreenshot);
+		// Keep screenshot capture focus-neutral; whileDrawing handles hidden pages without bringing them forward.
 		const configuredScale = page.viewport()?.deviceScaleFactor;
 		const captureScale =
 			configuredScale !== undefined && configuredScale !== 0
@@ -3064,72 +3035,136 @@ export class WorkerCore {
 			}
 			removeAnnotations = await installScreenshotAnnotations(page, targets, signal);
 		}
+		const resolveSelector = async (selector: string): Promise<ElementHandle | null> =>
+			parseAriaRefSelector(selector) !== null
+				? await this.#resolveAriaRef(selector)
+				: asElementHandle(await untilAborted(signal, () => page.$(normalizeSelector(selector))));
+		let captured: { comparison: Uint8Array; image: Uint8Array };
 		try {
-			const resolveSelector = async (selector: string): Promise<ElementHandle | null> =>
-				parseAriaRefSelector(selector) !== null
-					? this.#resolveAriaRef(selector)
-					: asElementHandle(await untilAborted(signal, () => page.$(normalizeSelector(selector))));
-			const captured = await captureScreenshotBuffer(page, opts, signal, resolveSelector, format);
-			let revision = 0;
-			let ratio = 1;
-			if (changeOnly) {
-				const png =
-					format === "png" ? captured : await captureScreenshotBuffer(page, opts, signal, resolveSelector, "png");
-				const previous = this.#screenshotHistory.get(scope);
-				ratio = previous ? pngPixelChangeRatio(previous.png, png) : 1;
-				revision = previous?.revision ?? 0;
-				if (previous && ratio <= threshold) {
-					return { changed: false, revision, pixelChangeRatio: ratio };
-				}
-				this.#screenshotHistory.set(scope, { png, revision: ++revision });
-			}
-			const captureMime = format === "jpeg" ? "image/jpeg" : "image/png";
-			const resized = await resizeImage(
-				{ type: "image", data: captured.toBase64(), mimeType: captureMime },
-				{
-					maxWidth: 1024,
-					maxHeight: 1024,
-					maxBytes: 150 * 1024,
-					jpegQuality: 70,
-					excludeWebP: session.excludeWebP,
-				},
-			);
-			const saveFullRes = !!session.browserScreenshotDir || format === "jpeg";
-			const savedBuffer = saveFullRes ? captured : resized.buffer;
-			const savedMimeType = saveFullRes ? captureMime : resized.mimeType;
-			const ext = savedMimeType === "image/webp" ? "webp" : savedMimeType === "image/jpeg" ? "jpg" : "png";
-			const dest = session.browserScreenshotDir
-				? path.join(
-						session.browserScreenshotDir,
-						`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.${ext}`,
-					)
-				: path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.${ext}`);
-			await fs.promises.mkdir(path.dirname(dest), { recursive: true });
-			await Bun.write(dest, savedBuffer);
-			screenshots.push({
-				dest,
-				mimeType: savedMimeType,
-				bytes: savedBuffer.length,
-				width: resized.width,
-				height: resized.height,
+			captured = await whileDrawing(page, signal, async () => {
+				const comparison = await captureScreenshotBuffer(page, opts, signal, resolveSelector, "png");
+				const image =
+					format === "png"
+						? comparison
+						: await captureScreenshotBuffer(page, opts, signal, resolveSelector, format);
+				return { comparison, image };
 			});
-			if (!opts.silent) {
-				const lines = formatScreenshot({
-					saveFullRes,
-					savedMimeType,
-					savedByteLength: savedBuffer.length,
-					dest,
-					resized,
-					capture: { area: screenshotArea(opts), scale: captureScale },
-				});
-				output.push({ type: "text", text: lines.join("\n") });
-				output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
-			}
-			if (opts.annotate) output.push({ type: "text", text: formatScreenshotLegend(targets) });
-			return changeOnly ? { path: dest, changed: true, revision, pixelChangeRatio: ratio } : dest;
 		} finally {
 			await removeAnnotations?.();
 		}
+		const { comparison, image } = captured;
+		let revision = 0;
+		let ratio = 1;
+		if (changeOnly) {
+			const previous = this.#screenshotHistory.get(scope);
+			ratio = previous ? pngPixelChangeRatio(previous.png, comparison) : 1;
+			revision = previous?.revision ?? 0;
+			if (previous && ratio <= threshold) return { changed: false, revision, pixelChangeRatio: ratio };
+			this.#screenshotHistory.set(scope, { png: comparison, revision: ++revision });
+		}
+		const captureMime = format === "jpeg" ? "image/jpeg" : "image/png";
+		const resized = await resizeImage(
+			{ type: "image", data: image.toBase64(), mimeType: captureMime },
+			{
+				maxWidth: 1024,
+				maxHeight: 1024,
+				maxBytes: 150 * 1024,
+				jpegQuality: 70,
+				excludeWebP: session.excludeWebP,
+			},
+		);
+		const saveFullRes = !!session.browserScreenshotDir || opts.format !== undefined;
+		const savedBuffer = saveFullRes ? image : resized.buffer;
+		const savedMimeType = saveFullRes ? captureMime : resized.mimeType;
+		const ext = savedMimeType === "image/webp" ? "webp" : savedMimeType === "image/jpeg" ? "jpg" : "png";
+		const dest = session.browserScreenshotDir
+			? path.join(
+					session.browserScreenshotDir,
+					`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.${ext}`,
+				)
+			: path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.${ext}`);
+		await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+		await Bun.write(dest, savedBuffer);
+		screenshots.push({
+			dest,
+			mimeType: savedMimeType,
+			bytes: savedBuffer.length,
+			width: resized.width,
+			height: resized.height,
+		});
+		if (!opts.silent) {
+			const lines = formatScreenshot({
+				saveFullRes,
+				savedMimeType,
+				savedByteLength: savedBuffer.length,
+				dest,
+				resized,
+				capture: { area: screenshotArea(opts), scale: captureScale },
+			});
+			output.push({ type: "text", text: lines.join("\n") });
+			output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
+		}
+		if (opts.annotate) output.push({ type: "text", text: formatScreenshotLegend(targets) });
+		return changeOnly ? { path: dest, changed: true, revision, pixelChangeRatio: ratio } : dest;
+	}
+	async #diffScreenshot(
+		session: SessionSnapshot,
+		output: RunOutput,
+		screenshots: ScreenshotResult[],
+		signal: AbortSignal | undefined,
+		baselinePath: string,
+		opts: DiffScreenshotOptions = {},
+	): Promise<DiffScreenshotResult> {
+		const page = this.#requirePage();
+		const absoluteBaseline = resolveToCwd(baselinePath, session.cwd);
+		const baseline = await untilAborted(signal, () => fs.promises.readFile(absoluteBaseline));
+		const current = await whileDrawing(page, signal, () =>
+			captureScreenshotBuffer(page, {}, signal, async () => null, "png"),
+		);
+		const diff = createPngDiff(baseline, current);
+		const threshold = screenshotThreshold(opts.threshold);
+		const changed = diff.pixelChangeRatio > threshold;
+		const diffPath = opts.output
+			? resolveToCwd(opts.output, session.cwd)
+			: path.join(os.tmpdir(), `omp-screenshot-diff-${Snowflake.next()}.png`);
+		await fs.promises.mkdir(path.dirname(diffPath), { recursive: true });
+		await Bun.write(diffPath, diff.png);
+		const resized = await resizeImage(
+			{ type: "image", data: diff.png.toBase64(), mimeType: "image/png" },
+			{ maxWidth: 1024, maxHeight: 1024, maxBytes: 150 * 1024, jpegQuality: 70, excludeWebP: session.excludeWebP },
+		);
+		screenshots.push({
+			dest: diffPath,
+			mimeType: "image/png",
+			bytes: diff.png.length,
+			width: resized.width,
+			height: resized.height,
+		});
+		output.push({
+			type: "text",
+			text: `Screenshot diff: ${diff.pixelChangeRatio.toFixed(6)} changed-pixel ratio (${changed ? "changed" : "unchanged"}); saved to ${diffPath}`,
+		});
+		output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
+		return { pixelChangeRatio: diff.pixelChangeRatio, changed, diffPath };
+	}
+
+	async #pdf(session: SessionSnapshot, signal: AbortSignal | undefined, opts: PdfOptions = {}): Promise<string> {
+		const dest = opts.path
+			? resolveToCwd(opts.path, session.cwd)
+			: path.join(os.tmpdir(), `omp-browser-${Snowflake.next()}.pdf`);
+		await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+		await untilAborted(signal, () =>
+			this.#requirePage().pdf({
+				path: dest,
+				format: opts.format,
+				landscape: opts.landscape,
+				scale: opts.scale,
+				printBackground: opts.printBackground,
+				margin: opts.margin,
+				pageRanges: opts.pageRanges,
+			}),
+		);
+		return dest;
 	}
 
 	async #drag(from: DragTarget, to: DragTarget, signal: AbortSignal): Promise<void> {
@@ -3379,8 +3414,20 @@ export class WorkerCore {
 		this.#clearElementCache();
 		const page = this.#page;
 		this.#active?.ac.abort(new ToolAbortError("Browser tab closed"));
-		await this.#disposePageResources();
-		if (this.#mode === "headless" && page && !page.isClosed()) await page.close().catch(() => undefined);
+		await this.#recording.close().catch(error => {
+			this.#log("warn", "Failed to finalize active browser recording during tab close", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		await this.#webmcp?.dispose().catch(() => undefined);
+		this.#webmcp = undefined;
+		this.#dialogs?.dispose();
+		await this.#network?.close();
+		await this.#downloads?.close();
+		await this.#tracing?.dispose();
+		await this.#console.detach();
+		this.#emulation?.dispose();
+		if (this.#ownsPage && page && !page.isClosed()) await page.close().catch(() => undefined);
 		if (this.#browser?.connected) this.#browser.disconnect();
 		this.#transport.send({ type: "closed" });
 		this.#transport.close();

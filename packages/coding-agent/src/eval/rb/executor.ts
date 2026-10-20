@@ -13,6 +13,7 @@ import {
 	waitForPromiseWithCancellation,
 } from "../executor-base";
 import type { JsStatusEvent } from "../js/shared/types";
+import type { EvalDisplayOutput } from "../types";
 import {
 	createKernelSessionRegistry,
 	formatSessionKernelTimeoutAnnotation,
@@ -22,13 +23,7 @@ import {
 	requireRemainingKernelTimeoutMs,
 } from "../kernel-session-registry";
 import { ensurePyToolBridge } from "../py/tool-bridge";
-import {
-	checkRubyKernelAvailability,
-	type KernelDisplayOutput,
-	type KernelExecuteOptions,
-	type KernelExecuteResult,
-	RubyKernel,
-} from "./kernel";
+import { checkRubyKernelAvailability, type KernelExecuteOptions, type KernelExecuteResult, RubyKernel } from "./kernel";
 import { resolveExplicitRubyRuntime } from "./runtime";
 
 export interface RubyExecutorOptions {
@@ -97,7 +92,7 @@ export interface RubyResult {
 	totalBytes: number;
 	outputLines: number;
 	outputBytes: number;
-	displayOutputs: KernelDisplayOutput[];
+	displayOutputs: EvalDisplayOutput[];
 	stdinRequested: boolean;
 }
 

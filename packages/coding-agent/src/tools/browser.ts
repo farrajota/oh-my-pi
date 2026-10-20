@@ -654,9 +654,10 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 				`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(result.tab)}`,
 				`URL: ${url}`,
 				title ? `Title: ${title}` : null,
-				...(result.tab.backend === "tern" ? ternNotes(result.tab) : []),
+				...(result.note ? [result.note] : []),
 				...notes,
 			].filter((l): l is string => typeof l === "string");
+			if (tab.backend === "tern") lines.push(...ternNotes(tab));
 			details.result = lines.join("\n");
 			return toolResult(details).text(lines.join("\n")).done();
 		} catch (error) {

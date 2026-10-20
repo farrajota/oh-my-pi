@@ -498,13 +498,56 @@ function build_mime_bundle(value)
     return bundle
 end
 
+function emit_display(rid, bundle)
+    status = get(bundle, "application/x-omp-status", nothing)
+    if status isa AbstractDict
+        emit_frame(Dict("type" => "status", "id" => rid, "event" => status))
+        return nothing
+    end
+
+    for mime_type in ("image/png", "image/jpeg")
+        data = get(bundle, mime_type, nothing)
+        data isa AbstractString || continue
+        emit_frame(Dict(
+            "type" => "image",
+            "id" => rid,
+            "image" => Dict("mimeType" => mime_type, "data" => String(data)),
+        ))
+    end
+
+    if haskey(bundle, "application/json")
+        emit_frame(Dict("type" => "json", "id" => rid, "value" => bundle["application/json"]))
+        return nothing
+    end
+
+    markdown = get(bundle, "text/markdown", nothing)
+    if markdown isa AbstractString
+        text = String(markdown)
+        emit_frame(Dict("type" => "stdout", "id" => rid, "data" => text))
+        emit_frame(Dict(
+            "type" => "view",
+            "id" => rid,
+            "text" => text,
+            "view" => Dict("kind" => "markdown", "text" => text),
+        ))
+        return nothing
+    end
+
+    text = get(bundle, "text/plain", nothing)
+    if text isa AbstractString && !isempty(text)
+        emit_frame(Dict("type" => "stdout", "id" => rid, "data" => String(text)))
+    end
+    return nothing
+end
+
+
 struct OmpDisplay <: AbstractDisplay end
 
 function Base.display(d::OmpDisplay, value)
     rid = current_rid
     if rid !== nothing
         bundle = build_mime_bundle(value)
-        emit_frame(Dict("type" => "display", "id" => rid, "bundle" => bundle))
+        emit_display(rid, bundle)
     end
     return nothing
 end
@@ -641,7 +684,7 @@ function main()
                     ans = Core.eval(Main, parsed)
                     if ans !== nothing && !silent && should_display_result(parsed)
                         bundle = build_mime_bundle(ans)
-                        emit_frame(Dict("type" => "result", "id" => rid, "bundle" => bundle))
+                        emit_display(rid, bundle)
                     end
                 end
             catch err

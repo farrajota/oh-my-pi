@@ -365,7 +365,13 @@ export async function executeSend(
 			try {
 				const batch = bus.admitDeliveryBatch(
 					transaction,
-					targets.map(target => ({ from: senderId, to: target, body: message, replyTo })),
+					targets.map(target => ({
+						from: senderId,
+						to: target,
+						body: message,
+						replyTo,
+						...(isBroadcast ? { broadcast: true } : {}),
+					})),
 				);
 				receipts = await bus.deliverBatch(transaction, batch, {
 					expectsReply: params.await || undefined,
@@ -380,7 +386,7 @@ export async function executeSend(
 			receipts = await Promise.all(
 				targets.map(target =>
 					bus.send(
-						{ from: senderId, to: target, body: message, replyTo },
+						{ from: senderId, to: target, body: message, replyTo, ...(isBroadcast ? { broadcast: true } : {}) },
 						{ expectsReply: params.await || undefined, suppressRelay: suppressRelay || undefined },
 					),
 				),

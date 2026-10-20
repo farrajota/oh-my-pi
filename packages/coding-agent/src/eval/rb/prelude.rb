@@ -59,7 +59,7 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
   # -------------------------------------------------------------------------
 
   def display(value)
-    __omp_present(value, "display")
+    __omp_present(value)
     nil
   end
 

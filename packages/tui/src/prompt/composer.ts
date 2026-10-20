@@ -37,6 +37,8 @@ export interface ComposerPreferences {
 	readonly showHardwareCursor: boolean;
 	readonly maxInlineImages: number;
 	readonly resizeScrollback: ResizeScrollbackMode;
+	/** Send rows a growing HUD or dialog pushes off screen straight to scrollback instead of holding them back until it shrinks. */
+	readonly completeScrollback: boolean;
 	readonly imeSafeCursor: boolean;
 	readonly autocompleteMaxVisible: number;
 	readonly spellingTypoDetection: boolean;
@@ -51,6 +53,7 @@ export const COMPOSER_DEFAULTS: ComposerPreferences = {
 	showHardwareCursor: true,
 	maxInlineImages: 8,
 	resizeScrollback: "rebuild",
+	completeScrollback: false,
 	imeSafeCursor: false,
 	autocompleteMaxVisible: 10,
 	spellingTypoDetection: true,
@@ -272,6 +275,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	// displaced rows, so those rows refill the screen when it shrinks (#11007).
 	// Displaced rows reach history when newer output pushes them past the floor
 	// or persistent idle chrome settles and raises it.
+	// With `completeScrollback`, rows the chrome pushes off screen go straight
+	// to scrollback, and when it shrinks the freed rows stay blank.
 	// The floor is terminal-height independent — chrome heights do not scale
 	// with rows — so it is retained across resizes rather than rediscovered
 	// from whatever chrome is expanded when the height changes.
@@ -434,7 +439,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const promotedChromeContracted = this.#chromeFloorPromoted && eligibleChrome < (this.#chromeFloor ?? 0);
 		this.#chromeFloor = Math.min(this.#chromeFloor ?? eligibleChrome, eligibleChrome);
 		this.#rebaselineChromeFloor(this.#runActive || transcript.hasActiveBlock(), eligibleChrome);
-		const belowFloor = this.#chromeFloor;
+		const belowFloor = this.#preferences.completeScrollback ? after.length : this.#chromeFloor;
 		// Preserve compactable transcript rows after a run overlaps expanded transient chrome
 		// with a promoted floor that has already contracted to the editor's resting height.
 		if (!this.#chromeFloorPromoted || belowFloor !== transientFloor) {
@@ -466,7 +471,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// billed against, so its compaction allocator (one row per block, no
 		// inter-block blanks) engages only when a block genuinely cannot retire.
 		// Rows the chrome above its floor displaces are clipped from the top by
-		// the `drop` slice below; they stay live until the chrome shrinks.
+		// the `drop` slice below; they stay live until the chrome shrinks. With
+		// `completeScrollback` none are held back.
 		const active = transcript.renderViewport(width, Math.max(0, rows - before.length - belowFloor), frame);
 		const activeSpans: ViewportClickSpan[] = [];
 		for (const span of transcript.getLastViewportSpans()) {
@@ -494,7 +500,9 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// inserting a seam band; subsequent frames retain that natural anchor
 		// until new output fills the screen again. Shell history stays untouched.
 		const slack =
-			filledHistoryRows === undefined || promotedChromeContracted || transientChromeContracted
+			filledHistoryRows === undefined ||
+			promotedChromeContracted ||
+			(!this.#preferences.completeScrollback && transientChromeContracted)
 				? 0
 				: Math.max(0, rows - Math.min(rows, filledHistoryRows + (history?.rows.length ?? 0)) - mutable.length);
 		// Park the slack below the live rows rather than above them. Above, it

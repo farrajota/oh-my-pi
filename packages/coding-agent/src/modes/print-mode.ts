@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { presentNarrationAsAnswer } from "@oh-my-pi/pi-ai/utils/narration";
 import { $flag, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { MCPManager } from "../mcp/manager";
 import { resolveMCPTimeoutMs } from "../mcp/timeout";
@@ -275,10 +276,14 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			) {
 				process.stderr.write(`${sanitizeText(assistantMsg.errorMessage)}\n`);
 			}
-			for (const content of assistantMsg.content) {
-				if (content.type === "text") writeStdoutLine(`${sanitizeText(content.text)}\n`);
-				else if (printThoughts && content.type === "thinking" && content.thinking.trim().length > 0)
+
+			// Output text content; narration the provider returned as thinking is part of the reply.
+			for (const content of presentNarrationAsAnswer(assistantMsg).content) {
+				if (content.type === "text") {
+					writeStdoutLine(`${sanitizeText(content.text)}\n`);
+				} else if (printThoughts && content.type === "thinking" && content.thinking.trim().length > 0) {
 					writeStdoutLine(`${sanitizeText(content.thinking)}\n`);
+				}
 			}
 		}
 		session.setTextOutputCommitted(true);

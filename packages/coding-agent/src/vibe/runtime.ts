@@ -32,7 +32,7 @@ import { resolveAgentModelSelection } from "../config/model-resolver";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
-import { getAgentLifecycleManager, lifecycleHasAgent, releaseAgent } from "../internal/agent-lifecycle-bridge";
+import { getAgentLifecycleManager, releaseAgent } from "../internal/agent-lifecycle-bridge";
 import {
 	lookupAgentRef,
 	registerInternalAgent,
@@ -620,13 +620,17 @@ export class VibeSessionRegistry {
 		ref: InternalAgentRef,
 		action: "detach" | "release",
 		registry: AgentRegistry,
+		tombstone = false,
 	): TrackedVibeTeardown {
-		return trackVibeTeardown(releaseAgent(getAgentLifecycleManager(registry), id, ref), error => {
-			logger.warn(`vibe: failed to ${action} worker session`, {
-				id,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		});
+		return trackVibeTeardown(
+			releaseAgent(getAgentLifecycleManager(registry), id, ref, tombstone ? { tombstone: true } : undefined),
+			error => {
+				logger.warn(`vibe: failed to ${action} worker session`, {
+					id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			},
+		);
 	}
 
 	#finishAgentRelease(
@@ -648,10 +652,12 @@ export class VibeSessionRegistry {
 		deadline: number,
 		action: "detach" | "release",
 		registry: AgentRegistry,
+		tombstone = false,
 	): Promise<void> {
-		const task = this.#trackAgentRelease(id, ref, action, registry);
+		const task = this.#trackAgentRelease(id, ref, action, registry, tombstone);
 		await waitForVibeTeardown([task], deadline);
-		this.#finishAgentRelease(id, ref, task, action, registry);
+		// A terminal ref must retain its hard-kill identity even if persistence outlives this deadline.
+		if (!tombstone) this.#finishAgentRelease(id, ref, task, action, registry);
 	}
 
 	#trackJobSettlement(record: VibeRecord, job: AsyncJob): TrackedVibeTeardown {
@@ -679,26 +685,22 @@ export class VibeSessionRegistry {
 		) {
 			return;
 		}
-		if (existing?.status === "aborted" && !existing.session) return;
-		if (existing && teardownDeadline !== undefined) {
-			await this.#releaseRefWithinDeadline(id, existing, teardownDeadline, "release", registry);
-		} else if (existing && lifecycleHasAgent(getAgentLifecycleManager(registry), id, existing)) {
-			await releaseAgent(getAgentLifecycleManager(registry), id, existing);
-		} else if (existing?.session) {
-			await existing.session.dispose();
+		const terminal =
+			existing ??
+			registerInternalAgent(registry, {
+				id,
+				displayName: id,
+				kind: "sub",
+				parentId: ownerId,
+				session: null,
+				sessionFile: childSessionFile,
+				status: "aborted",
+			});
+		if (teardownDeadline !== undefined) {
+			await this.#releaseRefWithinDeadline(id, terminal, teardownDeadline, "release", registry, true);
+		} else {
+			await releaseAgent(getAgentLifecycleManager(registry), id, terminal, { tombstone: true });
 		}
-		const current = lookupAgentRef(registry, id);
-		if (current && current !== existing) return;
-		if (current) unregisterAgentRef(registry, id, current);
-		registerInternalAgent(registry, {
-			id,
-			displayName: id,
-			kind: "sub",
-			parentId: ownerId,
-			session: null,
-			sessionFile: childSessionFile,
-			status: "aborted",
-		});
 	}
 
 	/** Reconcile resumable and terminal workers from the persisted parent journal. */

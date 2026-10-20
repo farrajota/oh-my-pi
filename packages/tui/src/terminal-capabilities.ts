@@ -10,17 +10,37 @@ import {
 	renderKittyPlaceholderLines,
 	setKittyGraphics,
 } from "./kitty-graphics";
+import { ensureSixelRasterWidth } from "./sixel";
 import {
 	isInsideTerminalMultiplexer,
+	isTerminalBackgroundQueryTrusted,
 	routeTerminalMultiplexerNotification,
 	terminalMultiplexerForTerm,
 	terminalMultiplexerSessions,
 } from "./terminal-multiplexer";
-import { resolveTmuxClientTerminalNames, wrapTmuxPassthroughIfNeeded } from "./tmux";
+import { resolveTmuxClientTerminalNames, tmuxPaneAllowsPassthrough, wrapTmuxPassthroughIfNeeded } from "./tmux";
+import { detectTerminalBackground } from "./theme/theme";
 import type { HangulCompatibilityJamoWidth } from "./utils";
 
 export * from "./terminal-multiplexer";
 export { wrapTmuxPassthrough } from "./tmux";
+
+/** Last valid OSC 11 background, packed as 0xRRGGBB. */
+let terminalBackgroundColor: number | undefined;
+
+/**
+ * Trusted terminal background when reported; otherwise black for detected dark
+ * appearance or white for detected light appearance, using theme auto-detection.
+ */
+export function getTerminalBackgroundColor(): number {
+	if (isTerminalBackgroundQueryTrusted() && terminalBackgroundColor !== undefined) return terminalBackgroundColor;
+	return detectTerminalBackground() === "light" ? 0xffffff : 0x000000;
+}
+
+/** Store an OSC 11 background, or reset to appearance detection (also for tests). */
+export function setTerminalBackgroundColor(color: number | undefined): void {
+	terminalBackgroundColor = color;
+}
 
 export enum ImageProtocol {
 	Kitty = "\x1b_G",
@@ -539,6 +559,12 @@ export function resolveImageProtocol(
 		imageProtocol !== null &&
 		terminalMultiplexerSessions(env).some(multiplexer => multiplexer.imagesRequireOverride)
 	) {
+		return null;
+	}
+	// Kitty graphics reach a tmux client only through the DCS passthrough
+	// envelope, which tmux drops unless `allow-passthrough` is enabled. A Kitty
+	// client identity alone would otherwise send images into the void.
+	if (imageProtocol === ImageProtocol.Kitty && env.TMUX && !tmuxPaneAllowsPassthrough(env)) {
 		return null;
 	}
 	return imageProtocol;
@@ -1249,9 +1275,16 @@ export function getImageDimensions(base64Data: string, mimeType: string): ImageD
  * thread; `null` when the encode fails. For output that cannot wait for an
  * off-thread encode.
  */
-export function encodeSixelNow(base64Data: string, widthPx: number, heightPx: number): string | null {
+export function encodeSixelNow(
+	base64Data: string,
+	widthPx: number,
+	heightPx: number,
+	backgroundRgb = getTerminalBackgroundColor(),
+): string | null {
 	try {
-		return encodeSixel(new Uint8Array(Buffer.from(base64Data, "base64")), widthPx, heightPx);
+		return ensureSixelRasterWidth(
+			encodeSixel(new Uint8Array(Buffer.from(base64Data, "base64")), widthPx, heightPx, backgroundRgb),
+		);
 	} catch {
 		return null;
 	}

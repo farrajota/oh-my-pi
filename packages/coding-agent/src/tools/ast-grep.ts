@@ -29,7 +29,15 @@ import {
 } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import { formatMatchLine } from "@oh-my-pi/pi-tui/tools/match-line-format";
 import type { OutputMeta } from "./output-meta";
-import { relativeSearchResultPath, resolveSearchResultPath, resolveToolSearchScope, toPathList } from "./path-utils";
+import {
+	parseSearchPath,
+	relativeSearchResultPath,
+	resolveSearchResultPath,
+	resolveToolSearchScope,
+	searchPathTier,
+	toPathList,
+} from "./path-utils";
+import { searchApprovalCacheTargets } from "./search-approval-targets";
 import { isRawSelector } from "./read-selector";
 import {
 	appendParseErrorsBulletList,
@@ -175,7 +183,14 @@ export interface AstGrepToolDetails {
 
 export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolDetails> {
 	readonly name = "ast_grep";
-	readonly approval = "read" as const;
+	readonly approval = searchPathTier;
+	/** `always-ask-cached` keys: the tree (or file) of every root it searches, as `grep` reports them. */
+	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined =>
+		searchApprovalCacheTargets(
+			toPathList((args as { path?: string } | null | undefined)?.path),
+			this.session.cwd,
+			entry => parseSearchPath(entry).basePath,
+		);
 	readonly label = "AST Grep";
 	readonly summary = "Search code with AST patterns (structural grep)";
 	get description(): string {

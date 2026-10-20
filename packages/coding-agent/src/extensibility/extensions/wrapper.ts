@@ -13,13 +13,17 @@ import type { PermissionDenialDetails } from "@oh-my-pi/pi-wire";
 import { prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import {
+	denyError,
+	recordApprovalGrant,
 	requestApproval,
 	truncateForPrompt,
-	denyError,
 	resolveApproval,
 	resolveApprovalFromContext,
 	sessionApprovalScope,
 } from "../../tools/approval";
+import { getApprovalGrants } from "../../tools/approval-cache";
+import { withFileMutationSession } from "../../tools/file-write-fallback";
+import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import {
@@ -33,8 +37,6 @@ import {
 } from "../../registry/operation-lease";
 import { rewriteAuthorizedInput, type SessionPathScope } from "../../internal/session-path-scope";
 import { evaluateRestrictedToolGuardrails } from "../../internal/restricted-startup-policy";
-import { defaultLoadModeForToolName } from "../../tools/essential-tools";
-import { withFileMutationSession } from "../../tools/file-write-fallback";
 import {
 	evaluateSubagentPermission,
 	type EffectiveSubagentPermissions,
@@ -44,7 +46,13 @@ import {
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { withLspSessionPolicy } from "../../lsp/client";
 import type { ExtensionRunner } from "./runner";
-import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult, ToolResultEventResult } from "./types";
+import type {
+	ExtensionAgentIdentity,
+	ExtensionApprovalAnswer,
+	RegisteredTool,
+	ToolCallEventResult,
+	ToolResultEventResult,
+} from "./types";
 type ClassFixedOperationRunner = typeof runMcpOperation;
 
 let descriptorSequence = 0;
@@ -121,7 +129,8 @@ export class EffectiveToolRegistry implements ToolExecutionAuthority {
 	}
 }
 function operationRunnerForTool(tool: AgentTool, params: unknown): ClassFixedOperationRunner | undefined {
-	if (tool.name === "hub") return undefined;
+	// Wait hands Hub-authorized completions across an interrupt; a generic extension lease would reject that handoff after return.
+	if (tool.name === "hub" || tool.name === "wait") return undefined;
 	const candidate = tool as AgentTool & { mcpServerName?: string };
 	if (candidate.mcpServerName !== undefined) return runMcpOperation;
 	if (tool.name === "eval") return runEvalOperation;
@@ -454,6 +463,24 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		};
 		assertAuthorized(params);
+		const { approvalMode: initialApprovalMode, userPolicies: initialUserPolicies } = resolveApprovalFromContext(
+			context ?? (this.runner.sessionSettings ? { settings: this.runner.sessionSettings } : undefined),
+		);
+		const approvalGrants =
+			initialApprovalMode === "always-ask-cached"
+				? getApprovalGrants(
+						(context?.settings ?? this.runner.sessionSettings)?.getAgentDir(),
+						this.runner.sessionId,
+					)
+				: undefined;
+		const preResolved = resolveApproval(
+			this.tool,
+			approvalArgs(params, context),
+			initialApprovalMode,
+			initialUserPolicies,
+			approvalGrants,
+		);
+		if (preResolved.policy === "deny") throw denyError(preResolved, this.tool.name);
 
 		// 1. Emit tool_call event first - extensions can block execution or revise the input the tool
 		// runs with. Doing this BEFORE the approval gate means approval (below) resolves against the
@@ -538,10 +565,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					throw new Error(preflight.reason || "Tool execution was blocked by a preflight rule");
 				}
 			}
-			const { approvalMode, userPolicies } =
-				context === undefined
-					? { approvalMode: "yolo" as const, userPolicies: {} }
-					: resolveApprovalFromContext(context);
+			const approvalMode = initialApprovalMode;
+			const userPolicies = initialUserPolicies;
 			const scope = runner.getPermissionScope?.call(this.runner);
 			const enforcePreparation = scope?.mode === "enforce";
 			const authority = runner.getToolExecutionAuthority?.call(this.runner);
@@ -587,7 +612,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// input that newly resolves to `deny` is caught here even though the original passed the
 			// short-circuit above.
 			const resolvedArgs = approvalArgs(effectiveParams, context);
-			const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies);
+			const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies, approvalGrants);
 			context?.xdevTierResolved?.(resolved.tier);
 			if (resolved.policy === "deny") {
 				throw denyError(resolved, this.tool.name);
@@ -601,9 +626,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// Explicit per-tool "prompt" policies and tool-demanded overrides still prompt.
 			// Provider safety checks are stronger: yolo, per-tool allow, and xdev approval never acknowledge
 			// them on the user's behalf.
+			const grantable =
+				approvalGrants !== undefined &&
+				resolved.policy === "prompt" &&
+				resolved.source === "mode" &&
+				pendingSafetyChecks.length === 0;
+			const cacheTargets = grantable ? (this.tool.approvalCacheTargets?.(resolvedArgs)?.length ?? 0) > 0 : false;
 			const configuredPrompt = Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
 			const sessionScope =
-				pendingSafetyChecks.length === 0 ? sessionApprovalScope(resolved, this.tool.name) : undefined;
+				pendingSafetyChecks.length === 0 && !cacheTargets
+					? sessionApprovalScope(resolved, this.tool.name)
+					: undefined;
 			const sessionApproved = sessionScope !== undefined && this.runner.hasSessionApproval(sessionScope.key);
 			const xdevBypass = context?.xdevApproved === true && !extensionRevisedParams;
 			const approvalCheck = {
@@ -671,7 +704,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				}
 
 				const uiContext = this.runner.getUIContext();
-				let answer: "once" | "session" | "deny";
+				let answer: ExtensionApprovalAnswer;
 				try {
 					answer = await requestApproval(uiContext, this.tool, resolvedArgs, {
 						reason: approvalCheck.reason,
@@ -679,6 +712,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 							? { appendix: [`Provider safety checks:`, ...safetyCheckLines(pendingSafetyChecks)] }
 							: {}),
 						...(sessionScope === undefined ? {} : { sessionSubject: sessionScope.subject }),
+						grants: cacheTargets,
 					});
 				} catch (err) {
 					await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
@@ -691,6 +725,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				}
 				if (answer === "session" && sessionScope !== undefined) {
 					this.runner.grantSessionApproval(sessionScope.key);
+				}
+				if (typeof answer === "object" && approvalGrants !== undefined) {
+					recordApprovalGrant(this.tool, resolvedArgs, approvalGrants, resolved.tier, answer);
 				}
 				if (pendingSafetyChecks.length > 0) {
 					if (!context) throw new Error("Provider safety approval context is unavailable");

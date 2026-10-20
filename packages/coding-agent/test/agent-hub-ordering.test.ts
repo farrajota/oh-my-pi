@@ -10,6 +10,7 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { type AgentHubDeps, AgentHubOverlayComponent } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import { lookupAgentRef, setAgentActivity } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
@@ -252,7 +253,7 @@ describe("Agent hub row ordering", () => {
 
 			// A heartbeat and B's status change must not move existing rows.
 			setSystemTime(4000);
-			agents.setActivity("A", "still running");
+			setAgentActivity(agents, "A", "still running", sessionA);
 			agents.setStatus("B", "idle");
 
 			setSystemTime(5000);
@@ -269,7 +270,7 @@ describe("Agent hub row ordering", () => {
 
 			// Further tool activity cannot displace either newcomer.
 			setSystemTime(7000);
-			agents.setActivity("A", "active again");
+			setAgentActivity(agents, "A", "active again", sessionA);
 			vi.advanceTimersByTime(100);
 			expect(renderedAgentIds(hub)).toEqual(["E", "D", "C", "B", "A"]);
 			expect(selectedAgentId(hub)).toBe("B");
@@ -1256,13 +1257,13 @@ describe("Agent hub row ordering", () => {
 		geometry.setRows(32);
 		const agents = new AgentRegistry();
 		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", parentId: "Main", session: null });
-		agents.setActivity("Parent", "Parent task");
+		setAgentActivity(agents, "Parent", "Parent task", lookupAgentRef(agents, "Parent")!);
 		agents.register({ id: "First", displayName: "First", kind: "sub", parentId: "Parent", session: null });
-		agents.setActivity("First", "First task");
+		setAgentActivity(agents, "First", "First task", lookupAgentRef(agents, "First")!);
 		agents.register({ id: "Grandchild", displayName: "Grandchild", kind: "sub", parentId: "First", session: null });
-		agents.setActivity("Grandchild", "Grandchild task");
+		setAgentActivity(agents, "Grandchild", "Grandchild task", lookupAgentRef(agents, "Grandchild")!);
 		agents.register({ id: "Last", displayName: "Last", kind: "sub", parentId: "Parent", session: null });
-		agents.setActivity("Last", "Last task");
+		setAgentActivity(agents, "Last", "Last task", lookupAgentRef(agents, "Last")!);
 		const hub = makeHub(agents);
 
 		try {

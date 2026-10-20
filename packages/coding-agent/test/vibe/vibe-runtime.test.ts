@@ -26,6 +26,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as lifecycleBridge from "../../src/internal/agent-lifecycle-bridge";
 import { lookupAgentRef, type InternalAgentRef } from "../../src/internal/agent-registry-bridge";
 import { AgentRegistry, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { getAgentTombstonePath } from "@oh-my-pi/pi-coding-agent/registry/agent-tombstone";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import {
 	SessionManager,
@@ -1925,6 +1926,8 @@ describe("vibe session registry", () => {
 		await simulateProcessBoundary();
 		const artifactsDir = parentSessionFile.slice(0, -6);
 		for (const id of ["explicitly-killed", "mode-exited"]) {
+			// Legacy kills persist only the parent journal; cold recovery must enforce them too.
+			await fs.rm(getAgentTombstonePath(path.join(artifactsDir, `${id}.jsonl`)), { force: true });
 			AgentRegistry.global().register({
 				id,
 				displayName: id,
@@ -1932,7 +1935,7 @@ describe("vibe session registry", () => {
 				parentId: "Main",
 				session: null,
 				sessionFile: path.join(artifactsDir, `${id}.jsonl`),
-				status: "parked",
+				status: id === "explicitly-killed" ? "aborted" : "parked",
 			});
 		}
 		const resumedManager = await SessionManager.open(parentSessionFile, undefined, undefined, {
@@ -1955,9 +1958,16 @@ describe("vibe session registry", () => {
 		}
 		expect((await SessionManager.peekSessionInit(explicitRef.sessionFile))?.init?.task).toBe(INITIAL_VIBE_TASK);
 		expect((await SessionManager.peekSessionInit(modeExitRef.sessionFile))?.init?.task).toBe(INITIAL_VIBE_TASK);
-		await expect(
-			lifecycleBridge.ensureAgentLive(lifecycleBridge.getAgentLifecycleManager(), "explicitly-killed"),
-		).rejects.toThrow("aborted and cannot be revived");
+		const reviver = vi.fn(async () => {
+			throw new Error("A tombstoned vibe worker reached the persisted reviver");
+		});
+		lifecycleBridge.setPersistedAgentReviverFactory(lifecycleBridge.getAgentLifecycleManager(), reviver, 0);
+		for (const id of ["explicitly-killed", "mode-exited"]) {
+			await expect(lifecycleBridge.ensureAgentLive(lifecycleBridge.getAgentLifecycleManager(), id)).rejects.toThrow(
+				"hard-killed and cannot be revived",
+			);
+			expect(reviver).not.toHaveBeenCalled();
+		}
 		await expect(
 			resumedRegistry.send(resumedSession, { session: "explicitly-killed", message: FOLLOW_UP_VIBE_TASK }),
 		).rejects.toThrow('Unknown vibe session "explicitly-killed"');

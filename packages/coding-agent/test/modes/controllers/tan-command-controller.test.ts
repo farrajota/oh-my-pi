@@ -167,7 +167,8 @@ async function createContext(overrides?: {
 	// Defer the job through the existing registration seam, but retain the real borrowed delivery service.
 	const register = vi.spyOn(asyncJobManager, "register").mockImplementation((_type, _label, run, options) => {
 		sequence.push("register");
-		const controlledRun: CapturedJobRun = ctx => run({ ...ctx, markRunning: vi.fn() });
+		const incarnationId = crypto.randomUUID();
+		const controlledRun: CapturedJobRun = ctx => run({ ...ctx, incarnationId, markRunning: vi.fn() });
 		capturedRun = controlledRun;
 		capturedOptions = options;
 		return overrides?.register ? overrides.register(controlledRun, options) : "job-123";

@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 
 import { getProjectDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { OutputArtifactError } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -18,7 +19,7 @@ import {
 import type { JsStatusEvent } from "../js/shared/types";
 import { getEnabledEvalPreludes } from "../preludes";
 import { updateEvalState } from "../state";
-import type { EvalToolDescriptor, EvalToolInvokeResult } from "../types";
+import type { EvalDisplayOutput, EvalToolDescriptor, EvalToolInvokeResult } from "../types";
 import {
 	createKernelSessionRegistry,
 	formatSessionKernelTimeoutAnnotation,
@@ -31,7 +32,6 @@ import {
 import type { PythonShadowPlan, PythonShadowSnapshot } from "./kernel";
 import {
 	checkPythonKernelAvailability,
-	type KernelDisplayOutput,
 	type KernelExecuteOptions,
 	type KernelExecuteResult,
 	type KernelShutdownResult,
@@ -119,7 +119,7 @@ export interface PythonExecutorOptions {
 	emitStatus?: (event: JsStatusEvent) => void;
 	/**
 	 * Live status events streamed as they are emitted (both host-side bridge
-	 * helpers like `agent()` and kernel-side `display`/`log`/`phase`). Mirrors
+	 * helpers like `agent()` and kernel-side `log`/`phase`). Mirrors
 	 * what lands in `displayOutputs` so callers can render progress before the
 	 * cell finishes.
 	 */
@@ -161,8 +161,8 @@ export interface PythonResult {
 	outputLines: number;
 	/** Number of bytes included in the output text */
 	outputBytes: number;
-	/** Rich display outputs captured from display_data/execute_result */
-	displayOutputs: KernelDisplayOutput[];
+	/** Images, views and status events the cell emitted, in order */
+	displayOutputs: EvalDisplayOutput[];
 	/** Whether stdin was requested */
 	stdinRequested: boolean;
 }
@@ -185,7 +185,34 @@ interface SessionKernelReplacement {
 interface PythonSession extends KernelSession<PythonKernel> {
 	generation: number;
 	replacement?: SessionKernelReplacement;
+	/** Tool sessions told this session's kernels are alive; each kernel death is reported to all of them. */
 	stateSessions: Set<ToolSession>;
+	/** Kernel whose death is already wired to `stateSessions`. */
+	watchedKernel?: PythonKernel;
+}
+
+/**
+ * Reports a retained kernel as alive in the eval state registry, so the
+ * host-registry reminder lists it, and reports its death once it exits or
+ * shuts down (crash, timeout kill, reset, or owner disposal).
+ */
+function reportKernelAlive(session: PythonSession, kernel: PythonKernel, toolSession: ToolSession | undefined): void {
+	if (!toolSession) return;
+	session.stateSessions.add(toolSession);
+	if (session.watchedKernel !== kernel) {
+		session.watchedKernel = kernel;
+		void kernel.whenDead().then(() => {
+			for (const stateSession of session.stateSessions) {
+				updateEvalState(stateSession, { language: "python", kernelId: kernel.id, alive: false });
+			}
+		});
+	}
+	updateEvalState(toolSession, {
+		language: "python",
+		kernelId: kernel.id,
+		alive: true,
+		interpreter: kernel.pythonPath,
+	});
 }
 
 function publishPythonKernelState(session: PythonSession, alive: boolean, loadedPath?: string): void {
@@ -194,7 +221,7 @@ function publishPythonKernelState(session: PythonSession, alive: boolean, loaded
 			language: "python",
 			kernelId: session.kernel.id,
 			alive,
-			interpreter: session.kernel.interpreter,
+			interpreter: session.kernel.pythonPath,
 			...(alive && loadedPath ? { loadedPath } : {}),
 		});
 	}
@@ -347,7 +374,10 @@ async function acquireLiveSessionKernel(
 ): Promise<PythonKernel> {
 	while (context.sessions.get(session.sessionKey) === session) {
 		const kernel = session.kernel;
-		if (kernel.isAlive()) return kernel;
+		if (kernel.isAlive()) {
+			reportKernelAlive(session, kernel, options.toolSession);
+			return kernel;
+		}
 		await context.replaceSessionKernel(session, cwd, options);
 	}
 	throw new PythonExecutionCancelledError(false);
@@ -402,7 +432,13 @@ async function executeInTrackedPythonSession(
 	try {
 		const result = await executeWithKernel(kernel, code, options);
 		if (kernel.isAlive()) {
-			publishPythonKernelState(session, true, result.exitCode === 0 ? options.filename : undefined);
+			publishPythonKernelState(
+				session,
+				true,
+				result.exitCode === 0 && options.filename && path.isAbsolute(options.filename)
+					? options.filename
+					: undefined,
+			);
 		} else {
 			publishPythonKernelState(session, false);
 		}
@@ -510,16 +546,9 @@ async function invokePythonToolRequest(
 		signal: options.signal,
 		emitStatus: undefined,
 	});
-	let envelope: unknown;
 	try {
-		const execution = await kernel.invokeTool(request, {
-			id: runId,
-			signal: options.signal,
-			onDisplay: output => {
-				if (output.type === "json") envelope = output.data;
-			},
-		});
-		return { execution, envelope };
+		const execution = await kernel.invokeTool(request, { id: runId, signal: options.signal });
+		return { execution, envelope: execution.reply };
 	} finally {
 		unregister();
 	}

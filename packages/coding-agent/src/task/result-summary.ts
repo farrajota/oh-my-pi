@@ -7,7 +7,7 @@
  */
 import { prompt } from "@oh-my-pi/pi-utils";
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
-import type { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, isResumable } from "../registry/agent-registry";
 import { escapeHarnessTags } from "../session/harness-tags";
 import { formatBytes, formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { SingleResult } from "./types";
@@ -62,11 +62,11 @@ export function formatTaskResultSummary(
 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
 	const truncated = outputCharCount > FULL_OUTPUT_THRESHOLD && result.outputPath !== undefined;
 	const preview = truncated ? previewHead(output) : output;
-	// A stopped-but-adopted agent (soft-budget stop) stays messageable; tell
-	// the parent so it can resume via irc instead of redoing the work. Isolated
-	// runs are parked without a reviver, so they must not read as resumable.
-	const refStatus = options.agentRegistry?.get(result.id)?.status;
-	const resumable = result.aborted && !result.isolated && (refStatus === "idle" || refStatus === "parked");
+	// A stopped agent stays messageable; tell the parent so it can resume via
+	// irc instead of redoing the work. Isolated runs are parked without a
+	// reviver (their worktree is gone), so they must not read as resumable.
+	const registry = options.agentRegistry ?? AgentRegistry.global();
+	const resumable = result.aborted && !result.isolated && isResumable(registry.get(result.id));
 	const rendered = prompt.render(taskSummaryTemplate, {
 		agentName: result.agent,
 		id: result.id,

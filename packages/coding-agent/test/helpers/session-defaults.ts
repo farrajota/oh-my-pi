@@ -16,6 +16,7 @@ export function createSessionDefaults() {
 		setWorkPoolYieldItems: async () => {},
 		getWorkPoolYieldItems: () => [],
 		getPermissionSummary: () => undefined,
+		isParentIrcSteer: () => false,
 		isAdvisorActive: () => false,
 		subscribeRunState: () => () => {},
 		addDisposer: () => {},

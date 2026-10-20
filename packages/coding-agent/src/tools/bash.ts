@@ -11,6 +11,7 @@ import type {
 	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { PipeStreams } from "@oh-my-pi/pi-natives";
 import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
@@ -20,6 +21,7 @@ import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash
 import { InternalUrlRouter } from "../internal-urls";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlFilesystem, UrlFsError } from "../internal-urls/url-filesystem";
+import { PipeTextSources, TextTap } from "../job-widgets";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
 import type {
 	ClientBridgeTerminalExitStatus,
@@ -457,6 +459,8 @@ interface ManagedBashJobHandle {
 	jobId: string;
 	completion: Promise<ManagedBashJobCompletion>;
 	getLatestText: () => string;
+	/** Notices for this call's results, including one added once the run starts (temporary shell). */
+	notices: readonly string[];
 	/** Hand the call's card to the job: later frames carry `details.async` and the last one settles it. */
 	background: () => void;
 }
@@ -469,6 +473,10 @@ interface BashProgressDetails extends BashToolDetails {
 
 /** Pid probe of a background job with no command in flight. */
 const NO_PIDS = (): readonly number[] => [];
+
+/** Shown when a call overlapped another one (parallel or backgrounded) and could not use the session's shell. */
+const SESSION_SHELL_BUSY_NOTICE =
+	"Ran in a temporary shell while the session shell is busy with another command: session variables and functions were unavailable, and nothing set here persists.";
 
 function normalizeResultOutput(result: BashResult | BashInteractiveResult): string {
 	return result.output || "";
@@ -873,6 +881,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		foreground: boolean;
 		/** Approval tier bounding the job's URL filesystem. */
 		approvalTier: ToolTier;
+		/** Session the call started in; its shell, even if the session changes before the job runs. */
+		sessionId: string | undefined;
+		/** The model's `i` intent on the call, for the job's widget author. */
+		intent?: string;
 	}): ManagedBashJobHandle {
 		const manager = this.session.asyncJobManager;
 		if (!manager) {
@@ -883,40 +895,51 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// Holds the run's Shell only while it runs: a retained reference would
 		// keep a finished `:async:` Shell (and its background children) alive.
 		let pids: () => readonly number[] = NO_PIDS;
+		// Outlives the run with the job row, so a finished pipeline stays readable.
+		const streams = new PipeStreams();
+		// The job's widget reads the command's own output and every pipe it opens.
+		const outputTap = new TextTap("out", "the command's own stdout+stderr");
+		const pipeSources = new PipeTextSources(streams);
 		let latestText = "";
 		let latestProgressDetails: BashProgressDetails | undefined;
 		let backgrounded = !options.foreground;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
+		const notices = [...(options.notices ?? [])];
 
 		const jobId = manager.register(
 			"bash",
 			label,
-			async ({ jobId, signal: runSignal, reportProgress }) =>
-				runJobOperation(
-					this.session.sessionManager,
-					`job:${jobId}`,
-					async () => {
-						// Records the job's progress and shows it on the call's card: plain output
-						// while the call still waits on it, the job frame (`details.async`) once
-						// backgrounded, so the card keeps filling and settles with the job.
-						const report = async (text: string, details: BashProgressDetails): Promise<void> => {
-							latestText = text;
-							const reported = reportProgress(text, { ...details });
-							// `output` feeds job listings; the card already shows `text`.
-							const { output: _output, ...frame } = details;
-							options.onUpdate?.({
-								content: [{ type: "text", text }],
-								details: backgrounded ? frame : (latestProgressDetails ?? {}),
-							});
-							await reported;
-						};
-						try {
+			async ({ jobId, incarnationId, signal: runSignal, reportProgress }) => {
+				// Records the job's progress and shows it on the call's card: plain output
+				// while the call still waits on it, the job frame (`details.async`) once
+				// backgrounded, so the card keeps filling and settles with the job.
+				const report = async (text: string, details: BashProgressDetails): Promise<void> => {
+					latestText = text;
+					const reported = reportProgress(text, { ...details });
+					// `output` feeds job listings; the card already shows `text`.
+					const { output: _output, ...frame } = details;
+					options.onUpdate?.({
+						content: [{ type: "text", text }],
+						details: backgrounded ? frame : (latestProgressDetails ?? {}),
+					});
+					await reported;
+				};
+				try {
+					// Admission can reject before the operation callback starts; settle the foreground waiter too.
+					return await runJobOperation(
+						this.session.sessionManager,
+						`job:${incarnationId}`,
+						async () => {
 							const { path: artifactPath, id: artifactId } =
 								(await this.session.allocateOutputArtifact?.("bash")) ?? {};
 							const wallTimeStart = performance.now();
 							const result = await executeBash(options.command, {
 								cwd: options.commandCwd,
-								sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
+								// Foreground auto-background keeps the session shell; explicit background jobs are isolated.
+								sessionKey: options.foreground
+									? options.sessionId
+									: `${options.sessionId ?? ""}:async:${jobId}`,
+								isSessionCurrent: () => (this.session.getSessionId?.() ?? undefined) === options.sessionId,
 								timeout: options.timeoutMs ?? 0,
 								signal: runSignal,
 								env: options.resolvedEnv,
@@ -926,6 +949,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								filesystem: this.#urlFilesystem(runSignal, options.approvalTier).shellFilesystem(),
 								artifactPath,
 								artifactId,
+								onChunk: chunk => outputTap.append(chunk),
+								streams,
 								onPreview: text => {
 									void report(text, { output: text, async: { state: "running", jobId, type: "bash" } });
 								},
@@ -933,15 +958,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								onStart: probe => {
 									pids = probe;
 								},
+								onSessionShellBusy: () => notices.push(SESSION_SHELL_BUSY_NOTICE),
 							}).finally(() => {
 								pids = NO_PIDS;
+								outputTap.close();
 							});
 							if (result.artifactError)
 								latestProgressDetails = { meta: { artifactError: result.artifactError } };
 							const wallTimeMs = performance.now() - wallTimeStart;
 							const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 								requestedTimeoutSec: options.requestedTimeoutSec,
-								notices: options.notices ?? [],
+								notices,
 								wallTimeMs,
 							});
 							const images = finalResult.content.filter(
@@ -972,24 +999,29 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								async: { state: "completed", jobId, type: "bash" },
 							});
 							return finalText;
-						} catch (error) {
-							const message = error instanceof Error ? error.message : String(error);
-							latestText = message;
-							completion.resolve({ kind: "failed", error });
-							// Only a cancel aborts the job's own signal (deadlines end in a timed-out result).
-							await report(message, {
-								...latestProgressDetails,
-								async: { state: runSignal.aborted ? "cancelled" : "failed", jobId, type: "bash" },
-							});
-							throw error;
-						}
-					},
-					runSignal,
-				),
+						},
+						runSignal,
+					);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					latestText = message;
+					completion.resolve({ kind: "failed", error });
+					// Only a cancel aborts the job's own signal (deadlines end in a timed-out result).
+					await report(message, {
+						...latestProgressDetails,
+						async: { state: runSignal.aborted ? "cancelled" : "failed", jobId, type: "bash" },
+					});
+					throw error;
+				}
+			},
 			{
 				ownerId: this.session.getAgentId?.() ?? undefined,
 				foreground: options.foreground,
-				process: { command: options.command, cwd: options.commandCwd, pids: () => pids() },
+				process: { command: options.command, cwd: options.commandCwd, pids: () => pids(), streams },
+				widgetInputs: {
+					sources: () => [outputTap, ...pipeSources.list()],
+					brief: () => ({ kind: "bash", command: options.command, intent: options.intent }),
+				},
 			},
 		);
 
@@ -997,6 +1029,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			jobId,
 			completion: completion.promise,
 			getLatestText: () => latestText,
+			notices,
 			background: () => {
 				backgrounded = true;
 			},
@@ -1004,7 +1037,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		{
 			command: rawCommand,
 			env: rawEnv,
@@ -1020,6 +1053,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
 		let command = rawCommand;
+		// The session this call belongs to, captured before any await: a session
+		// change while the call waits must not move it into the new session's shell.
+		const sessionId = this.session.getSessionId?.() ?? undefined;
 		const env = normalizeBashEnv(rawEnv);
 
 		// Extract a leading `cd <path> && ...` into cwd when the model ignores the
@@ -1212,6 +1248,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				onUpdate,
 				foreground: false,
 				approvalTier,
+				sessionId,
+				intent: this.session.getToolCallIntent?.(toolCallId),
 			});
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 				requestedTimeoutSec,
@@ -1254,6 +1292,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				onUpdate,
 				foreground: !startBackgrounded,
 				approvalTier,
+				sessionId,
+				intent: this.session.getToolCallIntent?.(toolCallId),
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
@@ -1287,10 +1327,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			autoBgManager.backgroundJob(job.jobId);
 			// "steer": a queued user/peer message arrived mid-wait — background
 			// the command (it keeps running) so the message injects promptly.
+			// `job.notices` also carries the temporary-shell notice once the run started.
 			const notices =
 				waitResult.kind === "steer"
-					? [...pendingNotices, "Backgrounded early to handle an incoming message; the command keeps running."]
-					: pendingNotices;
+					? [...job.notices, "Backgrounded early to handle an incoming message; the command keeps running."]
+					: job.notices;
 			return this.#buildBackgroundStartResult(job.jobId, job.getLatestText(), timeoutSec, {
 				requestedTimeoutSec,
 				notices,
@@ -1619,7 +1660,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				// applied twice.
 				await executeBash(command, {
 					cwd: commandCwd,
-					sessionKey: this.session.getSessionId?.() ?? undefined,
+					sessionKey: sessionId,
+					isSessionCurrent: () => (this.session.getSessionId?.() ?? undefined) === sessionId,
 					timeout: timeoutMs ?? 0,
 					signal,
 					env: resolvedEnv,
@@ -1630,6 +1672,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					// Stream the sink's own inline view rather than re-buffering chunks.
 					onPreview: onUpdate ? text => onUpdate({ content: [{ type: "text", text }], details: {} }) : undefined,
 					onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+					onSessionShellBusy: () => pendingNotices.push(SESSION_SHELL_BUSY_NOTICE),
 				});
 		const wallTimeMs = performance.now() - wallTimeStart;
 		if (result.cancelled) {

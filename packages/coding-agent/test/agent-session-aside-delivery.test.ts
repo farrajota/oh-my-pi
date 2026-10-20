@@ -458,6 +458,67 @@ describe("AgentSession aside delivery", () => {
 		expect(JSON.stringify(contexts[0]!.messages)).toContain("IDLE_ASIDE_BODY");
 	});
 
+	it("two asides sent back to back to an idle session both reach the model, in order", async () => {
+		const model = createMockModel({ provider: "openai", id: "gpt-test" }).model;
+		const modelRegistry = new ModelRegistry(authStorage);
+		const contexts: Context[] = [];
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm,
+			streamFn: (_model, context) => {
+				contexts.push(context);
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: "Acknowledged." }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: zeroUsage,
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "todo.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			settings,
+			modelRegistry,
+			toolRegistry: new Map(),
+		});
+
+		const first = session.sendCustomMessage(
+			{ customType: "ext-aside", content: "FIRST_ASIDE", display: true, attribution: "agent" },
+			{ deliverAs: "aside", triggerTurn: true },
+		);
+		const second = session.sendCustomMessage(
+			{ customType: "ext-aside", content: "SECOND_ASIDE", display: true, attribution: "agent" },
+			{ deliverAs: "aside", triggerTurn: true },
+		);
+		await Promise.all([first, second]);
+		await session.waitForIdle();
+
+		const sent = JSON.stringify(contexts.at(-1)!.messages);
+		expect(sent).toContain("FIRST_ASIDE");
+		expect(sent).toContain("SECOND_ASIDE");
+		expect(sent.indexOf("FIRST_ASIDE")).toBeLessThan(sent.indexOf("SECOND_ASIDE"));
+		const persisted = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "custom_message")
+			.map(entry => entry.content);
+		expect(persisted).toEqual(["FIRST_ASIDE", "SECOND_ASIDE"]);
+	});
+
 	it("a stranded aside queued during an aborted turn does not leak into a fresh session (newSession)", async () => {
 		const modelRegistry = new ModelRegistry(authStorage);
 		const started = Promise.withResolvers<void>();
@@ -887,6 +948,7 @@ describe("AgentSession aside delivery", () => {
 		const wakeRecords: AgentMessage[] = [];
 		const appended: AgentMessage[] = [];
 		let planMode = false;
+		const recipient = "ParentMarkerRecipient";
 		const host: IrcBridgeHost = {
 			agent: {
 				appendMessage: (message: AgentMessage) => appended.push(message),
@@ -894,70 +956,58 @@ describe("AgentSession aside delivery", () => {
 			sessionManager: manager,
 			isDisposed: () => false,
 			isStreaming: () => false,
+			isParentSender: (recipientId, senderId) => recipientId === recipient && senderId === "ParentMarkerSender",
 			planModeEnabled: () => planMode,
 			emitSessionEvent: async () => {},
 			wakeForIrc: records => wakeRecords.push(...records),
 			autoReplyIrcEnabled: () => false,
 			autoReplyIrc: async () => {},
 		};
-		const registry = AgentRegistry.global();
-		const recipient = "ParentMarkerRecipient";
-		registry.register({
-			id: recipient,
-			displayName: "task",
-			kind: "sub",
-			parentId: "ParentMarkerSender",
-			session: null,
+		const irc = new IrcBridge(host);
+		await irc.deliver({
+			id: "parent-wake",
+			from: "ParentMarkerSender",
+			to: recipient,
+			body: "parent assignment",
+			ts: 1,
 		});
-		try {
-			const irc = new IrcBridge(host);
-			await irc.deliver({
-				id: "parent-wake",
-				from: "ParentMarkerSender",
-				to: recipient,
-				body: "parent assignment",
-				ts: 1,
-			});
-			await irc.deliver({
-				id: "peer-wake",
-				from: "PeerMarkerSender",
-				to: recipient,
-				body: "peer note",
-				ts: 2,
-			});
+		await irc.deliver({
+			id: "peer-wake",
+			from: "PeerMarkerSender",
+			to: recipient,
+			body: "peer note",
+			ts: 2,
+		});
 
-			expect(wakeRecords[0]).toMatchObject({
-				role: "custom",
-				customType: "irc:incoming",
-				details: { from: "ParentMarkerSender", fromParent: true },
-			});
-			const peerWake = wakeRecords[1];
-			expect(peerWake).toMatchObject({
-				role: "custom",
-				customType: "irc:incoming",
-				details: { from: "PeerMarkerSender" },
-			});
-			if (peerWake?.role !== "custom") throw new Error("Expected peer IRC wake record");
-			expect(peerWake.details).not.toHaveProperty("fromParent");
+		expect(wakeRecords[0]).toMatchObject({
+			role: "custom",
+			customType: "irc:incoming",
+			details: { from: "ParentMarkerSender", fromParent: true },
+		});
+		const peerWake = wakeRecords[1];
+		expect(peerWake).toMatchObject({
+			role: "custom",
+			customType: "irc:incoming",
+			details: { from: "PeerMarkerSender" },
+		});
+		if (peerWake?.role !== "custom") throw new Error("Expected peer IRC wake record");
+		expect(peerWake.details).not.toHaveProperty("fromParent");
 
-			planMode = true;
-			await irc.deliver({
-				id: "parent-plan",
-				from: "ParentMarkerSender",
-				to: recipient,
-				body: "plan-mode parent assignment",
-				ts: 3,
-			});
-			expect(appended).toHaveLength(1);
-			const persisted = manager.getBranch().find(entry => entry.type === "custom_message");
-			expect(persisted).toMatchObject({
-				type: "custom_message",
-				customType: "irc:incoming",
-				details: { from: "ParentMarkerSender", fromParent: true },
-			});
-		} finally {
-			registry.unregister(recipient);
-		}
+		planMode = true;
+		await irc.deliver({
+			id: "parent-plan",
+			from: "ParentMarkerSender",
+			to: recipient,
+			body: "plan-mode parent assignment",
+			ts: 3,
+		});
+		expect(appended).toHaveLength(1);
+		const persisted = manager.getBranch().find(entry => entry.type === "custom_message");
+		expect(persisted).toMatchObject({
+			type: "custom_message",
+			customType: "irc:incoming",
+			details: { from: "ParentMarkerSender", fromParent: true },
+		});
 	});
 
 	it("IrcBridge.restorePending merges a rolled-back snapshot ahead of records queued during the rollback instead of discarding them", () => {
@@ -971,6 +1021,7 @@ describe("AgentSession aside delivery", () => {
 			sessionManager: {} as SessionManager,
 			isDisposed: () => false,
 			isStreaming: () => false,
+			isParentSender: () => false,
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
@@ -1015,6 +1066,7 @@ describe("AgentSession aside delivery", () => {
 			sessionManager: {} as SessionManager,
 			isDisposed: () => false,
 			isStreaming: () => false,
+			isParentSender: () => false,
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
@@ -1051,6 +1103,7 @@ describe("AgentSession aside delivery", () => {
 			sessionManager: {} as SessionManager,
 			isDisposed: () => false,
 			isStreaming: () => false,
+			isParentSender: () => false,
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},

@@ -75,12 +75,13 @@ import { TaskLaunchSession, type TaskLauncher } from "./speculative-launch";
 import { SpawnRun, type SpawnPermit } from "./spawn-run";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { all as allSettings, lookup as lookupSetting } from "../config/registry";
-import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID, isResumable } from "../registry/agent-registry";
+import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { parseAgent } from "./agents";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { discoverAgentsForCreate, getDiscoveredAgentSnapshot, refreshAgentDiscovery } from "./discovery-cache";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled, listEvalTools } from "./eval-tools";
-import { type ExecutorOptions, runSubprocess } from "./executor";
+import { type ExecutorOptions, type SubagentToolResult, runSubprocess } from "./executor";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -91,6 +92,7 @@ import {
 	runIsolatedSubprocess,
 } from "./isolation-runner";
 import { generateTaskName } from "./name-generator";
+import { TextTap } from "../job-widgets/text-tap";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import {
@@ -118,6 +120,8 @@ import {
 	StructuredSubagentError,
 	type StructuredSubagentRequest,
 } from "./structured-subagent";
+import { appendToolResult, createTaskWidgetInputs, TOOLS_SOURCE_LABEL } from "./widget-inputs";
+import { TOOLS_SOURCE_ID } from "../job-widgets/types";
 import { applyTaskToolProfile } from "./tool-profiles";
 import { type IsoBackendKind, parseIsolationBackend } from "./worktree";
 
@@ -1293,6 +1297,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					spawn.detached,
 					run.timing,
 					spawn.detached ? run.onArtifactsRetained : undefined,
+					run.tools,
 				),
 			{ agentId: spawn.agentId, detached: spawn.detached },
 		);
@@ -2193,6 +2198,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			onSettled,
 			run,
 		} = options;
+		const tools = run?.tools ?? new TextTap(TOOLS_SOURCE_ID, TOOLS_SOURCE_LABEL);
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
 			const isolated = spawnParams.isolated === true;
 			const ref = aborted ? this.session.agentRegistry?.get(agentId) : undefined;
@@ -2201,8 +2207,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				aborted,
 				isolated,
 				ircEnabled,
-				resumable: !isolated && (ref?.status === "idle" || ref?.status === "parked"),
-				transcriptAvailable: aborted ? ref?.sessionFile !== undefined : true,
+				resumable: !isolated && isResumable(ref),
+				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
 			})}`;
 		};
 		return manager.register(
@@ -2241,9 +2247,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					}
 					acquiredAt = Date.now();
 					if (!semaphoreHeld || runSignal.aborted) {
-						await this.#getOutputManager().release(agentId);
-						this.#preparedSpawns.delete(agentId);
-						releasePermit();
+						try {
+							await this.#getOutputManager().release(agentId);
+						} finally {
+							this.#preparedSpawns.delete(agentId);
+							releasePermit();
+							if (!run) tools.close();
+						}
 						progress.status = "aborted";
 						onSettled?.(true);
 						throw new Error("Aborted before execution");
@@ -2277,6 +2287,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								? nextProgress.resolvedModelIsFallback
 								: undefined;
 							progress.advisor = nextProgress.advisor ?? progress.advisor;
+							progress.stage = nextProgress.stage ?? progress.stage;
+							progress.watch = nextProgress.watch ?? progress.watch;
 							progress.resolvedModelRoute = nextProgress.resolvedModelRoute ?? progress.resolvedModelRoute;
 							progress.tokens = nextProgress.tokens;
 							progress.requests = nextProgress.requests;
@@ -2325,6 +2337,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								true,
 								{ invokedAt: startedAt, acquiredAt },
 								retainArtifacts,
+								tools,
 							);
 					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 					const singleResult = result.details?.results[0];
@@ -2394,6 +2407,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const hint = this.session.agentRegistry?.get(agentId) ? await buildFollowUpHint(false) : "";
 					throw new TaskJobError(`${message}${hint}`);
 				} finally {
+					if (!run) tools.close();
 					releasePermit();
 					this.#preparedSpawns.delete(agentId);
 				}
@@ -2403,6 +2417,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				agentId,
 				queued: true,
 				ownerId: this.session.getAgentId?.() ?? undefined,
+				widgetInputs: createTaskWidgetInputs({
+					manager,
+					agentId,
+					tools: () => tools,
+					progress,
+					intent: this.session.getToolCallIntent?.(toolCallId),
+				}),
 				onProgress: text => {
 					onUpdate?.({ content: [{ type: "text", text }], details: buildDetails() });
 				},
@@ -2587,6 +2608,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
 		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
+		tools?: TextTap,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		return this.#runSpawn(
 			toolCallId,
@@ -2598,6 +2620,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			detached,
 			launchTiming,
 			onArtifactsRetained,
+			tools,
 		);
 	}
 
@@ -2612,6 +2635,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
 		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
+		tools?: TextTap,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		let latestProgress: AgentProgress | undefined;
@@ -2821,6 +2845,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				restrictToolNames: restrictToolNames || undefined,
 				maxRuntimeMs,
 				signal,
+				...(tools ? { onToolResult: (result: SubagentToolResult) => appendToolResult(tools, result) } : {}),
 				onProgress: (progress: AgentProgress) => {
 					const nextProgress = {
 						...progress,

@@ -21,6 +21,23 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 const WIDTH = 60;
 
+function cancellableJob(gate: { promise: Promise<string> }, signal: AbortSignal): Promise<string> {
+	const { promise, resolve, reject } = Promise.withResolvers<string>();
+	const onAbort = () => resolve("cancelled");
+	signal.addEventListener("abort", onAbort, { once: true });
+	gate.promise.then(
+		value => {
+			signal.removeEventListener("abort", onAbort);
+			resolve(value);
+		},
+		error => {
+			signal.removeEventListener("abort", onAbort);
+			reject(error);
+		},
+	);
+	return promise;
+}
+
 /** `/jobs full` in text mode, as the report box above the editor shows it: its content rows, borders stripped. */
 async function renderFullJobs(running: AsyncJobSnapshotItem[]): Promise<string[]> {
 	const reportContainer = new Container();
@@ -135,7 +152,9 @@ describe("/jobs in the native terminal", () => {
 
 	it("`/jobs kill <id>` cancels the running job through the TUI dispatcher", async () => {
 		const gate = Promise.withResolvers<string>();
-		const id = manager.register("bash", "sleep 999", () => gate.promise, { ownerId: "main" });
+		const id = manager.register("bash", "sleep 999", ({ signal }) => cancellableJob(gate, signal), {
+			ownerId: "main",
+		});
 		const showStatus = vi.spyOn(mode, "showStatus");
 
 		const handled = await executeBuiltinSlashCommand(`/jobs kill ${id}`, { ctx: mode });
@@ -150,7 +169,7 @@ describe("/jobs in the native terminal", () => {
 	it("`/jobs kill all` cancels every running job", async () => {
 		const gates = [Promise.withResolvers<string>(), Promise.withResolvers<string>()];
 		const ids = gates.map((gate, index) =>
-			manager.register("bash", `job-${index}`, () => gate.promise, { ownerId: "main" }),
+			manager.register("bash", `job-${index}`, ({ signal }) => cancellableJob(gate, signal), { ownerId: "main" }),
 		);
 
 		const handled = await executeBuiltinSlashCommand("/jobs kill all", { ctx: mode });
@@ -176,7 +195,9 @@ describe("/jobs in the native terminal", () => {
 	it("`/jobs kill all` leaves a job owned by another session running", async () => {
 		const ownedGate = Promise.withResolvers<string>();
 		const foreignGate = Promise.withResolvers<string>();
-		const ownedId = manager.register("bash", "mine", () => ownedGate.promise, { ownerId: "main" });
+		const ownedId = manager.register("bash", "mine", ({ signal }) => cancellableJob(ownedGate, signal), {
+			ownerId: "main",
+		});
 		const foreignId = manager.register("bash", "theirs", () => foreignGate.promise, { ownerId: "other" });
 
 		const handled = await executeBuiltinSlashCommand("/jobs kill all", { ctx: mode });

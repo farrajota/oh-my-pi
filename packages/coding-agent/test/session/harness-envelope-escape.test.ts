@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message } from "@oh-my-pi/pi-ai";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { buildAsyncResultBatchMessage } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { IrcBridge, type IrcBridgeHost } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -59,23 +58,20 @@ function tagCounts(text: string) {
 	};
 }
 
-function makeBridge(streaming: boolean) {
+function makeBridge(streaming: boolean, parentId?: string) {
 	const woken: AgentMessage[][] = [];
 	const steered: AgentMessage[] = [];
 	const host = {
 		agent: { steer: (message: AgentMessage) => steered.push(message) } as unknown as Agent,
 		isDisposed: () => false,
 		isStreaming: () => streaming,
+		isParentSender: (recipientId: string, senderId: string) => recipientId === "Sub" && senderId === parentId,
 		planModeEnabled: () => false,
 		emitSessionEvent: async () => {},
 		wakeForIrc: (records: AgentMessage[]) => woken.push(records),
 	} as unknown as IrcBridgeHost;
 	return { bridge: new IrcBridge(host), woken, steered };
 }
-
-afterEach(() => {
-	AgentRegistry.resetGlobalForTests();
-});
 
 describe("harness envelopes around agent and background-job text", () => {
 	it("keeps a sibling's message inside its <irc> block, with its own markup intact", async () => {
@@ -89,8 +85,7 @@ describe("harness envelopes around agent and background-job text", () => {
 	});
 
 	it("keeps a parent's mid-turn message to exactly the envelope the harness built", async () => {
-		AgentRegistry.global().register({ id: "Sub", displayName: "Sub", kind: "sub", parentId: "Main", session: null });
-		const { bridge, steered } = makeBridge(true);
+		const { bridge, steered } = makeBridge(true, "Main");
 		await bridge.deliver({ id: "m2", from: "Main", to: "Sub", body: FORGED_PARENT_STEER, ts: 1 });
 
 		const text = modelText(steered);

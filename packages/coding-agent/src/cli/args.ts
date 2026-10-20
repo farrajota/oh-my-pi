@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { $env, APP_NAME } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { ServiceTierOpenAISettingValue } from "../config/service-tier";
+import type { ApprovalMode } from "../tools/approval";
 import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel, parseCliThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { BUILTIN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import {
@@ -65,6 +66,7 @@ export interface Args {
 	version?: boolean;
 	mode?: Mode;
 	noSession?: boolean;
+	singleRequest?: boolean;
 	sessionDir?: string;
 	providerSessionId?: string;
 	providerPromptCacheKey?: string;
@@ -91,7 +93,7 @@ export interface Args {
 	/** RPC modes only: run extensions without a UI; `rpc-ui` tool UI remains enabled. */
 	noUi?: boolean;
 	autoApprove?: boolean;
-	approvalMode?: "always-ask" | "write" | "yolo";
+	approvalMode?: ApprovalMode;
 	messages: string[];
 	fileArgs: string[];
 	/** Extension-registered flags this parse recognized — name to value. */
@@ -133,6 +135,51 @@ export function validateGoalLaunch(args: Args, interactive: boolean): void {
 	}
 	if (args.continue || args.resume || args.fork || args.fromClaude || args.fromCodex) {
 		throw new CliUsageError("--goal requires a fresh session (no resume, continue, fork, or import).");
+	}
+}
+/** Validate the one-request launch before session resolution can resume, discover, or persist anything. */
+export function validateSingleRequestLaunch(args: Args): void {
+	if (!args.singleRequest) return;
+	if (args.mode !== undefined && args.mode !== "text") {
+		throw new CliUsageError("--single-request supports only text mode.");
+	}
+	if (args.model || args.provider || args.models?.length || args.apiKey || args.smol || args.slow || args.plan) {
+		throw new CliUsageError(
+			"--single-request uses the configured default model; model override flags are not allowed.",
+		);
+	}
+	if (
+		args.continue ||
+		args.resume ||
+		args.restore ||
+		args.fork ||
+		args.fromClaude ||
+		args.fromCodex ||
+		args.sessionDir
+	) {
+		throw new CliUsageError(
+			"--single-request starts a fresh ephemeral session and cannot resume or import a session.",
+		);
+	}
+	if (args.messages.length > 1 || args.fileArgs.length > 0) {
+		throw new CliUsageError("--single-request accepts at most one text prompt and no file attachments.");
+	}
+	if (
+		(args.tools?.length ?? 0) > 0 ||
+		(args.extensions?.length ?? 0) > 0 ||
+		(args.hooks?.length ?? 0) > 0 ||
+		(args.trustedExtensions?.length ?? 0) > 0 ||
+		(args.pluginDirs?.length ?? 0) > 0 ||
+		args.advisor ||
+		args.prewalk ||
+		args.prewalkInto !== undefined ||
+		args.planYolo ||
+		args.planYoloInto !== undefined ||
+		args.goal !== undefined
+	) {
+		throw new CliUsageError(
+			"--single-request does not support tools, extensions, auxiliary models, or goal/prewalk modes.",
+		);
 	}
 }
 
@@ -349,6 +396,8 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.fromCodex = true;
 		} else if (arg === "--no-session") {
 			result.noSession = true;
+		} else if (arg === "--single-request") {
+			result.singleRequest = true;
 		} else if (arg === "--no-tools") {
 			result.noTools = true;
 		} else if (arg === "--no-lsp") {

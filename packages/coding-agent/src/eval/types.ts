@@ -1,6 +1,12 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import type { EvalLanguage, EvalStatusEvent } from "@oh-my-pi/pi-tui/tools/eval";
-export type { EvalCellResult, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "@oh-my-pi/pi-tui/tools/eval";
+import type {
+	EvalLanguage,
+	EvalStatusEvent,
+	EvalToolDetails as TuiEvalToolDetails,
+	EvalView,
+} from "@oh-my-pi/pi-tui/tools/eval";
+export type { EvalCellResult, EvalLanguage, EvalStatusEvent, EvalViewEntry } from "@oh-my-pi/pi-tui/tools/eval";
+export type EvalToolDetails = TuiEvalToolDetails & { jsonOutputs?: unknown[] };
 // Not the pi-utils barrel: it loads the native addon, which the computer worker graph must not require.
 import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 
@@ -35,9 +41,15 @@ export function evalImageMetadata(value: unknown): Pick<ImageContent, "detail" |
 	return metadata;
 }
 
-/** Display output captured during eval execution across supported backends. */
+/**
+ * Non-text output of an eval cell, from either backend:
+ * - an image, sent to the model and shown to the user;
+ * - a `view`: a pretty rendering of printed text, for the user only;
+ * - a structured `json` display, shown as bounded text to the model;
+ * - a helper `status` event for the UI.
+ */
 export type EvalDisplayOutput =
-	| { type: "json"; data: unknown }
 	| ImageContent
-	| { type: "markdown"; text?: string }
+	| { type: "json"; data: unknown }
+	| { type: "view"; text: string; view: EvalView }
 	| { type: "status"; event: EvalStatusEvent };

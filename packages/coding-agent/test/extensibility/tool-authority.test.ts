@@ -7,6 +7,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { EffectiveSubagentPermissions } from "@oh-my-pi/pi-coding-agent/task/permission-profiles";
+import { Settings } from "../../src/config/settings";
 
 const emptyScope = {
 	mode: "enforce",
@@ -38,12 +39,18 @@ function makeTool(name: string, seen: object[]): AgentTool {
 }
 
 function makeRunner(authority?: EffectiveToolRegistry, emitInput?: Record<string, unknown>) {
+	const sessionApprovals = new Set<string>();
 	const runner = {
 		consumeToolCallEmitted: () => false,
 		hasHandlers: (event: string) => event === "tool_call" && emitInput !== undefined,
 		emitToolCall: async () => (emitInput === undefined ? undefined : { input: emitInput }),
 		getPermissionScope: () => emptyScope,
 		getToolExecutionAuthority: () => authority,
+		sessionSettings: Settings.isolated({ "tools.approvalMode": "yolo" }),
+		hasSessionApproval: (key: string) => sessionApprovals.has(key),
+		grantSessionApproval: (key: string) => {
+			sessionApprovals.add(key);
+		},
 		getCwd: () => "/tmp",
 		getPathScope: () => undefined,
 		hasUI: () => false,

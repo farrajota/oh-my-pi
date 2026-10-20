@@ -12,6 +12,7 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { bindOwnedAgentLifecycle, replaceOwnedAgentLifecycle } from "../internal/agent-lifecycle-bridge";
 import {
+	bindAgentSessionRegistry,
 	kRootCompactionThresholds,
 	registerAgentRegistryBridge,
 	type InternalAgentOwnershipToken,
@@ -275,6 +276,16 @@ export interface AgentRef {
 type RegistryAgentRef = InternalAgentRef;
 export type AgentRefExpectation = AgentRef | AgentSession;
 
+/**
+ * Whether messaging `ref` resumes it: a live `idle` agent, or a `parked` or
+ * killed one whose transcript is on disk. Task summaries use it to tell the
+ * parent to resume a stopped agent instead of redoing its work.
+ */
+export function isResumable(ref: AgentRef | undefined): boolean {
+	if (ref?.status === "idle") return true;
+	return (ref?.status === "parked" || ref?.status === "aborted") && ref.sessionFile !== null;
+}
+
 export type RegistryEvent =
 	| { type: "registered"; ref: AgentRef }
 	| { type: "status_changed"; ref: AgentRef }
@@ -395,11 +406,14 @@ export class AgentRegistry {
 			ownershipToken: expected => this.#ownershipToken(expected),
 			bindAuthoritySession: parent => this.#bindAuthoritySession(parent),
 			lookupAuthoritySession: parent => this.#lookupAuthoritySession(parent),
+			isSessionParentIrcSender: (session, recipientId, senderId) =>
+				this.#isSessionParentIrcSender(session, recipientId, senderId),
 			lookupAuthorityLineage: parentId => this.#lookupAuthorityLineage(parentId),
 			createRootSession: options => this.#createRootSession(options),
 			setHistory: (expected, history, expectedSessionFile) =>
 				this.#setHistoryInternal(expected, history, expectedSessionFile),
 			setStatus: (id, status, expected) => this.#setStatusInternal(id, status, expected),
+			setActivity: (id, activity, expected) => this.#setActivityInternal(id, activity, expected),
 			attachSession: (id, session, sessionFile, expected) =>
 				this.#attachSessionInternal(id, session, sessionFile, expected),
 			detachSession: (id, expected) => this.#detachSessionInternal(id, expected),
@@ -413,6 +427,7 @@ export class AgentRegistry {
 			register: input => this.#register(input),
 			registerIfAvailable: (input, expected) => this.#registerIfAvailableInternal(input, expected),
 			replaceIfAvailable: (input, expected) => this.#replaceIfAvailableInternal(input, expected),
+			markResultAccepted: (id, expected, responseAt) => this.#markResultAcceptedInternal(id, expected, responseAt),
 			onChange: listener => {
 				this.#internalListeners.add(listener);
 				return () => this.#internalListeners.delete(listener);
@@ -994,6 +1009,10 @@ export class AgentRegistry {
 		this.#refCapabilities.set(ref, reservation.capability);
 		this.#ownershipTokens.set(ref, Object.freeze({}) as InternalAgentOwnershipToken);
 		prepared.activate(created.session);
+		if (!bindAgentSessionRegistry(this, created.session)) {
+			this.#removeExactRef(ref);
+			throw new Error("IRC parent classification requires an exact active authority session.");
+		}
 		if (reservation.parentId === undefined && !bindOwnedAgentLifecycle(this, created.session)) {
 			this.#removeExactRef(ref);
 			throw new Error("Root lifecycle ownership requires an exact claimed authority session.");
@@ -1059,6 +1078,12 @@ export class AgentRegistry {
 		this.#refCapabilities.set(replacement, reservation.capability);
 		this.#ownershipTokens.set(replacement, Object.freeze({}) as InternalAgentOwnershipToken);
 		prepared.activate(created.session);
+		if (!bindAgentSessionRegistry(this, created.session)) {
+			this.#refs.set(expected.id, expected);
+			this.#sessionCapabilities.delete(created.session);
+			this.#refCapabilities.delete(replacement);
+			throw new Error("Replacement root IRC parent classification could not be activated.");
+		}
 		if (!replaceOwnedAgentLifecycle(this, expected.session!, created.session)) {
 			this.#refs.set(expected.id, expected);
 			this.#sessionCapabilities.delete(created.session);
@@ -1307,6 +1332,63 @@ export class AgentRegistry {
 			return undefined;
 		return parentRef;
 	}
+	#isCurrentAuthorityRefSession(ref: RegistryAgentRef, session: AgentSession): boolean {
+		const capability = this.#sessionCapabilities.get(session);
+		const record = capability ? this.#capabilities.get(capability as object) : undefined;
+		return Boolean(
+			capability &&
+			record &&
+			this.#refs.get(ref.id) === ref &&
+			this.#authorityRefs.has(ref) &&
+			ref.session === session &&
+			this.#refCapabilities.get(ref) === capability &&
+			record.actorId === ref.id &&
+			record.rootId === ref.lineage?.rootId &&
+			record.parentId === ref.lineage?.parentId &&
+			record.generation === ref.lineage?.generation &&
+			!session.isDisposed &&
+			(ref.status === "running" || ref.status === "idle"),
+		);
+	}
+
+	#isSessionParentIrcSender(session: AgentSession, recipientId: string, senderId: string): boolean {
+		if (recipientId === senderId) return false;
+		const recipientRef = this.#refs.get(recipientId);
+		const recipientLineage = recipientRef?.lineage;
+		if (
+			!recipientRef ||
+			!recipientLineage ||
+			recipientRef.kind !== "sub" ||
+			recipientRef.parentId !== senderId ||
+			recipientLineage.parentId !== senderId ||
+			!this.#isCurrentAuthorityRefSession(recipientRef, session)
+		)
+			return false;
+
+		const parentRef = this.#refs.get(senderId);
+		const parentSession = parentRef?.session;
+		if (
+			!parentRef ||
+			!parentSession ||
+			parentRef.kind === "advisor" ||
+			parentRef.lineage?.rootId !== recipientLineage.rootId ||
+			!this.#isCurrentAuthorityRefSession(parentRef, parentSession)
+		)
+			return false;
+
+		const rootRef = this.#refs.get(recipientLineage.rootId);
+		const rootSession = rootRef?.session;
+		return Boolean(
+			rootRef &&
+			rootSession &&
+			rootRef.id === recipientLineage.rootId &&
+			rootRef.kind === "main" &&
+			rootRef.parentId === undefined &&
+			rootRef.lineage?.rootId === rootRef.id &&
+			parentRef.lineage?.rootId === rootRef.id &&
+			this.#isCurrentAuthorityRefSession(rootRef, rootSession),
+		);
+	}
 
 	#lookupAuthorityLineage(parentId: string): { readonly rootId: string; readonly parentId: string } | undefined {
 		const parentRef = this.#refs.get(parentId);
@@ -1417,7 +1499,11 @@ export class AgentRegistry {
 		return false;
 	}
 
-	#register(input: RegisterInput, finalLineage?: RegistryAgentRef["lineage"]): RegistryAgentRef {
+	#register(
+		input: RegisterInput,
+		finalLineage?: RegistryAgentRef["lineage"],
+		emitRegisteredEvent = true,
+	): RegistryAgentRef {
 		if (this.#terminating.has(input.id)) throw new Error(`Agent "${input.id}" is being terminated.`);
 		const existing = this.#refs.get(input.id);
 		if (existing && this.#authorityRefs.has(existing)) throw new Error(`Agent "${input.id}" is already registered.`);
@@ -1471,7 +1557,7 @@ export class AgentRegistry {
 		if (recoveredActor && recoveredLineage) this.#durableActorRecords.set(ref, recoveredActor);
 		this.#ownershipTokens.set(ref, Object.freeze({}) as InternalAgentOwnershipToken);
 		this.#refs.set(ref.id, ref);
-		this.#emit({ type: "registered", ref });
+		if (emitRegisteredEvent) this.#emit({ type: "registered", ref });
 		return ref;
 	}
 
@@ -1489,18 +1575,14 @@ export class AgentRegistry {
 		const current = this.#refs.get(input.id);
 		if (this.#claimedIds.has(input.id) || this.#terminating.has(input.id)) return undefined;
 		if (expected === null) return current ? undefined : this.#register(input);
-		if (current !== expected || current.status !== "parked" || current.session) return undefined;
-		this.#refs.delete(current.id);
+		if (current !== expected || current.session) return undefined;
+		const revivableAbort = current.status === "aborted" && !this.#authorityRefs.has(current);
+		if (current.status !== "parked" && !revivableAbort) return undefined;
+		// Replace the slot before events so observers never see a transiently missing id.
+		const replacement = this.#register(input, undefined, false);
 		this.#emit({ type: "removed", ref: current });
-		return this.#register(input);
-	}
-
-	/** Register only when the id is absent, or reuse the exact detached parked ref represented by the observation. */
-	registerIfAvailable(input: RegisterInput, expected: AgentRef | null): AgentRef | undefined {
-		const exactExpected = expected === null ? null : this.#observations.get(expected);
-		if (expected !== null && !exactExpected) return undefined;
-		const ref = this.#registerIfAvailableInternal(input, exactExpected ?? null);
-		return ref ? this.#observe(ref) : undefined;
+		this.#emit({ type: "registered", ref: replacement });
+		return replacement;
 	}
 
 	#mergeHistory(ref: RegistryAgentRef, history: AgentHistorySummary, expectedSessionFile?: string): true {
@@ -1616,29 +1698,13 @@ export class AgentRegistry {
 	}
 
 	/**
-	 * Record that this agent's run produced and handed over its final result,
-	 * and terminalize the ref when no turn is in flight. Acceptance is the
-	 * executor's run boundary: the result is settled, so a ref still `running`
-	 * with nothing streaming is a missed terminal transition the parent's
-	 * `wait` would otherwise keep blocking on. A ref with a genuinely
-	 * streaming session (a wake turn started at the boundary) stays `running`
-	 * and is surfaced by {@link staleAcceptedRuns} instead.
-	 *
-	 * Milestones are run-scoped: `responseAt` is the CURRENT call's response
-	 * time (never a previous run's, which {@link setStatus} cleared when the
-	 * ref re-entered `running`).
-	 *
-	 * Returns false when the id is gone, aborted, or no longer owned by
-	 * `expected`; those cases must not stamp a newer generation.
+	 * Record a settled run's accepted result only for its exact owning session/ref.
+	 * This remains internal so opaque public observations cannot mutate lifecycle
+	 * milestones or terminalize a different actor generation.
 	 */
-	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean {
+	#markResultAcceptedInternal(id: string, expected: RegistryAgentRef | AgentSession, responseAt?: number): boolean {
 		const ref = this.#refs.get(id);
-		if (!ref || ref.status === "aborted") return false;
-		const matches =
-			expected === undefined ||
-			this.#matchesPublicExpected(ref, expected) ||
-			this.#matchesInternalExpected(ref, expected as RegistryAgentRef | AgentSession);
-		if (!matches) return false;
+		if (!ref || ref.status === "aborted" || !this.#matchesInternalExpected(ref, expected)) return false;
 		const now = Date.now();
 		ref.lifecycle = {
 			...ref.lifecycle,
@@ -1679,27 +1745,20 @@ export class AgentRegistry {
 	}
 
 	/**
-	 * Record a short activity gist for the work-aware roster. Display-only and
-	 * read on demand (`irc list`, peer roster), so it emits no event — keeping
-	 * the per-tool-call update rate off the registry listener path (same as
-	 * `attachSession`, which also bumps `lastActivity` without emitting). Only a
-	 * `running` agent has current work: a heartbeat for any other status is
-	 * dropped, so a late progress flush can't resurrect activity on a ref that
-	 * `setStatus` just cleared. Every running heartbeat refreshes `lastActivity`
-	 * — even when the gist text is unchanged — so the roster's "active … ago" and
-	 * recency sort track real work, not just the last status change.
-	 * The gist is normalized to one bounded line (`oneLineLabel`) so model-derived
-	 * intent text can neither break the roster nor smuggle terminal escapes —
-	 * every caller is safe without sanitizing at its own call site.
+	 * Record a short activity gist only while its exact session/ref still owns
+	 * this running generation. Activity is display-only and emits no event, so
+	 * per-tool progress updates stay off the registry listener path. Every
+	 * accepted heartbeat refreshes `lastActivity`, even when the gist is unchanged.
+	 * The gist is normalized to one bounded line so model-derived intent text
+	 * cannot break the roster or smuggle terminal escapes.
 	 */
-	setActivity(id: string, activity: string): void {
+	#setActivityInternal(id: string, activity: string, expected: RegistryAgentRef | AgentSession): boolean {
 		const ref = this.#refs.get(id);
-		if (!ref) return;
-		if (ref.status !== "running") return;
+		if (!ref || !this.#matchesInternalExpected(ref, expected) || ref.status !== "running") return false;
 		const gist = oneLineLabel(activity);
 		ref.lastActivity = Date.now();
-		if (ref.activity === gist) return;
-		ref.activity = gist;
+		if (ref.activity !== gist) ref.activity = gist;
+		return true;
 	}
 
 	#attachSession(ref: RegistryAgentRef, session: AgentSession, sessionFile?: string | null): boolean {
@@ -1712,6 +1771,7 @@ export class AgentRegistry {
 			ref.sessionFile = sessionFile;
 		}
 		ref.lastActivity = Date.now();
+		bindAgentSessionRegistry(this, session);
 		return true;
 	}
 
