@@ -4,6 +4,7 @@ import {
 	CustomEditor,
 	cfgPromptSuggestionsEnabled,
 	cfgPromptSuggestionsModel,
+	cfgPromptSuggestionsFallbackModel,
 	convertToLlm,
 	getAgentDir,
 	settings,
@@ -14,6 +15,8 @@ import {
 import { completeSimple, Effort, type ApiKey, type AssistantMessage, type Message, type Model, type SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { Key, matchesKey, truncateToWidth, type AutocompleteProvider, type EditorTheme, type TUI } from "@oh-my-pi/pi-tui";
 
+const PRIMARY_SUGGESTION_TIMEOUT_MS = 30_000;
+const FALLBACK_SUGGESTION_TIMEOUT_MS = 10_000;
 const WIDGET_KEY = "next-prompt-suggestion";
 const DEFAULT_MAX_CHARS = 80;
 const DEFAULT_MAX_TOKENS = 256;
@@ -68,6 +71,15 @@ let cachedSuggestion: string | undefined;
 let visibleSuggestion: string | undefined;
 let suggestionHiddenByUserEdit = false;
 let generationId = 0;
+interface SuggestionRun {
+	id: number;
+	cancelled: boolean;
+	cancellation: Promise<void>;
+	resolveCancellation: () => void;
+	activeController?: AbortController;
+}
+
+let activeSuggestionRun: SuggestionRun | undefined;
 type SuggestionContext = Pick<ExtensionContext, "cwd" | "hasUI" | "hasPendingMessages" | "model" | "models"> & {
 	modelRegistry: {
 		getApiKey: (model: Model) => Promise<string | undefined>;
@@ -150,7 +162,7 @@ export default function ompPromptSuggestions(pi: Pick<ExtensionAPI, "on" | "setL
 		lastCtx = undefined;
 	});
 
-	pi.on("agent_end", async (event, ctx) => {
+	pi.on("agent_end", (event, ctx) => {
 		lastCtx = ctx;
 		resetSuggestion(ctx);
 
@@ -167,26 +179,134 @@ export default function ompPromptSuggestions(pi: Pick<ExtensionAPI, "on" | "setL
 		const model = resolveSuggestionModel(ctx, getPromptSuggestionModelSpec());
 		if (!model) return debug(ctx, "skipped: no model selected");
 
-		const id = ++generationId;
+		const run = createSuggestionRun(++generationId);
+		activeSuggestionRun = run;
 		debug(ctx, "generating...");
-
-		try {
-			const text = await generateSuggestion(event.messages, ctx, model, config);
-			debug(ctx, `raw: ${JSON.stringify(truncatePlain(text, 160))}`);
-			if (id !== generationId) return debug(ctx, "ignored: stale result");
-			if (ctx.hasPendingMessages()) return debug(ctx, "ignored: pending messages appeared");
-			if (ctx.ui.getEditorText().trim().length > 0) return debug(ctx, "ignored: editor became non-empty");
-
-			const clean = sanitizeSuggestion(text, config.maxChars);
-			if (!clean) return debug(ctx, `rejected: ${JSON.stringify(truncatePlain(text, 160))}`);
-
-			showSuggestion(clean, ctx);
-			debug(ctx, `shown: ${clean}`);
-		} catch (error) {
-			debug(ctx, `error: ${error instanceof Error ? error.message : String(error)}`);
-			// Suggestion generation is best-effort and must never interrupt normal use.
-		}
+		void runSuggestionSequence(event.messages, ctx, model, config, run)
+			.catch((error: unknown) => {
+				try {
+					debug(ctx, `error: ${error instanceof Error ? error.message : String(error)}`);
+				} catch {
+					// Background suggestion failures must never become unhandled rejections.
+				}
+			})
+			.finally(() => {
+				if (activeSuggestionRun === run) activeSuggestionRun = undefined;
+			});
 	});
+}
+
+function createSuggestionRun(id: number): SuggestionRun {
+	let resolveCancellation!: () => void;
+	const cancellation = new Promise<void>((resolve) => {
+		resolveCancellation = resolve;
+	});
+	return { id, cancelled: false, cancellation, resolveCancellation };
+}
+
+function cancelActiveSuggestionRun(): void {
+	const run = activeSuggestionRun;
+	if (!run) return;
+	activeSuggestionRun = undefined;
+	run.cancelled = true;
+	run.activeController?.abort();
+	run.resolveCancellation();
+}
+
+function isCurrentSuggestionRun(run: SuggestionRun): boolean {
+	return activeSuggestionRun === run && !run.cancelled && run.id === generationId;
+}
+
+type SuggestionAttemptResult =
+	| { kind: "success"; text: string }
+	| { kind: "timeout" }
+	| { kind: "cancelled" }
+	| { kind: "error"; error: unknown };
+
+function runSuggestionAttempt(
+	messages: AgentEndEvent["messages"],
+	ctx: SuggestionContext,
+	model: Model,
+	config: PromptSuggestionsConfig,
+	run: SuggestionRun,
+	timeoutMs: number,
+): Promise<SuggestionAttemptResult> {
+	const controller = new AbortController();
+	run.activeController = controller;
+	let timeoutId: NodeJS.Timeout | undefined;
+	const attempt = generateSuggestion(messages, ctx, model, config, controller.signal).then(
+		(text): SuggestionAttemptResult => ({ kind: "success", text }),
+		(error: unknown): SuggestionAttemptResult => ({ kind: "error", error }),
+	);
+	const timeout = new Promise<SuggestionAttemptResult>((resolve) => {
+		timeoutId = setTimeout(() => {
+			controller.abort();
+			resolve({ kind: "timeout" });
+		}, timeoutMs);
+	});
+	const cancellation = run.cancellation.then((): SuggestionAttemptResult => ({ kind: "cancelled" }));
+
+	return Promise.race([attempt, timeout, cancellation]).finally(() => {
+		clearTimeout(timeoutId);
+		if (run.activeController === controller) run.activeController = undefined;
+	});
+}
+
+async function runSuggestionSequence(
+	messages: AgentEndEvent["messages"],
+	ctx: SuggestionContext,
+	primaryModel: Model,
+	config: PromptSuggestionsConfig,
+	run: SuggestionRun,
+): Promise<void> {
+	const primary = await runSuggestionAttempt(
+		messages,
+		ctx,
+		primaryModel,
+		config,
+		run,
+		PRIMARY_SUGGESTION_TIMEOUT_MS,
+	);
+	if (primary.kind === "cancelled" || !isCurrentSuggestionRun(run)) return;
+	if (primary.kind === "error") throw primary.error;
+
+	let text: string;
+	if (primary.kind === "timeout") {
+		if (!isPromptSuggestionsEnabled()) return debug(ctx, "ignored: prompt suggestions disabled");
+		if (ctx.hasPendingMessages()) return debug(ctx, "ignored: pending messages appeared");
+		if (ctx.ui.getEditorText().trim().length > 0) return debug(ctx, "ignored: editor became non-empty");
+
+		const fallbackModelSpec = normalizeSuggestionModelSpec(getPromptSuggestionFallbackModelSpec());
+		const fallbackModel = ctx.models.resolve(fallbackModelSpec);
+		if (!fallbackModel) return debug(ctx, `fallback model not found: ${fallbackModelSpec}`);
+		debug(ctx, `primary timed out; trying ${fallbackModelSpec}`);
+		const fallback = await runSuggestionAttempt(
+			messages,
+			ctx,
+			fallbackModel,
+			config,
+			run,
+			FALLBACK_SUGGESTION_TIMEOUT_MS,
+		);
+		if (fallback.kind === "cancelled" || !isCurrentSuggestionRun(run)) return;
+		if (fallback.kind === "error") throw fallback.error;
+		if (fallback.kind === "timeout") return debug(ctx, "fallback timed out");
+		text = fallback.text;
+	} else {
+		text = primary.text;
+	}
+
+	debug(ctx, `raw: ${JSON.stringify(truncatePlain(text, 160))}`);
+	if (!isCurrentSuggestionRun(run)) return debug(ctx, "ignored: stale result");
+	if (!isPromptSuggestionsEnabled()) return debug(ctx, "ignored: prompt suggestions disabled");
+	if (ctx.hasPendingMessages()) return debug(ctx, "ignored: pending messages appeared");
+	if (ctx.ui.getEditorText().trim().length > 0) return debug(ctx, "ignored: editor became non-empty");
+
+	const clean = sanitizeSuggestion(text, config.maxChars);
+	if (!clean) return debug(ctx, `rejected: ${JSON.stringify(truncatePlain(text, 160))}`);
+
+	showSuggestion(clean, ctx);
+	debug(ctx, `shown: ${clean}`);
 }
 
 function isPromptSuggestionsEnabled(): boolean {
@@ -194,9 +314,10 @@ function isPromptSuggestionsEnabled(): boolean {
 }
 
 function resetSuggestion(ctx = lastCtx): void {
-	const hadVisibleSuggestion = visibleSuggestion !== undefined;
+	cancelActiveSuggestionRun();
 	generationId++;
 	cachedSuggestion = undefined;
+	const hadVisibleSuggestion = visibleSuggestion !== undefined;
 	visibleSuggestion = undefined;
 	suggestionHiddenByUserEdit = false;
 	ctx?.ui.setWidget(WIDGET_KEY, undefined);
@@ -279,8 +400,10 @@ async function generateSuggestion(
 	ctx: SuggestionContext,
 	model: Model,
 	config: PromptSuggestionsConfig,
+	signal: AbortSignal,
 ): Promise<string> {
 	const apiKey = await ctx.modelRegistry.getApiKey(model);
+	if (signal.aborted) return "";
 	if (!apiKey) {
 		debug(ctx, `auth unavailable: no API key for ${model.provider}/${model.id}`);
 		return "";
@@ -293,6 +416,7 @@ async function generateSuggestion(
 		apiKey: ctx.modelRegistry.resolver(model),
 		maxTokens: config.maxTokens,
 		reasoning: getSuggestionReasoningEffort(model),
+		signal,
 	};
 
 	const response = await completeSimple(
@@ -621,6 +745,11 @@ function getPromptSuggestionModelSpec(): string {
 	const value = cfgPromptSuggestionsModel.get(settings).trim();
 	return value.length > 0 ? value : DEFAULT_SUGGESTION_MODEL;
 }
+function getPromptSuggestionFallbackModelSpec(): string {
+	const value = cfgPromptSuggestionsFallbackModel.get(settings).trim();
+	return value.length > 0 ? value : DEFAULT_SUGGESTION_MODEL;
+}
+
 
 function normalizeSuggestionModelSpec(spec: string): string {
 	const trimmed = spec.trim();
@@ -669,6 +798,7 @@ function debug(ctx: SuggestionContext, message: string): void {
 }
 
 function __resetForTest(): void {
+	cancelActiveSuggestionRun();
 	cachedSuggestion = undefined;
 	visibleSuggestion = undefined;
 	suggestionHiddenByUserEdit = false;
@@ -691,6 +821,7 @@ export const __test__ = {
 	getMessageRole,
 	getPromptSuggestionModelSpec,
 	getSuggestionReasoningEffort,
+	getPromptSuggestionFallbackModelSpec,
 	isEditorTheme,
 	hideVisibleSuggestion,
 	isPrintableOrMutatingEditKey,

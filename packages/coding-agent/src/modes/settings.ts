@@ -958,6 +958,19 @@ export const cfgPromptSuggestionsModel = register({
 	},
 });
 
+export const cfgPromptSuggestionsFallbackModel = register({
+	id: "promptSuggestions.fallbackModel",
+	type: "string",
+	default: "pi/smol",
+	ui: {
+		tab: "interaction",
+		group: "Input",
+		label: "Prompt Suggestions Fallback Model",
+		description:
+			"Model or role used for next-prompt suggestions when the primary model times out",
+	},
+});
+
 export const cfgTreeFilterMode = register({
 	id: "treeFilterMode",
 	type: "enum",

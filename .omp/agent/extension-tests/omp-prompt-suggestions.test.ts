@@ -145,6 +145,7 @@ mock.module("@oh-my-pi/pi-coding-agent", () => ({
 	},
 	cfgPromptSuggestionsEnabled: { get: () => settingsGetMock("promptSuggestions.enabled") },
 	cfgPromptSuggestionsModel: { get: () => settingsGetMock("promptSuggestions.model") },
+	cfgPromptSuggestionsFallbackModel: { get: () => settingsGetMock("promptSuggestions.fallbackModel") ?? "pi/smol" },
 	convertToLlm: (messages: Message[]): Message[] => messages,
 	getAgentDir: () => testAgentDir,
 	settings: {},
@@ -158,9 +159,11 @@ function resetTestState() {
 	settingsValues.clear();
 	settingsValues.set("promptSuggestions.enabled", true);
 	settingsValues.set("promptSuggestions.model", "pi/smol");
+	settingsValues.set("promptSuggestions.fallbackModel", "pi/smol");
 	settingsGetMock.mockClear();
-	settingsGetMock.mockImplementation((path: string) => settingsValues.get(path));
 	completeSimpleMock.mockClear();
+	settingsGetMock.mockImplementation((path: string) => settingsValues.get(path));
+	completeSimpleMock.mockImplementation(async () => createAssistantMessage("run the tests"));
 	__test__.__resetForTest();
 }
 
@@ -187,6 +190,8 @@ function createEditorTheme() {
 		hintStyle: style,
 	};
 }
+
+let cancelOutstandingTestGeneration: (() => void) | undefined;
 
 function createHarness(options: { cwd?: string; editorTheme?: unknown } = {}) {
 	resetTestState();
@@ -232,12 +237,69 @@ function createHarness(options: { cwd?: string; editorTheme?: unknown } = {}) {
 		},
 	};
 	ompPromptSuggestions(fakePi);
+	cancelOutstandingTestGeneration = () => handlers.get("input")?.({}, ctx);
 	handlers.get("session_start")?.({}, ctx);
 	editor?.setAutocompleteProvider({
 		getSuggestions: async () => ({ items: [], prefix: "" }),
 		applyCompletion: (lines: string[], cursorLine: number, cursorCol: number) => ({ lines, cursorLine, cursorCol }),
 	});
 	return { ctx, editor: () => editor!, fakePi, handlers, requestRender, submit, widgets };
+}
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
+
+async function flushMicrotasks() {
+	for (let index = 0; index < 8; index++) await Promise.resolve();
+}
+
+async function withControlledTimers(run: (advance: (milliseconds: number) => Promise<void>) => Promise<void>) {
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	let now = 0;
+	let nextId = 0;
+	const timers = new Map<number, { at: number; callback: () => void }>();
+	// Controlled timers use numeric handles at this test-only boundary.
+	function fakeSetTimeout(callback: () => void, delay = 0) {
+		const id = ++nextId;
+		timers.set(id, { at: now + Number(delay), callback });
+		return id;
+	}
+	globalThis.setTimeout = fakeSetTimeout as unknown as typeof setTimeout;
+	globalThis.clearTimeout = ((id: number) => {
+		timers.delete(id);
+	}) as typeof clearTimeout;
+	const advance = async (milliseconds: number) => {
+		const target = now + milliseconds;
+		while (true) {
+			const next = [...timers.entries()].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+			if (!next) break;
+			now = next[1].at;
+			timers.delete(next[0]);
+			next[1].callback();
+			await flushMicrotasks();
+		}
+		now = target;
+		await flushMicrotasks();
+	};
+	try {
+		await run(advance);
+	} finally {
+		cancelOutstandingTestGeneration?.();
+		cancelOutstandingTestGeneration = undefined;
+		await flushMicrotasks();
+		__test__.__resetForTest();
+		timers.clear();
+		globalThis.setTimeout = originalSetTimeout;
+		globalThis.clearTimeout = originalClearTimeout;
+	}
 }
 
 describe("omp prompt suggestions", () => {
@@ -271,6 +333,11 @@ describe("omp prompt suggestions", () => {
 		resetTestState();
 
 		expect(__test__.getPromptSuggestionModelSpec()).toBe("pi/smol");
+		expect(settingsValues.get("promptSuggestions.fallbackModel")).toBe("pi/smol");
+		settingsValues.delete("promptSuggestions.fallbackModel");
+		expect(__test__.getPromptSuggestionFallbackModelSpec()).toBe("pi/smol");
+		settingsValues.set("promptSuggestions.fallbackModel", "  ");
+		expect(__test__.getPromptSuggestionFallbackModelSpec()).toBe("pi/smol");
 		expect(__test__.normalizeSuggestionModelSpec("smol")).toBe("pi/smol");
 		expect(__test__.normalizeSuggestionModelSpec("default")).toBe("pi/default");
 		expect(__test__.normalizeSuggestionModelSpec("slow")).toBe("pi/slow");
@@ -291,12 +358,15 @@ describe("omp prompt suggestions", () => {
 		const harness = createHarness();
 		const slowModel = createTestModel("slow");
 		settingsValues.set("promptSuggestions.model", "slow");
+		settingsValues.set("promptSuggestions.fallbackModel", "provider/custom-fallback");
 		harness.ctx.models.resolve.mockImplementation((spec: string) => (spec === "pi/slow" ? slowModel : undefined));
 
-		await harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+		harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+		await flushMicrotasks();
 
 		expect(harness.ctx.models.resolve).toHaveBeenCalledWith("pi/slow");
 		expect(completeSimpleMock.mock.calls[0]?.[0]).toBe(slowModel);
+		expect(harness.ctx.models.resolve).not.toHaveBeenCalledWith("provider/custom-fallback");
 	});
 
 	test("agent_end authenticates suggestions through model registry resolver", async () => {
@@ -307,7 +377,8 @@ describe("omp prompt suggestions", () => {
 			spec === "cliproxy-codex/gpt-5.4-mini" ? selectedModel : undefined,
 		);
 
-		await harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+		harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+		await flushMicrotasks();
 
 		expect(harness.ctx.models.resolve).toHaveBeenCalledWith("cliproxy-codex/gpt-5.4-mini");
 		expect(harness.ctx.modelRegistry.getApiKey).toHaveBeenCalledWith(selectedModel);
@@ -323,7 +394,8 @@ describe("omp prompt suggestions", () => {
 			spec === "cliproxy-codex/gpt-5.4-mini" ? selectedModel : undefined,
 		);
 
-		await harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+		harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+		await flushMicrotasks();
 
 		expect(__test__.getSuggestionReasoningEffort(selectedModel)).toBe(Effort.Low);
 		expect(completeSimpleMock.mock.calls[0]?.[2]?.reasoning).toBe(Effort.Low);
@@ -334,17 +406,339 @@ describe("omp prompt suggestions", () => {
 		settingsValues.set("promptSuggestions.model", "missing-role");
 		harness.ctx.models.resolve.mockImplementation(() => undefined);
 
-		await harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+		harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+		await flushMicrotasks();
 
 		expect(harness.ctx.models.resolve).toHaveBeenCalledWith("missing-role");
 		expect(completeSimpleMock.mock.calls[0]?.[0]).toBe(harness.ctx.model);
+	});
+
+	test("agent_end returns immediately and keeps the primary result before its deadline", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primary = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : undefined);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			settingsValues.set("promptSuggestions.fallbackModel", "provider/custom-fallback");
+			completeSimpleMock.mockImplementation((model: Model) => model === primaryModel ? primary.promise : Promise.resolve(createAssistantMessage("unexpected fallback")));
+
+			const returned = harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			expect(returned).toBeUndefined();
+			await flushMicrotasks();
+			expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+			await advance(29_999);
+			expect(harness.ctx.models.resolve).not.toHaveBeenCalledWith("pi/smol");
+			expect(harness.ctx.models.resolve).not.toHaveBeenCalledWith("provider/custom-fallback");
+			primary.resolve(createAssistantMessage("continue with the plan"));
+			await flushMicrotasks();
+			expect(harness.editor().render(40).join("\n")).toContain("continue with the plan");
+			await advance(1);
+			expect(harness.ctx.models.resolve).not.toHaveBeenCalledWith("pi/smol");
+			expect(harness.ctx.models.resolve).not.toHaveBeenCalledWith("provider/custom-fallback");
+		});
+	});
+
+	test("primary timeout uses the configured fallback with its own ten-second deadline", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primary = deferred<AssistantMessage>();
+			const fallback = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			const fallbackModel = createTestModel("custom-fallback");
+			harness.ctx.models.resolve.mockImplementation((spec: string) =>
+				spec === "configured-role" ? primaryModel : spec === "provider/custom-fallback" ? fallbackModel : undefined,
+			);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			settingsValues.set("promptSuggestions.fallbackModel", "provider/custom-fallback");
+			completeSimpleMock.mockImplementation((model: Model) => model === primaryModel ? primary.promise : fallback.promise);
+
+			const returned = harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			expect(returned).toBeUndefined();
+			await flushMicrotasks();
+			const primarySignal = completeSimpleMock.mock.calls[0]?.[2]?.signal;
+			await advance(30_000);
+			expect(primarySignal?.aborted).toBe(true);
+			expect(harness.ctx.models.resolve).toHaveBeenCalledWith("provider/custom-fallback");
+			expect(harness.ctx.models.resolve).not.toHaveBeenCalledWith("pi/smol");
+			expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+			const fallbackSignal = completeSimpleMock.mock.calls[1]?.[2]?.signal;
+			expect(fallbackSignal).toBeDefined();
+			expect(fallbackSignal).not.toBe(primarySignal);
+			await advance(9_999);
+			expect(harness.editor().render(40).join("\n")).not.toContain("fallback suggestion");
+			fallback.resolve(createAssistantMessage("continue with fallback suggestion"));
+			await flushMicrotasks();
+			expect(harness.editor().render(40).join("\n")).toContain("continue with fallback suggestion");
+			await advance(1);
+			expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+		});
+	});
+
+	test("fallback timeout aborts and ignores late primary and fallback results", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primary = deferred<AssistantMessage>();
+			const fallback = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			const fallbackModel = createTestModel("smol");
+			harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : spec === "pi/smol" ? fallbackModel : undefined);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			completeSimpleMock.mockImplementation((model: Model) => model === primaryModel ? primary.promise : fallback.promise);
+			harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			await flushMicrotasks();
+			await advance(30_000);
+			const fallbackSignal = completeSimpleMock.mock.calls[1]?.[2]?.signal;
+			await advance(10_000);
+			expect(fallbackSignal?.aborted).toBe(true);
+			primary.resolve(createAssistantMessage("late primary text"));
+			fallback.resolve(createAssistantMessage("late fallback text"));
+			await flushMicrotasks();
+			expect(harness.editor().render(40).join("\n")).not.toContain("late primary text");
+			expect(harness.editor().render(40).join("\n")).not.toContain("late fallback text");
+			expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+		});
+	});
+	test("primary timeout normalizes a trimmed fallback role alias", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primary = deferred<AssistantMessage>();
+			const fallback = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			const fallbackModel = createTestModel("slow");
+			harness.ctx.models.resolve.mockImplementation((spec: string) =>
+				spec === "configured-role" ? primaryModel : spec === "pi/slow" ? fallbackModel : undefined,
+			);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			settingsValues.set("promptSuggestions.fallbackModel", " slow ");
+			completeSimpleMock.mockImplementation((model: Model) => model === primaryModel ? primary.promise : fallback.promise);
+
+			harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			await flushMicrotasks();
+			await advance(30_000);
+
+			expect(harness.ctx.models.resolve).toHaveBeenCalledWith("pi/slow");
+			expect(completeSimpleMock.mock.calls[1]?.[0]).toBe(fallbackModel);
+			fallback.resolve(createAssistantMessage("continue with the slow fallback"));
+			await flushMicrotasks();
+			expect(harness.editor().render(40).join("\n")).toContain("continue with the slow fallback");
+		});
+	});
+
+	test("unresolved configured fallback is skipped without session or default substitution", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primary = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : undefined);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			settingsValues.set("promptSuggestions.fallbackModel", "missing-fallback");
+			completeSimpleMock.mockImplementation(() => primary.promise);
+
+			harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			await flushMicrotasks();
+			await advance(30_000);
+
+			expect(harness.ctx.models.resolve).toHaveBeenCalledWith("missing-fallback");
+			expect(harness.ctx.models.resolve).not.toHaveBeenCalledWith("pi/smol");
+			expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+			expect(harness.editor().render(40).join("\n")).not.toContain("fallback");
+		});
+	});
+
+	test("same resolved role receives a fresh pi/smol fallback attempt", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primary = deferred<AssistantMessage>();
+			const fallback = deferred<AssistantMessage>();
+			const sameModel = createTestModel("smol");
+			harness.ctx.models.resolve.mockImplementation(() => sameModel);
+			settingsValues.set("promptSuggestions.model", "pi/smol");
+			let calls = 0;
+			completeSimpleMock.mockImplementation(() => ++calls === 1 ? primary.promise : fallback.promise);
+			harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			await flushMicrotasks();
+			const primarySignal = completeSimpleMock.mock.calls[0]?.[2]?.signal;
+			await advance(30_000);
+			expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+			expect(completeSimpleMock.mock.calls[1]?.[0]).toBe(sameModel);
+			expect(completeSimpleMock.mock.calls[1]?.[2]?.signal).not.toBe(primarySignal);
+			fallback.resolve(createAssistantMessage("retry on the same model"));
+			await flushMicrotasks();
+			expect(harness.editor().render(40).join("\n")).toContain("retry on the same model");
+		});
+	});
+
+	test("typing in the editor before timeout prevents fallback", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primary = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : undefined);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			completeSimpleMock.mockImplementation(() => primary.promise);
+			harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			await flushMicrotasks();
+			harness.editor().handleInput("x");
+			await advance(30_000);
+			expect(harness.ctx.models.resolve).not.toHaveBeenCalledWith("pi/smol");
+			expect(harness.editor().getText()).toBe("x");
+		});
+	});
+
+	test("unresolved pi/smol fallback never substitutes the session model", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primary = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : undefined);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			completeSimpleMock.mockImplementation(() => primary.promise);
+			harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			await flushMicrotasks();
+			await advance(30_000);
+			expect(harness.ctx.models.resolve).toHaveBeenCalledWith("pi/smol");
+			expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+			expect(completeSimpleMock.mock.calls[0]?.[0]).toBe(primaryModel);
+		});
+	});
+
+	test("ordinary primary errors and empty output do not trigger fallback", async () => {
+		for (const result of [() => Promise.reject(new Error("primary failed")), () => Promise.resolve(createAssistantMessage(""))]) {
+			const harness = createHarness();
+			const primaryModel = createTestModel("primary");
+			harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : undefined);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			completeSimpleMock.mockImplementation(() => result());
+			harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			await flushMicrotasks();
+			expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+			expect(harness.ctx.models.resolve).not.toHaveBeenCalledWith("pi/smol");
+		}
+	});
+
+	test("new input cancels a pending primary timeout without fallback", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primary = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : undefined);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			completeSimpleMock.mockImplementation(() => primary.promise);
+			harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			await flushMicrotasks();
+			const signal = completeSimpleMock.mock.calls[0]?.[2]?.signal;
+			harness.handlers.get("input")?.({}, harness.ctx);
+			expect(signal?.aborted).toBe(true);
+			await advance(30_000);
+			expect(harness.ctx.models.resolve).not.toHaveBeenCalledWith("pi/smol");
+			primary.resolve(createAssistantMessage("stale primary result"));
+			await flushMicrotasks();
+			expect(harness.editor().render(40).join("\n")).not.toContain("stale primary result");
+		});
+	});
+
+	test("agent and session starts cancel pending primary work", async () => {
+		for (const eventName of ["agent_start", "session_start"]) {
+			await withControlledTimers(async () => {
+				const harness = createHarness();
+				const primary = deferred<AssistantMessage>();
+				const primaryModel = createTestModel("primary");
+				harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : undefined);
+				settingsValues.set("promptSuggestions.model", "configured-role");
+				completeSimpleMock.mockImplementation(() => primary.promise);
+				harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+				await flushMicrotasks();
+				const signal = completeSimpleMock.mock.calls[0]?.[2]?.signal;
+				harness.handlers.get(eventName)?.({}, harness.ctx);
+				expect(signal?.aborted).toBe(true);
+			});
+		}
+	});
+
+	test("a newer agent_end cancels and invalidates the previous generation", async () => {
+		await withControlledTimers(async () => {
+			const harness = createHarness();
+			const previous = deferred<AssistantMessage>();
+			const current = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : undefined);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			let calls = 0;
+			completeSimpleMock.mockImplementation(() => ++calls === 1 ? previous.promise : current.promise);
+			const event = { messages: [createAssistantMessage("done")] };
+			harness.handlers.get("agent_end")?.(event, harness.ctx);
+			await flushMicrotasks();
+			const previousSignal = completeSimpleMock.mock.calls[0]?.[2]?.signal;
+			harness.handlers.get("agent_end")?.(event, harness.ctx);
+			await flushMicrotasks();
+			const currentSignal = completeSimpleMock.mock.calls[1]?.[2]?.signal;
+			expect(previousSignal?.aborted).toBe(true);
+			expect(currentSignal).toBeDefined();
+			expect(currentSignal?.aborted).toBe(false);
+			expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+
+			previous.resolve(createAssistantMessage("stale previous result"));
+			await flushMicrotasks();
+			expect(harness.editor().render(40).join("\n")).not.toContain("stale previous result");
+			expect(harness.editor().render(40).join("\n")).not.toContain("current generation result");
+
+			current.resolve(createAssistantMessage("current generation result"));
+			await flushMicrotasks();
+			expect(harness.editor().render(40).join("\n")).toContain("current generation result");
+		});
+	});
+
+	test("late primary authentication after timeout cannot start a stale completion", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primaryAuth = deferred<string>();
+			const fallback = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			const fallbackModel = createTestModel("smol");
+			harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : spec === "pi/smol" ? fallbackModel : undefined);
+			harness.ctx.modelRegistry.getApiKey.mockImplementation((model: Model) => model === primaryModel ? primaryAuth.promise : Promise.resolve("fallback-key"));
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			completeSimpleMock.mockImplementation(() => fallback.promise);
+			harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			await flushMicrotasks();
+			expect(completeSimpleMock).not.toHaveBeenCalled();
+			await advance(30_000);
+			expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+			primaryAuth.resolve("late-primary-key");
+			await flushMicrotasks();
+			expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	test("session shutdown cancels pending fallback and ignores its late result", async () => {
+		await withControlledTimers(async (advance) => {
+			const harness = createHarness();
+			const primary = deferred<AssistantMessage>();
+			const fallback = deferred<AssistantMessage>();
+			const primaryModel = createTestModel("primary");
+			const fallbackModel = createTestModel("smol");
+			harness.ctx.models.resolve.mockImplementation((spec: string) => spec === "configured-role" ? primaryModel : spec === "pi/smol" ? fallbackModel : undefined);
+			settingsValues.set("promptSuggestions.model", "configured-role");
+			completeSimpleMock.mockImplementation((model: Model) => model === primaryModel ? primary.promise : fallback.promise);
+			harness.handlers.get("agent_end")?.({ messages: [createAssistantMessage("done")] }, harness.ctx);
+			await flushMicrotasks();
+			await advance(30_000);
+			const fallbackSignal = completeSimpleMock.mock.calls[1]?.[2]?.signal;
+			harness.handlers.get("session_shutdown")?.({}, harness.ctx);
+			expect(fallbackSignal?.aborted).toBe(true);
+			fallback.resolve(createAssistantMessage("stale fallback result"));
+			await flushMicrotasks();
+			expect(harness.ctx.ui.setWidget.mock.calls.at(-1)?.[1]).toBeUndefined();
+		});
 	});
 
 	test("settings toggle disables suggestions", async () => {
 		const harness = createHarness();
 		settingsValues.set("promptSuggestions.enabled", false);
 
-		await harness.handlers.get("agent_end")?.({ messages: [] }, harness.ctx);
+		harness.handlers.get("agent_end")?.({ messages: [] }, harness.ctx);
+		await flushMicrotasks();
 		expect(completeSimpleMock).not.toHaveBeenCalled();
 
 		settingsValues.set("promptSuggestions.enabled", true);
