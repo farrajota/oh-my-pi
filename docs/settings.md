@@ -916,7 +916,7 @@ With `ask.timeout: 0`, waiting for an answer does not consume the active-work le
 
 Configure the fallback model in `/settings` → Interaction → Input → Prompt Suggestions Fallback Model. It persists as `promptSuggestions.fallbackModel` in the agent's `config.yml`, defaults to `pi/smol`, and clearing the setting restores that default without changing the primary suggestion model.
 
-This setting appears only when the runtime includes it; mounting the prompt-suggestions extension does not add runtime `/settings` support. Durable container use requires an image built from a published fork revision that contains the setting—an installed-source patch in a running container is discarded when the container is recreated. Suggestion generation allows the primary model 30 seconds, then makes one fallback attempt with a separate 10-second deadline.
+The fork provides this runtime configuration setting but does not bundle the prompt-suggestions extension. The extension is external, project-local code that must be installed separately; suggestion generation behavior and timing depend on that extension.
 
 ### Providers and services
 

@@ -580,10 +580,6 @@ On first run omp inherits whatever is already on disk: rules, skills, and MCP se
 
 Ask omp to write the piece you're missing, then `/reload-plugins`. Keep it local, ship it in a `marketplace`, or publish it to npm.
 
-### Prompt suggestions
-
-When prompt suggestions are enabled, the configured primary suggestion model gets up to 30 seconds. If and only if that attempt times out, the extension aborts it and tries the model configured at `/settings` → `Interaction` → `Input` → `Prompt Suggestions Fallback Model` for up to 10 more seconds. This is controlled by `promptSuggestions.fallbackModel`, which defaults to `pi/smol` and is configurable independently of the primary model. The fallback model is resolved through the current session's model mapping; if it cannot be resolved, the fallback is skipped rather than substituting the active session model. Other errors or empty results do not trigger a retry, and fallback success is not guaranteed.
-
 ## Philosophy
 
 omp is a fork of [pi-mono](https://github.com/badlogic/pi-mono) by [Mario Zechner](https://github.com/mariozechner), extended with a batteries-included coding workflow.
