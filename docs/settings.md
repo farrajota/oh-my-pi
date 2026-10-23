@@ -912,6 +912,12 @@ The `cost` segment shows recorded session costs. For an active provider/model wi
 
 With `ask.timeout: 0`, waiting for an answer does not consume the active-work lease of the question or any enclosing tool operation. This includes untimed extension UI dialogs and approvals, including questions dispatched through `write xd://…`. The session must remain running; cancellation and session disposal still stop the operation. Dialogs with an explicit positive timeout retain their timed behavior.
 
+#### Prompt-suggestion fallback model
+
+Configure the fallback model in `/settings` → Interaction → Input → Prompt Suggestions Fallback Model. It persists as `promptSuggestions.fallbackModel` in the agent's `config.yml`, defaults to `pi/smol`, and clearing the setting restores that default without changing the primary suggestion model.
+
+This setting appears only when the runtime includes it; mounting the prompt-suggestions extension does not add runtime `/settings` support. Durable container use requires an image built from a published fork revision that contains the setting—an installed-source patch in a running container is discarded when the container is recreated. Suggestion generation allows the primary model 30 seconds, then makes one fallback attempt with a separate 10-second deadline.
+
 ### Providers and services
 
 Model/backend ordering for image generation, web search, speech, dictation, and judgments is configured through the corresponding `modelRoles` and `retry.fallbackChains` entries in [Models](#models). This section contains transport and service behavior that remains independent of model selection.

@@ -966,8 +966,7 @@ export const cfgPromptSuggestionsFallbackModel = register({
 		tab: "interaction",
 		group: "Input",
 		label: "Prompt Suggestions Fallback Model",
-		description:
-			"Model or role used for next-prompt suggestions when the primary model times out",
+		description: "Model or role used for next-prompt suggestions when the primary model times out",
 	},
 });
 
