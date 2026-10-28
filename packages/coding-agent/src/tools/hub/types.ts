@@ -11,7 +11,7 @@ import type { HubAdmissionStateTransaction } from "../../internal/hub-admission"
 import type { IrcDeliveryReceipt, IrcMessage } from "../../irc/bus";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
-import type { StructuredSubagentOutput } from "../../task/types";
+import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { LaunchParams, LaunchToolDetails } from "./launch";
 
@@ -163,6 +163,12 @@ export interface JobSnapshot {
 	/** True when the task progress reports an attached live advisor. */
 	advisor?: boolean;
 	stage?: string;
+	completionPercent?: number;
+	requests?: number;
+	cost?: number;
+	contextTokens?: number;
+	contextWindow?: number;
+	agentOutputPublished?: boolean;
 	widget?: JobWidgetView;
 	resultText?: string;
 	errorText?: string;

@@ -6,14 +6,13 @@ import type { AgentSession } from "../../session/agent-session";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
 import { type AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
+import { type SubagentEventPayload, TASK_SUBAGENT_EVENT_CHANNEL } from "../../task";
 import {
-	type SubagentEventPayload,
 	type SubagentLifecyclePayload,
 	type SubagentProgressPayload,
-	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
-} from "../../task";
+} from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import type { EventBus } from "../../utils/event-bus";
 import type {
 	RpcSubagentEventFrame,

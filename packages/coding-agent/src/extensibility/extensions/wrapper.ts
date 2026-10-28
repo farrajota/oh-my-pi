@@ -13,6 +13,7 @@ import type { PermissionDenialDetails } from "@oh-my-pi/pi-wire";
 import { prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import {
+	approvalRestrictions,
 	denyError,
 	recordApprovalGrant,
 	requestApproval,
@@ -463,22 +464,22 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		};
 		assertAuthorized(params);
+		const approvalSettings = context?.settings ?? this.runner.sessionSettings;
 		const { approvalMode: initialApprovalMode, userPolicies: initialUserPolicies } = resolveApprovalFromContext(
-			context ?? (this.runner.sessionSettings ? { settings: this.runner.sessionSettings } : undefined),
+			context ?? (approvalSettings ? { settings: approvalSettings } : undefined),
 		);
 		const approvalGrants =
 			initialApprovalMode === "always-ask-cached"
-				? getApprovalGrants(
-						(context?.settings ?? this.runner.sessionSettings)?.getAgentDir(),
-						this.runner.sessionId,
-					)
+				? getApprovalGrants(approvalSettings?.getAgentDir(), this.runner.sessionId)
 				: undefined;
+		const restrictions = approvalRestrictions(approvalSettings, this.runner.cwd);
 		const preResolved = resolveApproval(
 			this.tool,
 			approvalArgs(params, context),
 			initialApprovalMode,
 			initialUserPolicies,
 			approvalGrants,
+			restrictions,
 		);
 		if (preResolved.policy === "deny") throw denyError(preResolved, this.tool.name);
 
@@ -612,7 +613,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// input that newly resolves to `deny` is caught here even though the original passed the
 			// short-circuit above.
 			const resolvedArgs = approvalArgs(effectiveParams, context);
-			const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies, approvalGrants);
+			const resolved = resolveApproval(
+				this.tool,
+				resolvedArgs,
+				approvalMode,
+				userPolicies,
+				approvalGrants,
+				restrictions,
+			);
 			context?.xdevTierResolved?.(resolved.tier);
 			if (resolved.policy === "deny") {
 				throw denyError(resolved, this.tool.name);
@@ -632,20 +640,19 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				resolved.source === "mode" &&
 				pendingSafetyChecks.length === 0;
 			const cacheTargets = grantable ? (this.tool.approvalCacheTargets?.(resolvedArgs)?.length ?? 0) > 0 : false;
-			const configuredPrompt = Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
+			const policyKey = resolved.policyKey ?? this.tool.name;
+			const explicitPrompt =
+				resolved.override || (Object.hasOwn(userPolicies, policyKey) && policyKey !== context?.xdevPolicyKey);
 			const sessionScope =
 				pendingSafetyChecks.length === 0 && !cacheTargets
 					? sessionApprovalScope(resolved, this.tool.name)
 					: undefined;
 			const sessionApproved = sessionScope !== undefined && this.runner.hasSessionApproval(sessionScope.key);
-			const xdevBypass = context?.xdevApproved === true && !extensionRevisedParams;
+			const xdevBypass = context?.xdevPolicyKey !== undefined && !extensionRevisedParams;
 			const approvalCheck = {
 				required:
 					pendingSafetyChecks.length > 0 ||
-					(resolved.policy === "prompt" &&
-						!acpBypass &&
-						!sessionApproved &&
-						(resolved.override || configuredPrompt || !xdevBypass)),
+					(resolved.policy === "prompt" && !acpBypass && !sessionApproved && (explicitPrompt || !xdevBypass)),
 				reason: resolved.reason,
 			};
 
@@ -692,6 +699,13 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					if (pendingSafetyChecks.length > 0) {
 						throw new Error(
 							`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
+						);
+					}
+					if (resolved.source === "restriction") {
+						throw new Error(
+							`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
+								`Reason: ${resolved.reason}\n` +
+								`A restricted folder (tools.restrictedFolders) asks in every approval mode.`,
 						);
 					}
 					throw new Error(

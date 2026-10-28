@@ -281,12 +281,26 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 		/** The browser a relay target id belongs to (`PAGE<browser>.<tab>`). */
 		const browserOf = (targetId: string) => targetId.slice(4, targetId.lastIndexOf("."));
 		try {
+			if (!("browser" in relay)) throw new Error("Expected relay Chromium connection");
 			// Borrowing waits until the relay lists the tab, so the first browser's selected tab is listed first.
+			await relay.browser.waitForTarget(
+				target => target.type() === "page" && target.url() === `${fixture.origin}/human`,
+				{
+					timeout: 15_000,
+				},
+			);
 			const inFirst = await acquireTab(names[0]!, relay, { target: "Human sentinel", timeoutMs: 15_000 });
 			const other = await fixture.launchBrowser();
-			// The relay announces a browser's tabs to connected clients only as they change after its hello.
+			// Create the page only after the second browser has established its relay connection.
 			await secondHello.promise;
 			await (await other.browser.newPage()).goto(`${fixture.origin}/first`);
+			// Extension hello and direct navigation can precede the relay client's page-target initialization.
+			await relay.browser.waitForTarget(
+				target => target.type() === "page" && target.url() === `${fixture.origin}/first`,
+				{
+					timeout: 15_000,
+				},
+			);
 			const inSecond = await acquireTab(names[1]!, relay, { target: "First", timeoutMs: 15_000 });
 			expect(browserOf(inSecond.tab.targetId)).not.toBe(browserOf(inFirst.tab.targetId));
 			const owned = await acquireTab(names[2]!, relay, { url: `${fixture.origin}/second`, timeoutMs: 15_000 });

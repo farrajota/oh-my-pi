@@ -29,7 +29,8 @@ import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registr
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition, EffectivePermissionSummary } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import { resolveTaskEffortLevel } from "@oh-my-pi/pi-tui/thinking";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";

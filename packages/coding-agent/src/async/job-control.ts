@@ -21,8 +21,9 @@ import type { HubAdmissionStateTransaction } from "../internal/hub-admission";
 import { shimmerEnabled, shimmerText, type Theme } from "@oh-my-pi/pi-tui/theme";
 import { terminateSubagent } from "../registry/agent-control";
 import type { AgentRef } from "../registry/agent-registry";
-import { renderStructuredJson, structuredStatusLabel } from "../session/async-job-delivery";
-import type { StructuredSubagentOutput } from "../task/types";
+import { renderStructuredJson, structuredStatusLabel, taskAgentHandles } from "../session/async-job-delivery";
+import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
+import { formatNumber } from "@oh-my-pi/pi-tui/render/render-utils";
 import { formatArtifactErrorNotice, stripOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import {
@@ -226,6 +227,8 @@ interface TrackedJobLike {
 	resultText?: string;
 	errorText?: string;
 	structured?: StructuredSubagentOutput;
+	/** See {@link AsyncJob.agentOutputPublished}. */
+	agentOutputPublished?: boolean;
 }
 
 export function snapshotJobs(
@@ -251,15 +254,22 @@ export function snapshotJobs(
 		let advisor = false;
 		let completionPercent: number | undefined;
 		let stage: string | undefined;
+		let requests: number | undefined;
+		let cost: number | undefined;
+		let contextTokens: number | undefined;
+		let contextWindow: number | undefined;
 		if (latest.type === "task") {
 			const progressValue = latest.latestDetails?.progress;
 			if (Array.isArray(progressValue)) {
+				// A batch job's progress lists every spawn of the call, keyed by agent id.
+				// A collided job id is suffixed (`Foo-2`) while its agent id stays `Foo`.
+				const agentId = current?.agentId ?? latest.id;
 				let progressRecord: Record<string, unknown> | undefined;
 				for (const item of progressValue) {
 					if (!item || typeof item !== "object") continue;
 					const candidate = item as Record<string, unknown>;
 					if (!progressRecord) progressRecord = candidate;
-					if (candidate.id === latest.id) {
+					if (candidate.id === agentId) {
 						progressRecord = candidate;
 						break;
 					}
@@ -288,8 +298,13 @@ export function snapshotJobs(
 					const trimmed = stageValue.trim();
 					if (trimmed) stage = trimmed;
 				}
+				requests = finiteNumber(progressRecord?.requests);
+				cost = finiteNumber(progressRecord?.cost);
+				contextTokens = finiteNumber(progressRecord?.contextTokens);
+				contextWindow = finiteNumber(progressRecord?.contextWindow);
 			}
 		}
+		const running = latest.status === "running";
 		const widget = current ? session.asyncJobManager?.widgets?.view(current) : undefined;
 		return {
 			id: latest.id,
@@ -302,8 +317,12 @@ export function snapshotJobs(
 			...(resolvedModelIdentity ? { resolvedModelIdentity } : {}),
 			...(resolvedThinkingLevel !== undefined ? { resolvedThinkingLevel } : {}),
 			...(advisor ? { advisor: true } : {}),
-			...(completionPercent !== undefined && latest.status === "running" ? { completionPercent } : {}),
+			...(completionPercent !== undefined && running ? { completionPercent } : {}),
 			...(stage ? { stage } : {}),
+			...(requests !== undefined && running ? { requests } : {}),
+			...(cost !== undefined && running ? { cost } : {}),
+			...(contextTokens !== undefined && running ? { contextTokens } : {}),
+			...(contextWindow !== undefined && running ? { contextWindow } : {}),
 			...(widget ? { widget } : {}),
 			...(!resultWithheld && !resultConsumed && options.includeResults !== false && latest.resultText
 				? { resultText: latest.resultText }
@@ -318,20 +337,52 @@ export function snapshotJobs(
 				? { structured: latest.structured }
 				: {}),
 			...(latest.type === "task" ? { agentUrlId: current?.agentId ?? latest.id } : {}),
+			...(latest.agentOutputPublished !== undefined ? { agentOutputPublished: latest.agentOutputPublished } : {}),
 		};
 	});
 }
 
-export function buildJobResult(
+function finiteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Progress suffix for a running task row, e.g.
+ * ` — 5h7m · 90 req · $18.40 · ctx 160K/1M · stage: implementing`, from the
+ * fields {@link snapshotJobs} copies out of the task's latest progress record.
+ * Returns `""` for any other row and for a running task without progress
+ * fields, so those rows keep their plain shape; duration alone never makes a
+ * suffix. Pass `duration: false` where the row already shows the run time.
+ */
+export function runningTaskProgressSuffix(job: JobSnapshot, options: { duration: boolean }): string {
+	if (job.type !== "task" || job.status !== "running") return "";
+	const parts: string[] = [];
+	if (job.requests !== undefined && job.requests > 0) parts.push(`${job.requests} req`);
+	if (job.cost !== undefined && job.cost > 0) parts.push(job.cost < 0.005 ? "<$0.01" : `$${job.cost.toFixed(2)}`);
+	if (job.contextTokens !== undefined && job.contextTokens > 0) {
+		parts.push(
+			job.contextWindow !== undefined && job.contextWindow > 0
+				? `ctx ${formatNumber(job.contextTokens)}/${formatNumber(job.contextWindow)}`
+				: `ctx ${formatNumber(job.contextTokens)}`,
+		);
+	}
+	if (job.completionPercent !== undefined) parts.push(`~${job.completionPercent}%`);
+	if (job.stage) parts.push(`stage: ${job.stage.replace(/\s+/g, " ")}`);
+	if (parts.length === 0) return "";
+	if (options.duration) parts.unshift(formatDuration(job.durationMs));
+	return ` — ${parts.join(" · ")}`;
+}
+
+export function buildJobResult<Op extends "wait" | "cancel" | "jobs">(
 	session: ToolSession,
 	manager: AsyncJobManager,
 	scope: HubJobScope,
 	transaction: HubAdmissionStateTransaction,
-	op: "wait" | "cancel" | "jobs",
+	op: Op,
 	jobs: TrackedJobLike[],
 	cancelOutcomes: CancelOutcome[],
 	agents: AgentActivitySnapshot[] = [],
-): AgentToolResult<CoordinationDetails> {
+): AgentToolResult<CoordinationDetails & { op: Op }> {
 	const ownerId = resolveJobOwnerId(scope);
 	// Deduplicate by id (cancelled jobs may also appear in the watched set).
 	const seen = new Set<string>();
@@ -340,6 +391,13 @@ export function buildJobResult(
 		seen.add(j.id);
 		return true;
 	});
+	// Observation holds also suppress delivery, so capture wait provenance before reserving results.
+	const watchedByWait = new Set<string>();
+	if (op === "wait") {
+		for (const job of uniqueJobs) {
+			if (manager.isDeliverySuppressed(job.id)) watchedByWait.add(job.id);
+		}
+	}
 	const observation =
 		op === "jobs"
 			? undefined
@@ -361,6 +419,9 @@ export function buildJobResult(
 			)
 			.map(job => job.id),
 	);
+	for (const jobId of watchedByWait) {
+		if (alreadyConsumed.has(jobId)) watchedByWait.delete(jobId);
+	}
 
 	if (observation !== undefined) {
 		const consumable = jobResults
@@ -402,11 +463,21 @@ export function buildJobResult(
 		for (const j of completed) {
 			lines.push(`### ${j.id} [${j.type}] — ${j.status}`);
 			lines.push(`Label: ${j.label}`);
+			const handles = taskAgentHandles(j.id, j, j.agentUrlId);
+			if (handles) {
+				lines.push(
+					handles === "agent"
+						? `Agent: agent://${j.agentUrlId}, history://${j.agentUrlId}`
+						: `Agent: history://${j.agentUrlId}`,
+				);
+			}
 			if (j.status !== "cancelled") {
 				lines.push(
 					alreadyConsumed.has(j.id)
 						? "Delivery: already delivered or recovered."
-						: "Delivery: not auto-delivered; recovered by this snapshot.",
+						: watchedByWait.has(j.id)
+							? "Delivery: delivered directly to wait."
+							: "Delivery: not auto-delivered; recovered by this snapshot.",
 				);
 			}
 			if (j.resultText) {
@@ -435,10 +506,10 @@ export function buildJobResult(
 		}
 	}
 
-	if (op !== "jobs" && running.length > 0) {
+	if (running.length > 0) {
 		lines.push(`## Still Running (${running.length})\n`);
 		for (const j of running) {
-			lines.push(`- \`${j.id}\` [${j.type}] — ${j.label}`);
+			lines.push(`- \`${j.id}\` [${j.type}] — ${j.label}${runningTaskProgressSuffix(j, { duration: true })}`);
 		}
 	}
 
@@ -453,7 +524,7 @@ export function buildJobResult(
 		lines.push("No background jobs.");
 	}
 
-	const details: CoordinationDetails = {
+	const details: CoordinationDetails & { op: Op } = {
 		op,
 		jobs: jobResults,
 		...(cancelOutcomes.length ? { cancelled: cancelOutcomes.map(({ id, status }) => ({ id, status })) } : {}),
@@ -515,7 +586,7 @@ export async function executeCancel(
 	scope: HubJobScope,
 	transaction: HubAdmissionStateTransaction,
 	ids: string[],
-): Promise<AgentToolResult<CoordinationDetails>> {
+): Promise<AgentToolResult<CoordinationDetails & { op: "cancel" }>> {
 	const ownerId = resolveJobOwnerId(scope);
 	const ownerFilter = ownerId ? { ownerId } : undefined;
 	const registry = session.agentRegistry;

@@ -118,6 +118,7 @@ import {
 	shouldDropAutoToolChoiceForReasoning,
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
+import { readOpenRouterGenerationError } from "./openrouter-generation";
 
 // OpenAI Responses-specific options
 export interface OpenAIResponsesOptions extends StreamOptions {
@@ -204,6 +205,15 @@ function isOpenAIResponsesReplayUnsafeEvent(event: ResponseStreamEvent): boolean
 }
 
 function isRetryableOpenAIResponsesStreamFailure(error: unknown): boolean {
+	// Terminal malformed output needs the agent's corrective reminder, not an
+	// identical billable replay inside the transport adapter.
+	if (
+		error instanceof AIError.ProviderResponseError &&
+		error.kind === "output" &&
+		AIError.is(AIError.classify(error), AIError.Flag.MalformedFunctionCall)
+	) {
+		return false;
+	}
 	return (
 		AIError.isTransientStreamParseError(error) ||
 		(error instanceof AIError.ProviderResponseError && error.kind === "incomplete-stream") ||
@@ -791,6 +801,9 @@ const streamOpenAIResponsesOnce = (
 					messages: context.messages,
 					sessionId: options?.sessionId ?? routingSessionId,
 					promptCacheSessionId,
+					// The family affinity key rides only an explicit prompt-cache
+					// identity; the sessionId-derived cache-id fallback never does.
+					promptCacheAffinityKey: options?.promptCacheKey ? promptCacheSessionId : undefined,
 				});
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
@@ -1168,6 +1181,32 @@ const streamOpenAIResponsesOnce = (
 							"OpenAI responses stream closed before a terminal response event was received",
 							{ provider: model.provider, kind: "incomplete-stream" },
 						);
+					}
+
+					// OpenRouter's Responses translation can hide a native failure behind
+					// "completed". Consult metadata only for truly empty stops, never
+					// for replayable reasoning or provider-hosted tool progress.
+					if (
+						model.compat.isOpenRouterHost &&
+						output.stopReason === "stop" &&
+						output.content.length === 0 &&
+						nativeOutputItems.length === 0 &&
+						!output.stopDetails &&
+						output.responseId
+					) {
+						const nativeError = await readOpenRouterGenerationError({
+							baseUrl: resolvedBaseUrl,
+							headers,
+							responseId: output.responseId,
+							outputTokens: output.usage.output,
+							reasoningTokens: output.usage.reasoningTokens,
+							fetch: options?.fetch,
+							signal: requestSignal,
+						});
+						if (abortTracker.wasCallerAbort()) throw new AIError.AbortError();
+						if (nativeError) {
+							throw new AIError.ProviderResponseError(nativeError, { provider: model.provider, kind: "output" });
+						}
 					}
 
 					if (output.stopReason === "aborted" || output.stopReason === "error") {
@@ -1610,10 +1649,11 @@ function applyOpenAIResponsesPromptCachePolicy(
 	options: OpenAIResponsesOptions | undefined,
 	statefulCacheBaseline?: ResponseInput,
 ): void {
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	if (cacheRetention === "none") return;
 	const promptCache = options?.promptCache;
-	if (!promptCache || resolveCacheRetention(options?.cacheRetention) === "none") return;
 	if (!model.compat.supportsPromptCacheBreakpoints) {
-		if (promptCache.mode === "explicit") {
+		if (promptCache?.mode === "explicit") {
 			throw new AIError.ConfigurationError(
 				`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; enable compat.supportsPromptCacheBreakpoints only for a compatible endpoint.`,
 			);
@@ -1621,11 +1661,15 @@ function applyOpenAIResponsesPromptCachePolicy(
 		return;
 	}
 
+	// GPT-5.6+ replaces `prompt_cache_retention` with `prompt_cache_options.ttl`;
+	// long retention selects the 12h minimum lifetime even without an explicit policy.
+	const ttl = promptCache?.ttl ?? (cacheRetention === "long" ? "12h" : undefined);
+	if (!promptCache && ttl === undefined) return;
 	params.prompt_cache_options = {
-		mode: promptCache.mode,
-		ttl: promptCache.ttl ?? model.compat.promptCacheBreakpointTtl,
+		mode: promptCache?.mode ?? "implicit",
+		ttl: ttl ?? model.compat.promptCacheBreakpointTtl,
 	};
-	if (promptCache.mode === "explicit" && promptCache.breakpoint !== "none")
+	if (promptCache?.mode === "explicit" && promptCache.breakpoint !== "none")
 		markLatestStableResponsesCacheBreakpoint(params.input, statefulCacheBaseline);
 }
 
@@ -1707,11 +1751,14 @@ export function buildParams(
 		instructions: systemInstructions,
 		stream: true,
 		prompt_cache_key: promptCacheKey,
-		prompt_cache_retention: promptCacheKey
-			? cacheRetention === "long" && model.compat.supportsLongPromptCacheRetention
+		// GPT-5.6+ ignores the legacy retention field; its lifetime rides `prompt_cache_options.ttl`.
+		prompt_cache_retention:
+			promptCacheKey &&
+			cacheRetention === "long" &&
+			model.compat.supportsLongPromptCacheRetention &&
+			!model.compat.supportsPromptCacheBreakpoints
 				? "24h"
-				: undefined
-			: undefined,
+				: undefined,
 		// Gateway routing: OpenRouter-only Responses wire field for sticky upstream
 		// routing + observability grouping; no equivalent on direct OpenAI.
 		session_id: model.compat.isOpenRouterHost ? getOpenRouterResponsesSessionId(options) : undefined,

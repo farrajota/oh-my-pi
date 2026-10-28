@@ -98,6 +98,12 @@ export type {
 	SingleResult,
 	TaskToolDetails,
 } from "@oh-my-pi/pi-tui/tools/task";
+export type {
+	BoundedList,
+	EffectivePermissionSummary,
+	PermissionDenialDetails,
+	PermissionTargetSummary,
+} from "@oh-my-pi/pi-wire";
 // Tools (detail types and utilities)
 export * from "./tools";
 export * from "./utils/github";

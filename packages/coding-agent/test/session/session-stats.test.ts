@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { Tokenizer } from "@oh-my-pi/pi-agent-core";
 import { SessionStatsTracker } from "../../src/session/session-stats";
 
-function usage(totalTokens: number, input: number, output: number, cacheRead: number, cacheWrite: number) {
+function usage(totalTokens: number, input: number, output: number, cacheRead: number, cacheWrite: number, cost = 0) {
 	return {
 		input,
 		output,
@@ -10,7 +10,7 @@ function usage(totalTokens: number, input: number, output: number, cacheRead: nu
 		cacheRead,
 		cacheWrite,
 		totalTokens,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
 	};
 }
 const tokenizer = new Tokenizer();
@@ -47,13 +47,13 @@ test("does not add nested task-result usage to canonical session totals", () => 
 	const assistant = {
 		role: "assistant",
 		content: [{ type: "text", text: "done" }],
-		usage: usage(12, 4, 2, 3, 1),
+		usage: usage(12, 4, 2, 3, 1, 0.25),
 	};
 	const taskResult = {
 		role: "toolResult",
 		toolName: "task",
 		content: [],
-		details: { usage: usage(10_000, 5_000, 2_000, 2_000, 1_000) },
+		details: { usage: usage(10_000, 5_000, 2_000, 2_000, 1_000, 50) },
 	};
 	const tracker = new SessionStatsTracker({
 		agent: {
@@ -70,4 +70,13 @@ test("does not add nested task-result usage to canonical session totals", () => 
 	} as never);
 
 	expect(tracker.getSessionStats().tokens.total).toBe(12);
+	expect(tracker.getSessionStats().cost).toBe(0.25);
+	expect(tracker.getTokenTotals()).toEqual({
+		input: 5_004,
+		output: 2_002,
+		reasoning: 2,
+		cacheRead: 2_003,
+		cacheWrite: 1_001,
+		total: 10_012,
+	});
 });

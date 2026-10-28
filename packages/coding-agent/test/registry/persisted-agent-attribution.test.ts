@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { lookupAgentRef, setAgentHistory } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
@@ -516,5 +517,34 @@ describe("persisted agent model attribution", () => {
 		expect(history?.metrics?.requests).toBe(3);
 		expect(history?.metrics?.cost).toBeCloseTo(0.6);
 		expect(history?.resolvedModel).toBe("openai-codex/gpt-5.6-sol");
+	});
+});
+
+describe("persisted history rescans", () => {
+	it("reads a transcript again only after it changed", async () => {
+		using tempDir = TempDir.createSync("@omp-history-rescan-");
+		const rootFile = path.join(tempDir.path(), "main.jsonl");
+		const transcriptFile = path.join(tempDir.path(), "main", "Worker.jsonl");
+		const registry = await historyFor(tempDir.path(), "Worker", [
+			...transcriptHead(),
+			assistant("a1", "si", SONNET, "stop", [{ type: "text", text: "done" }], 0.5),
+		]);
+		const ref = registry.get("Worker")!;
+		expect(ref.history?.directCost).toBeCloseTo(0.5);
+		const changed: string[] = [];
+		registry.onChange(event => {
+			if (event.type === "metadata_changed") changed.push(event.ref.id);
+		});
+
+		await registerPersistedSubagents(registry, rootFile);
+		expect(changed).toEqual([]);
+
+		await fs.appendFile(
+			transcriptFile,
+			`${assistant("a2", "a1", SONNET, "stop", [{ type: "text", text: "more" }], 0.25)}\n`,
+		);
+		await registerPersistedSubagents(registry, rootFile);
+		expect(changed).toEqual(["Worker"]);
+		expect(registry.get("Worker")?.history?.directCost).toBeCloseTo(0.75);
 	});
 });

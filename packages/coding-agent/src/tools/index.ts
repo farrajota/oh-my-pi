@@ -17,7 +17,7 @@ import type {
 	BeforeSubagentSpawnEventResult,
 	PreparedExtension,
 } from "../extensibility/extensions/types";
-import type { Skill } from "../extensibility/skills";
+import type { Skill, SkillRediscoveryHost } from "../extensibility/skills";
 import type { SkillsSettings } from "../extensibility/settings";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
@@ -40,6 +40,7 @@ import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../sdk";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
+import type { CostGate } from "../session/cost-gate";
 import type { CustomMessage } from "../session/messages";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
@@ -47,7 +48,8 @@ import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
 import type { EffectiveSubagentPermissions, ToolExecutionAuthority } from "../task/permission-profiles";
-import { canSpawnAtDepth, type AgentDefinition, type StructuredSubagentSchemaMode } from "../task/types";
+import { canSpawnAtDepth, type AgentDefinition } from "../task/types";
+import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { EventBus } from "../utils/event-bus";
 import { WebSearchTool } from "../web/search";
@@ -225,6 +227,8 @@ export interface DeferredDiagnosticsEntry {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
+	/** Cost gate of the session tree, forwarded to subagents. */
+	costGate?: CostGate;
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */
 	additionalDirectories?: string[];
 	/** Whether UI is available */
@@ -253,6 +257,8 @@ export interface ToolSession {
 	skipPythonPreflight?: boolean;
 	/** Context files materialized for this session; fresh children rediscover their own. */
 	contextFiles?: ContextFileEntry[];
+	/** No context files beyond `contextFiles`, not even for additional workspace roots (forwarded to subagents). */
+	noContextFiles?: boolean;
 	/** Workspace tree materialized for this session; fresh children rescan. */
 	workspaceTree?: WorkspaceTree;
 	/** Skills materialized for this session; fresh children rediscover by identity. */
@@ -267,6 +273,8 @@ export interface ToolSession {
 	skillHintVisible?: boolean;
 	/** Rediscover live session skills after a tool mutates their backing files. */
 	refreshSkills?: () => Promise<void>;
+	/** The session as the holder of a `skill://` URI rediscovers through when a skill's files are gone. */
+	skillRediscoveryHost?: () => SkillRediscoveryHost;
 	/** Prompt templates materialized for this session. */
 	promptTemplates?: PromptTemplate[];
 	/** Full unfiltered rule discovery result for this session. */
@@ -338,11 +346,12 @@ export interface ToolSession {
 	getEvalSessionId?: () => string | null;
 	/** Get session file */
 	getSessionFile: () => string | null;
-	/** Owning journal; full SDK managers also supply registered identity without changing advisor-local IDs. */
-	sessionManager?: Pick<
-		SessionManager,
-		"appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"
-	> & { getSessionId?: SessionManager["getSessionId"] };
+	/**
+	 * Owning journal; full SDK managers also supply registered identity and the
+	 * cost ledger (`appendModelUsage`) without changing advisor-local IDs.
+	 */
+	sessionManager?: Pick<SessionManager, "appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"> &
+		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage" | "getArtifactContent">>;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
 	getEvalKernelOwnerId?: () => string | null;
 	/** Current enabled eval prelude definitions. */
@@ -369,7 +378,7 @@ export interface ToolSession {
 	getPermissionScope?: () => EffectiveSubagentPermissions | undefined;
 	/** Get active tool names in this session when available. */
 	getActiveToolNames?: () => string[];
-	/** Parent cache identity for sibling sharing, only when the parent model opts in. */
+	/** Parent cache identity for sibling sharing; the child stores it independently of its initial model, and each request consumes it only when its own model opts in. */
 	getPromptCacheKey?: () => string | undefined;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;

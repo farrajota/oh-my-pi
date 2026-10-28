@@ -24,7 +24,7 @@ import {
 	type SubagentPermissionMode,
 	type TaskPermissionRequest,
 } from "../permission-profiles";
-import type { PermissionDenialDetails } from "../types";
+import type { PermissionDenialDetails } from "@oh-my-pi/pi-wire";
 
 const immutablePathGroup: DeepImmutable<PathConstraintGroup> = ["src/**"] as const;
 void immutablePathGroup;

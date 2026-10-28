@@ -34,7 +34,7 @@ function trailerFrame(error: Record<string, unknown>): Uint8Array {
 	return frame;
 }
 
-async function runTrailer(error: Record<string, unknown>) {
+async function runTrailer(error: Record<string, unknown>, userMessage = "hi") {
 	const authPayload = toBinary(GetUserJwtResponseSchema, create(GetUserJwtResponseSchema, { userJwt: "jwt" }));
 	const trailer = trailerFrame(error);
 	const fetchImpl = (async (input: string | URL | Request) => {
@@ -52,7 +52,7 @@ async function runTrailer(error: Record<string, unknown>) {
 
 	return streamDevin(
 		devinModel,
-		{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+		{ messages: [{ role: "user", content: userMessage, timestamp: 1 }] },
 		{ apiKey: "token", fetch: fetchImpl },
 	).result();
 }
@@ -115,7 +115,7 @@ describe("streamDevin trailer evidence", () => {
 			code: "invalid_argument",
 			message: "Error",
 			requestBytes: expect.any(Number),
-			compressedBytes: expect.any(Number),
+			compressedBytes: undefined,
 			tools: 0,
 			messages: 1,
 			hadOutput: false,
@@ -124,5 +124,24 @@ describe("streamDevin trailer evidence", () => {
 		expect(warning?.rawTrailer).toHaveLength(2001);
 		expect(warning?.detail).toEndWith("…");
 		expect(warning?.rawTrailer).toEndWith("…");
+	});
+
+	it("reports compressed and uncompressed request byte evidence", async () => {
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		await runTrailer({ code: "invalid_argument", message: "Error" });
+		const plainWarning = warnSpy.mock.calls.find(
+			([message]) => message === "devin: stream rejected via Connect trailer",
+		)?.[1] as Record<string, unknown> | undefined;
+		expect(plainWarning?.requestBytes).toEqual(expect.any(Number));
+		expect(plainWarning?.compressedBytes).toBeUndefined();
+
+		warnSpy.mockClear();
+		await runTrailer({ code: "invalid_argument", message: "Error" }, "x".repeat(4096));
+		const compressedWarning = warnSpy.mock.calls.find(
+			([message]) => message === "devin: stream rejected via Connect trailer",
+		)?.[1] as Record<string, unknown> | undefined;
+		expect(compressedWarning?.requestBytes).toEqual(expect.any(Number));
+		expect(compressedWarning?.compressedBytes).toEqual(expect.any(Number));
+		expect(compressedWarning!.compressedBytes).toBeLessThan(compressedWarning!.requestBytes as number);
 	});
 });

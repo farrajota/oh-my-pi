@@ -261,10 +261,14 @@ export async function hasResolvableTranscript(agentId: string): Promise<boolean>
 	try {
 		const registry = AgentRegistry.global();
 		const lower = agentId.toLowerCase();
-		let ref = registry.get(agentId);
+		let ref = lookupAgentRef(registry, agentId);
 		if (ref?.kind === "advisor") ref = undefined;
-		ref ??= registry.list().find(candidate => candidate.kind !== "advisor" && candidate.id.toLowerCase() === lower);
+		ref ??= listAgentRefs(registry).find(
+			candidate => candidate.kind !== "advisor" && candidate.id.toLowerCase() === lower,
+		);
 		if (ref && lookupAgentRef(registry, ref.id)?.session) return true;
+		// A running worker resolves to a "no transcript yet" note, not an error.
+		if (ref?.status === "running") return true;
 		if (ref?.sessionFile && (await isReadableFile(ref.sessionFile))) return true;
 		const files = await sessionFilesFromDisk();
 		for (const id of files.keys()) {

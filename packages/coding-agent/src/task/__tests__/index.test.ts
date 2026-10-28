@@ -12,7 +12,8 @@ import { EventBus } from "../../utils/event-bus";
 import * as executor from "../executor";
 import { TaskTool } from "../index";
 import { freezePermissionScope } from "../permission-profiles";
-import { type AgentDefinition, getTaskSchema, type SingleResult, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../types";
+import { type AgentDefinition, getTaskSchema, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../types";
+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 
 const temporaryRoots: string[] = [];
 
@@ -102,7 +103,14 @@ describe("TaskTool toolProfile schema", () => {
 			permissions: { enabled: true, toolsEnabled: true, pathsEnabled: true },
 		});
 
-		expect(schema({ agent: "synthetic", task: "read", toolProfile: "inspect" }) instanceof type.errors).toBe(false);
+		expect(
+			schema({
+				agent: "synthetic",
+				task: "read",
+				solutionSpace: "focused inspection",
+				toolProfile: "inspect",
+			}) instanceof type.errors,
+		).toBe(false);
 	});
 
 	test("batch item schema accepts an omitted toolProfile", () => {
@@ -115,7 +123,7 @@ describe("TaskTool toolProfile schema", () => {
 
 		const parsed = schema({
 			context: "Shared context",
-			tasks: [{ task: "review" }],
+			tasks: [{ task: "review", solutionSpace: "focused review" }],
 		});
 
 		expect(parsed instanceof type.errors).toBe(false);
@@ -142,9 +150,8 @@ describe("TaskTool toolProfile schema", () => {
 
 		expect(
 			schema({
-				agent: "synthetic",
 				context: "Shared context",
-				tasks: [{ task: "review", toolProfile: "review" }],
+				tasks: [{ agent: "synthetic", task: "review", solutionSpace: "focused review", toolProfile: "review" }],
 			}) instanceof type.errors,
 		).toBe(false);
 	});
@@ -157,7 +164,14 @@ describe("TaskTool toolProfile schema", () => {
 			permissions: { enabled: true, toolsEnabled: true, pathsEnabled: true },
 		});
 
-		expect(schema({ agent: "synthetic", task: "read", toolProfile: "full" }) instanceof type.errors).toBe(true);
+		expect(
+			schema({
+				agent: "synthetic",
+				task: "read",
+				solutionSpace: "focused inspection",
+				toolProfile: "full",
+			}) instanceof type.errors,
+		).toBe(true);
 	});
 });
 
@@ -178,7 +192,8 @@ describe("TaskTool toolProfile execution", () => {
 		});
 
 		expect(runSpy).toHaveBeenCalledTimes(1);
-		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["browser", "yield"]);
+		// Required yield is installed by the child SDK, not declared in the agent's tools.
+		expect(runSpy.mock.calls[0]?.[0].agent.tools).toEqual(["browser"]);
 	});
 
 	test("plan mode intersects explicit agent tools with the plan profile", async () => {
@@ -233,7 +248,7 @@ describe("TaskTool toolProfile execution", () => {
 		});
 
 		const tools = runSpy.mock.calls[0]?.[0].agent.tools?.filter(tool => tool !== "irc");
-		expect(tools).toEqual(["read", "grep", "find", "hub"]);
+		expect(tools).toEqual(["read", "grep", "find"]);
 		expect(tools).not.toEqual(expect.arrayContaining(["edit", "write"]));
 	});
 
@@ -288,7 +303,7 @@ describe("TaskTool toolProfile execution", () => {
 			permissions: { profiles: ["focused-edit"] },
 		});
 
-		expect(runSpy.mock.calls[0]?.[0].agent.tools?.filter(tool => tool !== "irc")).toEqual(["hub"]);
+		expect(runSpy.mock.calls[0]?.[0].agent.tools?.filter(tool => tool !== "irc")).toEqual([]);
 	});
 
 	test("forwards synchronous child lifecycle events to the root observability bus", async () => {

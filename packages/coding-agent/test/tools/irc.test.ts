@@ -25,7 +25,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { IrcBridge, type IrcBridgeHost } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
+import { IrcBridge } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
 import { convertToLlm, type CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { attachIrcWakeTurnMonitor } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -1482,11 +1482,24 @@ describe("IRC", () => {
 				sessionManager,
 				isDisposed: () => false,
 				isParentSender: (recipientId: string, senderId: string) => recipientId === id && senderId === parentId,
+				isDescendantSender: (recipientId, senderId) => {
+					let ancestorId = lookupAgentRef(registry, senderId)?.parentId;
+					while (ancestorId) {
+						if (ancestorId === recipientId) return true;
+						ancestorId = lookupAgentRef(registry, ancestorId)?.parentId;
+					}
+					return false;
+				},
+				isSubagent: agentId => lookupAgentRef(registry, agentId)?.kind === "sub",
 				isStreaming: () => opts.streaming ?? false,
 				planModeEnabled: () => false,
 				emitSessionEvent: async () => {},
 				wakeForIrc: wake,
-			} as unknown as IrcBridgeHost);
+				autoReplyIrcEnabled: () => false,
+				autoReplyIrc: async () => {
+					throw new Error("Unexpected automatic reply in broadcast wake fixture.");
+				},
+			});
 			const session = {
 				...createSessionDefaults(),
 				subscribe: (listener: (event: AgentSessionEvent) => void) => {
@@ -1581,9 +1594,16 @@ describe("IRC", () => {
 			expect(incoming.content).toContain("No one replies on your behalf.");
 			expect(main.delivered.map(message => message.body)).toEqual(["everyone: status"]);
 			expect(sender.delivered).toEqual([]);
-			const parentSteer = streaming.steered[0];
-			if (!parentSteer) throw new Error("Expected the broadcast to reach the streaming recipient.");
-			expect(streaming.bridge.isParentSteer(parentSteer)).toBe(false);
+			const [peerMessage] = streaming.bridge.drainPending();
+			if (!peerMessage) throw new Error("Expected the broadcast to reach the streaming recipient.");
+			expect(peerMessage).toMatchObject({
+				role: "custom",
+				customType: "irc:incoming",
+				details: { from: "0-C", message: "everyone: status", broadcast: true },
+			});
+			expect(streaming.bridge.isPeerMessage(peerMessage)).toBe(true);
+			expect(streaming.bridge.isParentSteer(peerMessage)).toBe(false);
+			expect(streaming.steered).toEqual([]);
 		});
 
 		it("does not relay woken peers' turns back to a subagent broadcaster", async () => {

@@ -32,7 +32,7 @@ import type { SessionContext } from "../session/session-context";
 import type { SessionManager } from "../session/session-manager";
 import type { ShakeMode } from "../session/shake-types";
 import type { DictationTarget } from "../stt";
-import type { SessionInfo } from "../session/session-listing";
+import type { SessionContinuation, SessionInfo } from "../session/session-listing";
 import type { SpaceHoldHandler } from "@oh-my-pi/pi-tui/space-hold";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { LspStartupServerInfo } from "../tools";
@@ -97,6 +97,21 @@ export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions &
 	Pick<HookSelectorOptions, "disabledIndices" | "inline">;
 
 export type SessionPickHandler = (session: SessionInfo) => void | Promise<void>;
+
+/** How {@link InteractiveModeContext.handleResumeSession} picks the file it opens. */
+export interface ResumeSessionOptions {
+	/**
+	 * The user chose this session to resume (picker, `/resume <id>`, welcome
+	 * card): when its conversation went on in another file, resume that copy.
+	 * Restoring a session the process itself left (collab) opens the path as given.
+	 */
+	followContinuation?: boolean;
+	/**
+	 * The copy to resume, already found by the caller (`resolveResumeTarget`):
+	 * `sessionPath` is that copy, and the notice names the file it came from.
+	 */
+	continuation?: SessionContinuation;
+}
 
 export interface RenderSessionContextOptions {
 	updateFooter?: boolean;
@@ -359,7 +374,8 @@ export interface InteractiveModeContext {
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
 	flushPendingModelSwitch(): Promise<void>;
-	setWorkingMessage(message?: string): void;
+	/** No argument restores the default; a function label is re-read on every spinner tick. */
+	setWorkingMessage(message?: string | (() => string)): void;
 	applyPendingWorkingMessage(): void;
 	beginWorkingMessageRun(session: AgentSession, startedAt: number): void;
 	rehydrateWorkingMessageRun(session: AgentSession, startedAt: number | undefined): boolean;
@@ -533,7 +549,7 @@ export interface InteractiveModeContext {
 	showSessionSelector(source?: ForeignSessionSource, onSelect?: SessionPickHandler): void;
 	/** Settle side requests before replacing the session or deleting its artifacts. */
 	prepareSessionSwitch(): Promise<void>;
-	handleResumeSession(sessionPath: string): Promise<void>;
+	handleResumeSession(sessionPath: string, options?: ResumeSessionOptions): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void>;
 	showSessionPinSelector(): Promise<void>;
@@ -563,8 +579,9 @@ export interface InteractiveModeContext {
 		message: string,
 		detached?: Pick<SubmittedUserInput, "text" | "images" | "imageLinks">,
 	): Promise<void>;
-	handleBtwCommand(question: string): Promise<void>;
-	handleTanCommand(work: string): Promise<void>;
+	/** `title` heads the side question instead of its text, e.g. a side file command's `/sitrep the migration`. */
+	handleBtwCommand(question: string, images?: ImageContent[], title?: string): Promise<boolean>;
+	handleTanCommand(work: string, images?: ImageContent[]): Promise<boolean>;
 	hasActiveBtw(): boolean;
 	handleBtwEscape(): boolean;
 	handleBtwBranchKey(): Promise<boolean>;
@@ -579,6 +596,7 @@ export interface InteractiveModeContext {
 		assistantMessage: AssistantMessage,
 		leafId: string,
 		sessionId: string,
+		images?: ImageContent[],
 	): Promise<void>;
 	handleOmfgCommand(complaint: string): Promise<void>;
 	hasActiveOmfg(): boolean;

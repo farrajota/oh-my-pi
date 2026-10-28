@@ -39,10 +39,11 @@ import {
 	createMCPProxyTools,
 	createSubagentSettings,
 	followMCPTools,
+	replayRevivedAgentStart,
 	subagentRetryFallbackRole,
 	type MCPToolFollower,
 } from "./executor";
-import type { EffectivePermissionSummary } from "./types";
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import { isCompletionProbeEnabled } from "./completion-probe";
 import { cfgTaskAgentAccountPools } from "./settings";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
@@ -464,6 +465,7 @@ export function createPersistedSubagentReviverFactory(
 						sessionManager: reopened,
 						// Revived agents join the root session tree, so their observability
 						// frames ride the same bus the RPC/collab surfaces subscribed to.
+						costGate: ctx.session.costGate,
 						subagentEventBus: ctx.subagentEventBus,
 						authStorage: ctx.authStorage,
 						modelRegistry: ctx.modelRegistry,
@@ -550,6 +552,7 @@ export function createPersistedSubagentReviverFactory(
 					reportRuntimeError: err =>
 						logger.error("Extension error", { path: err.extensionPath, error: err.error }),
 				});
+				await replayRevivedAgentStart(session);
 				// Cold revives must drive registry status themselves — createAgentSession
 				// doesn't wire this generically (the live path does it in the executor).
 				// The internal run-state signal precedes deferrable public `agent_end`,

@@ -385,7 +385,7 @@ export type QueuedMessageQueue = "steering" | "followUp";
 
 export type CacheWarmingMode = "off" | "streaming" | "idle";
 
-/** `set_event_filter` projection: `delta` drops the accumulated snapshots from `message_update`. */
+/** `set_event_filter` projection: `delta` replaces the accumulated snapshots with the block a start/end event touches. */
 export type MessageUpdates = "full" | "delta";
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
@@ -619,6 +619,14 @@ export interface BranchResult {
 	cancelled: boolean;
 }
 
+export interface NavigateTreeResult {
+	cancelled: boolean;
+	/** Only ever `true`: `abort_branch_summary` stopped the summary; nothing moved. */
+	aborted?: boolean;
+	/** The target was a user message: its text, for the editor; the leaf moved to its parent. */
+	editorText?: string;
+}
+
 export interface TokenUsage {
 	input: number;
 	output: number;
@@ -647,6 +655,8 @@ export interface SessionStats {
 	sessionFile?: string;
 	credits?: SessionCredits;
 	routedModels?: Record<string, number>;
+	/** Failed edits by the engine's `errorKind`. */
+	editRejections?: Record<string, number>;
 	contextUsage?: ContextUsage;
 }
 
@@ -726,6 +736,8 @@ export interface BtwHistoryTurn {
 	status: BtwStatus;
 	createdAt: number;
 	updatedAt: number;
+	/** Images attached to the question. */
+	images?: ImageContent[];
 	error?: string;
 }
 
@@ -738,6 +750,8 @@ export interface BtwHistoryRecord {
 	updatedAt: number;
 	id: string;
 	leafId: string | null;
+	/** Images attached to the question. */
+	images?: ImageContent[];
 	error?: string;
 	followUps?: BtwHistoryTurn[];
 }
@@ -1069,6 +1083,8 @@ export interface PromptError {
 	provider?: string;
 	model?: string;
 	httpStatus?: number;
+	/** `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. */
+	code?: "cost_cap";
 }
 
 /** Terminal outcome of one accepted `prompt` / `abort_and_prompt`, keyed by request `id`. */
@@ -1272,6 +1288,7 @@ export interface InputUiRequest {
 	title: string;
 	placeholder?: string;
 	timeout?: number;
+	secret?: boolean;
 }
 
 export interface EditorUiRequest {
@@ -1748,6 +1765,19 @@ export interface ForkParams {
 	entryId?: string;
 }
 
+export interface NavigateTreeParams {
+	entryId: string;
+	/** Summarize the abandoned branch at the target. */
+	summarize?: boolean;
+	/** Instructions for the summarizer. */
+	customInstructions?: string;
+}
+
+export interface SetLabelParams {
+	entryId: string;
+	label?: string;
+}
+
 export interface GetBranchMessagesResult {
 	messages: BranchMessage[];
 }
@@ -1893,6 +1923,9 @@ export interface RpcWireCommands {
 	switch_session: { params: SwitchSessionParams; result: CancellationResult };
 	branch: { params: BranchParams; result: BranchResult };
 	fork: { params: ForkParams; result: CancellationResult };
+	navigate_tree: { params: NavigateTreeParams; result: NavigateTreeResult };
+	abort_branch_summary: { params: undefined; result: undefined };
+	set_label: { params: SetLabelParams; result: undefined };
 	get_branch_messages: { params: undefined; result: GetBranchMessagesResult };
 	get_last_assistant_text: { params: undefined; result: GetLastAssistantTextResult };
 	set_session_name: { params: SetSessionNameParams; result: undefined };

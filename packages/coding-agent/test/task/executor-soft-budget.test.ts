@@ -105,6 +105,7 @@ function createMockSession(
 		sessionManager,
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
+		getMountedXdevToolNames: () => [],
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {
@@ -478,7 +479,7 @@ describe("runSubprocess soft request budget", () => {
 		advisorActive.mockReturnValue(false);
 		const revivedTerminal = waitForFollowUpTerminal();
 		const revivedReceipt = await new IrcBus().send({ from: "Main", to: id, body: "resume after parking" });
-		expect(revivedReceipt.outcome).toBe("revived");
+		expect(revivedReceipt.outcome, revivedReceipt.error).toBe("revived");
 		await revivedTerminal;
 		expectRpcTurn(false);
 		rpcRegistry.dispose();

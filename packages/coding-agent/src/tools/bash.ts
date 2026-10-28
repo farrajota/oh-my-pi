@@ -199,7 +199,9 @@ export const CRITICAL_BASH_PATTERNS = [
 	// Disk / filesystem destruction.
 	/>\s*\/dev\/sd[a-z]/i, // write to disk device.
 	/\bmkfs(\.|\b)/i, // format filesystem.
-	/\bdd\s+if=.+of=\/dev\//i, // dd to a device.
+	// dd to a device. Write-only pseudo-device sinks (`of=/dev/null`, `/dev/stdout`, `/dev/fd/1`, …) are
+	// excluded: they cannot destroy data, and `dd … of=/dev/null` is the standard read-throughput idiom.
+	/\bdd\s+if=.+of=\/dev\/(?!(?:null|zero|stdout|stderr|tty|fd\/\d+)(?:[\s;&|)<>]|$))/i,
 	/\bshred\s+\/dev\//i,
 	/\bcryptsetup\b/i,
 
@@ -688,6 +690,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		return new InternalUrlFilesystem({ context: sessionResolveContext(this.session, { signal }), tier });
 	}
 
+	/**
+	 * Session identity for a command, read when its tool call starts, so
+	 * `/fork`, `/new`, and `/resume` take effect on the next call while a call
+	 * already under way keeps the session it began in. Always set both keys: an
+	 * empty value replaces a stale one inherited from a parent omp process,
+	 * since an env overlay cannot unset.
+	 */
+	#sessionEnv(): Record<string, string> {
+		return {
+			PI_SESSION_ID: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? "",
+			PI_SESSION_FILE: this.session.getSessionFile() ?? "",
+		};
+	}
+
 	/** Service launch mode: live `launch.enabled` while `bash` itself is an active tool. */
 	get #launchEnabled(): boolean {
 		return cfgLaunchEnabled.get(this.session.settings) === true && (this.session.isToolActive?.("bash") ?? true);
@@ -900,6 +916,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// The job's widget reads the command's own output and every pipe it opens.
 		const outputTap = new TextTap("out", "the command's own stdout+stderr");
 		const pipeSources = new PipeTextSources(streams);
+		let outputTapClosed = false;
+		const closeOutputTap = (): void => {
+			if (outputTapClosed) return;
+			outputTapClosed = true;
+			outputTap.close();
+		};
 		let latestText = "";
 		let latestProgressDetails: BashProgressDetails | undefined;
 		let backgrounded = !options.foreground;
@@ -961,7 +983,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								onSessionShellBusy: () => notices.push(SESSION_SHELL_BUSY_NOTICE),
 							}).finally(() => {
 								pids = NO_PIDS;
-								outputTap.close();
+								closeOutputTap();
 							});
 							if (result.artifactError)
 								latestProgressDetails = { meta: { artifactError: result.artifactError } };
@@ -1003,6 +1025,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						runSignal,
 					);
 				} catch (error) {
+					closeOutputTap();
 					const message = error instanceof Error ? error.message : String(error);
 					latestText = message;
 					completion.resolve({ kind: "failed", error });
@@ -1054,9 +1077,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	): Promise<AgentToolResult<BashToolDetails>> {
 		let command = rawCommand;
 		// The session this call belongs to, captured before any await: a session
-		// change while the call waits must not move it into the new session's shell.
+		// change while the call waits must not move it into the new session's
+		// shell, nor hand it the new session's identity.
 		const sessionId = this.session.getSessionId?.() ?? undefined;
 		const env = normalizeBashEnv(rawEnv);
+		const sessionEnv = this.#sessionEnv();
 
 		// Extract a leading `cd <path> && ...` into cwd when the model ignores the
 		// cwd parameter. The scanner captures only a single path token and defers
@@ -1093,7 +1118,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			// validation unchanged, but only warn when a condition was actually ignored.
 			pendingNotices.push("Ignored ready: service-only, and no service name was given.");
 		}
-		if (asyncRequested && !cfgAsyncEnabled.get(this.session.settings)) {
+		if (name === undefined && asyncRequested && !cfgAsyncEnabled.get(this.session.settings)) {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
 		}
 
@@ -1118,6 +1143,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		const resolvedEnv = env;
+		const commandEnv = { ...resolvedEnv, ...sessionEnv };
 		// Best-effort cache invalidation: drop github-cache rows for any issue/PR
 		// number touched by a mutating `gh` subcommand inside this bash call so
 		// subsequent issue:// / pr:// reads pick up the post-mutation state
@@ -1178,6 +1204,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					cwd: commandCwd,
 					pty: pty ?? true,
 					ready,
+					env: sessionEnv,
 				},
 				signal,
 				ready === undefined ? undefined : ctx?.toolCall?.steeringSignal,
@@ -1204,6 +1231,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					`NOT ready — readiness timed out after ${ready?.timeout ?? 30}s; process state: ${daemon.state}.`,
 				);
 			if (daemon.exitReason) lines.push(`Reason: ${daemon.exitReason}`);
+			lines.push(...pendingNotices);
 			const log = await serviceLogs(this.session, name, signal);
 			if (log) lines.push(log);
 			return {
@@ -1244,7 +1272,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				requestedTimeoutSec,
 				notices: pendingNotices,
 
-				resolvedEnv,
+				resolvedEnv: commandEnv,
 				onUpdate,
 				foreground: false,
 				approvalTier,
@@ -1288,7 +1316,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				requestedTimeoutSec,
 				notices: pendingNotices,
 
-				resolvedEnv,
+				resolvedEnv: commandEnv,
 				onUpdate,
 				foreground: !startBackgrounded,
 				approvalTier,
@@ -1351,7 +1379,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const backendPreflight =
 			bridgeTerminalAvailable || canUseInteractiveBashPty(pty === true, ctx)
 				? await applyDirenvPreflight(command, commandCwd, {
-						callerEnv: resolvedEnv,
+						callerEnv: commandEnv,
 						signal,
 						timeoutMs: cfgBashDirenvLoadTimeoutMs.get(this.session.settings),
 						callerTimeoutMs: timeoutMs,
@@ -1425,7 +1453,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				// direnv-transformed command (carries any `unset -v` prefix) + merged
 				// env; falls back to the raw command/env when direnv is off/absent.
 				const bridgeCommand = backendPreflight?.command ?? command;
-				const bridgeEnv = backendPreflight?.env ?? resolvedEnv;
+				const bridgeEnv = backendPreflight?.env ?? commandEnv;
 				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
 				const createP = clientBridge.createTerminal({
 					command: shellSpawn.command,
@@ -1651,12 +1679,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					cwd: commandCwd,
 					timeoutMs,
 					signal,
-					env: backendPreflight?.env ?? resolvedEnv,
+					env: backendPreflight?.env ?? commandEnv,
 					artifactPath,
 					artifactId,
 				})
 			: // executeBash runs its OWN direnv preflight internally — pass the RAW
-				// command + resolvedEnv here so the unset prefix / env merge is not
+				// command + session/per-call environment here so the unset prefix / env merge is not
 				// applied twice.
 				await executeBash(command, {
 					cwd: commandCwd,
@@ -1664,7 +1692,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					isSessionCurrent: () => (this.session.getSessionId?.() ?? undefined) === sessionId,
 					timeout: timeoutMs ?? 0,
 					signal,
-					env: resolvedEnv,
+					env: commandEnv,
 					gitGuard: cfgBashGitGuard.get(this.session.settings),
 					filesystem: this.#urlFilesystem(signal, approvalTier).shellFilesystem(),
 					artifactPath,

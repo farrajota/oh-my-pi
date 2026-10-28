@@ -262,6 +262,11 @@ use native OpenAI compaction without an opt-in, for any provider id. Set
 `enabled: false` to turn it off, or `v2StreamingEnabled: false` to keep only
 the V1 `/responses/compact` request. See [compaction](./compaction.md).
 
+Bedrock Converse Claude models compact natively through a Bedrock Runtime side request on AWS endpoints;
+a custom non-AWS `baseUrl` needs `remoteCompaction.enabled: true`, and `enabled: false` opts out. See
+[compaction](./compaction.md#summary-generation). The separate Anthropic Messages `/anthropic` route has
+its own [setup](./models.md#claude-on-bedrocks-anthropic-messages-api-anthropic).
+
 ### Model value checks
 
 - `id` is required and non-empty; optional `name`, model `baseUrl`, `contextPromotionTarget`, and `compactionModel` must also be non-empty
@@ -375,7 +380,9 @@ command.
 
 Direct Anthropic keeps its existing 5 min / 1 h lifetimes (`short: 300`, `long: 3600`),
 defaulting to 5 min for API keys and 1 h for OAuth subscriber sessions; API keys can
-explicitly select `long`. Claude on native Amazon Bedrock Converse has a 5 min TTL; 1 h is
+explicitly select `long`. Factory Droid's Claude models have the same 5 min / 1 h lifetimes and
+default to 5 min; `long` writes 1 h entries on the Anthropic, Vertex, Bedrock and Azure upstreams
+and stays 5 min elsewhere. Claude on native Amazon Bedrock Converse has a 5 min TTL; 1 h is
 available only where both catalog metadata and the request wire support it. Claude on
 Bedrock Runtime or Mantle's Anthropic Messages route has a 5 min lifetime under existing
 request support; an explicit `long` request falls back to `short` when unsupported. Other Amazon Bedrock models,
@@ -456,6 +463,11 @@ available. Native `loaded_context_length` takes precedence over the training win
 response JIT-loads a model, OMP refreshes that runtime metadata. Explicit custom-model and
 `modelOverrides` limits remain authoritative. Discovered LM Studio models use `imageInputDecoder: stb`.
 
+Decision models (`type: "decision"` in LM Studio's native `GET /api/v1/models`) are discovered as
+`judge` models on the `openai-decisions` API: judgments post to `{baseUrl}/decisions`, LM Studio's
+OpenAI-compatible Decisions endpoint, instead of chat completions. They accept images when LM Studio
+reports `has_vision_adapter: true`. Select one with `modelRoles.judge: lm-studio/<model>`.
+
 This path also works for local OpenAI-compatible servers that are not LM Studio. For example, if oMLX is bound to Ollama's usual port, set `LM_STUDIO_BASE_URL=http://127.0.0.1:11434/v1` to discover it through the existing `/v1/models` flow. Running oMLX and Ollama side by side requires assigning a different port to one of them. Do not configure oMLX as `ollama`: Ollama discovery uses native `/api/tags` and `/api/show` endpoints, not OpenAI `/v1/models`.
 
 ### Implicit Apple Foundation Models discovery
@@ -474,7 +486,7 @@ Its internal API is `apple-foundation-models`; no HTTP endpoint is used.
 When `litellm` is active (for example through `LITELLM_API_KEY` or stored auth), runtime discovery uses the LiteLLM proxy:
 
 - provider: `litellm`
-- api: `openai-responses` for OpenAI-backed models; `openai-completions` for other models
+- api: `openai-decisions` (kind `judge`) for model groups with `mode: decisions`; `openai-responses` for OpenAI-backed models; `openai-completions` for other models
 - base URL: explicit provider `baseUrl` / `models.yml` config, otherwise `LITELLM_BASE_URL`, otherwise `http://localhost:4000/v1`
 - auth mode: `LITELLM_API_KEY` or stored LiteLLM auth when the proxy requires a key
 

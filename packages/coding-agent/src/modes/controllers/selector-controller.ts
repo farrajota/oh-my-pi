@@ -66,6 +66,7 @@ import {
 import type {
 	AgentHubOpenOptions,
 	InteractiveModeContext,
+	ResumeSessionOptions,
 	SelectOnlyModelSelectorOptions,
 	SessionPickHandler,
 } from "../../modes/types";
@@ -82,7 +83,7 @@ import { previewModelCompactionPoint, setModelCompactionPoint } from "../../sess
 import { isTranscriptEntry, type TranscriptEntry } from "../../session/session-context";
 import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
-import { readSessionInfo, type SessionInfo } from "../../session/session-listing";
+import { findSessionContinuation, readSessionInfo, type SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { loadPinnedSessionIds } from "../../session/session-pins";
 import { assertSessionSwitchPreflight } from "../../session/session-switch-preflight";
@@ -135,12 +136,10 @@ import { createExtensionDashboardRuntime } from "../components/extensions/dashbo
 import { HistorySearchComponent } from "@oh-my-pi/pi-tui/overlays/history-search";
 import type { LoginDialogComponent as LoginDialogComponentType } from "@oh-my-pi/pi-tui/overlays/login-dialog";
 import type { LogoutAccountSelectorComponent as LogoutAccountSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
-import type {
-	ModelHubComponent as ModelHubComponentType,
-	ModelRoleSelectionScope,
-} from "@oh-my-pi/pi-tui/overlays/model-hub";
+import { ModelHubComponent, type ModelRoleSelectionScope } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { createModelBrowserSource } from "../model-browser-source";
-import type { ModelPickerComponent as ModelPickerComponentType } from "@oh-my-pi/pi-tui/overlays/model-picker";
+import { formatSessionContinuationNotice } from "../persistence-failure";
+import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import type { OAuthSelectorComponent as OAuthSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/oauth-selector";
 import { PluginSelectorComponent } from "@oh-my-pi/pi-tui/overlays/plugin-selector";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
@@ -176,19 +175,6 @@ import {
 	cfgTreeFilterMode,
 } from "../settings";
 import { cfgTaskAgentModelOverrides } from "../../task/settings";
-
-interface ModelOverlayModules {
-	ModelHubComponent: typeof ModelHubComponentType;
-	ModelPickerComponent: typeof ModelPickerComponentType;
-}
-
-/** Synchronous first-use boundary for model overlays; key callbacks require immediate mounting. */
-function loadModelOverlayComponents(): ModelOverlayModules {
-	return {
-		ModelHubComponent: require("@oh-my-pi/pi-tui/overlays/model-hub.js").ModelHubComponent,
-		ModelPickerComponent: require("@oh-my-pi/pi-tui/overlays/model-picker.js").ModelPickerComponent,
-	};
-}
 
 interface ProviderAuthUiModules {
 	PASTE_CODE_LOGIN_PROVIDERS: typeof PasteCodeLoginProviders;
@@ -1147,7 +1133,6 @@ export class SelectorController {
 			closeOpenMenu("model-picker-select");
 			if (this.#focusOpenMenu("model-picker")) return;
 		}
-		const { ModelPickerComponent } = loadModelOverlayComponents();
 		const viewed = this.ctx.viewSession;
 		const currentContextTokens = viewed.getContextUsage()?.tokens ?? 0;
 		const current = viewed.model;
@@ -1258,7 +1243,6 @@ export class SelectorController {
 	 */
 	#showModelHub(hubOptions: { initialProviderId?: string }): void {
 		if (this.#focusOpenMenu("model-hub")) return;
-		const { ModelHubComponent } = loadModelOverlayComponents();
 		let closed = false;
 		const done = () => {
 			// Re-entrant guard: cancel paths (Esc, login forward) may race;
@@ -2161,7 +2145,7 @@ export class SelectorController {
 			const historyMatcher = historyStorage
 				? (query: string) => historyStorage.matchingSessionIds(query)
 				: undefined;
-			onSelectSession = session => this.handleResumeSession(session.path);
+			onSelectSession = session => this.handleResumeSession(session.path, { followContinuation: true });
 			selectorOptions = {
 				...(!onSelect
 					? {
@@ -2290,7 +2274,10 @@ export class SelectorController {
 		this.ctx.ui.requestRender(true, { clearScrollback: true });
 		return true;
 	}
-	async handleResumeSession(sessionPath: string, options?: { settingsFlushed?: boolean }): Promise<boolean> {
+	async handleResumeSession(
+		sessionPath: string,
+		options?: ResumeSessionOptions & { settingsFlushed?: boolean },
+	): Promise<boolean> {
 		try {
 			assertSessionSwitchPreflight(this.ctx.sessionManager, { kind: "session", path: sessionPath });
 		} catch (error) {
@@ -2306,7 +2293,11 @@ export class SelectorController {
 				return false;
 			}
 		}
-		const target = await this.#relocateFromRemovedWorktree(sessionPath);
+		// The conversation may have gone on in a sibling file while another process held this one.
+		const continuation =
+			options?.continuation ??
+			(options?.followContinuation ? await findSessionContinuation(sessionPath) : undefined);
+		const target = await this.#relocateFromRemovedWorktree(continuation?.session.path ?? sessionPath);
 		if (!target) return false;
 		await this.ctx.prepareSessionSwitch();
 		this.ctx.resetObserverRegistry();
@@ -2342,6 +2333,7 @@ export class SelectorController {
 					? `Resumed session in ${shortenPath(newCwd)}`
 					: "Resumed session",
 		);
+		if (continuation) this.ctx.showWarning(formatSessionContinuationNotice(continuation));
 		if (modelFallbackWarning) this.ctx.showWarning(modelFallbackWarning);
 		return true;
 	}

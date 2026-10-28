@@ -3,7 +3,7 @@ import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { sanitizeErrorLine } from "@oh-my-pi/pi-tui/chrome/error-block";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { formatTaskResultSummary } from "@oh-my-pi/pi-coding-agent/task/result-summary";
-import type { TaskParams, TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task";
+import type { TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { BUILTIN_LIFECYCLE_SLASH_COMMANDS } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-lifecycle";
 import { BUILTIN_CONTROL_SLASH_COMMANDS } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-control";
 import * as seanceResolver from "@oh-my-pi/pi-coding-agent/task/seance";

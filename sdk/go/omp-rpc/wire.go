@@ -2007,7 +2007,7 @@ func (v *CacheWarmingMode) UnmarshalJSON(data []byte) error {
 	return unknownValue("CacheWarmingMode", s)
 }
 
-// `set_event_filter` projection: `delta` drops the accumulated snapshots from `message_update`.
+// `set_event_filter` projection: `delta` replaces the accumulated snapshots with the block a start/end event touches.
 type MessageUpdates string
 
 const (
@@ -2956,6 +2956,31 @@ func (v *BranchResult) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+type NavigateTreeResult struct {
+	Cancelled bool `json:"cancelled"`
+	// Only ever `true`: `abort_branch_summary` stopped the summary; nothing moved.
+	Aborted *bool `json:"aborted,omitempty"`
+	// The target was a user message: its text, for the editor; the leaf moved to its parent.
+	EditorText *string `json:"editorText,omitempty"`
+}
+
+func (v *NavigateTreeResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "NavigateTreeResult", v.decodeFrom)
+}
+
+func (v *NavigateTreeResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out NavigateTreeResult
+	d := fieldDecoder{raw: raw, owner: "NavigateTreeResult"}
+	d.required("cancelled", &out.Cancelled)
+	d.optional("aborted", &out.Aborted)
+	d.optional("editorText", &out.EditorText)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type TokenUsage struct {
 	Input      int64 `json:"input"`
 	Output     int64 `json:"output"`
@@ -3021,7 +3046,9 @@ type SessionStats struct {
 	SessionFile       *string            `json:"sessionFile,omitempty"`
 	Credits           *SessionCredits    `json:"credits,omitempty"`
 	RoutedModels      map[string]float64 `json:"routedModels,omitempty"`
-	ContextUsage      *ContextUsage      `json:"contextUsage,omitempty"`
+	// Failed edits by the engine's `errorKind`.
+	EditRejections map[string]float64 `json:"editRejections,omitempty"`
+	ContextUsage   *ContextUsage      `json:"contextUsage,omitempty"`
 }
 
 func (v *SessionStats) UnmarshalJSON(data []byte) error {
@@ -3043,6 +3070,7 @@ func (v *SessionStats) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("sessionFile", &out.SessionFile)
 	d.optional("credits", &out.Credits)
 	d.optional("routedModels", &out.RoutedModels)
+	d.optional("editRejections", &out.EditRejections)
 	d.optional("contextUsage", &out.ContextUsage)
 	if d.err != nil {
 		return d.err
@@ -3295,7 +3323,9 @@ type BtwHistoryTurn struct {
 	Status    BtwStatus `json:"status"`
 	CreatedAt int64     `json:"createdAt"`
 	UpdatedAt int64     `json:"updatedAt"`
-	Error     *string   `json:"error,omitempty"`
+	// Images attached to the question.
+	Images []ImageContent `json:"images,omitempty"`
+	Error  *string        `json:"error,omitempty"`
 }
 
 func (v *BtwHistoryTurn) UnmarshalJSON(data []byte) error {
@@ -3310,6 +3340,7 @@ func (v *BtwHistoryTurn) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("status", &out.Status)
 	d.required("createdAt", &out.CreatedAt)
 	d.required("updatedAt", &out.UpdatedAt)
+	d.optional("images", &out.Images)
 	d.optional("error", &out.Error)
 	if d.err != nil {
 		return d.err
@@ -3320,13 +3351,15 @@ func (v *BtwHistoryTurn) decodeFrom(raw map[string]json.RawMessage) error {
 
 // A side-question topic: its first turn's fields plus follow-ups; the latest turn is the last follow-up, else the record.
 type BtwHistoryRecord struct {
-	Question  string           `json:"question"`
-	Answer    string           `json:"answer"`
-	Status    BtwStatus        `json:"status"`
-	CreatedAt int64            `json:"createdAt"`
-	UpdatedAt int64            `json:"updatedAt"`
-	ID        string           `json:"id"`
-	LeafID    *string          `json:"leafId"`
+	Question  string    `json:"question"`
+	Answer    string    `json:"answer"`
+	Status    BtwStatus `json:"status"`
+	CreatedAt int64     `json:"createdAt"`
+	UpdatedAt int64     `json:"updatedAt"`
+	ID        string    `json:"id"`
+	LeafID    *string   `json:"leafId"`
+	// Images attached to the question.
+	Images    []ImageContent   `json:"images,omitempty"`
 	Error     *string          `json:"error,omitempty"`
 	FollowUps []BtwHistoryTurn `json:"followUps,omitempty"`
 }
@@ -3345,6 +3378,7 @@ func (v *BtwHistoryRecord) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("updatedAt", &out.UpdatedAt)
 	d.required("id", &out.ID)
 	d.nullable("leafId", &out.LeafID)
+	d.optional("images", &out.Images)
 	d.optional("error", &out.Error)
 	d.optional("followUps", &out.FollowUps)
 	if d.err != nil {
@@ -4805,6 +4839,8 @@ type PromptError struct {
 	Provider   *string `json:"provider,omitempty"`
 	Model      *string `json:"model,omitempty"`
 	HTTPStatus *int64  `json:"httpStatus,omitempty"`
+	// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request.
+	Code *PromptErrorCode `json:"code,omitempty"`
 }
 
 func (v *PromptError) UnmarshalJSON(data []byte) error {
@@ -4819,11 +4855,31 @@ func (v *PromptError) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("provider", &out.Provider)
 	d.optional("model", &out.Model)
 	d.optional("httpStatus", &out.HTTPStatus)
+	d.optional("code", &out.Code)
 	if d.err != nil {
 		return d.err
 	}
 	*v = out
 	return nil
+}
+
+type PromptErrorCode string
+
+const (
+	PromptErrorCodeCostCap PromptErrorCode = "cost_cap"
+)
+
+func (v *PromptErrorCode) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "PromptErrorCode")
+	if err != nil {
+		return err
+	}
+	switch value := PromptErrorCode(s); value {
+	case PromptErrorCodeCostCap:
+		*v = value
+		return nil
+	}
+	return unknownValue("PromptErrorCode", s)
 }
 
 // Terminal outcome of one accepted `prompt` / `abort_and_prompt`, keyed by request `id`.
@@ -5625,6 +5681,7 @@ type InputUiRequest struct {
 	Title       string  `json:"title"`
 	Placeholder *string `json:"placeholder,omitempty"`
 	Timeout     *int64  `json:"timeout,omitempty"`
+	Secret      *bool   `json:"secret,omitempty"`
 }
 
 func (v *InputUiRequest) UnmarshalJSON(data []byte) error {
@@ -5640,6 +5697,7 @@ func (v *InputUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("title", &out.Title)
 	d.optional("placeholder", &out.Placeholder)
 	d.optional("timeout", &out.Timeout)
+	d.optional("secret", &out.Secret)
 	if d.err != nil {
 		return d.err
 	}
@@ -8098,6 +8156,38 @@ func (c Commands) Fork(ctx context.Context, p ForkCommand) (CancellationResult, 
 	var out CancellationResult
 	err := c.call(ctx, "fork", p, 0, &out)
 	return out, err
+}
+
+// NavigateTreeCommand holds the parameters of "navigate_tree".
+type NavigateTreeCommand struct {
+	EntryID string `json:"entryId"`
+	// Summarize the abandoned branch at the target.
+	Summarize *bool `json:"summarize,omitempty"`
+	// Instructions for the summarizer.
+	CustomInstructions *string `json:"customInstructions,omitempty"`
+}
+
+// NavigateTree sends "navigate_tree": Move the session's leaf to an entry in the same file, optionally summarizing the branch it leaves; refused while busy.
+func (c Commands) NavigateTree(ctx context.Context, p NavigateTreeCommand) (NavigateTreeResult, error) {
+	var out NavigateTreeResult
+	err := c.call(ctx, "navigate_tree", p, 600*time.Second, &out)
+	return out, err
+}
+
+// AbortBranchSummary sends "abort_branch_summary": Stop a running `navigate_tree` branch summary; the navigation is cancelled.
+func (c Commands) AbortBranchSummary(ctx context.Context) error {
+	return c.call(ctx, "abort_branch_summary", nil, 0, nil)
+}
+
+// SetLabelCommand holds the parameters of "set_label".
+type SetLabelCommand struct {
+	EntryID string  `json:"entryId"`
+	Label   *string `json:"label,omitempty"`
+}
+
+// SetLabel sends "set_label": Set or clear (omit `label`) an entry's label.
+func (c Commands) SetLabel(ctx context.Context, p SetLabelCommand) error {
+	return c.call(ctx, "set_label", p, 0, nil)
 }
 
 // GetBranchMessages sends "get_branch_messages": List user messages that can be branched from.

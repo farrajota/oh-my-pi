@@ -1,5 +1,5 @@
 import { SEANCE_SLASH_COMMAND } from "./seance";
-import { clearSubmittedText } from "./helpers/draft";
+import { clearSubmittedText, refuseImages, runWithDetachedDraft } from "./helpers/draft";
 import { shutdownHandlerTui } from "./helpers/shutdown";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -11,7 +11,7 @@ import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-b
 import type { FreshSessionResult, HandoffResult } from "../session/agent-session";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
-import { resolveResumableSession } from "../session/session-listing";
+import { resolveResumableSession, resolveResumeTarget } from "../session/session-listing";
 import { toggleSessionPin } from "../session/session-pins";
 import {
 	cleanSourceCheckoutIfConfigured,
@@ -212,6 +212,10 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handle: async (command, runtime) => {
 			const parsed = parseCompactArgs(command.args);
 			if ("error" in parsed) return usage(parsed.error, runtime);
+			// Print mode turns a failed compaction into a nonzero exit; the
+			// flag is closure state because the background-dispatch branch
+			// (RPC) returns before `runCompact` settles.
+			let compactFailed = false;
 			const runCompact = async (): Promise<void> => {
 				const before = runtime.session.getContextUsage?.();
 				const beforeTokens = before?.tokens;
@@ -227,6 +231,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					// Compaction precondition failures (no model, already compacted, too
 					// small) and provider errors propagate as plain Errors; surface them
 					// via runtime.output so they don't fail the ACP prompt turn.
+					compactFailed = true;
 					await runtime.output(`Compaction failed: ${errorMessage(err)}`);
 					return;
 				}
@@ -247,7 +252,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				return commandConsumed();
 			}
 			await runCompact();
-			return commandConsumed();
+			return commandConsumed({ failed: compactFailed });
 		},
 		handleTui: async (command, runtime) => {
 			const parsed = parseCompactArgs(command.args);
@@ -302,6 +307,10 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			if (runtime.session.isGeneratingHandoff) {
 				return usage("Handoff generation is already in progress.", runtime);
 			}
+			// Print mode turns a failed handoff into a nonzero exit; closure
+			// state because the background-dispatch branch (RPC) returns
+			// before `runHandoff` settles.
+			let handoffFailed = false;
 			const runHandoff = async (): Promise<void> => {
 				let result: HandoffResult | undefined;
 				try {
@@ -330,6 +339,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					// Persist the real failure so it stays debuggable after the client
 					// message scrolls away (same rationale as the TUI path, #7993).
 					logger.error("Handoff failed", { error: message });
+					handoffFailed = true;
 					await runtime.output(`Handoff failed: ${message}`);
 					return;
 				}
@@ -347,9 +357,10 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				return commandConsumed();
 			}
 			await runHandoff();
-			return commandConsumed();
+			return commandConsumed({ failed: handoffFailed });
 		},
 		handleTui: async (command, runtime) => {
+			if (refuseImages(command, runtime)) return;
 			const customInstructions = command.args || undefined;
 			clearSubmittedText(runtime);
 			await runtime.ctx.handleHandoffCommand(customInstructions);
@@ -374,18 +385,18 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				runtime.ctx.showSessionSelector();
 				return;
 			}
-			const match = await resolveResumableSession(
+			const target = await resolveResumeTarget(
 				sessionArg,
 				runtime.ctx.sessionManager.getCwd(),
 				runtime.ctx.sessionManager.getSessionDir(),
 				{ allowGlobalFallback: true },
 			);
-			if (!match) {
+			if (!target) {
 				runtime.ctx.showError(`Session "${sessionArg}" not found`);
 				return;
 			}
 			try {
-				await runtime.ctx.handleResumeSession(match.session.path);
+				await runtime.ctx.handleResumeSession(target.session.path, { continuation: target.continuation });
 			} catch (error) {
 				// The picker reports a failed switch itself; `/resume <id>` has no picker.
 				runtime.ctx.showError(error instanceof Error ? error.message : String(error));
@@ -431,8 +442,12 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			const question = command.text.slice(`/${command.name}`.length).trim();
-			clearSubmittedText(runtime);
-			await runtime.ctx.handleBtwCommand(question);
+			await runWithDetachedDraft(
+				command,
+				runtime,
+				() => runtime.ctx.handleBtwCommand(question, runtime.input?.images),
+				{ restoreText: true },
+			);
 		},
 	},
 	{
@@ -443,8 +458,9 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			const work = command.text.slice(`/${command.name}`.length).trim();
-			clearSubmittedText(runtime);
-			await runtime.ctx.handleTanCommand(work);
+			await runWithDetachedDraft(command, runtime, () => runtime.ctx.handleTanCommand(work, runtime.input?.images), {
+				restoreText: true,
+			});
 		},
 	},
 	{
@@ -454,6 +470,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		inlineHint: "<complaint>",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
+			if (refuseImages(command, runtime)) return;
 			const complaint = command.text.slice(`/${command.name}`.length).trim();
 			clearSubmittedText(runtime);
 			await runtime.ctx.handleOmfgCommand(complaint);
@@ -466,6 +483,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		inlineHint: "[request] [--all]",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
+			if (refuseImages(command, runtime)) return;
 			const args = command.text.slice(`/${command.name}`.length).trim();
 			clearSubmittedText(runtime);
 			await runtime.ctx.handleCleanseCommand(args);

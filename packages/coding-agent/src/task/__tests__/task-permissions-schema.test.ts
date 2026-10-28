@@ -216,9 +216,8 @@ describe("task permission schema", () => {
 		);
 
 		const result = await taskTool.execute("tool-call", {
-			agent: "task",
 			context: "Shared context",
-			tasks: [{ task: "read", permissions: { profiles: ["read-only"] } }],
+			tasks: [{ agent: "task", task: "read", permissions: { profiles: ["read-only"] } }],
 		});
 
 		expect(result.content).toEqual([{ type: "text", text: DISABLED_PERMISSIONS_ERROR }]);

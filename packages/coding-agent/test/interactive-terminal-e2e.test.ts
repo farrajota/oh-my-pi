@@ -384,7 +384,12 @@ describe("libkitty end-to-end", () => {
 		const buffer = () => plainRows(term.getScrollBuffer());
 		expect(buffer().some(row => row.includes("SHAKE_RETIRED_REASONING"))).toBe(true);
 		await mode.handleShakeCommand("thinking");
-		await term.waitForRender();
+		await term.waitForRender(
+			() =>
+				buffer().some(row => row.trim() === "Answer marker 1") &&
+				buffer().some(row => row.trim() === "Answer marker 35") &&
+				!buffer().some(row => row.includes("SHAKE_RETIRED_REASONING")),
+		);
 
 		const rows = buffer();
 		expect(rows.some(row => row.includes("SHAKE_RETIRED_REASONING"))).toBe(false);
@@ -402,7 +407,11 @@ describe("libkitty end-to-end", () => {
 				skipped: false,
 				...(errorMessage ? { errorMessage } : {}),
 			});
-			await term.waitForRender();
+			await term.waitForRender(
+				() =>
+					buffer().some(row => row.trim() === "Answer marker 1") &&
+					plainRows(term.getViewport()).some(row => row.includes("Review answer")),
+			);
 			expect(buffer().filter(row => row.trim() === "Answer marker 1")).toHaveLength(1);
 			expect(plainRows(term.getViewport()).some(row => row.includes("Review answer"))).toBe(true);
 		}

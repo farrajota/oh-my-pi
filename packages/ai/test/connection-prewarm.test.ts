@@ -58,10 +58,17 @@ describe("prewarmModelConnection", () => {
 			isOAuth: true,
 			extraBetas: [],
 		});
+		const request = captureFetch();
+		// Extra trust roots are added by transportFetch, after client options are built.
+		await transportFetch(ANTHROPIC, request.fetch)("https://api.anthropic.com/v1/messages", {
+			...real.fetchOptions,
+			method: "POST",
+			body: "{}",
+		});
 		expect(calls).toHaveLength(1);
 		expect(calls[0].url).toBe("https://api.anthropic.com");
 		expect(calls[0].init.method).toBe("HEAD");
-		expect(calls[0].init.tls).toEqual(real.fetchOptions?.tls);
+		expect(calls[0].init.tls).toEqual(request.calls[0].init.tls);
 		const headers = new Headers(calls[0].init.headers);
 		expect([headers.get("authorization"), headers.get("x-api-key")]).toEqual([null, null]);
 	});

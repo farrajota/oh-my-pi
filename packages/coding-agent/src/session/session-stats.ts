@@ -6,6 +6,7 @@ import {
 	type SessionMessageEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ProviderResponseMetadata, Usage } from "@oh-my-pi/pi-ai";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 
@@ -153,9 +154,8 @@ export class SessionStatsTracker {
 	}
 
 	/**
-	 * Token totals of {@link getSessionStats} without the message counts or the
-	 * context breakdown — for per-turn accounting (goal budgets) that only
-	 * needs the counters.
+	 * Per-turn goal-budget accounting includes nested task usage, which is
+	 * excluded from canonical session statistics.
 	 */
 	getTokenTotals(): SessionStats["tokens"] {
 		const tokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
@@ -170,13 +170,16 @@ export class SessionStatsTracker {
 		for (const message of this.#host.agent.state.messages) {
 			if (message.role === "assistant") {
 				if (message.usage) addUsage(message.usage);
+			} else if (message.role === "toolResult" && message.toolName === "task") {
+				const usage = taskToolUsage(message.details);
+				if (usage) addUsage(usage);
 			}
 		}
 		forEachActiveModelUsage(this.#host.sessionManager.getBranchView(), addUsage);
 		return tokens;
 	}
 
-	/** Returns aggregate message, token, and cost statistics for the session. */
+	/** Returns canonical session statistics, excluding nested task-result usage. */
 	getSessionStats(): SessionStats {
 		const state = this.#host.agent.state;
 		let userMessages = 0;
@@ -196,6 +199,7 @@ export class SessionStatsTracker {
 		let committedAcuCost = 0;
 		let hasCredits = false;
 		const routedModels: Record<string, number> = {};
+		const editRejections: Record<string, number> = {};
 		const addUsage = (usage: Usage): void => {
 			totalInput += usage.input;
 			totalOutput += usage.output;
@@ -218,6 +222,13 @@ export class SessionStatsTracker {
 				userMessages++;
 			} else if (message.role === "toolResult") {
 				toolResults++;
+				if (message.toolName === "edit" && message.isError) {
+					const { details } = message;
+					if (details && typeof details === "object" && "errorKind" in details) {
+						const kind = details.errorKind;
+						if (typeof kind === "string") editRejections[kind] = (editRejections[kind] ?? 0) + 1;
+					}
+				}
 			} else if (message.role === "assistant") {
 				assistantMessages++;
 				for (const content of message.content) {
@@ -261,6 +272,7 @@ export class SessionStatsTracker {
 					}
 				: undefined),
 			...(Object.keys(routedModels).length > 0 ? { routedModels } : undefined),
+			...(Object.keys(editRejections).length > 0 ? { editRejections } : undefined),
 			contextUsage: this.getContextUsage(),
 		};
 	}
@@ -486,4 +498,22 @@ export class SessionStatsTracker {
 			responseStatus: response.status,
 		});
 	}
+}
+
+function taskToolUsage(details: unknown): Usage | undefined {
+	if (!details || typeof details !== "object") return undefined;
+	const usage = Reflect.get(details, "usage");
+	return isUsage(usage) ? usage : undefined;
+}
+
+function isUsage(value: unknown): value is Usage {
+	if (!isRecord(value) || !isRecord(value.cost)) return false;
+	return (
+		typeof value.input === "number" &&
+		typeof value.output === "number" &&
+		typeof value.cacheRead === "number" &&
+		typeof value.cacheWrite === "number" &&
+		typeof value.totalTokens === "number" &&
+		typeof value.cost.total === "number"
+	);
 }

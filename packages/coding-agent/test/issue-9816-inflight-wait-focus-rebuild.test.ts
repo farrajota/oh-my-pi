@@ -24,6 +24,7 @@ import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { AgentProgress, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
+import { Reconciler } from "@oh-my-pi/pi-tui/native/reconcile";
 import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 
 const usage = {
@@ -365,7 +366,16 @@ describe("#9816 focus blackout across an in-flight wait", () => {
 		await returning;
 
 		const rendered = Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
-		expect(rendered).toContain("Completed (1)");
+		expect(rendered).not.toContain('op="wait"');
+		expect(rendered).toContain("Sleeper1 done");
+		const native = JSON.stringify(
+			new Reconciler("focus-return").reconcile(
+				{ main: [ctx.chatContainer], dock: [], layer: [] },
+				{ cols: 120, reduceMotion: true, dark: true, supports: () => true, feature: () => false },
+			),
+		);
+		expect(native).toContain("Sleeper1");
+		expect(native).toContain("1 done");
 		const persistedWait = main.session
 			.buildTranscriptSessionContext()
 			.messages.find(message => message.role === "toolResult" && message.toolCallId === "wait-1");

@@ -18,7 +18,7 @@ import {
 	reserveStructuredSubagentId,
 	runStructuredSubagent,
 } from "./structured-subagent";
-import { type AgentProgress, oneLineLabel, type SingleResult, type TaskToolDetails } from "./types";
+import { type AgentProgress, oneLineLabel, type SingleResult, type TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { buildWorkPoolOutputSchema, type WorkPoolYieldItem } from "./workpool-yield";
 
 import { cfgEvalWorkpoolFreshAgents } from "../eval/settings";

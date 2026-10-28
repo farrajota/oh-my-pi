@@ -1,7 +1,6 @@
 /**
- * Undriven kept-alive subagent turns: focused-user yields reach the parent
- * (#14428), and an IRC parent follow-up consumed during a peer wake replaces
- * the accepted plain result without turning peer-only replies into completions.
+ * Kept-alive subagent turns publish consumed parent follow-ups from focused,
+ * peer-woken, queued and async continuations without adopting peer-only replies.
  */
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -25,7 +24,7 @@ import {
 	createAgentRootSession,
 	lookupAgentRef,
 } from "../../src/internal/agent-registry-bridge";
-import { getAgentLifecycleManager } from "../../src/internal/agent-lifecycle-bridge";
+import { disposeAgentLifecycle, getAgentLifecycleManager } from "../../src/internal/agent-lifecycle-bridge";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -69,7 +68,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	if (registry) await getAgentLifecycleManager(registry).dispose();
+	if (registry) await disposeAgentLifecycle(getAgentLifecycleManager(registry));
 	await parent?.dispose();
 	AgentLifecycleManager.resetGlobalForTests();
 	AgentRegistry.resetGlobalForTests();
@@ -343,3 +342,72 @@ it("publishes a consumed parent injection during a peer wake without publishing 
 		child.close();
 	}
 }, 15_000);
+
+for (const source of ["queued steering", "async completion"] as const) {
+	it(`publishes a consumed parent injection during ${source}`, async () => {
+		const continuationStarted = Promise.withResolvers<void>();
+		const peerOnlySeen = Promise.withResolvers<void>();
+		const releaseContinuation = Promise.withResolvers<void>();
+		let request = 0;
+		const child = await spawnKeptAliveChild({
+			structured: false,
+			enableIrc: true,
+			handler: async () => {
+				request++;
+				if (request === 1) return { content: ["INITIAL_FINAL"] };
+				if (request === 2) {
+					continuationStarted.resolve();
+					await releaseContinuation.promise;
+					return { content: ["INTERMEDIATE_FINAL"] };
+				}
+				if (request === 4) peerOnlySeen.resolve();
+				return { content: [request === 3 ? "PARENT_FRESH_FINAL" : "PEER_ONLY_FINAL"] };
+			},
+		});
+		const jobs = manager;
+		if (!jobs) throw new Error("Expected the child-owned async job manager");
+		const agentRegistry = registry;
+		if (!agentRegistry) throw new Error("Expected the focused child registry");
+		try {
+			if (source === "queued steering") {
+				await child.session.steer("Continue the task", undefined, { attribution: "agent" });
+			} else {
+				jobs.register("bash", "child-owned work", async () => "work complete", {
+					ownerId: AGENT_ID,
+					agentId: AGENT_ID,
+				});
+			}
+			await continuationStarted.promise;
+			const parent = await IrcBus.forRoot(agentRegistry, PARENT_ID).send({
+				from: PARENT_ID,
+				to: AGENT_ID,
+				body: "Publish fresh result",
+			});
+			expect(parent.outcome).toBe("injected");
+			expect(await Bun.file(child.artifact).text()).toContain("INITIAL_FINAL");
+			releaseContinuation.resolve();
+			await child.session.waitForIdle();
+			await child.session.settleAsyncWork();
+			await child.session.waitForIrcReplies();
+			await jobs.waitForOwnerJobs(PARENT_ID);
+			await jobs.drainDeliveries({ filter: { ownerId: PARENT_ID } });
+			expect(JSON.stringify(child.mock.calls.at(-1)?.context.messages)).toContain("Publish fresh result");
+			expect(await Bun.file(child.artifact).text()).toContain("PARENT_FRESH_FINAL");
+			expect(child.deliveries.filter(text => text.includes("PARENT_FRESH_FINAL"))).toHaveLength(1);
+			expect(
+				jobs.getAllJobs({ ownerId: PARENT_ID }).filter(job => job.resultText?.includes("PARENT_FRESH_FINAL")),
+			).toHaveLength(1);
+			if (source === "queued steering") {
+				await child.session.steer("Continue without parent input", undefined, { attribution: "agent" });
+				await peerOnlySeen.promise;
+				await child.session.waitForIdle();
+				await child.session.waitForIrcReplies();
+				expect(await Bun.file(child.artifact).text()).toContain("PARENT_FRESH_FINAL");
+				expect(child.deliveries).toHaveLength(1);
+			}
+		} finally {
+			releaseContinuation.resolve();
+			child.close();
+		}
+	}, 15_000);
+}

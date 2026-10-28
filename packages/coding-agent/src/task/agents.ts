@@ -15,7 +15,8 @@ import seanceMd from "../prompts/agents/seance.md" with { type: "text" };
 import taskMd from "../prompts/agents/task.md" with { type: "text" };
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 
-import type { AgentDefinition, AgentSource } from "./types";
+import type { AgentDefinition } from "./types";
+import type { AgentSource } from "@oh-my-pi/pi-tui/tools/task";
 
 interface AgentFrontmatter {
 	name: string;

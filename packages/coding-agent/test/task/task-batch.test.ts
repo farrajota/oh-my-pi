@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { Effort, type ServiceTierByFamily } from "@oh-my-pi/pi-ai";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
@@ -29,8 +29,10 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import { loadBundledAgents } from "@oh-my-pi/pi-coding-agent/task/agents";
 
-import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import { BUILTIN_TOOLS, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
 	BROWSER_AUDIT_CORE_PACKAGE_IDENTITY,
@@ -47,7 +49,7 @@ import {
 	installRegisteredBrowserAuditBinding,
 	takeBrowserAuditRunCapability,
 } from "../../src/internal/browser-audit-authority";
-import { cfgTaskDisabledAgents, cfgTaskEnableEffort, cfgTaskStructured } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { cfgTaskDisabledAgents, cfgTaskStructured } from "@oh-my-pi/pi-coding-agent/task/settings";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -211,7 +213,7 @@ describe("task.batch schema gating", () => {
 		expect(tool.description).toMatch(/^### scout \(READ-ONLY(?:;[^)]*)?\)$/m);
 	});
 
-	it("hides effort by default and exposes it when task.allowEffortOverride is enabled", async () => {
+	it("hides effort when overrides are disabled and exposes it when task.allowEffortOverride is enabled", async () => {
 		mockDiscovery();
 
 		const flatSession = createSession({ settings: { "task.batch": false, "task.allowEffortOverride": false } });
@@ -461,6 +463,19 @@ describe("task.batch validation", () => {
 		expect(text).toContain("not part of the batch shape");
 	});
 
+	it("rejects a misplaced specialist before spawning any agent", async () => {
+		mockDiscovery();
+		const run = vi.spyOn(executorModule, "runSubprocess");
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true, "async.enabled": false } }));
+		const result = await tool.execute("misplaced-specialist", {
+			context: "Inspect changes without edits",
+			agent: "custom-auditor",
+			tasks: [{ task: "Inspect the patch" }],
+		});
+		expect(getFirstText(result)).toContain("tasks[].agent");
+		expect(run).not.toHaveBeenCalled();
+	});
+
 	it("rejects empty task arrays and items without tasks", async () => {
 		const empty = await executeText({ tasks: [] }, { "task.batch": true });
 		expect(empty).toContain("Missing `tasks`");
@@ -664,6 +679,79 @@ describe("task.batch validation", () => {
 		const toolResult = agent.state.messages.find(message => message.role === "toolResult");
 		expect(toolResult?.role === "toolResult" && toolResult.isError).toBe(false);
 	});
+
+	// Unlike upstream's seance-only model contract, the fork permits ordinary
+	// request-local models when task.allowModelOverride authorizes them. Disabled
+	// calls must be refused before wire-schema deletion can silently drop the pin.
+	// sourceSession remains seance-only, independently of model authorization.
+	// Structured/isolation settings cover prebuilt and generated batch schemas.
+	it.each([
+		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: false, field: "model" },
+		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: false, field: "model" },
+		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: true, field: "model" },
+		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: true, field: "model" },
+		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: false, field: "sourceSession" },
+		{ form: "batch", seance: "advertised", batch: true, structured: false, isolation: false, field: "model" },
+		{ form: "flat", seance: "hidden", batch: false, structured: false, isolation: false, field: "model" },
+	])(
+		"refuses unauthorized $field on an ordinary agent in the $form form with seance $seance (structured: $structured, isolation: $isolation)",
+		async ({ seance, batch, structured, isolation, field }) => {
+			const bundledSeance = loadBundledAgents().find(agent => agent.name === "seance")!;
+			mockDiscovery(seance === "advertised" ? [taskAgent, bundledSeance] : taskAgent);
+			const run = vi
+				.spyOn(executorModule, "runSubprocess")
+				.mockImplementation(async options => makeResult(options.id ?? "?"));
+			const tool = await TaskTool.create(
+				createSession({
+					settings: {
+						"async.enabled": false,
+						"task.batch": batch,
+						"task.structured": structured,
+						"task.isolation.enabled": isolation,
+						"task.allowModelOverride": field === "sourceSession",
+					},
+				}),
+			);
+			const item = { name: "Alpha", agent: "task", task: "Do A.", solutionSpace: "c", [field]: "stub/model-b" };
+			const mock = createMockModel({
+				responses: [
+					{
+						content: [
+							{
+								type: "toolCall",
+								id: "tc-model-pin",
+								name: "task",
+								arguments: batch ? { context: "# Goal\nX", tasks: [item] } : item,
+							},
+						],
+					},
+					{ content: ["done"] },
+				],
+			});
+			const agent = new Agent({
+				initialState: {
+					model: mock.model,
+					systemPrompt: ["Test"],
+					tools: [tool as unknown as AgentTool],
+					messages: [],
+				},
+				streamFn: mock.stream,
+			});
+			await agent.prompt("go");
+
+			const toolResult = agent.state.messages.find(message => message.role === "toolResult");
+			const text = toolResult?.role === "toolResult" ? getFirstText(toolResult) : "";
+			if (field === "model") {
+				expect(text).toContain(
+					"Task model overrides are disabled. Enable task.allowModelOverride before using `model`.",
+				);
+			} else {
+				expect(text).toContain("`sourceSession` is only accepted for the `seance` agent.");
+			}
+			expect(toolResult?.role === "toolResult" && toolResult.isError).toBe(true);
+			expect(run).not.toHaveBeenCalled();
+		},
+	);
 });
 
 describe("task.batch spawning", () => {
@@ -1098,6 +1186,49 @@ describe("task.batch spawning", () => {
 		expect(new Map(seen.map(spawn => [spawn.id, spawn])).get("Alpha")?.requestedModel).toBe("request/alpha");
 		expect(new Map(seen.map(spawn => [spawn.id, spawn])).get("Beta")?.requestedModel).toBe("request/beta");
 		expect(new Map(seen.map(spawn => [spawn.id, spawn])).get("Gamma")?.requestedModel).toBeUndefined();
+	});
+
+	it.each([
+		{ form: "flat", batch: false },
+		{ form: "batch", batch: true },
+	])("uses the captured task.allowEffortOverride policy for $form effort", async ({ batch }) => {
+		mockDiscovery({ ...taskAgent, thinkingLevel: ThinkingLevel.Low });
+		const runSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		const params: TaskParams = batch
+			? { context: "Shared.", tasks: [{ name: "Solo", task: "Reply OK.", effort: "hi" }] }
+			: { name: "Solo", task: "Reply OK.", solutionSpace: "One exact response.", effort: "hi" };
+		const run = async (allowEffortOverride: boolean, enableEffort: boolean) => {
+			const session = createSession({
+				settings: {
+					"async.enabled": false,
+					"task.batch": batch,
+					"task.allowEffortOverride": allowEffortOverride,
+					"task.enableEffort": enableEffort,
+				},
+			});
+			const tool = await TaskTool.create(session);
+			const prepared = await tool.prepareExecution("tc-effort", params, undefined, undefined, {});
+			// Approval-time settings changes cannot replace the captured authorization.
+			settingHandle("task.allowEffortOverride").override(session.settings, !allowEffortOverride);
+			settingHandle("task.enableEffort").override(session.settings, !enableEffort);
+			const result = await tool.execute("tc-effort", params, undefined, undefined, undefined, prepared);
+			expect(result.isError, getFirstText(result)).not.toBe(true);
+			expect(result.details?.results.map(item => item.id)).toEqual(["Solo"]);
+		};
+
+		// Preserve the fork's authorization policy, not upstream's enableEffort gate:
+		// disabled calls keep configured thinking even when the upstream flag is on;
+		// enabled calls forward the supplied effort even when that flag is off.
+		await run(false, false);
+		await run(false, true);
+		await run(true, false);
+
+		expect(runSpy).toHaveBeenCalledTimes(3);
+		expect(runSpy.mock.calls.map(([options]) => options.effort)).toEqual([undefined, undefined, "hi"]);
+		for (const [options] of runSpy.mock.calls) expect(options.thinkingLevel).toBe(ThinkingLevel.Low);
+		for (const [options] of runSpy.mock.calls.slice(0, 2)) expect(options).not.toHaveProperty("effort");
 	});
 
 	it("keeps a long result inline when no readable output artifact exists", async () => {

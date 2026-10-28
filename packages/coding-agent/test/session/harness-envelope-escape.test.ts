@@ -66,6 +66,8 @@ function makeBridge(streaming: boolean, parentId?: string) {
 		isDisposed: () => false,
 		isStreaming: () => streaming,
 		isParentSender: (recipientId: string, senderId: string) => recipientId === "Sub" && senderId === parentId,
+		isDescendantSender: (recipientId: string, senderId: string) => recipientId === "Main" && senderId === "Sub",
+		isSubagent: (agentId: string) => agentId === "Sub" || agentId === "Peer",
 		planModeEnabled: () => false,
 		emitSessionEvent: async () => {},
 		wakeForIrc: (records: AgentMessage[]) => woken.push(records),

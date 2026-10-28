@@ -49,7 +49,9 @@ import {
 	registryDurableStateForSession,
 	RegistryDurableStateStore,
 } from "./durable-state";
-import { type EffectivePermissionSummary, oneLineLabel } from "../task/types";
+import { AgentAwaits } from "./agent-awaits";
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
+import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 import { MAIN_AGENT_ID } from "./agent-identity";
 
 export { MAIN_AGENT_ID };
@@ -366,6 +368,8 @@ export class AgentRegistry {
 
 	readonly #refs = new Map<string, RegistryAgentRef>();
 	readonly #listeners = new Set<RegistryListener>();
+	/** Agents currently blocked on other agents; used to identify reply-wait cycles. */
+	readonly awaits = new AgentAwaits();
 	readonly #internalListeners = new Set<InternalRegistryListener>();
 	readonly #terminating = new Map<string, RegistryAgentRef>();
 	readonly #capabilities = new WeakMap<
@@ -408,6 +412,9 @@ export class AgentRegistry {
 			lookupAuthoritySession: parent => this.#lookupAuthoritySession(parent),
 			isSessionParentIrcSender: (session, recipientId, senderId) =>
 				this.#isSessionParentIrcSender(session, recipientId, senderId),
+			isSessionDescendantIrcSender: (session, recipientId, senderId) =>
+				this.isSessionDescendantIrcSender(session, recipientId, senderId),
+			isSessionSubagent: (session, recipientId) => this.isSessionSubagent(session, recipientId),
 			lookupAuthorityLineage: parentId => this.#lookupAuthorityLineage(parentId),
 			createRootSession: options => this.#createRootSession(options),
 			setHistory: (expected, history, expectedSessionFile) =>
@@ -1387,6 +1394,81 @@ export class AgentRegistry {
 			rootRef.lineage?.rootId === rootRef.id &&
 			parentRef.lineage?.rootId === rootRef.id &&
 			this.#isCurrentAuthorityRefSession(rootRef, rootSession),
+		);
+	}
+
+	/** True when this exact registered session receives a message from one of its current descendants. */
+	isSessionDescendantIrcSender(session: AgentSession, recipientId: string, senderId: string): boolean {
+		if (recipientId === senderId) return false;
+		const recipientRef = this.#lookupAuthoritySession(session);
+		const rootId = recipientRef?.lineage?.rootId;
+		const rootRef = rootId ? this.#refs.get(rootId) : undefined;
+		const senderRef = this.#refs.get(senderId);
+		// A settled descendant may already be idle or parked; its current authority ref proves origin.
+		if (
+			!recipientRef ||
+			recipientRef.id !== recipientId ||
+			!this.#authorityRefs.has(recipientRef) ||
+			recipientRef.lineage?.parentId !== recipientRef.parentId ||
+			!rootId ||
+			!rootRef ||
+			rootRef.id !== rootId ||
+			rootRef.kind !== "main" ||
+			rootRef.parentId !== undefined ||
+			rootRef.lineage?.rootId !== rootId ||
+			rootRef.lineage?.parentId !== undefined ||
+			!this.#authorityRefs.has(rootRef) ||
+			!senderRef ||
+			!this.#authorityRefs.has(senderRef) ||
+			senderRef.kind !== "sub" ||
+			senderRef.parentId === undefined ||
+			senderRef.lineage?.rootId !== rootId ||
+			senderRef.lineage?.parentId !== senderRef.parentId
+		)
+			return false;
+		let remaining = this.#refs.size;
+		let parentId: string | undefined = senderRef.parentId;
+		while (parentId !== undefined && remaining-- > 0) {
+			if (parentId === recipientId) return true;
+			const parentRef = this.#refs.get(parentId);
+			if (
+				!parentRef ||
+				!this.#authorityRefs.has(parentRef) ||
+				parentRef.kind === "advisor" ||
+				parentRef.lineage?.rootId !== rootId ||
+				parentRef.lineage?.parentId !== parentRef.parentId
+			)
+				return false;
+			parentId = parentRef.parentId;
+		}
+		return false;
+	}
+
+	/** True only for the exact capability-bound subagent session in this registry. */
+	isSessionSubagent(session: AgentSession, recipientId: string): boolean {
+		const recipientRef = this.#lookupAuthoritySession(session);
+		const lineage = recipientRef?.lineage;
+		const rootRef = lineage ? this.#refs.get(lineage.rootId) : undefined;
+		const parentRef = recipientRef?.parentId ? this.#refs.get(recipientRef.parentId) : undefined;
+		return Boolean(
+			recipientRef &&
+			recipientRef.id === recipientId &&
+			recipientRef.kind === "sub" &&
+			this.#authorityRefs.has(recipientRef) &&
+			lineage &&
+			lineage.parentId === recipientRef.parentId &&
+			parentRef &&
+			this.#authorityRefs.has(parentRef) &&
+			parentRef.kind !== "advisor" &&
+			parentRef.lineage?.rootId === lineage.rootId &&
+			parentRef.lineage?.parentId === parentRef.parentId &&
+			rootRef &&
+			rootRef.id === lineage.rootId &&
+			rootRef.kind === "main" &&
+			rootRef.parentId === undefined &&
+			rootRef.lineage?.rootId === lineage.rootId &&
+			rootRef.lineage?.parentId === undefined &&
+			this.#authorityRefs.has(rootRef),
 		);
 	}
 

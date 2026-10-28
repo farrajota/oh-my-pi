@@ -3,15 +3,23 @@ import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
-import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { truncateForPrompt } from "./approval";
 import { resolveCmuxKind } from "./browser/cmux/rpc";
 import { describeRelayTargets, listRelayTargets, type RelayTarget, resolveSpawnArgs } from "./browser/attach";
-import { acquireBrowser, type BrowserKind, type BrowserKindTag, holdBrowser, releaseBrowser } from "./browser/registry";
+import {
+	acquireBrowser,
+	type BrowserKind,
+	type BrowserKindTag,
+	holdBrowser,
+	normalizeConnectedCdpUrl,
+	releaseBrowser,
+} from "./browser/registry";
 import { resolveRelayKind } from "./browser/relay/kind";
+import { relayExtensionNotice } from "./browser/relay/probe";
 import { describeTernTargets, listTernBlocks, type TernTarget, ternTargets } from "./browser/tern/blocks";
 import { resolveTernKind } from "./browser/tern/kind";
 import { isTernUnavailable } from "./browser/tern/wire";
@@ -32,7 +40,7 @@ import {
 	ternBlocksTaken,
 } from "./browser/tab-supervisor";
 import { renderTabCall } from "./browser/tab-call";
-import { renderFunctionRun } from "./run-code";
+import { renderCallChain, renderFunctionRun } from "./run-code";
 import type { OutputMeta } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
@@ -78,7 +86,9 @@ const BROWSER_RUN_SCOPE: readonly string[] = ["tab", "page", "browser", "wait", 
 const appSchema = type({
 	"path?": type("string").describe("binary path to spawn"),
 	"cdp_url?": type("string").describe("existing cdp endpoint"),
-	"relay?": type("boolean").describe("drive the user's own tabs via the omp browser relay"),
+	"relay?": type("boolean").describe(
+		"true drives the user's own tabs via the omp browser relay; false skips a relay the settings enable",
+	),
 	"tern?": type("boolean").describe("inside Tern: true forces a Tern picture-in-picture, false opts out"),
 	"args?": type("string[]").describe("extra cli args"),
 	"target?": type("string").describe(
@@ -126,7 +136,37 @@ const browserSchema = type({
 export function createBrowserPrelude(session: ToolSession): EvalPreludeDefinition {
 	return require("./browser/prelude-definition").createBrowserPreludeDefinition(session, {
 		invoke: (parameters: unknown, context: EvalPreludeContext) => invokeBrowser(session, parameters, context),
+		status: describeBrowserCall,
+		// The documentation promises omp's own browser for an open without `app`; while
+		// the relay takes that open, the prompt names where `app.relay: false` goes instead.
+		relayFallback:
+			resolveBrowserKind({ action: "open" }, session).kind === "relay"
+				? resolveBrowserKind({ action: "open", app: { relay: false } }, session)
+				: undefined,
 	});
+}
+
+/** Status-tree line for a completed browser call: `open main https://…`, `main.id(5).click()`, `close all`. */
+function describeBrowserCall(parameters: unknown, result: AgentToolResult<unknown>): string | undefined {
+	const parsed = browserSchema(parameters);
+	if (parsed instanceof type.errors) return undefined;
+	const name = parsed.name ?? DEFAULT_TAB_NAME;
+	switch (parsed.action) {
+		case "open": {
+			const url = isRecord(result.details) ? result.details.url : undefined;
+			return typeof url === "string" && url.length > 0 ? `open ${name} ${url}` : `open ${name}`;
+		}
+		case "close":
+			return parsed.all ? "close all" : `close ${name}`;
+		case "run":
+			return `${name}.run(${parsed.fn !== undefined ? "fn" : (parsed.code?.trim().split("\n", 1)[0] ?? "")})`;
+		case "call":
+			return `${name}.${renderCallChain(parsed.chain ?? [])}`;
+		case "tabs":
+			return "tabs";
+		case "targets":
+			return "targets";
+	}
 }
 
 async function invokeBrowser(
@@ -569,6 +609,13 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			);
 		}
 
+		// Chrome's extension debugger API exposes no Security domain, so the relay cannot honor the override.
+		if (params.ignore_https_errors && kind.kind === "relay") {
+			throw new ToolError(
+				"ignore_https_errors is not supported through the Chrome relay: the extension debugger API does not expose the CDP Security domain. Pass app.relay:false to use omp's Chromium instead.",
+			);
+		}
+
 		// The requested timeout must cover the *entire* open — browser
 		// acquisition (CDP discovery/connect), queued tab acquisition, worker
 		// creation, and navigation — not only `acquireTab`. Compose one deadline
@@ -606,9 +653,16 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			// exclusive — transferring ownership to the published tab on success or
 			// rolling the fresh browser back on failure.
 			holdBrowser(browser);
-			timeoutStage = `while opening tab ${JSON.stringify(name)}`;
+			let relayNotice: string | null = null;
 			let result: AcquireTabResult;
 			try {
+				// Read before the tab is acquired, so a cancel or the deadline landing during the read leaves no tab to close.
+				if (kind.kind === "relay") {
+					timeoutStage = "while reading the relay extension version";
+					relayNotice = await relayExtensionNotice(normalizeConnectedCdpUrl(kind.cdpUrl), openSignal);
+					throwIfAborted(openSignal);
+				}
+				timeoutStage = `while opening tab ${JSON.stringify(name)}`;
 				result = await untilAborted(openSignal, async () =>
 					acquireTab(name, browser, {
 						url: params.url,
@@ -656,6 +710,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 				title ? `Title: ${title}` : null,
 				...(result.note ? [result.note] : []),
 				...notes,
+				relayNotice,
 			].filter((l): l is string => typeof l === "string");
 			if (tab.backend === "tern") lines.push(...ternNotes(tab));
 			details.result = lines.join("\n");

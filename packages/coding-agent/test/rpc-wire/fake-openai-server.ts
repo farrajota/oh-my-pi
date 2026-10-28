@@ -16,7 +16,7 @@
  *   are mounted as devices)
  * - a user message containing `read_uri <url>` → a `read` call for `<url>`
  * - a user message containing `write_uri <url>` → a `write` call storing
- *   `written by model` at `<url>`
+ *   `written by model` at `<url>` (or the JSON value after `<url>`, if supplied)
  * - anything else → text `pong`
  */
 import * as path from "node:path";
@@ -46,10 +46,10 @@ function scriptedReply(request: ChatRequest): Reply {
 	if (last?.role === "tool") return { text: `tool said: ${messageText(last.content)}` };
 	const offered = new Set((request.tools ?? []).map(tool => tool.function?.name));
 	const userText = last?.role === "user" ? messageText(last.content) : "";
-	const uriRequest = /\b(read|write)_uri (\S+)/.exec(userText);
+	const uriRequest = /\b(read|write)_uri (\S+)(?: (\{[^\n]*\}))?/.exec(userText);
 	if (uriRequest?.[1] === "read") return { tool: "read", args: { path: uriRequest[2] } };
 	if (uriRequest?.[1] === "write") {
-		return { tool: "write", args: { path: uriRequest[2], content: "written by model" } };
+		return { tool: "write", args: { path: uriRequest[2], content: uriRequest[3] ?? "written by model" } };
 	}
 	if (userText.includes("echo_host")) {
 		const args = { message: "hello" };
@@ -61,6 +61,7 @@ function scriptedReply(request: ChatRequest): Reply {
 }
 
 const USAGE = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
+let nextToolCallId = 0;
 
 function completionChunks(reply: Reply): object[] {
 	const base = { id: "chatcmpl-fake", object: "chat.completion.chunk", created: 0, model: "fake-model" };
@@ -72,7 +73,7 @@ function completionChunks(reply: Reply): object[] {
 					tool_calls: [
 						{
 							index: 0,
-							id: `call_${reply.tool}`,
+							id: `call_${reply.tool}_${++nextToolCallId}`,
 							type: "function",
 							function: { name: reply.tool, arguments: JSON.stringify(reply.args) },
 						},
@@ -95,7 +96,7 @@ function completionBody(reply: Reply): object {
 					content: null,
 					tool_calls: [
 						{
-							id: `call_${reply.tool}`,
+							id: `call_${reply.tool}_${++nextToolCallId}`,
 							type: "function",
 							function: { name: reply.tool, arguments: JSON.stringify(reply.args) },
 						},

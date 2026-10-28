@@ -6,6 +6,7 @@ use std::{collections::VecDeque, fmt::Display, time::Duration};
 use std::os::windows::io::OwnedHandle;
 
 use futures::FutureExt;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::{ExecutionResult, error, processes, sys, trace_categories, traps};
@@ -18,6 +19,9 @@ pub(crate) type JobJoinHandle = AbortOnDropHandle<Result<ExecutionResult, error:
 pub(crate) type JobResult = (Job, Result<ExecutionResult, error::Error>);
 
 const WAIT_NEXT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long `kill %N` waits for an aborted in-shell task to unwind.
+const INTERNAL_TASK_UNWIND_LIMIT: Duration = Duration::from_millis(500);
 
 /// Selects a managed job by shell job ID or child process ID.
 #[derive(Clone, Copy)]
@@ -405,6 +409,15 @@ pub struct Job {
 
 	/// The current operational state of the job.
 	pub state: JobState,
+
+	/// Cancels the job's in-process task at its next cancellation check.
+	///
+	/// `abort()` on the task handle only takes effect where the future yields;
+	/// a backgrounded compound loop of synchronous builtins never does, so it
+	/// would keep spinning after `kill %N` marked the job done. The token is
+	/// wired into the job's execution parameters, which the interpreter polls
+	/// (`ensure_not_cancelled`) on every loop iteration and command.
+	cancellation: Option<CancellationToken>,
 }
 
 impl Display for Job {
@@ -439,7 +452,15 @@ impl Job {
 			annotation: JobAnnotation::None,
 			command_line,
 			state,
+			cancellation: None,
 		}
+	}
+
+	/// Attaches a token that ends the job's in-process task at its next
+	/// cancellation check, regardless of whether the task yields.
+	pub(crate) fn with_cancellation(mut self, token: CancellationToken) -> Self {
+		self.cancellation = Some(token);
+		self
 	}
 
 	/// Returns a pid-style string for the job.
@@ -589,17 +610,40 @@ impl Job {
 	/// internal tasks are still responsible for signalling any process trees
 	/// those tasks may have spawned.
 	pub fn abort_internal_tasks(&mut self) {
-		let mut aborted = false;
-		self.tasks.retain_mut(|task| {
-			if let JobTask::Internal(handle) = task {
-				handle.abort();
-				aborted = true;
-				return false;
+		drop(self.take_internal_tasks());
+	}
+
+	/// Aborts shell-internal background tasks and returns a future that
+	/// resolves once they have unwound and dropped what they held, or after
+	/// [`INTERNAL_TASK_UNWIND_LIMIT`]. `kill %N` awaits it, as a killed
+	/// process is gone once it is reaped: a FIFO open the job was waiting in is
+	/// then released before the next command opens that FIFO.
+	pub fn take_internal_tasks(&mut self) -> impl Future<Output = ()> + Send + 'static {
+		// Flag the execution first: aborting the handle below only lands where the
+		// task yields, and a loop of synchronous builtins may run for a long time
+		// before that.
+		if let Some(token) = &self.cancellation {
+			token.cancel();
+		}
+		let mut aborted = Vec::new();
+		let mut index = 0;
+		while index < self.tasks.len() {
+			if matches!(self.tasks.get(index), Some(JobTask::Internal(_))) {
+				if let Some(JobTask::Internal(handle)) = self.tasks.remove(index) {
+					handle.abort();
+					aborted.push(handle);
+				}
+			} else {
+				index += 1;
 			}
-			true
-		});
-		if aborted && self.tasks.is_empty() {
+		}
+		if !aborted.is_empty() && self.tasks.is_empty() {
 			self.state = JobState::Done;
+		}
+		async move {
+			for handle in aborted {
+				let _ = tokio::time::timeout(INTERNAL_TASK_UNWIND_LIMIT, handle).await;
+			}
 		}
 	}
 

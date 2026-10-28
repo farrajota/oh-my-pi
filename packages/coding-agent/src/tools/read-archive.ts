@@ -1,18 +1,23 @@
 import * as path from "node:path";
+import { createHash, type Hash } from "node:crypto";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { TextContent } from "@oh-my-pi/pi-ai";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	type ArchiveFormat,
 	type ArchiveReader,
 	type ArchiveNode,
+	type ByteSource,
 	archiveFormatFromPath,
 	formatArchiveEntryLines,
+	fileByteSource,
 	openArchive,
 	parseArchivePathCandidates,
 } from "@oh-my-pi/pi-utils/ar";
 import type { AuthorizedFilesystemTarget } from "../internal/session-path-scope";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { ToolSession } from "../sdk";
+import { convertBufferWithMarkit } from "../utils/markit";
 import { truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { applyListLimit } from "@oh-my-pi/pi-tui/tools/list-limit";
 import { resolveReadPath } from "./path-utils";
@@ -31,6 +36,8 @@ import {
 	type SuffixMatchCache,
 } from "./read-path-resolution";
 import { isMultiRange, type ParsedSelector, parseSel, resolveTailSelector, selToOffsetLimit } from "./read-selector";
+import { type PdfImageReadTarget, type PdfPageReadOptions, splitPdfImageReadPath } from "./read-pdf";
+import { cfgReadRenderMarkdown } from "./settings";
 import { formatBytes } from "@oh-my-pi/pi-tui/render/render-utils";
 import { throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -48,23 +55,42 @@ interface ResolvedArchiveReadPath {
  * reads from disk. Stream containers buffer the whole archive and RAR/7z keep
  * decoded solid blocks, so caching those would pin up to their in-memory limit.
  */
-const CACHEABLE_ARCHIVE_FORMATS: Partial<Record<ArchiveFormat, true>> = { zip: true, asar: true, iso: true };
+const CACHEABLE_ARCHIVE_FORMATS: Partial<Record<ArchiveFormat, true>> = { tar: true, zip: true, asar: true, iso: true };
 
 interface CachedArchiveReader {
 	reader: ArchiveReader;
 	ino: number;
 	mtimeMs: number;
-	/** Change time: moves on every write and permission change and cannot be set back, unlike mtime. */
+	/** Change time is an additional invalidation signal, not a content identity. */
 	ctimeMs: number;
 	size: number;
+	contentFingerprint: string;
+	indexReadRanges: [number, number][];
 	entryCount: number;
+}
+/** Validate the exact byte ranges consumed to construct the retained reader's index. */
+async function archiveIndexFingerprint(
+	source: ByteSource,
+	indexReadRanges: [number, number][],
+): Promise<string | undefined> {
+	try {
+		const hasher = createHash("sha256");
+		for (const [start, end] of indexReadRanges) {
+			const bytes = await source.read(start, end);
+			hasher.update(`${start}:${end}:`).update(bytes);
+		}
+		return hasher.digest("hex");
+	} catch {
+		// Let the ordinary opener report vanished, unreadable, or truncated archives.
+		return undefined;
+	}
 }
 
 /**
- * Recently opened archives, so paging through members does not re-read and
- * re-index the archive per read. Bounded by count and by total indexed entries;
- * an entry is reused only while the file's identity (inode, mtime, ctime, size)
- * holds, so a rewrite or a permission change reopens the archive.
+ * Recently opened archives, so paging through members can reuse their reader.
+ * Validation rereads only the ranges consumed while constructing that index.
+ * Bounded by count and total indexed entries; metadata and all bytes consumed
+ * while building the retained index must match before reuse.
  */
 const archiveReaderCache = new LRUCache<string, CachedArchiveReader>({
 	max: 4,
@@ -74,25 +100,47 @@ const archiveReaderCache = new LRUCache<string, CachedArchiveReader>({
 
 async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
 	// A vanished or unreadable archive is reported by the opener, as it always has been.
-	const stat = await Bun.file(absolutePath)
-		.stat()
-		.catch(() => null);
+	const file = Bun.file(absolutePath);
+	const stat = await file.stat().catch(() => null);
 	if (!stat) return openArchive(absolutePath);
+	const format = archiveFormatFromPath(absolutePath) as ArchiveFormat | undefined;
+	if (!format || !CACHEABLE_ARCHIVE_FORMATS[format]) {
+		archiveReaderCache.delete(absolutePath);
+		return openArchive(absolutePath);
+	}
+	const source = fileByteSource(absolutePath);
 	const cached = archiveReaderCache.get(absolutePath);
 	if (
 		cached &&
 		cached.ino === stat.ino &&
 		cached.mtimeMs === stat.mtimeMs &&
 		cached.ctimeMs === stat.ctimeMs &&
-		cached.size === stat.size
+		cached.size === stat.size &&
+		cached.size === source.size
 	) {
-		return cached.reader;
+		const contentFingerprint = await archiveIndexFingerprint(source, cached.indexReadRanges);
+		if (contentFingerprint !== undefined && contentFingerprint === cached.contentFingerprint) return cached.reader;
 	}
-	const reader = await openArchive(absolutePath);
-	if (!CACHEABLE_ARCHIVE_FORMATS[reader.format]) {
-		archiveReaderCache.delete(absolutePath);
-		return reader;
-	}
+	const indexReadRanges: [number, number][] = [];
+	let indexHasher: Hash | undefined = createHash("sha256");
+	const reader = await openArchive({
+		format,
+		path: absolutePath,
+		source: {
+			size: source.size,
+			async read(start, end) {
+				const bytes = await source.read(start, end);
+				if (indexHasher) {
+					indexReadRanges.push([start, end]);
+					indexHasher.update(`${start}:${end}:`).update(bytes);
+				}
+				return bytes;
+			},
+		},
+	});
+	const contentFingerprint = indexHasher.digest("hex");
+	// Member sources retain this wrapper; payload reads must not enter the finalized index hash.
+	indexHasher = undefined;
 	let entryCount = 0;
 	for (const _entry of reader.indexEntries()) entryCount++;
 	archiveReaderCache.set(absolutePath, {
@@ -100,7 +148,9 @@ async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
 		ino: stat.ino,
 		mtimeMs: stat.mtimeMs,
 		ctimeMs: stat.ctimeMs,
-		size: stat.size,
+		size: source.size,
+		contentFingerprint,
+		indexReadRanges,
 		entryCount,
 	});
 	return reader;
@@ -227,9 +277,10 @@ async function openResolvedArchive(
 	session: ToolSession,
 	resolved: ResolvedArchiveReadPath,
 ): Promise<{ archive: ArchiveReader; close(): Promise<void> }> {
-	if (!session.pathScope || !resolved.authorizedTarget) {
-		return { archive: await openArchive(resolved.absolutePath), close: async () => undefined };
+	if (!session.pathScope) {
+		return { archive: await openArchiveCached(resolved.absolutePath), close: async () => undefined };
 	}
+	if (!resolved.authorizedTarget) throw new Error("Missing authorized filesystem target for archive read");
 	const operation = session.pathScope.currentOperation();
 	const handle = await operation.openRead(resolved.authorizedTarget, "archive");
 	try {
@@ -262,6 +313,7 @@ export async function readArchive(
 	readPath: string,
 	parsedSel: ParsedSelector,
 	resolvedArchivePath: ResolvedArchiveReadPath,
+	readPdfPage: (options: PdfPageReadOptions) => Promise<AgentToolResult<ReadToolDetails>>,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<ReadToolDetails>> {
 	throwIfAborted(signal);
@@ -281,8 +333,10 @@ export async function readArchive(
 
 		let archiveSubPath = resolvedArchivePath.archiveSubPath;
 		let sel = parsedSel;
+		let pdfImageRead: PdfImageReadTarget | null = null;
 		let node = archive.getNode(archiveSubPath);
 		if (!node && archiveSubPath) {
+			// Member names take precedence; otherwise a whole subPath can be a selector on the archive root.
 			const wholeSel = parseSel(archiveSubPath);
 			if (wholeSel.kind !== "none") {
 				node = archive.getNode("");
@@ -290,7 +344,18 @@ export async function readArchive(
 				sel = wholeSel;
 			}
 		}
-		if (!node) throw new ToolError(`Path '${readPath}' not found inside archive`);
+		if (!node && sel.kind === "none") {
+			const candidate = splitPdfImageReadPath(archiveSubPath);
+			const pdfNode = candidate ? archive.getNode(candidate.pdfPath) : undefined;
+			if (candidate && pdfNode && !pdfNode.isDirectory) {
+				pdfImageRead = candidate;
+				archiveSubPath = candidate.pdfPath;
+				node = pdfNode;
+			}
+		}
+		if (!node) {
+			throw new ToolError(`Path '${readPath}' not found inside archive`);
+		}
 
 		assertSafeArchiveNode(node);
 		if (node.isDirectory) {
@@ -308,6 +373,55 @@ export async function readArchive(
 		}
 
 		const entry = await archive.readFile(archiveSubPath);
+		throwIfAborted(signal);
+		if (entry.path.toLowerCase().endsWith(".pdf")) {
+			const memberPath = `${resolvedArchivePath.absolutePath}:${entry.path}`;
+			const pdfDetails: ReadToolDetails = { ...details, resolvedPath: memberPath, fileSize: entry.size };
+			if (pdfImageRead) {
+				// Only the selected, extraction-bounded member is materialized, under
+				// an owned name rather than any untrusted archive path.
+				await using scratch = await TempDir.create("@omp-read-archive-pdf-");
+				const pdfPath = scratch.join("member.pdf");
+				await Bun.write(pdfPath, entry.bytes);
+				throwIfAborted(signal);
+				const result = await readPdfPage({
+					readPath,
+					absolutePdfPath: pdfPath,
+					page: pdfImageRead.page,
+					pdfFileSize: entry.size,
+					suffixResolution: resolvedArchivePath.suffixResolution,
+					signal,
+				});
+				return toolResult<ReadToolDetails>({ ...result.details, ...pdfDetails })
+					.content(result.content)
+					.sourcePath(memberPath)
+					.done();
+			}
+			const converted = await convertBufferWithMarkit(entry.bytes, ".pdf", signal);
+			if (!converted.ok) {
+				return toolResult<ReadToolDetails>(pdfDetails)
+					.text(
+						prependSuffixResolutionNotice(
+							`[Cannot read .pdf file: ${converted.error || "conversion failed"}]`,
+							resolvedArchivePath.suffixResolution,
+						),
+					)
+					.sourcePath(memberPath)
+					.done();
+			}
+			pdfDetails.contentType = cfgReadRenderMarkdown.get(session.settings) ? "text/markdown" : undefined;
+			const result = await buildInMemorySelectorResult(session, converted.content, sel, {
+				details: pdfDetails,
+				sourcePath: memberPath,
+				entityLabel: "document",
+				immutable: true,
+			});
+			const firstText = result.content.find((content): content is TextContent => content.type === "text");
+			if (firstText) {
+				firstText.text = prependSuffixResolutionNotice(firstText.text, resolvedArchivePath.suffixResolution);
+			}
+			return result;
+		}
 		const text = decodeUtf8Text(entry.bytes);
 		if (text === null) {
 			return toolResult<ReadToolDetails>(details)

@@ -665,19 +665,31 @@ describe("browser tabs whose renderer crashed", () => {
 		"cancels an inline worker's run whose renderer crashed instead of letting it go on after its caller was told",
 		async () => {
 			let requests = 0;
+			let gateOpen = false;
 			const predicateEntered = Promise.withResolvers<void>();
 			const releasePredicate = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			// Whichever the run reaches after release: stopped when cancelled, continued when not.
+			const outcome = Promise.withResolvers<"stopped" | "continued">();
 			const server = Bun.serve({
 				port: 0,
 				fetch: async request => {
-					const path = new URL(request.url).pathname;
-					if (path === "/predicate") {
+					const { pathname } = new URL(request.url);
+					if (pathname === "/started") started.resolve();
+					else if (pathname === "/predicate") {
 						predicateEntered.resolve();
 						await releasePredicate.promise;
-					} else {
+					} else if (pathname === "/gate") {
+						return new Response(null, {
+							status: gateOpen ? 200 : 503,
+							headers: { "access-control-allow-origin": "*" },
+						});
+					} else if (pathname === "/stopped") outcome.resolve("stopped");
+					else if (pathname === "/after-crash") {
 						requests++;
+						outcome.resolve("continued");
 					}
-					return new Response("ok");
+					return new Response("ok", { headers: { "access-control-allow-origin": "*" } });
 				},
 			});
 			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
@@ -701,19 +713,27 @@ describe("browser tabs whose renderer crashed", () => {
 				}
 				expect(getTab(name)).toMatchObject({ worker: { mode: "inline" } });
 				const { client, crashed } = await watchRenderer(browser, url);
+				// The wait predicate holds at a gate opened only after its caller is told of the crash.
+				const origin = `http://127.0.0.1:${server.port}`;
 				const run = runInTab(name, {
-					code: `await wait(async () => { await fetch("http://127.0.0.1:${server.port}/predicate"); return true; }); await fetch("http://127.0.0.1:${server.port}/after-crash");`,
+					code: `await fetch("${origin}/started"); try { await wait(async () => { await fetch("${origin}/predicate"); return (await fetch("${origin}/gate")).ok; }, { timeout: 8_000, interval: 20 }); } catch (error) { await fetch("${origin}/stopped"); throw error; } await fetch("${origin}/after-crash");`,
 					timeoutMs: 10_000,
 					session,
 				}).catch((error: unknown) => error);
+				await started.promise;
 				await predicateEntered.promise;
 				// Page.crash never answers: the renderer it would answer from is gone.
 				void client.send("Page.crash").catch(() => undefined);
 				await crashed;
 				expect(String(await run)).toContain("the tab could not be reattached and was closed");
+				gateOpen = true;
 				releasePredicate.resolve();
-				// Give an uncancelled predicate time to continue; this bounds cleanup after the explicit crash/error barrier.
+				// Real Chromium and network I/O cannot use fake time; no completion event proves absence of a late request.
+				// Even an immediate stopped report must not end observation before the released predicate can continue.
+				const report = Promise.race([outcome.promise, Bun.sleep(2_000).then(() => "no-report" as const)]);
 				await Bun.sleep(2_500);
+				const reported = await report;
+				expect(["stopped", "no-report"]).toContain(reported);
 				expect(requests).toBe(0);
 			} finally {
 				releasePredicate.resolve();

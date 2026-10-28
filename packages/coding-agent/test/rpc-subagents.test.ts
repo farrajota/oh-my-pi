@@ -13,14 +13,13 @@ import {
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { type AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
+import { type SubagentEventPayload, TASK_SUBAGENT_EVENT_CHANNEL } from "@oh-my-pi/pi-coding-agent/task";
 import {
-	type SubagentEventPayload,
 	type SubagentLifecyclePayload,
 	type SubagentProgressPayload,
-	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
-} from "@oh-my-pi/pi-coding-agent/task";
+} from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 

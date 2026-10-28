@@ -1,7 +1,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import { prompt, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import backgroundTanDispatchPrompt from "../../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import tanContextSwitchPrompt from "../../prompts/system/tan-context-switch.md" with { type: "text" };
 import {
@@ -12,6 +13,7 @@ import {
 import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { AgentSession } from "../../session/agent-session";
 import { BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE } from "../../session/messages";
+import { isHiddenUserCompanion } from "../../session/queued-messages";
 import { SessionManager } from "../../session/session-manager";
 import { createMCPProxyTools, createSubagentSettings, followMCPTools } from "../../task/executor";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
@@ -47,11 +49,12 @@ async function removeCloneSession(cloneFile: string): Promise<void> {
 export class TanCommandController {
 	constructor(private readonly ctx: InteractiveModeContext) {}
 
-	async start(work: string): Promise<void> {
+	/** Dispatch `work` to a background clone of this session; resolves `false` when nothing was dispatched. */
+	async start(work: string, images?: ImageContent[]): Promise<boolean> {
 		const trimmedWork = work.trim();
 		if (!trimmedWork) {
 			this.ctx.showStatus("Usage: /tan <work>");
-			return;
+			return false;
 		}
 
 		const session = this.ctx.session;
@@ -59,19 +62,19 @@ export class TanCommandController {
 		const model = session.model;
 		if (!model) {
 			this.ctx.showError("No active model available for /tan.");
-			return;
+			return false;
 		}
 
 		const manager = session.asyncJobManager;
 		if (!manager) {
 			this.ctx.showError("Background jobs are disabled; enable async jobs to use /tan.");
-			return;
+			return false;
 		}
 
 		const parentFile = this.ctx.sessionManager.getSessionFile();
 		if (!parentFile) {
 			this.ctx.showError("/tan requires a persisted session.");
-			return;
+			return false;
 		}
 
 		const parentSessionId = session.sessionId;
@@ -163,6 +166,7 @@ export class TanCommandController {
 							if (operationSignal.aborted) throw new Error("Aborted before execution");
 							const created = await authorityBinding.create({
 								cwd,
+								costGate: session.costGate,
 								sessionManager: cloneManager,
 								model,
 								thinkingLevel,
@@ -224,34 +228,58 @@ export class TanCommandController {
 									timestamp: Date.now(),
 								});
 							};
-							// Preserve the fork boundary if compaction drops it. Before the
-							// first prompt is dispatched the task is not in history yet, so
-							// restore only the notice; afterward restore the task only when
-							// compaction actually removed it to avoid duplicate instructions.
+							// Restore the request as the child admitted it if compaction removes it;
+							// before prompt dispatch only the inherited context exists.
 							let requestDispatched = false;
+							let requestText: string | undefined;
+							let admittedRequest: AgentMessage[] | undefined;
+							const isRequest = (message: AgentMessage) => {
+								if (message.role !== "user") return false;
+								const text = requestText ?? trimmedWork;
+								const content = message.content;
+								return typeof content === "string"
+									? content === text
+									: content.some(part => part.type === "text" && part.text === text);
+							};
+							const textRequest: AgentMessage = {
+								role: "user",
+								content: [{ type: "text", text: trimmedWork }],
+								attribution: "user",
+								timestamp: 0,
+							};
 							const unsubscribeCompaction = activeClone.subscribe(event => {
-								if (event.type === "agent_start") requestDispatched = true;
-								if (event.type === "auto_compaction_end" && event.result && !event.aborted) {
-									const requestRetained =
-										requestDispatched &&
-										activeClone.agent.state.messages.some(message => {
-											if (message.role !== "user") return false;
-											const content = message.content;
-											return typeof content === "string"
-												? content === trimmedWork
-												: content.some(part => part.type === "text" && part.text === trimmedWork);
-										});
-									if (!requestRetained) {
-										injectContextSwitch();
-										if (requestDispatched) {
-											activeClone.agent.appendMessage({
-												role: "user",
-												content: [{ type: "text", text: trimmedWork }],
-												attribution: "user",
-												timestamp: Date.now(),
-											});
-										}
-									}
+								if (event.type === "agent_start") {
+									requestDispatched = true;
+									return;
+								}
+								if (event.type === "message_end") {
+									const message = event.message;
+									if (!requestDispatched || requestText !== undefined || message.role !== "user") return;
+									const content = message.content;
+									requestText =
+										typeof content === "string"
+											? content
+											: content.find((part): part is TextContent => part.type === "text")?.text;
+									return;
+								}
+								const messages = activeClone.agent.state.messages;
+								if (event.type === "auto_compaction_start") {
+									const end = messages.findLastIndex(isRequest);
+									if (!requestDispatched || end === -1) return;
+									let start = end;
+									while (start > 0 && isHiddenUserCompanion(messages[start - 1]!)) start--;
+									admittedRequest = messages.slice(start, end + 1);
+									return;
+								}
+								if (event.type !== "auto_compaction_end" || !event.result || event.aborted) return;
+								if (!requestDispatched) {
+									injectContextSwitch();
+									return;
+								}
+								if (messages.some(isRequest)) return;
+								injectContextSwitch();
+								for (const message of admittedRequest ?? [textRequest]) {
+									activeClone.agent.appendMessage({ ...message, timestamp: Date.now() });
 								}
 							});
 							try {
@@ -263,7 +291,7 @@ export class TanCommandController {
 								// it is a tangential fork — its parent owns the prior conversation;
 								// this agent must focus exclusively on the user's request.
 								injectContextSwitch();
-								await activeClone.prompt(trimmedWork, { attribution: "user" });
+								await activeClone.prompt(trimmedWork, { attribution: "user", images });
 								while (activeClone.hasPendingAsyncWork()) {
 									if (operationSignal.aborted) throw new Error("Aborted during descendant settlement");
 									let onAbort: (() => void) | undefined;
@@ -320,7 +348,7 @@ export class TanCommandController {
 		} catch (error) {
 			if (cloneFile) await removeCloneSession(cloneFile);
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
-			return;
+			return false;
 		}
 
 		const content = prompt.render(backgroundTanDispatchPrompt, { jobId, work: trimmedWork });
@@ -341,5 +369,6 @@ export class TanCommandController {
 		);
 		if (!wasStreaming) this.ctx.rebuildChatFromMessages();
 		this.ctx.showStatus(`Dispatched background tan ${jobId}`);
+		return true;
 	}
 }

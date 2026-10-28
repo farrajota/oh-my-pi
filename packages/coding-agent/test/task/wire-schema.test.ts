@@ -3,7 +3,8 @@ import { type } from "@oh-my-pi/omptype";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TaskTool, taskSchema } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
-import { getTaskSchema, oneLineLabel } from "@oh-my-pi/pi-coding-agent/task/types";
+import { getTaskSchema } from "@oh-my-pi/pi-coding-agent/task/types";
+import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 // Contract: the task tool's wire shape is flat `{ name?, agent?, task, isolated? }`
@@ -127,6 +128,29 @@ describe("task wire schema", () => {
 		const item = items[0] ?? {};
 		expect("role" in item).toBe(false);
 		expect(item.task).toBe("x");
+	});
+
+	it("rejects a batch-level specialist instead of silently spawning the default agent", () => {
+		for (const options of [
+			{ isolationEnabled: false, batchEnabled: true },
+			{ isolationEnabled: true, batchEnabled: true, defaultAgent: "scout", effortEnabled: true },
+		]) {
+			const schema = getTaskSchema(options);
+			const parsed = schema({
+				context: "Inspect changes",
+				agent: "custom-auditor",
+				tasks: [{ task: "Inspect the patch", solutionSpace: "one inspection" }],
+			});
+			expect(parsed instanceof type.errors).toBe(true);
+			if (parsed instanceof type.errors) expect(parsed.summary).toContain("tasks[].agent");
+			const corrected = parsedItems(
+				schema({
+					context: "Inspect changes",
+					tasks: [{ agent: "custom-auditor", task: "Inspect the patch", solutionSpace: "one inspection" }],
+				}),
+			);
+			expect(corrected[0]?.agent).toBe("custom-auditor");
+		}
 	});
 });
 

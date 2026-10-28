@@ -11,6 +11,7 @@ import {
 	parseInternalUrl,
 	prepareLocalFileWrite,
 	resolveLocalRoot,
+	listLocalFiles,
 	resolveLocalUrlToPath,
 } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
@@ -375,6 +376,28 @@ describe("LocalProtocolHandler", () => {
 			).rejects.toBeInstanceOf(DurableStateUnavailableError);
 			expect(restartedStore.available).toBe(false);
 			expect(router.fileWritable("local://PLAN.md")).toBe(true);
+		});
+	});
+	it("listLocalFiles returns nested files newest first and [] for a missing root", async () => {
+		await withTempDir(async tempDir => {
+			const options = { getArtifactsDir: () => tempDir, getSessionId: () => "s" };
+			expect(await listLocalFiles(options)).toEqual([]);
+
+			const root = path.join(tempDir, "local");
+			const base = Date.now() / 1000 - 60;
+			for (const [name, offset] of [
+				["old.md", 0],
+				["sub/new.md", 2],
+				["mid.md", 1],
+			] as const) {
+				const filePath = path.join(root, name);
+				await Bun.write(filePath, name);
+				await fs.utimes(filePath, base + offset, base + offset);
+			}
+
+			const files = await listLocalFiles(options);
+			expect(files.map(file => file.url)).toEqual(["local://sub/new.md", "local://mid.md", "local://old.md"]);
+			expect(files[0]?.path).toBe(path.join(root, "sub", "new.md"));
 		});
 	});
 });

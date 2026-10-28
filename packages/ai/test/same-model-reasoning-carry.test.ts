@@ -11,6 +11,7 @@
  * Models are built from specs so the KDL rules, not baked rows, decide.
  */
 import { describe, expect, it } from "bun:test";
+import { CONNECT_COMPRESSED_FLAG } from "@oh-my-pi/pi-ai/providers/connect-frame";
 import { gunzipSync } from "node:zlib";
 import { streamDevin } from "@oh-my-pi/pi-ai/providers/devin";
 import { convertMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
@@ -139,8 +140,9 @@ async function devinRequest(model: Model<"devin-agent">, messages: Message[]) {
 	await streamDevin(model, { messages }, { apiKey: "token", fetch: fetchImpl }).result();
 	if (!requestPayload) throw new Error("Devin chat request was not captured");
 	const view = new DataView(requestPayload.buffer, requestPayload.byteOffset, requestPayload.byteLength);
-	const compressed = requestPayload.subarray(5, 5 + view.getUint32(1, false));
-	return fromBinary(GetChatMessageRequestSchema, gunzipSync(compressed));
+	const payload = requestPayload.subarray(5, 5 + view.getUint32(1, false));
+	const message = view.getUint8(0) & CONNECT_COMPRESSED_FLAG ? gunzipSync(payload) : payload;
+	return fromBinary(GetChatMessageRequestSchema, message);
 }
 
 const moonshotK3 = () => target("openai-completions", "moonshot", "kimi-k3");

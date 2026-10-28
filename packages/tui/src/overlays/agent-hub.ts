@@ -124,8 +124,8 @@ type ActivityScope = "all" | "agent" | "subtree";
 
 type HubViewMode = "roster" | "tree";
 
-interface CapturedRowOrder {
-	order: number;
+interface CapturedRowOrder extends Pick<AgentRecordLike, "status" | "lastActivity"> {
+	batch: number;
 	rootId?: string;
 	generation?: number;
 	createdAt: number;
@@ -221,12 +221,6 @@ const AGE_TICK_MS = 5_000;
 const DATA_CHANGE_RENDER_COALESCE_MS = 100;
 /** Double-tap window for the table's left-left "close hub" gesture. */
 const LEFT_TAP_WINDOW_MS = 500;
-
-function compareRosterAgents(a: AgentRecordLike, b: AgentRecordLike): number {
-	return (
-		STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || b.lastActivity - a.lastActivity || a.id.localeCompare(b.id)
-	);
-}
 
 function activityGlyph(row: AgentActivityRow): string {
 	if (row.status === "error") return theme.fg("error", theme.status.error);
@@ -449,10 +443,12 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	#rows: TRecord[] = [];
 	#statusCounts: Record<AgentStatus, number> = { running: 0, idle: 0, parked: 0, aborted: 0 };
 	#selectedRow = 0;
-	/** Existing generations retain their rank during heartbeats; newly appearing
-	 *  generations precede the frozen roster in status/recency order. */
+	/** Frozen by id and lineage because the public registry adapter projects fresh row objects. */
 	#rowOrder: Map<string, CapturedRowOrder> | undefined;
-	#nextRowOrder = 0;
+	/** IDs already ranked, including rows that have since disappeared or changed generation. */
+	#seenIds = new Set<string>();
+	#opened = false;
+	#spawnBatches = 0;
 	#hoveredRow: number | null = null;
 	/** Per-render screen-line to agent-row map, shared by click and hover routing. */
 	#hitRows: Array<number | undefined> = [];
@@ -607,13 +603,11 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 						logger.warn("Failed to register persisted subagents", { error });
 					})
 					.finally(() => {
-						// Clear the loading flag first so this refresh captures the
-						// full status/recency ranking rather than a partial roster.
+						if (this.#disposed) return;
+						// Rank what the scan found before its end turns later arrivals into spawns.
+						this.#refreshRows();
 						this.#loadingPersistedSubagents = false;
-						if (!this.#disposed) {
-							this.#refreshRows();
-							this.#requestRender();
-						}
+						this.#requestRender();
 					});
 		this.#refreshRows();
 	}
@@ -1625,48 +1619,53 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		this.#requestRender();
 	}
 
+	/** A parked or killed agent with no live session and an unknown id, seen while the saved-agent scan runs, is one the scan found. */
+	#foundOnDisk(ref: TRecord): boolean {
+		return (
+			this.#loadingPersistedSubagents &&
+			ref.session === null &&
+			(ref.status === "parked" || ref.status === "aborted") &&
+			!this.#seenIds.has(ref.id)
+		);
+	}
+
 	#refreshRows(): void {
 		const selectedId = this.#rows[this.#selectedRow]?.id;
 		const refs = this.#registry.list().filter(ref => ref.id !== MAIN_AGENT_ID);
 		this.#observedById = new Map();
 		for (const session of this.#observers.getSessions()) this.#observedById.set(session.id, session);
-		// Capture the status+recency ranking once so keyboard navigation does
-		// not jump on heartbeats. Defer until persisted-subagent discovery
-		// settles so a partial roster is not frozen in readdir order.
-		const rowOrder = this.#rowOrder;
-		let ordered: TRecord[];
-		if (!rowOrder) {
-			ordered = refs.sort(compareRosterAgents);
-			if (!this.#loadingPersistedSubagents && ordered.length > 0) {
-				this.#rowOrder = new Map();
-				for (const ref of ordered) {
-					this.#rowOrder.set(ref.id, {
-						order: this.#nextRowOrder++,
-						rootId: ref.lineage?.rootId,
-						generation: ref.lineage?.generation,
-						createdAt: ref.createdAt,
-					});
-				}
-			}
-		} else {
-			const refsById = new Map(refs.map(ref => [ref.id, ref]));
-			for (const [id, captured] of rowOrder) {
-				const ref = refsById.get(id);
-				if (!ref || !matchesRowGeneration(captured, ref)) rowOrder.delete(id);
-			}
-			const newcomers = refs.filter(ref => !rowOrder.has(ref.id)).sort(compareRosterAgents);
-			const firstNewOrder = -this.#nextRowOrder - newcomers.length;
-			this.#nextRowOrder += newcomers.length;
-			for (const [index, ref] of newcomers.entries()) {
-				rowOrder.set(ref.id, {
-					order: firstNewOrder + index,
-					rootId: ref.lineage?.rootId,
-					generation: ref.lineage?.generation,
-					createdAt: ref.createdAt,
-				});
-			}
-			ordered = refs.sort((a, b) => rowOrder.get(a.id)!.order - rowOrder.get(b.id)!.order);
+		const rowOrder = (this.#rowOrder ??= new Map<string, CapturedRowOrder>());
+		const refsById = new Map<string, TRecord>();
+		for (const ref of refs) refsById.set(ref.id, ref);
+		for (const [id, captured] of rowOrder) {
+			const ref = refsById.get(id);
+			if (!ref || !matchesRowGeneration(captured, ref)) rowOrder.delete(id);
 		}
+		let spawnBatch: number | undefined;
+		for (const ref of refs) {
+			if (rowOrder.has(ref.id)) continue;
+			const foundOnDisk = this.#foundOnDisk(ref);
+			rowOrder.set(ref.id, {
+				batch: this.#opened && !foundOnDisk ? (spawnBatch ??= --this.#spawnBatches) : 0,
+				status: ref.status,
+				lastActivity: ref.lastActivity,
+				rootId: ref.lineage?.rootId,
+				generation: ref.lineage?.generation,
+				createdAt: ref.createdAt,
+			});
+			this.#seenIds.add(ref.id);
+		}
+		this.#opened = true;
+		const ordered = refs.sort((a, b) => {
+			const left = rowOrder.get(a.id)!;
+			const right = rowOrder.get(b.id)!;
+			return (
+				left.batch - right.batch ||
+				STATUS_ORDER[left.status] - STATUS_ORDER[right.status] ||
+				right.lastActivity - left.lastActivity ||
+				a.id.localeCompare(b.id)
+			);
+		});
 		const query = this.#agentFilter.getValue().trim();
 		const rosterRows =
 			query.length > 0
@@ -1674,9 +1673,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 				: ordered;
 
 		if (this.#viewMode === "tree") {
-			const treeRank = new Map<TRecord, number>();
-			for (const ref of rosterRows) treeRank.set(ref, this.#rowOrder?.get(ref.id)?.order ?? 0);
-			const tree = projectAgentTree(rosterRows, treeRank);
+			const tree = projectAgentTree(rosterRows, ref => rowOrder.get(ref.id)!.batch < 0);
 			this.#rows = tree.rows;
 			this.#treeDepthById = tree.depthById;
 			this.#treeParentById = tree.parentById;

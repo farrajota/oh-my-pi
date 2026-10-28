@@ -954,9 +954,11 @@ describe("AgentSession aside delivery", () => {
 				appendMessage: (message: AgentMessage) => appended.push(message),
 			} as unknown as Agent,
 			sessionManager: manager,
-			isDisposed: () => false,
 			isStreaming: () => false,
+			isDisposed: () => false,
 			isParentSender: (recipientId, senderId) => recipientId === recipient && senderId === "ParentMarkerSender",
+			isDescendantSender: () => false,
+			isSubagent: agentId => agentId === recipient,
 			planModeEnabled: () => planMode,
 			emitSessionEvent: async () => {},
 			wakeForIrc: records => wakeRecords.push(...records),
@@ -1022,6 +1024,8 @@ describe("AgentSession aside delivery", () => {
 			isDisposed: () => false,
 			isStreaming: () => false,
 			isParentSender: () => false,
+			isDescendantSender: () => false,
+			isSubagent: () => false,
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
@@ -1067,6 +1071,8 @@ describe("AgentSession aside delivery", () => {
 			isDisposed: () => false,
 			isStreaming: () => false,
 			isParentSender: () => false,
+			isDescendantSender: () => false,
+			isSubagent: () => false,
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
@@ -1104,8 +1110,10 @@ describe("AgentSession aside delivery", () => {
 			isDisposed: () => false,
 			isStreaming: () => false,
 			isParentSender: () => false,
-			planModeEnabled: () => false,
+			isDescendantSender: () => false,
+			isSubagent: () => false,
 			emitSessionEvent: async () => {},
+			planModeEnabled: () => false,
 			wakeForIrc: () => {},
 			autoReplyIrcEnabled: () => false,
 			autoReplyIrc: async () => {},
@@ -1762,5 +1770,11 @@ describe("AgentSession aside delivery", () => {
 		);
 		expect(notice).toBeDefined();
 		expect(notice && typeof notice.content === "string" ? notice.content : "").toContain("m1");
+		// One-at-a-time steering must deliver the notice and the steer it announces
+		// in the same model call; split, the model answers the notice alone first.
+		expect(mock.calls.length).toBe(2);
+		const steerCall = JSON.stringify(mock.calls[1]!.context.messages);
+		expect(steerCall).toContain("Now available:");
+		expect(steerCall).toContain("delegate to");
 	});
 });

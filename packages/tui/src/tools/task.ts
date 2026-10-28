@@ -46,7 +46,7 @@ import { formatOutputInline, renderJsonTreeLines } from "./json-tree";
 import { repairDoubleEncodedJsonString } from "./task-repair-args";
 import { getSubprocessToolRenderer } from "./subprocess";
 import { assembleYieldResult, type YieldSectionShapes } from "./task-yield-assembly";
-import type { TspAgentProps, TspTone } from "@oh-my-pi/pi-wire";
+import type { EffectivePermissionSummary, TspAgentProps, TspTone } from "@oh-my-pi/pi-wire";
 import { compact, kv, md, node, span, text } from "../native/describe";
 import type { NativeNode } from "../native/node";
 import { OwnerMemo, sameItems } from "../native/memo";
@@ -2202,6 +2202,9 @@ export interface TaskItem {
 	name?: string;
 	/** Agent type to run this item (e.g. "scout"). Defaults to the spawn policy's default agent. */
 	agent?: string;
+	agentSource?: AgentSource;
+	agentDefinitionSha256?: string;
+	toolProfile?: "none" | "inspect" | "review" | "edit" | "plan" | "web-research" | "vision" | "browser-audit";
 	/** Historical source session selected by the bundled consult agent. */
 	sourceSession?: string;
 	/** Exact request-local model selector; may override model for the historical source session. */
@@ -2240,6 +2243,9 @@ export interface TaskParams {
 	name?: string;
 	/** Agent type to spawn (flat form); omitted values resolve from the session spawn policy. */
 	agent?: string;
+	agentSource?: AgentSource;
+	agentDefinitionSha256?: string;
+	toolProfile?: "none" | "inspect" | "review" | "edit" | "plan" | "web-research" | "vision" | "browser-audit";
 	/** Historical source session selected by the bundled consult agent. */
 	sourceSession?: string;
 	/** Exact request-local model selector; may override model for the historical source session. */
@@ -2338,6 +2344,7 @@ export interface AgentProgress {
 	id: string;
 	agent: string;
 	agentSource: AgentSource;
+	permissionSummary?: EffectivePermissionSummary;
 	status: "pending" | "running" | "completed" | "failed" | "aborted";
 	task: string;
 	assignment?: string;
@@ -2444,6 +2451,19 @@ export interface AgentProgress {
 	retryFailure?: {
 		attempt: number;
 		errorMessage: string;
+		mode?: "normal" | "repeated";
+		round?: number;
+		deadlineMs?: number;
+		timeoutMs?: number;
+		reason?:
+			| "success"
+			| "cancelled"
+			| "timeout"
+			| "manual-input"
+			| "generation-superseded"
+			| "not-recoverable"
+			| "max-retries"
+			| "max-delay";
 	};
 	/**
 	 * Snapshot of the most recent `task` tool call's in-flight `TaskToolDetails`,
@@ -2461,6 +2481,7 @@ export interface SingleResult {
 	id: string;
 	agent: string;
 	agentSource: AgentSource;
+	permissionSummary?: EffectivePermissionSummary;
 	task: string;
 	assignment?: string;
 	description?: string;

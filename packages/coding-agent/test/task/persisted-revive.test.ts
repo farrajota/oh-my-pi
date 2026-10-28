@@ -71,11 +71,8 @@ import {
 	createMCPProxyTools,
 	createSubagentSettings,
 } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type {
-	EffectivePermissionSummary,
-	PermissionDenialDetails,
-	SingleResult,
-} from "@oh-my-pi/pi-coding-agent/task/types";
+import type { EffectivePermissionSummary, PermissionDenialDetails } from "@oh-my-pi/pi-wire";
+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
@@ -713,7 +710,8 @@ describe("persisted subagent revival", () => {
 		const initialize = vi.fn();
 		const onError = vi.fn();
 		const emit = vi.fn(async () => undefined);
-		const extensionRunner = { initialize, onError, emit };
+		const emitBeforeAgentStart = vi.fn(async () => undefined);
+		const extensionRunner = { initialize, onError, emit, emitBeforeAgentStart };
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
 			async options =>
 				({
@@ -1775,6 +1773,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		await Promise.all(sessions.splice(0).map(session => session.dispose()));
 		resetAgentLifecycleForTests();
 		AgentRegistry.global().unregister("prompt-blocks");
+		AgentRegistry.global().unregister("Peer");
 	});
 
 	function createTool(name: string): AgentTool {
@@ -1895,13 +1894,19 @@ describe("cold revival replays the system prompt the last request sent", () => {
 	/** Spawns through runSubprocess on a real session, then returns its live session and requests. */
 	async function spawn(
 		cwd: string,
-		buildPrompt: (toolNames: string[]) => string[],
+		buildPrompt: (toolNames: string[], options?: CreateAgentSessionOptions) => string[],
 		responses: MockResponseSource,
 		hooks?: ExtensionHooks,
 		agentTools?: string[],
-		spawnOptions: { enableLsp?: boolean; enableIrc?: boolean; restrictToolNames?: boolean } = {},
+		spawnOptions: {
+			enableLsp?: boolean;
+			enableIrc?: boolean;
+			restrictToolNames?: boolean;
+			setupRegistry?: (registry: AgentRegistry) => void;
+		} = {},
 		toolNames?: string[],
 	): Promise<RecordingSession> {
+		const { setupRegistry, ...executorOptions } = spawnOptions;
 		const settings = Settings.isolated({}, { cwd, agentDir: cwd });
 		const rootManager = SessionManager.create(cwd, path.join(cwd, "root-sessions"));
 		const rootSessionFile = rootManager.getSessionFile();
@@ -1924,6 +1929,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 			toolNames: [],
 			skipPythonPreflight: true,
 		});
+		setupRegistry?.(registry);
 		const authority = bindInternalAgentAuthoritySession(registry, root.session);
 		if (!authority) throw new Error("Test fixture requires parent authority");
 		const loadedProfiles = await loadPermissionProfiles(cwd);
@@ -1943,11 +1949,12 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
 			spawned = createRecordingSession(
 				options!.sessionManager!,
-				buildPrompt,
+				names => buildPrompt(names, options),
 				responses,
 				hooks,
 				toolNames ?? agentTools,
 			);
+			// The owning registry claims this exact session after capability-bound construction returns.
 			return { session: spawned.session } as CreateAgentSessionResult;
 		});
 		const result = await executorModule.runSubprocess({
@@ -1963,7 +1970,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 			task: "do work",
 			index: 0,
 			id: "prompt-blocks",
-			...spawnOptions,
+			...executorOptions,
 			settings,
 			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 			enableMCP: false,
@@ -1979,6 +1986,10 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		});
 		expect(result.exitCode, result.stderr).toBe(0);
 		if (!spawned) throw new Error("Expected the spawn to create a session");
+		const ref = lookupAgentRef(registry, "prompt-blocks");
+		expect(ref?.session).toBe(spawned.session);
+		expect(ref?.parentId).toBe(MAIN_AGENT_ID);
+		expect(ref?.lineage?.rootId).toBe(MAIN_AGENT_ID);
 		return spawned;
 	}
 
@@ -2191,6 +2202,132 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		await live.waitForIdle();
 		expect(warm.requests.at(-1)).toEqual(spawned.requests.at(-1)!);
 		expect(warm.toolRequests.at(-1)).toBe(spawned.toolRequests.at(-1)!);
+	});
+
+	/** The executor's own subagent prompt over a default block listing the active tools. */
+	function subagentPrompt(toolNames: string[], options?: CreateAgentSessionOptions): string[] {
+		const build = options?.systemPrompt;
+		if (typeof build !== "function") throw new Error("Expected a system prompt builder");
+		return [build([`default: ${toolNames.join(",")}`])].flat();
+	}
+
+	function registerPeer(): void {
+		if (!fixtureRegistry) throw new Error("Expected the prompt test authority registry");
+		fixtureRegistry.register({
+			id: "Peer",
+			displayName: "Peer",
+			kind: "sub",
+			session: null,
+			sessionFile: null,
+			status: "running",
+		});
+	}
+
+	/** Parks the spawned subagent, lets `whileParked` change the registry, and warm-revives it. */
+	async function parkAndRevive(
+		whileParked: () => void,
+		hooks?: ExtensionHooks,
+	): Promise<{ live: AgentSession; warm: RecordingSession }> {
+		const registry = fixtureRegistry;
+		if (!registry) throw new Error("Expected the prompt test authority registry");
+		const lifecycle = getAgentLifecycleManager(registry);
+		await parkAgent(lifecycle, "prompt-blocks");
+		whileParked();
+		let warm: RecordingSession | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
+			warm = createRecordingSession(
+				options!.sessionManager!,
+				names => subagentPrompt(names, options),
+				[{ content: ["next"] }],
+				hooks,
+			);
+			return { session: warm.session } as CreateAgentSessionResult;
+		});
+		const live = await ensureAgentLive(lifecycle, "prompt-blocks");
+		if (!warm || live !== warm.session) throw new Error("Expected a warm revive through the lifecycle");
+		await live.prompt("next");
+		await live.waitForIdle();
+		return { live, warm };
+	}
+
+	it("warm-revives with the system prompt it was sent with after a peer joins, and keeps it on rebuild", async () => {
+		const cwd = makeTempDir("@pi-revive-warm-roster-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
+		const sentPrompt = spawned.requests.at(-1)!;
+		expect(sentPrompt.join("\n")).toContain("`Main` — Main (main, running)");
+		expect(sentPrompt.join("\n")).not.toContain("`Peer`");
+		const { live, warm } = await parkAndRevive(registerPeer);
+		expect(warm.requests[0]).toEqual(sentPrompt);
+		// A rebuild after the revive keeps the roster too: a live one would rewrite the cached conversation.
+		const revivedPrompt = [...live.systemPrompt];
+		await live.refreshBaseSystemPrompt();
+		expect(live.systemPrompt).toEqual(revivedPrompt);
+	});
+
+	// The rendered fork roster tracks membership and row data, not registry activity. A different
+	// roster entry is therefore needed to prove that rebuilds keep the cached prompt frozen.
+	it("keeps a live subagent's roster across a rebuild until the rest of its prompt changes", async () => {
+		const cwd = makeTempDir("@pi-live-rebuild-roster-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses(), undefined, undefined, {
+			setupRegistry: registry => {
+				registry.register({
+					id: "Peer",
+					displayName: "Peer",
+					kind: "sub",
+					session: null,
+					sessionFile: null,
+					status: "running",
+				});
+			},
+		});
+		const sentPrompt = spawned.requests.at(-1)!;
+		expect(sentPrompt.join("\n")).toContain("`Main` — Main (main, running)");
+		expect(sentPrompt.join("\n")).toContain("`Peer` — Peer (sub, running)");
+
+		const registry = fixtureRegistry;
+		if (!registry) throw new Error("Expected the prompt test authority registry");
+		expect(registry.unregister("Peer")).toBe(true);
+		registry.register({
+			id: "Peer-2",
+			displayName: "Peer Two",
+			kind: "sub",
+			session: null,
+			sessionFile: null,
+			status: "running",
+		});
+		await spawned.session.refreshBaseSystemPrompt();
+		await spawned.session.prompt("next");
+		await spawned.session.waitForIdle();
+		expect(spawned.requests.at(-1)).toEqual(sentPrompt);
+
+		await spawned.session.setActiveToolsByName(["read"]);
+		const refreshedPrompt = spawned.session.systemPrompt.join("\n");
+		expect(refreshedPrompt).toContain("`Main` — Main (main, running)");
+		expect(refreshedPrompt).not.toContain("`Peer` — Peer (sub, running)");
+		expect(refreshedPrompt).toContain("`Peer-2` — Peer Two (sub, running)");
+	});
+
+	it("warm-revives with the roster its prompt held, not one a discarded rebuild rendered", async () => {
+		const cwd = makeTempDir("@pi-revive-discarded-roster-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
+		registerPeer();
+		await spawned.session.refreshBaseSystemPrompt(() => false);
+		expect(spawned.session.systemPrompt.join("\n")).not.toContain("`Peer`");
+		const { warm } = await parkAndRevive(() => AgentRegistry.global().unregister("Peer"));
+		expect(warm.requests[0]).toEqual(spawned.requests.at(-1)!);
+	});
+
+	it("warm-revives with the roster its base held when a before_agent_start hook rewrites the prompt", async () => {
+		const cwd = makeTempDir("@pi-revive-hooked-roster-");
+		const mergeBlocks = {
+			beforeAgentStart: async (_session: AgentSession, systemPrompt: string[]) => [
+				`${systemPrompt.join("\n\n")}\n\nhooked`,
+			],
+		};
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses(), mergeBlocks);
+		expect(spawned.requests.at(-1)).toHaveLength(1);
+		const { warm } = await parkAndRevive(registerPeer, mergeBlocks);
+		expect(warm.requests[0]).toEqual(spawned.requests.at(-1)!);
 	});
 
 	it("replays the base a before_agent_start override was built from when the base rebuilds in the request window", async () => {

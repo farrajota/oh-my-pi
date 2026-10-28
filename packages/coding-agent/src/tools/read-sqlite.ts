@@ -119,6 +119,9 @@ export async function readSqlite(
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<ReadToolDetails>> {
 	throwIfAborted(signal);
+	if (session.pathScope && resolvedSqlitePath.authorizedTargets?.length !== 3) {
+		throw new Error("Missing authorized filesystem targets for SQLite read");
+	}
 
 	const selectorInput = {
 		subPath: resolvedSqlitePath.sqliteSubPath,
@@ -234,7 +237,7 @@ export async function readSqlite(
 				break;
 			}
 			case "raw": {
-				const queryResult = executeReadQuery(db, selector.sql);
+				const queryResult = executeReadQuery(db, selector.sql, selector.page);
 				let output = renderTable(queryResult.columns, queryResult.rows, {
 					totalCount: queryResult.rows.length,
 					offset: 0,
@@ -242,7 +245,14 @@ export async function readSqlite(
 					table: "query",
 					dbPath: resolvedSqlitePath.absolutePath,
 				});
-				if (queryResult.truncated) {
+				if (queryResult.truncated && selector.page) {
+					const next = new URLSearchParams({
+						q: selector.sql,
+						limit: String(selector.page.limit),
+						offset: String(selector.page.offset + queryResult.rows.length),
+					});
+					output += `\n[More rows; append ?${next} to the database path to continue]`;
+				} else if (queryResult.truncated) {
 					output += `\n[Output capped at ${MAX_RAW_QUERY_ROWS} rows; add a LIMIT/OFFSET clause to the query to page through more]`;
 				}
 				result = toolResult<ReadToolDetails>(details)

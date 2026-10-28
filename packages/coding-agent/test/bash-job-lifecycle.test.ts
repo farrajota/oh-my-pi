@@ -7,24 +7,27 @@ import { Settings } from "../src/config/settings";
 import type { ToolSession } from "../src/tools";
 import { BashTool } from "../src/tools/bash";
 import { WriteTool } from "../src/tools/write";
-import {
-	installSessionOperationLedger,
-	markUnregisteredSessionOperationProjection,
-} from "../src/registry/operation-lease";
+import { registerToolSessionLifecycleAuthority } from "../src/internal/agent-lifecycle-bridge";
+import { lookupAgentRef } from "../src/internal/agent-registry-bridge";
+import { AgentRegistry } from "../src/registry/agent-registry";
 import { SessionManager } from "../src/session/session-manager";
+import { createHubAuthorityFixture, type HubAuthorityFixture } from "./tools/hub-fixtures";
 
 let cwd: string;
 let manager: AsyncJobManager;
 let tool: BashTool;
 let write: WriteTool;
 let sessionManager: SessionManager;
+let authority: HubAuthorityFixture;
 
 beforeEach(async () => {
 	cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-job-lifecycle-"));
 	manager = new AsyncJobManager({});
-	sessionManager = SessionManager.inMemory(cwd);
-	installSessionOperationLedger(sessionManager);
-	markUnregisteredSessionOperationProjection(sessionManager, false);
+	authority = await createHubAuthorityFixture(new AgentRegistry(), "Main");
+	const owner = lookupAgentRef(authority.registry, "Main")?.session;
+	if (!owner) throw new Error("Expected the genuine Bash lifecycle fixture owner.");
+	sessionManager = owner.sessionManager;
+	await sessionManager.ensureOnDisk();
 	const session: ToolSession = {
 		cwd,
 		hasUI: false,
@@ -32,16 +35,19 @@ beforeEach(async () => {
 		getAgentId: () => "Main",
 		getSessionId: () => sessionManager.getSessionId(),
 		sessionManager,
+		agentRegistry: authority.registry,
 		getSessionSpawns: () => "*",
 		asyncJobManager: manager,
 		settings: Settings.isolated({}),
 	};
+	registerToolSessionLifecycleAuthority(session, authority.registry, owner);
 	tool = new BashTool(session);
 	write = new WriteTool(session);
 });
 
 afterEach(async () => {
 	await manager.dispose();
+	await authority.dispose();
 	await sessionManager.close();
 	await fs.rm(cwd, { recursive: true, force: true });
 });
@@ -103,3 +109,18 @@ it.skipIf(process.platform === "win32")(
 	},
 	10_000,
 );
+
+it.skipIf(process.platform === "win32")("gives a background job the session identity", async () => {
+	const sessionFile = sessionManager.getSessionFile();
+	if (!sessionFile) throw new Error("Expected a persisted background-job fixture session.");
+	const sessionId = sessionManager.getSessionId();
+	const result = await tool.execute("bg-env", {
+		command: `printf '%s|%s' "$PI_SESSION_ID" "$PI_SESSION_FILE" > env.txt`,
+		async: true,
+	});
+	if (!result.details?.async?.jobId) throw new Error("expected background job");
+	await manager.waitForAll();
+	const [id, file] = (await Bun.file(path.join(cwd, "env.txt")).text()).split("|");
+	expect(id).toBe(sessionId);
+	expect(file).toBe(sessionFile);
+});

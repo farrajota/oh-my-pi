@@ -3,9 +3,11 @@ import type { PipeStreams } from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { HubAdmissionStateTransaction } from "../internal/hub-admission";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import type { StructuredSubagentOutput } from "../task/types";
+import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { DurableHubStore, type HubDurableRecord } from "../internal/hub-durable-state";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { IrcBus } from "../irc/bus";
+import type { AgentRegistry } from "../registry/agent-registry";
 import type { JobWidgetInputs, JobWidgetRegistry } from "../job-widgets/types";
 
 const DELIVERY_RETRY_BASE_MS = 500;
@@ -70,6 +72,8 @@ export type AsyncJobType = "bash" | "task" | "eval";
 export interface AsyncJobRunResult {
 	text: string;
 	structured?: StructuredSubagentOutput;
+	/** See {@link AsyncJob.agentOutputPublished}. */
+	agentOutputPublished?: boolean;
 }
 
 /**
@@ -132,6 +136,14 @@ export interface AsyncJob {
 	 * id differs from the agent id (vibe turn jobs, tan clones).
 	 */
 	agentId?: string;
+	/**
+	 * Whether this job's turn published the agent's `<agentId>.md` output. A
+	 * follow-up turn that neither yielded nor produced a message result writes
+	 * none, so `agent://<agentId>` still holds an earlier turn's output; job
+	 * bodies that know this report it so deliveries advertise only the handles
+	 * that answer for this turn. Undefined where the body does not report it.
+	 */
+	agentOutputPublished?: boolean;
 	/** The process the job runs, when it spawns one. */
 	process?: AsyncJobProcess;
 	/** What the job's live widget reads; set by bash and task jobs. */
@@ -283,7 +295,15 @@ interface AsyncJobDelivery {
 	 */
 	jobSnapshot?: Pick<
 		AsyncJob,
-		"type" | "status" | "startTime" | "endTime" | "label" | "structured" | "agentId" | "latestDetails"
+		| "type"
+		| "status"
+		| "startTime"
+		| "endTime"
+		| "label"
+		| "structured"
+		| "agentId"
+		| "agentOutputPublished"
+		| "latestDetails"
 	>;
 }
 
@@ -314,6 +334,8 @@ export interface AsyncJobRegisterOptions {
 	ownerId?: string;
 	/** Registry id of the subagent this job runs; see {@link AsyncJob.agentId}. */
 	agentId?: string;
+	/** Registry root for root-scoped IRC reply settlement. */
+	agentRegistry?: AgentRegistry;
 	onProgress?: (text: string, details?: AsyncJobDetails) => void | Promise<void>;
 	/** Register the job in queued state; see {@link AsyncJob.queued}. */
 	queued?: boolean;
@@ -388,6 +410,7 @@ export class AsyncJobManager {
 	}
 
 	readonly #jobs = new Map<string, AsyncJob>();
+	readonly #jobRegistries = new WeakMap<AsyncJob, AgentRegistry>();
 	/** Per-owner terminal rows contain metadata only; never retain result or error bodies. */
 	readonly #terminalHistory = new Map<string | undefined, TerminalHistory>();
 	readonly #historySuppressedJobs = new WeakSet<AsyncJob>();
@@ -544,6 +567,7 @@ export class AsyncJobManager {
 			...(options?.foreground ? { foreground: true } : {}),
 		};
 		this.#jobs.set(id, job);
+		if (options?.agentRegistry) this.#jobRegistries.set(job, options.agentRegistry);
 		this.#persistJob(job, "registered");
 
 		const reportProgress = async (text: string, details?: AsyncJobDetails): Promise<void> => {
@@ -580,11 +604,15 @@ export class AsyncJobManager {
 				const text = typeof outcome === "string" ? outcome : outcome.text;
 				const structured = typeof outcome === "string" ? undefined : outcome.structured;
 				if (structured) job.structured = structured;
+				if (typeof outcome !== "string" && outcome.agentOutputPublished !== undefined) {
+					job.agentOutputPublished = outcome.agentOutputPublished;
+				}
 				if (job.status === "cancelled") {
 					job.resultText = text;
 				} else {
 					job.status = "completed";
 					job.resultText = text;
+					this.#recordAgentReply(job);
 					this.#enqueueDelivery(id, text);
 				}
 				this.#persistJob(job, "terminal");
@@ -598,6 +626,7 @@ export class AsyncJobManager {
 					const errorText = error instanceof Error ? error.message : String(error);
 					job.status = "failed";
 					job.errorText = errorText;
+					this.#recordAgentReply(job);
 					this.#enqueueDelivery(id, errorText);
 				}
 				this.#persistJob(job, "terminal");
@@ -618,7 +647,7 @@ export class AsyncJobManager {
 		type: AsyncJobType,
 		label: string,
 		result: AsyncJobRunResult,
-		options: { id?: string; ownerId?: string; agentId?: string },
+		options: { id?: string; ownerId?: string; agentId?: string; agentRegistry?: AgentRegistry },
 	): string {
 		if (this.#disposed) throw new Error("Async job manager is disposed");
 		const incarnationId = crypto.randomUUID();
@@ -638,11 +667,25 @@ export class AsyncJobManager {
 			agentId: options.agentId,
 			resultText: result.text,
 			structured: result.structured,
+			agentOutputPublished: result.agentOutputPublished,
 		};
 		this.#jobs.set(id, job);
+		if (options.agentRegistry) this.#jobRegistries.set(job, options.agentRegistry);
+		this.#recordAgentReply(job);
 		this.#enqueueDelivery(id, result.text);
 		this.#scheduleEviction(id);
 		return id;
+	}
+
+	/**
+	 * A settled job that runs a subagent carries that agent's outcome to the
+	 * job's owner, which answers whatever the owner asked the agent before now:
+	 * a reply `wait` must not keep reporting as owed.
+	 */
+	#recordAgentReply(job: AsyncJob): void {
+		if (job.agentId !== undefined && job.ownerId !== undefined) {
+			IrcBus.recordReply(job.agentId, job.ownerId, this.#jobRegistries.get(job));
+		}
 	}
 
 	/**
@@ -1799,6 +1842,7 @@ export class AsyncJobManager {
 						label: job.label,
 						structured: job.structured,
 						agentId: job.agentId,
+						agentOutputPublished: job.agentOutputPublished,
 						latestDetails: job.latestDetails,
 					}
 				: undefined,
@@ -1952,6 +1996,7 @@ export class AsyncJobManager {
 			resultText: delivery.text,
 			structured: snapshot.structured,
 			agentId: snapshot.agentId,
+			agentOutputPublished: snapshot.agentOutputPublished,
 			latestDetails: snapshot.latestDetails,
 		};
 	}

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
@@ -49,10 +50,12 @@ function createContext(
 		isStreaming?: boolean;
 		runIdleCompaction?: AgentSession["runIdleCompaction"];
 		promptCacheEntry?: AgentSession["promptCacheEntry"];
+		model?: AgentSession["model"];
 		runEphemeralTurn?: AgentSession["runEphemeralTurn"];
 		present?: InteractiveModeContext["present"];
 		sessionName?: string;
 		todoPhases?: InteractiveModeContext["todoPhases"];
+		messages?: AgentSession["messages"];
 	} = {},
 ) {
 	const runIdleCompaction = options.runIdleCompaction ?? (async () => {});
@@ -83,8 +86,8 @@ function createContext(
 			runIdleCompaction,
 			promptCacheEntry: options.promptCacheEntry,
 			runEphemeralTurn,
-			model: { provider: "anthropic", id: "claude-sonnet-4-5" },
-			messages: [createAssistantMessage()],
+			model: options.model ?? { provider: "anthropic", id: "claude-sonnet-4-5" },
+			messages: options.messages ?? [createAssistantMessage()],
 			getContextUsage: () => ({ tokens: 210, contextWindow: 1_000, percent: 21 }),
 			getGoalModeState: () => goalState,
 		},
@@ -220,6 +223,19 @@ describe("EventController idle compaction teardown", () => {
 		controller.dispose();
 	});
 
+	it("never idle-compacts a logged-in Codex session whose prompt cache does not expire", async () => {
+		const runIdleCompaction = vi.fn(async () => {});
+		const codex = getBundledModels("openai-codex").find(model => model.api === "openai-codex-responses");
+		expect(codex).toBeDefined();
+		const context = createContext({ runIdleCompaction, model: codex });
+		const controller = new EventController(context);
+		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+
+		vi.advanceTimersByTime(3_600_000);
+		expect(runIdleCompaction).not.toHaveBeenCalled();
+		controller.dispose();
+	});
+
 	it("arms the idle recap when enabled mid-idle and never re-delivers a shown recap", async () => {
 		resetSettingsForTest();
 		await Settings.init({
@@ -299,6 +315,126 @@ describe("EventController idle compaction teardown", () => {
 			"",
 			"※ recap: Reworking the login flow; auth suite passes. Next: wire the focused token-refresh test.",
 		]);
+		controller.dispose();
+	});
+
+	it("does not recap when the prior message is a user message", async () => {
+		resetSettingsForTest();
+		await Settings.init({
+			inMemory: true,
+			overrides: {
+				"compaction.idleEnabled": false,
+				"completion.notify": "off",
+			},
+		});
+		const present = vi.fn(recordPresented);
+		const runEphemeralTurn = vi.fn(async () => ({
+			replyText: "Recap body.",
+			assistantMessage: createAssistantMessage(),
+		}));
+		const userMessage = { role: "user" as const, content: "hello", timestamp: Date.now() };
+		const context = createContext({ present, runEphemeralTurn, messages: [userMessage] });
+		const controller = new EventController(context);
+		await controller.handleEvent({ type: "agent_end", messages: [userMessage] });
+
+		vi.advanceTimersByTime(240_000);
+		await flushMicrotasks();
+
+		expect(runEphemeralTurn).not.toHaveBeenCalled();
+		expect(present.mock.calls.some(([content]) => content instanceof RecapNotice)).toBe(false);
+		controller.dispose();
+	});
+
+	it("does not recap when the prior assistant message has no content", async () => {
+		resetSettingsForTest();
+		await Settings.init({
+			inMemory: true,
+			overrides: {
+				"compaction.idleEnabled": false,
+				"completion.notify": "off",
+			},
+		});
+		const present = vi.fn(recordPresented);
+		const runEphemeralTurn = vi.fn(async () => ({
+			replyText: "Recap body.",
+			assistantMessage: createAssistantMessage(),
+		}));
+		const emptyStop = { ...createAssistantMessage(), stopReason: "stop" as const, content: [] };
+		const context = createContext({ present, runEphemeralTurn, messages: [emptyStop] });
+		const controller = new EventController(context);
+		await controller.handleEvent({ type: "agent_end", messages: [emptyStop] });
+
+		vi.advanceTimersByTime(240_000);
+		await flushMicrotasks();
+
+		expect(runEphemeralTurn).not.toHaveBeenCalled();
+		expect(present.mock.calls.some(([content]) => content instanceof RecapNotice)).toBe(false);
+		controller.dispose();
+	});
+
+	it("recaps when an aborted assistant message already has text", async () => {
+		resetSettingsForTest();
+		await Settings.init({
+			inMemory: true,
+			overrides: {
+				"compaction.idleEnabled": false,
+				"completion.notify": "off",
+			},
+		});
+		const present = vi.fn(recordPresented);
+		const runEphemeralTurn = vi.fn(async () => ({
+			replyText: "Recap body.",
+			assistantMessage: createAssistantMessage(),
+		}));
+		const aborted = {
+			...createAssistantMessage(),
+			stopReason: "aborted" as const,
+			content: [{ type: "text" as const, text: "partial" }],
+		};
+		const context = createContext({ present, runEphemeralTurn, messages: [aborted] });
+		const controller = new EventController(context);
+		await controller.handleEvent({ type: "agent_end", messages: [aborted] });
+
+		vi.advanceTimersByTime(240_000);
+		await flushMicrotasks();
+
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+		expect(present.mock.calls.some(([content]) => content instanceof RecapNotice)).toBe(true);
+		controller.dispose();
+	});
+
+	it("does not rearm an idle recap after a non-generated prior message", async () => {
+		resetSettingsForTest();
+		await Settings.init({
+			inMemory: true,
+			overrides: {
+				"compaction.idleEnabled": false,
+				"completion.notify": "off",
+			},
+		});
+		const present = vi.fn(recordPresented);
+		const runEphemeralTurn = vi.fn(async () => ({
+			replyText: "Recap body.",
+			assistantMessage: createAssistantMessage(),
+		}));
+		const assistant = createAssistantMessage();
+		const userMessage = { role: "user" as const, content: "hello", timestamp: Date.now() };
+		const messages: AgentSession["messages"] = [assistant];
+		const context = createContext({ present, runEphemeralTurn, messages });
+		const controller = new EventController(context);
+		await controller.handleEvent({ type: "agent_end", messages: [assistant] });
+		await controller.handleEvent({ type: "agent_start" });
+
+		messages.splice(0, messages.length, userMessage);
+		await controller.handleEvent({ type: "agent_end", messages: [userMessage] });
+		controller.refreshIdleRecapTimer();
+		messages.splice(0, messages.length, assistant);
+
+		vi.advanceTimersByTime(240_000);
+		await flushMicrotasks();
+
+		expect(runEphemeralTurn).not.toHaveBeenCalled();
+		expect(present.mock.calls.some(([content]) => content instanceof RecapNotice)).toBe(false);
 		controller.dispose();
 	});
 

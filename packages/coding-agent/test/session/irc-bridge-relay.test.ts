@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { IrcDeliveryContext, IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { IrcBridge, type IrcBridgeHost } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
 function makeBridge(
 	options: {
@@ -15,25 +17,28 @@ function makeBridge(
 	const woken: AgentMessage[][] = [];
 	const persisted: Array<{ type: string; message: AgentMessage }> = [];
 	const observations: CustomMessage[] = [];
-	const host = {
+	const host: IrcBridgeHost = {
 		agent: {
 			emitExternalEvent: (event: { type: string; message: AgentMessage }) => {
 				persisted.push(event);
 			},
-		},
+		} as unknown as Agent,
+		sessionManager: SessionManager.inMemory(),
 		isDisposed: () => false,
 		isParentSender: options.isParentSender ?? (() => false),
+		isDescendantSender: () => false,
+		isSubagent: () => false,
 		isStreaming: () => options.isStreaming ?? false,
 		planModeEnabled: () => false,
-		emitSessionEvent: async (event: { type: string; message: CustomMessage }) => {
-			observations.push(event.message);
+		emitSessionEvent: async event => {
+			if (event.type === "irc_message") observations.push(event.message);
 		},
 		wakeForIrc: (records: AgentMessage[]) => {
 			woken.push(records);
 		},
 		autoReplyIrcEnabled: () => options.autoReplyIrcEnabled ?? true,
 		autoReplyIrc: options.autoReplyIrc ?? (async () => {}),
-	} as unknown as IrcBridgeHost;
+	};
 	return { bridge: new IrcBridge(host), woken, persisted, observations };
 }
 describe("IrcBridge awaited auto-replies", () => {
@@ -193,26 +198,87 @@ describe("IrcBridge aside persistence", () => {
 });
 
 describe("IrcBridge broadcast legs reaching a streaming recipient", () => {
-	function makeStreamingChild() {
+	function makeStreamingChild(options: { registry?: AgentRegistry } = {}) {
 		const steered: AgentMessage[] = [];
-		const host = {
+		const host: IrcBridgeHost = {
 			agent: { steer: (message: AgentMessage) => steered.push(message) } as unknown as Agent,
+			sessionManager: SessionManager.inMemory(),
 			isDisposed: () => false,
 			isParentSender: (recipientId: string, senderId: string) => recipientId === "Child" && senderId === "Main",
+			isDescendantSender: (recipientId: string, senderId: string) => {
+				const registry = options.registry;
+				if (!registry) return false;
+				let ref = registry.get(senderId);
+				while (ref?.parentId) {
+					if (ref.parentId === recipientId) return true;
+					ref = registry.get(ref.parentId);
+				}
+				return false;
+			},
+			isSubagent: agentId => agentId === "Child",
 			isStreaming: () => true,
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
-		} as unknown as IrcBridgeHost;
+			autoReplyIrcEnabled: () => false,
+			autoReplyIrc: async () => {},
+		};
 		return { bridge: new IrcBridge(host), steered };
 	}
 
-	it("never counts a parent's broadcast steer as a parent request", async () => {
+	it("never steers a parent's broadcast leg; only a direct parent message is a parent request", async () => {
 		const { bridge, steered } = makeStreamingChild();
 		await bridge.deliver({ id: "b1", from: "Main", to: "Child", body: "everyone: status", ts: 1, broadcast: true });
 		await bridge.deliver({ id: "d1", from: "Main", to: "Child", body: "you: status", ts: 2 });
 
-		expect(steered.map(message => bridge.isParentSteer(message))).toEqual([false, true]);
+		expect(steered.map(message => bridge.isParentSteer(message))).toEqual([true]);
+		expect(bridge.drainPending().map(record => (record as CustomMessage).details)).toMatchObject([
+			{ id: "b1", broadcast: true },
+		]);
+	});
+
+	it("leaves non-parent messages queued at a stop boundary and drains them after work", async () => {
+		const { bridge } = makeStreamingChild();
+		await bridge.deliver({ id: "p1", from: "Peer", to: "Child", body: "question?", ts: 3 });
+		await bridge.deliver({ id: "b3", from: "Main", to: "Child", body: "everyone: status", ts: 4, broadcast: true });
+		bridge.queueAside([{ role: "custom", customType: "note", content: "aside", display: false, timestamp: 5 }]);
+
+		expect(bridge.drainPending({ keepPeerMessages: true }).map(record => record.timestamp)).toEqual([5]);
+		expect(bridge.drainPending().map(record => record.timestamp)).toEqual([3, 4]);
+	});
+
+	it("drains a message from the recipient's own descendant at a stop boundary, since its run may wait on it", async () => {
+		const registry = new AgentRegistry();
+		const { bridge } = makeStreamingChild({ registry });
+		registry.register({ id: "Child.Kid", displayName: "kid", kind: "sub", parentId: "Child", session: null });
+		registry.register({
+			id: "Child.Kid.Grand",
+			displayName: "grand",
+			kind: "sub",
+			parentId: "Child.Kid",
+			session: null,
+		});
+		await bridge.deliver({ id: "k1", from: "Child.Kid", to: "Child", body: "question?", ts: 6 });
+		await bridge.deliver({ id: "g1", from: "Child.Kid.Grand", to: "Child", body: "question?", ts: 7 });
+
+		expect(bridge.drainPending({ keepPeerMessages: true }).map(record => record.timestamp)).toEqual([6, 7]);
+	});
+
+	it("counts only queued IRC messages as a sender's question still waiting for a turn", async () => {
+		const { bridge } = makeStreamingChild();
+		bridge.queueAside([
+			{
+				role: "custom",
+				customType: "note",
+				content: "aside",
+				display: false,
+				details: { from: "Peer" },
+				timestamp: 8,
+			},
+		]);
+		expect(bridge.hasQueuedFrom("Peer")).toBe(false);
+		await bridge.deliver({ id: "p2", from: "Peer", to: "Child", body: "question?", ts: 9 });
+		expect(bridge.hasQueuedFrom("Peer")).toBe(true);
 	});
 
 	it("keeps the broadcast flag on a message drained from the inbox", async () => {

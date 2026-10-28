@@ -383,7 +383,8 @@ class OperationLeaseRegistry {
 	}
 }
 
-interface SessionOperationControl {
+/** @internal Lifecycle control for an installed session operation ledger. */
+export interface SessionOperationControl {
 	close(): Promise<void>;
 }
 

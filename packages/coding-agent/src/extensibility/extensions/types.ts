@@ -214,6 +214,13 @@ export interface ExtensionUIDialogOptions {
 	onTimeoutStart?: () => void;
 	/** Invoked when user input resets a UI-managed timeout countdown */
 	onTimeoutReset?: () => void;
+	/**
+	 * Host hint to mask entered characters in `input` dialogs.
+	 * Enforced by the interactive TUI (masked as bullets), forwarded on RPC `input`
+	 * requests for hosts that honor it, and rejected (`undefined`) in ACP mode where
+	 * form elicitation does not support secret masking.
+	 */
+	secret?: boolean;
 	/** Initial cursor position for select dialogs (0-indexed) */
 	initialIndex?: number;
 	/** Render an outlined list for select dialogs */
@@ -562,7 +569,7 @@ export type AnnotationDiffSource =
 	| { kind: "diff"; diff: string; label?: string }
 	/** Staged + unstaged (or jj working-copy) changes in the live session cwd. */
 	| { kind: "uncommitted" }
-	/** A GitHub PR: `https://github.com/owner/repo/pull/N` or `pr://owner/repo/N`. */
+	/** A GitHub PR or GitLab MR: `https://github.com/owner/repo/pull/N`, `pr://owner/repo/N`, `https://<host>/<group>/<project>/-/merge_requests/N`, or `mr://<host>/<group>/<project>/N/diff`. */
 	| { kind: "pr"; ref: string };
 
 export type AnnotationSource = AnnotationTextSource | AnnotationDiffSource;
@@ -1015,6 +1022,14 @@ export interface ToolInfo {
 	parameters: TSchema;
 	promptGuidelines?: string[];
 	sourceInfo: SourceInfo;
+	/** MCP server name (as configured) when this tool fronts an MCP server. */
+	mcpServerName?: string;
+	/** Original MCP tool name, before `mcp__<server>_<tool>` minting. */
+	mcpToolName?: string;
+	/** The MCP tool's `annotations.readOnlyHint`, when it declared one. Lets an
+	 *  extension tell a read-only MCP call from one that changes things (e.g.
+	 *  to allow only read-only tools in a restricted turn). */
+	mcpReadOnlyHint?: boolean;
 }
 
 // ============================================================================
@@ -1085,10 +1100,17 @@ export interface AfterProviderResponseEvent extends ProviderResponseMetadata {
 	type: "after_provider_response";
 }
 
-/** Fired after user submits prompt but before agent loop. */
+/**
+ * Fired before an ordinary prompt or an actually dequeued user-containing batch reaches the provider
+ * (`reason: "prompt"`), and once with an empty `prompt` when a parked subagent is revived
+ * (`reason: "revive"`, result discarded).
+ */
 export interface BeforeAgentStartEvent {
 	type: "before_agent_start";
+	reason: "prompt" | "revive";
+	/** Already-transformed text; queued batches join user messages with two newlines, excluding agent companions. */
 	prompt: string;
+	/** Already-normalized user images in delivery order. */
 	images?: ImageContent[];
 	systemPrompt: string[];
 }
@@ -2289,6 +2311,8 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	/** Set once the extension calls `registerProvider`; providers feed startup model resolution. */
+	registersProviders?: boolean;
 }
 
 /**

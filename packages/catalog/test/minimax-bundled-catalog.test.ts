@@ -3,10 +3,21 @@ import { buildModel } from "../src/build";
 import { Effort } from "../src/effort";
 import { getSupportedEfforts, mapEffortToAnthropicAdaptiveEffort, minimumSupportedEffort } from "../src/model-thinking";
 import { MODELS_DEV_PROVIDER_DESCRIPTORS, mapModelsDevToModels } from "../src/provider-models/openai-compat";
+import { getBundledModel } from "../src/models";
 import modelsJson from "../src/models.json";
 
 const CODE_PROVIDERS = ["minimax-code", "minimax-code-cn"] as const;
 const CODE_API_MODELS = ["MiniMax-M2", "MiniMax-M3", "MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview"] as const;
+const LEGACY_BUNDLED_CODE_MODELS = [
+	"MiniMax-M2",
+	"MiniMax-M2.1",
+	"MiniMax-M2.5",
+	"MiniMax-M2.5-highspeed",
+	"MiniMax-M2.7",
+	"MiniMax-M2.7-highspeed",
+	"MiniMax-M3",
+	"MiniMax-M3.1-Flash-Preview",
+] as const;
 
 function buildAnthropicCodeModels(provider: (typeof CODE_PROVIDERS)[number]) {
 	const descriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(
@@ -38,9 +49,10 @@ describe("minimax bundled catalog", () => {
 		}
 	});
 
-	it("separates bundled OpenAI Code rows from the Anthropic API consumer contract", () => {
+	it("separates legacy bundled OpenAI Code rows from the Anthropic API consumer contract", () => {
 		for (const provider of CODE_PROVIDERS) {
-			for (const model of Object.values(modelsJson[provider])) {
+			for (const id of LEGACY_BUNDLED_CODE_MODELS) {
+				const model = modelsJson[provider][id];
 				expect(model.api).toBe("openai-completions");
 				expect(
 					model.thinking !== undefined && "effortMap" in model.thinking ? model.thinking.effortMap : undefined,
@@ -111,6 +123,27 @@ describe("minimax bundled catalog", () => {
 				}
 			}
 			const compat = modelFor("MiniMax-M3.1-Flash").compat;
+			expect(compat && "supportsSamplingParams" in compat ? compat.supportsSamplingParams : undefined).toBe(false);
+		}
+	});
+
+	it("preserves bundled Messages launch routing, capacity, and adaptive effort", () => {
+		for (const provider of CODE_PROVIDERS) {
+			const model = getBundledModel(provider, "MiniMax-M3.1-Flash");
+			expect(model.api).toBe("anthropic-messages");
+			expect(model.baseUrl).toBe(
+				provider === "minimax-code" ? "https://api.minimax.io/anthropic" : "https://api.minimaxi.com/anthropic",
+			);
+			expect(model.contextWindow).toBe(1_000_000);
+			expect(model.maxTokens).toBe(524_288);
+			expect(model.thinking?.mode).toBe("anthropic-adaptive");
+			expect(model.thinking?.requiresEffort).toBe(true);
+			expect(getSupportedEfforts(model)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+			expect(minimumSupportedEffort(model)).toBe(Effort.Low);
+			for (const effort of [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max] as const) {
+				expect(mapEffortToAnthropicAdaptiveEffort(model, effort)).toBe(effort);
+			}
+			const compat = model.compat;
 			expect(compat && "supportsSamplingParams" in compat ? compat.supportsSamplingParams : undefined).toBe(false);
 		}
 	});

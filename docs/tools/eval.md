@@ -26,7 +26,7 @@ The params object is one cell. There is no `cells` array, header parser, languag
 | `language` | `"py" \| "js"` | Yes | Explicit backend token. Normally the live schema includes only enabled runtimes. |
 | `code` | `string` | Yes | Inline code, or one standalone `%load` / `%pip install` (py) / `%bun add` / `%environment` (js) command. |
 | `title` | `string` | No | Short transcript label. |
-| `timeout` | `number` | No | Active-runtime timeout window in seconds. Default 30; `0` disables it. Nonzero values are clamped by the tool timeout policy (`TOOL_TIMEOUTS.eval`: 1–3600 s) and `tools.maxTimeout`. Paused host waits resume with a fresh window, not the unused remainder. |
+| `timeout` | `number` | No | Active-runtime timeout window in seconds. Default 30; `0` disables it. Nonzero values are clamped by the tool timeout policy (`TOOL_TIMEOUTS.eval`: 1–3600 s) and `tools.maxTimeout`. A supplied value that changes is disclosed as requested → effective at admission, in progress, and in the final result and `details.notice`. The schema and description include the configured ceiling. Paused host waits resume with a fresh window, not the unused remainder. |
 | `reset` | `boolean` | No | Recreate this language's retained runtime before execution. Other language runtimes are untouched. Default `false`. |
 
 Example across three calls:
@@ -53,7 +53,7 @@ Save reusable setup in a file, then load it once:
 
 Later cells reuse its definitions. Calling `%load` again executes the current file again; editing it alone does not reload it. The host reads the file (quote paths containing spaces; `local://` files are supported) and runs it with its filename: Python sets `__file__`, puts the script directory on `sys.path`, and reports tracebacks against the script; JavaScript/TypeScript resolves relative imports from the script while eval keeps its working directory.
 
-Python dependencies install with `%pip install pillow`: the runner's pip magic runs `python -m pip` for the kernel's own interpreter, pauses the cell watchdog while it runs, and keeps kernel variables. A missing-module error reminds that distribution names can differ from import names (`PIL` belongs to `pillow`).
+Python dependencies install with `%pip install pillow`: the runner's pip magic runs `python -m pip` for the kernel's own interpreter (in an interpreter without pip, such as a `uv venv` env, it first installs pip with `ensurepip`, or with `uv` when that fails and `uv` is on `PATH`), pauses the cell watchdog while it runs, and keeps kernel variables. A missing-module error reminds that distribution names can differ from import names (`PIL` belongs to `pillow`).
 
 JavaScript dependencies install with `%bun add csv-parse` into an OMP-managed package environment shared by sessions in the same project; each worker keeps its own variables. Installation does not restart the worker; already imported modules stay cached until an explicit reset. Lifecycle scripts are disabled; packages needing native builds/postinstall must be prepared explicitly. `%environment project` selects the repository itself for package/lockfile changes; `%environment managed` returns to OMP-managed dependencies. The selection persists for later calls through that eval tool.
 
@@ -69,10 +69,12 @@ Compaction receives a bounded live-kernel snapshot with environment and successf
 
 | Token | Runtime | Setting/default | Environment override | Additional prerequisite |
 | --- | --- | --- | --- | --- |
-| `py` | retained IPython-style Python kernel | `eval.py=true` | `PI_PY` | usable configured Python interpreter/kernel |
+| `py` | retained IPython-style Python kernel | `eval.py=true` | `PI_PY` | working Python 3.8+ on PATH or configured with `python.interpreter` |
 | `js` | retained Bun worker VM | `eval.js=true` | `PI_JS` | bundled JS runtime |
 
-When at least one runtime is enabled, disabled runtimes are removed from the session-scoped wire schema and model prompt. A requested unavailable runtime raises `ToolError`; the tool never substitutes another language. `eval.tools.enabled=true` (default) independently controls whether kernel-defined tools and the `tools` subagent fields are advertised and usable.
+Disabled runtimes are removed from the session-scoped wire schema and model prompt. After a definitive failed Python probe, the next schema, description, and prelude also omit `py`; synchronous schema reads never run a probe. A successful explicit availability refresh restores Python, while changes to PATH, active environment, cwd, or the configured interpreter invalidate the advertised snapshot. Cancelled or deadline-limited probes do not establish permanent unavailability. Explicit Python calls retry failed probes, so a repaired interpreter can be picked up without restarting.
+
+A requested unavailable runtime raises `ToolError` with the bounded, sanitized probe reason and a remedy: provide a working Python 3.8+ on PATH or set `python.interpreter`. The tool never substitutes another language. `eval.tools.enabled=true` (default) independently controls whether kernel-defined tools and the `tools` subagent fields are advertised and usable.
 
 `eval.autoProvision=true` lets the first `%bun add` create the managed JavaScript package environment; turning it off requires an existing environment or `%environment project`. Package installation pauses the compute watchdog but has its own ten-minute deadline and remains cancellable.
 
@@ -97,6 +99,8 @@ When at least one runtime is enabled, disabled runtimes are removed from the ses
 - `async`: present when the cell was auto-backgrounded as an async job (`{ state, jobId, type: "eval" }`).
 - `isError`: set for backend failure or cancellation.
 
+`mcp_progress` status lines show an MCP tool's name and its latest progress while an awaited call is running: the server's message with `progress/total` when a total exists, or the bare progress value when there is no message. Updates for one call replace one another, including after Eval auto-backgrounds; old MCP snapshots can be evicted under the status-log cap. Internal call ids are not displayed.
+
 The renderer merges call and result inline, syntax-highlights from the declared language, renders cell views as tables, JSON trees, and Markdown in place of their text, and shows timeout/truncation metadata. `session.allocateOutputArtifact?.("eval")` backs spilled output; `artifact://...` in `meta` reaches the full capture.
 
 ## Execution flow
@@ -105,7 +109,7 @@ The renderer merges call and result inline, syntax-highlights from the declared 
 2. `execute()` maps `py/js` to `python/js`, resolves availability, reads file-backed source once, and wraps the input in the renderer-compatible cell list. Runtime probing is bounded by the requested timeout and abort signal. The JS backend installs requested packages inside the cancellation/background lifecycle.
 3. It obtains the retained executor id from `session.getEvalSessionId?.()` or `defaultEvalSessionId(session)`, allocates the output sink/artifact, and registers the run through `trackEvalExecution?.(...)`.
 4. The timeout defaults to 30 seconds. `0` creates no watchdog. Otherwise `IdleTimeout` is combined with tool and session abort signals.
-5. Waiting on agent/completion handles, `judge()`, judgment-batch drains, and package installation pause the watchdog. Resuming starts a fresh timeout window. Compute, output, status helpers, and ordinary `tool.*` calls count against it.
+5. Agent/completion handle waits, `judge()`, judgment-batch drains, package installation, delegated `tool.task()`/`tool.wait()`, and browser/computer preludes pause the watchdog. Resuming starts a fresh timeout window. Compute, output, status helpers, and ordinary `tool.*` calls, including MCP tools that report progress, count against it.
 6. The selected backend receives cwd, retained session id, session file, kernel owner, reset flag, callbacks, and cancellation signal.
 7. Output chunks stream into an artifact-aware `OutputSink` and live tail. Runtime display outputs are separated into view, image, and status channels.
 8. Success, nonzero exit, and cancellation are assembled into the result shapes above. The output sink is finalized even when execution fails.
@@ -115,7 +119,7 @@ The renderer merges call and result inline, syntax-highlights from the declared 
 With `eval.autoBackground.enabled` (default `false`), a cell that outlives `eval.autoBackground.thresholdMs` (default 60000 ms) is converted into a managed async job instead of blocking the turn:
 
 - The tool foreground-waits for `resolveAutoBackgroundWaitMs(thresholdMs, clampedCellTimeoutMs)`: the threshold, clamped down to the cell's own clamped timeout minus a 1 s buffer so a deadline expiry resolves inline rather than backgrounding moments before it fires. Raising `timeout` therefore does not extend foreground execution beyond the threshold. A threshold of `0` backgrounds immediately.
-- On backgrounding, the tool returns the live output tail plus `Backgrounded as job <id> (killed once it has run <n>s in total; …)` — or `(no deadline)` under `timeout: 0` — and the no-polling instruction (`formatBackgroundNotice`), stating the cell's clamped timeout, with `details.async = { state: "running", jobId, type: "eval" }`. The deadline is the cell's runtime budget, counted from cell start (including the foreground wait) and paused across `agent()`/tool bridge calls, so it is not a wall-clock time left. The job's completion is delivered later like a backgrounded bash command.
+- On backgrounding, the tool returns the live output tail plus `Backgrounded as job <id> (killed once it has run <n>s in total; …)` — or `(no deadline)` under `timeout: 0` — and the no-polling instruction (`formatBackgroundNotice`), stating the cell's clamped timeout, with `details.async = { state: "running", jobId, type: "eval" }`. The deadline is the cell's runtime budget, counted from cell start (including the foreground wait), not wall-clock time left. Agent/completion handle waits, `judge()`, judgment-batch drains, package installation, delegated `tool.task()`/`tool.wait()`, and browser/computer preludes pause the watchdog; ordinary `tool.*` calls, including MCP tools that report progress, do not. The job's completion is delivered later like a backgrounded bash command.
 - A queued user/peer message (steer) arriving mid-wait backgrounds the cell immediately ("Backgrounded early to handle an incoming message; the cell keeps running.").
 - At the async-job manager's running-job capacity the tool falls through to ordinary foreground execution instead of failing.
 - A failed, cancelled, or timed-out cell is reported as a failed background job (an errored execution is re-entered into the job manager's failure path), never as a silent success.
@@ -152,6 +156,10 @@ All enabled runtimes expose equivalent helpers where the language permits:
 - `log(message)`, `phase(title)`, `budget`
 
 JS helpers are asynchronous; Python file helpers are synchronous while `tool.<name>()` is a coroutine. `read()` delegates non-`local://` schemes to the registered read tool, resolves `local://` through injected roots, and reads regular paths relative to cwd. A bare `read("artifact://<id>")` returns the artifact file's full text, with `offset`/`limit` selecting lines, whichever session's artifacts dir holds it; selector forms such as `artifact://<id>:raw:5-9` go to the read tool. `write()` accepts regular and `local://` paths but rejects other protocol URLs.
+
+The prelude lists accepted session tool names, including unambiguous wire aliases such as `tool.apply_patch({ input: "..." })` for an enabled `edit` tool in apply-patch mode. Exact registered names shadow aliases; ambiguous aliases are unavailable. Both canonical and wire calls check the resolved tool's enablement and use its ordinary approval/ACP gate.
+
+Bridge restrictions and bookkeeping use the resolved canonical tool, not the requested wire spelling. Aliases of `checkpoint` and `rewind` are omitted and rejected because those tools need direct result events; aliases of `todo` retain branch persistence, and aliases of `task`/`wait` pause the cell watchdog like their canonical calls.
 
 Printing an image or figure attaches it to the result for both the model and the user. Printed data frames, `console.table`, Markdown objects, and large structured values also carry a pretty view for the user; the model sees the printed text.
 

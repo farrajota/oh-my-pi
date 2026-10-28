@@ -18,7 +18,7 @@ import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import * as toolTimeouts from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { $which, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
-import { openArchive, readArchiveEntries } from "@oh-my-pi/pi-utils/ar";
+import { DEFAULT_ARCHIVE_LIMITS, openArchive, readArchiveEntries } from "@oh-my-pi/pi-utils/ar";
 import { GlobTool } from "../src/tools/glob";
 import { DEFAULT_FILE_LIMIT, GrepTool, MULTI_FILE_PER_FILE_MATCHES } from "../src/tools/grep";
 import { HubTool } from "../src/tools/hub";
@@ -2219,17 +2219,20 @@ describe("Coding Agent Tools", () => {
 			}
 		});
 
-		it("should reject oversized tar rewrites before reading the archive bytes", async () => {
+		it("should reject tar rewrites with oversized members before reading their payloads", async () => {
 			const archivePath = path.join(testDir, "oversized.tar");
-			fs.writeFileSync(archivePath, "");
-			fs.truncateSync(archivePath, 256 * 1024 * 1024 + 1);
+			const memberSize = DEFAULT_ARCHIVE_LIMITS.maxMemberSize + 1;
+			const archiveSize = 512 + Math.ceil(memberSize / 512) * 512 + 1024;
+			fs.writeFileSync(archivePath, createTarHeader("pkg/huge.txt", memberSize, "0"));
+			fs.truncateSync(archivePath, archiveSize);
 
 			await expect(
 				writeTool.execute("test-call-archive-write-oversized", {
 					path: `${archivePath}:pkg/new.txt`,
 					content: "new\n",
 				}),
-			).rejects.toThrow(/too large to read in memory/);
+			).rejects.toThrow(/too large to extract in memory/);
+			expect(fs.statSync(archivePath).size).toBe(archiveSize);
 		});
 
 		it("should write to an existing archive entry", async () => {

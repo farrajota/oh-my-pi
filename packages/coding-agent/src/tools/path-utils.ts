@@ -275,7 +275,9 @@ export async function probeLiteralPathExists(filePath: string, cwd: string): Pro
  * filenames or NTFS alternate data streams, so a confirmed `lstat` always
  * preserves the literal path. Ambiguous probe errors preserve the literal on
  * POSIX, where colon filenames are valid, but fall back to the strict split on
- * Windows, where only a confirmed alternate data stream can be literal.
+ * Windows, where only a confirmed alternate data stream can be literal. A list
+ * repeating its colon (`a:1-30,:-30`) folds into one selector unless the path
+ * before the last colon (`a:1-30,`) names an existing file.
  */
 export async function splitPathAndSelPreferringLiteral(
 	rawPath: string,
@@ -284,7 +286,11 @@ export async function splitPathAndSelPreferringLiteral(
 	const strict = splitPathAndSel(rawPath);
 	if (strict.sel === undefined) return strict;
 	const probe = await probeLiteralPathExists(rawPath, cwd);
-	return probe === "exists" || (probe === "unknown" && process.platform !== "win32") ? { path: rawPath } : strict;
+	if (probe === "exists" || (probe === "unknown" && process.platform !== "win32")) return { path: rawPath };
+	const unfolded = splitPathAndSel(rawPath, { foldListColons: false });
+	if (unfolded.path !== strict.path && (await probeLiteralPathExists(unfolded.path, cwd)) === "exists")
+		return unfolded;
+	return strict;
 }
 
 /**
@@ -313,7 +319,10 @@ export function splitPathAndSelPreferringLiteralSync(rawPath: string, cwd: strin
 	const strict = splitPathAndSel(rawPath);
 	if (strict.sel === undefined) return strict;
 	const probe = probeLiteralPathExistsSync(rawPath, cwd);
-	return probe === "exists" || (probe === "unknown" && process.platform !== "win32") ? { path: rawPath } : strict;
+	if (probe === "exists" || (probe === "unknown" && process.platform !== "win32")) return { path: rawPath };
+	const unfolded = splitPathAndSel(rawPath, { foldListColons: false });
+	if (unfolded.path !== strict.path && probeLiteralPathExistsSync(unfolded.path, cwd) === "exists") return unfolded;
+	return strict;
 }
 
 function assertNotInternalUrl(expanded: string, original: string): void {
@@ -706,12 +715,19 @@ async function tryDelimitedPathSplit(
  * string. Existing paths are kept intact, so real filenames containing spaces,
  * commas, or semicolons win over delimiter recovery.
  */
+/** A `!glob` exclusion part of a path list, which search tools take beside URLs. */
+function isExclusionPart(part: string): boolean {
+	return part.length > 1 && part.startsWith("!") && !part.includes("://");
+}
+
 export async function splitDelimitedPathEntry(
 	entry: string,
 	cwd: string,
 	options: {
 		splitter?: PathEntrySplitter;
 		routedUrlPredicate?: (entry: string) => boolean;
+		/** Let `!glob` exclusion parts sit beside URLs in a `;` list (grep's path syntax). */
+		exclusionParts?: boolean;
 	} = {},
 ): Promise<string[] | null> {
 	const normalizedEntry = normalizePathLikeInput(entry);
@@ -719,16 +735,24 @@ export async function splitDelimitedPathEntry(
 	const splitter = options.splitter ?? parseSearchPath;
 	if (options.routedUrlPredicate?.(normalizedEntry)) {
 		const parts = await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "semicolon", "none");
-		return parts?.every(options.routedUrlPredicate) ? parts : null;
+		const routed = options.routedUrlPredicate;
+		return parts?.every(part => routed(part) || (options.exclusionParts === true && isExclusionPart(part)))
+			? parts
+			: null;
 	}
 	if (isInternalUrlPath(normalizedEntry)) {
 		// A `;` list of internal URLs (`artifact://44;artifact://43`) names
 		// several resources: the router resolves one URI per entry, so the list
 		// must split before dispatch (issue #14091). Split only when every part
-		// is itself an internal URL — a URL whose own path contains `;` stays
-		// whole, and a single URL ending in `;` (`local://report;`) names one resource.
+		// is itself an internal URL or a `!glob` exclusion (`local://notes;!*.test.ts`)
+		// — a URL whose own path contains `;` stays whole, and a single URL ending
+		// in `;` (`local://report;`) names one resource.
 		const parts = await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "semicolon", "none");
-		return parts && parts.length > 1 && parts.every(part => isInternalUrlPath(part)) ? parts : null;
+		return parts &&
+			parts.length > 1 &&
+			parts.every(part => isInternalUrlPath(part) || (options.exclusionParts === true && isExclusionPart(part)))
+			? parts
+			: null;
 	}
 	// A real POSIX file may contain a delimiter and a selector-shaped tail
 	// (`a;b:1-2`, `a b:1-2`). Preserve the raw entry whenever the full literal
@@ -741,6 +765,9 @@ export async function splitDelimitedPathEntry(
 	// with glob syntax (`a;b[1].md:1-2`). Check the exact peeled path before the
 	// search splitter interprets those characters and semicolon fan-out wins.
 	if (selectorSplit.sel !== undefined && (await probeLiteralPathExists(peeledEntry, cwd)) !== "missing") return null;
+	// `a:1-30,:-30` may name a literal `a:1-30,` with a tail selector instead of `a` with a list.
+	const unfoldedPath = splitPathAndSel(normalizedEntry, { foldListColons: false }).path;
+	if (unfoldedPath !== peeledEntry && (await probeLiteralPathExists(unfoldedPath, cwd)) !== "missing") return null;
 	if (!hasGlobPathChars(peeledEntry) && (await delimitedPathPartResolves(normalizedEntry, cwd, splitter))) {
 		return null;
 	}
@@ -792,7 +819,7 @@ export async function splitMixedUrlPathList(
 export async function expandDelimitedPathEntries(
 	entries: readonly string[],
 	cwd: string,
-	options: { splitter?: PathEntrySplitter } = {},
+	options: { splitter?: PathEntrySplitter; exclusionParts?: boolean } = {},
 ): Promise<string[]> {
 	const expanded: string[] = [];
 	for (const entry of entries) {

@@ -58,19 +58,10 @@ import { formatTaskResultSummary } from "./result-summary";
 import { isScoutSpawnable, type ResolvedSpawnPolicy, resolveSpawnPolicy } from "./spawn-policy";
 import { getSeanceTaskSchemaFields, isBundledSeance, seanceTaskGuidance, validateSeanceParams } from "./seance";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
-import {
-	type AgentDefinition,
-	type AgentProgress,
-	type EffectivePermissionSummary,
-	canSpawnAtDepth,
-	getTaskSchema,
-	oneLineLabel,
-	type SingleResult,
-	type TaskItem,
-	type TaskParams,
-	type TaskToolDetails,
-	type TaskToolSchemaInstance,
-} from "./types";
+import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
+import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
+import { type AgentDefinition, canSpawnAtDepth, getTaskSchema, type TaskToolSchemaInstance } from "./types";
 import { TaskLaunchSession, type TaskLauncher } from "./speculative-launch";
 import { SpawnRun, type SpawnPermit } from "./spawn-run";
 import { AsyncJobError, type AsyncJobManager } from "../async";
@@ -224,16 +215,7 @@ export { discoverCommands, expandCommand, getCommand } from "./commands";
 export { discoverAgents, getAgent } from "./discovery";
 export { AgentOutputManager } from "./output-manager";
 export * from "./read-only-policy";
-export type {
-	AgentDefinition,
-	AgentProgress,
-	SingleResult,
-	SubagentEventPayload,
-	SubagentLifecyclePayload,
-	SubagentProgressPayload,
-	TaskParams,
-	TaskToolDetails,
-} from "./types";
+export type { AgentDefinition, SubagentEventPayload } from "./types";
 export * from "./result-summary";
 export {
 	taskSchema,
@@ -491,6 +473,9 @@ function validateShapeParams(
 	}
 	if (Object.hasOwn(params, "schema")) {
 		return "The task tool uses `outputSchema`; rename the stale `schema` field.";
+	}
+	if (batchEnabled && params.tasks !== undefined && Object.hasOwn(params, "agent")) {
+		return "Top-level `agent` is not part of the batch shape. Set `tasks[].agent` instead.";
 	}
 	if (!permissionsEnabled) {
 		if (params.permissions !== undefined || params.tasks?.some(item => item.permissions !== undefined)) {
@@ -1247,6 +1232,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 	}
 
+	/** Apply the fork's captured effort authorization equally to preflight and execution. */
+	#effortParams(params: TaskParams, allowEffortOverride: boolean): Pick<StructuredSubagentRequest, "effort"> {
+		if (params.effort === undefined || !allowEffortOverride) return {};
+		return { effort: params.effort };
+	}
+
 	#seanceSchemaFields() {
 		const spawnPolicy = resolveSpawnPolicy(this.session.getSessionSpawns());
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
@@ -1392,6 +1383,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		settings: Settings,
 		batchEnabled: boolean,
 		taskDepth: number,
+		allowEffortOverride: boolean,
 	): Promise<EffectiveSubagentPolicy> {
 		const discovery = await discoverAgents(this.session.cwd, undefined, this.session.effectiveExtensionRoots?.());
 		const frozenDiscovery = await freezeDiscoveredAgent(discovery, params);
@@ -1407,7 +1399,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			...(params.sourceSession !== undefined ? { sourceSession: params.sourceSession } : {}),
 			...(params.model !== undefined ? { model: params.model } : {}),
 			...this.#resultParams(params),
-			...(params.effort !== undefined ? { effort: params.effort } : {}),
+			...this.#effortParams(params, allowEffortOverride),
 			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 			blockedAgent: this.#blockedAgent,
 			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(settings),
@@ -1510,6 +1502,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const permissionToolsEnabled = settingValue<boolean>("task.permissions.tools.enabled", preparedSettings);
 		const permissionPathsEnabled = settingValue<boolean>("task.permissions.paths.enabled", preparedSettings);
 		const modelOverrideEnabled = settingValue<boolean>("task.allowModelOverride", preparedSettings);
+		const allowEffortOverride = settingValue<boolean>("task.allowEffortOverride", preparedSettings);
 		const validationError =
 			validateIdentityPins(params) ??
 			validateShapeParams(batchEnabled, permissionMode !== "off", params) ??
@@ -1529,7 +1522,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const resolvedAgents = normalizedSpawnParams.map(spawn => spawn.agent ?? defaultAgent);
 		const preflightResults = await Promise.allSettled(
 			normalizedSpawnParams.map(spawn =>
-				this.#resolveSpawnPreflight(spawn, preparedSettings, batchEnabled, taskDepth),
+				this.#resolveSpawnPreflight(spawn, preparedSettings, batchEnabled, taskDepth, allowEffortOverride),
 			),
 		);
 		const preflights: EffectiveSubagentPolicy[] = [];
@@ -1558,7 +1551,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		signal?.throwIfAborted();
 
 		const manager = this.#getOutputManager();
-		const allowEffortOverride = settingValue<boolean>("task.allowEffortOverride", preparedSettings);
 		const reservations: PreparedSpawnReservation[] = [];
 		const reservedIds: string[] = [];
 		try {
@@ -2417,6 +2409,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				agentId,
 				queued: true,
 				ownerId: this.session.getAgentId?.() ?? undefined,
+				agentRegistry: this.session.agentRegistry,
 				widgetInputs: createTaskWidgetInputs({
 					manager,
 					agentId,
@@ -2789,6 +2782,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const sharedRunOptions: ExecutorOptions = {
 				asyncJobManager: this.session.asyncJobManager,
 				settings: preparedSettings,
+				costGate: this.session.costGate,
 				artifactsDir: this.session.getArtifactsDir?.() ?? effectiveArtifactsDir,
 
 				cwd: this.session.cwd,
@@ -2807,7 +2801,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				preparedSession: preparedPolicy.preparedSession,
 				...this.#resultParams(params),
 				structured,
-				...(allowEffortOverride && params.effort !== undefined ? { effort: params.effort } : {}),
+				...this.#effortParams(params, allowEffortOverride),
 				solutionSpace: params.solutionSpace,
 				...(params.model !== undefined ? { model: params.model } : {}),
 				planReference,
@@ -2879,6 +2873,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				contextFiles: this.session.contextFiles?.filter(
 					file => path.basename(file.path).toLowerCase() !== "agents.md",
 				),
+				noContextFiles: this.session.noContextFiles,
 				skills: this.session.skills ? [...this.session.skills] : undefined,
 				workspaceTree: this.session.workspaceTree,
 				promptTemplates: this.session.promptTemplates,

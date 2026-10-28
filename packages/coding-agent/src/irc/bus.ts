@@ -67,18 +67,18 @@ interface IrcWaiter {
 	cancel: () => void;
 }
 
-/**
- * Rejection reason for a `send await:true` whose awaited peer reached a
- * terminal stop (ended its turn, parked, was aborted, or unregistered)
- * without ever replying. Distinct from a plain timeout so the sender can
- * surface "they stopped" instead of stranding the caller on the full
- * `irc.timeoutMs` window.
- */
+/** Rejection reason for a send awaiting a peer that stopped without replying. */
 export class IrcAwaitTargetStopped extends Error {
 	constructor(target: string) {
 		super(`Awaited peer "${target}" stopped without replying.`);
 		this.name = "IrcAwaitTargetStopped";
 	}
+}
+
+/** When a send went out: wall-clock time plus per-namespace ordering. */
+interface SendMark {
+	ts: number;
+	seq: number;
 }
 
 /** Mailbox cap per agent, including slots reserved by in-flight transactions. */
@@ -87,13 +87,17 @@ const MAILBOX_CAP = 100;
 interface IrcNamespaceState {
 	readonly mailboxes: Map<string, IrcMessage[]>;
 	readonly waiters: Map<string, IrcWaiter[]>;
-	readonly lastSent: Map<string, Map<string, number>>;
+	readonly lastSent: Map<string, Map<string, SendMark>>;
+	readonly lastDirect: Map<string, Map<string, SendMark>>;
+	readonly lastJobReply: Map<string, Map<string, SendMark>>;
 	readonly reservedSlots: Map<string, number>;
+	sendSeq: number;
 }
 
 interface IrcDeliveryReservation {
 	readonly message: IrcMessage;
 	readonly targetRef: object;
+	readonly mark: SendMark;
 	convertedToMailbox: boolean;
 }
 
@@ -162,6 +166,24 @@ export class IrcBus {
 		IrcBus.#namespaces = new WeakMap();
 	}
 
+	/**
+	 * Count a settled job of agent `from` owned by `to` as `from`'s reply to
+	 * `to`: the job delivers that agent's outcome, so it answers what `to`
+	 * asked it before now (see {@link unansweredSends}). With no bus yet no
+	 * message was ever sent, so there is nothing to answer.
+	 */
+	static recordReply(from: string, to: string, registry: AgentRegistry = AgentRegistry.global()): void {
+		const fromRef = lookupAgentRef(registry, from);
+		const toRef = lookupAgentRef(registry, to);
+		if (!fromRef && !toRef) return;
+		const fromRoot = fromRef?.lineage?.rootId;
+		const toRoot = toRef?.lineage?.rootId;
+		if (fromRoot && toRoot && fromRoot !== toRoot) return;
+		const rootId = fromRoot ?? toRoot;
+		const bus = rootId ? IrcBus.forRoot(registry, rootId) : IrcBus.forRegistry(registry);
+		bus.#recordReply(from, to);
+	}
+
 	readonly #registry: AgentRegistry;
 	readonly #namespace?: string;
 	readonly #lifecycle: () => AgentLifecycleManager;
@@ -187,7 +209,15 @@ export class IrcBus {
 		}
 		let state = registryNamespaces.get(namespaceKey);
 		if (!state) {
-			state = { mailboxes: new Map(), waiters: new Map(), lastSent: new Map(), reservedSlots: new Map() };
+			state = {
+				mailboxes: new Map(),
+				waiters: new Map(),
+				lastSent: new Map(),
+				lastDirect: new Map(),
+				lastJobReply: new Map(),
+				reservedSlots: new Map(),
+				sendSeq: 0,
+			};
 			registryNamespaces.set(namespaceKey, state);
 		}
 		this.#state = state;
@@ -274,7 +304,7 @@ export class IrcBus {
 		const reservation = reservations[0]!;
 		try {
 			const receipt = await this.#deliver(reservation, opts);
-			this.#recordSent(reservation.message, receipt);
+			this.#recordSent(reservation, receipt);
 			return receipt;
 		} finally {
 			this.#finishReservations(reservations, true);
@@ -319,7 +349,7 @@ export class IrcBus {
 		const receipts: IrcDeliveryReceipt[] = [];
 		for (const reservation of record.reservations) {
 			const receipt = await this.#deliver(reservation, opts, transaction);
-			this.#recordSent(reservation.message, receipt, record);
+			this.#recordSent(reservation, receipt, record);
 			receipts.push(receipt);
 		}
 		return receipts;
@@ -331,7 +361,8 @@ export class IrcBus {
 		this.#finishReservations(record.reservations, preserveBuffered);
 	}
 
-	#recordSent(message: IrcMessage, receipt: IrcDeliveryReceipt, batch?: IrcDeliveryBatchRecord): void {
+	#recordSent(reservation: IrcDeliveryReservation, receipt: IrcDeliveryReceipt, batch?: IrcDeliveryBatchRecord): void {
+		const { message, mark } = reservation;
 		if (receipt.outcome === "failed") {
 			const buffered = this.#state.mailboxes.get(message.to)?.includes(message) === true;
 			if (!buffered) {
@@ -342,12 +373,9 @@ export class IrcBus {
 		}
 		if (batch) batch.stagedMutations.push(this.#mailboxMutation(message, "delivered"));
 		else this.#persistMailbox(message, "delivered");
-		let sent = this.#state.lastSent.get(message.from);
-		if (!sent) {
-			sent = new Map();
-			this.#state.lastSent.set(message.from, sent);
-		}
-		sent.set(message.to, message.ts);
+		this.#record(this.#state.lastSent, message.from, message.to, mark);
+		if (!message.broadcast && !message.wakeRelay)
+			this.#record(this.#state.lastDirect, message.from, message.to, mark);
 	}
 
 	#reserveDeliveries(messages: readonly Omit<IrcMessage, "id" | "ts">[]): IrcDeliveryReservation[] {
@@ -356,6 +384,7 @@ export class IrcBus {
 		const failures: IrcDeliveryReceipt[] = [];
 		for (const raw of messages) {
 			const message: IrcMessage = { ...raw, id: Snowflake.next(), ts: Date.now() };
+			const mark: SendMark = { ts: message.ts, seq: ++this.#state.sendSeq };
 			if (this.#namespace !== undefined) {
 				const senderRef = lookupAgentRef(this.#registry, message.from);
 				if (!senderRef || !this.#inScope(senderRef)) {
@@ -386,7 +415,7 @@ export class IrcBus {
 				});
 				continue;
 			}
-			reservations.push({ message, targetRef: ref, convertedToMailbox: false });
+			reservations.push({ message, targetRef: ref, mark, convertedToMailbox: false });
 			requiredByRecipient.set(message.to, (requiredByRecipient.get(message.to) ?? 0) + 1);
 		}
 		if (failures.length > 0) throw new IrcDeliveryAdmissionError(failures);
@@ -442,14 +471,46 @@ export class IrcBus {
 		if (mailbox.length === 0) this.#state.mailboxes.delete(message.to);
 	}
 
+	#record(table: Map<string, Map<string, SendMark>>, from: string, to: string, mark: SendMark): void {
+		let sent = table.get(from);
+		if (!sent) {
+			sent = new Map();
+			table.set(from, sent);
+		}
+		// Deliveries can settle out of order; keep the latest send.
+		if ((sent.get(to)?.seq ?? 0) < mark.seq) sent.set(to, mark);
+	}
+
+	#recordReply(from: string, to: string): void {
+		this.#record(this.#state.lastJobReply, from, to, { ts: Date.now(), seq: ++this.#state.sendSeq });
+	}
+
 	/**
 	 * Whether `from` successfully sent `to` anything at or after `sinceTs`.
 	 * The wake-turn relay uses it to skip agents that already answered their
 	 * waker themselves.
 	 */
 	sentSince(from: string, to: string, sinceTs: number): boolean {
-		const ts = this.#state.lastSent.get(from)?.get(to);
-		return ts !== undefined && ts >= sinceTs;
+		const sent = this.#state.lastSent.get(from)?.get(to);
+		return sent !== undefined && sent.ts >= sinceTs;
+	}
+
+	/**
+	 * Direct messages sent by `from` at or after `sinceTs` without a later
+	 * direct answer or settled subagent result, ordered by send rather than time.
+	 */
+	unansweredSends(from: string, sinceTs: number): Array<{ to: string; sentAt: number }> {
+		const sends = this.#state.lastDirect.get(from);
+		if (!sends) return [];
+		const unanswered: Array<{ to: string; sentAt: number }> = [];
+		for (const [to, sent] of sends) {
+			if (sent.ts < sinceTs) continue;
+			const answered = [this.#state.lastSent, this.#state.lastJobReply].some(
+				replies => (replies.get(to)?.get(from)?.seq ?? 0) > sent.seq,
+			);
+			if (!answered) unanswered.push({ to, sentAt: sent.ts });
+		}
+		return unanswered;
 	}
 
 	async #deliver(

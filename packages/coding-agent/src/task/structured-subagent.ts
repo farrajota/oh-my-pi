@@ -35,7 +35,7 @@ import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" wit
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import isolationRecoveryHintTemplate from "../prompts/tools/isolation-recovery-hint.md" with { type: "text" };
 import salvagedChildHintTemplate from "../prompts/tools/salvaged-child-hint.md" with { type: "text" };
-import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
@@ -59,13 +59,8 @@ import { AgentOutputManager } from "./output-manager";
 import { resolveSpawnPolicy } from "./spawn-policy";
 import { isBundledSeance, prepareSeance, type PreparedSeanceSession } from "./seance";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
-import {
-	type AgentDefinition,
-	type AgentProgress,
-	canSpawnAtDepth,
-	type SingleResult,
-	type StructuredSubagentOutput,
-} from "./types";
+import type { AgentProgress, SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
+import { type AgentDefinition, canSpawnAtDepth } from "./types";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import { parseIsolationBackend } from "./worktree";
 
@@ -748,6 +743,7 @@ function buildRunSubprocessOptions(
 	const permissionSnapshot = composedPermissions?.ok ? freezePermissionScope(composedPermissions.value) : undefined;
 	return {
 		cwd: session.cwd,
+		costGate: session.costGate,
 		additionalDirectories: session.additionalDirectories,
 		getApiKey: session.getApiKey,
 		credentialSourceSessionId: session.providerSessionId ?? session.getSessionId?.() ?? undefined,
@@ -811,7 +807,8 @@ function buildRunSubprocessOptions(
 		enableMCP,
 		customTools: request.customTools,
 		workPoolYieldItems: request.workPoolYieldItems,
-		contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),
+		contextFiles: session.contextFiles,
+		noContextFiles: session.noContextFiles,
 		skills,
 		autoloadSkills,
 		workspaceTree: session.workspaceTree,
@@ -1035,23 +1032,37 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				);
 			}
 		}
+		// An inline (`detached: false`) spawn keeps its parent's tool call open
+		// until the child finishes: no message to the parent lands before then.
+		const releaseHold =
+			request.detached === false
+				? (request.session.agentRegistry ?? AgentRegistry.global()).awaits.hold(
+						baseOptions.parentAgentId ?? MAIN_AGENT_ID,
+						[id],
+						{ interruptible: false },
+					)
+				: undefined;
 		let result: SingleResult;
-		if (!isolationContext) {
-			result = await runSubprocess(baseOptions);
-			onSubprocessResult?.(result);
-		} else {
-			result = await runIsolatedSubprocess({
-				baseOptions,
-				context: isolationContext,
-				preferredBackend: parseIsolationBackend(cfgIsolationBackend.get(request.session.settings)),
-				agentId: id,
-				mergeMode: policy.mergeMode,
-				artifactsDir: lease.artifactsDir,
-				description: trimToUndefined(request.identity?.label),
-				buildCommitMessage: makeIsolationCommitMessage(request.session),
-				buildFailureResult: buildFailureResult(request, policy, id, Date.now()),
-				onSubprocessResult,
-			});
+		try {
+			if (!isolationContext) {
+				result = await runSubprocess(baseOptions);
+				onSubprocessResult?.(result);
+			} else {
+				result = await runIsolatedSubprocess({
+					baseOptions,
+					context: isolationContext,
+					preferredBackend: parseIsolationBackend(cfgIsolationBackend.get(request.session.settings)),
+					agentId: id,
+					mergeMode: policy.mergeMode,
+					artifactsDir: lease.artifactsDir,
+					description: trimToUndefined(request.identity?.label),
+					buildCommitMessage: makeIsolationCommitMessage(request.session),
+					buildFailureResult: buildFailureResult(request, policy, id, Date.now()),
+					onSubprocessResult,
+				});
+			}
+		} finally {
+			releaseHold?.();
 		}
 		settled = result;
 		attachStructuredOutputMetadata(result, policy.schema);

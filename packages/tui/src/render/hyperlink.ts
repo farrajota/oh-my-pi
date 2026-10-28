@@ -36,32 +36,63 @@ function buildLinkId(uri: string): string {
 }
 
 /**
+ * A `file:` URL for `filePath`, or `undefined` when Node cannot encode it.
+ *
+ * Node rejects a malformed UNC target (a UNC path escaped twice by its author,
+ * e.g. `\\\wsl.localhost\…`) with `ERR_INVALID_ARG_VALUE: Empty UNC servername`.
+ * A stored session keeps whatever a tool call recorded, so a transcript must
+ * render such a path without a link rather than throw while it rebuilds.
+ */
+export function tryFileUri(filePath: string): string | undefined {
+	try {
+		return url.pathToFileURL(filePath).href;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Build the OSC 8 target for a file path on `terminalId`.
+ *
+ * A `file:` URI handed to an editor has to be a plain path. `Paths.get(URI)`
+ * rejects one carrying a query or a fragment outright — `IllegalArgumentException:
+ * URI has a query component` / `URI has a fragment component` — so appending
+ * `?line=` made every JVM-based language server (Kotlin LSP, Eclipse JDT LS)
+ * fail *every* request for the resulting document, and VS Code reads the query
+ * as part of the resource identity rather than as a cursor position: a blank
+ * editor tab that navigates nowhere and persists across window reloads (#12109).
+ *
+ * The VS Code family instead navigates the documented
+ * `vscode://file/<path>:<line>:<col>` form. Everywhere else the plain `file:`
+ * URI is right, with the location left in the visible text — terminals that
+ * parse a `path:line:col` suffix resolve that on their own.
+ *
+ * Returns `undefined` when `filePath` cannot be encoded — a malformed UNC
+ * target on the `file:` branch, or a lone surrogate on the `vscode://` branch.
  */
 export function fileUriForTerminal(
 	filePath: string,
 	opts: { line?: number; col?: number } | undefined,
 	terminalId: TerminalId,
-): string {
-	if (terminalId !== "vscode") {
-		return url.pathToFileURL(filePath).href;
-	}
+): string | undefined {
+	if (terminalId !== "vscode") return tryFileUri(filePath);
 	// vscode:// takes a filesystem path with forward slashes. Encode each
 	// segment independently so separators and a Windows drive colon stay
 	// structural while reserved bytes in file names cannot become URI syntax.
-	const asPath = filePath.replace(/\\/gu, "/");
-	const encodedPath = asPath
-		.split("/")
-		.map((segment, index) => (index === 0 && /^[a-z]:$/iu.test(segment) ? segment : encodeURIComponent(segment)))
-		.join("/");
-	const position =
-		opts?.line === undefined ? "" : opts.col === undefined ? `:${opts.line}` : `:${opts.line}:${opts.col}`;
-	return `vscode://file${encodedPath.startsWith("/") ? "" : "/"}${encodedPath}${position}`;
-}
-
-/** Build the OSC 8 target for `filePath` on this terminal. */
-function buildFileUri(filePath: string, opts?: { line?: number; col?: number }): string {
-	return fileUriForTerminal(filePath, opts, TERMINAL.id);
+	try {
+		const asPath = filePath.replace(/\\/gu, "/");
+		const encodedPath = asPath
+			.split("/")
+			.map((segment, index) => (index === 0 && /^[a-z]:$/iu.test(segment) ? segment : encodeURIComponent(segment)))
+			.join("/");
+		const position =
+			opts?.line === undefined ? "" : opts.col === undefined ? `:${opts.line}` : `:${opts.line}:${opts.col}`;
+		return `vscode://file${encodedPath.startsWith("/") ? "" : "/"}${encodedPath}${position}`;
+	} catch {
+		// `encodeURIComponent` throws URIError on a lone surrogate, which a
+		// model-authored path can carry; the row keeps its text and loses the link.
+		return undefined;
+	}
 }
 
 /**
@@ -201,7 +232,8 @@ export function isNativeLinkEnabled(): boolean {
  */
 export function fileLinkSpan(filePath: string, displayText: string, s = "path"): TspSpan {
 	if (hyperlinkMode === "off") return span(displayText, s);
-	const href = safeHyperlinkUri(url.pathToFileURL(filePath).href);
+	const uri = tryFileUri(filePath);
+	const href = uri === undefined ? undefined : safeHyperlinkUri(uri);
 	return href ? span(displayText, s, { href }) : span(displayText, s);
 }
 
@@ -211,12 +243,14 @@ export function fileLinkSpan(filePath: string, displayText: string, s = "path"):
  * Returns `displayText` unchanged when hyperlinks are disabled or when
  * the text already contains an OSC 8 sequence (prevents double-wrapping).
  * Relative paths resolve against the current working directory before URI
- * encoding so the OSC 8 target is always a valid `file://` URL.
+ * encoding so the OSC 8 target is always a valid `file://` URL. A path Node
+ * cannot encode renders as `displayText` with no link.
  *
  * @param filePath - Filesystem path
  * @param displayText - Text to render as the hyperlink anchor (may contain ANSI codes)
  * @param opts - Optional line/col position used by VS Code links; omitted from file:// targets
  */
 export function fileHyperlink(filePath: string, displayText: string, opts?: { line?: number; col?: number }): string {
-	return wrapHyperlink(buildFileUri(filePath, opts), displayText);
+	const uri = fileUriForTerminal(filePath, opts, TERMINAL.id);
+	return uri ? wrapHyperlink(uri, displayText) : displayText;
 }

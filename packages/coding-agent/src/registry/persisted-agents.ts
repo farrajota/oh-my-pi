@@ -25,6 +25,7 @@ import { persistedVibeChildIds } from "../vibe/lifecycle";
 import {
 	type AgentHistorySummary,
 	type AgentMetricsSummary,
+	type AgentRef,
 	type AgentRegistry,
 	MAIN_AGENT_ID,
 } from "./agent-registry";
@@ -54,6 +55,20 @@ interface PersistedTranscript {
 	sessionFile: string;
 	createdAt?: number;
 	lastActivity?: number;
+}
+
+/** Size and mtime of a transcript when a ref's history was last read from it; an unchanged transcript is not read again. */
+const historyStamps = new WeakMap<AgentRef, string>();
+
+async function transcriptStamp(sessionFile: string): Promise<string | undefined> {
+	try {
+		const stat = await fs.promises.stat(sessionFile);
+		return `${stat.size}:${stat.mtimeMs}`;
+	} catch (error) {
+		// A vanished transcript reads as empty history, as before.
+		if (isFilesystemError(error)) throw error;
+		return undefined;
+	}
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
@@ -200,7 +215,17 @@ async function readPersistedAgentHistory(
 				if (!id) return;
 				const parentId = typeof record.parentId === "string" ? record.parentId : undefined;
 				parents.set(id, parentId);
-				leafId = id;
+				// Same replay rule as `sessionEntryLeafId`: an entry written off the active
+				// branch (late usage, a routed bash result) restores the leaf it captured
+				// instead of becoming the leaf itself.
+				if (typeof record.activeLeafId === "string") {
+					leafId = record.activeLeafId;
+				} else if (record.activeLeafId === null) {
+					leafId = undefined;
+				} else {
+					leafId = id;
+					selfSelectedLeafId = id;
+				}
 				const parsedTimestamp = timestampOf(record.timestamp);
 				if (parsedTimestamp !== undefined) leafTimestamp = parsedTimestamp;
 				if (record.type === "session_init" && typeof record.modelRole === "string") {
@@ -228,7 +253,6 @@ async function readPersistedAgentHistory(
 					}
 					return;
 				}
-				selfSelectedLeafId = id;
 				if (record.type === "model_change" && typeof record.model === "string") {
 					modelChangeById.set(id, {
 						model: record.model,
@@ -709,15 +733,16 @@ export async function registerPersistedSubagents(
 	const shouldContinue = options.shouldContinue ?? (() => true);
 	const hydrateHistory = options.hydrateHistory ?? true;
 	if (!shouldContinue()) return;
-	const vibeOwnedIds = await readPersistedVibeChildIds(sessionFile, shouldContinue);
-	if (!shouldContinue()) return;
+	// The main transcript can be large: read it once, and only for a transcript the registry does not hold yet.
+	let vibeOwnedIds: Promise<Set<string>> | undefined;
+	const vibeOwned = () => (vibeOwnedIds ??= readPersistedVibeChildIds(sessionFile, shouldContinue));
 	const root = sessionFile.slice(0, -6);
 	const transcripts: PersistedTranscript[] = [];
 	await registerPersistedSubagentsFromDir(
 		registry,
 		root,
 		undefined,
-		vibeOwnedIds,
+		vibeOwned,
 		transcripts,
 		shouldContinue,
 		sessionFile,
@@ -731,9 +756,15 @@ export async function registerPersistedSubagents(
 			const index = nextTranscript++;
 			const transcript = transcripts[index];
 			if (!transcript) return;
+			const ref = lookupAgentRef(registry, transcript.ref.id);
+			if (ref !== transcript.ref || ref.sessionFile !== transcript.sessionFile) continue;
+			const stamp = await transcriptStamp(transcript.sessionFile);
+			if (stamp !== undefined && historyStamps.get(ref) === stamp) continue;
 			const history = await readPersistedAgentHistory(transcript, shouldContinue);
 			if (!shouldContinue()) return;
-			setAgentHistory(registry, transcript.ref, history, transcript.sessionFile);
+			if (setAgentHistory(registry, ref, history, transcript.sessionFile) && stamp !== undefined) {
+				historyStamps.set(ref, stamp);
+			}
 		}
 	});
 	await Promise.all(workers);
@@ -743,7 +774,7 @@ async function registerPersistedSubagentsFromDir(
 	registry: AgentRegistry,
 	dir: string,
 	parentId: string | undefined,
-	vibeOwnedIds: ReadonlySet<string>,
+	vibeOwned: () => Promise<ReadonlySet<string>>,
 	transcripts: PersistedTranscript[],
 	shouldContinue: () => boolean,
 	rootSessionFile: string,
@@ -827,7 +858,7 @@ async function registerPersistedSubagentsFromDir(
 		const id = entry.name.slice(0, -6);
 		if (id === "" || id === "." || id === "..") continue;
 		const existing = lookupAgentRef(registry, id);
-		if (vibeOwnedIds.has(id) && existing?.sessionFile !== sessionFile) continue;
+		if (existing?.sessionFile !== sessionFile && (await vibeOwned()).has(id)) continue;
 		let tombstoned = false;
 		try {
 			await fs.promises.access(getAgentTombstonePath(sessionFile));
@@ -901,7 +932,7 @@ async function registerPersistedSubagentsFromDir(
 				registry,
 				path.join(dir, id),
 				id,
-				vibeOwnedIds,
+				vibeOwned,
 				transcripts,
 				shouldContinue,
 				rootSessionFile,

@@ -45,6 +45,8 @@ interface AgentRegistryBridge {
 	bindAuthoritySession(parent: AgentSession): AgentAuthoritySessionBinding | undefined;
 	lookupAuthoritySession(parent: AgentSession): InternalAgentRef | undefined;
 	isSessionParentIrcSender(session: AgentSession, recipientId: string, senderId: string): boolean;
+	isSessionDescendantIrcSender(session: AgentSession, recipientId: string, senderId: string): boolean;
+	isSessionSubagent(session: AgentSession, recipientId: string): boolean;
 	lookupAuthorityLineage(parentId: string): { readonly rootId: string; readonly parentId: string } | undefined;
 	operationAuthority(parent: AgentSession): BoundSessionOperationAuthority | undefined;
 	createRootSession(options?: CreateAgentSessionOptions): Promise<CreateAgentSessionResult>;
@@ -166,7 +168,7 @@ export function bindAgentSessionRegistry(registry: AgentRegistry, session: Agent
 	return true;
 }
 
-export function isSessionParentIrcSender(session: AgentSession, recipientId: string, senderId: string): boolean {
+function liveSessionRegistryBinding(session: AgentSession): AgentSessionRegistryBinding | undefined {
 	const binding = sessionRegistryBindings.get(session);
 	if (
 		!binding ||
@@ -179,8 +181,23 @@ export function isSessionParentIrcSender(session: AgentSession, recipientId: str
 		binding.rootRef.lineage?.rootId !== binding.rootId ||
 		binding.rootRef.lineage?.generation !== binding.rootGeneration
 	)
-		return false;
-	return bridgeFor(binding.registry).isSessionParentIrcSender(session, recipientId, senderId);
+		return undefined;
+	return binding;
+}
+
+export function isSessionParentIrcSender(session: AgentSession, recipientId: string, senderId: string): boolean {
+	const binding = liveSessionRegistryBinding(session);
+	return binding ? bridgeFor(binding.registry).isSessionParentIrcSender(session, recipientId, senderId) : false;
+}
+
+export function isSessionDescendantIrcSender(session: AgentSession, recipientId: string, senderId: string): boolean {
+	const binding = liveSessionRegistryBinding(session);
+	return binding ? bridgeFor(binding.registry).isSessionDescendantIrcSender(session, recipientId, senderId) : false;
+}
+
+export function isSessionSubagent(session: AgentSession, recipientId: string): boolean {
+	const binding = liveSessionRegistryBinding(session);
+	return binding ? bridgeFor(binding.registry).isSessionSubagent(session, recipientId) : false;
 }
 
 export function lookupAgentAuthorityLineage(

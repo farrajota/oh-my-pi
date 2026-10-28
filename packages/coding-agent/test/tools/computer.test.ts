@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import * as path from "node:path";
 import { inspect } from "node:util";
 import { createContext, runInContext } from "node:vm";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -30,6 +31,7 @@ import {
 import { ComputerWorkerCore, type NativeDesktopSession } from "@oh-my-pi/pi-coding-agent/tools/computer/worker";
 import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import type {
+	ApplicationOpenOptions,
 	AxNode,
 	AxQuery,
 	AxSelectTextOptions,
@@ -1879,12 +1881,27 @@ describe("computer worker round trips", () => {
 			{ ...windowFixture, id: "9", app: "TextEdit", title: "draft.txt", pid: 10, focused: false },
 		];
 
-		async function missMessage(windows: DesktopWindow[], selector: string): Promise<string> {
+		class MacSession extends FakeNativeSession {
+			override get capabilities(): DesktopCapabilities {
+				return { ...super.capabilities, backend: "quartz" };
+			}
+		}
+
+		async function missMessage(
+			windows: DesktopWindow[],
+			selector: string,
+			options: { native?: FakeNativeSession; readOnly?: boolean } = {},
+		): Promise<string> {
 			const transport = new MemoryTransport();
-			const native = new FakeNativeSession();
+			const native = options.native ?? new FakeNativeSession();
 			native.listWindows = async () => windows;
 			new ComputerWorkerCore(transport, () => native);
-			const result = await runWorker(transport, "window-miss", `await desktop.window(${selector})`);
+			const result = await runWorker(
+				transport,
+				"window-miss",
+				`await desktop.window(${selector})`,
+				options.readOnly,
+			);
 			expect(result.ok).toBe(false);
 			return result.ok ? "" : result.error.message;
 		}
@@ -1901,9 +1918,44 @@ describe("computer worker round trips", () => {
 		it("says the app has no window and lists every app's windows, untitled ones included", async () => {
 			const lines = (await missMessage(desktopWindows, '{ app: "Calendar" }')).split("\n");
 			expect(lines).toContain('No open window belongs to an app matching "Calendar".');
+			expect(lines).toContain('computer.apps.open("Calendar") launches it by that exact name or ID.');
 			expect(lines).toContain('- Code: 42 "Editor", 43 ""');
 			expect(lines).toContain('- Finder: 7 "Downloads"');
 			expect(lines).toContain('- TextEdit: 8 "notes.txt", 9 "draft.txt"');
+		});
+
+		it("on macOS names apps.open as the call that also shows a running app's window and returns it", async () => {
+			const lines = (await missMessage(desktopWindows, '{ app: "Calendar" }', { native: new MacSession() })).split(
+				"\n",
+			);
+			const hint = lines.find(line => line.startsWith('computer.apps.open("Calendar")'));
+			expect(hint).toContain("shows a window of it if it runs without one");
+			expect(hint).toContain("window: null if none appears");
+		});
+
+		it("names apps.open when no window is open at all, and in a read-only run such as a direct window call", async () => {
+			expect(await missMessage([], '{ app: "Calendar" }')).toContain('computer.apps.open("Calendar")');
+			expect(await missMessage(desktopWindows, '{ app: "Calendar" }', { readOnly: true })).toContain(
+				'computer.apps.open("Calendar")',
+			);
+		});
+
+		it("names the missing selector when called with nothing, instead of matching undefined", async () => {
+			for (const windows of [desktopWindows, []]) {
+				const message = await missMessage(windows, "");
+				expect(message.split("\n")[0]).toContain("computer.window() without an id or { app, title } filter");
+				expect(message).not.toContain("undefined");
+			}
+		});
+
+		it("returns the only open window when called with nothing", async () => {
+			const transport = new MemoryTransport();
+			const native = new FakeNativeSession();
+			native.listWindows = async () => [windowFixture];
+			new ComputerWorkerCore(transport, () => native);
+			const result = await runWorker(transport, "window-only", "(await desktop.window()).id");
+			expect(result.ok).toBe(true);
+			if (result.ok) expect(result.payload.returnValue).toBe(windowFixture.id);
 		});
 
 		it("lists untitled windows by id after titled ones, as when macOS hides other apps' titles", async () => {
@@ -2486,6 +2538,77 @@ describe("expanded computer APIs", () => {
 			await expect(pending).rejects.toThrow();
 			expect(native.acquireCount).toBe(0);
 			expect(native.controlActive).toBe(false);
+		} finally {
+			await supervisor.close();
+		}
+	});
+
+	it.each([
+		["settles when its dialog closes", true],
+		["ignores the close", false],
+	])("closes an unanswered control prompt before the run times out, when the UI %s", async (_label, settles) => {
+		const native = new FakeNativeSession();
+		const supervisor = new ComputerSupervisor(
+			toolSession(),
+			() => liveWorker(native),
+			undefined,
+			undefined,
+			NO_ESCAPE_STOPS,
+		);
+		const lateAnswer = Promise.withResolvers<boolean>();
+		let closedAfterMs: number | undefined;
+		try {
+			const result = await supervisor.run(
+				'return await desktop.control.acquire({ reason: "Nobody is here" })',
+				2_000,
+				snapshot(),
+				undefined,
+				confirmationContext(async (_title, _reason, options) => {
+					const shown = performance.now();
+					options?.signal?.addEventListener("abort", () => {
+						closedAfterMs = performance.now() - shown;
+						if (settles) lateAnswer.resolve(false);
+					});
+					return await lateAnswer.promise;
+				}),
+			);
+			expect(result.returnValue).toEqual({ active: false, reason: "unanswered" });
+			// The prompt closed before the 2 s run timed out, leaving a quarter of it to the script.
+			expect(closedAfterMs).toBeGreaterThan(1_000);
+			expect(closedAfterMs).toBeLessThan(2_000);
+			// A yes after the prompt closed grants nothing.
+			lateAnswer.resolve(true);
+			expect(
+				(await supervisor.run("return await desktop.control.state()", 2_000, snapshot(true))).returnValue,
+			).toEqual({ active: false });
+			expect(native.acquireCount).toBe(0);
+		} finally {
+			await supervisor.close();
+		}
+	});
+
+	it("answers unanswered without a prompt when the run has no time left to wait", async () => {
+		const native = new FakeNativeSession();
+		const supervisor = new ComputerSupervisor(
+			toolSession(),
+			() => liveWorker(native),
+			undefined,
+			undefined,
+			NO_ESCAPE_STOPS,
+		);
+		const confirm = vi.fn(async () => true);
+		try {
+			const result = await supervisor.run(
+				// 400 ms remain of the 2 s run, less than the quarter (500 ms) a prompt must leave the script.
+				'await wait(1_600); return await desktop.control.acquire({ reason: "Too late" })',
+				2_000,
+				snapshot(),
+				undefined,
+				confirmationContext(confirm),
+			);
+			expect(result.returnValue).toEqual({ active: false, reason: "unanswered" });
+			expect(confirm).not.toHaveBeenCalled();
+			expect(native.acquireCount).toBe(0);
 		} finally {
 			await supervisor.close();
 		}
@@ -3550,6 +3673,31 @@ describe("display hold follows the agent turn", () => {
 		expect(native.acquireCount).toBe(0);
 	});
 
+	it("gives a control confirmation the run's time less 5 s, and passes an unanswered verdict on", async () => {
+		const native = new FakeNativeSession();
+		const transport = new MemoryTransport();
+		new ComputerWorkerCore(transport, () => native);
+		transport.inbound({
+			type: "run",
+			id: "unanswered-verdict",
+			code: 'return await desktop.control.acquire({ reason: "Edit" });',
+			timeoutMs: 120_000,
+			session: snapshot(),
+			escape: escapeScope(),
+		});
+		const confirm = await transport.waitFor(message => message.type === "control-request");
+		if (confirm.type !== "control-request") throw new Error("Expected the run's control confirmation");
+		expect(confirm.timeoutMs).toBeGreaterThan(114_000);
+		expect(confirm.timeoutMs).toBeLessThanOrEqual(115_000);
+		transport.inbound({ type: "tool-reply", id: confirm.id, reply: { ok: true, value: "unanswered" } });
+		const result = await transport.waitFor(
+			message => message.type === "result" && message.id === "unanswered-verdict",
+		);
+		if (result.type !== "result" || !result.ok) throw new Error("control.acquire failed");
+		expect(result.payload.returnValue).toEqual({ active: false, reason: "unanswered" });
+		expect(native.acquireCount).toBe(0);
+	});
+
 	it("carries a turn resumed while a cold run starts into that run's hold", async () => {
 		const native = new FakeNativeSession();
 		const transport = new MemoryTransport();
@@ -3919,6 +4067,11 @@ describe("computer background fallback", () => {
 				call: "open:test.editor:true",
 				route: "without activate",
 			},
+			{
+				code: 'await desktop.apps.open("/tmp/report.pdf", { reveal: true })',
+				call: "open:/tmp/report.pdf:-",
+				route: "apps.open(folder)",
+			},
 			{ code: 'await desktop.type("x")', call: "type:desktop:-", route: "window handle" },
 			{
 				code: 'await (await desktop.display("active")).click(1, 2)',
@@ -3990,6 +4143,58 @@ describe("computer background fallback", () => {
 				"axClick:false",
 				"holdKeys:42:false",
 				"open:test.editor:false",
+			]);
+		});
+
+		class FileSession extends ForegroundSession {
+			readonly opened: Array<{ id: string; options?: ApplicationOpenOptions }> = [];
+			override async openApplication(id: string, options?: ApplicationOpenOptions) {
+				this.opened.push({ id, options });
+				return super.openApplication(id, options);
+			}
+		}
+		const here = (name: string) => path.join(import.meta.dir, name);
+
+		it("opens a relative path in the session's folder, even a missing one, and passes reveal and app on", async () => {
+			const native = new FileSession();
+			const code = [
+				'await desktop.apps.open("computer.test.ts", { reveal: true });',
+				'await desktop.apps.open("computer.test.ts", { app: "Editor" });',
+				'await desktop.apps.open("./missing/report.pdf", { app: "./Editor.app" });',
+				'await desktop.apps.open("Editor");',
+				'await desktop.apps.open("/tmp/report.pdf");',
+				'await desktop.apps.open("https://example.com");',
+				'await desktop.apps.open("shell:AppsFolder\\\\Calculator!App");',
+			].join("\n");
+			expect((await run(native, code, "takeover")).ok).toBe(true);
+			expect(native.opened).toEqual([
+				{ id: here("computer.test.ts"), options: { reveal: true } },
+				{ id: here("computer.test.ts"), options: { app: "Editor" } },
+				{ id: here("missing/report.pdf"), options: { app: here("Editor.app") } },
+				{ id: "Editor", options: {} },
+				{ id: "/tmp/report.pdf", options: {} },
+				{ id: "https://example.com", options: {} },
+				{ id: "shell:AppsFolder\\Calculator!App", options: {} },
+			]);
+		});
+
+		it("keeps an exact application ID over a same-named file in the session's folder", async () => {
+			class ShadowedSession extends FileSession {
+				override async listApplications() {
+					return [
+						{ id: "computer.test.ts", name: "Editor", path: "/Applications/Editor.app", running: true, pid: 123 },
+					];
+				}
+			}
+			const native = new ShadowedSession();
+			const code = [
+				'await desktop.apps.open("computer.test.ts");',
+				'await desktop.apps.open("README.md", { app: "computer.test.ts" });',
+			].join("\n");
+			expect((await run(native, code, "takeover")).ok).toBe(true);
+			expect(native.opened).toEqual([
+				{ id: "computer.test.ts", options: {} },
+				{ id: "README.md", options: { app: "computer.test.ts" } },
 			]);
 		});
 

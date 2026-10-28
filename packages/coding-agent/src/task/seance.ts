@@ -19,7 +19,7 @@ import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
 import { getBundledAgent } from "./agents";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
-import type { AgentDefinition } from "./types";
+import type { AgentDefinition, SeanceTaskSchemaFields } from "./types";
 
 export interface ResolvedSeanceSource {
 	file: string;
@@ -161,7 +161,7 @@ export function getSeanceTaskSchemaFields(modelEnabled: boolean) {
 	return {
 		"sourceSession?": type("string"),
 		...(modelEnabled ? { "model?": modelSelectorInputSchema } : {}),
-	};
+	} satisfies SeanceTaskSchemaFields;
 }
 export const seanceTaskGuidance = seanceTaskGuidanceTemplate;
 

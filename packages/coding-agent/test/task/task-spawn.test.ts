@@ -17,9 +17,15 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { resetAgentLifecycleForTests } from "../../src/internal/agent-lifecycle-bridge";
+import {
+	registerToolSessionLifecycleAuthority,
+	resetAgentLifecycleForTests,
+} from "../../src/internal/agent-lifecycle-bridge";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { createAgentsHubDeps } from "@oh-my-pi/pi-coding-agent/modes/agents-hub-deps";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
@@ -29,6 +35,7 @@ import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runne
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { AgentProgress, SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { snapshotJobs } from "@oh-my-pi/pi-coding-agent/async/job-control";
 import { cfgTaskAgentModelOverrides, cfgTaskMaxConcurrency } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -44,6 +51,7 @@ const authoritySessions: AgentSession[] = [];
 
 async function createSession(options: {
 	manager?: AsyncJobManager;
+	sessionManager?: SessionManager;
 	settings?: Record<string, unknown>;
 	overrides?: Partial<ToolSession>;
 }): Promise<ToolSession> {
@@ -54,6 +62,7 @@ async function createSession(options: {
 		agentDisplayName: "Main",
 		cwd: "/tmp",
 		agentDir: "/tmp",
+		sessionManager: options.sessionManager,
 		settings,
 		disableExtensionDiscovery: true,
 		enableMCP: false,
@@ -72,7 +81,8 @@ async function createSession(options: {
 		settings,
 		agentRegistry: registry,
 		createAuthoritySession,
-		getSessionFile: () => null,
+		getAgentId: () => root.session.getAgentId(),
+		getSessionFile: () => root.session.sessionManager.getSessionFile(),
 		getSessionSpawns: () => "*",
 		asyncJobManager: options.manager,
 		...options.overrides,
@@ -138,16 +148,19 @@ describe("task spawn routing", () => {
 	beforeEach(() => {
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+		IrcBus.resetGlobalForTests();
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		for (const session of authoritySessions.splice(0)) await session.dispose();
+		for (const session of authoritySessions.splice(0).reverse()) await session.dispose();
 		for (const manager of managers.splice(0)) {
 			await manager.dispose({ timeoutMs: 1000 });
 		}
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
+		IrcBus.resetGlobalForTests();
 	});
 
 	it("returns immediately on spawn and delivers the follow-up hint when the job completes", async () => {
@@ -212,6 +225,7 @@ describe("task spawn routing", () => {
 				overrides: {
 					additionalDirectories: ["/task/shared-worktree"],
 					getApiKey,
+					noContextFiles: true,
 					enableMCP: true,
 					mcpManager,
 					effectiveExtensionRoots: () => extensionRoots,
@@ -227,10 +241,70 @@ describe("task spawn routing", () => {
 
 		expect(captured?.additionalDirectories).toEqual(["/task/shared-worktree"]);
 		expect(captured?.getApiKey).toBe(getApiKey);
+		expect(captured?.noContextFiles).toBe(true);
 		expect(captured?.enableMCP).toBe(true);
 		expect(captured?.mcpManager).toBe(mcpManager);
 		extensionRoots.explicit.push("/late/task-extension");
 		expect(captured?.extensionRoots?.explicit).toEqual(["/task/explicit"]);
+	});
+
+	it("owes the parent no reply once the spawn job of the child it messaged has delivered", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+		const gate = deferred();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			await gate.promise;
+			return makeResult(options.id ?? "?", { output: "Mask path checked too." });
+		});
+		const manager = createManager();
+		const parent = await createSession({
+			manager,
+			settings: { "launch.enabled": false },
+			overrides: { getAgentId: () => "Main" },
+		});
+		const registry = parent.agentRegistry;
+		const root = authoritySessions.at(-1);
+		if (!registry || !root || !parent.createAuthoritySession) throw new Error("Expected parent authority fixture");
+		registerToolSessionLifecycleAuthority(parent, registry, root);
+		const tool = await TaskTool.create(parent);
+		const spawned = await tool.execute("tc-ask", {
+			agent: "task",
+			name: "Spawnling",
+			task: "Check the mask.",
+		} as TaskParams);
+		const job = manager.getJob(spawned.details!.async!.jobId!)!;
+		// The child is mid-run when its parent sends it a follow-up.
+		const { session: child } = await parent.createAuthoritySession({
+			agentId: "Spawnling",
+			agentDisplayName: "Spawnling",
+			cwd: "/tmp",
+			agentDir: "/tmp",
+			settings: parent.settings,
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: [],
+			skipPythonPreflight: true,
+		});
+		authoritySessions.push(child);
+		vi.spyOn(child, "deliverIrcMessage").mockResolvedValue("injected");
+		const receipt = await IrcBus.forRoot(registry, "Main").send({
+			from: "Main",
+			to: "Spawnling",
+			body: "check the mask path too",
+		});
+		expect(receipt.outcome).toBe("injected");
+
+		const waiting = new WaitTool(parent).execute("wait-job", {});
+		gate.resolve();
+		const waited = await waiting;
+		expect(waited.isError, getFirstText(waited)).not.toBe(true);
+		expect(waited.details?.jobs?.[0]).toMatchObject({ id: job.id, status: "completed" });
+
+		// The job carried the child's result: it did not end without replying, and nothing is owed.
+		const again = await new WaitTool(parent).execute("wait-again", {});
+		expect(again.content[0]).toMatchObject({
+			text: expect.stringContaining("no agent you messaged this run owes a reply"),
+		});
 	});
 
 	it("uses the persisted /agents model after replacing a session-only task selection", async () => {
@@ -778,7 +852,9 @@ describe("task spawn routing", () => {
 		});
 
 		const manager = createManager();
-		const tool = await TaskTool.create(await createSession({ manager }));
+		const tool = await TaskTool.create(
+			await createSession({ manager, sessionManager: SessionManager.inMemory("/tmp") }),
+		);
 
 		const result = await tool.execute("tc-retain", {
 			agent: "task",
@@ -833,7 +909,9 @@ describe("task spawn routing", () => {
 			retainedArtifactsCleanupGraceMs: 0,
 		});
 		managers.push(manager);
-		const tool = await TaskTool.create(await createSession({ manager }));
+		const tool = await TaskTool.create(
+			await createSession({ manager, sessionManager: SessionManager.inMemory("/tmp") }),
+		);
 
 		const result = await tool.execute("tc-evict", {
 			agent: "task",
@@ -852,13 +930,6 @@ describe("task spawn routing", () => {
 	});
 
 	it("attaches retained-artifacts cleanup to the collision-suffixed job, not the pre-existing row", async () => {
-		// Regression: `AsyncJobManager.register()` suffixes the requested job
-		// id when it collides with another live job (e.g. a task id reusing a
-		// vibe turn's job id). The cleanup wiring looked the job back up by
-		// the *requested* id, which — after a collision — resolves to the
-		// unrelated pre-existing row instead of the newly registered task, so
-		// cleanup attached to (and could later delete artifacts alongside)
-		// the wrong job (PR #10625 review).
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: [taskAgent],
 			projectAgentsDir: null,
@@ -869,11 +940,21 @@ describe("task spawn routing", () => {
 			return makeResult(options.id ?? "?");
 		});
 
-		const manager = createManager();
-		// Placeholder job occupying "Foo", the id the fresh task would
-		// otherwise be allocated — its own agent output id is unique per
-		// AgentOutputManager, independent of the job manager's id map, so
-		// this simulates the collision without needing a second spawn.
+		const rmCalled = deferred();
+		const realRm = fs.rm.bind(fs);
+		vi.spyOn(fs, "rm").mockImplementation(async (target, opts) => {
+			const outcome = await realRm(target as Parameters<typeof fs.rm>[0], opts as Parameters<typeof fs.rm>[1]);
+			if (capturedArtifactsDir && target === capturedArtifactsDir) rmCalled.resolve();
+			return outcome;
+		});
+
+		// Keep completed rows available until this fixture explicitly retires each owner.
+		const manager = new AsyncJobManager({
+			onJobComplete: () => {},
+			retentionMs: 5 * 60 * 1000,
+			retainedArtifactsCleanupGraceMs: 0,
+		});
+		managers.push(manager);
 		const placeholderGate = deferred();
 		manager.register(
 			"bash",
@@ -885,7 +966,9 @@ describe("task spawn routing", () => {
 			{ id: "Foo" },
 		);
 
-		const tool = await TaskTool.create(await createSession({ manager }));
+		const tool = await TaskTool.create(
+			await createSession({ manager, sessionManager: SessionManager.inMemory("/tmp") }),
+		);
 		const result = await tool.execute("tc-collide", {
 			agent: "task",
 			name: "Foo",
@@ -896,14 +979,27 @@ describe("task spawn routing", () => {
 		expect(jobId).toBe("Foo-2");
 		const job = manager.getJob(jobId!);
 		await job!.promise;
-
+		expect(capturedArtifactsDir).toBeTruthy();
 		expect(job!.status).toBe("completed");
 		expect(job!.retainedArtifactsCleanup).toBeDefined();
+		await expect(fs.stat(capturedArtifactsDir!)).resolves.toBeDefined();
 		const placeholder = manager.getJob("Foo");
 		expect(placeholder!.retainedArtifactsCleanup).toBeUndefined();
 
+		// Retire Foo only; owner-scoped eviction must leave the completed Foo-2 row and directory.
 		placeholderGate.resolve();
-		if (capturedArtifactsDir) await fs.rm(capturedArtifactsDir, { recursive: true, force: true });
+		await placeholder!.promise;
+		expect(manager.evictCompletedJobs({ ownerId: undefined })).toBe(1);
+		expect(manager.getJob("Foo")).toBeUndefined();
+		expect(manager.getJob(jobId!)).toBe(job);
+		expect(job!.retainedArtifactsCleanup).toBeDefined();
+		await expect(fs.stat(capturedArtifactsDir!)).resolves.toBeDefined();
+
+		// Retiring the owning suffixed task performs its real filesystem cleanup.
+		expect(manager.evictCompletedJobs({ ownerId: "Main" })).toBe(1);
+		expect(manager.getJob(jobId!)).toBeUndefined();
+		await rmCalled.promise;
+		await expect(fs.stat(capturedArtifactsDir!)).rejects.toThrow();
 	});
 
 	it("bounds concurrent job bodies with the session spawn semaphore", async () => {

@@ -26,6 +26,8 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 const tempRoots: string[] = [];
 const authoritySessions = new Set<AgentSession>();
+/** Order of worktree captures and the run's IRC wake release. */
+let events: string[] = [];
 
 async function createAuthorityFixture() {
 	const registry = AgentRegistry.global();
@@ -56,6 +58,7 @@ afterEach(async () => {
 	for (const session of authoritySessions) await session.dispose();
 	authoritySessions.clear();
 	resetAgentLifecycleForTests();
+	events = [];
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -100,11 +103,9 @@ async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatc
 	vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(baseline);
 	vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 	vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: releasePatch, nestedPatches: [] });
-	const commitSpy = vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue({
-		branchName: `omp/task/${id}`,
-		baseSha: "base",
-		rootPatch: runEndPatch,
-		nestedPatches: [],
+	const commitSpy = vi.spyOn(worktreeModule, "commitToBranch").mockImplementation(async () => {
+		events.push("commit");
+		return { branchName: `omp/task/${id}`, baseSha: "base", rootPatch: runEndPatch, nestedPatches: [] };
 	});
 	const session = {
 		prepareForHeadlessAdvisorDrain: () => {},
@@ -129,6 +130,8 @@ async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatc
 			throw new Error("Expected live child authority fixture");
 		}
 		adoptAgent(lifecycle, options.id, { idleTtlMs: 0, onRelease: options.onRelease }, attachedRef);
+		// A held peer message would wake a turn in the worktree once released.
+		options.deferIrcWakeRelease?.(() => events.push("irc wakes released"));
 		await executorModule.finalizeSubagentLifecycle({
 			id: options.id,
 			session,
@@ -173,5 +176,10 @@ describe("isolated agent release", () => {
 
 	it("commits follow-up work made after the run-end branch", async () => {
 		expect(await commitsAcrossRelease("ReleaseChanged", patch, `${patch}+follow-up\n`)).toBe(2);
+	});
+
+	it("lets held peer messages wake the agent only after the run-end branch is committed", async () => {
+		await commitsAcrossRelease("ReleaseAfterCapture", patch, patch);
+		expect(events).toEqual(["commit", "irc wakes released"]);
 	});
 });

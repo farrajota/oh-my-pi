@@ -274,7 +274,7 @@ describe("eval js read() URI delegation", () => {
 		const { calls, sandbox } = loadArtifactPrelude(undefined, artifactReadBridge(tmp.path(), tmp.path()));
 
 		expect(await vm.runInContext(`read("artifact://${artifactId}")`, sandbox)).toBe(largeArtifact);
-		expect(await vm.runInContext(`read("artifact://${artifactId}:raw:1-1")`, sandbox)).toStartWith("head\n");
+		expect(await vm.runInContext(`read("artifact://${artifactId}:raw:1-1")`, sandbox)).toBe("head");
 		expect(calls).toEqual([
 			{ name: "read", args: { path: `artifact://${artifactId}:raw:1-1` } },
 			{ name: "read", args: { path: `artifact://${artifactId}:raw:1-1` } },

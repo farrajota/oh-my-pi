@@ -10,6 +10,8 @@
 
 # Delegation
 Use most specific agent.{{#if scoutAvailable}} Read-only research MUST use `scout` only when files are unknown.{{/if}} Prefer one agent to investigate + edit. Omit `agent` when the spawn-policy default is the best fit (`{{defaultAgent}}`); NEVER specify the default explicitly. Check the available agents below before choosing a specialist. User-tagged model agents such as `m<N>` are not specialists; use one only when the user names it.
+{{#if batchEnabled}}Specialist `agent` selectors belong inside each `tasks[]` item; NEVER put `agent` at the top level.
+{{/if}}
 Name one integration owner. Shared edits are not guaranteed to merge in the same file;{{#if ircEnabled}} coordinate through `write agent://<id>` before editing shared files (or broadcast to `agent://all`){{else}} assign shared-file edits to one integration owner{{/if}}. Set interfaces in {{#if batchEnabled}}`context`{{else}}the task{{/if}}. Every task MUST skip build/lint/tests/formatters mid-flight; run once afterward.
 
 # Inputs
@@ -28,7 +30,7 @@ Name one integration owner. Shared edits are not guaranteed to merge in the same
   - `agentDefinitionSha256`: Optional lowercase SHA-256 pin for the exact file-backed agent definition bytes. A pin mismatch blocks before launch.
 {{#if evalToolsEnabled}}  - `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
 {{/if}}
-{{#if effortEnabled}}  - `effort`: Scale w/ how open-ended this task's problem is: `"lo"`|`"med"`|`"hi"`
+{{#if effortEnabled}}  - `effort`: Available when `task.allowEffortOverride` is enabled. Overrides the configured agent/model thinking for this invocation only; omission preserves configured thinking. Scale w/ how open-ended this task's problem is: `"lo"`|`"med"`|`"hi"`
 {{/if}}
 {{#if structured}}
   - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
@@ -54,7 +56,7 @@ Name one integration owner. Shared edits are not guaranteed to merge in the same
 - `agentDefinitionSha256`: Optional lowercase SHA-256 pin for the exact file-backed agent definition bytes. A pin mismatch blocks before launch.
 {{#if evalToolsEnabled}}- `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
 {{/if}}
-{{#if effortEnabled}}- `effort`: Scale w/ how open-ended this task's problem is: `"lo"`|`"med"`|`"hi"`
+{{#if effortEnabled}}- `effort`: Available when `task.allowEffortOverride` is enabled. Overrides the configured agent/model thinking for this invocation only; omission preserves configured thinking. Scale w/ how open-ended this task's problem is: `"lo"`|`"med"`|`"hi"`
 {{/if}}
 {{#if structured}}
 - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
