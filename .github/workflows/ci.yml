@@ -308,7 +308,7 @@ jobs:
               echo "prefix=natives-linux-x64-v1-" >> "$GITHUB_OUTPUT"
               echo "key=natives-linux-x64-v1-$NATIVE_INPUTS_HASH" >> "$GITHUB_OUTPUT"
 
-         # ---- PR path: main-built addons from actions/cache, else npm ----
+         # ---- PR path: main-built addons from actions/cache, else built below ----
          # `ci-natives` is a plain workspace-relative path on purpose: the
          # cache version hashes the literal path list, so kata (save) and
          # hosted (restore) must spell it identically, and upload-artifact
@@ -322,17 +322,6 @@ jobs:
               key: ${{ steps.natives-key.outputs.key }}
               restore-keys: |
                  ${{ steps.natives-key.outputs.prefix }}
-         - name: Fetch release native addons (npm)
-           if: github.event_name == 'pull_request' && steps.natives-cache.outputs.cache-matched-key == ''
-           shell: bash
-           run: |
-              set -euo pipefail
-              tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
-              echo "Fetching $tarball"
-              curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
-              mkdir -p ci-natives/natives-linux-x64-baseline ci-natives/natives-linux-x64-modern
-              cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" ci-natives/natives-linux-x64-baseline/
-              cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" ci-natives/natives-linux-x64-modern/
          # Make the addon source visible whenever it is not source-matched,
          # instead of leaving a reviewer to wonder which addons the tests ran.
          - name: Report native addon source
@@ -347,15 +336,20 @@ jobs:
               elif [ -n "$MATCHED" ]; then
                 echo "::notice title=Native addons not source-matched::No main build matches this PR's native sources; testing against main's newest addon build ($MATCHED). Native changes are validated post-merge on main and at release."
               else
-                echo "::notice title=Native addons from npm::No main-built addon cache entry is available; testing against the latest npm release addons."
+                echo "::notice title=Native addons built from source::No main-built addon cache entry is available; building this PR's linux-x64 addons from source (uncached)."
               fi
 
-         # ---- main path: bazel build of the linux-x64 pair ----
+         # ---- bazel build of the linux-x64 pair ----
+         # Main always builds. A PR builds from its own sources when no
+         # main-built entry exists: the latest npm release does not match a
+         # fork's native sources (e.g. a removed export fails every TS test
+         # with "<symbol> is not a function"), and a fork without the omp-kata
+         # pool never saves a main-built entry for PRs to restore.
          - id: cache
-           if: github.event_name != 'pull_request'
+           if: github.event_name != 'pull_request' || steps.natives-cache.outputs.cache-matched-key == ''
            uses: ./.github/actions/bazel-cache
          - name: Build linux-x64 native addons
-           if: github.event_name != 'pull_request'
+           if: github.event_name != 'pull_request' || steps.natives-cache.outputs.cache-matched-key == ''
            run: |
               set -eo pipefail
               if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
@@ -378,7 +372,7 @@ jobs:
          # thousands of actions is the failure mode that made CI slow — make
          # it visible in the run summary instead of discovering it weeks in.
          - name: Report bazel cache stats
-           if: github.event_name != 'pull_request'
+           if: github.event_name != 'pull_request' || steps.natives-cache.outputs.cache-matched-key == ''
            shell: bash
            run: |
               # Bazel runs with --color=yes (config=ci); strip ANSI before

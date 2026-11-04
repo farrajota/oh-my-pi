@@ -5,6 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	chromiumExecutableProbeForTest,
+	launchHeadlessBrowser,
+	removeUserDataDir,
 	resolveSharedBrowserLaunchSpec,
 	stealthIgnoreDefaultArgs,
 	systemChromiumCandidatesForTest,
@@ -48,6 +50,32 @@ describe("browser launch stealth defaults", () => {
 			const ignoreDefaultArgs = stealthIgnoreDefaultArgs(executablePath);
 
 			expect(ignoreDefaultArgs).toContain(AUTOMATION_FLAG);
+		}
+	});
+});
+
+describe("headless browser launch args", () => {
+	it("passes an explicitly requested flag that is also a stealth-ignored default", async () => {
+		// The audit browser requests --disable-component-extensions-with-background-pages;
+		// puppeteer filters requested args through ignoreDefaultArgs too, which used to
+		// drop it and let component-extension service workers block every audit.
+		const requested = "--disable-component-extensions-with-background-pages";
+		expect(stealthIgnoreDefaultArgs("/usr/bin/chromium")).toContain(requested);
+		const chromium = "/usr/bin/chromium";
+		if (!fs.existsSync(chromium)) throw new Error(`Headless launch args test requires Chromium at ${chromium}`);
+		const previousExecutable = process.env.PUPPETEER_EXECUTABLE_PATH;
+		process.env.PUPPETEER_EXECUTABLE_PATH = chromium;
+		try {
+			const { browser, userDataDir } = await launchHeadlessBrowser({ headless: true, args: [requested] });
+			try {
+				expect(browser.process()?.spawnargs).toContain(requested);
+			} finally {
+				await browser.close();
+				if (userDataDir) await removeUserDataDir(userDataDir);
+			}
+		} finally {
+			if (previousExecutable === undefined) delete process.env.PUPPETEER_EXECUTABLE_PATH;
+			else process.env.PUPPETEER_EXECUTABLE_PATH = previousExecutable;
 		}
 	});
 });

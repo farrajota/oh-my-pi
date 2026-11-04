@@ -227,6 +227,24 @@ export interface BrowserAuditOperationResult {
 	readonly status: BrowserAuditOutcomeStatus | "CLOSED";
 	readonly operation_id?: string;
 	readonly evidence_ids: readonly string[];
+	/**
+	 * Why an operation was BLOCKED: the host observation's error, or the
+	 * error the engine failed closed on (validation, executor or host
+	 * failure). Fail-closed paths used to drop it, leaving a bare BLOCKED
+	 * that could not be diagnosed. Never set on PASS or CLOSED.
+	 */
+	readonly reason?: string;
+}
+
+/** Flatten an error and its cause chain into one line for a BLOCKED result. */
+export function describeBrowserAuditError(error: unknown): string {
+	const parts: string[] = [];
+	let current: unknown = error;
+	for (let depth = 0; current !== undefined && current !== null && depth < 5; depth++) {
+		parts.push(current instanceof Error ? current.message || current.name : String(current));
+		current = current instanceof Error ? current.cause : undefined;
+	}
+	return parts.join(": caused by: ");
 }
 
 function fail(message: string): never {
@@ -851,9 +869,9 @@ export class BrowserAuditEngine {
 		return this.#enqueue(async () => {
 			try {
 				validateBrowserAuditInput(input);
-			} catch {
+			} catch (error) {
 				await this.#invalidateUnderQueue();
-				return { status: "BLOCKED", evidence_ids: [] };
+				return { status: "BLOCKED", evidence_ids: [], reason: describeBrowserAuditError(error) };
 			}
 			if (input.operation === "close") return this.#closeUnderQueue(input.audit_id);
 			if (signal?.aborted) {
@@ -869,9 +887,9 @@ export class BrowserAuditEngine {
 				if (!resolved.tuple) fail("ordinary operation requires tuple");
 				tuple = resolved.tuple;
 				actionId = resolved.actionId;
-			} catch {
+			} catch (error) {
 				await this.#invalidateUnderQueue();
-				return { status: "BLOCKED", evidence_ids: [] };
+				return { status: "BLOCKED", evidence_ids: [], reason: describeBrowserAuditError(error) };
 			}
 			if (
 				this.#sequence >= BROWSER_AUDIT_MAX_ORDINARY_OPERATIONS ||
@@ -931,10 +949,23 @@ export class BrowserAuditEngine {
 					}),
 				);
 				if (observation.status === "BLOCKED") await this.#invalidateUnderQueue();
+				if (observation.status === "BLOCKED" && observation.error) {
+					return {
+						status: "BLOCKED",
+						operation_id: operationId,
+						evidence_ids: evidenceIds,
+						reason: observation.error,
+					};
+				}
 				return { status: observation.status, operation_id: operationId, evidence_ids: evidenceIds };
-			} catch {
+			} catch (error) {
 				await this.#invalidateUnderQueue();
-				return { status: "BLOCKED", operation_id: operationId, evidence_ids: [] };
+				return {
+					status: "BLOCKED",
+					operation_id: operationId,
+					evidence_ids: [],
+					reason: describeBrowserAuditError(error),
+				};
 			}
 		});
 	}

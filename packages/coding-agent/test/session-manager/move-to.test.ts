@@ -696,8 +696,17 @@ describe("SessionManager.moveTo", () => {
 		const linkSpy = spyOn(fs.promises, "link").mockImplementation(async (from, to) => {
 			await link(from, to);
 			if (from.toString() === path.join(oldArtifacts, "owned.log")) {
-				await fsp.unlink(destinationFile);
-				await fsp.writeFile(destinationFile, "replacement session");
+				// Swap in a replacement while an extra link still pins the moved
+				// session's inode. Unlinking first and recreating lets ext4 hand
+				// the freed inode number straight back, so the replacement would
+				// keep the same dev+ino and the identity check under test would
+				// never see a different file.
+				const pin = `${destinationFile}.pin`;
+				const replacement = `${destinationFile}.replacement`;
+				await link(destinationFile, pin);
+				await fsp.writeFile(replacement, "replacement session");
+				await fsp.rename(replacement, destinationFile);
+				await fsp.unlink(pin);
 			}
 		});
 		try {
