@@ -397,7 +397,10 @@ export class AgentRegistry {
 		AgentRegistry.#global = registry;
 	}
 
-	/** Create a private registry whose durable authority ledger follows one session transcript. */
+	/**
+	 * Create a private registry whose durable authority ledger follows one session transcript. The transcript must
+	 * already be on disk (for a new session, call `SessionManager.ensureOnDisk()` first): authority binds to its header.
+	 */
 	static async isolatedForSession(sessionFile: string): Promise<AgentRegistry> {
 		const durableState = await registryDurableStateForSession(sessionFile);
 		return AgentRegistry.create({ durableState });

@@ -93,7 +93,9 @@ export default function (api) {
 					const sessionManager = SessionManager.create(fixture.cwd, fixture.work + "/sessions-" + name);
 					const sessionFile = sessionManager.getSessionFile();
 					assert(sessionFile, "Persisted fixture session did not allocate a transcript");
-					const agentRegistry = AgentRegistry.isolatedForSession(sessionFile);
+					// Authority binds to the transcript on disk, so persist the new session before opening it.
+					await sessionManager.ensureOnDisk();
+					const agentRegistry = await AgentRegistry.isolatedForSession(sessionFile);
 					const { session } = await agentRegistry.createIsolatedRootSession({
 						cwd: fixture.cwd, agentDir: fixture.agentDir, settings,
 						modelRegistry: new ModelRegistry(ctx.modelRegistry.authStorage, fixture.agentDir + "/models.yml"),
