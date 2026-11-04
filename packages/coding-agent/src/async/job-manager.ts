@@ -8,6 +8,7 @@ import { DurableHubStore, type HubDurableRecord } from "../internal/hub-durable-
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { IrcBus } from "../irc/bus";
 import type { AgentRegistry } from "../registry/agent-registry";
+import { runDetachedFromOperation } from "../registry/operation-lease";
 import type { JobWidgetInputs, JobWidgetRegistry } from "../job-widgets/types";
 
 const DELIVERY_RETRY_BASE_MS = 500;
@@ -588,18 +589,24 @@ export class AsyncJobManager {
 		};
 		job.promise = (async () => {
 			try {
-				const outcome = await run({
-					jobId: id,
-					incarnationId,
-					signal: abortController.signal,
-					reportProgress,
-					markRunning: () => {
-						if (job.status === "running" && job.queued) {
-							job.queued = false;
-							this.#persistJob(job, "registered");
-						}
-					},
-				});
+				// The job outlives the call that registered it: it must not borrow that
+				// call's operation lease or join its authority effect scope, which would
+				// hold the call open on the job and refuse the job's effects once the
+				// call settled. Each operation the job performs is admitted on its own.
+				const outcome = await runDetachedFromOperation(() =>
+					run({
+						jobId: id,
+						incarnationId,
+						signal: abortController.signal,
+						reportProgress,
+						markRunning: () => {
+							if (job.status === "running" && job.queued) {
+								job.queued = false;
+								this.#persistJob(job, "registered");
+							}
+						},
+					}),
+				);
 				job.endTime = Date.now();
 				const text = typeof outcome === "string" ? outcome : outcome.text;
 				const structured = typeof outcome === "string" ? undefined : outcome.structured;

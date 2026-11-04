@@ -823,7 +823,8 @@ async function registerPersistedSubagentsFromDir(
 				const metadata = await readPersistedAgentMetadata(sessionFile);
 				if (!shouldContinue()) return;
 				// The id is reused across `/new`; refresh it to the current session's file.
-				if (existing) unregisterAgentRef(registry, advisorId, existing);
+				if (existing && !(await unregisterAgentRef(registry, advisorId, existing))) continue;
+				if (!shouldContinue()) return;
 				const ref = registerInternalAgent(registry, {
 					id: advisorId,
 					displayName,

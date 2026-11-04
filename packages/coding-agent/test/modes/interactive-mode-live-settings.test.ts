@@ -90,13 +90,13 @@ describe("InteractiveMode live settings", () => {
 			vi.advanceTimersByTime(100);
 			expect(sync).toHaveBeenCalledTimes(1);
 			expect(badge.mock.calls.at(-1)?.[0]).toEqual(expect.arrayContaining(ids));
-			for (const id of ids) registry.unregister(id);
+			await Promise.all(ids.map(id => registry.unregister(id)));
 			vi.advanceTimersByTime(100);
 			expect(sync).toHaveBeenCalledTimes(2);
 			expect(badge.mock.calls.at(-1)?.[0].some(id => ids.includes(id))).toBe(false);
 		} finally {
 			vi.useRealTimers();
-			for (const id of ids) registry.unregister(id);
+			await Promise.all(ids.map(id => registry.unregister(id)));
 		}
 	});
 

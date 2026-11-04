@@ -220,8 +220,17 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		onUpdate?: AgentToolUpdateCallback<LspToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<LspToolDetails>> {
-		return withLspSessionPolicy(this.lspPolicy, () =>
-			this.executeWithPolicy(_toolCallId, params, signal, onUpdate, context),
+		return withLspSessionPolicy(
+			this.lspPolicy,
+			() => this.executeWithPolicy(_toolCallId, params, signal, onUpdate, context),
+			this.session.pathScope
+				? {
+						operation: this.session.pathScope.currentOperation(),
+						authorizePath: async (filePath, mustExist) => {
+							await this.session.pathScope!.authorizePath("lsp", filePath, mustExist);
+						},
+					}
+				: undefined,
 		);
 	}
 
@@ -824,7 +833,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// Apply the reference edits and move as one unit: a failed move rolls
 			// the reference edits back so the source, destination, and every
 			// reference file are left unchanged.
-			await applyEditsThenRename(referenceEdits, source, dest);
+			await applyEditsThenRename(referenceEdits, source, dest, this.session.pathScope?.currentOperation());
 			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
 
 			for (const [serverName, serverConfig] of servers) {
@@ -1470,6 +1479,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 									signal,
 									this.session.pathScope
 										? {
+												operation: this.session.pathScope.currentOperation(),
 												authorizePath: async (filePath, mustExist) => {
 													await this.session.pathScope!.authorizePath("lsp", filePath, mustExist);
 												},
@@ -1586,6 +1596,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 								signal,
 								this.session.pathScope
 									? {
+											operation: this.session.pathScope.currentOperation(),
 											authorizePath: async (filePath, mustExist) => {
 												await this.session.pathScope!.authorizePath("lsp", filePath, mustExist);
 											},

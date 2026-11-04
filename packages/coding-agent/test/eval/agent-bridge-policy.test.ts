@@ -38,6 +38,7 @@ import { AgentOutputManager } from "../../src/task/output-manager";
 import type { AgentDefinition } from "../../src/task/types";
 import type { AgentProgress, SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../../src/tools";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 let fixtureAuthStorage!: AuthStorage;
 let fixtureModelRegistry!: ModelRegistry;
@@ -538,6 +539,7 @@ describe("runEvalAgent", () => {
 		const order: string[] = [];
 		let disposed = false;
 		const cleanupSession = {
+			...createSessionDefaults(),
 			prepareForHeadlessAdvisorDrain: () => {
 				order.push("prepare");
 			},

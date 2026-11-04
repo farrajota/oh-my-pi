@@ -17,6 +17,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/internal/agent-lifecycle-bridge";
 import { createAgentRootSession, listAgentRefs } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import * as sdk from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -29,12 +30,15 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 describe("task sibling prompt-cache routing", () => {
 	const sessions: AgentSession[] = [];
 	const scopedRegistries: AgentRegistry[] = [];
+	const authorityFiles = new Set<string>();
 
 	afterEach(async () => {
 		await Promise.all(sessions.splice(0).map(session => session.dispose()));
 		await Promise.all(
 			scopedRegistries.splice(0).map(registry => disposeAgentLifecycle(getAgentLifecycleManager(registry))),
 		);
+		for (const file of authorityFiles) await closeSessionAuthority(file);
+		authorityFiles.clear();
 		vi.restoreAllMocks();
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
@@ -299,9 +303,13 @@ describe("task sibling prompt-cache routing", () => {
 			);
 			try {
 				const parentSessionManager = SessionManager.create(directory.path(), directory.join("parent"));
+				await parentSessionManager.ensureOnDisk();
 				const parentSessionFile = parentSessionManager.getSessionFile();
 				if (!parentSessionFile) throw new Error("Expected a persisted parent session file");
-				const agentRegistry = AgentRegistry.isolatedForSession(parentSessionFile);
+				authorityFiles.add(parentSessionFile);
+				const agentRegistry = await AgentRegistry.create({
+					durableState: await registryDurableStateForSession(parentSessionFile, { create: true }),
+				});
 				AgentRegistry.installGlobal(agentRegistry);
 				const { session: parent } = await createAgentRootSession(agentRegistry, {
 					agentId: MAIN_AGENT_ID,
@@ -426,6 +434,8 @@ describe("task sibling prompt-cache routing", () => {
 				}
 			} finally {
 				await Promise.all(sessions.splice(0).map(session => session.dispose()));
+				for (const file of authorityFiles) await closeSessionAuthority(file);
+				authorityFiles.clear();
 				authStorage.close();
 			}
 		},
@@ -507,9 +517,13 @@ describe("task sibling prompt-cache routing", () => {
 				const lineage = `parent-lineage-${suffix}`;
 				const childName = `sibling-${suffix}`;
 				const sessionManager = SessionManager.create(directory.path(), directory.join(lineage));
+				await sessionManager.ensureOnDisk();
 				const sessionFile = sessionManager.getSessionFile();
 				if (!sessionFile) throw new Error("Expected a persisted parent session file");
-				const registry = AgentRegistry.isolatedForSession(sessionFile);
+				authorityFiles.add(sessionFile);
+				const registry = await AgentRegistry.create({
+					durableState: await registryDurableStateForSession(sessionFile, { create: true }),
+				});
 				scopedRegistries.push(registry);
 				const { session: parent } = await createAgentRootSession(registry, {
 					agentId: MAIN_AGENT_ID,
@@ -558,6 +572,8 @@ describe("task sibling prompt-cache routing", () => {
 			expect(requests.map(request => request.wireKey)).toEqual(requests.map(request => request.sessionId));
 		} finally {
 			await Promise.all(sessions.splice(0).map(session => session.dispose()));
+			for (const file of authorityFiles) await closeSessionAuthority(file);
+			authorityFiles.clear();
 			authStorage.close();
 		}
 	});
@@ -641,9 +657,13 @@ describe("task sibling prompt-cache routing", () => {
 		const parentRegistries = new WeakMap<AgentSession, AgentRegistry>();
 		async function createParent(lineage: string, model: Model, explicitKey?: string) {
 			const sessionManager = SessionManager.create(directory.path(), directory.join(lineage));
+			await sessionManager.ensureOnDisk();
 			const sessionFile = sessionManager.getSessionFile();
 			if (!sessionFile) throw new Error("Expected a persisted parent session file");
-			const registry = AgentRegistry.isolatedForSession(sessionFile);
+			authorityFiles.add(sessionFile);
+			const registry = await AgentRegistry.create({
+				durableState: await registryDurableStateForSession(sessionFile, { create: true }),
+			});
 			scopedRegistries.push(registry);
 			const { session } = await createAgentRootSession(registry, {
 				agentId: MAIN_AGENT_ID,
@@ -790,6 +810,8 @@ describe("task sibling prompt-cache routing", () => {
 			expect(requests[6]?.sessionId).toBe(requests[5]?.sessionId);
 		} finally {
 			await Promise.all(sessions.splice(0).map(session => session.dispose()));
+			for (const file of authorityFiles) await closeSessionAuthority(file);
+			authorityFiles.clear();
 			authStorage.close();
 		}
 	});
@@ -848,6 +870,8 @@ describe("task sibling prompt-cache routing", () => {
 				expect(requests[0]?.cacheKey).toBe(expected);
 			} finally {
 				await Promise.all(sessions.splice(0).map(session => session.dispose()));
+				for (const file of authorityFiles) await closeSessionAuthority(file);
+				authorityFiles.clear();
 				authStorage.close();
 			}
 		},
@@ -982,6 +1006,8 @@ describe("task sibling prompt-cache routing", () => {
 			]);
 		} finally {
 			await Promise.all(sessions.splice(0).map(session => session.dispose()));
+			for (const file of authorityFiles) await closeSessionAuthority(file);
+			authorityFiles.clear();
 			authStorage.close();
 		}
 	});
@@ -1064,6 +1090,8 @@ describe("task sibling prompt-cache routing", () => {
 			}
 		} finally {
 			await Promise.all(sessions.splice(0).map(session => session.dispose()));
+			for (const file of authorityFiles) await closeSessionAuthority(file);
+			authorityFiles.clear();
 			authStorage.close();
 		}
 	});
@@ -1174,6 +1202,9 @@ describe("task sibling prompt-cache routing", () => {
 			expect(requests.at(-1)?.wireKey).toBe(requests.at(-1)?.sessionId);
 		} finally {
 			await Promise.all(sessions.splice(0).map(session => session.dispose()));
+			// Close authority before `using directory` removes its journal.
+			for (const file of authorityFiles) await closeSessionAuthority(file);
+			authorityFiles.clear();
 			authStorage.close();
 		}
 	});
@@ -1252,6 +1283,9 @@ describe("task sibling prompt-cache routing", () => {
 			expect(requests.at(-1)?.wireKey).toBe("parent-lineage:task");
 		} finally {
 			await Promise.all(sessions.splice(0).map(session => session.dispose()));
+			// Close authority before `using directory` removes its journal.
+			for (const file of authorityFiles) await closeSessionAuthority(file);
+			authorityFiles.clear();
 			authStorage.close();
 		}
 	});
@@ -1301,6 +1335,9 @@ describe("task sibling prompt-cache routing", () => {
 			expect(requests.at(-1)?.wireKey).toBe("parent-lineage:task");
 		} finally {
 			await Promise.all(sessions.splice(0).map(session => session.dispose()));
+			// Close authority before `using directory` removes its journal.
+			for (const file of authorityFiles) await closeSessionAuthority(file);
+			authorityFiles.clear();
 			authStorage.close();
 		}
 	});
@@ -1353,6 +1390,9 @@ describe("task sibling prompt-cache routing", () => {
 			expect(revived.sessionManager.getTaskSiblingCandidate()).toBe("parent-lineage:task");
 		} finally {
 			await Promise.all(sessions.splice(0).map(session => session.dispose()));
+			// Close authority before `using directory` removes its journal.
+			for (const file of authorityFiles) await closeSessionAuthority(file);
+			authorityFiles.clear();
 			authStorage.close();
 		}
 	});

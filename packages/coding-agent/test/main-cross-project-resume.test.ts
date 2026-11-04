@@ -16,6 +16,7 @@ import * as modelResolverModule from "@oh-my-pi/pi-coding-agent/config/model-res
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as pluginHelpers from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { createSessionManager, runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
+import { readAuthorityDescriptor } from "@oh-my-pi/pi-coding-agent/registry/authority/descriptor";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
@@ -308,6 +309,12 @@ describe("runRootCommand — cross-project --resume", () => {
 		expect(parsed.cwd).toBe(resumedProject);
 		expect(sessionOptionsCwd).toBe(resumedProject);
 		expect(preloadedDestinationAtCreation).toBe(true);
+		// The fixture is a pre-journaling transcript; resuming it adopted a fresh JSONL authority store.
+		expect(await readAuthorityDescriptor(match.session.path)).toMatchObject({
+			state: "active",
+			backend: "jsonl",
+			owningSessionId: match.session.id,
+		});
 	}, 15_000);
 
 	it("re-scopes Settings back to the launch project when destination rescope fails", async () => {

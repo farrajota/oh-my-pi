@@ -28,6 +28,7 @@ import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { getSessionsDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { getActiveProfile, getConfigRootDir, setProfile } from "@oh-my-pi/pi-utils/dirs";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 function createTtsrRule(name: string): Rule {
 	return {
@@ -486,7 +487,7 @@ describe("createAgentSession session storage isolation", () => {
 		AgentRegistry.resetGlobalForTests();
 		const laterRegistry = AgentRegistry.global();
 		const laterLifecycle = lifecycleBridge.getAgentLifecycleManager(laterRegistry);
-		const laterSession = { dispose: vi.fn(async () => {}) } as unknown as AgentSession;
+		const laterSession = { ...createSessionDefaults(), dispose: vi.fn(async () => {}) } as unknown as AgentSession;
 		const laterRef = laterRegistry.register({
 			id: "LaterWorker",
 			displayName: "Later worker",

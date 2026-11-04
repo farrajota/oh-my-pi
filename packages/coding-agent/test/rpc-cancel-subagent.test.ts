@@ -123,7 +123,7 @@ describe("handleRpcCancelSubagent", () => {
 			session: {
 				// The executor may accept a yield that lands while the abort is in flight.
 				abort: async () => {
-					acceptedDuringAbort = markAgentResultAccepted(AgentRegistry.global(), "SubagentA", acceptedRef);
+					acceptedDuringAbort = await markAgentResultAccepted(AgentRegistry.global(), "SubagentA", acceptedRef);
 				},
 				dispose: async () => {},
 			} as never,
@@ -194,11 +194,13 @@ describe("handleRpcCancelSubagent", () => {
 		emitLifecycle("SubagentA", "started");
 		registerLiveAgent("SubagentA");
 		// Yield acceptance flips the ref to idle while the roster still lists it.
-		markAgentResultAccepted(
-			AgentRegistry.global(),
-			"SubagentA",
-			lookupAgentRef(AgentRegistry.global(), "SubagentA")!,
-		);
+		await expect(
+			markAgentResultAccepted(
+				AgentRegistry.global(),
+				"SubagentA",
+				lookupAgentRef(AgentRegistry.global(), "SubagentA")!,
+			),
+		).resolves.toBe(true);
 
 		await expect(handleRpcCancelSubagent(registry, "SubagentA")).resolves.toBe(false);
 

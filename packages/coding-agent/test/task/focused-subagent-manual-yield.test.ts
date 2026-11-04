@@ -16,7 +16,7 @@ import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
@@ -67,9 +67,12 @@ beforeEach(async () => {
 	parent = undefined;
 });
 
+const authorityFiles = new Set<string>();
 afterEach(async () => {
 	if (registry) await disposeAgentLifecycle(getAgentLifecycleManager(registry));
 	await parent?.dispose();
+	for (const file of authorityFiles) await closeSessionAuthority(file);
+	authorityFiles.clear();
 	AgentLifecycleManager.resetGlobalForTests();
 	AgentRegistry.resetGlobalForTests();
 	IrcBus.resetGlobalForTests();
@@ -143,12 +146,16 @@ async function spawnKeptAliveChild(options?: { handler?: MockHandler; structured
 		modelRoles: { default: "mock/mock-model" },
 	});
 	const parentManager = SessionManager.create(cwd, path.join(root, "parent-sessions"));
+	await parentManager.ensureOnDisk();
 	const parentFile = parentManager.getSessionFile();
 	if (!parentFile) throw new Error("Expected a persistent parent session fixture");
+	authorityFiles.add(parentFile);
 	// Task finalization publishes beside the owning parent session, not under an independently chosen root.
 	const artifactsDir = parentFile.slice(0, -".jsonl".length);
 	await fs.mkdir(artifactsDir, { recursive: true });
-	registry = new AgentRegistry({ durableState: registryDurableStateForSession(parentFile) });
+	registry = await AgentRegistry.create({
+		durableState: await registryDurableStateForSession(parentFile, { create: true }),
+	});
 	({ session: parent } = await createAgentRootSession(registry, {
 		agentId: PARENT_ID,
 		cwd,

@@ -139,7 +139,7 @@ describe("SessionManager.continueRecent /new boundary", () => {
 		// All writes below share one terminal, so the breadcrumb points at the
 		// foreign project while -c runs in cwd: the different-cwd branch.
 		process.env.TMUX_PANE = "%new-boundary-skip-empty-terminal";
-		const stubFile = SessionManager.createEmptySessionFile(cwd);
+		const stubFile = await SessionManager.createEmptySessionFile(cwd);
 		expect(fs.existsSync(stubFile)).toBe(true);
 
 		const cwdOther = path.join(testAgentDir, "other-project");

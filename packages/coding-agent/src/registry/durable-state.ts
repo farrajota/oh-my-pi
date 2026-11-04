@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { durableFsyncSync } from "./authority/durable-sync";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { FileLock } from "@oh-my-pi/pi-natives";
@@ -176,6 +177,12 @@ export interface DurableRegistryRecoverySnapshot {
 	readonly localEntries: ReadonlyMap<string, DurableLocalEntryRecord>;
 }
 
+export interface DurableLegacyAuthorityImport {
+	readonly sourceSha256: string;
+	readonly entries: readonly DurableJournalRecord[];
+	readonly snapshot: DurableRegistryRecoverySnapshot;
+}
+
 export class DurableStateConflictError extends Error {
 	constructor(message = "Durable state compare-and-swap conflict.") {
 		super(message);
@@ -183,10 +190,29 @@ export class DurableStateConflictError extends Error {
 	}
 }
 
+export interface DurableAuthorityRequestIdentity {
+	readonly requestId: string;
+	readonly incarnation: string;
+	readonly ownerEpoch: number;
+	readonly ownerToken: string;
+}
+
 export class DurableStateUnavailableError extends Error {
-	constructor(message = "Durable registry state is quarantined and unavailable.") {
-		super(message);
+	readonly unknownOutcome: boolean;
+	readonly request?: DurableAuthorityRequestIdentity;
+
+	constructor(
+		message = "Durable registry state is quarantined and unavailable.",
+		options: {
+			readonly unknownOutcome?: boolean;
+			readonly cause?: unknown;
+			readonly request?: DurableAuthorityRequestIdentity;
+		} = {},
+	) {
+		super(message, { cause: options.cause });
 		this.name = "DurableStateUnavailableError";
+		this.unknownOutcome = options.unknownOutcome === true;
+		if (options.request) this.request = Object.freeze({ ...options.request });
 	}
 }
 
@@ -240,6 +266,14 @@ export function canonicalDurableSha256(value: unknown): string {
 	return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
+/**
+ * The validated canonical JSON text `canonicalDurableSha256` hashes. Streaming digests hash a large document as
+ * the concatenation of its members' canonical texts, which equals the canonical text of the whole document.
+ */
+export function canonicalDurableJson(value: unknown): string {
+	return canonicalJson(value);
+}
+
 /** SHA-256 of exact durable backing bytes, without JSON canonicalization. */
 export function durableBackingSha256(value: string | Uint8Array): string {
 	return createHash("sha256").update(value).digest("hex");
@@ -285,7 +319,7 @@ function assertOneOf<T extends string>(value: unknown, allowed: readonly T[], la
 	if (typeof value !== "string" || !allowed.includes(value as T)) throw new Error(`${label} is invalid.`);
 }
 
-function validateRecord(value: unknown): asserts value is DurableRegistryRecord {
+export function validateDurableRegistryRecord(value: unknown): asserts value is DurableRegistryRecord {
 	assertPlainJson(value);
 	if (!value || typeof value !== "object" || Array.isArray(value))
 		throw new Error("Durable record must be an object.");
@@ -602,7 +636,7 @@ function parseJournalText(text: string): DurableJournalRecord[] {
 		assertHash(entry.previousHash, "Previous journal hash", true);
 		if (entry.previousHash !== previousHash)
 			throw new Error(`Durable journal chain mismatch at record ${index + 1}.`);
-		validateRecord(entry.record);
+		validateDurableRegistryRecord(entry.record);
 		assertHash(entry.contentHash, "Durable content hash");
 		if (entry.contentHash !== canonicalDurableSha256(entry.record))
 			throw new Error(`Durable content hash mismatch at record ${index + 1}.`);
@@ -666,7 +700,7 @@ export class RegistryDurableStateStore {
 
 	append(record: DurableRegistryRecord, expectedHead?: DurableRecoveryCursor | null): DurableJournalRecord {
 		if (!this.available) throw new DurableStateUnavailableError(this.#unavailableReason);
-		validateRecord(record);
+		validateDurableRegistryRecord(record);
 		fs.mkdirSync(path.dirname(this.#journalPath), { recursive: true });
 		const lock = FileLock.tryAcquire(this.#journalPath);
 		if (!lock.acquired) throw new DurableStateConflictError();
@@ -753,7 +787,7 @@ export class RegistryDurableStateStore {
 					if (written <= 0) throw new Error("Durable journal append made no progress.");
 					offset += written;
 				}
-				fs.fsyncSync(handle);
+				durableFsyncSync(handle);
 				verifiedBytes = verifiedJournalBytes(observedBytes, encoded);
 				afterWrite = journalMetadataFromStat(fs.fstatSync(handle, { bigint: true }));
 				const current = journalMetadata(this.#journalPath);
@@ -962,7 +996,7 @@ function repairJournalEntry(
 	sequence: number,
 	previousHash: string,
 ): DurableJournalRecord {
-	validateRecord(record);
+	validateDurableRegistryRecord(record);
 	const base = {
 		version: DURABLE_STATE_VERSION,
 		sequence,
@@ -1110,7 +1144,7 @@ function assertRepairSourceUnchanged(journalPath: string, source: RepairSourceId
 function fsyncFile(filePath: string): void {
 	const handle = fs.openSync(filePath, fs.constants.O_RDONLY | O_NOFOLLOW);
 	try {
-		fs.fsyncSync(handle);
+		durableFsyncSync(handle);
 	} finally {
 		fs.closeSync(handle);
 	}
@@ -1124,7 +1158,7 @@ function writeRepairBackup(filePath: string, bytes: Uint8Array): void {
 function fsyncDirectory(directory: string): void {
 	const handle = fs.openSync(directory, fs.constants.O_RDONLY);
 	try {
-		fs.fsyncSync(handle);
+		durableFsyncSync(handle);
 	} finally {
 		fs.closeSync(handle);
 	}
@@ -1285,19 +1319,6 @@ export async function repairSessionAuthority(
 			lock.release();
 		}
 	}
-}
-
-const registryDurableStoresByPath = new Map<string, RegistryDurableStateStore>();
-
-/** Process-local singleton for one session authority journal. */
-export function registryDurableStateForSession(sessionFile: string): RegistryDurableStateStore {
-	const journalPath = registryDurableJournalPath(sessionFile);
-	let store = registryDurableStoresByPath.get(journalPath);
-	if (!store) {
-		store = new RegistryDurableStateStore(journalPath);
-		registryDurableStoresByPath.set(journalPath, store);
-	}
-	return store;
 }
 
 function transitionKey(record: DurableTransitionRecord): string {
@@ -1749,6 +1770,44 @@ export function recoverRegistryDurableState(store: RegistryDurableStateStore): D
 	}
 }
 
+function legacyImportFromValidatedEntries(
+	sourceSha256: string,
+	entries: readonly DurableJournalRecord[],
+): DurableLegacyAuthorityImport {
+	if (!SHA256_PATTERN.test(sourceSha256)) throw new Error("Legacy source fingerprint is invalid.");
+	verifyRepairLineage(entries);
+	const state = createMutableRecoveryState();
+	for (const entry of entries) applyRecord(state, entry.record);
+	state.head = currentCursor(entries);
+	const snapshot = durableSnapshot(state);
+	return Object.freeze({ sourceSha256, entries: Object.freeze([...entries]), snapshot });
+}
+
+/** Validates embedded legacy journal evidence without constructing a live store or invoking recovery side effects. */
+export function validateLegacyAuthorityEntries(
+	sourceSha256: string,
+	sourceEntries: readonly DurableJournalRecord[],
+): DurableLegacyAuthorityImport {
+	if (!Array.isArray(sourceEntries)) throw new Error("Legacy journal entries are invalid.");
+	assertPlainJson(sourceEntries);
+	const text = sourceEntries.length === 0 ? "" : `${sourceEntries.map(entry => JSON.stringify(entry)).join("\n")}\n`;
+	return legacyImportFromValidatedEntries(sourceSha256, parseJournalText(text));
+}
+
+export function importLegacyAuthorityJournal(journalPath: string): DurableLegacyAuthorityImport {
+	if (!path.isAbsolute(journalPath)) throw new TypeError("Legacy authority journal path must be absolute.");
+	const store = new RegistryDurableStateStore(path.resolve(journalPath));
+	if (!store.available) throw new DurableStateUnavailableError(store.quarantineReason);
+	const bytes = fs.readFileSync(journalPath);
+	const result = legacyImportFromValidatedEntries(
+		durableBackingSha256(bytes),
+		parseJournalText(bytes.toString("utf8")),
+	);
+	if (!bytes.equals(fs.readFileSync(journalPath)))
+		throw new DurableStateConflictError("Legacy authority journal changed during import verification.");
+	return result;
+}
+
 export interface DurableLocalPublishResult {
 	readonly version: number;
 	readonly headHash: string;
@@ -1757,171 +1816,6 @@ export interface DurableLocalPublishResult {
 export interface DurableLocalBackingExpectation extends DurableLocalPublishResult {
 	readonly entryId: string;
 	readonly entryHash: string;
-}
-
-/** Single-head local:// metadata journal. It persists hashes and opaque ids only; backing paths never enter records. */
-export class DurableLocalState {
-	readonly #store: RegistryDurableStateStore;
-	readonly #localId: string;
-	#validatedHeadHash = GENESIS_HASH;
-
-	constructor(store: RegistryDurableStateStore, localId: string) {
-		assertId(localId, "Local id");
-		this.#store = store;
-		this.#localId = localId;
-	}
-	/** Identity-only ownership check; the journal path remains encapsulated. */
-	isOwnedBy(store: RegistryDurableStateStore): boolean {
-		return this.#store === store;
-	}
-
-	current(): DurableLocalPublishResult | null {
-		const current = this.#currentEntry();
-		return current ? Object.freeze({ version: current.version, headHash: current.headHash }) : null;
-	}
-
-	/** Validate a recovered head through caller-owned backing lookup before another publish. */
-	async ensureRecoveredBacking(
-		validate: (expectation: DurableLocalBackingExpectation) => boolean | Promise<boolean>,
-	): Promise<void> {
-		const current = this.#currentEntry();
-		if (!current || current.headHash === this.#validatedHeadHash) return;
-		let valid = false;
-		try {
-			valid = await validate(current);
-		} catch {
-			valid = false;
-		}
-		if (!valid) this.#store.quarantine("Recovered local:// backing bytes do not match the durable head.");
-		this.#validatedHeadHash = current.headHash;
-	}
-
-	publish(entryId: string, entryHash: string, expectedHeadHash = GENESIS_HASH): DurableLocalPublishResult {
-		assertId(entryId, "Local entry id");
-		assertHash(entryHash, "Local entry hash");
-		assertHash(expectedHeadHash, "Expected local head hash", true);
-		const current = this.#currentEntry();
-		this.#assertRecoveredBackingValidated(current);
-		const actualHead = current?.headHash ?? GENESIS_HASH;
-		const version = (current?.version ?? 0) + 1;
-		const headHash = canonicalDurableSha256({
-			localId: this.#localId,
-			entryId,
-			version,
-			previousHeadHash: actualHead,
-			entryHash,
-		});
-		const base = {
-			kind: "local-entry" as const,
-			at: Date.now(),
-			localId: this.#localId,
-			entryId,
-			version,
-			expectedHeadHash,
-			entryHash,
-			headHash,
-		};
-		this.#store.append({ ...base, phase: "intent" });
-		if (expectedHeadHash !== actualHead) {
-			this.#store.append({ ...base, at: Date.now(), phase: "conflict" });
-			throw new DurableStateConflictError("local:// expected head does not match the current durable head.");
-		}
-		this.#store.append({ ...base, at: Date.now(), phase: "effect" });
-		this.#store.append({ ...base, at: Date.now(), phase: "committed" });
-		this.#store.append({
-			kind: "local-head",
-			at: Date.now(),
-			localId: this.#localId,
-			version,
-			previousHeadHash: actualHead,
-			headHash,
-			phase: "current",
-		});
-		this.#validatedHeadHash = headHash;
-		return Object.freeze({ version, headHash });
-	}
-
-	async publishWithEffect(
-		entryId: string,
-		entryHash: string,
-		expectedHeadHash: string,
-		effect: () => Promise<void>,
-	): Promise<DurableLocalPublishResult> {
-		assertId(entryId, "Local entry id");
-		assertHash(entryHash, "Local entry hash");
-		assertHash(expectedHeadHash, "Expected local head hash", true);
-		const current = this.#currentEntry();
-		this.#assertRecoveredBackingValidated(current);
-		const actualHead = current?.headHash ?? GENESIS_HASH;
-		const version = (current?.version ?? 0) + 1;
-		const headHash = canonicalDurableSha256({
-			localId: this.#localId,
-			entryId,
-			version,
-			previousHeadHash: actualHead,
-			entryHash,
-		});
-		const base = {
-			kind: "local-entry" as const,
-			at: Date.now(),
-			localId: this.#localId,
-			entryId,
-			version,
-			expectedHeadHash,
-			entryHash,
-			headHash,
-		};
-		this.#store.append({ ...base, phase: "intent" });
-		if (expectedHeadHash !== actualHead) {
-			this.#store.append({ ...base, at: Date.now(), phase: "conflict" });
-			throw new DurableStateConflictError("local:// expected head does not match the current durable head.");
-		}
-		try {
-			await effect();
-		} catch (error) {
-			this.#store.append({ ...base, at: Date.now(), phase: "cancelled" });
-			throw error;
-		}
-		this.#store.append({ ...base, at: Date.now(), phase: "effect" });
-		this.#store.append({ ...base, at: Date.now(), phase: "committed" });
-		this.#store.append({
-			kind: "local-head",
-			at: Date.now(),
-			localId: this.#localId,
-			version,
-			previousHeadHash: actualHead,
-			headHash,
-			phase: "current",
-		});
-		this.#validatedHeadHash = headHash;
-		return Object.freeze({ version, headHash });
-	}
-
-	#currentEntry(): DurableLocalBackingExpectation | null {
-		const snapshot = this.#store.snapshot();
-		const head = snapshot.localHeads.get(this.#localId);
-		if (!head || head.phase !== "current") return null;
-		const entry = [...snapshot.localEntries.values()].find(
-			candidate =>
-				candidate.localId === this.#localId &&
-				candidate.version === head.version &&
-				candidate.headHash === head.headHash &&
-				candidate.phase === "committed",
-		);
-		if (!entry) return this.#store.quarantine("Current local:// durable head has no committed backing entry.");
-		return Object.freeze({
-			version: head.version,
-			headHash: head.headHash,
-			entryId: entry.entryId,
-			entryHash: entry.entryHash,
-		});
-	}
-
-	#assertRecoveredBackingValidated(current: DurableLocalBackingExpectation | null): void {
-		if (current && current.headHash !== this.#validatedHeadHash) {
-			throw new DurableStateUnavailableError("Recovered local:// backing must be validated before publication.");
-		}
-	}
 }
 
 export function durableRootHeadHash(input: {

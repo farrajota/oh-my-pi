@@ -8,6 +8,7 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 describe("commit agent prompt attribution", () => {
 	afterEach(() => {
@@ -17,6 +18,7 @@ describe("commit agent prompt attribution", () => {
 	it("marks generated commit prompts and reminders as agent-attributed", async () => {
 		const prompts: Array<{ text: string; options?: PromptOptions }> = [];
 		const session = {
+			...createSessionDefaults(),
 			sessionManager: undefined as unknown as SessionManager,
 			prompt: async (text: string, options?: PromptOptions) => {
 				prompts.push({ text, options });
@@ -61,6 +63,7 @@ describe("commit agent prompt attribution", () => {
 	it("runs completion before session disposal", async () => {
 		const events: string[] = [];
 		const session = {
+			...createSessionDefaults(),
 			sessionManager: undefined as unknown as SessionManager,
 			prompt: async () => {},
 			subscribe: () => () => {},

@@ -8,6 +8,7 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ToolApprovalDecision,
+	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import { type AstReplaceChange, type AstReplaceFileChange, astEdit, type ShellFilesystem } from "@oh-my-pi/pi-natives";
@@ -16,7 +17,10 @@ import { replaceTabs, Text } from "@oh-my-pi/pi-tui";
 import { $envpos, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
-import { InternalUrlRouter, sessionResolveContext } from "../internal-urls";
+import { InternalUrlRouter, sessionResolveContext, sessionWriteContext, parseInternalUrl } from "../internal-urls";
+import type { ResolveContext } from "../internal-urls/types";
+import { prepareLocalFileWrite } from "../internal-urls/local-protocol";
+import { getActiveOperationSignal, runLocalOperation } from "../registry/operation-lease";
 import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
 import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -25,10 +29,14 @@ import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text
 import { Ellipsis, fileHyperlink, renderStatusLine, truncateToWidth } from "@oh-my-pi/pi-tui/render";
 import { framedToolCard } from "@oh-my-pi/pi-tui/render/tool-card";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
-import type { AuthorizedFilesystemTarget, FilesystemOperation } from "../internal/session-path-scope";
+import type {
+	AuthorizedFilesystemTarget,
+	AuthorizedSearchWalkOptions,
+	FilesystemOperation,
+} from "../internal/session-path-scope";
 import { missingGrammarsNote, rerunWithGrammars } from "../utils/grammars";
 import type { ToolSession } from ".";
-import { resolveToolTier, strictestApproval, truncateForPrompt } from "./approval";
+import { resolveToolTier, strictestApproval, truncateForPrompt, TIER_RANK } from "./approval";
 import { parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file-recorder";
 import {
@@ -180,6 +188,7 @@ interface ScopedAstEditSnapshot {
 interface ScopedAstEditWrite {
 	target: AuthorizedFilesystemTarget;
 	content: string;
+	url?: string;
 }
 
 interface ScopedAstEditRun {
@@ -198,28 +207,121 @@ function sameFilesystemIdentity(left: AuthorizedFilesystemTarget, right: Authori
 	);
 }
 
+interface ScopedAstTarget {
+	basePath: string;
+	glob?: string;
+	url?: string;
+}
+
+async function resolveScopedAstTargets(
+	targets: Array<{ basePath: string; glob?: string }>,
+	context: ResolveContext,
+	tier: ToolTier,
+): Promise<ScopedAstTarget[]> {
+	const router = InternalUrlRouter.instance();
+	return Promise.all(
+		targets.map(async target => {
+			if (!isInternalUrlPath(target.basePath)) return target;
+			if (!router.fileWritable(target.basePath))
+				throw new ToolError(`Cannot rewrite read-only URL: ${target.basePath}`);
+			const readTier = router.readTier(target.basePath);
+			if (TIER_RANK[readTier] > TIER_RANK[tier])
+				throw new ToolError(`URL rewrite requires ${readTier} read approval: ${target.basePath}`);
+			const decision = router.writeTier(target.basePath, undefined, context.session);
+			if (typeof decision !== "string" && decision.policy === "deny")
+				throw new ToolError(decision.reason ?? `Cannot rewrite ${target.basePath}`);
+			const requiredTier = typeof decision === "string" ? decision : decision.tier;
+			if (TIER_RANK[requiredTier] > TIER_RANK[tier])
+				throw new ToolError(`URL rewrite requires ${requiredTier} approval: ${target.basePath}`);
+			const basePath = await router.requireLocal(target.basePath, "rewrite", context, { directory: true });
+			return { basePath, glob: target.glob, url: target.basePath };
+		}),
+	);
+}
+
+/** local:// uses local authority, rather than treating its private backing as an ordinary path. */
+async function walkLocalAstTarget(
+	operation: FilesystemOperation,
+	root: AuthorizedFilesystemTarget,
+	options: AuthorizedSearchWalkOptions,
+): Promise<void> {
+	const visit = async (target: AuthorizedFilesystemTarget): Promise<void> => {
+		if (options.stop?.()) return;
+		operation.assertActive();
+		options.signal?.throwIfAborted();
+		const handle = await operation.openRead(target, "local");
+		try {
+			const stat = await handle.stat({ bigint: true });
+			operation.assertActive();
+			const entry = {
+				path: target.canonicalTarget,
+				isFile: stat.isFile(),
+				isDirectory: stat.isDirectory(),
+				size: stat.size,
+				mtimeMs: Number(stat.mtimeMs),
+			};
+			if (options.include?.(entry) !== false) await options.visit?.(entry);
+			if (entry.isDirectory && options.descend?.(entry) !== false) {
+				if (process.platform !== "linux")
+					throw new Error("Exact local AST traversal requires Linux /proc support.");
+				const children = await fs.readdir(`/proc/self/fd/${handle.fd}`, { withFileTypes: true });
+				operation.assertActive();
+				for (const child of children) {
+					if (options.stop?.()) break;
+					if (!child.isFile() && !child.isDirectory()) continue;
+					await visit(await operation.authorizeLocal(path.join(target.canonicalTarget, child.name), "search"));
+				}
+			}
+		} catch (error) {
+			try {
+				await handle.close();
+			} catch (closeError) {
+				throw new AggregateError([error, closeError], "Local AST traversal and close failed.");
+			}
+			throw error;
+		}
+		await handle.close();
+		operation.assertActive();
+	};
+	await visit(root);
+}
+
 async function readAuthorizedAstSource(
 	operation: FilesystemOperation,
 	filePath: string,
 	assertAstEditPermission: (canonicalTarget: string) => void,
+	local = false,
 ): Promise<{ target: AuthorizedFilesystemTarget; content: string }> {
-	const target = await operation.authorize(filePath, "read");
-	assertAstEditPermission(target.canonicalTarget);
+	const target = local
+		? await operation.authorizeLocal(filePath, "read")
+		: await operation.authorize(filePath, "read");
+	if (!local) assertAstEditPermission(target.canonicalTarget);
 	const handle = await operation.openRead(target, "filesystem");
+	let content: string;
 	try {
-		return { target, content: await handle.readFile({ encoding: "utf8" }) };
-	} finally {
-		await handle.close();
+		content = await handle.readFile({ encoding: "utf8" });
+		operation.assertActive();
+	} catch (error) {
+		try {
+			await handle.close();
+		} catch (closeError) {
+			throw new AggregateError([error, closeError], "AST source read and close failed.");
+		}
+		throw error;
 	}
+	await handle.close();
+	operation.assertActive();
+	return { target, content };
 }
 
 /** Native astEdit only sees private copies of authorized source snapshots. */
 async function runScopedAstEdit(
-	targets: Array<{ basePath: string; glob?: string }>,
+	targets: ScopedAstTarget[],
 	commonBasePath: string,
 	options: AstEditCallOptions,
 	operation: FilesystemOperation,
 	assertAstEditPermission: (canonicalTarget: string) => void,
+	context: ResolveContext,
 ): Promise<ScopedAstEditRun> {
 	const changes: AstReplaceChange[] = [];
 	const fileCounts = new Map<string, number>();
@@ -236,11 +338,15 @@ async function runScopedAstEdit(
 
 	try {
 		for (const target of targets) {
-			const rootTarget = await operation.authorize(target.basePath, "search");
+			const local = target.url?.startsWith("local://") === true;
+			const rootTarget = local
+				? await operation.authorizeLocal(target.basePath, "search")
+				: await operation.authorize(target.basePath, "search");
+			if (!local) assertAstEditPermission(rootTarget.canonicalTarget);
 			const matcher = target.glob ? new Bun.Glob(target.glob) : undefined;
 			let targetFilesTouched = 0;
 			let targetLimitReached = false;
-			await operation.walkAuthorized(rootTarget, {
+			const walkOptions: AuthorizedSearchWalkOptions = {
 				signal: options.signal,
 				include: entry => {
 					if (entry.isDirectory) return true;
@@ -255,12 +361,31 @@ async function runScopedAstEdit(
 					const absolutePath = path.resolve(entry.path);
 					if (seenPaths.has(absolutePath)) return;
 					seenPaths.add(absolutePath);
+					const relative = path.relative(rootTarget.canonicalTarget, entry.path).replace(/\\/g, "/");
+					const fileUrl =
+						target.url === undefined
+							? undefined
+							: relative === ""
+								? target.url
+								: `${target.url.replace(/\/?$/, "/")}${relative.split("/").map(encodeURIComponent).join("/")}`;
+					if (fileUrl) {
+						const current = await InternalUrlRouter.instance().requireLocal(fileUrl, "rewrite", context);
+						const currentTarget = local
+							? await operation.authorizeLocal(current, "read")
+							: await operation.authorize(current, "read");
+						if (currentTarget.canonicalTarget !== absolutePath)
+							throw new ToolError(`AST URL backing changed: ${fileUrl}`);
+						operation.assertActive();
+					}
 
 					const { target: readTarget, content: source } = await readAuthorizedAstSource(
 						operation,
 						entry.path,
 						assertAstEditPermission,
+						local,
 					);
+					operation.assertActive();
+					options.signal?.throwIfAborted();
 					// Keep the original basename (including extension and special names such as Dockerfile)
 					// so native language detection is identical to a scan of the real file.
 					scratchDir ??= await fs.mkdtemp(path.join(os.tmpdir(), "omp-ast-edit-"));
@@ -276,6 +401,8 @@ async function runScopedAstEdit(
 						failOnParseError: options.failOnParseError,
 						signal: options.signal,
 					});
+					operation.assertActive();
+					options.signal?.throwIfAborted();
 					filesSearched += rewritten.filesSearched;
 					for (const error of rewritten.parseErrors ?? []) {
 						parseErrors.push(error.replaceAll(scratchFile, entry.path));
@@ -289,18 +416,16 @@ async function runScopedAstEdit(
 						return;
 					}
 
-					let writeTarget: AuthorizedFilesystemTarget;
-					try {
-						writeTarget = await operation.authorize(readTarget.canonicalTarget, "write");
-						assertAstEditPermission(writeTarget.canonicalTarget);
-					} catch {
-						throw new ToolError("AST edit includes a filesystem target outside this operation's authority.");
-					}
+					const writeTarget = local
+						? await operation.authorizeLocal(readTarget.canonicalTarget, "write")
+						: await operation.authorize(readTarget.canonicalTarget, "write");
+					if (!local) assertAstEditPermission(writeTarget.canonicalTarget);
 					if (!sameFilesystemIdentity(readTarget, writeTarget)) {
 						throw new ToolError(`AST edit target changed while reading ${entry.path}.`);
 					}
-					const resultPath = path.relative(commonBasePath, readTarget.canonicalTarget).replace(/\\/g, "/");
+					const resultPath = relativeSearchResultPath(commonBasePath, fileUrl ?? readTarget.canonicalTarget);
 					const after = await fs.readFile(scratchFile, "utf8");
+					operation.assertActive();
 					targetFilesTouched++;
 					changes.push(...rewritten.changes.map(change => ({ ...change, path: resultPath })));
 					const count = rewritten.fileChanges.reduce((sum, change) => sum + change.count, 0);
@@ -311,14 +436,24 @@ async function runScopedAstEdit(
 						after,
 						canonicalPath: writeTarget.canonicalTarget,
 					});
-					writes.push({ target: writeTarget, content: after });
+					writes.push({ target: writeTarget, content: after, url: fileUrl });
 				},
 				stop: () => targetLimitReached,
-			});
+			};
+			if (local) await walkLocalAstTarget(operation, rootTarget, walkOptions);
+			else await operation.walkAuthorized(rootTarget, walkOptions);
 		}
-	} finally {
-		if (scratchDir) await fs.rm(scratchDir, { recursive: true, force: true });
+	} catch (error) {
+		if (scratchDir) {
+			try {
+				await fs.rm(scratchDir, { recursive: true, force: true });
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], "AST preview and snapshot cleanup failed.");
+			}
+		}
+		throw error;
 	}
+	if (scratchDir) await fs.rm(scratchDir, { recursive: true, force: true });
 
 	const fileChanges: AstReplaceFileChange[] = Array.from(fileCounts, ([filePath, count]) => ({
 		path: filePath,
@@ -344,9 +479,21 @@ async function runScopedAstEdit(
 async function applyScopedAstWrites(
 	operation: FilesystemOperation,
 	writes: readonly ScopedAstEditWrite[],
+	session: ToolSession,
 ): Promise<void> {
 	for (const write of writes) await operation.verify(write.target);
-	for (const write of writes) await operation.writeFile(write.target, write.content);
+	for (const write of writes) {
+		if (write.url?.startsWith("local://")) {
+			const prepared = await prepareLocalFileWrite(parseInternalUrl(write.url), sessionWriteContext(session));
+			const currentTarget = await operation.authorizeLocal(prepared.path, "write");
+			if (
+				currentTarget.canonicalTarget !== write.target.canonicalTarget ||
+				!sameFilesystemIdentity(currentTarget, write.target)
+			)
+				throw new ToolError(`AST URL backing changed: ${write.url}`);
+			await prepared.commit(write.content, () => operation.writeFile(write.target, write.content));
+		} else await operation.writeFile(write.target, write.content);
+	}
 	for (const write of writes) await operation.verifyPostWrite(write.target);
 }
 
@@ -471,7 +618,8 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 		_onUpdate?: AgentToolUpdateCallback<AstEditToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<AstEditToolDetails>> {
-		return untilAborted(signal, async () => {
+		signal?.throwIfAborted();
+		const work = async (): Promise<AgentToolResult<AstEditToolDetails>> => {
 			const ops = params.ops.map((entry, index) => {
 				if (entry.pat.length === 0) {
 					throw new ToolError(`\`ops[${index}].pat\` must be a non-empty pattern`);
@@ -492,9 +640,32 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			const maxFiles = $envpos("PI_MAX_AST_FILES", 1000);
 
 			const resolveContext = sessionResolveContext(this.session, { signal });
-			// Internal URLs resolve inside the native rewrite, bounded by the tier this call was approved at.
+			// URL policy is checked before resolving its current operation's backing.
 			const tier = resolveToolTier(this, params);
 			const urlFilesystem = new InternalUrlFilesystem({ context: resolveContext, tier });
+			const scopedAuthority =
+				this.session.pathScope?.isRestricted || this.session.pathScope?.lease?.effectOwnerId !== undefined;
+			if (scopedAuthority) {
+				const ordinaryStat = urlFilesystem.stat.bind(urlFilesystem);
+				// Native URL stat creates sandbox roots as a convenience. A scoped AST
+				// preview must remain read-only, including an absent local:// backing.
+				urlFilesystem.stat = async input => {
+					if (!isInternalUrlPath(input)) return ordinaryStat(input);
+					const [mapped] = await resolveScopedAstTargets([{ basePath: input }], resolveContext, tier);
+					if (!mapped) throw new ToolError(`Cannot resolve AST URL: ${input}`);
+					const operation = this.session.pathScope!.currentOperation();
+					const target = input.startsWith("local://")
+						? await operation.authorizeLocal(mapped.basePath, "stat")
+						: await operation.authorize(mapped.basePath, "stat");
+					const stat = await fs.stat(target.canonicalTarget);
+					await operation.verify(target);
+					return {
+						type: stat.isDirectory() ? "directory" : stat.isFile() ? "file" : "other",
+						size: stat.size,
+						mtimeMs: stat.mtimeMs,
+					};
+				};
+			}
 			const scope = await resolveToolSearchScope({
 				rawPaths: params.paths,
 				cwd: this.session.cwd,
@@ -516,18 +687,14 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			};
 			const filesystem = urlFilesystem.shellFilesystem();
 			let scopedRun: ScopedAstEditRun | undefined;
-			if (this.session.pathScope?.isRestricted) {
-				const operation = this.session.pathScope.currentOperation();
-				const roots = astTargets.map(target => target.basePath);
-				const rootTargets = await operation.preflight(roots.map(root => ({ path: root, kind: "search" as const })));
-				for (const target of rootTargets) assertAstEditPermission(target.canonicalTarget);
-			}
+			let scopedTargets: ScopedAstTarget[] | undefined;
+			if (scopedAuthority) scopedTargets = await resolveScopedAstTargets(astTargets, resolveContext, tier);
 			// This remains a dry run even when grammars are installed and the scan is retried.
 			const result = await rerunWithGrammars(async () => {
-				if (this.session.pathScope?.isRestricted) {
-					const operation = this.session.pathScope.currentOperation();
+				if (scopedAuthority) {
+					const operation = this.session.pathScope!.currentOperation();
 					scopedRun = await runScopedAstEdit(
-						astTargets,
+						scopedTargets!,
 						resolvedSearchPath,
 						{
 							rewrites: normalizedRewrites,
@@ -539,6 +706,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						},
 						operation,
 						assertAstEditPermission,
+						resolveContext,
 					);
 					return scopedRun.result;
 				}
@@ -552,6 +720,10 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					filesystem,
 				});
 			});
+			// An ordinary path-scoped session may run without an operation lease; check liveness only
+			// when this invocation holds one.
+			if (this.session.pathScope?.lease) this.session.pathScope.currentOperation().assertActive();
+			signal?.throwIfAborted();
 			const grammarNote = result.missingGrammars?.length ? missingGrammarsNote(result.missingGrammars) : undefined;
 			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(result.parseErrors);
 			const formatPath = (filePath: string): string =>
@@ -608,8 +780,8 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				const snapshotStore = getEditStore(this.session);
 				for (const relativePath of fileList) {
 					const scopedSnapshot = previewSnapshots.get(relativePath);
-					if (this.session.pathScope?.isRestricted) {
-						if (!scopedSnapshot) continue;
+					if (scopedRun) {
+						if (!scopedSnapshot) throw new Error("Missing admitted AST preview snapshot.");
 						const tag = snapshotStore.recordSnapshot(
 							scopedSnapshot.canonicalPath,
 							normalizeToLF(scopedSnapshot.before),
@@ -714,13 +886,10 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						const applyFilesystem = new InternalUrlFilesystem({ context: applyContext, tier }).shellFilesystem();
 						const applyChanges = async (): Promise<AstEditAggregatedResult> => {
 							const operation = this.session.pathScope!.currentOperation();
-							const rootTargets = await operation.preflight(
-								astTargets.map(target => ({ path: target.basePath, kind: "search" as const })),
-							);
-							for (const target of rootTargets) assertAstEditPermission(target.canonicalTarget);
+							const currentTargets = await resolveScopedAstTargets(astTargets, applyContext, tier);
 
 							const currentScopedRun = await runScopedAstEdit(
-								astTargets,
+								currentTargets,
 								resolvedSearchPath,
 								{
 									rewrites: normalizedRewrites,
@@ -731,6 +900,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 								},
 								operation,
 								assertAstEditPermission,
+								applyContext,
 							);
 							const currentPreview = currentScopedRun.result;
 							const currentCounts = new Map(
@@ -763,22 +933,46 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 								throw new ToolError("AST edit preview is stale; no replacements were applied.");
 							}
 
-							await applyScopedAstWrites(operation, currentScopedRun.writes);
+							await applyScopedAstWrites(operation, currentScopedRun.writes, this.session);
 							appliedScopedRun = {
 								...currentScopedRun,
 								result: { ...currentPreview, applied: true },
 							};
 							return appliedScopedRun.result;
 						};
-						const applyResult = this.session.pathScope?.isRestricted
-							? await applyChanges()
-							: await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-									rewrites: normalizedRewrites,
-									dryRun: false,
-									maxFiles,
-									failOnParseError: false,
-									filesystem: applyFilesystem,
-								});
+						const applyWithCurrentAuthority = async (): Promise<AstEditAggregatedResult> => {
+							const pathScope = this.session.pathScope!;
+							const parent = pathScope.currentOperation();
+							parent.assertActive();
+							if (
+								parent.lease.effectClass === "local" ||
+								!astTargets.some(target => target.basePath.startsWith("local://"))
+							)
+								return applyChanges();
+							// Resolution arrives through xd://resolve's filesystem invocation. Its
+							// local publication is an awaited child of that *current* invocation.
+							const manager = pathScope.operationManager();
+							const signal = getActiveOperationSignal(manager, parent.operationId);
+							if (!signal)
+								throw new Error("Deferred local AST apply requires current operation cancellation authority.");
+							const operationId = `local:${parent.operationId}:ast-edit`;
+							return runLocalOperation(
+								manager,
+								operationId,
+								() => pathScope.withOperationLease(operationId, applyChanges),
+								signal,
+							);
+						};
+						const applyResult =
+							scopedAuthority || this.session.pathScope?.lease?.effectOwnerId !== undefined
+								? await applyWithCurrentAuthority()
+								: await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+										rewrites: normalizedRewrites,
+										dryRun: false,
+										maxFiles,
+										failOnParseError: false,
+										filesystem: applyFilesystem,
+									});
 						const { errors: cappedApplyParseErrors, total: applyParseErrorsTotal } = capParseErrors(
 							applyResult.parseErrors,
 						);
@@ -809,8 +1003,8 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							const snapshotStore = getEditStore(this.session);
 							for (const relativePath of appliedFileList) {
 								const scopedSnapshot = appliedSnapshots.get(relativePath);
-								if (this.session.pathScope?.isRestricted) {
-									if (!scopedSnapshot) continue;
+								if (appliedScopedRun) {
+									if (!scopedSnapshot) throw new Error("Missing admitted AST applied snapshot.");
 									const freshTag = snapshotStore.recordSnapshot(
 										scopedSnapshot.canonicalPath,
 										normalizeToLF(scopedSnapshot.after),
@@ -884,7 +1078,12 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				displayContent: displayLines.join("\n"),
 			};
 			return toolResult(details).text(outputLines.join("\n")).done();
-		});
+		};
+		// Cancellation cannot detach an admitted source read or its terminal close.
+		const result = this.session.pathScope ? await work() : await untilAborted(signal, work);
+		if (this.session.pathScope?.lease) this.session.pathScope.currentOperation().assertActive();
+		signal?.throwIfAborted();
+		return result;
 	}
 }
 

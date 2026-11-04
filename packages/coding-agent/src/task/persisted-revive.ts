@@ -12,16 +12,15 @@ import { initializeExtensions } from "../modes/runtime-init";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
 import {
 	bindInternalAgentAuthoritySession,
-	detachAgentSession,
 	lookupAgentRef,
-	setAgentStatus,
+	parkAgentRef,
 	setAgentHistory,
 	syncAgentSessionStatus,
 } from "../internal/agent-registry-bridge";
 import { deriveRestrictedStartupPolicy } from "../internal/restricted-startup-policy";
 import { getSessionLocalProtocolOptions } from "../internal-urls";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
-import type { RegistryDurableStateStore } from "../registry/durable-state";
+import type { AuthorityStore } from "../registry/authority/types";
 import type { AgentSession } from "../session/agent-session";
 import { installRetryFallbackRole } from "../session/retry-fallback-chains";
 import type { AuthStorage } from "../session/auth-storage";
@@ -79,7 +78,7 @@ export interface PersistedSubagentReviveContext {
 	/** Root-scoped observability bus the revived run's frames also publish to. */
 	subagentEventBus?: EventBus;
 	/** Optional W4 authority journal; configured cold revival requires an exact validated actor/root snapshot. */
-	durableState?: RegistryDurableStateStore;
+	durableState?: AuthorityStore;
 }
 
 type PersistedRevivalInit = Pick<
@@ -125,7 +124,7 @@ async function validatePersistedRevivalContract(
 	init: PersistedRevivalInit,
 	cwd: string,
 	ref: { id: string; parentId?: string; lineage?: { rootId: string; generation: number } },
-	durableState: RegistryDurableStateStore | undefined,
+	durableState: AuthorityStore | undefined,
 ): Promise<
 	| {
 			init: PersistedRevivalInit;
@@ -175,13 +174,13 @@ async function validatePersistedRevivalContract(
 		const lineage = ref.lineage;
 		if (
 			!lineage ||
-			!durableState.validateRevival({
+			!(await durableState.validateRevival({
 				actorId: ref.id,
 				parentId: ref.parentId,
 				rootId: lineage.rootId,
 				generation: lineage.generation,
 				scopeHash: permissionSnapshot.canonicalSha256,
-			})
+			}))
 		)
 			return undefined;
 	}
@@ -306,13 +305,13 @@ export function createPersistedSubagentReviverFactory(
 			const lineage = ref.lineage;
 			if (
 				!lineage ||
-				!durableState.validateRevival({
+				!(await durableState.validateRevival({
 					actorId: ref.id,
 					parentId: ref.parentId,
 					rootId: lineage.rootId,
 					generation: lineage.generation,
 					scopeHash: permissionSnapshot.canonicalSha256,
-				})
+				}))
 			)
 				return undefined;
 		}
@@ -590,30 +589,56 @@ export function createPersistedSubagentReviverFactory(
 				}
 				return session;
 			} catch (error) {
-				try {
+				const cleanupErrors: unknown[] = [];
+				let followerReleaseAttempted = false;
+				const releaseFollower = async (): Promise<void> => {
+					if (followerReleaseAttempted) return;
+					followerReleaseAttempted = true;
 					mcpFollower?.dispose();
-				} catch {
-					// Continue releasing the session even if its MCP follower failed to stop.
-				}
+				};
 				if (revivedSession) {
-					try {
-						setAgentStatus(registry, ref.id, "parked", revivedSession);
-						detachAgentSession(registry, ref.id, revivedSession);
-					} catch {
-						// Session disposal below still owns and closes the reopened manager.
-					}
-					try {
-						await revivedSession.dispose();
-					} catch {
-						// Preserve the revival failure when session teardown also fails.
+					const current = lookupAgentRef(registry, ref.id);
+					if (current?.session === revivedSession) {
+						let parked = false;
+						let parkFailed = false;
+						try {
+							parked = await parkAgentRef(registry, current, revivedSession, undefined, releaseFollower);
+						} catch (parkError) {
+							parkFailed = true;
+							cleanupErrors.push(parkError);
+						}
+						if (!followerReleaseAttempted) {
+							try {
+								await releaseFollower();
+							} catch (followerError) {
+								if (!cleanupErrors.includes(followerError)) cleanupErrors.push(followerError);
+							}
+						}
+						if (!parked && !parkFailed)
+							cleanupErrors.push(
+								new Error(`Persisted revival "${ref.id}" could not transfer cleanup to its current authority.`),
+							);
+					} else {
+						try {
+							await releaseFollower();
+						} catch (followerError) {
+							cleanupErrors.push(followerError);
+						}
+						try {
+							await revivedSession.dispose();
+						} catch (disposeError) {
+							if (!cleanupErrors.includes(disposeError)) cleanupErrors.push(disposeError);
+						}
 					}
 				} else if (reopened) {
 					try {
 						await reopened.close();
-					} catch {
-						// Preserve the revival failure when manager teardown also fails.
+					} catch (closeError) {
+						cleanupErrors.push(closeError);
 					}
 				}
+				if (cleanupErrors.length > 0)
+					throw new AggregateError([error, ...cleanupErrors], "Persisted revival and cleanup failed.");
 				throw error;
 			}
 		};

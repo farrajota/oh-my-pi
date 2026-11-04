@@ -5,6 +5,7 @@
 import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
+import type { FileWriteMutationHooks } from "../../tools/file-write-fallback";
 
 // =============================================================================
 // Biome JSON Output Types
@@ -62,7 +63,7 @@ async function runBiome(
 	cwd: string,
 	resolvedCommand?: string,
 	signal?: AbortSignal,
-): Promise<{ stdout: string; stderr: string; success: boolean }> {
+): Promise<{ stdout: string; stderr: string; success: boolean; error?: unknown }> {
 	const command = resolvedCommand ?? "biome";
 
 	try {
@@ -74,14 +75,25 @@ async function runBiome(
 			signal,
 		});
 
-		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-		const exitCode = await proc.exited;
+		// Stream failure/cancellation must not leave a --write process running after its caller settles.
+		const [stdout, stderr, exited] = await Promise.allSettled([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		const failures = [stdout, stderr, exited]
+			.filter(result => result.status === "rejected")
+			.map(result => result.reason);
+		if (failures.length === 1) throw failures[0];
+		if (failures.length > 1) throw new AggregateError(failures, "Biome process/output failed.");
 		signal?.throwIfAborted();
-
-		return { stdout, stderr, success: exitCode === 0 };
+		if (stdout.status !== "fulfilled" || stderr.status !== "fulfilled" || exited.status !== "fulfilled") {
+			throw new Error("Biome process did not finish successfully.");
+		}
+		return { stdout: stdout.value, stderr: stderr.value, success: exited.value === 0 };
 	} catch (err) {
 		if (signal?.aborted) throw err;
-		return { stdout: "", stderr: String(err), success: false };
+		return { stdout: "", stderr: String(err), success: false, error: err };
 	}
 }
 
@@ -114,19 +126,30 @@ export class BiomeClient implements LinterClient {
 		private readonly cwd: string,
 	) {}
 
-	async format(filePath: string, content: string): Promise<string> {
-		// Keep the standalone LinterClient contract: callers supply the content to
-		// format, regardless of what is currently on disk.
+	async format(
+		filePath: string,
+		content: string,
+		signal?: AbortSignal,
+		mutationHooks?: FileWriteMutationHooks,
+	): Promise<string> {
+		// formatContent retains the current exact write resource around this entire callback.
+		signal?.throwIfAborted();
+		mutationHooks?.assertActive?.();
 		await Bun.write(filePath, content);
-
-		const result = await runBiome(["format", "--write", filePath], this.cwd, this.config.resolvedCommand);
-
-		if (result.success) {
-			return await Bun.file(filePath).text();
+		signal?.throwIfAborted();
+		mutationHooks?.assertActive?.();
+		const result = await runBiome(["format", "--write", filePath], this.cwd, this.config.resolvedCommand, signal);
+		if (!result.success) {
+			if ("error" in result) throw result.error;
+			throw new Error(`Biome format failed: ${result.stderr}`);
 		}
-
-		// Format failed, return original
-		return content;
+		const formatted = mutationHooks?.readText
+			? await mutationHooks.readText(filePath)
+			: await Bun.file(filePath).text();
+		if (formatted === undefined) throw new Error(`Biome formatter output is unreadable: ${filePath}`);
+		signal?.throwIfAborted();
+		mutationHooks?.assertActive?.();
+		return formatted;
 	}
 
 	async lint(filePath: string, signal?: AbortSignal): Promise<Diagnostic[]> {

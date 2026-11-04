@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { readJsonl, TempDir } from "@oh-my-pi/pi-utils";
 import { quoteShellArgument } from "../src/utils/resume-command";
@@ -127,6 +128,10 @@ describe("headless startup resume", () => {
 						new Response(proc.stderr).text(),
 					]);
 					expect(stderr).toContain("Could not restore model local/missing-model");
+					// The saved transcript predates authority journaling; resume adopts it with a one-line notice.
+					expect(stderr).toContain(
+						"Authority: this session predates authority journaling; created a new JSONL authority store for it.",
+					);
 					expect(exitCode).toBe(1);
 					expect(requests).toEqual([]);
 					expect(out).toBe("");
@@ -140,6 +145,58 @@ describe("headless startup resume", () => {
 		},
 		30_000,
 	);
+
+	test("prints on stderr in print mode that the persisted backend wins over a differing default", async () => {
+		using tempDir = TempDir.createSync("@omp-resume-backend-notice-");
+		const sessionFile = tempDir.join("saved.jsonl");
+		const timestamp = "2026-06-01T00:00:00.000Z";
+		await Bun.write(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 3, id: "saved", timestamp, cwd: tempDir.path() })}\n`,
+		);
+		const proc = Bun.spawn(
+			[
+				process.execPath,
+				cliEntry,
+				"--no-title",
+				"--no-lsp",
+				"--no-extensions",
+				"--no-tools",
+				"--resume",
+				sessionFile,
+				"-p",
+				"Continue.",
+			],
+			{
+				cwd: tempDir.path(),
+				env: {
+					PATH: process.env.PATH,
+					HOME: tempDir.join("home"),
+					USERPROFILE: tempDir.join("home"),
+					TMPDIR: process.env.TMPDIR,
+					NO_COLOR: "1",
+					// Adoption always selects JSONL, so this default differs from the root's persisted backend.
+					OMP_JOURNALING_BACKEND: "sqlite",
+				},
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		try {
+			proc.stdin.end();
+			const [, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+			expect(stderr).toContain(
+				"Authority: this session predates authority journaling; created a new JSONL authority store for it.",
+			);
+			expect(stderr).toContain(
+				`Authority: this session keeps its persisted jsonl backend; the sqlite default (OMP_JOURNALING_BACKEND) applies only to new sessions. To migrate it, run: omp session authority ${quoteShellArgument(await fs.realpath(sessionFile))} --to sqlite`,
+			);
+		} finally {
+			proc.kill();
+			await proc.exited;
+		}
+	}, 30_000);
 });
 
 type RpcFrame = { type?: string; id?: string; success?: boolean; error?: string; data?: Record<string, unknown> };

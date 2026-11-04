@@ -2,6 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
@@ -14,18 +15,102 @@ import {
 	listLocalFiles,
 	resolveLocalUrlToPath,
 } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import type { AuthorityStore, LocalClaim } from "@oh-my-pi/pi-coding-agent/registry/authority/types";
+import { AuthorityRpcClient } from "../../src/registry/authority/client";
+import { acquireAuthorityOwnership } from "../../src/registry/authority/ownership";
+import { DurableLocalState } from "../../src/registry/authority-local";
 import {
-	DurableLocalState,
-	DurableStateUnavailableError,
-	RegistryDurableStateStore,
+	canonicalDurableSha256,
+	type DurableLocalBackingExpectation,
+	type DurableLocalPublishResult,
 } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+const authorityClients: AuthorityRpcClient[] = [];
+
+async function createLocalAuthorityHarness(directory: string) {
+	let backing: DurableLocalBackingExpectation | null = null;
+	let activeClaim: LocalClaim | undefined;
+	let quarantineReason: string | undefined;
+	let revision = 0;
+	let nextClaim = 0;
+	const sessionFile = path.join(directory, "authority-session.jsonl");
+	await fs.writeFile(sessionFile, '{"type":"session","id":"restart-session"}\n');
+	const ownership = await acquireAuthorityOwnership(sessionFile, { owningSessionId: "restart-session", create: true });
+	const client = await AuthorityRpcClient.open(
+		{
+			path: ownership.paths.jsonl,
+			identity: {
+				backend: "jsonl",
+				owningSessionId: "restart-session",
+				incarnation: Bun.randomUUIDv7(),
+				format: 2,
+			},
+			create: true,
+		},
+		ownership,
+	);
+	authorityClients.push(client);
+	const store = client as AuthorityRpcClient & AuthorityStore;
+	store.reserveLocal = async input => {
+		if (activeClaim) throw new Error("local publication claim is already active");
+		const previousHeadHash = backing?.headHash ?? "0".repeat(64);
+		if (input.expectedHeadHash !== previousHeadHash) throw new Error("local expected head conflict");
+		const version = (backing?.version ?? 0) + 1;
+		const headHash = canonicalDurableSha256({ ...input, version, previousHeadHash });
+		activeClaim = {
+			localId: input.localId,
+			entryId: input.entryId,
+			version,
+			entryHash: input.entryHash,
+			headHash,
+			previousHeadHash,
+			claimToken: `claim-${++nextClaim}`,
+			ownerEpoch: 1,
+			incarnation: "incarnation-1",
+			phase: "reserved",
+		};
+		return activeClaim;
+	};
+	store.authorizeLocalEffect = async value => {
+		if (activeClaim?.claimToken !== value.claimToken) throw new Error("local claim is stale");
+		return {
+			requestId: `request-${++revision}`,
+			ownerEpoch: value.ownerEpoch,
+			revision,
+			payloadHash: "a".repeat(64),
+			incarnation: value.incarnation,
+			commandKind: "authorize-local-effect",
+			committedAt: revision,
+			result: { kind: "mutation" },
+		};
+	};
+	store.finalizeLocal = async (value, outcome) => {
+		if (activeClaim?.claimToken !== value.claimToken) throw new Error("local claim is stale");
+		const publication: DurableLocalPublishResult = { version: value.version, headHash: value.headHash };
+		if (outcome === "committed") {
+			backing = { ...publication, entryId: value.entryId, entryHash: value.entryHash };
+			activeClaim = undefined;
+		}
+		return publication;
+	};
+	store.localBacking = async () => backing;
+	store.quarantine = async reason => {
+		quarantineReason = reason;
+		throw new Error(reason);
+	};
+	return {
+		store,
+		get quarantineReason() {
+			return quarantineReason;
+		},
+	};
+}
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "local-protocol-"));
 	try {
 		return await fn(dir);
 	} finally {
+		await Promise.all(authorityClients.splice(0).map(client => client.close()));
 		await removeWithRetries(dir);
 	}
 }
@@ -337,9 +422,8 @@ describe("LocalProtocolHandler", () => {
 	it("quarantines a recovered local head when backing bytes changed", async () => {
 		await withTempDir(async tempDir => {
 			const artifactsDir = path.join(tempDir, "artifacts");
-			const journalPath = path.join(tempDir, "authority.jsonl");
-			const firstStore = new RegistryDurableStateStore(journalPath);
-			const firstLocalState = new DurableLocalState(firstStore, "restart-session");
+			const authority = await createLocalAuthorityHarness(tempDir);
+			const firstLocalState = new DurableLocalState(authority.store, "restart-session");
 			const firstOptions = {
 				getArtifactsDir: () => artifactsDir,
 				getSessionId: () => "restart-session",
@@ -362,8 +446,7 @@ describe("LocalProtocolHandler", () => {
 			const localPath = resolveLocalUrlToPath("local://PLAN.md", firstOptions);
 			expect(await fs.readFile(localPath, "utf8")).toBe("# durable");
 			await fs.writeFile(localPath, "# tampered", "utf8");
-			const restartedStore = new RegistryDurableStateStore(journalPath);
-			const restartedLocalState = new DurableLocalState(restartedStore, "restart-session");
+			const restartedLocalState = new DurableLocalState(authority.store, "restart-session");
 			await expect(
 				createTool({
 					getArtifactsDir: () => artifactsDir,
@@ -373,8 +456,9 @@ describe("LocalProtocolHandler", () => {
 					path: "local://PLAN.md",
 					content: "# replacement",
 				}),
-			).rejects.toBeInstanceOf(DurableStateUnavailableError);
-			expect(restartedStore.available).toBe(false);
+			).rejects.toThrow(/backing/i);
+			expect(authority.quarantineReason).toMatch(/backing/i);
+			expect(await fs.readFile(localPath, "utf8")).toBe("# tampered");
 			expect(router.fileWritable("local://PLAN.md")).toBe(true);
 		});
 	});

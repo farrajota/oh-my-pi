@@ -193,21 +193,21 @@ interface TrackedVibeTeardown {
 	status: () => VibeTeardownStatus;
 }
 
-/** Observe cleanup without propagating a detached late rejection. */
+/** Observe detached rejection while retaining it for the owning teardown. */
 function trackVibeTeardown(promise: Promise<unknown>, onError: (error: unknown) => void): TrackedVibeTeardown {
 	let status: VibeTeardownStatus = "pending";
-	return {
-		promise: promise.then(
-			() => {
-				status = "settled";
-			},
-			error => {
-				status = "failed";
-				onError(error);
-			},
-		),
-		status: () => status,
-	};
+	const tracked = promise.then(
+		() => {
+			status = "settled";
+		},
+		error => {
+			status = "failed";
+			onError(error);
+			throw error;
+		},
+	);
+	void tracked.catch(() => {});
+	return { promise: tracked, status: () => status };
 }
 
 /** Wait for cleanup only until the caller's shared absolute deadline. */
@@ -633,18 +633,30 @@ export class VibeSessionRegistry {
 		);
 	}
 
-	#finishAgentRelease(
+	async #finishAgentRelease(
 		id: string,
 		ref: InternalAgentRef,
 		task: TrackedVibeTeardown,
 		action: "detach" | "release",
 		registry: AgentRegistry,
-	): void {
-		if (task.status() === "settled") return;
+	): Promise<void> {
+		let fallbackError: unknown;
 		if (task.status() === "pending") {
 			logger.warn(`vibe: timed out waiting to ${action} worker session; detaching registry ref`, { id });
+			try {
+				await unregisterAgentRef(registry, id, ref);
+			} catch (error) {
+				fallbackError = error;
+			}
 		}
-		unregisterAgentRef(registry, id, ref);
+		try {
+			await task.promise;
+		} catch (error) {
+			if (fallbackError !== undefined)
+				throw new AggregateError([error, fallbackError], "Vibe release and fallback cleanup failed.");
+			throw error;
+		}
+		if (fallbackError !== undefined) throw fallbackError;
 	}
 	async #releaseRefWithinDeadline(
 		id: string,
@@ -656,8 +668,8 @@ export class VibeSessionRegistry {
 	): Promise<void> {
 		const task = this.#trackAgentRelease(id, ref, action, registry, tombstone);
 		await waitForVibeTeardown([task], deadline);
-		// A terminal ref must retain its hard-kill identity even if persistence outlives this deadline.
-		if (!tombstone) this.#finishAgentRelease(id, ref, task, action, registry);
+		if (tombstone) await task.promise;
+		else await this.#finishAgentRelease(id, ref, task, action, registry);
 	}
 
 	#trackJobSettlement(record: VibeRecord, job: AsyncJob): TrackedVibeTeardown {
@@ -1074,7 +1086,8 @@ export class VibeSessionRegistry {
 			deadline,
 		);
 		for (const { record, ref, releaseTask, job, jobTask } of cleanup) {
-			if (ref && releaseTask) this.#finishAgentRelease(record.id, ref, releaseTask, "detach", scope.agentRegistry);
+			if (ref && releaseTask)
+				await this.#finishAgentRelease(record.id, ref, releaseTask, "detach", scope.agentRegistry);
 			if (job && jobTask?.status() === "pending") {
 				logger.warn("vibe: timed out waiting for cancelled worker turn; cleanup continues in the background", {
 					id: record.id,
@@ -1225,7 +1238,8 @@ export class VibeSessionRegistry {
 			[releaseTask, ...jobCleanup.map(entry => entry.task)].filter(task => task !== undefined),
 			deadline,
 		);
-		if (registered && releaseTask) this.#finishAgentRelease(record.id, registered, releaseTask, "release", registry);
+		if (registered && releaseTask)
+			await this.#finishAgentRelease(record.id, registered, releaseTask, "release", registry);
 		const pendingJobs = jobCleanup.filter(entry => entry.task.status() === "pending");
 		for (const { job } of pendingJobs) {
 			logger.warn("vibe: timed out waiting for cancelled worker turn; cleanup continues in the background", {
@@ -1277,23 +1291,24 @@ export class VibeSessionRegistry {
 		registry: AgentRegistry,
 	): Promise<void> {
 		if (!record.childSessionFile) return;
+		let hasInit = false;
 		try {
-			const persisted = await SessionManager.peekSessionInit(record.childSessionFile);
-			if (persisted?.init) {
-				await this.#markTerminalRef(
-					record.id,
-					record.ownerId,
-					record.childSessionFile,
-					registry,
-					expected,
-					teardownDeadline,
-				);
-			}
+			hasInit = Boolean((await SessionManager.peekSessionInit(record.childSessionFile))?.init);
 		} catch (error) {
 			logger.warn("vibe: failed to retain terminal worker transcript", {
 				id: record.id,
 				error: error instanceof Error ? error.message : String(error),
 			});
+		}
+		if (hasInit) {
+			await this.#markTerminalRef(
+				record.id,
+				record.ownerId,
+				record.childSessionFile,
+				registry,
+				expected,
+				teardownDeadline,
+			);
 		}
 	}
 

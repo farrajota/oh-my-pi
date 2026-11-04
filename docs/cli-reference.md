@@ -101,6 +101,14 @@ fixed request budgets, and approved selector/destination match booleans.
 | `--export <session>` | Export a session file to HTML and exit. |
 | `--no-title` | Disable title auto-generation (equivalent to the `PI_NO_TITLE` [environment variable](./environment-variables.md)). |
 
+Each saved root also has a durable authority store beside its transcript. Resume, continue and
+restore open it with the backend recorded for that root; `OMP_JOURNALING_BACKEND` (`jsonl` default,
+or `sqlite`) applies only to new roots and `OMP_JOURNALING_CAPACITY` (`off` default, or `xfs`)
+selects the disk-reserve policy ([environment variables](./environment-variables.md#durable-session-authority-backend)).
+A session saved before authority journaling is adopted as JSONL on resume, and a transcript copied
+or moved without its authority bundle is refused with the command to run; see [session authority
+backends](./session-operations-export-share-fork-resume.md#session-authority-backends).
+
 `--continue`, `--resume`, `--restore`, `--fork`, and foreign-session imports require
 persistence and cannot use `--no-session`. `--from-claude` and `--from-codex`
 are mutually exclusive and cannot be combined with `--continue`, `--resume`,
@@ -303,6 +311,7 @@ Run `omp <command> --help` for each command's own flags and examples.
 | `predict` | Compare word-completion engines' live ghost text for a prompt. | |
 | `ps` | List and control daemon-supervised background processes (logs, stop, kill, restart). | |
 | `say` | Synthesize text with the local TTS engine and play it through the speakers. | [tts tool](./tools/tts.md) |
+| `session` | Inspect, repair, migrate, pack, unpack, and mark saved sessions as moved. `authority` and `repair` are dry-run by default (`--apply` performs them); `authority --recover finish\|abort` resolves an interrupted migration or lifecycle operation, and `repair` is the full integrity check (it also lists any JSONL tail recovery file). Expected failures print one `Session ... failed` line and exit 1. | [session operations](./session-operations-export-share-fork-resume.md#session-authority-backends) |
 | `share` | Share a saved session via an encrypted link (same as the `/share` slash command). | [session operations](./session-operations-export-share-fork-resume.md) |
 | `setup` | Run onboarding setup or install dependencies for optional features. | |
 | `shell` | Interactive shell console. | |

@@ -355,23 +355,25 @@ describe("collab guest bus mirror", () => {
 				if (event.type === "metadata_changed") staleMetadataEvents.push(event);
 				if (event.type !== "status_changed" || replacing) return;
 				replacing = true;
-				removedObservedRow = guest.agentRegistry.unregister(initial.id, event.ref);
-				registeredReplacement =
-					guest.agentRegistry.register({
-						id: initial.id,
-						displayName: "Local replacement",
-						kind: "sub",
-						session: null,
-						status: "running",
-						createdAt: 700,
-						lastActivity: 800,
-						history: {
-							modelRole: "replacement-role",
-							resolvedModel: "replacement-model",
-							resolvedModelIsFallback: false,
-						},
-					}).id === initial.id;
-				replacementInstalled.resolve();
+				void (async () => {
+					removedObservedRow = await guest.agentRegistry.unregister(initial.id, event.ref);
+					registeredReplacement =
+						guest.agentRegistry.register({
+							id: initial.id,
+							displayName: "Local replacement",
+							kind: "sub",
+							session: null,
+							status: "running",
+							createdAt: 700,
+							lastActivity: 800,
+							history: {
+								modelRole: "replacement-role",
+								resolvedModel: "replacement-model",
+								resolvedModelIsFallback: false,
+							},
+						}).id === initial.id;
+					replacementInstalled.resolve();
+				})().catch(replacementInstalled.reject);
 			});
 			hostSocket.send({ t: "agents", agents: [racedUpdate] } as CollabFrame);
 			await replacementInstalled.promise;

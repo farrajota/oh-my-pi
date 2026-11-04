@@ -563,6 +563,25 @@ describe("SQLite tool support", () => {
 		expect(readUserEmail(dbPath, 2)).toBe("bob+new@example.com");
 	});
 
+	it("updates SQLite rows by ROWID without shifting the key and update data", async () => {
+		const dbPath = await stampFreshDb("write-update-rowid.sqlite");
+		await writeTool.execute("sqlite-write-update-rowid", {
+			path: `${dbPath}:notes:2`,
+			content: "{ body: 'updated second note' }",
+		});
+
+		const db = new Database(dbPath, { readonly: true });
+		try {
+			expect(db.query("SELECT rowid, body FROM notes ORDER BY rowid").all()).toEqual([
+				{ rowid: 1, body: "First note" },
+				{ rowid: 2, body: "updated second note" },
+				{ rowid: 3, body: "Third; note" },
+			]);
+		} finally {
+			db.close();
+		}
+	});
+
 	it("deletes rows through the write tool with empty content", async () => {
 		const dbPath = await stampFreshDb("write-delete.sqlite");
 		await writeTool.execute("sqlite-write-delete", {

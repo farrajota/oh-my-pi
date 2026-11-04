@@ -38,7 +38,7 @@ This document describes operator-visible behavior for session export, sharing, c
 | `--resume <id\|path>`                   | CLI startup                  | Yes after session creation                    | Opens existing session; a missing recorded cwd may be re-rooted into the current directory | None                                                                                |
 | `/restart`                              | Interactive slash command    | Yes (process relaunches)                      | Keeps configuration flags; resumes a materialized session, otherwise starts fresh          | None                                                                                |
 | `--continue`                            | CLI startup                  | Yes after session creation                    | Opens terminal breadcrumb or most-recent session; creates new one if none exists           | None                                                                                |
-| `omp session repair <session-id-or-path> [--apply]` | CLI command | Dry-run is read-only; `--apply` appends authority closure records only | No transcript switch or provider mutation; apply requires the owning client to be stopped | Status, retained backup directory, and fresh-process resume command |
+| `omp session repair <session-id-or-path> [--apply]` | CLI command | Dry-run is read-only; legacy apply appends verified terminal-ancestor closures; selected format-2 repair is integrity/export inspection only | No transcript switch or provider mutation; legacy apply requires the owning client to be stopped | Diagnosis; legacy repair may retain a backup and report a fresh-process resume command |
 
 ## Export and dump
 
@@ -421,33 +421,714 @@ Ownership: [`src/slash-commands/seance.ts`](../packages/coding-agent/src/slash-c
 
 ## Resume and continue
 
-## Session authority repair
+## Session authority backends
 
-`omp session repair <session-id-or-path>` is a provider-independent inspection and repair command for the durable authority sidecar associated with a saved session. The command accepts a session id or a path to a `.jsonl` file; use a quoted path placeholder when the path contains spaces.
+The durable **authority journal** records the agent tree and its lifecycle state; it is separate
+from the conversation transcript. Let `S` be the complete transcript path, including its `.jsonl`
+suffix. `OMP_JOURNALING_BACKEND` selects the default for a newly allocated root (`jsonl` when
+unset, otherwise exactly `jsonl` or `sqlite`); a saved root's `<S>.authority.json` descriptor pins
+the backend for that root and its descendants. When the environment default differs, OMP continues
+with the pinned backend and prints one line with the dry-run migration command (on stderr in print,
+JSON and RPC modes, or as a notification in the TUI); it also writes a `warn` entry to the log file
+(`logs/omp.<date>.<pid>.log`). Changing or reverting the environment default affects new roots
+only and does not migrate or roll back an existing root.
+
+Each open root runs one authority worker thread, and a process runs at most 8 of them at once (a
+frozen resource cap that bounds threads, descriptors and queued bytes per process). Child agents,
+forks being initialized and short-lived commands share or briefly hold that budget; opening a ninth
+root, for example from an SDK host or ACP server holding more than 8 sessions, fails with
+`Authority worker/session limit of 8 active roots was reached` until another root closes.
+
+Authority requests are bounded per root (`AUTHORITY_RESOURCE_CAPS` in
+`src/registry/authority/client.ts`):
+
+- A command that admits new work may be up to 2 MiB encoded.
+- A **continuation**, a command that only advances an already-admitted record along a step its
+  admission promised (an operation or resource phase such as `effect`, `committed` or `completed`,
+  gate phases, construction progress, root-transition phases, local effect authorization and
+  finalization), is limited to 16 KiB, request id, options and records included. A larger
+  continuation is refused before anything is written or acknowledged, with a known outcome
+  (`AuthorityContinuationTooLargeError`):
+
+  ```text
+  Authority transition continuation request is 20480 bytes; continuations of admitted records are limited to 16384 bytes (requestId, options and records included). Nothing was written.
+  ```
+
+  The record stays at its previous phase, so the caller can retry with a smaller request. The cap
+  applies with capacity `off` and `xfs` alike; under `xfs` it is what lets the reserve price every
+  promised future step at 16 KiB rather than 2 MiB.
+- Responses are bounded at 64 MiB, at most 64 ordinary requests (8 MiB) may be outstanding per root,
+  and each request and each open has a 60 s end-to-end deadline that includes queueing. A request
+  or open that misses it fails as an unknown outcome; a timed-out open terminates its worker,
+  confirms the exit, releases ownership, and the next open recovers the store as after a crash.
+
+Use either backend for a newly allocated root by setting the environment on the launch command:
 
 ```sh
-omp session repair '/path/to/session.jsonl'
+OMP_JOURNALING_BACKEND=jsonl omp
+OMP_JOURNALING_BACKEND=sqlite omp
 ```
 
-Repair is a **dry-run by default**. It reads and validates the complete authority journal, including its hash/history chain, root identity, actor generations, parent lineage, and permission snapshots. A dry-run never changes the journal or its quarantine marker and reports either `clean` or an explicitly `repairable` diagnosis. It refuses unexplained quarantine markers, hash/history corruption, cycles, root or lineage conflicts, scope drift, and other states that cannot be proven safe.
+The unset default remains `jsonl`; these examples select a new root's default and do not authorize
+production rollout or migrate an existing root.
 
-Any actor records that repair appends are limited to verified legacy descendants of terminal ancestors (`retired` or `aborted`). A recognized quarantine marker may also be resolved when whole-history validation proves that no affected actor closure remains. The repair set is closed leaf-first: each affected descendant is retired before its terminal parent is relied on. This is authority recovery, not transcript repair; the session `.jsonl` and its conversation history are preserved.
+For `/path/to/session.jsonl`, the descriptor is
+`/path/to/session.jsonl.authority.json` (not `/path/to/session.authority.json`). The selected
+payloads are `<S>.authority.jsonl` and `<S>.authority.sqlite`, with SQLite sidecars
+`<S>.authority.sqlite-wal` and `<S>.authority.sqlite-shm` when present. After a clean exit with capacity
+`off` a SQLite root leaves neither `-wal` nor `-shm`; with capacity `xfs` a 0-byte `-shm` may remain.
+Neither sidecar indicates damage. The ownership lock is
+`<S>.authority.lock`; the legacy journal and retained denial fence are
+`<S>.authority-v1.jsonl` and `<S>.authority-v1.jsonl.quarantine`. Migration records, stages, and
+backups use `<S>.authority.migration.<id>.json`, `<S>.authority.stage.<id>/`, and
+`<S>.authority.backup.<id>/` respectively. A rotated JSONL store adds
+`<S>.authority.segment.<k>.jsonl`, `<S>.authority.segment.<k>.index.json` and
+`<S>.authority.snapshot.<n>.json` ([JSONL segment rotation](#jsonl-segment-rotation)). A
+`<S>.authority-recovered.<offset>.<sha256>.bin` file is not part of the bundle: it holds bytes a
+JSONL open cut from a torn tail ([interrupted appends](#jsonl-segment-rotation)).
 
-After reviewing a repairable dry-run, stop the client that owns the session before applying:
+An empty, padded, uppercase or unknown value of either variable fails with one line, for example
+`Invalid OMP_JOURNALING_BACKEND value "SQLITE"; expected exactly "jsonl" or "sqlite"`, before any
+authority file is written. Both variables are read once per process, at CLI startup or at the top of
+`createAgentSession` for SDK hosts.
+
+### Authority capacity and platform support
+
+`OMP_JOURNALING_CAPACITY` selects physical capacity accounting: exactly `off` (the default when
+unset) or `xfs`. It is a runtime admission policy, not a store format, so a root created under one
+value opens under the other without migration.
+
+```sh
+omp                              # capacity off: any supported host and filesystem
+OMP_JOURNALING_CAPACITY=xfs omp  # physical reserve: Linux x86_64 on XFS only
+```
+
+With `xfs`, OMP reserves disk for each acknowledged authority write and its promised continuations
+from an anonymous, unlinked file in the session directory (not another authority store or backup).
+The SQLite payload itself is also allocated ahead of use: a new or small `<S>.authority.sqlite` is
+about 9 MB under `xfs` (about 0.1 MB under `off`), so its size says little about its history.
+It requires Linux x86_64 with glibc, kernel `PIDFD_THREAD` (6.9+), the native calls `fallocate`,
+`statx`, `fcntl` and `ioctl` (`FS_IOC_FSGETXATTR`, `FS_IOC_FIEMAP`), the source-pinned SQLite 3.53.4
+build, and the session directory on XFS. Backing must be dense, private, and in the same XFS project
+as the allocation it backs; project 0 is permitted and project quotas are not required. An
+unsupported host, kernel or filesystem is refused before any authority write with one line, for
+example `OMP_JOURNALING_CAPACITY=xfs requires the session directory on XFS, but <dir> is on
+filesystem type 0x794c7630; unset OMP_JOURNALING_CAPACITY (or set it to "off") ...`. Resuming an
+existing root under the refusal changes no file. Starting a new root writes no authority file, but
+the new transcript `S` already exists as a header-only stub (about 600 bytes, no messages) when the
+check runs; it holds no conversation and can be deleted, or resumed later with capacity `off`.
+
+With `xfs`, a funded transfer allocates each step (24 KiB) into its target before it shrinks the pool,
+so no other writer can take the space between the two. One residual window remains under real
+pressure: when the filesystem has no room outside the pool for the next step, the target allocation
+fails with `ENOSPC`/`EDQUOT`, and OMP releases pool data for that step and retries the allocation once. Between
+that release and the retry a concurrent writer outside OMP (or another root on the same filesystem)
+can take the freed blocks; the retry then fails and the reserved continuation is refused with a known
+outcome before acknowledgement. Nothing acknowledged is lost, but a promised continuation is not
+guaranteed when other writers compete for the last free blocks; keep the filesystem from running that
+close to full.
+
+A second residual window concerns other processes that change the payload's extents. Within one
+SQLite group commit, the first write certifies the store's backing with a full extent readback and
+later writes in the same group reuse that certificate while every file's size is unchanged. If another
+process reflink-copies the session directory (coreutils 9 `cp` reflinks by default on XFS) or punches
+a hole in the payload during that window, the shared or freed extents below end of file need new
+blocks when SQLite writes them, which can fail with `ENOSPC`. The worst case is an unknown outcome
+for that group and an unavailable store until the next open; nothing in the group was acknowledged,
+so there is never `ENOSPC` after an acknowledgement. Do not copy or modify a live root's files; copy
+a stopped root, or use `omp session pack`. A per-write recheck of only the WAL tail would not close
+this window, because SQLite also rewrites WAL frames from the start after a restart and database pages
+below end of file at checkpoints.
+
+With `off`, the client opens no capacity file and the drivers get no capacity option. On a full disk
+an authority write fails as it did before capacity accounting: the write is refused or reported as
+an unknown outcome, and a refusal before acknowledgement is not guaranteed.
+
+What `xfs` costs, measured on one Linux x86_64 XFS host with histories of 10,000 to 1,000,000
+terminal rows (the reserve is the space held in the anonymous pool, not data written):
+
+| | SQLite | JSONL |
+| --- | --- | --- |
+| Reserve per open (unresolved) operation | about 5.5–6.3 MiB | about 0.56 MiB |
+| Pool held right after open | about 43 MiB (10k rows) to 59 MiB (1M rows) | about 8 MiB |
+| Pool with 1,000 open operations | about 5.6–6.3 GiB | about 0.56 GiB |
+| Open time | adds roughly 0.3–0.5 s | adds little |
+
+The reserve depends on the number of open operations, not on history length. Size the session
+filesystem for the open operations you expect: 100 concurrent open SQLite operations hold about
+580 MiB. Capacity accounting also costs some latency and throughput (see the limitations below).
+
+On Windows, file privacy relies on the user profile directory ACLs rather than POSIX mode bits: Node reports modes such as `0o666` there, so the group/other mode checks are skipped and every other authority check still applies.
+
+| | `off` on Linux (any arch) | `off` on macOS / BSD | `off` on Windows | `xfs` |
+| --- | --- | --- | --- | --- |
+| Hosts and filesystems | Any local filesystem (ext4, btrfs, XFS, tmpfs, overlayfs) | Any local filesystem | Any local volume | Linux x86_64 on XFS only; anything else refused before writing |
+| Root exclusion | Non-blocking exclusive `flock(2)` on the transcript and the persistent `<S>.authority.lock` anchor | Same `flock(2)` | Process-owned named kernel object keyed by the transcript's and anchor's volume serial and file index | Same as Linux |
+| Worker lifetime before ownership release | Kernel exit of the worker's exact thread (`pidfd_open` with `PIDFD_THREAD`) on kernel 6.9+ with glibc; otherwise the worker `close` event | Worker `close` event | Worker `close` event | `PIDFD_THREAD` required |
+| Disk full | No reserve; write fails as before capacity accounting | Same | Same | Refusal before acknowledgement; funded continuations still complete |
+| SQLite | Any Bun SQLite build | Any Bun SQLite, including the system library | Any Bun SQLite | Source-pinned 3.53.4, Linux x86_64 ABI and VFS readback |
+| Durable sync | `fsync(2)` | `fcntl(F_FULLFSYNC)`, which flushes the drive cache; SQLite also runs `fullfsync=ON` and `checkpoint_fullfsync=ON`. If the full flush fails (a filesystem without it), OMP falls back to `fsync(2)`, logs a `warn` entry once per distinct failure reason in each thread that syncs (the store worker and the main process), and shows a one-line notice once per process and session directory. The open probes the session directory once per process: a successful probe is remembered, so later opens there issue no extra drive-cache flush | `FlushFileBuffers` (Node `fsync`) | `fsync(2)` |
+| Network filesystem | Not supported; NFS, SMB/CIFS, 9p, Ceph and AFS session directories open with a one-line notice | Not supported; `nfs`, `smbfs`, `afpfs` and `webdav` session directories open with the notice | Not supported; UNC session paths open with the notice | Refused: XFS required |
+
+Every row gives an acknowledged write the same power-loss durability: SQLite runs WAL with
+`synchronous=FULL`, foreign keys and a finite busy timeout, and JSONL writes, syncs and reads back
+each frame before acknowledging it; every authority sync (file, directory, descriptor, ownership
+anchor, migration and lifecycle step) goes through the platform's full flush in the row above. On
+macOS a plain `fsync(2)` only hands data to the drive, which may keep it in a volatile cache across a
+power loss, so OMP never relies on it unless `F_FULLFSYNC` itself fails. When it fails, opening the
+root prints one line, the same way as the network-filesystem notice below, and logs it as `warn`:
+
+```text
+Authority: F_FULLFSYNC is not available for /path/to/sessions (fcntl(F_FULLFSYNC) failed with errno 45); OMP falls back to fsync(2), so acknowledged session writes may be lost from the drive cache on a power loss.
+```
+
+The live owner holds the
+SQLite database in exclusive locking mode and proves it at open: after `BEGIN EXCLUSIVE; COMMIT`, a
+second read-only connection must be refused with `SQLITE_BUSY`, or the open is refused. SQLite stores
+must use 4 KiB pages, no auto-vacuum and UTF-8, so they stay openable under `xfs`.
+
+What changes off Linux:
+
+- **Worker lifetime.** Without `PIDFD_THREAD`, the client confirms that a worker stopped through
+  Bun's worker `close` event, which Bun sends after the worker's JavaScript runtime has shut down.
+  No worker JavaScript runs after it, but the kernel does not confirm that the native thread has
+  exited, so native teardown on that thread can still be finishing when ownership is released. The
+  worker closes its store before acknowledging close; a store left open by a crashed worker still
+  holds its own SQLite file lock, so another process sees the store busy rather than writing to it.
+- **Windows exclusion.** Windows has no `flock`. The lock is a named kernel object, released by
+  Windows when the owning process exits. It excludes other processes on the same machine that open
+  the same physical files. The object is named by a SHA-256 over the exact (64-bit) volume serial and
+  file index, read as BigInts: as JavaScript numbers, file indexes at or above 2^53 (NTFS ids with a
+  high sequence number) round together, which made two files share a lock and the second open fail
+  with a false `Authority ownership is already held`. The 128-bit `FILE_ID_INFO` id (ReFS) is not
+  read; where the 64-bit index is not unique, the worst case is the same false "already held"
+  refusal, never two owners. It was not exercised on Windows for this release.
+- **Network filesystems** are not supported on any platform: `flock` there is either local to one
+  client or emulated (Linux NFS maps it to whole-file POSIX locks, which any close of the file in the
+  process drops), so exclusion between hosts is not guaranteed. With capacity `off`, OMP detects
+  them and **warns, without refusing**: Linux by `statfs` type (NFS `0x6969`, SMB `0x517b`, CIFS
+  `0xff534d42`, SMB2 `0xfe534d42`, 9p `0x01021997`, Ceph, AFS), macOS by `f_fstypename` (`nfs`,
+  `smbfs`, `afpfs`, `webdav`), and Windows by a UNC session path (including a mapped network drive,
+  which canonicalizes to one). The notice is printed once per process and session directory, the same
+  way as the backend-mismatch line (stderr in print, JSON and RPC modes, a TUI notification), and
+  logged as `warn`:
+
+  ```text
+  Authority: /home/me/.omp/sessions/... is on a network filesystem (nfs); this host's processes still exclude each other, but cross-host exclusion is not guaranteed. Do not open the same session from two machines at once.
+  ```
+
+  FUSE mounts (sshfs, virtiofs) share one filesystem type with local FUSE filesystems and are not
+  detected. With `xfs` the XFS requirement already refuses every network filesystem.
+
+Authority exclusion never spans hosts. OMP binds each persistence worker before opening the
+authority payload, and shutdown and replacement wait for the confirmation in the table, not merely
+the return from `Worker.terminate()`.
+
+### SQLite store format
+
+A SQLite authority payload uses physical schema v4 (`PRAGMA user_version` 4, application id
+`0x4f4d5042`). Each current-state table and the control table is one B-tree keyed by a compact order
+key, so a commit touches about a quarter of the B-trees the earlier v3 layout did. Each commit is one
+immutable frame row that also holds its receipt; one unique index serves idempotent replay. The
+frame body is stored once, with values the row already holds and records it repeats replaced by
+in-frame references, and is zstd-compressed when that is smaller. Decoding a frame needs no other
+frame. Frame and receipt hashes cover the logical frame, so they do not depend on the physical
+format.
+
+This build does not open a v3 store (one written before this format change). Opening one fails with
+the command that converts it:
+
+```sh
+omp session authority '/path/to/session.jsonl' --to sqlite --apply
+```
+
+The conversion is an ordinary offline migration whose target is a new v4 store. It reads the v3 store
+once, verifies the complete history, keeps every frame hash, receipt, row and control unchanged, and
+gives the root a new incarnation. It uses the same manifest, backup (the exact v3 payload stays in
+`<S>.authority.backup.<id>/`) and `--recover finish|abort` contract as a backend migration, and it is
+refused while unresolved external effects or claims remain. Without `--apply` it is a dry run that
+reports `sqlite -> sqlite`. `--to jsonl --apply` also accepts a v3 source. Builds that write v3 cannot
+open a v4 store, and a v4 store is never converted back to v3. A store reporting any other physical
+version is refused.
+
+Store size grows linearly with history. On the synthetic qualification histories a v4 store held
+about 7.3 MiB at 10,000 terminal rows, 72 MiB at 100,000 and 719 MiB at 1,000,000; a JSONL store of
+the same history held about 25, 255 and 2,166 MiB, and a v3 store about 28, 279 and 2,809 MiB.
+
+### Group commit
+
+Both backends let concurrent commands of one root share one durable sync, without weakening it.
+The worker groups only the mutations already queued when the first member runs: there is no wait
+window, so a lone command syncs immediately. A group holds at most 64 commands or 8 MiB of requests;
+reads, recovery, quarantine, close and export are barriers that sync and acknowledge the open group
+first. Every member is acknowledged only after the sync that covers it, responses keep request
+order, and a failed sync reports every member of the group as an unknown outcome.
+
+- **SQLite** runs the group as one `BEGIN IMMEDIATE ... COMMIT` transaction with a savepoint per
+  member, so a refused member rolls back to its savepoint without touching the others, and the one
+  `COMMIT` is the sync (WAL, `synchronous=FULL`).
+- **JSONL** appends each member's complete line and syncs once; see [JSONL segment
+  rotation](#jsonl-segment-rotation) for the member marker and torn-tail rules.
+
+Single-command latency is bounded below by the disk's sync time on both backends. On the
+qualification host (sync about 5–6 ms), one command at a time reached about 105–150 commands/s on
+either backend with capacity `off` (95–150/s with `xfs`), and 16 concurrent commands about
+610–1,040/s with `off` (about 370–620/s with `xfs`), across three measurement rounds.
+
+### JSONL segment rotation
+
+A JSONL authority is a sequence of segments so that opening it reads the current state and a short
+tail, not the whole history. `<S>.authority.jsonl` is always the **active segment**. Rotation adds
+three kinds of sibling files, all private (`0600`) and all members of the authority bundle:
+
+| File | Contents |
+|---|---|
+| `<S>.authority.segment.<k>.jsonl` | Sealed segment `k`: the exact bytes the active segment held when it was sealed. |
+| `<S>.authority.segment.<k>.index.json` | One JSON line: segment `k`'s byte length and SHA-256, its revision range and head hash, every receipt it introduced (sorted by key), and the length and SHA-256 of index `k-1`. |
+| `<S>.authority.snapshot.<n>.json` | One JSON line: the rows and non-receipt controls at the start of active segment `n`, its revision, head hash and generation high-water, the length and SHA-256 of index `n-1`, and the highest owner epoch of any sealed receipt. |
+
+Segment 0 starts with the original format-2 header line (`"version":2`, optionally seeded), so a store
+that never rotated, or that was written before rotation existed, is a single segment 0 and opens
+unchanged. Every later segment starts with a `"version":3` header naming its segment number and its
+base: the revision, head hash and generation high-water it continues from, and the name, length and
+SHA-256 of its snapshot. A binary that only knows version 2 refuses a rotated store instead of
+misreading it, and this binary refuses any header version other than 2 or 3.
+
+**Open** verifies the snapshot against the digest in the active header, loads it, and replays only the
+active segment. The first commit after open re-proves only the active segment's bytes. Sealed
+segments and indexes are read only by full verification (`omp session repair`, migration, packing),
+which replays every segment against its index and checks the snapshot against the replayed state at
+its boundary, and by evidence export, which reads the full frame history and every receipt back. A
+receipt lookup by request id alone, or for an earlier owner epoch, consults the sealed indexes;
+an owner's own retries never do. The first such lookup after an open reads and verifies every sealed
+index once to build an in-memory lookup (about 160 bytes per sealed receipt); it took about 0.45–0.8 s
+on a 1,000,000-row store and runs inside that command's 60 s deadline. Later lookups are
+sub-millisecond.
+
+**Rotation** happens before the append of a command that is a new admission, once the active segment
+holds at least the larger of 4 MiB and the size of the snapshot it started from, or 16,384 frames.
+Its steps are each durable before the next: publish index `k` and snapshot `k+1` (temporary file,
+fsync, rename, directory fsync); hard-link the active inode to `segment.<k>.jsonl`; publish the
+segment `k+1` header over `<S>.authority.jsonl`, which commits the rotation; then remove snapshot
+`k`. A crash before the commit point leaves the active segment as it was, and the next owner (or a
+pack, move or migration under the authority lock) removes the partial files and the extra hard link;
+a crash after it leaves the complete new layout and only a stale snapshot to remove. Capacity funds
+the new files and the fresh segment before anything is written and refuses before acknowledgement; a
+command that consumes an already funded promise defers rotation instead.
+
+Do not delete, rename or edit rotation files by hand: a store missing a sealed segment or index fails
+closed. Packing, restore, move, delete and migration carry them with the store.
+
+**Conversions** that write a JSONL store from an existing history (SQLite to JSONL, a legacy v1 upgrade
+including automatic adoption, a bundle restore or archive replacement) write it already rotated once the
+seeded history reaches the rotation threshold: segment 0 holds the seeded header, and the store's first
+open reads snapshot 1 and an empty active segment instead of replaying the whole history. The rotation
+files are staged and published before the payload, under the same migration and restore recovery
+(`--recover finish|abort`); an abort removes them with the payload. Shorter histories stay one segment.
+
+**Group members.** In a [group commit](#group-commit) each JSONL command appends its own complete
+line without a sync, and one sync covers the group before any of them is acknowledged. A group
+member's line starts with one space (insignificant JSON whitespace) that marks it as a member.
+Rotation never happens inside a group: only a group's first command may rotate.
+
+**Interrupted appends.** Every acknowledgement follows a sync that covers its line through the final
+newline, so the bytes a crash leaves after the last complete line were never acknowledged. When the
+active segment does not open, the next open cuts its tail only when everything after the last
+complete, valid frame line is one of two crash shapes:
+
+- zeros through end of file (the file size reached disk but the data did not); or
+- one newline-less fragment that starts like a frame line (optionally after the group-member space),
+  optionally followed by zeros through end of file that start on a 512-byte boundary.
+
+Anything else refuses to open and leaves the file byte-for-byte unchanged: a complete line after a
+zero run (frame or foreign), any non-zero byte after zeros, zeros that start inside a written block,
+foreign text, or a tail longer than one write episode can produce. The resume refusal names the
+`omp session repair <S>` dry-run as the diagnosis step. Repair, migration and packing verify a
+private copy; when they meet the same tail they name the real `S` and its offset, state that the
+store cannot be repaired automatically, and point to
+[Refused authority stores](#refused-authority-stores) instead of naming repair again. Zeros inside
+synced data come only from a faulty or lying flush
+(a drive or VM write cache), and the lines after them may be acknowledged intents whose effects
+already happened, so they are kept as evidence rather than dropped.
+
+Before cutting, the open copies the dropped bytes to a private (`0600`) recovery file beside the
+store, `<S>.authority-recovered.<offset>.<sha256>.bin`, where `<offset>` is where the cut starts and
+`<sha256>` is the digest of the dropped bytes; it syncs that file and the directory, then truncates
+and syncs the segment, and logs a `warn` entry with the recovery file's path. The open also prints
+one line naming the file, the same way as the network-filesystem notice (stderr in print, JSON and RPC
+modes, a TUI notification):
+
+```text
+Authority: an interrupted write left an unacknowledged torn tail in this session's JSONL store; it was cut and its bytes are kept in /path/to/session.jsonl.authority-recovered.<offset>.<sha256>.bin (inspect it, then delete it when no longer needed).
+```
+
+The recovery file is outside the authority bundle on purpose (its name does not start with
+`<S>.authority.`). Repair, migration, packing, moving and adoption recognize its exact name: it is
+never treated as authority evidence or copied into a bundle, so it never blocks those commands, and a
+move or pack leaves it where it was. `omp session repair <S>` lists it on a `Recovery file: <path>`
+line and still reports `Status: clean` when the store is clean. It is operator
+evidence: inspect it (`cat -v`, or compare its frames with the transcript), then delete it with `rm`
+once you have no further use for it. One shape remains indistinguishable from a torn append: if the
+last block of the final acknowledged frame reads back as zeros (a lost write of a synced block), that
+frame is cut like a torn append; its bytes are kept in the recovery file. If an earlier open was
+killed after writing the recovery file but before cutting, the next open checks that the existing
+file is a private regular file holding exactly the bytes it is about to cut (and refuses otherwise),
+syncs it and the directory again before the cut, and prints the same notice.
+
+### Refused authority stores
+
+Some authority states have no recover command: a tail kept as evidence (above), a missing selected
+payload, both a JSONL and a SQLite payload, a corrupt descriptor or one whose lock identity or root
+UUID disagrees with the anchor or transcript, a legacy journal without its denial fence, or authority
+files without a committed descriptor on a new root. The resume refusal, and the refusal from repair,
+migration or packing, is one line that ends with `keep every <name>.authority* file unchanged and
+follow "Refused authority stores" in docs/session-operations-export-share-fork-resume.md`. The session
+stays unavailable; nothing is changed until you act. To recover:
+
+1. **Preserve the evidence first.** Stop every client that has the session open, then copy the
+   transcript and every sibling whose name starts with `<S>.authority` (including
+   `<S>.authority-v1.jsonl*` and any `<S>.authority.backup.<id>/` directory) to a safe place, for
+   example `cp -a '<S>' '<S>'.authority* /safe/place/`. Do not delete, rename or truncate any
+   authority file before this copy exists; deleting them blindly discards the record of external
+   effects (operations, claims, receipts) and lets a later resume start an empty authority over
+   work that already happened.
+2. **Inspect the refused store.** The refusal names the file and, for a tail, the byte offset after
+   the last valid frame. `ls -la '<S>'.authority*` shows the files and their modes (authority files are
+   `0600`); `cat '<S>'.authority.json` shows the descriptor and which payload it selects. For a refused
+   JSONL tail, `tail -c +<offset+1> '<S>'.authority.jsonl | cat -v` shows the bytes after the last valid
+   frame: zeros followed by complete frame lines mean a lost write inside synced data, and those lines
+   may be acknowledged intents whose effects already happened.
+3. **Choose a safe option.**
+   - **Restore from the migration backup**, if `<S>.authority.backup.<id>/` exists and the root has
+     not accepted writes since that migration (a backup older than later writes is stale and must not
+     be restored). The backup holds the whole pre-migration bundle: its descriptor, payload files and
+     legacy files. Move every `<S>.authority*` sibling except `<S>.authority.lock` and the backup
+     directory into a new directory (keep them), copy every file of the backup except
+     `<S>.authority.lock` and `migration.json` back beside the transcript with mode `0600`, and keep
+     the existing `<S>.authority.lock` in place (the descriptor names that file's identity). Then run
+     `omp session repair '<S>'`; it must report `clean` before you resume, and the root resumes on
+     its pre-migration backend.
+   - **Review the bytes after the last valid frame by hand.** If the review shows they are not
+     acknowledged history (for example foreign text appended to the file), truncate the payload to
+     the offset named in the refusal, on the preserved copy first, then on the real file, and run
+     `omp session repair '<S>'` until it reports `clean`. If the bytes include frames that may have
+     been acknowledged, do not truncate: the external effects they record must be reconciled first.
+   - **Otherwise** leave the session unavailable, keep the preserved copy for later review, and
+     continue the work in a new session.
+
+`omp session repair`, `omp session authority ... --recover` and resume never delete these files for
+you, and the steps above never require deleting an authority file.
+
+Two refusals have a narrower cause:
+
+- **Lock identity mismatch after copying or moving a session directory.** A plain `cp -r`, a
+  directory copy, or a move across filesystems gives `<S>.authority.lock` a new inode, so the
+  descriptor no longer matches it and none of the options above recovers the copy. Move or transfer
+  sessions with `omp session pack` and `omp session unpack`, which carry the authority bundle. Keep the
+  original directory if it still exists; resume it there instead.
+- **A recovery file with "different bytes" after an interrupted resume.** If an earlier resume was
+  interrupted while writing `<S>.authority-recovered.<offset>.<sha256>.bin`, that file can be empty or
+  shorter than the bytes it names, and every later resume refuses with "exists with different bytes"
+  while `omp session repair` still reports `clean` (the payload has not been cut yet, so nothing was
+  lost). Check that the file is a prefix of the payload bytes from `<offset>` (for example
+  `cmp <(tail -c +<offset+1> '<S>'.authority.jsonl) '<recovery file>'` reports EOF on the recovery
+  file, not a difference), move that recovery file aside, then resume: the resume writes it again in
+  full before cutting.
+
+The transcript `S` remains the source for conversation messages, tool results, branches, and
+compaction summaries. This flag does not switch transcript storage, the separate Hub custody
+journal, artifacts, or unrelated SQLite caches. `--no-session` creates no durable authority
+payload. An unavailable selected payload, unknown commit outcome, or worker failure remains
+unavailable: there is no automatic fallback to another format and no retry of an external callback
+to guess whether an effect happened.
+
+After SQLite has accepted writes, returning a root to JSONL requires explicitly migrating the
+current SQLite state; the pre-migration JSONL backup is stale and must not be restored over newer
+state. The supported target is the versioned JSONL format in this release, not arbitrary
+older-binary compatibility.
+
+Exclusion and worker-lifetime guarantees per platform, and what `OMP_JOURNALING_CAPACITY=xfs`
+adds, are in [authority capacity and platform support](#authority-capacity-and-platform-support).
+
+Operation-scoped generated-file header protection also requires accessible Linux
+`/proc/self/fd`. With the guard enabled, OMP reads the authorized open inode through that
+interface and fails closed if it cannot establish that binding; it does not reopen the target
+pathname as a fallback.
+
+Session-path-scoped JSON and binary input copying, and scoped local AST directory traversal,
+also require accessible `/proc/self/fd`. Native query and persistent binary-analysis hosts receive
+private snapshots rather than a parent process's original input descriptor. Scoped JSON and SQLite
+reads use scratch snapshots; scoped IDA databases use private cached snapshots rather than opening
+the original `.i64` or `.idb` in place. This adds temporary-space and full-input copying I/O costs.
+SQLite captures include existing WAL/SHM inputs and refuse a source that changes during capture.
+The private analysis cache is not an authority store.
+Scoped JSON reads also require successful removal of their private scratch snapshot. Cleanup
+failure is reported even if the query succeeded; simultaneous query, cleanup, and admitted-input
+close failures preserve their original causes rather than reporting successful output.
+
+Ordinary copied-root admission is forbidden on every host. A UUID is not a
+global lock: `flock` coordinates only participants sharing the same physical anchor and kernel.
+Explicit restore is separate and requires the operator/caller to stop or fence the source root and
+reconcile external effects newer than the backup before exposing restored grants. The restore input
+does not identify its source, so OMP cannot locate, lock, fence, or detect a disconnected original;
+automatic safety proof across disconnected inode or network domains is unsupported. A fresh restored
+incarnation does not prove the source authority was revoked.
+
+### Sessions saved before authority journaling
+
+Resuming a root that has no `<S>.authority.json` descriptor (a session saved by an earlier release)
+adopts it automatically, under the root's exclusive ownership, when OMP can account for every
+authority artifact beside the transcript:
+
+| Evidence beside `S` | Resume does |
+|---|---|
+| None (a lone empty `<S>.authority.lock` counts as none) | Creates a fresh versioned JSONL authority store |
+| A clean `<S>.authority-v1.jsonl` journal and nothing else | Upgrades it in place to versioned JSONL with the same conversion as `omp session authority <S> --to jsonl --apply`: the original journal is kept in `<S>.authority.backup.<id>/`, and the legacy path keeps its permanent denial fence |
+
+Adoption always selects JSONL, whatever `OMP_JOURNALING_BACKEND` says; that variable still applies
+only to new roots, and a descriptor written by an earlier resume or migration always wins. Use
+`--to sqlite --apply` afterwards to move an adopted root to SQLite. The transcript bytes are never
+rewritten. Adoption prints one line, on stderr in print, JSON and RPC modes or as a notification in
+the TUI, for example:
+
+```text
+Authority: upgraded this session's legacy v1 authority journal to versioned JSONL; original kept in /path/to/session.jsonl.authority.backup.<id>
+```
+
+It also writes an `info` log entry with the message `Adopted pre-journaling session authority` and the
+fields `sessionFile`, `kind` (`bootstrapped` for a new store, `upgraded` for a legacy journal),
+`backend` (`jsonl`) and, for an upgrade, `backupDirectory`.
+
+Anything else refuses before changing a file, with the command to run:
+
+| Evidence | Command named in the refusal |
+|---|---|
+| A legacy journal with unresolved effects or claims | `omp session authority <S> --to jsonl` (the dry-run lists them) |
+| A corrupt or quarantined legacy journal; a denial fence, payload, backup or legacy repair backup without a descriptor; a lock file with content; an unrecognized `<S>.authority*` sibling | `omp session repair <S>` |
+| The backup of an aborted upgrade beside its legacy journal | `omp session authority <S> --to jsonl --apply` |
+| A migration record (`<S>.authority.migration.<id>.json`) | `omp session authority <S> --recover finish` (or `--recover abort` before the target is selected) |
+| A migration stage, restore record, or hidden lifecycle marker (`.<name>.authority-*`) | `omp session authority <S> --recover finish` |
+| An initialization that never became active (`initializing` descriptor or an interrupted descriptor write) | `omp session authority <S> --recover abort` |
+| An older client still writing the legacy journal | Stop it, then `omp --resume <S>` |
+| A transcript whose header `authorityRoot` names another path: a copy or move that left its authority bundle behind, or a child agent transcript (task subagent, seance or `/tan` fork, stamped with the root that owns it) | `omp --resume <stamped path>`; or move the session with its bundle (`omp session pack`/`unpack`), or start a new root from it with `--fork` |
+
+Transcripts written by this release record `authorityRoot`, the canonical path of the transcript
+whose authority governs them, in their header. A child agent's transcript (task subagent, seance,
+`/tan`) records the root that owns its actor: its parent's own stamp, so a subagent of a subagent
+names the top root. Task subagent transcripts created before this change recorded their own path and
+still adopt as roots when resumed directly. The path is canonicalized once, the same way for the stamp
+and for every check, through the native realpath (which resolves `subst` and mapped drives on
+Windows and returns the on-disk case on case-insensitive macOS volumes). Forks and continuations get their own path, a move
+through `omp session` lifecycle commands or `/move` updates it together with the bundle, and shares
+and HTML exports omit it. A transcript without the field (saved by an earlier release) is adopted by
+the evidence rules above.
+
+A crash during adoption leaves either the untouched session or recoverable state: an interrupted
+upgrade is a staged migration that `--recover finish|abort` resolves, and an interrupted fresh
+initialization refuses until `--recover abort` removes the never-activated store (only when it holds
+no authority records), after which the next resume starts over. When several processes resume the
+same root at once, exactly one adopts it; the others either open the adopted store or fail with
+`Authority ownership is already held`.
+
+### Migrate or upgrade explicitly
+
+`omp session authority <session-id-or-path> --to jsonl|sqlite` is a dry-run by default: it inspects a
+migration without changing the authority artifacts or transcript, and only `--apply` performs it.
+Expected refusals (unknown session, unresolved claims, ownership held by a live client) print one
+line, `Session authority failed for <path>: <reason>`, and exit 1. `omp session repair`, `pack`,
+`unpack` and `moved` report authority refusals (a quarantined or torn store, a pending recovery) the
+same way, as `Session <action> failed for <path>: <reason>`, without a stack trace; when a refusal
+also left cleanup failures, the line lists each of them after the primary reason. Transfer errors
+from `pack`/`unpack` print one `error: <message>` line. Usage errors print usage, and an unexpected
+internal error in `pack`, `unpack` or `moved` (a `TypeError` or similar defect) is not flattened: it
+prints its stack so it can be reported. Use a session ID or quote a transcript path containing
+spaces:
+
+```sh
+omp session authority '/path/to/session.jsonl' --to sqlite
+```
+
+After reviewing the dry-run, stop the client that owns the session, then add `--apply` to perform
+the migration. Both JSONL-to-SQLite and SQLite-to-JSONL migrations are supported; the same explicit
+command upgrades a legacy `.authority-v1.jsonl` journal into the selected current format (resume does
+this automatically for a clean journal, always to JSONL; see above). Migration
+preserves a backup and is refused while unresolved external effects or claims remain. If SQLite
+has accepted newer writes, the reverse migration uses the current SQLite state; its older JSONL
+backup is not a rollback source.
+
+```sh
+omp session authority '/path/to/session.jsonl' --to sqlite --apply
+omp session authority '/path/to/session.jsonl' --to jsonl --apply
+```
+
+If a migration was interrupted, inspect and explicitly choose how to resolve its staged state:
+
+```sh
+omp session authority '/path/to/session.jsonl' --recover finish
+omp session authority '/path/to/session.jsonl' --recover abort
+```
+
+For backend migration, `finish` completes the staged conversion; `abort` restores the source and
+works until the descriptor selects the target. It is refused once the migration reaches
+`descriptor-published` or `ready`, because the target is then selected and only `finish` is safe.
+`--recover abort` also removes an initialization that never became active (its descriptor is still
+the first `initializing` revision and its payload holds no authority records); `finish` refuses that
+state. When there is nothing to recover, `--recover finish|abort` prints `Status: recovered` and
+`Authority: <backend>` and exits 0. Backend conversion preserves the conversation transcript bytes.
+`omp session repair` handles legacy v1 repair and selected format-2 integrity/export inspection;
+see the branch-specific behavior below.
+
+Runbook for one root (the same steps apply in either direction and to a v3-to-v4 conversion):
+
+1. `omp session repair '<S>'` — full integrity check of the current store; it must report `clean`.
+2. `omp session authority '<S>' --to sqlite` — dry run. It reports `Status: dry-run` and the
+   direction, or refuses with one line (unresolved effects or claims, rotation recovery pending, an
+   interrupted migration). A dry run changes nothing and may run while the session is open.
+3. Stop every client that has the session open (including child agents and ACP or SDK hosts).
+   `--apply` takes exclusive ownership and refuses with `Authority ownership is already held` while
+   a client still holds it.
+4. `omp session authority '<S>' --to sqlite --apply` — prints `Status: migrated` and
+   `Authority: <from> -> <to>`. The original payload stays in `<S>.authority.backup.<id>/`; the
+   transcript bytes are unchanged. When the root already uses the requested backend, the command
+   prints `Status: already-selected` and `Authority: <backend> -> <backend>`, changes nothing and
+   exits 0; the dry run (step 2) reports the same status.
+5. If step 4 was interrupted (crash, kill, full disk), the next resume refuses and names the
+   command: run `--recover finish`, or `--recover abort` while the descriptor still selects the
+   source. Do not delete the migration record, stage or backup by hand.
+6. `omp session repair '<S>'` again, then resume normally. Remove the backup directory only once you
+   no longer need to return to the pre-migration payload; after the migrated root has accepted
+   writes, that backup is stale and is never a rollback source.
+
+Conversion reads and writes the history in a streaming pass, so its memory does not grow with the
+history: on the qualification host the peak resident set stayed at about 230–250 MiB for a
+1,000,000-row history in both directions. Its time does grow linearly: about 25–35 s at 10,000
+terminal rows, 4.5–5.5 minutes at 100,000, and about 51 minutes at 1,000,000 (v3 SQLite to v4, and
+v4 SQLite to JSONL, each measured under `nice`/`ionice` idle priority). Every step verifies the
+complete history, so plan for the source store, its backup copy, a disposable verification copy and
+the target to exist at once: roughly three times the source store plus the target. A JSONL target
+is about three times the size of the equivalent SQLite v4 store. A legacy v1 journal is the
+exception to bounded memory: it is read whole, as earlier releases did.
+
+### Recover a whole-session lifecycle operation
+
+Quiescent authority-backed moves, archive replacement of local copies, and root deletion retain
+durable whole-bundle recovery material under `<S>.authority.stage.<id>/` and identified backups.
+The bundle includes the transcript, artifacts, descriptor, selected payload, required SQLite WAL
+state, and authority provenance. Do not remove these guards or backups to make a root reopen.
+
+A filesystem root still bound to registry operation authority cannot be moved through the live
+managed session. The move is refused with `SessionMoveRefusedError` before its shared authority
+store or bundle is relocated. Close the managed session and its authority handles, then use the
+quiescent lifecycle path; closing a store does not rebind the live registry. A failed adoption or
+rewrite after a committed authority move fences the stale manager. Reopen the validated selected
+root after any required recovery instead of continuing writes through that manager.
+
+The same `--recover finish|abort` commands resolve interrupted lifecycle operations. Supply an
+explicit source or target transcript path, including `.jsonl`, even if that transcript has already
+been moved or deleted; session-ID lookup cannot find a retired transcript. Recovery checks the
+retained operation before attempting backend-migration recovery.
+
+Before the durable selection decision, `finish` completes the prepared operation and `abort`
+restores verified original state. After target authority has been selected, only `finish` is
+permitted: restoring old source grants would create stale authority. Deletion also retains its
+durable decision and provenance; it is not undone by abort after that decision. Unlike backend
+conversion, lifecycle recovery can move, replace, or delete transcript and artifact files.
+
+An interrupted authority-backed `SessionManager.moveTo()` seals that manager against further
+source writes. Recover the retained operation, then reopen the selected root; do not continue
+using the old manager. Unpack refuses a pending replacement before classifying local transcript
+divergence, rather than treating a second archive as a fresh operation.
+
+Root deletion requires quiescent ownership and removes the owned active bundle while retaining
+recovery provenance. Deleting a child transcript does not delete the shared root authority.
+Explicit restore after deletion still requires the source-stop and post-backup reconciliation
+preconditions above; retained bytes do not reverse external effects.
+
+### Known limitations
+
+- **Qualified platform.** Qualification ran on Linux x86_64: capacity `xfs` on XFS, capacity `off` on
+  XFS, overlayfs and tmpfs (`/dev/shm`), through print-mode launches, the `omp session` commands and the test suites.
+  macOS, Windows, Linux arm64, ext4 and btrfs are supported by the code paths in the platform table
+  but were not exercised on real hosts, and the interactive TUI and ACP server were not driven end
+  to end.
+- **One host per root.** Exclusion holds between processes of one kernel. Network filesystems are
+  detected and warned about, not refused; FUSE network mounts are not detected. Never open one
+  session from two machines.
+- **Capacity `off`** (the default) gives no disk-full guarantee: a write on a full disk can fail
+  after it reached the file and is then reported as an unknown outcome.
+- **Capacity `xfs` overhead.** In the final measurement against the same host with capacity `off`,
+  durable-write p95 was 1.11–1.17 times higher for SQLite and 1.09–1.10 times for JSONL at 10k to 1M
+  terminal rows (earlier builds measured up to 1.8 times for SQLite at some sizes), JSONL worker CPU
+  per command was about 11% higher at 10,000 rows, 16% at 100,000 and 3% at 1,000,000, and
+  concurrent throughput was lower (see [group commit](#group-commit)). The residual windows
+  described above can refuse a promised continuation when other writers take the last free blocks,
+  or make a SQLite group's outcome unknown when another process reflinks or hole-punches a live store.
+- **JSONL at very long histories.** Opening a rotated JSONL store with 1,000,000 terminal rows took
+  about 3–7 s (SQLite about 0.1–0.4 s), JSONL CPU per command at 1,000,000 rows was about 1.6–1.7
+  times that at 10,000 rows with p95 latency level, and the first lookup of a receipt by request id
+  alone after open costs about 0.45–0.8 s at that size (see [Open](#jsonl-segment-rotation)). A JSONL store written as one segment by
+  a build without rotation replays its whole history on open, and at about 1,000,000 rows that
+  exceeds the 60 s open deadline; convert it offline (`--to sqlite --apply`, then back with `--to
+  jsonl --apply` if wanted), which was not exercised at that size.
+- **Open does not verify history.** Normal open validates the header, identity, schema, the JSONL
+  snapshot digest and the active segment; sealed segments and full SQLite history are verified only
+  by `omp session repair`, migration and packing.
+- **Torn-tail recovery.** If the last block of the final acknowledged JSONL frame reads back as zeros
+  after a crash (a lost write of a synced block), it is cut like a torn append; its bytes are kept in
+  the `<S>.authority-recovered.*.bin` file.
+- **macOS durability** depends on `F_FULLFSYNC`; on a filesystem without it OMP falls back to
+  `fsync(2)` (logged, and shown once as a notice), which may leave acknowledged data in the drive
+  cache across a power loss.
+- **Compatibility.** Earlier builds cannot open v4 SQLite stores or rotated JSONL stores, and v4 is
+  never converted back to v3. Task subagent transcripts saved before `authorityRoot` stamping still
+  adopt as separate roots when resumed directly by path.
+- **Per-process limit.** At most 8 roots per process (see above).
+
+## Session authority repair
+
+`omp session repair <session-id-or-path>` inspects and, where supported, repairs the authority
+sidecar for a saved session. It accepts a session id or a path to a `.jsonl` file; quote paths that
+contain spaces.
+
+Repair is a **dry-run by default**. It is also the integrity verification: normal session open and
+resume validate the descriptor header, identity, and schema but do not run a full integrity scan,
+which is O(history). A corrupted index row is therefore detected by `omp session repair`, not by
+resume. Without a selected format-2 descriptor, the command validates
+the legacy v1 journal and its history/lineage. A dry-run never changes the journal or quarantine
+marker and reports either `clean` or a proven `repairable` diagnosis. It refuses unexplained
+quarantine markers, hash/history corruption, cycles, root or lineage conflicts, scope drift, and
+other states that cannot be proven safe.
+
+Legacy repair may append closure records only for verified descendants of terminal ancestors
+(`retired` or `aborted`). It may resolve a recognized quarantine marker only when whole-history
+validation proves no affected actor closure remains. The repair set is closed leaf-first. After
+reviewing a repairable diagnosis, stop the owning client before applying:
 
 ```sh
 omp session repair '/path/to/session.jsonl' --apply
 ```
 
-`--apply` takes the journal and, when present, quarantine-marker locks; rechecks the source bytes, metadata, journal head, and affected lineage; writes the exact pre-repair journal and marker bytes to a retained `.authority-repair-*` backup directory; and appends terminal closure records to the journal. A source change, lock conflict, or failed verification aborts safely rather than overwriting a competing source. The active quarantine marker is resolved only as part of a successful apply; do not manually delete the journal, marker, or backup.
+Legacy apply takes the journal and, when present, quarantine-marker locks; rechecks source bytes,
+metadata, journal head, and affected lineage; writes exact pre-repair bytes to a retained
+`.authority-repair-*` backup; and appends terminal closure records. A source change, lock conflict,
+or failed verification aborts safely. Do not manually delete the journal, marker, or backup.
 
-After a successful apply, start a **fresh process** with the reported command instead of trying to hot-reload the repaired authority:
+When a format-2 descriptor selects a backend, repair performs selected-store integrity/export
+inspection only. Passing checks report `clean`; this path does not append legacy closure records,
+resolve legacy quarantine, or create `.authority-repair-*` backups. A missing selected payload,
+corruption, or other unavailable state fails closed rather than falling back to legacy repair.
+Use the explicitly supported migration recovery or restore procedure to reconcile such state; do
+not clear markers or restore a stale backup over newer authority writes.
+
+After a successful legacy repair, start a **fresh process** with the reported command instead of
+trying to hot-reload the repaired authority:
 
 ```sh
 omp --resume '/path/to/session.jsonl'
 ```
 
-Do not use this command to deploy, repair live provider data, revive old actor authority, or alter unrelated session behavior.
+Do not use this command to deploy, repair live provider data, revive old actor authority, or alter
+unrelated session behavior.
 
 ## Interactive `/resume [value]`
 

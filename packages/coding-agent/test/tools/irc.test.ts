@@ -63,6 +63,7 @@ function makeFakeSession(): FakeSession {
 	const deliveryContexts: Array<IrcDeliveryContext | undefined> = [];
 	const relayed: CustomMessage[] = [];
 	const session = {
+		...createSessionDefaults(),
 		isStreaming: true,
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.add(listener);
@@ -270,7 +271,7 @@ describe("IRC", () => {
 
 			const sub = makeFakeSession();
 			registry.register({ id: "0-Dead", displayName: "task", kind: "sub", session: sub.session });
-			registry.setStatus("0-Dead", "aborted");
+			await registry.setStatus("0-Dead", "aborted");
 			const aborted = await bus.send({ from: "0-Main", to: "0-Dead", body: "hello?" });
 			expect(aborted.outcome).toBe("failed");
 			expect(sub.delivered).toEqual([]);
@@ -370,6 +371,7 @@ describe("IRC", () => {
 			let disposeCalls = 0;
 			const delivered: IrcMessage[] = [];
 			const session = {
+				...createSessionDefaults(),
 				deliverIrcMessage: async (msg: IrcMessage) => {
 					delivered.push(msg);
 					return "injected" as const;
@@ -416,6 +418,7 @@ describe("IRC", () => {
 			const { promise: disposeGate, resolve: resolveDispose } = Promise.withResolvers<void>();
 			let disposeCalls = 0;
 			const oldSession = {
+				...createSessionDefaults(),
 				deliverIrcMessage: async () => {
 					throw new Error("dying session must not receive mail");
 				},
@@ -445,9 +448,9 @@ describe("IRC", () => {
 			});
 
 			const parking = parkAgent(getAgentLifecycleManager(registry), "0-Parking");
-			// Pass the cancel window so park detaches before send.
-			await Promise.resolve();
-			await Promise.resolve();
+			// Pass the cancel window so park detaches and blocks in dispose before send. Registry
+			// status changes settle through async actor mutations, so wait on that observable point.
+			for (let tick = 0; tick < 100 && disposeCalls === 0; tick++) await Promise.resolve();
 			expect(registry.get("0-Parking")?.status).toBe("parked");
 			expect(lookupAgentRef(registry, "0-Parking")?.session).toBeNull();
 			expect(disposeCalls).toBe(1);
@@ -479,6 +482,7 @@ describe("IRC", () => {
 		it("multiple concurrent sends during park coalesce revive and all deliver", async () => {
 			const { promise: disposeGate, resolve: resolveDispose } = Promise.withResolvers<void>();
 			const oldSession = {
+				...createSessionDefaults(),
 				deliverIrcMessage: async () => {
 					throw new Error("dying session must not receive mail");
 				},

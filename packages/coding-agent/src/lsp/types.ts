@@ -1,5 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
 import { TOOL_TIMEOUTS } from "../tools/tool-timeouts";
+import type { FileWriteMutationHooks } from "../tools/file-write-fallback";
 
 import type { ReadableStreamDefaultReader } from "node:stream/web";
 
@@ -304,8 +305,13 @@ export interface Hover {
  * Can be implemented using LSP protocol or CLI tools.
  */
 export interface LinterClient {
-	/** Format file content. Returns formatted content. */
-	format(filePath: string, content: string): Promise<string>;
+	/** The caller encloses custom formatting in current write authority; implementations join all physical work and use the hooks for readback. */
+	format(
+		filePath: string,
+		content: string,
+		signal?: AbortSignal,
+		mutationHooks?: FileWriteMutationHooks,
+	): Promise<string>;
 
 	/** Get diagnostics for a file. Content should already be written to disk. */
 	lint(filePath: string, signal?: AbortSignal): Promise<Diagnostic[]>;

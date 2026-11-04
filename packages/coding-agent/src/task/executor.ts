@@ -67,8 +67,10 @@ import {
 	getAgentLifecycleManager,
 	lifecycleManagesRegistry,
 	lifecycleHasAgent,
+	parkAgent,
 	releaseAgent,
 } from "../internal/agent-lifecycle-bridge";
+import { runDetachedFromOperation } from "../registry/operation-lease";
 import {
 	detachAgentSession,
 	type InternalAgentRef,
@@ -3513,7 +3515,8 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			const lastAssistant = session.getLastAssistantMessage();
 			const yielded = turnMonitor.yieldCalled();
 			if (yielded) {
-				markAgentResultAccepted(registry, id, session, turnMonitor.yieldAcceptedAt());
+				if (!(await markAgentResultAccepted(registry, id, session, turnMonitor.yieldAcceptedAt())))
+					throw new Error("Agent result authority changed before acceptance could be persisted.");
 			}
 			const runtimeLimitExceeded = turnMonitor.runtimeLimitExceeded();
 			const aborted = runtimeLimitExceeded || (lastAssistant?.stopReason === "aborted" && !yielded);
@@ -3538,7 +3541,8 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				// Acceptance boundary for an autonomous wake turn (#11079): the
 				// turn's terminal yield is settled, so terminalize the ref here
 				// even when the run-state mirror never delivers `idle`.
-				markAgentResultAccepted(registry, id, session, turnMonitor.yieldAcceptedAt());
+				if (!(await markAgentResultAccepted(registry, id, session, turnMonitor.yieldAcceptedAt())))
+					throw new Error("Agent result authority changed before acceptance could be persisted.");
 			}
 			// Read before finalization: a schema-bearing agent that answered in
 			// prose gets a missing-yield warning prepended to `result.output`.
@@ -3747,7 +3751,7 @@ export async function finalizeSubagentLifecycle(args: {
 	const managesAgentRegistry = lifecycleManagesRegistry(lifecycle, registry);
 	const ownsRef = Boolean(ref && ref.session === args.session);
 	const cleanupDeadlineAt = args.cleanupDeadlineAt ?? Date.now() + 5000;
-	const disposeSession = async (): Promise<void> => {
+	const prepareForDisposal = async (): Promise<void> => {
 		// On a graceful finish (e.g. a `yield`) the advisor's review of the final
 		// turn was enqueued at turn end but may still be draining. Give it a
 		// chance to land in the transcript before the runtime is torn down —
@@ -3757,19 +3761,49 @@ export async function finalizeSubagentLifecycle(args: {
 			args.session.prepareForHeadlessAdvisorDrain();
 			await args.session.waitForAdvisorCatchup(Math.max(0, cleanupDeadlineAt - Date.now()));
 		}
+	};
+	const disposeSession = async (
+		deferredOwner?: { completion: Promise<void>; signal: () => void },
+		advisorDrainComplete = false,
+	): Promise<void> => {
+		if (!advisorDrainComplete) await prepareForDisposal();
 		const disposal = args.session.dispose();
 		const remainingMs = Math.max(0, cleanupDeadlineAt - Date.now());
 		try {
 			await untilAborted(AbortSignal.timeout(remainingMs), () => disposal);
 		} catch (error) {
 			if (Date.now() >= cleanupDeadlineAt) {
-				args.onCleanupDeferred?.(disposal);
+				if (args.onCleanupDeferred) {
+					if (deferredOwner) {
+						let callbackError: unknown;
+						let callbackFailed = false;
+						try {
+							args.onCleanupDeferred(deferredOwner.completion);
+						} catch (deferredError) {
+							callbackFailed = true;
+							callbackError = deferredError;
+						}
+						deferredOwner.signal();
+						try {
+							await disposal;
+						} catch (disposeError) {
+							if (callbackFailed)
+								throw new AggregateError(
+									[callbackError, disposeError],
+									"Deferred subagent cleanup and disposal failed.",
+								);
+							throw disposeError;
+						}
+						if (callbackFailed) throw callbackError;
+						return;
+					}
+					args.onCleanupDeferred(disposal);
+					return;
+				}
+				await disposal;
 				return;
 			}
-			logger.warn("Subagent session cleanup failed", {
-				id: args.id,
-				error: error instanceof Error ? error.message : String(error),
-			});
+			throw error;
 		}
 	};
 
@@ -3792,29 +3826,33 @@ export async function finalizeSubagentLifecycle(args: {
 					if (managesAgentRegistry) await releaseAgent(lifecycle, args.id, ref);
 					else {
 						await disposeSession();
-						unregisterAgentRef(registry, args.id, args.session);
+						await unregisterAgentRef(registry, args.id, args.session);
 					}
 				} catch (error) {
-					logger.warn("runSubagent: failed to release session during shutdown or caller cancellation", {
-						id: args.id,
-						error: String(error),
-					});
-					await disposeSession();
-					unregisterAgentRef(registry, args.id, args.session);
+					try {
+						await disposeSession();
+						await unregisterAgentRef(registry, args.id, args.session);
+					} catch (cleanupError) {
+						throw new AggregateError([error, cleanupError], "Subagent release and cleanup failed.");
+					}
+					throw error;
 				}
 			} else {
 				try {
 					if (managesAgentRegistry) await releaseAgent(lifecycle, args.id, ref, { tombstone: true });
 					else {
-						setAgentStatus(registry, args.id, "aborted", args.session);
+						if (!(await setAgentStatus(registry, args.id, "aborted", args.session)))
+							throw new Error("Agent authority changed before abort status could be persisted.");
 						detachAgentSession(registry, args.id, args.session);
 						await disposeSession();
 					}
 				} catch (error) {
-					logger.warn("runSubagent: failed to persist kill tombstone", { id: args.id, error: String(error) });
-					setAgentStatus(registry, args.id, "aborted", args.session);
-					detachAgentSession(registry, args.id, args.session);
-					await disposeSession();
+					try {
+						await disposeSession();
+					} catch (cleanupError) {
+						throw new AggregateError([error, cleanupError], "Subagent tombstone and cleanup failed.");
+					}
+					throw error;
 				}
 			}
 		}
@@ -3824,19 +3862,40 @@ export async function finalizeSubagentLifecycle(args: {
 	if (!args.keepAlive) {
 		// One-shot helper: dispose and unregister. No IRC, no revival.
 		await disposeSession();
-		if (ref && ownsRef) unregisterAgentRef(registry, args.id, args.session);
+		if (ref && ownsRef) await unregisterAgentRef(registry, args.id, args.session);
 		return;
 	}
 
 	if (args.isolated) {
 		// Adopt while the exact session is still attached. The workspace remains
 		// owned until release, but a parked isolated session is not resumable.
-		if (ref && ownsRef && managesAgentRegistry && !lifecycleHasAgent(lifecycle, args.id, ref)) {
-			adoptAgent(lifecycle, args.id, { idleTtlMs: 0 }, ref);
+		if (ref && ownsRef && managesAgentRegistry) {
+			if (!lifecycleHasAgent(lifecycle, args.id, ref)) adoptAgent(lifecycle, args.id, { idleTtlMs: 0 }, ref);
+			const { promise: deferred, resolve: signalDeferred } = Promise.withResolvers<void>();
+			// Bound after parkAgent returns; the cleanup closure handed to parkAgent checks it explicitly.
+			// oxlint-disable-next-line prefer-const
+			let parking: Promise<void> | undefined;
+			const disposeParkedSession = (): Promise<void> => {
+				if (!parking) throw new Error("Lifecycle park was not initialized before session cleanup.");
+				return disposeSession(
+					args.onCleanupDeferred ? { completion: parking, signal: signalDeferred } : undefined,
+					true,
+				);
+			};
+			parking = parkAgent(lifecycle, args.id, disposeParkedSession, prepareForDisposal);
+			const cleanupDeferred = args.onCleanupDeferred
+				? await Promise.race([parking.then(() => false), deferred.then(() => true)])
+				: false;
+			if (!cleanupDeferred) await parking;
+			const current = lookupAgentRef(registry, args.id);
+			if (current !== ref || current.status !== "parked" || current.session !== null)
+				throw new Error("Agent authority changed before isolated session park completed.");
+			return;
 		}
-		// Status must flip to "parked" before dispose so the sdk dispose
-		// wrapper skips unregister.
-		if (ref && ownsRef) setAgentStatus(registry, args.id, "parked", args.session);
+		// Legacy sessions have no lifecycle owner; authority-managed sessions
+		// must use the subtree-ordered park transition above.
+		if (ref && ownsRef && !(await setAgentStatus(registry, args.id, "parked", args.session)))
+			throw new Error("Agent authority changed before park status could be persisted.");
 		await disposeSession();
 		if (ref && ownsRef) detachAgentSession(registry, args.id, args.session);
 		return;
@@ -3844,7 +3903,11 @@ export async function finalizeSubagentLifecycle(args: {
 
 	// Keep-alive: finished and failed subagents both stay interrogable.
 	// The lifecycle manager owns idle-TTL parking + revival from here on.
-	if (!ref || !ownsRef || !setAgentStatus(registry, args.id, "idle", args.session)) {
+	if (!ref || !ownsRef || !(await setAgentStatus(registry, args.id, "idle", args.session))) {
+		await disposeSession();
+		return;
+	}
+	if (lookupAgentRef(registry, args.id) !== ref || lookupAgentRef(registry, args.id)?.session !== args.session) {
 		await disposeSession();
 		return;
 	}
@@ -4051,7 +4114,8 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 			if (resultDelivered(outcome, monitor, structured)) {
 				// A follow-up turn's accepted result is the run's final result too:
 				// terminalize the ref here, not just on the initial run (#11079).
-				markAgentResultAccepted(registry, id, session, monitor.yieldAcceptedAt());
+				if (!(await markAgentResultAccepted(registry, id, session, monitor.yieldAcceptedAt())))
+					throw new Error("Agent result authority changed before acceptance could be persisted.");
 			}
 		} finally {
 			try {
@@ -4403,31 +4467,24 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 			suppressBreadcrumb: true,
 			throwIfMissing: true,
 		});
-		if (!hasConversationalHistory(reopened.getEntries())) {
-			await reopened.close();
-			throw new Error(
-				`Cannot revive subagent "${id}": session file "${capture.sessionFile}" has no message history ` +
-					`(truncated to header/session_init). The agent was not revived.`,
-			);
-		}
-		if (capture.parentArtifactManager) {
-			reopened.adoptArtifactManager(capture.parentArtifactManager);
-		}
-		// The stash died with the parked manager: hand the pending, never-promoted
-		// family candidate to the fresh one so the first eligible request after
-		// revival still finds and persists it.
-		if (capture.pendingCacheCandidate !== undefined) {
-			reopened.setTaskSiblingCandidate(capture.pendingCacheCandidate);
-		}
-		await refreshSubagentIrcRoot(capture.spec.prompt, reopened, capture.sessionFile);
-		const mcpManager = capture.spec.options.mcpManager;
-		const mcpFollower = mcpManager ? followMCPTools(mcpManager, explicitSubagentToolNames(capture.spec)) : undefined;
-		let revived: AgentSession;
-		// Account pools are owner policy: take the live exact-name entry, as
-		// dispatch and persisted revival do, never the spawn-time copy.
-		const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(capture.parentSettings));
-		capture.spec.prompt.reviving = true;
+		let revived: AgentSession | undefined;
+		let mcpFollower: MCPToolFollower | undefined;
 		try {
+			if (!hasConversationalHistory(reopened.getEntries())) {
+				throw new Error(
+					`Cannot revive subagent "${id}": session file "${capture.sessionFile}" has no message history ` +
+						`(truncated to header/session_init). The agent was not revived.`,
+				);
+			}
+			if (capture.parentArtifactManager) reopened.adoptArtifactManager(capture.parentArtifactManager);
+			// Only the unpromoted candidate lives outside the persisted header.
+			if (capture.pendingCacheCandidate !== undefined)
+				reopened.setTaskSiblingCandidate(capture.pendingCacheCandidate);
+			await refreshSubagentIrcRoot(capture.spec.prompt, reopened, capture.sessionFile);
+			const mcpManager = capture.spec.options.mcpManager;
+			mcpFollower = mcpManager ? followMCPTools(mcpManager, explicitSubagentToolNames(capture.spec)) : undefined;
+			const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(capture.parentSettings));
+			capture.spec.prompt.reviving = true;
 			try {
 				({ session: revived } = await capture.createAuthoritySession(
 					{
@@ -4438,43 +4495,77 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 					},
 					expectedAgentRef,
 				));
-			} catch (error) {
-				mcpFollower?.dispose();
-				throw error;
+				mcpFollower?.bind(revived);
+				trackSubagentSettings(revived, capture);
+				trackSubagentPendingCandidate(revived, capture);
+				trackSubagentIrcRoster(revived, capture.spec.prompt);
+				const withoutParentOwnedTools = (toolNames: string[]): string[] =>
+					capture.keepTodo ? toolNames : toolNames.filter(name => name !== "todo");
+				const revivedToolNames = withoutParentOwnedTools(revived.getEnabledToolNames());
+				const subagentToolNames =
+					!capture.spec.options.restrictToolNames && !capture.spec.preparedSession
+						? [...revivedToolNames, ...revived.getMountedXdevToolNames()]
+						: revivedToolNames;
+				await revived.setActiveToolsByName(subagentToolNames);
+				await initializeExtensions(revived, {
+					reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
+					reportRuntimeError: err =>
+						logger.error("Extension error", { path: err.extensionPath, error: err.error }),
+					filterActiveTools: withoutParentOwnedTools,
+				});
+				await replayRevivedAgentStart(revived);
+			} finally {
+				capture.spec.prompt.reviving = false;
 			}
-			mcpFollower?.bind(revived);
-			trackSubagentSettings(revived, capture);
-			trackSubagentPendingCandidate(revived, capture);
-			trackSubagentIrcRoster(revived, capture.spec.prompt);
-			const withoutParentOwnedTools = (toolNames: string[]): string[] =>
-				capture.keepTodo ? toolNames : toolNames.filter(name => name !== "todo");
-			// Strip parent-owned tools before extensions start; warm revival restores the parent's active tool defaults.
-			const revivedToolNames = withoutParentOwnedTools(revived.getEnabledToolNames());
-			const subagentToolNames =
-				!capture.spec.options.restrictToolNames && !capture.spec.preparedSession
-					? [...revivedToolNames, ...revived.getMountedXdevToolNames()]
-					: revivedToolNames;
-			await revived.setActiveToolsByName(subagentToolNames);
-			// The rebuilt session's extension runner must be initialized before revived startup hooks run.
-			await initializeExtensions(revived, {
-				reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
-				reportRuntimeError: err => logger.error("Extension error", { path: err.extensionPath, error: err.error }),
-				filterActiveTools: withoutParentOwnedTools,
-			});
-			await replayRevivedAgentStart(revived);
-		} finally {
-			capture.spec.prompt.reviving = false;
+			syncAgentSessionStatus(capture.spec.prompt.agentRegistry, id, revived);
+			if (capture.wake) attachIrcWakeTurnMonitor(revived, capture.wake);
+			return revived;
+		} catch (error) {
+			const failures: unknown[] = [error];
+			try {
+				mcpFollower?.dispose();
+			} catch (cleanupError) {
+				failures.push(cleanupError);
+			}
+			if (revived) {
+				try {
+					await revived.dispose();
+				} catch (cleanupError) {
+					if (!failures.includes(cleanupError)) failures.push(cleanupError);
+					// Even a failed durable retirement must not expose partial setup
+					// as a live session to the next ensureLive/peer wake.
+					try {
+						revived.beginDispose();
+					} catch (fenceError) {
+						failures.push(fenceError);
+					}
+				}
+			}
+			try {
+				await reopened.close();
+			} catch (cleanupError) {
+				if (!failures.includes(cleanupError)) failures.push(cleanupError);
+			}
+			if (failures.length > 1) throw new AggregateError(failures, `Agent "${id}" warm revival and cleanup failed.`);
+			throw error;
 		}
-		syncAgentSessionStatus(capture.spec.prompt.agentRegistry, id, revived);
-		if (capture.wake) attachIrcWakeTurnMonitor(revived, capture.wake);
-		return revived;
 	};
 }
 
 /**
  * Run a single agent in-process.
+ *
+ * A detached (background) run outlives the tool call that launched it, so it
+ * starts outside that call's operation lease and authority effect scope: the
+ * call's scope stops admitting nested effects once the call returns. The child
+ * keeps the shared root authority and admits its own operations instead.
  */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	if (options.detached) return await runDetachedFromOperation(() => runSubprocessInCaller(options));
+	return runSubprocessInCaller(options);
+}
+
+async function runSubprocessInCaller(options: ExecutorOptions): Promise<SingleResult> {
 	const {
 		cwd,
 		agent,
@@ -4982,6 +5073,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const sessionManagerPromise = fork
 				? SessionManager.forkFrom(fork.sourceFile, effectiveCwd, undefined, undefined, {
 						seance: true,
+						// The consulting session owns the child's actor, not the consulted source.
+						authorityParent: options.sessionFile ?? undefined,
 						suppressBreadcrumb: true,
 						sessionFile: subtaskSessionFile,
 						resetInheritedCost: true,
@@ -4991,6 +5084,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					? SessionManager.open(sessionFile, undefined, undefined, {
 							initialCwd: effectiveCwd,
 							parentSession: options.sessionFile ?? undefined,
+							// The child's actor lives in the parent's authority; resuming its transcript directly is refused.
+							authorityParent: options.sessionFile ?? undefined,
 							suppressBreadcrumb: true,
 						})
 					: Promise.resolve(SessionManager.inMemory(effectiveCwd));
@@ -5509,7 +5604,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				},
 			});
 			if (resultDelivered(outcome, monitor, structured)) {
-				markAgentResultAccepted(agentRegistry, id, session, monitor.yieldAcceptedAt());
+				if (!(await markAgentResultAccepted(agentRegistry, id, session, monitor.yieldAcceptedAt())))
+					throw new Error("Agent result authority changed before acceptance could be persisted.");
 			}
 			exitCode = outcome.exitCode;
 			error = outcome.error;
@@ -5604,7 +5700,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						monitor.abortKind() === "budget" && worktree === undefined && reviveSession !== null;
 					if (options.onRelease && options.keepAlive !== false && (!aborted || resumableAbort)) {
 						const ref = lookupAgentRef(agentRegistry, id);
-						if (ref?.session === session && setAgentStatus(agentRegistry, id, "idle", session)) {
+						if (
+							ref?.session === session &&
+							(await setAgentStatus(agentRegistry, id, "idle", session)) &&
+							lookupAgentRef(agentRegistry, id) === ref &&
+							ref.session === session
+						) {
 							adoptAgent(
 								agentLifecycle,
 								id,
@@ -5712,9 +5813,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 			if (lateCleanups.length > 0) {
-				const completion = Promise.allSettled(lateCleanups).then(() => {});
+				const completion = Promise.allSettled(lateCleanups).then(outcomes => {
+					const failures = outcomes
+						.filter(outcome => outcome.status === "rejected")
+						.map(outcome => outcome.reason);
+					if (failures.length > 0) throw new AggregateError(failures, "Subagent deferred cleanup failed.");
+				});
 				trackLateCleanup(completion, { id, resource: "subagent" });
-				options.onCleanupDeferred?.(completion);
+				if (options.onCleanupDeferred) options.onCleanupDeferred(completion);
+				else await completion;
 			}
 		}
 

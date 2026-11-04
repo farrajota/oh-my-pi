@@ -115,15 +115,18 @@ describe("BiomeClient format", () => {
 		expect(result).toBe(unformatted);
 	});
 
-	test("returns the original content when Biome fails", async () => {
+	test("reports a Biome failure and leaves the original content in place", async () => {
 		const tempDir = await makeTempDir();
 		const command = writeFakeExecutable(tempDir, "biome-failure", "process.exit(1);\n");
 		const targetFile = path.join(tempDir, "example.ts");
 		const content = "export const value = 1;\n";
 
-		const result = await new BiomeClient(biomeConfig(command), tempDir).format(targetFile, content);
-
-		expect(result).toBe(content);
+		// Formatter failures reject so the diagnostics caller can record them instead of
+		// mistaking the unformatted input for a successful format.
+		await expect(new BiomeClient(biomeConfig(command), tempDir).format(targetFile, content)).rejects.toThrow(
+			/Biome format failed/,
+		);
+		expect(await Bun.file(targetFile).text()).toBe(content);
 	});
 });
 

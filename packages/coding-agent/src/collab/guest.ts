@@ -418,8 +418,7 @@ export class CollabGuestLink {
 						else firstWelcome.reject(new Error(frame.message));
 						return;
 					}
-					if (!this.#welcomed || this.#left) return;
-					this.#applyFrame(frame);
+					await this.#applyFrame(frame);
 				})
 				.catch(err => {
 					logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
@@ -568,13 +567,13 @@ export class CollabGuestLink {
 		];
 		this.#ctx.eventController.resetTranscriptAnchors();
 		this.#clearTransientUi(true);
-		this.#clearAgentMirror();
+		await this.#clearAgentMirror();
 		this.state = pending.state;
 		reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
 		this.#reconcileLifecycle(pending.state.isStreaming);
 		this.#applyHostState(pending.state);
 		this.#ctx.resetObserverRegistry();
-		this.#applyAgentSnapshots(pending.agents);
+		await this.#applyAgentSnapshots(pending.agents);
 		this.#ctx.syncRunningSubagentBadge();
 		this.#assistantStreamSynced = false;
 		this.#streamedSnapshot = undefined;
@@ -636,7 +635,7 @@ export class CollabGuestLink {
 		}
 	}
 
-	#applyFrame(frame: CollabFrame): void {
+	async #applyFrame(frame: CollabFrame): Promise<void> {
 		switch (frame.t) {
 			case "entry": {
 				// Entries are never rendered directly — rendering is events-only
@@ -677,7 +676,7 @@ export class CollabGuestLink {
 				emitSubagentFrame(this.#ctx.eventBus, this.#ctx.subagentEventBus, frame.channel, frame.data);
 				break;
 			case "agents":
-				this.#applyAgentSnapshots(frame.agents);
+				await this.#applyAgentSnapshots(frame.agents);
 				this.#ctx.syncRunningSubagentBadge();
 				break;
 			case "ui-request":
@@ -804,13 +803,13 @@ export class CollabGuestLink {
 	}
 
 	/** Diff a host agent snapshot into the local registry (refs keep `session: null`). */
-	#applyAgentSnapshots(agents: AgentSnapshot[]): void {
+	async #applyAgentSnapshots(agents: AgentSnapshot[]): Promise<void> {
 		const seen = new Set<string>();
 		for (const snap of agents) seen.add(snap.id);
 		for (const ref of this.agentRegistry.list()) {
 			if (!seen.has(ref.id)) {
-				this.agentRegistry.unregister(ref.id);
-				this.#agentHasTranscript.delete(ref.id);
+				const removed = await this.agentRegistry.unregister(ref.id, ref);
+				if (removed || !this.agentRegistry.get(ref.id)) this.#agentHasTranscript.delete(ref.id);
 			}
 		}
 		for (const snap of agents) {
@@ -831,13 +830,17 @@ export class CollabGuestLink {
 			// rejected without partially applying host metadata.
 			const observation = this.agentRegistry.get(snap.id);
 			if (observation) {
-				this.agentRegistry.setStatus(snap.id, snap.status, observation);
-				if (Object.keys(history).length > 0) this.agentRegistry.setHistoryExact(snap.id, observation, history);
-				this.agentRegistry.updateAgentMetadata(snap.id, observation, {
-					displayName: snap.displayName,
-					createdAt: snap.createdAt,
-					lastActivity: snap.lastActivity,
-				});
+				if (!(await this.agentRegistry.setStatus(snap.id, snap.status, observation))) continue;
+				if (Object.keys(history).length > 0 && !this.agentRegistry.setHistoryExact(snap.id, observation, history))
+					continue;
+				if (
+					!this.agentRegistry.updateAgentMetadata(snap.id, observation, {
+						displayName: snap.displayName,
+						createdAt: snap.createdAt,
+						lastActivity: snap.lastActivity,
+					})
+				)
+					continue;
 			} else {
 				this.agentRegistry.register({
 					id: snap.id,
@@ -855,10 +858,9 @@ export class CollabGuestLink {
 		}
 	}
 
-	#clearAgentMirror(): void {
-		for (const ref of this.agentRegistry.list()) {
-			this.agentRegistry.unregister(ref.id);
-		}
+	async #clearAgentMirror(): Promise<void> {
+		const refs = this.agentRegistry.list();
+		await Promise.all(refs.map(ref => this.agentRegistry.unregister(ref.id, ref)));
 		this.#agentHasTranscript.clear();
 	}
 
@@ -1002,7 +1004,7 @@ export class CollabGuestLink {
 		this.#flushPendingTranscripts();
 		// A pending coalesced mirror message_update must not flush after leave.
 		this.#ctx.eventController.resetTranscriptAnchors();
-		this.#clearAgentMirror();
+		await this.#clearAgentMirror();
 		this.#ctx.syncRunningSubagentBadge();
 		this.#ctx.resetObserverRegistry();
 		this.#clearTransientUi();

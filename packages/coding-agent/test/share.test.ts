@@ -592,6 +592,7 @@ describe("shareSession", () => {
 			cwd: tempDir.path(),
 			providerPromptCacheKey: "private-explicit-affinity",
 			taskPromptCacheKey: "private-parent-provider-session:reviewer",
+			authorityRoot: "/home/private-user/sessions/session.jsonl",
 		};
 		await Bun.write(
 			file,
@@ -621,6 +622,7 @@ describe("shareSession", () => {
 				const opened = await open(key, uploaded);
 				expect(opened.header?.taskPromptCacheKey).toBeUndefined();
 				expect(opened.header?.providerPromptCacheKey).toBeUndefined();
+				expect(opened.header?.authorityRoot).toBeUndefined();
 				expect(JSON.stringify(opened)).not.toContain("private-");
 				expect(opened.header?.id).toBe(header.id);
 				expect(opened.leafId).toBe("e1");

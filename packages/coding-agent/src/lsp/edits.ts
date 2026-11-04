@@ -1,8 +1,9 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEexist, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { isEexist, isEnoent } from "@oh-my-pi/pi-utils";
 import { formatPathRelativeToCwd } from "../tools/path-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import type { FilesystemOperation, FilesystemTargetCandidate } from "../internal/session-path-scope";
 import type {
 	CreateFile,
 	CreateFileOptions,
@@ -17,6 +18,16 @@ import type {
 	WorkspaceEdit,
 } from "./types";
 import { readTextFromDisk, uriToFile } from "./utils";
+
+async function withWorkspaceMutation<T>(
+	operation: FilesystemOperation | undefined,
+	targets: readonly FilesystemTargetCandidate[],
+	effect: () => Promise<T>,
+): Promise<T> {
+	if (!operation) return effect();
+	const proofs = await operation.preflight(targets);
+	return operation.withResourceEffects(proofs, "filesystem", effect);
+}
 
 // =============================================================================
 // Text Edit Application
@@ -160,10 +171,16 @@ export function flattenWorkspaceTextEdits(edit: WorkspaceEdit): Map<string, Text
  * Apply text edits to a file.
  * Edits are applied in reverse order (bottom-to-top) to preserve line/character indices.
  */
-export async function applyTextEdits(filePath: string, edits: TextEdit[]): Promise<void> {
-	const content = await readTextFromDisk(filePath);
+export async function applyTextEdits(
+	filePath: string,
+	edits: TextEdit[],
+	operation?: FilesystemOperation,
+): Promise<void> {
+	const content = await readTextFromDisk(filePath, operation);
 	const result = applyTextEditsToString(content, edits);
-	await Bun.write(filePath, result);
+	await withWorkspaceMutation(operation, [{ path: filePath, kind: "write" }], async () => {
+		await Bun.write(filePath, result);
+	});
 }
 
 /** A reference file and the text edits a rename computed for it. */
@@ -188,17 +205,40 @@ export async function applyEditsThenRename(
 	references: RenameReferenceEdit[],
 	source: string,
 	dest: string,
+	operation?: FilesystemOperation,
 ): Promise<void> {
 	const backups: Array<{ filePath: string; original: string }> = [];
 	for (const { filePath, edits } of references) {
-		backups.push({ filePath, original: await readTextFromDisk(filePath) });
-		await applyTextEdits(filePath, edits);
+		backups.push({ filePath, original: await readTextFromDisk(filePath, operation) });
+		await applyTextEdits(filePath, edits, operation);
 	}
+	let moved = false;
 	try {
-		await fs.mkdir(path.dirname(dest), { recursive: true });
-		await fs.rename(source, dest);
+		if (operation) await operation.createDirectories(path.dirname(dest));
+		else await fs.mkdir(path.dirname(dest), { recursive: true });
+		await withWorkspaceMutation(
+			operation,
+			[
+				{ path: source, kind: "rename" },
+				{ path: dest, kind: "write" },
+			],
+			async () => {
+				await fs.rename(source, dest);
+				moved = true;
+			},
+		);
 	} catch (err) {
-		await Promise.all(backups.map(({ filePath, original }) => Bun.write(filePath, original)));
+		if (moved) throw err;
+		const restored = await Promise.allSettled(
+			backups.map(({ filePath, original }) =>
+				withWorkspaceMutation(operation, [{ path: filePath, kind: "write" }], async () => {
+					await Bun.write(filePath, original);
+				}),
+			),
+		);
+		const failures = restored.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+		if (failures.length)
+			throw new AggregateError([err, ...failures], "Rename failed and reference rollback did not complete.");
 		throw err;
 	}
 }
@@ -299,6 +339,7 @@ export type ExecutedWorkspaceChange =
 /** Optional authority callback run for every workspace mutation before any effect. */
 export interface WorkspaceEditAuthorization {
 	authorizePath: (filePath: string, mustExist: boolean) => Promise<void>;
+	operation?: FilesystemOperation;
 }
 
 /** What {@link applyWorkspaceEdit} did: human-readable summaries plus the ops that really ran. */
@@ -325,6 +366,7 @@ export async function applyWorkspaceEdit(
 	authorization?: WorkspaceEditAuthorization,
 ): Promise<WorkspaceEditResult> {
 	const applied: string[] = [];
+	const operation = authorization?.operation;
 	const executed: ExecutedWorkspaceChange[] = [];
 	const record = (change: ExecutedWorkspaceChange) => {
 		executed.push(change);
@@ -349,19 +391,22 @@ export async function applyWorkspaceEdit(
 		for (const op of ops) {
 			if (op.kind === "text") {
 				const filePath = uriToFile(op.uri);
-				await applyTextEdits(filePath, op.edits);
+				await applyTextEdits(filePath, op.edits, operation);
 				applied.push(`Applied ${op.edits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`);
 				record({ kind: "edit", uri: op.uri });
 			} else if (op.kind === "create") {
 				const filePath = uriToFile(op.uri);
-				await fs.mkdir(path.dirname(filePath), { recursive: true });
+				if (operation) await operation.createDirectories(path.dirname(filePath));
+				else await fs.mkdir(path.dirname(filePath), { recursive: true });
 				try {
-					if (op.options?.overwrite) {
-						await Bun.write(filePath, "");
-					} else {
-						const handle = await fs.open(filePath, "wx");
-						await handle.close();
-					}
+					await withWorkspaceMutation(operation, [{ path: filePath, kind: "write" }], async () => {
+						if (op.options?.overwrite) {
+							await Bun.write(filePath, "");
+						} else {
+							const handle = await fs.open(filePath, "wx");
+							await handle.close();
+						}
+					});
 				} catch (error) {
 					if (!(op.options?.ignoreIfExists && !op.options.overwrite && isEexist(error))) {
 						throw error;
@@ -373,9 +418,10 @@ export async function applyWorkspaceEdit(
 			} else if (op.kind === "rename") {
 				const oldPath = uriToFile(op.oldUri);
 				const newPath = uriToFile(op.newUri);
-				await fs.mkdir(path.dirname(newPath), { recursive: true });
+				if (operation) await operation.createDirectories(path.dirname(newPath));
+				else await fs.mkdir(path.dirname(newPath), { recursive: true });
 				if (oldPath !== newPath) {
-					// Displace an overwritten destination into a kernel-reserved sibling
+					// Displace an overwritten destination into an exclusively created sibling
 					// temp dir (same filesystem, so the moves stay atomic) instead of
 					// deleting it, so a failed rename (EXDEV, permissions) can restore
 					// it and leave the workspace exactly as it was.
@@ -392,12 +438,32 @@ export async function applyWorkspaceEdit(
 						// source, so let fs.rename change the case in place instead.
 						const sourceStat = await fs.lstat(oldPath);
 						if (sourceStat.dev !== targetStat.dev || sourceStat.ino !== targetStat.ino) {
-							const holdDir = await fs.mkdtemp(path.join(path.dirname(newPath), ".omp-displaced-"));
+							const holdDir = path.join(path.dirname(newPath), `.omp-displaced-${Bun.randomUUIDv7()}`);
+							if (operation) await operation.createDirectory(await operation.authorize(holdDir, "create"));
+							else await fs.mkdir(holdDir);
 							const holdFile = path.join(holdDir, path.basename(newPath));
+							let displacedPhysically = false;
 							try {
-								await fs.rename(newPath, holdFile);
+								await withWorkspaceMutation(
+									operation,
+									[
+										{ path: newPath, kind: "rename" },
+										{ path: holdFile, kind: "write" },
+									],
+									async () => {
+										await fs.rename(newPath, holdFile);
+										displacedPhysically = true;
+									},
+								);
 							} catch (error) {
-								await fs.rm(holdDir, { recursive: true, force: true }).catch(() => {});
+								if (displacedPhysically) throw error;
+								try {
+									await withWorkspaceMutation(operation, [{ path: holdDir, kind: "delete" }], () =>
+										fs.rm(holdDir, { recursive: true, force: true }),
+									);
+								} catch (cleanupError) {
+									throw new AggregateError([error, cleanupError], "Rename displacement and cleanup failed.");
+								}
 								throw error;
 							}
 							displaced = { dir: holdDir, file: holdFile };
@@ -405,28 +471,60 @@ export async function applyWorkspaceEdit(
 					} catch (error) {
 						if (!isEnoent(error)) throw error;
 					}
+					let moved = false;
 					try {
-						await fs.rename(oldPath, newPath);
+						await withWorkspaceMutation(
+							operation,
+							[
+								{ path: oldPath, kind: "rename" },
+								{ path: newPath, kind: "write" },
+							],
+							async () => {
+								await fs.rename(oldPath, newPath);
+								moved = true;
+							},
+						);
 					} catch (error) {
+						if (moved) throw error;
 						if (displaced) {
 							try {
-								await fs.rename(displaced.file, newPath);
-							} catch {
-								// Restoration failed: the destination really is gone, so
-								// report it to reconciliation as an executed delete.
+								await withWorkspaceMutation(
+									operation,
+									[
+										{ path: displaced.file, kind: "rename" },
+										{ path: newPath, kind: "write" },
+									],
+									() => fs.rename(displaced!.file, newPath),
+								);
+							} catch (restoreError) {
 								record({ kind: "delete", uri: op.newUri });
+								throw new AggregateError(
+									[error, restoreError],
+									"Rename failed and displaced destination rollback did not complete.",
+								);
 							}
-							await fs.rm(displaced.dir, { recursive: true, force: true }).catch(() => {});
+							try {
+								await withWorkspaceMutation(operation, [{ path: displaced.dir, kind: "delete" }], () =>
+									fs.rm(displaced!.dir, { recursive: true, force: true }),
+								);
+							} catch (cleanupError) {
+								throw new AggregateError(
+									[error, cleanupError],
+									"Rename failed and displacement cleanup did not complete.",
+								);
+							}
 						}
 						throw error;
 					}
 					if (displaced) {
-						await fs.rm(displaced.dir, { recursive: true, force: true }).catch((error: unknown) => {
-							logger.debug("LSP rename: failed to remove displaced overwrite target", {
-								displaced: displaced?.dir,
-								error: error instanceof Error ? error.message : String(error),
-							});
-						});
+						await withWorkspaceMutation(
+							operation,
+							[
+								{ path: displaced.file, kind: "delete" },
+								{ path: displaced.dir, kind: "delete" },
+							],
+							() => fs.rm(displaced!.dir, { recursive: true, force: true }),
+						);
 					}
 				}
 				applied.push(`Renamed ${formatPathRelativeToCwd(oldPath, cwd)} → ${formatPathRelativeToCwd(newPath, cwd)}`);
@@ -435,11 +533,13 @@ export async function applyWorkspaceEdit(
 				const filePath = uriToFile(op.uri);
 				try {
 					const stat = await fs.lstat(filePath);
-					if (stat.isDirectory() && !stat.isSymbolicLink() && !op.options?.recursive) {
-						await fs.rmdir(filePath);
-					} else {
-						await fs.rm(filePath, { recursive: op.options?.recursive ?? false });
-					}
+					await withWorkspaceMutation(operation, [{ path: filePath, kind: "delete" }], async () => {
+						if (stat.isDirectory() && !stat.isSymbolicLink() && !op.options?.recursive) {
+							await fs.rmdir(filePath);
+						} else {
+							await fs.rm(filePath, { recursive: op.options?.recursive ?? false });
+						}
+					});
 				} catch (error) {
 					if (!(op.options?.ignoreIfNotExists && isEnoent(error))) throw error;
 					continue;
@@ -463,7 +563,7 @@ export async function applyWorkspaceEdit(
 			const textEdits = changes[uri];
 			if (textEdits.length === 0) continue;
 			const filePath = uriToFile(uri);
-			await applyTextEdits(filePath, textEdits);
+			await applyTextEdits(filePath, textEdits, operation);
 			applied.push(`Applied ${textEdits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`);
 			record({ kind: "edit", uri });
 		}

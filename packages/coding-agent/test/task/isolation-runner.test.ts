@@ -23,6 +23,7 @@ import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { $ } from "bun";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 function result(overrides: Partial<SingleResult> = {}): SingleResult {
 	return {
@@ -427,6 +428,7 @@ describe("runIsolatedSubprocess", () => {
 			fallbackReason: null,
 		});
 		const liveSession = {
+			...createSessionDefaults(),
 			prepareForHeadlessAdvisorDrain: () => {},
 			waitForAdvisorCatchup: async () => true,
 			dispose: async () => {},
@@ -496,6 +498,7 @@ describe("runIsolatedSubprocess", () => {
 			fallbackReason: null,
 		});
 		const oneShotSession = {
+			...createSessionDefaults(),
 			prepareForHeadlessAdvisorDrain: () => {},
 			waitForAdvisorCatchup: async () => true,
 			dispose: async () => {},

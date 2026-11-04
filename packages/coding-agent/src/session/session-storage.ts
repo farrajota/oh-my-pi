@@ -5,7 +5,12 @@ import * as path from "node:path";
 import { FileLock as NativeFileLock } from "@oh-my-pi/pi-natives";
 import { getSessionOwnersDir } from "@oh-my-pi/pi-utils/dirs";
 import { isBunTestRuntime } from "@oh-my-pi/pi-utils/env";
-import { type FileLockHandle, tryAcquireFileLock, withFileLockSync } from "@oh-my-pi/pi-utils/file-lock";
+import {
+	acquireFileLock,
+	type FileLockHandle,
+	tryAcquireFileLock,
+	withFileLockSync,
+} from "@oh-my-pi/pi-utils/file-lock";
 import { type FsError, hasFsCode, isEnoent } from "@oh-my-pi/pi-utils/fs-error";
 import { openCloexecSync } from "@oh-my-pi/pi-utils/fs-open";
 import * as logger from "@oh-my-pi/pi-utils/logger";
@@ -19,6 +24,8 @@ import {
 	type SessionTitleUpdate,
 	serializeTitleSlot,
 } from "./session-title-slot";
+import { deleteSessionAuthorityBundle } from "../registry/authority/lifecycle";
+import { inspectAuthorityArtifacts } from "../registry/authority/ownership";
 
 /** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
 const SESSION_WRITE_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT;
@@ -1338,11 +1345,21 @@ export class FileSessionStorage implements SessionStorage {
 	 * Conditionally delete under the same cross-process lock used by the first
 	 * durable append to a draft-only session.
 	 */
-	deleteSessionWithArtifactsIf(sessionPath: string, shouldDelete: (content: string) => boolean): Promise<boolean> {
-		const deleted = this.withSessionFileLockSync(sessionPath, () => {
+	async deleteSessionWithArtifactsIf(
+		sessionPath: string,
+		shouldDelete: (content: string) => boolean,
+	): Promise<boolean> {
+		const lock = await acquireFileLock(sessionPath);
+		try {
 			const content = fs.readFileSync(sessionPath, "utf-8");
 			if (!shouldDelete(content)) return false;
-
+			const authority = await inspectAuthorityArtifacts(sessionPath);
+			if (authority.any) {
+				await deleteSessionAuthorityBundle(sessionPath, { expectedTranscript: content });
+				return true;
+			}
+			if (fs.readFileSync(sessionPath, "utf-8") !== content)
+				throw new Error("Session changed while preparing deletion.");
 			fs.unlinkSync(sessionPath);
 			const artifactsDir = sessionPath.slice(0, -6);
 			try {
@@ -1355,8 +1372,9 @@ export class FileSessionStorage implements SessionStorage {
 				);
 			}
 			return true;
-		});
-		return Promise.resolve(deleted);
+		} finally {
+			lock.release();
+		}
 	}
 
 	/**
@@ -1364,41 +1382,38 @@ export class FileSessionStorage implements SessionStorage {
 	 * Artifacts are stored in a sibling directory with the same name minus .jsonl extension.
 	 */
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
-		// Delete the session file itself
-		await this.unlink(sessionPath);
-
-		// Compute artifacts directory: /path/to/session.jsonl -> /path/to/session
-		const artifactsDir = sessionPath.slice(0, -6);
-
-		// Delete artifacts directory if it exists. Missing directories are fine, but
-		// surface real cleanup failures because the session file is already gone.
+		const lock = await acquireFileLock(sessionPath);
 		try {
-			await fsp.rm(artifactsDir, { recursive: true, force: true });
-		} catch (err) {
-			const error = toError(err);
-			throw new Error(
-				`Session file deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`,
-				{
-					cause: error,
-				},
-			);
-		}
-
-		// Remove EPERM-rewrite leftovers (`<name>.jsonl.<snowflake>.bak`): the
-		// picker scan would otherwise resurrect the deleted session from the
-		// newest stale backup (#11499). Best-effort — a locked file warns
-		// instead of failing the delete the user asked for.
-		const base = path.basename(sessionPath);
-		for (const bak of this.listFilesSync(path.dirname(sessionPath), "*.bak")) {
-			if (!path.basename(bak).startsWith(`${base}.`)) continue;
-			try {
-				await fsp.unlink(bak);
-			} catch (err) {
-				logger.warn("Failed to remove stale session backup during delete", {
-					path: bak,
-					error: toError(err).message,
-				});
+			const authority = await inspectAuthorityArtifacts(sessionPath);
+			if (authority.any) await deleteSessionAuthorityBundle(sessionPath);
+			else {
+				await this.unlink(sessionPath);
+				const artifactsDir = sessionPath.slice(0, -6);
+				try {
+					await fsp.rm(artifactsDir, { recursive: true, force: true });
+				} catch (err) {
+					const error = toError(err);
+					throw new Error(
+						`Session file deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`,
+						{ cause: error },
+					);
+				}
 			}
+
+			const base = path.basename(sessionPath);
+			for (const bak of this.listFilesSync(path.dirname(sessionPath), "*.bak")) {
+				if (!path.basename(bak).startsWith(`${base}.`)) continue;
+				try {
+					await fsp.unlink(bak);
+				} catch (err) {
+					logger.warn("Failed to remove stale session backup during delete", {
+						path: bak,
+						error: toError(err).message,
+					});
+				}
+			}
+		} finally {
+			lock.release();
 		}
 	}
 }

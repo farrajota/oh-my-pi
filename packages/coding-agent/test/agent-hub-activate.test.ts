@@ -18,7 +18,7 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { visitEntriesFromFileStream } from "@oh-my-pi/pi-coding-agent/session/session-loader";
@@ -1102,12 +1102,16 @@ describe("Agent hub data refresh coalescing", () => {
 		let parentSession: AgentSession | undefined;
 		let session: AgentSession | undefined;
 		let lifecycle: AgentLifecycleManager | undefined;
+		let authorityFile: string | undefined;
 		try {
 			const rootSessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "root-sessions"));
 			await rootSessionManager.ensureOnDisk();
 			const rootSessionFile = rootSessionManager.getSessionFile();
 			if (!rootSessionFile) throw new Error("Test fixture requires a persisted root transcript");
-			const registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
+			authorityFile = rootSessionFile;
+			const registry = await AgentRegistry.create({
+				durableState: await registryDurableStateForSession(rootSessionFile, { create: true }),
+			});
 			const settings = Settings.isolated(
 				{ "compaction.enabled": false, "advisor.enabled": false },
 				{ cwd: tempDir.path(), agentDir: tempDir.path() },
@@ -1165,7 +1169,7 @@ describe("Agent hub data refresh coalescing", () => {
 					},
 				}),
 			).toBe(true);
-			expect(setAgentStatus(registry, "ParkingWorker", "idle", session)).toBe(true);
+			expect(await setAgentStatus(registry, "ParkingWorker", "idle", session)).toBe(true);
 			const ref = registry.get("ParkingWorker");
 			if (!ref) throw new Error("Expected the authority-created child observation");
 			const registeredGeneration = resolveAgentObservation(registry, ref);
@@ -1222,6 +1226,7 @@ describe("Agent hub data refresh coalescing", () => {
 			if (lifecycle) await disposeAgentLifecycle(lifecycle);
 			await session?.dispose();
 			await parentSession?.dispose();
+			if (authorityFile) await closeSessionAuthority(authorityFile);
 			authStorage.close();
 		}
 	});

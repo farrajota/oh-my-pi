@@ -131,6 +131,7 @@ import * as path from "node:path";
 import { isEnoent, isFsError, logger } from "@oh-my-pi/pi-utils";
 import type { BunFile } from "bun";
 import type { ExtensionContext } from "../extensibility/extensions/types";
+import { FilesystemReadDeniedError, type FilesystemOperation } from "../internal/session-path-scope";
 import { resolveSyscallTarget } from "./path-utils";
 
 /** A denied write, captured for a registered fallback to retry through a privileged channel. */
@@ -367,6 +368,56 @@ export async function deleteFileWithFallback(dst: string, file?: BunFile): Promi
  */
 type WriteFailureKind = { kind: "denied"; cause: unknown } | { kind: "retry" } | { kind: "rethrow" };
 
+/** Host-authorized hooks surrounding a complete fallback-aware disk write. */
+export interface FileWriteMutationHooks {
+	beforeWrite?: () => Promise<void> | void;
+	assertActive?: () => void;
+	ensureParent?: (parentPath: string) => Promise<void>;
+	withResourceEffect?: <T>(dst: string, effect: () => Promise<T>) => Promise<T>;
+	/** Fresh exact-target readback; undefined only for physical permission denial. */
+	readText?: (dst: string) => Promise<string | undefined>;
+}
+
+export class FilesystemReadMissingError extends Error {
+	readonly code = "ENOENT";
+}
+
+/** Current invocation authority, never retained by deferred batch entries. */
+export function filesystemMutationHooks(operation: FilesystemOperation): FileWriteMutationHooks {
+	return {
+		assertActive: () => operation.assertActive(),
+		ensureParent: directory => operation.createDirectories(directory),
+		withResourceEffect: async (dst, effect) => {
+			const target = await operation.authorize(dst, "write");
+			if (path.resolve(dst) !== target.canonicalTarget)
+				throw new Error("Filesystem write destination changed after authorization.");
+			return operation.withResourceEffects([target], "filesystem", effect);
+		},
+		readText: async dst => {
+			const probe = await operation.authorize(dst, "probe");
+			if (!probe.existed) throw new FilesystemReadMissingError(`Filesystem read target is missing: ${dst}`);
+			const target = await operation.authorize(dst, "read");
+			let handle: fs.FileHandle;
+			try {
+				handle = await operation.openRead(target);
+			} catch (error) {
+				if (error instanceof FilesystemReadDeniedError) return undefined;
+				throw error;
+			}
+			try {
+				try {
+					return await handle.readFile("utf8");
+				} catch (error) {
+					if (isPermissionDeniedError(error)) return undefined;
+					throw error;
+				}
+			} finally {
+				await handle.close();
+			}
+		},
+	};
+}
+
 /**
  * Decide whether a failed write hit a permission boundary.
  *
@@ -381,87 +432,94 @@ type WriteFailureKind = { kind: "denied"; cause: unknown } | { kind: "retry" } |
  * Only called with at least one handler registered, so a stock host never pays
  * for this.
  */
-async function classifyWriteFailure(dst: string, error: unknown): Promise<WriteFailureKind> {
+async function classifyWriteFailure(
+	dst: string,
+	error: unknown,
+	ensureParent?: FileWriteMutationHooks["ensureParent"],
+	signal?: AbortSignal,
+): Promise<WriteFailureKind> {
 	if (isPermissionDeniedError(error)) return { kind: "denied", cause: error };
 	if (!isEnoent(error)) return { kind: "rethrow" };
-	try {
-		await fs.mkdir(path.dirname(dst), { recursive: true });
-	} catch (mkdirError) {
-		// A denied `mkdir` is the boundary the write hid; anything else (`ENOTDIR`
-		// for a file used as a directory, ...) is a genuine bad path.
-		if (isPermissionDeniedError(mkdirError)) return { kind: "denied", cause: mkdirError };
-		return { kind: "rethrow" };
+	signal?.throwIfAborted();
+	if (ensureParent) {
+		await ensureParent(path.dirname(dst));
+	} else {
+		try {
+			await fs.mkdir(path.dirname(dst), { recursive: true });
+		} catch (mkdirError) {
+			if (isPermissionDeniedError(mkdirError)) return { kind: "denied", cause: mkdirError };
+			return { kind: "rethrow" };
+		}
 	}
-	// The parent exists now, so the `ENOENT` was a lost race rather than a
-	// boundary. Any directory just created stays, matching what a permitted
-	// `Bun.write` would have left behind; removing it could race a concurrent
-	// writer that legitimately needs it.
+	signal?.throwIfAborted();
 	return { kind: "retry" };
 }
 
-export async function writeFileWithFallback(dst: string, content: string, file?: BunFile): Promise<void> {
-	// Attempt 0 is the plain write. The single retry is reachable only when the
-	// first failure turned out to be a parent-directory race this call repaired,
-	// which bounds the loop at two writes.
-	for (let attempt = 0; ; attempt++) {
-		try {
-			if (file) {
-				await file.write(content);
-			} else {
-				await Bun.write(dst, content);
-			}
-			return;
-		} catch (error) {
-			if (fallbackHandlers.length === 0) throw error;
-			// On the second attempt a `retry` verdict can no longer change the
-			// outcome, so skip the probe and let the error stand unless it is a
-			// denial the handlers should see.
-			const failure =
-				attempt === 0
-					? await classifyWriteFailure(dst, error)
-					: isPermissionDeniedError(error)
-						? ({ kind: "denied", cause: error } as const)
-						: ({ kind: "rethrow" } as const);
-			if (failure.kind === "retry") continue;
-			if (failure.kind === "denied") {
-				// A handler is more privileged than the write that just failed, so it is
-				// told where the bytes would REALLY have landed rather than the lexical
-				// path the tool used. `open` follows EVERY component, so `ws/link/file`
-				// under a `ws/link -> /elsewhere` link writes outside `ws` while still
-				// looking in-workspace — which defeats the defence a helper author
-				// reaches for first, since a prefix allowlist passes on the link's own
-				// path. Resolving closes that, and closes the TOCTOU window with it: the
-				// helper no longer traverses a link the agent could re-point after the
-				// check. A path that cannot be canonicalized is not brokered at all,
-				// because "where would this land" then has no answer to hand over.
-				const target = await resolveSyscallTarget(dst, true);
-				// Snapshot: a concurrent session shutdown splices the live array, and
-				// iterating it directly would skip whichever handler shifted into the hole.
-				if (target !== null) {
-					// The process-wide registry can hand this to a handler from another
-					// session, so the request names the one that issued it.
-					const sessionId = mutationSessionStorage.getStore();
-					for (const handler of Array.from(fallbackHandlers)) {
-						try {
-							if (await handler({ dst: target, content, cause: failure.cause, sessionId })) return;
-						} catch (handlerError) {
-							logger.warn("File write fallback handler threw; trying next handler", {
-								dst: target,
-								error: handlerError instanceof Error ? handlerError.message : String(handlerError),
-							});
+export async function writeFileWithFallback(
+	dst: string,
+	content: string,
+	file?: BunFile,
+	hooks?: FileWriteMutationHooks,
+	signal?: AbortSignal,
+): Promise<void> {
+	const write = async (): Promise<void> => {
+		for (let attempt = 0; ; attempt++) {
+			signal?.throwIfAborted();
+			await hooks?.beforeWrite?.();
+			signal?.throwIfAborted();
+			hooks?.assertActive?.();
+			try {
+				if (file) {
+					await file.write(content);
+				} else {
+					await Bun.write(dst, content);
+				}
+				return;
+			} catch (error) {
+				if (signal?.aborted) signal.throwIfAborted();
+				if (fallbackHandlers.length === 0) throw error;
+				const failure =
+					attempt === 0
+						? await classifyWriteFailure(dst, error, hooks?.ensureParent, signal)
+						: isPermissionDeniedError(error)
+							? ({ kind: "denied", cause: error } as const)
+							: ({ kind: "rethrow" } as const);
+				signal?.throwIfAborted();
+				hooks?.assertActive?.();
+				if (failure.kind === "retry") continue;
+				if (failure.kind === "denied") {
+					const target = await resolveSyscallTarget(dst, true);
+					signal?.throwIfAborted();
+					hooks?.assertActive?.();
+					if (target !== null) {
+						const sessionId = mutationSessionStorage.getStore();
+						for (const handler of Array.from(fallbackHandlers)) {
+							signal?.throwIfAborted();
+							await hooks?.beforeWrite?.();
+							signal?.throwIfAborted();
+							hooks?.assertActive?.();
+							try {
+								if (await handler({ dst: target, content, cause: failure.cause, sessionId })) return;
+							} catch (handlerError) {
+								logger.warn("File write fallback handler threw; trying next handler", {
+									dst: target,
+									error: handlerError instanceof Error ? handlerError.message : String(handlerError),
+								});
+							}
 						}
 					}
 				}
+				if (failure.kind === "denied" && failure.cause !== error && error instanceof Error && error.cause == null) {
+					error.cause = failure.cause;
+				}
+				throw error;
 			}
-			// Always the ORIGINAL error, never a handler's, so behaviour matches a
-			// host with no fallback registered. When the real boundary was recovered
-			// from behind a masked `ENOENT`, attach it so the denial is not lost:
-			// without this the caller is told `ENOENT` for a path this code has
-			// already proven is `EACCES`.
-			if (failure.kind === "denied" && failure.cause !== error && error instanceof Error && error.cause == null) {
-				error.cause = failure.cause;
-			}
-			throw error;
 		}
-	}
+	};
+	signal?.throwIfAborted();
+	await hooks?.ensureParent?.(path.dirname(dst));
+	signal?.throwIfAborted();
+	if (hooks?.withResourceEffect) await hooks.withResourceEffect(dst, write);
+	else await write();
+	signal?.throwIfAborted();
 }

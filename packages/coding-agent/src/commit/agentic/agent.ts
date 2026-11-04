@@ -10,8 +10,12 @@ import type { Settings } from "../../config/settings";
 import { getMarkdownTheme } from "@oh-my-pi/pi-tui/theme";
 import { createAgentRootSession } from "../../internal/agent-registry-bridge";
 import { AgentRegistry } from "../../registry/agent-registry";
-import { registryDurableStateForSession } from "../../registry/durable-state";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import {
+	closeSessionAuthority,
+	registryDurableStateForSession,
+	validateJournalingEnvironment,
+} from "../../registry/authority";
+import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
 import { SessionManager } from "../../session/session-manager";
 import agentUserPrompt from "./prompts/session-user.md" with { type: "text" };
@@ -59,38 +63,88 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		enableAnalyzeFiles: true,
 	});
 
-	const localSessionManager = SessionManager.create(
-		input.cwd,
-		SessionManager.getDefaultSessionDir(input.cwd, input.settings.getAgentDir()),
-	);
-	const sessionManager = input.sessionManager ?? localSessionManager;
+	const createRoot = input.sessionManager === undefined;
+	const sessionManager =
+		input.sessionManager ??
+		SessionManager.create(input.cwd, SessionManager.getDefaultSessionDir(input.cwd, input.settings.getAgentDir()));
 	const sessionFile = sessionManager.getSessionFile();
-	if (!sessionFile) throw new Error("Commit agent restricted startup requires a persisted session file.");
-	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
-	const { session } = await createAgentRootSession(registry, {
-		cwd: input.cwd,
-		sessionManager,
-		authStorage: input.authStorage,
-		modelRegistry: input.modelRegistry,
-		cacheWarming: false,
-		settings: input.settings,
-		model: input.model,
-		thinkingLevel: input.thinkingLevel,
-		systemPrompt: [systemPrompt],
-		customTools: tools,
-		enableLsp: false,
-		enableMCP: false,
-		hasUI: false,
-		spawns,
-		toolNames: tools.map(tool => tool.name),
-		restrictToolNames: true,
-		allowRestrictedCustomTools: true,
-		contextFiles: input.contextFiles,
-		disableExtensionDiscovery: true,
-		skills: [],
-		promptTemplates: [],
-		slashCommands: [],
-	});
+	if (!sessionFile) {
+		if (createRoot) await sessionManager.close();
+		throw new Error("Commit agent restricted startup requires a persisted session file.");
+	}
+	const header = sessionManager.getHeader();
+	if (!header || header.id !== sessionManager.getSessionId()) {
+		if (createRoot) await sessionManager.close();
+		throw new Error("Commit agent session has no matching persisted session header.");
+	}
+	let authorityOpenAttempted = false;
+	const failBeforeSession = async (error: unknown): Promise<never> => {
+		if (!createRoot) throw error;
+		const cleanupErrors: unknown[] = [];
+		let authorityCloseSucceeded = !authorityOpenAttempted;
+		if (authorityOpenAttempted) {
+			try {
+				await closeSessionAuthority(sessionFile);
+				authorityCloseSucceeded = true;
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (authorityCloseSucceeded) {
+			try {
+				await sessionManager.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError([error, ...cleanupErrors], "Commit root startup failed and cleanup was incomplete");
+		}
+		throw error;
+	};
+	let registry: AgentRegistry;
+	try {
+		if (createRoot) await sessionManager.ensureOnDisk();
+		authorityOpenAttempted = true;
+		const durableState = await registryDurableStateForSession(sessionFile, {
+			backend: validateJournalingEnvironment(),
+			owningSessionId: header.id,
+			create: createRoot,
+		});
+		registry = await AgentRegistry.create({ durableState });
+	} catch (error) {
+		return await failBeforeSession(error);
+	}
+	let session: AgentSession;
+	try {
+		({ session } = await createAgentRootSession(registry, {
+			cwd: input.cwd,
+			sessionManager,
+			authStorage: input.authStorage,
+			modelRegistry: input.modelRegistry,
+			cacheWarming: false,
+			settings: input.settings,
+			model: input.model,
+			thinkingLevel: input.thinkingLevel,
+			systemPrompt: [systemPrompt],
+			customTools: tools,
+			enableLsp: false,
+			enableMCP: false,
+			hasUI: false,
+			spawns,
+			toolNames: tools.map(tool => tool.name),
+			restrictToolNames: true,
+			allowRestrictedCustomTools: true,
+			contextFiles: input.contextFiles,
+			disableExtensionDiscovery: true,
+			skills: [],
+			promptTemplates: [],
+			slashCommands: [],
+		}));
+	} catch (error) {
+		return await failBeforeSession(error);
+	}
+	const releaseDraftCleanup = createRoot ? sessionManager.deferDraftCleanup() : undefined;
 	let toolCalls = 0;
 	let messageCount = 0;
 	let isThinking = false;
@@ -199,6 +253,10 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 	} finally {
 		unsubscribe();
 		await session.dispose();
+		if (createRoot) {
+			await closeSessionAuthority(sessionFile);
+			await releaseDraftCleanup?.();
+		}
 	}
 }
 

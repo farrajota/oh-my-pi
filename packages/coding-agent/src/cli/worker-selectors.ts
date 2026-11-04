@@ -5,6 +5,8 @@
  * recognize a worker before importing protocol/runtime graphs whose top-level
  * evaluation is unnecessary in an ordinary interactive process.
  */
+/** Durable authority worker selector shared by the CLI and authority launcher. */
+export const AUTHORITY_WORKER_ARG = "__omp_worker_authority";
 /** Blob-broker selector shared by the CLI dispatcher and worker launcher. */
 export const BLOB_BROKER_WORKER_ARG = "__omp_worker_blob_broker";
 /** Computer-worker selector shared by the CLI dispatcher and worker launcher. */

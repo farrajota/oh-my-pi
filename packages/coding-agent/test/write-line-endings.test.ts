@@ -213,15 +213,6 @@ describe("write tool keeps the replaced file's line endings and BOM", () => {
 		const original = `${"a".repeat(200_000)}\r\n`;
 		await fs.writeFile(filePath, original);
 		const controller = new AbortController();
-		// `untilAborted` rejects at once and lets the work run on; it removes its abort listener when
-		// that work settles, which is the point to check the file.
-		const settled = Promise.withResolvers<void>();
-		const signal = controller.signal;
-		const removeListener = signal.removeEventListener.bind(signal);
-		signal.removeEventListener = (...args: Parameters<AbortSignal["removeEventListener"]>) => {
-			removeListener(...args);
-			settled.resolve();
-		};
 		// Cancel when the scan reads past the 8 KiB sniff window.
 		const realFile = Bun.file;
 		const fileSpy = spyOn(Bun, "file").mockImplementation(((target: string, options?: BlobPropertyBag) => {
@@ -245,10 +236,9 @@ describe("write tool keeps the replaced file's line endings and BOM", () => {
 			const call = new WriteTool(createSession(tmpDir)).execute(
 				"call-1",
 				{ path: filePath, content: "replaced\n" },
-				signal,
+				controller.signal,
 			);
 			await rejectionOf(call);
-			await settled.promise;
 		} finally {
 			fileSpy.mockRestore();
 		}

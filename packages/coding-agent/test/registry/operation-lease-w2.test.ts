@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, setSystemTime, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Agent, type AgentTool, type AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "../../src/config/model-registry";
 import type { AuthStorage } from "../../src/session/auth-storage";
@@ -20,6 +23,116 @@ import { AgentSession } from "../../src/session/agent-session";
 import { SessionManager } from "../../src/session/session-manager";
 import { Settings } from "../../src/config/settings";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import type { AuthorityStore, MutationOptions, MutationReceipt } from "../../src/registry/authority/types";
+import type { DurableOperationRecord, DurableRegistryRecord } from "../../src/registry/durable-state";
+import { AuthorityRpcClient } from "../../src/registry/authority/client";
+import { acquireAuthorityOwnership } from "../../src/registry/authority/ownership";
+import { SessionPathScope } from "../../src/internal/session-path-scope";
+
+const authorityClients: AuthorityRpcClient[] = [];
+const authorityDirectories: string[] = [];
+async function createOperationStore(
+	waitForTransition: (record: DurableRegistryRecord) => Promise<void> = async () => {},
+) {
+	const records: DurableRegistryRecord[] = [];
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-operation-lease-test-"));
+	authorityDirectories.push(directory);
+	const sessionFile = path.join(directory, "session.jsonl");
+	await fs.writeFile(sessionFile, '{"type":"session","id":"root"}\n');
+	const ownership = await acquireAuthorityOwnership(sessionFile, { owningSessionId: "root", create: true });
+	const client = await AuthorityRpcClient.open(
+		{
+			path: ownership.paths.jsonl,
+			identity: { backend: "jsonl", owningSessionId: "root", incarnation: Bun.randomUUIDv7(), format: 2 },
+			create: true,
+		},
+		ownership,
+	);
+	authorityClients.push(client);
+	let revision = 0;
+	const store = client as AuthorityRpcClient & AuthorityStore;
+	store.transition = async (record: DurableRegistryRecord, options?: MutationOptions): Promise<MutationReceipt> => {
+		if (record.kind !== "operation" && record.kind !== "resource")
+			throw new Error(`Unexpected durable transition: ${record.kind}`);
+		records.push(record);
+		await waitForTransition(record);
+		revision++;
+		return {
+			requestId: options?.requestId ?? `request-${revision}`,
+			ownerEpoch: 1,
+			revision,
+			payloadHash: "a".repeat(64),
+			incarnation: "incarnation-1",
+			commandKind: "transition",
+			committedAt: revision,
+			result: { kind: "mutation" },
+		};
+	};
+	return { store, records, directory };
+}
+
+function operationPhases(records: readonly DurableRegistryRecord[]): DurableOperationRecord["phase"][] {
+	return records.map(record => {
+		if (record.kind !== "operation") throw new Error("Expected durable operation record.");
+		return record.phase;
+	});
+}
+
+function installDurableOperationManager(store: AuthorityStore): { manager: object; close: () => Promise<void> } {
+	const manager = {};
+	const control = operationLease.installSessionOperationLedger(manager);
+	operationLease.markUnregisteredSessionOperationProjection(manager, false);
+	operationLease.bindSessionOperationDurability(manager, store);
+	return { manager, close: () => control.close() };
+}
+async function createRealOperationAuthority() {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-operation-real-test-"));
+	authorityDirectories.push(directory);
+	const sessionFile = path.join(directory, "session.jsonl");
+	await fs.writeFile(sessionFile, '{"type":"session","id":"root"}\n');
+	const ownership = await acquireAuthorityOwnership(sessionFile, { owningSessionId: "root", create: true });
+	const client = await AuthorityRpcClient.open(
+		{
+			path: ownership.paths.jsonl,
+			identity: { backend: "jsonl", owningSessionId: "root", incarnation: Bun.randomUUIDv7(), format: 2 },
+			create: true,
+		},
+		ownership,
+	);
+	authorityClients.push(client);
+	return { client, store: client as AuthorityRpcClient & AuthorityStore, directory };
+}
+
+async function installBoundOperationManager(store: AuthorityStore, validate: () => boolean = () => true) {
+	const manager = {};
+	const control = operationLease.installSessionOperationLedger(manager);
+	operationLease.bindSessionOperationDurability(manager, store);
+	const authority = operationLease.issueBoundSessionOperationAuthority(
+		{
+			capability: {},
+			actorId: "Worker",
+			rootId: "Main",
+			generation: 1,
+			sessionFile: null,
+			validate,
+		},
+		manager,
+	);
+	await operationLease.bindSessionOperationAuthority(manager, authority);
+	return { manager, control, authority };
+}
+
+function gateRealTransitionAcknowledgement(
+	store: AuthorityRpcClient & AuthorityStore,
+	gate: (record: DurableRegistryRecord) => Promise<void>,
+): void {
+	const transition = store.transition.bind(store);
+	store.transition = async (record, options) => {
+		const receipt = await transition(record, options);
+		await gate(record);
+		return receipt;
+	};
+}
 
 function createSession(): { session: AgentSession; auth: AuthStorage } {
 	const auth = createInMemoryAuthStorage();
@@ -56,7 +169,11 @@ function simpleTool(name: string, execute: () => Promise<string>): AgentTool {
 	} as unknown as AgentTool;
 }
 
-afterEach(() => {
+afterEach(async () => {
+	await Promise.all(authorityClients.splice(0).map(client => client.close()));
+	await Promise.all(
+		authorityDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
+	);
 	vi.useRealTimers();
 	setSystemTime();
 });
@@ -158,13 +275,19 @@ describe("W2 non-Hub operation ownership", () => {
 		setSystemTime(1_000);
 		const { session, auth } = createSession();
 		const answer = Promise.withResolvers<string>();
+		const userWaitStarted = Promise.withResolvers<void>();
 		const manager = session.sessionManager;
 		let operation: Promise<string> | undefined;
 		try {
 			operation = runFilesystemOperation(manager, "filesystem:user-wait", () =>
-				runExtensionOperation(manager, "extension:user-wait", () => session.waitForUser(() => answer.promise)),
+				runExtensionOperation(manager, "extension:user-wait", () =>
+					session.waitForUser(() => {
+						userWaitStarted.resolve();
+						return answer.promise;
+					}),
+				),
 			);
-			await Promise.resolve();
+			await userWaitStarted.promise;
 			setSystemTime(1_000 + 5 * 60_000 + 1);
 			await expect(runFilesystemOperation(manager, "filesystem:user-wait", async () => "duplicate")).rejects.toThrow(
 				"already-active",
@@ -272,9 +395,16 @@ describe("W2 non-Hub operation ownership", () => {
 		setSystemTime(1_000);
 		const { session, auth } = createSession();
 		const completion = Promise.withResolvers<string>();
+		const callbackStarted = Promise.withResolvers<void>();
 		try {
-			const stale = runEvalOperation(session.sessionManager, "eval:expiry-race", () => completion.promise);
-			await Promise.resolve();
+			let callbackContinued = false;
+			const stale = runEvalOperation(session.sessionManager, "eval:expiry-race", async () => {
+				callbackStarted.resolve();
+				const value = await completion.promise;
+				callbackContinued = true;
+				return value;
+			});
+			await callbackStarted.promise;
 			setSystemTime(1_000 + 5 * 60_000 + 1);
 			await expect(
 				runEvalOperation(session.sessionManager, "eval:expiry-race", async () => "new attempt"),
@@ -284,8 +414,10 @@ describe("W2 non-Hub operation ownership", () => {
 				status: "abandoned",
 				detail: "Operation lease expired",
 			});
+			expect(callbackContinued).toBe(false);
 			completion.resolve("late stale completion");
 			await expect(stale).rejects.toThrow("Operation eval lease expired");
+			expect(callbackContinued).toBe(true);
 			expect(getOperationTerminal(session.sessionManager, "eval:expiry-race")).toMatchObject({
 				status: "abandoned",
 				detail: "Operation lease expired",
@@ -295,6 +427,68 @@ describe("W2 non-Hub operation ownership", () => {
 			setSystemTime();
 			await session.dispose();
 			auth.close();
+		}
+	});
+	it("serializes competing authority binds and rejects installation after ledger close", async () => {
+		const manager = {};
+		const control = operationLease.installSessionOperationLedger(manager);
+		const issue = (target: object, actorId: string) =>
+			operationLease.issueBoundSessionOperationAuthority(
+				{
+					capability: {},
+					actorId,
+					rootId: "Main",
+					generation: 1,
+					sessionFile: null,
+					validate: () => true,
+				},
+				target,
+			);
+		try {
+			const competing = await Promise.allSettled([
+				operationLease.bindSessionOperationAuthority(manager, issue(manager, "WorkerA")),
+				operationLease.bindSessionOperationAuthority(manager, issue(manager, "WorkerB")),
+			]);
+			expect(competing.filter(result => result.status === "fulfilled")).toHaveLength(1);
+			expect(competing.filter(result => result.status === "rejected")).toHaveLength(1);
+		} finally {
+			await control.close();
+		}
+
+		const closingManager = {};
+		const closingControl = operationLease.installSessionOperationLedger(closingManager);
+		operationLease.markUnregisteredSessionOperationProjection(closingManager, false);
+		const callback = Promise.withResolvers<string>();
+		const started = Promise.withResolvers<void>();
+		const active = runFilesystemOperation(closingManager, "filesystem:bind-close-race", async () => {
+			started.resolve();
+			return callback.promise;
+		});
+		await started.promise;
+		const pendingBind = operationLease.bindSessionOperationAuthority(
+			closingManager,
+			issue(closingManager, "WorkerC"),
+		);
+		const pendingBindResult = pendingBind.then(
+			() => ({ kind: "fulfilled" as const }),
+			error => ({ kind: "rejected" as const, error }),
+		);
+		try {
+			const closed = closingControl.close();
+			callback.resolve("late callback result");
+			await expect(active).rejects.toThrow(/cancelled/i);
+			await closed;
+			const bindResult = await pendingBindResult;
+			expect(bindResult.kind).toBe("rejected");
+			if (bindResult.kind !== "rejected") throw new Error("Authority bind unexpectedly succeeded after close.");
+			expect(bindResult.error).toBeInstanceOf(Error);
+			if (!(bindResult.error instanceof Error)) throw bindResult.error;
+			expect(bindResult.error.message).toMatch(/closed/i);
+			expect(operationLease.hasBoundSessionOperationAuthority(closingManager)).toBe(false);
+		} finally {
+			callback.resolve("late callback result");
+			await active.catch(() => undefined);
+			await closingControl.close();
 		}
 	});
 
@@ -346,6 +540,8 @@ describe("W2 non-Hub operation ownership", () => {
 		const { session, auth } = createSession();
 		const completion = Promise.withResolvers<string>();
 		const secondCompletion = Promise.withResolvers<string>();
+		const operationStarted = Promise.withResolvers<void>();
+		const secondOperationStarted = Promise.withResolvers<void>();
 		const controller = new operationLease.MigrationFenceController();
 		let cancellationCount = 0;
 		try {
@@ -358,6 +554,7 @@ describe("W2 non-Hub operation ownership", () => {
 					},
 					{ once: true },
 				);
+				operationStarted.resolve();
 				return completion.promise;
 			});
 			const secondOperation = runMcpOperation(session.sessionManager, "mcp:drain", async signal => {
@@ -369,12 +566,12 @@ describe("W2 non-Hub operation ownership", () => {
 					},
 					{ once: true },
 				);
+				secondOperationStarted.resolve();
 				return secondCompletion.promise;
 			});
-			await Promise.resolve();
+			await Promise.all([operationStarted.promise, secondOperationStarted.promise]);
 			const opened = controller.open("root", "token");
 			const quiescing = controller.quiesce(opened, session.sessionManager);
-			await Promise.resolve();
 			expect(cancellationCount).toBe(2);
 			let quiesced = false;
 			void quiescing.then(() => {
@@ -448,7 +645,7 @@ describe("W2 non-Hub operation ownership", () => {
 		);
 		try {
 			expect(operationLease.hasBoundSessionOperationAuthority(manager)).toBe(false);
-			operationLease.bindSessionOperationAuthority(manager, authority);
+			await operationLease.bindSessionOperationAuthority(manager, authority);
 			expect(operationLease.hasBoundSessionOperationAuthority(manager)).toBe(true);
 			valid = false;
 			expect(operationLease.hasBoundSessionOperationAuthority(manager)).toBe(true);
@@ -456,6 +653,314 @@ describe("W2 non-Hub operation ownership", () => {
 			expect(operationLease.hasBoundSessionOperationAuthority(manager)).toBe(true);
 		} finally {
 			await control.close();
+		}
+	});
+	it("reserves duplicate operation IDs before an awaited durable intent", async () => {
+		const intent = Promise.withResolvers<void>();
+		const intentStarted = Promise.withResolvers<void>();
+		const { store, records } = await createOperationStore(async record => {
+			if (record.kind !== "operation" || record.phase !== "intent") return;
+			intentStarted.resolve();
+			await intent.promise;
+		});
+		const { manager, close } = installDurableOperationManager(store);
+		let callbacks = 0;
+		try {
+			const first = runFilesystemOperation(manager, "filesystem:duplicate", async () => {
+				callbacks++;
+				return "written";
+			});
+			await intentStarted.promise;
+			await expect(
+				runFilesystemOperation(manager, "filesystem:duplicate", async () => {
+					callbacks++;
+					return "duplicate";
+				}),
+			).rejects.toThrow(/already-active/i);
+			expect(callbacks).toBe(0);
+			intent.resolve();
+			await expect(first).resolves.toBe("written");
+			expect(callbacks).toBe(1);
+			expect(operationPhases(records)).toEqual(["intent", "effect", "committed", "completed"]);
+		} finally {
+			await close();
+		}
+	});
+
+	it("revalidates bound ownership after a durable intent wait", async () => {
+		const intent = Promise.withResolvers<void>();
+		const intentStarted = Promise.withResolvers<void>();
+		const { store } = await createOperationStore(async record => {
+			if (record.kind !== "operation" || record.phase !== "intent") return;
+			intentStarted.resolve();
+			await intent.promise;
+		});
+		const { manager, close } = installDurableOperationManager(store);
+		let authorityIsCurrent = true;
+		const authority = operationLease.issueBoundSessionOperationAuthority(
+			{
+				capability: {},
+				actorId: "Worker",
+				rootId: "Main",
+				generation: 1,
+				sessionFile: null,
+				validate: () => authorityIsCurrent,
+			},
+			manager,
+		);
+		await operationLease.bindSessionOperationAuthority(manager, authority);
+		let callbacks = 0;
+		try {
+			const pending = runFilesystemOperation(manager, "filesystem:stale", async () => {
+				callbacks++;
+				return "must not run";
+			});
+			await intentStarted.promise;
+			authorityIsCurrent = false;
+			intent.resolve();
+			await expect(pending).rejects.toThrow(/stale|current|authority/i);
+			expect(callbacks).toBe(0);
+		} finally {
+			await close();
+		}
+	});
+
+	it("does not invoke the effect or retry an intent after a lost worker acknowledgement", async () => {
+		const { store, records } = await createOperationStore(async record => {
+			if (record.kind !== "operation" || record.phase !== "intent") return;
+			throw Object.assign(new Error("worker acknowledgement lost"), { unknownOutcome: true });
+		});
+		const { manager, close } = installDurableOperationManager(store);
+		let callbacks = 0;
+		try {
+			await expect(
+				runFilesystemOperation(manager, "filesystem:lost-ack", async () => {
+					callbacks++;
+					return "must not run";
+				}),
+			).rejects.toThrow("worker acknowledgement lost");
+			expect(callbacks).toBe(0);
+			expect(records).toHaveLength(1);
+			const [intentRecord] = records;
+			if (!intentRecord || intentRecord.kind !== "operation")
+				throw new Error("Lost acknowledgement must retain its operation intent.");
+			expect(intentRecord.phase).toBe("intent");
+		} finally {
+			await close();
+		}
+	});
+	it("awaits resource authorization before O_CREAT and resource completion before success", async () => {
+		const effectAuthorization = Promise.withResolvers<void>();
+		const effectStarted = Promise.withResolvers<void>();
+		const resourceCompletion = Promise.withResolvers<void>();
+		const completionStarted = Promise.withResolvers<void>();
+		const { store, records, directory } = await createOperationStore(async record => {
+			if (record.kind !== "resource") return;
+			if (record.phase === "effect") {
+				effectStarted.resolve();
+				await effectAuthorization.promise;
+			}
+			if (record.phase === "completed") {
+				completionStarted.resolve();
+				await resourceCompletion.promise;
+			}
+		});
+		const { manager, close } = installDurableOperationManager(store);
+		const authority = operationLease.issueBoundSessionOperationAuthority(
+			{
+				capability: {},
+				actorId: "Worker",
+				rootId: "Main",
+				generation: 1,
+				sessionFile: null,
+				validate: () => true,
+			},
+			manager,
+		);
+		await operationLease.bindSessionOperationAuthority(manager, authority);
+		const scope = new SessionPathScope({
+			actorId: () => "Worker",
+			sessionId: () => "session-1",
+			operationManager: () => manager,
+			cwd: () => directory,
+			permissionScope: () => undefined,
+		});
+		const targetPath = path.join(directory, "effect-authorized.txt");
+		let callbackReturned = false;
+		const operationId = "filesystem:resource-boundary";
+		const pending = runFilesystemOperation(manager, operationId, () =>
+			scope.withOperationLease(operationId, async operation => {
+				const target = await operation.authorize(targetPath, "create");
+				await operation.writeFile(target, "authorized bytes");
+				callbackReturned = true;
+				return "written";
+			}),
+		);
+		try {
+			await effectStarted.promise;
+			await expect(fs.readFile(targetPath, "utf8")).rejects.toThrow();
+			expect(callbackReturned).toBe(false);
+			effectAuthorization.resolve();
+			await completionStarted.promise;
+			expect(await fs.readFile(targetPath, "utf8")).toBe("authorized bytes");
+			expect(callbackReturned).toBe(false);
+			resourceCompletion.resolve();
+			await expect(pending).resolves.toBe("written");
+			expect(callbackReturned).toBe(true);
+			expect(records.filter(record => record.kind === "resource").map(record => record.phase)).toEqual([
+				"intent",
+				"effect",
+				"committed",
+				"completed",
+			]);
+		} finally {
+			effectAuthorization.resolve();
+			resourceCompletion.resolve();
+			await close();
+		}
+	});
+	it("does not resolve a resource handle close before durable completion", async () => {
+		const resourceCompletion = Promise.withResolvers<void>();
+		const completionStarted = Promise.withResolvers<void>();
+		const { store, directory } = await createOperationStore(async record => {
+			if (record.kind === "resource" && record.phase === "completed") {
+				completionStarted.resolve();
+				await resourceCompletion.promise;
+			}
+		});
+		const { manager, close } = installDurableOperationManager(store);
+		const authority = operationLease.issueBoundSessionOperationAuthority(
+			{
+				capability: {},
+				actorId: "Worker",
+				rootId: "Main",
+				generation: 1,
+				sessionFile: null,
+				validate: () => true,
+			},
+			manager,
+		);
+		await operationLease.bindSessionOperationAuthority(manager, authority);
+		const targetPath = path.join(directory, "read-resource.txt");
+		await fs.writeFile(targetPath, "read bytes");
+		const scope = new SessionPathScope({
+			actorId: () => "Worker",
+			sessionId: () => "session-1",
+			operationManager: () => manager,
+			cwd: () => directory,
+			permissionScope: () => undefined,
+		});
+		let closeReturned = false;
+		const operationId = "filesystem:resource-close";
+		const pending = runFilesystemOperation(manager, operationId, () =>
+			scope.withOperationLease(operationId, async operation => {
+				const target = await operation.authorize(targetPath, "read");
+				const handle = await operation.openRead(target);
+				await handle.close();
+				closeReturned = true;
+				return "closed";
+			}),
+		);
+		try {
+			await completionStarted.promise;
+			expect(closeReturned).toBe(false);
+			resourceCompletion.resolve();
+			await expect(pending).resolves.toBe("closed");
+			expect(closeReturned).toBe(true);
+		} finally {
+			resourceCompletion.resolve();
+			await close();
+		}
+	});
+	it("awaits durable cancellation when a resource effect fails", async () => {
+		const cancellation = Promise.withResolvers<void>();
+		const cancellationStarted = Promise.withResolvers<void>();
+		const { store, records, directory } = await createOperationStore(async record => {
+			if (record.kind === "resource" && record.phase === "cancelled") {
+				cancellationStarted.resolve();
+				await cancellation.promise;
+			}
+		});
+		const { manager, close } = installDurableOperationManager(store);
+		const authority = operationLease.issueBoundSessionOperationAuthority(
+			{
+				capability: {},
+				actorId: "Worker",
+				rootId: "Main",
+				generation: 1,
+				sessionFile: null,
+				validate: () => true,
+			},
+			manager,
+		);
+		await operationLease.bindSessionOperationAuthority(manager, authority);
+		const targetPath = path.join(directory, "directory-target");
+		await fs.mkdir(targetPath);
+		const scope = new SessionPathScope({
+			actorId: () => "Worker",
+			sessionId: () => "session-1",
+			operationManager: () => manager,
+			cwd: () => directory,
+			permissionScope: () => undefined,
+		});
+		const operationId = "filesystem:resource-cancel";
+		const pending = runFilesystemOperation(manager, operationId, () =>
+			scope.withOperationLease(operationId, async operation => {
+				const target = await operation.authorize(targetPath, "write");
+				await operation.writeFile(target, "cannot replace a directory");
+			}),
+		);
+		let settled = false;
+		const observedPending = pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		try {
+			await cancellationStarted.promise;
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			cancellation.resolve();
+			await expect(pending).rejects.toThrow();
+			await observedPending;
+			expect(records.filter(record => record.kind === "resource").map(record => record.phase)).toEqual([
+				"intent",
+				"effect",
+				"cancelled",
+			]);
+		} finally {
+			cancellation.resolve();
+			await close();
+		}
+	});
+	it("does not repeat an effect after terminal acknowledgement is lost", async () => {
+		const { store, records } = await createOperationStore(async record => {
+			if (record.kind === "operation" && record.phase === "completed") {
+				throw Object.assign(new Error("terminal acknowledgement lost"), { unknownOutcome: true });
+			}
+		});
+		const { manager, close } = installDurableOperationManager(store);
+		let callbacks = 0;
+		const run = () =>
+			runFilesystemOperation(manager, "filesystem:terminal-lost-ack", async () => {
+				callbacks++;
+				return "written";
+			});
+		try {
+			await expect(run()).rejects.toThrow("terminal acknowledgement lost");
+			await expect(run()).rejects.toThrow(/not admitted: terminal/i);
+			expect(callbacks).toBe(1);
+			expect(records.filter(record => record.kind === "operation").map(record => record.phase)).toEqual([
+				"intent",
+				"effect",
+				"committed",
+				"completed",
+			]);
+		} finally {
+			await close();
 		}
 	});
 });

@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import { type } from "arktype";
 import type { ModelRegistry } from "../../config/model-registry";
@@ -10,6 +10,7 @@ import * as sdk from "../../sdk";
 import type { AgentSession } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
 import { EventBus } from "../../utils/event-bus";
+import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../internal/agent-registry-bridge";
 import { AgentRegistry } from "../../registry/agent-registry";
 import { createMCPProxyTools, runSubprocess } from "../executor";
 import * as taskLabel from "../label";
@@ -64,6 +65,7 @@ function fakeSession(): AgentSession {
 		waitForAdvisorCatchup: async () => true,
 		waitForIdle: async () => {},
 		getLastAssistantMessage: () => ({ stopReason: "error", errorMessage: "test stop" }),
+		beginDispose: () => {},
 		dispose: async () => {},
 		isStreaming: false,
 		queuedMessageCount: 0,
@@ -79,11 +81,20 @@ function fakeModelRegistry(): ModelRegistry {
 	} as unknown as ModelRegistry;
 }
 
-function createAuthorityFixture() {
+const authorityRoots: AgentSession[] = [];
+
+afterEach(async () => {
+	for (const root of authorityRoots.splice(0)) await root.dispose();
+});
+
+/** Live "Main" root whose authority binding creates the child; create it before spying on createAgentSession. */
+async function createAuthorityFixture() {
 	const agentRegistry = new AgentRegistry();
-	const createAuthoritySession = (options: Parameters<typeof sdk.createAgentSession>[0]) =>
-		sdk.createAgentSession({ ...options, agentRegistry });
-	return { agentRegistry, createAuthoritySession };
+	const root = await createAgentRootSession(agentRegistry, { agentId: "Main" });
+	authorityRoots.push(root.session);
+	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
+	if (!authority) throw new Error("Test fixture requires parent authority");
+	return { agentRegistry, createAuthoritySession: authority.create };
 }
 
 async function runWithAgentTools(
@@ -91,6 +102,7 @@ async function runWithAgentTools(
 	settings = Settings.isolated({ "task.agentIdleTtlMs": 0 }),
 ): Promise<readonly string[] | undefined> {
 	let capturedToolNames: readonly string[] | undefined;
+	const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 	const createSpy = vi.spyOn(sdk, "createAgentSession").mockImplementation(async (options = {}) => {
 		capturedToolNames = options.toolNames;
 		return {
@@ -100,7 +112,6 @@ async function runWithAgentTools(
 	});
 
 	try {
-		const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 		await runSubprocess({
 			cwd: process.cwd(),
 			agent: fakeAgent(agentTools),
@@ -112,6 +123,7 @@ async function runWithAgentTools(
 			modelRegistry: fakeModelRegistry(),
 			agentRegistry,
 			createAuthoritySession,
+			parentAgentId: "Main",
 		});
 	} finally {
 		createSpy.mockRestore();
@@ -156,6 +168,7 @@ describe("runSubprocess subagent event bus propagation", () => {
 	test("forwards the lifecycle bus without forwarding a general session bus", async () => {
 		const subagentEventBus = new EventBus();
 		let capturedOptions: sdk.CreateAgentSessionOptions | undefined;
+		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
 		const createSpy = vi.spyOn(sdk, "createAgentSession").mockImplementation(async (options = {}) => {
 			capturedOptions = options;
 			return {
@@ -165,7 +178,6 @@ describe("runSubprocess subagent event bus propagation", () => {
 		});
 
 		try {
-			const { agentRegistry, createAuthoritySession } = createAuthorityFixture();
 			await runSubprocess({
 				cwd: process.cwd(),
 				agent: fakeAgent([]),
@@ -178,6 +190,7 @@ describe("runSubprocess subagent event bus propagation", () => {
 				subagentEventBus,
 				agentRegistry,
 				createAuthoritySession,
+				parentAgentId: "Main",
 			});
 			expect(capturedOptions?.subagentEventBus).toBe(subagentEventBus);
 			expect(Object.hasOwn(capturedOptions ?? {}, "eventBus")).toBe(false);

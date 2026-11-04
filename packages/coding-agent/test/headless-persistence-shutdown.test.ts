@@ -1,9 +1,12 @@
 /**
  * Contract (issue #11493): a session store that fails on its very first write —
  * before print mode installs its persistence subscription — still surfaces to a
- * headless consumer through the CLI shutdown path `runRootCommand` owns: the
- * diagnostic reaches stderr, the process terminator is handed a nonzero code,
- * and no raw postmortem fatal dump is written.
+ * headless consumer through the CLI shutdown path: the diagnostic reaches
+ * stderr, the process terminator is handed a nonzero code, and no raw
+ * postmortem fatal dump is written. `runRootCommand` rethrows the persistence
+ * failure to its caller; `runRootCommandAtCliBoundary` (what `omp` launch runs)
+ * turns it into that exit. The same holds when the disk is already full while
+ * root startup materializes its transcript, before any session exists.
  *
  * `test/modes/print-persistence-failure.test.ts` covers the mode functions in
  * isolation; this file drives the externally observable shutdown path the three
@@ -13,7 +16,7 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import { parseArgs, type Args } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
+import { runRootCommandAtCliBoundary } from "@oh-my-pi/pi-coding-agent/main";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { TempDir, postmortem } from "@oh-my-pi/pi-utils";
@@ -99,6 +102,8 @@ interface ShutdownHarnessDeps {
 interface ShutdownHarness {
 	parsed: Args;
 	rawArgs: string[];
+	/** Calls of the injected session factory; startup failures never reach it. */
+	sessionFactoryCalls: () => number;
 	session: AgentSession;
 	manager: SessionManager;
 	authStorage: AuthStorage;
@@ -109,7 +114,7 @@ interface ShutdownHarness {
 	deps: ShutdownHarnessDeps;
 }
 
-async function createHarness(): Promise<ShutdownHarness> {
+async function createHarness(armWrites: "session" | "startup" = "session"): Promise<ShutdownHarness> {
 	const dir = TempDir.createSync("@pi-headless-shutdown-");
 	tempDirs.push(dir);
 	const authStorage = await AuthStorage.create(":memory:");
@@ -149,7 +154,14 @@ async function createHarness(): Promise<ShutdownHarness> {
 	parsed.sessionDir = dir.path();
 	const rawArgs = ["--print", "hello"];
 
-	const restoreWrites = failWrites();
+	// Root startup materializes its own transcript before the authority store opens, so the
+	// store failure is armed at session creation: the injected session's first write is the
+	// first write this scenario fails.
+	let disarmWrites: (() => void) | undefined = armWrites === "startup" ? failWrites() : undefined;
+	const restoreWrites = () => {
+		disarmWrites?.();
+		disarmWrites = undefined;
+	};
 
 	async function recordFirstWrite(): Promise<void> {
 		await manager.ensureOnDisk().catch(() => undefined);
@@ -157,16 +169,30 @@ async function createHarness(): Promise<ShutdownHarness> {
 		unsubscribe();
 	}
 
+	let sessionFactoryCalls = 0;
 	const deps = {
 		discoverAuthStorage: async () => authStorage,
 		settings,
 		createAgentSession: async () => {
+			sessionFactoryCalls++;
+			disarmWrites ??= failWrites();
 			await recordFirstWrite();
 			return { session } as unknown as CreateAgentSessionResult;
 		},
 	};
 
-	return { parsed, rawArgs, session, manager, authStorage, latchedBeforeRun, restoreWrites, recordFirstWrite, deps };
+	return {
+		parsed,
+		rawArgs,
+		sessionFactoryCalls: () => sessionFactoryCalls,
+		session,
+		manager,
+		authStorage,
+		latchedBeforeRun,
+		restoreWrites,
+		recordFirstWrite,
+		deps,
+	};
 }
 
 async function teardown(
@@ -192,7 +218,7 @@ describe("headless persistence-failure shutdown path", () => {
 
 		let escaped: unknown;
 		try {
-			await runRootCommand(harness.parsed, harness.rawArgs, harness.deps);
+			await runRootCommandAtCliBoundary(harness.parsed, harness.rawArgs, harness.deps);
 		} catch (error) {
 			// `cli.ts` runs `runCli(...).catch(fatal)`, and `fatal()` renders
 			// `Bun.inspect(error)` onto fd 2. Reproduce that here so the stderr
@@ -219,5 +245,39 @@ describe("headless persistence-failure shutdown path", () => {
 		const sessionFile = harness.manager.getSessionFile();
 		expect(sessionFile).toBeString();
 		expect(fs.existsSync(String(sessionFile))).toBe(false);
+	}, 15_000);
+
+	it("reports a disk-full root startup cleanly and exits nonzero without a raw fatal dump", async () => {
+		const harness = await createHarness("startup");
+		const stderr = captureStderr();
+		const quitCodes: number[] = [];
+		const quitSpy = spyOn(postmortem, "quit").mockImplementation(async (code?: number) => {
+			quitCodes.push(code ?? 0);
+		});
+
+		let escaped: unknown;
+		try {
+			await runRootCommandAtCliBoundary(harness.parsed, harness.rawArgs, harness.deps);
+		} catch (error) {
+			// Same reproduction of `cli.ts`'s `fatal()` rendering as above.
+			escaped = error;
+			process.stderr.write(`${Bun.inspect(error, { colors: false })}\n`);
+		} finally {
+			await teardown(harness, stderr, quitSpy);
+		}
+
+		const output = stderr.written();
+		expect(output).not.toMatch(RAW_FATAL_DUMP_RE);
+		expect(escaped).toBeUndefined();
+		expect(output).toContain("Session persistence failed: ");
+		expect(output).toContain("ENOSPC");
+		expect(quitCodes).toEqual([1]);
+		// Root startup could not materialize the transcript its authority needs, so no
+		// session was created and no transcript landed in the session directory.
+		expect(harness.sessionFactoryCalls()).toBe(0);
+		const transcripts = fs
+			.readdirSync(String(harness.parsed.sessionDir), { recursive: true })
+			.filter(entry => String(entry).endsWith(".jsonl"));
+		expect(transcripts).toEqual([]);
 	}, 15_000);
 });

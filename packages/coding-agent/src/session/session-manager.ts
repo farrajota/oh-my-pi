@@ -28,6 +28,17 @@ import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
+import { AuthorityRelocationInterruptedError, relocateSessionAuthority } from "../registry/authority/lifecycle";
+import { AuthorityCleanupError } from "../registry/authority/private-cleanup";
+import { inspectAuthorityArtifacts } from "../registry/authority/ownership";
+import { canonicalAuthorityPathSync } from "../registry/authority/canonical-path";
+import { closeSessionAuthority, registryDurableStateForSession } from "../registry/authority";
+import {
+	issueFreshAuthorityRootAllocation,
+	revokeFreshAuthorityRootAllocation,
+} from "../registry/authority/allocation";
+import { hasBoundSessionOperationAuthority } from "../registry/operation-lease";
+import type { FreshAuthorityRootAllocation } from "../registry/authority/allocation";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
@@ -164,6 +175,45 @@ function nowIso(): string {
 
 function fileSafeTimestamp(iso: string): string {
 	return iso.replace(/[:.]/g, "-");
+}
+
+/** Canonical transcript path for `authorityRoot` stamps: the same function every authority check compares against. */
+const canonicalSessionPathSync = canonicalAuthorityPathSync;
+
+/**
+ * The transcript whose authority owns a child created under `parentFile`: the parent's own `authorityRoot` stamp
+ * when it has one (a root names itself, a child names its root, so nested children name the top root), otherwise
+ * the parent's canonical path.
+ */
+async function resolveAuthorityOwner(parentFile: string): Promise<string> {
+	const canonical = canonicalSessionPathSync(parentFile);
+	let text: string;
+	try {
+		const handle = await fs.promises.open(canonical, "r");
+		try {
+			const buffer = Buffer.alloc(64 * 1024);
+			const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+			text = buffer.toString("utf8", 0, bytesRead);
+		} finally {
+			await handle.close();
+		}
+	} catch (error) {
+		if (isEnoent(error)) return canonical;
+		throw error;
+	}
+	for (const line of text.split("\n")) {
+		if (!line.startsWith("{")) continue;
+		let entry: unknown;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (typeof entry !== "object" || entry === null || (entry as { type?: unknown }).type !== "session") continue;
+		const stamp = (entry as { authorityRoot?: unknown }).authorityRoot;
+		return typeof stamp === "string" && path.isAbsolute(stamp) ? stamp : canonical;
+	}
+	return canonical;
 }
 
 function artifactsDirectoryFor(sessionFile: string | undefined): string | null {
@@ -844,6 +894,7 @@ interface SessionManagerStateSnapshot {
 	taskSiblingCandidate: string | undefined;
 	header: SessionHeader;
 	entries: SessionEntry[];
+	freshAuthorityAllocation?: FreshAuthorityRootAllocation;
 }
 
 interface DiskQueueOptions {
@@ -946,6 +997,20 @@ export class ForkSourceNotFoundError extends Error {
 		this.name = "ForkSourceNotFoundError";
 	}
 }
+
+function hasRetainedRelocationInterruption(error: unknown): boolean {
+	if (error instanceof AuthorityRelocationInterruptedError) return true;
+	if (!(error instanceof AuthorityCleanupError) || !error.pending) return false;
+	const visited = new Set<unknown>();
+	const visit = (candidate: unknown): boolean => {
+		if (candidate instanceof AuthorityRelocationInterruptedError) return true;
+		if (!(candidate instanceof Error) || visited.has(candidate)) return false;
+		visited.add(candidate);
+		if (candidate instanceof AggregateError && candidate.errors.some(visit)) return true;
+		return visit(candidate.cause);
+	};
+	return visit(error);
+}
 /**
  * Stores and navigates an append-only conversation journal.
  *
@@ -970,6 +1035,7 @@ export class ForkSourceNotFoundError extends Error {
  * A trailing atomic rewrite still rewrites the header cwd after the path is
  * repointed.
  */
+
 export class SessionManager {
 	#cwd: string;
 	/** Additional workspace directories beyond cwd (multi-root). Normalized absolute, deduped, excludes cwd. */
@@ -981,6 +1047,7 @@ export class SessionManager {
 	readonly #blobs: BlobStore;
 
 	#sessionId = "";
+	#freshAuthorityAllocation: FreshAuthorityRootAllocation | undefined;
 	/**
 	 * Parent-derived sibling family candidate stashed by the Task executor once
 	 * the child session exists. Session-scoped and non-persisted: the header
@@ -1019,6 +1086,9 @@ export class SessionManager {
 	 * ensureOnDisk() callers (ACP session/new, handoff) must survive close().
 	 */
 	#draftOnlySessionCleanupArmed = false;
+	#draftCleanupDeferrals = 0;
+	#draftCleanupCloseRequested = false;
+	#draftCleanupPromise: Promise<void> | undefined;
 
 	/**
 	 * Collab replication tap: invoked for every appended entry with the
@@ -1210,6 +1280,40 @@ export class SessionManager {
 		// moves this session to a sibling instead of appending into that journal.
 		this.#sessionClaim = { sessionId, release: this.#storage.claimSession(sessionId, sessionFile) ?? undefined };
 	}
+	#revokeFreshAuthorityAllocation(): void {
+		const allocation = this.#freshAuthorityAllocation;
+		this.#freshAuthorityAllocation = undefined;
+		if (allocation) revokeFreshAuthorityRootAllocation(allocation);
+	}
+
+	#issueFreshAuthorityAllocation(): void {
+		this.#revokeFreshAuthorityAllocation();
+		if (!this.#persist || !this.#sessionFile || !(this.#storage instanceof FileSessionStorage)) return;
+		this.#freshAuthorityAllocation = issueFreshAuthorityRootAllocation(this.#sessionFile, this.#sessionId);
+	}
+
+	/** The header stamp for a root transcript at `sessionFile`; only file-backed persisted sessions can own an authority bundle. */
+	#authorityRootStamp(sessionFile: string | undefined): string | undefined {
+		if (!this.#persist || !sessionFile || !(this.#storage instanceof FileSessionStorage)) return undefined;
+		return canonicalSessionPathSync(sessionFile);
+	}
+
+	/**
+	 * Re-stamps a root whose transcript now lives at `to`. A stamp naming another path (a child transcript's
+	 * owning parent, or the original of a bundle-less copy) is evidence for adoption and is kept as is.
+	 */
+	#restampAuthorityRoot(from: string, to: string): void {
+		const current = this.#header.authorityRoot;
+		if (current !== undefined && current !== canonicalSessionPathSync(from)) return;
+		const stamp = this.#authorityRootStamp(to);
+		if (stamp !== undefined) this.#header.authorityRoot = stamp;
+	}
+
+	#relocateFreshAuthorityAllocation(sessionFile: string): void {
+		if (!this.#freshAuthorityAllocation) return;
+		this.#revokeFreshAuthorityAllocation();
+		this.#freshAuthorityAllocation = issueFreshAuthorityRootAllocation(sessionFile, this.#sessionId);
+	}
 
 	/**
 	 * Whether another live omp process owns this session, claiming it first
@@ -1366,9 +1470,16 @@ export class SessionManager {
 		const from = this.#sessionFile as string;
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
-		this.#sessionId = mintSessionId();
+		const nextSessionId = mintSessionId();
+		const to = path.join(path.dirname(from), `${fileSafeTimestamp(timestamp)}_${nextSessionId}.jsonl`);
+		const allocation =
+			this.#persist && this.#storage instanceof FileSessionStorage
+				? issueFreshAuthorityRootAllocation(to, nextSessionId)
+				: undefined;
+		this.#revokeFreshAuthorityAllocation();
+		this.#freshAuthorityAllocation = allocation;
+		this.#sessionId = nextSessionId;
 		this.#taskSiblingCandidate = undefined;
-		const to = path.join(path.dirname(from), `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		// The marker goes before the carried-over fields: the session listing
 		// reads only the first 4 KB of a file, and a header grows with them.
 		const {
@@ -1388,6 +1499,7 @@ export class SessionManager {
 			...carried,
 			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(this.#header),
 		};
+		this.#restampAuthorityRoot(from, to);
 		this.#closeWriterEventually();
 		this.#sessionFile = to;
 		this.#expectedDiskSize = null;
@@ -2214,7 +2326,12 @@ export class SessionManager {
 		}
 	}
 
-	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
+	#resetToNewSession(
+		options?: NewSessionOptions,
+		forcedSessionFile?: string,
+		authorityOwner?: string,
+	): string | undefined {
+		this.#revokeFreshAuthorityAllocation();
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
 		this.#reconcileSessionDirForFallback();
@@ -2273,15 +2390,27 @@ export class SessionManager {
 				forcedSessionFile ??
 				path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 			this.#rememberBreadcrumb(this.#cwd, this.#sessionFile, true);
+			// A child agent's transcript names the authority that owns its actor, never its own path.
+			const stamp = this.#authorityRootStamp(this.#sessionFile);
+			if (stamp !== undefined) this.#header.authorityRoot = authorityOwner ?? stamp;
 		} else {
 			this.#sessionFile = undefined;
 		}
+		// A child agent's transcript is never a root, so it gets no fresh root allocation either.
+		if (authorityOwner === undefined) this.#issueFreshAuthorityAllocation();
+		else this.#revokeFreshAuthorityAllocation();
 
 		return this.#sessionFile;
 	}
 
-	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
+	#applyEntries(
+		header: SessionHeader,
+		entries: SessionEntry[],
+		freshAuthorityAllocation?: FreshAuthorityRootAllocation,
+	): void {
 		this.#header = header;
+		if (this.#freshAuthorityAllocation !== freshAuthorityAllocation) this.#revokeFreshAuthorityAllocation();
+		this.#freshAuthorityAllocation = freshAuthorityAllocation;
 		this.#entries = entries;
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
@@ -2455,6 +2584,7 @@ export class SessionManager {
 			// (cwd, additionalDirectories), so a by-reference capture would let
 			// a rollback observe the move it is undoing.
 			header: structuredClone(this.#header),
+			freshAuthorityAllocation: this.#freshAuthorityAllocation,
 			entries: [...this.#entries],
 		};
 	}
@@ -2469,7 +2599,9 @@ export class SessionManager {
 		const persist = options?.persist ?? this.#persist;
 		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage);
 		clone.#suppressBreadcrumb = true;
-		clone.restoreState(this.captureState());
+		const snapshot = this.captureState();
+		if (!persist) snapshot.freshAuthorityAllocation = undefined;
+		clone.restoreState(snapshot);
 		if (!persist) {
 			clone.#sessionFile = undefined;
 			clone.#fileIsCurrent = false;
@@ -2479,7 +2611,10 @@ export class SessionManager {
 		return clone;
 	}
 
-	restoreState(snapshot: SessionManagerStateSnapshot): void {
+	restoreState(
+		snapshot: SessionManagerStateSnapshot,
+		freshAuthorityAllocation = snapshot.freshAuthorityAllocation,
+	): void {
 		this.#closeWriterEventually();
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
@@ -2497,7 +2632,7 @@ export class SessionManager {
 		this.#fallbackRuntimeOnly = snapshot.fallbackRuntimeOnly;
 		// A completed moveTo drops the stash, so a rollback restores it here.
 		this.#taskSiblingCandidate = snapshot.taskSiblingCandidate;
-		this.#applyEntries(snapshot.header, [...snapshot.entries]);
+		this.#applyEntries(snapshot.header, [...snapshot.entries], freshAuthorityAllocation);
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 
@@ -2534,7 +2669,7 @@ export class SessionManager {
 				`could not relocate the session back to ${snapshot.sessionDir} (${error instanceof Error ? error.message : String(error)}); the session file remains at ${movedFile}`,
 			);
 		}
-		this.restoreState(snapshot);
+		this.restoreState(snapshot, this.#freshAuthorityAllocation ?? snapshot.freshAuthorityAllocation);
 		// The inverse moveTo already rewrote the source file with the
 		// target-filtered header. Persist the captured one so disk and memory
 		// agree after a fresh open.
@@ -2552,6 +2687,7 @@ export class SessionManager {
 		sessionFile: string,
 		loadedSession?: SessionLoadResult,
 		newSessionOptions?: Pick<NewSessionOptions, "parentSession">,
+		authorityOwner?: string,
 	): Promise<void> {
 		const switchGeneration = ++this.#sessionFileSwitchGeneration;
 		this.#sessionFileSwitching = true;
@@ -2581,7 +2717,7 @@ export class SessionManager {
 			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 			const { entries: fileEntries, titleSlot } = loaded;
 			if (fileEntries.length === 0) {
-				this.#resetToNewSession(newSessionOptions, resolvedSessionFile);
+				this.#resetToNewSession(newSessionOptions, resolvedSessionFile, authorityOwner);
 				this.#forceFileCreation = true;
 				await this.#rewriteAtomically();
 				this.#fileIsCurrent = true;
@@ -2615,8 +2751,8 @@ export class SessionManager {
 			} else {
 				this.#fallbackRuntimeOnly = false;
 			}
-
 			this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
+
 			this.#additionalDirectories = header.additionalDirectories ?? [];
 			this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
 			this.#hasTitleSlot = titleSlot !== undefined;
@@ -2663,6 +2799,8 @@ export class SessionManager {
 		} catch (err) {
 			if (!isEnoent(err)) throw err;
 		}
+		if (this.#sessionFile && path.resolve(sessionPath) === path.resolve(this.#sessionFile))
+			this.#revokeFreshAuthorityAllocation();
 	}
 
 	/**
@@ -2679,14 +2817,22 @@ export class SessionManager {
 		this.#reconcileSessionDirForFallback();
 
 		const timestamp = nowIso();
-		this.#sessionId = mintSessionId();
+		const newSessionId = mintSessionId();
+		const newSessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${newSessionId}.jsonl`);
+		const allocation =
+			this.#storage instanceof FileSessionStorage
+				? issueFreshAuthorityRootAllocation(newSessionFile, newSessionId)
+				: undefined;
+		this.#revokeFreshAuthorityAllocation();
+		this.#freshAuthorityAllocation = allocation;
+		this.#sessionId = newSessionId;
 		this.#taskSiblingCandidate = undefined;
-		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
+		this.#sessionFile = newSessionFile;
 		this.#expectedDiskSize = null;
 		this.#header = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
-			id: this.#sessionId,
+			id: newSessionId,
 			title: this.#header.title ?? this.#sessionName,
 			titleSource: this.#header.titleSource ?? this.#titleSource,
 			timestamp,
@@ -2695,6 +2841,7 @@ export class SessionManager {
 			parentSession: parentSessionId,
 			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(this.#header),
 			taskPromptCacheKey: this.#header.taskPromptCacheKey,
+			authorityRoot: this.#authorityRootStamp(newSessionFile),
 		};
 		this.#sessionName = this.#header.title;
 		this.#titleSource = this.#header.titleSource;
@@ -2706,10 +2853,33 @@ export class SessionManager {
 		this.#draftOnlySessionCleanupArmed = false;
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
-		this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
+		this.#rememberBreadcrumb(this.#cwd, newSessionFile);
 
-		await this.#rewriteAtomically();
-		return { oldSessionFile, newSessionFile: this.#sessionFile };
+		let openingAttempted = false;
+		try {
+			await this.#rewriteAtomically();
+			if (this.#storage instanceof FileSessionStorage) {
+				openingAttempted = true;
+				await registryDurableStateForSession(newSessionFile, { create: true, owningSessionId: newSessionId });
+				await closeSessionAuthority(newSessionFile);
+			}
+			if (this.#freshAuthorityAllocation === allocation) this.#freshAuthorityAllocation = undefined;
+		} catch (error) {
+			if (allocation) revokeFreshAuthorityRootAllocation(allocation);
+			if (this.#freshAuthorityAllocation === allocation) this.#freshAuthorityAllocation = undefined;
+			if (openingAttempted) {
+				try {
+					await closeSessionAuthority(newSessionFile);
+				} catch (cleanupError) {
+					throw new AggregateError(
+						[error, cleanupError],
+						"Fork authority initialization and cleanup failed; preserve its evidence.",
+					);
+				}
+			}
+			throw error;
+		}
+		return { oldSessionFile, newSessionFile };
 	}
 
 	/** Move the session to a new working directory. */
@@ -2733,6 +2903,21 @@ export class SessionManager {
 		) {
 			return;
 		}
+		const refuseBoundAuthorityMove = async (): Promise<void> => {
+			if (
+				!(this.#storage instanceof FileSessionStorage) ||
+				!this.#sessionFile ||
+				!hasBoundSessionOperationAuthority(this)
+			)
+				return;
+			const artifacts = await inspectAuthorityArtifacts(this.#sessionFile);
+			if (artifacts.any && hasBoundSessionOperationAuthority(this)) {
+				throw new SessionMoveRefusedError(
+					`Cannot move session "${this.#sessionFile}": its selected authority is still bound to a live registry. Close the managed session and its authority handles before relocating it. Nothing was moved.`,
+				);
+			}
+		};
+		await refuseBoundAuthorityMove();
 
 		// A move writes both paths: it must neither move a session another live
 		// omp process writes nor replace a destination one writes. Checked before
@@ -2814,10 +2999,12 @@ export class SessionManager {
 			};
 		}
 
+		let authorityRelocationCommittedOrRetained = false;
 		try {
 			if (this.#persist && this.#sessionFile) {
 				this.#storage.ensureDirSync(nextSessionDir);
 				await this.#drainAndCloseWriter();
+				await refuseBoundAuthorityMove();
 				this.#clearDiskError();
 
 				const oldSessionFile = this.#sessionFile;
@@ -2838,11 +3025,28 @@ export class SessionManager {
 					}
 				}
 				if (!sessionFileExisted) this.#expectedDiskSize = null;
+				const hadFreshAuthorityAllocation = this.#freshAuthorityAllocation !== undefined;
+				const authorityRelocation =
+					this.#storage instanceof FileSessionStorage &&
+					sessionFileExisted &&
+					(await inspectAuthorityArtifacts(oldSessionFile)).any;
 				let sessionMoved = false;
 				let artifactRelocation: ArtifactRelocation | undefined;
 
 				try {
-					if (sessionFileExisted && sessionPathChanged) {
+					if (authorityRelocation) {
+						await this.#pendingArtifactCopy?.done;
+						await refuseBoundAuthorityMove();
+						const publication = await relocateSessionAuthority(oldSessionFile, newSessionFile, {
+							cwd: resolvedCwd,
+						});
+						authorityRelocationCommittedOrRetained = true;
+						this.#revokeFreshAuthorityAllocation();
+						sessionMoved = true;
+						this.#expectedDiskSize = publication.size;
+						if (this.#sessionFileRelocating) this.#sessionFileRelocating.destIdentity = publication.identity;
+					}
+					if (!authorityRelocation && sessionFileExisted && sessionPathChanged) {
 						const owned = this.#sessionFileRelocating?.sourceIdentity;
 						if (!owned) throw new Error("Relocating session source identity changed");
 						// The drain awaited: re-check that both paths still hold the
@@ -2875,7 +3079,7 @@ export class SessionManager {
 						sessionMoved = true;
 					}
 
-					if (artifactPathChanged) {
+					if (!authorityRelocation && artifactPathChanged) {
 						try {
 							const artifactStat = await fs.promises.stat(oldArtifactsDir);
 							if (artifactStat.isDirectory()) {
@@ -2892,17 +3096,20 @@ export class SessionManager {
 							throw new Error("Relocating session destination identity changed");
 						}
 					}
+					if (sessionPathChanged && !authorityRelocation) this.#relocateFreshAuthorityAllocation(newSessionFile);
 				} catch (err) {
+					if (authorityRelocation) {
+						if (hasRetainedRelocationInterruption(err)) authorityRelocationCommittedOrRetained = true;
+						throw err;
+					}
+					let rollbackFailure: string | undefined;
 					if (artifactRelocation) {
 						try {
 							await artifactRelocation.rollback();
 						} catch (rollbackErr) {
-							throw new Error(
-								`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
-							);
+							rollbackFailure = `Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`;
 						}
 					}
-
 					if (sessionMoved) {
 						try {
 							const owned = this.#sessionFileRelocating?.destIdentity;
@@ -2917,12 +3124,20 @@ export class SessionManager {
 								await moveFileAcrossDevices(newSessionFile, oldSessionFile, owned);
 							}
 						} catch (rollbackErr) {
+							rollbackFailure = `Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`;
+						}
+					}
+					if (rollbackFailure) throw new Error(rollbackFailure, { cause: err });
+					if (hadFreshAuthorityAllocation) {
+						try {
+							this.#issueFreshAuthorityAllocation();
+						} catch (allocationError) {
 							throw new Error(
-								`Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+								`Session relocation failed and its fresh authority allocation could not be restored: ${String(allocationError)}`,
+								{ cause: err },
 							);
 						}
 					}
-
 					throw err;
 				}
 
@@ -2931,6 +3146,7 @@ export class SessionManager {
 						...new Set([...(this.#header.previousSessionFiles ?? []), path.resolve(oldSessionFile)]),
 					];
 				}
+				if (sessionPathChanged) this.#restampAuthorityRoot(oldSessionFile, newSessionFile);
 
 				this.#sessionFile = newSessionFile;
 				this.#artifactManager = null;
@@ -2968,6 +3184,32 @@ export class SessionManager {
 			}
 
 			if (this.#sessionFile) this.#rememberBreadcrumb(resolvedCwd, this.#sessionFile);
+		} catch (error) {
+			if (!authorityRelocationCommittedOrRetained) throw error;
+			const cleanupErrors: unknown[] = [];
+			try {
+				this.seal();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				this.#revokeFreshAuthorityAllocation();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				this.#sessionClaim?.release?.();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			this.#sessionClaim = undefined;
+			if (cleanupErrors.length)
+				throw new AggregateError(
+					[error, ...cleanupErrors],
+					"Committed authority relocation adoption and manager fencing failed",
+					{ cause: error },
+				);
+			throw error;
 		} finally {
 			this.#sessionFileRelocating = null;
 			// The destination is ours or untouched now.
@@ -2995,18 +3237,32 @@ export class SessionManager {
 		const manager = new SessionManager(this.#cwd, sessionDir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		manager.#resetToNewSession({ taskPromptCacheKey: this.#header.taskPromptCacheKey });
-		manager.#sessionName = this.#sessionName;
-		manager.#titleSource = this.#titleSource;
-		manager.#titleUpdatedAt = this.#titleUpdatedAt;
-		manager.#header.title = this.#sessionName;
-		manager.#header.titleSource = this.#titleSource;
-		manager.#additionalDirectories = [...this.#additionalDirectories];
-		manager.#header.additionalDirectories =
-			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
-		manager.#entries = structuredClone(this.#entries);
-		manager.#index.rebuild(manager.#entries);
-		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
+		try {
+			manager.#sessionName = this.#sessionName;
+			manager.#titleSource = this.#titleSource;
+			manager.#titleUpdatedAt = this.#titleUpdatedAt;
+			manager.#header.title = this.#sessionName;
+			manager.#header.titleSource = this.#titleSource;
+			manager.#additionalDirectories = [...this.#additionalDirectories];
+			manager.#header.additionalDirectories =
+				manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
+			manager.#entries = structuredClone(this.#entries);
+			manager.#index.rebuild(manager.#entries);
+			manager.#forceFileCreation = true;
+			await manager.#rewriteAtomically();
+		} catch (error) {
+			manager.#revokeFreshAuthorityAllocation();
+			try {
+				await manager.close();
+			} catch (cleanupError) {
+				if (cleanupError === error) throw error;
+				throw new AggregateError(
+					[error, cleanupError],
+					"Copy publication and cleanup failed; preserve its evidence.",
+				);
+			}
+			throw error;
+		}
 		return manager;
 	}
 
@@ -3142,7 +3398,7 @@ export class SessionManager {
 	 * that still contain no durable conversation or extension state. Explicit
 	 * ensureOnDisk() records (ACP session/new, handoff) stay resumable.
 	 */
-	async #dropIfEmptyAndNoDraft(): Promise<void> {
+	async #dropIfEmptyAndNoDraft(propagateFailures = false): Promise<void> {
 		if (!this.#draftOnlySessionCleanupArmed) return;
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile || !this.#storage.existsSync(sessionFile)) {
@@ -3178,13 +3434,47 @@ export class SessionManager {
 		} catch (err) {
 			if (!isEnoent(err)) {
 				logger.warn("Failed to drop empty session on close", { sessionFile, error: String(err) });
+				if (propagateFailures) throw err;
 			}
 		}
+	}
+	async #runDraftCleanup(propagateFailures: boolean): Promise<void> {
+		if (this.#draftCleanupPromise) return this.#draftCleanupPromise;
+		const cleanup = this.#dropIfEmptyAndNoDraft(propagateFailures);
+		this.#draftCleanupPromise = cleanup;
+		try {
+			await cleanup;
+		} finally {
+			if (this.#draftCleanupPromise === cleanup) this.#draftCleanupPromise = undefined;
+		}
+	}
+
+	/** Defer only this manager's draft-only transcript/bundle deletion until close completes. */
+	deferDraftCleanup(): () => Promise<void> {
+		if (!this.#persist) return async () => {};
+		if (this.#draftCleanupPromise || (this.#draftCleanupCloseRequested && this.#draftCleanupDeferrals === 0)) {
+			throw new Error("Cannot defer draft cleanup after close has started its cleanup pass.");
+		}
+		this.#draftCleanupDeferrals++;
+		let releasePromise: Promise<void> | undefined;
+		return () => {
+			if (releasePromise) return releasePromise;
+			this.#draftCleanupDeferrals--;
+			if (this.#draftCleanupDeferrals === 0 && this.#draftCleanupCloseRequested) {
+				releasePromise = this.#runDraftCleanup(true).finally(() => {
+					this.#draftCleanupCloseRequested = false;
+				});
+			} else {
+				releasePromise = Promise.resolve();
+			}
+			return releasePromise;
+		};
 	}
 
 	/** Flush, then close the append writer. */
 	async close(): Promise<void> {
 		if (!this.#persist) return;
+		this.#revokeFreshAuthorityAllocation();
 		// Closing gives up this process's ownership claim; a later write reclaims it.
 		const claim = this.#sessionClaim;
 		claim?.release?.();
@@ -3202,7 +3492,6 @@ export class SessionManager {
 			{ ignorePriorError: true },
 		);
 		await this.#pendingArtifactCopy?.done;
-		await this.#dropIfEmptyAndNoDraft();
 		// Wait for any queued backing writes (IndexedSessionStorage per-path
 		// tail) to become durable so a graceful shutdown does not exit while
 		// a fire-and-forget publish is still on the wire.
@@ -3235,6 +3524,14 @@ export class SessionManager {
 			).catch(() => undefined);
 		}
 		if (this.#diskFailure) throw this.#diskFailure;
+		this.#draftCleanupCloseRequested = true;
+		if (this.#draftCleanupDeferrals === 0) {
+			try {
+				await this.#runDraftCleanup(false);
+			} finally {
+				this.#draftCleanupCloseRequested = false;
+			}
+		}
 	}
 
 	/**
@@ -3347,9 +3644,10 @@ export class SessionManager {
 	 * Add a workspace directory. Normalizes (relative to cwd), dedupes, rejects
 	 * the cwd itself, persists to the session header, and triggers an atomic
 	 * rewrite so the change survives a crash. Returns the resolved absolute
-	 * path or `null` when the directory was already present (no-op).
+	 * path or `null` when the directory is already present or the manager is terminally sealed (no-op).
 	 */
 	async addWorkspaceDirectory(directory: string): Promise<string | null> {
+		if (this.#released) return null;
 		const resolved = normalizeWorkspaceDirectory(directory, this.#cwd);
 		if (resolved === path.resolve(this.#cwd)) {
 			throw new Error("The current working directory is already the primary workspace root.");
@@ -3368,10 +3666,11 @@ export class SessionManager {
 
 	/**
 	 * Remove a workspace directory by absolute or cwd-relative path. Persists
-	 * the trimmed header. Returns the resolved path that was removed, or
-	 * `null` when the directory was not an additional root (no-op).
+	 * the trimmed header. Returns the resolved path that was removed, or `null`
+	 * when it is not an additional root or the manager is terminally sealed (no-op).
 	 */
 	async removeWorkspaceDirectory(directory: string): Promise<string | null> {
+		if (this.#released) return null;
 		const resolved = normalizeWorkspaceDirectory(directory, this.#cwd);
 		const idx = this.#additionalDirectories.findIndex(p => path.resolve(p) === resolved);
 		if (idx === -1) return null;
@@ -3389,8 +3688,14 @@ export class SessionManager {
 		return resolved;
 	}
 
-	/** Seed additional directories from settings or a passed list. Also called on resumed sessions with --add-dir; persists the updated header when the session file is already durable. No-op when the normalized list is unchanged (avoids rewriting large session files on every startup). */
+	/**
+	 * Seed additional directories from settings or a passed list, including
+	 * resumed sessions with --add-dir. Persists the updated header when durable.
+	 * No-op when the normalized list is unchanged or the manager is terminally
+	 * sealed.
+	 */
 	async setAdditionalDirectories(directories: string[]): Promise<void> {
+		if (this.#released) return;
 		const workspace = normalizeSessionWorkspace({ cwd: this.#cwd, directories });
 		const next = additionalWorkspaceDirectories(workspace);
 		// In fallback keep edits runtime-only until relocation.
@@ -4311,6 +4616,12 @@ export class SessionManager {
 		const newSessionId = mintSessionId();
 		this.#reconcileSessionDirForFallback();
 		const newSessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${newSessionId}.jsonl`);
+		const allocation =
+			this.#persist && this.#storage instanceof FileSessionStorage
+				? issueFreshAuthorityRootAllocation(newSessionFile, newSessionId)
+				: undefined;
+		this.#revokeFreshAuthorityAllocation();
+		this.#freshAuthorityAllocation = allocation;
 		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -4321,6 +4632,7 @@ export class SessionManager {
 			titleSource: this.#titleSource,
 			parentSession: this.#persist ? sourceSessionFile : undefined,
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
+			authorityRoot: this.#authorityRootStamp(newSessionFile),
 		};
 
 		const labels: LabelEntry[] = [];
@@ -4398,19 +4710,45 @@ export class SessionManager {
 	 * `setSessionFile` / `AgentSession.switchSession` when a caller explicitly
 	 * needs a brand-new persisted session at a cwd-derived path.
 	 */
-	static createEmptySessionFile(cwd: string, storage: SessionStorage = new FileSessionStorage()): string {
-		const sessionDir = SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		const id = mintSessionId();
-		const timestamp = nowIso();
-		const header: SessionHeader = {
-			type: "session",
-			version: CURRENT_SESSION_VERSION,
-			id,
-			timestamp,
-			cwd: path.resolve(cwd),
-		};
-		const file = path.join(sessionDir, `${fileSafeTimestamp(timestamp)}_${id}.jsonl`);
-		storage.writeTextSync(file, `${serializeTitleSlot({ updatedAt: timestamp })}${JSON.stringify(header)}\n`);
+	static async createEmptySessionFile(
+		cwd: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<string> {
+		const resolvedCwd = path.resolve(cwd);
+		const sessionDir = SessionManager.getDefaultSessionDir(resolvedCwd, undefined, storage);
+		const manager = new SessionManager(resolvedCwd, sessionDir, true, storage);
+		manager.#suppressBreadcrumb = true;
+		const file = manager.#resetToNewSession();
+		if (!file) throw new Error("Persistent empty session allocation did not provide a path.");
+		let openingAttempted = false;
+		let primary: unknown;
+		const failures: unknown[] = [];
+		try {
+			await manager.ensureOnDisk();
+			if (storage instanceof FileSessionStorage) {
+				openingAttempted = true;
+				await registryDurableStateForSession(file, { create: true, owningSessionId: manager.#sessionId });
+			}
+		} catch (error) {
+			primary = error;
+		}
+		try {
+			await manager.close();
+		} catch (error) {
+			failures.push(error);
+		}
+		if (openingAttempted) {
+			try {
+				await closeSessionAuthority(file);
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (primary !== undefined || failures.length) {
+			const errors = primary === undefined ? failures : [primary, ...failures];
+			if (errors.length === 1) throw errors[0];
+			throw new AggregateError(errors, "Empty session publication or cleanup failed; preserve its evidence.");
+		}
 		return file;
 	}
 
@@ -4428,6 +4766,10 @@ export class SessionManager {
 	 * workspace roots are dropped, and the source's `session_init` contracts
 	 * become inert `source_session_init` custom entries so revival never
 	 * mistakes them for the fork's own.
+	 *
+	 * `childAgent` marks the fork as a child agent's transcript (as `seance` does):
+	 * its actor is recorded in the owning root's authority, so it gets no
+	 * authority bundle. Every other fork is a new root and gets its own.
 	 */
 	static async forkFrom(
 		sourcePath: string,
@@ -4441,6 +4783,9 @@ export class SessionManager {
 			resetInheritedCost?: boolean;
 			repairInterruptedTail?: boolean;
 			seance?: boolean;
+			childAgent?: boolean;
+			/** For `seance`/`childAgent`: the transcript of the session that owns the child (default `sourcePath`). */
+			authorityParent?: string;
 		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
@@ -4469,34 +4814,69 @@ export class SessionManager {
 			},
 			options?.sessionFile,
 		);
-		manager.#header.title = sourceHeader?.title;
-		manager.#header.titleSource = sourceHeader?.titleSource;
-		manager.#additionalDirectories = options?.seance
-			? []
-			: (sourceHeader?.additionalDirectories ?? []).filter(d => d !== path.resolve(cwd));
-		manager.#header.additionalDirectories =
-			manager.#additionalDirectories.length > 0 ? manager.#additionalDirectories : undefined;
-		if (options?.seance) {
-			manager.#header.seanceSource = path.resolve(sourcePath);
-			SessionManager.#neutralizeSessionInits(history);
-		}
-		manager.#sessionName = manager.#header.title;
-		manager.#titleSource = manager.#header.titleSource;
-		manager.#titleUpdatedAt = nowIso();
-		manager.#hasTitleSlot = true;
-		manager.#entries = history;
-		manager.#index.rebuild(history);
-		if (options?.repairInterruptedTail) {
-			SessionManager.#repairForkedInterruptedTail(history, manager.getBranch());
+		let openingAttempted = false;
+		try {
+			manager.#header.title = sourceHeader?.title;
+			manager.#header.titleSource = sourceHeader?.titleSource;
+			manager.#additionalDirectories = options?.seance
+				? []
+				: (sourceHeader?.additionalDirectories ?? []).filter(d => d !== path.resolve(cwd));
+			manager.#header.additionalDirectories =
+				manager.#additionalDirectories.length > 0 ? manager.#additionalDirectories : undefined;
+			if (options?.seance) {
+				manager.#header.seanceSource = path.resolve(sourcePath);
+				SessionManager.#neutralizeSessionInits(history);
+			}
+			if ((options?.seance || options?.childAgent) && manager.#header.authorityRoot !== undefined) {
+				// A child's actor lives in its owner's authority: stamping the owner keeps resume-time adoption
+				// from ever bootstrapping a root authority for the child's own path.
+				manager.#header.authorityRoot = await resolveAuthorityOwner(options.authorityParent ?? sourcePath);
+			}
+			manager.#sessionName = manager.#header.title;
+			manager.#titleSource = manager.#header.titleSource;
+			manager.#titleUpdatedAt = nowIso();
+			manager.#hasTitleSlot = true;
+			manager.#entries = history;
 			manager.#index.rebuild(history);
+			if (options?.repairInterruptedTail) {
+				SessionManager.#repairForkedInterruptedTail(history, manager.getBranch());
+				manager.#index.rebuild(history);
+			}
+			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
+			manager.#forceFileCreation = true;
+			await manager.#rewriteAtomically();
+			if (!options?.seance && options?.copyArtifacts !== false) {
+				await copySessionArtifacts(sourcePath, manager.#sessionFile!);
+			}
+			const newSessionFile = manager.#sessionFile!;
+			if (options?.seance || options?.childAgent) {
+				// A child agent's transcript is not a root: its actor is recorded in the owning root's
+				// authority, so it never gets (or may later create) a root bundle of its own.
+				manager.#revokeFreshAuthorityAllocation();
+				return manager;
+			}
+			const allocation = manager.#freshAuthorityAllocation;
+			if (storage instanceof FileSessionStorage) {
+				openingAttempted = true;
+				await registryDurableStateForSession(newSessionFile, { create: true, owningSessionId: manager.#sessionId });
+				await closeSessionAuthority(newSessionFile);
+			}
+			if (manager.#freshAuthorityAllocation === allocation) manager.#freshAuthorityAllocation = undefined;
+			return manager;
+		} catch (error) {
+			manager.#revokeFreshAuthorityAllocation();
+			if (openingAttempted && manager.#sessionFile) {
+				try {
+					await closeSessionAuthority(manager.#sessionFile);
+				} catch (cleanupError) {
+					throw new AggregateError(
+						[error, cleanupError],
+						"Fork authority initialization and cleanup failed; preserve its evidence.",
+					);
+				}
+			}
+			throw error;
 		}
-		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
-		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
-		if (!options?.seance && options?.copyArtifacts !== false) {
-			await copySessionArtifacts(sourcePath, manager.#sessionFile!);
-		}
-		return manager;
 	}
 
 	/** Replace inherited `session_init` entries, in place, with inert custom entries keeping the same tree position. */
@@ -4588,6 +4968,11 @@ export class SessionManager {
 			suppressBreadcrumb?: boolean;
 			throwIfMissing?: boolean;
 			parentSession?: string;
+			/**
+			 * Transcript of the session whose authority owns this child agent. A file created here is stamped with
+			 * that owner (resolved to its root) instead of its own path, so resuming the child directly is refused.
+			 */
+			authorityParent?: string;
 		},
 	): Promise<SessionManager> {
 		const loaded = await loadSessionFile(filePath, storage, { throwIfMissing: options?.throwIfMissing });
@@ -4611,7 +4996,10 @@ export class SessionManager {
 				: path.dirname(path.resolve(filePath)));
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
-		await manager.#setSessionFile(filePath, loaded, { parentSession: options?.parentSession });
+		const authorityOwner = options?.authorityParent
+			? await resolveAuthorityOwner(options.authorityParent)
+			: undefined;
+		await manager.#setSessionFile(filePath, loaded, { parentSession: options?.parentSession }, authorityOwner);
 		return manager;
 	}
 

@@ -3,12 +3,25 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseXdUrl } from "../internal-urls/xd-protocol";
-import { getActiveOperationDurability, getActiveOperationLease } from "../registry/operation-lease";
+import {
+	assertActiveOperationLease,
+	getActiveOperationDurability,
+	getActiveOperationLease,
+} from "../registry/operation-lease";
+import { withAuthorityEffect } from "../registry/authority/client";
 import { durableTargetHash, type DurableResourceClass, type DurableResourceRecord } from "../registry/durable-state";
 import type { EffectiveSubagentPermissions } from "../task/permission-profiles";
 import { evaluateSubagentPermission } from "../task/permission-profiles";
 import { expandDelimitedPathEntries, isInternalUrlPath, resolveSyscallTarget } from "../tools/path-utils";
 import { evaluateRestrictedToolGuardrails } from "./restricted-startup-policy";
+
+const filesystemOperationContext = new AsyncLocalStorage<FilesystemOperation>();
+
+/** Transitive readers use the invoking operation, including a revoked one that must fail closed. */
+export function getCurrentFilesystemOperation(): FilesystemOperation | undefined {
+	return filesystemOperationContext.getStore();
+}
+
 export interface SessionPathScopeOptions {
 	readonly actorId: () => string | null | undefined;
 	readonly sessionId: () => string | null | undefined;
@@ -32,9 +45,39 @@ export interface FilesystemOperationLease {
 }
 
 export interface DurableOpenResource {
-	effect(): void;
-	complete(): void;
-	cancel(): void;
+	effect(): Promise<void>;
+	complete(): Promise<void>;
+	cancel(): Promise<void>;
+}
+
+/** Only a physical read-open denial, never an authority or terminal failure. */
+export class FilesystemReadDeniedError extends Error {}
+
+async function cancelDurableResource(resource: DurableOpenResource | undefined, cause: unknown): Promise<void> {
+	try {
+		await resource?.cancel();
+	} catch (finalizeError) {
+		throw new AggregateError(
+			[cause, finalizeError],
+			"Filesystem operation failed and durable resource cancellation did not complete.",
+		);
+	}
+}
+
+async function closeSearchResource(
+	resource: { close(): Promise<void> },
+	failure: { error: unknown } | undefined,
+): Promise<void> {
+	try {
+		await resource.close();
+	} catch (closeError) {
+		if (failure)
+			throw new AggregateError(
+				[failure.error, closeError],
+				"Search traversal failed and resource close did not complete.",
+			);
+		throw closeError;
+	}
 }
 
 export type FilesystemOperationKind =
@@ -284,6 +327,7 @@ export class FilesystemOperation {
 	#active = true;
 	#nextResourceId = 1;
 	readonly #openResources = new Set<DurableOpenResource>();
+	readonly #effectResources = new Set<DurableOpenResource>();
 
 	constructor(key: symbol, scope: SessionPathScope, toolName: string, lease: FilesystemOperationLease) {
 		if (key !== operationConstructionKey)
@@ -339,6 +383,7 @@ export class FilesystemOperation {
 			if (options.stop?.()) return;
 			checkActive();
 			const handle = await this.openRead(target);
+			let traversalFailure: { error: unknown } | undefined;
 			try {
 				checkActive();
 				const stat = await handle.stat({ bigint: true });
@@ -375,6 +420,7 @@ export class FilesystemOperation {
 				let ignoreTarget: AuthorizedFilesystemTarget | undefined;
 				if (options.gitignore === true) {
 					const ruleDirectory = await fs.promises.opendir(directoryPath);
+					let ruleFailure: { error: unknown } | undefined;
 					try {
 						for (;;) {
 							if (options.stop?.()) return;
@@ -389,6 +435,7 @@ export class FilesystemOperation {
 							}
 							checkActive();
 							const ignoreHandle = await this.openRead(ignoreTarget);
+							let ignoreFailure: { error: unknown } | undefined;
 							try {
 								checkActive();
 								const ignoreStat = await ignoreHandle.stat({ bigint: true });
@@ -398,17 +445,24 @@ export class FilesystemOperation {
 									checkActive();
 									childRules = [...rules, ...parseGitignore(ignoreContent, target.canonicalTarget)];
 								}
+							} catch (error) {
+								ignoreFailure = { error };
+								throw error;
 							} finally {
-								await ignoreHandle.close();
+								await closeSearchResource(ignoreHandle, ignoreFailure);
 							}
 							break;
 						}
+					} catch (error) {
+						ruleFailure = { error };
+						throw error;
 					} finally {
-						await ruleDirectory.close();
+						await closeSearchResource(ruleDirectory, ruleFailure);
 					}
 				}
 
 				const directory = await fs.promises.opendir(directoryPath);
+				let directoryFailure: { error: unknown } | undefined;
 				try {
 					for (;;) {
 						if (options.stop?.()) return;
@@ -426,11 +480,17 @@ export class FilesystemOperation {
 						}
 						await visit(authorized, childRules, true);
 					}
+				} catch (error) {
+					directoryFailure = { error };
+					throw error;
 				} finally {
-					await directory.close();
+					await closeSearchResource(directory, directoryFailure);
 				}
+			} catch (error) {
+				traversalFailure = { error };
+				throw error;
 			} finally {
-				await handle.close();
+				await closeSearchResource(handle, traversalFailure);
 			}
 		};
 		await visit(root, [], false);
@@ -501,52 +561,59 @@ export class FilesystemOperation {
 	): Promise<fs.promises.FileHandle> {
 		this.assertTarget(target, ["read", "stat", "list", "search"]);
 		await this.verify(target);
-		const resource = this.beginOpenResource(target, resourceClass);
+		const resource = await this.beginOpenResource(target, resourceClass);
 		try {
-			const handle = await fs.promises.open(
-				target.canonicalTarget,
-				fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
-			);
+			this.assertActive();
+			await resource?.effect();
+			this.assertActive();
+			const handle = await fs.promises
+				.open(target.canonicalTarget, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+				.catch((error: NodeJS.ErrnoException) => {
+					if (error.code === "EACCES" || error.code === "EPERM")
+						throw new FilesystemReadDeniedError("Filesystem read is denied", { cause: error });
+					throw error;
+				});
 			try {
 				const opened = identityOf(await handle.stat({ bigint: true }));
 				if (!target.identity || !sameIdentity(opened, target.identity)) {
 					throw new Error(`Filesystem target changed while opening: ${target.originalPath}`);
 				}
 				this.assertActive();
-				resource?.effect();
 				if (resource) {
 					const close = handle.close.bind(handle);
-					let closed = false;
-					handle.close = async () => {
-						if (closed) return;
-						try {
-							await close();
-							closed = true;
-							resource.complete();
-						} catch (error) {
-							resource.cancel();
-							throw error;
-						}
+					let closePromise: Promise<void> | undefined;
+					handle.close = () => {
+						closePromise ??= (async () => {
+							try {
+								await close();
+								await resource.complete();
+								this.assertActive();
+							} catch (error) {
+								await cancelDurableResource(resource, error);
+								throw error;
+							}
+						})();
+						return closePromise;
 					};
 				}
 				return handle;
 			} catch (error) {
 				await handle.close();
-				resource?.cancel();
 				throw error;
 			}
 		} catch (error) {
-			resource?.cancel();
+			await cancelDurableResource(resource, error);
 			throw error;
 		}
 	}
 
-	beginOpenResource(
+	async beginOpenResource(
 		target: AuthorizedFilesystemTarget,
 		resourceClass: DurableResourceClass,
-	): DurableOpenResource | undefined {
+	): Promise<DurableOpenResource | undefined> {
 		this.assertTarget(target);
 		const durability = getActiveOperationDurability(this.#scope.operationManager(), this.operationId);
+		this.assertActive();
 		if (!durability || durability.lease.actorId === undefined || durability.lease.generation === undefined)
 			return undefined;
 		const base: Omit<DurableResourceRecord, "at" | "phase"> = {
@@ -565,31 +632,161 @@ export class FilesystemOperation {
 				identity: target.identity,
 			}),
 		};
-		durability.store.append({ ...base, at: Date.now(), phase: "intent" });
-		let phase: "intent" | "effect" | "terminal" = "intent";
+		let phase: "intent" | "effect" | "committed" | "terminal" | "uncertain" = "intent";
+		const transition = async (next: DurableResourceRecord["phase"]): Promise<void> => {
+			try {
+				await durability.store.transition({ ...base, at: Date.now(), phase: next });
+			} catch (error) {
+				phase = "uncertain";
+				throw error;
+			}
+			phase = next === "intent" || next === "effect" || next === "committed" ? next : "terminal";
+		};
+		await transition("intent");
 		const control: DurableOpenResource = Object.freeze({
-			effect: () => {
+			effect: async () => {
 				if (phase !== "intent") throw new Error("Durable resource effect was already recorded.");
-				durability.store.append({ ...base, at: Date.now(), phase: "effect" });
-				phase = "effect";
+				this.assertActive();
+				await transition("effect");
+				this.assertActive();
 			},
-			complete: () => {
+			complete: async () => {
 				if (phase === "terminal") return;
 				if (phase !== "effect") throw new Error("Durable resource cannot complete before its effect.");
-				durability.store.append({ ...base, at: Date.now(), phase: "committed" });
-				durability.store.append({ ...base, at: Date.now(), phase: "completed" });
-				phase = "terminal";
+				await transition("committed");
+				await transition("completed");
 				this.#openResources.delete(control);
 			},
-			cancel: () => {
-				if (phase === "terminal") return;
-				durability.store.append({ ...base, at: Date.now(), phase: "cancelled" });
-				phase = "terminal";
+			cancel: async () => {
+				if (phase === "terminal" || phase === "uncertain") return;
+				await transition("cancelled");
 				this.#openResources.delete(control);
 			},
 		});
 		this.#openResources.add(control);
-		return control;
+		try {
+			this.assertActive();
+			return control;
+		} catch (error) {
+			await cancelDurableResource(control, error);
+			throw error;
+		}
+	}
+
+	async withResourceEffects<T>(
+		targets: readonly AuthorizedFilesystemTarget[],
+		resourceClass: DurableResourceClass,
+		effect: () => Promise<T>,
+	): Promise<T> {
+		const durability = getActiveOperationDurability(this.#scope.operationManager(), this.operationId);
+		const run = async (): Promise<T> => {
+			const resources: Array<DurableOpenResource | undefined> = [];
+			try {
+				for (const target of targets) {
+					this.assertTarget(target, ["write", "create", "delete", "rename"]);
+					await this.verify(target);
+					const resource = await this.beginOpenResource(target, resourceClass);
+					resources.push(resource);
+					if (resource) this.#effectResources.add(resource);
+					this.assertActive();
+				}
+				for (const resource of resources) {
+					this.assertActive();
+					await resource?.effect();
+					this.assertActive();
+				}
+				for (let index = targets.length - 1; index >= 0; index--) {
+					const target = targets[index];
+					if (target) await this.verify(target);
+				}
+				this.assertActive();
+				const value = await effect();
+				for (const resource of resources) await resource?.complete();
+				this.assertActive();
+				return value;
+			} catch (error) {
+				let failure = error;
+				for (let index = resources.length - 1; index >= 0; index--) {
+					try {
+						await cancelDurableResource(resources[index], failure);
+					} catch (cancelError) {
+						failure = cancelError;
+					}
+				}
+				throw failure;
+			} finally {
+				for (const resource of resources) {
+					if (resource) this.#effectResources.delete(resource);
+				}
+			}
+		};
+		return filesystemOperationContext.run(this, () =>
+			durability ? withAuthorityEffect(durability.store, run) : run(),
+		);
+	}
+
+	async createDirectories(directoryPath: string, resourceClass: DurableResourceClass = "filesystem"): Promise<void> {
+		this.assertActive();
+		const missing: string[] = [];
+		let current = path.resolve(directoryPath);
+		for (;;) {
+			let stat: fs.Stats | undefined;
+			try {
+				stat = await fs.promises.stat(current);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			this.assertActive();
+			if (stat) {
+				if (!stat.isDirectory()) throw new Error(`Filesystem parent is not a directory: ${current}`);
+				break;
+			}
+			missing.push(current);
+			const parent = path.dirname(current);
+			if (parent === current) throw new Error(`Filesystem parent directory could not be created: ${directoryPath}`);
+			current = parent;
+		}
+		for (const directory of missing.reverse()) {
+			const target = await this.authorize(directory, "create");
+			await this.createDirectory(target, resourceClass);
+		}
+	}
+
+	async createDirectory(
+		target: AuthorizedFilesystemTarget,
+		resourceClass: DurableResourceClass = "filesystem",
+	): Promise<void> {
+		this.assertTarget(target, "create");
+		if (target.existed) throw new Error(`Filesystem directory already exists: ${target.originalPath}`);
+		if (this.#usedEffects.has(target as object))
+			throw new Error("Filesystem target effect has already been consumed.");
+		await this.withResourceEffects([target], resourceClass, async () => {
+			const parentHandle = await fs.promises.open(
+				target.canonicalParent,
+				fs.constants.O_RDONLY | fs.constants.O_DIRECTORY,
+			);
+			try {
+				const heldParent = identityOf(await parentHandle.stat({ bigint: true }));
+				this.assertActive();
+				if (!sameIdentity(heldParent, target.parentIdentity)) {
+					throw new Error(`Filesystem target parent changed before directory creation: ${target.originalPath}`);
+				}
+				const heldTarget = heldParentChildPath(parentHandle, target);
+				this.assertActive();
+				await fs.promises.mkdir(heldTarget);
+				const created = await fs.promises.lstat(heldTarget, { bigint: true });
+				if (!created.isDirectory() || (await fs.promises.realpath(heldTarget)) !== target.canonicalTarget) {
+					throw new Error(`Filesystem directory creation produced an unsafe target: ${target.originalPath}`);
+				}
+				const heldAfter = identityOf(await parentHandle.stat({ bigint: true }));
+				if (!sameIdentity(heldAfter, target.parentIdentity)) {
+					throw new Error(`Filesystem target parent changed during directory creation: ${target.originalPath}`);
+				}
+			} finally {
+				await parentHandle.close();
+			}
+			this.#usedEffects.add(target as object);
+		});
 	}
 
 	/** Validate the final name after an API that may replace the inode atomically. */
@@ -620,17 +817,22 @@ export class FilesystemOperation {
 		if (this.#usedEffects.has(target as object))
 			throw new Error("Filesystem target effect has already been consumed.");
 		await this.verify(target);
-		const resource = this.beginOpenResource(target, resourceClass);
+		const resource = await this.beginOpenResource(target, resourceClass);
 		try {
+			this.assertActive();
 			const parentHandle = await fs.promises.open(
 				target.canonicalParent,
 				fs.constants.O_RDONLY | fs.constants.O_DIRECTORY,
 			);
+			let parentFailure: unknown;
+			let parentFailed = false;
 			try {
 				const heldParent = identityOf(await parentHandle.stat({ bigint: true }));
 				if (!sameIdentity(heldParent, target.parentIdentity)) {
 					throw new Error(`Filesystem target parent changed before write: ${target.originalPath}`);
 				}
+				await resource?.effect();
+				this.assertActive();
 				const flags =
 					fs.constants.O_WRONLY |
 					fs.constants.O_CREAT |
@@ -651,10 +853,12 @@ export class FilesystemOperation {
 					if (!target.identity && target.existed)
 						throw new Error(`Filesystem target identity is unavailable: ${target.originalPath}`);
 					this.assertActive();
-					resource?.effect();
 					await handle.truncate(0);
+					this.assertActive();
 					await handle.writeFile(payload);
+					this.assertActive();
 					const after = identityOf(await handle.stat({ bigint: true }));
+					this.assertActive();
 					if (!sameIdentity(opened, after))
 						throw new Error(`Filesystem target changed during write: ${target.originalPath}`);
 					this.#usedEffects.add(target as object);
@@ -662,15 +866,32 @@ export class FilesystemOperation {
 					await handle.close();
 				}
 				const heldAfter = identityOf(await parentHandle.stat({ bigint: true }));
+				this.assertActive();
 				if (!sameIdentity(heldAfter, target.parentIdentity)) {
 					throw new Error(`Filesystem target parent changed during write: ${target.originalPath}`);
 				}
+			} catch (error) {
+				parentFailure = error;
+				parentFailed = true;
+				throw error;
 			} finally {
-				await parentHandle.close();
+				try {
+					await parentHandle.close();
+				} catch (closeError) {
+					if (parentFailed) {
+						throw new AggregateError(
+							[parentFailure, closeError],
+							"Filesystem write and parent close both failed.",
+						);
+					}
+					throw closeError;
+				}
 			}
-			resource?.complete();
+			this.assertActive();
+			await resource?.complete();
+			this.assertActive();
 		} catch (error) {
-			resource?.cancel();
+			await cancelDurableResource(resource, error);
 			throw error;
 		}
 	}
@@ -691,48 +912,85 @@ export class FilesystemOperation {
 		}
 		await this.verify(target);
 		await this.verify(temporary);
-		const resource = this.beginOpenResource(target, "filesystem");
+		const resource = await this.beginOpenResource(target, "filesystem");
 		try {
+			this.assertActive();
+			await resource?.effect();
+			this.assertActive();
 			const parentHandle = await fs.promises.open(
 				target.canonicalParent,
 				fs.constants.O_RDONLY | fs.constants.O_DIRECTORY,
 			);
-			resource?.effect();
-			const heldTemporaryPath = heldParentChildPath(parentHandle, temporary);
+			let heldTemporaryPath: string | undefined;
+			let parentFailure: unknown;
+			let parentFailed = false;
 			try {
-				const heldParent = identityOf(await parentHandle.stat({ bigint: true }));
-				if (
-					!sameIdentity(heldParent, target.parentIdentity) ||
-					!sameIdentity(heldParent, temporary.parentIdentity)
-				) {
-					throw new Error(`Filesystem target parent changed before replacement: ${target.originalPath}`);
+				heldTemporaryPath = heldParentChildPath(parentHandle, temporary);
+				try {
+					const heldParent = identityOf(await parentHandle.stat({ bigint: true }));
+					if (
+						!sameIdentity(heldParent, target.parentIdentity) ||
+						!sameIdentity(heldParent, temporary.parentIdentity)
+					) {
+						throw new Error(`Filesystem target parent changed before replacement: ${target.originalPath}`);
+					}
+					this.assertActive();
+					await produce(heldTemporaryPath);
+					this.assertActive();
+					const temporaryStat = await fs.promises.lstat(heldTemporaryPath, { bigint: true });
+					if (!temporaryStat.isFile() || temporaryStat.nlink > 1n) {
+						throw new Error(`Filesystem replacement produced an unsafe temp file: ${temporary.originalPath}`);
+					}
+					this.assertActive();
+					await fs.promises.rename(heldTemporaryPath, heldParentChildPath(parentHandle, target));
+					this.assertActive();
+					const finalStat = await fs.promises.lstat(heldParentChildPath(parentHandle, target), { bigint: true });
+					this.assertActive();
+					if (!finalStat.isFile() || finalStat.nlink > 1n) {
+						throw new Error(`Filesystem replacement produced an unsafe target: ${target.originalPath}`);
+					}
+					const heldAfter = identityOf(await parentHandle.stat({ bigint: true }));
+					this.assertActive();
+					if (!sameIdentity(heldAfter, target.parentIdentity)) {
+						throw new Error(`Filesystem target parent changed during replacement: ${target.originalPath}`);
+					}
+					this.#usedEffects.add(target as object);
+					this.#usedEffects.add(temporary as object);
+				} catch (error) {
+					if (heldTemporaryPath) {
+						try {
+							await fs.promises.rm(heldTemporaryPath, { force: true });
+						} catch (cleanupError) {
+							throw new AggregateError(
+								[error, cleanupError],
+								"Filesystem replacement failed and temporary-file cleanup did not complete.",
+							);
+						}
+					}
+					throw error;
 				}
-				await produce(heldTemporaryPath);
-				const temporaryStat = await fs.promises.lstat(heldTemporaryPath, { bigint: true });
-				if (!temporaryStat.isFile() || temporaryStat.nlink > 1n) {
-					throw new Error(`Filesystem replacement produced an unsafe temp file: ${temporary.originalPath}`);
-				}
-				this.assertActive();
-				await fs.promises.rename(heldTemporaryPath, heldParentChildPath(parentHandle, target));
-				const finalStat = await fs.promises.lstat(heldParentChildPath(parentHandle, target), { bigint: true });
-				if (!finalStat.isFile() || finalStat.nlink > 1n) {
-					throw new Error(`Filesystem replacement produced an unsafe target: ${target.originalPath}`);
-				}
-				const heldAfter = identityOf(await parentHandle.stat({ bigint: true }));
-				if (!sameIdentity(heldAfter, target.parentIdentity)) {
-					throw new Error(`Filesystem target parent changed during replacement: ${target.originalPath}`);
-				}
-				this.#usedEffects.add(target as object);
-				this.#usedEffects.add(temporary as object);
 			} catch (error) {
-				await fs.promises.rm(heldTemporaryPath, { force: true }).catch(() => undefined);
+				parentFailure = error;
+				parentFailed = true;
 				throw error;
 			} finally {
-				await parentHandle.close();
+				try {
+					await parentHandle.close();
+				} catch (closeError) {
+					if (parentFailed) {
+						throw new AggregateError(
+							[parentFailure, closeError],
+							"Filesystem replacement and parent close both failed.",
+						);
+					}
+					throw closeError;
+				}
 			}
-			resource?.complete();
+			this.assertActive();
+			await resource?.complete();
+			this.assertActive();
 		} catch (error) {
-			resource?.cancel();
+			await cancelDurableResource(resource, error);
 			throw error;
 		}
 	}
@@ -743,13 +1001,15 @@ export class FilesystemOperation {
 		if (this.#usedEffects.has(target as object))
 			throw new Error("Filesystem target effect has already been consumed.");
 		await this.verify(target);
-		const resource = this.beginOpenResource(target, "filesystem");
+		const resource = await this.beginOpenResource(target, "filesystem");
 		try {
+			this.assertActive();
+			await resource?.effect();
+			this.assertActive();
 			const parentHandle = await fs.promises.open(
 				target.canonicalParent,
 				fs.constants.O_RDONLY | fs.constants.O_DIRECTORY,
 			);
-			resource?.effect();
 			try {
 				const heldParent = identityOf(await parentHandle.stat({ bigint: true }));
 				if (!sameIdentity(heldParent, target.parentIdentity)) {
@@ -758,27 +1018,44 @@ export class FilesystemOperation {
 				this.assertActive();
 				const heldTargetPath = heldParentChildPath(parentHandle, target);
 				await fs.promises.unlink(heldTargetPath);
+				this.assertActive();
 				this.#usedEffects.add(target as object);
-				if (await lstatIdentity(heldTargetPath)) {
+				const targetStillExists = await lstatIdentity(heldTargetPath);
+				this.assertActive();
+				if (targetStillExists) {
 					throw new Error(`Filesystem target still exists after delete: ${target.originalPath}`);
 				}
 				const heldAfter = identityOf(await parentHandle.stat({ bigint: true }));
+				this.assertActive();
 				if (!sameIdentity(heldAfter, target.parentIdentity)) {
 					throw new Error(`Filesystem target parent changed during delete: ${target.originalPath}`);
 				}
 			} finally {
 				await parentHandle.close();
 			}
-			resource?.complete();
+			this.assertActive();
+			await resource?.complete();
+			this.assertActive();
 		} catch (error) {
-			resource?.cancel();
+			await cancelDurableResource(resource, error);
 			throw error;
 		}
 	}
 
-	dispose(): void {
+	async dispose(): Promise<void> {
 		this.#active = false;
-		for (const resource of this.#openResources) resource.cancel();
+		const failures: unknown[] = [];
+		for (const resource of this.#openResources) {
+			if (this.#effectResources.has(resource)) continue;
+			try {
+				await resource.cancel();
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (failures.length === 1) throw failures[0];
+		if (failures.length > 1)
+			throw new AggregateError(failures, "Multiple durable filesystem resources failed to cancel.");
 	}
 
 	async #resolveCandidate(candidate: FilesystemTargetCandidate): Promise<AuthorizedFilesystemTarget> {
@@ -884,10 +1161,18 @@ export class SessionPathScope {
 		);
 		this.#operations.add(operation);
 		try {
-			return await this.#context.run(operation, () => run(operation));
+			const durability = getActiveOperationDurability(this.operationManager(), operationId);
+			return await filesystemOperationContext.run(operation, () =>
+				this.#context.run(operation, () =>
+					durability ? withAuthorityEffect(durability.store, () => run(operation)) : run(operation),
+				),
+			);
 		} finally {
-			operation.dispose();
-			this.#operations.delete(operation);
+			try {
+				await operation.dispose();
+			} finally {
+				this.#operations.delete(operation);
+			}
 		}
 	}
 
@@ -900,6 +1185,22 @@ export class SessionPathScope {
 			throw new Error("Filesystem authority generation changed during the operation.");
 		if (operation.actorId !== identity.actorId || operation.sessionId !== identity.sessionId) {
 			throw new Error("Filesystem authority actor or session changed during the operation.");
+		}
+		if (operation.lease.effectOwnerId !== undefined) {
+			const effectClass = operation.lease.effectClass;
+			const acquiredAt = operation.lease.effectAcquiredAt;
+			if (effectClass === undefined || acquiredAt === undefined) {
+				throw new Error("Filesystem operation is missing its active session operation lease identity.");
+			}
+			assertActiveOperationLease(this.#options.operationManager?.(), {
+				operationId: operation.lease.operationId,
+				ownerId: operation.lease.effectOwnerId,
+				effectClass,
+				acquiredAt,
+				actorId: operation.lease.authorityGeneration === undefined ? undefined : operation.actorId,
+				rootId: operation.lease.rootId,
+				generation: operation.lease.authorityGeneration,
+			});
 		}
 	}
 
@@ -981,8 +1282,6 @@ export class SessionPathScope {
 		const identity = this.#currentIdentity();
 		if (identity.key !== this.#identityKey) {
 			this.#generation++;
-			for (const operation of this.#operations) operation.dispose();
-			this.#operations.clear();
 			this.#identityKey = identity.key;
 		}
 		return identity;

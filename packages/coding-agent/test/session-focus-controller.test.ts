@@ -11,6 +11,7 @@ import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "@oh-my-pi/pi-coding
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 interface SessionStub {
 	session: AgentSession;
@@ -30,6 +31,7 @@ function makeSessionStub(
 	let unsubscribeCalls = 0;
 	let queue: { steering: string[]; followUp: string[] } = { steering: [], followUp: [] };
 	const stub = {
+		...createSessionDefaults(),
 		activeRunStartedAt: opts.activeRunStartedAt,
 		isStreaming: opts.isStreaming ?? false,
 		sessionFile: opts.sessionFile,
@@ -398,7 +400,7 @@ describe("SessionFocusController", () => {
 		registerSub(h.registry, "Worker", worker.session);
 
 		const focus = h.controller.focusAgent("Worker");
-		h.registry.unregister("Worker");
+		await h.registry.unregister("Worker");
 		live.resolve(worker.session);
 		await focus;
 
@@ -413,7 +415,7 @@ describe("SessionFocusController", () => {
 		const worker = makeSessionStub();
 		registerSub(h.registry, "Worker", worker.session);
 		await h.controller.focusAgent("Worker");
-		h.registry.unregister("Worker");
+		await h.registry.unregister("Worker");
 		await flushAsync();
 
 		expect(h.controller.focusedAgentId).toBeUndefined();

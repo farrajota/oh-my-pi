@@ -11,7 +11,7 @@ import { launchHelp } from "./launch-help";
 async function loadRunRootCommand() {
 	// Startup boundary: a static import makes command construction evaluate the
 	// provider, browser-prelude, codec, and interactive-mode graphs.
-	return (await import("../main")).runRootCommand;
+	return (await import("../main")).runRootCommandAtCliBoundary;
 }
 
 export default class Index extends Command {

@@ -84,7 +84,12 @@ import {
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
 import type { InteractiveMode } from "./modes/interactive-mode";
-import { formatSessionContinuationNotice } from "./modes/persistence-failure";
+import {
+	formatSessionContinuationNotice,
+	formatStartupPersistenceFailure,
+	isReportedPersistenceFailure,
+	RootStartupPersistenceError,
+} from "./modes/persistence-failure";
 import type { PrintModeOptions } from "./modes/print-mode";
 import type { RpcModeOptions } from "./modes/rpc/rpc-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
@@ -105,10 +110,19 @@ import { getAgentLifecycleManager, setPersistedAgentReviverFactory } from "./int
 import { createAgentRootSession } from "./internal/agent-registry-bridge";
 import { AgentRegistry } from "./registry/agent-registry";
 import {
-	DurableStateUnavailableError,
+	AuthorityAdoptionRefusedError,
+	AuthorityCapacityUnsupportedError,
+	AuthorityRecoveryRequiredError,
+	closeSessionAuthority,
+	formatAuthorityAdoptionNotice,
+	formatAuthorityBackendMismatchNotice,
+	formatAuthorityFullFsyncNotice,
+	formatAuthorityTailRecoveryNotice,
+	formatAuthorityWeakLockNotice,
+	journalingEnvironment,
 	registryDurableStateForSession,
-	type RegistryDurableStateStore,
-} from "./registry/durable-state";
+} from "./registry/authority";
+import type { AuthorityStore } from "./registry/authority/types";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -619,77 +633,139 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		// ACP sessions coexist in one host, so each persisted root gets its own
 		// recovered registry and carries it explicitly instead of replacing global state.
 		if (!sessionFile) {
+			await nextSessionManager.close();
 			throw new Error("ACP session persistence did not resolve a session file");
 		}
-		const durableState = registryDurableStateForSession(sessionFile);
-		const agentRegistry = new AgentRegistry({ durableState });
+		const header = nextSessionManager.getHeader();
+		if (!header || header.id !== nextSessionManager.getSessionId()) {
+			await nextSessionManager.close();
+			throw new Error("ACP session has no matching persisted session header.");
+		}
+		let authorityOpenAttempted = false;
+		const failBeforeSession = async (error: unknown): Promise<never> => {
+			const cleanupErrors: unknown[] = [];
+			let authorityCloseSucceeded = !authorityOpenAttempted;
+			if (authorityOpenAttempted) {
+				try {
+					await closeSessionAuthority(sessionFile);
+					authorityCloseSucceeded = true;
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+			if (authorityCloseSucceeded) {
+				try {
+					await nextSessionManager.close();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError([error, ...cleanupErrors], "ACP root startup failed and cleanup was incomplete");
+			}
+			throw error;
+		};
+		let agentRegistry: AgentRegistry;
+		try {
+			await nextSessionManager.ensureOnDisk();
+			authorityOpenAttempted = true;
+			const durableState = await registryDurableStateForSession(sessionFile, {
+				...journalingEnvironment(),
+				owningSessionId: header.id,
+				create: true,
+			});
+			agentRegistry = await AgentRegistry.create({ durableState });
+		} catch (error) {
+			return await failBeforeSession(error);
+		}
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
 		// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
 		// host can open `session/new` for any client-supplied workspace, so
 		// re-discover `TITLE_SYSTEM.md` against THIS session's `cwd` to keep the
 		// replan-driven title refresh consistent with the target project's
 		// policy (PR #3736 follow-up).
-		const titleSystemPromptSource = discoverTitleSystemPromptFile(cwd);
-		const titleSystemPrompt = await resolvePromptInput(titleSystemPromptSource, "title system prompt");
+		let titleSystemPrompt: string | undefined;
+		try {
+			const titleSystemPromptSource = discoverTitleSystemPromptFile(cwd);
+			titleSystemPrompt = await resolvePromptInput(titleSystemPromptSource, "title system prompt");
+		} catch (error) {
+			return await failBeforeSession(error);
+		}
 		const eventBus = new EventBus();
-		const trustedExtensions =
-			args.parsedArgs.trustedExtensions && args.parsedArgs.trustedExtensions.length > 0
-				? await loadTrustedSessionExtensions(args.baseOptions, cwd, eventBus)
-				: undefined;
-		if (trustedExtensions && trustedExtensions.errors.length > 0) {
-			throw new Error(
-				`Trusted extension failed to load: ${trustedExtensions.errors.map(item => item.error).join("; ")}`,
-			);
+		let trustedExtensions: LoadExtensionsResult | undefined;
+		try {
+			trustedExtensions =
+				args.parsedArgs.trustedExtensions && args.parsedArgs.trustedExtensions.length > 0
+					? await loadTrustedSessionExtensions(args.baseOptions, cwd, eventBus)
+					: undefined;
+			if (trustedExtensions && trustedExtensions.errors.length > 0) {
+				throw new Error(
+					`Trusted extension failed to load: ${trustedExtensions.errors.map(item => item.error).join("; ")}`,
+				);
+			}
+		} catch (error) {
+			return await failBeforeSession(error);
 		}
 		// Like every top-level session, it holds process-wide effects (`worktree.base`, request
 		// limits, …) on its own project's settings until disposed; its requests redact credentials
 		// per that project's `secrets.enabled` regardless of which session holds the effects.
-		const { session: nextSession, setToolUIContext } = await args.createSession({
-			...args.baseOptions,
-			cwd,
-			sessionManager: nextSessionManager,
-			settings: nextSettings,
-			authStorage: args.authStorage,
-			modelRegistry: args.modelRegistry,
-			agentId,
-			agentRegistry,
-			// ACP defers the `ask` capability and reserve-policy confirmation until
-			// client capabilities are known, without enabling other UI-only behavior.
-			interactivePrompts: factoryOptions?.interactivePrompts,
-			deferUsageReserveConfirmation: true,
-			enableMCP: false,
-			titleSystemPrompt,
-			eventBus,
-			preloadedExtensions: trustedExtensions,
-		});
-		if (args.parsedArgs.apiKey && !args.baseOptions.model && nextSession.model) {
-			args.authStorage.keys.setRuntime(nextSession.model.provider, args.parsedArgs.apiKey);
+		let createdSession: CreateAgentSessionResult;
+		try {
+			createdSession = await args.createSession({
+				...args.baseOptions,
+				cwd,
+				sessionManager: nextSessionManager,
+				settings: nextSettings,
+				authStorage: args.authStorage,
+				modelRegistry: args.modelRegistry,
+				agentId,
+				agentRegistry,
+				// ACP defers the `ask` capability and reserve-policy confirmation until
+				// client capabilities are known, without enabling other UI-only behavior.
+				interactivePrompts: factoryOptions?.interactivePrompts,
+				deferUsageReserveConfirmation: true,
+				enableMCP: false,
+				titleSystemPrompt,
+				eventBus,
+				preloadedExtensions: trustedExtensions,
+			});
+		} catch (error) {
+			return await failBeforeSession(error);
 		}
-		const runner = nextSession.extensionRunner;
-		const reparsedArgs = applyExtensionFlags(
-			runner
-				? {
-						getFlags: () => runner.getFlags(),
-						setFlagValue: (name, value) => {
-							runner.setFlagValue(name, value);
-						},
-					}
-				: undefined,
-			args.rawArgs,
-		);
-		const effectiveArgs = reparsedArgs ?? args.parsedArgs;
-		if (effectiveArgs.invalidFlagValues.length > 0) {
-			await nextSession.dispose();
-			throw new CliUsageError(effectiveArgs.invalidFlagValues.join("\n"));
-		}
-		const requestedTools = reparsedArgs?.tools ?? args.parsedArgs.tools;
-		if (requestedTools) {
-			try {
-				validateToolNames(requestedTools, nextSession.getAllToolNames());
-			} catch (error) {
-				await nextSession.dispose();
-				throw error;
+		attachRootAuthorityDisposal(createdSession.session, sessionFile);
+		const { session: nextSession, setToolUIContext } = createdSession;
+		try {
+			if (args.parsedArgs.apiKey && !args.baseOptions.model && nextSession.model) {
+				args.authStorage.keys.setRuntime(nextSession.model.provider, args.parsedArgs.apiKey);
 			}
+			const runner = nextSession.extensionRunner;
+			const reparsedArgs = applyExtensionFlags(
+				runner
+					? {
+							getFlags: () => runner.getFlags(),
+							setFlagValue: (name, value) => {
+								runner.setFlagValue(name, value);
+							},
+						}
+					: undefined,
+				args.rawArgs,
+			);
+			const effectiveArgs = reparsedArgs ?? args.parsedArgs;
+			if (effectiveArgs.invalidFlagValues.length > 0) {
+				throw new CliUsageError(effectiveArgs.invalidFlagValues.join("\n"));
+			}
+			const requestedTools = reparsedArgs?.tools ?? args.parsedArgs.tools;
+			if (requestedTools) validateToolNames(requestedTools, nextSession.getAllToolNames());
+		} catch (error) {
+			try {
+				await disposeRootSession(nextSession);
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"ACP session setup failed and root disposal was incomplete",
+				);
+			}
+			throw error;
 		}
 		return { session: nextSession, setToolUIContext };
 	};
@@ -1309,6 +1385,7 @@ function validateSessionPersistenceArgs(parsed: Pick<Args, "continue" | "noSessi
  * before extensions establish whether a built-in-named flag belongs to them.
  * `onSessionContinuation` hears when `--resume`, `--continue` or auto-resume
  * opens a newer copy of the chosen session's conversation instead of its file.
+ * `onNewRoot` is emitted only when startup allocates or forks a root, not when it opens a saved one.
  */
 export async function createSessionManager(
 	parsed: Args,
@@ -1318,8 +1395,15 @@ export async function createSessionManager(
 	options: {
 		nativeFlagOwnership?: "preliminary" | "resolved";
 		onSessionContinuation?: (continuation: SessionContinuation) => void;
+		onNewRoot?: (manager: SessionManager) => void;
 	} = {},
 ): Promise<SessionManager | undefined> {
+	const forkAndTrack = async (manager: SessionManager): Promise<SessionManager> => {
+		const originalSessionId = manager.getSessionId();
+		const forked = await forkIfMovedAway(manager, parsed.sessionDir);
+		if (forked.getSessionId() !== originalSessionId) options.onNewRoot?.(forked);
+		return forked;
+	};
 	if (parsed.fork) {
 		if (parsed.noSession) {
 			throw new SessionResolutionError("--fork requires session persistence");
@@ -1327,9 +1411,11 @@ export async function createSessionManager(
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
 			try {
-				return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir, undefined, {
+				const manager = await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir, undefined, {
 					repairInterruptedTail: true,
 				});
+				options.onNewRoot?.(manager);
+				return manager;
 			} catch (err) {
 				if (err instanceof ForkSourceNotFoundError) {
 					throw new SessionResolutionError(err.message, SESSION_NOT_FOUND_HINT);
@@ -1342,9 +1428,11 @@ export async function createSessionManager(
 			throw new SessionResolutionError(`Session "${forkSource}" not found.`, SESSION_NOT_FOUND_HINT);
 		}
 		try {
-			return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir, undefined, {
+			const manager = await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir, undefined, {
 				repairInterruptedTail: true,
 			});
+			options.onNewRoot?.(manager);
+			return manager;
 		} catch (err) {
 			if (err instanceof ForkSourceNotFoundError) {
 				throw new SessionResolutionError(`Session "${forkSource}" not found.`, SESSION_NOT_FOUND_HINT);
@@ -1385,7 +1473,7 @@ export async function createSessionManager(
 				throw err;
 			}
 			// A copy whose conversation moved to another machine continues as a fork.
-			return await forkIfMovedAway(manager, parsed.sessionDir);
+			return await forkAndTrack(manager);
 		}
 		const target = await resolveResumeTarget(sessionArg, cwd, parsed.sessionDir);
 		if (!target) {
@@ -1401,25 +1489,25 @@ export async function createSessionManager(
 			askToMoveSession,
 		);
 		if (moveResult.status === "moved") {
-			return await forkIfMovedAway(moveResult.manager, parsed.sessionDir);
+			return await forkAndTrack(moveResult.manager);
 		}
 		if (moveResult.status === "declined") {
 			return undefined;
 		}
-		return await forkIfMovedAway(await SessionManager.open(session.path, parsed.sessionDir), parsed.sessionDir);
+		return await forkAndTrack(await SessionManager.open(session.path, parsed.sessionDir));
 	}
 	if (parsed.continue) {
-		return await forkIfMovedAway(
-			await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
-				onSessionContinuation: options.onSessionContinuation,
-			}),
-			parsed.sessionDir,
-		);
+		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
+			onSessionContinuation: options.onSessionContinuation,
+		});
+		return await forkAndTrack(manager);
 	}
 	if (parsed.resume === true) return undefined;
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
-		return SessionManager.create(cwd, parsed.sessionDir);
+		const manager = SessionManager.create(cwd, parsed.sessionDir);
+		options.onNewRoot?.(manager);
+		return manager;
 	}
 	// Auto-resume: behave like --continue if the setting is enabled and a prior
 	// session exists. When a prior session is resumed, mark parsed.continue so
@@ -1427,18 +1515,18 @@ export async function createSessionManager(
 	// overriding them with CLI defaults.
 	// An explicit startup goal starts fresh even when implicit auto-resume is configured.
 	if (parsed.goal === undefined && cfgAutoResume.get(activeSettings)) {
-		const manager = await forkIfMovedAway(
-			await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
-				onSessionContinuation: options.onSessionContinuation,
-			}),
-			parsed.sessionDir,
-		);
-		if (manager.getEntries().length > 0) {
+		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
+			onSessionContinuation: options.onSessionContinuation,
+		});
+		const resolved = await forkAndTrack(manager);
+		if (resolved.getEntries().length > 0) {
 			parsed.continue = true;
 		}
-		return manager;
+		return resolved;
 	}
-	return SessionManager.create(cwd);
+	const manager = SessionManager.create(cwd);
+	options.onNewRoot?.(manager);
+	return manager;
 }
 
 /** Discover APPEND_SYSTEM.md file if no CLI append system prompt was provided */
@@ -1860,17 +1948,71 @@ interface RunRootCommandDependencies {
 	createForeignSessionStore?: (source: ForeignSessionSource) => ForeignSessionStore;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
+	createSessionManager?: typeof createSessionManager;
+	openAuthority?: typeof registryDurableStateForSession;
+	closeAuthority?: typeof closeSessionAuthority;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
+/** Close authority only after root descendants/effects/registry disposal; then release draft-only cleanup. */
+export function attachRootAuthorityDisposal(session: AgentSession, sessionFile: string): void {
+	const releaseDraftCleanup = session.sessionManager.deferDraftCleanup();
+	let authorityClose: Promise<void> | undefined;
+	const closeAuthority = (): Promise<void> => {
+		if (!authorityClose) authorityClose = closeSessionAuthority(sessionFile);
+		return authorityClose;
+	};
+	const disposeSession = session.dispose.bind(session);
+	let rootDisposal: Promise<void> | undefined;
+	session.dispose = (...args: Parameters<AgentSession["dispose"]>) => {
+		if (!rootDisposal) {
+			rootDisposal = (async () => {
+				await disposeSession(...args);
+				await closeAuthority();
+				await releaseDraftCleanup();
+			})();
+		}
+		return rootDisposal;
+	};
+}
+
+/** The root authority store binds to the transcript file, so a transcript that cannot be written stops startup. */
+async function ensureRootTranscriptOnDisk(sessionManager: SessionManager): Promise<void> {
+	try {
+		await sessionManager.ensureOnDisk();
+	} catch (error) {
+		throw new RootStartupPersistenceError(error);
+	}
+}
+
 /**
- * Settle the session's dispose promise without letting a failure the caller has
- * already reported escape as a raw fatal dump. `AgentSession.dispose()` memoizes
- * its first call, so awaiting it again after print mode swallowed a store
- * failure rethrows the identical rejection (issue #11493).
+ * CLI boundary of {@link runRootCommand}. Session persistence failures leave the root command as
+ * errors so embedders see them; here they become a one-line diagnostic and exit code 1 instead of
+ * a fatal dump (issue #11493). Print mode reports its own persistence failures before rethrowing.
  */
-export async function disposeSessionQuietly(session: AgentSession): Promise<void> {
-	await session.dispose().catch(() => undefined);
+export async function runRootCommandAtCliBoundary(
+	parsed: Args,
+	rawArgs: string[],
+	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
+): Promise<void> {
+	try {
+		await runRootCommand(parsed, rawArgs, deps);
+	} catch (error) {
+		if (error instanceof RootStartupPersistenceError) {
+			process.stderr.write(`${formatStartupPersistenceFailure(error.message)}\n`);
+		} else if (error instanceof AuthorityCapacityUnsupportedError) {
+			// Raised before any authority mutation by every open path (startup, resume fallback, ACP).
+			process.stderr.write(`${error.message}\n`);
+		} else if (!isReportedPersistenceFailure(error)) {
+			throw error;
+		}
+		await postmortem.quit(1);
+	}
+}
+
+/** Await root disposal so registry child/effect drain and authority-close failures propagate. */
+export async function disposeRootSession(session: AgentSession): Promise<void> {
+	await session.dispose();
 }
 
 export async function runRootCommand(
@@ -1878,6 +2020,45 @@ export async function runRootCommand(
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
+	let rootAuthorityOpenAttempted = false;
+	let rootAuthorityCloseAttempted = false;
+	let rootAuthorityCloseSucceeded = false;
+	let rootAuthorityCloseFailure: unknown;
+	let startupManagerCloseAttempted = false;
+	let startupManagerCloseSucceeded = false;
+	let startupManagerCloseFailure: unknown;
+	let startupSessionManager: SessionManager | undefined;
+	let rootAgentSession: AgentSession | undefined;
+	let rootSessionDisposalStarted = false;
+	// Print mode owns the session disposal await; keep its settled result to avoid re-awaiting failures.
+	let printModeDisposeOutcome: { status: "fulfilled" } | { status: "rejected"; error: unknown } | undefined;
+	const closeStartupAuthority = async (sessionFile: string): Promise<void> => {
+		if (rootAuthorityCloseAttempted) {
+			if (rootAuthorityCloseSucceeded) return;
+			throw rootAuthorityCloseFailure;
+		}
+		rootAuthorityCloseAttempted = true;
+		try {
+			await (deps.closeAuthority ?? closeSessionAuthority)(sessionFile);
+			rootAuthorityCloseSucceeded = true;
+		} catch (error) {
+			rootAuthorityCloseFailure = error;
+			throw error;
+		}
+	};
+	const closeStartupSessionManager = async (): Promise<void> => {
+		if (!startupSessionManager || startupManagerCloseSucceeded) return;
+		if (startupManagerCloseAttempted) throw startupManagerCloseFailure;
+		startupManagerCloseAttempted = true;
+		try {
+			await startupSessionManager.close();
+			startupManagerCloseSucceeded = true;
+			startupSessionManager = undefined;
+		} catch (error) {
+			startupManagerCloseFailure = error;
+			throw error;
+		}
+	};
 	logger.startTiming();
 	startStartupWatchdog();
 	try {
@@ -2189,6 +2370,7 @@ export async function runRootCommand(
 			isForeignSessionImport(parsedArgs),
 		);
 		let sessionManager: SessionManager | undefined;
+		let newRootEvidence = false;
 		let foreignSource: ForeignSessionSource | undefined;
 		// A resumed session whose conversation went on in another file resumes that file; say so.
 		const resumedContinuations: SessionContinuation[] = [];
@@ -2247,14 +2429,15 @@ export async function runRootCommand(
 						foreignSession,
 						{ fallbackCwd: cwd, sessionDir: parsedArgs.sessionDir },
 					);
+					newRootEvidence = true;
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					throw new SessionResolutionError(`Failed to import ${sourceName} session: ${message}`);
 				}
-			} else {
+			} else if (mode !== "acp") {
 				sessionManager = await logger.time(
 					"createSessionManager",
-					createSessionManager,
+					deps.createSessionManager ?? createSessionManager,
 					parsedArgs,
 					cwd,
 					settingsInstance,
@@ -2262,6 +2445,9 @@ export async function runRootCommand(
 					{
 						nativeFlagOwnership: "preliminary",
 						onSessionContinuation: continuation => resumedContinuations.push(continuation),
+						onNewRoot: () => {
+							newRootEvidence = true;
+						},
 					},
 				);
 			}
@@ -2271,6 +2457,7 @@ export async function runRootCommand(
 			}
 			throw error;
 		}
+		startupSessionManager = sessionManager;
 		// Only createSessionManager's implicit auto-resume promotes continue here.
 		const autoResumed = !explicitSessionSelection && parsedArgs.continue === true;
 
@@ -2308,7 +2495,7 @@ export async function runRootCommand(
 		// --no-session — createSessionManager already returned an ephemeral manager,
 		// and the deferred persistence check below (after extension flag ownership is
 		// resolved) rejects a native --resume, so the picker must not run first.
-		if (parsedArgs.resume === true && !parsedArgs.fork && !parsedArgs.noSession) {
+		if (mode !== "acp" && parsedArgs.resume === true && !parsedArgs.fork && !parsedArgs.noSession) {
 			const folderSessions = await logger.time(
 				"SessionManager.listForPicker",
 				SessionManager.listForPicker,
@@ -2354,12 +2541,11 @@ export async function runRootCommand(
 			if (continuation) resumedContinuations.push(continuation);
 			const chosen = continuation?.session ?? selected;
 			try {
-				sessionManager = await forkIfMovedAway(
-					(await SessionManager.isFromRemovedWorktree(chosen, cwd, parsedArgs.sessionDir))
-						? await openRelocatedSession(chosen, cwd, parsedArgs.sessionDir)
-						: await SessionManager.open(chosen.path),
-					parsedArgs.sessionDir,
-				);
+				const openedManager = (await SessionManager.isFromRemovedWorktree(chosen, cwd, parsedArgs.sessionDir))
+					? await openRelocatedSession(chosen, cwd, parsedArgs.sessionDir)
+					: await SessionManager.open(chosen.path);
+				sessionManager = await forkIfMovedAway(openedManager, parsedArgs.sessionDir);
+				if (sessionManager.getSessionId() !== openedManager.getSessionId()) newRootEvidence = true;
 			} catch (error: unknown) {
 				if (error instanceof SessionResolutionError) exitForSessionResolutionError(error);
 				throw error;
@@ -2385,31 +2571,106 @@ export async function runRootCommand(
 		// projection. Root creation, lifecycle management, and revival all retain
 		// these exact instances; `--no-session` intentionally installs a storeless
 		// unrestricted projection whose authority creator rejects restricted roots.
-		const sessionFile = sessionManager?.getSessionFile();
-		let durableState: RegistryDurableStateStore | undefined;
+		let sessionFile = sessionManager?.getSessionFile();
+		startupSessionManager = sessionManager;
+		let durableState: AuthorityStore | undefined;
 		let agentRegistry: AgentRegistry;
+		let authorityAdoptionNotice: string | undefined;
+		let authorityBackendNotice: string | undefined;
+		let authorityWeakLockNotice: string | undefined;
+		const authorityTailRecoveryNotices: string[] = [];
+		let authorityFullFsyncNotice: string | undefined;
 		try {
-			durableState = sessionFile ? registryDurableStateForSession(sessionFile) : undefined;
-			agentRegistry = new AgentRegistry({ durableState });
+			const { backend, capacity } = journalingEnvironment();
+			if (sessionFile && sessionManager) {
+				const header = sessionManager.getHeader();
+				if (!header || header.id !== sessionManager.getSessionId()) {
+					throw new Error("Authority root header does not match the session manager UUID.");
+				}
+				await ensureRootTranscriptOnDisk(sessionManager);
+				rootAuthorityOpenAttempted = true;
+				durableState = await (deps.openAuthority ?? registryDurableStateForSession)(sessionFile, {
+					backend,
+					capacity,
+					owningSessionId: header.id,
+					create: newRootEvidence,
+					onAdopted: adoption => {
+						authorityAdoptionNotice = formatAuthorityAdoptionNotice(adoption);
+					},
+					onBackendMismatch: mismatch => {
+						authorityBackendNotice = formatAuthorityBackendMismatchNotice(mismatch);
+					},
+					onWeakLockFilesystem: notice => {
+						authorityWeakLockNotice = formatAuthorityWeakLockNotice(notice);
+					},
+					onTailRecovered: recovery => {
+						authorityTailRecoveryNotices.push(formatAuthorityTailRecoveryNotice(recovery));
+					},
+					onFullFsyncFallback: fallback => {
+						authorityFullFsyncNotice = formatAuthorityFullFsyncNotice(fallback);
+					},
+				});
+			}
+			agentRegistry = await AgentRegistry.create({ durableState });
 		} catch (error) {
-			if (!(error instanceof DurableStateUnavailableError)) throw error;
+			const unavailable =
+				error instanceof Error &&
+				(error.name === "DurableStateUnavailableError" ||
+					error.message.startsWith("Authority recovery did not reach ready state:"));
+			// Adoption, recovery and capacity-host refusals already name the exact remedy; print them as one line.
+			const adoptionRefused =
+				error instanceof AuthorityAdoptionRefusedError || error instanceof AuthorityRecoveryRequiredError;
+			const capacityRefused = error instanceof AuthorityCapacityUnsupportedError;
+			if (!unavailable && !adoptionRefused && !capacityRefused) throw error;
+			const cleanupErrors: unknown[] = [];
+			if (rootAuthorityOpenAttempted && sessionFile) {
+				try {
+					await closeStartupAuthority(sessionFile);
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError([error, ...cleanupErrors], "Root startup failed and cleanup was incomplete");
+			}
+			await closeStartupSessionManager();
 			stopPendingStartupComposer();
 			stopStartupWatchdog();
 			stopThemeWatcher();
 			const target = sessionFile ?? "the current session";
 			const reason = error instanceof Error ? error.message : String(error);
+			if (adoptionRefused) {
+				process.stderr.write(`Unable to resume ${target}: ${reason}\n`);
+				process.exit(1);
+				return;
+			}
+			if (capacityRefused) {
+				process.stderr.write(`Unable to open ${target}: ${reason}\n`);
+				process.exit(1);
+				return;
+			}
 			process.stderr.write(
-				`Unable to resume ${target}: ${reason}\\nRun ${repairSessionCommand(target)} first (dry-run), review the diagnosis, stop the owning client, then add --apply only if it is explicitly repairable. Start a fresh process after repair.\\n`,
+				`Unable to resume ${target}: ${reason}\nRun ${repairSessionCommand(target)} first (dry-run), review the diagnosis, stop the owning client, then add --apply only if it is explicitly repairable. Start a fresh process after repair.\n`,
 			);
 			process.exit(1);
 			return;
 		}
 		AgentRegistry.installGlobal(agentRegistry);
+		for (const notice of [authorityAdoptionNotice, authorityBackendNotice]) {
+			if (!notice) continue;
+			if (isInteractive) notifs.push({ kind: "info", message: notice });
+			else process.stderr.write(`${chalk.dim(notice)}\n`);
+		}
+		for (const notice of [authorityWeakLockNotice, authorityFullFsyncNotice, ...authorityTailRecoveryNotices]) {
+			if (!notice) continue;
+			if (isInteractive) notifs.push({ kind: "warn", message: notice });
+			else process.stderr.write(`${chalk.yellow(notice)}\n`);
+		}
 
 		for (const continuation of resumedContinuations) {
 			const notice = formatSessionContinuationNotice(continuation);
 			if (isInteractive) notifs.push({ kind: "warn", message: notice });
-			else process.stderr.write(`${chalk.yellow(notice)}\\n`);
+			else process.stderr.write(`${chalk.yellow(notice)}\n`);
 		}
 		if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource)) {
 			const pendingToolWarning = describePendingToolCalls(sessionManager.getBranch());
@@ -2459,7 +2720,7 @@ export async function runRootCommand(
 			options.extensions = startupExtensions;
 			options.onPrewalkWarning = warning => {
 				if (isInteractive) notifs.push({ kind: "warn", message: warning });
-				else process.stderr.write(`${chalk.yellow(`Warning: ${warning}`)}\\n`);
+				else process.stderr.write(`${chalk.yellow(`Warning: ${warning}`)}\n`);
 			};
 			return options;
 		};
@@ -2703,26 +2964,48 @@ export async function runRootCommand(
 				deferRetryFallbackValidation: true,
 			};
 			let createdSession: CreateAgentSessionResult;
+			let autoResumeFailure: SessionModelRestoreError | undefined;
 			try {
 				createdSession = await createSession({ ...sessionOptions, ...startupContext });
 			} catch (error) {
 				if (!isInteractive || !autoResumed || !sessionManager || !(error instanceof SessionModelRestoreError)) {
 					throw error;
 				}
+				autoResumeFailure = error;
+				if (sessionFile) {
+					await closeStartupAuthority(sessionFile);
+				}
 				await sessionManager.close();
-				sessionManager = undefined;
+				rootAuthorityOpenAttempted = false;
+				rootAuthorityCloseAttempted = false;
+				rootAuthorityCloseSucceeded = false;
+				rootAuthorityCloseFailure = undefined;
+				sessionManager = SessionManager.create(cwd, parsedArgs.sessionDir);
+				startupSessionManager = sessionManager;
+				newRootEvidence = true;
 				parsedArgs.continue = false;
+				sessionFile = sessionManager.getSessionFile();
+				if (!sessionFile) throw new Error("Fresh auto-resume fallback requires a persisted session");
+				const header = sessionManager.getHeader();
+				if (!header || header.id !== sessionManager.getSessionId()) {
+					throw new Error("Fresh auto-resume root header does not match its session UUID.");
+				}
+				await ensureRootTranscriptOnDisk(sessionManager);
+				rootAuthorityOpenAttempted = true;
+				durableState = await (deps.openAuthority ?? registryDurableStateForSession)(sessionFile, {
+					...journalingEnvironment(),
+					owningSessionId: header.id,
+					create: true,
+				});
+				agentRegistry = await AgentRegistry.create({ durableState });
+				AgentRegistry.installGlobal(agentRegistry);
 				// The failed SDK attempt consumed this queue; the fresh attempt clears
 				// source registrations again before applying it.
 				extensionsResult.runtime.pendingProviderRegistrations.unshift(...preloadProviderRegistrations);
 				const startupDeadline = sessionOptions.deadline;
-				sessionOptions = await buildStartupSessionOptions(undefined);
+				sessionOptions = await buildStartupSessionOptions(sessionManager);
 				sessionOptions.deadline = startupDeadline;
 				createdSession = await createSession({ ...sessionOptions, ...startupContext });
-				notifs.push({
-					kind: "warn",
-					message: `Auto resume skipped: ${sanitizeDisplayWarnings([error.message])[0]}. Started a new session without the saved history.`,
-				});
 			}
 			const {
 				session,
@@ -2733,6 +3016,18 @@ export async function runRootCommand(
 				startBackgroundModelDiscovery,
 				singleRequestVerification,
 			} = createdSession;
+			rootAgentSession = session;
+			if (durableState) {
+				if (!sessionFile) throw new Error("Root authority requires a persisted session file.");
+				attachRootAuthorityDisposal(session, sessionFile);
+			}
+			startupSessionManager = undefined;
+			if (autoResumeFailure) {
+				notifs.push({
+					kind: "warn",
+					message: `Auto resume skipped: ${sanitizeDisplayWarnings([autoResumeFailure.message])[0]}. Started a new session without the saved history.`,
+				});
+			}
 			if (parsedArgs.singleRequest) {
 				const verification = singleRequestVerification;
 				if (!verification || verification.dispatchBudget !== 1 || verification.fetchBudget !== 1) {
@@ -2753,7 +3048,8 @@ export async function runRootCommand(
 			try {
 				validateToolNames(initialArgs.tools, sessionToolNames);
 			} catch (error) {
-				await session.dispose();
+				rootSessionDisposalStarted = true;
+				await disposeRootSession(session);
 				// With no working eval backend, `--tools eval` is rejected here, before the startup
 				// notification path; carry the interpreter diagnosis instead of a bare "Unknown tool".
 				const evalWarning = sessionToolNames.includes("eval") ? undefined : await pythonEvalWarningPromise;
@@ -2971,11 +3267,12 @@ export async function runRootCommand(
 					startupLease?.dispose();
 				}
 			} else {
-				// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
 				stopStartupWatchdog();
 				// PI_TIMING prints the tree after the run; otherwise stop recording now so a
 				// long `-p` run's subagents do not keep growing it.
 				if (!$env.PI_TIMING) logger.endTiming();
+				// Branch-only single-shot runner: keep print-mode code out of normal interactive startup
+				// (a static import also closes a slash-command module cycle).
 				const runPrintMode: RunPrintMode = (await import("./modes/print-mode")).runPrintMode;
 				const exitCode = await runPrintMode(session, {
 					mode,
@@ -2986,11 +3283,23 @@ export async function runRootCommand(
 					planYolo: parsedArgs.planYolo,
 					mcpManager,
 					deadline: sessionOptions.deadline,
+					onDisposeOutcome: outcome => {
+						printModeDisposeOutcome = outcome;
+					},
 				});
+				if (printModeDisposeOutcome?.status === "rejected") {
+					rootSessionDisposalStarted = true;
+					stopThemeWatcher();
+					throw printModeDisposeOutcome.error;
+				}
 				if ($env.PI_TIMING) {
 					logger.printTimings();
 				}
-				await disposeSessionQuietly(session);
+				rootSessionDisposalStarted = printModeDisposeOutcome?.status === "fulfilled";
+				if (!rootSessionDisposalStarted) {
+					rootSessionDisposalStarted = true;
+					await disposeRootSession(session);
+				}
 				stopThemeWatcher();
 				await postmortem.quit(exitCode);
 			}
@@ -2998,6 +3307,53 @@ export async function runRootCommand(
 	} catch (error) {
 		stopPendingStartupComposer();
 		stopStartupWatchdog();
+		const cleanupErrors: unknown[] = [];
+		if (rootAgentSession) {
+			// A settled print-mode outcome is authoritative; do not invoke its memoized disposer again.
+			if (!rootSessionDisposalStarted) {
+				rootSessionDisposalStarted = true;
+				if (printModeDisposeOutcome?.status === "rejected") {
+					if (printModeDisposeOutcome.error !== error) cleanupErrors.push(printModeDisposeOutcome.error);
+				} else if (!printModeDisposeOutcome) {
+					try {
+						await disposeRootSession(rootAgentSession);
+					} catch (cleanupError) {
+						cleanupErrors.push(cleanupError);
+					}
+				}
+			}
+		} else {
+			let authorityCloseFailed = rootAuthorityCloseAttempted && !rootAuthorityCloseSucceeded;
+			const sessionFile = startupSessionManager?.getSessionFile();
+			if (rootAuthorityOpenAttempted && !rootAuthorityCloseAttempted) {
+				if (!sessionFile) {
+					cleanupErrors.push(
+						new Error("Root authority open was attempted without a session file; cleanup cannot be established"),
+					);
+					authorityCloseFailed = true;
+				} else {
+					try {
+						await closeStartupAuthority(sessionFile);
+					} catch (cleanupError) {
+						cleanupErrors.push(cleanupError);
+						authorityCloseFailed = true;
+					}
+				}
+			}
+			if (!authorityCloseFailed && startupSessionManager) {
+				try {
+					await closeStartupSessionManager();
+				} catch (cleanupError) {
+					// The manager latches the write failure that stopped startup and rethrows it on close;
+					// that is the startup failure itself, not an incomplete cleanup.
+					const startupFailure = error instanceof RootStartupPersistenceError ? error.failure : undefined;
+					if (cleanupError !== startupFailure) cleanupErrors.push(cleanupError);
+				}
+			}
+		}
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError([error, ...cleanupErrors], "Root startup failed and cleanup was incomplete");
+		}
 		throw error;
 	}
 }

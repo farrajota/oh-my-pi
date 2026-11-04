@@ -485,6 +485,9 @@ describe("SessionManager cross-process rewrite freshness", () => {
 			suppressBreadcrumb: true,
 		});
 		expect(userTurnsOf(moved.getBranch())).toEqual(["our turn before the conflict", ...ourTurnsAfter]);
+		// The continuation is a new authority root at its own path; it must not carry the contested file's stamp.
+		expect(moved.getHeader()?.authorityRoot).toBe(await fs.realpath(sibling));
+		expect(left.getHeader()?.authorityRoot).toBe(await fs.realpath(contested));
 		await moved.close();
 	});
 

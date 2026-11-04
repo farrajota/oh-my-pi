@@ -16,7 +16,7 @@ import {
 } from "../../src/internal/agent-lifecycle-bridge";
 import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -50,13 +50,18 @@ function preparedSession(sourceFile: string, sourceSessionId: string): PreparedS
 }
 
 async function createDurableRootAuthority(tempDir: TempDir, cwd: string) {
-	const rootSessionFile = path.join(tempDir.path(), "main.jsonl");
-	await Bun.write(rootSessionFile, "");
-	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
+	const rootManager = SessionManager.create(cwd, tempDir.join("root-sessions"));
+	await rootManager.ensureOnDisk();
+	const rootSessionFile = rootManager.getSessionFile();
+	if (!rootSessionFile) throw new Error("Expected materialized owning root");
+	const registry = await AgentRegistry.create({
+		durableState: await registryDurableStateForSession(rootSessionFile, { create: true }),
+	});
 	AgentRegistry.installGlobal(registry);
 	const agentDir = path.join(tempDir.path(), "agent");
 	const root = await createAgentRootSession(registry, {
 		agentId: "Main",
+		sessionManager: rootManager,
 		cwd,
 		agentDir,
 		settings: Settings.isolated(),
@@ -284,6 +289,8 @@ describe("seance artifact lifecycle", () => {
 			await releaseFixtureAgent(cleanupRegistry, AGENT_ID);
 			try {
 				await authorityRoot?.dispose();
+				const authorityFile = authorityRoot?.sessionManager.getSessionFile();
+				if (authorityFile) await closeSessionAuthority(authorityFile);
 			} finally {
 				try {
 					AgentStorage.close();
@@ -444,6 +451,8 @@ describe("seance artifact lifecycle", () => {
 			await releaseFixtureAgent(cleanupRegistry, UNSTRUCTURED_AGENT_ID);
 			try {
 				await authorityRoot?.dispose();
+				const authorityFile = authorityRoot?.sessionManager.getSessionFile();
+				if (authorityFile) await closeSessionAuthority(authorityFile);
 			} finally {
 				try {
 					AgentStorage.close();

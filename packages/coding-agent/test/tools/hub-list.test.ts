@@ -32,6 +32,7 @@ import {
 import { executeList, executeSend } from "@oh-my-pi/pi-coding-agent/tools/hub/messaging";
 import { prompt, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { createHubAuthorityFixture } from "./hub-fixtures";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 function sessionHeader(id: string): string {
 	return JSON.stringify({
@@ -847,7 +848,7 @@ describe("hub list", () => {
 		expect(registry.get("SecondWorker")).toBeDefined();
 		expect(hintedRoster).not.toContain("FirstWorker");
 		expect(hintedRoster).not.toContain("SecondWorker");
-		registry.unregister(MAIN_AGENT_ID);
+		await registry.unregister(MAIN_AGENT_ID);
 		registry.register({
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
@@ -951,6 +952,7 @@ describe("hub list", () => {
 			});
 			const delivered: string[] = [];
 			const revived = {
+				...createSessionDefaults(),
 				isStreaming: false,
 				deliverIrcMessage: async (msg: { body: string }) => {
 					delivered.push(msg.body);

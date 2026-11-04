@@ -55,9 +55,9 @@ interface AgentRegistryBridge {
 		history: AgentHistorySummary,
 		expectedSessionFile?: string,
 	): boolean;
-	setStatus(id: string, status: AgentStatus, expected: InternalAgentRef | AgentSession): boolean;
+	setStatus(id: string, status: AgentStatus, expected: InternalAgentRef | AgentSession): Promise<boolean>;
 	setActivity(id: string, activity: string, expected: InternalAgentRef | AgentSession): boolean;
-	markResultAccepted(id: string, expected: InternalAgentRef | AgentSession, responseAt?: number): boolean;
+	markResultAccepted(id: string, expected: InternalAgentRef | AgentSession, responseAt?: number): Promise<boolean>;
 	attachSession(
 		id: string,
 		session: AgentSession,
@@ -65,12 +65,17 @@ interface AgentRegistryBridge {
 		expected: InternalAgentRef | AgentSession,
 	): boolean;
 	detachSession(id: string, expected: InternalAgentRef | AgentSession): boolean;
-	unregister(id: string, expected: InternalAgentRef | AgentSession): boolean;
-	park(expectedRef: InternalAgentRef, expectedSession: AgentSession): boolean;
-	abort(expectedRef: InternalAgentRef, expectedSession?: AgentSession): boolean;
-	remove(expectedRef: InternalAgentRef): boolean;
+	unregister(id: string, expected: InternalAgentRef | AgentSession): Promise<boolean>;
+	park(
+		expectedRef: InternalAgentRef,
+		expectedSession: AgentSession,
+		dispose?: () => Promise<void>,
+		beforeDispose?: () => Promise<void>,
+	): Promise<boolean>;
+	abort(expectedRef: InternalAgentRef, expectedSession?: AgentSession): Promise<boolean>;
+	remove(expectedRef: InternalAgentRef): Promise<boolean>;
 	endTermination(expectedRef: InternalAgentRef): void;
-	syncSessionStatus(id: string, session: AgentSession): () => void;
+	syncSessionStatus(id: string, session: AgentSession): () => Promise<void>;
 	register(input: RegisterInput): InternalAgentRef;
 	registerIfAvailable(input: RegisterInput, expected: InternalAgentRef | null): InternalAgentRef | undefined;
 	replaceIfAvailable(input: RegisterInput, expected: InternalAgentRef | null): InternalAgentRef | undefined;
@@ -231,13 +236,13 @@ export function setAgentHistory(
 	return bridgeFor(registry).setHistory(expected, history, expectedSessionFile);
 }
 
-/** Accept a settled task result only while its exact session/ref still owns this registry generation. */
+/** Accept a settled task result only while the exact session/ref still owns this registry generation. */
 export function markAgentResultAccepted(
 	registry: AgentRegistry,
 	id: string,
 	expected: InternalAgentRef | AgentSession,
 	responseAt?: number,
-): boolean {
+): Promise<boolean> {
 	return bridgeFor(registry).markResultAccepted(id, expected, responseAt);
 }
 
@@ -256,7 +261,7 @@ export function setAgentStatus(
 	id: string,
 	status: AgentStatus,
 	expected: InternalAgentRef | AgentSession,
-): boolean {
+): Promise<boolean> {
 	return bridgeFor(registry).setStatus(id, status, expected);
 }
 
@@ -282,19 +287,21 @@ export function parkAgentRef(
 	registry: AgentRegistry,
 	expectedRef: InternalAgentRef,
 	expectedSession: AgentSession,
-): boolean {
-	return bridgeFor(registry).park(expectedRef, expectedSession);
+	dispose?: () => Promise<void>,
+	beforeDispose?: () => Promise<void>,
+): Promise<boolean> {
+	return bridgeFor(registry).park(expectedRef, expectedSession, dispose, beforeDispose);
 }
 
 export function abortAgentRef(
 	registry: AgentRegistry,
 	expectedRef: InternalAgentRef,
 	expectedSession?: AgentSession,
-): boolean {
+): Promise<boolean> {
 	return bridgeFor(registry).abort(expectedRef, expectedSession);
 }
 
-export function removeAgentRef(registry: AgentRegistry, expectedRef: InternalAgentRef): boolean {
+export function removeAgentRef(registry: AgentRegistry, expectedRef: InternalAgentRef): Promise<boolean> {
 	return bridgeFor(registry).remove(expectedRef);
 }
 
@@ -306,11 +313,15 @@ export function unregisterAgentRef(
 	registry: AgentRegistry,
 	id: string,
 	expected: InternalAgentRef | AgentSession,
-): boolean {
+): Promise<boolean> {
 	return bridgeFor(registry).unregister(id, expected);
 }
 
-export function syncAgentSessionStatus(registry: AgentRegistry, id: string, session: AgentSession): () => void {
+export function syncAgentSessionStatus(
+	registry: AgentRegistry,
+	id: string,
+	session: AgentSession,
+): () => Promise<void> {
 	return bridgeFor(registry).syncSessionStatus(id, session);
 }
 

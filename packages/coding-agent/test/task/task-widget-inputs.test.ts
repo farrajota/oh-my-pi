@@ -11,9 +11,10 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TextTap } from "@oh-my-pi/pi-coding-agent/job-widgets/text-tap";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -24,17 +25,26 @@ import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../..
 let authorityRoot: AgentSession | undefined;
 let directory: TempDir;
 let jobManager: AsyncJobManager | undefined;
+const authorityFiles = new Set<string>();
 let finishRun: (() => void) | undefined;
 
 beforeEach(async () => {
 	AgentRegistry.resetGlobalForTests();
 	AgentLifecycleManager.resetGlobalForTests();
 	directory = TempDir.createSync("@omp-task-widget-");
-	const rootSessionFile = directory.join("main.jsonl");
-	await Bun.write(rootSessionFile, "");
-	AgentRegistry.installGlobal(new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) }));
+	const rootManager = SessionManager.create(directory.path(), directory.join("root-sessions"));
+	await rootManager.ensureOnDisk();
+	const rootSessionFile = rootManager.getSessionFile();
+	if (!rootSessionFile) throw new Error("Expected materialized owning root");
+	authorityFiles.add(rootSessionFile);
+	AgentRegistry.installGlobal(
+		await AgentRegistry.create({
+			durableState: await registryDurableStateForSession(rootSessionFile, { create: true }),
+		}),
+	);
 	const root = await createAgentRootSession(AgentRegistry.global(), {
 		agentId: "Main",
+		sessionManager: rootManager,
 		cwd: directory.path(),
 		agentDir: directory.join("agent"),
 		settings: Settings.isolated({ "async.enabled": true, "task.batch": true }),
@@ -54,6 +64,8 @@ afterEach(async () => {
 	await jobManager?.dispose({ timeoutMs: 1_000 });
 	jobManager = undefined;
 	await authorityRoot?.dispose();
+	for (const file of authorityFiles) await closeSessionAuthority(file);
+	authorityFiles.clear();
 	authorityRoot = undefined;
 	directory.removeSync();
 	vi.restoreAllMocks();

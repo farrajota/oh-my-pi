@@ -1,6 +1,9 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { Database } from "bun:sqlite";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import type { AuthorizedFilesystemTarget, DurableOpenResource } from "../internal/session-path-scope";
+import type { AuthorizedFilesystemTarget } from "../internal/session-path-scope";
 import type { ToolSession } from "../sdk";
 import { DEFAULT_MAX_LINES, truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { applyListLimit } from "@oh-my-pi/pi-tui/tools/list-limit";
@@ -19,6 +22,7 @@ import {
 	getRowByRowId,
 	getTableSchema,
 	isSqliteFile,
+	looksLikeSqlite,
 	listTables,
 	MAX_RAW_QUERY_ROWS,
 	openSqliteReadConnection,
@@ -63,6 +67,28 @@ async function authorizeSqlitePath(
 	return { absolutePath: targets[0]!.canonicalTarget, targets };
 }
 
+async function sniffSqlite(session: ToolSession, absolutePath: string): Promise<boolean> {
+	if (!session.pathScope) return isSqliteFile(absolutePath);
+	const operation = session.pathScope.currentOperation();
+	const target = await operation.authorize(absolutePath, "read");
+	const handle = await operation.openRead(target);
+	let result: boolean;
+	try {
+		const header = Buffer.alloc(16);
+		const { bytesRead } = await handle.read(header, 0, header.length, 0);
+		result = looksLikeSqlite(header.subarray(0, bytesRead));
+	} catch (error) {
+		try {
+			await handle.close();
+		} catch (closeError) {
+			throw new AggregateError([error, closeError], "SQLite header read and close failed.");
+		}
+		throw error;
+	}
+	await handle.close();
+	return result;
+}
+
 export async function resolveSqliteReadPath(
 	session: ToolSession,
 	readPath: string,
@@ -75,40 +101,39 @@ export async function resolveSqliteReadPath(
 		const initial = await authorizeSqlitePath(session, absolutePath, false);
 		absolutePath = initial.absolutePath;
 
+		let exists = false;
 		try {
 			const stat = await Bun.file(absolutePath).stat();
-			// Sniffing a FIFO or device can block; leave it to the read tool's rejection.
-			if (!stat.isFile()) continue;
-			if (!(await isSqliteFile(absolutePath))) continue;
+			exists = stat.isFile();
+		} catch (error) {
+			if (!isNotFoundError(error) || isRemoteMountPath(absolutePath)) continue;
+			const suffixMatch = await findSuffixMatchCached(session, suffixCache, candidate.sqlitePath, signal);
+			if (!suffixMatch) continue;
+			absolutePath = (await authorizeSqlitePath(session, suffixMatch.absolutePath, false)).absolutePath;
+			try {
+				exists = (await Bun.file(absolutePath).stat()).isFile();
+			} catch (retryError) {
+				if (isNotFoundError(retryError)) continue;
+				throw retryError;
+			}
+			if (!exists || !(await sniffSqlite(session, absolutePath))) continue;
 			const authorized = await authorizeSqlitePath(session, absolutePath, true);
 			return {
 				absolutePath: authorized.absolutePath,
 				sqliteSubPath: candidate.subPath,
 				queryString: candidate.queryString,
+				suffixResolution: { from: candidate.sqlitePath, to: suffixMatch.displayPath },
 				authorizedTargets: authorized.targets,
 			};
-		} catch (error) {
-			if (!isNotFoundError(error) || isRemoteMountPath(absolutePath)) continue;
-			const suffixMatch = await findSuffixMatchCached(session, suffixCache, candidate.sqlitePath, signal);
-			if (!suffixMatch) continue;
-
-			try {
-				const probe = await authorizeSqlitePath(session, suffixMatch.absolutePath, false);
-				const retryStat = await Bun.file(probe.absolutePath).stat();
-				if (!retryStat.isFile()) continue;
-				if (!(await isSqliteFile(probe.absolutePath))) continue;
-				const authorized = await authorizeSqlitePath(session, probe.absolutePath, true);
-				return {
-					absolutePath: authorized.absolutePath,
-					sqliteSubPath: candidate.subPath,
-					queryString: candidate.queryString,
-					suffixResolution: { from: candidate.sqlitePath, to: suffixMatch.displayPath },
-					authorizedTargets: authorized.targets,
-				};
-			} catch (retryError) {
-				if (!isNotFoundError(retryError)) throw retryError;
-			}
 		}
+		if (!exists || !(await sniffSqlite(session, absolutePath))) continue;
+		const authorized = await authorizeSqlitePath(session, absolutePath, true);
+		return {
+			absolutePath: authorized.absolutePath,
+			sqliteSubPath: candidate.subPath,
+			queryString: candidate.queryString,
+			authorizedTargets: authorized.targets,
+		};
 	}
 
 	return null;
@@ -134,26 +159,49 @@ export async function readSqlite(
 	};
 
 	let db: Database | null = null;
-	let durableResource: DurableOpenResource | undefined;
+	const inputHandles: fs.FileHandle[] = [];
+	let snapshotDirectory: string | undefined;
 	let result: AgentToolResult<ReadToolDetails> | undefined;
 	let operationError: unknown;
 	let operationFailed = false;
 	try {
+		let inputPath = resolvedSqlitePath.absolutePath;
 		if (session.pathScope && resolvedSqlitePath.authorizedTargets) {
 			const operation = session.pathScope.currentOperation();
-			for (const target of resolvedSqlitePath.authorizedTargets) await operation.verify(target);
+			// SQLite discovers sidecars by basename and cannot consume our held descriptors.
+			// Give it a private, stable copy of every admitted input, never the mutable source paths.
+			const targets = resolvedSqlitePath.authorizedTargets;
+			for (const target of targets) {
+				if (target.existed) inputHandles.push(await operation.openRead(target, "sqlite"));
+				else await operation.verify(target);
+			}
+			const before = await Promise.all(inputHandles.map(handle => handle.stat({ bigint: true })));
+			snapshotDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sqlite-read-"));
+			inputPath = path.join(snapshotDirectory, "input.sqlite");
+			let index = 0;
+			for (const [targetIndex, target] of targets.entries()) {
+				if (!target.existed) continue;
+				const handle = inputHandles[index++]!;
+				const bytes = await handle.readFile();
+				operation.assertActive();
+				throwIfAborted(signal);
+				await fs.writeFile(`${inputPath}${targetIndex === 0 ? "" : targetIndex === 1 ? "-wal" : "-shm"}`, bytes);
+			}
+			// Reject an in-place writer/checkpointer crossing the multi-file capture. WAL
+			// remains a real WAL; readonly SQLite performs its normal recovery/read logic.
+			for (const [index, handle] of inputHandles.entries()) {
+				const after = await handle.stat({ bigint: true });
+				const prior = before[index]!;
+				if (prior.size !== after.size || prior.mtimeNs !== after.mtimeNs || prior.ctimeNs !== after.ctimeNs) {
+					throw new Error("SQLite input changed during snapshot capture.");
+				}
+			}
+			for (const target of targets) await operation.verify(target);
+			operation.assertActive();
 		}
-		if (session.pathScope && resolvedSqlitePath.authorizedTargets?.[0]) {
-			durableResource = session.pathScope
-				.currentOperation()
-				.beginOpenResource(resolvedSqlitePath.authorizedTargets[0], "sqlite");
-		}
-		db = await openSqliteReadConnection(resolvedSqlitePath.absolutePath);
-		durableResource?.effect();
-		if (session.pathScope && resolvedSqlitePath.authorizedTargets) {
-			const operation = session.pathScope.currentOperation();
-			for (const target of resolvedSqlitePath.authorizedTargets) await operation.verify(target);
-		}
+		throwIfAborted(signal);
+		db = await openSqliteReadConnection(inputPath);
+		session.pathScope?.currentOperation().assertActive();
 		throwIfAborted(signal);
 
 		switch (selector.kind) {
@@ -269,21 +317,29 @@ export async function readSqlite(
 		operationError = error;
 	}
 
-	if (db) {
+	const errors: unknown[] = operationFailed ? [operationError] : [];
+	try {
+		db?.close();
+	} catch (error) {
+		errors.push(error);
+	}
+	// Attempt every close even when another physical close or terminal ACK failed.
+	for (const handle of inputHandles) {
 		try {
-			db.close();
-			durableResource?.complete();
+			await handle.close();
 		} catch (error) {
-			durableResource?.cancel();
-			throw error;
+			errors.push(error);
 		}
-	} else {
-		durableResource?.cancel();
 	}
-	if (operationFailed) {
-		if (operationError instanceof ToolError) throw operationError;
-		throw new ToolError(operationError instanceof Error ? operationError.message : String(operationError));
+	if (snapshotDirectory) {
+		try {
+			await fs.rm(snapshotDirectory, { recursive: true, force: true });
+		} catch (error) {
+			errors.push(error);
+		}
 	}
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, "SQLite read and input cleanup failed.");
 	if (result === undefined) throw new ToolError("Unsupported SQLite selector");
 	return result;
 }

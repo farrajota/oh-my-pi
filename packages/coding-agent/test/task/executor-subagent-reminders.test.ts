@@ -340,7 +340,7 @@ describe("runSubprocess yield reminders", () => {
 				/no text \(thinking only\)/,
 			);
 		} finally {
-			registry.unregister("subagent-race");
+			await registry.unregister("subagent-race");
 		}
 	});
 	it("waits out a running turn before installing the pooled contract", async () => {
@@ -390,7 +390,7 @@ describe("runSubprocess yield reminders", () => {
 			expect(result.exitCode).toBe(0);
 			expect(result.output).toContain('"batch": true');
 		} finally {
-			registry.unregister("subagent-prewait");
+			await registry.unregister("subagent-prewait");
 		}
 	});
 	it("fails the follow-up instead of installing under a wedged turn", async () => {
@@ -424,7 +424,7 @@ describe("runSubprocess yield reminders", () => {
 			expect(calls).toEqual(["waitForIdle", "waitForIdle", "waitForIdle"]);
 			expect(calls).not.toContain("setYield");
 		} finally {
-			registry.unregister("subagent-wedged");
+			await registry.unregister("subagent-wedged");
 		}
 	});
 	it("drives the reacquired session when parking replaces the worker mid-install", async () => {
@@ -459,6 +459,14 @@ describe("runSubprocess yield reminders", () => {
 		// the revived replacement (reinstalling its empty contract) instead of
 		// the detached corpse.
 		const ensureLive = vi.spyOn(lifecycle, "ensureLive").mockResolvedValueOnce(stale).mockResolvedValue(revived);
+		// The revived replacement is the registry's current session, so its accepted result lands on that ref.
+		registry.register({
+			id: "subagent-revive",
+			displayName: "subagent-revive",
+			kind: "sub",
+			status: "idle",
+			session: revived,
+		});
 		try {
 			const result = await runSubagentFollowUpTurn({ ...baseOptions, id: "subagent-revive", message: "batch work" });
 			expect(ensureLive).toHaveBeenCalledTimes(3);
@@ -466,7 +474,7 @@ describe("runSubprocess yield reminders", () => {
 			expect(result.exitCode).toBe(0);
 			expect(result.output).toContain('"revived": true');
 		} finally {
-			registry.unregister("subagent-revive");
+			await registry.unregister("subagent-revive");
 		}
 	});
 	it("fails fast when parking replaces the worker on every install", async () => {
@@ -496,7 +504,7 @@ describe("runSubprocess yield reminders", () => {
 			).rejects.toThrow("was replaced during every install attempt");
 			expect(ensureLive).toHaveBeenCalledTimes(4);
 		} finally {
-			registry.unregister("subagent-churn");
+			await registry.unregister("subagent-churn");
 		}
 	});
 	it("waits out a wake running on the replacement worker before reinstalling", async () => {
@@ -539,6 +547,14 @@ describe("runSubprocess yield reminders", () => {
 		// replacement straight into an ordinary wake: the follow-up must wait out
 		// that wake before installing the keyed contract, not reject its yield.
 		vi.spyOn(lifecycle, "ensureLive").mockResolvedValueOnce(stale).mockResolvedValue(revived);
+		// The revived replacement is the registry's current session, so its accepted result lands on that ref.
+		registry.register({
+			id: "subagent-revive-wake",
+			displayName: "subagent-revive-wake",
+			kind: "sub",
+			status: "idle",
+			session: revived,
+		});
 		try {
 			const result = await runSubagentFollowUpTurn({
 				...baseOptions,
@@ -549,7 +565,7 @@ describe("runSubprocess yield reminders", () => {
 			expect(result.exitCode).toBe(0);
 			expect(result.output).toContain('"revived": true');
 		} finally {
-			registry.unregister("subagent-revive-wake");
+			await registry.unregister("subagent-revive-wake");
 		}
 	});
 	it("fails before session creation when authority creator is missing", async () => {

@@ -31,7 +31,7 @@ describe("move-session cleanup tracking", () => {
 	});
 
 	it("does not delete an empty session file without the owning move marker", async () => {
-		const file = SessionManager.createEmptySessionFile(cwd);
+		const file = await SessionManager.createEmptySessionFile(cwd);
 		const manager = SessionManager.create(cwd);
 		await manager.setSessionFile(file);
 
@@ -42,7 +42,7 @@ describe("move-session cleanup tracking", () => {
 	});
 
 	it("createEmptySessionFile + cleanupEmptyMoveSession deletes an empty move session file", async () => {
-		const file = SessionManager.createEmptySessionFile(cwd);
+		const file = await SessionManager.createEmptySessionFile(cwd);
 		expect(fs.existsSync(file)).toBe(true);
 
 		const manager = SessionManager.create(cwd);
@@ -60,7 +60,7 @@ describe("move-session cleanup tracking", () => {
 	});
 
 	it("a move session that received real messages is NOT deleted", async () => {
-		const file = SessionManager.createEmptySessionFile(cwd);
+		const file = await SessionManager.createEmptySessionFile(cwd);
 
 		const manager = SessionManager.create(cwd);
 		await manager.setSessionFile(file);

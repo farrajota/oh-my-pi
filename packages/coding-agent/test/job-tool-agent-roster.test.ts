@@ -34,6 +34,7 @@ import {
 	setAgentStatus,
 } from "../src/internal/agent-registry-bridge";
 import { type CoordinationDetails, HubTool } from "../src/tools/hub";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 interface ManagerFixture {
 	readonly manager: AsyncJobManager;
@@ -315,7 +316,7 @@ describe("hub jobs snapshot", () => {
 		const { registry } = fixture;
 		registerRunningSub(registry, "Worker");
 		registerRunningSub(registry, "Idler");
-		registry.setStatus("Idler", "idle");
+		await registry.setStatus("Idler", "idle");
 		registry.register({ id: "advisor", displayName: "advisor", kind: "advisor", session: null });
 		const tool = new HubTool(createToolSession({ fixture }));
 
@@ -419,6 +420,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 		let aborts = 0;
 		let disposes = 0;
 		const session = {
+			...createSessionDefaults(),
 			abort: async () => {
 				aborts += 1;
 				onAbort?.();
@@ -659,7 +661,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 			status: "idle",
 		});
 		const authorized = lookupAgentRef(registry, "Runner")!;
-		if (!unregisterAgentRef(registry, "Runner", authorized))
+		if (!(await unregisterAgentRef(registry, "Runner", authorized)))
 			throw new Error("Failed to retire authorized generation");
 		const replacement = registry.register({
 			id: "Runner",

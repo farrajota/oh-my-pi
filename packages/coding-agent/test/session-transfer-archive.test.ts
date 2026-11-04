@@ -9,6 +9,9 @@ import type { FileEntry, SessionHeader } from "@oh-my-pi/pi-coding-agent/session
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { findSessionFiles } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { loadEntriesFromFile, resolveBlobRefsInEntries } from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
+import { readAuthorityDescriptor } from "@oh-my-pi/pi-coding-agent/registry/authority/descriptor";
+import { authorityPaths } from "@oh-my-pi/pi-coding-agent/registry/authority/ownership";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	packSession,
@@ -71,7 +74,7 @@ describe("omp session pack/unpack archive", () => {
 	});
 
 	/** A laptop session with an image turn, a subagent transcript, and a tool artifact; returns its file. */
-	async function createLaptopSession(): Promise<string> {
+	async function createLaptopSession(withAuthority = false): Promise<string> {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({
 			role: "user",
@@ -82,9 +85,17 @@ describe("omp session pack/unpack archive", () => {
 			timestamp: 1,
 		});
 		session.appendMessage(makeAssistantMessage());
-		await session.flush();
+		await session.ensureOnDisk();
 		const file = session.getSessionFile();
 		if (!file) throw new Error("session has no file");
+		if (withAuthority) {
+			const store = await registryDurableStateForSession(file, {
+				backend: "jsonl",
+				owningSessionId: session.getSessionId(),
+				create: true,
+			});
+			await store.close();
+		}
 		await session.close();
 		const artifacts = file.slice(0, -".jsonl".length);
 		await Bun.write(path.join(artifacts, "0-Explore.jsonl"), '{"type":"session","id":"sub","cwd":"/x"}\n');
@@ -92,18 +103,26 @@ describe("omp session pack/unpack archive", () => {
 		return file;
 	}
 
-	it("lands in the target cwd with identical entries, rewritten cwd, artifacts, and hydratable images", async () => {
-		const source = await createLaptopSession();
+	it("lands a complete authority bundle with a fresh incarnation and unchanged transcript history", async () => {
+		const source = await createLaptopSession(true);
+		const before = await loadEntriesFromFile(source);
+		const sourceId = headerOf(before).id;
+		const sourceDescriptor = await readAuthorityDescriptor(source);
+		if (!sourceDescriptor) throw new Error("Expected a source authority descriptor");
 		const archive = path.join(root, "out", "session.tar");
 		const packed = await packSession(source, archive);
 		expect(packed.missingBlobs).toEqual([]);
 
 		setAgentDir(agentB);
 		const result = await unpackSession(archive, { cwd: cwdB });
+		const restoredDescriptor = await readAuthorityDescriptor(result.sessionFile);
+		if (!restoredDescriptor) throw new Error("Expected a restored authority descriptor");
+		expect(restoredDescriptor.owningSessionId).toBe(sourceId);
+		expect(restoredDescriptor.incarnation).not.toBe(sourceDescriptor.incarnation);
+		expect(await Bun.file(authorityPaths(result.sessionFile).jsonl).exists()).toBe(true);
 
 		expect(result.mode).toBe("created");
 		expect(path.dirname(result.sessionFile)).toBe(SessionManager.getDefaultSessionDir(cwdB));
-		const before = await loadEntriesFromFile(source);
 		const after = await loadEntriesFromFile(result.sessionFile);
 		expect(headerOf(after).id).toBe(headerOf(before).id);
 		expect(headerOf(after).cwd).toBe(path.resolve(cwdB));
@@ -123,6 +142,25 @@ describe("omp session pack/unpack archive", () => {
 		expect(isBlobRef(userImage(after)?.data ?? "")).toBe(true);
 		await resolveBlobRefsInEntries(after, new BlobStore(getBlobsDir()));
 		expect(userImage(after)?.data).toBe(IMAGE_DATA);
+	});
+	it("keeps diverged imported authority as provenance on a grant-free fork", async () => {
+		const source = await createLaptopSession(true);
+		const archive = path.join(root, "diverged.tar");
+		await packSession(source, archive);
+		const local = await SessionManager.open(source);
+		local.appendMessage({ role: "user", content: "local divergence", timestamp: 2 });
+		await local.flush();
+		await local.close();
+		const result = await unpackSession(archive, { cwd: cwdA, sessionDir: path.dirname(source) });
+		expect(result.mode).toBe("forked");
+		const fork = await registryDurableStateForSession(result.sessionFile, { owningSessionId: result.id });
+		try {
+			expect(await fork.getRoot("Main")).toBeUndefined();
+		} finally {
+			await fork.close();
+		}
+		const names = await fsp.readdir(path.dirname(result.sessionFile));
+		expect(names.some(name => name.startsWith(`${path.basename(result.sessionFile)}.authority.backup.`))).toBe(true);
 	});
 
 	it("rejects a tampered blob before writing anything", async () => {

@@ -181,6 +181,8 @@ export interface IdbLocation {
 	dir: string;
 	/** Absolute path the user asked for (binary or `.i64`/`.idb`). */
 	sourcePath: string;
+	/** Descriptor-backed source held by the invoking operation through staging. */
+	sourceReadPath?: string;
 	/** `store` = managed under the agent dir; `inplace` = user's own `.i64`/`.idb`. */
 	kind: "store" | "inplace";
 	/** Path passed to the worker's `open`; provisional for store DBs until {@link prepareStoreDir}. */
@@ -202,6 +204,8 @@ export function idbRef(loc: Pick<IdbLocation, "sourcePath" | "fat">): string {
 export interface LocateIdbOptions {
 	/** Slice of a universal binary to analyze; defaults to the host architecture. Rejected for thin binaries and IDBs. */
 	arch?: string;
+	/** Descriptor-backed source for operation-authorized input bytes. */
+	sourceReadPath?: string;
 }
 
 /** Replace characters outside `[A-Za-z0-9._-]` with `_` and cap at 64 chars. */
@@ -217,16 +221,16 @@ interface ContentHash {
 
 const contentHashes = new Map<string, ContentHash>();
 
-async function hashFileContent(absPath: string): Promise<string> {
+async function hashFileContent(absPath: string, cache = true): Promise<string> {
 	const stat = await fs.promises.stat(absPath);
-	const cached = contentHashes.get(absPath);
+	const cached = cache ? contentHashes.get(absPath) : undefined;
 	if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.sha;
 	const hasher = new Bun.CryptoHasher("sha256");
 	for await (const chunk of Bun.file(absPath).stream()) {
 		hasher.update(chunk);
 	}
 	const sha = hasher.digest("hex");
-	contentHashes.set(absPath, { size: stat.size, mtimeMs: stat.mtimeMs, sha });
+	if (cache) contentHashes.set(absPath, { size: stat.size, mtimeMs: stat.mtimeMs, sha });
 	return sha;
 }
 
@@ -238,12 +242,12 @@ async function hashFileContent(absPath: string): Promise<string> {
 export async function locateIdb(sourcePath: string, options: LocateIdbOptions = {}): Promise<IdbLocation> {
 	const absPath = path.resolve(sourcePath);
 	const name = sanitizeIdbName(path.basename(absPath));
-	const slices = isIdaDatabasePath(absPath) ? null : await readFatSlices(absPath);
+	const slices = isIdaDatabasePath(absPath) ? null : await readFatSlices(options.sourceReadPath ?? absPath);
 	if (options.arch !== undefined && !slices) {
 		throw new ToolError(`${shortenPath(absPath)} is not a universal binary; drop ${SLICE_SEPARATOR}${options.arch}`);
 	}
 
-	if (isIdaDatabasePath(absPath)) {
+	if (isIdaDatabasePath(absPath) && !options.sourceReadPath) {
 		const pathSha = new Bun.CryptoHasher("sha256").update(absPath).digest("hex");
 		return {
 			id: `${name}-${pathSha.slice(0, 8)}`,
@@ -256,7 +260,7 @@ export async function locateIdb(sourcePath: string, options: LocateIdbOptions = 
 		};
 	}
 
-	const sha = await hashFileContent(absPath);
+	const sha = await hashFileContent(options.sourceReadPath ?? absPath, options.sourceReadPath === undefined);
 	const fat = slices ? { slice: selectSlice(slices, options.arch), slices } : undefined;
 	const id = `${sha.slice(0, 16)}-${name}${fat ? `.${sanitizeIdbName(fat.slice.arch)}` : ""}`;
 	const dir = path.join(getAgentDir(), "idbs", id);
@@ -264,6 +268,7 @@ export async function locateIdb(sourcePath: string, options: LocateIdbOptions = 
 		id,
 		dir,
 		sourcePath: absPath,
+		sourceReadPath: options.sourceReadPath,
 		kind: "store",
 		openPath: path.join(dir, name),
 		isNew: true,
@@ -288,21 +293,33 @@ export async function prepareStoreDir(loc: IdbLocation): Promise<void> {
 	}
 	await fs.promises.mkdir(loc.dir, { recursive: true });
 
-	const stagedName = sanitizeIdbName(path.basename(loc.sourcePath));
+	const databaseExtension = isIdaDatabasePath(loc.sourcePath) ? path.extname(loc.sourcePath).toLowerCase() : "";
+	const stagedName = databaseExtension
+		? `${sanitizeIdbName(path.basename(loc.sourcePath, path.extname(loc.sourcePath))).slice(0, MAX_NAME_LENGTH - databaseExtension.length)}${databaseExtension}`
+		: sanitizeIdbName(path.basename(loc.sourcePath));
 	const staged = path.join(loc.dir, stagedName);
 	if (!(await Bun.file(staged).exists())) {
 		if (loc.fat) {
 			// IDA's loader would silently take the first slice of a fat file; stage the chosen thin Mach-O instead.
 			const { arch, offset, size } = loc.fat.slice;
-			const source = Bun.file(loc.sourcePath);
+			const source = Bun.file(loc.sourceReadPath ?? loc.sourcePath);
 			if (offset + size > source.size) {
 				throw new ToolError(`${shortenPath(loc.sourcePath)}: ${arch} slice extends past end of file`);
 			}
 			// Materialize the bytes: `Bun.write` of a sliced BunFile copies the whole source file.
 			await Bun.write(staged, await source.slice(offset, offset + size).bytes());
 		} else {
-			await fs.promises.copyFile(loc.sourcePath, staged, fs.constants.COPYFILE_FICLONE);
+			await fs.promises.copyFile(loc.sourceReadPath ?? loc.sourcePath, staged, fs.constants.COPYFILE_FICLONE);
 		}
+	}
+	// An admitted existing IDB is copied into the content-addressed private cache.
+	// Persistent hosts consume only that copy, including cache-hit hosts; they never
+	// inherit an operation-owned descriptor or reopen the user's original pathname.
+	if (isIdaDatabasePath(loc.sourcePath)) {
+		await fs.promises.chmod(staged, 0o600);
+		loc.openPath = staged;
+		loc.isNew = false;
+		return;
 	}
 
 	const entries = (await fs.promises.readdir(loc.dir)).sort();
