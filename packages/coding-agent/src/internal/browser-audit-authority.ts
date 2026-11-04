@@ -15,6 +15,7 @@ import {
 	type BrowserAuditAction,
 	type BrowserAuditAuthorization,
 	BrowserAuditEngine,
+	describeBrowserAuditError,
 	type BrowserAuditFileDocumentAuthority,
 	type BrowserAuditObservation,
 	type BrowserAuditOperationResult,
@@ -622,8 +623,9 @@ class BrowserAuditTool implements AgentTool<typeof browserAuditSchema, BrowserAu
 			if (params.operation === "close" && !(await this.#terminalize(result.status === "CLOSED", signal))) {
 				result = BLOCKED_RESULT;
 			}
-		} catch {
+		} catch (error) {
 			await this.#invalidate();
+			result = Object.freeze({ ...BLOCKED_RESULT, reason: describeBrowserAuditError(error) });
 		}
 		return { content: [{ type: "text", text: result.status }], details: result };
 	}

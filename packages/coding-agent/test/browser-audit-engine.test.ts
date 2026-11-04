@@ -386,6 +386,36 @@ describe("BrowserAuditEngine fail-closed lifecycle", () => {
 		expect(wrong.cleanups()).toBe(1);
 	});
 
+	it("reports the executor error and its cause when an effect fails closed", async () => {
+		const failing = createExecutor({
+			execute: async () => {
+				throw new Error("chromium launch failed", { cause: new Error("no usable sandbox") });
+			},
+		});
+		const engine = createEngine(failing.executor);
+		const result = await engine.open();
+		expect(result.status).toBe("BLOCKED");
+		expect(result.evidence_ids).toEqual([]);
+		expect(result.reason).toBe("chromium launch failed: caused by: no usable sandbox");
+		expect(engine.lifecycle).toBe("INVALID");
+		expect(failing.cleanups()).toBe(1);
+	});
+
+	it("reports the host observation error on a blocked observation and omits a reason on PASS", async () => {
+		const blocked = createEngine(
+			createExecutor({ execute: async () => ({ status: "BLOCKED", error: "screenshot byte limit exceeded" }) })
+				.executor,
+		);
+		const blockedResult = await blocked.open();
+		expect(blockedResult.status).toBe("BLOCKED");
+		expect(blockedResult.reason).toBe("screenshot byte limit exceeded");
+
+		const passing = createEngine(createExecutor().executor);
+		const passed = await passing.open();
+		expect(passed.status).toBe("PASS");
+		expect(passed.reason).toBeUndefined();
+	});
+
 	it("gates snapshots on verified cleanup and burns audit identifiers", async () => {
 		const auditId = createAuditId();
 		const unverified = createExecutor({
@@ -573,8 +603,13 @@ describe("BrowserAuditEngine fail-closed lifecycle", () => {
 	});
 });
 
-function expectRegisteredStatus(details: { status: string } | undefined, expected: string): void {
+function expectRegisteredStatus(details: { status: string; reason?: string } | undefined, expected: string): void {
 	if (details === undefined) throw new Error("Registered browser audit operation omitted its required result details");
+	if (details.status !== expected) {
+		throw new Error(
+			`Registered browser audit operation returned ${details.status}, expected ${expected} (reason: ${details.reason ?? "none"})`,
+		);
+	}
 	expect(details.status).toBe(expected);
 }
 

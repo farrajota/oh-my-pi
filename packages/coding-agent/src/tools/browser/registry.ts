@@ -43,6 +43,10 @@ export type BrowserKindTag = BrowserKind["kind"];
 const HEADLESS_CLOSE_TIMEOUT_MS = 5_000;
 const AUDIT_CHROMIUM_ARGS = Object.freeze([
 	"--disable-background-networking",
+	// Component extensions with background pages start service workers at
+	// browser launch (e.g. Chromium snapshot builds); the audit's target guard
+	// treats any foreign worker as a forbidden channel and blocks the audit.
+	"--disable-component-extensions-with-background-pages",
 	"--disable-component-update",
 	"--disable-domain-reliability",
 	"--disable-sync",
