@@ -10,6 +10,10 @@ import {
 	BorrowedAuthorityCapacityPool,
 	AuthorityCapacityPoolError,
 } from "../../src/registry/authority/capacity-native";
+import { xfsCapacityHost } from "./authority-capacity-host";
+
+// Cases that fund real XFS capacity under os.tmpdir(); see authority-capacity-host.ts for when a host qualifies.
+const itOnXfs = it.skipIf(!xfsCapacityHost);
 
 const directories: string[] = [];
 const handles: FileHandle[] = [];
@@ -53,20 +57,25 @@ function allocatePastEof(fd: number, offset: number, length: number): void {
 }
 
 describe("borrowed native authority capacity pool", () => {
-	it("reconciles a growth that failed partway by returning its allocation past EOF, then grows again", async () => {
-		const handle = await anonymousFile();
-		const pool = await openPool(handle);
-		const grown = pool.ensureDataBytes(2 * pool.inspect().blockSize);
-		const allocated = (await handle.stat()).blocks * 512;
-		allocatePastEof(handle.fd, grown.dataBytes, 6 * grown.blockSize);
-		expect((await handle.stat()).blocks * 512).toBeGreaterThan(allocated);
-		const reconciled = pool.reconcile();
-		// The uncredited blocks past EOF are gone and the verified EOF prefix is the pool again.
-		expect(reconciled.dataBytes).toBe(grown.dataBytes);
-		expect((await handle.stat()).size).toBe(grown.dataBytes);
-		expect((await handle.stat()).blocks * 512).toBe(allocated);
-		expect(pool.ensureDataBytes(grown.dataBytes + grown.blockSize).dataBytes).toBe(grown.dataBytes + grown.blockSize);
-	});
+	itOnXfs(
+		"reconciles a growth that failed partway by returning its allocation past EOF, then grows again",
+		async () => {
+			const handle = await anonymousFile();
+			const pool = await openPool(handle);
+			const grown = pool.ensureDataBytes(2 * pool.inspect().blockSize);
+			const allocated = (await handle.stat()).blocks * 512;
+			allocatePastEof(handle.fd, grown.dataBytes, 6 * grown.blockSize);
+			expect((await handle.stat()).blocks * 512).toBeGreaterThan(allocated);
+			const reconciled = pool.reconcile();
+			// The uncredited blocks past EOF are gone and the verified EOF prefix is the pool again.
+			expect(reconciled.dataBytes).toBe(grown.dataBytes);
+			expect((await handle.stat()).size).toBe(grown.dataBytes);
+			expect((await handle.stat()).blocks * 512).toBe(allocated);
+			expect(pool.ensureDataBytes(grown.dataBytes + grown.blockSize).dataBytes).toBe(
+				grown.dataBytes + grown.blockSize,
+			);
+		},
+	);
 
 	it("rejects named files and identity mismatches without changing them", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "capacity-native-named-"));
@@ -86,24 +95,27 @@ describe("borrowed native authority capacity pool", () => {
 		expect(after.ino).toBe(before.ino);
 	});
 
-	it("allocates a real dense aligned EOF, reports physical blocks separately, and retains the borrowed descriptor", async () => {
-		const handle = await anonymousFile();
-		const pool = await openPool(handle);
-		const initial = pool.inspect();
-		expect(initial.dataBytes).toBe(0);
-		expect(initial.device).toBe((await identityFor(handle)).device);
-		expect(initial.inode).toBe((await identityFor(handle)).inode);
-		const grown = pool.ensureDataBytes(initial.blockSize + 1);
-		expect(grown.dataBytes).toBe(initial.blockSize * 2);
-		expect(grown.allocatedBytes).toBeGreaterThanOrEqual(grown.dataBytes);
-		expect((await handle.stat()).size).toBe(grown.dataBytes);
-		const fd = handle.fd;
-		await handle.write(Buffer.from([0x5a]), 0, 1, 0);
-		expect(pool.inspect().dataBytes).toBe(grown.dataBytes);
-		expect(handle.fd).toBe(fd);
-	});
+	itOnXfs(
+		"allocates a real dense aligned EOF, reports physical blocks separately, and retains the borrowed descriptor",
+		async () => {
+			const handle = await anonymousFile();
+			const pool = await openPool(handle);
+			const initial = pool.inspect();
+			expect(initial.dataBytes).toBe(0);
+			expect(initial.device).toBe((await identityFor(handle)).device);
+			expect(initial.inode).toBe((await identityFor(handle)).inode);
+			const grown = pool.ensureDataBytes(initial.blockSize + 1);
+			expect(grown.dataBytes).toBe(initial.blockSize * 2);
+			expect(grown.allocatedBytes).toBeGreaterThanOrEqual(grown.dataBytes);
+			expect((await handle.stat()).size).toBe(grown.dataBytes);
+			const fd = handle.fd;
+			await handle.write(Buffer.from([0x5a]), 0, 1, 0);
+			expect(pool.inspect().dataBytes).toBe(grown.dataBytes);
+			expect(handle.fd).toBe(fd);
+		},
+	);
 
-	it("releases only an aligned previously allocated EOF suffix and can regrow it", async () => {
+	itOnXfs("releases only an aligned previously allocated EOF suffix and can regrow it", async () => {
 		const handle = await anonymousFile();
 		const pool = await openPool(handle);
 		const initial = pool.inspect();
@@ -121,7 +133,7 @@ describe("borrowed native authority capacity pool", () => {
 		expect(pool.ensureDataBytes(full.dataBytes).dataBytes).toBe(full.dataBytes);
 	});
 
-	it("reconciles a real same-inode EOF change before reporting restored capacity", async () => {
+	itOnXfs("reconciles a real same-inode EOF change before reporting restored capacity", async () => {
 		const handle = await anonymousFile();
 		const pool = await openPool(handle);
 		const initial = pool.inspect();
@@ -140,7 +152,7 @@ describe("borrowed native authority capacity pool", () => {
 		expect(() => BorrowedAuthorityCapacityPool.open(identity)).toThrow(AuthorityCapacityPoolError);
 		expect((await handle.stat()).size).toBe(before.size);
 	});
-	it("rejects invalid growth and release requests without mutating coverage", async () => {
+	itOnXfs("rejects invalid growth and release requests without mutating coverage", async () => {
 		const handle = await anonymousFile();
 		const pool = await openPool(handle);
 		const initial = pool.inspect();
@@ -151,7 +163,7 @@ describe("borrowed native authority capacity pool", () => {
 		expect(pool.inspect().dataBytes).toBe(initial.dataBytes);
 		expect((await handle.stat()).size).toBe(0);
 	});
-	it("refuses a reused borrowed descriptor without mutating the replacement inode", async () => {
+	itOnXfs("refuses a reused borrowed descriptor without mutating the replacement inode", async () => {
 		const handle = await anonymousFile();
 		const pool = await openPool(handle);
 		const blockSize = pool.inspect().blockSize;
@@ -172,7 +184,7 @@ describe("borrowed native authority capacity pool", () => {
 		expect((await replacement.stat()).size).toBe(0);
 		expect(() => pool.reconcile()).toThrow(AuthorityCapacityPoolError);
 	});
-	it("reports uncertain native failures and reconciles before credit", () => {
+	itOnXfs("reports uncertain native failures and reconciles before credit", () => {
 		const moduleUrl = new URL("../../src/registry/authority/capacity-native.ts", import.meta.url).href;
 		const childSource = `
 			import { dlopen, FFIType, ptr } from "bun:ffi";
@@ -300,30 +312,33 @@ describe("borrowed native authority capacity pool", () => {
 		expect(result.borrowedDescriptorRetained).toBe(true);
 	});
 
-	it("proves each bounded growth step's exact EOF with a full identity readback per call, not per step", async () => {
-		const handle = await anonymousFile();
-		const pool = await openPool(handle);
-		const { blockSize } = pool.inspect();
-		const steps = spyOn(syncFs, "fstatSync");
-		const identities = spyOn(syncFs, "statfsSync");
-		try {
-			pool.ensureDataBytes(blockSize * 12, blockSize * 6);
-			const shortCall = identities.mock.calls.length;
-			identities.mockClear();
-			steps.mockClear();
-			const grown = pool.ensureDataBytes(blockSize * 612, blockSize * 6);
-			expect(grown.dataBytes).toBe(blockSize * 612);
-			// 100 steps: each still reads back its EOF, but the inode's project, geometry and flags are read a fixed number of times.
-			expect(steps.mock.calls.length).toBeGreaterThanOrEqual(100);
-			expect(identities.mock.calls.length).toBe(shortCall);
-		} finally {
-			identities.mockRestore();
-			steps.mockRestore();
-		}
-		expect((await handle.stat()).size).toBe(blockSize * 612);
-	});
+	itOnXfs(
+		"proves each bounded growth step's exact EOF with a full identity readback per call, not per step",
+		async () => {
+			const handle = await anonymousFile();
+			const pool = await openPool(handle);
+			const { blockSize } = pool.inspect();
+			const steps = spyOn(syncFs, "fstatSync");
+			const identities = spyOn(syncFs, "statfsSync");
+			try {
+				pool.ensureDataBytes(blockSize * 12, blockSize * 6);
+				const shortCall = identities.mock.calls.length;
+				identities.mockClear();
+				steps.mockClear();
+				const grown = pool.ensureDataBytes(blockSize * 612, blockSize * 6);
+				expect(grown.dataBytes).toBe(blockSize * 612);
+				// 100 steps: each still reads back its EOF, but the inode's project, geometry and flags are read a fixed number of times.
+				expect(steps.mock.calls.length).toBeGreaterThanOrEqual(100);
+				expect(identities.mock.calls.length).toBe(shortCall);
+			} finally {
+				identities.mockRestore();
+				steps.mockRestore();
+			}
+			expect((await handle.stat()).size).toBe(blockSize * 612);
+		},
+	);
 
-	it("rejects a growth step that is not a whole number of blocks without changing coverage", async () => {
+	itOnXfs("rejects a growth step that is not a whole number of blocks without changing coverage", async () => {
 		const handle = await anonymousFile();
 		const pool = await openPool(handle);
 		const { blockSize } = pool.inspect();
@@ -336,7 +351,7 @@ describe("borrowed native authority capacity pool", () => {
 		expect((await handle.stat()).size).toBe(0);
 	});
 
-	it("counts every completed growth step when a later step fails", () => {
+	itOnXfs("counts every completed growth step when a later step fails", () => {
 		const moduleUrl = new URL("../../src/registry/authority/capacity-native.ts", import.meta.url).href;
 		const childSource = `
 			import { dlopen, FFIType, ptr } from "bun:ffi";

@@ -17,6 +17,10 @@ import * as threadLifetime from "../../src/registry/authority/thread-lifetime";
 import type { JournalingBackend } from "../../src/registry/authority/types";
 import type { DurableOperationRecord } from "../../src/registry/durable-state";
 import { SessionManager } from "../../src/session/session-manager";
+import { xfsCapacityHost } from "./authority-capacity-host";
+
+// Cases that fund real XFS capacity under os.tmpdir(); see authority-capacity-host.ts for when a host qualifies.
+const itOnXfs = it.skipIf(!xfsCapacityHost);
 
 const XFS_MAGIC = 0x58465342;
 const backends: readonly JournalingBackend[] = ["jsonl", "sqlite"];
@@ -251,87 +255,113 @@ describe("default capacity off on non-XFS filesystems", () => {
 });
 
 describe("explicit OMP_JOURNALING_CAPACITY=xfs", () => {
-	it("refuses a non-XFS session directory with one line before writing any authority artifact", async () => {
-		const [{ parent }] = await nonXfsParents();
-		const root = await freshRoot(parent);
-		const before = (await fs.readdir(root.directory)).sort();
-		let failure: unknown;
-		try {
-			await registryDurableStateForSession(root.session, {
-				owningSessionId: root.owningSessionId,
-				create: true,
-				capacity: "xfs",
-			});
-		} catch (error) {
-			failure = error;
-		}
-		expect(failure).toBeInstanceOf(AuthorityCapacityUnsupportedError);
-		const message = (failure as Error).message;
-		expect(message).toContain("OMP_JOURNALING_CAPACITY=xfs requires the session directory on XFS");
-		expect(message).toContain('set it to "off"');
-		expect(message.includes("\n")).toBe(false);
-		expect((await fs.readdir(root.directory)).sort()).toEqual(before);
-		await closeSessionAuthority(root.session);
-		// Nothing was consumed: the same fresh root still starts once capacity is off.
-		const record = await writeAndClose(
-			root.session,
-			{ owningSessionId: root.owningSessionId, create: true, capacity: "off" },
-			"after-refusal",
-		);
-		await expectRecord(root.session, root.owningSessionId, "off", [record], "jsonl");
-	}, 60_000);
+	// The PIDFD_THREAD check precedes the mount check, so each refusal pins the kernel capability it is about;
+	// GitHub's Ubuntu 22.04 runners lack PIDFD_THREAD and really take the first path.
+	for (const { label, lifetimeMode, refusal } of [
+		{
+			label: "a non-XFS session directory",
+			lifetimeMode: "pidfd-thread",
+			refusal: "OMP_JOURNALING_CAPACITY=xfs requires the session directory on XFS",
+		},
+		{
+			label: "a host without PIDFD_THREAD",
+			lifetimeMode: "worker-close",
+			refusal: "OMP_JOURNALING_CAPACITY=xfs requires Linux 6.9+ with glibc for exact worker lifetime",
+		},
+	] as const) {
+		it(`refuses ${label} with one line before writing any authority artifact`, async () => {
+			const [{ parent }] = await nonXfsParents();
+			const root = await freshRoot(parent);
+			const before = (await fs.readdir(root.directory)).sort();
+			let failure: unknown;
+			const lifetime = spyOn(threadLifetime, "authorityThreadLifetimeMode").mockReturnValue(lifetimeMode);
+			try {
+				await registryDurableStateForSession(root.session, {
+					owningSessionId: root.owningSessionId,
+					create: true,
+					capacity: "xfs",
+				});
+			} catch (error) {
+				failure = error;
+			} finally {
+				lifetime.mockRestore();
+			}
+			expect(failure).toBeInstanceOf(AuthorityCapacityUnsupportedError);
+			const message = (failure as Error).message;
+			expect(message).toContain(refusal);
+			expect(message).toContain('set it to "off"');
+			expect(message.includes("\n")).toBe(false);
+			expect((await fs.readdir(root.directory)).sort()).toEqual(before);
+			await closeSessionAuthority(root.session);
+			// Nothing was consumed: the same fresh root still starts once capacity is off.
+			const record = await writeAndClose(
+				root.session,
+				{ owningSessionId: root.owningSessionId, create: true, capacity: "off" },
+				"after-refusal",
+			);
+			await expectRecord(root.session, root.owningSessionId, "off", [record], "jsonl");
+		}, 60_000);
+	}
 
 	for (const backend of backends) {
-		it(`funds a ${backend} root from the anonymous capacity file on XFS`, async () => {
-			expect(await filesystemType(os.tmpdir())).toBe(XFS_MAGIC);
-			const capacitySpy = spyOn(capacityFile, "openAuthorityCapacityFile");
-			try {
-				const root = await freshRoot(os.tmpdir());
-				const record = await writeAndClose(
-					root.session,
-					{ owningSessionId: root.owningSessionId, create: true, backend, capacity: "xfs" },
-					"xfs-funded",
-				);
-				expect(capacitySpy).toHaveBeenCalledTimes(1);
-				await expectRecord(root.session, root.owningSessionId, "xfs", [record], backend);
-				expect(capacitySpy).toHaveBeenCalledTimes(2);
-			} finally {
-				capacitySpy.mockRestore();
-			}
-		}, 60_000);
+		itOnXfs(
+			`funds a ${backend} root from the anonymous capacity file on XFS`,
+			async () => {
+				expect(await filesystemType(os.tmpdir())).toBe(XFS_MAGIC);
+				const capacitySpy = spyOn(capacityFile, "openAuthorityCapacityFile");
+				try {
+					const root = await freshRoot(os.tmpdir());
+					const record = await writeAndClose(
+						root.session,
+						{ owningSessionId: root.owningSessionId, create: true, backend, capacity: "xfs" },
+						"xfs-funded",
+					);
+					expect(capacitySpy).toHaveBeenCalledTimes(1);
+					await expectRecord(root.session, root.owningSessionId, "xfs", [record], backend);
+					expect(capacitySpy).toHaveBeenCalledTimes(2);
+				} finally {
+					capacitySpy.mockRestore();
+				}
+			},
+			60_000,
+		);
 	}
 });
 
 describe("capacity is a runtime policy, not a store format", () => {
 	for (const backend of backends) {
-		it(`reopens a ${backend} root created under xfs with off, and one created under off with xfs`, async () => {
-			expect(await filesystemType(os.tmpdir())).toBe(XFS_MAGIC);
-			const fundedFirst = await freshRoot(os.tmpdir());
-			const funded = await writeAndClose(
-				fundedFirst.session,
-				{ owningSessionId: fundedFirst.owningSessionId, create: true, backend, capacity: "xfs" },
-				"created-xfs",
-			);
-			const unfunded = await writeAndClose(
-				fundedFirst.session,
-				{ owningSessionId: fundedFirst.owningSessionId, capacity: "off" },
-				"appended-off",
-			);
-			await expectRecord(fundedFirst.session, fundedFirst.owningSessionId, "xfs", [funded, unfunded], backend);
+		itOnXfs(
+			`reopens a ${backend} root created under xfs with off, and one created under off with xfs`,
+			async () => {
+				expect(await filesystemType(os.tmpdir())).toBe(XFS_MAGIC);
+				const fundedFirst = await freshRoot(os.tmpdir());
+				const funded = await writeAndClose(
+					fundedFirst.session,
+					{ owningSessionId: fundedFirst.owningSessionId, create: true, backend, capacity: "xfs" },
+					"created-xfs",
+				);
+				const unfunded = await writeAndClose(
+					fundedFirst.session,
+					{ owningSessionId: fundedFirst.owningSessionId, capacity: "off" },
+					"appended-off",
+				);
+				await expectRecord(fundedFirst.session, fundedFirst.owningSessionId, "xfs", [funded, unfunded], backend);
 
-			const plainFirst = await freshRoot(os.tmpdir());
-			const plain = await writeAndClose(
-				plainFirst.session,
-				{ owningSessionId: plainFirst.owningSessionId, create: true, backend, capacity: "off" },
-				"created-off",
-			);
-			const later = await writeAndClose(
-				plainFirst.session,
-				{ owningSessionId: plainFirst.owningSessionId, capacity: "xfs" },
-				"appended-xfs",
-			);
-			await expectRecord(plainFirst.session, plainFirst.owningSessionId, "off", [plain, later], backend);
-		}, 90_000);
+				const plainFirst = await freshRoot(os.tmpdir());
+				const plain = await writeAndClose(
+					plainFirst.session,
+					{ owningSessionId: plainFirst.owningSessionId, create: true, backend, capacity: "off" },
+					"created-off",
+				);
+				const later = await writeAndClose(
+					plainFirst.session,
+					{ owningSessionId: plainFirst.owningSessionId, capacity: "xfs" },
+					"appended-xfs",
+				);
+				await expectRecord(plainFirst.session, plainFirst.owningSessionId, "off", [plain, later], backend);
+			},
+			90_000,
+		);
 	}
 });
 

@@ -23,6 +23,10 @@ import type {
 	MutationReceipt,
 } from "../../src/registry/authority/types";
 import type { DurableOperationRecord } from "../../src/registry/durable-state";
+import { xfsCapacityHost } from "./authority-capacity-host";
+
+// Cases that fund real XFS capacity under os.tmpdir(); see authority-capacity-host.ts for when a host qualifies.
+const itOnXfs = it.skipIf(!xfsCapacityHost);
 
 // Real worker opens fund capacity arenas with fallocate/fsync; on a loaded shared host one open plus a
 // stalled sync takes seconds, so worker-level cases carry the same order of budget as the other suites.
@@ -137,7 +141,7 @@ describe("SQLite group commit through the engine", () => {
 		["group sync", "groupCommitted"],
 		["single transaction", "committed"],
 	] as const) {
-		it(`stops admission when capacity settlement throws after a durable COMMIT (${label})`, async () => {
+		itOnXfs(`stops admission when capacity settlement throws after a durable COMMIT (${label})`, async () => {
 			const directory = await makeDirectory();
 			const capacity = await openAuthorityCapacityFile(directory);
 			capacityHandles.push(capacity.handle);
@@ -553,7 +557,7 @@ describe("JSONL group commit through the engine", () => {
 		expect(() => engine.transition(operation("after-settlement"), { requestId: "after-settlement" })).toThrow();
 	});
 
-	it("keeps a funded journal arena when a member's undo cuts the journal back", async () => {
+	itOnXfs("keeps a funded journal arena when a member's undo cuts the journal back", async () => {
 		const directory = await makeDirectory();
 		const capacity = await openAuthorityCapacityFile(directory);
 		capacityHandles.push(capacity.handle);
@@ -621,7 +625,7 @@ describe("JSONL group commit through the engine", () => {
 		expect(() => engine.syncGroup()).toThrow(expect.objectContaining({ unknownOutcome: true }));
 	});
 
-	it("refuses a later member that capacity cannot fund as a group boundary with nothing appended", async () => {
+	itOnXfs("refuses a later member that capacity cannot fund as a group boundary with nothing appended", async () => {
 		const directory = await makeDirectory();
 		const capacity = await openAuthorityCapacityFile(directory);
 		capacityHandles.push(capacity.handle);
@@ -803,7 +807,7 @@ function expectAcknowledgedAfterCoveringCommit(events: readonly GroupCommitEvent
 }
 
 for (const backend of ["sqlite", "jsonl"] as const)
-	describe(`${backend} worker group commit over the real client`, () => {
+	describe.skipIf(!xfsCapacityHost)(`${backend} worker group commit over the real client`, () => {
 		it(
 			"shares one COMMIT among concurrent commands and acknowledges each only after a COMMIT that covers it",
 			async () => {
@@ -1020,7 +1024,7 @@ for (const backend of ["sqlite", "jsonl"] as const)
 	});
 
 for (const backend of ["sqlite", "jsonl"] as const)
-	describe(`${backend} group commit crash cuts`, () => {
+	describe.skipIf(!xfsCapacityHost)(`${backend} group commit crash cuts`, () => {
 		for (const cut of ["before", "after"] as const) {
 			// A killed process loses no page cache: JSONL members appended before the sync survive it unacknowledged.
 			const groupSurvives = cut === "after" || backend === "jsonl";

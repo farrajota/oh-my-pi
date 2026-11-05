@@ -47,6 +47,10 @@ import {
 	runFilesystemOperation,
 } from "../../src/registry/operation-lease";
 import type { SessionOperationControl } from "../../src/registry/operation-lease";
+import { xfsCapacityHost } from "./authority-capacity-host";
+
+// Cases that fund real XFS capacity under os.tmpdir(); see authority-capacity-host.ts for when a host qualifies.
+const itOnXfs = it.skipIf(!xfsCapacityHost);
 
 const temporaryDirectories: string[] = [];
 
@@ -1088,7 +1092,7 @@ describe("SQLite authority persistence", () => {
 		expect(persistence.exportState().frames).toHaveLength(0);
 		persistence.close();
 	});
-	it("reconciles a same-handle SQLITE_LOCKED reset before an explicit funded continuation", async () => {
+	itOnXfs("reconciles a same-handle SQLITE_LOCKED reset before an explicit funded continuation", async () => {
 		const { directory } = await createLocation();
 		const sessionId = `wal-reset-${crypto.randomUUID()}`;
 		const sessionFile = path.join(directory, "session.jsonl");

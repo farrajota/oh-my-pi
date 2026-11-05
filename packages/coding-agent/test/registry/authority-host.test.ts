@@ -42,6 +42,8 @@ import {
 import { durableGenesisHash, durableTargetHash, RegistryDurableStateStore } from "../../src/registry/durable-state";
 import { SessionManager } from "../../src/session/session-manager";
 import type { DurableOperationRecord, DurableResourceRecord } from "../../src/registry/durable-state";
+import * as threadLifetime from "../../src/registry/authority/thread-lifetime";
+import { tmpdirOnXfs } from "./authority-capacity-host";
 
 type AsyncOutcome<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
 
@@ -1963,7 +1965,7 @@ describe("authority backend configuration", () => {
 		const ownership = await acquireAuthorityOwnership(session, { owningSessionId: "root-uuid" });
 		await ownership.release();
 	});
-	it("rejects an independent process opening a hardlink alias of an owned root", async () => {
+	it.skipIf(!tmpdirOnXfs)("rejects an independent process opening a hardlink alias of an owned root", async () => {
 		const directory = await makeDirectory();
 		const session = await makeSession(directory);
 		await prepareActiveJsonlAuthority(session);
@@ -1989,9 +1991,30 @@ describe("authority backend configuration", () => {
 		if (os.platform() !== "linux") return;
 		const procFile = "/proc/self/status";
 		expect((await fs.statfs(procFile)).type).not.toBe(0x58465342);
-		await expect(acquireAuthorityOwnership(procFile, { create: true, capacity: "xfs" })).rejects.toThrow(
-			/OMP_JOURNALING_CAPACITY=xfs requires the session directory on XFS/,
-		);
+		// The kernel check precedes the mount check; pin it so this case reaches the mount check on every host.
+		const lifetime = spyOn(threadLifetime, "authorityThreadLifetimeMode").mockReturnValue("pidfd-thread");
+		try {
+			await expect(acquireAuthorityOwnership(procFile, { create: true, capacity: "xfs" })).rejects.toThrow(
+				/OMP_JOURNALING_CAPACITY=xfs requires the session directory on XFS/,
+			);
+		} finally {
+			lifetime.mockRestore();
+		}
+	});
+	it("refuses xfs-capacity ownership without PIDFD_THREAD before checking the mount or parsing session data", async () => {
+		if (os.platform() !== "linux" || os.arch() !== "x64") return;
+		const procFile = "/proc/self/status";
+		const lifetime = spyOn(threadLifetime, "authorityThreadLifetimeMode").mockReturnValue("worker-close");
+		const statfs = spyOn(fs, "statfs");
+		try {
+			await expect(acquireAuthorityOwnership(procFile, { create: true, capacity: "xfs" })).rejects.toThrow(
+				/OMP_JOURNALING_CAPACITY=xfs requires Linux 6\.9\+ with glibc .*PIDFD_THREAD.*set it to "off"/,
+			);
+			expect(statfs).not.toHaveBeenCalled();
+		} finally {
+			statfs.mockRestore();
+			lifetime.mockRestore();
+		}
 	});
 	it("requires matching transcript UUID evidence before creating or adopting authority", async () => {
 		// Opening without creation evidence now adopts evidence-free roots (authority-adoption.test.ts);

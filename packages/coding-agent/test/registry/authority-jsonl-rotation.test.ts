@@ -10,6 +10,7 @@ import { AuthorityEngine } from "../../src/registry/authority/engine";
 import { JsonlAuthorityPersistence } from "../../src/registry/authority/jsonl-driver";
 import { jsonlLayout, listJsonlRotationArtifacts } from "../../src/registry/authority/jsonl-layout";
 import type { AuthorityDriverOptions, AuthorityIdentity } from "../../src/registry/authority/types";
+import { xfsCapacityHost } from "./authority-capacity-host";
 
 // A rotated JSONL store keeps the active segment small: open reads its snapshot and the active segment only,
 // sealed history is read back only for export and full verification, and every crash cut of a rotation
@@ -659,7 +660,7 @@ describe("JSONL rotation failure before its commit point", () => {
 	});
 });
 
-describe("JSONL rotation capacity", () => {
+describe.skipIf(!xfsCapacityHost)("JSONL rotation capacity", () => {
 	async function fundedStore(maxFrames: number) {
 		const directory = await makeDirectory();
 		const capacity = await openAuthorityCapacityFile(directory);

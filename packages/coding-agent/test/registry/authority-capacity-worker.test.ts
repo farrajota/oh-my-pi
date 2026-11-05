@@ -26,6 +26,10 @@ import {
 	waitForAuthorityThreadExit,
 	type AuthorityThreadPin,
 } from "../../src/registry/authority/thread-lifetime";
+import { xfsCapacityHost } from "./authority-capacity-host";
+
+// Cases that fund real XFS capacity under os.tmpdir(); see authority-capacity-host.ts for when a host qualifies.
+const itOnXfs = it.skipIf(!xfsCapacityHost);
 
 const clients: AuthorityRpcClient[] = [];
 const directories: string[] = [];
@@ -398,59 +402,69 @@ async function consumeCapacityRootPromises(
 	expect((await client.getActor(actor.actorId))?.record).toEqual(actor);
 }
 
-it("rejects a capacity SQLite header outside the source-bound format-4 assumptions", async () => {
-	const { client, directory, sessionId } = await openLiveAuthority("sqlite");
-	const identity = client.identity;
-	await client.close();
-	const ownership = await acquireAuthorityOwnership(path.join(directory, "session.jsonl"), {
-		owningSessionId: sessionId,
-		create: false,
-	});
-	const header = await fs.open(ownership.paths.sqlite, "r+");
-	try {
-		const legacyFormat = Buffer.alloc(4);
-		legacyFormat.writeUInt32BE(3);
-		await header.write(legacyFormat, 0, legacyFormat.length, 44);
-		await header.sync();
-	} finally {
-		await header.close();
-	}
-	expect(
-		thrownBy(await settle(openAuthorityClient({ path: ownership.paths.sqlite, identity, create: false }, ownership))),
-	).toThrow("format-4");
-}, 45_000);
+itOnXfs(
+	"rejects a capacity SQLite header outside the source-bound format-4 assumptions",
+	async () => {
+		const { client, directory, sessionId } = await openLiveAuthority("sqlite");
+		const identity = client.identity;
+		await client.close();
+		const ownership = await acquireAuthorityOwnership(path.join(directory, "session.jsonl"), {
+			owningSessionId: sessionId,
+			create: false,
+		});
+		const header = await fs.open(ownership.paths.sqlite, "r+");
+		try {
+			const legacyFormat = Buffer.alloc(4);
+			legacyFormat.writeUInt32BE(3);
+			await header.write(legacyFormat, 0, legacyFormat.length, 44);
+			await header.sync();
+		} finally {
+			await header.close();
+		}
+		expect(
+			thrownBy(
+				await settle(openAuthorityClient({ path: ownership.paths.sqlite, identity, create: false }, ownership)),
+			),
+		).toThrow("format-4");
+	},
+	45_000,
+);
 
-it("removes a newly created SQLite main file after bootstrap funding fails before database allocation", async () => {
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-authority-capacity-bootstrap-"));
-	directories.push(directory);
-	const sessionId = `capacity-bootstrap-${crypto.randomUUID()}`;
-	const session = path.join(directory, "session.jsonl");
-	await fs.writeFile(session, `${JSON.stringify({ type: "session", id: sessionId })}\n`, { mode: 0o600 });
-	const ownership = await acquireAuthorityOwnership(session, { owningSessionId: sessionId, create: true });
-	const fault = faultWorker("bootstrap-failure");
-	const storePath = ownership.paths.sqlite;
-	expect(
-		thrownBy(
-			await settle(
-				openAuthorityClient(
-					{
-						path: storePath,
-						identity: {
-							backend: "sqlite",
-							owningSessionId: sessionId,
-							incarnation: crypto.randomUUID(),
-							format: 2,
+itOnXfs(
+	"removes a newly created SQLite main file after bootstrap funding fails before database allocation",
+	async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-authority-capacity-bootstrap-"));
+		directories.push(directory);
+		const sessionId = `capacity-bootstrap-${crypto.randomUUID()}`;
+		const session = path.join(directory, "session.jsonl");
+		await fs.writeFile(session, `${JSON.stringify({ type: "session", id: sessionId })}\n`, { mode: 0o600 });
+		const ownership = await acquireAuthorityOwnership(session, { owningSessionId: sessionId, create: true });
+		const fault = faultWorker("bootstrap-failure");
+		const storePath = ownership.paths.sqlite;
+		expect(
+			thrownBy(
+				await settle(
+					openAuthorityClient(
+						{
+							path: storePath,
+							identity: {
+								backend: "sqlite",
+								owningSessionId: sessionId,
+								incarnation: crypto.randomUUID(),
+								format: 2,
+							},
+							create: true,
 						},
-						create: true,
-					},
-					ownership,
-					fault.factory,
+						ownership,
+						fault.factory,
+					),
 				),
 			),
-		),
-	).toThrow("after real SQLite bootstrap funding");
-	await expect(fs.lstat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
-}, 45_000);
+		).toThrow("after real SQLite bootstrap funding");
+		await expect(fs.lstat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+	},
+	45_000,
+);
 
 async function legalMaximumOptions(
 	client: AuthorityRpcClient,
@@ -646,17 +660,43 @@ int sqlite3_ompclose_init(sqlite3 *database, char **error, const sqlite3_api_rou
 	return library;
 }
 
-async function pressureRoot(backend: JournalingBackend, budget: "positive" | "refusal" = "positive"): Promise<string> {
-	const fixtureBinding =
-		budget === "refusal"
-			? { variable: "OMP_QUAL_XFS_FIXTURE", label: "64MiB refusal" }
-			: backend === "jsonl"
-				? { variable: "OMP_QUAL_XFS_JSONL_FIXTURE", label: "128MiB JSONL positive" }
-				: { variable: "OMP_QUAL_SQLITE_POSITIVE_XFS_FIXTURE", label: "96MiB SQLite positive" };
-	const manifest = process.env[`${fixtureBinding.variable}_MANIFEST`];
-	const hash = process.env[`${fixtureBinding.variable}_SHA256`];
-	const launcher = process.env.OMP_QUAL_NATIVE_LAUNCHER;
-	const evidence = process.env.OMP_QUAL_RESULT_JOURNAL;
+type PressureBudget = "positive" | "refusal";
+
+function pressureFixtureBinding(
+	backend: JournalingBackend,
+	budget: PressureBudget,
+): { readonly variable: string; readonly label: string } {
+	return budget === "refusal"
+		? { variable: "OMP_QUAL_XFS_FIXTURE", label: "64MiB refusal" }
+		: backend === "jsonl"
+			? { variable: "OMP_QUAL_XFS_JSONL_FIXTURE", label: "128MiB JSONL positive" }
+			: { variable: "OMP_QUAL_SQLITE_POSITIVE_XFS_FIXTURE", label: "96MiB SQLite positive" };
+}
+
+function pressureFixtureEnvironment(backend: JournalingBackend, budget: PressureBudget) {
+	const { variable } = pressureFixtureBinding(backend, budget);
+	return {
+		manifest: process.env[`${variable}_MANIFEST`],
+		hash: process.env[`${variable}_SHA256`],
+		launcher: process.env.OMP_QUAL_NATIVE_LAUNCHER,
+		evidence: process.env.OMP_QUAL_RESULT_JOURNAL,
+	};
+}
+
+/*
+ * The held-pressure cases need a private, root-provisioned XFS project-quota directory of an exact size plus a
+ * native inspector, which only the qualification harness supplies through the OMP_QUAL_* variables. A host that
+ * supplies none of them (developer machines, GitHub's ext4 runners) skips exactly these cases. Supplying any of
+ * them runs the cases, so a partial or wrong binding still fails loudly in pressureRoot instead of skipping.
+ */
+function itWithPressureFixture(backend: JournalingBackend, budget: PressureBudget = "positive") {
+	const supplied = Object.values(pressureFixtureEnvironment(backend, budget)).some(value => value !== undefined);
+	return it.skipIf(!supplied);
+}
+
+async function pressureRoot(backend: JournalingBackend, budget: PressureBudget = "positive"): Promise<string> {
+	const fixtureBinding = pressureFixtureBinding(backend, budget);
+	const { manifest, hash, launcher, evidence } = pressureFixtureEnvironment(backend, budget);
 	if (!manifest || !hash || !launcher || !evidence)
 		throw new Error(
 			`Main must supply the private ${fixtureBinding.label} project fixture and read-only native inspector/evidence bindings`,
@@ -1724,45 +1764,49 @@ function nestedErrorMessages(value: unknown): string[] {
 	return messages;
 }
 
-it("distinguishes the fresh 0/0 SQLite header from an existing supported 4/1 store", async () => {
-	const firstFault = faultWorker();
-	const opened = await openLiveAuthority("sqlite", os.tmpdir(), firstFault.factory);
-	const identity = opened.client.identity;
-	expect(firstFault.headers).toHaveLength(1);
-	expect(firstFault.headers[0]).toEqual({
-		pageSize: 4_096,
-		reservedBytes: 0,
-		schemaFormat: 0,
-		encoding: 0,
-		applicationId: 0,
-		userVersion: 0,
-		configuredBeforeApplicationRead: true,
-		liveCapacityConfigured: true,
-	});
-	await opened.client.close();
-	const ownership = await acquireAuthorityOwnership(path.join(opened.directory, "session.jsonl"), {
-		owningSessionId: opened.sessionId,
-		create: false,
-	});
-	const secondFault = faultWorker();
-	const reopened = await openAuthorityClient(
-		{ path: ownership.paths.sqlite, identity, create: false },
-		ownership,
-		secondFault.factory,
-	);
-	expect(secondFault.headers).toHaveLength(1);
-	expect(secondFault.headers[0]).toMatchObject({
-		pageSize: 4_096,
-		reservedBytes: 0,
-		schemaFormat: 4,
-		encoding: 1,
-		configuredBeforeApplicationRead: true,
-		liveCapacityConfigured: true,
-	});
-	expect(secondFault.headers[0]!.applicationId).toBeGreaterThan(0);
-	expect(secondFault.headers[0]!.userVersion).toBeGreaterThan(0);
-	await reopened.close();
-}, 45_000);
+itOnXfs(
+	"distinguishes the fresh 0/0 SQLite header from an existing supported 4/1 store",
+	async () => {
+		const firstFault = faultWorker();
+		const opened = await openLiveAuthority("sqlite", os.tmpdir(), firstFault.factory);
+		const identity = opened.client.identity;
+		expect(firstFault.headers).toHaveLength(1);
+		expect(firstFault.headers[0]).toEqual({
+			pageSize: 4_096,
+			reservedBytes: 0,
+			schemaFormat: 0,
+			encoding: 0,
+			applicationId: 0,
+			userVersion: 0,
+			configuredBeforeApplicationRead: true,
+			liveCapacityConfigured: true,
+		});
+		await opened.client.close();
+		const ownership = await acquireAuthorityOwnership(path.join(opened.directory, "session.jsonl"), {
+			owningSessionId: opened.sessionId,
+			create: false,
+		});
+		const secondFault = faultWorker();
+		const reopened = await openAuthorityClient(
+			{ path: ownership.paths.sqlite, identity, create: false },
+			ownership,
+			secondFault.factory,
+		);
+		expect(secondFault.headers).toHaveLength(1);
+		expect(secondFault.headers[0]).toMatchObject({
+			pageSize: 4_096,
+			reservedBytes: 0,
+			schemaFormat: 4,
+			encoding: 1,
+			configuredBeforeApplicationRead: true,
+			liveCapacityConfigured: true,
+		});
+		expect(secondFault.headers[0]!.applicationId).toBeGreaterThan(0);
+		expect(secondFault.headers[0]!.userVersion).toBeGreaterThan(0);
+		await reopened.close();
+	},
+	45_000,
+);
 
 it("preserves raw offline SQLite construction for fresh and existing stores", async () => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-authority-capacity-raw-sqlite-"));
@@ -1862,61 +1906,65 @@ it("rejects a truncated existing raw SQLite header", async () => {
 }, 45_000);
 
 for (const mode of ["raw-bootstrap-fd-dual", "raw-header-fd-dual"] as const) {
-	it(`retains exact ${mode} construction cleanup with both causes and the same admission`, async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-authority-capacity-raw-fd-"));
-		directories.push(directory);
-		const capacity = await openAuthorityCapacityFile(directory);
-		ballastHandles.push(capacity.handle);
-		const storePath = path.join(directory, `${mode}.sqlite`);
-		const identity = {
-			backend: "sqlite" as const,
-			owningSessionId: `capacity-raw-${crypto.randomUUID()}`,
-			incarnation: crypto.randomUUID(),
-			format: 2 as const,
-		};
-		const fault = faultWorker();
-		const response = await fault.rawSqlite(
-			{
-				path: storePath,
-				identity,
-				create: true,
-				capacity: { identity: capacity.identity, maxRequestBytes: AUTHORITY_RESOURCE_CAPS.maxRequestBytes },
-			},
-			mode,
-		);
-		const result = response.result as Record<string, unknown>;
-		expect(result.ok).toBe(false);
-		expect(result.error).toMatchObject({ name: "SqliteAuthorityConstructionError" });
-		expect(result.cleanupFailures).toEqual([]);
-		expect(result.cleanupSucceeded).toBe(true);
-		expect(result.cleanupAttempts).toBe(1);
-		expect(response.rawCloseAttempts).toBe(1);
-		expect(response.rawDescriptorClosed).toBe(true);
-		expect(response.rawReplacementVerified).toBe(true);
-		expect(response.rawReplacementClosed).toBe(true);
-		expect(response.rawReplacementIdentity).toEqual(response.rawDescriptor);
-		const rawClose = fault.events.find(event => event.event === "raw-descriptor-close-failure");
-		expect(rawClose).toMatchObject({
-			nativeCloseCompleted: true,
-			replacementStartByte: mode === "raw-bootstrap-fd-dual" ? undefined : 0x53,
-		});
-		expect(rawClose?.replacement).toEqual(response.rawDescriptor);
-		expect(fault.events.some(event => event.event === "raw-replacement-verification-error")).toBe(false);
-		const messages = nestedErrorMessages(result.error);
-		expect(messages).toContain(
-			mode === "raw-bootstrap-fd-dual"
-				? "injected SQLite raw descriptor fchmod primary failure"
-				: "injected SQLite header descriptor read primary failure after actual read",
-		);
-		expect(messages).toContain("injected SQLite raw descriptor close response failure after actual native close");
-		const admissionIds = response.prepareCloseIds as number[];
-		expect(admissionIds.length).toBeGreaterThanOrEqual(2);
-		expect(new Set(admissionIds).size).toBe(1);
-		await expect(fs.lstat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
-	}, 45_000);
+	itOnXfs(
+		`retains exact ${mode} construction cleanup with both causes and the same admission`,
+		async () => {
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-authority-capacity-raw-fd-"));
+			directories.push(directory);
+			const capacity = await openAuthorityCapacityFile(directory);
+			ballastHandles.push(capacity.handle);
+			const storePath = path.join(directory, `${mode}.sqlite`);
+			const identity = {
+				backend: "sqlite" as const,
+				owningSessionId: `capacity-raw-${crypto.randomUUID()}`,
+				incarnation: crypto.randomUUID(),
+				format: 2 as const,
+			};
+			const fault = faultWorker();
+			const response = await fault.rawSqlite(
+				{
+					path: storePath,
+					identity,
+					create: true,
+					capacity: { identity: capacity.identity, maxRequestBytes: AUTHORITY_RESOURCE_CAPS.maxRequestBytes },
+				},
+				mode,
+			);
+			const result = response.result as Record<string, unknown>;
+			expect(result.ok).toBe(false);
+			expect(result.error).toMatchObject({ name: "SqliteAuthorityConstructionError" });
+			expect(result.cleanupFailures).toEqual([]);
+			expect(result.cleanupSucceeded).toBe(true);
+			expect(result.cleanupAttempts).toBe(1);
+			expect(response.rawCloseAttempts).toBe(1);
+			expect(response.rawDescriptorClosed).toBe(true);
+			expect(response.rawReplacementVerified).toBe(true);
+			expect(response.rawReplacementClosed).toBe(true);
+			expect(response.rawReplacementIdentity).toEqual(response.rawDescriptor);
+			const rawClose = fault.events.find(event => event.event === "raw-descriptor-close-failure");
+			expect(rawClose).toMatchObject({
+				nativeCloseCompleted: true,
+				replacementStartByte: mode === "raw-bootstrap-fd-dual" ? undefined : 0x53,
+			});
+			expect(rawClose?.replacement).toEqual(response.rawDescriptor);
+			expect(fault.events.some(event => event.event === "raw-replacement-verification-error")).toBe(false);
+			const messages = nestedErrorMessages(result.error);
+			expect(messages).toContain(
+				mode === "raw-bootstrap-fd-dual"
+					? "injected SQLite raw descriptor fchmod primary failure"
+					: "injected SQLite header descriptor read primary failure after actual read",
+			);
+			expect(messages).toContain("injected SQLite raw descriptor close response failure after actual native close");
+			const admissionIds = response.prepareCloseIds as number[];
+			expect(admissionIds.length).toBeGreaterThanOrEqual(2);
+			expect(new Set(admissionIds).size).toBe(1);
+			await expect(fs.lstat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+		},
+		45_000,
+	);
 }
 
-describe("live authority capacity worker integration", () => {
+describe.skipIf(!xfsCapacityHost)("live authority capacity worker integration", () => {
 	for (const backend of ["jsonl", "sqlite"] as const) {
 		if (backend === "jsonl") {
 			for (const sameInode of [false, true]) {
@@ -2295,85 +2343,92 @@ describe("live authority capacity worker integration", () => {
 			);
 		}, 45_000);
 		for (const action of ["commit", "restore-predecessor"] as const) {
-			it(`rearms funded ${backend} local uncertainty and ${action} under held real ${pressureBudget(backend) / (1024 * 1024)}MiB pressure`, async () => {
-				const opened = await openLiveAuthority(backend, await pressureRoot(backend));
-				const { directory, sessionId } = opened;
-				let client = opened.client;
-				const bytes = Buffer.from("real approved local publication");
-				const entryHash = createHash("sha256").update(bytes).digest("hex");
-				const input = { localId: "local", entryId: "entry", entryHash, expectedHeadHash: "0".repeat(64) };
-				const claim = await client.reserveLocal(input, await legalMaximumOptions(client, "reserveLocal", [input]));
-				const effect = { ...claim, phase: "effect" as const };
-				const backing = path.join(directory, "local-backing");
-				await withAuthorityEffect(client, async () => {
-					await client.authorizeLocalEffect(
-						claim,
-						await legalMaximumContinuation(client, "authorizeLocalEffect", [claim]),
+			itWithPressureFixture(backend)(
+				`rearms funded ${backend} local uncertainty and ${action} under held real ${pressureBudget(backend) / (1024 * 1024)}MiB pressure`,
+				async () => {
+					const opened = await openLiveAuthority(backend, await pressureRoot(backend));
+					const { directory, sessionId } = opened;
+					let client = opened.client;
+					const bytes = Buffer.from("real approved local publication");
+					const entryHash = createHash("sha256").update(bytes).digest("hex");
+					const input = { localId: "local", entryId: "entry", entryHash, expectedHeadHash: "0".repeat(64) };
+					const claim = await client.reserveLocal(
+						input,
+						await legalMaximumOptions(client, "reserveLocal", [input]),
 					);
-					const handle = await fs.open(backing, "wx", 0o600);
-					try {
-						await handle.writeFile(bytes);
-						await handle.sync();
-					} finally {
-						await handle.close();
+					const effect = { ...claim, phase: "effect" as const };
+					const backing = path.join(directory, "local-backing");
+					await withAuthorityEffect(client, async () => {
+						await client.authorizeLocalEffect(
+							claim,
+							await legalMaximumContinuation(client, "authorizeLocalEffect", [claim]),
+						);
+						const handle = await fs.open(backing, "wx", 0o600);
+						try {
+							await handle.writeFile(bytes);
+							await handle.sync();
+						} finally {
+							await handle.close();
+						}
+					});
+					const ballast = await exhaustUnpromisedSpace(directory, pressureBudget(backend));
+					const beforeUncertain = await readCapacityState(client);
+					const entryBefore = await client.getLocalEntry(claim.localId, claim.entryId, claim.version);
+					const headBefore = await client.getLocalHead(claim.localId);
+					const options = await legalMaximumContinuation(client, "finalizeLocal", [effect, "uncertain"]);
+					const publication = await client.finalizeLocal(effect, "uncertain", options);
+					expect(publication).toEqual({ version: claim.version, headHash: claim.headHash });
+					const uncertain = await readCapacityState(client);
+					expect(uncertain).toEqual({
+						...beforeUncertain,
+						recovery: { ...beforeUncertain.recovery, revision: beforeUncertain.recovery.revision + 1 },
+					});
+					expect(entryBefore?.record.phase).toBe("effect");
+					expect(await client.getLocalEntry(claim.localId, claim.entryId, claim.version)).toEqual(entryBefore);
+					expect(await client.getLocalHead(claim.localId)).toEqual(headBefore);
+					const uncertainReceipt = await client.resolveReceipt(
+						options.requestId!,
+						beforeUncertain.recovery.owner.epoch,
+					);
+					expect(uncertainReceipt).toMatchObject({
+						requestId: options.requestId,
+						ownerEpoch: beforeUncertain.recovery.owner.epoch,
+						incarnation: client.identity.incarnation,
+						commandKind: "finalize-local",
+						revision: beforeUncertain.recovery.revision + 1,
+						result: { kind: "local-publication", publication },
+					});
+					const identity = client.identity;
+					await client.close();
+					client = (await reopenFundedOrRefused(backend, directory, sessionId, identity, ballast)).client;
+					expect(await client.resolveReceipt(options.requestId!, beforeUncertain.recovery.owner.epoch)).toEqual(
+						uncertainReceipt,
+					);
+					if (action === "restore-predecessor") await fs.unlink(backing);
+					const reconciliation = {
+						claim: { ...claim, phase: "uncertain" as const },
+						action,
+						observedEntryHash: action === "commit" ? entryHash : "0".repeat(64),
+					};
+					const receipt = await client.reconcileLocal(
+						reconciliation,
+						await legalMaximumContinuation(client, "reconcileLocal", [reconciliation]),
+					);
+					expect(await client.resolveReceipt(receipt.requestId, receipt.ownerEpoch)).toEqual(receipt);
+					expect((await client.getLocalEntry(claim.localId, claim.entryId, claim.version))?.record.phase).toBe(
+						action === "commit" ? "committed" : "cancelled",
+					);
+					if (action === "commit") {
+						expect(await fs.readFile(backing)).toEqual(bytes);
+						expect((await client.getLocalHead(claim.localId))?.record.headHash).toBe(claim.headHash);
+						expect(receipt.result).toEqual({ kind: "local-publication", publication });
+					} else {
+						expect(await client.getLocalHead(claim.localId)).toBeUndefined();
+						expect(receipt.result).toEqual({ kind: "mutation" });
 					}
-				});
-				const ballast = await exhaustUnpromisedSpace(directory, pressureBudget(backend));
-				const beforeUncertain = await readCapacityState(client);
-				const entryBefore = await client.getLocalEntry(claim.localId, claim.entryId, claim.version);
-				const headBefore = await client.getLocalHead(claim.localId);
-				const options = await legalMaximumContinuation(client, "finalizeLocal", [effect, "uncertain"]);
-				const publication = await client.finalizeLocal(effect, "uncertain", options);
-				expect(publication).toEqual({ version: claim.version, headHash: claim.headHash });
-				const uncertain = await readCapacityState(client);
-				expect(uncertain).toEqual({
-					...beforeUncertain,
-					recovery: { ...beforeUncertain.recovery, revision: beforeUncertain.recovery.revision + 1 },
-				});
-				expect(entryBefore?.record.phase).toBe("effect");
-				expect(await client.getLocalEntry(claim.localId, claim.entryId, claim.version)).toEqual(entryBefore);
-				expect(await client.getLocalHead(claim.localId)).toEqual(headBefore);
-				const uncertainReceipt = await client.resolveReceipt(
-					options.requestId!,
-					beforeUncertain.recovery.owner.epoch,
-				);
-				expect(uncertainReceipt).toMatchObject({
-					requestId: options.requestId,
-					ownerEpoch: beforeUncertain.recovery.owner.epoch,
-					incarnation: client.identity.incarnation,
-					commandKind: "finalize-local",
-					revision: beforeUncertain.recovery.revision + 1,
-					result: { kind: "local-publication", publication },
-				});
-				const identity = client.identity;
-				await client.close();
-				client = (await reopenFundedOrRefused(backend, directory, sessionId, identity, ballast)).client;
-				expect(await client.resolveReceipt(options.requestId!, beforeUncertain.recovery.owner.epoch)).toEqual(
-					uncertainReceipt,
-				);
-				if (action === "restore-predecessor") await fs.unlink(backing);
-				const reconciliation = {
-					claim: { ...claim, phase: "uncertain" as const },
-					action,
-					observedEntryHash: action === "commit" ? entryHash : "0".repeat(64),
-				};
-				const receipt = await client.reconcileLocal(
-					reconciliation,
-					await legalMaximumContinuation(client, "reconcileLocal", [reconciliation]),
-				);
-				expect(await client.resolveReceipt(receipt.requestId, receipt.ownerEpoch)).toEqual(receipt);
-				expect((await client.getLocalEntry(claim.localId, claim.entryId, claim.version))?.record.phase).toBe(
-					action === "commit" ? "committed" : "cancelled",
-				);
-				if (action === "commit") {
-					expect(await fs.readFile(backing)).toEqual(bytes);
-					expect((await client.getLocalHead(claim.localId))?.record.headHash).toBe(claim.headHash);
-					expect(receipt.result).toEqual({ kind: "local-publication", publication });
-				} else {
-					expect(await client.getLocalHead(claim.localId)).toBeUndefined();
-					expect(receipt.result).toEqual({ kind: "mutation" });
-				}
-			}, 45_000);
+				},
+				45_000,
+			);
 		}
 		it(`opens, funds, and completes a staged six-step root transition through the real ${backend} worker`, async () => {
 			const { client, sessionId } = await openLiveAuthority(backend);
@@ -2389,129 +2444,87 @@ describe("live authority capacity worker integration", () => {
 			expect((await client.getActor(rootId))?.record.state).toBe("retired");
 		}, 45_000);
 		for (let cut = 0; cut < 6; cut++) {
-			it(`preserves all six funded future commands after real ${pressureBudget(backend) / (1024 * 1024)}MiB ${backend} pressure at cut ${cut}`, async () => {
-				const { client, sessionId, directory } = await openLiveAuthority(backend, await pressureRoot(backend));
-				await exerciseSixStepRootTransition(
-					client,
-					sessionId,
-					async step => {
-						if (step === cut) await exhaustUnpromisedSpace(directory, pressureBudget(backend));
-					},
-					true,
-					true,
-				);
-			}, 45_000);
+			itWithPressureFixture(backend)(
+				`preserves all six funded future commands after real ${pressureBudget(backend) / (1024 * 1024)}MiB ${backend} pressure at cut ${cut}`,
+				async () => {
+					const { client, sessionId, directory } = await openLiveAuthority(backend, await pressureRoot(backend));
+					await exerciseSixStepRootTransition(
+						client,
+						sessionId,
+						async step => {
+							if (step === cut) await exhaustUnpromisedSpace(directory, pressureBudget(backend));
+						},
+						true,
+						true,
+					);
+				},
+				45_000,
+			);
 		}
 
-		it(`keeps the genuine 64MiB ${backend} refusal assignment effect-free while retaining a funded disposition`, async () => {
-			const { client, directory } = await openLiveAuthority(backend, await pressureRoot(backend, "refusal"));
-			const operation = {
-				kind: "operation" as const,
-				at: Date.now(),
-				ownerId: "refusal-owner",
-				classOwnerId: "refusal-owner",
-				operationId: "funded-disposition",
-				effectClass: "filesystem" as const,
-				acquiredAt: 1,
-				expiresAt: Number.MAX_SAFE_INTEGER,
-				phase: "intent" as const,
-			};
-			await client.transition(operation);
-			await exhaustUnpromisedSpace(directory, pressureBudget(backend, "refusal"));
-			const before = await client.exportState();
-			let callbacks = 0;
-			expect(
-				thrownBy(
-					await settle(
-						withAuthorityEffect(client, async () => {
-							await client.transitionBatch(
-								Array.from({ length: 100 }, (_, index) => ({ ...operation, operationId: `unfunded-${index}` })),
-							);
-							callbacks++;
-							await fs.writeFile(path.join(directory, "forbidden-effect"), "not authorized");
-						}),
-					),
-				),
-			).toThrow();
-			const after = await client.exportState();
-			expect([after.revision, after.headHash, after.frames.length]).toEqual([
-				before.revision,
-				before.headHash,
-				before.frames.length,
-			]);
-			expect(callbacks).toBe(0);
-			await expect(fs.lstat(path.join(directory, "forbidden-effect"))).rejects.toMatchObject({ code: "ENOENT" });
-			const cancelled = { ...operation, phase: "cancelled" as const };
-			await client.transition(cancelled, await legalMaximumContinuation(client, "transition", [cancelled]));
-			expect(
-				(await client.getOperation(operation.ownerId, operation.effectClass, operation.operationId))?.record.phase,
-			).toBe("cancelled");
-		}, 45_000);
-
-		it(`independently consumes every maximum-option ${backend} gate/root/actor promise under held positive pressure and closed NEW admission`, async () => {
-			const fault = faultWorker();
-			const { client, directory, sessionId } = await openLiveAuthority(
-				backend,
-				await pressureRoot(backend),
-				fault.factory,
-			);
-			const activation = await activateCapacityRoot(client, `independent-gate-${sessionId}`);
-			await exhaustUnpromisedSpace(directory, pressureBudget(backend));
-			await fault.arm("admission-gate");
-			const operation = {
-				kind: "operation" as const,
-				at: Date.now(),
-				ownerId: "owner",
-				classOwnerId: "owner",
-				operationId: "independent-gate-new",
-				effectClass: "filesystem" as const,
-				acquiredAt: 1,
-				expiresAt: Number.MAX_SAFE_INTEGER,
-				phase: "intent" as const,
-			};
-			expect(
-				thrownBy(
-					await settle(
-						client.transitionBatch(
-							Array.from({ length: 100 }, (_, index) => ({
-								...operation,
-								operationId: `gate-refused-${index}`,
-							})),
+		itWithPressureFixture(backend, "refusal")(
+			`keeps the genuine 64MiB ${backend} refusal assignment effect-free while retaining a funded disposition`,
+			async () => {
+				const { client, directory } = await openLiveAuthority(backend, await pressureRoot(backend, "refusal"));
+				const operation = {
+					kind: "operation" as const,
+					at: Date.now(),
+					ownerId: "refusal-owner",
+					classOwnerId: "refusal-owner",
+					operationId: "funded-disposition",
+					effectClass: "filesystem" as const,
+					acquiredAt: 1,
+					expiresAt: Number.MAX_SAFE_INTEGER,
+					phase: "intent" as const,
+				};
+				await client.transition(operation);
+				await exhaustUnpromisedSpace(directory, pressureBudget(backend, "refusal"));
+				const before = await client.exportState();
+				let callbacks = 0;
+				expect(
+					thrownBy(
+						await settle(
+							withAuthorityEffect(client, async () => {
+								await client.transitionBatch(
+									Array.from({ length: 100 }, (_, index) => ({
+										...operation,
+										operationId: `unfunded-${index}`,
+									})),
+								);
+								callbacks++;
+								await fs.writeFile(path.join(directory, "forbidden-effect"), "not authorized");
+							}),
 						),
 					),
-				),
-			).toThrow();
-			expect(thrownBy(await settle(client.transition(operation)))).toThrow("NEW admission");
-			await consumeCapacityRootPromises(client, activation);
-			expect(thrownBy(await settle(client.transition(operation)))).toThrow("NEW admission");
-		}, 45_000);
+				).toThrow();
+				const after = await client.exportState();
+				expect([after.revision, after.headHash, after.frames.length]).toEqual([
+					before.revision,
+					before.headHash,
+					before.frames.length,
+				]);
+				expect(callbacks).toBe(0);
+				await expect(fs.lstat(path.join(directory, "forbidden-effect"))).rejects.toMatchObject({ code: "ENOENT" });
+				const cancelled = { ...operation, phase: "cancelled" as const };
+				await client.transition(cancelled, await legalMaximumContinuation(client, "transition", [cancelled]));
+				expect(
+					(await client.getOperation(operation.ownerId, operation.effectClass, operation.operationId))?.record
+						.phase,
+				).toBe("cancelled");
+			},
+			45_000,
+		);
 
-		for (const cut of ["staged", "quiescing", "quiesced", "validated"] as const) {
-			it(`consumes constrained pre-CAS ${backend} recovery from ${cut} and reopened gate promises under held pressure with NEW closed`, async () => {
+		itWithPressureFixture(backend)(
+			`independently consumes every maximum-option ${backend} gate/root/actor promise under held positive pressure and closed NEW admission`,
+			async () => {
 				const fault = faultWorker();
 				const { client, directory, sessionId } = await openLiveAuthority(
 					backend,
 					await pressureRoot(backend),
 					fault.factory,
 				);
-				const activation = await activateCapacityRoot(client, `recover-transition-${sessionId}`);
-				for (const phase of ["quiescing", "quiesced"] as const)
-					await client.transition({ ...activation.gate, phase });
-				const transition = {
-					kind: "transition" as const,
-					at: Date.now(),
-					rootId: activation.root.rootId,
-					transitionId: "recover-pre-cas",
-					sourceGeneration: 1,
-					destinationGeneration: 2,
-					sourceHeadHash: activation.root.headHash,
-					destinationHeadHash: canonicalDurableSha256("unused-destination"),
-					phase: "staged" as const,
-				};
-				for (const phase of ["staged", "quiescing", "quiesced", "validated"] as const) {
-					await client.transition({ ...transition, phase });
-					if (phase === cut) break;
-				}
+				const activation = await activateCapacityRoot(client, `independent-gate-${sessionId}`);
 				await exhaustUnpromisedSpace(directory, pressureBudget(backend));
 				await fault.arm("admission-gate");
 				const operation = {
@@ -2519,7 +2532,7 @@ describe("live authority capacity worker integration", () => {
 					at: Date.now(),
 					ownerId: "owner",
 					classOwnerId: "owner",
-					operationId: "recovery-new",
+					operationId: "independent-gate-new",
 					effectClass: "filesystem" as const,
 					acquiredAt: 1,
 					expiresAt: Number.MAX_SAFE_INTEGER,
@@ -2531,242 +2544,316 @@ describe("live authority capacity worker integration", () => {
 							client.transitionBatch(
 								Array.from({ length: 100 }, (_, index) => ({
 									...operation,
-									operationId: `recovery-refused-${index}`,
+									operationId: `gate-refused-${index}`,
 								})),
 							),
 						),
 					),
 				).toThrow();
 				expect(thrownBy(await settle(client.transition(operation)))).toThrow("NEW admission");
-				const recovery = {
-					transition: { ...transition, phase: "recovered" as const, recovery: true as const },
-					expectedRootGeneration: 1,
-					expectedRootHeadHash: activation.root.headHash,
-					root: activation.root,
-					gate: activation.gate,
-				};
-				const receipt = await client.commitRootTransition(
-					recovery,
-					await legalMaximumContinuation(client, "commitRootTransition", [recovery]),
-				);
-				expect(await client.resolveReceipt(receipt.requestId, receipt.ownerEpoch)).toEqual(receipt);
-				expect((await client.getTransition(activation.root.rootId, transition.transitionId))?.record).toEqual(
-					recovery.transition,
-				);
-				expect((await client.getRoot(activation.root.rootId))?.record).toEqual(activation.root);
-				expect((await client.getGate(activation.root.rootId))?.record).toEqual(activation.gate);
-				expect((await client.exportState()).generationHighWater).toBe(2);
 				await consumeCapacityRootPromises(client, activation);
 				expect(thrownBy(await settle(client.transition(operation)))).toThrow("NEW admission");
-			}, 45_000);
+			},
+			45_000,
+		);
+
+		for (const cut of ["staged", "quiescing", "quiesced", "validated"] as const) {
+			itWithPressureFixture(backend)(
+				`consumes constrained pre-CAS ${backend} recovery from ${cut} and reopened gate promises under held pressure with NEW closed`,
+				async () => {
+					const fault = faultWorker();
+					const { client, directory, sessionId } = await openLiveAuthority(
+						backend,
+						await pressureRoot(backend),
+						fault.factory,
+					);
+					const activation = await activateCapacityRoot(client, `recover-transition-${sessionId}`);
+					for (const phase of ["quiescing", "quiesced"] as const)
+						await client.transition({ ...activation.gate, phase });
+					const transition = {
+						kind: "transition" as const,
+						at: Date.now(),
+						rootId: activation.root.rootId,
+						transitionId: "recover-pre-cas",
+						sourceGeneration: 1,
+						destinationGeneration: 2,
+						sourceHeadHash: activation.root.headHash,
+						destinationHeadHash: canonicalDurableSha256("unused-destination"),
+						phase: "staged" as const,
+					};
+					for (const phase of ["staged", "quiescing", "quiesced", "validated"] as const) {
+						await client.transition({ ...transition, phase });
+						if (phase === cut) break;
+					}
+					await exhaustUnpromisedSpace(directory, pressureBudget(backend));
+					await fault.arm("admission-gate");
+					const operation = {
+						kind: "operation" as const,
+						at: Date.now(),
+						ownerId: "owner",
+						classOwnerId: "owner",
+						operationId: "recovery-new",
+						effectClass: "filesystem" as const,
+						acquiredAt: 1,
+						expiresAt: Number.MAX_SAFE_INTEGER,
+						phase: "intent" as const,
+					};
+					expect(
+						thrownBy(
+							await settle(
+								client.transitionBatch(
+									Array.from({ length: 100 }, (_, index) => ({
+										...operation,
+										operationId: `recovery-refused-${index}`,
+									})),
+								),
+							),
+						),
+					).toThrow();
+					expect(thrownBy(await settle(client.transition(operation)))).toThrow("NEW admission");
+					const recovery = {
+						transition: { ...transition, phase: "recovered" as const, recovery: true as const },
+						expectedRootGeneration: 1,
+						expectedRootHeadHash: activation.root.headHash,
+						root: activation.root,
+						gate: activation.gate,
+					};
+					const receipt = await client.commitRootTransition(
+						recovery,
+						await legalMaximumContinuation(client, "commitRootTransition", [recovery]),
+					);
+					expect(await client.resolveReceipt(receipt.requestId, receipt.ownerEpoch)).toEqual(receipt);
+					expect((await client.getTransition(activation.root.rootId, transition.transitionId))?.record).toEqual(
+						recovery.transition,
+					);
+					expect((await client.getRoot(activation.root.rootId))?.record).toEqual(activation.root);
+					expect((await client.getGate(activation.root.rootId))?.record).toEqual(activation.gate);
+					expect((await client.exportState()).generationHighWater).toBe(2);
+					await consumeCapacityRootPromises(client, activation);
+					expect(thrownBy(await settle(client.transition(operation)))).toThrow("NEW admission");
+				},
+				45_000,
+			);
 		}
 
-		it(`reactivates recovered ${backend} root evidence with maximum options and consumes downstream promises under held pressure with NEW closed`, async () => {
-			const opened = await openLiveAuthority(backend, await pressureRoot(backend));
-			const activation = await activateCapacityRoot(opened.client, `recovered-root-${opened.sessionId}`);
-			const rootBefore = await opened.client.getRoot(activation.root.rootId);
-			const constructionBefore = await opened.client.getConstruction(
-				activation.root.rootId,
-				activation.actor.actorId,
-				1,
-			);
-			const ballast = await exhaustUnpromisedSpace(opened.directory, pressureBudget(backend));
-			await opened.client.close();
-			const fault = faultWorker();
-			const { client } = await reopenFundedOrRefused(
-				backend,
-				opened.directory,
-				opened.sessionId,
-				opened.client.identity,
-				ballast,
-				fault.factory,
-			);
-			expect((await client.recoveryState()).owner.phase).toBe("ready");
-			expect((await client.getGate(activation.root.rootId))?.record.phase).toBe("closed");
-			await fault.arm("admission-gate");
-			const operation = {
-				kind: "operation" as const,
-				at: Date.now(),
-				ownerId: "owner",
-				classOwnerId: "owner",
-				operationId: "recovered-root-new",
-				effectClass: "filesystem" as const,
-				acquiredAt: 1,
-				expiresAt: Number.MAX_SAFE_INTEGER,
-				phase: "intent" as const,
-			};
-			expect(
-				thrownBy(
-					await settle(
-						client.transitionBatch(
-							Array.from({ length: 100 }, (_, index) => ({
-								...operation,
-								operationId: `revival-refused-${index}`,
-							})),
+		itWithPressureFixture(backend)(
+			`reactivates recovered ${backend} root evidence with maximum options and consumes downstream promises under held pressure with NEW closed`,
+			async () => {
+				const opened = await openLiveAuthority(backend, await pressureRoot(backend));
+				const activation = await activateCapacityRoot(opened.client, `recovered-root-${opened.sessionId}`);
+				const rootBefore = await opened.client.getRoot(activation.root.rootId);
+				const constructionBefore = await opened.client.getConstruction(
+					activation.root.rootId,
+					activation.actor.actorId,
+					1,
+				);
+				const ballast = await exhaustUnpromisedSpace(opened.directory, pressureBudget(backend));
+				await opened.client.close();
+				const fault = faultWorker();
+				const { client } = await reopenFundedOrRefused(
+					backend,
+					opened.directory,
+					opened.sessionId,
+					opened.client.identity,
+					ballast,
+					fault.factory,
+				);
+				expect((await client.recoveryState()).owner.phase).toBe("ready");
+				expect((await client.getGate(activation.root.rootId))?.record.phase).toBe("closed");
+				await fault.arm("admission-gate");
+				const operation = {
+					kind: "operation" as const,
+					at: Date.now(),
+					ownerId: "owner",
+					classOwnerId: "owner",
+					operationId: "recovered-root-new",
+					effectClass: "filesystem" as const,
+					acquiredAt: 1,
+					expiresAt: Number.MAX_SAFE_INTEGER,
+					phase: "intent" as const,
+				};
+				expect(
+					thrownBy(
+						await settle(
+							client.transitionBatch(
+								Array.from({ length: 100 }, (_, index) => ({
+									...operation,
+									operationId: `revival-refused-${index}`,
+								})),
+							),
 						),
 					),
-				),
-			).toThrow();
-			expect(thrownBy(await settle(client.transition(operation)))).toThrow("NEW admission");
-			const revival = {
-				actor: { ...activation.actor, at: Date.now() },
-				construction: constructionBefore!.record,
-				gate: { ...activation.gate, at: Date.now() },
-			};
-			const receipt = await client.activateAuthority(
-				revival,
-				await legalMaximumContinuation(client, "activateAuthority", [revival]),
-			);
-			expect(await client.resolveReceipt(receipt.requestId, receipt.ownerEpoch)).toEqual(receipt);
-			expect(await client.getRoot(activation.root.rootId)).toEqual(rootBefore);
-			expect(await client.getConstruction(activation.root.rootId, activation.actor.actorId, 1)).toEqual(
-				constructionBefore,
-			);
-			expect((await client.getActor(activation.actor.actorId))?.record).toEqual(revival.actor);
-			expect((await client.getGate(activation.root.rootId))?.record).toEqual(revival.gate);
-			await consumeCapacityRootPromises(client, { root: activation.root, actor: revival.actor, gate: revival.gate });
-			expect(thrownBy(await settle(client.transition(operation)))).toThrow("NEW admission");
-		}, 45_000);
-
-		it(`refuses an unfunded admission without a frame or callback and preserves funded ${backend} completion/disposition on its positive budget`, async () => {
-			const { client, directory } = await openLiveAuthority(backend, await pressureRoot(backend, "positive"));
-			const base = {
-				kind: "operation" as const,
-				at: Date.now(),
-				ownerId: "capacity-owner",
-				classOwnerId: "capacity-owner",
-				operationId: "funded",
-				effectClass: "filesystem" as const,
-				acquiredAt: 1,
-				expiresAt: Number.MAX_SAFE_INTEGER,
-				phase: "intent" as const,
-			};
-			const intentReceipt = await client.transition(base);
-			const effect = { ...base, phase: "effect" as const };
-			const effectReceipt = await withAuthorityEffect(client, async () => {
-				const receipt = await client.transition(effect);
-				await fs.writeFile(path.join(directory, "real-effect"), "completed callback");
-				return receipt;
-			});
-			const disposition = { ...base, operationId: "disposition" };
-			const dispositionReceipt = await client.transition(disposition);
-			const resource = {
-				kind: "resource" as const,
-				at: Date.now(),
-				actorId: "resource-actor",
-				generation: 1,
-				resourceId: "funded-resource",
-				resourceClass: "filesystem" as const,
-				operationId: "resource-operation",
-				targetHash: canonicalDurableSha256("funded-resource"),
-				phase: "intent" as const,
-			};
-			const resourceIntentReceipt = await client.transition(
-				resource,
-				await legalMaximumOptions(client, "transition", [resource]),
-			);
-			const resourceEffect = { ...resource, phase: "effect" as const };
-			const resourceEffectReceipt = await withAuthorityEffect(client, async () => {
-				const receipt = await client.transition(
-					resourceEffect,
-					await legalMaximumContinuation(client, "transition", [resourceEffect]),
+				).toThrow();
+				expect(thrownBy(await settle(client.transition(operation)))).toThrow("NEW admission");
+				const revival = {
+					actor: { ...activation.actor, at: Date.now() },
+					construction: constructionBefore!.record,
+					gate: { ...activation.gate, at: Date.now() },
+				};
+				const receipt = await client.activateAuthority(
+					revival,
+					await legalMaximumContinuation(client, "activateAuthority", [revival]),
 				);
-				await fs.writeFile(path.join(directory, "resource-effect"), "resource completed");
-				return receipt;
-			});
-			await exhaustUnpromisedSpace(directory, pressureBudget(backend, "positive"));
-			const before = await readCapacityState(client);
-			let callback = false;
-			const refusedRequestId = `unfunded-${crypto.randomUUID()}`;
-			const unfunded = Array.from({ length: 100 }, (_, index) => ({ ...base, operationId: `unfunded-${index}` }));
-			expect(
-				thrownBy(
-					await settle(
-						withAuthorityEffect(client, async () => {
-							await client.transitionBatch(unfunded, { requestId: refusedRequestId });
-							callback = true;
-							await fs.writeFile(path.join(directory, "forbidden-effect"), "not authorized");
-						}),
-					),
-				),
-			).toThrow();
-			expect(callback).toBe(false);
-			expect(await readCapacityState(client)).toEqual(before);
-			expect(await client.resolveReceipt(refusedRequestId, before.recovery.owner.epoch)).toBeUndefined();
-			expect(await client.getOperation(base.ownerId, base.effectClass, unfunded[0]!.operationId)).toBeUndefined();
-			expect(
-				await client.getOperation(base.ownerId, base.effectClass, unfunded.at(-1)!.operationId),
-			).toBeUndefined();
-			await expect(fs.lstat(path.join(directory, "forbidden-effect"))).rejects.toMatchObject({ code: "ENOENT" });
-			for (const receipt of [
-				intentReceipt,
-				effectReceipt,
-				dispositionReceipt,
-				resourceIntentReceipt,
-				resourceEffectReceipt,
-			]) {
 				expect(await client.resolveReceipt(receipt.requestId, receipt.ownerEpoch)).toEqual(receipt);
-			}
-			const committedOperation = { ...effect, phase: "committed" as const };
-			const committedOperationReceipt = await client.transition(
-				committedOperation,
-				await legalMaximumContinuation(client, "transition", [committedOperation]),
-			);
-			expect(
-				await client.resolveReceipt(committedOperationReceipt.requestId, committedOperationReceipt.ownerEpoch),
-			).toEqual(committedOperationReceipt);
-			expect(await client.getOperation(base.ownerId, base.effectClass, base.operationId)).toEqual({
-				version: 3,
-				record: committedOperation,
-			});
-			const completedOperation = { ...effect, phase: "completed" as const };
-			const completedOperationReceipt = await client.transition(
-				completedOperation,
-				await legalMaximumContinuation(client, "transition", [completedOperation]),
-			);
-			expect(
-				await client.resolveReceipt(completedOperationReceipt.requestId, completedOperationReceipt.ownerEpoch),
-			).toEqual(completedOperationReceipt);
-			const committedResource = { ...resource, phase: "committed" as const };
-			const committedResourceReceipt = await client.transition(
-				committedResource,
-				await legalMaximumContinuation(client, "transition", [committedResource]),
-			);
-			expect(
-				await client.resolveReceipt(committedResourceReceipt.requestId, committedResourceReceipt.ownerEpoch),
-			).toEqual(committedResourceReceipt);
-			expect(await client.getResource(resource.actorId, resource.generation, resource.resourceId)).toEqual({
-				version: 3,
-				record: committedResource,
-			});
-			const completedResource = { ...resource, phase: "completed" as const };
-			const completedResourceReceipt = await client.transition(
-				completedResource,
-				await legalMaximumContinuation(client, "transition", [completedResource]),
-			);
-			expect(
-				await client.resolveReceipt(completedResourceReceipt.requestId, completedResourceReceipt.ownerEpoch),
-			).toEqual(completedResourceReceipt);
-			expect(await client.getResource(resource.actorId, resource.generation, resource.resourceId)).toEqual({
-				version: 4,
-				record: completedResource,
-			});
-			expect(await fs.readFile(path.join(directory, "resource-effect"), "utf8")).toBe("resource completed");
-			const cancelled = { ...disposition, phase: "cancelled" as const };
-			const cancelledReceipt = await client.transition(cancelled);
-			expect(await client.resolveReceipt(cancelledReceipt.requestId, cancelledReceipt.ownerEpoch)).toEqual(
-				cancelledReceipt,
-			);
-			expect(await fs.readFile(path.join(directory, "real-effect"), "utf8")).toBe("completed callback");
-			expect(await client.getOperation(base.ownerId, base.effectClass, base.operationId)).toEqual({
-				version: 4,
-				record: completedOperation,
-			});
-			expect(await client.getOperation(base.ownerId, base.effectClass, disposition.operationId)).toEqual({
-				version: 2,
-				record: cancelled,
-			});
-		}, 45_000);
+				expect(await client.getRoot(activation.root.rootId)).toEqual(rootBefore);
+				expect(await client.getConstruction(activation.root.rootId, activation.actor.actorId, 1)).toEqual(
+					constructionBefore,
+				);
+				expect((await client.getActor(activation.actor.actorId))?.record).toEqual(revival.actor);
+				expect((await client.getGate(activation.root.rootId))?.record).toEqual(revival.gate);
+				await consumeCapacityRootPromises(client, {
+					root: activation.root,
+					actor: revival.actor,
+					gate: revival.gate,
+				});
+				expect(thrownBy(await settle(client.transition(operation)))).toThrow("NEW admission");
+			},
+			45_000,
+		);
+
+		itWithPressureFixture(backend)(
+			`refuses an unfunded admission without a frame or callback and preserves funded ${backend} completion/disposition on its positive budget`,
+			async () => {
+				const { client, directory } = await openLiveAuthority(backend, await pressureRoot(backend, "positive"));
+				const base = {
+					kind: "operation" as const,
+					at: Date.now(),
+					ownerId: "capacity-owner",
+					classOwnerId: "capacity-owner",
+					operationId: "funded",
+					effectClass: "filesystem" as const,
+					acquiredAt: 1,
+					expiresAt: Number.MAX_SAFE_INTEGER,
+					phase: "intent" as const,
+				};
+				const intentReceipt = await client.transition(base);
+				const effect = { ...base, phase: "effect" as const };
+				const effectReceipt = await withAuthorityEffect(client, async () => {
+					const receipt = await client.transition(effect);
+					await fs.writeFile(path.join(directory, "real-effect"), "completed callback");
+					return receipt;
+				});
+				const disposition = { ...base, operationId: "disposition" };
+				const dispositionReceipt = await client.transition(disposition);
+				const resource = {
+					kind: "resource" as const,
+					at: Date.now(),
+					actorId: "resource-actor",
+					generation: 1,
+					resourceId: "funded-resource",
+					resourceClass: "filesystem" as const,
+					operationId: "resource-operation",
+					targetHash: canonicalDurableSha256("funded-resource"),
+					phase: "intent" as const,
+				};
+				const resourceIntentReceipt = await client.transition(
+					resource,
+					await legalMaximumOptions(client, "transition", [resource]),
+				);
+				const resourceEffect = { ...resource, phase: "effect" as const };
+				const resourceEffectReceipt = await withAuthorityEffect(client, async () => {
+					const receipt = await client.transition(
+						resourceEffect,
+						await legalMaximumContinuation(client, "transition", [resourceEffect]),
+					);
+					await fs.writeFile(path.join(directory, "resource-effect"), "resource completed");
+					return receipt;
+				});
+				await exhaustUnpromisedSpace(directory, pressureBudget(backend, "positive"));
+				const before = await readCapacityState(client);
+				let callback = false;
+				const refusedRequestId = `unfunded-${crypto.randomUUID()}`;
+				const unfunded = Array.from({ length: 100 }, (_, index) => ({ ...base, operationId: `unfunded-${index}` }));
+				expect(
+					thrownBy(
+						await settle(
+							withAuthorityEffect(client, async () => {
+								await client.transitionBatch(unfunded, { requestId: refusedRequestId });
+								callback = true;
+								await fs.writeFile(path.join(directory, "forbidden-effect"), "not authorized");
+							}),
+						),
+					),
+				).toThrow();
+				expect(callback).toBe(false);
+				expect(await readCapacityState(client)).toEqual(before);
+				expect(await client.resolveReceipt(refusedRequestId, before.recovery.owner.epoch)).toBeUndefined();
+				expect(await client.getOperation(base.ownerId, base.effectClass, unfunded[0]!.operationId)).toBeUndefined();
+				expect(
+					await client.getOperation(base.ownerId, base.effectClass, unfunded.at(-1)!.operationId),
+				).toBeUndefined();
+				await expect(fs.lstat(path.join(directory, "forbidden-effect"))).rejects.toMatchObject({ code: "ENOENT" });
+				for (const receipt of [
+					intentReceipt,
+					effectReceipt,
+					dispositionReceipt,
+					resourceIntentReceipt,
+					resourceEffectReceipt,
+				]) {
+					expect(await client.resolveReceipt(receipt.requestId, receipt.ownerEpoch)).toEqual(receipt);
+				}
+				const committedOperation = { ...effect, phase: "committed" as const };
+				const committedOperationReceipt = await client.transition(
+					committedOperation,
+					await legalMaximumContinuation(client, "transition", [committedOperation]),
+				);
+				expect(
+					await client.resolveReceipt(committedOperationReceipt.requestId, committedOperationReceipt.ownerEpoch),
+				).toEqual(committedOperationReceipt);
+				expect(await client.getOperation(base.ownerId, base.effectClass, base.operationId)).toEqual({
+					version: 3,
+					record: committedOperation,
+				});
+				const completedOperation = { ...effect, phase: "completed" as const };
+				const completedOperationReceipt = await client.transition(
+					completedOperation,
+					await legalMaximumContinuation(client, "transition", [completedOperation]),
+				);
+				expect(
+					await client.resolveReceipt(completedOperationReceipt.requestId, completedOperationReceipt.ownerEpoch),
+				).toEqual(completedOperationReceipt);
+				const committedResource = { ...resource, phase: "committed" as const };
+				const committedResourceReceipt = await client.transition(
+					committedResource,
+					await legalMaximumContinuation(client, "transition", [committedResource]),
+				);
+				expect(
+					await client.resolveReceipt(committedResourceReceipt.requestId, committedResourceReceipt.ownerEpoch),
+				).toEqual(committedResourceReceipt);
+				expect(await client.getResource(resource.actorId, resource.generation, resource.resourceId)).toEqual({
+					version: 3,
+					record: committedResource,
+				});
+				const completedResource = { ...resource, phase: "completed" as const };
+				const completedResourceReceipt = await client.transition(
+					completedResource,
+					await legalMaximumContinuation(client, "transition", [completedResource]),
+				);
+				expect(
+					await client.resolveReceipt(completedResourceReceipt.requestId, completedResourceReceipt.ownerEpoch),
+				).toEqual(completedResourceReceipt);
+				expect(await client.getResource(resource.actorId, resource.generation, resource.resourceId)).toEqual({
+					version: 4,
+					record: completedResource,
+				});
+				expect(await fs.readFile(path.join(directory, "resource-effect"), "utf8")).toBe("resource completed");
+				const cancelled = { ...disposition, phase: "cancelled" as const };
+				const cancelledReceipt = await client.transition(cancelled);
+				expect(await client.resolveReceipt(cancelledReceipt.requestId, cancelledReceipt.ownerEpoch)).toEqual(
+					cancelledReceipt,
+				);
+				expect(await fs.readFile(path.join(directory, "real-effect"), "utf8")).toBe("completed callback");
+				expect(await client.getOperation(base.ownerId, base.effectClass, base.operationId)).toEqual({
+					version: 4,
+					record: completedOperation,
+				});
+				expect(await client.getOperation(base.ownerId, base.effectClass, disposition.operationId)).toEqual({
+					version: 2,
+					record: cancelled,
+				});
+			},
+			45_000,
+		);
 		for (const mode of ["allocation", "reconciliation"] as const) {
 			it(`preserves funded ${backend} disposition across ${mode} failure and rearms the same owner`, async () => {
 				const fault = faultWorker();

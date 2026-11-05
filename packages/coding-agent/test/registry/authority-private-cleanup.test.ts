@@ -24,6 +24,7 @@ import {
 import { registryDurableStateForSession } from "../../src/registry/authority";
 import { readAuthorityDescriptor } from "../../src/registry/authority/descriptor";
 import type { AuthorityDriverOptions, AuthorityPersistence } from "../../src/registry/authority/types";
+import { tmpdirOnXfs } from "./authority-capacity-host";
 
 const directories: string[] = [];
 const rootId = "019ed676-02fb-7000-8dac-396e2f84d484";
@@ -113,8 +114,10 @@ function useDriver<T>(driver: AuthorityPersistence, run: () => T): T {
 	return result;
 }
 
-function it(name: string, run: () => Promise<void>, timeout?: number): void {
-	bunIt(
+type Register = (name: string, run: () => Promise<void>, timeout?: number) => void;
+
+function it(name: string, run: () => Promise<void>, timeout?: number, register: Register = bunIt): void {
+	register(
 		name,
 		async () => {
 			try {
@@ -126,6 +129,11 @@ function it(name: string, run: () => Promise<void>, timeout?: number): void {
 		},
 		timeout,
 	);
+}
+
+// These cases pin real XFS root flock behaviour under os.tmpdir(); a host whose temp directory is not XFS skips them.
+function itOnXfsTmpdir(name: string, run: () => Promise<void>, timeout?: number): void {
+	it(name, run, timeout, bunIt.skipIf(!tmpdirOnXfs));
 }
 
 // Real migration, inspection and reopen with funded capacity take 3.4-6.7 s on the
@@ -491,7 +499,7 @@ describe("private authority cleanup ownership", () => {
 		expect(order).toEqual(["physical-start", "physical-done", "release-one", "release-two"]);
 		expect(owner.pending).toBe(false);
 	});
-	it("retains real XFS root flock until the same cleanup owner releases it", async () => {
+	itOnXfsTmpdir("retains real XFS root flock until the same cleanup owner releases it", async () => {
 		expect(os.platform()).toBe("linux");
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-authority-flock-cleanup-"));
 		directories.push(directory);
@@ -1096,7 +1104,7 @@ describe("private authority cleanup ownership", () => {
 			expect(actual.frames).toEqual(expectedState.frames);
 		});
 	});
-	it("closes nested header cleanup before releasing the transcript flock", async () => {
+	itOnXfsTmpdir("closes nested header cleanup before releasing the transcript flock", async () => {
 		expect(os.platform()).toBe("linux");
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-authority-nested-cleanup-"));
 		directories.push(directory);
@@ -1197,7 +1205,7 @@ describe("private authority cleanup ownership", () => {
 		await releaseRecovered();
 		releases.delete(releaseRecovered);
 	});
-	it("finishes nested anchor-directory cleanup before releasing outer root locks", async () => {
+	itOnXfsTmpdir("finishes nested anchor-directory cleanup before releasing outer root locks", async () => {
 		expect(os.platform()).toBe("linux");
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-authority-nested-anchor-cleanup-"));
 		directories.push(directory);
@@ -1299,7 +1307,7 @@ describe("private authority cleanup ownership", () => {
 		await releaseRecovered();
 		releases.delete(releaseRecovered);
 	});
-	it("retains partial anchor cleanup and never flocks a reused descriptor", async () => {
+	itOnXfsTmpdir("retains partial anchor cleanup and never flocks a reused descriptor", async () => {
 		expect(os.platform()).toBe("linux");
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-authority-reused-fd-cleanup-"));
 		directories.push(directory);

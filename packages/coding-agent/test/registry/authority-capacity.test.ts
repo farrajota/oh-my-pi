@@ -35,6 +35,10 @@ import {
 import { durableRootHeadHash, type DurableRegistryRecord } from "../../src/registry/durable-state";
 import { AUTHORITY_MAX_CONTINUATION_REQUEST_BYTES } from "../../src/registry/authority/types";
 import type { AuthorityCommand, AuthorityCommitFrame } from "../../src/registry/authority/types";
+import { xfsCapacityHost } from "./authority-capacity-host";
+
+// Cases that fund real XFS capacity under os.tmpdir(); see authority-capacity-host.ts for when a host qualifies.
+const itOnXfs = it.skipIf(!xfsCapacityHost);
 
 const CONTINUATION = AUTHORITY_MAX_CONTINUATION_REQUEST_BYTES;
 const ADMISSION = 2_097_152;
@@ -117,7 +121,7 @@ describe("anonymous authority capacity backing", () => {
 		expect(capacity.identity).toEqual({ fd: capacity.handle.fd, device: stat.dev, inode: stat.ino });
 	});
 });
-it("funds and returns only a verified allocated EOF suffix", async () => {
+itOnXfs("funds and returns only a verified allocated EOF suffix", async () => {
 	const directory = await makeDirectory();
 	const capacity = await openAuthorityCapacityFile(directory);
 	handles.push(capacity.handle);
@@ -246,7 +250,7 @@ describe("authority XFS target capacity envelope", () => {
 });
 
 describe("physical target funding", () => {
-	it("allocates private target coverage without changing EOF or existing bytes", async () => {
+	itOnXfs("allocates private target coverage without changing EOF or existing bytes", async () => {
 		const directory = await makeDirectory();
 		const capacity = await openAuthorityCapacityFile(directory);
 		handles.push(capacity.handle);
@@ -271,7 +275,7 @@ describe("physical target funding", () => {
 		expect(() => fundAuthorityCapacityTarget(target.fd, domain, funded.coveredBytes, funded)).toThrow();
 	});
 
-	it("does not certify a sparse logical prefix or a different allocation domain", async () => {
+	itOnXfs("does not certify a sparse logical prefix or a different allocation domain", async () => {
 		const directory = await makeDirectory();
 		const capacity = await openAuthorityCapacityFile(directory);
 		handles.push(capacity.handle);
@@ -286,7 +290,7 @@ describe("physical target funding", () => {
 		expect((await target.stat()).size).toBe(4_096);
 	});
 
-	it("never credits reflink-shared target extents and unshares them when funding", async () => {
+	itOnXfs("never credits reflink-shared target extents and unshares them when funding", async () => {
 		const directory = await makeDirectory();
 		const capacity = await openAuthorityCapacityFile(directory);
 		handles.push(capacity.handle);
@@ -312,80 +316,83 @@ describe("physical target funding", () => {
 
 for (const backend of ["sqlite", "jsonl"] as const) {
 	for (const errno of [28, 122, 5] as const) {
-		it(`${backend} reopen ${errno === 5 ? "keeps an unproved EIO growth failure uncertain" : `refuses before claim when growth hits errno ${errno}`}`, async () => {
-			const directory = await makeDirectory();
-			const capacity = await openAuthorityCapacityFile(directory);
-			handles.push(capacity.handle);
-			const filename = path.join(directory, `refused.${backend}`);
-			const identity = { backend, owningSessionId: "session", incarnation: "incarnation", format: 2 as const };
-			const options = {
-				path: filename,
-				identity,
-				create: false,
-				capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
-			};
-			const open = (create: boolean, funded = true) => {
-				const selected = funded ? { ...options, create } : { path: filename, identity, create };
-				return backend === "sqlite"
-					? new SqliteAuthorityPersistence(selected)
-					: new JsonlAuthorityPersistence(selected);
-			};
-			const engine = new AuthorityEngine(open(true), "o".repeat(36));
-			engine.recover();
-			engine.close();
-			const snapshot = (): unknown => {
-				const reader = open(false, false);
+		itOnXfs(
+			`${backend} reopen ${errno === 5 ? "keeps an unproved EIO growth failure uncertain" : `refuses before claim when growth hits errno ${errno}`}`,
+			async () => {
+				const directory = await makeDirectory();
+				const capacity = await openAuthorityCapacityFile(directory);
+				handles.push(capacity.handle);
+				const filename = path.join(directory, `refused.${backend}`);
+				const identity = { backend, owningSessionId: "session", incarnation: "incarnation", format: 2 as const };
+				const options = {
+					path: filename,
+					identity,
+					create: false,
+					capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
+				};
+				const open = (create: boolean, funded = true) => {
+					const selected = funded ? { ...options, create } : { path: filename, identity, create };
+					return backend === "sqlite"
+						? new SqliteAuthorityPersistence(selected)
+						: new JsonlAuthorityPersistence(selected);
+				};
+				const engine = new AuthorityEngine(open(true), "o".repeat(36));
+				engine.recover();
+				engine.close();
+				const snapshot = (): unknown => {
+					const reader = open(false, false);
+					try {
+						return reader.exportState();
+					} finally {
+						reader.close();
+					}
+				};
+				const before = snapshot();
+				// A reopening process starts from an empty reserve; drop any arena slack the first owner left.
+				const drained = BorrowedAuthorityCapacityPool.open(capacity.identity);
+				drained.releaseDataBytes(drained.inspect().dataBytes);
+				const exhausted = Object.assign(new Error(`fallocate(mode 0) failed with Linux errno ${errno}`), {
+					errno: -errno,
+					code: `ERRNO_${errno}`,
+				});
+				const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(() => {
+					throw new AuthorityCapacityPoolError(
+						"Capacity growth may have partially changed the inode; reconcile before credit",
+						"uncertain",
+						undefined,
+						exhausted,
+					);
+				});
+				let refusal: unknown;
 				try {
-					return reader.exportState();
+					try {
+						new AuthorityEngine(open(false), "o".repeat(36)).recover();
+					} catch (error) {
+						refusal = error;
+					}
+					expect(growth).toHaveBeenCalled();
 				} finally {
-					reader.close();
+					growth.mockRestore();
 				}
-			};
-			const before = snapshot();
-			// A reopening process starts from an empty reserve; drop any arena slack the first owner left.
-			const drained = BorrowedAuthorityCapacityPool.open(capacity.identity);
-			drained.releaseDataBytes(drained.inspect().dataBytes);
-			const exhausted = Object.assign(new Error(`fallocate(mode 0) failed with Linux errno ${errno}`), {
-				errno: -errno,
-				code: `ERRNO_${errno}`,
-			});
-			const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(() => {
-				throw new AuthorityCapacityPoolError(
-					"Capacity growth may have partially changed the inode; reconcile before credit",
-					"uncertain",
-					undefined,
-					exhausted,
-				);
-			});
-			let refusal: unknown;
-			try {
+				if (errno === 5) {
+					expect(refusal).toBeInstanceOf(AuthorityCapacityPoolError);
+					expect(refusal).not.toBeInstanceOf(AuthorityCapacityRefusedError);
+				} else {
+					expect(refusal).toBeInstanceOf(AuthorityCapacityRefusedError);
+					expect((refusal as Error).cause).toBeInstanceOf(AuthorityCapacityPoolError);
+				}
+				expect(snapshot()).toEqual(before);
+				const reopened = new AuthorityEngine(open(false), "o".repeat(36));
 				try {
-					new AuthorityEngine(open(false), "o".repeat(36)).recover();
-				} catch (error) {
-					refusal = error;
+					expect(reopened.recover().owner.phase).toBe("ready");
+				} finally {
+					reopened.close();
 				}
-				expect(growth).toHaveBeenCalled();
-			} finally {
-				growth.mockRestore();
-			}
-			if (errno === 5) {
-				expect(refusal).toBeInstanceOf(AuthorityCapacityPoolError);
-				expect(refusal).not.toBeInstanceOf(AuthorityCapacityRefusedError);
-			} else {
-				expect(refusal).toBeInstanceOf(AuthorityCapacityRefusedError);
-				expect((refusal as Error).cause).toBeInstanceOf(AuthorityCapacityPoolError);
-			}
-			expect(snapshot()).toEqual(before);
-			const reopened = new AuthorityEngine(open(false), "o".repeat(36));
-			try {
-				expect(reopened.recover().owner.phase).toBe("ready");
-			} finally {
-				reopened.close();
-			}
-		});
+			},
+		);
 	}
 
-	it(`${backend} owner reopens and continues its store after a reflink copy of it`, async () => {
+	itOnXfs(`${backend} owner reopens and continues its store after a reflink copy of it`, async () => {
 		const directory = await makeDirectory();
 		const capacity = await openAuthorityCapacityFile(directory);
 		handles.push(capacity.handle);
@@ -714,7 +721,7 @@ it("reserves separate public options for root retirement and later revival", () 
 	}
 });
 
-it("allows an already funded CAS and pre-CAS recovery when NEW reconciliation fails", async () => {
+itOnXfs("allows an already funded CAS and pre-CAS recovery when NEW reconciliation fails", async () => {
 	const hash = "1".repeat(64);
 	for (const recovery of [false, true]) {
 		const directory = await makeDirectory();
@@ -831,7 +838,7 @@ function admissionFrame(
 	};
 }
 
-it("requires NEW reconciliation for first quiescing and closed-to-quiescing gates", async () => {
+itOnXfs("requires NEW reconciliation for first quiescing and closed-to-quiescing gates", async () => {
 	for (const previous of [undefined, "closed", "open"] as const) {
 		const directory = await makeDirectory();
 		const capacity = await openAuthorityCapacityFile(directory);
@@ -876,7 +883,7 @@ it("requires NEW reconciliation for first quiescing and closed-to-quiescing gate
 	}
 });
 
-it("consumes a funded recovering-ready-close episode without any reserve growth", async () => {
+itOnXfs("consumes a funded recovering-ready-close episode without any reserve growth", async () => {
 	const directory = await makeDirectory();
 	const capacity = await openAuthorityCapacityFile(directory);
 	handles.push(capacity.handle);
@@ -1060,32 +1067,313 @@ for (const { backend, budget, recovery, activationOnly } of [
 	{ backend: "jsonl", budget: 134_217_728, recovery: false, activationOnly: true },
 	{ backend: "jsonl", budget: 1_048_576, recovery: false, activationOnly: false },
 ] as const) {
-	it(`${backend} funds actual ${activationOnly ? "activation" : recovery ? "recovery" : "CAS"} or refuses before ACK inside ${budget} physical bytes`, async () => {
+	itOnXfs(
+		`${backend} funds actual ${activationOnly ? "activation" : recovery ? "recovery" : "CAS"} or refuses before ACK inside ${budget} physical bytes`,
+		async () => {
+			const directory = await makeDirectory();
+			const filename = path.join(directory, `coexist.${backend}`);
+			const capacity = await openAuthorityCapacityFile(directory);
+			handles.push(capacity.handle);
+			const original = BorrowedAuthorityCapacityPool.prototype.ensureDataBytes;
+			const boundedGrowth = function (
+				this: BorrowedAuthorityCapacityPool,
+				bytes: number,
+			): ReturnType<BorrowedAuthorityCapacityPool["ensureDataBytes"]> {
+				let targetBytes = 0;
+				for (const suffix of ["", "-wal", "-shm"]) {
+					try {
+						const data = syncFs.statSync(filename + suffix).blocks * 512;
+						if (data)
+							targetBytes += xfsTargetEnvelope({ databaseBytes: data, walBytes: 0, shmBytes: 0 }).totalBytes;
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					}
+				}
+				const pool = xfsTargetEnvelope({ databaseBytes: bytes, walBytes: 0, shmBytes: 0 });
+				if (targetBytes + pool.totalBytes > budget) throw new Error("complete physical coexistence exceeds budget");
+				return original.call(this, bytes);
+			};
+			const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(
+				boundedGrowth,
+			);
+			const captured: { connection?: Database } = {};
+			const fileControl = Database.prototype.fileControl;
+			const captureFileControl: Database["fileControl"] = function (
+				this: Database,
+				databaseOrOpcode: string | number,
+				opcodeOrArgument?: number | ArrayBufferView,
+				argument?: number | ArrayBufferView,
+			): number {
+				captured.connection = this;
+				const native = fileControl.bind(this);
+				if (typeof databaseOrOpcode === "number") return native(databaseOrOpcode, opcodeOrArgument);
+				if (typeof opcodeOrArgument !== "number")
+					throw new TypeError("Named SQLite file control requires a numeric opcode");
+				return native(databaseOrOpcode, opcodeOrArgument, argument);
+			};
+			const capture =
+				backend === "sqlite"
+					? spyOn(Database.prototype, "fileControl").mockImplementation(captureFileControl)
+					: undefined;
+			const assertRetainedArena = (): void => {
+				if (backend !== "sqlite" || !activationOnly) return;
+				if (!captured.connection) throw new Error("SQLite arena regression did not capture the actual connection");
+				assertSqliteArena(filename, capacity.identity, captured.connection);
+			};
+			let driver: SqliteAuthorityPersistence | JsonlAuthorityPersistence | undefined;
+			try {
+				const identity = { backend, owningSessionId: "session", incarnation: "incarnation", format: 2 as const };
+				const Persistence = backend === "sqlite" ? SqliteAuthorityPersistence : JsonlAuthorityPersistence;
+				driver = new Persistence({
+					path: filename,
+					identity,
+					create: true,
+					capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
+				});
+				const engine = new AuthorityEngine(driver, "o".repeat(36));
+				expect(engine.recover().owner.phase).toBe("ready");
+				const hash = "1".repeat(64);
+				const rootHash = durableRootHeadHash({
+					rootId: "r",
+					generation: 1,
+					actorId: "r",
+					startupHash: hash,
+					provenanceHash: hash,
+				});
+				const nextHash = durableRootHeadHash({
+					rootId: "r",
+					generation: 2,
+					actorId: "r",
+					startupHash: hash,
+					provenanceHash: hash,
+				});
+				const construction = {
+					kind: "construction",
+					at: 1,
+					rootId: "r",
+					actorId: "r",
+					generation: 1,
+					startupHash: hash,
+					provenanceHash: hash,
+					phase: "reserved",
+				} satisfies DurableRegistryRecord;
+				if (backend === "jsonl" && budget === 1_048_576) {
+					expect(() => engine.transition(construction)).toThrow("complete physical coexistence exceeds budget");
+					expect(engine.getConstruction("r", "r", 1)).toBeUndefined();
+					growth.mockClear();
+					growth.mockImplementation(() => {
+						throw new Error("no fresh capacity after refused NEW admission");
+					});
+					engine.close();
+					expect(growth).not.toHaveBeenCalled();
+					driver = undefined;
+					return;
+				}
+				engine.transition(construction);
+				if (activationOnly) {
+					growth.mockClear();
+					growth.mockImplementation(() => {
+						throw new Error("no fresh capacity after construction reservation");
+					});
+				}
+				const constructing = { ...construction, phase: "constructing" } satisfies DurableRegistryRecord;
+				if (activationOnly)
+					refuseOversizedThenContinue(
+						engine,
+						"constructing",
+						{ kind: "transition", record: constructing },
+						options => engine.transition(constructing, options),
+					);
+				else engine.transition(constructing);
+				assertRetainedArena();
+				const constructed = { ...construction, phase: "constructed" } satisfies DurableRegistryRecord;
+				if (activationOnly)
+					refuseOversizedThenContinue(
+						engine,
+						"constructed",
+						{ kind: "transition", record: constructed },
+						options => engine.transition(constructed, options),
+					);
+				else engine.transition(constructed);
+				assertRetainedArena();
+				const activation = {
+					construction: { ...construction, phase: "activated" as const },
+					root: {
+						kind: "root" as const,
+						at: 1,
+						rootId: "r",
+						generation: 1,
+						headHash: rootHash,
+						state: "active" as const,
+					},
+					actor: {
+						kind: "actor" as const,
+						at: 1,
+						actorId: "r",
+						rootId: "r",
+						generation: 1,
+						rootGeneration: 1,
+						rootHeadHash: rootHash,
+						startupHash: hash,
+						provenanceHash: hash,
+						state: "active" as const,
+					},
+					gate: { kind: "gate" as const, at: 1, rootId: "r", generation: 1, phase: "open" as const },
+				};
+				if (activationOnly)
+					refuseOversizedThenContinue(engine, "activation", { kind: "activate-authority", activation }, options =>
+						engine.activateAuthority(activation, options),
+					);
+				else engine.activateAuthority(activation);
+				assertRetainedArena();
+				if (activationOnly) {
+					expect(engine.getActor("r")?.record.state).toBe("active");
+					engine.close();
+					expect(growth).not.toHaveBeenCalled();
+					if (backend === "sqlite") {
+						// Reopen funds its own owner and root-recovery episode: it may grow within the
+						// budget, or refuse before claiming the store.
+						growth.mockImplementation(boundedGrowth);
+						const reopenOptions = {
+							path: filename,
+							create: false,
+							identity: { backend, owningSessionId: "session", incarnation: "incarnation", format: 2 as const },
+						};
+						let refusal: unknown;
+						let reopened: AuthorityEngine | undefined;
+						try {
+							driver = new SqliteAuthorityPersistence({
+								...reopenOptions,
+								capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
+							});
+							reopened = new AuthorityEngine(driver, "o".repeat(36));
+							expect(reopened.recover().owner.phase).toBe("ready");
+						} catch (error) {
+							refusal = error;
+						}
+						if (refusal !== undefined) {
+							expect(String(refusal)).toContain("complete physical coexistence exceeds budget");
+							driver?.close();
+							const unclaimed = new SqliteAuthorityPersistence(reopenOptions);
+							try {
+								expect(unclaimed.getControl("owner")).toMatchObject({ phase: "closed" });
+								expect(unclaimed.get("actor", ["r"])?.record.state).toBe("active");
+							} finally {
+								unclaimed.close();
+							}
+						} else {
+							growth.mockClear();
+							growth.mockImplementation(() => {
+								throw new Error("no fresh capacity after funded reopen");
+							});
+							expect(reopened!.getActor("r")?.record.state).toBe("active");
+							assertRetainedArena();
+							reopened!.close();
+							expect(growth).not.toHaveBeenCalled();
+						}
+					}
+					driver = undefined;
+					return;
+				}
+				engine.transition({ kind: "gate", at: 2, rootId: "r", generation: 1, phase: "quiescing" });
+				engine.transition({ kind: "gate", at: 3, rootId: "r", generation: 1, phase: "quiesced" });
+				const transition = {
+					kind: "transition",
+					at: 3,
+					rootId: "r",
+					transitionId: "t",
+					sourceGeneration: 1,
+					destinationGeneration: 2,
+					sourceHeadHash: rootHash,
+					destinationHeadHash: nextHash,
+					phase: "staged",
+				} satisfies DurableRegistryRecord;
+				engine.transition(transition);
+				const inspect = BorrowedAuthorityCapacityPool.open(capacity.identity);
+				expect(inspect.inspect().dataBytes).toBeGreaterThan(0);
+				growth.mockClear();
+				growth.mockImplementation(() => {
+					throw new Error("no fresh capacity after staged admission");
+				});
+				const step = (prefix: string, record: DurableRegistryRecord): void => {
+					refuseOversizedThenContinue(engine, prefix, { kind: "transition", record }, options =>
+						engine.transition(record, options),
+					);
+				};
+				for (const phase of ["quiescing", "quiesced", "validated"] as const) step(phase, { ...transition, phase });
+				if (recovery) {
+					const source = engine.getRoot("r");
+					if (!source) throw new Error("Recovery fixture lost its source root");
+					const recovered = {
+						transition: { ...transition, phase: "recovered" as const, recovery: true as const },
+						expectedRootGeneration: 1,
+						expectedRootHeadHash: rootHash,
+						root: source.record,
+						gate: { kind: "gate" as const, at: 4, rootId: "r", generation: 1, phase: "open" as const },
+					};
+					refuseOversizedThenContinue(
+						engine,
+						"recovery",
+						{ kind: "commit-root-transition", transition: recovered },
+						options => engine.commitRootTransition(recovered, options),
+					);
+					for (const phase of ["quiescing", "quiesced", "closed"] as const)
+						step(`recovery-gate-${phase}`, { kind: "gate", at: 5, rootId: "r", generation: 1, phase });
+					expect(engine.getTransition("r", "t")?.record.phase).toBe("recovered");
+					engine.close();
+					expect(growth).not.toHaveBeenCalled();
+					driver = undefined;
+					return;
+				}
+				const cas = {
+					transition: { ...transition, phase: "cas-committed" as const },
+					expectedRootGeneration: 1,
+					expectedRootHeadHash: rootHash,
+					root: {
+						kind: "root" as const,
+						at: 4,
+						rootId: "r",
+						generation: 2,
+						headHash: nextHash,
+						state: "active" as const,
+					},
+					gate: { kind: "gate" as const, at: 4, rootId: "r", generation: 1, phase: "closed" as const },
+				};
+				refuseOversizedThenContinue(engine, "cas", { kind: "commit-root-transition", transition: cas }, options =>
+					engine.commitRootTransition(cas, options),
+				);
+				for (const phase of ["activated", "retired"] as const) step(phase, { ...transition, phase });
+				expect(engine.getTransition("r", "t")?.record.phase).toBe("retired");
+				engine.close();
+				expect(growth).not.toHaveBeenCalled();
+				growth.mockImplementation(boundedGrowth);
+				const options = {
+					path: filename,
+					create: false,
+					identity: { backend, owningSessionId: "session", incarnation: "incarnation", format: 2 as const },
+					capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
+				};
+				driver =
+					backend === "sqlite" ? new SqliteAuthorityPersistence(options) : new JsonlAuthorityPersistence(options);
+				expect(driver.get("root", ["r"])?.record.generation).toBe(2);
+				driver.close();
+				driver = undefined;
+			} finally {
+				growth.mockRestore();
+				driver?.close();
+				capture?.mockRestore();
+			}
+		},
+	);
+}
+
+itOnXfs(
+	"keeps known SQLite COMMIT successful and retries a failed reset before the next transaction, so the funded continuation is admitted",
+	async () => {
 		const directory = await makeDirectory();
-		const filename = path.join(directory, `coexist.${backend}`);
+		const filename = path.join(directory, "reset.sqlite");
 		const capacity = await openAuthorityCapacityFile(directory);
 		handles.push(capacity.handle);
-		const original = BorrowedAuthorityCapacityPool.prototype.ensureDataBytes;
-		const boundedGrowth = function (
-			this: BorrowedAuthorityCapacityPool,
-			bytes: number,
-		): ReturnType<BorrowedAuthorityCapacityPool["ensureDataBytes"]> {
-			let targetBytes = 0;
-			for (const suffix of ["", "-wal", "-shm"]) {
-				try {
-					const data = syncFs.statSync(filename + suffix).blocks * 512;
-					if (data) targetBytes += xfsTargetEnvelope({ databaseBytes: data, walBytes: 0, shmBytes: 0 }).totalBytes;
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				}
-			}
-			const pool = xfsTargetEnvelope({ databaseBytes: bytes, walBytes: 0, shmBytes: 0 });
-			if (targetBytes + pool.totalBytes > budget) throw new Error("complete physical coexistence exceeds budget");
-			return original.call(this, bytes);
-		};
-		const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(
-			boundedGrowth,
-		);
 		const captured: { connection?: Database } = {};
 		const fileControl = Database.prototype.fileControl;
 		const captureFileControl: Database["fileControl"] = function (
@@ -1101,358 +1389,90 @@ for (const { backend, budget, recovery, activationOnly } of [
 				throw new TypeError("Named SQLite file control requires a numeric opcode");
 			return native(databaseOrOpcode, opcodeOrArgument, argument);
 		};
-		const capture =
-			backend === "sqlite"
-				? spyOn(Database.prototype, "fileControl").mockImplementation(captureFileControl)
-				: undefined;
-		const assertRetainedArena = (): void => {
-			if (backend !== "sqlite" || !activationOnly) return;
-			if (!captured.connection) throw new Error("SQLite arena regression did not capture the actual connection");
-			assertSqliteArena(filename, capacity.identity, captured.connection);
-		};
-		let driver: SqliteAuthorityPersistence | JsonlAuthorityPersistence | undefined;
+		const capture = spyOn(Database.prototype, "fileControl").mockImplementation(captureFileControl);
+		let driver: SqliteAuthorityPersistence;
 		try {
-			const identity = { backend, owningSessionId: "session", incarnation: "incarnation", format: 2 as const };
-			const Persistence = backend === "sqlite" ? SqliteAuthorityPersistence : JsonlAuthorityPersistence;
-			driver = new Persistence({
+			driver = new SqliteAuthorityPersistence({
 				path: filename,
-				identity,
 				create: true,
+				identity: { backend: "sqlite", owningSessionId: "session", incarnation: "incarnation", format: 2 },
 				capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
 			});
-			const engine = new AuthorityEngine(driver, "o".repeat(36));
-			expect(engine.recover().owner.phase).toBe("ready");
-			const hash = "1".repeat(64);
-			const rootHash = durableRootHeadHash({
-				rootId: "r",
-				generation: 1,
-				actorId: "r",
-				startupHash: hash,
-				provenanceHash: hash,
-			});
-			const nextHash = durableRootHeadHash({
-				rootId: "r",
-				generation: 2,
-				actorId: "r",
-				startupHash: hash,
-				provenanceHash: hash,
-			});
-			const construction = {
-				kind: "construction",
-				at: 1,
-				rootId: "r",
-				actorId: "r",
-				generation: 1,
-				startupHash: hash,
-				provenanceHash: hash,
-				phase: "reserved",
-			} satisfies DurableRegistryRecord;
-			if (backend === "jsonl" && budget === 1_048_576) {
-				expect(() => engine.transition(construction)).toThrow("complete physical coexistence exceeds budget");
-				expect(engine.getConstruction("r", "r", 1)).toBeUndefined();
-				growth.mockClear();
-				growth.mockImplementation(() => {
-					throw new Error("no fresh capacity after refused NEW admission");
-				});
-				engine.close();
-				expect(growth).not.toHaveBeenCalled();
-				driver = undefined;
-				return;
-			}
-			engine.transition(construction);
-			if (activationOnly) {
-				growth.mockClear();
-				growth.mockImplementation(() => {
-					throw new Error("no fresh capacity after construction reservation");
-				});
-			}
-			const constructing = { ...construction, phase: "constructing" } satisfies DurableRegistryRecord;
-			if (activationOnly)
-				refuseOversizedThenContinue(engine, "constructing", { kind: "transition", record: constructing }, options =>
-					engine.transition(constructing, options),
-				);
-			else engine.transition(constructing);
-			assertRetainedArena();
-			const constructed = { ...construction, phase: "constructed" } satisfies DurableRegistryRecord;
-			if (activationOnly)
-				refuseOversizedThenContinue(engine, "constructed", { kind: "transition", record: constructed }, options =>
-					engine.transition(constructed, options),
-				);
-			else engine.transition(constructed);
-			assertRetainedArena();
-			const activation = {
-				construction: { ...construction, phase: "activated" as const },
-				root: {
-					kind: "root" as const,
-					at: 1,
-					rootId: "r",
-					generation: 1,
-					headHash: rootHash,
-					state: "active" as const,
-				},
-				actor: {
-					kind: "actor" as const,
-					at: 1,
-					actorId: "r",
-					rootId: "r",
-					generation: 1,
-					rootGeneration: 1,
-					rootHeadHash: rootHash,
-					startupHash: hash,
-					provenanceHash: hash,
-					state: "active" as const,
-				},
-				gate: { kind: "gate" as const, at: 1, rootId: "r", generation: 1, phase: "open" as const },
+		} finally {
+			capture.mockRestore();
+		}
+		const engine = new AuthorityEngine(driver, "o".repeat(36));
+		engine.recover();
+		const connection = captured.connection;
+		if (!connection) {
+			engine.close();
+			throw new Error("Reset regression did not capture the actual connection");
+		}
+		const resetFailure = new Error("injected checkpoint I/O failure");
+		// Bun's per-connection statement cache holds 20 entries, so the checkpoint statement
+		// is evicted between commits; inject at query() to reach the live WAL reconciliation
+		// (the NOOP frame read or the RESTART reset that follows every COMMIT).
+		const query = connection.query;
+		let injected = false;
+		const checkpointsAfterFailure: { sql: string; inTransaction: boolean }[] = [];
+		const checkpoint = spyOn(connection, "query").mockImplementation(function (this: Database, sql: string) {
+			const statement = query.call(this, sql);
+			if (sql.startsWith("PRAGMA wal_checkpoint(") && injected)
+				checkpointsAfterFailure.push({ sql, inTransaction: this.inTransaction });
+			if (!sql.startsWith("PRAGMA wal_checkpoint(") || injected) return statement;
+			injected = true;
+			const get = statement.get;
+			statement.get = () => {
+				statement.get = get;
+				throw resetFailure;
 			};
-			if (activationOnly)
-				refuseOversizedThenContinue(engine, "activation", { kind: "activate-authority", activation }, options =>
-					engine.activateAuthority(activation, options),
-				);
-			else engine.activateAuthority(activation);
-			assertRetainedArena();
-			if (activationOnly) {
-				expect(engine.getActor("r")?.record.state).toBe("active");
-				engine.close();
-				expect(growth).not.toHaveBeenCalled();
-				if (backend === "sqlite") {
-					// Reopen funds its own owner and root-recovery episode: it may grow within the
-					// budget, or refuse before claiming the store.
-					growth.mockImplementation(boundedGrowth);
-					const reopenOptions = {
-						path: filename,
-						create: false,
-						identity: { backend, owningSessionId: "session", incarnation: "incarnation", format: 2 as const },
-					};
-					let refusal: unknown;
-					let reopened: AuthorityEngine | undefined;
-					try {
-						driver = new SqliteAuthorityPersistence({
-							...reopenOptions,
-							capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
-						});
-						reopened = new AuthorityEngine(driver, "o".repeat(36));
-						expect(reopened.recover().owner.phase).toBe("ready");
-					} catch (error) {
-						refusal = error;
-					}
-					if (refusal !== undefined) {
-						expect(String(refusal)).toContain("complete physical coexistence exceeds budget");
-						driver?.close();
-						const unclaimed = new SqliteAuthorityPersistence(reopenOptions);
-						try {
-							expect(unclaimed.getControl("owner")).toMatchObject({ phase: "closed" });
-							expect(unclaimed.get("actor", ["r"])?.record.state).toBe("active");
-						} finally {
-							unclaimed.close();
-						}
-					} else {
-						growth.mockClear();
-						growth.mockImplementation(() => {
-							throw new Error("no fresh capacity after funded reopen");
-						});
-						expect(reopened!.getActor("r")?.record.state).toBe("active");
-						assertRetainedArena();
-						reopened!.close();
-						expect(growth).not.toHaveBeenCalled();
-					}
-				}
-				driver = undefined;
-				return;
-			}
-			engine.transition({ kind: "gate", at: 2, rootId: "r", generation: 1, phase: "quiescing" });
-			engine.transition({ kind: "gate", at: 3, rootId: "r", generation: 1, phase: "quiesced" });
-			const transition = {
-				kind: "transition",
-				at: 3,
-				rootId: "r",
-				transitionId: "t",
-				sourceGeneration: 1,
-				destinationGeneration: 2,
-				sourceHeadHash: rootHash,
-				destinationHeadHash: nextHash,
-				phase: "staged",
-			} satisfies DurableRegistryRecord;
-			engine.transition(transition);
-			const inspect = BorrowedAuthorityCapacityPool.open(capacity.identity);
-			expect(inspect.inspect().dataBytes).toBeGreaterThan(0);
-			growth.mockClear();
-			growth.mockImplementation(() => {
-				throw new Error("no fresh capacity after staged admission");
+			return statement;
+		} as Database["query"]);
+		const hash = "1".repeat(64);
+		const record = {
+			kind: "construction",
+			at: 1,
+			rootId: "r",
+			actorId: "r",
+			generation: 1,
+			startupHash: hash,
+			provenanceHash: hash,
+			phase: "reserved",
+		} satisfies DurableRegistryRecord;
+		let restoreGrowth: (() => void) | undefined;
+		try {
+			const forwardFileControl: Database["fileControl"] = captureFileControl.bind(connection);
+			const numericLock = new Int32Array([-1, 0]);
+			const namedLock = new Int32Array([-1, 0]);
+			expect(forwardFileControl(constants.SQLITE_FCNTL_LOCKSTATE, numericLock)).toBe(0);
+			expect(forwardFileControl("main", constants.SQLITE_FCNTL_LOCKSTATE, namedLock)).toBe(0);
+			expect(numericLock[0]).toBe(4);
+			expect(namedLock[0]).toBe(4);
+			const receipt = engine.transition(record, { requestId: "known-commit" });
+			expect(engine.resolveReceipt("known-commit")?.revision).toBe(receipt.revision);
+			expect(engine.getConstruction("r", "r", 1)?.record.phase).toBe("reserved");
+			const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(() => {
+				throw new Error("no fresh capacity after known commit");
 			});
-			const step = (prefix: string, record: DurableRegistryRecord): void => {
-				refuseOversizedThenContinue(engine, prefix, { kind: "transition", record }, options =>
-					engine.transition(record, options),
-				);
-			};
-			for (const phase of ["quiescing", "quiesced", "validated"] as const) step(phase, { ...transition, phase });
-			if (recovery) {
-				const source = engine.getRoot("r");
-				if (!source) throw new Error("Recovery fixture lost its source root");
-				const recovered = {
-					transition: { ...transition, phase: "recovered" as const, recovery: true as const },
-					expectedRootGeneration: 1,
-					expectedRootHeadHash: rootHash,
-					root: source.record,
-					gate: { kind: "gate" as const, at: 4, rootId: "r", generation: 1, phase: "open" as const },
-				};
-				refuseOversizedThenContinue(
-					engine,
-					"recovery",
-					{ kind: "commit-root-transition", transition: recovered },
-					options => engine.commitRootTransition(recovered, options),
-				);
-				for (const phase of ["quiescing", "quiesced", "closed"] as const)
-					step(`recovery-gate-${phase}`, { kind: "gate", at: 5, rootId: "r", generation: 1, phase });
-				expect(engine.getTransition("r", "t")?.record.phase).toBe("recovered");
-				engine.close();
-				expect(growth).not.toHaveBeenCalled();
-				driver = undefined;
-				return;
-			}
-			const cas = {
-				transition: { ...transition, phase: "cas-committed" as const },
-				expectedRootGeneration: 1,
-				expectedRootHeadHash: rootHash,
-				root: {
-					kind: "root" as const,
-					at: 4,
-					rootId: "r",
-					generation: 2,
-					headHash: nextHash,
-					state: "active" as const,
-				},
-				gate: { kind: "gate" as const, at: 4, rootId: "r", generation: 1, phase: "closed" as const },
-			};
-			refuseOversizedThenContinue(engine, "cas", { kind: "commit-root-transition", transition: cas }, options =>
-				engine.commitRootTransition(cas, options),
-			);
-			for (const phase of ["activated", "retired"] as const) step(phase, { ...transition, phase });
-			expect(engine.getTransition("r", "t")?.record.phase).toBe("retired");
+			restoreGrowth = () => growth.mockRestore();
+			const next = { ...record, phase: "constructing" } satisfies DurableRegistryRecord;
+			// The failed reset is retried (forced RESTART) before BEGIN, outside any transaction, so the
+			// continuation is admitted on its first attempt instead of being refused once.
+			expect(() => engine.transition(next, { requestId: "funded-continuation" })).not.toThrow();
+			expect(checkpointsAfterFailure[0]).toEqual({ sql: "PRAGMA wal_checkpoint(RESTART)", inTransaction: false });
+			expect(engine.getConstruction("r", "r", 1)?.record.phase).toBe("constructing");
+			expect(engine.resolveReceipt("funded-continuation")?.revision).toBe(receipt.revision + 1);
 			engine.close();
 			expect(growth).not.toHaveBeenCalled();
-			growth.mockImplementation(boundedGrowth);
-			const options = {
-				path: filename,
-				create: false,
-				identity: { backend, owningSessionId: "session", incarnation: "incarnation", format: 2 as const },
-				capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
-			};
-			driver =
-				backend === "sqlite" ? new SqliteAuthorityPersistence(options) : new JsonlAuthorityPersistence(options);
-			expect(driver.get("root", ["r"])?.record.generation).toBe(2);
-			driver.close();
-			driver = undefined;
 		} finally {
-			growth.mockRestore();
-			driver?.close();
-			capture?.mockRestore();
+			restoreGrowth?.();
+			checkpoint.mockRestore();
+			engine.close();
 		}
-	});
-}
+	},
+);
 
-it("keeps known SQLite COMMIT successful and retries a failed reset before the next transaction, so the funded continuation is admitted", async () => {
-	const directory = await makeDirectory();
-	const filename = path.join(directory, "reset.sqlite");
-	const capacity = await openAuthorityCapacityFile(directory);
-	handles.push(capacity.handle);
-	const captured: { connection?: Database } = {};
-	const fileControl = Database.prototype.fileControl;
-	const captureFileControl: Database["fileControl"] = function (
-		this: Database,
-		databaseOrOpcode: string | number,
-		opcodeOrArgument?: number | ArrayBufferView,
-		argument?: number | ArrayBufferView,
-	): number {
-		captured.connection = this;
-		const native = fileControl.bind(this);
-		if (typeof databaseOrOpcode === "number") return native(databaseOrOpcode, opcodeOrArgument);
-		if (typeof opcodeOrArgument !== "number")
-			throw new TypeError("Named SQLite file control requires a numeric opcode");
-		return native(databaseOrOpcode, opcodeOrArgument, argument);
-	};
-	const capture = spyOn(Database.prototype, "fileControl").mockImplementation(captureFileControl);
-	let driver: SqliteAuthorityPersistence;
-	try {
-		driver = new SqliteAuthorityPersistence({
-			path: filename,
-			create: true,
-			identity: { backend: "sqlite", owningSessionId: "session", incarnation: "incarnation", format: 2 },
-			capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
-		});
-	} finally {
-		capture.mockRestore();
-	}
-	const engine = new AuthorityEngine(driver, "o".repeat(36));
-	engine.recover();
-	const connection = captured.connection;
-	if (!connection) {
-		engine.close();
-		throw new Error("Reset regression did not capture the actual connection");
-	}
-	const resetFailure = new Error("injected checkpoint I/O failure");
-	// Bun's per-connection statement cache holds 20 entries, so the checkpoint statement
-	// is evicted between commits; inject at query() to reach the live WAL reconciliation
-	// (the NOOP frame read or the RESTART reset that follows every COMMIT).
-	const query = connection.query;
-	let injected = false;
-	const checkpointsAfterFailure: { sql: string; inTransaction: boolean }[] = [];
-	const checkpoint = spyOn(connection, "query").mockImplementation(function (this: Database, sql: string) {
-		const statement = query.call(this, sql);
-		if (sql.startsWith("PRAGMA wal_checkpoint(") && injected)
-			checkpointsAfterFailure.push({ sql, inTransaction: this.inTransaction });
-		if (!sql.startsWith("PRAGMA wal_checkpoint(") || injected) return statement;
-		injected = true;
-		const get = statement.get;
-		statement.get = () => {
-			statement.get = get;
-			throw resetFailure;
-		};
-		return statement;
-	} as Database["query"]);
-	const hash = "1".repeat(64);
-	const record = {
-		kind: "construction",
-		at: 1,
-		rootId: "r",
-		actorId: "r",
-		generation: 1,
-		startupHash: hash,
-		provenanceHash: hash,
-		phase: "reserved",
-	} satisfies DurableRegistryRecord;
-	let restoreGrowth: (() => void) | undefined;
-	try {
-		const forwardFileControl: Database["fileControl"] = captureFileControl.bind(connection);
-		const numericLock = new Int32Array([-1, 0]);
-		const namedLock = new Int32Array([-1, 0]);
-		expect(forwardFileControl(constants.SQLITE_FCNTL_LOCKSTATE, numericLock)).toBe(0);
-		expect(forwardFileControl("main", constants.SQLITE_FCNTL_LOCKSTATE, namedLock)).toBe(0);
-		expect(numericLock[0]).toBe(4);
-		expect(namedLock[0]).toBe(4);
-		const receipt = engine.transition(record, { requestId: "known-commit" });
-		expect(engine.resolveReceipt("known-commit")?.revision).toBe(receipt.revision);
-		expect(engine.getConstruction("r", "r", 1)?.record.phase).toBe("reserved");
-		const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(() => {
-			throw new Error("no fresh capacity after known commit");
-		});
-		restoreGrowth = () => growth.mockRestore();
-		const next = { ...record, phase: "constructing" } satisfies DurableRegistryRecord;
-		// The failed reset is retried (forced RESTART) before BEGIN, outside any transaction, so the
-		// continuation is admitted on its first attempt instead of being refused once.
-		expect(() => engine.transition(next, { requestId: "funded-continuation" })).not.toThrow();
-		expect(checkpointsAfterFailure[0]).toEqual({ sql: "PRAGMA wal_checkpoint(RESTART)", inTransaction: false });
-		expect(engine.getConstruction("r", "r", 1)?.record.phase).toBe("constructing");
-		expect(engine.resolveReceipt("funded-continuation")?.revision).toBe(receipt.revision + 1);
-		engine.close();
-		expect(growth).not.toHaveBeenCalled();
-	} finally {
-		restoreGrowth?.();
-		checkpoint.mockRestore();
-		engine.close();
-	}
-});
-
-it("keeps a funded SQLite continuation's reservation when its conversion fails partway", async () => {
+itOnXfs("keeps a funded SQLite continuation's reservation when its conversion fails partway", async () => {
 	const directory = await makeDirectory();
 	const capacity = await openAuthorityCapacityFile(directory);
 	handles.push(capacity.handle);
@@ -1564,7 +1584,7 @@ it("keeps recovered-root activation funded after NEW admission is closed", () =>
 	}
 });
 
-it("spends the funded recovered-root activation instead of requesting fresh capacity", async () => {
+itOnXfs("spends the funded recovered-root activation instead of requesting fresh capacity", async () => {
 	const directory = await makeDirectory();
 	const capacity = await openAuthorityCapacityFile(directory);
 	handles.push(capacity.handle);
@@ -1709,7 +1729,7 @@ it("maintains independent allocator-command collateral through every gate phase"
 	}
 });
 
-it("refuses an unmodelled physical index before issuing a capacity capability", async () => {
+itOnXfs("refuses an unmodelled physical index before issuing a capacity capability", async () => {
 	const directory = await makeDirectory();
 	const filename = path.join(directory, "extra-index.sqlite");
 	const identity = {
@@ -1739,75 +1759,78 @@ it("refuses an unmodelled physical index before issuing a capacity capability", 
 });
 
 for (const backend of ["sqlite", "jsonl"] as const) {
-	it(`${backend} consumes full-size standalone gate and final-close collateral without fresh growth`, async () => {
-		const directory = await makeDirectory();
-		const filename = path.join(directory, `gate-collateral.${backend}`);
-		const capacity = await openAuthorityCapacityFile(directory);
-		handles.push(capacity.handle);
-		const identity = { backend, owningSessionId: "session", incarnation: "incarnation", format: 2 as const };
-		const Persistence = backend === "sqlite" ? SqliteAuthorityPersistence : JsonlAuthorityPersistence;
-		const driver = new Persistence({
-			path: filename,
-			identity,
-			create: true,
-			capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
-		});
-		const engine = new AuthorityEngine(driver, "o".repeat(36));
-		engine.recover();
-		const hash = "1".repeat(64);
-		const rootHash = durableRootHeadHash({
-			rootId: "r",
-			generation: 1,
-			actorId: "r",
-			startupHash: hash,
-			provenanceHash: hash,
-		});
-		const construction = {
-			kind: "construction",
-			at: 1,
-			rootId: "r",
-			actorId: "r",
-			generation: 1,
-			startupHash: hash,
-			provenanceHash: hash,
-			phase: "reserved",
-		} satisfies DurableRegistryRecord;
-		for (const phase of ["reserved", "constructing", "constructed"] as const)
-			engine.transition({ ...construction, phase });
-		engine.activateAuthority({
-			construction: { ...construction, phase: "activated" },
-			root: { kind: "root", at: 1, rootId: "r", generation: 1, headHash: rootHash, state: "active" },
-			actor: {
-				kind: "actor",
-				at: 1,
-				actorId: "r",
+	itOnXfs(
+		`${backend} consumes full-size standalone gate and final-close collateral without fresh growth`,
+		async () => {
+			const directory = await makeDirectory();
+			const filename = path.join(directory, `gate-collateral.${backend}`);
+			const capacity = await openAuthorityCapacityFile(directory);
+			handles.push(capacity.handle);
+			const identity = { backend, owningSessionId: "session", incarnation: "incarnation", format: 2 as const };
+			const Persistence = backend === "sqlite" ? SqliteAuthorityPersistence : JsonlAuthorityPersistence;
+			const driver = new Persistence({
+				path: filename,
+				identity,
+				create: true,
+				capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
+			});
+			const engine = new AuthorityEngine(driver, "o".repeat(36));
+			engine.recover();
+			const hash = "1".repeat(64);
+			const rootHash = durableRootHeadHash({
 				rootId: "r",
 				generation: 1,
-				rootGeneration: 1,
-				rootHeadHash: rootHash,
+				actorId: "r",
 				startupHash: hash,
 				provenanceHash: hash,
-				state: "active",
-			},
-			gate: { kind: "gate", at: 1, rootId: "r", generation: 1, phase: "open" },
-		});
-		const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(() => {
-			throw new Error("funded metadata/workspace collateral must not be replenished");
-		});
-		try {
-			for (const phase of ["quiescing", "quiesced", "closed"] as const) {
-				const gate = { kind: "gate", at: 2, rootId: "r", generation: 1, phase } satisfies DurableRegistryRecord;
-				refuseOversizedThenContinue(engine, phase, { kind: "transition", record: gate }, options =>
-					engine.transition(gate, options),
-				);
+			});
+			const construction = {
+				kind: "construction",
+				at: 1,
+				rootId: "r",
+				actorId: "r",
+				generation: 1,
+				startupHash: hash,
+				provenanceHash: hash,
+				phase: "reserved",
+			} satisfies DurableRegistryRecord;
+			for (const phase of ["reserved", "constructing", "constructed"] as const)
+				engine.transition({ ...construction, phase });
+			engine.activateAuthority({
+				construction: { ...construction, phase: "activated" },
+				root: { kind: "root", at: 1, rootId: "r", generation: 1, headHash: rootHash, state: "active" },
+				actor: {
+					kind: "actor",
+					at: 1,
+					actorId: "r",
+					rootId: "r",
+					generation: 1,
+					rootGeneration: 1,
+					rootHeadHash: rootHash,
+					startupHash: hash,
+					provenanceHash: hash,
+					state: "active",
+				},
+				gate: { kind: "gate", at: 1, rootId: "r", generation: 1, phase: "open" },
+			});
+			const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(() => {
+				throw new Error("funded metadata/workspace collateral must not be replenished");
+			});
+			try {
+				for (const phase of ["quiescing", "quiesced", "closed"] as const) {
+					const gate = { kind: "gate", at: 2, rootId: "r", generation: 1, phase } satisfies DurableRegistryRecord;
+					refuseOversizedThenContinue(engine, phase, { kind: "transition", record: gate }, options =>
+						engine.transition(gate, options),
+					);
+				}
+				engine.close();
+				expect(growth).not.toHaveBeenCalled();
+			} finally {
+				growth.mockRestore();
+				engine.close();
 			}
-			engine.close();
-			expect(growth).not.toHaveBeenCalled();
-		} finally {
-			growth.mockRestore();
-			engine.close();
-		}
-	});
+		},
+	);
 }
 
 // Activates root "r" and returns the binding that operation records need.
@@ -1874,283 +1897,298 @@ function operationRow(
 	};
 }
 
-it("reopens a multi-thousand-row SQLite store with a reserve bounded by its file horizon and open obligations", async () => {
-	const directory = await makeDirectory();
-	const filename = path.join(directory, "history.sqlite");
-	const identity = {
-		backend: "sqlite" as const,
-		owningSessionId: "session",
-		incarnation: "incarnation",
-		format: 2 as const,
-	};
-	// Build the history without capacity: only the reopen below is under test.
-	const builder = new AuthorityEngine(
-		new SqliteAuthorityPersistence({ path: filename, identity, create: true }),
-		"o".repeat(36),
-	);
-	builder.recover();
-	const binding = activateRoot(builder);
-	// Physical schema v4 stores a history in about a quarter of the v3 bytes; longer ids keep this one above the
-	// observer's page bound below. One commit group keeps its ~180 commands to a single durable sync.
-	builder.beginGroup();
-	for (let batch = 0; batch < 30; batch++) {
-		const ids = Array.from(
-			{ length: 100 },
-			(_, index) => `toolu_01${String(batch * 100 + index).padStart(392, "0")}`,
+itOnXfs(
+	"reopens a multi-thousand-row SQLite store with a reserve bounded by its file horizon and open obligations",
+	async () => {
+		const directory = await makeDirectory();
+		const filename = path.join(directory, "history.sqlite");
+		const identity = {
+			backend: "sqlite" as const,
+			owningSessionId: "session",
+			incarnation: "incarnation",
+			format: 2 as const,
+		};
+		// Build the history without capacity: only the reopen below is under test.
+		const builder = new AuthorityEngine(
+			new SqliteAuthorityPersistence({ path: filename, identity, create: true }),
+			"o".repeat(36),
 		);
-		builder.transitionBatch(ids.map(id => operationRow(binding, id, "intent", 10)));
-		// Abandonment continues admitted operations, so each batch must fit the continuation request bound.
-		for (let chunk = 0; chunk < ids.length; chunk += 20)
-			builder.transitionBatch(ids.slice(chunk, chunk + 20).map(id => operationRow(binding, id, "abandoned", 11)));
-	}
-	builder.syncGroup();
-	builder.close();
-	const reader = new SqliteAuthorityPersistence({ path: filename, identity, create: false });
-	let open: DurableRegistryRecord[];
-	try {
-		open = reader
-			.exportState()
-			.rows.map(row => row.record)
-			.filter(record =>
-				"state" in record ? record.state === "active" : record.kind === "gate" && record.phase === "open",
+		builder.recover();
+		const binding = activateRoot(builder);
+		// Physical schema v4 stores a history in about a quarter of the v3 bytes; longer ids keep this one above the
+		// observer's page bound below. One commit group keeps its ~180 commands to a single durable sync.
+		builder.beginGroup();
+		for (let batch = 0; batch < 30; batch++) {
+			const ids = Array.from(
+				{ length: 100 },
+				(_, index) => `toolu_01${String(batch * 100 + index).padStart(392, "0")}`,
 			);
-	} finally {
-		reader.close();
-	}
-	const fileBytes = syncFs.statSync(filename).size;
-	// Precondition: the store is larger than the bounded 256-page native observer, so no tree walk can make it cheap.
-	expect(fileBytes).toBeGreaterThan(256 * 4_096 * 3);
-	const obligations = new AuthorityCapacityDebtLedger(identity, 2_097_152, open).currentDebt();
-	// The reopening owner's own recovering, ready and closed frames are obligations as well as the open records'.
-	const episode = authorityOwnerEpisodeDebt(identity);
-	// Database growth is at most the obligations' additive allocations; any one WAL transaction rewrites at most
-	// the pages that can then exist; close may delete and refund that WAL; XFS metadata is a fraction of the horizon.
-	const horizon = fileBytes + obligations.sqliteDatabaseBytes + episode.sqliteDatabaseBytes;
-	const bound = 3 * horizon + 64 * 1_048_576;
-	const capacity = await openAuthorityCapacityFile(directory);
-	handles.push(capacity.handle);
-	const requests: number[] = [];
-	const original = BorrowedAuthorityCapacityPool.prototype.ensureDataBytes;
-	const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(function (
-		this: BorrowedAuthorityCapacityPool,
-		bytes: number,
-		step?: number,
-	) {
-		requests.push(bytes);
-		// Refuse before allocating so a regression fails here instead of filling the disk.
-		if (bytes > bound)
-			throw new Error(`reopen requested ${bytes} reserve bytes above the ${bound}-byte horizon bound`);
-		return original.call(this, bytes, step);
-	});
-	try {
+			builder.transitionBatch(ids.map(id => operationRow(binding, id, "intent", 10)));
+			// Abandonment continues admitted operations, so each batch must fit the continuation request bound.
+			for (let chunk = 0; chunk < ids.length; chunk += 20)
+				builder.transitionBatch(ids.slice(chunk, chunk + 20).map(id => operationRow(binding, id, "abandoned", 11)));
+		}
+		builder.syncGroup();
+		builder.close();
+		const reader = new SqliteAuthorityPersistence({ path: filename, identity, create: false });
+		let open: DurableRegistryRecord[];
+		try {
+			open = reader
+				.exportState()
+				.rows.map(row => row.record)
+				.filter(record =>
+					"state" in record ? record.state === "active" : record.kind === "gate" && record.phase === "open",
+				);
+		} finally {
+			reader.close();
+		}
+		const fileBytes = syncFs.statSync(filename).size;
+		// Precondition: the store is larger than the bounded 256-page native observer, so no tree walk can make it cheap.
+		expect(fileBytes).toBeGreaterThan(256 * 4_096 * 3);
+		const obligations = new AuthorityCapacityDebtLedger(identity, 2_097_152, open).currentDebt();
+		// The reopening owner's own recovering, ready and closed frames are obligations as well as the open records'.
+		const episode = authorityOwnerEpisodeDebt(identity);
+		// Database growth is at most the obligations' additive allocations; any one WAL transaction rewrites at most
+		// the pages that can then exist; close may delete and refund that WAL; XFS metadata is a fraction of the horizon.
+		const horizon = fileBytes + obligations.sqliteDatabaseBytes + episode.sqliteDatabaseBytes;
+		const bound = 3 * horizon + 64 * 1_048_576;
+		const capacity = await openAuthorityCapacityFile(directory);
+		handles.push(capacity.handle);
+		const requests: number[] = [];
+		const original = BorrowedAuthorityCapacityPool.prototype.ensureDataBytes;
+		const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(function (
+			this: BorrowedAuthorityCapacityPool,
+			bytes: number,
+			step?: number,
+		) {
+			requests.push(bytes);
+			// Refuse before allocating so a regression fails here instead of filling the disk.
+			if (bytes > bound)
+				throw new Error(`reopen requested ${bytes} reserve bytes above the ${bound}-byte horizon bound`);
+			return original.call(this, bytes, step);
+		});
+		try {
+			const engine = new AuthorityEngine(
+				new SqliteAuthorityPersistence({
+					path: filename,
+					identity,
+					create: false,
+					capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
+				}),
+				"o".repeat(36),
+			);
+			try {
+				expect(engine.recover().owner.phase).toBe("ready");
+				expect(engine.getActor("r")?.record.state).toBe("active");
+			} finally {
+				engine.close();
+			}
+		} finally {
+			growth.mockRestore();
+		}
+		expect(requests.length).toBeGreaterThan(0);
+		expect(Math.max(...requests)).toBeLessThanOrEqual(bound);
+	},
+);
+
+itOnXfs(
+	"commits steady-state SQLite transitions without capacity fsyncs except at amortized arena extensions",
+	async () => {
+		const directory = await makeDirectory();
+		const capacity = await openAuthorityCapacityFile(directory);
+		handles.push(capacity.handle);
+		const identity = {
+			backend: "sqlite" as const,
+			owningSessionId: "session",
+			incarnation: "incarnation",
+			format: 2 as const,
+		};
 		const engine = new AuthorityEngine(
 			new SqliteAuthorityPersistence({
-				path: filename,
+				path: path.join(directory, "steady.sqlite"),
 				identity,
-				create: false,
+				create: true,
 				capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
 			}),
 			"o".repeat(36),
 		);
+		const fsyncs = spyOn(syncFs, "fsyncSync");
+		const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes");
+		const query = Database.prototype.query;
+		let resets = 0;
+		const checkpoints = spyOn(Database.prototype, "query").mockImplementation(function (this: Database, sql: string) {
+			if (sql === "PRAGMA wal_checkpoint(RESTART)") resets++;
+			return query.call(this, sql);
+		} as Database["query"]);
 		try {
-			expect(engine.recover().owner.phase).toBe("ready");
-			expect(engine.getActor("r")?.record.state).toBe("active");
+			engine.recover();
+			const binding = activateRoot(engine);
+			let at = 10;
+			const perCommit: number[] = [];
+			const continuationGrowth: number[] = [];
+			const lifecycle = (operationId: string): void => {
+				for (const phase of ["intent", "effect", "completed"] as const) {
+					const [syncsBefore, growthBefore] = [fsyncs.mock.calls.length, growth.mock.calls.length];
+					engine.transition(operationRow(binding, operationId, phase, at++));
+					perCommit.push(fsyncs.mock.calls.length - syncsBefore);
+					// Effect and completion consume funded promises: they never ask for fresh reserve.
+					if (phase !== "intent") continuationGrowth.push(growth.mock.calls.length - growthBefore);
+				}
+			};
+			// Warm-up funds the first arenas.
+			for (let index = 0; index < 3; index++) lifecycle(`toolu_01warm${index}`);
+			perCommit.length = 0;
+			continuationGrowth.length = 0;
+			resets = 0;
+			for (let index = 0; index < 20; index++) lifecycle(`toolu_01steady${index}`);
+			expect(engine.getOperation("r", "eval", "toolu_01steady19")?.record.phase).toBe("completed");
+			// Before: every commit released pool data and allocated+fsynced targets (~4 capacity fsyncs each).
+			expect(perCommit.filter(count => count > 0).length).toBeLessThanOrEqual(perCommit.length / 10);
+			expect(continuationGrowth.every(count => count === 0)).toBe(true);
+			// The WAL is reset when its funded room runs out, not after every commit.
+			expect(resets).toBeLessThanOrEqual(perCommit.length / 10);
+		} finally {
+			checkpoints.mockRestore();
+			growth.mockRestore();
+			fsyncs.mockRestore();
+			engine.close();
+		}
+	},
+);
+
+itOnXfs(
+	"commits steady-state JSONL appends inside the funded journal arena without pool release, growth or capacity fsync",
+	async () => {
+		const directory = await makeDirectory();
+		const capacity = await openAuthorityCapacityFile(directory);
+		handles.push(capacity.handle);
+		const identity = {
+			backend: "jsonl" as const,
+			owningSessionId: "session",
+			incarnation: "incarnation",
+			format: 2 as const,
+		};
+		const engine = new AuthorityEngine(
+			new JsonlAuthorityPersistence({
+				path: path.join(directory, "steady.jsonl"),
+				identity,
+				create: true,
+				capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
+			}),
+			"o".repeat(36),
+		);
+		const releases = spyOn(BorrowedAuthorityCapacityPool.prototype, "releaseDataBytes");
+		const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes");
+		const truncates = spyOn(syncFs, "ftruncateSync");
+		const fsyncs = spyOn(syncFs, "fsyncSync");
+		try {
+			engine.recover();
+			const binding = activateRoot(engine);
+			let at = 10;
+			const lifecycle = (operationId: string): void => {
+				for (const phase of ["intent", "effect", "completed"] as const)
+					engine.transition(operationRow(binding, operationId, phase, at++));
+			};
+			// Warm-up funds the first journal arena.
+			for (let index = 0; index < 3; index++) lifecycle(`toolu_01warm${index}`);
+			releases.mockClear();
+			growth.mockClear();
+			truncates.mockClear();
+			fsyncs.mockClear();
+			for (let index = 0; index < 20; index++) lifecycle(`toolu_01steady${index}`);
+			expect(engine.getOperation("r", "eval", "toolu_01steady19")?.record.phase).toBe("completed");
+			// Each append lands inside the already funded arena: no transfer, no pool truncate or regrowth, and the only
+			// fsyncs are the journal's own commit points (never the pool's).
+			expect(releases).not.toHaveBeenCalled();
+			expect(truncates).not.toHaveBeenCalled();
+			expect(growth).not.toHaveBeenCalled();
+			expect(fsyncs.mock.calls.filter(([fd]) => fd === capacity.identity.fd)).toHaveLength(0);
+		} finally {
+			fsyncs.mockRestore();
+			truncates.mockRestore();
+			growth.mockRestore();
+			releases.mockRestore();
+			engine.close();
+		}
+	},
+);
+
+itOnXfs(
+	"keeps a small store's funded journal arena proportional to its data instead of a fixed 8 MiB floor",
+	async () => {
+		const directory = await makeDirectory();
+		const capacity = await openAuthorityCapacityFile(directory);
+		handles.push(capacity.handle);
+		const identity = {
+			backend: "jsonl" as const,
+			owningSessionId: "session",
+			incarnation: "incarnation",
+			format: 2 as const,
+		};
+		const filename = path.join(directory, "small.jsonl");
+		const engine = new AuthorityEngine(
+			new JsonlAuthorityPersistence({
+				path: filename,
+				identity,
+				create: true,
+				capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
+			}),
+			"o".repeat(36),
+		);
+		try {
+			engine.recover();
+			const binding = activateRoot(engine);
+			let at = 10;
+			for (let index = 0; index < 10; index++)
+				for (const phase of ["intent", "effect", "completed"] as const)
+					engine.transition(operationRow(binding, `toolu_01small${index}`, phase, at++));
 		} finally {
 			engine.close();
 		}
-	} finally {
-		growth.mockRestore();
-	}
-	expect(requests.length).toBeGreaterThan(0);
-	expect(Math.max(...requests)).toBeLessThanOrEqual(bound);
-});
+		const stat = syncFs.statSync(filename);
+		// The funded arena past EOF is at most the journal's own size plus the 2 MiB floor (it doubles below 8 MiB).
+		expect(stat.blocks * 512).toBeGreaterThanOrEqual(stat.size);
+		expect(stat.blocks * 512).toBeLessThanOrEqual(2 * stat.size + 2 * 1_048_576 + 65_536);
+	},
+);
 
-it("commits steady-state SQLite transitions without capacity fsyncs except at amortized arena extensions", async () => {
-	const directory = await makeDirectory();
-	const capacity = await openAuthorityCapacityFile(directory);
-	handles.push(capacity.handle);
-	const identity = {
-		backend: "sqlite" as const,
-		owningSessionId: "session",
-		incarnation: "incarnation",
-		format: 2 as const,
-	};
-	const engine = new AuthorityEngine(
-		new SqliteAuthorityPersistence({
-			path: path.join(directory, "steady.sqlite"),
-			identity,
-			create: true,
-			capacity: { identity: capacity.identity, maxRequestBytes: 2_097_152 },
-		}),
-		"o".repeat(36),
-	);
-	const fsyncs = spyOn(syncFs, "fsyncSync");
-	const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes");
-	const query = Database.prototype.query;
-	let resets = 0;
-	const checkpoints = spyOn(Database.prototype, "query").mockImplementation(function (this: Database, sql: string) {
-		if (sql === "PRAGMA wal_checkpoint(RESTART)") resets++;
-		return query.call(this, sql);
-	} as Database["query"]);
-	try {
-		engine.recover();
-		const binding = activateRoot(engine);
-		let at = 10;
-		const perCommit: number[] = [];
-		const continuationGrowth: number[] = [];
-		const lifecycle = (operationId: string): void => {
-			for (const phase of ["intent", "effect", "completed"] as const) {
-				const [syncsBefore, growthBefore] = [fsyncs.mock.calls.length, growth.mock.calls.length];
-				engine.transition(operationRow(binding, operationId, phase, at++));
-				perCommit.push(fsyncs.mock.calls.length - syncsBefore);
-				// Effect and completion consume funded promises: they never ask for fresh reserve.
-				if (phase !== "intent") continuationGrowth.push(growth.mock.calls.length - growthBefore);
-			}
+itOnXfs(
+	"amortizes JSONL pool growth across many NEW admissions instead of growing and syncing it for each",
+	async () => {
+		const directory = await makeDirectory();
+		const capacity = await openAuthorityCapacityFile(directory);
+		handles.push(capacity.handle);
+		const identity = {
+			backend: "jsonl" as const,
+			owningSessionId: "session",
+			incarnation: "incarnation",
+			format: 2 as const,
 		};
-		// Warm-up funds the first arenas.
-		for (let index = 0; index < 3; index++) lifecycle(`toolu_01warm${index}`);
-		perCommit.length = 0;
-		continuationGrowth.length = 0;
-		resets = 0;
-		for (let index = 0; index < 20; index++) lifecycle(`toolu_01steady${index}`);
-		expect(engine.getOperation("r", "eval", "toolu_01steady19")?.record.phase).toBe("completed");
-		// Before: every commit released pool data and allocated+fsynced targets (~4 capacity fsyncs each).
-		expect(perCommit.filter(count => count > 0).length).toBeLessThanOrEqual(perCommit.length / 10);
-		expect(continuationGrowth.every(count => count === 0)).toBe(true);
-		// The WAL is reset when its funded room runs out, not after every commit.
-		expect(resets).toBeLessThanOrEqual(perCommit.length / 10);
-	} finally {
-		checkpoints.mockRestore();
-		growth.mockRestore();
-		fsyncs.mockRestore();
-		engine.close();
-	}
-});
-
-it("commits steady-state JSONL appends inside the funded journal arena without pool release, growth or capacity fsync", async () => {
-	const directory = await makeDirectory();
-	const capacity = await openAuthorityCapacityFile(directory);
-	handles.push(capacity.handle);
-	const identity = {
-		backend: "jsonl" as const,
-		owningSessionId: "session",
-		incarnation: "incarnation",
-		format: 2 as const,
-	};
-	const engine = new AuthorityEngine(
-		new JsonlAuthorityPersistence({
-			path: path.join(directory, "steady.jsonl"),
-			identity,
-			create: true,
-			capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
-		}),
-		"o".repeat(36),
-	);
-	const releases = spyOn(BorrowedAuthorityCapacityPool.prototype, "releaseDataBytes");
-	const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes");
-	const truncates = spyOn(syncFs, "ftruncateSync");
-	const fsyncs = spyOn(syncFs, "fsyncSync");
-	try {
-		engine.recover();
-		const binding = activateRoot(engine);
-		let at = 10;
-		const lifecycle = (operationId: string): void => {
-			for (const phase of ["intent", "effect", "completed"] as const)
-				engine.transition(operationRow(binding, operationId, phase, at++));
-		};
-		// Warm-up funds the first journal arena.
-		for (let index = 0; index < 3; index++) lifecycle(`toolu_01warm${index}`);
-		releases.mockClear();
-		growth.mockClear();
-		truncates.mockClear();
-		fsyncs.mockClear();
-		for (let index = 0; index < 20; index++) lifecycle(`toolu_01steady${index}`);
-		expect(engine.getOperation("r", "eval", "toolu_01steady19")?.record.phase).toBe("completed");
-		// Each append lands inside the already funded arena: no transfer, no pool truncate or regrowth, and the only
-		// fsyncs are the journal's own commit points (never the pool's).
-		expect(releases).not.toHaveBeenCalled();
-		expect(truncates).not.toHaveBeenCalled();
-		expect(growth).not.toHaveBeenCalled();
-		expect(fsyncs.mock.calls.filter(([fd]) => fd === capacity.identity.fd)).toHaveLength(0);
-	} finally {
-		fsyncs.mockRestore();
-		truncates.mockRestore();
-		growth.mockRestore();
-		releases.mockRestore();
-		engine.close();
-	}
-});
-
-it("keeps a small store's funded journal arena proportional to its data instead of a fixed 8 MiB floor", async () => {
-	const directory = await makeDirectory();
-	const capacity = await openAuthorityCapacityFile(directory);
-	handles.push(capacity.handle);
-	const identity = {
-		backend: "jsonl" as const,
-		owningSessionId: "session",
-		incarnation: "incarnation",
-		format: 2 as const,
-	};
-	const filename = path.join(directory, "small.jsonl");
-	const engine = new AuthorityEngine(
-		new JsonlAuthorityPersistence({
-			path: filename,
-			identity,
-			create: true,
-			capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
-		}),
-		"o".repeat(36),
-	);
-	try {
-		engine.recover();
-		const binding = activateRoot(engine);
-		let at = 10;
-		for (let index = 0; index < 10; index++)
-			for (const phase of ["intent", "effect", "completed"] as const)
-				engine.transition(operationRow(binding, `toolu_01small${index}`, phase, at++));
-	} finally {
-		engine.close();
-	}
-	const stat = syncFs.statSync(filename);
-	// The funded arena past EOF is at most the journal's own size plus the 2 MiB floor (it doubles below 8 MiB).
-	expect(stat.blocks * 512).toBeGreaterThanOrEqual(stat.size);
-	expect(stat.blocks * 512).toBeLessThanOrEqual(2 * stat.size + 2 * 1_048_576 + 65_536);
-});
-
-it("amortizes JSONL pool growth across many NEW admissions instead of growing and syncing it for each", async () => {
-	const directory = await makeDirectory();
-	const capacity = await openAuthorityCapacityFile(directory);
-	handles.push(capacity.handle);
-	const identity = {
-		backend: "jsonl" as const,
-		owningSessionId: "session",
-		incarnation: "incarnation",
-		format: 2 as const,
-	};
-	const engine = new AuthorityEngine(
-		new JsonlAuthorityPersistence({
-			path: path.join(directory, "growing.jsonl"),
-			identity,
-			create: true,
-			capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
-		}),
-		"o".repeat(36),
-	);
-	const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes");
-	try {
-		engine.recover();
-		const binding = activateRoot(engine);
-		growth.mockClear();
-		// Every intent is a NEW admission that adds an open obligation the pool must fund before its ACK.
-		for (let index = 0; index < 40; index++)
-			engine.transition(operationRow(binding, `toolu_01open${index}`, "intent", 10 + index));
-		expect(engine.getOperation("r", "eval", "toolu_01open39")?.record.phase).toBe("intent");
-		expect(growth.mock.calls.length).toBeLessThanOrEqual(4);
-	} finally {
-		growth.mockRestore();
-		engine.close();
-	}
-});
+		const engine = new AuthorityEngine(
+			new JsonlAuthorityPersistence({
+				path: path.join(directory, "growing.jsonl"),
+				identity,
+				create: true,
+				capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
+			}),
+			"o".repeat(36),
+		);
+		const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes");
+		try {
+			engine.recover();
+			const binding = activateRoot(engine);
+			growth.mockClear();
+			// Every intent is a NEW admission that adds an open obligation the pool must fund before its ACK.
+			for (let index = 0; index < 40; index++)
+				engine.transition(operationRow(binding, `toolu_01open${index}`, "intent", 10 + index));
+			expect(engine.getOperation("r", "eval", "toolu_01open39")?.record.phase).toBe("intent");
+			expect(growth.mock.calls.length).toBeLessThanOrEqual(4);
+		} finally {
+			growth.mockRestore();
+			engine.close();
+		}
+	},
+);
 
 it("keeps incremental SQLite WAL and SHM maxima equal to a fresh ledger as the largest obligations settle", () => {
 	const hash = "1".repeat(64);
@@ -2272,7 +2310,7 @@ it("sizes a SQLite database arena above the signed-int chunk ABI to within a pag
 	}
 });
 
-it("refuses a reserve larger than the filesystem's free space before allocating any of it", async () => {
+itOnXfs("refuses a reserve larger than the filesystem's free space before allocating any of it", async () => {
 	const directory = await makeDirectory();
 	const capacity = await openAuthorityCapacityFile(directory);
 	handles.push(capacity.handle);
@@ -2331,81 +2369,84 @@ it("refuses a reserve larger than the filesystem's free space before allocating 
 	expect(BorrowedAuthorityCapacityPool.open(capacity.identity).inspect().dataBytes).toBe(0);
 });
 
-it("re-reads the JSONL journal before appending when capacity funding moved its timestamps, catching a same-size foreign rewrite", async () => {
-	const directory = await makeDirectory();
-	const capacity = await openAuthorityCapacityFile(directory);
-	handles.push(capacity.handle);
-	// 12 MiB of reported free space funds the mandatory reserve but no pre-funded arena, so the admission
-	// below must allocate into the journal itself (fallocate moves its mtime and ctime).
-	const statfs = syncFs.statfsSync;
-	const poolPath = `/proc/self/fd/${capacity.identity.fd}`;
-	const free = spyOn(syncFs, "statfsSync").mockImplementation(((
-		target: syncFs.PathLike,
-		options?: syncFs.StatFsOptions,
-	) => {
-		const actual = statfs(target, options as { bigint?: false });
-		return target === poolPath ? { ...actual, bavail: 12 * 256, bsize: 4_096 } : actual;
-	}) as typeof syncFs.statfsSync);
-	const filename = path.join(directory, "fenced.jsonl");
-	const identity = {
-		backend: "jsonl" as const,
-		owningSessionId: "session",
-		incarnation: "incarnation",
-		format: 2 as const,
-	};
-	const driver = new JsonlAuthorityPersistence({
-		path: filename,
-		identity,
-		create: true,
-		capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
-	});
-	const engine = new AuthorityEngine(driver, "o".repeat(36));
-	const release = BorrowedAuthorityCapacityPool.prototype.releaseDataBytes;
-	let armed = false;
-	let rewrittenSize: number | undefined;
-	// A foreign writer rewrites the header in place, keeping the size, while the transfer is releasing pool data
-	// for the journal's own allocation.
-	const releases = spyOn(BorrowedAuthorityCapacityPool.prototype, "releaseDataBytes").mockImplementation(function (
-		this: BorrowedAuthorityCapacityPool,
-		bytes: number,
-	) {
-		if (armed && rewrittenSize === undefined) {
-			const changed = syncFs.readFileSync(filename);
-			changed[0] = changed[0] === 0x7b ? 0x5b : 0x7b;
-			syncFs.writeFileSync(filename, changed);
-			rewrittenSize = changed.byteLength;
+itOnXfs(
+	"re-reads the JSONL journal before appending when capacity funding moved its timestamps, catching a same-size foreign rewrite",
+	async () => {
+		const directory = await makeDirectory();
+		const capacity = await openAuthorityCapacityFile(directory);
+		handles.push(capacity.handle);
+		// 12 MiB of reported free space funds the mandatory reserve but no pre-funded arena, so the admission
+		// below must allocate into the journal itself (fallocate moves its mtime and ctime).
+		const statfs = syncFs.statfsSync;
+		const poolPath = `/proc/self/fd/${capacity.identity.fd}`;
+		const free = spyOn(syncFs, "statfsSync").mockImplementation(((
+			target: syncFs.PathLike,
+			options?: syncFs.StatFsOptions,
+		) => {
+			const actual = statfs(target, options as { bigint?: false });
+			return target === poolPath ? { ...actual, bavail: 12 * 256, bsize: 4_096 } : actual;
+		}) as typeof syncFs.statfsSync);
+		const filename = path.join(directory, "fenced.jsonl");
+		const identity = {
+			backend: "jsonl" as const,
+			owningSessionId: "session",
+			incarnation: "incarnation",
+			format: 2 as const,
+		};
+		const driver = new JsonlAuthorityPersistence({
+			path: filename,
+			identity,
+			create: true,
+			capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
+		});
+		const engine = new AuthorityEngine(driver, "o".repeat(36));
+		const release = BorrowedAuthorityCapacityPool.prototype.releaseDataBytes;
+		let armed = false;
+		let rewrittenSize: number | undefined;
+		// A foreign writer rewrites the header in place, keeping the size, while the transfer is releasing pool data
+		// for the journal's own allocation.
+		const releases = spyOn(BorrowedAuthorityCapacityPool.prototype, "releaseDataBytes").mockImplementation(function (
+			this: BorrowedAuthorityCapacityPool,
+			bytes: number,
+		) {
+			if (armed && rewrittenSize === undefined) {
+				const changed = syncFs.readFileSync(filename);
+				changed[0] = changed[0] === 0x7b ? 0x5b : 0x7b;
+				syncFs.writeFileSync(filename, changed);
+				rewrittenSize = changed.byteLength;
+			}
+			return release.call(this, bytes);
+		});
+		try {
+			engine.recover();
+			armed = true;
+			const record = {
+				kind: "operation",
+				at: 1,
+				ownerId: "r",
+				classOwnerId: "r",
+				operationId: "fenced",
+				effectClass: "filesystem",
+				acquiredAt: 1,
+				expiresAt: 2,
+				phase: "intent",
+			} satisfies DurableRegistryRecord;
+			// A large admission frame needs journal blocks beyond the funded prefix.
+			expect(() => engine.transition(record, { requestId: `fenced-${"a".repeat(256 * 1_024)}` })).toThrow(
+				"changed outside its active owner during capacity funding",
+			);
+			expect(rewrittenSize).toBeDefined();
+			expect(syncFs.statSync(filename).size).toBe(rewrittenSize!);
+			expect(() => engine.getOperation("r", "filesystem", "fenced")).toThrow();
+		} finally {
+			releases.mockRestore();
+			free.mockRestore();
+			driver.close();
 		}
-		return release.call(this, bytes);
-	});
-	try {
-		engine.recover();
-		armed = true;
-		const record = {
-			kind: "operation",
-			at: 1,
-			ownerId: "r",
-			classOwnerId: "r",
-			operationId: "fenced",
-			effectClass: "filesystem",
-			acquiredAt: 1,
-			expiresAt: 2,
-			phase: "intent",
-		} satisfies DurableRegistryRecord;
-		// A large admission frame needs journal blocks beyond the funded prefix.
-		expect(() => engine.transition(record, { requestId: `fenced-${"a".repeat(256 * 1_024)}` })).toThrow(
-			"changed outside its active owner during capacity funding",
-		);
-		expect(rewrittenSize).toBeDefined();
-		expect(syncFs.statSync(filename).size).toBe(rewrittenSize!);
-		expect(() => engine.getOperation("r", "filesystem", "fenced")).toThrow();
-	} finally {
-		releases.mockRestore();
-		free.mockRestore();
-		driver.close();
-	}
-});
+	},
+);
 
-it("allocates a transfer into the target before the pool gives up any space", async () => {
+itOnXfs("allocates a transfer into the target before the pool gives up any space", async () => {
 	const directory = await makeDirectory();
 	const capacity = await openAuthorityCapacityFile(directory);
 	handles.push(capacity.handle);
@@ -2474,79 +2515,85 @@ it("allocates a transfer into the target before the pool gives up any space", as
 	}
 });
 
-it("keeps continuations admitted after a pool growth step fails partway and leaves blocks past the pool's EOF", async () => {
-	const directory = await makeDirectory();
-	const capacity = await openAuthorityCapacityFile(directory);
-	handles.push(capacity.handle);
-	const filename = path.join(directory, "partial-growth.jsonl");
-	const identity = {
-		backend: "jsonl" as const,
-		owningSessionId: "session",
-		incarnation: "incarnation",
-		format: 2 as const,
-	};
-	const engine = new AuthorityEngine(
-		new JsonlAuthorityPersistence({
-			path: filename,
-			identity,
-			create: true,
-			capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
-		}),
-		"o".repeat(36),
-	);
-	engine.recover();
-	const intent = {
-		kind: "operation",
-		at: 1,
-		ownerId: "r",
-		classOwnerId: "r",
-		operationId: "admitted",
-		effectClass: "filesystem",
-		acquiredAt: 1,
-		expiresAt: 2,
-		phase: "intent",
-	} satisfies DurableRegistryRecord;
-	engine.transition(intent);
-	// XFS mode-0 fallocate can allocate part of a step and then fail: blocks past EOF with an unchanged size.
-	const libc = dlopen("libc.so.6", {
-		fallocate: { args: [FFIType.i32, FFIType.i32, FFIType.i64, FFIType.i64], returns: FFIType.i32 },
-	});
-	const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(
-		function (this: BorrowedAuthorityCapacityPool) {
-			const eof = syncFs.fstatSync(capacity.identity.fd).size;
-			if (libc.symbols.fallocate(capacity.identity.fd, 0x01, BigInt(eof), BigInt(6 * 4_096)) !== 0)
-				throw new Error("fixture fallocate failed");
-			throw new AuthorityCapacityPoolError(
-				"Capacity growth may have partially changed the inode; reconcile before credit",
-				"uncertain",
-				undefined,
-				Object.assign(new Error("fallocate(mode 0) failed with Linux errno 28"), { code: "ERRNO_28", errno: -28 }),
-			);
-		},
-	);
-	try {
-		const large = { ...intent, operationId: "large" } satisfies DurableRegistryRecord;
-		let refused: unknown;
+itOnXfs(
+	"keeps continuations admitted after a pool growth step fails partway and leaves blocks past the pool's EOF",
+	async () => {
+		const directory = await makeDirectory();
+		const capacity = await openAuthorityCapacityFile(directory);
+		handles.push(capacity.handle);
+		const filename = path.join(directory, "partial-growth.jsonl");
+		const identity = {
+			backend: "jsonl" as const,
+			owningSessionId: "session",
+			incarnation: "incarnation",
+			format: 2 as const,
+		};
+		const engine = new AuthorityEngine(
+			new JsonlAuthorityPersistence({
+				path: filename,
+				identity,
+				create: true,
+				capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
+			}),
+			"o".repeat(36),
+		);
+		engine.recover();
+		const intent = {
+			kind: "operation",
+			at: 1,
+			ownerId: "r",
+			classOwnerId: "r",
+			operationId: "admitted",
+			effectClass: "filesystem",
+			acquiredAt: 1,
+			expiresAt: 2,
+			phase: "intent",
+		} satisfies DurableRegistryRecord;
+		engine.transition(intent);
+		// XFS mode-0 fallocate can allocate part of a step and then fail: blocks past EOF with an unchanged size.
+		const libc = dlopen("libc.so.6", {
+			fallocate: { args: [FFIType.i32, FFIType.i32, FFIType.i64, FFIType.i64], returns: FFIType.i32 },
+		});
+		const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(
+			function (this: BorrowedAuthorityCapacityPool) {
+				const eof = syncFs.fstatSync(capacity.identity.fd).size;
+				if (libc.symbols.fallocate(capacity.identity.fd, 0x01, BigInt(eof), BigInt(6 * 4_096)) !== 0)
+					throw new Error("fixture fallocate failed");
+				throw new AuthorityCapacityPoolError(
+					"Capacity growth may have partially changed the inode; reconcile before credit",
+					"uncertain",
+					undefined,
+					Object.assign(new Error("fallocate(mode 0) failed with Linux errno 28"), {
+						code: "ERRNO_28",
+						errno: -28,
+					}),
+				);
+			},
+		);
 		try {
-			engine.transition(large, { requestId: `large-${"a".repeat(1_900_000)}` });
-		} catch (error) {
-			refused = error;
+			const large = { ...intent, operationId: "large" } satisfies DurableRegistryRecord;
+			let refused: unknown;
+			try {
+				engine.transition(large, { requestId: `large-${"a".repeat(1_900_000)}` });
+			} catch (error) {
+				refused = error;
+			}
+			expect(growth).toHaveBeenCalled();
+			expect(refused).toBeInstanceOf(AuthorityCapacityRefusedError);
+			// The continuation of the admitted intent is funded by the reserve the failed growth never touched.
+			engine.transition({ ...intent, phase: "abandoned" }, { requestId: "continuation" });
+			expect(engine.getOperation("r", "filesystem", "admitted")?.record.phase).toBe("abandoned");
+		} finally {
+			growth.mockRestore();
+			libc.close();
 		}
-		expect(growth).toHaveBeenCalled();
-		expect(refused).toBeInstanceOf(AuthorityCapacityRefusedError);
-		// The continuation of the admitted intent is funded by the reserve the failed growth never touched.
-		engine.transition({ ...intent, phase: "abandoned" }, { requestId: "continuation" });
-		expect(engine.getOperation("r", "filesystem", "admitted")?.record.phase).toBe("abandoned");
-	} finally {
-		growth.mockRestore();
-		libc.close();
-	}
-	// With growth working again NEW admission reopens.
-	engine.transition({ ...intent, operationId: "after" }, { requestId: "after" });
-	engine.close();
-});
+		// With growth working again NEW admission reopens.
+		engine.transition({ ...intent, operationId: "after" }, { requestId: "after" });
+		engine.close();
+	},
+);
 
-it("reopens a JSONL store whose funded arena sits above reflink-shared journal extents", async () => {
+itOnXfs("reopens a JSONL store whose funded arena sits above reflink-shared journal extents", async () => {
 	const directory = await makeDirectory();
 	const filename = path.join(directory, "arena.jsonl");
 	const identity = {
@@ -2601,94 +2648,98 @@ it("reopens a JSONL store whose funded arena sits above reflink-shared journal e
 	}
 });
 
-it("reserves per open SQLite operation its database growth only, with WAL bounded by one transaction", async () => {
-	const directory = await makeDirectory();
-	const identity = {
-		backend: "sqlite" as const,
-		owningSessionId: "session",
-		incarnation: "incarnation",
-		format: 2 as const,
-	};
-	const source = path.join(directory, "history.sqlite");
-	// Build a terminal history without capacity: only the reopen reserve is under test.
-	const builder = new AuthorityEngine(
-		new SqliteAuthorityPersistence({ path: source, identity, create: true }),
-		"o".repeat(36),
-	);
-	builder.recover();
-	const binding = activateRoot(builder);
-	// Physical schema v4 stores a history in about a quarter of the v3 bytes; longer ids keep this one above the
-	// observer's page bound below. One commit group keeps its ~180 commands to a single durable sync.
-	builder.beginGroup();
-	for (let batch = 0; batch < 30; batch++) {
-		const ids = Array.from(
-			{ length: 100 },
-			(_, index) => `toolu_01${String(batch * 100 + index).padStart(392, "0")}`,
+itOnXfs(
+	"reserves per open SQLite operation its database growth only, with WAL bounded by one transaction",
+	async () => {
+		const directory = await makeDirectory();
+		const identity = {
+			backend: "sqlite" as const,
+			owningSessionId: "session",
+			incarnation: "incarnation",
+			format: 2 as const,
+		};
+		const source = path.join(directory, "history.sqlite");
+		// Build a terminal history without capacity: only the reopen reserve is under test.
+		const builder = new AuthorityEngine(
+			new SqliteAuthorityPersistence({ path: source, identity, create: true }),
+			"o".repeat(36),
 		);
-		builder.transitionBatch(ids.map(id => operationRow(binding, id, "intent", 10)));
-		for (let chunk = 0; chunk < ids.length; chunk += 20)
-			builder.transitionBatch(ids.slice(chunk, chunk + 20).map(id => operationRow(binding, id, "abandoned", 11)));
-	}
-	builder.syncGroup();
-	builder.close();
-	// Precondition: larger than the bounded 256-page native observer, so only the proven bounds apply.
-	expect(syncFs.statSync(source).size).toBeGreaterThan(256 * 4_096 * 3);
-	const OPEN = 100;
-	const reopenReserve = async (open: number): Promise<number> => {
-		const copy = path.join(directory, `open-${open}`);
-		await fs.mkdir(copy, { mode: 0o700 });
-		const filename = path.join(copy, "history.sqlite");
-		await fs.copyFile(source, filename);
-		const adder = new AuthorityEngine(
-			new SqliteAuthorityPersistence({ path: filename, identity, create: false }),
-			"a".repeat(36),
-		);
-		adder.recover();
-		for (let index = 0; index < open; index++)
-			adder.transition(operationRow(binding, `toolu_01open${String(index).padStart(18, "0")}`, "intent", 12));
-		adder.close();
-		const capacity = await openAuthorityCapacityFile(copy);
-		handles.push(capacity.handle);
-		const requests: number[] = [];
-		const original = BorrowedAuthorityCapacityPool.prototype.ensureDataBytes;
-		// Refuse before allocating so a regression fails here instead of filling the disk.
-		const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(function (
-			this: BorrowedAuthorityCapacityPool,
-			bytes: number,
-			step?: number,
-		) {
-			requests.push(bytes);
-			if (bytes > 8 * 1_073_741_824) throw new Error(`reopen requested ${bytes} reserve bytes`);
-			return original.call(this, bytes, step);
-		});
-		try {
-			const engine = new AuthorityEngine(
-				new SqliteAuthorityPersistence({
-					path: filename,
-					identity,
-					create: false,
-					capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
-				}),
-				"r".repeat(36),
+		builder.recover();
+		const binding = activateRoot(builder);
+		// Physical schema v4 stores a history in about a quarter of the v3 bytes; longer ids keep this one above the
+		// observer's page bound below. One commit group keeps its ~180 commands to a single durable sync.
+		builder.beginGroup();
+		for (let batch = 0; batch < 30; batch++) {
+			const ids = Array.from(
+				{ length: 100 },
+				(_, index) => `toolu_01${String(batch * 100 + index).padStart(392, "0")}`,
 			);
-			try {
-				expect(engine.recover().blocked).toHaveLength(open);
-			} finally {
-				engine.close();
-			}
-		} finally {
-			growth.mockRestore();
+			builder.transitionBatch(ids.map(id => operationRow(binding, id, "intent", 10)));
+			for (let chunk = 0; chunk < ids.length; chunk += 20)
+				builder.transitionBatch(ids.slice(chunk, chunk + 20).map(id => operationRow(binding, id, "abandoned", 11)));
 		}
-		return Math.max(...requests);
-	};
-	const perOperation = ((await reopenReserve(OPEN)) - (await reopenReserve(0))) / OPEN;
-	// One open operation's own database obligation, priced at the source-pinned 20-level cursor depth (an upper bound
-	// on the height the live owner may use). Each operation adds its additive page growth, at most 1/8 database arena
-	// slack and its XFS extent metadata; the WAL and the WAL close refund depend only on the largest single
-	// transaction, so they add nothing per operation (the old sum-over-later-allocations WAL tripled this).
-	const operationDebt = new AuthorityCapacityDebtLedger(identity, ADMISSION, [
-		operationRow(binding, "toolu_01bound", "intent", 12),
-	]).currentDebt();
-	expect(perOperation).toBeGreaterThan(0);
-	expect(perOperation).toBeLessThanOrEqual(1.25 * operationDebt.sqliteDatabaseBytes);
-}, 120_000);
+		builder.syncGroup();
+		builder.close();
+		// Precondition: larger than the bounded 256-page native observer, so only the proven bounds apply.
+		expect(syncFs.statSync(source).size).toBeGreaterThan(256 * 4_096 * 3);
+		const OPEN = 100;
+		const reopenReserve = async (open: number): Promise<number> => {
+			const copy = path.join(directory, `open-${open}`);
+			await fs.mkdir(copy, { mode: 0o700 });
+			const filename = path.join(copy, "history.sqlite");
+			await fs.copyFile(source, filename);
+			const adder = new AuthorityEngine(
+				new SqliteAuthorityPersistence({ path: filename, identity, create: false }),
+				"a".repeat(36),
+			);
+			adder.recover();
+			for (let index = 0; index < open; index++)
+				adder.transition(operationRow(binding, `toolu_01open${String(index).padStart(18, "0")}`, "intent", 12));
+			adder.close();
+			const capacity = await openAuthorityCapacityFile(copy);
+			handles.push(capacity.handle);
+			const requests: number[] = [];
+			const original = BorrowedAuthorityCapacityPool.prototype.ensureDataBytes;
+			// Refuse before allocating so a regression fails here instead of filling the disk.
+			const growth = spyOn(BorrowedAuthorityCapacityPool.prototype, "ensureDataBytes").mockImplementation(function (
+				this: BorrowedAuthorityCapacityPool,
+				bytes: number,
+				step?: number,
+			) {
+				requests.push(bytes);
+				if (bytes > 8 * 1_073_741_824) throw new Error(`reopen requested ${bytes} reserve bytes`);
+				return original.call(this, bytes, step);
+			});
+			try {
+				const engine = new AuthorityEngine(
+					new SqliteAuthorityPersistence({
+						path: filename,
+						identity,
+						create: false,
+						capacity: { identity: capacity.identity, maxRequestBytes: ADMISSION },
+					}),
+					"r".repeat(36),
+				);
+				try {
+					expect(engine.recover().blocked).toHaveLength(open);
+				} finally {
+					engine.close();
+				}
+			} finally {
+				growth.mockRestore();
+			}
+			return Math.max(...requests);
+		};
+		const perOperation = ((await reopenReserve(OPEN)) - (await reopenReserve(0))) / OPEN;
+		// One open operation's own database obligation, priced at the source-pinned 20-level cursor depth (an upper bound
+		// on the height the live owner may use). Each operation adds its additive page growth, at most 1/8 database arena
+		// slack and its XFS extent metadata; the WAL and the WAL close refund depend only on the largest single
+		// transaction, so they add nothing per operation (the old sum-over-later-allocations WAL tripled this).
+		const operationDebt = new AuthorityCapacityDebtLedger(identity, ADMISSION, [
+			operationRow(binding, "toolu_01bound", "intent", 12),
+		]).currentDebt();
+		expect(perOperation).toBeGreaterThan(0);
+		expect(perOperation).toBeLessThanOrEqual(1.25 * operationDebt.sqliteDatabaseBytes);
+	},
+	120_000,
+);
