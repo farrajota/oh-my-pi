@@ -8,6 +8,7 @@ import { arkToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { preloadPluginRoots } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { rejectionOf } from "../helpers/rejection";
+import { SessionPathScope } from "../../src/internal/session-path-scope";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 import { createLspWritethrough, LspTool } from "@oh-my-pi/pi-coding-agent/lsp";
 import * as lspClient from "@oh-my-pi/pi-coding-agent/lsp/client";
@@ -51,6 +52,7 @@ import {
 	fileToUri,
 	filterWorkspaceSymbols,
 	hasGlobPattern,
+	LspFilesystemReadError,
 	readLocationContext,
 	resolveDiagnosticTargets,
 	resolveSymbolColumn,
@@ -2729,6 +2731,316 @@ describe("lsp regressions", () => {
 			tempDir.removeSync();
 		}
 	});
+
+	it("awaits the real workspace reconciliation read close and never treats its ENOENT failure as a missing file", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-refresh-authority-");
+		const target = path.join(tempDir.path(), "refresh.ts");
+		const uri = fileToUri(target);
+		const failure = Object.assign(new Error("reconciliation durable close failed"), { code: "ENOENT" });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const scope = new SessionPathScope({
+			actorId: () => "Worker",
+			sessionId: () => "root",
+			cwd: () => tempDir.path(),
+			permissionScope: () => undefined,
+		});
+		const peer = installFakeLsp((message, server) => {
+			if (message.method === "initialize")
+				server.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+			else if (message.method === "shutdown") server.send({ jsonrpc: "2.0", id: message.id, result: null });
+			else if (message.method === "exit") server.exit(0);
+		});
+		try {
+			await Bun.write(target, "old\n");
+			const client = await lspClient.getOrCreateClient(
+				{ command: "fake-lsp", fileTypes: ["ts"], rootMarkers: [] },
+				tempDir.path(),
+			);
+			await lspClient.ensureFileOpen(client, target);
+			let reads = 0;
+			let settled = false;
+			const pending = scope.withOperationLease("lsp:refresh-close", operation => {
+				const openRead = operation.openRead.bind(operation);
+				vi.spyOn(operation, "openRead").mockImplementation(async (...args) => {
+					const handle = await openRead(...args);
+					reads++;
+					if (reads === 2) {
+						const close = handle.close.bind(handle);
+						handle.close = async () => {
+							await close();
+							started.resolve();
+							await release.promise;
+							throw failure;
+						};
+					}
+					return handle;
+				});
+				return lspClient.withLspSessionPolicy(
+					{ shared: false },
+					() =>
+						lspClient.applyWorkspaceEditWithLsp(
+							{
+								changes: {
+									[uri]: [
+										{
+											range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } },
+											newText: "new",
+										},
+									],
+								},
+							},
+							tempDir.path(),
+							undefined,
+							{ operation, authorizePath: async () => {} },
+						),
+					{ operation, authorizePath: async () => {} },
+				);
+			});
+			void pending.then(
+				() => {
+					settled = true;
+				},
+				() => {
+					settled = true;
+				},
+			);
+			try {
+				const stage = await Promise.race([
+					started.promise.then(() => "read-close"),
+					pending.then(
+						() => "settled",
+						() => "settled",
+					),
+				]);
+				expect(stage).toBe("read-close");
+				expect(settled).toBe(false);
+				expect(reads).toBe(2);
+				expect(await Bun.file(target).text()).toBe("new\n");
+				expect(peer.received.filter(message => message.method === "textDocument/didChange")).toHaveLength(0);
+				release.resolve();
+				const outcome = await rejectionOf(pending);
+				expect(outcome).toBeInstanceOf(LspFilesystemReadError);
+				expect((outcome as LspFilesystemReadError).cause).toBe(failure);
+				expect(client.openFiles.has(uri)).toBe(true);
+			} finally {
+				release.resolve();
+				await pending.catch(() => undefined);
+			}
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("retains both workspace apply failure and exact read-authority reconciliation failure", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-refresh-errors-");
+		// Text edits run before a resource op only when it targets their subtree (see "reconciles the
+		// executed prefix when a workspace edit fails partway"), so the failing op is a non-recursive
+		// delete of the edited file's own non-empty directory: the edit lands, then the delete throws.
+		const sourceDir = path.join(tempDir.path(), "src");
+		const target = path.join(sourceDir, "prefix.ts");
+		const uri = fileToUri(target);
+		const scope = new SessionPathScope({
+			actorId: () => "Worker",
+			sessionId: () => "root",
+			cwd: () => tempDir.path(),
+			permissionScope: () => undefined,
+		});
+		const failure = new Error("reconciliation authority denied");
+		installHandshakeLsp();
+		try {
+			await Bun.write(target, "old\n");
+			const client = await lspClient.getOrCreateClient(
+				{ command: "fake-lsp", fileTypes: ["ts"], rootMarkers: [] },
+				tempDir.path(),
+			);
+			await lspClient.ensureFileOpen(client, target);
+			const outcome = await scope
+				.withOperationLease("lsp:refresh-errors", operation => {
+					const authorize = operation.authorize.bind(operation);
+					let reads = 0;
+					vi.spyOn(operation, "authorize").mockImplementation(async (filePath, kind) => {
+						if (kind === "read" && ++reads === 2) throw failure;
+						return authorize(filePath, kind);
+					});
+					return lspClient.applyWorkspaceEditWithLsp(
+						{
+							documentChanges: [
+								{
+									textDocument: { uri, version: null },
+									edits: [
+										{
+											range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } },
+											newText: "new",
+										},
+									],
+								},
+								{ kind: "delete", uri: fileToUri(sourceDir), options: { recursive: false } },
+							],
+						},
+						tempDir.path(),
+						undefined,
+						{ operation, authorizePath: async () => {} },
+					);
+				})
+				.catch(error => error);
+			expect(outcome).toBeInstanceOf(AggregateError);
+			expect((outcome as AggregateError).errors[0]).toBeInstanceOf(Error);
+			expect((outcome as AggregateError).errors[1]).toBeInstanceOf(LspFilesystemReadError);
+			expect(((outcome as AggregateError).errors[1] as LspFilesystemReadError).cause).toBe(failure);
+			expect(await Bun.file(target).text()).toBe("new\n");
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("binds server workspace edits to the live request invocation and refuses late unsolicited edits", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-apply-authority-");
+		const target = path.join(tempDir.path(), "command.ts");
+		await Bun.write(target, "old\n");
+		const scope = new SessionPathScope({
+			actorId: () => "Worker",
+			sessionId: () => "root",
+			cwd: () => tempDir.path(),
+			permissionScope: () => undefined,
+		});
+		let commandId: number | string | undefined;
+		const edit = {
+			changes: {
+				[fileToUri(target)]: [
+					{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: "new" },
+				],
+			},
+		};
+		const peer = installFakeLsp((message, server) => {
+			if (message.method === "initialize")
+				server.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+			else if (message.method === "workspace/executeCommand") {
+				commandId = message.id;
+				server.send({ jsonrpc: "2.0", id: "server-edit", method: "workspace/applyEdit", params: { edit } });
+			} else if (message.id === "server-edit") {
+				server.send({ jsonrpc: "2.0", id: commandId, result: message.result });
+			} else if (message.method === "shutdown") server.send({ jsonrpc: "2.0", id: message.id, result: null });
+			else if (message.method === "exit") server.exit(0);
+		});
+		try {
+			let client: LspClient | undefined;
+			await scope.withOperationLease("lsp:command", operation =>
+				lspClient.withLspSessionPolicy(
+					{ shared: false },
+					async () => {
+						client = await lspClient.getOrCreateClient(
+							{ command: "fake-lsp", fileTypes: ["ts"], rootMarkers: [] },
+							tempDir.path(),
+						);
+						expect(await lspClient.sendRequest(client, "workspace/executeCommand", { command: "apply" })).toEqual(
+							{ applied: true },
+						);
+					},
+					{
+						operation,
+						authorizePath: async filePath => {
+							await operation.authorize(filePath, "write");
+						},
+					},
+				),
+			);
+			expect(await Bun.file(target).text()).toBe("new\n");
+			peer.send({ jsonrpc: "2.0", id: "late-edit", method: "workspace/applyEdit", params: { edit } });
+			const response = await peer.waitFor(message => message.id === "late-edit");
+			expect(response.result).toMatchObject({
+				applied: false,
+				failureReason: expect.stringMatching(/live|authority|invocation/i),
+			});
+			expect(await Bun.file(target).text()).toBe("new\n");
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	for (const nonError of [false, true]) {
+		it(`propagates a server workspace edit's ${nonError ? "non-Error cause" : "original Error"} to its owning request`, async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-apply-request-failure-");
+			const target = path.join(tempDir.path(), "command.ts");
+			const scope = new SessionPathScope({
+				actorId: () => "Worker",
+				sessionId: () => "root",
+				cwd: () => tempDir.path(),
+				permissionScope: () => undefined,
+			});
+			const failure = nonError ? "server workspace edit denied" : new Error("server workspace edit denied");
+			let commandId: number | string | undefined;
+			let authorizations = 0;
+			const edit = {
+				changes: {
+					[fileToUri(target)]: [
+						{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: "new" },
+					],
+				},
+			};
+			const peer = installFakeLsp((message, server) => {
+				if (message.method === "initialize")
+					server.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+				else if (message.method === "workspace/executeCommand") {
+					commandId = message.id;
+					server.send({
+						jsonrpc: "2.0",
+						id: "server-edit-failure",
+						method: "workspace/applyEdit",
+						params: { edit },
+					});
+				} else if (message.id === "server-edit-failure") {
+					server.send({ jsonrpc: "2.0", id: commandId, result: message.result });
+				} else if (message.method === "shutdown") server.send({ jsonrpc: "2.0", id: message.id, result: null });
+				else if (message.method === "exit") server.exit(0);
+			});
+			try {
+				await Bun.write(target, "old\n");
+				let client: LspClient | undefined;
+				const outcome = await rejectionOf(
+					scope.withOperationLease("lsp:command-failure", operation =>
+						lspClient.withLspSessionPolicy(
+							{ shared: false },
+							async () => {
+								client = await lspClient.getOrCreateClient(
+									{ command: "fake-lsp", fileTypes: ["ts"], rootMarkers: [] },
+									tempDir.path(),
+								);
+								return lspClient.sendRequest(client, "workspace/executeCommand", { command: "apply" });
+							},
+							{
+								operation,
+								authorizePath: async () => {
+									authorizations++;
+									throw failure;
+								},
+							},
+						),
+					),
+				);
+				expect(authorizations).toBe(1);
+				expect(outcome).toBeInstanceOf(Error);
+				if (typeof failure === "string") {
+					if (!(outcome instanceof Error))
+						throw new Error("Expected a non-Error server rejection to be wrapped as an Error.");
+					expect(outcome.message).toBe(failure);
+					expect(outcome.cause).toBe(failure);
+				} else {
+					expect(outcome).toBe(failure);
+				}
+				const response = await peer.waitFor(message => message.id === "server-edit-failure");
+				expect(response.result).toEqual({ applied: false, failureReason: String(failure) });
+				expect(client?.pendingRequests.size).toBe(0);
+				expect(await Bun.file(target).text()).toBe("old\n");
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+	}
 
 	it("reloads TypeScript projects after create before opening the new module", async () => {
 		// #12924/#12925: tsserver pins a failed import resolution when the new

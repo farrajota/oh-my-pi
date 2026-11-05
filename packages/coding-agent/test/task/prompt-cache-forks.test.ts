@@ -13,6 +13,7 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import { createAgentRootSession } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import * as sdk from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -37,6 +38,7 @@ async function fixture() {
 	auth.keys.setRuntime("muse-code", JSON.stringify({ oauthAccessToken: "test-oauth", apiKey: "test-key" }));
 	auth.keys.setRuntime("openai-codex", "test-key");
 	const sessions: AgentSession[] = [];
+	const authorityFiles = new Set<string>();
 	const requests: Array<{
 		key: unknown;
 		sessionId: string | undefined;
@@ -121,6 +123,7 @@ async function fixture() {
 	return {
 		dir,
 		sessions,
+		authorityFiles,
 		auth,
 		requests,
 		create,
@@ -128,6 +131,7 @@ async function fixture() {
 		context,
 		async [Symbol.asyncDispose]() {
 			await Promise.all(sessions.map(session => session.dispose()));
+			for (const file of authorityFiles) await closeSessionAuthority(file);
 			auth.close();
 			dir[Symbol.dispose]();
 		},
@@ -207,9 +211,13 @@ it.each([false, true])("keeps tan's copied candidate model-gated (explicit=%s)",
 	});
 	await modelRegistry.refreshProvider("muse-code", "online");
 	const parentSessionManager = SessionManager.create(h.dir.path(), h.dir.join("parent"));
+	await parentSessionManager.ensureOnDisk();
 	const parentSessionFile = parentSessionManager.getSessionFile();
 	if (!parentSessionFile) throw new Error("Expected a persisted parent session file");
-	const agentRegistry = AgentRegistry.isolatedForSession(parentSessionFile);
+	h.authorityFiles.add(parentSessionFile);
+	const agentRegistry = await AgentRegistry.create({
+		durableState: await registryDurableStateForSession(parentSessionFile, { create: true }),
+	});
 	AgentRegistry.installGlobal(agentRegistry);
 	const { session: parent } = await createAgentRootSession(agentRegistry, {
 		agentId: MAIN_AGENT_ID,

@@ -23,7 +23,7 @@ import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/a
 import type { AgentAuthoritySessionBinding } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -228,12 +228,16 @@ describe("runSubprocess soft request budget", () => {
 	let settings: Settings;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
+	const authorityFiles = new Set<string>();
 	beforeEach(async () => {
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		tempDir = TempDir.createSync("@pi-soft-budget-");
-		const rootSessionFile = `${tempDir.path()}/main.jsonl`;
-		await Bun.write(rootSessionFile, "");
+		const rootManager = SessionManager.create(tempDir.path(), tempDir.join("root-sessions"));
+		await rootManager.ensureOnDisk();
+		const rootSessionFile = rootManager.getSessionFile();
+		if (!rootSessionFile) throw new Error("Expected materialized owning root");
+		authorityFiles.add(rootSessionFile);
 		// A hermetic root: the default root session reads the developer's real
 		// agent dir, auth, and model catalog, which is slow and machine-dependent.
 		settings = Settings.isolated({ "task.softRequestBudget": 2 }, { cwd: tempDir.path(), agentDir: tempDir.path() });
@@ -256,10 +260,13 @@ describe("runSubprocess soft request budget", () => {
 				},
 			],
 		});
-		registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
+		registry = await AgentRegistry.create({
+			durableState: await registryDurableStateForSession(rootSessionFile, { create: true }),
+		});
 		AgentRegistry.installGlobal(registry);
 		({ session: rootSession } = await createAgentRootSession(registry, {
 			agentId: "Main",
+			sessionManager: rootManager,
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
 			settings,
@@ -282,6 +289,8 @@ describe("runSubprocess soft request budget", () => {
 		vi.restoreAllMocks();
 		await disposeAgentLifecycle(lifecycle);
 		await rootSession.dispose();
+		for (const file of authorityFiles) await closeSessionAuthority(file);
+		authorityFiles.clear();
 		resetAgentLifecycleForTests();
 		AgentRegistry.resetGlobalForTests();
 		AsyncJobManager.resetForTests();

@@ -1,7 +1,12 @@
 import * as fs from "node:fs";
 import { isEnoent, isRecord, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { BunFile } from "bun";
-import { isPermissionDeniedError, writeFileWithFallback } from "../tools/file-write-fallback";
+import {
+	FilesystemReadMissingError,
+	isPermissionDeniedError,
+	writeFileWithFallback,
+	type FileWriteMutationHooks,
+} from "../tools/file-write-fallback";
 import {
 	beginPendingDiskWrite,
 	endPendingDiskWrite,
@@ -23,11 +28,12 @@ import {
 	INLINE_DIAGNOSTICS_WAIT_TIMEOUT_MS,
 	limitDiagnosticMessages,
 	type ServerVersionMap,
+	type FormatContentResult,
 } from "./diagnostics";
 import { type FileDiagnosticsResult, FileFormatResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import { notifyFileSaved, splitServers, syncFileContent } from "./servers";
 import type { LspClient, ServerConfig } from "./types";
-import { summarizeDiagnosticMessages } from "./utils";
+import { isLspFilesystemReadFailure, LspFilesystemReadError, summarizeDiagnosticMessages } from "./utils";
 
 const TSSERVER_REQUEST_COMMAND = "typescript.tsserverRequest";
 
@@ -97,12 +103,18 @@ export interface WritethroughOptions {
 	transformDiagnostics?: (absPath: string, result: FileDiagnosticsResult) => FileDiagnosticsResult;
 	/** `lsp.requestTimeout` in seconds; raises the late-diagnostics wait for slow (cold-starting) servers. */
 	requestTimeoutSec?: number;
+	/** Active host filesystem authority for each backing-file mutation. */
+	mutationHooks?: FileWriteMutationHooks;
+	/** Current invocation authority for earlier destinations, distinct from local publication hooks. */
+	batchMutationHooks?: FileWriteMutationHooks;
 }
 
 /** Internal resolved form of {@link WritethroughOptions} that the writethrough machinery operates on. */
 type ResolvedWritethroughOptions = {
 	enableFormat: boolean;
 	enableDiagnostics: boolean;
+	mutationHooks?: FileWriteMutationHooks;
+	batchMutationHooks?: FileWriteMutationHooks;
 	transformDiagnostics?: (absPath: string, result: FileDiagnosticsResult) => FileDiagnosticsResult;
 	/** Per-server wait budget (ms) for diagnostics delivered late through the deferred channel. */
 	deferredWaitMs: number;
@@ -134,12 +146,13 @@ export type WritethroughCallback = (
 export async function writethroughNoop(
 	dst: string,
 	content: string,
-	_signal?: AbortSignal,
+	signal?: AbortSignal,
 	file?: BunFile,
 	_batch?: LspWritethroughBatchRequest,
 	_getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
+	mutationHooks?: FileWriteMutationHooks,
 ): Promise<WritethroughResult> {
-	await writeFileWithFallback(dst, content, file);
+	await writeFileWithFallback(dst, content, file, mutationHooks, signal);
 	return { finalContent: content };
 }
 
@@ -153,10 +166,13 @@ interface PendingWritethrough {
 	 * back to these when that read is denied.
 	 */
 	content: string;
+	authorityBound: boolean;
+	enableFormat: boolean;
 }
 
 interface RunLspWritethroughOptions {
 	contentAlreadyWritten?: boolean;
+	mutationHooks?: FileWriteMutationHooks;
 }
 
 interface LspWritethroughBatchRequest {
@@ -182,7 +198,7 @@ function getOrCreateWritethroughBatch(id: string, options: ResolvedWritethroughO
 	}
 	const batch: LspWritethroughBatchState = {
 		entries: new Map<string, PendingWritethrough>(),
-		options: { ...options },
+		options: { ...options, mutationHooks: undefined, batchMutationHooks: undefined },
 	};
 	writethroughBatches.set(id, batch);
 	return batch;
@@ -192,14 +208,22 @@ export async function flushLspWritethroughBatch(
 	id: string,
 	cwd: string,
 	signal?: AbortSignal,
+	mutationHooks?: FileWriteMutationHooks,
 ): Promise<FileDiagnosticsResult | undefined> {
 	const state = writethroughBatches.get(id);
 	if (!state) {
 		return undefined;
 	}
 	writethroughBatches.delete(id);
-	return (await flushWritethroughBatch(Array.from(state.entries.values()), "", cwd, state.options, signal))
-		.diagnostics;
+	return (
+		await flushWritethroughBatch(
+			Array.from(state.entries.values()),
+			"",
+			cwd,
+			{ ...state.options, mutationHooks },
+			signal,
+		)
+	).diagnostics;
 }
 
 function mergeDiagnostics(
@@ -392,16 +416,35 @@ async function runLspWritethrough(
 	const contentAlreadyWritten = runOptions?.contentAlreadyWritten ?? false;
 
 	let finalContent = content;
+	let timedOut = false;
 	// Bytes this operation has committed to disk; `undefined` until they land
 	// there (the caller already wrote `content` when `contentAlreadyWritten`).
 	let diskContent = contentAlreadyWritten ? content : undefined;
-	const writeContent = async (value: string) => {
-		await writeFileWithFallback(dst, value, file);
-		diskContent = value;
+	let writeInFlight: Promise<void> | undefined;
+	let writeFailure: { error: unknown } | undefined;
+	let formatterInFlight: Promise<FormatContentResult> | undefined;
+	let formatterFailure: { error: unknown } | undefined;
+	const writeContent = async (value: string, allowAfterTimeout = false) => {
+		if (timedOut && !allowAfterTimeout) return;
+		const mutationHooks = runOptions ? runOptions.mutationHooks : options.mutationHooks;
+		const pending = (async () => {
+			await writeFileWithFallback(dst, value, file, mutationHooks, signal);
+			diskContent = value;
+		})();
+		writeInFlight = pending;
+		try {
+			await pending;
+		} catch (error) {
+			writeFailure = { error };
+			throw error;
+		} finally {
+			if (writeInFlight === pending) writeInFlight = undefined;
+		}
 	};
 	/** Commit {@link finalContent} unless those exact bytes are already on disk. */
-	const commitWrite = async () => {
-		if (diskContent !== finalContent) await writeContent(finalContent);
+	const commitWrite = async (allowAfterTimeout = false) => {
+		if (timedOut && !allowAfterTimeout) return;
+		if (diskContent !== finalContent) await writeContent(finalContent, allowAfterTimeout);
 	};
 	let writeNotified = false;
 	const notifyWriteCommitted = async (notifySignal: AbortSignal | undefined = signal) => {
@@ -410,6 +453,7 @@ async function runLspWritethrough(
 		try {
 			await notifyWorkspaceWatchedFiles(cwd, [{ filePath: dst, type: changeType }], notifySignal);
 		} catch (error) {
+			if (isLspFilesystemReadFailure(error)) throw error;
 			if (notifySignal?.aborted && !signal?.aborted) {
 				// The operation budget died mid-notify while the caller is still
 				// live: allow the post-write retry below to re-announce with the
@@ -446,7 +490,6 @@ async function runLspWritethrough(
 
 	let formatter: FileFormatResult | undefined;
 	let diagnostics: FileDiagnosticsResult | undefined;
-	let timedOut = false;
 	let synced = false;
 	let operationSignal: AbortSignal | undefined;
 	// The overlay leads disk from the first sync below until the write commits;
@@ -463,89 +506,111 @@ async function runLspWritethrough(
 			{ once: true },
 		);
 		operationSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-		await untilAborted(operationSignal, async () => {
-			if (enableDiagnostics) {
-				// The target overlay leads disk until commit; reconcile only other
-				// open documents before computing diagnostics for the new content.
-				await Promise.all(
-					lspServers.map(async ([, serverConfig]) => {
-						const client = await getActiveOrPendingClient(serverConfig, cwd, operationSignal);
-						if (client) await reconcileOpenFilesFromDisk(client, operationSignal);
-					}),
-				);
-			}
-			if (useCustomFormatter) {
-				// Custom linters operate on on-disk input; the shared pre-write also
-				// supports implementations that inspect the file before formatting.
-				if (diskContent !== content) await writeContent(content);
-				const [formattedContent, capturedVersions] = await Promise.all([
-					formatContent(dst, content, cwd, customLinterServers, operationSignal),
-					minVersionsPromise,
-				]);
-				finalContent = formattedContent.content;
-				minVersions = capturedVersions;
-				if (formattedContent.failed) {
-					formatter = FileFormatResult.FAILED;
-				} else if (formattedContent.unsupported) {
-					formatter = FileFormatResult.UNSUPPORTED;
-				} else {
-					formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
+		await untilAborted(operationSignal, () =>
+			(async () => {
+				if (enableDiagnostics) {
+					// The target overlay leads disk until commit; reconcile only other
+					// open documents before computing diagnostics for the new content.
+					await Promise.all(
+						lspServers.map(async ([, serverConfig]) => {
+							const client = await getActiveOrPendingClient(serverConfig, cwd, operationSignal);
+							if (client) await reconcileOpenFilesFromDisk(client, operationSignal);
+						}),
+					);
 				}
-				await commitWrite();
-				await notifyWriteCommitted(operationSignal);
-				if (changeType === FileChangeType.Created) {
-					await reloadTypeScriptProjectsAfterCreate(cwd, lspServers, operationSignal, {
-						createMissing: enableDiagnostics,
+				if (useCustomFormatter) {
+					// Custom linters operate on on-disk input; the shared pre-write also
+					// supports implementations that inspect the file before formatting.
+					if (diskContent !== content) await writeContent(content);
+					formatterInFlight = formatContent(
+						dst,
+						content,
+						cwd,
+						customLinterServers,
+						operationSignal,
+						runOptions ? runOptions.mutationHooks : options.mutationHooks,
+					).catch(error => {
+						formatterFailure = { error };
+						throw error;
 					});
-				}
-				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, enableDiagnostics);
-			} else {
-				// Created paths must exist before their first `didOpen`. tsserver also
-				// needs an acknowledged project reload: on delayed filesystem watchers
-				// (notably macOS FSEvents), opening immediately after the write pins the
-				// dependent's cached missing-module resolution indefinitely.
-				if (changeType === FileChangeType.Created) {
-					await commitWrite();
-					await notifyWriteCommitted(operationSignal);
-					await reloadTypeScriptProjectsAfterCreate(cwd, lspServers, operationSignal);
-				}
-
-				// 1. Sync original content to LSP servers
-				await syncFileContent(dst, content, cwd, lspServers, operationSignal);
-
-				// 2. Format in-memory via LSP
-				if (enableFormat) {
-					const formatted = await formatContent(dst, content, cwd, lspServers, operationSignal);
-					finalContent = formatted.content;
-					if (formatted.failed) {
+					const [formattedContent, capturedVersions] = await Promise.all([formatterInFlight, minVersionsPromise]);
+					finalContent = formattedContent.content;
+					minVersions = capturedVersions;
+					if (formattedContent.failed) {
 						formatter = FileFormatResult.FAILED;
-					} else if (formatted.unsupported) {
+					} else if (formattedContent.unsupported) {
 						formatter = FileFormatResult.UNSUPPORTED;
 					} else {
 						formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
 					}
+					await commitWrite();
+					await notifyWriteCommitted(operationSignal);
+					if (changeType === FileChangeType.Created) {
+						await reloadTypeScriptProjectsAfterCreate(cwd, lspServers, operationSignal, {
+							createMissing: enableDiagnostics,
+						});
+					}
+					await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, enableDiagnostics);
+				} else {
+					// Created paths must exist before their first `didOpen`. tsserver also
+					// needs an acknowledged project reload: on delayed filesystem watchers
+					// (notably macOS FSEvents), opening immediately after the write pins the
+					// dependent's cached missing-module resolution indefinitely.
+					if (changeType === FileChangeType.Created) {
+						await commitWrite();
+						await notifyWriteCommitted(operationSignal);
+						await reloadTypeScriptProjectsAfterCreate(cwd, lspServers, operationSignal);
+					}
+
+					// 1. Sync original content to LSP servers
+					await syncFileContent(dst, content, cwd, lspServers, operationSignal);
+
+					// 2. Format in-memory via LSP
+					if (enableFormat) {
+						const formatted = await formatContent(dst, content, cwd, lspServers, operationSignal);
+						finalContent = formatted.content;
+						if (formatted.failed) {
+							formatter = FileFormatResult.FAILED;
+						} else if (formatted.unsupported) {
+							formatter = FileFormatResult.UNSUPPORTED;
+						} else {
+							formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
+						}
+					}
+
+					// 3. If formatted, sync formatted content to LSP servers
+					if (finalContent !== content) {
+						await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal);
+					}
+
+					// 4. Write to disk. A formatter-altered body is the only thing left to
+					// commit when the create already landed above.
+					await commitWrite();
+					await notifyWriteCommitted(operationSignal);
 				}
 
-				// 3. If formatted, sync formatted content to LSP servers
-				if (finalContent !== content) {
-					await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal);
+				if (enableDiagnostics) {
+					expectedDocumentVersions = await captureOpenFileVersions(dst, cwd, lspServers, operationSignal);
 				}
 
-				// 4. Write to disk. A formatter-altered body is the only thing left to
-				// commit when the create already landed above.
-				await commitWrite();
-				await notifyWriteCommitted(operationSignal);
-			}
-
-			if (enableDiagnostics) {
-				expectedDocumentVersions = await captureOpenFileVersions(dst, cwd, lspServers, operationSignal);
-			}
-
-			// 5. Notify saved to LSP servers
-			await notifyFileSaved(dst, cwd, lspServers, operationSignal, !useCustomFormatter || enableDiagnostics);
-		});
+				// 5. Notify saved to LSP servers
+				await notifyFileSaved(dst, cwd, lspServers, operationSignal, !useCustomFormatter || enableDiagnostics);
+			})(),
+		);
 		synced = true;
-	} catch {
+	} catch (error) {
+		// A deadline races LSP work, not the lifetime or disposition of admitted physical effects.
+		await Promise.allSettled([writeInFlight, formatterInFlight]);
+		if (writeFailure && formatterFailure && writeFailure.error !== formatterFailure.error) {
+			throw new AggregateError(
+				[writeFailure.error, formatterFailure.error],
+				"Filesystem write and custom formatter both failed.",
+			);
+		}
+		if (writeFailure) throw writeFailure.error;
+		if (formatterFailure) throw formatterFailure.error;
+		if (isLspFilesystemReadFailure(error)) throw error instanceof LspFilesystemReadError ? error.cause : error;
+		if (signal?.aborted) throw error;
 		if (timedOut) {
 			formatter = undefined;
 			diagnostics = undefined;
@@ -563,7 +628,7 @@ async function runLspWritethrough(
 				});
 			}
 		}
-		await commitWrite();
+		await commitWrite(timedOut);
 		// The write above committed even though the operation budget elapsed:
 		// announce it on the caller's signal — the dead `operationSignal` would
 		// abort the notify before it ever reaches the server.
@@ -613,18 +678,23 @@ async function flushWritethroughBatch(
 	const results: Array<FileDiagnosticsResult | undefined> = [];
 	const finalContents = new Map<string, string>();
 	for (const entry of batch) {
+		if (entry.authorityBound && (!options.mutationHooks || !options.mutationHooks.readText)) {
+			throw new Error("LSP batch requires current filesystem mutation and read authority");
+		}
 		const bundle = getDeferred?.(entry.dst);
 		let content: string;
 		try {
-			content = await fs.promises.readFile(entry.dst, "utf8");
+			content = options.mutationHooks?.readText
+				? ((await options.mutationHooks.readText(entry.dst)) ?? entry.content)
+				: await fs.promises.readFile(entry.dst, "utf8");
 		} catch (error) {
-			if (isEnoent(error)) {
+			if (error instanceof FilesystemReadMissingError || (!options.mutationHooks?.readText && isEnoent(error))) {
 				bundle?.finalize(undefined);
 				continue;
 			}
 			// A brokered write may deny read-back even after the write succeeds.
 			// Keep the committed request content as the source for diagnostics.
-			if (!isPermissionDeniedError(error)) throw error;
+			if (options.mutationHooks?.readText || !isPermissionDeniedError(error)) throw error;
 			content = entry.content;
 		}
 		const deferredInner =
@@ -637,12 +707,12 @@ async function flushWritethroughBatch(
 			entry.dst,
 			content,
 			cwd,
-			options,
+			{ ...options, enableFormat: entry.enableFormat },
 			entry.changeType,
 			signal,
 			entry.file,
 			deferredInner,
-			{ contentAlreadyWritten: true },
+			{ contentAlreadyWritten: true, mutationHooks: options.mutationHooks },
 		);
 		finalContents.set(entry.dst, diag.finalContent);
 		bundle?.finalize(diag.diagnostics);
@@ -663,6 +733,8 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 		enableFormat: options?.enableFormat ?? false,
 		enableDiagnostics: options?.enableDiagnostics ?? false,
 		transformDiagnostics: options?.transformDiagnostics,
+		mutationHooks: options?.mutationHooks,
+		batchMutationHooks: options?.batchMutationHooks,
 		deferredWaitMs: deferredDiagnosticsWaitMs(options?.requestTimeoutSec),
 	};
 	return async (
@@ -699,7 +771,7 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 		// File commits are never deferred: the batch owns only LSP post-processing,
 		// so a later flush cannot replay an obsolete whole-file snapshot.
 		try {
-			await writethroughNoop(dst, content, signal, file);
+			await writethroughNoop(dst, content, signal, file, undefined, undefined, resolvedOptions.mutationHooks);
 		} catch (error) {
 			if (batch.flush) {
 				const pending = writethroughBatches.get(batch.id);
@@ -710,15 +782,18 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 							Array.from(pending.entries.values()),
 							"",
 							cwd,
-							pending.options,
+							{
+								...pending.options,
+								mutationHooks: resolvedOptions.batchMutationHooks ?? resolvedOptions.mutationHooks,
+							},
 							signal,
 							getDeferred,
 						);
 					} catch (flushError) {
-						logger.warn("Failed to flush pending LSP batch after final write failure", {
-							batchId: batch.id,
-							error: flushError instanceof Error ? flushError.message : String(flushError),
-						});
+						throw new AggregateError(
+							[error, flushError],
+							"Final write failed and pending LSP batch disposition did not complete.",
+						);
 					}
 				}
 			}
@@ -726,14 +801,21 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 		}
 
 		const state = getOrCreateWritethroughBatch(batch.id, resolvedOptions);
-		state.entries.set(dst, { dst, file, changeType, content });
+		state.entries.set(dst, {
+			dst,
+			file,
+			changeType,
+			content,
+			enableFormat: resolvedOptions.enableFormat,
+			authorityBound: resolvedOptions.mutationHooks !== undefined,
+		});
 		if (!batch.flush) return { finalContent: content };
 		writethroughBatches.delete(batch.id);
 		const result = await flushWritethroughBatch(
 			Array.from(state.entries.values()),
 			dst,
 			cwd,
-			state.options,
+			{ ...state.options, mutationHooks: resolvedOptions.batchMutationHooks ?? resolvedOptions.mutationHooks },
 			signal,
 			getDeferred,
 		);

@@ -13,7 +13,13 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { TanCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/tan-command-controller";
-import { createAgentRootSession, lookupAgentRef } from "../../../src/internal/agent-registry-bridge";
+
+import {
+	createAgentRootSession,
+	detachAgentSession,
+	lookupAgentRef,
+	removeAgentRef,
+} from "../../../src/internal/agent-registry-bridge";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -26,6 +32,8 @@ import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-l
 import { extractSessionInit, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { closeSessionAuthority, registryDurableStateForSession } from "../../../src/registry/authority";
+import { authorityPaths } from "../../../src/registry/authority/ownership";
 import { removeSyncWithRetries, TempDir } from "@oh-my-pi/pi-utils";
 
 const createRealAgentSession = sdkModule.createAgentSession;
@@ -39,8 +47,27 @@ interface CapturedJobRunContext {
 type CapturedJobRun = (ctx: CapturedJobRunContext) => Promise<string | AsyncJobRunResult>;
 
 const model = { provider: "anthropic", id: "claude-sonnet-4-5" } as Model;
-const rootSessions: Array<{ dispose: () => Promise<void> }> = [];
+const rootSessions: Array<{
+	dispose: () => Promise<void>;
+	disposeRaw: () => Promise<void>;
+	expectedFailures: unknown[];
+}> = [];
 const operationLedgerClosers: Array<() => Promise<void>> = [];
+const fixturePaths: string[] = [];
+
+interface ManagedTanCleanup {
+	parentManager: SessionManager;
+	parentFile: string;
+	closeLedger: () => Promise<void>;
+	childLedgerClosers: Array<() => Promise<void>>;
+	childManagerClosers: Array<() => Promise<void>>;
+}
+
+interface ManagedTanFixture {
+	cleanup: ManagedTanCleanup;
+}
+
+const managedTanCleanups: ManagedTanCleanup[] = [];
 
 function assistantText(text: string): AssistantMessage {
 	return {
@@ -69,7 +96,7 @@ interface TanSessionEvent {
 	message?: AgentMessage;
 }
 interface TanCloneStub {
-	clone: object;
+	clone: { sessionManager: Pick<SessionManager, "appendSessionInit"> | undefined };
 	attachSessionManager(sessionManager: CreateAgentSessionOptions["sessionManager"]): void;
 }
 
@@ -92,6 +119,7 @@ function createCloneStub(overrides?: {
 		sessionManager: overrides?.sessionManager,
 
 		setTodoPhases: vi.fn(),
+		beginDispose: vi.fn(),
 		getActiveToolNames: vi.fn(() => overrides?.activeToolNames ?? ["read", "bash"]),
 		getEnabledToolNames: vi.fn(() => overrides?.enabledToolNames ?? overrides?.activeToolNames ?? ["read", "bash"]),
 		setActiveToolPresentation: vi.fn(async () => {}),
@@ -158,6 +186,7 @@ async function createContext(overrides?: {
 	settings?: Settings;
 }) {
 	const tempDir = TempDir.createSync("@omp-tan-controller-");
+	fixturePaths.push(tempDir.path());
 	const parentFile = path.join(tempDir.path(), "parent.jsonl");
 	// The clone nests inside the parent's artifact directory, like a subagent.
 	const cloneFile = path.join(parentFile.slice(0, -6), "clone.jsonl");
@@ -207,12 +236,16 @@ async function createContext(overrides?: {
 		ensureOnDisk: vi.fn(async () => {}),
 		flush: vi.fn(async () => {}),
 	} as unknown as InteractiveModeContext["sessionManager"];
+	let parentDisposeStarted = false;
 	Object.assign(session, {
 		sessionManager,
+		beginDispose: vi.fn(),
 		dispose: vi.fn(async () => {
+			parentDisposeStarted = true;
 			await asyncJobManager.dispose();
 		}),
 	});
+	const disposeRaw = session.dispose.bind(session);
 	const cloneManager = {
 		getSessionFile: vi.fn(() => cloneFile),
 		appendCustomEntry: vi.fn(),
@@ -239,7 +272,14 @@ async function createContext(overrides?: {
 	} finally {
 		rootCreate.mockRestore();
 	}
-	rootSessions.push(session);
+	const rootCleanup = {
+		dispose: () => session.dispose(),
+		disposeRaw: async () => {
+			if (!parentDisposeStarted) await disposeRaw();
+		},
+		expectedFailures: [] as unknown[],
+	};
+	rootSessions.push(rootCleanup);
 	operationLedgerClosers.push(operationLedger.close);
 	return {
 		tempDir,
@@ -251,6 +291,7 @@ async function createContext(overrides?: {
 		getArtifactsDir,
 		getSessionId,
 		register,
+		rootCleanup,
 		operationLedger,
 		sequence,
 		get capturedRun() {
@@ -262,12 +303,130 @@ async function createContext(overrides?: {
 	};
 }
 
+async function createManagedContext(backend: "jsonl" | "sqlite") {
+	const harness = await createContext();
+	AgentRegistry.resetGlobalForTests();
+	const parentManager = SessionManager.create(
+		harness.tempDir.path(),
+		path.join(harness.tempDir.path(), "managed-parent"),
+	);
+	parentManager.appendMessage({ role: "user", content: "managed durable tan parent", timestamp: 1 });
+	await parentManager.ensureOnDisk();
+	const parentFile = parentManager.getSessionFile();
+	if (!parentFile) throw new Error("Managed Tan fixture requires a persisted parent transcript");
+	const store = await registryDurableStateForSession(parentFile, {
+		backend,
+		owningSessionId: parentManager.getSessionId(),
+		create: true,
+	});
+	const registry = await AgentRegistry.create({ durableState: store });
+	AgentRegistry.installGlobal(registry);
+	Object.assign(harness.ctx.session, { sessionManager: parentManager });
+	Object.assign(harness.ctx, { sessionManager: parentManager });
+	const operationLedger = installSessionOperationLedger(parentManager);
+	const cleanup: ManagedTanCleanup = {
+		parentManager,
+		parentFile,
+		closeLedger: operationLedger.close,
+		childLedgerClosers: [],
+		childManagerClosers: [],
+	};
+	managedTanCleanups.push(cleanup);
+	const rootCreate = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		if (options?.sessionManager !== parentManager) throw new Error("Managed Tan root used another session manager");
+		return { session: harness.ctx.session } as unknown as CreateAgentSessionResult;
+	});
+	try {
+		await createAgentRootSession(registry, { agentId: MAIN_AGENT_ID, sessionManager: parentManager });
+	} finally {
+		rootCreate.mockRestore();
+	}
+	return { harness, registry, store, parentManager, parentFile, cleanup };
+}
+
+function mockManagedClone(managed: ManagedTanFixture, stub: TanCloneStub) {
+	let childId: string | undefined;
+	let closeChildManager: (() => Promise<void>) | undefined;
+	let childManager: SessionManager | undefined;
+	mockTanSessionCreation(
+		stub,
+		options => {
+			childId = options.agentId;
+		},
+		async options => {
+			const capturedManager = options.sessionManager;
+			if (!capturedManager) throw new Error("Managed Tan child requires a real session manager");
+			childManager = capturedManager;
+			stub.clone.sessionManager = capturedManager;
+			const operationLedger = installSessionOperationLedger(capturedManager);
+			managed.cleanup.childLedgerClosers.push(operationLedger.close);
+			let managerClosed = false;
+			const closeManager = async () => {
+				if (managerClosed) return;
+				managerClosed = true;
+				await capturedManager.close();
+			};
+			closeChildManager = closeManager;
+			managed.cleanup.childManagerClosers.push(closeManager);
+			return { session: stub.clone } as unknown as CreateAgentSessionResult;
+		},
+	);
+	return {
+		get childId() {
+			return childId;
+		},
+		get childManager() {
+			return childManager;
+		},
+		closeChildManager: async () => closeChildManager?.(),
+	};
+}
+
+function managedChildId(id: string | undefined): string {
+	if (!id) throw new Error("Tan child id was not passed to session creation");
+	return id;
+}
+
 describe("TanCommandController", () => {
 	afterEach(async () => {
-		for (const closeLedger of operationLedgerClosers.splice(0)) await closeLedger();
-		for (const root of rootSessions.splice(0)) await root.dispose();
-		AgentRegistry.resetGlobalForTests();
-		vi.restoreAllMocks();
+		const errors: unknown[] = [];
+		const attempt = async (action: () => void | Promise<void>) => {
+			try {
+				await action();
+			} catch (error) {
+				errors.push(error);
+			}
+		};
+		for (const closeLedger of operationLedgerClosers.splice(0)) await attempt(closeLedger);
+		for (const root of rootSessions.splice(0)) {
+			try {
+				await root.dispose();
+				if (root.expectedFailures.length)
+					errors.push(new Error("Expected retained descendant disposal failure during root cleanup"));
+			} catch (error) {
+				if (
+					!(error instanceof AggregateError) ||
+					error.errors.length !== root.expectedFailures.length ||
+					error.errors.some((failure, index) => failure !== root.expectedFailures[index])
+				)
+					errors.push(error);
+				// Root retirement stops at retained descendants; close the fixture's own job manager separately.
+				await attempt(root.disposeRaw);
+			}
+		}
+		for (const cleanup of managedTanCleanups.splice(0)) {
+			for (const closeLedger of cleanup.childLedgerClosers) await attempt(closeLedger);
+			for (const closeManager of cleanup.childManagerClosers) await attempt(closeManager);
+			await attempt(cleanup.closeLedger);
+			await attempt(() => cleanup.parentManager.close());
+			await attempt(() => closeSessionAuthority(cleanup.parentFile));
+		}
+		for (const fixturePath of fixturePaths.splice(0)) await attempt(() => removeSyncWithRetries(fixturePath));
+		await attempt(() => AgentRegistry.resetGlobalForTests());
+		await attempt(() => {
+			vi.restoreAllMocks();
+		});
+		if (errors.length) throw new AggregateError(errors, "TAN fixture cleanup failed.");
 	});
 
 	it("rejects empty work before forking", async () => {
@@ -353,6 +512,9 @@ describe("TanCommandController", () => {
 				sessionFile: expect.stringMatching(/Tan-.+\.jsonl$/),
 				resetInheritedCost: true,
 				repairInterruptedTail: true,
+				childAgent: true,
+				// The clone's actor lives in the parent root's authority; its header names that root.
+				authorityParent: harness.parentFile,
 			},
 		);
 		expect(harness.register).toHaveBeenCalledWith("task", "/tan write the release note", expect.any(Function));
@@ -798,6 +960,8 @@ describe("TanCommandController", () => {
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
 		const promptStarted = Promise.withResolvers<void>();
 		const abortObserved = Promise.withResolvers<void>();
+		const disposalStarted = Promise.withResolvers<void>();
+		const allowDisposal = Promise.withResolvers<void>();
 		const stub = createCloneStub({
 			prompt: async () => {
 				promptStarted.resolve();
@@ -809,6 +973,10 @@ describe("TanCommandController", () => {
 			lastAssistantText: "finished",
 		});
 		const { clone } = stub;
+		stub.dispose.mockImplementation(async () => {
+			disposalStarted.resolve();
+			await allowDisposal.promise;
+		});
 		const registry = AgentRegistry.global();
 		const parentRef = lookupAgentRef(registry, MAIN_AGENT_ID);
 		if (!parentRef) throw new Error("Parent registry reference was not created");
@@ -829,14 +997,22 @@ describe("TanCommandController", () => {
 			reportProgress: async () => {},
 		});
 		await promptStarted.promise;
-		abortController.abort();
+		try {
+			abortController.abort();
+			await disposalStarted.promise;
+			if (!childId) throw new Error("Tan child id was not passed to session creation");
+			expect(registry.get(childId)).toEqual(
+				expect.objectContaining({ id: childId, status: "aborted", sessionFile: harness.cloneFile }),
+			);
+			expect(lookupAgentRef(registry, childId)?.session).toBeNull();
+			expect(lookupAgentRef(registry, MAIN_AGENT_ID)?.session).toBe(parentRef.session);
+		} finally {
+			allowDisposal.resolve();
+		}
 		await expect(resultPromise).rejects.toThrow(/^Operation job cancelled:/);
-
 		expect(clone.abort).toHaveBeenCalled();
 		expect(stub.dispose).toHaveBeenCalledTimes(1);
 		if (!childId) throw new Error("Tan child id was not passed to session creation");
-		expect(registry.get(childId)).toEqual(expect.objectContaining({ id: childId, status: "aborted" }));
-		expect(lookupAgentRef(registry, childId)?.session).toBeNull();
 		expect(lookupAgentRef(registry, MAIN_AGENT_ID)?.session).toBe(parentRef.session);
 		expect(parentRef.session).toBe(harness.ctx.session);
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]).toEqual(
@@ -893,6 +1069,7 @@ describe("TanCommandController", () => {
 			initialCwd: harness.tempDir.path(),
 			suppressBreadcrumb: true,
 		});
+		const allowDisposal = Promise.withResolvers<void>();
 		try {
 			await cloneManager.ensureOnDisk();
 			const registry = AgentRegistry.global();
@@ -902,6 +1079,8 @@ describe("TanCommandController", () => {
 			});
 			const { clone } = stub;
 			let childId: string | undefined;
+			const disposalStarted = Promise.withResolvers<void>();
+			let runSettled = false;
 			let childBeforeDispose: AgentRef | undefined;
 			let childSessionBeforeDispose: unknown;
 			mockTanSessionCreation(stub, options => {
@@ -911,17 +1090,31 @@ describe("TanCommandController", () => {
 				if (!childId) throw new Error("Tan child id was not passed to session creation");
 				childBeforeDispose = registry.get(childId);
 				childSessionBeforeDispose = lookupAgentRef(registry, childId)?.session;
+				disposalStarted.resolve();
+				await allowDisposal.promise;
 			});
 			const controller = new TanCommandController(harness.ctx);
 
 			await controller.start("park me");
 			const run = harness.capturedRun;
 			if (!run) throw new Error("run function was not captured");
-			const result = await run({
+			const runResult = run({
 				jobId: "job-123",
 				signal: new AbortController().signal,
 				reportProgress: async () => {},
+			}).then(value => {
+				runSettled = true;
+				return value;
 			});
+			await disposalStarted.promise;
+			if (!childId) throw new Error("Tan child id was not passed to session creation");
+			expect(registry.get(childId)).toEqual(
+				expect.objectContaining({ id: childId, status: "parked", sessionFile: harness.cloneFile }),
+			);
+			expect(lookupAgentRef(registry, childId)?.session).toBeNull();
+			expect(runSettled).toBe(false);
+			allowDisposal.resolve();
+			const result = await runResult;
 
 			expect(result).toBe("done");
 			await cloneManager.flush();
@@ -945,14 +1138,16 @@ describe("TanCommandController", () => {
 					sessionFile: harness.cloneFile,
 				}),
 			);
-			expect(childSessionBeforeDispose).toBe(clone);
+			expect(childSessionBeforeDispose).toBeNull();
 			const childAfterDispose = registry.get(childId);
 			expect(childAfterDispose).toEqual(
 				expect.objectContaining({ id: childId, status: "parked", sessionFile: harness.cloneFile }),
 			);
 			expect(lookupAgentRef(registry, childId)?.session).toBeNull();
 			expect(stub.dispose).toHaveBeenCalledTimes(1);
+			expect(clone.beginDispose).toHaveBeenCalledTimes(1);
 		} finally {
+			allowDisposal.resolve();
 			try {
 				await cloneManager.close();
 			} finally {
@@ -961,6 +1156,534 @@ describe("TanCommandController", () => {
 		}
 	});
 
+	for (const backend of ["jsonl", "sqlite"] as const) {
+		it(`holds TAN park behind the managed ${backend} terminal commit`, async () => {
+			const managed = await createManagedContext(backend);
+			const promptStarted = Promise.withResolvers<void>();
+			const finishPrompt = Promise.withResolvers<void>();
+			const commitStarted = Promise.withResolvers<void>();
+			const allowCommit = Promise.withResolvers<void>();
+			const disposalStarted = Promise.withResolvers<void>();
+			const allowDisposal = Promise.withResolvers<void>();
+			let runSettled = false;
+			let runResult: Promise<string | AsyncJobRunResult> | undefined;
+			const stub = createCloneStub({
+				prompt: async () => {
+					promptStarted.resolve();
+					await finishPrompt.promise;
+				},
+			});
+			const created = mockManagedClone(managed, stub);
+			let disposalObservedCommittedState = false;
+			stub.dispose.mockImplementation(async () => {
+				const childId = managedChildId(created.childId);
+				const childManager = created.childManager;
+				if (!childManager) throw new Error("Managed Tan child manager was not captured");
+				expect((await managed.store.getActor(childId))?.record.state).toBe("parked");
+				expect((await managed.store.getActor(MAIN_AGENT_ID))?.record.state).toBe("active");
+				disposalObservedCommittedState = true;
+				disposalStarted.resolve();
+				await allowDisposal.promise;
+				await created.closeChildManager();
+			});
+			const originalTransition = managed.store.transition.bind(managed.store);
+			managed.store.transition = async (record, options) => {
+				if (record.kind === "actor" && record.actorId === created.childId && record.state === "parked") {
+					commitStarted.resolve();
+					await allowCommit.promise;
+				}
+				return originalTransition(record, options);
+			};
+			try {
+				await new TanCommandController(managed.harness.ctx).start("durable park boundary");
+				const run = managed.harness.capturedRun;
+				if (!run) throw new Error("Managed TAN run function was not captured");
+				runResult = run({
+					jobId: "job-123",
+					signal: new AbortController().signal,
+					reportProgress: async () => {},
+				}).then(
+					value => {
+						runSettled = true;
+						return value;
+					},
+					error => {
+						runSettled = true;
+						throw error;
+					},
+				);
+				await promptStarted.promise;
+				finishPrompt.resolve();
+				await commitStarted.promise;
+				const childId = managedChildId(created.childId);
+				const childRef = lookupAgentRef(managed.registry, childId);
+				const parentRef = lookupAgentRef(managed.registry, MAIN_AGENT_ID);
+				if (!childRef || !parentRef) throw new Error("Managed TAN refs were not retained");
+				expect(managed.store.identity.backend).toBe(backend);
+				expect((await managed.store.getActor(childId))?.record.state).toBe("active");
+				expect(managed.registry.get(childId)).toEqual(expect.objectContaining({ id: childId, status: "running" }));
+				expect(Object.is(childRef.session, stub.clone)).toBe(true);
+				expect(stub.dispose).not.toHaveBeenCalled();
+				expect(runSettled).toBe(false);
+				expect(parentRef.session).toBe(managed.harness.ctx.session);
+				expect((await managed.store.getActor(MAIN_AGENT_ID))?.record.state).toBe("active");
+
+				allowCommit.resolve();
+				await disposalStarted.promise;
+				expect(disposalObservedCommittedState).toBe(true);
+				expect((await managed.store.getActor(childId))?.record.state).toBe("parked");
+				expect(managed.registry.get(childId)).toEqual(expect.objectContaining({ id: childId, status: "parked" }));
+				expect(childRef.session).toBeNull();
+				expect(runSettled).toBe(false);
+
+				allowDisposal.resolve();
+				expect(await runResult).toBe("done");
+				const childManager = created.childManager;
+				if (!childManager) throw new Error("Managed TAN child manager was not captured");
+				const childFile = childManager.getSessionFile();
+				if (!childFile) throw new Error("Managed TAN child transcript was not retained");
+				expect(await Bun.file(childFile).exists()).toBe(true);
+				// The clone's actor lives in the parent root's authority; its transcript gets no root bundle.
+				const sidecars = authorityPaths(childFile);
+				for (const sidecar of [
+					sidecars.descriptor,
+					sidecars.jsonl,
+					sidecars.sqlite,
+					sidecars.legacyFence,
+					sidecars.lock,
+				]) {
+					expect(await Bun.file(sidecar).exists()).toBe(false);
+				}
+				expect((await managed.store.getActor(childId))?.record).toMatchObject({
+					rootId: MAIN_AGENT_ID,
+					parentId: MAIN_AGENT_ID,
+				});
+				expect(
+					extractSessionInit(await loadEntriesFromFile(childFile, undefined, { throwIfMissing: true })),
+				).toEqual(
+					expect.objectContaining({
+						systemPrompt: ["system prompt"],
+						task: "durable park boundary",
+						tools: ["read", "bash"],
+					}),
+				);
+				expect(managed.registry.get(MAIN_AGENT_ID)?.status).toBe("running");
+				expect(lookupAgentRef(managed.registry, MAIN_AGENT_ID)?.session).toBe(managed.harness.ctx.session);
+				expect(await Bun.file(managed.parentFile).exists()).toBe(true);
+			} finally {
+				finishPrompt.resolve();
+				allowCommit.resolve();
+				allowDisposal.resolve();
+				await runResult?.catch(() => {});
+				managed.store.transition = originalTransition;
+			}
+		});
+	}
+	for (const backend of ["jsonl", "sqlite"] as const) {
+		it(`holds TAN abort behind the managed ${backend} terminal commit`, async () => {
+			const managed = await createManagedContext(backend);
+			const promptStarted = Promise.withResolvers<void>();
+			const abortObserved = Promise.withResolvers<void>();
+			const commitStarted = Promise.withResolvers<void>();
+			const allowCommit = Promise.withResolvers<void>();
+			const disposalStarted = Promise.withResolvers<void>();
+			const allowDisposal = Promise.withResolvers<void>();
+			let runSettled = false;
+			let runResult: Promise<string | AsyncJobRunResult> | undefined;
+			const stub = createCloneStub({
+				prompt: async () => {
+					promptStarted.resolve();
+					await abortObserved.promise;
+				},
+				abort: () => abortObserved.resolve(),
+			});
+			const created = mockManagedClone(managed, stub);
+			stub.dispose.mockImplementation(async () => {
+				const childId = managedChildId(created.childId);
+				const childManager = created.childManager;
+				if (!childManager) throw new Error("Managed Tan child manager was not captured");
+				expect((await managed.store.getActor(childId))?.record.state).toBe("aborted");
+				expect((await managed.store.getActor(MAIN_AGENT_ID))?.record.state).toBe("active");
+				disposalStarted.resolve();
+				await allowDisposal.promise;
+				await created.closeChildManager();
+			});
+			const originalTransition = managed.store.transition.bind(managed.store);
+			managed.store.transition = async (record, options) => {
+				if (record.kind === "actor" && record.actorId === created.childId && record.state === "aborted") {
+					commitStarted.resolve();
+					await allowCommit.promise;
+				}
+				return originalTransition(record, options);
+			};
+			let run: CapturedJobRun | undefined;
+			try {
+				await new TanCommandController(managed.harness.ctx).start("cancel at durable abort boundary");
+				run = managed.harness.capturedRun;
+				if (!run) throw new Error("Managed TAN run function was not captured");
+				const abortController = new AbortController();
+				runResult = run({ jobId: "job-123", signal: abortController.signal, reportProgress: async () => {} }).then(
+					value => {
+						runSettled = true;
+						return value;
+					},
+					error => {
+						runSettled = true;
+						throw error;
+					},
+				);
+				await promptStarted.promise;
+				abortController.abort();
+				await commitStarted.promise;
+				const childId = managedChildId(created.childId);
+				const childRef = lookupAgentRef(managed.registry, childId);
+				const parentRef = lookupAgentRef(managed.registry, MAIN_AGENT_ID);
+				if (!childRef || !parentRef) throw new Error("Managed TAN refs were not retained");
+				expect(stub.clone.abort).toHaveBeenCalledTimes(1);
+				expect((await managed.store.getActor(childId))?.record.state).toBe("active");
+				expect(managed.registry.get(childId)).toEqual(expect.objectContaining({ id: childId, status: "running" }));
+				expect(Object.is(childRef.session, stub.clone)).toBe(true);
+				expect(stub.dispose).not.toHaveBeenCalled();
+				expect(runSettled).toBe(false);
+				expect(parentRef.session).toBe(managed.harness.ctx.session);
+				expect((await managed.store.getActor(MAIN_AGENT_ID))?.record.state).toBe("active");
+
+				allowCommit.resolve();
+				await disposalStarted.promise;
+				expect((await managed.store.getActor(childId))?.record.state).toBe("aborted");
+				expect(managed.registry.get(childId)).toEqual(expect.objectContaining({ id: childId, status: "aborted" }));
+				expect(childRef.session).toBeNull();
+				expect(runSettled).toBe(false);
+				allowDisposal.resolve();
+				await expect(runResult).rejects.toThrow(/^Operation job cancelled:/);
+				const childManager = created.childManager;
+				if (!childManager) throw new Error("Managed TAN child manager was not captured");
+				const childFile = childManager.getSessionFile();
+				if (!childFile) throw new Error("Managed TAN child transcript was not retained");
+				expect(await Bun.file(childFile).exists()).toBe(true);
+				expect(
+					extractSessionInit(await loadEntriesFromFile(childFile, undefined, { throwIfMissing: true })),
+				).toEqual(expect.objectContaining({ task: "cancel at durable abort boundary" }));
+				expect(lookupAgentRef(managed.registry, MAIN_AGENT_ID)?.session).toBe(managed.harness.ctx.session);
+				expect(await Bun.file(managed.parentFile).exists()).toBe(true);
+			} finally {
+				allowCommit.resolve();
+				allowDisposal.resolve();
+				if (runResult) await runResult.catch(() => {});
+				managed.store.transition = originalTransition;
+			}
+		});
+	}
+	for (const backend of ["jsonl", "sqlite"] as const) {
+		for (const failureKind of ["transition", "disposal"] as const) {
+			it(`retains ${failureKind} failure with cancellation at the managed ${backend} TAN boundary`, async () => {
+				const managed = await createManagedContext(backend);
+				const promptStarted = Promise.withResolvers<void>();
+				const abortObserved = Promise.withResolvers<void>();
+				const failure = new Error(`managed ${backend} abort ${failureKind} failed`);
+				const stub = createCloneStub({
+					prompt: async () => {
+						promptStarted.resolve();
+						await abortObserved.promise;
+					},
+					abort: () => abortObserved.resolve(),
+				});
+				const created = mockManagedClone(managed, stub);
+				if (failureKind === "disposal") stub.dispose.mockRejectedValue(failure);
+				const originalTransition = managed.store.transition.bind(managed.store);
+				managed.store.transition = async (record, options) => {
+					if (
+						failureKind === "transition" &&
+						record.kind === "actor" &&
+						record.actorId === created.childId &&
+						record.state === "aborted"
+					)
+						throw failure;
+					return originalTransition(record, options);
+				};
+				const abortController = new AbortController();
+				let result: Promise<string | AsyncJobRunResult> | undefined;
+				try {
+					await new TanCommandController(managed.harness.ctx).start("cancel with terminal failure");
+					const run = managed.harness.capturedRun;
+					if (!run) throw new Error("Managed TAN run function was not captured");
+					result = run({ jobId: "job-123", signal: abortController.signal, reportProgress: async () => {} });
+					await promptStarted.promise;
+					const childId = managedChildId(created.childId);
+					abortController.abort();
+					const error = await result.catch(error => error);
+					expect(error).toBeInstanceOf(AggregateError);
+					expect((error as AggregateError).errors[0].message).toMatch(/^Operation job cancelled:/);
+					expect((error as AggregateError).errors[1]).toBe(failure);
+					expect(stub.clone.abort).toHaveBeenCalledTimes(1);
+					expect(stub.dispose).toHaveBeenCalledTimes(failureKind === "disposal" ? 1 : 0);
+					expect(lookupAgentRef(managed.registry, MAIN_AGENT_ID)?.session).toBe(managed.harness.ctx.session);
+					expect((await managed.store.getActor(childId))?.record.state).toBe(
+						failureKind === "disposal" ? "aborted" : "active",
+					);
+				} finally {
+					abortController.abort();
+					abortObserved.resolve();
+					await result?.catch(() => {});
+					managed.store.transition = originalTransition;
+				}
+			});
+		}
+	}
+	for (const backend of ["jsonl", "sqlite"] as const) {
+		it(`preserves the managed ${backend} child when park persistence rejects`, async () => {
+			const managed = await createManagedContext(backend);
+			const transitionStarted = Promise.withResolvers<void>();
+			const failure = new Error(`managed ${backend} park write failed`);
+			const stub = createCloneStub();
+			const created = mockManagedClone(managed, stub);
+			const originalTransition = managed.store.transition.bind(managed.store);
+			let rejectPark = true;
+			managed.store.transition = async (record, options) => {
+				if (
+					rejectPark &&
+					record.kind === "actor" &&
+					record.actorId === created.childId &&
+					record.state === "parked"
+				) {
+					rejectPark = false;
+					transitionStarted.resolve();
+					throw failure;
+				}
+				return originalTransition(record, options);
+			};
+			try {
+				await new TanCommandController(managed.harness.ctx).start("retain child after durable refusal");
+				const run = managed.harness.capturedRun;
+				if (!run) throw new Error("Managed TAN run function was not captured");
+				const result = run({
+					jobId: "job-123",
+					signal: new AbortController().signal,
+					reportProgress: async () => {},
+				});
+				await transitionStarted.promise;
+				await expect(result).rejects.toBe(failure);
+				const childId = managedChildId(created.childId);
+				const childRef = lookupAgentRef(managed.registry, childId);
+				if (!childRef) throw new Error("Managed TAN child ref was not retained");
+				expect(managed.store.identity.backend).toBe(backend);
+				expect((await managed.store.getActor(childId))?.record.state).toBe("active");
+				expect(managed.registry.get(childId)).toEqual(expect.objectContaining({ id: childId, status: "running" }));
+				expect(Object.is(childRef.session, stub.clone)).toBe(true);
+				expect(stub.dispose).not.toHaveBeenCalled();
+				expect(lookupAgentRef(managed.registry, MAIN_AGENT_ID)?.session).toBe(managed.harness.ctx.session);
+				const childManager = created.childManager;
+				if (!childManager) throw new Error("Managed TAN child manager was not captured");
+				const childFile = childManager.getSessionFile();
+				if (!childFile) throw new Error("Managed TAN child transcript was not retained");
+				expect(await Bun.file(childFile).exists()).toBe(true);
+			} finally {
+				managed.store.transition = originalTransition;
+			}
+		});
+	}
+	for (const backend of ["jsonl", "sqlite"] as const) {
+		it(`refuses managed ${backend} park after the actor was durably aborted elsewhere`, async () => {
+			const managed = await createManagedContext(backend);
+			const promptStarted = Promise.withResolvers<void>();
+			const finishPrompt = Promise.withResolvers<void>();
+			const stub = createCloneStub({
+				prompt: async () => {
+					promptStarted.resolve();
+					await finishPrompt.promise;
+				},
+			});
+			const created = mockManagedClone(managed, stub);
+			try {
+				await new TanCommandController(managed.harness.ctx).start("respect competing durable terminal state");
+				const run = managed.harness.capturedRun;
+				if (!run) throw new Error("Managed TAN run function was not captured");
+				const result = run({
+					jobId: "job-123",
+					signal: new AbortController().signal,
+					reportProgress: async () => {},
+				});
+				await promptStarted.promise;
+				const childId = managedChildId(created.childId);
+				const childActor = await managed.store.getActor(childId);
+				if (!childActor) throw new Error("Managed TAN child actor was not persisted");
+				await managed.store.transition(
+					{ ...childActor.record, at: Date.now(), state: "aborted" },
+					{ expected: [{ domain: "actor", key: [childId], version: childActor.version }] },
+				);
+				finishPrompt.resolve();
+				// `await expect(p).rejects` starves the authority worker replies this run still needs on Bun 1.4.4.
+				const parkOutcome = await result.then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				expect(() => {
+					throw parkOutcome;
+				}).toThrow(`Tan child "${childId}" park transition was refused.`);
+				expect(managed.store.identity.backend).toBe(backend);
+				expect((await managed.store.getActor(childId))?.record.state).toBe("aborted");
+				expect(managed.registry.get(childId)).toEqual(expect.objectContaining({ id: childId, status: "running" }));
+				expect(Object.is(lookupAgentRef(managed.registry, childId)?.session, stub.clone)).toBe(true);
+				expect(stub.dispose).not.toHaveBeenCalled();
+				expect(lookupAgentRef(managed.registry, MAIN_AGENT_ID)?.session).toBe(managed.harness.ctx.session);
+			} finally {
+				finishPrompt.resolve();
+			}
+		});
+	}
+	for (const backend of ["jsonl", "sqlite"] as const) {
+		it(`disposes a stale managed ${backend} clone without terminalizing its retained actor`, async () => {
+			const managed = await createManagedContext(backend);
+			const promptStarted = Promise.withResolvers<void>();
+			const finishPrompt = Promise.withResolvers<void>();
+			const stub = createCloneStub({
+				prompt: async () => {
+					promptStarted.resolve();
+					await finishPrompt.promise;
+				},
+			});
+			const created = mockManagedClone(managed, stub);
+			const originalTransition = managed.store.transition.bind(managed.store);
+			let childTerminalWrites = 0;
+			managed.store.transition = async (record, options) => {
+				if (
+					record.kind === "actor" &&
+					record.actorId === created.childId &&
+					(record.state === "parked" || record.state === "aborted")
+				)
+					childTerminalWrites++;
+				return originalTransition(record, options);
+			};
+			try {
+				await new TanCommandController(managed.harness.ctx).start("retain stale clone transcript");
+				const run = managed.harness.capturedRun;
+				if (!run) throw new Error("Managed TAN run function was not captured");
+				const result = run({
+					jobId: "job-123",
+					signal: new AbortController().signal,
+					reportProgress: async () => {},
+				});
+				await promptStarted.promise;
+				const childId = managedChildId(created.childId);
+				const childRef = lookupAgentRef(managed.registry, childId);
+				if (!childRef) throw new Error("Managed TAN child ref was not retained");
+				expect(detachAgentSession(managed.registry, childId, stub.clone as unknown as AgentSession)).toBe(true);
+				finishPrompt.resolve();
+				await expect(result).rejects.toThrow(
+					`Tan child "${childId}" lost its exact registry session before termination.`,
+				);
+				expect(managed.store.identity.backend).toBe(backend);
+				expect(childTerminalWrites).toBe(0);
+				expect((await managed.store.getActor(childId))?.record.state).toBe("active");
+				expect(managed.registry.get(childId)).toEqual(expect.objectContaining({ id: childId, status: "running" }));
+				expect(childRef.session).toBeNull();
+				expect(stub.dispose).toHaveBeenCalledTimes(1);
+				expect(lookupAgentRef(managed.registry, MAIN_AGENT_ID)?.session).toBe(managed.harness.ctx.session);
+				const childManager = created.childManager;
+				if (!childManager) throw new Error("Managed TAN child manager was not captured");
+				const childFile = childManager.getSessionFile();
+				if (!childFile) throw new Error("Managed TAN child transcript was not retained");
+				expect(await Bun.file(childFile).exists()).toBe(true);
+				expect(
+					extractSessionInit(await loadEntriesFromFile(childFile, undefined, { throwIfMissing: true })),
+				).toEqual(expect.objectContaining({ task: "retain stale clone transcript" }));
+				expect(await Bun.file(managed.parentFile).exists()).toBe(true);
+			} finally {
+				finishPrompt.resolve();
+				managed.store.transition = originalTransition;
+			}
+		});
+	}
+	it("refuses terminal cleanup after the child session loses exact registry ownership", async () => {
+		const harness = await createContext();
+		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
+		const promptStarted = Promise.withResolvers<void>();
+		const finishPrompt = Promise.withResolvers<void>();
+		const stub = createCloneStub({
+			prompt: async () => {
+				promptStarted.resolve();
+				await finishPrompt.promise;
+			},
+		});
+		let childId: string | undefined;
+		mockTanSessionCreation(stub, options => {
+			childId = options.agentId;
+		});
+		await new TanCommandController(harness.ctx).start("retain ownership fences");
+		const run = harness.capturedRun;
+		if (!run) throw new Error("run function was not captured");
+		const result = run({ jobId: "job-123", signal: new AbortController().signal, reportProgress: async () => {} });
+		try {
+			await promptStarted.promise;
+			if (!childId) throw new Error("Tan child id was not passed to session creation");
+			const registry = AgentRegistry.global();
+			const capturedRef = lookupAgentRef(registry, childId);
+			if (!capturedRef) throw new Error("Tan child ref was not registered");
+			expect(detachAgentSession(registry, childId, stub.clone as unknown as AgentSession)).toBe(true);
+			expect(await removeAgentRef(registry, capturedRef)).toBe(true);
+			const replacement = createCloneStub();
+			const replacementDispose = replacement.dispose;
+			registry.register({
+				id: childId,
+				displayName: "replacement",
+				kind: "sub",
+				parentId: MAIN_AGENT_ID,
+				status: "idle",
+				session: replacement.clone as unknown as AgentSession,
+				sessionFile: "replacement.jsonl",
+			});
+			const replacementRef = lookupAgentRef(registry, childId);
+			if (!replacementRef) throw new Error("Replacement agent ref was not registered");
+			finishPrompt.resolve();
+			await expect(result).rejects.toThrow(
+				`Tan child "${childId}" lost its exact registry session before termination.`,
+			);
+			expect(registry.get(childId)).toEqual(
+				expect.objectContaining({ id: childId, status: "idle", sessionFile: "replacement.jsonl" }),
+			);
+			expect(Object.is(replacementRef.session, replacement.clone)).toBe(true);
+			expect(stub.dispose).toHaveBeenCalledTimes(1);
+			expect(replacementDispose).not.toHaveBeenCalled();
+		} finally {
+			finishPrompt.resolve();
+			await result.catch(() => {});
+		}
+	});
+
+	it("retains a primary work error when terminal physical cleanup also fails", async () => {
+		const harness = await createContext();
+		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
+		const primaryError = new Error("tan prompt failed");
+		const cleanupError = new Error("tan terminal disposal failed");
+		const stub = createCloneStub({
+			prompt: async () => {
+				throw primaryError;
+			},
+		});
+		mockTanSessionCreation(stub);
+		stub.dispose.mockRejectedValue(cleanupError);
+		harness.rootCleanup.expectedFailures.push(cleanupError);
+		try {
+			await new TanCommandController(harness.ctx).start("keep both failures");
+			const run = harness.capturedRun;
+			if (!run) throw new Error("Tan run function was not captured");
+			const result = await run({
+				jobId: "job-123",
+				signal: new AbortController().signal,
+				reportProgress: async () => {},
+			}).catch(error => error);
+			expect(result).toBeInstanceOf(AggregateError);
+			expect((result as AggregateError).errors).toEqual([primaryError, cleanupError]);
+			const child = AgentRegistry.global()
+				.list()
+				.find(ref => ref.parentId === MAIN_AGENT_ID);
+			expect(child).toEqual(expect.objectContaining({ status: "parked" }));
+			expect(lookupAgentRef(AgentRegistry.global(), MAIN_AGENT_ID)?.session).toBe(harness.ctx.session);
+			expect(stub.dispose).toHaveBeenCalledTimes(1);
+		} finally {
+			removeSyncWithRetries(harness.tempDir.path());
+		}
+	});
 	it("detaches a successful tan when clone disposal rejects", async () => {
 		const harness = await createContext();
 		const cloneManager = await SessionManager.open(harness.cloneFile, harness.parentArtifactsDir, undefined, {
@@ -976,6 +1699,7 @@ describe("TanCommandController", () => {
 			});
 			const disposalError = new Error("clone disposal failed");
 			stub.dispose.mockRejectedValue(disposalError);
+			harness.rootCleanup.expectedFailures.push(disposalError);
 			let childId: string | undefined;
 			mockTanSessionCreation(stub, options => {
 				childId = options.agentId;

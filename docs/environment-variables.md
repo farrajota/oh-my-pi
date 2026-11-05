@@ -475,6 +475,8 @@ Shell subprocess filtering is separate (`packages/utils/src/env.ts`): it strips 
 | `PI_PLAN_MODEL`              | Ephemeral model-role override for `plan` (CLI `--plan` takes precedence)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `PI_NO_TITLE`                | If set (any non-empty value), disables auto session title generation on first user message                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `OMP_BUILD_LABEL`            | Free-form name (collapsed to one line, first 80 characters) recorded with the build on every session entry this process writes, so transcripts from a custom or experimental build can be told apart; shown by `/session` |
+| `OMP_JOURNALING_BACKEND`     | Default durable authority backend for new roots: exact `jsonl` or `sqlite`; omitted means `jsonl`. Existing roots are pinned by their authority descriptor; see [session authority backends](./session-operations-export-share-fork-resume.md#session-authority-backends). |
+| `OMP_JOURNALING_CAPACITY`    | Physical authority capacity policy: exact `off` (default when unset) or `xfs`. `xfs` reserves disk for acknowledged authority writes and requires Linux x86_64 with the session directory on XFS; other hosts refuse with a one-line error before any authority write. Not stored per root; see [authority capacity](./session-operations-export-share-fork-resume.md#authority-capacity-and-platform-support). |
 | `PI_TINY_DEVICE`             | Inference backend for local tiny models; overrides the `providers.tinyModelDevice` setting (default: CPU; ONNX providers `cpu`, `gpu`, `webgpu`, `auto`, `cuda`, `dml`, `coreml`, `wasm`, `webnn`, `webnn-gpu`, `webnn-cpu`, `webnn-npu`, or `mlx`/`metal` to run MLX weights through mlx-lm on Apple silicon)                                                                                                                                                                                                                                                                                                                                                          |
 | `PI_TINY_DTYPE`              | ONNX quantization/precision for local tiny models; overrides the `providers.tinyModelDtype` setting (default: each model's shipped dtype, currently `q4`; supports `auto`, `fp32`, `fp16`, `q8`, `int8`, `uint8`, `q4`, `bnb4`, `q4f16`, `q2`, `q2f16`, `q1`, `q1f16`)                                                                                                                                                                                                                                                                                                                                     |
 | `PI_NO_INTERLEAVED_THINKING` | If `1`, disables Anthropic interleaved thinking budget behavior and uses output-token inflation for older thinking mode                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -521,6 +523,84 @@ Shell subprocess filtering is separate (`packages/utils/src/env.ts`): it strips 
 | `PI_AUTO_QA_PUSH_TOKEN` | Bearer-token override for auto QA grievance push; wins over `dev.autoqaPush.token` |
 | `PI_BROWSER_RELAY`           | `0`/`1` kill switch for the browser relay; overrides the `browser.relay` setting (relay auto-starts when Eval's browser API needs it)                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `OMP_DAEMON_IDLE_GRACE_MS`   | Milliseconds a daemon broker waits after its last `omp` client disconnects before it shuts down and stops the non-detached daemons it supervises, such as services started with the bash tool's `name` (default `3000`). Read once when an `omp` process launches the broker, using the base-10 `parseInt` prefix (`5s` reads as `5`, `2.5` as `2`); `0` shuts the broker down as soon as the last client disconnects, and negative values or values without leading digits use the default |
+
+### Durable session authority backend
+
+`OMP_JOURNALING_BACKEND` accepts exactly the lowercase values `jsonl` and `sqlite`; when unset,
+new session roots use `jsonl`. The CLI validates it before command dispatch can write authority
+state, including on non-interactive and auxiliary-command paths. A root's persisted
+`<S>.authority.json` descriptor pins its selected backend for the entire root/child tree. If the
+environment default differs, OMP keeps using the descriptor-selected backend and prints one line
+naming the dry-run migration command, on stderr in print, JSON and RPC modes or as a notification in
+the TUI ("Authority: this session keeps its persisted sqlite backend; the jsonl default
+(OMP_JOURNALING_BACKEND) applies only to new sessions. To migrate it, run: omp session authority <S>
+--to jsonl"). The same event is also logged as a `warn` entry (`logs/omp.<date>.<pid>.log`).
+Changing the variable does not migrate a saved root. A root saved before authority
+journaling (no descriptor) is adopted on resume as JSONL regardless of this variable: a fresh store
+when it has no authority evidence, or an in-place upgrade of a clean legacy v1 journal; anything
+ambiguous refuses with the recovery command (see [sessions saved before authority
+journaling](./session-operations-export-share-fork-resume.md#sessions-saved-before-authority-journaling)). An unavailable selected payload, unknown commit outcome,
+or worker failure remains unavailable: OMP never falls back to another format or retries an external
+callback to guess whether an effect happened.
+
+Let `S` be the complete conversation-transcript path, including its `.jsonl` suffix. For example, if
+`S` is `/path/to/session.jsonl`, `<S>.authority.json` expands to
+`/path/to/session.jsonl.authority.json`.
+The other authority artifacts are:
+
+- `<S>.authority.json` — backend/identity descriptor
+- `<S>.authority.jsonl` — current JSONL payload (the active segment); `<S>.authority.sqlite` — SQLite payload (physical schema v4; a v3 store from an earlier build is refused until `omp session authority <S> --to sqlite --apply` converts it, see [SQLite store format](./session-operations-export-share-fork-resume.md#sqlite-store-format))
+- `<S>.authority.segment.<k>.jsonl`, `<S>.authority.segment.<k>.index.json`, `<S>.authority.snapshot.<n>.json` — sealed JSONL segments, their indexes, and the snapshot the active segment starts from (see [JSONL segment rotation](./session-operations-export-share-fork-resume.md#jsonl-segment-rotation))
+- `<S>.authority.sqlite-wal` and `<S>.authority.sqlite-shm` — SQLite sidecars when present; after a clean exit with capacity `off` neither remains, and with capacity `xfs` a 0-byte `-shm` may remain
+- `<S>.authority.lock` — ownership lock
+- `<S>.authority-v1.jsonl` — legacy journal; `<S>.authority-v1.jsonl.quarantine` — retained denial fence
+- `<S>.authority.migration.<id>.json`, `<S>.authority.stage.<id>/`, and `<S>.authority.backup.<id>/` — migration record, stage, and backup
+- `<S>.authority-recovered.<offset>.<sha256>.bin` — bytes a JSONL open cut from a torn tail after a crash (the open prints a one-line notice naming it), kept as operator evidence outside the bundle; it never blocks repair, migration, packing, moving or adoption (see [interrupted appends](./session-operations-export-share-fork-resume.md#jsonl-segment-rotation))
+
+These authority artifacts are separate from the transcript `S`, which remains the source for
+conversation messages and other session history. The variable does not switch transcript storage,
+the separate Hub custody journal, artifacts, or unrelated SQLite caches. `--no-session` creates no
+durable authority payload. Apart from that resume-time adoption, use the explicit migration,
+recovery, and repair commands in [session
+operations](./session-operations-export-share-fork-resume.md#session-authority-backends) to change
+or inspect a root; there is no automatic backend fallback.
+
+Reverting the environment default affects new roots only; it does not roll existing roots back.
+After SQLite has accepted writes, returning a root to JSONL requires explicitly migrating the
+current SQLite state. The pre-migration JSONL backup is stale and must not be restored over newer
+state. The supported return format is the versioned JSONL format in this release, not arbitrary
+older-binary compatibility.
+
+### Durable session authority capacity
+
+`OMP_JOURNALING_CAPACITY` accepts exactly the lowercase values `off` and `xfs`; when unset it is
+`off`. Like the backend variable, it is parsed once before command dispatch (and at the top of
+`createAgentSession` for SDK hosts), and an empty, padded, uppercase or unknown value fails with a
+one-line error before any authority write.
+
+- `off` runs on every supported host and filesystem. Authority writes have no physical disk
+  reserve: on a full disk a write fails the way it did before capacity accounting existed, so a
+  refusal before acknowledgement is not guaranteed.
+- `xfs` reserves disk for every acknowledged authority write and its promised continuations. It
+  requires Linux x86_64 (glibc, kernel 6.9+ for `PIDFD_THREAD`) with the session directory on XFS.
+  Any other host or filesystem is refused before anything is written, with a one-line error that
+  names the requirement and the variable. The reserve is held per open (unresolved) operation:
+  about 5.5–6.3 MiB for SQLite and 0.56 MiB for JSONL on the qualification host, plus a pool of
+  about 8 MiB (JSONL) or 43–59 MiB (SQLite) once a root is open.
+
+The choice is a runtime admission policy, not a store format: a root created under one value opens
+under the other without migration. Exclusion, worker lifetime and SQLite guarantees per platform are
+in [authority capacity and platform
+support](./session-operations-export-share-fork-resume.md#authority-capacity-and-platform-support).
+Authority exclusion never spans hosts, and network filesystems are not supported.
+
+Ordinary copied-root admission is forbidden on every host. A UUID is not a
+global lock: `flock` coordinates only participants sharing the same physical anchor and kernel.
+Explicit restore is separate and requires the operator/caller to stop or fence the source root and
+reconcile external effects newer than the backup before exposing restored grants. The restore input
+does not identify its source, so OMP cannot locate, lock, fence, or detect a disconnected original;
+automatic safety proof across disconnected inode or network domains is unsupported. A fresh restored
+incarnation does not prove the source authority was revoked.
 
 ### Hindsight memory backend
 

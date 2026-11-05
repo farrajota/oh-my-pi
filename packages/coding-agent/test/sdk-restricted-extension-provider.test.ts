@@ -10,6 +10,8 @@ import * as commitTools from "@oh-my-pi/pi-coding-agent/commit/agentic/tools";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+import { closeSessionAuthority } from "@oh-my-pi/pi-coding-agent/registry/authority";
+import { readAuthorityDescriptor } from "@oh-my-pi/pi-coding-agent/registry/authority/descriptor";
 import {
 	type CreateAgentSessionOptions,
 	createAgentSession,
@@ -361,9 +363,17 @@ describe("restricted sessions sharing extension providers", () => {
 			extensions: [providerExtension],
 		});
 
+		// A caller-supplied commit root is an existing transcript; one saved before authority journaling
+		// is adopted (a fresh JSONL store bootstrapped) when the commit agent opens it.
+		const commitManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		const commitFile = commitManager.getSessionFile();
+		const commitHeader = commitManager.getHeader();
+		if (!commitFile || !commitHeader) throw new Error("Expected a persisted commit root");
 		try {
 			const model = modelRegistry.find(providerName, modelId);
 			if (!model) throw new Error("Expected extension model registration");
+			await commitManager.ensureOnDisk();
+			expect(await readAuthorityDescriptor(commitFile)).toBeUndefined();
 
 			const state = await runCommitAgentSession({
 				cwd: tempDir,
@@ -371,7 +381,7 @@ describe("restricted sessions sharing extension providers", () => {
 				settings,
 				modelRegistry,
 				authStorage,
-				sessionManager: SessionManager.create(tempDir, path.join(tempDir, "sessions")),
+				sessionManager: commitManager,
 				changelogTargets: [],
 				requireChangelog: false,
 			});
@@ -379,8 +389,15 @@ describe("restricted sessions sharing extension providers", () => {
 			expect(providerRequests).toBe(2);
 			expect(state.proposal?.summary).toBe("fix(commit): retained extension provider");
 			expect(modelRegistry.authStorage.keys.source(providerName) !== undefined).toBe(true);
+			expect(await readAuthorityDescriptor(commitFile)).toMatchObject({
+				state: "active",
+				backend: "jsonl",
+				owningSessionId: commitHeader.id,
+			});
 		} finally {
 			await parent.dispose();
+			await closeSessionAuthority(commitFile);
+			await commitManager.close();
 		}
 	});
 });

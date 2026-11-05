@@ -4,22 +4,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLock } from "@oh-my-pi/pi-natives";
-import { AgentRegistry } from "../../src/registry/agent-registry";
 import {
 	canonicalDurableSha256,
-	DurableLocalState,
 	DurableStateConflictError,
 	DurableStateUnavailableError,
 	RegistryDurableStateStore,
-	registryDurableJournalPath,
-	registryDurableStateForSession,
 } from "../../src/registry/durable-state";
-import {
-	bindSessionOperationDurability,
-	installSessionOperationLedger,
-	markUnregisteredSessionOperationProjection,
-	runLocalOperation,
-} from "../../src/registry/operation-lease";
 
 const temporaryDirectories: string[] = [];
 
@@ -77,16 +67,6 @@ afterEach(async () => {
 });
 
 describe("W4 durable registry state", () => {
-	it("derives one canonical per-session authority journal and process store", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-durable-path-"));
-		temporaryDirectories.push(directory);
-		const sessionFile = path.join(directory, "nested", "..", "main.jsonl");
-		expect(registryDurableJournalPath(sessionFile)).toBe(`${path.resolve(sessionFile)}.authority-v1.jsonl`);
-		expect(registryDurableStateForSession(sessionFile)).toBe(
-			registryDurableStateForSession(path.resolve(sessionFile)),
-		);
-	});
-
 	it("enforces append head CAS and returns recovery batches of at most 100 records", async () => {
 		const { store } = await createStore();
 		const first = store.append({ kind: "gate", at: 1, rootId: "root-0", generation: 1, phase: "open" }, null);
@@ -290,7 +270,7 @@ describe("W4 durable registry state", () => {
 		const original = await fs.readFile(journal, "utf8");
 		await fs.writeFile(journal, original.replace('"rootId":"Main"', '"rootId":"Other"'));
 		const restarted = new RegistryDurableStateStore(journal);
-		expect(() => new AgentRegistry({ durableState: restarted })).toThrow(DurableStateUnavailableError);
+		expect(() => restarted.head()).toThrow(DurableStateUnavailableError);
 		expect(() => restarted.recover()).toThrow(DurableStateUnavailableError);
 		const restartedAgain = new RegistryDurableStateStore(journal);
 		expect(restartedAgain.available).toBe(false);
@@ -426,46 +406,5 @@ describe("W4 durable registry state", () => {
 		});
 		expect(snapshot.actors.get("Main")).toMatchObject({ generation: 2, state: "parked" });
 		expect([...snapshot.constructions.values()].find(record => record.generation === 2)?.phase).toBe("activated");
-	});
-
-	it("does not recover-abandon a live operation while local state reads the journal", async () => {
-		const { store } = await createStore();
-		const manager = {};
-		const operationControl = installSessionOperationLedger(manager);
-		markUnregisteredSessionOperationProjection(manager, false);
-		bindSessionOperationDurability(manager, store);
-		const local = new DurableLocalState(store, "session-live");
-
-		try {
-			await expect(
-				runLocalOperation(manager, "write:live-local", async () => {
-					await local.publishWithEffect("entry-live", hash("live"), "0".repeat(64), async () => {
-						throw new Error("unknown agent");
-					});
-				}),
-			).rejects.toThrow("unknown agent");
-			const snapshot = store.recover();
-			expect(
-				[...snapshot.operations.values()].find(record => record.operationId === "write:live-local")?.phase,
-			).toBe("failed");
-			expect(store.available).toBe(true);
-		} finally {
-			await operationControl.close();
-		}
-	});
-
-	it("maintains one local head and terminally records an expected-head conflict", async () => {
-		const { store } = await createStore();
-		const local = new DurableLocalState(store, "session-1");
-		const first = local.publish("entry-1", hash("one"));
-		expect(local.current()).toEqual(first);
-		expect(() => local.publish("entry-2", hash("two"), "0".repeat(64))).toThrow(DurableStateConflictError);
-		const snapshot = store.recover();
-		expect(snapshot.localHeads.get("session-1")).toMatchObject({
-			version: 1,
-			headHash: first.headHash,
-			phase: "current",
-		});
-		expect([...snapshot.localEntries.values()].find(entry => entry.entryId === "entry-2")?.phase).toBe("conflict");
 	});
 });

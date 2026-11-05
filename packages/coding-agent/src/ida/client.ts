@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { IpcConnection, ipcEndpoint } from "@oh-my-pi/pi-natives";
-import { logger, postmortem, ptree, untilAborted } from "@oh-my-pi/pi-utils";
+import { logger, postmortem, ptree, TempDir, untilAborted } from "@oh-my-pi/pi-utils";
 import { TERMINAL_STATES } from "@oh-my-pi/pi-tui/apps/ps-data";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -411,8 +411,35 @@ export async function acquireIdaDatabase(
 	sourcePath: string,
 	options: AcquireIdaDatabaseOptions = {},
 ): Promise<IdaDatabase> {
-	const { signal, arch } = options;
-	const loc = await locateIdb(sourcePath, { arch });
+	if (!options.sourceReadPath) return acquirePreparedIdaDatabase(session, sourcePath, options);
+	const scratch = await TempDir.create("@omp-ida-input-");
+	let db: IdaDatabase;
+	try {
+		// Complete the original physical consumer in this process. Neither an old
+		// cache-hit daemon nor a failed/continuing host startup inherits the grant.
+		const snapshot = scratch.join(path.basename(sourcePath));
+		await fs.copyFile(options.sourceReadPath, snapshot);
+		options.signal?.throwIfAborted();
+		db = await acquirePreparedIdaDatabase(session, sourcePath, { ...options, sourceReadPath: snapshot });
+	} catch (error) {
+		try {
+			await scratch.remove();
+		} catch (closeError) {
+			throw new AggregateError([error, closeError], "IDA input and snapshot cleanup failed.");
+		}
+		throw error;
+	}
+	await scratch.remove();
+	return db;
+}
+
+async function acquirePreparedIdaDatabase(
+	session: ToolSession,
+	sourcePath: string,
+	options: AcquireIdaDatabaseOptions,
+): Promise<IdaDatabase> {
+	const { signal, arch, sourceReadPath } = options;
+	const loc = await locateIdb(sourcePath, { arch, sourceReadPath });
 	const cached = handles.get(idaDaemonName(loc.id));
 	if (cached?.connected && cached.status.state === "open") return cached;
 	let opening = pending.get(loc.id);
@@ -421,6 +448,12 @@ export async function acquireIdaDatabase(
 		// Every caller may have stopped waiting; remaining ones still receive the failure.
 		opening.catch(error => logger.debug("IDA database open failed", { id: loc.id, error: errorMessage(error) }));
 		pending.set(loc.id, opening);
+	}
+	if (sourceReadPath) {
+		// The host may still be copying the descriptor-backed source after a caller aborts.
+		const db = await opening;
+		signal?.throwIfAborted();
+		return db;
 	}
 	const deadline = AbortSignal.timeout(OPEN_WAIT_MS);
 	try {

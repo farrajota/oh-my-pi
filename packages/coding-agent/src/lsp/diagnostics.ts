@@ -1,9 +1,10 @@
 import { type FileDiagnosticsResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import * as fs from "node:fs";
-import path from "node:path";
+import * as path from "node:path";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { formatPathRelativeToCwd } from "../tools/path-utils";
 import { throwIfAborted } from "../tools/tool-errors";
+import type { FileWriteMutationHooks } from "../tools/file-write-fallback";
 import { getOrCreateClient, sendRequest, supportsDocumentDiagnostics, waitForProjectLoaded } from "./client";
 import { getLinterClient } from "./clients";
 import { hasRootMarkerAncestor } from "./config";
@@ -568,6 +569,7 @@ export async function formatContent(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	mutationHooks?: FileWriteMutationHooks,
 ): Promise<FormatContentResult> {
 	if (servers.length === 0) {
 		// No formatters configured at all
@@ -594,7 +596,19 @@ export async function formatContent(
 			// Use custom linter client if configured
 			if (serverConfig.createClient) {
 				const linterClient = getLinterClient(serverName, serverConfig, cwd);
-				const formattedContent = await linterClient.format(absolutePath, content);
+				const format = async () => {
+					throwIfAborted(signal);
+					await mutationHooks?.beforeWrite?.();
+					throwIfAborted(signal);
+					mutationHooks?.assertActive?.();
+					const result = await linterClient.format(absolutePath, content, signal, mutationHooks);
+					throwIfAborted(signal);
+					mutationHooks?.assertActive?.();
+					return result;
+				};
+				const formattedContent = mutationHooks?.withResourceEffect
+					? await mutationHooks.withResourceEffect(absolutePath, format)
+					: await format();
 				return { content: formattedContent, failed: false, unsupported: false };
 			}
 
@@ -626,7 +640,8 @@ export async function formatContent(
 
 			// Apply edits in-memory and return
 			return { content: applyTextEditsToString(content, edits), failed: false, unsupported: false };
-		} catch {
+		} catch (error) {
+			if (signal?.aborted || (serverConfig.createClient && mutationHooks)) throw error;
 			// A formatter was available but the request failed;
 			// record the failure and try the next server
 			hadFailure = true;

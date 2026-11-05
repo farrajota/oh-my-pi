@@ -2,9 +2,11 @@ export { truncate } from "@oh-my-pi/pi-utils";
 export { formatGroupedDiagnosticMessages } from "@oh-my-pi/pi-tui/tools/output-meta";
 
 import * as fs from "node:fs/promises";
-import path from "node:path";
+import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
+import { getCurrentFilesystemOperation, type FilesystemOperation } from "../internal/session-path-scope";
+import { FilesystemReadMissingError } from "../tools/file-write-fallback";
 import { formatPathRelativeToCwd, resolveToCwd, specialFileKind } from "../tools/path-utils";
 import type {
 	CodeAction,
@@ -21,8 +23,48 @@ import type {
 
 export { detectLanguageId } from "@oh-my-pi/pi-tui/lang-from-path";
 
+/** Optional LSP fallback must never consume invocation authority or durable read-close failures. */
+export class LspFilesystemReadError extends Error {
+	constructor(cause: unknown) {
+		super(cause instanceof Error ? cause.message : String(cause), { cause });
+	}
+}
+
+export function isLspFilesystemReadFailure(error: unknown): boolean {
+	return (
+		error instanceof LspFilesystemReadError ||
+		(error instanceof AggregateError && error.errors.some(isLspFilesystemReadFailure))
+	);
+}
+
 /** Read a file's text, refusing FIFOs, devices and sockets, whose reads can block forever or never end. */
-export async function readTextFromDisk(filePath: string): Promise<string> {
+export async function readTextFromDisk(
+	filePath: string,
+	operation: FilesystemOperation | undefined = getCurrentFilesystemOperation(),
+): Promise<string> {
+	if (operation) {
+		try {
+			const content = await operation.withResourceEffects([], "filesystem", async () => {
+				const probe = await operation.authorize(filePath, "probe");
+				if (!probe.existed) return undefined;
+				const handle = await operation.openRead(await operation.authorize(filePath, "read"));
+				try {
+					const kind = specialFileKind(await handle.stat());
+					if (kind)
+						throw new Error(`Cannot open '${filePath}': it is a ${kind}, not a regular file or directory.`);
+					return await handle.readFile("utf8");
+				} finally {
+					await handle.close();
+				}
+			});
+			if (content === undefined)
+				throw new FilesystemReadMissingError(`Filesystem read target is missing: ${filePath}`);
+			return content;
+		} catch (error) {
+			if (error instanceof FilesystemReadMissingError) throw error;
+			throw new LspFilesystemReadError(error);
+		}
+	}
 	const kind = specialFileKind(await fs.stat(filePath));
 	if (kind) throw new Error(`Cannot open '${filePath}': it is a ${kind}, not a regular file or directory.`);
 	return Bun.file(filePath).text();
@@ -671,7 +713,7 @@ export async function resolveSymbolColumn(filePath: string, line: number, symbol
 		}
 		return fallbackIndexes[occurrence - 1];
 	} catch (error) {
-		if (isEnoent(error)) {
+		if (error instanceof FilesystemReadMissingError || isEnoent(error)) {
 			throw new Error(`File not found: ${filePath}`);
 		}
 		throw error;
@@ -684,7 +726,7 @@ export async function readLocationContext(filePath: string, line: number, contex
 	try {
 		// Context is decoration: a special-file location keeps its header, like a missing file.
 		if (specialFileKind(await fs.stat(filePath))) return [];
-		const fileText = await Bun.file(filePath).text();
+		const fileText = await readTextFromDisk(filePath);
 		const lines = fileText.split("\n");
 		if (lines.length === 0) return [];
 
@@ -697,7 +739,7 @@ export async function readLocationContext(filePath: string, line: number, contex
 		}
 		return context;
 	} catch (error) {
-		if (isEnoent(error)) {
+		if (error instanceof FilesystemReadMissingError || isEnoent(error)) {
 			return [];
 		}
 		throw error;

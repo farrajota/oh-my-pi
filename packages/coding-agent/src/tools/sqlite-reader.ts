@@ -21,7 +21,11 @@ function configureSqliteReadConnection(db: Database): Database {
 		db.query("SELECT name FROM sqlite_master LIMIT 1").get();
 		return db;
 	} catch (error) {
-		db.close();
+		try {
+			db.close();
+		} catch (closeError) {
+			throw new AggregateError([error, closeError], "SQLite configuration and close failed.");
+		}
 		throw error;
 	}
 }

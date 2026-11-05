@@ -29,6 +29,22 @@ import { parseSel } from "./read-selector";
 import { throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
+async function withJsonInput<T>(handle: fs.FileHandle, consume: () => Promise<T>): Promise<T> {
+	let value: T;
+	try {
+		value = await consume();
+	} catch (error) {
+		try {
+			await handle.close();
+		} catch (closeError) {
+			throw new AggregateError([error, closeError], "JSON input and resource close failed.");
+		}
+		throw error;
+	}
+	await handle.close();
+	return value;
+}
+
 /** A JSON name, including a backup or dated copy of one (`config.json.bak`, `data.jsonl~`). */
 const JSON_FILE_PATTERN = /\.(?:jsonl?|ndjson)(?:[.~][^/\\]*)?$/i;
 const UTF8_BOM = [0xef, 0xbb, 0xbf] as const;
@@ -287,6 +303,7 @@ async function runJq(
 	const onAbort = () => run.abort();
 	signal?.addEventListener("abort", onAbort, { once: true });
 
+	let failure: { error: unknown } | undefined;
 	try {
 		const result = await new Shell().run(
 			{ command, timeoutMs: JSON_QUERY_TIMEOUT_MS, signal: run.signal },
@@ -315,10 +332,22 @@ async function runJq(
 			throw new ToolError(`Failed to execute JSON query: ${stderr || `jq exited with code ${result.exitCode}`}`);
 		}
 		return { output, stopped, stderr };
+	} catch (error) {
+		failure = { error };
+		throw error;
 	} finally {
 		clearTimeout(abortTimer);
 		signal?.removeEventListener("abort", onAbort);
-		await fs.rm(stderrPath, { force: true });
+		try {
+			await fs.rm(stderrPath, { force: true });
+		} catch (cleanupError) {
+			if (failure)
+				throw new AggregateError(
+					[failure.error, cleanupError],
+					"JSON query failed and stderr cleanup did not complete.",
+				);
+			throw cleanupError;
+		}
 	}
 }
 
@@ -406,26 +435,39 @@ export async function resolveJsonReadPath(
 	// A `.json`/`.jsonl`/`.ndjson` name always admits; any other name (a backup, an
 	// extensionless file) admits only when it opens like JSON, so `?q=` on a video,
 	// SVG, PDF or raster image keeps its vision-question route.
+	let readingInput = false;
 	const resolved = async (filePath: string): Promise<boolean> => {
 		const stat = await Bun.file(filePath).stat();
 		if (!stat.isFile()) return false;
+		readingInput = true;
 		const jsonName = JSON_FILE_PATTERN.test(filePath);
-		return peekFile(filePath, IMAGE_METADATA_HEADER_BYTES, header => {
+		const inspect = (header: Uint8Array): boolean => {
 			if (parseImageMetadata(header) || parseHeifImageMimeType(header)) return false;
 			return jsonName || opensLikeJson(header);
+		};
+		if (!session.pathScope) return peekFile(filePath, IMAGE_METADATA_HEADER_BYTES, inspect);
+		const operation = session.pathScope.currentOperation();
+		const handle = await operation.openRead(await operation.authorize(filePath, "read"));
+		return withJsonInput(handle, async () => {
+			const header = Buffer.alloc(IMAGE_METADATA_HEADER_BYTES);
+			const { bytesRead } = await handle.read(header, 0, header.length, 0);
+			return inspect(header.subarray(0, bytesRead));
 		});
 	};
 	try {
 		return (await resolved(absolutePath)) ? { absolutePath, selector } : null;
 	} catch (error) {
+		if (readingInput && session.pathScope) throw error;
 		if (!isNotFoundError(error) || isRemoteMountPath(absolutePath)) return null;
 	}
 
 	const suffixMatch = await findSuffixMatchCached(session, suffixCache, target.jsonPath, signal);
 	if (!suffixMatch) return null;
+	readingInput = false;
 	try {
 		if (!(await resolved(suffixMatch.absolutePath))) return null;
 	} catch (error) {
+		if (readingInput && session.pathScope) throw error;
 		if (isNotFoundError(error)) return null;
 		throw error;
 	}
@@ -459,7 +501,42 @@ export async function readJson(
 		await Bun.write(inputPath, resolvedJsonPath.content);
 		queryOutput = await executeJsonQuery(inputPath, resolvedJsonPath.selector, signal);
 	} else {
-		queryOutput = await executeJsonQuery(resolvedJsonPath.absolutePath, resolvedJsonPath.selector, signal);
+		if (!session.pathScope) {
+			queryOutput = await executeJsonQuery(resolvedJsonPath.absolutePath, resolvedJsonPath.selector, signal);
+		} else {
+			const operation = session.pathScope.currentOperation();
+			const handle = await operation.openRead(await operation.authorize(resolvedJsonPath.absolutePath, "read"));
+			queryOutput = await withJsonInput(handle, async () => {
+				// The shell can abandon a blocking builtin after cancellation grace. Never
+				// let that detached worker retain the operation's physical source input:
+				// finish the admitted read here, then query only owned private snapshot bytes.
+				if (process.platform !== "linux") throw new Error("Exact JSON input reads require Linux /proc support.");
+				const source = `/proc/self/fd/${handle.fd}`;
+				const identity = await handle.stat({ bigint: true });
+				const procIdentity = await fs.stat(source, { bigint: true });
+				if (identity.dev !== procIdentity.dev || identity.ino !== procIdentity.ino)
+					throw new Error("JSON input descriptor identity changed.");
+				const scratch = await TempDir.create("@omp-read-json-");
+				const inputPath = scratch.join("input.json");
+				let output: string;
+				try {
+					await fs.copyFile(source, inputPath);
+					operation.assertActive();
+					throwIfAborted(signal);
+					output = await executeJsonQuery(inputPath, resolvedJsonPath.selector, signal);
+					operation.assertActive();
+				} catch (error) {
+					try {
+						await scratch.remove();
+					} catch (cleanupError) {
+						throw new AggregateError([error, cleanupError], "JSON input snapshot and cleanup failed.");
+					}
+					throw error;
+				}
+				await scratch.remove();
+				return output;
+			});
+		}
 	}
 
 	const output = prependSuffixResolutionNotice(queryOutput, file?.suffixResolution);

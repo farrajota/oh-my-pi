@@ -10,6 +10,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/internal/agent-registry-bridge";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import * as sdk from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -47,7 +48,10 @@ it("shares Vibe sibling cache routing by worker type while keeping conversations
 	const parentSessionManager = SessionManager.create(directory.path(), directory.join("parent"));
 	const parentSessionFile = parentSessionManager.getSessionFile();
 	if (!parentSessionFile) throw new Error("Expected a persisted parent session file");
-	const agentRegistry = AgentRegistry.isolatedForSession(parentSessionFile);
+	await parentSessionManager.ensureOnDisk();
+	const agentRegistry = await AgentRegistry.create({
+		durableState: await registryDurableStateForSession(parentSessionFile, { create: true }),
+	});
 	AgentRegistry.installGlobal(agentRegistry);
 	const model = modelRegistry.find("muse-code", modelId);
 	if (!model) throw new Error(`Model missing from online catalog fixture: muse-code/${modelId}`);
@@ -148,6 +152,7 @@ it("shares Vibe sibling cache routing by worker type while keeping conversations
 		expect(new Set(requests.map(request => request.sessionId)).size).toBe(3);
 	} finally {
 		await Promise.all(sessions.map(session => session.dispose()));
+		await closeSessionAuthority(parentSessionFile);
 		authStorage.close();
 	}
 }, 30_000);

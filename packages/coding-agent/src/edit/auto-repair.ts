@@ -19,6 +19,7 @@ import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { WritethroughCallback } from "../lsp";
 import type { ToolSession } from "../tools";
+import { filesystemMutationHooks, FilesystemReadMissingError } from "../tools/file-write-fallback";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
 import repairPromptSource from "./auto-repair.md" with { type: "text" };
 import type { AppliedEditSnapshot } from "./blackbox";
@@ -329,6 +330,13 @@ export interface EditAutoRepairOutcome {
 	attempts: number;
 }
 
+/** The caller may decline model repair, never an admitted filesystem effect's disposition. */
+export class EditAutoRepairEffectError extends Error {
+	constructor(cause: unknown) {
+		super(cause instanceof Error ? cause.message : String(cause), { cause });
+	}
+}
+
 /**
  * Attempt to auto-repair a committed edit that introduced a parse failure,
  * writing the repaired content through the edit tool's LSP writethrough.
@@ -357,11 +365,22 @@ export async function attemptEditAutoRepair(options: {
 	// Repair against the bytes on disk, not the snapshot: a later operation in
 	// the same call or a format-on-write pass may have moved the file since the
 	// observation — and may even have restored the parse.
-	let current: string;
-	try {
-		current = await Bun.file(snapshot.path).text();
-	} catch {
-		return undefined;
+	const operation = session.pathScope?.currentOperation();
+	let current: string | undefined;
+	if (operation) {
+		try {
+			current = await filesystemMutationHooks(operation).readText!(snapshot.path);
+		} catch (error) {
+			if (error instanceof FilesystemReadMissingError) return undefined;
+			throw new EditAutoRepairEffectError(error);
+		}
+		if (current === undefined) return undefined;
+	} else {
+		try {
+			current = await Bun.file(snapshot.path).text();
+		} catch {
+			return undefined;
+		}
 	}
 	if (parsesSource(current, snapshot.path)) return undefined;
 
@@ -407,7 +426,12 @@ export async function attemptEditAutoRepair(options: {
 	const repair = await repairParseRegression({ ...snapshot, next: current }, complete);
 	if (!repair) return undefined;
 
-	await writethrough(snapshot.path, repair.content, options.signal, Bun.file(snapshot.path));
+	try {
+		await writethrough(snapshot.path, repair.content, options.signal, Bun.file(snapshot.path));
+	} catch (error) {
+		if (operation) throw new EditAutoRepairEffectError(error);
+		throw error;
+	}
 	invalidateFsScanAfterWrite(snapshot.path);
 	logger.debug("Edit auto-repair applied", {
 		path: snapshot.path,

@@ -36,7 +36,7 @@ import { getSessionLocalProtocolOptions } from "@oh-my-pi/pi-coding-agent/intern
 import { deriveRestrictedStartupPolicy } from "../../src/internal/restricted-startup-policy";
 import type { AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import { installSessionOperationLedger, runLocalOperation } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -76,7 +76,7 @@ import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
@@ -90,6 +90,13 @@ let fixtureRegistry: AgentRegistry | undefined;
 let fixtureAuthStorage: AuthStorage | undefined;
 let fixtureModelRegistry: ModelRegistry | undefined;
 let fixtureSettings: Settings | undefined;
+const authorityFiles = new Set<string>();
+
+async function createDurableRegistry(sessionFile: string): Promise<AgentRegistry> {
+	authorityFiles.add(sessionFile);
+	const durableState = await registryDurableStateForSession(sessionFile, { create: true });
+	return AgentRegistry.create({ durableState });
+}
 
 function makeTempDir(prefix: string): string {
 	const dir = TempDir.createSync(prefix);
@@ -132,11 +139,19 @@ async function createRef(sessionFile: string, options: FixtureOptions = {}): Pro
 		const rootModel = fixtureModelRegistry.find("anthropic", "claude-sonnet-4-5");
 		expect(rootModel).toMatchObject({ provider: "anthropic", id: "claude-sonnet-4-5" });
 		expect(rootModel && fixtureModelRegistry.hasConfiguredAuth(rootModel)).toBe(true);
-		fixtureRegistry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
+		const rootManager = SessionManager.create(
+			path.dirname(sessionFile),
+			path.join(path.dirname(sessionFile), "fixture-roots"),
+		);
+		await rootManager.ensureOnDisk();
+		const rootFile = rootManager.getSessionFile();
+		if (!rootFile) throw new Error("Expected allocated fixture root");
+		fixtureRegistry = await createDurableRegistry(rootFile);
 		AgentRegistry.installGlobal(fixtureRegistry);
 		await createAgentRootSession(fixtureRegistry, {
 			agentId: MAIN_AGENT_ID,
 			agentDisplayName: MAIN_AGENT_ID,
+			sessionManager: rootManager,
 			cwd: path.dirname(sessionFile),
 			agentDir: path.dirname(sessionFile),
 			settings: fixtureSettings,
@@ -238,7 +253,8 @@ async function createRef(sessionFile: string, options: FixtureOptions = {}): Pro
 			enableMCP,
 			...(mcpManager ? { mcpManager, customTools: customTools.length > 0 ? customTools : undefined } : {}),
 		});
-		if (!setAgentStatus(registry, id, "idle", session)) throw new Error("Expected live child authority fixture");
+		if (!(await setAgentStatus(registry, id, "idle", session)))
+			throw new Error("Expected live child authority fixture");
 		const lifecycle = getAgentLifecycleManager(registry);
 		adoptAgent(lifecycle, id, { idleTtlMs: 0 }, session);
 		await parkAgent(lifecycle, id);
@@ -280,7 +296,8 @@ function createRevivedSession(
 	options?: CreateAgentSessionOptions,
 ): RevivedSessionHandle {
 	const sessionManager = options?.sessionManager ?? SessionManager.inMemory("/tmp");
-	installSessionOperationLedger(sessionManager);
+	const operationControl = installSessionOperationLedger(sessionManager);
+	let disposed = false;
 	let observer: IrcWakeObserver | undefined;
 	let lastAssistant:
 		| {
@@ -297,6 +314,18 @@ function createRevivedSession(
 		...createSessionDefaults(),
 		...(options?.settings ? { settings: options.settings } : {}),
 		sessionManager,
+		beginDispose: () => {
+			if (disposed) return;
+			disposed = true;
+			void operationControl.close();
+		},
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			disposed = true;
+			await operationControl.close();
+		},
 		getPermissionSummary: () => sessionManager.getLatestPermissionSummary(),
 		getPermissionScope: () => options?.permissionScope,
 		getMountedXdevToolNames: () => [],
@@ -491,13 +520,17 @@ function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptio
 	};
 }
 
+/** Roots a test proved can no longer retire (a descendant's session disposal failed); teardown must not retry them. */
+const unretirableRoots = new Set<AgentSession>();
+
 afterEach(async () => {
 	vi.restoreAllMocks();
 	MCPManager.resetForTests();
 	const registry = fixtureRegistry;
 	const root = registry ? lookupAgentRef(registry, MAIN_AGENT_ID)?.session : undefined;
 	if (registry) await disposeAgentLifecycle(getAgentLifecycleManager(registry));
-	await root?.dispose();
+	if (root && !unretirableRoots.has(root)) await root.dispose();
+	unretirableRoots.clear();
 	resetAgentLifecycleForTests();
 	AgentRegistry.resetGlobalForTests();
 	IrcBus.resetGlobalForTests();
@@ -506,6 +539,8 @@ afterEach(async () => {
 	fixtureAuthStorage = undefined;
 	fixtureModelRegistry = undefined;
 	fixtureSettings = undefined;
+	await Promise.all([...authorityFiles].map(file => closeSessionAuthority(file)));
+	authorityFiles.clear();
 	await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
 });
 
@@ -523,12 +558,12 @@ describe("persisted subagent revival", () => {
 			return { session: handle.session } as CreateAgentSessionResult;
 		});
 		const childSessionFile = await createPersistedSession(cwd);
-		fixtureRegistry = new AgentRegistry({ durableState: registryDurableStateForSession(childSessionFile) });
-		AgentRegistry.installGlobal(fixtureRegistry);
 		const initialRootManager = SessionManager.create(cwd, path.join(cwd, "roots"));
 		await initialRootManager.ensureOnDisk();
 		const initialRootFile = initialRootManager.getSessionFile();
 		if (!initialRootFile) throw new Error("Expected persisted root fixture");
+		fixtureRegistry = await createDurableRegistry(initialRootFile);
+		AgentRegistry.installGlobal(fixtureRegistry);
 		await createAgentRootSession(fixtureRegistry, {
 			agentId: MAIN_AGENT_ID,
 			sessionManager: initialRootManager,
@@ -539,8 +574,10 @@ describe("persisted subagent revival", () => {
 		// Simulate process restart without retiring the durable Main actor.
 		await initialRootManager.close();
 
+		await closeSessionAuthority(initialRootFile);
+		authorityFiles.delete(initialRootFile);
 		AgentRegistry.resetGlobalForTests();
-		const registry = new AgentRegistry({ durableState: registryDurableStateForSession(childSessionFile) });
+		const registry = await createDurableRegistry(initialRootFile);
 		fixtureRegistry = registry;
 		AgentRegistry.installGlobal(registry);
 		const resumedRootManager = await SessionManager.open(initialRootFile, undefined, undefined, {
@@ -584,6 +621,37 @@ describe("persisted subagent revival", () => {
 		await resumedRootManager.close();
 	});
 
+	it("parks persisted-revival setup failures through the owned authority cleanup", async () => {
+		const cwd = makeTempDir("@pi-revive-park-failure-");
+		const sessionFile = await createPersistedSession(cwd, false, "default", undefined, { agent: "task" });
+		const ref = await createRef(sessionFile);
+		const registry = fixtureRegistry;
+		if (!registry) throw new Error("Expected the durable authority registry");
+		const durableState = registry.getDurableStateStore();
+		if (!durableState) throw new Error("Expected durable registry state");
+		const primary = new Error("persisted tool setup failed");
+		let failedSession: AgentSession | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
+			const handle = createRevivedSession([], undefined, options);
+			failedSession = handle.session;
+			vi.spyOn(handle.session, "setActiveToolsByName").mockRejectedValue(primary);
+			return { session: handle.session } as CreateAgentSessionResult;
+		});
+		const revive = await createFactory(cwd)(ref);
+		if (!revive) throw new Error("Expected the persisted child reviver");
+
+		// Plain await: Bun's `expect(promise).rejects` stops delivering the authority worker's
+		// replies while it waits, so the revival's own durable cleanup would never settle.
+		const revivalError = await revive(ref).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(revivalError).toBe(primary);
+
+		expect(failedSession?.isDisposed).toBe(true);
+		expect(lookupAgentRef(registry, ref.id)).toMatchObject({ status: "parked", session: null });
+		expect((await durableState.getActor(ref.id))?.record.state).toBe("parked");
+	});
 	it("revives a persisted child despite non-authoritative startup input drift", async () => {
 		const cwd = makeTempDir("@pi-revive-startup-inputs-");
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
@@ -594,9 +662,16 @@ describe("persisted subagent revival", () => {
 		);
 		const sessionFile = await createPersistedSession(cwd, false, "default", undefined, { agent: "task" });
 		const id = `persisted-${path.basename(sessionFile, ".jsonl")}`;
-		fixtureRegistry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
+		const rootManager = SessionManager.create(cwd, path.join(cwd, "roots"));
+		await rootManager.ensureOnDisk();
+		const rootFile = rootManager.getSessionFile();
+		if (!rootFile) throw new Error("Expected allocated fixture root");
+		fixtureRegistry = await createDurableRegistry(rootFile);
 		AgentRegistry.installGlobal(fixtureRegistry);
-		const { session: root } = await createAgentRootSession(fixtureRegistry, { agentId: MAIN_AGENT_ID });
+		const { session: root } = await createAgentRootSession(fixtureRegistry, {
+			agentId: MAIN_AGENT_ID,
+			sessionManager: rootManager,
+		});
 		const authorityBinding = bindInternalAgentAuthoritySession(fixtureRegistry, root);
 		if (!authorityBinding) throw new Error("Expected bound Main authority fixture");
 		const peek = await SessionManager.peekSessionInit(sessionFile);
@@ -633,7 +708,7 @@ describe("persisted subagent revival", () => {
 				enableIrc: true,
 				enableMCP: true,
 			});
-			if (!setAgentStatus(fixtureRegistry, id, "idle", session))
+			if (!(await setAgentStatus(fixtureRegistry, id, "idle", session)))
 				throw new Error("Expected live child authority fixture");
 			const lifecycle = getAgentLifecycleManager(fixtureRegistry);
 			adoptAgent(lifecycle, id, { idleTtlMs: 0 }, session);
@@ -1772,8 +1847,8 @@ describe("cold revival replays the system prompt the last request sent", () => {
 	afterEach(async () => {
 		await Promise.all(sessions.splice(0).map(session => session.dispose()));
 		resetAgentLifecycleForTests();
-		AgentRegistry.global().unregister("prompt-blocks");
-		AgentRegistry.global().unregister("Peer");
+		await AgentRegistry.global().unregister("prompt-blocks");
+		await AgentRegistry.global().unregister("Peer");
 	});
 
 	function createTool(name: string): AgentTool {
@@ -1912,7 +1987,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		const rootSessionFile = rootManager.getSessionFile();
 		if (!rootSessionFile) throw new Error("Test fixture requires a persisted root transcript");
 		await rootManager.ensureOnDisk();
-		const registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
+		const registry = await createDurableRegistry(rootSessionFile);
 		fixtureRegistry = registry;
 		fixtureSettings = settings;
 		AgentRegistry.installGlobal(registry);
@@ -2204,6 +2279,104 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		expect(warm.toolRequests.at(-1)).toBe(spawned.toolRequests.at(-1)!);
 	});
 
+	it("removes a warm revival whose post-create tool setup fails and retains cleanup failures", async () => {
+		const cwd = makeTempDir("@pi-revive-warm-setup-failure-");
+		const buildPrompt = (names: string[]) => ["base", `tools: ${names.join(",")}`];
+		await spawn(cwd, buildPrompt, spawnResponses());
+		const registry = fixtureRegistry!;
+		const lifecycle = getAgentLifecycleManager(registry);
+		await parkAgent(lifecycle, "prompt-blocks");
+		const primary = new Error("warm tool setup failed");
+		const cleanup = new Error("warm manager close failed");
+		let failedSession: AgentSession | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
+			const warm = createRecordingSession(options!.sessionManager!, buildPrompt, [{ content: ["next"] }]);
+			failedSession = warm.session;
+			vi.spyOn(warm.session, "setActiveToolsByName").mockRejectedValue(primary);
+			const close = options!.sessionManager!.close.bind(options!.sessionManager);
+			vi.spyOn(options!.sessionManager!, "close").mockImplementation(async () => {
+				await close();
+				throw cleanup;
+			});
+			return { session: warm.session } as CreateAgentSessionResult;
+		});
+		let error: unknown;
+		try {
+			await ensureAgentLive(lifecycle, "prompt-blocks");
+		} catch (caught) {
+			error = caught;
+		} finally {
+			// This session's rejected disposal was already awaited by the revival.
+			if (failedSession) {
+				const index = sessions.indexOf(failedSession);
+				if (index >= 0) sessions.splice(index, 1);
+			}
+		}
+		expect(error).toBeInstanceOf(AggregateError);
+		expect((error as AggregateError).errors).toContain(primary);
+		expect((error as AggregateError).errors).toContain(cleanup);
+		expect(failedSession).toBeDefined();
+		expect(lookupAgentRef(registry, "prompt-blocks")?.session).not.toBe(failedSession);
+		await expect(ensureAgentLive(lifecycle, "prompt-blocks")).rejects.toThrow(/unknown|released/i);
+		// The retained cleanup failure stays unresolved, so the owning root refuses to retire over it.
+		const root = lookupAgentRef(registry, MAIN_AGENT_ID)?.session;
+		if (!root) throw new Error("Expected real owning root session");
+		const rootDisposalError = await root.dispose().then(
+			() => undefined,
+			(caught: unknown) => caught,
+		);
+		unretirableRoots.add(root);
+		expect(rootDisposalError).toBeInstanceOf(AggregateError);
+		expect((rootDisposalError as AggregateError).errors).toEqual([cleanup]);
+	});
+
+	it("records the initiating abnormal root shutdown only after its child manager drains", async () => {
+		const cwd = makeTempDir("@pi-revive-root-shutdown-options-");
+		const spawned = await spawn(cwd, names => ["base", names.join(",")], spawnResponses());
+		const registry = fixtureRegistry!;
+		const root = lookupAgentRef(registry, MAIN_AGENT_ID)?.session;
+		if (!root) throw new Error("Expected real owning root session");
+		for (const entry of spawned.session.sessionManager.getEntries()) {
+			if (entry.type === "message" && entry.message.role === "assistant")
+				root.sessionManager.appendMessage(entry.message);
+		}
+		const started = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const close = spawned.session.sessionManager.close.bind(spawned.session.sessionManager);
+		vi.spyOn(spawned.session.sessionManager, "close").mockImplementation(async () => {
+			started.resolve();
+			await gate.promise;
+			await close();
+		});
+		const rootFile = root.sessionManager.getSessionFile();
+		if (!rootFile) throw new Error("Expected persisted owning root transcript");
+		const exits = () =>
+			root.sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "custom" && entry.customType === "session_exit");
+		const disposal = root.dispose({
+			reason: postmortem.Reason.UNHANDLED_REJECTION,
+			drainTimeoutMs: 17,
+			mnemopiConsolidateTimeoutMs: 0,
+		});
+		try {
+			await started.promise;
+			expect(exits()).toEqual([]);
+		} finally {
+			gate.resolve();
+		}
+		await disposal;
+		await root.dispose();
+		// Disposal releases the manager's in-memory entries; the record of the exit is the transcript.
+		const persistedExits = (
+			Bun.JSONL.parse(await Bun.file(rootFile).text()) as Array<{ type?: string; customType?: string }>
+		).filter(entry => entry.type === "custom" && entry.customType === "session_exit");
+		expect(persistedExits).toMatchObject([
+			{ data: { reason: postmortem.Reason.UNHANDLED_REJECTION, kind: "fatal" } },
+		]);
+		expect(persistedExits).toHaveLength(1);
+	});
+
 	/** The executor's own subagent prompt over a default block listing the active tools. */
 	function subagentPrompt(toolNames: string[], options?: CreateAgentSessionOptions): string[] {
 		const build = options?.systemPrompt;
@@ -2225,14 +2398,14 @@ describe("cold revival replays the system prompt the last request sent", () => {
 
 	/** Parks the spawned subagent, lets `whileParked` change the registry, and warm-revives it. */
 	async function parkAndRevive(
-		whileParked: () => void,
+		whileParked: () => void | Promise<void>,
 		hooks?: ExtensionHooks,
 	): Promise<{ live: AgentSession; warm: RecordingSession }> {
 		const registry = fixtureRegistry;
 		if (!registry) throw new Error("Expected the prompt test authority registry");
 		const lifecycle = getAgentLifecycleManager(registry);
 		await parkAgent(lifecycle, "prompt-blocks");
-		whileParked();
+		await whileParked();
 		let warm: RecordingSession | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
 			warm = createRecordingSession(
@@ -2286,7 +2459,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 
 		const registry = fixtureRegistry;
 		if (!registry) throw new Error("Expected the prompt test authority registry");
-		expect(registry.unregister("Peer")).toBe(true);
+		await expect(registry.unregister("Peer")).resolves.toBe(true);
 		registry.register({
 			id: "Peer-2",
 			displayName: "Peer Two",
@@ -2313,7 +2486,32 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		registerPeer();
 		await spawned.session.refreshBaseSystemPrompt(() => false);
 		expect(spawned.session.systemPrompt.join("\n")).not.toContain("`Peer`");
-		const { warm } = await parkAndRevive(() => AgentRegistry.global().unregister("Peer"));
+		const removalStarted = Promise.withResolvers<void>();
+		const removalGate = Promise.withResolvers<void>();
+		const registry = fixtureRegistry!;
+		const unregister = registry.unregister.bind(registry);
+		vi.spyOn(registry, "unregister").mockImplementation(async (...args) => {
+			if (args[0] === "Peer") {
+				removalStarted.resolve();
+				await removalGate.promise;
+			}
+			return unregister(...args);
+		});
+		let revived = false;
+		const revival = parkAndRevive(async () => {
+			expect(await registry.unregister("Peer")).toBe(true);
+		}).then(result => {
+			revived = true;
+			return result;
+		});
+		try {
+			await removalStarted.promise;
+			expect(revived).toBe(false);
+			expect(registry.get("prompt-blocks")?.status).toBe("parked");
+		} finally {
+			removalGate.resolve();
+		}
+		const { warm } = await revival;
 		expect(warm.requests[0]).toEqual(spawned.requests.at(-1)!);
 	});
 
@@ -2389,19 +2587,18 @@ describe("cold revival replays the system prompt the last request sent", () => {
 
 	it("keeps a finished child in the Agent Hub when startup extensions append many entries", async () => {
 		const cwd = makeTempDir("@pi-revive-hub-prefix-");
-		const parentFile = path.join(cwd, "parent.jsonl");
-		await Bun.write(
-			parentFile,
-			`${JSON.stringify({ type: "session", version: 3, id: "parent", timestamp: new Date().toISOString(), cwd })}\n`,
-		);
-		const childrenDir = path.join(cwd, "parent");
+		const rootManager = SessionManager.create(cwd, path.join(cwd, "roots"));
+		await rootManager.ensureOnDisk();
+		const parentFile = rootManager.getSessionFile();
+		if (!parentFile) throw new Error("Expected allocated parent transcript");
+		const childrenDir = parentFile.slice(0, -6);
 		await fs.mkdir(childrenDir);
 		const settings = Settings.isolated({}, { cwd, agentDir: cwd });
-		const registry = new AgentRegistry({ durableState: registryDurableStateForSession(parentFile) });
+		const registry = await createDurableRegistry(parentFile);
 		fixtureRegistry = registry;
 		fixtureSettings = settings;
 		AgentRegistry.installGlobal(registry);
-		const rootManager = await SessionManager.open(parentFile);
+		// The manager that minted the root remains its owner through authority creation.
 		const root = await createAgentRootSession(registry, {
 			agentId: MAIN_AGENT_ID,
 			agentDisplayName: MAIN_AGENT_ID,

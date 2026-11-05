@@ -15,8 +15,9 @@ import {
 import {
 	bindInternalAgentAuthoritySession,
 	createAgentRootSession,
-	detachAgentSession,
 	lookupAgentRef,
+	removeAgentRef,
+	parkAgentRef,
 	resolveAgentSessionOperationAuthority,
 	setAgentHistory,
 	setAgentActivity,
@@ -37,10 +38,23 @@ import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 function fakeSession(sessionFile: string): AgentSession {
 	const sessionManager = { getSessionFile: () => sessionFile };
-	operationLease.installSessionOperationLedger(sessionManager);
+	const operationControl = operationLease.installSessionOperationLedger(sessionManager);
+	let disposed = false;
+	const beginDispose = () => {
+		if (disposed) return;
+		disposed = true;
+		void operationControl.close();
+	};
 	return {
 		sessionManager,
-		dispose: vi.fn(async () => {}),
+		beginDispose,
+		dispose: vi.fn(async () => {
+			beginDispose();
+			await operationControl.close();
+		}),
+		get isDisposed() {
+			return disposed;
+		},
 	} as unknown as AgentSession;
 }
 
@@ -64,7 +78,7 @@ function authority(registry: AgentRegistry, parent: AgentSession) {
 }
 
 describe("W2 registry capabilities", () => {
-	it("updates activity only for the exact running generation", () => {
+	it("updates activity only for the exact running generation", async () => {
 		const registry = new AgentRegistry();
 		const currentSession = fakeSession("/worker.jsonl");
 		const current = registry.register({
@@ -83,7 +97,7 @@ describe("W2 registry capabilities", () => {
 		expect(registry.get("Worker")?.activity).toBe("working");
 		expect(setAgentActivity(registry, "Worker", "attached", attachedSession)).toBe(true);
 		expect(registry.get("Worker")?.activity).toBe("attached");
-		expect(registry.unregister("Worker", current)).toBe(true);
+		expect(await registry.unregister("Worker", current)).toBe(true);
 
 		const replacementSession = fakeSession("/worker-replacement.jsonl");
 		const replacement = registry.register({
@@ -97,7 +111,7 @@ describe("W2 registry capabilities", () => {
 		expect(registry.get("Worker")?.activity).toBeUndefined();
 		expect(setAgentActivity(registry, "Worker", "current", replacementSession)).toBe(true);
 		expect(registry.get("Worker")?.activity).toBe("current");
-		expect(registry.setStatus("Worker", "idle", replacement)).toBe(true);
+		expect(await registry.setStatus("Worker", "idle", replacement)).toBe(true);
 		expect(setAgentActivity(registry, "Worker", "late", replacementSession)).toBe(false);
 	});
 
@@ -122,14 +136,24 @@ describe("W2 registry capabilities", () => {
 				error => error,
 			);
 			await constructionStarted.promise;
-			await rootSession.dispose();
+			const rootRef = lookupAgentRef(registry, "Main");
+			if (!rootRef) throw new Error("Expected live root ref");
+			let removalSettled = false;
+			const removal = removeAgentRef(registry, rootRef).then(result => {
+				removalSettled = true;
+				return result;
+			});
+			await Promise.resolve();
+			expect(removalSettled).toBe(false);
 			pending.resolve({ session: childSession } as sdk.CreateAgentSessionResult);
 			const error = await outcome;
 			expect(error).toBeInstanceOf(Error);
 			expect(error.message).toContain("Parent session authority changed");
 			expect(registry.get("Worker")).toBeUndefined();
 			expect(childSession.dispose).toHaveBeenCalledTimes(1);
+			expect(await removal).toBe(true);
 		} finally {
+			pending.resolve({ session: childSession } as sdk.CreateAgentSessionResult);
 			createSession.mockRestore();
 		}
 	});
@@ -156,14 +180,20 @@ describe("W2 registry capabilities", () => {
 				() => undefined,
 				error => error,
 			);
-			await constructionStarted.promise;
-			expect(await releaseAgent(lifecycle, "Main", original)).toBe(true);
-			// This fake session remains reusable after disposal; identity alone is not authority.
+			let releaseSettled = false;
+			const releasing = releaseAgent(lifecycle, "Main", original).then(result => {
+				releaseSettled = true;
+				return result;
+			});
+			await Promise.resolve();
+			expect(releaseSettled).toBe(false);
+			pending.resolve({ session: child } as sdk.CreateAgentSessionResult);
+			expect(await releasing).toBe(true);
+			// This disposed fake is reused only to prove a new generation cannot inherit old authority.
 			const replacement = registry.register({ id: "Main", displayName: "main", kind: "main", session: parent });
 			expect(replacement).not.toBe(original);
 			expect(replacement.lineage?.generation).not.toBe(original.lineage?.generation);
 			expect(lookupAgentRef(registry, "Main")?.session).toBe(parent);
-			pending.resolve({ session: child } as sdk.CreateAgentSessionResult);
 			const error = await outcome;
 			expect(error).toBeInstanceOf(Error);
 			expect(error.message).toContain("Parent session authority changed");
@@ -175,6 +205,7 @@ describe("W2 registry capabilities", () => {
 				registry.register({ id: "Worker", displayName: "worker", kind: "sub", parentId: "Main", session: null }).id,
 			).toBe("Worker");
 		} finally {
+			pending.resolve({ session: child } as sdk.CreateAgentSessionResult);
 			createSession.mockRestore();
 			await disposeAgentLifecycle(lifecycle);
 		}
@@ -311,7 +342,7 @@ describe("W2 registry capabilities", () => {
 			expect(manager.getLeafId()).toBe(leaf);
 			expect(manager.getBranch().some(entry => entry.id === finalUsage)).toBe(false);
 			expect(manager.getUsageStatistics()).toMatchObject({ cost: 1.5, subagentCost: 0.5 });
-			expect(setAgentStatus(registry, "Worker", "idle", child.session)).toBe(true);
+			expect(await setAgentStatus(registry, "Worker", "idle", child.session)).toBe(true);
 			adoptAgent(lifecycle, "Worker", { idleTtlMs: 0 }, child.session);
 			const parkedEvents: Array<{ directCost: number | undefined; detached: boolean }> = [];
 			const unsubscribe = registry.onChange(event => {
@@ -376,10 +407,12 @@ describe("W2 registry capabilities", () => {
 			if (!worker) throw new Error("Expected live worker");
 			const workerSession = lookupAgentRef(registry, worker.id)?.session;
 			if (!workerSession) throw new Error("Expected exact live worker session");
-			expect(registry.setStatus(worker.id, "parked", workerSession)).toBe(false);
+			await expect(registry.setStatus(worker.id, "parked", workerSession)).resolves.toBe(false);
 			expect(registry.detachSession(worker.id, workerSession)).toBe(false);
-			expect(setAgentStatus(registry, worker.id, "parked", workerSession)).toBe(true);
-			expect(detachAgentSession(registry, worker.id, workerSession)).toBe(true);
+			await expect(setAgentStatus(registry, worker.id, "parked", workerSession)).resolves.toBe(false);
+			const workerRef = lookupAgentRef(registry, worker.id);
+			if (!workerRef) throw new Error("Expected owned worker ref");
+			expect(await parkAgentRef(registry, workerRef, workerSession)).toBe(true);
 			await expect(authority(registry, rootB.session).create({ agentId: worker.id }, worker)).rejects.toThrow(
 				"Invalid live parent revival",
 			);
@@ -435,7 +468,10 @@ describe("W2 registry capabilities", () => {
 			const child = await authority(registry, original.session).create({ agentId: "RetiredChild" });
 			const oldGeneration = registry.get("Main")?.lineage?.generation;
 			let callbackFinished = false;
-			const active = runEvalOperation(original.session.sessionManager, "eval:root-replacement", async () => {
+			const cancelled = Promise.withResolvers<void>();
+			const active = runEvalOperation(original.session.sessionManager, "eval:root-replacement", async signal => {
+				if (signal?.aborted) cancelled.resolve();
+				else signal?.addEventListener("abort", () => cancelled.resolve(), { once: true });
 				callbackStarted.resolve();
 				try {
 					return await pending.promise;
@@ -455,6 +491,11 @@ describe("W2 registry capabilities", () => {
 				},
 			);
 			await Promise.resolve();
+			expect(callbackFinished).toBe(false);
+			expect(replacementSettled).toBe(false);
+			// Replacement constructs its candidate before quiescing; hold the old callback until quiescence
+			// cancels it so completion cannot race ahead of the fence.
+			await cancelled.promise;
 			expect(callbackFinished).toBe(false);
 			expect(replacementSettled).toBe(false);
 			pending.resolve("old completion");
@@ -535,11 +576,12 @@ describe("W2 registry capabilities", () => {
 		try {
 			await createAgentRootSession(registry, { agentId: "Main" });
 			first.session.dispose = vi.fn(async () => {
+				await originalDispose.call(first.session);
 				throw new Error("retirement failpoint");
 			});
-			const replacement = await createAgentRootSession(registry, { agentId: "Main" });
-			expect(replacement.session).toBe(second.session);
+			await expect(createAgentRootSession(registry, { agentId: "Main" })).rejects.toThrow("retirement failpoint");
 			expect(lookupAgentRef(registry, "Main")?.session).toBe(second.session);
+			expect(resolveAgentSessionOperationAuthority(registry, second.session)).toBeDefined();
 			await expect(
 				runEvalOperation(second.session.sessionManager, "eval:post-cas", async () => "forward"),
 			).resolves.toBe("forward");
@@ -579,13 +621,13 @@ describe("W2 registry capabilities", () => {
 			await createAgentRootSession(registry, { agentId: "Main" });
 			const authority = resolveAgentSessionOperationAuthority(registry, root.session);
 			expect(authority).toBeDefined();
-			expect(() => operationLease.bindSessionOperationAuthority(foreign.session.sessionManager, authority!)).toThrow(
-				/different session manager/i,
-			);
+			await expect(
+				operationLease.bindSessionOperationAuthority(foreign.session.sessionManager, authority!),
+			).rejects.toThrow(/different session manager/i);
 			const forged = { ...authority } as typeof authority;
-			expect(() => operationLease.bindSessionOperationAuthority(root.session.sessionManager, forged!)).toThrow(
-				/different session manager/i,
-			);
+			await expect(
+				operationLease.bindSessionOperationAuthority(root.session.sessionManager, forged!),
+			).rejects.toThrow(/different session manager/i);
 		} finally {
 			createSession.mockRestore();
 			await root.session.dispose();

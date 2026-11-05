@@ -263,10 +263,20 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		const cancelled = await run;
 		expect(cancelled.aborted).toBe(true);
 
-		// Replacing the real root retires its outstanding child reservation. The
-		// new bound parent can then create the same id while the old SDK call waits.
+		// Replacing the real root drains its outstanding child construction first:
+		// the replacement cannot commit while the old SDK call waits, and the late
+		// session is disposed before any newer same-id worker can exist.
 		createSession.mockRestore();
-		createAuthoritySession = await bindRootAuthority(registry);
+		let rootReplaced = false;
+		const replacingRoot = bindRootAuthority(registry).then(create => {
+			rootReplaced = true;
+			return create;
+		});
+		await Promise.resolve();
+		expect(rootReplaced).toBe(false);
+		creationGate.resolve();
+		await lateDisposed.promise;
+		createAuthoritySession = await replacingRoot;
 		const replacementManager = SessionManager.inMemory("/tmp");
 		installSessionOperationLedger(replacementManager);
 		const replacementSession = {
@@ -275,11 +285,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		} as unknown as AgentSession;
 		mockCreateAgentSession(replacementSession);
 		await createAuthoritySession({ agentId: "late-generation", agentDisplayName: "replacement B" });
-		expect(setAgentStatus(registry, "late-generation", "idle", replacementSession)).toBe(true);
+		expect(await setAgentStatus(registry, "late-generation", "idle", replacementSession)).toBe(true);
 		const replacement = registry.get("late-generation");
 		if (!replacement) throw new Error("Expected replacement worker generation");
-		creationGate.resolve();
-		await lateDisposed.promise;
 
 		expect(registry.get("late-generation")).toMatchObject({
 			id: replacement.id,
@@ -346,7 +354,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		await setupPaused.promise;
 		const original = lookupAgentRef(registry, "history-generation");
 		if (!original) throw new Error("Expected original history generation");
-		expect(parkAgentRef(registry, original, session)).toBe(true);
+		expect(await parkAgentRef(registry, original, session)).toBe(true);
 		await session.dispose();
 		const parked = registry.get("history-generation");
 		if (!parked) throw new Error("Expected parked history generation");

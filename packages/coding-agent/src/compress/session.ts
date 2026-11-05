@@ -11,7 +11,11 @@ import { formatModelString, resolveCliModel } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { createAgentRootSession } from "../internal/agent-registry-bridge";
 import { AgentRegistry } from "../registry/agent-registry";
-import { registryDurableStateForSession } from "../registry/durable-state";
+import {
+	closeSessionAuthority,
+	registryDurableStateForSession,
+	validateJournalingEnvironment,
+} from "../registry/authority";
 import { discoverAuthStorage } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import { SessionManager } from "../session/session-manager";
@@ -45,39 +49,96 @@ export async function createCompressSession(options: {
 	}
 	const sessionManager = SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, settings.getAgentDir()));
 	const sessionFile = sessionManager.getSessionFile();
-	if (!sessionFile) throw new Error("Compress restricted startup requires a persisted session file.");
-	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
-	const { session } = await createAgentRootSession(registry, {
-		cwd,
-		settings,
-		authStorage,
-		modelRegistry,
-		sessionManager,
-		cacheWarming: false,
-		...(resolved?.model ? { model: resolved.model } : {}),
-		customTools: [options.protocol.rewriteTool(), options.protocol.approveTool()],
-		toolNames: ["rewrite", "approve"],
-		restrictToolNames: true,
-		allowRestrictedCustomTools: true,
-		// Replace the default blocks outright: a compressor needs its own contract, not
-		// the coding-agent workflow. Every discovery source below defaults to ON when
-		// omitted, and each one would inject instruction-shaped project text into a
-		// session whose only legitimate input is the source document.
-		systemPrompt: [systemPrompt.trim()],
-		skills: [],
-		rules: [],
-		contextFiles: [],
-		promptTemplates: [],
-		slashCommands: [],
-		disableExtensionDiscovery: true,
-		enableMCP: false,
-		enableIrc: false,
-		enableLsp: false,
-		hasUI: false,
-		autoApprove: true,
-		agentId: options.agentId ?? "Compress",
-		agentDisplayName: "compress",
-	});
+	if (!sessionFile) {
+		await sessionManager.close();
+		throw new Error("Compress restricted startup requires a persisted session file.");
+	}
+	const header = sessionManager.getHeader();
+	if (!header || header.id !== sessionManager.getSessionId()) {
+		await sessionManager.close();
+		throw new Error("Compress session has no matching persisted session header.");
+	}
+	let authorityOpenAttempted = false;
+	const failStartup = async (error: unknown): Promise<never> => {
+		const cleanupErrors: unknown[] = [];
+		let authorityCloseSucceeded = !authorityOpenAttempted;
+		if (authorityOpenAttempted) {
+			try {
+				await closeSessionAuthority(sessionFile);
+				authorityCloseSucceeded = true;
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (authorityCloseSucceeded) {
+			try {
+				await sessionManager.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError([error, ...cleanupErrors], "Compress root startup failed and cleanup was incomplete");
+		}
+		throw error;
+	};
+	let session: AgentSession;
+	try {
+		await sessionManager.ensureOnDisk();
+		authorityOpenAttempted = true;
+		const durableState = await registryDurableStateForSession(sessionFile, {
+			backend: validateJournalingEnvironment(),
+			owningSessionId: header.id,
+			create: true,
+		});
+		const registry = await AgentRegistry.create({ durableState });
+		({ session } = await createAgentRootSession(registry, {
+			cwd,
+			settings,
+			authStorage,
+			modelRegistry,
+			sessionManager,
+			cacheWarming: false,
+			...(resolved?.model ? { model: resolved.model } : {}),
+			customTools: [options.protocol.rewriteTool(), options.protocol.approveTool()],
+			toolNames: ["rewrite", "approve"],
+			restrictToolNames: true,
+			allowRestrictedCustomTools: true,
+			// Replace the default blocks outright: a compressor needs its own contract, not
+			// the coding-agent workflow. Every discovery source below defaults to ON when
+			// omitted, and each one would inject instruction-shaped project text into a
+			// session whose only legitimate input is the source document.
+			systemPrompt: [systemPrompt.trim()],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableIrc: false,
+			enableLsp: false,
+			hasUI: false,
+			autoApprove: true,
+			agentId: options.agentId ?? "Compress",
+			agentDisplayName: "compress",
+		}));
+	} catch (error) {
+		return await failStartup(error);
+	}
+	const releaseDraftCleanup = sessionManager.deferDraftCleanup();
+	const disposeSession = session.dispose.bind(session);
+	let rootDisposal: Promise<void> | undefined;
+	session.dispose = (...args: Parameters<AgentSession["dispose"]>) => {
+		if (!rootDisposal) {
+			rootDisposal = (async () => {
+				await disposeSession(...args);
+				await closeSessionAuthority(sessionFile);
+				await releaseDraftCleanup();
+			})();
+		}
+		return rootDisposal;
+	};
 	const active = resolved?.model ?? session.model;
 	return { session, model: active ? formatModelString(active) : "session default" };
 }

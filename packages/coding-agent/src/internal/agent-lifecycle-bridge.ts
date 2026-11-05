@@ -1,6 +1,7 @@
 import {
 	AgentLifecycleManager,
 	type AdoptOptions,
+	type AgentLifecycleReplacementDrain,
 	type PersistedSubagentReviverFactory,
 } from "../registry/agent-lifecycle";
 import { AgentRegistry, type AgentRef } from "../registry/agent-registry";
@@ -94,8 +95,13 @@ export function isAgentParking(
 	return exact ? manager.isParking(id, exact, lifecycleCapability) : false;
 }
 
-export function parkAgent(manager: AgentLifecycleManager, id: string): Promise<void> {
-	return manager.park(id, lifecycleCapability);
+export function parkAgent(
+	manager: AgentLifecycleManager,
+	id: string,
+	dispose?: () => Promise<void>,
+	beforeDispose?: () => Promise<void>,
+): Promise<void> {
+	return manager.park(id, lifecycleCapability, dispose, beforeDispose);
 }
 
 export function ensureAgentLive(manager: AgentLifecycleManager, id: string): Promise<AgentSession> {
@@ -167,6 +173,13 @@ export function lookupOwnedAgentLifecycle(session: AgentSession): AgentLifecycle
 	return sessionLifecycleOwners.get(session);
 }
 
+export function quiesceOwnedAgentLifecycleForReplacement(
+	manager: AgentLifecycleManager,
+): Promise<AgentLifecycleReplacementDrain> | undefined {
+	const registry = managerRegistries.get(manager);
+	if (!registry || registryManagers.get(registry) !== manager) return undefined;
+	return manager.quiesceRevivalsForRootReplacement(lifecycleCapability);
+}
 export function disposeOwnedAgentLifecycle(
 	manager: AgentLifecycleManager,
 	deadlineAt?: number,

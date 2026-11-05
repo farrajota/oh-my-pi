@@ -132,7 +132,7 @@ export const searchHelp = { description: "Test web search providers" } satisfies
 
 export const sessionHelp = {
 	description:
-		"Inspect or repair saved session authority (repair is dry-run by default); hand a session to another machine by packing it, unpacking it, or marking the local copy moved",
+		"Inspect, migrate, or repair saved session authority (migration and repair are dry-run by default; --apply performs them; --recover finish|abort resolves an interrupted one); hand a session to another machine by packing it, unpacking it, or marking the local copy moved",
 } satisfies CommandMetadata;
 
 export const shareHelp = {

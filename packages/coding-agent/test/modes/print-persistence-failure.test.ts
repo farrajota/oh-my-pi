@@ -9,7 +9,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
-import { disposeSessionQuietly } from "../../src/main";
 import { Settings } from "../../src/config/settings";
 import { runPrintMode } from "../../src/modes/print-mode";
 import { formatPersistenceFailure } from "../../src/modes/persistence-failure";
@@ -381,11 +380,15 @@ describe("headless persistence-failure surface", () => {
 		manager.appendMessage({ role: "user", content: "pre-latch", timestamp: Date.now() } as never);
 
 		const stderr = captureStderr();
+		const disposeOutcomes: ({ status: "fulfilled" } | { status: "rejected"; error: unknown })[] = [];
 		const session = assistantSession(manager, memoizingDispose(manager));
 
 		let exitCode = -1;
 		try {
-			exitCode = await runPrintMode(session, { mode: "text" });
+			exitCode = await runPrintMode(session, {
+				mode: "text",
+				onDisposeOutcome: outcome => disposeOutcomes.push(outcome),
+			});
 		} finally {
 			stderr.restore();
 			restoreWrites();
@@ -398,22 +401,56 @@ describe("headless persistence-failure surface", () => {
 		expect(reported).toHaveLength(1);
 		expect(reported[0]).toContain("ENOSPC");
 		expect(exitCode).toBe(1);
+		const persistenceError = manager.getPersistenceError();
+		if (!persistenceError) throw new Error("Expected the manager's latched persistence failure");
+		expect(disposeOutcomes).toEqual([{ status: "rejected", error: persistenceError }]);
+		expect(() => manager.flushSync()).toThrow("ENOSPC");
 	});
 
-	it("settles a memoized dispose rejection instead of rethrowing it into the fatal handler", async () => {
-		let call: Promise<void> | undefined;
-		const dispose = (): Promise<void> => {
-			call ??= Promise.resolve().then(() => {
-				throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
-			});
-			return call;
-		};
-		const session = { dispose } as unknown as AgentSession;
+	it("does not misattribute an unrelated dispose failure after a persistence notice", async () => {
+		const persistenceError = new Error("temporary persistence failure");
+		const unrelatedDisposeError = new Error("unrelated dispose failure");
+		let notifyPersistenceError: ((error: Error) => void) | undefined;
+		const stderr = captureStderr();
+		const session = {
+			extensionRunner: undefined,
+			subscribe: () => {},
+			settings: Settings.isolated(),
+			sessionManager: {
+				getPersistenceError: () => undefined,
+				onPersistenceError: (callback: (error: Error) => void) => {
+					notifyPersistenceError = callback;
+					return () => {};
+				},
+				onPersistenceNotice: () => () => {},
+			},
+			getLastAssistantMessage: () => assistant(""),
+			disableStopTimeTodoReminders: () => {},
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForIdle: async () => {},
+			setTextOutputCommitted: () => {},
+			waitForAdvisorCatchup: async () => true,
+			prompt: async () => {
+				notifyPersistenceError?.(persistenceError);
+			},
+			dispose: async () => {
+				throw unrelatedDisposeError;
+			},
+		} as unknown as AgentSession;
+		const disposeOutcomes: ({ status: "fulfilled" } | { status: "rejected"; error: unknown })[] = [];
 
-		// The hazard: runRootCommand disposed a second time after print mode, and
-		// the cached rejection escaped through main()'s fatal handler.
-		await expect(session.dispose()).rejects.toThrow("ENOSPC");
-		await expect(disposeSessionQuietly(session)).resolves.toBeUndefined();
+		try {
+			await expect(
+				runPrintMode(session, {
+					mode: "text",
+					initialMessage: "hello",
+					onDisposeOutcome: outcome => disposeOutcomes.push(outcome),
+				}),
+			).rejects.toBe(unrelatedDisposeError);
+		} finally {
+			stderr.restore();
+		}
+		expect(disposeOutcomes).toEqual([{ status: "rejected", error: unrelatedDisposeError }]);
 	});
 
 	it("replays a store failure latched before the RPC surface subscribed", async () => {

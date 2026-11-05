@@ -2784,6 +2784,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				settings: preparedSettings,
 				costGate: this.session.costGate,
 				artifactsDir: this.session.getArtifactsDir?.() ?? effectiveArtifactsDir,
+				// The parent's transcript: the child's header records it as parentSession and as the authority that
+				// owns the child's actor, so resuming the child transcript directly is refused.
+				sessionFile,
 
 				cwd: this.session.cwd,
 				additionalDirectories: this.session.additionalDirectories,

@@ -303,7 +303,11 @@ async function openResolvedArchive(
 		const archive = await openArchive({ source, format, path: resolved.absolutePath });
 		return { archive, close: () => handle.close() };
 	} catch (error) {
-		await handle.close();
+		try {
+			await handle.close();
+		} catch (closeError) {
+			throw new AggregateError([error, closeError], "Archive opening failed and resource close did not complete.");
+		}
 		throw error;
 	}
 }
@@ -319,6 +323,8 @@ export async function readArchive(
 	throwIfAborted(signal);
 	assertSafeArchiveMemberPath(resolvedArchivePath.archiveSubPath);
 	const opened = await openResolvedArchive(session, resolvedArchivePath);
+	let readFailure: unknown;
+	let readFailed = false;
 	try {
 		throwIfAborted(signal);
 		const archive = opened.archive;
@@ -449,7 +455,21 @@ export async function readArchive(
 			firstText.text = prependSuffixResolutionNotice(firstText.text, resolvedArchivePath.suffixResolution);
 		}
 		return result;
+	} catch (error) {
+		readFailure = error;
+		readFailed = true;
+		throw error;
 	} finally {
-		await opened.close();
+		try {
+			await opened.close();
+		} catch (closeError) {
+			if (readFailed) {
+				throw new AggregateError(
+					[readFailure, closeError],
+					"Archive read failed and resource close did not complete.",
+				);
+			}
+			throw closeError;
+		}
 	}
 }

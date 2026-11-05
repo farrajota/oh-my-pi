@@ -11,6 +11,7 @@ export function createSessionDefaults() {
 		getLastAssistantMessage: () => undefined,
 		hasPendingAsyncWork: () => false,
 		abort: async () => {},
+		beginDispose: () => {},
 		dispose: async () => {},
 		setIrcWakeTurnObserver: () => {},
 		setWorkPoolYieldItems: async () => {},

@@ -57,7 +57,7 @@ describe("running subagent badge over a live registry", () => {
 		expect(badge.state.ids).toStrictEqual(["sub-1"]);
 	});
 
-	it("settles after a running subagent goes idle mid-session", () => {
+	it("settles after a running subagent goes idle mid-session", async () => {
 		const registry = new AgentRegistry();
 		const badge = createBadgeSync(registry, 50);
 		badge.sync();
@@ -71,13 +71,13 @@ describe("running subagent badge over a live registry", () => {
 		});
 		const afterRegister = badge.state.syncs;
 
-		registry.setStatus("sub-1", "idle");
+		await registry.setStatus("sub-1", "idle");
 
 		expect(badge.state.syncs).toBe(afterRegister + 1);
 		expect(badge.state.ids).toStrictEqual([]);
 	});
 
-	it("settles after a retired subagent is removed", () => {
+	it("settles after a retired subagent is removed", async () => {
 		const registry = new AgentRegistry();
 		const badge = createBadgeSync(registry, 50);
 		badge.sync();
@@ -91,7 +91,7 @@ describe("running subagent badge over a live registry", () => {
 		});
 		const afterRegister = badge.state.syncs;
 
-		registry.unregister("sub-1");
+		await registry.unregister("sub-1");
 
 		expect(badge.state.syncs).toBe(afterRegister + 1);
 		expect(badge.state.ids).toStrictEqual([]);

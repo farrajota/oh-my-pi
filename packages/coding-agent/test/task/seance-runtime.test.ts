@@ -6,13 +6,14 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { AuthorityStore } from "@oh-my-pi/pi-coding-agent/registry/authority/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
@@ -39,6 +40,7 @@ import {
 } from "../../src/internal/agent-lifecycle-bridge";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { getAgentDir, prompt, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+const authorityStores: AuthorityStore[] = [];
 
 function preparedSourceSession(sourceFile: string, sourceSessionId: string): PreparedSeanceSession {
 	return {
@@ -122,14 +124,19 @@ async function createDurableRootAuthority(
 	cwd: string,
 	options: Parameters<typeof createAgentRootSession>[1] = {},
 ) {
-	const rootSessionFile = path.join(tempDir.path(), "main.jsonl");
-	await Bun.write(rootSessionFile, "");
-	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
+	const rootManager = SessionManager.create(cwd, path.join(tempDir.path(), "sessions"));
+	const rootSessionFile = rootManager.getSessionFile();
+	if (!rootSessionFile) throw new Error("Expected a SessionManager-allocated root fixture");
+	await rootManager.ensureOnDisk();
+	const store = await registryDurableStateForSession(rootSessionFile, { create: true });
+	authorityStores.push(store);
+	const registry = await AgentRegistry.create({ durableState: store });
 	AgentRegistry.installGlobal(registry);
 	const root = await createAgentRootSession(registry, {
 		...options,
 		agentId: "Main",
 		cwd,
+		sessionManager: rootManager,
 		agentDir: path.join(tempDir.path(), "agent"),
 		settings: Settings.isolated(),
 	});
@@ -147,7 +154,12 @@ beforeEach(() => {
 	IrcBus.resetGlobalForTests();
 });
 
-afterEach(() => {
+async function closeAuthorityStores(): Promise<void> {
+	await Promise.all(authorityStores.splice(0).map(store => store.close()));
+}
+
+afterEach(async () => {
+	await closeAuthorityStores();
 	resetAgentLifecycleForTests();
 	IrcBus.resetGlobalForTests();
 	AgentRegistry.resetGlobalForTests();
@@ -314,7 +326,12 @@ describe("seance startup contracts", () => {
 			expect(await fs.readFile(sourceFile, "utf8")).toBe(sourceText);
 		} finally {
 			try {
-				await authorityRoot?.dispose();
+				try {
+					await authorityRoot?.dispose();
+				} finally {
+					// The store must close before `using tempDir` removes its journal.
+					await closeAuthorityStores();
+				}
 			} finally {
 				try {
 					AgentStorage.close();
@@ -471,7 +488,7 @@ describe("seance startup contracts", () => {
 			expect(persisted.init.systemPrompt).toEqual(warmPrompt);
 			expect(persisted.init.tools.toSorted()).toEqual(warmToolNames);
 			expect(persisted.init.systemPrompt.join("\n")).not.toContain("source-only startup contract");
-			expect(setAgentStatus(agentRegistry, "SeanceCold", "idle", createdLiveSession)).toBe(true);
+			expect(await setAgentStatus(agentRegistry, "SeanceCold", "idle", createdLiveSession)).toBe(true);
 			const liveRef = agentRegistry.get("SeanceCold");
 			if (!liveRef) throw new Error("Expected the authority-bound SeanceCold registry snapshot");
 			adoptAgent(initialLifecycle, "SeanceCold", { idleTtlMs: 0 }, liveRef);
@@ -522,7 +539,12 @@ describe("seance startup contracts", () => {
 						else if (!forkManagerClosed) await forked.close();
 					} finally {
 						try {
-							await authorityRoot?.dispose();
+							try {
+								await authorityRoot?.dispose();
+							} finally {
+								// The store must close before `using tempDir` removes its journal.
+								await closeAuthorityStores();
+							}
 						} finally {
 							try {
 								AgentStorage.close();
@@ -584,7 +606,12 @@ describe("seance startup contracts", () => {
 			expect(reviver).toBeUndefined();
 		} finally {
 			try {
-				await authorityRoot?.dispose();
+				try {
+					await authorityRoot?.dispose();
+				} finally {
+					// The store must close before `using tempDir` removes its journal.
+					await closeAuthorityStores();
+				}
 			} finally {
 				try {
 					AgentStorage.close();

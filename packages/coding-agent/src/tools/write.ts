@@ -18,7 +18,6 @@ import {
 	isProbablyBinaryHeader,
 	isRecord,
 	prompt,
-	untilAborted,
 	withFileLock,
 } from "@oh-my-pi/pi-utils";
 import {
@@ -29,13 +28,18 @@ import {
 	readArchiveEntries,
 	writeArchive,
 } from "@oh-my-pi/pi-utils/ar";
-import type { AuthorizedFilesystemTarget } from "../internal/session-path-scope";
+import {
+	FilesystemReadDeniedError,
+	type AuthorizedFilesystemTarget,
+	type FilesystemOperation,
+} from "../internal/session-path-scope";
 import { getEditStore } from "../edit/store";
 import { detectLineEnding, normalizeToLF, restoreLineEndings } from "../edit/normalize";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { WriteToolDetails as PiTuiWriteToolDetails } from "@oh-my-pi/pi-tui/tools/write";
 import { couldBecomeXdUrl, parseXdUrl } from "../internal-urls/xd-protocol";
 import { prepareLocalFileWrite } from "../internal-urls/local-protocol";
+import { filesystemMutationHooks, type FileWriteMutationHooks } from "./file-write-fallback";
 import {
 	extractUriScheme,
 	InternalUrlRouter,
@@ -44,7 +48,7 @@ import {
 	sessionResolveContext,
 	sessionWriteContext,
 } from "../internal-urls";
-import { createLspWritethrough, type WritethroughCallback, writethroughNoop } from "../lsp";
+import { createLspWritethrough, flushLspWritethroughBatch, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 import { createHighlightStream, getLanguageFromPath, highlightCode, type Theme } from "@oh-my-pi/pi-tui/theme";
@@ -105,6 +109,7 @@ import {
 	deleteRowByRowId,
 	insertRow,
 	isSqliteFile,
+	looksLikeSqlite,
 	parseSqlitePathCandidates,
 	resolveTableRowLookup,
 	updateRowByKey,
@@ -120,6 +125,7 @@ import {
 	cfgLspFormatOnWrite,
 	cfgLspRequestTimeout,
 } from "../lsp/settings";
+const pathModule = path;
 
 const EXECUTABLE_NOTICE = "[Notice: Made executable via chmod +x]";
 const URI_LIKE_WRITE_PATH_RE = /^([a-z][a-z0-9+.-]*):\/{1,2}(.*)$/i;
@@ -343,6 +349,27 @@ async function readCurrentWriteSource(
 	requestedPath: string,
 	absolutePath: string,
 ): Promise<string | undefined> {
+	const operation = session.pathScope?.currentOperation();
+	if (operation) {
+		const probe = await operation.authorize(absolutePath, "probe");
+		if (!probe.existed) return undefined;
+		const handle = await operation.openRead(await operation.authorize(absolutePath, "read"));
+		try {
+			if (await shouldRouteWriteThroughBridge(session, requestedPath, absolutePath)) {
+				const bridgeRead = routeReadThroughBridge(session, absolutePath);
+				if (bridgeRead) {
+					try {
+						return await bridgeRead;
+					} catch {
+						/* A failed broker read falls back to the held disk source. */
+					}
+				}
+			}
+			return await handle.readFile("utf8");
+		} finally {
+			await handle.close();
+		}
+	}
 	const readDisk = async (): Promise<string | undefined> => {
 		try {
 			return await Bun.file(absolutePath).text();
@@ -448,21 +475,56 @@ async function readTextFileConvention(
 	absolutePath: string,
 	size: number,
 	signal: AbortSignal | undefined,
+	operation?: FilesystemOperation,
 ): Promise<TextFileConvention | undefined> {
-	const file = Bun.file(absolutePath);
-	let chunk = await file.slice(0, BINARY_SNIFF_BYTES).bytes();
-	if (isProbablyBinaryHeader(chunk)) return undefined;
-	const bom = chunk[0] === 0xef && chunk[1] === 0xbb && chunk[2] === 0xbf;
-	let offset = 0;
-	let previous: number | undefined;
-	for (;;) {
-		const lf = chunk.indexOf(0x0a);
-		if (lf !== -1) return { bom, crlf: (lf > 0 ? chunk[lf - 1] : previous) === 0x0d };
-		offset += chunk.length;
-		if (chunk.length === 0 || offset >= size) return { bom, crlf: false };
+	let handle: fs.FileHandle | undefined;
+	if (operation) {
+		const target = await operation.authorize(absolutePath, "read");
+		try {
+			handle = await operation.openRead(target);
+		} catch (error) {
+			if (error instanceof FilesystemReadDeniedError) return undefined;
+			throw error;
+		}
+	}
+	const file = handle ? undefined : Bun.file(absolutePath);
+	const readChunk = async (offset: number, length: number): Promise<Uint8Array | undefined> => {
 		signal?.throwIfAborted();
-		previous = chunk[chunk.length - 1];
-		chunk = await file.slice(offset, offset + LINE_BREAK_SCAN_BYTES).bytes();
+		operation?.assertActive();
+		let chunk: Uint8Array;
+		try {
+			if (handle) {
+				const buffer = Buffer.allocUnsafe(length);
+				const { bytesRead } = await handle.read(buffer, 0, length, offset);
+				chunk = buffer.subarray(0, bytesRead);
+			} else {
+				chunk = await file!.slice(offset, offset + length).bytes();
+			}
+		} catch {
+			// Only physical byte-read failures are optional; authority and close are outside this catch.
+			return undefined;
+		}
+		signal?.throwIfAborted();
+		operation?.assertActive();
+		return chunk;
+	};
+	try {
+		let chunk = await readChunk(0, BINARY_SNIFF_BYTES);
+		if (!chunk || isProbablyBinaryHeader(chunk)) return undefined;
+		const bom = chunk[0] === 0xef && chunk[1] === 0xbb && chunk[2] === 0xbf;
+		let offset = 0;
+		let previous: number | undefined;
+		for (;;) {
+			const lf = chunk.indexOf(0x0a);
+			if (lf !== -1) return { bom, crlf: (lf > 0 ? chunk[lf - 1] : previous) === 0x0d };
+			offset += chunk.length;
+			if (chunk.length === 0 || offset >= size) return { bom, crlf: false };
+			previous = chunk[chunk.length - 1];
+			chunk = await readChunk(offset, Math.min(LINE_BREAK_SCAN_BYTES, size - offset));
+			if (!chunk) return undefined;
+		}
+	} finally {
+		await handle?.close();
 	}
 }
 
@@ -654,12 +716,22 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		this.#deferredDiagnostics = session.queueDeferredDiagnostics ? new DeferredDiagnostics(session) : undefined;
 	}
 
-	/** Resolves the LSP writethrough from the current `lsp.*` settings so changes apply to the next write. */
-	#lspWritethrough(options?: { format?: boolean }): {
+	/** Resolves the LSP writethrough from current settings and the active file authority. */
+	#lspWritethrough(
+		options?: { format?: boolean },
+		mutationHooks?: FileWriteMutationHooks,
+		batchMutationHooks?: FileWriteMutationHooks,
+	): {
 		writethrough: WritethroughCallback;
 		deferred: DeferredDiagnostics | undefined;
 	} {
-		if (!(this.session.enableLsp ?? true)) return { writethrough: writethroughNoop, deferred: undefined };
+		if (!(this.session.enableLsp ?? true)) {
+			const writethrough: WritethroughCallback = mutationHooks
+				? (dst, content, signal, file, batch, getDeferred) =>
+						writethroughNoop(dst, content, signal, file, batch, getDeferred, mutationHooks)
+				: writethroughNoop;
+			return { writethrough, deferred: undefined };
+		}
 		const { settings } = this.session;
 		const enableDiagnostics = cfgLspDiagnosticsOnWrite.get(settings);
 		const dedup = enableDiagnostics && cfgLspDiagnosticsDeduplicate.get(settings);
@@ -670,6 +742,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				? (path, result) => getDiagnosticsLedger(this.session).reduce(path, result)
 				: undefined,
 			requestTimeoutSec: cfgLspRequestTimeout.get(settings),
+			mutationHooks,
+			batchMutationHooks,
 		});
 		return { writethrough, deferred: enableDiagnostics ? this.#deferredDiagnostics : undefined };
 	}
@@ -781,48 +855,53 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 				const entries = new Map<string, ArchiveMemberContent>();
 				if (exists) {
-					try {
-						signal?.throwIfAborted();
-						if (operation) {
-							if (!authorizedReadTarget) throw new Error("Archive read authorization returned no target.");
-							const handle = await operation.openRead(authorizedReadTarget);
-							try {
-								const size = Number(authorizedReadTarget.size);
-								if (!Number.isSafeInteger(size)) throw new ToolError("Archive is too large to read safely");
-								const source = {
-									size,
-									async read(start: number, end: number): Promise<Uint8Array> {
-										signal?.throwIfAborted();
-										if (
-											!Number.isSafeInteger(start) ||
-											!Number.isSafeInteger(end) ||
-											start < 0 ||
-											end < start ||
-											end > size
-										) {
-											throw new ToolError("Invalid archive range");
-										}
-										const bytes = Buffer.allocUnsafe(end - start);
-										const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, start);
-										if (bytesRead !== bytes.byteLength) {
-											throw new ToolError("Invalid archive: truncated data");
-										}
-										return bytes;
-									},
-								};
-								const existing = await readArchiveEntries({ source, format, path: finalPath });
-								for (const [entryPath, data] of existing) entries.set(entryPath, data);
-							} finally {
-								await handle.close();
-							}
-						} else {
-							const existing = await readArchiveEntries({ path: finalPath, format });
+					signal?.throwIfAborted();
+					if (operation) {
+						if (!authorizedReadTarget) throw new Error("Archive read authorization returned no target.");
+						const handle = await operation.openRead(authorizedReadTarget);
+						try {
+							const size = Number(authorizedReadTarget.size);
+							if (!Number.isSafeInteger(size)) throw new ToolError("Archive is too large to read safely");
+							const source = {
+								size,
+								async read(start: number, end: number): Promise<Uint8Array> {
+									signal?.throwIfAborted();
+									if (
+										!Number.isSafeInteger(start) ||
+										!Number.isSafeInteger(end) ||
+										start < 0 ||
+										end < start ||
+										end > size
+									) {
+										throw new ToolError("Invalid archive range");
+									}
+									const bytes = Buffer.allocUnsafe(end - start);
+									const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, start);
+									if (bytesRead !== bytes.byteLength) {
+										throw new ToolError("Invalid archive: truncated data");
+									}
+									return bytes;
+								},
+							};
+							const existing = await readArchiveEntries({ source, format, path: finalPath });
 							for (const [entryPath, data] of existing) entries.set(entryPath, data);
+						} catch (error) {
+							try {
+								await handle.close();
+							} catch (closeError) {
+								throw new AggregateError(
+									[error, closeError],
+									"Archive read failed and resource close did not complete.",
+								);
+							}
+							throw error;
 						}
-						signal?.throwIfAborted();
-					} catch (error) {
-						throw new ToolError(error instanceof Error ? error.message : String(error));
+						await handle.close();
+					} else {
+						const existing = await readArchiveEntries({ path: finalPath, format });
+						for (const [entryPath, data] of existing) entries.set(entryPath, data);
 					}
+					signal?.throwIfAborted();
 				}
 
 				const writeTarget = `${resolvedArchivePath.archivePath}:${resolvedArchivePath.archiveSubPath}`;
@@ -859,7 +938,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					}
 				} catch (error) {
 					if (!operation) await fs.rm(tmpPath, { force: true }).catch(() => {});
-					throw new ToolError(error instanceof Error ? error.message : String(error));
+					throw error;
 				}
 
 				invalidateFsScanAfterWrite(resolvedArchivePath.absolutePath);
@@ -899,6 +978,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				absolutePath = (await this.session.pathScope.currentOperation().authorize(absolutePath, "probe"))
 					.canonicalTarget;
 			}
+			let contentReadStarted = false;
 			try {
 				const stat = await Bun.file(absolutePath).stat();
 				if (stat.isDirectory()) {
@@ -910,7 +990,23 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						`Cannot write '${candidate.sqlitePath}': it is a ${kind}, not a regular file or directory.`,
 					);
 				}
-				if (!(await isSqliteFile(absolutePath))) {
+				const operation = this.session.pathScope?.currentOperation();
+				let isSqlite: boolean;
+				if (operation) {
+					contentReadStarted = true;
+					const readTarget = await operation.authorize(absolutePath, "read");
+					const handle = await operation.openRead(readTarget);
+					try {
+						const header = Buffer.allocUnsafe(16);
+						const { bytesRead } = await handle.read(header, 0, header.byteLength, 0);
+						isSqlite = looksLikeSqlite(header.subarray(0, bytesRead));
+					} finally {
+						await handle.close();
+					}
+				} else {
+					isSqlite = await isSqliteFile(absolutePath);
+				}
+				if (!isSqlite) {
 					sawExistingNonSqlite = true;
 					continue;
 				}
@@ -923,7 +1019,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					exists: true,
 				};
 			} catch (error) {
-				if (!isArchivePathNotFound(error)) {
+				if (contentReadStarted || !isArchivePathNotFound(error)) {
 					throw error;
 				}
 			}
@@ -940,94 +1036,110 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		displayPath: string,
 		content: string,
 		resolvedSqlitePath: ResolvedSqliteWritePath,
+		signal?: AbortSignal,
 	): Promise<AgentToolResult<WriteToolDetails>> {
-		let db: Database | null = null;
-		let authorizedTargets: readonly AuthorizedFilesystemTarget[] = [];
 		try {
 			if (!resolvedSqlitePath.exists) {
 				throw new ToolError(`SQLite database '${displayPath}' not found`);
 			}
 
-			if (this.session.pathScope) {
-				const operation = this.session.pathScope.currentOperation();
-				const probes = await operation.preflight([
-					{ path: resolvedSqlitePath.absolutePath, kind: "probe" },
-					{ path: `${resolvedSqlitePath.absolutePath}-wal`, kind: "probe" },
-					{ path: `${resolvedSqlitePath.absolutePath}-shm`, kind: "probe" },
-				]);
+			signal?.throwIfAborted();
+			const operation = this.session.pathScope?.currentOperation();
+			let authorizedTargets: readonly AuthorizedFilesystemTarget[] = [];
+			if (operation) {
+				const databasePath = resolvedSqlitePath.absolutePath;
+				const probes = await operation.preflight(
+					[databasePath, `${databasePath}-wal`, `${databasePath}-shm`, `${databasePath}-journal`].map(path => ({
+						path,
+						kind: "probe" as const,
+					})),
+				);
 				authorizedTargets = await operation.preflight(
-					probes
-						.filter((target, index) => index === 0 || target.existed)
-						.map(target => ({ path: target.canonicalTarget, kind: "write" as const })),
+					probes.map(target => ({ path: target.canonicalTarget, kind: "write" as const })),
 				);
 				for (const target of authorizedTargets) await operation.verify(target);
+				operation.assertActive();
 				resolvedSqlitePath.absolutePath = authorizedTargets[0]!.canonicalTarget;
+				signal?.throwIfAborted();
 			}
-			db = new Database(resolvedSqlitePath.absolutePath, { create: false, strict: true });
-			if (this.session.pathScope) {
-				const operation = this.session.pathScope.currentOperation();
-				for (const target of authorizedTargets) await operation.verify(target);
-			}
-			db.run("PRAGMA busy_timeout = 3000");
-			// FK enforcement is per-connection and off by default; enable it so edits
-			// honor the schema's REFERENCES constraints and ON DELETE/UPDATE actions.
-			db.run("PRAGMA foreign_keys = ON");
 
-			const trimmedContent = content.trim();
-			let resultText: string;
-			if (trimmedContent.length === 0) {
-				if (!resolvedSqlitePath.key) {
-					throw new ToolError("SQLite deletes require a row key in the path");
-				}
-
-				const lookup = resolveTableRowLookup(db, resolvedSqlitePath.table);
-				const deleted =
-					lookup.kind === "pk"
-						? deleteRowByKey(db, resolvedSqlitePath.table, lookup, resolvedSqlitePath.key)
-						: deleteRowByRowId(db, resolvedSqlitePath.table, resolvedSqlitePath.key);
-				resultText =
-					deleted > 0
-						? `Deleted row '${resolvedSqlitePath.key}' from ${resolvedSqlitePath.table}`
-						: `No row deleted from ${resolvedSqlitePath.table} for key '${resolvedSqlitePath.key}'`;
-			} else {
-				let parsedContent: unknown;
+			const write = async (): Promise<AgentToolResult<WriteToolDetails>> => {
+				signal?.throwIfAborted();
+				let db: Database | null = null;
 				try {
-					parsedContent = Bun.JSON5.parse(content);
-				} catch (error) {
-					throw new ToolError(
-						`SQLite write content must be valid JSON5: ${error instanceof Error ? error.message : String(error)}`,
-					);
-				}
+					db = new Database(resolvedSqlitePath.absolutePath, { create: false, strict: true });
+					if (operation) {
+						const databaseTarget = authorizedTargets[0];
+						if (databaseTarget) await operation.verify(databaseTarget);
+						operation.assertActive();
+					}
+					db.run("PRAGMA busy_timeout = 3000");
+					// FK enforcement is per-connection and off by default; enable it so edits
+					// honor the schema's REFERENCES constraints and ON DELETE/UPDATE actions.
+					db.run("PRAGMA foreign_keys = ON");
 
-				if (!isRecord(parsedContent)) {
-					throw new ToolError("SQLite write content must be a JSON object");
-				}
+					const trimmedContent = content.trim();
+					let resultText: string;
+					if (trimmedContent.length === 0) {
+						if (!resolvedSqlitePath.key) {
+							throw new ToolError("SQLite deletes require a row key in the path");
+						}
 
-				if (resolvedSqlitePath.key) {
-					const lookup = resolveTableRowLookup(db, resolvedSqlitePath.table);
-					const updated =
-						lookup.kind === "pk"
-							? updateRowByKey(db, resolvedSqlitePath.table, lookup, resolvedSqlitePath.key, parsedContent)
-							: updateRowByRowId(db, resolvedSqlitePath.table, resolvedSqlitePath.key, parsedContent);
-					resultText =
-						updated > 0
-							? `Updated row '${resolvedSqlitePath.key}' in ${resolvedSqlitePath.table}`
-							: `No row updated in ${resolvedSqlitePath.table} for key '${resolvedSqlitePath.key}'`;
-				} else {
-					insertRow(db, resolvedSqlitePath.table, parsedContent);
-					resultText = `Inserted row into ${resolvedSqlitePath.table}`;
-				}
-			}
+						const lookup = resolveTableRowLookup(db, resolvedSqlitePath.table);
+						const deleted =
+							lookup.kind === "pk"
+								? deleteRowByKey(db, resolvedSqlitePath.table, lookup, resolvedSqlitePath.key)
+								: deleteRowByRowId(db, resolvedSqlitePath.table, resolvedSqlitePath.key);
+						resultText =
+							deleted > 0
+								? `Deleted row '${resolvedSqlitePath.key}' from ${resolvedSqlitePath.table}`
+								: `No row deleted from ${resolvedSqlitePath.table} for key '${resolvedSqlitePath.key}'`;
+					} else {
+						let parsedContent: unknown;
+						try {
+							parsedContent = Bun.JSON5.parse(content);
+						} catch (error) {
+							throw new ToolError(
+								`SQLite write content must be valid JSON5: ${error instanceof Error ? error.message : String(error)}`,
+							);
+						}
 
-			if (this.session.pathScope) {
-				const operation = this.session.pathScope.currentOperation();
-				for (const target of authorizedTargets) await operation.verify(target);
-			}
-			invalidateFsScanAfterWrite(resolvedSqlitePath.absolutePath);
-			return toolResult<WriteToolDetails>({ resolvedPath: resolvedSqlitePath.absolutePath })
-				.text(resultText)
-				.sourcePath(resolvedSqlitePath.absolutePath)
-				.done();
+						if (!isRecord(parsedContent)) {
+							throw new ToolError("SQLite write content must be a JSON object");
+						}
+
+						if (resolvedSqlitePath.key) {
+							const lookup = resolveTableRowLookup(db, resolvedSqlitePath.table);
+							const updated =
+								lookup.kind === "pk"
+									? updateRowByKey(db, resolvedSqlitePath.table, lookup, resolvedSqlitePath.key, parsedContent)
+									: updateRowByRowId(db, resolvedSqlitePath.table, resolvedSqlitePath.key, parsedContent);
+							resultText =
+								updated > 0
+									? `Updated row '${resolvedSqlitePath.key}' in ${resolvedSqlitePath.table}`
+									: `No row updated in ${resolvedSqlitePath.table} for key '${resolvedSqlitePath.key}'`;
+						} else {
+							insertRow(db, resolvedSqlitePath.table, parsedContent);
+							resultText = `Inserted row into ${resolvedSqlitePath.table}`;
+						}
+					}
+
+					invalidateFsScanAfterWrite(resolvedSqlitePath.absolutePath);
+					return toolResult<WriteToolDetails>({ resolvedPath: resolvedSqlitePath.absolutePath })
+						.text(resultText)
+						.sourcePath(resolvedSqlitePath.absolutePath)
+						.done();
+				} finally {
+					db?.close();
+				}
+			};
+
+			const result =
+				operation && authorizedTargets.length > 0
+					? await operation.withResourceEffects(authorizedTargets, "sqlite", write)
+					: await write();
+			if (operation && authorizedTargets[0]) await operation.verify(authorizedTargets[0]);
+			return result;
 		} catch (error) {
 			if (isEnoent(error)) {
 				throw new ToolError(`SQLite database '${displayPath}' not found`);
@@ -1035,13 +1147,58 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (error instanceof ToolError) {
 				throw error;
 			}
-			throw new ToolError(error instanceof Error ? error.message : String(error));
-		} finally {
-			db?.close();
+			// Keep the driver error reachable so the enclosing authority effect scope recognizes it as already reported.
+			const failure = new ToolError(error instanceof Error ? error.message : String(error));
+			failure.cause = error;
+			throw failure;
 		}
 	}
 
 	async execute(
+		toolCallId: string,
+		params: WriteParams,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<WriteToolDetails>,
+		context?: AgentToolContext,
+	): Promise<AgentToolResult<WriteToolDetails>> {
+		const batch = getLspBatchRequest(context?.toolCall);
+		const flushPending = async () => {
+			if (!batch?.flush) return undefined;
+			const operation = this.session.pathScope?.currentOperation();
+			return flushLspWritethroughBatch(
+				batch.id,
+				this.session.cwd,
+				signal,
+				operation ? filesystemMutationHooks(operation) : undefined,
+			);
+		};
+		let result: AgentToolResult<WriteToolDetails>;
+		try {
+			result = await this.#execute(toolCallId, params, signal, onUpdate, context);
+		} catch (error) {
+			try {
+				await flushPending();
+			} catch (flushError) {
+				throw new AggregateError(
+					[error, flushError],
+					"Write failed and pending LSP batch disposition did not complete.",
+				);
+			}
+			throw error;
+		}
+		const diagnostics = await flushPending();
+		if (diagnostics)
+			result.details = {
+				...result.details,
+				diagnostics,
+				meta: outputMeta()
+					.diagnostics(diagnostics.summary, diagnostics.messages ?? [])
+					.get(),
+			};
+		return result;
+	}
+
+	async #execute(
 		_toolCallId: string,
 		{ path: rawPath, content: rawContent }: WriteParams,
 		signal?: AbortSignal,
@@ -1097,7 +1254,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}),
 			);
 		}
-		return untilAborted(signal, async () => {
+		signal?.throwIfAborted();
+		{
 			// Text payloads get hashline display prefixes ([PATH#HASH] + LINE:) stripped if the model
 			// copied them from read output. Verbatim payloads (messages, process stdin, setting
 			// values, conflict directives) reach their handler exactly as the model wrote them.
@@ -1133,6 +1291,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 							toolCall: { id: _toolCallId, onUpdate, context },
 						}),
 					);
+					signal?.throwIfAborted();
 					if (handlerResult) {
 						const result: AgentToolResult<WriteToolDetails> = {
 							content: handlerResult.content,
@@ -1177,6 +1336,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					resolvedArchivePath,
 					signal,
 				);
+				signal?.throwIfAborted();
 				if (stripped) {
 					const firstText = archiveResult.content.find(
 						(block): block is { type: "text"; text: string } =>
@@ -1194,7 +1354,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				await enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update", signal });
 
 				emitWriteProgress(onUpdate, cleanBytes, path, resolvedSqlitePath.absolutePath);
-				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath);
+				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath, signal);
+				signal?.throwIfAborted();
 				if (stripped) {
 					const firstText = sqliteResult.content.find(
 						(block): block is { type: "text"; text: string } =>
@@ -1215,14 +1376,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					? await prepareLocalFileWrite(target.url, sessionWriteContext(this.session, { signal }))
 					: undefined;
 			if (localWrite) absolutePath = localWrite.path;
-			const authorizedTarget = localWrite
-				? (localWrite.authorizedTarget ??
-					(this.session.pathScope
-						? await this.session.pathScope.currentOperation().authorize(absolutePath, "write")
-						: undefined))
-				: this.session.pathScope
+			if (!localWrite && this.session.pathScope) {
+				await this.session.pathScope.currentOperation().createDirectories(pathModule.dirname(absolutePath));
+			}
+			const authorizedTarget =
+				localWrite?.authorizedTarget ??
+				(!localWrite && this.session.pathScope
 					? await this.session.pathScope.currentOperation().authorize(absolutePath, "write")
-					: undefined;
+					: undefined);
 			if (authorizedTarget) {
 				absolutePath = authorizedTarget.canonicalTarget;
 				await this.session.pathScope!.currentOperation().verify(authorizedTarget);
@@ -1241,7 +1402,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			}
 			// Check if file exists and is auto-generated before overwriting.
 			if (existing) {
-				await assertEditableFile(absolutePath, path, this.session.settings);
+				await assertEditableFile(
+					absolutePath,
+					path,
+					this.session.settings,
+					this.session.pathScope?.currentOperation(),
+				);
 			}
 			await assertNotTruncatedFileReadProjection(
 				this.session,
@@ -1261,21 +1427,43 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				(await shouldRouteWriteThroughBridge(this.session, path, absolutePath));
 			const convention =
 				existing?.isFile() && !editorOwnsFile
-					? await readTextFileConvention(absolutePath, existing.size, signal).catch(() => undefined)
+					? await readTextFileConvention(
+							absolutePath,
+							existing.size,
+							signal,
+							this.session.pathScope?.currentOperation(),
+						)
 					: undefined;
-			// `untilAborted` has already rejected the call if it was cancelled during the scan; don't write.
+			// Recheck cancellation after the final asynchronous readback and immediately before the write pipeline.
 			signal?.throwIfAborted();
 			const { text: writeContent, applied } = applyTextFileConvention(cleanContent, convention);
 			const writeBytes = writeContent === cleanContent ? cleanBytes : Buffer.byteLength(writeContent, "utf8");
 
 			emitWriteProgress(onUpdate, writeBytes, displayPath, absolutePath);
 
+			const filesystemOperation = this.session.pathScope?.currentOperation();
+			const currentMutationHooks = filesystemOperation ? filesystemMutationHooks(filesystemOperation) : undefined;
+			const mutationHooks = localWrite?.mutationHooks ?? currentMutationHooks;
+			const markExecutable = async (content: string): Promise<boolean> => {
+				if (!content.startsWith("#!") || content.startsWith("#![")) return false;
+				const effect = async () => {
+					signal?.throwIfAborted();
+					return maybeMarkExecutableForShebang(absolutePath, content);
+				};
+				if (!mutationHooks?.withResourceEffect) return effect();
+				return mutationHooks.withResourceEffect(absolutePath, async () => {
+					await mutationHooks.beforeWrite?.();
+					mutationHooks.assertActive?.();
+					return effect();
+				});
+			};
 			// Try ACP bridge first for editor-visible filesystem paths. Internal
 			// artifacts such as local:// plans are owned by OMP, not the editor.
 			if (authorizedTarget) await this.session.pathScope!.currentOperation().verify(authorizedTarget);
 			const bridgeWrite = localWrite
 				? undefined
-				: await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent, signal);
+				: await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent, signal, mutationHooks);
+			signal?.throwIfAborted();
 			if (bridgeWrite) {
 				// `write` always replaces the whole file, so (unlike hashline's
 				// hunk-scoped diff) there's no size cost to keying the header/
@@ -1283,7 +1471,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				// use it so a drifted write (e.g. client format-on-save) still
 				// hands back a tag that matches what's actually on disk.
 				if (authorizedTarget) await this.session.pathScope!.currentOperation().verifyPostWrite(authorizedTarget);
-				const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, bridgeWrite.text);
+				const madeExecutable = await markExecutable(bridgeWrite.text);
+				signal?.throwIfAborted();
 				const header = maybeWriteSnapshotHeader(this.session, absolutePath, bridgeWrite.text, displayPath);
 				const writeLine = `Successfully wrote ${cleanBytes} bytes to ${displayPath}`;
 				let resultText = header ? `${header}\n${writeLine}` : writeLine;
@@ -1299,7 +1488,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				};
 			}
 
-			const { writethrough, deferred } = this.#lspWritethrough(localWrite?.durable ? { format: false } : undefined);
+			const { writethrough, deferred } = this.#lspWritethrough(
+				localWrite?.durable ? { format: false } : undefined,
+				mutationHooks,
+				currentMutationHooks,
+			);
 			const writeEffect = async () => {
 				if (authorizedTarget) await this.session.pathScope!.currentOperation().verify(authorizedTarget);
 				const diagnostics = await writethrough(absolutePath, writeContent, signal, undefined, batchRequest, dst =>
@@ -1311,12 +1504,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return diagnostics;
 			};
 			const diagnostics = localWrite ? await localWrite.commit(writeContent, writeEffect) : await writeEffect();
+			signal?.throwIfAborted();
 			invalidateFsScanAfterWrite(absolutePath);
 			if (!deferred || batchRequest?.flush === false) {
 				this.session.bumpFileMutationVersion?.(absolutePath);
 			}
 			const finalContent = diagnostics.finalContent;
-			const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, finalContent);
+			const madeExecutable = await markExecutable(finalContent);
+			signal?.throwIfAborted();
 
 			const header = maybeWriteSnapshotHeader(this.session, absolutePath, finalContent, displayPath);
 			const finalBytes = finalContent === writeContent ? writeBytes : Buffer.byteLength(finalContent, "utf8");
@@ -1352,7 +1547,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						.get(),
 				},
 			};
-		});
+		}
 	}
 }
 

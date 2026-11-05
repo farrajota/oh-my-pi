@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { type DurableOperationRecord, RegistryDurableStateStore } from "./durable-state";
+import { AuthorityRpcError, detachFromAuthorityEffect, withAuthorityEffect } from "./authority/client";
+import type { AuthorityStore } from "./authority/types";
+import type { DurableOperationRecord } from "./durable-state";
 export type EffectClass = "eval" | "mcp" | "job" | "filesystem" | "local" | "artifact" | "extension" | "session";
 
 export type OperationTerminalStatus = "completed" | "failed" | "abandoned";
@@ -31,23 +33,41 @@ export interface OperationTerminalRecord {
 
 type OperationAdmission =
 	| { readonly ok: true; readonly lease: OperationLease }
-	| { readonly ok: false; readonly reason: "already-active" | "terminal" | "invalid-lease" | "quiesced" };
+	| { readonly ok: false; readonly reason: "already-active" | "terminal" | "invalid-lease" | "quiesced" }
+	| { readonly ok: false; readonly reason: "expired"; readonly terminal: Promise<OperationTerminalRecord> };
 
 const DEFAULT_LEASE_MS = 5 * 60_000;
 const operationRegistries = new WeakMap<object, OperationLeaseRegistry>();
 const sessionOperationLedgerStates = new WeakMap<object, SessionOperationLedgerState>();
 const issuedOperationAuthorityManagers = new WeakMap<BoundSessionOperationAuthority, object>();
 const quiescedRegistries = new WeakMap<OperationLeaseRegistry, MigrationFenceController>();
-const operationDurableStores = new WeakMap<OperationLeaseRegistry, RegistryDurableStateStore>();
-const sessionDurableStores = new WeakMap<object, RegistryDurableStateStore>();
+const operationDurableStores = new WeakMap<OperationLeaseRegistry, AuthorityStore>();
+const sessionDurableStores = new WeakMap<object, AuthorityStore>();
 let nextOperationOwnerId = 1;
 interface OperationLeaseContext {
 	readonly registry: OperationLeaseRegistry;
 	readonly lease: OperationLease;
+	readonly signal: AbortSignal;
 	readonly parent?: OperationLeaseContext;
 }
 
 const operationLeaseContext = new AsyncLocalStorage<OperationLeaseContext>();
+
+function hasUnknownAuthorityOutcome(error: unknown): boolean {
+	const pending = [error];
+	const seen = new Set<Error>();
+	while (pending.length > 0) {
+		const current = pending.pop();
+		if (!(current instanceof Error) || seen.has(current)) continue;
+		seen.add(current);
+		if (current instanceof AuthorityRpcError && current.unknownOutcome) return true;
+		if (current instanceof AggregateError) {
+			for (const nested of current.errors) pending.push(nested);
+		}
+		if (current.cause !== undefined) pending.push(current.cause);
+	}
+	return false;
+}
 
 const boundSessionOperationAuthorityBrand: unique symbol = Symbol("boundSessionOperationAuthority");
 
@@ -80,6 +100,7 @@ interface SessionOperationLedgerState {
 	current: OperationLeaseRegistry;
 	readonly owned: Set<OperationLeaseRegistry>;
 	closed: boolean;
+	binding: Promise<void>;
 }
 
 /** Internal non-Hub ledger. Callers enter it only through class-fixed manager wrappers below. */
@@ -87,6 +108,9 @@ interface ActiveOperation {
 	readonly lease: OperationLease;
 	readonly controller: AbortController;
 	settled: boolean;
+	terminalizing: boolean;
+	terminalRecordPromise?: Promise<OperationTerminalRecord>;
+	terminalPromise?: Promise<void>;
 	abandonReason?: string;
 	userWaitDepth: number;
 	userWaitStartedAt?: number;
@@ -126,10 +150,29 @@ class OperationLeaseRegistry {
 		return binding.authority;
 	}
 
-	#recordDurable(lease: OperationLease, phase: DurableOperationRecord["phase"], now = Date.now()): void {
+	assertActive(lease: OperationLease): void {
+		const operation = this.#active.get(lease.operationId);
+		if (!operation || operation.lease !== lease || operation.settled) {
+			throw new Error("Operation lease is no longer active.");
+		}
+		this.#throwIfStale(operation);
+		try {
+			this.#authority(lease.effectClass);
+		} catch (error) {
+			operation.abandonReason = error instanceof Error ? error.message : String(error);
+			operation.controller.abort(error);
+			throw error;
+		}
+	}
+
+	async #recordDurable(
+		lease: OperationLease,
+		phase: DurableOperationRecord["phase"],
+		now = Date.now(),
+	): Promise<void> {
 		const store = operationDurableStores.get(this);
 		if (!store || lease.effectClass === "artifact" || lease.effectClass === "job") return;
-		store.append({
+		await store.transition({
 			kind: "operation",
 			at: now,
 			operationId: lease.operationId,
@@ -152,11 +195,17 @@ class OperationLeaseRegistry {
 		if (!Number.isFinite(leaseMs) || leaseMs <= 0) return { ok: false, reason: "invalid-lease" };
 		const active = this.#active.get(operationId);
 		if (active) {
-			if (this.#effectiveExpiresAt(active, now) > now) return { ok: false, reason: "already-active" };
+			if (active.terminalizing || this.#effectiveExpiresAt(active, now) > now) {
+				return { ok: false, reason: "already-active" };
+			}
 			active.abandonReason = "Operation lease expired";
-			active.controller.abort(new Error("Operation lease expired"));
-			this.#recordTerminal(active.lease, "abandoned", active.abandonReason, now);
-			return { ok: false, reason: "terminal" };
+			active.controller.abort(new Error(active.abandonReason));
+			active.terminalizing = true;
+			return {
+				ok: false,
+				reason: "expired",
+				terminal: this.#recordTerminal(active.lease, "abandoned", active.abandonReason),
+			};
 		}
 		const lease = Object.freeze({
 			operationId,
@@ -169,11 +218,11 @@ class OperationLeaseRegistry {
 			acquiredAt: now,
 			expiresAt: now + leaseMs,
 		});
-		this.#recordDurable(lease, "intent", now);
 		this.#active.set(operationId, {
 			lease,
 			controller: new AbortController(),
 			settled: false,
+			terminalizing: false,
 			userWaitDepth: 0,
 			userWaitDuration: 0,
 		});
@@ -185,56 +234,116 @@ class OperationLeaseRegistry {
 		status: OperationTerminalStatus,
 		detail?: string,
 		now = Date.now(),
-	): OperationTerminalRecord {
+	): Promise<OperationTerminalRecord> {
 		const existing = this.#terminals.get(lease.operationId);
-		if (existing) return existing;
-		this.#recordDurable(lease, status, now);
-		const record = Object.freeze({
-			operationId: lease.operationId,
-			effectClass: lease.effectClass,
-			ownerId: lease.ownerId,
-			classOwnerId: lease.classOwnerId,
-			...(lease.actorId === undefined ? {} : { actorId: lease.actorId }),
-			...(lease.rootId === undefined ? {} : { rootId: lease.rootId }),
-			...(lease.generation === undefined ? {} : { generation: lease.generation }),
-			status,
-			at: now,
-			...(detail ? { detail } : {}),
-		});
-		this.#terminals.set(lease.operationId, record);
-		return record;
+		if (existing) return Promise.resolve(existing);
+		const active = this.#active.get(lease.operationId);
+		if (active?.terminalRecordPromise) return active.terminalRecordPromise;
+		const pending = (async () => {
+			await this.#recordDurable(lease, status, now);
+			const record = Object.freeze({
+				operationId: lease.operationId,
+				effectClass: lease.effectClass,
+				ownerId: lease.ownerId,
+				classOwnerId: lease.classOwnerId,
+				...(lease.actorId === undefined ? {} : { actorId: lease.actorId }),
+				...(lease.rootId === undefined ? {} : { rootId: lease.rootId }),
+				...(lease.generation === undefined ? {} : { generation: lease.generation }),
+				status,
+				at: now,
+				...(detail ? { detail } : {}),
+			});
+			this.#terminals.set(lease.operationId, record);
+			return record;
+		})();
+		if (active) active.terminalRecordPromise = pending;
+		return pending;
 	}
 
-	#terminal(operation: ActiveOperation, status: OperationTerminalStatus, detail?: string): void {
-		if (status === "completed" && !this.#terminals.has(operation.lease.operationId)) {
-			this.#recordDurable(operation.lease, "committed");
-		}
-		if (!this.#terminals.has(operation.lease.operationId)) this.#recordTerminal(operation.lease, status, detail);
+	#settle(operation: ActiveOperation): void {
 		if (operation.settled) return;
 		operation.settled = true;
 		this.#active.delete(operation.lease.operationId);
 		this.#maybeResolveDrain();
 	}
 
-	#throwIfStale(operation: ActiveOperation): void {
+	#settleWithoutDurableTerminal(operation: ActiveOperation, status: OperationTerminalStatus, detail: string): void {
+		if (!this.#terminals.has(operation.lease.operationId)) {
+			this.#terminals.set(
+				operation.lease.operationId,
+				Object.freeze({
+					operationId: operation.lease.operationId,
+					effectClass: operation.lease.effectClass,
+					ownerId: operation.lease.ownerId,
+					classOwnerId: operation.lease.classOwnerId,
+					...(operation.lease.actorId === undefined ? {} : { actorId: operation.lease.actorId }),
+					...(operation.lease.rootId === undefined ? {} : { rootId: operation.lease.rootId }),
+					...(operation.lease.generation === undefined ? {} : { generation: operation.lease.generation }),
+					status,
+					at: Date.now(),
+					detail,
+				}),
+			);
+		}
+		this.#settle(operation);
+	}
+
+	async #terminal(operation: ActiveOperation, status: OperationTerminalStatus, detail?: string): Promise<void> {
+		if (operation.settled) return;
+		if (operation.terminalPromise) return operation.terminalPromise;
+		operation.terminalizing = true;
+		const pending = (async () => {
+			try {
+				if (
+					status === "completed" &&
+					!this.#terminals.has(operation.lease.operationId) &&
+					!operation.terminalRecordPromise
+				) {
+					await this.#recordDurable(operation.lease, "committed");
+				}
+				if (!this.#terminals.has(operation.lease.operationId)) {
+					await this.#recordTerminal(operation.lease, status, detail);
+				} else if (operation.terminalRecordPromise) {
+					await operation.terminalRecordPromise;
+				}
+			} catch (error) {
+				this.#settleWithoutDurableTerminal(
+					operation,
+					"abandoned",
+					"Authority outcome is unknown; durable terminal state was not asserted.",
+				);
+				throw error;
+			} finally {
+				this.#settle(operation);
+			}
+		})();
+		operation.terminalPromise = pending;
+		return pending;
+	}
+
+	/** `cause` retains the failure a stale disposition replaces, so nested effect evidence stays attached. */
+	#throwIfStale(operation: ActiveOperation, cause?: unknown): void {
+		const options = cause === undefined ? undefined : { cause };
 		const recorded = this.#terminals.get(operation.lease.operationId);
 		if (recorded?.detail === "Operation lease expired") {
-			throw new Error(`Operation ${operation.lease.effectClass} lease expired.`);
+			throw new Error(`Operation ${operation.lease.effectClass} lease expired.`, options);
 		}
 		if (operation.abandonReason || recorded?.status === "abandoned") {
 			throw new Error(
 				`Operation ${operation.lease.effectClass} cancelled: ${operation.abandonReason ?? recorded?.detail ?? "abandoned"}.`,
+				options,
 			);
 		}
 		if (operation.controller.signal.aborted) {
+			// Same shape as the abandoned branch above, so the message does not depend on how many
+			// stale checks ran before the caller saw the cancellation.
 			operation.abandonReason = "Operation cancelled";
-			throw new Error(`Operation ${operation.lease.effectClass} cancelled.`);
+			throw new Error(`Operation ${operation.lease.effectClass} cancelled: ${operation.abandonReason}.`, options);
 		}
 		if (this.#effectiveExpiresAt(operation) <= Date.now()) {
 			operation.abandonReason = "Operation lease expired";
 			operation.controller.abort(new Error(operation.abandonReason));
-			this.#recordTerminal(operation.lease, "abandoned", operation.abandonReason);
-			throw new Error(`Operation ${operation.lease.effectClass} lease expired.`);
+			throw new Error(`Operation ${operation.lease.effectClass} lease expired.`, options);
 		}
 	}
 
@@ -254,7 +363,7 @@ class OperationLeaseRegistry {
 		if (operation.userWaitDepth++ === 0) operation.userWaitStartedAt = Date.now();
 	}
 
-	resumeFromUserWait(lease: OperationLease): void {
+	async resumeFromUserWait(lease: OperationLease): Promise<void> {
 		const operation = this.#active.get(lease.operationId);
 		if (!operation || operation.lease !== lease || operation.userWaitDepth === 0)
 			throw new Error("Operation user wait is no longer active.");
@@ -268,7 +377,7 @@ class OperationLeaseRegistry {
 		} catch (error) {
 			operation.abandonReason = error instanceof Error ? error.message : String(error);
 			operation.controller.abort(error);
-			this.#recordTerminal(lease, "abandoned", operation.abandonReason);
+			await this.#terminal(operation, "abandoned", operation.abandonReason);
 			throw error;
 		}
 	}
@@ -280,39 +389,102 @@ class OperationLeaseRegistry {
 		signal?: AbortSignal,
 	): Promise<T> {
 		const admission = this.#admit(effectClass, operationId, DEFAULT_LEASE_MS);
-		if (!admission.ok) throw new Error(`Operation ${effectClass} was not admitted: ${admission.reason}`);
+		if (!admission.ok) {
+			if (admission.reason === "expired") await admission.terminal;
+			throw new Error(
+				`Operation ${effectClass} was not admitted: ${admission.reason === "expired" ? "terminal" : admission.reason}`,
+			);
+		}
 		const operation = this.#active.get(admission.lease.operationId);
 		if (!operation) throw new Error("Operation lease was not registered.");
 		const relayAbort = () => operation.controller.abort(signal?.reason);
 		if (signal?.aborted) relayAbort();
 		else signal?.addEventListener("abort", relayAbort, { once: true });
-		try {
-			this.#recordDurable(operation.lease, "effect");
-			operation.controller.signal.throwIfAborted();
-			const parent = operationLeaseContext.getStore();
-			const value = await operationLeaseContext.run(
-				{ registry: this, lease: operation.lease, ...(parent ? { parent } : {}) },
-				() => run(operation.controller.signal),
-			);
+		const store = operationDurableStores.get(this);
+		const validateRuntime = () => {
 			this.#throwIfStale(operation);
-			this.#terminal(operation, "completed");
-			return value;
-		} catch (error) {
-			const staleError = (() => {
-				try {
-					this.#throwIfStale(operation);
-					return undefined;
-				} catch (stale) {
-					return stale instanceof Error ? stale : new Error(String(stale));
-				}
-			})();
-			if (staleError) {
-				this.#terminal(operation, "abandoned", operation.abandonReason ?? staleError.message);
-				throw staleError;
+			try {
+				this.#authority(effectClass);
+			} catch (error) {
+				operation.abandonReason = error instanceof Error ? error.message : String(error);
+				operation.controller.abort(error);
+				throw error;
 			}
-			const detail = error instanceof Error ? error.message : String(error);
-			const abandoned = operation.controller.signal.aborted || signal?.aborted;
-			this.#terminal(operation, abandoned ? "abandoned" : "failed", detail);
+		};
+		const execute = async (): Promise<T> => {
+			let boundaryFailure = false;
+			try {
+				try {
+					await this.#recordDurable(operation.lease, "intent");
+				} catch (error) {
+					boundaryFailure = true;
+					throw error;
+				}
+				validateRuntime();
+				try {
+					await this.#recordDurable(operation.lease, "effect");
+				} catch (error) {
+					boundaryFailure = true;
+					throw error;
+				}
+				validateRuntime();
+				const parent = operationLeaseContext.getStore();
+				const invoke = () =>
+					operationLeaseContext.run(
+						{
+							registry: this,
+							lease: operation.lease,
+							signal: operation.controller.signal,
+							...(parent ? { parent } : {}),
+						},
+						() => run(operation.controller.signal),
+					);
+				// Join admitted descendants before publishing a successful durable parent.
+				const value = store ? await withAuthorityEffect(store, invoke) : await invoke();
+				validateRuntime();
+				await this.#terminal(operation, "completed");
+				validateRuntime();
+				return value;
+			} catch (error) {
+				if (operation.settled) throw error;
+				if (boundaryFailure || hasUnknownAuthorityOutcome(error)) {
+					this.#settleWithoutDurableTerminal(
+						operation,
+						"abandoned",
+						"Authority outcome is unknown; durable terminal state was not asserted.",
+					);
+					throw error;
+				}
+				let staleError: Error | undefined;
+				try {
+					this.#throwIfStale(operation, error);
+				} catch (stale) {
+					staleError = stale instanceof Error ? stale : new Error(String(stale));
+				}
+				const detail = operation.abandonReason ?? (error instanceof Error ? error.message : String(error));
+				const status =
+					staleError || operation.controller.signal.aborted || signal?.aborted ? "abandoned" : "failed";
+				try {
+					await this.#terminal(operation, status, detail);
+				} catch (terminalError) {
+					throw new AggregateError(
+						[error, terminalError],
+						"Operation failed and durable terminal recording did not complete.",
+					);
+				}
+				throw staleError ?? error;
+			}
+		};
+		try {
+			return store ? await withAuthorityEffect(store, execute) : await execute();
+		} catch (error) {
+			if (!operation.settled) {
+				this.#settleWithoutDurableTerminal(
+					operation,
+					"failed",
+					error instanceof Error ? error.message : String(error),
+				);
+			}
 			throw error;
 		} finally {
 			signal?.removeEventListener("abort", relayAbort);
@@ -398,7 +570,12 @@ function boundOwnerId(authority: BoundSessionOperationAuthority): string {
 
 function createSessionOperationLedger(manager: object): SessionOperationLedgerState {
 	const registry = new OperationLeaseRegistry(projectionOwnerId());
-	const state: SessionOperationLedgerState = { current: registry, owned: new Set([registry]), closed: false };
+	const state: SessionOperationLedgerState = {
+		current: registry,
+		owned: new Set([registry]),
+		closed: false,
+		binding: Promise.resolve(),
+	};
 	operationRegistries.set(manager, registry);
 	sessionOperationLedgerStates.set(manager, state);
 	operationAuthorities.set(registry, Object.freeze({ kind: "projection", restricted: true }));
@@ -412,15 +589,23 @@ export function installSessionOperationLedger(manager: object): SessionOperation
 	let closePromise: Promise<void> | undefined;
 	return Object.freeze({
 		close: () => {
+			if (closePromise) return closePromise;
 			state.closed = true;
-			closePromise ??= Promise.all([...state.owned].map(registry => registry.close())).then(() => undefined);
+			// Cancel active operations synchronously, as callers rely on close() aborting
+			// in-flight work immediately; an in-progress authority binding observes `closed`
+			// and refuses to install a new registry, so the drain below covers every owner.
+			const aborting = [...state.owned].map(registry => registry.close());
+			const binding = state.binding;
+			closePromise = binding.then(async () => {
+				await Promise.all([...aborting, ...[...state.owned].map(registry => registry.close())]);
+			});
 			return closePromise;
 		},
 	});
 }
 
 /** @internal Bind one session ledger to the registry-owned durable journal without exposing it through SDK payloads. */
-export function bindSessionOperationDurability(manager: object, store: RegistryDurableStateStore): void {
+export function bindSessionOperationDurability(manager: object, store: AuthorityStore): void {
 	const state = sessionOperationLedgerStates.get(manager);
 	if (!state || state.closed) throw new Error("Session operation durability requires an open installed ledger.");
 	sessionDurableStores.set(manager, store);
@@ -451,14 +636,22 @@ export function issueBoundSessionOperationAuthority(
 }
 
 /** @internal Binds this exact manager ledger to one registry-owned actor generation. */
-export function bindSessionOperationAuthority(manager: object, authority: BoundSessionOperationAuthority): void {
+export async function bindSessionOperationAuthority(
+	manager: object,
+	authority: BoundSessionOperationAuthority,
+): Promise<void> {
 	if (issuedOperationAuthorityManagers.get(authority) !== manager)
 		throw new Error("Session operation authority belongs to a different session manager.");
 	if (!authority.validate()) throw new Error("Cannot bind stale session operation authority.");
 	let state = sessionOperationLedgerStates.get(manager);
 	if (!state) {
 		const registry = new OperationLeaseRegistry(boundOwnerId(authority));
-		state = { current: registry, owned: new Set([registry]), closed: false };
+		state = {
+			current: registry,
+			owned: new Set([registry]),
+			closed: false,
+			binding: Promise.resolve(),
+		};
 		operationRegistries.set(manager, registry);
 		sessionOperationLedgerStates.set(manager, state);
 		operationAuthorities.set(registry, Object.freeze({ kind: "bound", authority }));
@@ -468,23 +661,37 @@ export function bindSessionOperationAuthority(manager: object, authority: BoundS
 	}
 	const ledgerState = state;
 	if (ledgerState.closed) throw new Error("Cannot bind authority to a closed session operation ledger.");
-	const previousRegistry = ledgerState.current;
-	const currentAuthority = operationAuthorities.get(previousRegistry);
-	if (currentAuthority?.kind === "bound") {
-		if (currentAuthority.authority === authority) return;
-		if (currentAuthority.authority.validate())
-			throw new Error("Session operation authority is already bound to another actor generation.");
+	const previousBinding = ledgerState.binding;
+	const { promise: binding, resolve: releaseBinding } = Promise.withResolvers<void>();
+	ledgerState.binding = binding;
+	try {
+		await previousBinding;
+		if (ledgerState.closed) throw new Error("Cannot bind authority to a closed session operation ledger.");
+		if (!authority.validate()) throw new Error("Cannot bind stale session operation authority.");
+		const previousRegistry = ledgerState.current;
+		const currentAuthority = operationAuthorities.get(previousRegistry);
+		if (currentAuthority?.kind === "bound") {
+			if (currentAuthority.authority === authority) return;
+			if (currentAuthority.authority.validate())
+				throw new Error("Session operation authority is already bound to another actor generation.");
+		}
+		await previousRegistry.close();
+		if (ledgerState.closed) throw new Error("Cannot bind authority to a closed session operation ledger.");
+		if (ledgerState.current !== previousRegistry)
+			throw new Error("Session operation ledger changed during authority binding.");
+		if (!authority.validate()) throw new Error("Cannot bind stale session operation authority.");
+		ledgerState.owned.delete(previousRegistry);
+		const registry = new OperationLeaseRegistry(boundOwnerId(authority));
+		operationAuthorities.set(registry, Object.freeze({ kind: "bound", authority }));
+		const store = sessionDurableStores.get(manager);
+		if (store) operationDurableStores.set(registry, store);
+		ledgerState.current = registry;
+		ledgerState.owned.add(registry);
+		operationRegistries.set(manager, registry);
+	} finally {
+		releaseBinding();
 	}
-	void previousRegistry.close().then(() => ledgerState.owned.delete(previousRegistry));
-	const registry = new OperationLeaseRegistry(boundOwnerId(authority));
-	operationAuthorities.set(registry, Object.freeze({ kind: "bound", authority }));
-	const store = sessionDurableStores.get(manager);
-	if (store) operationDurableStores.set(registry, store);
-	ledgerState.current = registry;
-	ledgerState.owned.add(registry);
-	operationRegistries.set(manager, registry);
 }
-
 /** Returns true whenever this manager retains installed bound actor ownership, including stale or closed bindings. */
 export function hasBoundSessionOperationAuthority(manager: object): boolean {
 	const registry = operationRegistries.get(manager);
@@ -522,8 +729,47 @@ export function getActiveOperationLease(
 	return active.lease;
 }
 
+/** @internal Cancellation belonging to the exact current invocation, never a captured earlier lease. */
+export function getActiveOperationSignal(manager: object | undefined, operationId: string): AbortSignal | undefined {
+	if (!getActiveOperationLease(manager, operationId)) return undefined;
+	return operationLeaseContext.getStore()?.signal;
+}
+
+/** @internal Revalidates the exact effect lease that authorized a dependent filesystem operation. */
+export function assertActiveOperationLease(
+	manager: object | undefined,
+	expected: Readonly<{
+		operationId: string;
+		ownerId: string;
+		effectClass: string;
+		acquiredAt: number;
+		actorId?: string;
+		rootId?: string;
+		generation?: number;
+	}>,
+): void {
+	const registry = registryFor(manager);
+	const active = operationLeaseContext.getStore();
+	const lease = active?.lease;
+	if (
+		!registry ||
+		active?.registry !== registry ||
+		!lease ||
+		lease.operationId !== expected.operationId ||
+		lease.ownerId !== expected.ownerId ||
+		lease.effectClass !== expected.effectClass ||
+		lease.acquiredAt !== expected.acquiredAt ||
+		lease.actorId !== expected.actorId ||
+		lease.rootId !== expected.rootId ||
+		lease.generation !== expected.generation
+	) {
+		throw new Error("Filesystem effect no longer has its exact active session operation lease.");
+	}
+	registry.assertActive(lease);
+}
+
 export interface ActiveOperationDurability {
-	readonly store: RegistryDurableStateStore;
+	readonly store: AuthorityStore;
 	readonly lease: OperationLease;
 }
 
@@ -538,6 +784,20 @@ export function getActiveOperationDurability(
 	const lease = getActiveOperationLease(manager, operationId, effectClass);
 	const store = operationDurableStores.get(registry);
 	return lease && store ? Object.freeze({ store, lease }) : undefined;
+}
+
+/**
+ * @internal Starts work that deliberately outlives the current operation (a
+ * background job) outside that operation's lease context and authority effect
+ * scope. The launching operation neither joins nor extends it, and it never
+ * borrows the launcher's lease: every effect it performs must be admitted as
+ * its own operation against the shared root authority.
+ */
+export function runDetachedFromOperation<T>(run: () => T): T {
+	const active = operationLeaseContext.getStore();
+	const store = active ? operationDurableStores.get(active.registry) : undefined;
+	const detached = () => operationLeaseContext.exit(run);
+	return store ? detachFromAuthorityEffect(store, detached) : detached();
 }
 
 /** @internal Excludes the union of a user's wait from every active enclosing operation lease. */
@@ -560,7 +820,7 @@ export async function withOperationUserWait<T>(wait: () => Promise<T>): Promise<
 	for (let index = paused.length - 1; index >= 0; index--) {
 		const current = paused[index]!;
 		try {
-			current.registry.resumeFromUserWait(current.lease);
+			await current.registry.resumeFromUserWait(current.lease);
 		} catch (error) {
 			if (!resumeFailed) resumeError = error;
 			resumeFailed = true;

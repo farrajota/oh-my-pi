@@ -439,7 +439,7 @@ describe("registerPersistedSubagents mid-spawn stubs", () => {
 			if (!authority) throw new Error("Expected root authority binding");
 			const revived = await authority.create({ agentId: "Worker", agentDisplayName: "Worker" }, parked);
 			expect(lookupAgentRef(registry, "Worker")).toBe(parkedRef);
-			expect(parkAgentRef(registry, parkedRef, revived.session)).toBe(true);
+			await expect(parkAgentRef(registry, parkedRef, revived.session)).resolves.toBe(true);
 
 			await ensurePersistedRoster(registry, rootFile);
 

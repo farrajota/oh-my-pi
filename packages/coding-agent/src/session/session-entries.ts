@@ -73,6 +73,13 @@ export interface SessionHeader {
 	/** Local-only Task candidate, gated by the actual request model's cache policy; omitted from shares and HTML. */
 	taskPromptCacheKey?: string;
 	/**
+	 * Canonical transcript path whose authority bundle governs this transcript: its own path for a root,
+	 * the owning parent's for a child agent or seance fork. Resume-time adoption refuses a transcript whose
+	 * stamp names another path, because it was copied or moved without its bundle, or is not a root at all.
+	 * Local-only; omitted from shares and HTML.
+	 */
+	authorityRoot?: string;
+	/**
 	 * Source session file of a read-only seance fork. Its artifacts stay in the
 	 * source: `history://`, `artifact://`, and `agent://` read them from there.
 	 */

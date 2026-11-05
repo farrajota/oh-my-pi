@@ -63,11 +63,20 @@ export interface LspSessionPolicy {
 
 interface StoredLspSessionPolicy extends LspSessionPolicy {
 	readonly identity: string;
+	readonly workspaceEditAuthorization?: WorkspaceEditAuthorization;
 }
 
 const lspSessionPolicy = new AsyncLocalStorage<StoredLspSessionPolicy>();
 const lspSessionIdentities = new WeakMap<LspSessionPolicy, string>();
 let nextLspSessionIdentity = 0;
+
+interface RequestWorkspaceAuthority {
+	readonly authorization: WorkspaceEditAuthorization;
+	readonly reenter: <T>(run: () => T) => T;
+	readonly reject: (error: unknown) => void;
+}
+const managedWorkspaceClients = new WeakSet<LspClient>();
+const requestWorkspaceAuthorities = new WeakMap<LspClient, Map<number, RequestWorkspaceAuthority>>();
 
 function policyIdentity(policy: StoredLspSessionPolicy | undefined): string {
 	if (policy?.shared === true) return "shared";
@@ -83,13 +92,17 @@ export function setSharedLspEnabled(_enabled: boolean): void {
 	void _enabled;
 }
 
-export function withLspSessionPolicy<T>(policy: LspSessionPolicy, run: () => T): T {
+export function withLspSessionPolicy<T>(
+	policy: LspSessionPolicy,
+	run: () => T,
+	workspaceEditAuthorization?: WorkspaceEditAuthorization,
+): T {
 	let identity = lspSessionIdentities.get(policy);
 	if (!identity) {
 		identity = `private:${++nextLspSessionIdentity}`;
 		lspSessionIdentities.set(policy, identity);
 	}
-	return lspSessionPolicy.run(Object.freeze({ ...policy, identity }), run);
+	return lspSessionPolicy.run(Object.freeze({ ...policy, identity, workspaceEditAuthorization }), run);
 }
 
 /**
@@ -614,9 +627,29 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 	}
 
 	try {
-		await applyWorkspaceEditWithLsp(params.edit, client.cwd);
+		if (managedWorkspaceClients.has(client)) {
+			const bindings = [...(requestWorkspaceAuthorities.get(client)?.values() ?? [])];
+			const binding = bindings[0];
+			if (
+				!binding?.authorization.operation ||
+				bindings.some(candidate => candidate.authorization.operation !== binding.authorization.operation)
+			)
+				throw new Error("Server workspace edit requires one exact live invocation authority.");
+			const operation = binding.authorization.operation;
+			const edit = params.edit;
+			await binding.reenter(() =>
+				operation.withResourceEffects([], "filesystem", () =>
+					applyWorkspaceEditWithLsp(edit, client.cwd, undefined, binding.authorization),
+				),
+			);
+		} else {
+			await applyWorkspaceEditWithLsp(params.edit, client.cwd);
+		}
 		await sendResponse(client, message.id, { applied: true }, "workspace/applyEdit");
 	} catch (err) {
+		if (managedWorkspaceClients.has(client)) {
+			for (const binding of [...(requestWorkspaceAuthorities.get(client)?.values() ?? [])]) binding.reject(err);
+		}
 		await sendResponse(client, message.id, { applied: false, failureReason: String(err) }, "workspace/applyEdit");
 	}
 }
@@ -710,14 +743,14 @@ export async function applyWorkspaceEditWithLsp(
 	try {
 		({ applied } = await applyWorkspaceEdit(edit, cwd, change => executed.push(change), authorization));
 	} catch (err) {
-		// Best-effort: overlays for the mutated prefix must not stay stale, but
-		// reconciliation problems must not mask the original apply failure.
+		// Reconcile the mutated prefix without losing either failure.
 		try {
 			await reconcileExecutedChanges(executed, cwd, signal);
 		} catch (reconcileErr) {
-			logger.warn("LSP overlay reconciliation after failed workspace edit failed", {
-				error: reconcileErr instanceof Error ? reconcileErr.message : String(reconcileErr),
-			});
+			throw new AggregateError(
+				[err, reconcileErr],
+				"Workspace edit failed and overlay reconciliation did not complete.",
+			);
 		}
 		throw err;
 	}
@@ -1763,9 +1796,12 @@ export async function refreshFile(client: LspClient, filePath: string, signal?: 
  * not a use: idle documents keep aging, and documents closed meanwhile stay closed.
  */
 export async function refreshOpenFiles(client: LspClient, signal?: AbortSignal): Promise<void> {
-	await Promise.all(
+	const results = await Promise.allSettled(
 		Array.from(client.openFiles.keys(), uri => refreshDocument(client, uriToFile(uri), "resync", signal)),
 	);
+	const failures = results.filter(result => result.status === "rejected").map(result => result.reason);
+	if (failures.length === 1) throw failures[0];
+	if (failures.length > 1) throw new AggregateError(failures, "LSP open-document reconciliation reads failed.");
 }
 
 async function refreshDocument(
@@ -1957,8 +1993,28 @@ export async function sendRequest(
 	client.lastActivity = Date.now();
 
 	const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+	const policy = lspSessionPolicy.getStore();
+	if (policy) managedWorkspaceClients.add(client);
+	let requestAuthorities = requestWorkspaceAuthorities.get(client);
+	if (policy?.workspaceEditAuthorization) {
+		if (!requestAuthorities) {
+			requestAuthorities = new Map();
+			requestWorkspaceAuthorities.set(client, requestAuthorities);
+		}
+		const reenter = AsyncLocalStorage.snapshot();
+		requestAuthorities.set(id, {
+			authorization: policy.workspaceEditAuthorization,
+			reenter: run => reenter(run),
+			reject: error => {
+				const pending = client.pendingRequests.get(id);
+				client.pendingRequests.delete(id);
+				pending?.reject(error instanceof Error ? error : new Error(String(error), { cause: error }));
+			},
+		});
+	}
 	let timeout: NodeJS.Timeout | undefined;
 	const cleanup = () => {
+		requestAuthorities?.delete(id);
 		if (signal) {
 			signal.removeEventListener("abort", abortHandler);
 		}

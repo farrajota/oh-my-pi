@@ -16,6 +16,37 @@ export function formatPersistenceFailure(message: string): string {
 }
 
 /**
+ * Persistence failures print mode has already reported on stderr. The root command rethrows such a
+ * failure to its caller unchanged, so the CLI boundary recognizes it by identity and exits nonzero
+ * without rendering it again as a fatal dump.
+ */
+const reportedPersistenceFailures = new WeakSet<Error>();
+
+export function markPersistenceFailureReported(error: Error): void {
+	reportedPersistenceFailures.add(error);
+}
+
+export function isReportedPersistenceFailure(error: unknown): boolean {
+	return error instanceof Error && reportedPersistenceFailures.has(error);
+}
+
+/**
+ * Root startup could not write the session transcript that the session's authority store is bound
+ * to, so no session was created. The CLI boundary reports it as a one-line diagnostic.
+ */
+export class RootStartupPersistenceError extends Error {
+	constructor(readonly failure: unknown) {
+		super(failure instanceof Error ? failure.message : String(failure), { cause: failure });
+		this.name = "RootStartupPersistenceError";
+	}
+}
+
+export function formatStartupPersistenceFailure(message: string): string {
+	const detail = truncateToWidth(replaceTabs(sanitizeText(message)).replace(/[\r\n]+/g, " "), TRUNCATE_LENGTHS.LINE);
+	return `Session persistence failed: ${detail}. The session transcript could not be created, so no session was started.`;
+}
+
+/**
  * Teardown-time durability claim, emitted only while the store failure is
  * still latched at dispose: the retry never landed, so the transcript is not
  * durable and the in-memory entries are gone with the process.

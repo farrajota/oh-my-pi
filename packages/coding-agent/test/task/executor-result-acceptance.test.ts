@@ -693,7 +693,7 @@ describe("runSubprocess result acceptance", () => {
 			]);
 			harness.emitAssistantText('{"reports":[{"verdict":"round-2"}]}');
 			await finish?.(undefined);
-			AgentRegistry.global().setStatus(AGENT_ID, "idle");
+			await AgentRegistry.global().setStatus(AGENT_ID, "idle");
 
 			const resolved = await InternalUrlRouter.instance().resolve(`agent://${AGENT_ID}`);
 			expect(resolved.content).toBe('{"reports":[{"verdict":"round-2"}]}');
@@ -805,7 +805,7 @@ describe("runSubprocess result acceptance", () => {
 			await finish?.(undefined);
 			expect(manager.atCapacity).toBe(true);
 			await manager.drainDeliveries({ timeoutMs: 1000 });
-			AgentRegistry.global().setStatus(AGENT_ID, "idle");
+			await AgentRegistry.global().setStatus(AGENT_ID, "idle");
 
 			const resolved = await InternalUrlRouter.instance().resolve(`agent://${AGENT_ID}`);
 			expect(resolved.content).toBe("## Report\nroot cause found");

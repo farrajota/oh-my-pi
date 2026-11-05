@@ -2,11 +2,36 @@ import * as fs from "node:fs/promises";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { acquireIdaDatabase, cfgIdaAvailable, isExecutableFile, isIdaDatabasePath, SLICE_SEPARATOR } from "../ida";
+import {
+	acquireIdaDatabase,
+	cfgIdaAvailable,
+	EXECUTABLE_SNIFF_BYTES,
+	isExecutableFile,
+	isExecutableHeader,
+	isIdaDatabasePath,
+	SLICE_SEPARATOR,
+} from "../ida";
+import type { IdaDatabase } from "../ida";
 import type { ToolSession } from "../sdk";
 import { formatPathRelativeToCwd, resolveReadPath } from "./path-utils";
 import { buildInMemorySelectorResult } from "./read-format";
 import type { ParsedSelector } from "./read-selector";
+
+async function withBinaryInput<T>(handle: fs.FileHandle, consume: () => Promise<T>): Promise<T> {
+	let value: T;
+	try {
+		value = await consume();
+	} catch (error) {
+		try {
+			await handle.close();
+		} catch (closeError) {
+			throw new AggregateError([error, closeError], "Binary input and resource close failed.");
+		}
+		throw error;
+	}
+	await handle.close();
+	return value;
+}
 
 /** IDA view rendered by the worker's `view` method. */
 export type IdaViewKind = "overview" | "pseudocode" | "asm" | "imports" | "exports" | "strings" | "xrefs";
@@ -65,7 +90,20 @@ export async function resolveBinaryViewPath(session: ToolSession, readPath: stri
 	for (let i = readPath.lastIndexOf(":"); i > 0; i = readPath.lastIndexOf(":", i - 1)) {
 		const absolutePath = resolveReadPath(readPath.slice(0, i), session.cwd);
 		if (!(await isFile(absolutePath))) continue;
-		if (isIdaDatabasePath(absolutePath) || (await isExecutableFile(absolutePath))) {
+		let executable = false;
+		if (!isIdaDatabasePath(absolutePath)) {
+			if (!session.pathScope) executable = await isExecutableFile(absolutePath);
+			else {
+				const operation = session.pathScope.currentOperation();
+				const handle = await operation.openRead(await operation.authorize(absolutePath, "read"));
+				executable = await withBinaryInput(handle, async () => {
+					const header = Buffer.alloc(EXECUTABLE_SNIFF_BYTES);
+					const { bytesRead } = await handle.read(header, 0, header.length, 0);
+					return isExecutableHeader(header.subarray(0, bytesRead));
+				});
+			}
+		}
+		if (isIdaDatabasePath(absolutePath) || executable) {
 			return { absolutePath, ...splitSliceView(readPath.slice(i + 1)) };
 		}
 	}
@@ -89,8 +127,35 @@ export async function readBinary(
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<ReadToolDetails>> {
 	const view = parseBinaryView(target.view);
-	const db = await acquireIdaDatabase(session, target.absolutePath, { arch: target.arch, signal });
-	const { text } = await db.request<{ text: string }>("view", view, { signal, timeoutMs: VIEW_TIMEOUT_MS });
+	let handle: fs.FileHandle | undefined;
+	let sourceReadPath: string | undefined;
+	if (session.pathScope) {
+		const operation = session.pathScope.currentOperation();
+		handle = await operation.openRead(await operation.authorize(target.absolutePath, "read"));
+		sourceReadPath = `/proc/self/fd/${handle.fd}`;
+	}
+	let db!: IdaDatabase;
+	let text!: string;
+	const consume = async (): Promise<void> => {
+		if (handle && sourceReadPath) {
+			if (process.platform !== "linux") throw new Error("Exact binary input reads require Linux /proc support.");
+			const actual = await handle.stat({ bigint: true });
+			const source = await fs.stat(sourceReadPath, { bigint: true });
+			if (actual.dev !== source.dev || actual.ino !== source.ino)
+				throw new Error("Binary input descriptor identity changed.");
+		}
+		db = await acquireIdaDatabase(session, target.absolutePath, { arch: target.arch, signal, sourceReadPath });
+		session.pathScope?.currentOperation().assertActive();
+		signal?.throwIfAborted();
+		({ text } = await db.request<{ text: string }>("view", view, {
+			signal: handle ? undefined : signal,
+			timeoutMs: VIEW_TIMEOUT_MS,
+		}));
+		signal?.throwIfAborted();
+		session.pathScope?.currentOperation().assertActive();
+	};
+	if (handle) await withBinaryInput(handle, consume);
+	else await consume();
 	let output = text;
 	if (view.kind === "overview") {
 		const bin = formatPathRelativeToCwd(target.absolutePath, session.cwd);

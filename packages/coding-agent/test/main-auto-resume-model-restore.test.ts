@@ -17,6 +17,8 @@ interface Observation {
 	providerRequests?: number;
 	agentError?: unknown;
 	session?: { id: string; model?: string; messages: unknown[]; cacheKey?: string };
+	/** The saved fixture is a pre-journaling transcript; resuming it must adopt an authority store. */
+	savedAuthoritySelected?: boolean;
 }
 
 /** Run real CLI/SDK startup in a process whose config, leases and registries cannot escape the fixture. */
@@ -141,6 +143,7 @@ async function runScenario(scenario: Scenario): Promise<Observation> {
 			providerServer.stop(true);
 		}
 		observation.providerRequests = providerRequests;
+		observation.savedAuthoritySelected = await Bun.file(file + ".authority.json").exists();
 		console.log("OBSERVATION_17043:" + JSON.stringify(observation));
 		process.exit(0);
 	`;
@@ -209,6 +212,7 @@ describe("implicit auto-resume model restoration", () => {
 			expect(result.session?.id).toBe("saved-session");
 			expect(result.session?.model).toBe("resume-fixture/fresh");
 			expect(JSON.stringify(result.session?.messages)).toContain("OLD_PRIVATE_HISTORY");
+			expect(result.savedAuthoritySelected).toBe(true);
 		},
 		30_000,
 	);
@@ -368,6 +372,8 @@ describe("implicit auto-resume model restoration", () => {
 				expect(output).not.toContain("\x9b");
 				expect(output).not.toContain("UNTRUSTED_MODEL_TAIL");
 				expect(warningScreen).toContain("Could not restore model lost/visible-");
+				// Auto-resume adopted the pre-journaling transcript before its model restore failed.
+				expect(output).toContain("predates authority journaling");
 				expect(warningScreen).not.toContain("OLD_WARNING_HISTORY");
 			} finally {
 				if (proc.exitCode === null) proc.kill();

@@ -62,11 +62,11 @@ describe("IRC roster activity", () => {
 		expect(registry.get("Worker")?.lastActivity).toBe(90_000);
 	});
 
-	it("clears activity when a peer leaves running so finished work is not shown as current", () => {
+	it("clears activity when a peer leaves running so finished work is not shown as current", async () => {
 		registry.register({ id: "Done", displayName: "task", kind: "sub", session: null, status: "running" });
 		setAgentActivity(registry, "Done", "running bash", lookupAgentRef(registry, "Done")!);
 		expect(registry.get("Done")?.activity).toBe("running bash");
-		registry.setStatus("Done", "idle");
+		await registry.setStatus("Done", "idle");
 		expect(registry.get("Done")?.activity).toBeUndefined();
 	});
 

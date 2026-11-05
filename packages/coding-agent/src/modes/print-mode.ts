@@ -20,11 +20,13 @@ import {
 	formatPersistenceDurabilityFailure,
 	formatPersistenceFailure,
 	formatPersistenceNotice,
+	markPersistenceFailureReported,
 } from "./persistence-failure";
 
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 import { cfgAsyncPrintWake } from "../tools/settings";
 
+type PrintDisposeOutcome = { status: "fulfilled" } | { status: "rejected"; error: unknown };
 /**
  * Options for print mode.
  */
@@ -39,6 +41,8 @@ export interface PrintModeOptions {
 	mcpManager?: MCPManager;
 	/** `--max-time` deadline (epoch ms). It aborts running turns; the background-job wait enforces it itself. */
 	deadline?: number;
+	/** Internal entry handoff for the settled result of the memoized session/root disposer. */
+	onDisposeOutcome?: (outcome: PrintDisposeOutcome) => void;
 }
 
 export const PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS = 10 * 60_000;
@@ -92,7 +96,15 @@ export function printableEvent(event: AgentSessionEvent): unknown {
 }
 
 export async function runPrintMode(session: AgentSession, options: PrintModeOptions): Promise<number> {
-	const { mode, messages = [], initialMessage, initialImages, printThoughts, planYolo = false } = options;
+	const {
+		mode,
+		messages = [],
+		initialMessage,
+		initialImages,
+		printThoughts,
+		planYolo = false,
+		onDisposeOutcome,
+	} = options;
 	session.disableStopTimeTodoReminders();
 
 	// process.stdout.write is fire-and-forget: a large final record (e.g. a
@@ -107,11 +119,25 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	let persistenceError: Error | undefined;
 	let signalShutdown = false;
 	let pendingDispose: Promise<void> | undefined;
+	let disposeOutcomeReported = false;
+	const reportDisposeOutcome = (outcome: PrintDisposeOutcome): void => {
+		if (disposeOutcomeReported) return;
+		disposeOutcomeReported = true;
+		onDisposeOutcome?.(outcome);
+	};
 	const disposeSession = (reason?: postmortem.Reason): Promise<void> => {
-		pendingDispose ??= session.dispose({
-			mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
-			reason,
-		});
+		pendingDispose ??= session
+			.dispose({
+				mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
+				reason,
+			})
+			.then(
+				() => reportDisposeOutcome({ status: "fulfilled" }),
+				error => {
+					reportDisposeOutcome({ status: "rejected", error });
+					throw error;
+				},
+			);
 		return pendingDispose;
 	};
 	const preexistingPersistenceError = session.sessionManager.getPersistenceError?.();
@@ -151,6 +177,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	const unsubscribePersistenceError = session.sessionManager.onPersistenceError?.(error => {
 		if (persistenceError) return;
 		persistenceError = error;
+		markPersistenceFailureReported(error);
 		writeStderrLine(formatPersistenceFailure(error.message));
 	});
 	const unregisterSignalTeardown = postmortem.register("print-session-teardown", async reason => {

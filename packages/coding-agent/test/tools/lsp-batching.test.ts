@@ -33,6 +33,135 @@ describe("createLspWritethrough batching", () => {
 		tempDir.removeSync();
 	});
 
+	it("does not repeat a physical write after its terminal acknowledgement fails", async () => {
+		const formatter = createFormatter(async (_filePath, content) => content);
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([["formatter", formatter]]);
+		const terminalError = new Error("terminal acknowledgement failed");
+		let writes = 0;
+		const writethrough = createLspWritethrough(tempDir.path(), {
+			enableFormat: true,
+			mutationHooks: {
+				withResourceEffect: async (_dst, effect) => {
+					writes++;
+					await effect();
+					throw terminalError;
+				},
+			},
+		});
+		const target = path.join(tempDir.path(), "terminal.ts");
+		await expect(writethrough(target, "const a=1\n")).rejects.toBe(terminalError);
+		expect(writes).toBe(1);
+		expect(await Bun.file(target).text()).toBe("const a=1\n");
+	});
+
+	it("drains a timed-out physical write and preserves its terminal rejection", async () => {
+		const formatter = createFormatter(async (_filePath, content) => content);
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([["formatter", formatter]]);
+		const timeout = new AbortController();
+		vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const terminalError = new Error("late terminal rejection");
+		let writes = 0;
+		let settled = false;
+		const writethrough = createLspWritethrough(tempDir.path(), {
+			enableFormat: true,
+			mutationHooks: {
+				withResourceEffect: async (_dst, effect) => {
+					writes++;
+					await effect();
+					started.resolve();
+					await release.promise;
+					throw terminalError;
+				},
+			},
+		});
+		const target = path.join(tempDir.path(), "timeout.ts");
+		const pending = writethrough(target, "const a=1\n");
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await started.promise;
+		timeout.abort();
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		release.resolve();
+		await expect(pending).rejects.toBe(terminalError);
+		expect(writes).toBe(1);
+		expect(await Bun.file(target).text()).toBe("const a=1\n");
+	});
+
+	it("formats earlier batch files using the live invocation capability", async () => {
+		const formatter = createFormatter(async (_filePath, content) => content.replace("=1", " = 1;"));
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([["formatter", formatter]]);
+		const first = path.join(tempDir.path(), "a.ts");
+		const second = path.join(tempDir.path(), "b.ts");
+		let firstLive = true;
+		const currentTargets: string[] = [];
+		const prior = createLspWritethrough(tempDir.path(), {
+			enableFormat: true,
+			mutationHooks: {
+				withResourceEffect: async (_dst, effect) => {
+					if (!firstLive) throw new Error("disposed invocation");
+					return effect();
+				},
+			},
+		});
+		const current = createLspWritethrough(tempDir.path(), {
+			enableFormat: true,
+			mutationHooks: {
+				withResourceEffect: async (dst, effect) => {
+					currentTargets.push(dst);
+					return effect();
+				},
+				readText: dst => Bun.file(dst).text(),
+			},
+		});
+		await prior(first, "const a=1\n", undefined, undefined, { id: "live-capability", flush: false });
+		firstLive = false;
+		await current(second, "const b=1\n", undefined, undefined, { id: "live-capability", flush: true });
+		expect(currentTargets).toContain(first);
+		expect(await Bun.file(first).text()).toBe("const a = 1;\n");
+		expect(await Bun.file(second).text()).toBe("const b = 1;\n");
+	});
+
+	it("retains both a final write failure and an earlier batch read close failure", async () => {
+		const first = path.join(tempDir.path(), "pending.ts");
+		const final = path.join(tempDir.path(), "failed.ts");
+		const writeFailure = new Error("final resource failed");
+		const closeFailure = new Error("earlier read close failed");
+		await createLspWritethrough(tempDir.path())(first, "pending bytes", undefined, undefined, {
+			id: "compound-failure",
+			flush: false,
+		});
+		const current = createLspWritethrough(tempDir.path(), {
+			mutationHooks: {
+				withResourceEffect: async () => {
+					throw writeFailure;
+				},
+				readText: async () => {
+					throw closeFailure;
+				},
+			},
+		});
+		const outcome = await current(final, "never written", undefined, undefined, {
+			id: "compound-failure",
+			flush: true,
+		}).catch(error => error);
+		expect(outcome).toBeInstanceOf(AggregateError);
+		expect((outcome as AggregateError).errors).toEqual([writeFailure, closeFailure]);
+		expect(await Bun.file(first).text()).toBe("pending bytes");
+		expect(await Bun.file(final).exists()).toBe(false);
+	});
+
 	it("defers LSP work until the batch flush", async () => {
 		const loadConfigSpy = vi
 			.spyOn(lspConfig, "loadConfig")

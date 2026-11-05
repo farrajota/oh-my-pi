@@ -29,7 +29,7 @@ function makeSession(overrides: Partial<ToolSession> = {}): ToolSession {
 		hasUI: false,
 		settings: Settings.isolated(),
 		getSessionSpawns: () => "",
-		toolRegistry: new Map([
+		toolRegistry: new Map<string, typeof read | typeof write>([
 			["read", read],
 			["write", write],
 		]),

@@ -17,12 +17,14 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { createAcpSessionFactory } from "@oh-my-pi/pi-coding-agent/main";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority } from "@oh-my-pi/pi-coding-agent/registry/authority";
+import type { AuthorityStore } from "@oh-my-pi/pi-coding-agent/registry/authority/types";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 const authStorage = createInMemoryAuthStorage();
 const modelRegistry = new ModelRegistry(authStorage);
@@ -31,17 +33,31 @@ afterAll(() => {
 	authStorage.close();
 });
 
+/** The SDK returns a session bound to the factory's root manager, which ACP root authority disposal defers on. */
+function bindFakeRoot(session: AgentSession, options: CreateAgentSessionOptions): AgentSession {
+	return Object.assign(session, { sessionManager: options.sessionManager });
+}
+
+async function closeAcpTestRoot(options: CreateAgentSessionOptions | undefined): Promise<void> {
+	const manager = options?.sessionManager;
+	const sessionFile = manager?.getSessionFile();
+	if (sessionFile) await closeSessionAuthority(sessionFile);
+	await manager?.close();
+}
+
 describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 	it("forces enableMCP=false even when baseOptions opts in", async () => {
 		const tempDir = TempDir.createSync("@pi-acp-mcp-isolation-");
+		let capturedOptions: CreateAgentSessionOptions | undefined;
 		try {
 			const settings = Settings.isolated({});
-			const fakeSession = {} as AgentSession;
+			const fakeSession = { ...createSessionDefaults() } as unknown as AgentSession;
 			const captured: CreateAgentSessionOptions[] = [];
 			const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
 				captured.push(options);
+				capturedOptions = options;
 				return {
-					session: fakeSession,
+					session: bindFakeRoot(fakeSession, options),
 					extensionsResult: {
 						extensions: [],
 						errors: [],
@@ -73,21 +89,24 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			expect(captured).toHaveLength(1);
 			expect(captured[0].enableMCP).toBe(false);
 		} finally {
+			await closeAcpTestRoot(capturedOptions);
 			await tempDir.remove();
 		}
 	});
 
 	it("creates each persisted ACP session with its canonical durable registry before creation", async () => {
 		const tempDir = TempDir.createSync("@pi-acp-durable-registry-");
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		let capturedRegistry: CreateAgentSessionOptions["agentRegistry"];
+		let capturedStore: AuthorityStore | undefined;
+		let sessionFile: string | undefined;
 		try {
 			const settings = Settings.isolated({});
-			const fakeSession = {} as AgentSession;
-			let capturedOptions: CreateAgentSessionOptions | undefined;
-			let capturedRegistry: CreateAgentSessionOptions["agentRegistry"];
+			const fakeSession = { ...createSessionDefaults() } as unknown as AgentSession;
 			const factory = createAcpSessionFactory({
 				baseOptions: {} as CreateAgentSessionOptions,
-				settings,
 				sessionDir: tempDir.join("sessions"),
+				settings,
 				authStorage,
 				modelRegistry,
 				parsedArgs: { invalidFlagValues: [] },
@@ -95,8 +114,10 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				createSession: async options => {
 					capturedOptions = options;
 					capturedRegistry = options.agentRegistry;
+					capturedStore = options.agentRegistry?.getDurableStateStore();
+					sessionFile = options.sessionManager?.getSessionFile();
 					return {
-						session: fakeSession,
+						session: bindFakeRoot(fakeSession, options),
 						extensionsResult: { extensions: [], errors: [], runtime: new ExtensionRuntime() },
 						setToolUIContext: () => {},
 						eventBus: new EventBus(),
@@ -106,21 +127,28 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 
 			await factory(tempDir.path());
 
-			const sessionFile = capturedOptions?.sessionManager?.getSessionFile();
-			if (!sessionFile) throw new Error("Expected a persisted ACP session file");
+			const sessionManager = capturedOptions?.sessionManager;
+			const header = sessionManager?.getHeader();
+			if (!sessionFile || !sessionManager) throw new Error("Expected a persisted ACP session file");
 			expect(capturedOptions?.agentRegistry).toBe(capturedRegistry);
-			expect(capturedRegistry?.getDurableStateStore()).toBe(registryDurableStateForSession(sessionFile));
+			expect(capturedStore).toBe(capturedRegistry?.getDurableStateStore());
+			expect(capturedStore?.identity.owningSessionId).toBe(header?.id);
+			expect(header?.id).toBe(sessionManager.getSessionId());
 		} finally {
+			if (sessionFile) await closeSessionAuthority(sessionFile);
+			await capturedOptions?.sessionManager?.close();
 			await tempDir.remove();
 		}
 	});
 
 	it("rejects allowlisted tools absent from the completed ACP session registry", async () => {
 		const tempDir = TempDir.createSync("@pi-acp-tool-allowlist-");
+		let capturedOptions: CreateAgentSessionOptions | undefined;
 		try {
 			const settings = Settings.isolated({});
 			let disposed = false;
 			const fakeSession = {
+				...createSessionDefaults(),
 				extensionRunner: undefined,
 				getAllToolNames: () => ["read"],
 				dispose: async () => {
@@ -135,18 +163,23 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				modelRegistry,
 				parsedArgs: { tools: ["read", "missing"], invalidFlagValues: [] },
 				rawArgs: ["--tools", "read,missing"],
-				createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
+				createSession: async options => {
+					capturedOptions = options;
+					return { session: bindFakeRoot(fakeSession, options) } as CreateAgentSessionResult;
+				},
 			});
 
 			await expect(factory(tempDir.path())).rejects.toThrow(/Unknown tool in --tools: missing/);
 			expect(disposed).toBe(true);
 		} finally {
+			await closeAcpTestRoot(capturedOptions);
 			await tempDir.remove();
 		}
 	});
 
 	it("shares the trusted extension EventBus with the ACP session", async () => {
 		const tempDir = TempDir.createSync("@pi-acp-trusted-extension-");
+		let captured: CreateAgentSessionOptions | undefined;
 		try {
 			const settings = Settings.isolated({});
 			const trustedPath = tempDir.join("trusted.ts");
@@ -160,8 +193,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				trustedPath,
 				`import { writeFileSync } from "node:fs"; export default function (pi) { pi.events.on("acp-session-live", () => writeFileSync(${JSON.stringify(firedPath)}, "fired")); }`,
 			);
-			let captured: CreateAgentSessionOptions | undefined;
-			const fakeSession = {} as AgentSession;
+			const fakeSession = { ...createSessionDefaults() } as unknown as AgentSession;
 			const factory = createAcpSessionFactory({
 				baseOptions: {
 					disableExtensionDiscovery: true,
@@ -177,7 +209,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 					captured = options;
 					options.eventBus?.emit("acp-session-live", undefined);
 					return {
-						session: fakeSession,
+						session: bindFakeRoot(fakeSession, options),
 						extensionsResult: options.preloadedExtensions,
 						setToolUIContext: () => {},
 						eventBus: options.eventBus,
@@ -192,6 +224,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			expect(await Bun.file(firedPath).text()).toBe("fired");
 			expect(await Bun.file(ambientFiredPath).exists()).toBe(false);
 		} finally {
+			await closeAcpTestRoot(captured);
 			await tempDir.remove();
 		}
 	});
@@ -231,18 +264,18 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 describe("createAcpSessionFactory TITLE_SYSTEM.md per-cwd resolution (PR #3736)", () => {
 	it("re-resolves the title prompt for the per-session cwd instead of inheriting the launch cwd's override", async () => {
 		const tempDir = TempDir.createSync("@pi-acp-title-prompt-");
+		const captured: CreateAgentSessionOptions[] = [];
 		try {
 			const settings = Settings.isolated({});
 
 			const projectDir = tempDir.join("project");
 			await Bun.write(`${projectDir}/.omp/TITLE_SYSTEM.md`, "Project-specific title policy.");
 
-			const fakeSession = {} as AgentSession;
-			const captured: CreateAgentSessionOptions[] = [];
+			const fakeSession = { ...createSessionDefaults() } as unknown as AgentSession;
 			const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
 				captured.push(options);
 				return {
-					session: fakeSession,
+					session: bindFakeRoot(fakeSession, options),
 					extensionsResult: {
 						extensions: [],
 						errors: [],
@@ -277,6 +310,7 @@ describe("createAcpSessionFactory TITLE_SYSTEM.md per-cwd resolution (PR #3736)"
 			expect(captured).toHaveLength(1);
 			expect(captured[0].titleSystemPrompt).toBe("Project-specific title policy.");
 		} finally {
+			await closeAcpTestRoot(captured.at(-1));
 			await tempDir.remove();
 		}
 	});

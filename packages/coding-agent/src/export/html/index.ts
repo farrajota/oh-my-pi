@@ -182,6 +182,7 @@ function sessionHeaderForExport(header: SessionHeader | null): SessionHeader | n
 	delete exported.previousSessionFiles;
 	delete exported.providerPromptCacheKey;
 	delete exported.taskPromptCacheKey;
+	delete exported.authorityRoot;
 	return exported;
 }
 

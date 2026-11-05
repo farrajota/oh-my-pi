@@ -43,6 +43,7 @@ import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 const PERSISTED_WORKER_SYSTEM_PROMPT = "Persisted vibe worker";
 const PERSISTED_WORKER_TOOLS = ["read", "yield"];
@@ -308,6 +309,7 @@ function createFakeWorkerSession(
 	let lastAssistant: { stopReason: string; content: Array<{ type: string; text: string }> } | undefined;
 	let script: { events: unknown[]; responseText: string } | undefined;
 	const fake = {
+		...createSessionDefaults(),
 		isStreaming: options.streaming ?? false,
 		model: undefined,
 		isAdvisorActive: () => false,
@@ -1141,6 +1143,62 @@ describe("vibe session registry", () => {
 		expect(await fs.readFile(targetSessionFile, "utf8")).not.toContain(sourceSessionId);
 	});
 
+	it("propagates a release failure after the registry row is removed", async () => {
+		installPersistedSpawnMock();
+		const parentManager = await createPersistedParent();
+		parentManager.appendModeChange("vibe");
+		const jobs = createManager();
+		const session = createSession({ manager: jobs, sessionManager: parentManager });
+		const registry = VibeSessionRegistry.global();
+		const spawned = await registry.spawn(session, { cli: "fast", name: "failed-release", prompt: INITIAL_VIBE_TASK });
+		await jobs.getJob(spawned.jobId)!.promise;
+		const failure = new Error("release callback failed");
+		const original = lifecycleBridge.releaseAgent;
+		vi.spyOn(lifecycleBridge, "releaseAgent").mockImplementation(async (...args) => {
+			const released = await original(...args);
+			if (args[1] === "failed-release") throw failure;
+			return released;
+		});
+		await expect(registry.kill(session, "failed-release")).rejects.toBe(failure);
+		expect(AgentRegistry.global().get("failed-release")).toBeUndefined();
+	});
+
+	it.each(["kill", "mode-exit"] as const)(
+		"rejects %s when ordinary release succeeds but terminal release fails",
+		async action => {
+			installPersistedSpawnMock();
+			const parentManager = await createPersistedParent();
+			parentManager.appendModeChange("vibe");
+			const jobs = createManager();
+			const session = createSession({ manager: jobs, sessionManager: parentManager });
+			const registry = VibeSessionRegistry.global();
+			const spawned = await registry.spawn(session, {
+				cli: "fast",
+				name: "terminal-failure",
+				prompt: INITIAL_VIBE_TASK,
+			});
+			await jobs.getJob(spawned.jobId)!.promise;
+			const failure = new Error("terminal release failed");
+			const original = lifecycleBridge.releaseAgent;
+			let ordinaryReleased = false;
+			vi.spyOn(lifecycleBridge, "releaseAgent").mockImplementation(async (...args) => {
+				if (args[1] === "terminal-failure" && args[3]?.tombstone) {
+					expect(ordinaryReleased).toBe(true);
+					throw failure;
+				}
+				const released = await original(...args);
+				if (args[1] === "terminal-failure") {
+					expect(released).toBe(true);
+					ordinaryReleased = true;
+				}
+				return released;
+			});
+			if (action === "kill") await expect(registry.kill(session, "terminal-failure")).rejects.toBe(failure);
+			else await expect(registry.killAll(session)).rejects.toBe(failure);
+			expect(ordinaryReleased).toBe(true);
+		},
+	);
+
 	it("never sends through or releases a registry ref with the wrong child session file", async () => {
 		installPersistedSpawnMock();
 		const parentManager = await createPersistedParent();
@@ -1455,7 +1513,7 @@ describe("vibe session registry", () => {
 			}),
 		).toBe(true);
 
-		AgentRegistry.global().unregister("collision", otherRef);
+		expect(await AgentRegistry.global().unregister("collision", otherRef)).toBe(true);
 		await parentManager.close();
 		await simulateProcessBoundary();
 		const reopened = await SessionManager.open(parentSessionFile, undefined, undefined, { suppressBreadcrumb: true });
@@ -2225,10 +2283,14 @@ describe("vibe session registry", () => {
 		);
 	});
 
-	it("does not terminalize a same-path replacement installed while the killed worker disposes", async () => {
+	it("does not terminalize a same-path replacement installed once the killed worker has disposed", async () => {
+		// The registry keeps a terminating agent's id reserved until its session finishes disposing, so
+		// the earliest point a same-path replacement can appear is right after the killed worker's
+		// ordinary release returns, before kill persists its terminal tombstone.
 		let worker: FakeWorkerSession | undefined;
 		let replacement: AgentRef | undefined;
 		let replacementWorker: FakeWorkerSession | undefined;
+		let installReplacement: (() => void) | undefined;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			const artifactsDir = options.artifactsDir;
 			if (!artifactsDir) throw new Error("Persisted vibe test requires an artifacts directory");
@@ -2239,19 +2301,18 @@ describe("vibe session registry", () => {
 				task: options.task,
 			});
 			replacementWorker = createFakeWorkerSession();
-			worker = createFakeWorkerSession({
-				onDispose: () => {
-					replacement = AgentRegistry.global().register({
-						id: options.id,
-						displayName: options.id,
-						kind: "sub",
-						parentId: options.parentAgentId ?? "Main",
-						session: replacementWorker!.session,
-						sessionFile: childSessionFile,
-						status: "idle",
-					});
-				},
-			});
+			worker = createFakeWorkerSession();
+			installReplacement = () => {
+				replacement = AgentRegistry.global().register({
+					id: options.id,
+					displayName: options.id,
+					kind: "sub",
+					parentId: options.parentAgentId ?? "Main",
+					session: replacementWorker!.session,
+					sessionFile: childSessionFile,
+					status: "idle",
+				});
+			};
 			AgentRegistry.global().register({
 				id: options.id,
 				displayName: options.id,
@@ -2273,6 +2334,15 @@ describe("vibe session registry", () => {
 				{ ...options, authority },
 				makeResult(options.id, { output: "Old worker killed.", aborted: true }),
 			);
+		});
+		const originalRelease = lifecycleBridge.releaseAgent;
+		vi.spyOn(lifecycleBridge, "releaseAgent").mockImplementation(async (...args) => {
+			const released = await originalRelease(...args);
+			if (args[1] === "same-path-replacement" && !args[3]?.tombstone && replacement === undefined) {
+				expect(worker!.isDisposed()).toBe(true);
+				installReplacement!();
+			}
+			return released;
 		});
 		const parentManager = await createPersistedParent();
 		parentManager.appendModeChange("vibe");

@@ -31,6 +31,7 @@ import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from
 import { extractProfileFlags } from "./cli/profile-bootstrap";
 import {
 	BLOB_BROKER_WORKER_ARG,
+	AUTHORITY_WORKER_ARG,
 	COMPUTER_WORKER_ARG,
 	DAEMON_BROKER_WORKER_ARG,
 	IDA_HOST_WORKER_ARG,
@@ -44,6 +45,7 @@ import {
 import type * as JsProcessEntry from "./eval/js/process-entry";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
 import { installStatsSyncHost } from "./stats/sync-host";
+import { journalingEnvironment } from "./registry/authority/journaling-env";
 import { startParentWatchdog } from "./subprocess/parent-watchdog";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -156,6 +158,8 @@ async function runSmokeTest(): Promise<void> {
 	const { smokeTestBlobBroker } = await import("./blob-broker/daemon");
 	const { smokeTestTerminalOutputWorker } = await import("./launch/terminal-output-worker-client");
 	const { smokeTestTextPredictDaemon } = await import("./predict/client");
+	// Keep the session-manager/authority worker graph out of the normal CLI startup path.
+	const { smokeTestAuthorityWorker } = await import("./cli/authority-worker-smoke");
 	await smokeTestSyncWorker();
 	await smokeTestStatsActivityWorker();
 
@@ -184,6 +188,7 @@ async function runSmokeTest(): Promise<void> {
 	await smokeTestBlobBroker();
 	await smokeTestTerminalOutputWorker();
 	await smokeTestTextPredictDaemon();
+	await smokeTestAuthorityWorker();
 	process.stdout.write("smoke-test: ok\n");
 }
 
@@ -197,6 +202,12 @@ const TTS_WORKER_ARG = "__omp_worker_tts";
 const MNEMOPI_EMBED_WORKER_ARG = "__omp_worker_mnemopi_embed";
 
 async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
+	if (arg === AUTHORITY_WORKER_ARG) {
+		// Lazy like the other worker entrypoints: the authority worker graph loads the native addon.
+		const { runAuthorityWorker } = await import("./registry/authority/worker");
+		await runAuthorityWorker();
+		return true;
+	}
 	if (arg === TINY_WORKER_ARG) {
 		await runTinyWorker();
 		return true;
@@ -464,6 +475,9 @@ export async function runCli(argv: string[]): Promise<void> {
 			// profile instead of the default agent directory.
 			setProfile(resolveProfileEnv(process.env.OMP_PROFILE, process.env.PI_PROFILE));
 		}
+		// Resolve OMP_JOURNALING_BACKEND and OMP_JOURNALING_CAPACITY before command dispatch can initialize
+		// or mutate authority state; consumers read the cached typed choice, never the environment.
+		journalingEnvironment();
 		if (extracted.aliasName !== undefined) {
 			// Command boundary: shell/path setup is used only by --alias.
 			const { installProfileAlias, resolveProfileAliasCommandFromProcess } = await import("./cli/profile-alias");

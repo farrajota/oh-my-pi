@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
@@ -19,10 +19,19 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { canonicalDurableSha256, durableRootHeadHash } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import {
+	AuthorityAdoptionRefusedError,
+	closeSessionAuthority,
+	registryDurableStateForSession,
+} from "@oh-my-pi/pi-coding-agent/registry/authority";
+import { authorityPaths } from "@oh-my-pi/pi-coding-agent/registry/authority/ownership";
+import { readAuthorityDescriptor } from "@oh-my-pi/pi-coding-agent/registry/authority/descriptor";
 import { FileSessionStorage, MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getTerminalId } from "@oh-my-pi/pi-tui";
 import { isTaskToolDetails, type TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { getAgentDir, getTerminalSessionsDir, removeWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import * as authority from "@oh-my-pi/pi-coding-agent/registry/authority";
 
 interface JsonlMessageEntry {
 	type: "message";
@@ -220,6 +229,18 @@ describe("SessionManager.forkFrom", () => {
 			expect(forked.getSeanceSourceArtifactsDir()).toBe(sourceArtifactsDir);
 			expect(forked.getAdditionalDirectories()).toEqual([]);
 			await expect(fs.stat(forkFile.slice(0, -".jsonl".length))).rejects.toMatchObject({ code: "ENOENT" });
+			// A seance consult is a child transcript: its actor lives in the consulting root's
+			// authority, so the fork gets no root authority bundle of its own.
+			const sidecars = authorityPaths(forkFile);
+			for (const sidecar of [
+				sidecars.descriptor,
+				sidecars.jsonl,
+				sidecars.sqlite,
+				sidecars.legacyFence,
+				sidecars.lock,
+			]) {
+				expect(await Bun.file(sidecar).exists()).toBe(false);
+			}
 		} finally {
 			await forked.close();
 		}
@@ -1075,5 +1096,402 @@ describe("SessionManager.forkFrom", () => {
 		expect(forkedEntries.some(entry => entry.type === "message" && isSyntheticToolResultMessage(entry.message))).toBe(
 			false,
 		);
+	});
+	it("revokes persistCopy allocation when transcript publication fails", async () => {
+		using tempDir = TempDir.createSync("@omp-copy-allocation-failure-");
+		const source = SessionManager.inMemory(tempDir.path());
+		source.appendMessage({ role: "user", content: "copy", timestamp: 1 });
+		const storage = new FileSessionStorage();
+		let failedPath: string | undefined;
+		const original = storage.writeTextAtomic.bind(storage);
+		const publish = spyOn(storage, "writeTextAtomic").mockImplementation(async (file, content, options) => {
+			failedPath = file;
+			await original(file, content, options);
+			throw new Error("publication outcome unknown");
+		});
+		try {
+			await expect(
+				source.persistCopy({ sessionDir: tempDir.path(), suppressBreadcrumb: true }, storage),
+			).rejects.toThrow(/publication outcome unknown/);
+		} finally {
+			publish.mockRestore();
+		}
+		if (!failedPath) throw new Error("Expected attempted publication.");
+		const header = (await loadEntriesFromFile(failedPath))[0] as SessionHeader;
+		await expect(
+			registryDurableStateForSession(failedPath, { create: true, owningSessionId: header.id }),
+		).rejects.toThrow(/allocation/i);
+	});
+
+	it("closes an attempted direct fork open and preserves initialization and cleanup errors", async () => {
+		using tempDir = TempDir.createSync("@omp-direct-fork-cleanup-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		await manager.ensureOnDisk();
+		const opening = new Error("unknown open");
+		const cleanup = new Error("unknown cleanup");
+		const open = spyOn(authority, "registryDurableStateForSession").mockRejectedValue(opening);
+		const close = spyOn(authority, "closeSessionAuthority").mockRejectedValue(cleanup);
+		try {
+			let failure: unknown;
+			try {
+				await manager.fork();
+			} catch (error) {
+				failure = error;
+			}
+			expect(close).toHaveBeenCalledWith(manager.getSessionFile());
+			expect(failure).toBeInstanceOf(AggregateError);
+			if (!(failure instanceof AggregateError)) throw failure;
+			expect(failure.errors).toEqual([opening, cleanup]);
+		} finally {
+			open.mockRestore();
+			close.mockRestore();
+			await manager.close();
+		}
+	});
+
+	it("directly forks memory storage without filesystem authority or sidecars", async () => {
+		using tempDir = TempDir.createSync("@omp-memory-direct-fork-");
+		const storage = new MemorySessionStorage();
+		const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "memory"), storage);
+		manager.appendMessage({ role: "user", content: "memory", timestamp: 1 });
+		await manager.ensureOnDisk();
+		const result = await manager.fork();
+		if (!result) throw new Error("Expected persistent storage fork.");
+		expect(await storage.readText(result.newSessionFile)).toContain("memory");
+		expect(await Bun.file(result.newSessionFile).exists()).toBe(false);
+		expect(await Bun.file(`${result.newSessionFile}.authority.lock`).exists()).toBe(false);
+		await manager.close();
+	});
+	it("revokes the fresh allocation when fork authority initialization fails", async () => {
+		using tempDir = TempDir.createSync("@omp-fork-allocation-failure-");
+		const { cwd, sessionDir, sourceFile } = await createSessionWithArtifacts(tempDir.path());
+		const forkFile = path.join(sessionDir, "failed-fork.jsonl");
+		await fs.writeFile(`${forkFile}.authority.jsonl`, "unrelated", { mode: 0o600 });
+		await expect(
+			SessionManager.forkFrom(sourceFile, cwd, sessionDir, new FileSessionStorage(), {
+				sessionFile: forkFile,
+				copyArtifacts: false,
+				suppressBreadcrumb: true,
+			}),
+		).rejects.toThrow();
+		const header = (await loadEntriesFromFile(forkFile))[0] as SessionHeader;
+		await fs.rm(`${forkFile}.authority.jsonl`);
+		await expect(
+			registryDurableStateForSession(forkFile, { owningSessionId: header.id, create: true }),
+		).rejects.toThrow(/allocation/i);
+	});
+	it("forks root authority into a fresh incarnation without changing the source transcript", async () => {
+		using tempDir = TempDir.createSync("@omp-session-authority-fork-");
+		const cwd = path.join(tempDir.path(), "project");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		await fs.mkdir(sessionDir, { recursive: true });
+		const owner = SessionManager.create(cwd, sessionDir);
+		owner.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		await owner.ensureOnDisk();
+		const sourceFile = owner.getSessionFile()!;
+		const sourceId = owner.getSessionId();
+		const source = await registryDurableStateForSession(sourceFile, {
+			owningSessionId: sourceId,
+			backend: "jsonl",
+			create: true,
+		});
+		const startupHash = canonicalDurableSha256("Main:startup");
+		const provenanceHash = canonicalDurableSha256("Main:provenance");
+		const headHash = durableRootHeadHash({
+			rootId: "Main",
+			generation: 1,
+			actorId: "Main",
+			startupHash,
+			provenanceHash,
+		});
+		const construction = {
+			kind: "construction" as const,
+			at: 1,
+			actorId: "Main",
+			rootId: "Main",
+			generation: 1,
+			startupHash,
+			provenanceHash,
+		};
+		await source.transitionBatch(
+			[
+				{ ...construction, phase: "reserved" as const },
+				{ ...construction, at: 2, phase: "constructing" as const },
+				{ ...construction, at: 3, phase: "constructed" as const },
+			],
+			{ requestId: "fork-source-construction" },
+		);
+		await source.activateAuthority(
+			{
+				root: { kind: "root", at: 4, rootId: "Main", generation: 1, headHash, state: "active" },
+				actor: {
+					kind: "actor",
+					at: 4,
+					actorId: "Main",
+					rootId: "Main",
+					generation: 1,
+					rootGeneration: 1,
+					rootHeadHash: headHash,
+					startupHash,
+					provenanceHash,
+					state: "active",
+				},
+				construction: { ...construction, at: 4, phase: "activated" },
+				gate: { kind: "gate", at: 4, rootId: "Main", generation: 1, phase: "open" },
+			},
+			{ requestId: "fork-source-activation" },
+		);
+		await source.close();
+		await owner.close();
+
+		const sourceDescriptor = await readAuthorityDescriptor(sourceFile);
+		if (!sourceDescriptor) throw new Error("Expected the source authority descriptor.");
+		const sourceTranscript = await fs.readFile(sourceFile);
+
+		const forked = await SessionManager.forkFrom(sourceFile, cwd, sessionDir, new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+			copyArtifacts: false,
+		});
+		try {
+			const forkPath = forked.getSessionFile()!;
+			const forkHeader = (await loadEntriesFromFile(forkPath))[0] as SessionHeader;
+			const forkDescriptor = await readAuthorityDescriptor(forkPath);
+			if (!forkDescriptor) throw new Error("Expected a fork authority descriptor.");
+			expect(forkDescriptor.owningSessionId).toBe(forkHeader.id);
+			expect(forkDescriptor.incarnation).not.toBe(sourceDescriptor.incarnation);
+			expect(forkDescriptor.backend).toBe("jsonl");
+			expect(await fs.readFile(sourceFile)).toEqual(sourceTranscript);
+			const forkAuthority = await registryDurableStateForSession(forkPath, { owningSessionId: forkHeader.id });
+			try {
+				expect(await forkAuthority.getRoot("Main")).toBeUndefined();
+				expect(await forkAuthority.getActor("Main")).toBeUndefined();
+			} finally {
+				await forkAuthority.close();
+			}
+			const sourceAuthority = await registryDurableStateForSession(sourceFile, { owningSessionId: sourceId });
+			try {
+				expect((await sourceAuthority.getRoot("Main"))?.record.state).toBe("active");
+				expect((await sourceAuthority.getActor("Main"))?.record.state).toBe("active");
+			} finally {
+				await sourceAuthority.close();
+			}
+		} finally {
+			await forked.close();
+		}
+	});
+	it("moves the selected authority bundle with its persisted root session", async () => {
+		using tempDir = TempDir.createSync("@omp-session-authority-move-");
+		const cwd = path.join(tempDir.path(), "source-project");
+		const targetCwd = path.join(tempDir.path(), "target-project");
+		const sourceDir = path.join(tempDir.path(), "source-sessions");
+		const targetDir = path.join(tempDir.path(), "target-sessions");
+		await fs.mkdir(sourceDir, { recursive: true });
+		const owner = SessionManager.create(cwd, sourceDir);
+		owner.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		await owner.ensureOnDisk();
+		const sourceFile = owner.getSessionFile()!;
+		const sourceId = owner.getSessionId();
+		const source = await registryDurableStateForSession(sourceFile, {
+			owningSessionId: sourceId,
+			backend: "jsonl",
+			create: true,
+		});
+		await source.close();
+		await owner.close();
+		const manager = await SessionManager.open(sourceFile, sourceDir, new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		try {
+			await manager.moveTo(targetCwd, targetDir);
+			const targetFile = manager.getSessionFile()!;
+			const targetDescriptor = await readAuthorityDescriptor(targetFile);
+			if (!targetDescriptor) throw new Error("Expected a moved authority descriptor.");
+			expect(targetDescriptor.owningSessionId).toBe(sourceId);
+			expect(targetDescriptor.backend).toBe("jsonl");
+			expect(await Bun.file(authorityPaths(sourceFile).descriptor).exists()).toBe(false);
+			// The moved transcript names its new location, so adoption does not mistake it for a bundle-less copy.
+			expect(await diskAuthorityRoot(targetFile)).toBe(await fs.realpath(targetFile));
+		} finally {
+			await manager.close();
+		}
+		const targetFile = manager.getSessionFile()!;
+		const reopened = await registryDurableStateForSession(targetFile, { owningSessionId: sourceId });
+		try {
+			expect(reopened.identity.backend).toBe("jsonl");
+		} finally {
+			await closeSessionAuthority(targetFile);
+		}
+	});
+
+	it("refuses to adopt a root transcript copied without its authority bundle, leaving the copy untouched", async () => {
+		using tempDir = TempDir.createSync("@omp-session-authority-copy-");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const copyDir = path.join(tempDir.path(), "copies");
+		await fs.mkdir(sessionDir, { recursive: true });
+		await fs.mkdir(copyDir, { recursive: true });
+		const owner = SessionManager.create(tempDir.path(), sessionDir);
+		owner.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		await owner.ensureOnDisk();
+		const sourceFile = owner.getSessionFile()!;
+		const sourceId = owner.getSessionId();
+		await registryDurableStateForSession(sourceFile, { owningSessionId: sourceId, backend: "jsonl", create: true });
+		await closeSessionAuthority(sourceFile);
+		await owner.close();
+		expect(await diskAuthorityRoot(sourceFile)).toBe(await fs.realpath(sourceFile));
+
+		const copy = path.join(copyDir, path.basename(sourceFile));
+		await fs.copyFile(sourceFile, copy);
+		const copied = await fs.readFile(copy);
+		const outcome = await registryDurableStateForSession(copy, { owningSessionId: sourceId }).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		await closeSessionAuthority(copy);
+		expect(outcome).toBeInstanceOf(AuthorityAdoptionRefusedError);
+		expect((outcome as AuthorityAdoptionRefusedError).command).toContain(await fs.realpath(sourceFile));
+		expect(await fs.readdir(copyDir)).toEqual([path.basename(copy)]);
+		expect(await fs.readFile(copy)).toEqual(copied);
+		// The original, with its bundle, still resumes.
+		const original = await registryDurableStateForSession(sourceFile, { owningSessionId: sourceId });
+		try {
+			expect(original.identity.backend).toBe("jsonl");
+		} finally {
+			await closeSessionAuthority(sourceFile);
+		}
+	});
+
+	it("stamps every fork with its own path and never inherits the source's", async () => {
+		using tempDir = TempDir.createSync("@omp-session-authority-fork-stamp-");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		await fs.mkdir(sessionDir, { recursive: true });
+		const owner = SessionManager.create(tempDir.path(), sessionDir);
+		owner.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		await owner.ensureOnDisk();
+		const sourceFile = owner.getSessionFile()!;
+		await owner.close();
+		const sourceStamp = await diskAuthorityRoot(sourceFile);
+		expect(sourceStamp).toBe(await fs.realpath(sourceFile));
+
+		const forked = await SessionManager.forkFrom(sourceFile, tempDir.path(), sessionDir, new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+			copyArtifacts: false,
+		});
+		const forkPath = forked.getSessionFile()!;
+		try {
+			expect(await diskAuthorityRoot(forkPath)).toBe(await fs.realpath(forkPath));
+			const direct = await forked.fork();
+			if (!direct) throw new Error("Expected a persisted direct fork.");
+			expect(await diskAuthorityRoot(direct.newSessionFile)).toBe(await fs.realpath(direct.newSessionFile));
+		} finally {
+			await forked.close();
+		}
+		expect(await diskAuthorityRoot(forkPath)).not.toBe(sourceStamp);
+	});
+
+	it("stamps a child fork with its owning parent so it can never be adopted as a root", async () => {
+		using tempDir = TempDir.createSync("@omp-session-authority-child-stamp-");
+		const { cwd, sourceFile } = await createSessionWithArtifacts(tempDir.path());
+		const parentFile = path.join(tempDir.path(), "sessions", "parent.jsonl");
+		await Bun.write(
+			parentFile,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "parent", timestamp: new Date().toISOString(), cwd })}\n`,
+		);
+		for (const kind of ["seance", "childAgent"] as const) {
+			const childFile = path.join(tempDir.path(), "children", `${kind}.jsonl`);
+			const child = await SessionManager.forkFrom(sourceFile, cwd, undefined, undefined, {
+				[kind]: true,
+				suppressBreadcrumb: true,
+				sessionFile: childFile,
+				authorityParent: parentFile,
+			});
+			await child.close();
+			expect(await diskAuthorityRoot(childFile)).toBe(await fs.realpath(parentFile));
+			const header = (await loadEntriesFromFile(childFile))[0] as SessionHeader;
+			const outcome = await registryDurableStateForSession(childFile, { owningSessionId: header.id }).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await closeSessionAuthority(childFile);
+			expect(outcome).toBeInstanceOf(AuthorityAdoptionRefusedError);
+			for (const sidecar of Object.values(authorityPaths(childFile)).filter(file => file !== childFile)) {
+				expect(await Bun.file(sidecar).exists()).toBe(false);
+			}
+		}
+	});
+});
+
+/** The `authorityRoot` stamp in a transcript's on-disk session header. */
+async function diskAuthorityRoot(file: string): Promise<string | undefined> {
+	const header = (await loadEntriesFromFile(file)).find(entry => entry.type === "session") as
+		| SessionHeader
+		| undefined;
+	return header?.authorityRoot;
+}
+
+describe("task subagent transcripts carry their owner's authority root", () => {
+	async function persistedRoot(directory: string): Promise<{ rootFile: string; rootId: string }> {
+		const sessionDir = path.join(directory, "sessions");
+		await fs.mkdir(sessionDir, { recursive: true });
+		const root = SessionManager.create(directory, sessionDir);
+		root.appendMessage({ role: "user", content: "root", timestamp: 1 });
+		await root.ensureOnDisk();
+		const rootFile = root.getSessionFile()!;
+		const rootId = root.getSessionId();
+		await root.close();
+		return { rootFile, rootId };
+	}
+
+	async function openChild(childFile: string, parentFile: string): Promise<string> {
+		const child = await SessionManager.open(childFile, undefined, undefined, {
+			parentSession: parentFile,
+			authorityParent: parentFile,
+			suppressBreadcrumb: true,
+		});
+		const id = child.getSessionId();
+		await child.close();
+		return id;
+	}
+
+	it("refuses resuming a subagent transcript directly and still resumes its parent", async () => {
+		using tempDir = TempDir.createSync("@omp-session-authority-subagent-stamp-");
+		const { rootFile, rootId } = await persistedRoot(tempDir.path());
+		const childFile = path.join(tempDir.path(), "artifacts", "Probe.jsonl");
+		const childId = await openChild(childFile, rootFile);
+		expect(await diskAuthorityRoot(childFile)).toBe(await fs.realpath(rootFile));
+		const outcome = await registryDurableStateForSession(childFile, { owningSessionId: childId }).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		await closeSessionAuthority(childFile);
+		expect(outcome).toBeInstanceOf(AuthorityAdoptionRefusedError);
+		expect((outcome as AuthorityAdoptionRefusedError).command).toContain(await fs.realpath(rootFile));
+		for (const sidecar of Object.values(authorityPaths(childFile)).filter(file => file !== childFile))
+			expect(await Bun.file(sidecar).exists()).toBe(false);
+		const parent = await registryDurableStateForSession(rootFile, { owningSessionId: rootId });
+		try {
+			expect(parent.identity.backend).toBe("jsonl");
+		} finally {
+			await closeSessionAuthority(rootFile);
+		}
+	});
+
+	it("stamps a nested subagent with the top root, not its intermediate parent", async () => {
+		using tempDir = TempDir.createSync("@omp-session-authority-nested-stamp-");
+		const { rootFile } = await persistedRoot(tempDir.path());
+		const childFile = path.join(tempDir.path(), "artifacts", "Child.jsonl");
+		await openChild(childFile, rootFile);
+		const grandchildFile = path.join(tempDir.path(), "artifacts", "Child", "Grandchild.jsonl");
+		await openChild(grandchildFile, childFile);
+		expect(await diskAuthorityRoot(grandchildFile)).toBe(await fs.realpath(rootFile));
+	});
+
+	it("keeps an existing child transcript's stamp when the subagent is reopened", async () => {
+		using tempDir = TempDir.createSync("@omp-session-authority-reopen-stamp-");
+		const { rootFile } = await persistedRoot(tempDir.path());
+		const childFile = path.join(tempDir.path(), "artifacts", "Probe.jsonl");
+		await openChild(childFile, rootFile);
+		const reopened = await SessionManager.open(childFile, undefined, undefined, { suppressBreadcrumb: true });
+		await reopened.close();
+		expect(await diskAuthorityRoot(childFile)).toBe(await fs.realpath(rootFile));
 	});
 });

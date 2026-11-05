@@ -33,6 +33,8 @@ import {
 	type BrowserAuditSpawnBindingIdentity,
 } from "../src/internal/browser-audit-authority";
 import { AgentRegistry } from "../src/registry/agent-registry";
+import type { AgentLifecycleManager } from "../src/registry/agent-lifecycle";
+import { closeSessionAuthority, registryDurableStateForSession } from "../src/registry/authority";
 import type { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 import type { AgentSession } from "../src/session/agent-session";
@@ -162,11 +164,17 @@ describe("browser-audit session option custody", () => {
 		const rootManager = SessionManager.create(temp.path(), path.join(temp.path(), "root-sessions"));
 		const rootFile = rootManager.getSessionFile();
 		if (!rootFile) throw new Error("Test fixture requires a persisted root transcript");
-		const registry = AgentRegistry.isolatedForSession(rootFile);
-		const lifecycle = getAgentLifecycleManager(registry);
+		const releaseDraftCleanup = rootManager.deferDraftCleanup();
+		let lifecycle: AgentLifecycleManager | undefined;
 		let rootSession: AgentSession | undefined;
-
+		let primaryError: unknown;
+		let failed = false;
 		try {
+			await rootManager.ensureOnDisk();
+			const registry = await AgentRegistry.create({
+				durableState: await registryDurableStateForSession(rootFile, { create: true }),
+			});
+			lifecycle = getAgentLifecycleManager(registry);
 			const rootResult = await createAgentRootSession(registry, {
 				agentId: "Main",
 				agentDisplayName: "Main",
@@ -292,11 +300,49 @@ describe("browser-audit session option custody", () => {
 			expect(registry.get(spawnId)?.lineage?.generation).toBe(generation);
 			expect(revivedSession.getAllToolNames()).not.toContain("browser_audit");
 			expect(revivedSession.getToolByName("browser_audit")).toBeUndefined();
+		} catch (error) {
+			failed = true;
+			primaryError = error;
 		} finally {
-			vi.restoreAllMocks();
-			await disposeAgentLifecycle(lifecycle);
-			await rootSession?.dispose();
-			authStorage.close();
+			const errors: unknown[] = failed ? [primaryError] : [];
+			try {
+				vi.restoreAllMocks();
+			} catch (error) {
+				errors.push(error);
+			}
+			try {
+				if (lifecycle) await disposeAgentLifecycle(lifecycle);
+			} catch (error) {
+				errors.push(error);
+			}
+			try {
+				if (rootSession) await rootSession.dispose();
+				else await rootManager.close();
+			} catch (error) {
+				errors.push(error);
+			}
+			let authorityClosed = false;
+			try {
+				await closeSessionAuthority(rootFile);
+				authorityClosed = true;
+			} catch (error) {
+				errors.push(error);
+			}
+			if (authorityClosed) {
+				try {
+					await releaseDraftCleanup();
+				} catch (error) {
+					errors.push(error);
+				}
+			}
+			try {
+				authStorage.close();
+			} catch (error) {
+				errors.push(error);
+			}
+			if (errors.length === 1) throw errors[0];
+			if (errors.length > 1)
+				throw new AggregateError(errors, "Browser audit custody fixture failed and cleanup reported errors.");
 		}
 	});
 
@@ -338,8 +384,10 @@ describe("browser-audit session option custody", () => {
 		const rootManager = SessionManager.create(temp.path(), path.join(temp.path(), "root-sessions"));
 		const rootFile = rootManager.getSessionFile();
 		if (!rootFile) throw new Error("Test fixture requires a persisted root transcript");
-		const registry = AgentRegistry.isolatedForSession(rootFile);
-		const lifecycle = getAgentLifecycleManager(registry);
+		const releaseDraftCleanup = rootManager.deferDraftCleanup();
+		let lifecycle: AgentLifecycleManager | undefined;
+		let primaryError: unknown;
+		let failed = false;
 		const sessions: AgentSession[] = [];
 		const rootOptions: CreateAgentSessionOptions = {
 			...publicSessionOptions(temp.path(), authStorage, modelRegistry, model),
@@ -356,6 +404,11 @@ describe("browser-audit session option custody", () => {
 			sessionManager: SessionManager.create(temp.path(), path.join(temp.path(), "child-sessions")),
 		};
 		try {
+			await rootManager.ensureOnDisk();
+			const registry = await AgentRegistry.create({
+				durableState: await registryDurableStateForSession(rootFile, { create: true }),
+			});
+			lifecycle = getAgentLifecycleManager(registry);
 			const root = await createAgentRootSession(registry, rootOptions);
 			sessions.push(root.session);
 			await root.session.sessionManager.ensureOnDisk();
@@ -470,10 +523,52 @@ describe("browser-audit session option custody", () => {
 			sessions.push(currentParentChild.session);
 			expect(currentParentChild.session.getAllToolNames()).toContain("browser_audit");
 			expect(registry.get(spawnId)?.lineage?.generation).not.toBe(currentObservation.lineage.generation);
+		} catch (error) {
+			failed = true;
+			primaryError = error;
 		} finally {
-			await disposeAgentLifecycle(lifecycle);
-			for (const session of sessions) await session.dispose();
-			authStorage.close();
+			const errors: unknown[] = failed ? [primaryError] : [];
+			try {
+				if (lifecycle) await disposeAgentLifecycle(lifecycle);
+			} catch (error) {
+				errors.push(error);
+			}
+			for (const session of sessions) {
+				try {
+					await session.dispose();
+				} catch (error) {
+					errors.push(error);
+				}
+			}
+			if (sessions.length === 0) {
+				try {
+					await rootManager.close();
+				} catch (error) {
+					errors.push(error);
+				}
+			}
+			let authorityClosed = false;
+			try {
+				await closeSessionAuthority(rootFile);
+				authorityClosed = true;
+			} catch (error) {
+				errors.push(error);
+			}
+			if (authorityClosed) {
+				try {
+					await releaseDraftCleanup();
+				} catch (error) {
+					errors.push(error);
+				}
+			}
+			try {
+				authStorage.close();
+			} catch (error) {
+				errors.push(error);
+			}
+			if (errors.length === 1) throw errors[0];
+			if (errors.length > 1)
+				throw new AggregateError(errors, "Browser audit stale custody fixture failed and cleanup reported errors.");
 		}
 	});
 

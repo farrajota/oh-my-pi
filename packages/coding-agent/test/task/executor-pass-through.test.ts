@@ -24,7 +24,7 @@ import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import { installSessionOperationLedger } from "@oh-my-pi/pi-coding-agent/registry/operation-lease";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
@@ -157,12 +157,18 @@ function createModelRegistry(
 	} as unknown as ModelRegistry;
 }
 
+const authorityFiles = new Set<string>();
 beforeEach(async () => {
 	tempDir = TempDir.createSync("@pi-pass-through-");
-	const rootSessionFile = tempDir.join("main.jsonl");
-	await Bun.write(rootSessionFile, "");
-	registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
-	const root = await createAgentRootSession(registry, { agentId: "Main" });
+	const rootManager = SessionManager.create(tempDir.path(), tempDir.join("root-sessions"));
+	await rootManager.ensureOnDisk();
+	const rootSessionFile = rootManager.getSessionFile();
+	if (!rootSessionFile) throw new Error("Expected materialized owning root");
+	authorityFiles.add(rootSessionFile);
+	registry = await AgentRegistry.create({
+		durableState: await registryDurableStateForSession(rootSessionFile, { create: true }),
+	});
+	const root = await createAgentRootSession(registry, { agentId: "Main", sessionManager: rootManager });
 	authorityRoots.push(root.session);
 	const authority = bindInternalAgentAuthoritySession(registry, root.session);
 	if (!authority) throw new Error("Test fixture requires parent authority");
@@ -172,6 +178,8 @@ beforeEach(async () => {
 afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const root of authorityRoots.splice(0)) await root.dispose();
+	for (const file of authorityFiles) await closeSessionAuthority(file);
+	authorityFiles.clear();
 	tempDir[Symbol.dispose]();
 });
 describe("runSubprocess fresh child-session boundary", () => {

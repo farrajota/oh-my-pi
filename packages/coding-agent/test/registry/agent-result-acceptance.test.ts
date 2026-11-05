@@ -30,12 +30,12 @@ describe("AgentRegistry final-result acceptance", () => {
 		return registry.register({ id, displayName: id, kind: "sub", session, status: "running" });
 	}
 
-	it("terminalizes a settled run and stamps response, acceptance, and terminal milestones", () => {
+	it("terminalizes a settled run and stamps response, acceptance, and terminal milestones", async () => {
 		const session = sessionStub(false);
 		const ref = registerRunning("PolicyCommand", session);
 		const respondedAt = ref.createdAt + 5;
 
-		expect(markAgentResultAccepted(registry, "PolicyCommand", session, respondedAt)).toBe(true);
+		expect(await markAgentResultAccepted(registry, "PolicyCommand", session, respondedAt)).toBe(true);
 
 		const settled = registry.get("PolicyCommand");
 		expect(settled?.status).toBe("idle");
@@ -46,30 +46,30 @@ describe("AgentRegistry final-result acceptance", () => {
 		expect(registry.staleAcceptedRuns()).toEqual([]);
 	});
 
-	it("does not report a follow-up turn that produced no accepted result", () => {
+	it("does not report a follow-up turn that produced no accepted result", async () => {
 		const session = sessionStub(false);
 		const ref = registerRunning("PolicyCommand", session);
-		expect(markAgentResultAccepted(registry, "PolicyCommand", session, ref.createdAt)).toBe(true);
+		expect(await markAgentResultAccepted(registry, "PolicyCommand", session, ref.createdAt)).toBe(true);
 
 		// The next turn starts: run-scoped milestones rotate away.
-		registry.setStatus("PolicyCommand", "running", ref);
+		await registry.setStatus("PolicyCommand", "running", ref);
 
 		expect(registry.get("PolicyCommand")?.lifecycle).toBeUndefined();
 		expect(registry.staleAcceptedRuns()).toEqual([]);
 	});
 
-	it("records the current run's response and acceptance when a ref is reused", () => {
+	it("records the current run's response and acceptance when a ref is reused", async () => {
 		const session = sessionStub(false);
 		const ref = registerRunning("PolicyCommand", session);
 		const firstResponseAt = ref.createdAt + 1;
 		const secondResponseAt = ref.createdAt + 2;
 
-		expect(markAgentResultAccepted(registry, "PolicyCommand", session, firstResponseAt)).toBe(true);
+		expect(await markAgentResultAccepted(registry, "PolicyCommand", session, firstResponseAt)).toBe(true);
 		expect(registry.get("PolicyCommand")?.lifecycle?.responseAt).toBe(firstResponseAt);
 
 		// Second turn on the same ref: the first run's milestones must not leak.
-		registry.setStatus("PolicyCommand", "running", ref);
-		expect(markAgentResultAccepted(registry, "PolicyCommand", session, secondResponseAt)).toBe(true);
+		await registry.setStatus("PolicyCommand", "running", ref);
+		expect(await markAgentResultAccepted(registry, "PolicyCommand", session, secondResponseAt)).toBe(true);
 
 		const settled = registry.get("PolicyCommand");
 		expect(settled?.status).toBe("idle");
@@ -78,7 +78,7 @@ describe("AgentRegistry final-result acceptance", () => {
 		expect(settled?.lifecycle?.terminalAt).toBeNumber();
 	});
 
-	it("reports an accepted run whose turn never went idle", () => {
+	it("reports an accepted run whose turn never went idle", async () => {
 		let streaming = true;
 		const session = {
 			get isStreaming(): boolean {
@@ -88,7 +88,7 @@ describe("AgentRegistry final-result acceptance", () => {
 		const ref = registerRunning("PolicyCommand", session);
 
 		// Acceptance lands while a wake turn is still in flight: not terminal yet.
-		expect(markAgentResultAccepted(registry, "PolicyCommand", session, ref.createdAt)).toBe(true);
+		expect(await markAgentResultAccepted(registry, "PolicyCommand", session, ref.createdAt)).toBe(true);
 		expect(registry.get("PolicyCommand")?.status).toBe("running");
 		expect(registry.staleAcceptedRuns()).toEqual([]);
 
@@ -96,15 +96,15 @@ describe("AgentRegistry final-result acceptance", () => {
 		streaming = false;
 
 		expect(registry.staleAcceptedRuns().map(stale => stale.id)).toEqual(["PolicyCommand"]);
-		registry.setStatus("PolicyCommand", "idle", ref);
+		await registry.setStatus("PolicyCommand", "idle", ref);
 		expect(registry.staleAcceptedRuns()).toEqual([]);
 	});
 
-	it("ignores acceptance from a session the ref no longer owns", () => {
+	it("ignores acceptance from a session the ref no longer owns", async () => {
 		const ownedSession = sessionStub(false);
 		const ref = registerRunning("PolicyCommand", ownedSession);
 
-		expect(markAgentResultAccepted(registry, "PolicyCommand", sessionStub(false), ref.createdAt)).toBe(false);
+		expect(await markAgentResultAccepted(registry, "PolicyCommand", sessionStub(false), ref.createdAt)).toBe(false);
 		expect(registry.get("PolicyCommand")?.lifecycle?.acceptedAt).toBeUndefined();
 		expect(registry.get("PolicyCommand")?.status).toBe("running");
 	});

@@ -13,6 +13,7 @@ import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { lookupAgentRef, setAgentStatus } from "../../src/internal/agent-registry-bridge";
 import { createHubAuthorityFixture, type HubAuthorityFixture } from "./hub-fixtures";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 let authorityFixture: HubAuthorityFixture;
 
@@ -88,11 +89,11 @@ describe("wait", () => {
 
 	test("errors for a subagent whose only running work is its parent's job on it", async () => {
 		const registry = AgentRegistry.global();
-		const streaming = { isStreaming: true } as never;
+		const streaming = { ...createSessionDefaults(), isStreaming: true } as never;
 		const parent = lookupAgentRef(registry, "Main")?.session;
 		if (!parent) throw new Error("Expected wait authority fixture root");
 		Object.defineProperty(parent, "isStreaming", { value: true, configurable: true });
-		expect(setAgentStatus(registry, "Main", "running", parent)).toBe(true);
+		expect(await setAgentStatus(registry, "Main", "running", parent)).toBe(true);
 		registry.register({
 			id: "Child",
 			displayName: "Child",
@@ -299,13 +300,13 @@ describe("wait", () => {
 		const parent = await authorityFixture.createChild("Parent");
 		await authorityFixture.createChild("Child", "Parent");
 		Object.defineProperty(parent.session, "isStreaming", { value: true, configurable: true });
-		expect(setAgentStatus(registry, "Parent", "running", parent.session)).toBe(true);
+		expect(await setAgentStatus(registry, "Parent", "running", parent.session)).toBe(true);
 		registry.register({
 			id: "Sibling",
 			displayName: "Sibling",
 			kind: "sub",
 			parentId: "Parent",
-			session: { isStreaming: true } as never,
+			session: { ...createSessionDefaults(), isStreaming: true } as never,
 			status: "running",
 		});
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
@@ -342,7 +343,7 @@ describe("wait", () => {
 			expect(manager.getRunningJobs({ ownerId: "Child" })).toEqual([]);
 			vi.advanceTimersByTime(1_000);
 			const id = manager.register("bash", "late child work", async () => finalized.promise, { ownerId: "Child" });
-			expect(registry.setStatus("Sibling", "idle")).toBe(true);
+			expect(await registry.setStatus("Sibling", "idle")).toBe(true);
 			expect(await Promise.race([jobWaitInstalled.promise, waiting])).toEqual([id]);
 			vi.advanceTimersByTime(300_000);
 			finalized.resolve("child followup complete");
@@ -372,13 +373,13 @@ describe("wait", () => {
 		const parent = await authorityFixture.createChild("Parent");
 		await authorityFixture.createChild("Child", "Parent");
 		Object.defineProperty(parent.session, "isStreaming", { value: true, configurable: true });
-		expect(setAgentStatus(registry, "Parent", "running", parent.session)).toBe(true);
+		expect(await setAgentStatus(registry, "Parent", "running", parent.session)).toBe(true);
 		registry.register({
 			id: "Sibling",
 			displayName: "Sibling",
 			kind: "sub",
 			parentId: "Parent",
-			session: { isStreaming: true } as never,
+			session: { ...createSessionDefaults(), isStreaming: true } as never,
 			status: "running",
 		});
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
@@ -394,7 +395,7 @@ describe("wait", () => {
 				result => ({ result, error: undefined }),
 				error => ({ result: undefined, error }),
 			);
-			expect(registry.setStatus("Sibling", "idle")).toBe(true);
+			expect(await registry.setStatus("Sibling", "idle")).toBe(true);
 			for (let turn = 0; turn < 10; turn++) await Promise.resolve();
 			vi.advanceTimersByTime(5_000);
 			const outcome = await stopped;
@@ -418,7 +419,7 @@ describe("wait", () => {
 			displayName: "EchoPeer",
 			kind: "sub",
 			parentId: "Main",
-			session: { isStreaming: true } as never,
+			session: { ...createSessionDefaults(), isStreaming: true } as never,
 			status: "running",
 		});
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
@@ -429,7 +430,7 @@ describe("wait", () => {
 			ownerId: "Main",
 			agentId: "EchoPeer",
 		});
-		registry.setStatus("EchoPeer", "idle");
+		expect(await registry.setStatus("EchoPeer", "idle")).toBe(true);
 		finalized.resolve("followup-done");
 		const result = await waiting;
 		expect(result.details?.jobs?.[0]).toMatchObject({ id, status: "completed", resultText: "followup-done" });
@@ -438,7 +439,7 @@ describe("wait", () => {
 	test("a message-only wait hands the turn back on a growing window while its parent streams", async () => {
 		vi.useFakeTimers();
 		const registry = AgentRegistry.global();
-		const streaming = { isStreaming: true } as never;
+		const streaming = { ...createSessionDefaults(), isStreaming: true } as never;
 		// The fixture root "Main" is authority-owned and idle; a separate streaming root plays the parent.
 		registry.register({ id: "Lead", displayName: "Lead", kind: "main", session: streaming, status: "running" });
 		registry.register({
@@ -484,7 +485,7 @@ describe("wait", () => {
 			displayName: "EchoPeer",
 			kind: "sub",
 			parentId: "Main",
-			session: { isStreaming: true } as never,
+			session: { ...createSessionDefaults(), isStreaming: true } as never,
 			status: "running",
 		});
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
@@ -495,7 +496,7 @@ describe("wait", () => {
 			ownerId: "Main",
 			agentId: "EchoPeer",
 		});
-		registry.setStatus("EchoPeer", "idle");
+		expect(await registry.setStatus("EchoPeer", "idle")).toBe(true);
 		for (let turn = 0; turn < 10; turn++) await Promise.resolve();
 		// Past the top message rung: only the job-wait cap may end this wait.
 		vi.advanceTimersByTime(300_000);
@@ -507,7 +508,7 @@ describe("wait", () => {
 	test("points a message-only wait at an owner blocked in wait on its result, not at a delivery watch", async () => {
 		vi.useFakeTimers();
 		const registry = AgentRegistry.global();
-		const streaming = { isStreaming: true } as never;
+		const streaming = { ...createSessionDefaults(), isStreaming: true } as never;
 		// The fixture root "Main" is authority-owned and not streaming, so a running
 		// sibling keeps the child's message-only wait open.
 		registry.register({
@@ -558,7 +559,7 @@ describe("wait", () => {
 			displayName: "Peer",
 			kind: "sub",
 			parentId: "Main",
-			session: { isStreaming: true } as never,
+			session: { ...createSessionDefaults(), isStreaming: true } as never,
 			status: "running",
 		});
 		const waiting = new WaitTool(session()).execute("message-only", {});
@@ -704,6 +705,7 @@ describe("wait", () => {
 			const listeners = new Set<(event: { type: string }) => void>();
 			const state = { isStreaming: true, runStartedAt: 0, holdsQuestion: false };
 			const session = {
+				...createSessionDefaults(),
 				get isStreaming() {
 					return state.isStreaming;
 				},
@@ -757,10 +759,10 @@ describe("wait", () => {
 			};
 		}
 
-		function registerParentAndChild() {
+		async function registerParentAndChild() {
 			const registry = AgentRegistry.global();
 			const main = controllableMainSession();
-			expect(setAgentStatus(registry, "Main", "running", main.session)).toBe(true);
+			expect(await setAgentStatus(registry, "Main", "running", main.session)).toBe(true);
 			const child = liveSession();
 			registry.register({
 				id: "Child",
@@ -798,7 +800,7 @@ describe("wait", () => {
 		};
 
 		test("blocks for the answer to a question the caller asked", async () => {
-			const { main } = registerParentAndChild();
+			const { main } = await registerParentAndChild();
 			await ask();
 			const waiting = childWait();
 			await authorityFixture.bus.send({ from: "Main", to: "Child", body: "heliotrope" });
@@ -811,7 +813,7 @@ describe("wait", () => {
 		});
 
 		test("blocks for a second question asked in the same millisecond its first was answered", async () => {
-			registerParentAndChild();
+			await registerParentAndChild();
 			vi.spyOn(Date, "now").mockReturnValue(1_000_000);
 			await ask();
 			await authorityFixture.bus.send({ from: "Main", to: "Child", body: "heliotrope" });
@@ -824,7 +826,7 @@ describe("wait", () => {
 		});
 
 		test("ends once the agent asked starts waiting on the caller's result instead of answering", async () => {
-			registerParentAndChild();
+			await registerParentAndChild();
 			const manager = new AsyncJobManager({ onJobComplete: () => {} });
 			const childRun = registerChildJob(manager);
 			await ask();
@@ -840,7 +842,7 @@ describe("wait", () => {
 		});
 
 		test("keeps waiting while the agent asked waits on the caller or other work, whichever ends first", async () => {
-			registerParentAndChild();
+			await registerParentAndChild();
 			const manager = new AsyncJobManager({ onJobComplete: () => {} });
 			const childRun = registerChildJob(manager);
 			const build = Promise.withResolvers<string>();
@@ -856,7 +858,7 @@ describe("wait", () => {
 		});
 
 		test("ends once the agent asked finishes its turn without replying", async () => {
-			const { main } = registerParentAndChild();
+			const { main } = await registerParentAndChild();
 			await ask();
 			const waiting = childWait();
 			main.endTurn();
@@ -868,7 +870,7 @@ describe("wait", () => {
 		});
 
 		test("keeps waiting when the agent asked ends its turn still holding the question for a turn of its own", async () => {
-			const { main } = registerParentAndChild();
+			const { main } = await registerParentAndChild();
 			await ask();
 			const waiting = childWait();
 			let settled = false;
@@ -887,7 +889,7 @@ describe("wait", () => {
 		});
 
 		test("returns at once when the agent asked runs the caller inline and cannot see the question", async () => {
-			const { registry } = registerParentAndChild();
+			const { registry } = await registerParentAndChild();
 			const release = registry.awaits.hold("Main", ["Child"], { interruptible: false });
 			await ask();
 			expect(await idleText(childWait())).toContain("`Main` cannot reply before you finish");
@@ -895,7 +897,7 @@ describe("wait", () => {
 		});
 
 		test("keeps waiting for another peer when the asked agent is blocked", async () => {
-			const { registry } = registerParentAndChild();
+			const { registry } = await registerParentAndChild();
 			const peer = liveSession();
 			registry.register({
 				id: "Peer",
@@ -914,7 +916,7 @@ describe("wait", () => {
 		});
 
 		test("accepts an independent peer message after the asked agent becomes blocked", async () => {
-			const { registry } = registerParentAndChild();
+			const { registry } = await registerParentAndChild();
 			const peer = liveSession();
 			registry.register({
 				id: "Peer",
@@ -951,7 +953,7 @@ describe("wait", () => {
 
 		test("reconciles a reply becoming blocked with an independent peer without restarting the window", async () => {
 			vi.useFakeTimers();
-			const { registry } = registerParentAndChild();
+			const { registry } = await registerParentAndChild();
 			const peer = liveSession();
 			registry.register({
 				id: "Peer",
@@ -990,7 +992,7 @@ describe("wait", () => {
 		});
 
 		test("returns at once while the agent asked waits on the caller's eval handle with no timeout", async () => {
-			registerParentAndChild();
+			await registerParentAndChild();
 			const manager = new AsyncJobManager({ onJobComplete: () => {} });
 			const childRun = registerChildJob(manager);
 			const parentSession = { asyncJobManager: manager, getAgentId: () => "Main" } as unknown as ToolSession;
@@ -1002,7 +1004,7 @@ describe("wait", () => {
 		});
 
 		test("keeps waiting while the agent asked runs a timed eval handle wait on the caller", async () => {
-			registerParentAndChild();
+			await registerParentAndChild();
 			const manager = new AsyncJobManager({ onJobComplete: () => {} });
 			const childRun = registerChildJob(manager);
 			const parentSession = { asyncJobManager: manager, getAgentId: () => "Main" } as unknown as ToolSession;
@@ -1019,7 +1021,7 @@ describe("wait", () => {
 		});
 
 		test("a broadcast owes the caller no reply", async () => {
-			const { main } = registerParentAndChild();
+			const { main } = await registerParentAndChild();
 			await authorityFixture.bus.send({ from: "Child", to: "Main", body: "status: halfway", broadcast: true });
 			main.endTurn();
 			const result = await childWait();
@@ -1034,7 +1036,7 @@ describe("wait", () => {
 		});
 
 		test("a question from the caller's previous run owes no reply in the next", async () => {
-			const { child, main } = registerParentAndChild();
+			const { child, main } = await registerParentAndChild();
 			await ask();
 			child.state.runStartedAt = Date.now() + 1;
 			main.endTurn();

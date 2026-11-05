@@ -189,7 +189,8 @@ import {
 } from "./internal/agent-lifecycle-bridge";
 import { bindInternalAgentAuthoritySession } from "./internal/agent-registry-bridge";
 import { type AgentRef, type AgentReservation, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
-import { DurableLocalState } from "./registry/durable-state";
+import { journalingEnvironment } from "./registry/authority";
+import { DurableLocalState } from "./registry/authority-local";
 import { markUnregisteredSessionOperationProjection, runSessionOperation } from "./registry/operation-lease";
 import {
 	buildSecretObfuscator,
@@ -1924,6 +1925,8 @@ function snapshotCreateAgentSessionOptions(options: CreateAgentSessionOptions): 
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	// Embedders skip cli.ts, so parse both journaling variables here before any authority mutation.
+	journalingEnvironment();
 	if (options.agentReservation !== undefined || options.expectedAgentRef !== undefined) {
 		throw new Error(
 			"Agent reservation and expected-ref hints are assertion-only and cannot register a public SDK session.",
@@ -2608,7 +2611,7 @@ async function createAgentSessionScoped(
 	const agentKind = (options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? ("sub" as const) : ("main" as const);
 	const inheritedDurableLocalState = options.localProtocolOptions?.getDurableLocalState;
 	const registryDurableState = agentRegistry.getDurableStateStore();
-	let durableLocalStateId: string | undefined;
+	let durableLocalStateRootId: string | undefined;
 	let durableLocalState: DurableLocalState | undefined;
 	const getDurableLocalState = (): DurableLocalState | undefined => {
 		const inherited = inheritedDurableLocalState?.();
@@ -2617,10 +2620,10 @@ async function createAgentSessionScoped(
 		}
 		if (inherited) return inherited;
 		if (!registryDurableState) return undefined;
-		const sessionId = sessionManager.getSessionId();
-		if (!durableLocalState || durableLocalStateId !== sessionId) {
-			durableLocalStateId = sessionId;
-			durableLocalState = new DurableLocalState(registryDurableState, sessionId);
+		const rootId = registryDurableState.identity.owningSessionId;
+		if (!durableLocalState || durableLocalStateRootId !== rootId) {
+			durableLocalStateRootId = rootId;
+			durableLocalState = new DurableLocalState(registryDurableState, rootId);
 		}
 		return durableLocalState;
 	};

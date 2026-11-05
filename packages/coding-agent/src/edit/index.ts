@@ -39,6 +39,7 @@ import { approvalTargetKey } from "../tools/approval-targets";
 import { strictestApproval, truncateForPrompt } from "../tools/approval";
 import {
 	deleteFileWithFallback,
+	filesystemMutationHooks,
 	hasFileWriteFallback,
 	isPermissionDeniedError,
 	writeFileWithFallback,
@@ -55,7 +56,7 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { DEFAULT_MAX_COLUMN } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { resolveEditMode } from "../utils/edit-mode";
-import { attemptEditAutoRepair, type EditAutoRepairOutcome } from "./auto-repair";
+import { attemptEditAutoRepair, EditAutoRepairEffectError, type EditAutoRepairOutcome } from "./auto-repair";
 import { type AppliedEditSnapshot, createEditBlackboxRecorder } from "./blackbox";
 import hashlineCompactPrompt from "./hashline-compact.md" with { type: "text" };
 import { getLspBatchRequest } from "../lsp/batch";
@@ -182,17 +183,20 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 	const enableLsp = session.enableLsp ?? true;
 	const enableDiagnostics = enableLsp && cfgLspDiagnosticsOnEdit.get(session.settings);
 	const enableFormat = enableLsp && cfgLspFormatOnWrite.get(session.settings);
+	const mutationHooks = session.pathScope ? filesystemMutationHooks(session.pathScope.currentOperation()) : undefined;
 	const deduplicate = enableDiagnostics && cfgLspDiagnosticsDeduplicate.get(session.settings);
 	return enableLsp
 		? createLspWritethrough(session.cwd, {
 				enableFormat,
 				enableDiagnostics,
+				mutationHooks,
 				transformDiagnostics: deduplicate
 					? (filePath, result) => getDiagnosticsLedger(session).reduce(filePath, result)
 					: undefined,
 				requestTimeoutSec: cfgLspRequestTimeout.get(session.settings),
 			})
-		: writethroughNoop;
+		: (dst, content, signal, file, batch, getDeferred) =>
+				writethroughNoop(dst, content, signal, file, batch, getDeferred, mutationHooks);
 }
 
 function operationFromNative(op: string): Operation | undefined {
@@ -363,6 +367,8 @@ interface ScopedEditAuthorization {
 	readTargets: Map<string, AuthorizedFilesystemTarget>;
 	sourcePaths: ReadonlySet<string>;
 	snapshotPaths: readonly string[];
+	/** Unrestricted move destinations whose parent does not exist yet, keyed to their canonical path. */
+	unparentedDestinations: ReadonlyMap<string, string>;
 	sourceSnapshots: EditSourceSnapshot[];
 	sourceSnapshotBytes: Map<string, Uint8Array>;
 }
@@ -396,6 +402,27 @@ function sloppySectionEntries(args: unknown): Array<{ path: string; digest: stri
 		entries.push({ path: target, digest: `«\n${find}\n»\n${put}` });
 	}
 	return entries;
+}
+
+/**
+ * The canonical path of `target` when its parent directory does not exist yet: the nearest
+ * existing ancestor's real path joined with the missing segments. Undefined when the parent exists.
+ */
+async function canonicalPathUnderMissingParent(target: string): Promise<string | undefined> {
+	const missing: string[] = [path.basename(target)];
+	let current = path.dirname(target);
+	for (;;) {
+		try {
+			const real = await fs.realpath(current);
+			return missing.length === 1 ? undefined : path.join(real, ...missing.reverse());
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		const parent = path.dirname(current);
+		if (parent === current) throw new Error(`Filesystem path has no existing ancestor: ${target}`);
+		missing.push(path.basename(current));
+		current = parent;
+	}
 }
 
 async function editPathKey(session: ToolSession, target: string, signal?: AbortSignal): Promise<string> {
@@ -548,7 +575,7 @@ export class EditTool implements AgentTool<TInput> {
 		existing?.native.close();
 		this.#sessions.delete(init.toolCallId);
 		this.#streamedArgs.delete(init.toolCallId);
-		if (this.session.pathScope?.isRestricted) {
+		if (this.session.pathScope) {
 			// Native streaming previews may read source files before the complete
 			// payload can be authorized. Restricted sessions defer native parsing
 			// until execute() has preflighted every inspected target.
@@ -603,7 +630,7 @@ export class EditTool implements AgentTool<TInput> {
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
 		let open = this.#sessions.get(toolCallId);
 		const argsJson = JSON.stringify(params);
-		if (open && (this.session.pathScope?.isRestricted || this.#streamedArgs.get(toolCallId) !== argsJson)) {
+		if (open && (this.session.pathScope || this.#streamedArgs.get(toolCallId) !== argsJson)) {
 			open.native.close();
 			this.#sessions.delete(toolCallId);
 			open = undefined;
@@ -614,8 +641,9 @@ export class EditTool implements AgentTool<TInput> {
 		const batch = getLspBatchRequest(context?.toolCall);
 		let authorization: ScopedEditAuthorization | undefined;
 		let outcome;
+		const callbackOutcome: { failure?: { error: unknown } } = {};
 		try {
-			if (this.session.pathScope?.isRestricted) {
+			if (this.session.pathScope) {
 				authorization = await this.#authorizeInspection(params, signal);
 				authorization.sourceSnapshots = await this.#snapshotSources(authorization, signal);
 			}
@@ -631,14 +659,42 @@ export class EditTool implements AgentTool<TInput> {
 			if (authorization) throwIfAborted(signal);
 			outcome = await editSession.apply(
 				{ lspBatchId: batch?.id, lspFlush: batch?.flush ?? false },
-				(_error, request) => this.#write(request, signal, authorization),
+				async (_error, request) => {
+					try {
+						return await this.#write(request, signal, authorization);
+					} catch (error) {
+						if (this.session.pathScope) callbackOutcome.failure = { error };
+						throw error;
+					}
+				},
 			);
+			if (callbackOutcome.failure) throw callbackOutcome.failure.error;
 			if (!this.session.pathScope?.isRestricted && outcome.isError && batch?.flush) {
-				await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
+				await flushLspWritethroughBatch(
+					batch.id,
+					this.session.cwd,
+					signal,
+					this.session.pathScope ? filesystemMutationHooks(this.session.pathScope.currentOperation()) : undefined,
+				);
 			}
 		} catch (error) {
-			if (!this.session.pathScope?.isRestricted && batch?.flush)
-				await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
+			if (!this.session.pathScope?.isRestricted && batch?.flush) {
+				try {
+					await flushLspWritethroughBatch(
+						batch.id,
+						this.session.cwd,
+						signal,
+						this.session.pathScope
+							? filesystemMutationHooks(this.session.pathScope.currentOperation())
+							: undefined,
+					);
+				} catch (flushError) {
+					throw new AggregateError(
+						[error, flushError],
+						"Edit failed and pending LSP batch disposition did not complete.",
+					);
+				}
+			}
 			throw error;
 		} finally {
 			editSession?.close();
@@ -676,7 +732,7 @@ export class EditTool implements AgentTool<TInput> {
 			const display = path.relative(this.session.cwd, snapshot.path) || snapshot.path;
 			let repaired: EditAutoRepairOutcome | undefined;
 			try {
-				// Auto-repair performs its own path reads and writes without an operation proof.
+				// Restricted repair remains disabled; ordinary repair uses the live invocation's read/write proof.
 				if (!this.session.pathScope?.isRestricted) {
 					repaired = await attemptEditAutoRepair({
 						session: this.session,
@@ -687,6 +743,7 @@ export class EditTool implements AgentTool<TInput> {
 					if (repaired) getEditStore(this.session).invalidate(snapshot.path);
 				}
 			} catch (error) {
+				if (error instanceof EditAutoRepairEffectError) throw error.cause;
 				logger.warn("Edit auto-repair failed", {
 					path: snapshot.path,
 					error: error instanceof Error ? error.message : String(error),
@@ -745,6 +802,7 @@ export class EditTool implements AgentTool<TInput> {
 		const sourcePaths = new Set<string>();
 		const writePaths = new Set<string>();
 		const deletePaths = new Set<string>();
+		const unparentedDestinations = new Map<string, string>();
 		const addSourcePath = async (rawPath: string): Promise<void> => {
 			if (!rawPath.trim()) {
 				throw new ToolError("Native edit path inspection returned an empty source path.");
@@ -767,7 +825,12 @@ export class EditTool implements AgentTool<TInput> {
 				if (typeof fileOp.to !== "string" || !fileOp.to.trim()) {
 					throw new ToolError("Native edit move inspection omitted its destination path.");
 				}
-				writePaths.add(await editPathKey(this.session, fileOp.to, signal));
+				const destination = await editPathKey(this.session, fileOp.to, signal);
+				// Unrestricted moves create missing parent directories and authorize the destination at
+				// effect time; only a restricted (scoped) write needs its destination preflighted here.
+				const unparented = scope.isRestricted ? undefined : await canonicalPathUnderMissingParent(destination);
+				if (unparented === undefined) writePaths.add(destination);
+				else unparentedDestinations.set(destination, unparented);
 			}
 		}
 		if (writePaths.size === 0) {
@@ -835,6 +898,7 @@ export class EditTool implements AgentTool<TInput> {
 			readTargets,
 			sourcePaths,
 			snapshotPaths: writePathList,
+			unparentedDestinations,
 			sourceSnapshots: [],
 			sourceSnapshotBytes: new Map(),
 		};
@@ -880,6 +944,9 @@ export class EditTool implements AgentTool<TInput> {
 				exists: proof.existed,
 				...(bytes === undefined ? {} : { bytes }),
 			});
+		}
+		for (const [target, canonicalPath] of authorization.unparentedDestinations) {
+			snapshots.push({ path: target, canonicalPath, exists: false });
 		}
 		return snapshots;
 	}
@@ -1109,14 +1176,24 @@ export class EditTool implements AgentTool<TInput> {
 		signal?: AbortSignal,
 		authorization?: ScopedEditAuthorization,
 	): Promise<EditWriteResponse> {
-		if (authorization) return this.#writeScoped(request, signal, authorization);
+		if (authorization && this.session.pathScope?.isRestricted)
+			return this.#writeScoped(request, signal, authorization);
+		const operation = this.session.pathScope?.currentOperation();
+		const mutationHooks = operation ? filesystemMutationHooks(operation) : undefined;
+		if (authorization && request.op !== "create")
+			await this.#assertSourceSnapshotCurrent(authorization, request.path, signal);
 		if (this.session.pathScope?.isRestricted) {
 			throw new ToolError("Restricted edit callback has no preflighted filesystem authorization.", {
 				path: request.path,
 			});
 		}
 		if (request.op === "delete") {
-			await deleteFileWithFallback(request.path, Bun.file(request.path));
+			if (operation) {
+				const target = await operation.authorize(request.path, "delete");
+				await operation.withResourceEffects([target], "filesystem", () =>
+					deleteFileWithFallback(request.path, Bun.file(request.path)),
+				);
+			} else await deleteFileWithFallback(request.path, Bun.file(request.path));
 			if (this.session.enableLsp ?? true) {
 				await notifyWorkspaceWatchedFiles(
 					this.session.cwd,
@@ -1128,7 +1205,7 @@ export class EditTool implements AgentTool<TInput> {
 			this.session.bumpFileMutationVersion?.(request.path);
 			const diagnostics =
 				request.flushLsp && request.lspBatchId
-					? await flushLspWritethroughBatch(request.lspBatchId, this.session.cwd, signal)
+					? await flushLspWritethroughBatch(request.lspBatchId, this.session.cwd, signal, mutationHooks)
 					: undefined;
 			return {
 				written: "",
@@ -1145,10 +1222,23 @@ export class EditTool implements AgentTool<TInput> {
 				throw new ToolError("Native edit move request omitted destination", { path: request.path });
 			}
 			const mode = await movedFileMode(request.path);
-			await mkdirAllowingFallback(path.dirname(request.moveTo));
-			await writeFileWithFallback(request.moveTo, request.content);
-			if (mode !== undefined) await chmodMovedFile(request.moveTo, mode);
-			await deleteFileWithFallback(request.path, Bun.file(request.path));
+			if (operation) await operation.createDirectories(path.dirname(request.moveTo));
+			else await mkdirAllowingFallback(path.dirname(request.moveTo));
+			await writeFileWithFallback(request.moveTo, request.content, undefined, mutationHooks, signal);
+			if (mode !== undefined) {
+				if (operation)
+					await operation.withResourceEffects(
+						[await operation.authorize(request.moveTo, "write")],
+						"filesystem",
+						() => chmodMovedFile(request.moveTo!, mode),
+					);
+				else await chmodMovedFile(request.moveTo, mode);
+			}
+			if (operation)
+				await operation.withResourceEffects([await operation.authorize(request.path, "delete")], "filesystem", () =>
+					deleteFileWithFallback(request.path, Bun.file(request.path)),
+				);
+			else await deleteFileWithFallback(request.path, Bun.file(request.path));
 			if (this.session.enableLsp ?? true) {
 				await notifyWorkspaceWatchedFiles(
 					this.session.cwd,
@@ -1164,7 +1254,7 @@ export class EditTool implements AgentTool<TInput> {
 			this.session.bumpFileMutationVersion?.(request.moveTo);
 			const diagnostics =
 				request.flushLsp && request.lspBatchId
-					? await flushLspWritethroughBatch(request.lspBatchId, this.session.cwd, signal)
+					? await flushLspWritethroughBatch(request.lspBatchId, this.session.cwd, signal, mutationHooks)
 					: undefined;
 			return {
 				written: request.content,
@@ -1178,20 +1268,31 @@ export class EditTool implements AgentTool<TInput> {
 			request.path,
 			request.content,
 			signal,
+			mutationHooks,
 		);
-		if (bridge) return { written: bridge.text };
+		if (bridge) {
+			const diagnostics =
+				request.flushLsp && request.lspBatchId
+					? await flushLspWritethroughBatch(request.lspBatchId, this.session.cwd, signal, mutationHooks)
+					: undefined;
+			return { written: bridge.text, diagnosticsJson: diagnostics ? JSON.stringify(diagnostics) : undefined };
+		}
 
 		// The pre-image is the only way to tell "the write never landed" from
 		// "something else rewrote the file"; a stat cannot (coarse mtimes).
 		let preWriteBytes: Uint8Array | undefined;
 		if (request.op === "update") {
 			try {
-				preWriteBytes = await Bun.file(request.path).bytes();
+				if (mutationHooks?.readText) {
+					const text = await mutationHooks.readText(request.path);
+					preWriteBytes = text === undefined ? undefined : Buffer.from(text, "utf8");
+				} else preWriteBytes = await Bun.file(request.path).bytes();
 			} catch (error) {
 				if (!isEnoent(error)) throw error;
 			}
 		} else if (request.op === "create") {
-			await mkdirAllowingFallback(path.dirname(request.path));
+			if (operation) await operation.createDirectories(path.dirname(request.path));
+			else await mkdirAllowingFallback(path.dirname(request.path));
 		}
 
 		// `begin()` claims this mutation's version; only bump when the writethrough
@@ -1216,7 +1317,10 @@ export class EditTool implements AgentTool<TInput> {
 			// requested content is only encoded when disk really is unchanged.
 			let postWriteBytes: Uint8Array | undefined;
 			try {
-				postWriteBytes = await Bun.file(request.path).bytes();
+				if (mutationHooks?.readText) {
+					const text = await mutationHooks.readText(request.path);
+					postWriteBytes = text === undefined ? undefined : Buffer.from(text, "utf8");
+				} else postWriteBytes = await Bun.file(request.path).bytes();
 			} catch (error) {
 				if (!isEnoent(error)) throw error;
 			}

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
-import path from "node:path";
+import * as path from "node:path";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
@@ -29,7 +29,7 @@ import {
 	resetAgentLifecycleForTests,
 } from "../../src/internal/agent-lifecycle-bridge";
 import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -50,6 +50,7 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { __resetDirsFromEnvForTests, getAgentDir, removeWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
@@ -60,6 +61,7 @@ let createAuthoritySession: NonNullable<ToolSession["createAuthoritySession"]>;
 let tempDir: TempDir | undefined;
 let previousAgentDir: string | undefined;
 let rootArtifactDirs: string[];
+const authorityFiles = new Set<string>();
 
 beforeEach(async () => {
 	resetAgentLifecycleForTests();
@@ -68,12 +70,18 @@ beforeEach(async () => {
 	previousAgentDir = getAgentDir();
 	const agentDir = tempDir.join("agent");
 	setAgentDir(agentDir);
-	const rootSessionFile = tempDir.join("main.jsonl");
-	await Bun.write(rootSessionFile, "");
-	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
+	const rootManager = SessionManager.create(tempDir.path(), tempDir.join("root-sessions"));
+	await rootManager.ensureOnDisk();
+	const rootSessionFile = rootManager.getSessionFile();
+	if (!rootSessionFile) throw new Error("Expected materialized owning root");
+	authorityFiles.add(rootSessionFile);
+	const registry = await AgentRegistry.create({
+		durableState: await registryDurableStateForSession(rootSessionFile, { create: true }),
+	});
 	AgentRegistry.installGlobal(registry);
 	const root = await createAgentRootSession(registry, {
 		agentId: "Main",
+		sessionManager: rootManager,
 		cwd: tempDir.path(),
 		agentDir,
 		settings: Settings.isolated(),
@@ -176,6 +184,8 @@ afterEach(async () => {
 	resetAgentLifecycleForTests();
 	try {
 		await authorityRoot?.dispose();
+		for (const file of authorityFiles) await closeSessionAuthority(file);
+		authorityFiles.clear();
 	} finally {
 		authorityRoot = undefined;
 		try {
@@ -1351,6 +1361,8 @@ describe("agent frontmatter structured opt-in", () => {
 	beforeEach(async () => {
 		await disposeAgentLifecycle(getAgentLifecycleManager(AgentRegistry.global()));
 		await authorityRoot?.dispose();
+		for (const file of authorityFiles) await closeSessionAuthority(file);
+		authorityFiles.clear();
 		authorityRoot = undefined;
 		AgentStorage.close();
 		closeModelCache();
@@ -1368,12 +1380,18 @@ describe("agent frontmatter structured opt-in", () => {
 		vi.spyOn(os, "homedir").mockReturnValue(home);
 		__resetDirsFromEnvForTests();
 		setAgentDir(agentDir);
-		const rootSessionFile = path.join(root, "main.jsonl");
-		await Bun.write(rootSessionFile, "");
-		const registry = new AgentRegistry({ durableState: registryDurableStateForSession(rootSessionFile) });
+		const rootManager = SessionManager.create(cwd, path.join(root, "root-sessions"));
+		await rootManager.ensureOnDisk();
+		const rootSessionFile = rootManager.getSessionFile();
+		if (!rootSessionFile) throw new Error("Expected materialized owning root");
+		authorityFiles.add(rootSessionFile);
+		const registry = await AgentRegistry.create({
+			durableState: await registryDurableStateForSession(rootSessionFile, { create: true }),
+		});
 		AgentRegistry.installGlobal(registry);
 		const parent = await createAgentRootSession(registry, {
 			agentId: "Main",
+			sessionManager: rootManager,
 			cwd,
 			agentDir,
 			settings: Settings.isolated(),
@@ -1389,6 +1407,8 @@ describe("agent frontmatter structured opt-in", () => {
 		await disposeAgentLifecycle(getAgentLifecycleManager(AgentRegistry.global()));
 		try {
 			await authorityRoot?.dispose();
+			for (const file of authorityFiles) await closeSessionAuthority(file);
+			authorityFiles.clear();
 		} finally {
 			authorityRoot = undefined;
 			resetAgentLifecycleForTests();

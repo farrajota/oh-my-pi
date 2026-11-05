@@ -17,6 +17,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 const ATTRIBUTION_OWNER = "vibe-parent";
 
@@ -96,7 +97,7 @@ describe("vibe_send attribution", () => {
 		const registry = VibeSessionRegistry.global();
 		const spawned = await registry.spawn(parent, { cli: "fast", prompt: "initial work" });
 		const steer = vi.fn(async () => {});
-		const live = { isStreaming: true, steer } as unknown as AgentSession;
+		const live = { ...createSessionDefaults(), isStreaming: true, steer } as unknown as AgentSession;
 		AgentRegistry.global().register({
 			id: spawned.id,
 			displayName: spawned.id,
@@ -123,7 +124,7 @@ describe("vibe_send attribution", () => {
 		const registry = VibeSessionRegistry.global();
 		const spawned = await registry.spawn(parent, { cli: "fast", prompt: "initial work" });
 		const steer = vi.fn(async () => {});
-		const live = { isStreaming: false, steer } as unknown as AgentSession;
+		const live = { ...createSessionDefaults(), isStreaming: false, steer } as unknown as AgentSession;
 		AgentRegistry.global().register({
 			id: spawned.id,
 			displayName: spawned.id,

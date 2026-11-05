@@ -247,7 +247,9 @@ async function runResolveInvocation(
 			}
 			if (error instanceof ToolError) throw error;
 			const message = error instanceof Error ? error.message : String(error);
-			throw new ToolError(`Apply failed: ${message}`);
+			const failure = new ToolError(`Apply failed: ${message}`);
+			failure.cause = error;
+			throw failure;
 		}
 		return {
 			...result,

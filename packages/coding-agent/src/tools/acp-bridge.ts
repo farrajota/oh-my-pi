@@ -13,8 +13,9 @@ import { FileChangeType, notifyWorkspaceWatchedFiles } from "../lsp/client";
 import type { ToolSession } from ".";
 import { invalidateFsScanAfterWrite } from "./fs-cache-invalidation";
 import { resolvePlanPath, targetsLocalSandbox } from "./plan-mode-guard";
+import { isEnoent } from "@oh-my-pi/pi-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-
+import { filesystemMutationHooks, isPermissionDeniedError, type FileWriteMutationHooks } from "./file-write-fallback";
 /**
  * Return `true` when an ACP client bridge write is appropriate for this path.
  *
@@ -81,20 +82,33 @@ export async function routeWriteThroughBridge(
 	absolutePath: string,
 	content: string,
 	signal?: AbortSignal,
+	mutationHooks?: FileWriteMutationHooks,
 ): Promise<BridgeWriteResult | undefined> {
 	const bridge = session.getClientBridge?.();
-	if (!bridge?.capabilities.writeTextFile || !bridge.writeTextFile) return undefined;
+	const writeTextFile = bridge?.writeTextFile;
+	if (!bridge?.capabilities.writeTextFile || !writeTextFile) return undefined;
 	if (!(await shouldRouteWriteThroughBridge(session, requestedPath, absolutePath))) return undefined;
+	mutationHooks ??= session.pathScope ? filesystemMutationHooks(session.pathScope.currentOperation()) : undefined;
 
 	const changeType = (await Bun.file(absolutePath).exists()) ? FileChangeType.Changed : FileChangeType.Created;
 	// The ACP protocol has no cancellation for fs writes; the most we can do is
 	// refuse to start one after the tool was aborted. Racing the promise would
 	// report failure while the editor still applies the write.
 	signal?.throwIfAborted();
-	try {
-		await bridge.writeTextFile({ path: absolutePath, content });
-	} catch (error) {
-		throw new ToolError(error instanceof Error ? error.message : String(error));
+	const write = async () => {
+		await mutationHooks?.beforeWrite?.();
+		mutationHooks?.assertActive?.();
+		signal?.throwIfAborted();
+		try {
+			await writeTextFile({ path: absolutePath, content });
+		} catch (error) {
+			throw new ToolError(error instanceof Error ? error.message : String(error));
+		}
+	};
+	if (mutationHooks?.withResourceEffect) {
+		await mutationHooks.withResourceEffect(absolutePath, write);
+	} else {
+		await write();
 	}
 	if (session.enableLsp ?? true) {
 		await notifyWorkspaceWatchedFiles(session.cwd, [{ filePath: absolutePath, type: changeType }], signal);
@@ -102,24 +116,18 @@ export async function routeWriteThroughBridge(
 	invalidateFsScanAfterWrite(absolutePath);
 	session.bumpFileMutationVersion?.(absolutePath);
 
-	// Best-effort verification: the client already flushed the write (that's
-	// the whole point of `fs/write_text_file`), so the file on disk reflects
-	// whatever the client actually persisted, formatter and all. If the
-	// read-back itself fails, fall back to trusting `content` rather than
-	// failing an otherwise-successful write. This is a best-effort signal,
-	// not a guarantee: ACP defines no ordering between a client acking the
-	// write and its own async format-on-save settling, so a client that acks
-	// before its formatter runs will look verbatim here. That degrades to
-	// the pre-fix behavior for THIS write, but never corrupts state: the
-	// next `readText` still observes whatever the client eventually settles
-	// on, and a real desync there surfaces as an honest stale-tag error
-	// instead of a silently wrong tag.
+	// Only physical unreadability permits trusting the broker's committed content: the client may
+	// persist outside this process's view (absent or unreadable locally). Authority admission and
+	// durable close failures must remain observable.
 	let actualText = content;
-	try {
-		actualText = await Bun.file(absolutePath).text();
-	} catch {
-		// Unreadable right after a reported-successful write; nothing more we
-		// can verify here.
+	if (mutationHooks?.readText) {
+		actualText = (await mutationHooks.readText(absolutePath)) ?? content;
+	} else {
+		try {
+			actualText = await Bun.file(absolutePath).text();
+		} catch (error) {
+			if (!isPermissionDeniedError(error) && !isEnoent(error)) throw error;
+		}
 	}
 	return { text: actualText, driftedFromRequest: actualText !== content };
 }

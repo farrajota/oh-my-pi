@@ -27,6 +27,7 @@ import {
 	setAgentStatus,
 } from "../../src/internal/agent-registry-bridge";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -52,6 +53,7 @@ let savedEnv: Record<string, string | undefined> = {};
 let root: string;
 let lifecycle: AgentLifecycleManager | undefined;
 let rootSession: AgentSession | undefined;
+let authorityFile: string | undefined;
 
 function restoreEnvValue(key: string, value: string | undefined): void {
 	if (value === undefined) {
@@ -82,6 +84,8 @@ afterEach(async () => {
 	lifecycle = undefined;
 	await rootSession?.dispose();
 	rootSession = undefined;
+	if (authorityFile) await closeSessionAuthority(authorityFile);
+	authorityFile = undefined;
 	resetAgentLifecycleForTests();
 	AgentRegistry.resetGlobalForTests();
 	AsyncJobManager.setInstance(undefined);
@@ -103,6 +107,7 @@ it("revives a subagent a crash cut off mid tool call, runs the call again, and d
 	// The main session and its subagent's transcript, as the process left them when it died
 	// inside the subagent's `read` call: no tool result, no exit record.
 	const main = SessionManager.create(cwd, path.join(root, "sessions"));
+	await main.ensureOnDisk();
 	const mainFile = main.getSessionFile();
 	if (!mainFile) throw new Error("Expected a persisted session file");
 	const loadedPermissions = await loadPermissionProfiles(cwd);
@@ -181,7 +186,10 @@ it("revives a subagent a crash cut off mid tool call, runs the call again, and d
 		"advisor.enabled": false,
 		modelRoles: { default: "mock/mock-model" },
 	});
-	const agentRegistry = AgentRegistry.isolatedForSession(mainFile);
+	authorityFile = mainFile;
+	const agentRegistry = await AgentRegistry.create({
+		durableState: await registryDurableStateForSession(mainFile, { create: true }),
+	});
 	AgentRegistry.installGlobal(agentRegistry);
 	const { session } = await createAgentRootSession(agentRegistry, {
 		agentId: MAIN_AGENT_ID,
@@ -234,10 +242,11 @@ it("revives a subagent a crash cut off mid tool call, runs the call again, and d
 			enableMCP: true,
 		});
 		parkedFixtureSession = childSession;
-		if (!setAgentStatus(agentRegistry, AGENT_ID, "idle", childSession))
+		if (!(await setAgentStatus(agentRegistry, AGENT_ID, "idle", childSession)))
 			throw new Error("Expected the persisted child authority fixture.");
 		const childRef = lookupAgentRef(agentRegistry, AGENT_ID);
-		if (!childRef || !parkAgentRef(agentRegistry, childRef, childSession))
+		// Park owns the parked session's disposal; hand it the writer close so no exit record is appended.
+		if (!childRef || !(await parkAgentRef(agentRegistry, childRef, childSession, () => reopened.close())))
 			throw new Error("Expected the persisted child authority fixture to be parked.");
 	} finally {
 		await reopened.close();

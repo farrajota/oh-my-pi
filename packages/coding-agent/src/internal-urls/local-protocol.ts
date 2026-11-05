@@ -15,8 +15,8 @@ import {
 	canonicalDurableSha256,
 	durableBackingSha256,
 	type DurableLocalBackingExpectation,
-	type DurableLocalState,
 } from "../registry/durable-state";
+import { DurableLocalState } from "../registry/authority-local";
 import localDoc from "../prompts/internal-urls/local.md" with { type: "text" };
 import { isMarkdownPath } from "@oh-my-pi/pi-tui/lang-from-path";
 import {
@@ -38,6 +38,7 @@ import type {
 	UrlCompletion,
 	WriteContext,
 } from "./types";
+import type { FileWriteMutationHooks } from "../tools/file-write-fallback";
 import { formatByteSize } from "../utils/video";
 
 export interface LocalProtocolOptions {
@@ -257,10 +258,18 @@ async function listFilesRecursively(rootPath: string, options?: LocalProtocolOpt
 		const relativeDir = pending.pop();
 		if (relativeDir === undefined) continue;
 		const absoluteDir = path.join(rootPath, relativeDir);
-		const directoryTarget = operation ? await operation.authorize(absoluteDir, "list") : undefined;
+		const directoryTarget =
+			operation && expectedRoot ? await operation.authorizeLocal(absoluteDir, "list") : undefined;
+		if (directoryTarget && expectedRoot) {
+			const canonicalRoot = await fs.realpath(expectedRoot);
+			ensureWithinRoot(directoryTarget.canonicalTarget, canonicalRoot, "local");
+			if (directoryTarget.canonicalTarget !== canonicalRoot)
+				ensureWithinRoot(directoryTarget.canonicalParent, canonicalRoot, "local");
+		}
 		const directoryHandle = directoryTarget ? await operation!.openRead(directoryTarget, "local") : undefined;
 		try {
-			const entries = await fs.readdir(absoluteDir, { withFileTypes: true });
+			const entries = await fs.readdir(directoryTarget?.canonicalTarget ?? absoluteDir, { withFileTypes: true });
+			if (directoryTarget) await operation!.verify(directoryTarget);
 			if (options && expectedRoot) assertLocalRootCurrent(options, expectedRoot);
 
 			for (const entry of entries) {
@@ -268,7 +277,12 @@ async function listFilesRecursively(rootPath: string, options?: LocalProtocolOpt
 				const absoluteEntry = path.join(rootPath, entryPath);
 				if (operation) {
 					try {
-						await operation.authorize(absoluteEntry, entry.isDirectory() ? "list" : "search");
+						await authorizeLocalTarget(
+							operation,
+							absoluteEntry,
+							entry.isDirectory() ? "list" : "search",
+							await fs.realpath(expectedRoot!),
+						);
 					} catch {
 						continue;
 					}
@@ -298,7 +312,14 @@ async function buildListing(
 	localRoot: string,
 	options?: LocalProtocolOptions,
 ): Promise<InternalResource> {
-	const files = await listFilesRecursively(localRoot, options);
+	const rootExists = await fs.lstat(localRoot).then(
+		() => true,
+		error => {
+			if (isEnoent(error)) return false;
+			throw error;
+		},
+	);
+	const files = rootExists ? await listFilesRecursively(localRoot, options) : [];
 	const listing = files.length === 0 ? "(empty)" : files.map(file => `- [${file}](local://${file})`).join("\n");
 	const content =
 		`# Local\n\n` +
@@ -489,19 +510,16 @@ async function resolveLocalTarget(url: InternalUrl, opts: LocalProtocolOptions):
 	const localRoot = path.resolve(resolveLocalRoot(opts));
 	const operation = currentLocalOperation(opts);
 	if (operation) await operation.authorizeLocal(localRoot, "probe");
-	await fs.mkdir(localRoot, { recursive: true });
-	assertLocalRootCurrent(opts, localRoot);
-
+	const relativePath = extractRelativePath(url);
 	let resolvedRoot: string;
 	try {
 		resolvedRoot = await fs.realpath(localRoot);
 	} catch (error) {
-		if (isEnoent(error)) throw new Error("Unable to initialize local:// root");
-		throw error;
+		if (!isEnoent(error)) throw error;
+		if (!relativePath) return { kind: "listing", root: localRoot };
+		throw new Error(`Local file not found: ${url.href}`);
 	}
 	assertLocalRootCurrent(opts, localRoot);
-
-	const relativePath = extractRelativePath(url);
 	const targetPath = relativePath ? path.resolve(resolvedRoot, relativePath) : resolvedRoot;
 	ensureWithinRoot(targetPath, resolvedRoot, "local", url.href);
 
@@ -570,10 +588,136 @@ async function locateLocalTarget(
 	return (await containedRealPath(underRealRoot, realRoot, "local", url.href)) ?? null;
 }
 
+function pathWithinOrAncestor(candidate: string, root: string): boolean {
+	const relativeToRoot = path.relative(root, candidate);
+	const relativeToCandidate = path.relative(candidate, root);
+	const isRelativeChild = (relative: string) =>
+		relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+	return isRelativeChild(relativeToRoot) || isRelativeChild(relativeToCandidate);
+}
+
+async function canonicalPathForCreation(filePath: string): Promise<string> {
+	const tail: string[] = [];
+	for (let current = path.resolve(filePath); ; current = path.dirname(current)) {
+		try {
+			return path.join(await fs.realpath(current), ...tail);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		try {
+			await fs.lstat(current);
+			throw new Error("local:// path goes through an unresolved filesystem entry");
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		const parent = path.dirname(current);
+		if (parent === current) throw new Error("local:// path has no canonical filesystem ancestor");
+		tail.unshift(path.basename(current));
+	}
+}
+
+async function createLocalParentDirectories(
+	operation: FilesystemOperation,
+	targetPath: string,
+	localRoot: string,
+	options: LocalProtocolOptions,
+): Promise<void> {
+	const missing: string[] = [];
+	let current = path.dirname(targetPath);
+	for (;;) {
+		let exists = false;
+		let isDirectory = false;
+		try {
+			const stat = await fs.stat(current);
+			exists = true;
+			isDirectory = stat.isDirectory();
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		operation.assertActive();
+		if (exists) {
+			if (!isDirectory) throw new Error(`local:// parent is not a directory: ${current}`);
+			break;
+		}
+		missing.push(current);
+		const parent = path.dirname(current);
+		if (parent === current) throw new Error("local:// parent directory could not be created");
+		current = parent;
+	}
+
+	const canonicalRoot = await canonicalPathForCreation(localRoot);
+	for (const directory of missing.reverse()) {
+		const canonicalDirectory = await canonicalPathForCreation(directory);
+		if (!pathWithinOrAncestor(canonicalDirectory, canonicalRoot))
+			throw new Error("local:// directory creation would leave the session-local root");
+		const target = await operation.authorizeLocal(directory, "create");
+		operation.assertActive();
+		assertLocalRootCurrent(options, localRoot);
+		if (target.canonicalTarget !== canonicalDirectory)
+			throw new Error("local:// parent changed after directory authorization");
+		await operation.createDirectory(target, "local");
+		assertLocalRootCurrent(options, localRoot);
+	}
+}
+
+async function validateLocalBacking(
+	options: LocalProtocolOptions,
+	localRoot: string,
+	expectation: DurableLocalBackingExpectation,
+	currentEntryId: string,
+	targetPath: string,
+): Promise<boolean> {
+	assertLocalRootCurrent(options, localRoot);
+	const operation = currentLocalOperation(options);
+	const readBacking = async (filePath: string): Promise<boolean> => {
+		try {
+			const target = operation
+				? await authorizeLocalTarget(operation, filePath, "read", await fs.realpath(localRoot))
+				: undefined;
+			const handle = target ? await operation!.openRead(target, "local") : undefined;
+			try {
+				const bytes = handle ? await handle.readFile() : await fs.readFile(filePath);
+				const valid = durableBackingSha256(bytes) === expectation.entryHash;
+				assertLocalRootCurrent(options, localRoot);
+				return valid;
+			} finally {
+				await handle?.close();
+			}
+		} catch (error) {
+			if (isEnoent(error)) return false;
+			throw error;
+		}
+	};
+	if (expectation.entryId === currentEntryId) {
+		return readBacking(targetPath);
+	}
+	const entries = await listFilesRecursively(localRoot, options);
+	assertLocalRootCurrent(options, localRoot);
+	const localId = safeSessionId(options);
+	for (const name of entries) {
+		const encodedUrl = `local://${name
+			.split("/")
+			.map(segment => encodeURIComponent(segment))
+			.join("/")}`;
+		for (const candidateUrl of [`local://${name}`, encodedUrl]) {
+			let href: string;
+			try {
+				href = parseInternalUrl(candidateUrl).href;
+			} catch {
+				continue;
+			}
+			if (canonicalDurableSha256({ localId, url: href }) !== expectation.entryId) continue;
+			return readBacking(path.join(localRoot, name));
+		}
+	}
+	return false;
+}
+
 interface PreparedLocalFileWrite {
 	path: string;
 	authorizedTarget?: AuthorizedFilesystemTarget;
 	durable: boolean;
+	mutationHooks?: FileWriteMutationHooks;
 	commit<T>(content: string, effect: () => Promise<T>): Promise<T>;
 }
 
@@ -586,59 +730,152 @@ export async function prepareLocalFileWrite(url: InternalUrl, context?: WriteCon
 	if (targetPath === localRoot) throw new Error("local:// root is not a writable file");
 	ensureWithinRoot(targetPath, localRoot, "local", url.href);
 	const operation = currentLocalOperation(opts);
-	if (operation) await fs.mkdir(path.dirname(targetPath), { recursive: true });
 	assertLocalRootCurrent(opts, localRoot);
-	if ((await locateLocalTarget(url, opts, true)) === null) throw new Error(`Local file not found: ${url.href}`);
-	const exists = await fs.lstat(targetPath).then(
-		() => true,
-		error => {
-			if (isEnoent(error)) return false;
-			throw error;
-		},
-	);
-	let authorizedTarget: AuthorizedFilesystemTarget | undefined;
-	if (operation) {
-		const resolvedRoot = await fs.realpath(localRoot);
-		authorizedTarget = await authorizeLocalTarget(operation, targetPath, exists ? "write" : "create", resolvedRoot);
-	}
 	const durable = opts.getDurableLocalState?.();
+	let committedTarget: AuthorizedFilesystemTarget | undefined;
+	let activeResourceTarget: AuthorizedFilesystemTarget | undefined;
+	const reauthorizeTarget = async (): Promise<AuthorizedFilesystemTarget> => {
+		if (!operation) throw new Error("local:// filesystem authority is unavailable.");
+		assertLocalRootCurrent(opts, localRoot);
+		operation.assertActive();
+		const currentPath = await locateLocalTarget(url, opts, true);
+		if (currentPath === null || path.resolve(currentPath) !== path.resolve(targetPath)) {
+			throw new Error(`local:// write target changed: ${url.href}`);
+		}
+		const exists = await fs.lstat(targetPath).then(
+			() => true,
+			error => {
+				if (isEnoent(error)) return false;
+				throw error;
+			},
+		);
+		operation.assertActive();
+		const resolvedRoot = await fs.realpath(localRoot);
+		assertLocalRootCurrent(opts, localRoot);
+		const target = await authorizeLocalTarget(operation, targetPath, exists ? "write" : "create", resolvedRoot);
+		operation.assertActive();
+		assertLocalRootCurrent(opts, localRoot);
+		await operation.verify(target);
+		operation.assertActive();
+		return target;
+	};
+	const mutationHooks: FileWriteMutationHooks | undefined = operation
+		? {
+				beforeWrite: async () => {
+					assertLocalRootCurrent(opts, localRoot);
+					operation.assertActive();
+					const target = activeResourceTarget ?? (await reauthorizeTarget());
+					await operation.verify(target);
+					operation.assertActive();
+					assertLocalRootCurrent(opts, localRoot);
+				},
+				assertActive: () => {
+					operation.assertActive();
+					assertLocalRootCurrent(opts, localRoot);
+				},
+				ensureParent: async parentPath => {
+					if (path.resolve(parentPath) !== path.dirname(path.resolve(targetPath)))
+						throw new Error(`local:// parent changed during write: ${url.href}`);
+					assertLocalRootCurrent(opts, localRoot);
+					await createLocalParentDirectories(operation, targetPath, localRoot, opts);
+					operation.assertActive();
+					assertLocalRootCurrent(opts, localRoot);
+				},
+				withResourceEffect: async (dst, effect) => {
+					if (path.resolve(dst) !== path.resolve(targetPath))
+						throw new Error(`local:// write destination changed: ${url.href}`);
+					const target = await reauthorizeTarget();
+					activeResourceTarget = target;
+					try {
+						return await operation.withResourceEffects([target], "filesystem", effect);
+					} finally {
+						activeResourceTarget = undefined;
+					}
+				},
+			}
+		: undefined;
 	return {
-		path: authorizedTarget?.canonicalTarget ?? targetPath,
-		authorizedTarget,
+		path: targetPath,
+		get authorizedTarget() {
+			return committedTarget;
+		},
 		durable: durable !== undefined,
+		mutationHooks,
 		async commit<T>(content: string, effect: () => Promise<T>): Promise<T> {
 			const writeEffect = async (): Promise<T> => {
 				assertLocalRootCurrent(opts, localRoot);
-				await fs.mkdir(path.dirname(targetPath), { recursive: true });
+				if (operation) await createLocalParentDirectories(operation, targetPath, localRoot, opts);
+				else await fs.mkdir(path.dirname(targetPath), { recursive: true });
 				assertLocalRootCurrent(opts, localRoot);
 				if ((await locateLocalTarget(url, opts, true)) === null)
 					throw new Error(`Local file not found: ${url.href}`);
+				operation?.assertActive();
+				let authorizedTarget: AuthorizedFilesystemTarget | undefined;
+				if (operation) {
+					const exists = await fs.lstat(targetPath).then(
+						() => true,
+						error => {
+							if (isEnoent(error)) return false;
+							throw error;
+						},
+					);
+					operation.assertActive();
+					const resolvedRoot = await fs.realpath(localRoot);
+					assertLocalRootCurrent(opts, localRoot);
+					authorizedTarget = await authorizeLocalTarget(
+						operation,
+						targetPath,
+						exists ? "write" : "create",
+						resolvedRoot,
+					);
+					operation.assertActive();
+					assertLocalRootCurrent(opts, localRoot);
+					await operation.verify(authorizedTarget);
+					operation.assertActive();
+					committedTarget = authorizedTarget;
+					const result = await operation.withResourceEffects([authorizedTarget], "local", effect);
+					operation.assertActive();
+					await operation.verifyPostWrite(authorizedTarget);
+					assertLocalRootCurrent(opts, localRoot);
+					return result;
+				}
 				const result = await effect();
-				if (operation && authorizedTarget) await operation.verifyPostWrite(authorizedTarget);
 				assertLocalRootCurrent(opts, localRoot);
 				return result;
 			};
-			if (!durable) return writeEffect();
+
+			if (!durable) {
+				const result = await writeEffect();
+				operation?.assertActive();
+				assertLocalRootCurrent(opts, localRoot);
+				return result;
+			}
+
 			assertLocalRootCurrent(opts, localRoot);
 			const entryId = canonicalDurableSha256({ localId: safeSessionId(opts), url: url.href });
-			await durable.ensureRecoveredBacking(async expectation => {
-				if (opts.validateDurableLocalBacking) return await opts.validateDurableLocalBacking(expectation);
-				if (expectation.entryId !== entryId) return false;
-				try {
-					return durableBackingSha256(await fs.readFile(targetPath)) === expectation.entryHash;
-				} catch {
-					return false;
-				}
-			});
-			const expectedHeadHash = durable.current()?.headHash ?? "0".repeat(64);
-			let result: T | undefined;
-			let completed = false;
-			await durable.publishWithEffect(entryId, durableBackingSha256(content), expectedHeadHash, async () => {
-				result = await writeEffect();
-				completed = true;
-			});
-			if (!completed) throw new Error("local:// write did not complete");
-			return result as T;
+			const expectedHeadHash = (await durable.current())?.headHash ?? "0".repeat(64);
+			operation?.assertActive();
+			const result = await durable.publishWithEffect(
+				entryId,
+				durableBackingSha256(content),
+				expectedHeadHash,
+				writeEffect,
+				async expectation => {
+					operation?.assertActive();
+					if (opts.validateDurableLocalBacking) {
+						const valid = await opts.validateDurableLocalBacking(expectation);
+						operation?.assertActive();
+						assertLocalRootCurrent(opts, localRoot);
+						return valid;
+					}
+					const valid = await validateLocalBacking(opts, localRoot, expectation, entryId, targetPath);
+					operation?.assertActive();
+					return valid;
+				},
+			);
+			operation?.assertActive();
+			assertLocalRootCurrent(opts, localRoot);
+			return result;
 		},
 	};
 }

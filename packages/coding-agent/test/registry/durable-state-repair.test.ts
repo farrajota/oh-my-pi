@@ -7,6 +7,8 @@ import * as path from "node:path";
 import { FileLock } from "@oh-my-pi/pi-natives";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { AgentRegistry } from "../../src/registry/agent-registry";
+import { closeSessionAuthority, registryDurableStateForSession } from "../../src/registry/authority";
+import { migrateAuthority } from "../../src/registry/authority/migration";
 import {
 	canonicalDurableSha256,
 	RegistryDurableStateStore,
@@ -42,19 +44,6 @@ async function createStore(): Promise<{
 	const sessionFile = path.join(directory, "main.jsonl");
 	const journal = registryDurableJournalPath(sessionFile);
 	return { directory, sessionFile, journal, store: new RegistryDurableStateStore(journal) };
-}
-
-function realSession(): { session: AgentSession; auth: AuthStorage } {
-	const auth = createInMemoryAuthStorage();
-	return {
-		auth,
-		session: new AgentSession({
-			agent: new Agent({ initialState: { systemPrompt: [], tools: [], messages: [] } }),
-			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
-			modelRegistry: new ModelRegistry(auth),
-		}),
-	};
 }
 
 function hash(value: unknown): string {
@@ -472,25 +461,100 @@ describe("durable authority repair", () => {
 		const { sessionFile, journal, store } = await createStore();
 		appendRepairableTree(store);
 		await repairSessionAuthority(sessionFile, { apply: true });
-		const fresh = realSession();
-		const createSession = vi
-			.spyOn(sdk, "createAgentSession")
-			.mockResolvedValue({ session: fresh.session } as sdk.CreateAgentSessionResult);
+		const snapshot = new RegistryDurableStateStore(journal).snapshot();
+		expect(snapshot.actors.get("Child")?.state).toBe("retired");
+		expect(snapshot.actors.get("Grandchild")?.state).toBe("retired");
+		const clean = await repairSessionAuthority(sessionFile);
+		expect(clean.status).toBe("clean");
+		expect(clean.affectedActorIds).toEqual([]);
+		const repairedEvidence = await fs.readFile(journal, "utf8");
+		await Bun.write(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 3, id: crypto.randomUUID(), timestamp: new Date().toISOString(), cwd: path.dirname(sessionFile) })}\n`,
+		);
+		await migrateAuthority(sessionFile, "jsonl", { apply: true });
+		let freshSession: AgentSession | undefined;
+		let auth: AuthStorage | undefined;
+		let restoreCreateSession: (() => void) | undefined;
+		let primaryError: unknown;
+		let failed = false;
 		try {
-			const registry = new AgentRegistry({ durableState: new RegistryDurableStateStore(journal) });
+			const durableState = await registryDurableStateForSession(sessionFile);
+			auth = createInMemoryAuthStorage();
+			freshSession = new AgentSession({
+				agent: new Agent({ initialState: { systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: SessionManager.inMemory(),
+				settings: Settings.isolated(),
+				modelRegistry: new ModelRegistry(auth),
+			});
+			const createSession = vi
+				.spyOn(sdk, "createAgentSession")
+				.mockResolvedValue({ session: freshSession } as sdk.CreateAgentSessionResult);
+			restoreCreateSession = () => createSession.mockRestore();
+			const registry = await AgentRegistry.create({ durableState });
+			const highWater = (await durableState.recoveryState()).generationHighWater;
+			const sourceRoot = (await durableState.getRoot("Main"))!.record;
+			expect((await durableState.getGate("Main"))?.record).toMatchObject({
+				generation: sourceRoot.generation,
+				phase: "closed",
+			});
 			const created = await registry.createIsolatedRootSession({ agentId: "Main" });
-			expect(created.session).toBe(fresh.session);
-			const snapshot = new RegistryDurableStateStore(journal).snapshot();
-			expect(snapshot.actors.get("Child")?.state).toBe("retired");
-			expect(snapshot.actors.get("Grandchild")?.state).toBe("retired");
-			expect(snapshot.actors.get("Main")?.state).toBe("active");
-			const clean = await repairSessionAuthority(sessionFile);
-			expect(clean.status).toBe("clean");
-			expect(clean.affectedActorIds).toEqual([]);
+			expect(created.session).toBe(freshSession);
+			expect((await durableState.getActor("Child"))?.record.state).toBe("retired");
+			expect((await durableState.getActor("Grandchild"))?.record.state).toBe("retired");
+			expect((await durableState.getActor("Main"))?.record.state).toBe("active");
+			const current = (await durableState.getActor("Main"))!.record;
+			expect(current.generation).toBeGreaterThan(highWater);
+			expect(current.rootGeneration).toBe(current.generation);
+			expect((await durableState.getRoot("Main"))?.record).toMatchObject({
+				generation: current.generation,
+				headHash: current.rootHeadHash,
+				state: "active",
+			});
+			expect((await durableState.getGate("Main"))?.record).toMatchObject({
+				generation: current.generation,
+				phase: "open",
+			});
+			const transitionId = `root-reopen:Main:${sourceRoot.generation}:${current.generation}`;
+			expect((await durableState.getTransition("Main", transitionId))?.record).toMatchObject({
+				phase: "retired",
+				sourceGeneration: sourceRoot.generation,
+				sourceHeadHash: sourceRoot.headHash,
+				destinationGeneration: current.generation,
+				destinationHeadHash: current.rootHeadHash,
+			});
+			expect((await durableState.getActorGeneration("Main", 1))?.record.state).toBe("retired");
+			const evidence = (await durableState.exportState()).legacy;
+			if (!evidence) throw new Error("Expected complete imported legacy evidence.");
+			expect(Bun.JSONL.parse(repairedEvidence)).toEqual([...evidence.entries]);
+		} catch (error) {
+			failed = true;
+			primaryError = error;
 		} finally {
-			createSession.mockRestore();
-			await fresh.session.dispose();
-			fresh.auth.close();
+			const errors: unknown[] = failed ? [primaryError] : [];
+			try {
+				restoreCreateSession?.();
+			} catch (error) {
+				errors.push(error);
+			}
+			try {
+				await freshSession?.dispose();
+			} catch (error) {
+				errors.push(error);
+			}
+			try {
+				await closeSessionAuthority(sessionFile);
+			} catch (error) {
+				errors.push(error);
+			}
+			try {
+				auth?.close();
+			} catch (error) {
+				errors.push(error);
+			}
+			if (errors.length === 1) throw errors[0];
+			if (errors.length > 1)
+				throw new AggregateError(errors, "Durable repair fixture failed and cleanup reported errors.");
 		}
 	});
 });

@@ -6,10 +6,12 @@ import { prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import backgroundTanDispatchPrompt from "../../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import tanContextSwitchPrompt from "../../prompts/system/tan-context-switch.md" with { type: "text" };
 import {
+	abortAgentRef,
 	bindInternalAgentAuthoritySession,
-	detachAgentSession,
-	setAgentStatus,
+	lookupAgentRef,
+	parkAgentRef,
 } from "../../internal/agent-registry-bridge";
+import type { InternalAgentRef } from "../../internal/agent-registry-bridge";
 import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { AgentSession } from "../../session/agent-session";
 import { BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE } from "../../session/messages";
@@ -149,15 +151,26 @@ export class TanCommandController {
 				// so the clone inherits a terminal transcript instead of rendering the
 				// parent's in-flight call as its own pending work (issue #11118).
 				repairInterruptedTail: true,
+				// The clone is created through the parent's authority binding as a child actor of
+				// this root, so its transcript must not become a root with its own authority bundle.
+				childAgent: true,
+				authorityParent: parentFile,
 			});
 			let childCreated = false;
-			jobId = manager.register("task", label, ({ signal, jobId: registeredJobId }) =>
-				runJobOperation(
+			jobId = manager.register("task", label, ({ signal, jobId: registeredJobId }) => {
+				let callbackFailure: unknown;
+				let hasTerminalFailure = false;
+				return runJobOperation(
 					session.sessionManager,
 					`job:${registeredJobId}`,
 					async leaseSignal => {
+						let workResult: string | undefined;
+						let workError: unknown;
+						let workFailed = false;
+						const cleanupErrors: unknown[] = [];
 						const operationSignal = leaseSignal ?? signal;
 						let clone: AgentSession | undefined;
+						let cloneRef: InternalAgentRef | undefined;
 						// Subscribe before taking the clone-time snapshot so MCP changes during
 						// creation are replayed after the child session is bound.
 						const mcpFollower = mcpManager ? followMCPTools(mcpManager) : undefined;
@@ -203,6 +216,9 @@ export class TanCommandController {
 							});
 							clone = created.session;
 							childCreated = true;
+							cloneRef = lookupAgentRef(agentRegistry, cloneId);
+							if (!cloneRef || cloneRef.session !== clone)
+								throw new Error(`Tan child "${cloneId}" did not retain its exact registry session.`);
 							await clone.setActiveToolPresentation(toolNames, mountedToolNames);
 							const activeClone = clone as AgentSession;
 							mcpFollower?.bind(activeClone);
@@ -309,42 +325,114 @@ export class TanCommandController {
 									}
 								}
 								await activeClone.waitForIdle();
-								return extractAssistantText(activeClone.getLastAssistantMessage()) || "(no output)";
+								workResult = extractAssistantText(activeClone.getLastAssistantMessage()) || "(no output)";
 							} finally {
-								unsubscribeCompaction();
-								operationSignal.removeEventListener("abort", abortClone);
+								try {
+									unsubscribeCompaction();
+								} catch (error) {
+									cleanupErrors.push(error);
+								}
+								try {
+									operationSignal.removeEventListener("abort", abortClone);
+								} catch (error) {
+									cleanupErrors.push(error);
+								}
 							}
-						} finally {
-							mcpFollower?.dispose();
-							// Keep successful tans as transcript-only parked rows. Aborted rows are also
-							// tombstones, so detach the exact child even if disposal rejects.
-							if (clone) {
-								if (operationSignal.aborted) {
-									setAgentStatus(agentRegistry, cloneId, "aborted", clone);
-									try {
-										await clone.dispose();
-									} finally {
-										detachAgentSession(agentRegistry, cloneId, clone);
-									}
-								} else {
-									setAgentStatus(agentRegistry, cloneId, "parked", clone);
-									try {
-										await clone.dispose();
-									} finally {
-										detachAgentSession(agentRegistry, cloneId, clone);
-									}
+						} catch (error) {
+							workFailed = true;
+							workError = error;
+						}
+						try {
+							await mcpFollower?.dispose();
+						} catch (error) {
+							cleanupErrors.push(error);
+						}
+						if (clone) {
+							const exactCapturedRef =
+								cloneRef !== undefined &&
+								lookupAgentRef(agentRegistry, cloneId) === cloneRef &&
+								cloneRef.session === clone;
+							let parkAttempted = false;
+							let physicalCleanupAttempted = false;
+							if (!cloneRef) {
+								// The creation guard already retained any missing-ref failure.
+							} else if (!exactCapturedRef) {
+								cleanupErrors.push(
+									new Error(`Tan child "${cloneId}" lost its exact registry session before termination.`),
+								);
+							} else if (operationSignal.aborted) {
+								try {
+									if (!(await abortAgentRef(agentRegistry, cloneRef, clone)))
+										throw new Error(`Tan child "${cloneId}" abort transition was refused.`);
+									physicalCleanupAttempted = true;
+									await clone.dispose();
+								} catch (error) {
+									cleanupErrors.push(error);
 								}
 							} else {
-								await removeCloneSession(cloneFile);
+								parkAttempted = true;
+								try {
+									if (!(await parkAgentRef(agentRegistry, cloneRef, clone)))
+										throw new Error(`Tan child "${cloneId}" park transition was refused.`);
+									physicalCleanupAttempted = true;
+								} catch (error) {
+									cleanupErrors.push(error);
+								}
+							}
+							const currentCapturedRef = cloneRef && lookupAgentRef(agentRegistry, cloneId) === cloneRef;
+							const terminalProjection =
+								cloneRef !== undefined &&
+								currentCapturedRef &&
+								cloneRef.session !== clone &&
+								(cloneRef.status === "parked" || cloneRef.status === "aborted");
+							if (terminalProjection && parkAttempted && cloneRef?.status === "parked")
+								physicalCleanupAttempted = true;
+							if (!physicalCleanupAttempted && (!currentCapturedRef || cloneRef?.session !== clone)) {
+								// The captured session is no longer registry-owned. Its wrapper fences replacement refs.
+								physicalCleanupAttempted = true;
+								try {
+									await clone.dispose();
+								} catch (error) {
+									cleanupErrors.push(error);
+								}
 							}
 						}
+						if (cleanupErrors.length > 0) {
+							hasTerminalFailure = true;
+							callbackFailure = workFailed
+								? new AggregateError([workError, ...cleanupErrors], "Tan work and terminal cleanup failed.")
+								: cleanupErrors.length === 1
+									? cleanupErrors[0]
+									: new AggregateError(cleanupErrors, "Tan terminal cleanup failed.");
+							throw callbackFailure;
+						}
+						if (workFailed) throw workError;
+						return workResult!;
 					},
 					signal,
 				).catch(async error => {
-					if (!childCreated) await removeCloneSession(cloneFile);
+					// The lease may replace a callback failure with its cancellation classification.
+					// Preserve both without altering the shared lease's durable outcome handling.
+					if (
+						hasTerminalFailure &&
+						error !== callbackFailure &&
+						!(error instanceof AggregateError && error.errors.includes(callbackFailure))
+					) {
+						error = new AggregateError(
+							[error, callbackFailure],
+							error instanceof Error ? error.message : String(error),
+						);
+					}
+					if (!childCreated) {
+						try {
+							await removeCloneSession(cloneFile);
+						} catch (cleanupError) {
+							throw new AggregateError([error, cleanupError], "Tan execution and clone cleanup failed.");
+						}
+					}
 					throw error;
-				}),
-			);
+				});
+			});
 		} catch (error) {
 			if (cloneFile) await removeCloneSession(cloneFile);
 			this.ctx.showError(error instanceof Error ? error.message : String(error));

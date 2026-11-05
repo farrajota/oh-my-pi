@@ -18,12 +18,17 @@ import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibili
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { finalizeSubagentLifecycle, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { getAgentLifecycleManager } from "../../src/internal/agent-lifecycle-bridge";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
-import { bindInternalAgentAuthoritySession, createAgentRootSession } from "../../src/internal/agent-registry-bridge";
+import {
+	bindInternalAgentAuthoritySession,
+	createAgentRootSession,
+	lookupAgentRef,
+} from "../../src/internal/agent-registry-bridge";
 
 const authoritySessions: AgentSession[] = [];
 
@@ -73,6 +78,7 @@ function mockSession(opts: {
 	abort?: () => Promise<void>;
 	dispose?: () => Promise<void>;
 }): AgentSession {
+	let disposed = false;
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const state = { messages: [] as AssistantMessage[] };
 	const emit = (event: AgentSessionEvent) => {
@@ -86,6 +92,12 @@ function mockSession(opts: {
 		model: undefined,
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
+		beginDispose: () => {
+			disposed = true;
+		},
+		get isDisposed() {
+			return disposed;
+		},
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		subscribe: (l: (event: AgentSessionEvent) => void) => {
@@ -214,5 +226,56 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 		expect(deferredCleanup).toBeDefined();
 		abortGate.resolve();
 		await deferredCleanup;
+	});
+	it("parks isolated task finalization through the root-owned lifecycle after its descendants settle", async () => {
+		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
+		const childDisposalStarted = Promise.withResolvers<void>();
+		const releaseChildDisposal = Promise.withResolvers<void>();
+		const childDispose = vi.fn(async () => {
+			childDisposalStarted.resolve();
+			await releaseChildDisposal.promise;
+		});
+		const descendantDispose = vi.fn(async () => {});
+		const child = mockSession({ onPrompt: () => {}, dispose: childDispose });
+		const descendant = mockSession({ onPrompt: () => {}, dispose: descendantDispose });
+		authoritySessions.push(child, descendant);
+		vi.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValueOnce({ session: child } as CreateAgentSessionResult)
+			.mockResolvedValueOnce({ session: descendant } as CreateAgentSessionResult);
+
+		let finalization: Promise<void> | undefined;
+		let finalized = false;
+		try {
+			const created = await createAuthoritySession({ agentId: "Main/isolated" });
+			const childBinding = bindInternalAgentAuthoritySession(agentRegistry, created.session);
+			if (!childBinding) throw new Error("Expected the child authority binding");
+			await childBinding.create({ agentId: "Main/isolated/descendant" });
+			const lifecycle = getAgentLifecycleManager(agentRegistry);
+			finalization = finalizeSubagentLifecycle({
+				id: "Main/isolated",
+				session: child,
+				aborted: false,
+				keepAlive: true,
+				isolated: true,
+				agentIdleTtlMs: 0,
+				reviveSession: null,
+				agentRegistry,
+				agentLifecycle: lifecycle,
+			}).then(() => {
+				finalized = true;
+			});
+			await childDisposalStarted.promise;
+			expect(lookupAgentRef(agentRegistry, "Main/isolated")).toMatchObject({ status: "parked", session: null });
+			expect(lookupAgentRef(agentRegistry, "Main/isolated/descendant")).toBeUndefined();
+			expect(descendantDispose).toHaveBeenCalledTimes(1);
+			expect(finalized).toBe(false);
+			releaseChildDisposal.resolve();
+			await finalization;
+			expect(childDispose).toHaveBeenCalledTimes(1);
+			expect(finalized).toBe(true);
+		} finally {
+			releaseChildDisposal.resolve();
+			if (finalization) await Promise.allSettled([finalization]);
+		}
 	});
 });

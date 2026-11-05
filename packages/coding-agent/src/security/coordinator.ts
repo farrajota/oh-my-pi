@@ -14,7 +14,11 @@ import securityRequestPrompt from "../prompts/security/scan-request.md" with { t
 import securityPublishDescription from "../prompts/tools/security-publish.md" with { type: "text" };
 import { createAgentRootSession } from "../internal/agent-registry-bridge";
 import { AgentRegistry } from "../registry/agent-registry";
-import { registryDurableStateForSession } from "../registry/durable-state";
+import {
+	closeSessionAuthority,
+	registryDurableStateForSession,
+	validateJournalingEnvironment,
+} from "../registry/authority";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
@@ -246,40 +250,97 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 	});
 	const providerSessionId = `security:${input.scanId}`;
 	const sessionFile = input.sessionManager.getSessionFile();
-	if (!sessionFile) throw new Error("Security restricted startup requires a persisted session file.");
-	const registry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
-	const { session } = await createAgentRootSession(registry, {
-		cwd: input.executionRoot,
-		authStorage: input.host.authStorage,
-		modelRegistry: input.host.modelRegistry,
-		settings: scanSettings,
-		model: input.model,
-		getApiKey: createSecurityAuthResolver({
+	if (!sessionFile) {
+		await input.sessionManager.close();
+		throw new Error("Security restricted startup requires a persisted session file.");
+	}
+	const header = input.sessionManager.getHeader();
+	if (!header || header.id !== input.sessionManager.getSessionId()) {
+		await input.sessionManager.close();
+		throw new Error("Security session has no matching persisted session header.");
+	}
+	let authorityOpenAttempted = false;
+	const failStartup = async (error: unknown): Promise<never> => {
+		const cleanupErrors: unknown[] = [];
+		let authorityCloseSucceeded = !authorityOpenAttempted;
+		if (authorityOpenAttempted) {
+			try {
+				await closeSessionAuthority(sessionFile);
+				authorityCloseSucceeded = true;
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (authorityCloseSucceeded) {
+			try {
+				await input.sessionManager.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError([error, ...cleanupErrors], "Security root startup failed and cleanup was incomplete");
+		}
+		throw error;
+	};
+	let session: AgentSession;
+	try {
+		await input.sessionManager.ensureOnDisk();
+		authorityOpenAttempted = true;
+		const durableState = await registryDurableStateForSession(sessionFile, {
+			backend: validateJournalingEnvironment(),
+			owningSessionId: header.id,
+			create: true,
+		});
+		const registry = await AgentRegistry.create({ durableState });
+		({ session } = await createAgentRootSession(registry, {
+			cwd: input.executionRoot,
 			authStorage: input.host.authStorage,
-			auth: input.plan.account,
-			providerResolver: model => input.host.modelRegistry.resolver(model, providerSessionId),
-		}),
-		providerSessionId,
-		sessionManager: input.sessionManager,
-		customTools: [input.publicationTool],
-		toolNames: SECURITY_SESSION_TOOLS,
-		restrictToolNames: true,
-		allowRestrictedCustomTools: true,
-		spawns: "security-reviewer",
-		appendSystemPrompt: securityCoordinatorPrompt.trim(),
-		disableExtensionDiscovery: true,
-		enableMCP: false,
-		enableIrc: false,
-		enableLsp: true,
-		lspReadOnly: true,
-		hasUI: false,
-		autoApprove: true,
-		skipPythonPreflight: true,
-		agentId: `Security-${input.scanId.slice(-12)}`,
-		agentDisplayName: "security",
-		// A helper for the host session: the host keeps the process-wide effects and provider toggles.
-		bindProcessState: false,
-	});
+			modelRegistry: input.host.modelRegistry,
+			settings: scanSettings,
+			model: input.model,
+			getApiKey: createSecurityAuthResolver({
+				authStorage: input.host.authStorage,
+				auth: input.plan.account,
+				providerResolver: model => input.host.modelRegistry.resolver(model, providerSessionId),
+			}),
+			providerSessionId,
+			sessionManager: input.sessionManager,
+			customTools: [input.publicationTool],
+			toolNames: SECURITY_SESSION_TOOLS,
+			restrictToolNames: true,
+			allowRestrictedCustomTools: true,
+			spawns: "security-reviewer",
+			appendSystemPrompt: securityCoordinatorPrompt.trim(),
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableIrc: false,
+			enableLsp: true,
+			lspReadOnly: true,
+			hasUI: false,
+			autoApprove: true,
+			skipPythonPreflight: true,
+			agentId: `Security-${input.scanId.slice(-12)}`,
+			agentDisplayName: "security",
+			// A helper for the host session: the host keeps the process-wide effects and provider toggles.
+			bindProcessState: false,
+		}));
+	} catch (error) {
+		return await failStartup(error);
+	}
+	const releaseDraftCleanup = input.sessionManager.deferDraftCleanup();
+	const disposeSession = session.dispose.bind(session);
+	let rootDisposal: Promise<void> | undefined;
+	session.dispose = (...args: Parameters<AgentSession["dispose"]>) => {
+		if (!rootDisposal) {
+			rootDisposal = (async () => {
+				await disposeSession(...args);
+				await closeSessionAuthority(sessionFile);
+				await releaseDraftCleanup();
+			})();
+		}
+		return rootDisposal;
+	};
 	return session;
 }
 
@@ -708,9 +769,12 @@ export class SecurityCoordinator {
 			this.#update(record, cancelled ? "cancelled" : "failed", message);
 			await store.putBundle(terminal);
 		} finally {
-			await session?.dispose().catch(() => undefined);
-			await executionTarget?.cleanup().catch(() => undefined);
-			ACTIVE_SECURITY_OPERATIONS.delete(record.snapshot.operationId);
+			try {
+				await session?.dispose();
+			} finally {
+				await executionTarget?.cleanup().catch(() => undefined);
+				ACTIVE_SECURITY_OPERATIONS.delete(record.snapshot.operationId);
+			}
 		}
 	}
 }

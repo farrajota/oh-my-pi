@@ -21,6 +21,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
 import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import { AgentActivityIndex, type AgentActivityRow } from "../src/activity";
+import { createSessionDefaults } from "./helpers/session-defaults";
 import { createHubAuthorityFixture, type HubAuthorityFixture } from "./tools/hub-fixtures";
 
 interface GeometryStub {
@@ -278,7 +279,7 @@ describe("Agent hub row ordering", () => {
 
 			// Reusing an unregistered id creates a new generation at the top,
 			// rather than reclaiming the previous generation's old rank.
-			unregisterAgentRef(agents, "B", sessionB);
+			await unregisterAgentRef(agents, "B", sessionB);
 			agents.register({ id: "B", displayName: "Beta 2", kind: "sub", session: null });
 			vi.advanceTimersByTime(100);
 			expect(renderedAgentIds(hub)).toEqual(["B", "E", "D", "C", "A"]);
@@ -338,7 +339,7 @@ describe("Agent hub row ordering", () => {
 			expect(selectedAgentId(hub)).toBe("A");
 
 			// A killed agent reopened during the scan is a new generation, not a saved one.
-			agents.unregister("Killed", killed);
+			await agents.unregister("Killed", killed);
 			agents.register({ id: "Killed", displayName: "Killed", kind: "sub", session: null, status: "running" });
 			vi.advanceTimersByTime(100);
 			expect(renderedAgentIds(hub)).toEqual(["Killed", "Fresh", "B", "A", "Saved"]);
@@ -765,7 +766,7 @@ describe("Agent hub row ordering", () => {
 		}
 	});
 
-	it("shows sampled live-only usage without exposing a session through the registry", () => {
+	it("shows sampled live-only usage without exposing a session through the registry", async () => {
 		geometry = stubStdoutGeometry(140);
 		geometry.setRows(28);
 		vi.useFakeTimers();
@@ -778,6 +779,7 @@ describe("Agent hub row ordering", () => {
 			cost: 0.42,
 		};
 		const first = {
+			...createSessionDefaults(),
 			getSessionStats: () => stats,
 			sessionManager: { getUsageStatistics: () => ({ cost: stats.cost, subagentCost: 0 }) },
 		} as unknown as AgentSession;
@@ -798,8 +800,9 @@ describe("Agent hub row ordering", () => {
 			vi.advanceTimersByTime(5_000);
 			rendered = Bun.stripANSI(hub.render(140).join("\n"));
 			expect(rendered).toContain("255 tok");
-			agents.unregister("LiveUsage", first);
+			await agents.unregister("LiveUsage", first);
 			const second = {
+				...createSessionDefaults(),
 				sessionManager: { getUsageStatistics: () => ({ cost: 0.01, subagentCost: 0 }) },
 				getSessionStats: () => ({
 					...stats,

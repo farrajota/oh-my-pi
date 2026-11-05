@@ -43,6 +43,15 @@ import { findSessionFiles } from "./session-listing";
 import { loadEntriesFromFile, parseSessionContent, readSessionHeaderId } from "./session-loader";
 import { SessionManager } from "./session-manager";
 import { FileSessionStorage } from "./session-storage";
+import {
+	assertAuthorityRelocationSettled,
+	packAuthorityBundle,
+	replaceSessionAuthorityBundle,
+	retainAuthorityBundleProvenance,
+	validateAuthorityBundleSource,
+} from "../registry/authority/lifecycle";
+import type { AuthorityBundle } from "../registry/authority/lifecycle";
+import { AUTHORITY_JSONL_ROTATION_MEMBER } from "../registry/authority/jsonl-layout";
 
 /** Archive format version written by {@link packSession} and the only one {@link unpackSession} reads. */
 export const SESSION_ARCHIVE_VERSION = 1;
@@ -120,10 +129,12 @@ export interface UnpackSessionResult {
 const MANIFEST_MEMBER = "manifest.json";
 const SESSION_MEMBER = "session.jsonl";
 const ARTIFACTS_PREFIX = "artifacts/";
+const AUTHORITY_PREFIX = "authority/";
 const BLOBS_PREFIX = "blobs/";
 const BLOB_REF_RE = /\bblob:sha256:([a-f0-9]{64})\b/g;
 /** Ids name files and leases; anything else in an archive header is refused. */
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const AUTHORITY_ID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const ARCHIVE_SIZE_LIMIT = 2 * 1024 * 1024 * 1024;
 const TEXT_DECODER = new TextDecoder();
 
@@ -299,6 +310,12 @@ export async function packSession(sessionFile: string, outPath: string): Promise
 			[MANIFEST_MEMBER, `${JSON.stringify(manifest, null, 2)}\n`],
 			[SESSION_MEMBER, journal],
 		];
+		const authority = await packAuthorityBundle(source);
+		if (authority) {
+			if (authority.owningSessionId !== id)
+				throw new SessionTransferError("The authority bundle root does not match the session header.");
+			for (const entry of authority.entries) members.push([`${AUTHORITY_PREFIX}${entry.name}`, entry.data]);
+		}
 		const hashes = new Set<string>();
 		collectBlobHashes(journalText, hashes);
 
@@ -342,6 +359,7 @@ interface SessionArchiveContents {
 	entries: SessionEntry[];
 	artifacts: [relative: string, bytes: Uint8Array][];
 	blobs: [hash: string, bytes: Uint8Array][];
+	authority?: AuthorityBundle;
 }
 
 function isSafeRelativePath(relative: string): boolean {
@@ -398,6 +416,7 @@ async function readSessionArchive(archive: string): Promise<SessionArchiveConten
 	let journal: Uint8Array | undefined;
 	const artifacts: [string, Uint8Array][] = [];
 	const blobs: [string, Uint8Array][] = [];
+	const authorityEntries: { name: string; data: Uint8Array }[] = [];
 	for (const [name, bytes] of members) {
 		if (name === MANIFEST_MEMBER) {
 			manifestBytes = bytes;
@@ -407,6 +426,12 @@ async function readSessionArchive(archive: string): Promise<SessionArchiveConten
 			artifacts.push([name.slice(ARTIFACTS_PREFIX.length), bytes]);
 		} else if (name.startsWith(BLOBS_PREFIX) && BLOB_HASH_RE.test(name.slice(BLOBS_PREFIX.length))) {
 			blobs.push([name.slice(BLOBS_PREFIX.length), bytes]);
+		} else if (name.startsWith(AUTHORITY_PREFIX) && isSafeRelativePath(name.slice(AUTHORITY_PREFIX.length))) {
+			authorityEntries.push({ name: name.slice(AUTHORITY_PREFIX.length), data: bytes });
+		} else if (name.startsWith(AUTHORITY_PREFIX)) {
+			throw new SessionTransferError(
+				`Bad session archive ${archive}: unsafe authority member "${formatArchivePathForError(name)}".`,
+			);
 		} else {
 			throw new SessionTransferError(
 				`Bad session archive ${archive}: unexpected member "${formatArchivePathForError(name)}".`,
@@ -438,7 +463,76 @@ async function readSessionArchive(archive: string): Promise<SessionArchiveConten
 			);
 		}
 	}
-	return { manifest, journal, header, entries: parsed.entries.filter(isBodyEntry), artifacts, blobs };
+	let authority: AuthorityBundle | undefined;
+	if (authorityEntries.length) {
+		if (!AUTHORITY_ID_RE.test(manifest.id) || !authorityEntries.some(entry => entry.name === "authority.lock")) {
+			throw new SessionTransferError(
+				`Bad session archive ${archive}: authority bundle has invalid root or lock provenance.`,
+			);
+		}
+		const allowed: Record<string, true> = {
+			"authority.json": true,
+			"authority.sqlite": true,
+			"authority.sqlite-wal": true,
+			"authority.sqlite-shm": true,
+			"authority.jsonl": true,
+			"authority-v1.jsonl": true,
+			"authority-v1.jsonl.quarantine": true,
+			"authority.lock": true,
+		};
+		for (const entry of authorityEntries) {
+			if (
+				!allowed[entry.name] &&
+				!AUTHORITY_JSONL_ROTATION_MEMBER.test(entry.name) &&
+				!/^authority\.backup\.[a-f0-9-]{36}\/.+/.test(entry.name)
+			) {
+				throw new SessionTransferError(
+					`Bad session archive ${archive}: unrecognized authority member ${entry.name}.`,
+				);
+			}
+		}
+		const descriptorEntry = authorityEntries.find(entry => entry.name === "authority.json");
+		if (descriptorEntry) {
+			let descriptor: unknown;
+			try {
+				descriptor = JSON.parse(TEXT_DECODER.decode(descriptorEntry.data));
+			} catch {
+				throw new SessionTransferError(`Bad session archive ${archive}: invalid authority descriptor.`);
+			}
+			if (
+				!isRecord(descriptor) ||
+				descriptor.owningSessionId !== manifest.id ||
+				descriptor.state !== "active" ||
+				(descriptor.backend !== "jsonl" && descriptor.backend !== "sqlite") ||
+				!authorityEntries.some(
+					entry => entry.name === (descriptor.backend === "sqlite" ? "authority.sqlite" : "authority.jsonl"),
+				)
+			) {
+				throw new SessionTransferError(
+					`Bad session archive ${archive}: authority descriptor does not select a bundled payload.`,
+				);
+			}
+		} else if (
+			authorityEntries.some(
+				entry =>
+					entry.name === "authority.sqlite" ||
+					entry.name === "authority.jsonl" ||
+					AUTHORITY_JSONL_ROTATION_MEMBER.test(entry.name),
+			)
+		) {
+			throw new SessionTransferError(`Bad session archive ${archive}: v2 payload has no authority descriptor.`);
+		}
+		authority = { version: 1, owningSessionId: manifest.id, entries: authorityEntries };
+	}
+	return {
+		manifest,
+		journal,
+		header,
+		entries: parsed.entries.filter(isBodyEntry),
+		artifacts,
+		blobs,
+		...(authority ? { authority } : {}),
+	};
 }
 
 /**
@@ -470,9 +564,8 @@ async function findLocalCopies(id: string, sessionDir: string): Promise<string[]
 		if (!isEnoent(error)) throw error;
 	}
 	// One transcript reached by two names — a bucket symlinked to another
-	// lists it under both (#5385) — is one copy, or `setAside` would try to
-	// move the same file aside twice. `path.resolve` leaves the symlink in
-	// place, so the identity has to come from `realpath`.
+	// lists it under both (#5385) — is one copy. Resolve physical names before
+	// reserving the complete replacement group; path.resolve leaves symlinks.
 	const seen = new Set<string>();
 	const copies: string[] = [];
 	for (const file of candidates) {
@@ -490,54 +583,11 @@ async function findLocalCopies(id: string, sessionDir: string): Promise<string[]
 	return copies.sort();
 }
 
-/** One path renamed aside by {@link setAside}. */
-interface AsidePath {
-	original: string;
-	backup: string;
-}
-
-async function restoreAside(aside: readonly AsidePath[]): Promise<void> {
-	for (const { original, backup } of [...aside].reverse()) {
-		try {
-			await fs.promises.rename(backup, original);
-		} catch (error) {
-			logger.error("Failed to restore a session set aside for unpack", { original, backup, error: String(error) });
-		}
-	}
-}
-
-/** Rename session files and their artifacts directories to sibling backups, all or nothing. */
-async function setAside(files: readonly string[]): Promise<AsidePath[]> {
-	const aside: AsidePath[] = [];
-	try {
-		for (const file of files) {
-			const suffix = `.unpack-${Snowflake.next()}.bak`;
-			await fs.promises.rename(file, `${file}${suffix}`);
-			aside.push({ original: file, backup: `${file}${suffix}` });
-			const artifacts = file.slice(0, -".jsonl".length);
-			try {
-				await fs.promises.rename(artifacts, `${artifacts}${suffix}`);
-				aside.push({ original: artifacts, backup: `${artifacts}${suffix}` });
-			} catch (error) {
-				if (!isEnoent(error)) throw error;
-			}
-		}
-	} catch (error) {
-		await restoreAside(aside);
-		throw error;
-	}
-	return aside;
-}
-
 async function removeSessionFiles(sessionFile: string): Promise<void> {
-	await fs.promises.rm(sessionFile, { force: true });
-	await fs.promises.rm(sessionFile.slice(0, -".jsonl".length), { recursive: true, force: true });
+	await new FileSessionStorage().deleteSessionWithArtifacts(sessionFile);
 }
 
-/**
- * Open a session through `open`, record its arrival, and close it. A failure
- * after the session landed removes it again, so the caller can roll back.
- */
+/** Open a freshly issued fork, record arrival, and close it. */
 async function placeSession(
 	open: () => Promise<SessionManager>,
 	arrival: SessionTransferDetails,
@@ -555,7 +605,17 @@ async function placeSession(
 		if (!placed) throw new SessionTransferError("Unpacked session has no session file.");
 		return { sessionFile: placed, id };
 	} catch (error) {
-		if (placed) await removeSessionFiles(placed);
+		if (placed) {
+			try {
+				await removeSessionFiles(placed);
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"Session placement and durable cleanup failed; retain lifecycle evidence.",
+					{ cause: error },
+				);
+			}
+		}
 		throw error;
 	}
 }
@@ -563,13 +623,14 @@ async function placeSession(
 /**
  * Unpack a {@link packSession} archive so the session continues in
  * `options.cwd`. The archive is validated in full (manifest version, member
- * layout, every blob's sha256) before anything is written. Blobs go into the
- * local blob store; the journal and artifacts are staged in a temp directory
- * and moved with {@link SessionManager.openRelocated}, which rewrites the
- * header `cwd`. An `arrived` marker is appended.
+ * layout, every blob's sha256 and the selected authority provenance). The
+ * journal, artifacts and arrival marker are prepared before grouped local-copy
+ * replacement. One target descriptor selects the fresh restored incarnation;
+ * exact displaced copies remain in durable recovery provenance.
  *
- * One live copy: local copies of the same session whose entries are a prefix
- * of the incoming ones are replaced (restored if placing fails); if any local
+ * One live copy: local copies whose entries prefix the incoming transcript are
+ * replaced. Before selection, explicit recovery can finish or abort; afterward
+ * it can only finish. If any local
  * copy diverged, the incoming transcript lands as a fork with a new id whose
  * `parentSession` is the original id, and local copies stay untouched.
  */
@@ -599,8 +660,12 @@ export async function unpackSession(archivePath: string, options: UnpackSessionO
 		for (const [relative, bytes] of contents.artifacts) {
 			await Bun.write(path.join(stagedArtifacts, ...relative.split("/")), bytes);
 		}
+		if (contents.authority) await validateAuthorityBundleSource(stagedFile, contents.authority);
 
+		await fs.promises.mkdir(sessionDir, { recursive: true, mode: 0o700 });
+		const target = path.join(sessionDir, path.basename(stagedFile));
 		const localCopies = await findLocalCopies(id, sessionDir);
+		for (const file of new Set([...localCopies, target])) await assertAuthorityRelocationSettled(file);
 		let diverged = false;
 		for (const file of localCopies) {
 			const entries = (await loadEntriesFromFile(file)).filter(isBodyEntry);
@@ -609,6 +674,7 @@ export async function unpackSession(archivePath: string, options: UnpackSessionO
 
 		if (diverged) {
 			const placed = await placeSession(() => SessionManager.forkFrom(stagedFile, cwd, sessionDir), arrival);
+			if (contents.authority) await retainAuthorityBundleProvenance(placed.sessionFile, contents.authority);
 			logger.info("Unpacked session as a fork of a diverged local copy", { parent: id, ...placed });
 			return { ...placed, mode: "forked" };
 		}
@@ -616,18 +682,39 @@ export async function unpackSession(archivePath: string, options: UnpackSessionO
 		const releases: (() => void)[] = [];
 		try {
 			for (const file of localCopies) releases.push(claimSessionOrRefuse(id, file, "replace"));
-			const aside = await setAside(localCopies);
-			let placed: { sessionFile: string; id: string };
+			const manager = await SessionManager.open(stagedFile, staging.path(), new FileSessionStorage(), {
+				throwIfMissing: true,
+				suppressBreadcrumb: true,
+			});
 			try {
-				placed = await placeSession(
-					() => SessionManager.openRelocated(stagedFile, recordedCwd, cwd, sessionDir),
-					arrival,
-				);
-			} catch (error) {
-				await restoreAside(aside);
-				throw error;
+				await appendTransferNotice(manager, arrival);
+			} finally {
+				await manager.close();
 			}
-			for (const { backup } of aside) await fs.promises.rm(backup, { recursive: true, force: true });
+			await replaceSessionAuthorityBundle({
+				sources: localCopies,
+				target,
+				owningSessionId: id,
+				transcript: await fs.promises.readFile(stagedFile),
+				artifacts: [...contents.artifacts].map(([name, data]) => ({ name, data })),
+				...(contents.authority ? { authority: contents.authority } : {}),
+				cwd,
+				revalidateSources: async () => {
+					const current = await findLocalCopies(id, sessionDir);
+					const expected = (await Promise.all(localCopies.map(file => fs.promises.realpath(file)))).sort();
+					const actual = (await Promise.all(current.map(file => fs.promises.realpath(file)))).sort();
+					if (JSON.stringify(actual) !== JSON.stringify(expected))
+						throw new SessionTransferError(
+							"Local copies changed while replacement was being reserved; nothing was replaced.",
+						);
+				},
+				validateSource: (file, transcript) => {
+					const parsed = parseSessionContent(TEXT_DECODER.decode(transcript));
+					if (parsed.invalidHeader || !isTranscriptPrefix(parsed.entries.filter(isBodyEntry), contents.entries))
+						throw new SessionTransferError(`Local session changed or diverged before replacement: ${file}`);
+				},
+			});
+			const placed = { sessionFile: target, id };
 			const mode: UnpackMode = localCopies.length > 0 ? "replaced" : "created";
 			logger.info("Unpacked session", { mode, replaced: localCopies, ...placed });
 			return { ...placed, mode };

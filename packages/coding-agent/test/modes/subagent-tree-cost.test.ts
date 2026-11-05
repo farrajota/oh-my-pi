@@ -22,7 +22,7 @@ import {
 	type AgentRef,
 	AgentRegistry,
 } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -246,15 +246,22 @@ describe("sumSubagentTreeCost", () => {
 		let lifecycle: AgentLifecycleManager | undefined;
 		let authorityRoot: AgentSession | undefined;
 		const createdSessions = new Set<AgentSession>();
+		let authorityFile: string | undefined;
 		try {
-			const durableRootSessionFile = path.join(tempDir.path(), "main.jsonl");
-			await Bun.write(durableRootSessionFile, "");
-			const registry = new AgentRegistry({ durableState: registryDurableStateForSession(durableRootSessionFile) });
+			const rootManager = SessionManager.create(tempDir.path(), tempDir.join("root-sessions"));
+			await rootManager.ensureOnDisk();
+			const durableRootSessionFile = rootManager.getSessionFile();
+			if (!durableRootSessionFile) throw new Error("Expected materialized owning root");
+			authorityFile = durableRootSessionFile;
+			const registry = await AgentRegistry.create({
+				durableState: await registryDurableStateForSession(durableRootSessionFile, { create: true }),
+			});
 			const models = new ModelRegistry(auth);
 			const model = models.getAll().find(candidate => candidate.contextWindow && candidate.contextWindow > 0);
 			if (!model) throw new Error("Expected a bundled model");
 			const root = await createAgentRootSession(registry, {
 				agentId: "Main",
+				sessionManager: rootManager,
 				cwd: tempDir.path(),
 				agentDir: tempDir.join("agent"),
 				settings: Settings.isolated(),
@@ -296,7 +303,7 @@ describe("sumSubagentTreeCost", () => {
 			manager.appendMessage(assistant(model, 0.6, 1));
 			const { session } = await authority.create(workerOptions(manager));
 			createdSessions.add(session);
-			expect(setAgentStatus(registry, "Worker", "idle", session)).toBe(true);
+			expect(await setAgentStatus(registry, "Worker", "idle", session)).toBe(true);
 			const worker = registry.get("Worker");
 			if (!worker) throw new Error("Expected Worker registry snapshot");
 			adoptAgent(
@@ -347,6 +354,7 @@ describe("sumSubagentTreeCost", () => {
 				} finally {
 					try {
 						await authorityRoot?.dispose();
+						if (authorityFile) await closeSessionAuthority(authorityFile);
 					} finally {
 						try {
 							AgentStorage.close();

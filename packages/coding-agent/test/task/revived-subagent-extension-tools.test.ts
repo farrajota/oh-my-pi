@@ -17,6 +17,7 @@ import { lookup as lookupSetting } from "@oh-my-pi/pi-coding-agent/config/regist
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -45,6 +46,7 @@ let savedEnv: Record<string, string | undefined> = {};
 let root: string;
 let registry: AgentRegistry;
 let authorityRoot: AgentSession | undefined;
+const authorityFiles = new Set<string>();
 
 function restoreEnvValue(key: string, value: string | undefined): void {
 	if (value === undefined) {
@@ -75,6 +77,8 @@ afterEach(async () => {
 		if (!authorityRoot.isDisposed) await authorityRoot.dispose();
 		authorityRoot = undefined;
 	}
+	for (const file of authorityFiles) await closeSessionAuthority(file);
+	authorityFiles.clear();
 	AgentLifecycleManager.resetGlobalForTests();
 	AgentRegistry.resetGlobalForTests();
 	unregisterCustomApis(MOCK_API_SOURCE);
@@ -156,9 +160,13 @@ async function spawnAndPark() {
 		{ path: "<inline-0>", resolvedPath: "<inline-0>", factory: registersAtFirstTurn, error: null },
 	];
 	const sessionManager = SessionManager.create(cwd, path.join(root, "sessions"));
+	await sessionManager.ensureOnDisk();
 	const sessionFile = sessionManager.getSessionFile();
 	if (!sessionFile) throw new Error("Expected a persisted root session file");
-	registry = AgentRegistry.isolatedForSession(sessionFile);
+	authorityFiles.add(sessionFile);
+	registry = await AgentRegistry.create({
+		durableState: await registryDurableStateForSession(sessionFile, { create: true }),
+	});
 	const { session: parent } = await createAgentRootSession(registry, {
 		agentId: "Main",
 		agentDisplayName: "Main",

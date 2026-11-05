@@ -5,7 +5,7 @@ import { hasBoundSessionOperationAuthority } from "@oh-my-pi/pi-coding-agent/reg
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAgentRootSession } from "../src/internal/agent-registry-bridge";
 import { AgentRegistry } from "../src/registry/agent-registry";
-import { registryDurableStateForSession } from "../src/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "../src/registry/authority";
 import { createAgentSession, type CreateAgentSessionOptions } from "../src/sdk";
 import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -49,7 +49,9 @@ async function createSessionHarness(options: { bound?: boolean } = {}): Promise<
 		options.bound === false
 			? await createAgentSession(createOptions)
 			: await createAgentRootSession(
-					new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) }),
+					await AgentRegistry.create({
+						durableState: await registryDurableStateForSession(sessionFile, { create: true }),
+					}),
 					createOptions,
 				);
 	return { tempDir, authStorage, sessionManager, session: created.session };
@@ -76,6 +78,7 @@ describe("AgentSession resume authority", () => {
 			expect(harness.sessionManager.getSessionFile()).toBe(currentFile);
 		} finally {
 			await harness.session.dispose();
+			await closeSessionAuthority(currentFile);
 			harness.authStorage.close();
 			harness.tempDir.removeSync();
 		}
@@ -92,6 +95,7 @@ describe("AgentSession resume authority", () => {
 			expect(harness.sessionManager.getSessionFile()).toBe(currentFile);
 		} finally {
 			await harness.session.dispose();
+			await closeSessionAuthority(currentFile);
 			harness.authStorage.close();
 			harness.tempDir.removeSync();
 		}

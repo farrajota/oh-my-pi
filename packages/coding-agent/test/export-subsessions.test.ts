@@ -17,7 +17,7 @@ function sessionJsonl(
 	id: string,
 	entryIds: string[],
 	previousSessionFiles?: string[],
-	cacheKeys?: Pick<SessionHeader, "providerPromptCacheKey" | "taskPromptCacheKey">,
+	cacheKeys?: Pick<SessionHeader, "providerPromptCacheKey" | "taskPromptCacheKey" | "authorityRoot">,
 ): string {
 	const lines = [
 		JSON.stringify({
@@ -95,8 +95,16 @@ describe("collectSubSessions", () => {
 	test("omits internal routing and move history from standalone HTML and nested sessions", async () => {
 		const mainPreviousPath = "/Users/private/main.jsonl";
 		const subPreviousPath = "/Users/private/Alpha.jsonl";
-		const mainKeys = { providerPromptCacheKey: "private-main-cache", taskPromptCacheKey: "private-parent:reviewer" };
-		const subKeys = { providerPromptCacheKey: "private-sub-cache", taskPromptCacheKey: "private-parent:scout" };
+		const mainKeys = {
+			providerPromptCacheKey: "private-main-cache",
+			taskPromptCacheKey: "private-parent:reviewer",
+			authorityRoot: "/Users/private-root/main.jsonl",
+		};
+		const subKeys = {
+			providerPromptCacheKey: "private-sub-cache",
+			taskPromptCacheKey: "private-parent:scout",
+			authorityRoot: "/Users/private-root/main.jsonl",
+		};
 		const mainJsonl = sessionJsonl("main", ["m1"], [mainPreviousPath], mainKeys);
 		const subJsonl = sessionJsonl("alpha", ["a1"], [subPreviousPath], subKeys);
 		const subFile = path.join(root, "main/Alpha.jsonl");
@@ -118,6 +126,7 @@ describe("collectSubSessions", () => {
 		for (const header of [data.header, data.subSessions.Alpha.header]) {
 			expect(header.providerPromptCacheKey).toBeUndefined();
 			expect(header.taskPromptCacheKey).toBeUndefined();
+			expect(header.authorityRoot).toBeUndefined();
 		}
 		expect(JSON.stringify(data)).not.toContain("private-");
 		expect(data.header.id).toBe("main");

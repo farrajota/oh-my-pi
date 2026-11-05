@@ -16,7 +16,7 @@ import { bindInternalAgentAuthoritySession } from "../../src/internal/agent-regi
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { getAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/durable-state";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
 const mode = process.argv[2] ?? "collision";
@@ -29,6 +29,7 @@ await fs.mkdir(cwd);
 const marker = "REPRO_B_WAKE_ONLY";
 const childId = "ReproChildB";
 const sessions: AgentSession[] = [];
+const authorityFiles = new Set<string>();
 const agentRegistries = new Map<AgentSession, AgentRegistry>();
 const sessionSettings = new Map<AgentSession, Settings>();
 const auth = await AuthStorage.create(":memory:");
@@ -109,7 +110,11 @@ const create = async (
 	await rootSessionManager.ensureOnDisk();
 	const sessionFile = rootSessionManager.getSessionFile();
 	if (!sessionFile) throw new Error("Test fixture requires a persisted root transcript");
-	const agentRegistry = new AgentRegistry({ durableState: registryDurableStateForSession(sessionFile) });
+	authorityFiles.add(sessionFile);
+	// A fresh root transcript is the creation evidence; a reopened one must find its existing ledger.
+	const agentRegistry = await AgentRegistry.create({
+		durableState: await registryDurableStateForSession(sessionFile, { create: sessionManager === undefined }),
+	});
 	const { session } = await agentRegistry.createIsolatedRootSession({
 		cwd,
 		agentDir: profileDir,
@@ -153,6 +158,7 @@ try {
 		if (mode === "reload") {
 			const sessionFile = a.sessionFile!;
 			await a.dispose();
+			await closeSessionAuthority(sessionFile);
 			a = await create("A reloaded", [], undefined, await SessionManager.open(sessionFile));
 		}
 	}
@@ -248,6 +254,7 @@ try {
 		const session = sessions[index];
 		if (session) await session.dispose();
 	}
+	for (const file of authorityFiles) await closeSessionAuthority(file);
 	unregisterCustomApis("repro-sdk-async-routing");
 	auth.close();
 }

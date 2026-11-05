@@ -30,7 +30,7 @@ async function createAuthorityFixture() {
 	const authority = bindInternalAgentAuthoritySession(agentRegistry, root.session);
 	if (!authority) throw new Error("Test fixture requires parent authority");
 	authorityRoots.push(root.session);
-	return { agentRegistry, createAuthoritySession: authority.create };
+	return { agentRegistry, createAuthoritySession: authority.create, rootSession: root.session };
 }
 
 function assistantStopMessage(text: string, totalTokens = 0): AssistantMessage {
@@ -393,7 +393,7 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 				},
 			},
 		);
-		const { agentRegistry, createAuthoritySession } = await createAuthorityFixture();
+		const { agentRegistry, createAuthoritySession, rootSession } = await createAuthorityFixture();
 		mockCreateAgentSession(harness.session);
 		const run = runSubprocess({
 			cwd: "/tmp",
@@ -431,13 +431,16 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 		const cleanupOutcome = deferredCleanup?.then(
 			() => {
 				cleanupSettled = true;
+				return undefined;
 			},
-			() => {
+			(error: unknown) => {
 				cleanupSettled = true;
+				return error;
 			},
 		);
+		const disposeFailure = new Error("dispose failed");
 		abortGate.resolve();
-		disposeGate.reject(new Error("dispose failed"));
+		disposeGate.reject(disposeFailure);
 		for (let attempt = 0; attempt < 10 && manager.getJob(lateJobId ?? "")?.status === "running"; attempt += 1) {
 			await Promise.resolve();
 		}
@@ -445,7 +448,13 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 		expect(manager.getJob(lateJobId ?? "")?.status).toBe("cancelled");
 
 		lateJobGate.resolve();
-		await cleanupOutcome;
+		const cleanupError = await cleanupOutcome;
 		expect(cleanupSettled).toBe(true);
+		// The deferred teardown reports the failed disposal instead of dropping it.
+		expect(cleanupError).toBeInstanceOf(AggregateError);
+		expect((cleanupError as AggregateError).errors).toContain(disposeFailure);
+		// The child's session disposal stays unresolved, so retiring its root reports it too.
+		authorityRoots.splice(authorityRoots.indexOf(rootSession), 1);
+		await expect(rootSession.dispose()).rejects.toThrow(/descendants still own sessions whose disposal failed/);
 	}, 15_000);
 });

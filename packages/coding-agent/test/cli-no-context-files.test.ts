@@ -7,6 +7,7 @@ import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { closeSessionAuthority, registryDurableStateForSession } from "@oh-my-pi/pi-coding-agent/registry/authority";
 import { buildSessionOptions } from "@oh-my-pi/pi-coding-agent/main";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -97,7 +98,10 @@ describe("--no-context-files", () => {
 		const sessionFile = sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a persisted context-files fixture root.");
 		const options = await buildSessionOptions(args, [], sessionManager, modelRegistry, settings);
-		const { session } = await createAgentRootSession(AgentRegistry.isolatedForSession(sessionFile), {
+		const registry = await AgentRegistry.create({
+			durableState: await registryDurableStateForSession(sessionFile, { create: true }),
+		});
+		const { session } = await createAgentRootSession(registry, {
 			...options,
 			agentId: "Main",
 			authStorage,
@@ -152,7 +156,9 @@ describe("--no-context-files", () => {
 				expect(childPrompt).not.toContain(marker);
 			}
 		} finally {
+			const ambientFile = ambient.sessionFile;
 			await ambient.dispose();
+			if (ambientFile) await closeSessionAuthority(ambientFile);
 		}
 
 		const session = await createSession(["--no-context-files"]);
@@ -163,7 +169,9 @@ describe("--no-context-files", () => {
 			const childPrompt = await subagentPrompt(session);
 			for (const marker of MARKERS) expect(childPrompt).not.toContain(marker);
 		} finally {
+			const sessionFile = session.sessionFile;
 			await session.dispose();
+			if (sessionFile) await closeSessionAuthority(sessionFile);
 		}
 	}, 60_000);
 });
