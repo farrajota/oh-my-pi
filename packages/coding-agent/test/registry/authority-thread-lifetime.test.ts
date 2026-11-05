@@ -17,14 +17,22 @@ import * as threadLifetime from "../../src/registry/authority/thread-lifetime";
 import type { AuthorityDriverOptions, AuthorityExport, AuthorityIdentity } from "../../src/registry/authority/types";
 import { SqliteAuthorityPersistence } from "../../src/registry/authority/sqlite-driver";
 import type { DurableOperationRecord } from "../../src/registry/durable-state";
+import { pidfdThreadHost, xfsCapacityHost } from "./authority-capacity-host";
 
-const libc = dlopen("libc.so.6", {
-	pidfd_open: { args: [FFIType.i32, FFIType.u32], returns: FFIType.i32 },
-	poll: { args: [FFIType.ptr, FFIType.u64, FFIType.i32], returns: FFIType.i32 },
-	pipe2: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
-	write: { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i64 },
-	close: { args: [FFIType.i32], returns: FFIType.i32 },
-});
+function openTestLibc() {
+	return dlopen("libc.so.6", {
+		pidfd_open: { args: [FFIType.i32, FFIType.u32], returns: FFIType.i32 },
+		poll: { args: [FFIType.ptr, FFIType.u64, FFIType.i32], returns: FFIType.i32 },
+		pipe2: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+		write: { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i64 },
+		close: { args: [FFIType.i32], returns: FFIType.i32 },
+	});
+}
+// This suite proves the PIDFD_THREAD worker lifetime. Hosts without it (glibc before 2.36 does not export
+// pidfd_open) skip the suite and never bind the symbol, which would otherwise fail the whole file at load.
+const libc = (pidfdThreadHost ? openTestLibc() : undefined) as ReturnType<typeof openTestLibc>;
+// Cases that also fund real XFS capacity under os.tmpdir(); see authority-capacity-host.ts.
+const itOnXfs = it.skipIf(!xfsCapacityHost);
 const THREAD_EXIT_EVENTS = 17;
 // Every worker open, including fenced replacements, borrows the client's anonymous capacity backing.
 const borrowedCapacity = {
@@ -590,8 +598,8 @@ afterEach(async () => {
 	if (failures.length) throw new AggregateError(failures, "Native lifetime fixture cleanup remains owned");
 });
 
-describe("authority native worker lifetime", () => {
-	it("waits for the exact native thread blocked in read before replacing or releasing ownership", async () => {
+describe.skipIf(!pidfdThreadHost)("authority native worker lifetime", () => {
+	itOnXfs("waits for the exact native thread blocked in read before replacing or releasing ownership", async () => {
 		const pipe = new Int32Array(2);
 		if (libc.symbols.pipe2(ptr(pipe), 0) !== 0) throw new Error("Could not create test pipe");
 		for (const descriptor of pipe) descriptors.add(descriptor);
@@ -825,7 +833,7 @@ describe("authority native worker lifetime", () => {
 		const repeated = await observePromise(threadLifetime.waitForAuthorityThreadExit(pin, Date.now() + 1_000));
 		expect(repeated).toEqual({ status: "fulfilled", value: undefined });
 	});
-	it("retains an unknown real open until explicit cleanup recovers exactly once", async () => {
+	itOnXfs("retains an unknown real open until explicit cleanup recovers exactly once", async () => {
 		const { ownership: acquired, path: databasePath, directory } = await makeOwnedAuthority("sqlite");
 		const identity: AuthorityIdentity = {
 			backend: "sqlite",
@@ -895,184 +903,9 @@ describe("authority native worker lifetime", () => {
 		expect(await recovered.recoveryState()).toMatchObject({ owner: { phase: "ready" } });
 		await recovered.close();
 	});
-	it("retains the unknown-opening worker and every physical cleanup failure until same-owner cleanup and exact exit", async () => {
-		const { ownership: acquired, path: databasePath, directory } = await makeOwnedAuthority("sqlite");
-		const identity: AuthorityIdentity = {
-			backend: "sqlite",
-			owningSessionId: "native-root",
-			incarnation: crypto.randomUUID(),
-			format: 2,
-		};
-		let releases = 0;
-		let originalPidfd: number | undefined;
-		let recoveries = 0;
-		let mutations = 0;
-		let callbacks = 0;
-		let physicallyClosed = false;
-		const replacementBoundaries: boolean[] = [];
-		const releaseBoundaries: boolean[] = [];
-		const cleanupAttempts: unknown[] = [];
-		const cleanupReplies: unknown[] = [];
-		const terminations: Array<PromiseWithResolvers<void>> = [];
-		const opens: unknown[] = [];
-		let workerCount = 0;
-		const ownership: AuthorityOwnership = {
-			...acquired,
-			release: async () => {
-				releaseBoundaries.push(
-					physicallyClosed &&
-						originalPidfd !== undefined &&
-						(threadExitEvents(originalPidfd) & THREAD_EXIT_EVENTS) !== 0,
-				);
-				releases++;
-				await acquired.release();
-			},
-		};
-		const factory = (): Worker => {
-			const mode = workerCount++ === 0 ? "unknown-open-close-failure" : "normal";
-			return createTrackedWorkerFactory(
-				message => {
-					opens.push(message);
-					if (opens.length > 1)
-						replacementBoundaries.push(
-							physicallyClosed &&
-								originalPidfd !== undefined &&
-								(threadExitEvents(originalPidfd) & THREAD_EXIT_EVENTS) !== 0,
-						);
-				},
-				terminations,
-				() => {
-					mutations++;
-				},
-				mode,
-				value => {
-					if (isFixturePhase(value, "recovered-before-unknown")) {
-						recoveries++;
-						if (typeof value !== "object" || value === null || !("tid" in value) || typeof value.tid !== "number")
-							throw new Error("Unknown-opening fixture omitted its actual thread ID");
-						originalPidfd = libc.symbols.pidfd_open(value.tid, fsSync.constants.O_EXCL);
-						if (originalPidfd < 0) throw new Error("Could not independently pin the failed-opening worker");
-						descriptors.add(originalPidfd);
-					}
-					if (isFixturePhase(value, "unknown-open-close")) {
-						cleanupAttempts.push(value);
-						physicallyClosed =
-							typeof value === "object" &&
-							value !== null &&
-							"physicallyClosed" in value &&
-							value.physicallyClosed === true;
-					}
-					if (
-						typeof value === "object" &&
-						value !== null &&
-						"kind" in value &&
-						value.kind === "authority-thread-lifetime" &&
-						"phase" in value &&
-						value.phase === "cleanup"
-					)
-						cleanupReplies.push(value);
-				},
-			)();
-		};
-		const opening = openTrackedAuthority({ path: databasePath, identity, create: true }, ownership, factory).then(
-			client => {
-				callbacks++;
-				return client;
-			},
-		);
-		expect(rejectionReason(await observePromise(opening))).toMatchObject({
-			unknownOutcome: true,
-			message: "injected failure after real recovery",
-		});
-		expect(recoveries).toBe(1);
-		expect(cleanupAttempts).toEqual([]);
-		expect(cleanupReplies).toEqual([]);
-		if (originalPidfd === undefined) throw new Error("Failed-opening worker was not independently pinned");
-		for (const attempt of [1, 2]) {
-			let cleanupFailure: unknown;
-			try {
-				await trackCleanupAttempt(identity.owningSessionId);
-			} catch (error) {
-				cleanupFailure = error;
-			}
-			expect(cleanupFailure).toMatchObject({
-				message: `injected unknown-open physical close failure ${attempt}`,
-				cause: {
-					errors: expect.arrayContaining([
-						expect.objectContaining({ message: "injected failure after real recovery" }),
-						...Array.from({ length: attempt }, (_, index) =>
-							expect.objectContaining({ message: `injected unknown-open physical close failure ${index + 1}` }),
-						),
-					]),
-				},
-			});
-			expect(cleanupAttempts).toHaveLength(attempt);
-			expect(threadExitEvents(originalPidfd)).toBe(0);
-			expect(workers).toHaveLength(1);
-			expect(opens).toHaveLength(1);
-			expect(releases).toBe(0);
-			let terminated = false;
-			void terminations[0]!.promise.then(() => {
-				terminated = true;
-			});
-			await Promise.resolve();
-			expect(terminated).toBe(false);
-			await expect(
-				acquireAuthorityOwnership(path.join(directory, "root.jsonl"), { owningSessionId: "native-root" }),
-			).rejects.toThrow(/ownership|lock/i);
-		}
-		expect(await trackCleanupAttempt(identity.owningSessionId)).toBe(true);
-		failedOpenRoots.delete(identity.owningSessionId);
-		expect(cleanupAttempts).toEqual([
-			expect.objectContaining({ attempt: 1, sameHandle: true, force: true, physicallyClosed: false }),
-			expect.objectContaining({ attempt: 2, sameHandle: true, force: true, physicallyClosed: false }),
-			expect.objectContaining({ attempt: 3, sameHandle: true, force: true, physicallyClosed: true }),
-		]);
-		expect(cleanupReplies).toEqual([
-			expect.objectContaining({ ok: false }),
-			expect.objectContaining({ ok: false }),
-			expect.objectContaining({
-				ok: true,
-				failures: [
-					expect.objectContaining({ message: "injected failure after real recovery" }),
-					expect.objectContaining({ message: "injected unknown-open physical close failure 1" }),
-					expect.objectContaining({ message: "injected unknown-open physical close failure 2" }),
-				],
-			}),
-		]);
-		expect(opens).toEqual([
-			expect.objectContaining({
-				driver: { path: databasePath, identity, create: true, liveOwner: true, capacity: borrowedCapacity },
-			}),
-			expect.objectContaining({
-				driver: { path: databasePath, identity, create: false, liveOwner: true, capacity: borrowedCapacity },
-			}),
-		]);
-		expect(replacementBoundaries).toEqual([true]);
-		expect(releaseBoundaries).toEqual([true]);
-		expect(releases).toBe(1);
-		expect(recoveries).toBe(1);
-		expect(mutations).toBe(0);
-		expect(callbacks).toBe(0);
-		const recoveredOwnership = await acquireAuthorityOwnership(path.join(directory, "root.jsonl"), {
-			owningSessionId: "native-root",
-		});
-		const recovered = await openTrackedAuthority(
-			{ path: databasePath, identity, create: false },
-			recoveredOwnership,
-			createTrackedWorkerFactory(
-				() => {},
-				[],
-				() => {},
-				"normal",
-				() => {},
-			),
-		);
-		expect(await recovered.recoveryState()).toMatchObject({ owner: { phase: "ready" } });
-		await recovered.close();
-	});
-	for (const retryCleanupAndExit of [false, true]) {
-		it(`keeps nested real post-COMMIT opening evidence on the original rejection after successful cleanup${retryCleanupAndExit ? " and cleanup/exit retries" : ""}`, async () => {
+	itOnXfs(
+		"retains the unknown-opening worker and every physical cleanup failure until same-owner cleanup and exact exit",
+		async () => {
 			const { ownership: acquired, path: databasePath, directory } = await makeOwnedAuthority("sqlite");
 			const identity: AuthorityIdentity = {
 				backend: "sqlite",
@@ -1080,34 +913,24 @@ describe("authority native worker lifetime", () => {
 				incarnation: crypto.randomUUID(),
 				format: 2,
 			};
-			let pipe: Int32Array | undefined;
-			if (retryCleanupAndExit) {
-				pipe = new Int32Array(2);
-				if (libc.symbols.pipe2(ptr(pipe), 0) !== 0) throw new Error("Could not create cleanup-exit test pipe");
-				for (const descriptor of pipe) descriptors.add(descriptor);
-				releaseDescriptors.add(pipe[1]);
-			}
-			let originalThreadId: number | undefined;
-			let originalPidfd: number | undefined;
-			let committedOpenings = 0;
-			let rollbackFailure: unknown;
-			let cleanupAcknowledged = false;
 			let releases = 0;
+			let originalPidfd: number | undefined;
+			let recoveries = 0;
 			let mutations = 0;
 			let callbacks = 0;
-			let workerCount = 0;
-			let cleanupBridge: NativeCleanupAckBridge | undefined;
-			const opens: unknown[] = [];
-			const cleanupReplies: unknown[] = [];
-			const cleanupAttempts: unknown[] = [];
-			const cleanupBlockTids: number[] = [];
+			let physicallyClosed = false;
 			const replacementBoundaries: boolean[] = [];
 			const releaseBoundaries: boolean[] = [];
+			const cleanupAttempts: unknown[] = [];
+			const cleanupReplies: unknown[] = [];
+			const terminations: Array<PromiseWithResolvers<void>> = [];
+			const opens: unknown[] = [];
+			let workerCount = 0;
 			const ownership: AuthorityOwnership = {
 				...acquired,
 				release: async () => {
 					releaseBoundaries.push(
-						cleanupAcknowledged &&
+						physicallyClosed &&
 							originalPidfd !== undefined &&
 							(threadExitEvents(originalPidfd) & THREAD_EXIT_EVENTS) !== 0,
 					);
@@ -1116,59 +939,44 @@ describe("authority native worker lifetime", () => {
 				},
 			};
 			const factory = (): Worker => {
-				const original = workerCount++ === 0;
-				const mode = original
-					? retryCleanupAndExit
-						? "post-commit-open-failure-with-retries"
-						: "post-commit-open-failure"
-					: "normal";
+				const mode = workerCount++ === 0 ? "unknown-open-close-failure" : "normal";
 				return createTrackedWorkerFactory(
 					message => {
 						opens.push(message);
-						if (!original)
+						if (opens.length > 1)
 							replacementBoundaries.push(
-								cleanupAcknowledged &&
+								physicallyClosed &&
 									originalPidfd !== undefined &&
 									(threadExitEvents(originalPidfd) & THREAD_EXIT_EVENTS) !== 0,
 							);
 					},
-					[],
+					terminations,
 					() => {
 						mutations++;
 					},
 					mode,
 					value => {
-						if (
-							isFixturePhase(value, "cleanup-block-started") &&
-							typeof value === "object" &&
-							value !== null &&
-							"tid" in value &&
-							typeof value.tid === "number"
-						)
-							cleanupBlockTids.push(value.tid);
-						if (isFixturePhase(value, "opening-committed")) {
-							committedOpenings++;
+						if (isFixturePhase(value, "recovered-before-unknown")) {
+							recoveries++;
 							if (
 								typeof value !== "object" ||
 								value === null ||
 								!("tid" in value) ||
 								typeof value.tid !== "number"
 							)
-								throw new Error("Post-COMMIT fixture omitted its native thread ID");
-							originalThreadId = value.tid;
+								throw new Error("Unknown-opening fixture omitted its actual thread ID");
 							originalPidfd = libc.symbols.pidfd_open(value.tid, fsSync.constants.O_EXCL);
-							if (originalPidfd < 0)
-								throw new Error("Could not independently pin the post-COMMIT opening worker");
+							if (originalPidfd < 0) throw new Error("Could not independently pin the failed-opening worker");
 							descriptors.add(originalPidfd);
 						}
-						if (
-							isFixturePhase(value, "opening-rollback-failed") &&
-							typeof value === "object" &&
-							value !== null &&
-							"failure" in value
-						)
-							rollbackFailure = value.failure;
-						if (isFixturePhase(value, "unknown-open-close")) cleanupAttempts.push(value);
+						if (isFixturePhase(value, "unknown-open-close")) {
+							cleanupAttempts.push(value);
+							physicallyClosed =
+								typeof value === "object" &&
+								value !== null &&
+								"physicallyClosed" in value &&
+								value.physicallyClosed === true;
+						}
 						if (
 							typeof value === "object" &&
 							value !== null &&
@@ -1176,15 +984,8 @@ describe("authority native worker lifetime", () => {
 							value.kind === "authority-thread-lifetime" &&
 							"phase" in value &&
 							value.phase === "cleanup"
-						) {
+						)
 							cleanupReplies.push(value);
-							if ("ok" in value && value.ok === true) cleanupAcknowledged = true;
-						}
-					},
-					original && retryCleanupAndExit ? pipe![0] : undefined,
-					bridge => {
-						cleanupBridge = bridge;
-						bridge.root = identity.owningSessionId;
 					},
 				)();
 			};
@@ -1194,142 +995,70 @@ describe("authority native worker lifetime", () => {
 					return client;
 				},
 			);
-			let failure: unknown;
-			try {
-				await opening;
-			} catch (error) {
-				failure = error;
-			}
-			expect(failure).toBeInstanceOf(AuthorityRpcError);
-			if (!(failure instanceof AuthorityRpcError))
-				throw new Error("Post-COMMIT opening did not reject with its original RPC error");
-			const originalFailure = failure;
-			const originalProperties = {
-				name: failure.name,
-				message: failure.message,
-				requestId: failure.requestId,
-				unknownOutcome: failure.unknownOutcome,
-				stack: failure.stack,
-			};
-			expect(originalFailure).toMatchObject({ name: "SQLiteUnknownCommitOutcomeError", unknownOutcome: true });
-			expect(originalFailure.cause).toBeUndefined();
-			expect(committedOpenings).toBe(1);
-			expect(rollbackFailure).toMatchObject({
-				message: expect.stringMatching(/rollback|transaction/i),
-				stack: expect.any(String),
+			expect(rejectionReason(await observePromise(opening))).toMatchObject({
+				unknownOutcome: true,
+				message: "injected failure after real recovery",
 			});
-			expect(cleanupReplies).toEqual([]);
+			expect(recoveries).toBe(1);
 			expect(cleanupAttempts).toEqual([]);
-			expect(opens).toHaveLength(1);
-			expect(releases).toBe(0);
-			await expect(
-				acquireAuthorityOwnership(path.join(directory, "root.jsonl"), {
-					owningSessionId: identity.owningSessionId,
-				}),
-			).rejects.toThrow(/ownership|lock/i);
-			const nativeThreadId = originalThreadId;
-			if (nativeThreadId === undefined || originalPidfd === undefined)
-				throw new Error("Post-COMMIT opening worker was not independently pinned");
-			let acknowledgedEvidence: unknown;
-			if (retryCleanupAndExit) {
-				if (!pipe) throw new Error("Cleanup-exit retry fixture lost its pipe");
-				if (!cleanupBridge) throw new Error("Cleanup-exit retry fixture lost its ACK owner");
-				for (const attempt of [1, 2]) {
-					const closeFailure = rejectionReason(
-						await observePromise(trackCleanupAttempt(identity.owningSessionId, cleanupBridge)),
-					);
-					expect(closeFailure).toBeInstanceOf(Error);
-					if (!(closeFailure instanceof Error))
-						throw new Error("Native physical-close retry did not reject with an Error");
-					expect(closeFailure.message).toContain(`injected unknown-open physical close failure ${attempt}`);
-					expect(cleanupReplies).toHaveLength(attempt);
-					expect(cleanupAttempts).toHaveLength(attempt);
-					expect(threadExitEvents(originalPidfd)).toBe(0);
-					expect(opens).toHaveLength(1);
-					expect(releases).toBe(0);
-				}
-				const waitForExit = threadLifetime.waitForAuthorityThreadExit;
-				const exitWait = spyOn(threadLifetime, "waitForAuthorityThreadExit").mockImplementationOnce(async pin => {
-					expect(pin.threadId).toBe(nativeThreadId);
-					if (pin.threadId === null) throw new Error("PIDFD_THREAD pin omitted its kernel thread ID");
-					await waitForBlockedRead(pin.threadId, pipe![0]);
-					// Poll the real, still-live pin with an expired boundary; never fake successful exit.
-					await waitForExit(pin, Date.now());
-				});
+			expect(cleanupReplies).toEqual([]);
+			if (originalPidfd === undefined) throw new Error("Failed-opening worker was not independently pinned");
+			for (const attempt of [1, 2]) {
+				let cleanupFailure: unknown;
 				try {
-					const exitFailure = rejectionReason(
-						await observePromise(trackCleanupAttempt(identity.owningSessionId, cleanupBridge)),
-					);
-					expect(exitFailure).toBeInstanceOf(Error);
-					if (!(exitFailure instanceof Error))
-						throw new Error("Native exact-exit retry did not reject with an Error");
-					expect(exitFailure.message).toMatch(/exit remains unconfirmed/);
-					expect(threadExitEvents(originalPidfd)).toBe(0);
-					expect(cleanupReplies).toHaveLength(3);
-					expect(cleanupReplies[2]).toMatchObject({ ok: true });
-					expect(cleanupBlockTids).toEqual([nativeThreadId]);
-					expect(cleanupAttempts).toHaveLength(3);
-					expect(opens).toHaveLength(1);
-					expect(releases).toBe(0);
-					acknowledgedEvidence = originalFailure.cause;
-					expect(acknowledgedEvidence).toBeDefined();
-				} finally {
-					exitWait.mockRestore();
+					await trackCleanupAttempt(identity.owningSessionId);
+				} catch (error) {
+					cleanupFailure = error;
 				}
-				if (libc.symbols.write(pipe[1], ptr(new Uint8Array([1])), 1) !== 1n)
-					throw new Error("Could not release the acknowledged cleanup worker");
-				releaseDescriptors.delete(pipe[1]);
+				expect(cleanupFailure).toMatchObject({
+					message: `injected unknown-open physical close failure ${attempt}`,
+					cause: {
+						errors: expect.arrayContaining([
+							expect.objectContaining({ message: "injected failure after real recovery" }),
+							...Array.from({ length: attempt }, (_, index) =>
+								expect.objectContaining({
+									message: `injected unknown-open physical close failure ${index + 1}`,
+								}),
+							),
+						]),
+					},
+				});
+				expect(cleanupAttempts).toHaveLength(attempt);
+				expect(threadExitEvents(originalPidfd)).toBe(0);
+				expect(workers).toHaveLength(1);
+				expect(opens).toHaveLength(1);
+				expect(releases).toBe(0);
+				let terminated = false;
+				void terminations[0]!.promise.then(() => {
+					terminated = true;
+				});
+				await Promise.resolve();
+				expect(terminated).toBe(false);
+				await expect(
+					acquireAuthorityOwnership(path.join(directory, "root.jsonl"), { owningSessionId: "native-root" }),
+				).rejects.toThrow(/ownership|lock/i);
 			}
-			expect(await trackCleanupAttempt(identity.owningSessionId, cleanupBridge)).toBe(true);
+			expect(await trackCleanupAttempt(identity.owningSessionId)).toBe(true);
 			failedOpenRoots.delete(identity.owningSessionId);
-			if (retryCleanupAndExit) {
-				expect(originalFailure.cause).toBe(acknowledgedEvidence);
-				expect(cleanupAttempts).toEqual([
-					expect.objectContaining({ attempt: 1, sameHandle: true, force: true, physicallyClosed: false }),
-					expect.objectContaining({ attempt: 2, sameHandle: true, force: true, physicallyClosed: false }),
-					expect.objectContaining({ attempt: 3, sameHandle: true, force: true, physicallyClosed: true }),
-				]);
-			}
-			expect(cleanupReplies).toHaveLength(retryCleanupAndExit ? 3 : 1);
-			expect(await trackCleanupAttempt(identity.owningSessionId, cleanupBridge)).toBe(false);
-			expect(rejectionReason(await observePromise(opening))).toBe(originalFailure);
-			expect(originalFailure).toMatchObject(originalProperties);
-			const underlyingCause = {
-				name: "TypeError",
-				message: "injected opening storage boundary failure",
-				stack: expect.any(String),
-				cause: { name: "RangeError", message: "injected nested opening cause", stack: expect.any(String) },
-			};
-			const originalWorkerEvidence = {
-				name: "SQLiteUnknownCommitOutcomeError",
-				message: originalProperties.message,
-				stack: expect.any(String),
-				cause: {
-					name: "AggregateError",
-					message: "injected failure after real opening COMMIT",
-					stack: expect.any(String),
-					cause: underlyingCause,
-					errors: [
-						underlyingCause,
-						{ name: "Error", message: "injected distinct opening evidence", stack: expect.any(String) },
+			expect(cleanupAttempts).toEqual([
+				expect.objectContaining({ attempt: 1, sameHandle: true, force: true, physicallyClosed: false }),
+				expect.objectContaining({ attempt: 2, sameHandle: true, force: true, physicallyClosed: false }),
+				expect.objectContaining({ attempt: 3, sameHandle: true, force: true, physicallyClosed: true }),
+			]);
+			expect(cleanupReplies).toEqual([
+				expect.objectContaining({ ok: false }),
+				expect.objectContaining({ ok: false }),
+				expect.objectContaining({
+					ok: true,
+					failures: [
+						expect.objectContaining({ message: "injected failure after real recovery" }),
+						expect.objectContaining({ message: "injected unknown-open physical close failure 1" }),
+						expect.objectContaining({ message: "injected unknown-open physical close failure 2" }),
 					],
-				},
-				rollbackError: rollbackFailure,
-			};
-			expect(originalFailure.cause).toMatchObject(
-				retryCleanupAndExit
-					? {
-							errors: [
-								originalWorkerEvidence,
-								{ message: "injected unknown-open physical close failure 1", stack: expect.any(String) },
-								{ message: "injected unknown-open physical close failure 2", stack: expect.any(String) },
-							],
-						}
-					: originalWorkerEvidence,
-			);
+				}),
+			]);
 			expect(opens).toEqual([
 				expect.objectContaining({
-					id: originalFailure.requestId,
 					driver: { path: databasePath, identity, create: true, liveOwner: true, capacity: borrowedCapacity },
 				}),
 				expect.objectContaining({
@@ -1339,140 +1068,448 @@ describe("authority native worker lifetime", () => {
 			expect(replacementBoundaries).toEqual([true]);
 			expect(releaseBoundaries).toEqual([true]);
 			expect(releases).toBe(1);
-			expect(committedOpenings).toBe(1);
+			expect(recoveries).toBe(1);
 			expect(mutations).toBe(0);
 			expect(callbacks).toBe(0);
 			const recoveredOwnership = await acquireAuthorityOwnership(path.join(directory, "root.jsonl"), {
-				owningSessionId: identity.owningSessionId,
+				owningSessionId: "native-root",
+			});
+			const recovered = await openTrackedAuthority(
+				{ path: databasePath, identity, create: false },
+				recoveredOwnership,
+				createTrackedWorkerFactory(
+					() => {},
+					[],
+					() => {},
+					"normal",
+					() => {},
+				),
+			);
+			expect(await recovered.recoveryState()).toMatchObject({ owner: { phase: "ready" } });
+			await recovered.close();
+		},
+	);
+	for (const retryCleanupAndExit of [false, true]) {
+		itOnXfs(
+			`keeps nested real post-COMMIT opening evidence on the original rejection after successful cleanup${retryCleanupAndExit ? " and cleanup/exit retries" : ""}`,
+			async () => {
+				const { ownership: acquired, path: databasePath, directory } = await makeOwnedAuthority("sqlite");
+				const identity: AuthorityIdentity = {
+					backend: "sqlite",
+					owningSessionId: "native-root",
+					incarnation: crypto.randomUUID(),
+					format: 2,
+				};
+				let pipe: Int32Array | undefined;
+				if (retryCleanupAndExit) {
+					pipe = new Int32Array(2);
+					if (libc.symbols.pipe2(ptr(pipe), 0) !== 0) throw new Error("Could not create cleanup-exit test pipe");
+					for (const descriptor of pipe) descriptors.add(descriptor);
+					releaseDescriptors.add(pipe[1]);
+				}
+				let originalThreadId: number | undefined;
+				let originalPidfd: number | undefined;
+				let committedOpenings = 0;
+				let rollbackFailure: unknown;
+				let cleanupAcknowledged = false;
+				let releases = 0;
+				let mutations = 0;
+				let callbacks = 0;
+				let workerCount = 0;
+				let cleanupBridge: NativeCleanupAckBridge | undefined;
+				const opens: unknown[] = [];
+				const cleanupReplies: unknown[] = [];
+				const cleanupAttempts: unknown[] = [];
+				const cleanupBlockTids: number[] = [];
+				const replacementBoundaries: boolean[] = [];
+				const releaseBoundaries: boolean[] = [];
+				const ownership: AuthorityOwnership = {
+					...acquired,
+					release: async () => {
+						releaseBoundaries.push(
+							cleanupAcknowledged &&
+								originalPidfd !== undefined &&
+								(threadExitEvents(originalPidfd) & THREAD_EXIT_EVENTS) !== 0,
+						);
+						releases++;
+						await acquired.release();
+					},
+				};
+				const factory = (): Worker => {
+					const original = workerCount++ === 0;
+					const mode = original
+						? retryCleanupAndExit
+							? "post-commit-open-failure-with-retries"
+							: "post-commit-open-failure"
+						: "normal";
+					return createTrackedWorkerFactory(
+						message => {
+							opens.push(message);
+							if (!original)
+								replacementBoundaries.push(
+									cleanupAcknowledged &&
+										originalPidfd !== undefined &&
+										(threadExitEvents(originalPidfd) & THREAD_EXIT_EVENTS) !== 0,
+								);
+						},
+						[],
+						() => {
+							mutations++;
+						},
+						mode,
+						value => {
+							if (
+								isFixturePhase(value, "cleanup-block-started") &&
+								typeof value === "object" &&
+								value !== null &&
+								"tid" in value &&
+								typeof value.tid === "number"
+							)
+								cleanupBlockTids.push(value.tid);
+							if (isFixturePhase(value, "opening-committed")) {
+								committedOpenings++;
+								if (
+									typeof value !== "object" ||
+									value === null ||
+									!("tid" in value) ||
+									typeof value.tid !== "number"
+								)
+									throw new Error("Post-COMMIT fixture omitted its native thread ID");
+								originalThreadId = value.tid;
+								originalPidfd = libc.symbols.pidfd_open(value.tid, fsSync.constants.O_EXCL);
+								if (originalPidfd < 0)
+									throw new Error("Could not independently pin the post-COMMIT opening worker");
+								descriptors.add(originalPidfd);
+							}
+							if (
+								isFixturePhase(value, "opening-rollback-failed") &&
+								typeof value === "object" &&
+								value !== null &&
+								"failure" in value
+							)
+								rollbackFailure = value.failure;
+							if (isFixturePhase(value, "unknown-open-close")) cleanupAttempts.push(value);
+							if (
+								typeof value === "object" &&
+								value !== null &&
+								"kind" in value &&
+								value.kind === "authority-thread-lifetime" &&
+								"phase" in value &&
+								value.phase === "cleanup"
+							) {
+								cleanupReplies.push(value);
+								if ("ok" in value && value.ok === true) cleanupAcknowledged = true;
+							}
+						},
+						original && retryCleanupAndExit ? pipe![0] : undefined,
+						bridge => {
+							cleanupBridge = bridge;
+							bridge.root = identity.owningSessionId;
+						},
+					)();
+				};
+				const opening = openTrackedAuthority(
+					{ path: databasePath, identity, create: true },
+					ownership,
+					factory,
+				).then(client => {
+					callbacks++;
+					return client;
+				});
+				let failure: unknown;
+				try {
+					await opening;
+				} catch (error) {
+					failure = error;
+				}
+				expect(failure).toBeInstanceOf(AuthorityRpcError);
+				if (!(failure instanceof AuthorityRpcError))
+					throw new Error("Post-COMMIT opening did not reject with its original RPC error");
+				const originalFailure = failure;
+				const originalProperties = {
+					name: failure.name,
+					message: failure.message,
+					requestId: failure.requestId,
+					unknownOutcome: failure.unknownOutcome,
+					stack: failure.stack,
+				};
+				expect(originalFailure).toMatchObject({ name: "SQLiteUnknownCommitOutcomeError", unknownOutcome: true });
+				expect(originalFailure.cause).toBeUndefined();
+				expect(committedOpenings).toBe(1);
+				expect(rollbackFailure).toMatchObject({
+					message: expect.stringMatching(/rollback|transaction/i),
+					stack: expect.any(String),
+				});
+				expect(cleanupReplies).toEqual([]);
+				expect(cleanupAttempts).toEqual([]);
+				expect(opens).toHaveLength(1);
+				expect(releases).toBe(0);
+				await expect(
+					acquireAuthorityOwnership(path.join(directory, "root.jsonl"), {
+						owningSessionId: identity.owningSessionId,
+					}),
+				).rejects.toThrow(/ownership|lock/i);
+				const nativeThreadId = originalThreadId;
+				if (nativeThreadId === undefined || originalPidfd === undefined)
+					throw new Error("Post-COMMIT opening worker was not independently pinned");
+				let acknowledgedEvidence: unknown;
+				if (retryCleanupAndExit) {
+					if (!pipe) throw new Error("Cleanup-exit retry fixture lost its pipe");
+					if (!cleanupBridge) throw new Error("Cleanup-exit retry fixture lost its ACK owner");
+					for (const attempt of [1, 2]) {
+						const closeFailure = rejectionReason(
+							await observePromise(trackCleanupAttempt(identity.owningSessionId, cleanupBridge)),
+						);
+						expect(closeFailure).toBeInstanceOf(Error);
+						if (!(closeFailure instanceof Error))
+							throw new Error("Native physical-close retry did not reject with an Error");
+						expect(closeFailure.message).toContain(`injected unknown-open physical close failure ${attempt}`);
+						expect(cleanupReplies).toHaveLength(attempt);
+						expect(cleanupAttempts).toHaveLength(attempt);
+						expect(threadExitEvents(originalPidfd)).toBe(0);
+						expect(opens).toHaveLength(1);
+						expect(releases).toBe(0);
+					}
+					const waitForExit = threadLifetime.waitForAuthorityThreadExit;
+					const exitWait = spyOn(threadLifetime, "waitForAuthorityThreadExit").mockImplementationOnce(
+						async pin => {
+							expect(pin.threadId).toBe(nativeThreadId);
+							if (pin.threadId === null) throw new Error("PIDFD_THREAD pin omitted its kernel thread ID");
+							await waitForBlockedRead(pin.threadId, pipe![0]);
+							// Poll the real, still-live pin with an expired boundary; never fake successful exit.
+							await waitForExit(pin, Date.now());
+						},
+					);
+					try {
+						const exitFailure = rejectionReason(
+							await observePromise(trackCleanupAttempt(identity.owningSessionId, cleanupBridge)),
+						);
+						expect(exitFailure).toBeInstanceOf(Error);
+						if (!(exitFailure instanceof Error))
+							throw new Error("Native exact-exit retry did not reject with an Error");
+						expect(exitFailure.message).toMatch(/exit remains unconfirmed/);
+						expect(threadExitEvents(originalPidfd)).toBe(0);
+						expect(cleanupReplies).toHaveLength(3);
+						expect(cleanupReplies[2]).toMatchObject({ ok: true });
+						expect(cleanupBlockTids).toEqual([nativeThreadId]);
+						expect(cleanupAttempts).toHaveLength(3);
+						expect(opens).toHaveLength(1);
+						expect(releases).toBe(0);
+						acknowledgedEvidence = originalFailure.cause;
+						expect(acknowledgedEvidence).toBeDefined();
+					} finally {
+						exitWait.mockRestore();
+					}
+					if (libc.symbols.write(pipe[1], ptr(new Uint8Array([1])), 1) !== 1n)
+						throw new Error("Could not release the acknowledged cleanup worker");
+					releaseDescriptors.delete(pipe[1]);
+				}
+				expect(await trackCleanupAttempt(identity.owningSessionId, cleanupBridge)).toBe(true);
+				failedOpenRoots.delete(identity.owningSessionId);
+				if (retryCleanupAndExit) {
+					expect(originalFailure.cause).toBe(acknowledgedEvidence);
+					expect(cleanupAttempts).toEqual([
+						expect.objectContaining({ attempt: 1, sameHandle: true, force: true, physicallyClosed: false }),
+						expect.objectContaining({ attempt: 2, sameHandle: true, force: true, physicallyClosed: false }),
+						expect.objectContaining({ attempt: 3, sameHandle: true, force: true, physicallyClosed: true }),
+					]);
+				}
+				expect(cleanupReplies).toHaveLength(retryCleanupAndExit ? 3 : 1);
+				expect(await trackCleanupAttempt(identity.owningSessionId, cleanupBridge)).toBe(false);
+				expect(rejectionReason(await observePromise(opening))).toBe(originalFailure);
+				expect(originalFailure).toMatchObject(originalProperties);
+				const underlyingCause = {
+					name: "TypeError",
+					message: "injected opening storage boundary failure",
+					stack: expect.any(String),
+					cause: { name: "RangeError", message: "injected nested opening cause", stack: expect.any(String) },
+				};
+				const originalWorkerEvidence = {
+					name: "SQLiteUnknownCommitOutcomeError",
+					message: originalProperties.message,
+					stack: expect.any(String),
+					cause: {
+						name: "AggregateError",
+						message: "injected failure after real opening COMMIT",
+						stack: expect.any(String),
+						cause: underlyingCause,
+						errors: [
+							underlyingCause,
+							{ name: "Error", message: "injected distinct opening evidence", stack: expect.any(String) },
+						],
+					},
+					rollbackError: rollbackFailure,
+				};
+				expect(originalFailure.cause).toMatchObject(
+					retryCleanupAndExit
+						? {
+								errors: [
+									originalWorkerEvidence,
+									{ message: "injected unknown-open physical close failure 1", stack: expect.any(String) },
+									{ message: "injected unknown-open physical close failure 2", stack: expect.any(String) },
+								],
+							}
+						: originalWorkerEvidence,
+				);
+				expect(opens).toEqual([
+					expect.objectContaining({
+						id: originalFailure.requestId,
+						driver: { path: databasePath, identity, create: true, liveOwner: true, capacity: borrowedCapacity },
+					}),
+					expect.objectContaining({
+						driver: { path: databasePath, identity, create: false, liveOwner: true, capacity: borrowedCapacity },
+					}),
+				]);
+				expect(replacementBoundaries).toEqual([true]);
+				expect(releaseBoundaries).toEqual([true]);
+				expect(releases).toBe(1);
+				expect(committedOpenings).toBe(1);
+				expect(mutations).toBe(0);
+				expect(callbacks).toBe(0);
+				const recoveredOwnership = await acquireAuthorityOwnership(path.join(directory, "root.jsonl"), {
+					owningSessionId: identity.owningSessionId,
+				});
+				const recovered = await openTrackedAuthority(
+					{ path: databasePath, identity, create: false },
+					recoveredOwnership,
+					factory,
+				);
+				const exported = await recovered.exportState();
+				const committed = exported.frames[0];
+				if (!committed) throw new Error("Real post-COMMIT opening lost its committed owner frame");
+				expect(committed.command).toMatchObject({ kind: "owner", owner: { epoch: 1, phase: "recovering" } });
+				expect(
+					await recovered.resolveReceipt(
+						committed.request.requestId,
+						committed.receipt.ownerEpoch,
+						identity.incarnation,
+						committed.receipt.payloadHash,
+					),
+				).toEqual(committed.receipt);
+				expect(exported.frames.filter(frame => frame.command.kind !== "owner")).toEqual([]);
+				await recovered.close();
+			},
+		);
+	}
+	itOnXfs(
+		"recovers a valid seeded SQLite client at the exact existing store without seed, callback or mutation replay",
+		async () => {
+			const { ownership: acquired, path: databasePath, directory } = await makeOwnedAuthority("sqlite");
+			const identity: AuthorityIdentity = {
+				backend: "sqlite",
+				owningSessionId: "native-root",
+				incarnation: crypto.randomUUID(),
+				format: 2,
+			};
+			const source = new SqliteAuthorityPersistence({
+				path: path.join(directory, "valid-seed.sqlite"),
+				identity,
+				create: true,
+			});
+			fixtureDrivers.add(source);
+			const sourceEngine = new AuthorityEngine(source, "native-seed-owner");
+			sourceEngine.recover();
+			const seededIntent = operationRecord("native-seeded-operation");
+			const seededIntentReceipt = sourceEngine.transition(seededIntent, {
+				requestId: "native-seeded-intent-request",
+			});
+			const seededRecord: DurableOperationRecord = { ...seededIntent, phase: "cancelled" };
+			const seededReceipt = sourceEngine.transition(seededRecord, { requestId: "native-seeded-request" });
+			const seed = sourceEngine.exportState();
+			sourceEngine.close();
+			fixtureDrivers.delete(source);
+			let releases = 0;
+			let callbacks = 0;
+			let mutations = 0;
+			const opens: unknown[] = [];
+			const factory = createTrackedWorkerFactory(
+				message => {
+					opens.push(message);
+				},
+				[],
+				() => {
+					mutations++;
+				},
+				"normal",
+				() => {},
+			);
+			const ownership: AuthorityOwnership = {
+				...acquired,
+				release: async () => {
+					releases++;
+					await acquired.release();
+				},
+			};
+			const client = await openTrackedAuthority(
+				{ path: databasePath, identity, create: true, seed },
+				ownership,
+				factory,
+			);
+			expect(
+				await client.getOperation(seededRecord.ownerId, seededRecord.effectClass, seededRecord.operationId),
+			).toEqual({ record: seededRecord, version: 2 });
+			expect(await client.resolveReceipt("native-seeded-intent-request")).toEqual(seededIntentReceipt);
+			expect(await client.resolveReceipt("native-seeded-request")).toEqual(seededReceipt);
+			const record = operationRecord("native-after-seed-operation");
+			const receipt = await withAuthorityEffect(client, async () => {
+				const result = await client.transition(record, { requestId: "native-after-seed-request" });
+				callbacks++;
+				return result;
+			});
+			const beforeFailure = await client.exportState();
+			expect(beforeFailure.frames.slice(0, seed.frames.length)).toEqual([...seed.frames]);
+			workers[0]!.dispatchEvent(new ErrorEvent("error", { message: "injected seeded-client transport failure" }));
+			await client.close();
+			expect(opens).toEqual([
+				expect.objectContaining({
+					driver: {
+						path: databasePath,
+						identity,
+						create: true,
+						seed,
+						liveOwner: true,
+						capacity: borrowedCapacity,
+					},
+				}),
+				expect.objectContaining({
+					driver: { path: databasePath, identity, create: false, liveOwner: true, capacity: borrowedCapacity },
+				}),
+			]);
+			expect(releases).toBe(1);
+			expect(mutations).toBe(1);
+			expect(callbacks).toBe(1);
+			const recoveredOwnership = await acquireAuthorityOwnership(path.join(directory, "root.jsonl"), {
+				owningSessionId: "native-root",
 			});
 			const recovered = await openTrackedAuthority(
 				{ path: databasePath, identity, create: false },
 				recoveredOwnership,
 				factory,
 			);
-			const exported = await recovered.exportState();
-			const committed = exported.frames[0];
-			if (!committed) throw new Error("Real post-COMMIT opening lost its committed owner frame");
-			expect(committed.command).toMatchObject({ kind: "owner", owner: { epoch: 1, phase: "recovering" } });
 			expect(
-				await recovered.resolveReceipt(
-					committed.request.requestId,
-					committed.receipt.ownerEpoch,
-					identity.incarnation,
-					committed.receipt.payloadHash,
-				),
-			).toEqual(committed.receipt);
-			expect(exported.frames.filter(frame => frame.command.kind !== "owner")).toEqual([]);
+				await recovered.getOperation(seededRecord.ownerId, seededRecord.effectClass, seededRecord.operationId),
+			).toEqual({ record: seededRecord, version: 2 });
+			expect(await recovered.resolveReceipt("native-seeded-intent-request")).toEqual(seededIntentReceipt);
+			expect(await recovered.resolveReceipt("native-seeded-request")).toEqual(seededReceipt);
+			expect(await recovered.getOperation(record.ownerId, record.effectClass, record.operationId)).toEqual({
+				record,
+				version: 1,
+			});
+			expect(await recovered.resolveReceipt("native-after-seed-request")).toEqual(receipt);
+			const evidence = await recovered.exportState();
+			expect(evidence.frames.slice(0, beforeFailure.frames.length)).toEqual([...beforeFailure.frames]);
+			expect(evidence.frames.filter(frame => frame.command.kind === "transition")).toEqual(
+				beforeFailure.frames.filter(frame => frame.command.kind === "transition"),
+			);
+			expect((await recovered.recoveryState()).blocked).toEqual([
+				"operation:native-root:native-after-seed-operation:intent",
+			]);
+			expect(mutations).toBe(1);
+			expect(callbacks).toBe(1);
 			await recovered.close();
-		});
-	}
-	it("recovers a valid seeded SQLite client at the exact existing store without seed, callback or mutation replay", async () => {
-		const { ownership: acquired, path: databasePath, directory } = await makeOwnedAuthority("sqlite");
-		const identity: AuthorityIdentity = {
-			backend: "sqlite",
-			owningSessionId: "native-root",
-			incarnation: crypto.randomUUID(),
-			format: 2,
-		};
-		const source = new SqliteAuthorityPersistence({
-			path: path.join(directory, "valid-seed.sqlite"),
-			identity,
-			create: true,
-		});
-		fixtureDrivers.add(source);
-		const sourceEngine = new AuthorityEngine(source, "native-seed-owner");
-		sourceEngine.recover();
-		const seededIntent = operationRecord("native-seeded-operation");
-		const seededIntentReceipt = sourceEngine.transition(seededIntent, { requestId: "native-seeded-intent-request" });
-		const seededRecord: DurableOperationRecord = { ...seededIntent, phase: "cancelled" };
-		const seededReceipt = sourceEngine.transition(seededRecord, { requestId: "native-seeded-request" });
-		const seed = sourceEngine.exportState();
-		sourceEngine.close();
-		fixtureDrivers.delete(source);
-		let releases = 0;
-		let callbacks = 0;
-		let mutations = 0;
-		const opens: unknown[] = [];
-		const factory = createTrackedWorkerFactory(
-			message => {
-				opens.push(message);
-			},
-			[],
-			() => {
-				mutations++;
-			},
-			"normal",
-			() => {},
-		);
-		const ownership: AuthorityOwnership = {
-			...acquired,
-			release: async () => {
-				releases++;
-				await acquired.release();
-			},
-		};
-		const client = await openTrackedAuthority(
-			{ path: databasePath, identity, create: true, seed },
-			ownership,
-			factory,
-		);
-		expect(
-			await client.getOperation(seededRecord.ownerId, seededRecord.effectClass, seededRecord.operationId),
-		).toEqual({ record: seededRecord, version: 2 });
-		expect(await client.resolveReceipt("native-seeded-intent-request")).toEqual(seededIntentReceipt);
-		expect(await client.resolveReceipt("native-seeded-request")).toEqual(seededReceipt);
-		const record = operationRecord("native-after-seed-operation");
-		const receipt = await withAuthorityEffect(client, async () => {
-			const result = await client.transition(record, { requestId: "native-after-seed-request" });
-			callbacks++;
-			return result;
-		});
-		const beforeFailure = await client.exportState();
-		expect(beforeFailure.frames.slice(0, seed.frames.length)).toEqual([...seed.frames]);
-		workers[0]!.dispatchEvent(new ErrorEvent("error", { message: "injected seeded-client transport failure" }));
-		await client.close();
-		expect(opens).toEqual([
-			expect.objectContaining({
-				driver: { path: databasePath, identity, create: true, seed, liveOwner: true, capacity: borrowedCapacity },
-			}),
-			expect.objectContaining({
-				driver: { path: databasePath, identity, create: false, liveOwner: true, capacity: borrowedCapacity },
-			}),
-		]);
-		expect(releases).toBe(1);
-		expect(mutations).toBe(1);
-		expect(callbacks).toBe(1);
-		const recoveredOwnership = await acquireAuthorityOwnership(path.join(directory, "root.jsonl"), {
-			owningSessionId: "native-root",
-		});
-		const recovered = await openTrackedAuthority(
-			{ path: databasePath, identity, create: false },
-			recoveredOwnership,
-			factory,
-		);
-		expect(
-			await recovered.getOperation(seededRecord.ownerId, seededRecord.effectClass, seededRecord.operationId),
-		).toEqual({ record: seededRecord, version: 2 });
-		expect(await recovered.resolveReceipt("native-seeded-intent-request")).toEqual(seededIntentReceipt);
-		expect(await recovered.resolveReceipt("native-seeded-request")).toEqual(seededReceipt);
-		expect(await recovered.getOperation(record.ownerId, record.effectClass, record.operationId)).toEqual({
-			record,
-			version: 1,
-		});
-		expect(await recovered.resolveReceipt("native-after-seed-request")).toEqual(receipt);
-		const evidence = await recovered.exportState();
-		expect(evidence.frames.slice(0, beforeFailure.frames.length)).toEqual([...beforeFailure.frames]);
-		expect(evidence.frames.filter(frame => frame.command.kind === "transition")).toEqual(
-			beforeFailure.frames.filter(frame => frame.command.kind === "transition"),
-		);
-		expect((await recovered.recoveryState()).blocked).toEqual([
-			"operation:native-root:native-after-seed-operation:intent",
-		]);
-		expect(mutations).toBe(1);
-		expect(callbacks).toBe(1);
-		await recovered.close();
-	});
-	it("cancels replacement RPC listeners on a synchronous open send failure", async () => {
+		},
+	);
+	itOnXfs("cancels replacement RPC listeners on a synchronous open send failure", async () => {
 		const { ownership, path: authorityPath } = await makeOwnedAuthority("jsonl");
 		const identity: AuthorityIdentity = {
 			backend: "jsonl",
@@ -1537,85 +1574,88 @@ describe("authority native worker lifetime", () => {
 		expect(sends).toBe(1);
 		clients.splice(clients.indexOf(client), 1);
 	});
-	it("preserves construction and distinct cleanup failures while retrying the worker-owned SQLite handle", async () => {
-		const { ownership: acquired, path: databasePath, directory } = await makeOwnedAuthority("sqlite");
-		const identity: AuthorityIdentity = {
-			backend: "sqlite",
-			owningSessionId: "native-root",
-			incarnation: crypto.randomUUID(),
-			format: 2,
-		};
-		const sourceOptions: AuthorityDriverOptions = {
-			path: path.join(directory, "seed-source.sqlite"),
-			identity,
-			create: true,
-		};
-		const source = new SqliteAuthorityPersistence(sourceOptions);
-		fixtureDrivers.add(source);
-		const seed = source.exportState();
-		source.close();
-		fixtureDrivers.delete(source);
-		const invalidSeed: AuthorityExport = { ...seed, revision: -1 };
-		let ownershipReleases = 0;
-		const ownership: AuthorityOwnership = {
-			...acquired,
-			release: async () => {
-				ownershipReleases++;
-				await acquired.release();
-			},
-		};
-		const closeAttempts: unknown[] = [];
-		let openCount = 0;
-		const terminations: Array<PromiseWithResolvers<void>> = [];
-		const workerFactory = createTrackedWorkerFactory(
-			() => openCount++,
-			terminations,
-			() => {},
-			"sqlite-construction-failure",
-			value => {
-				if (isFixturePhase(value, "sqlite-close")) closeAttempts.push(value);
-			},
-		);
-		let openingFailure: unknown;
-		try {
-			await openTrackedAuthority(
-				{ path: databasePath, identity, create: true, seed: invalidSeed },
-				ownership,
-				workerFactory,
+	itOnXfs(
+		"preserves construction and distinct cleanup failures while retrying the worker-owned SQLite handle",
+		async () => {
+			const { ownership: acquired, path: databasePath, directory } = await makeOwnedAuthority("sqlite");
+			const identity: AuthorityIdentity = {
+				backend: "sqlite",
+				owningSessionId: "native-root",
+				incarnation: crypto.randomUUID(),
+				format: 2,
+			};
+			const sourceOptions: AuthorityDriverOptions = {
+				path: path.join(directory, "seed-source.sqlite"),
+				identity,
+				create: true,
+			};
+			const source = new SqliteAuthorityPersistence(sourceOptions);
+			fixtureDrivers.add(source);
+			const seed = source.exportState();
+			source.close();
+			fixtureDrivers.delete(source);
+			const invalidSeed: AuthorityExport = { ...seed, revision: -1 };
+			let ownershipReleases = 0;
+			const ownership: AuthorityOwnership = {
+				...acquired,
+				release: async () => {
+					ownershipReleases++;
+					await acquired.release();
+				},
+			};
+			const closeAttempts: unknown[] = [];
+			let openCount = 0;
+			const terminations: Array<PromiseWithResolvers<void>> = [];
+			const workerFactory = createTrackedWorkerFactory(
+				() => openCount++,
+				terminations,
+				() => {},
+				"sqlite-construction-failure",
+				value => {
+					if (isFixturePhase(value, "sqlite-close")) closeAttempts.push(value);
+				},
 			);
-		} catch (error) {
-			openingFailure = error;
-		}
-		expect(openingFailure).toBeInstanceOf(AuthorityRpcError);
-		if (!(openingFailure instanceof AuthorityRpcError))
-			throw new Error("SQLite worker opening did not preserve its RPC failure");
-		expect(openingFailure.cause).toEqual(
-			expect.objectContaining({
-				name: "SqliteAuthorityConstructionError",
-				constructionError: expect.objectContaining({ message: expect.stringMatching(/header metadata/i) }),
-				cleanupErrors: expect.arrayContaining([
-					expect.objectContaining({ message: "injected physical close boundary failure" }),
-				]),
-				errors: expect.arrayContaining([
-					expect.objectContaining({ message: expect.stringMatching(/header metadata/i) }),
-					expect.objectContaining({ message: "injected physical close boundary failure" }),
-				]),
-			}),
-		);
-		expect(closeAttempts).toEqual([
-			expect.objectContaining({ attempt: "initial", force: true }),
-			expect.objectContaining({ attempt: "retry", sameHandle: true, force: true }),
-		]);
-		expect(openCount).toBe(1);
-		expect(ownershipReleases).toBe(1);
-		for (const suffix of ["", "-wal", "-shm"]) {
-			let statFailure: unknown;
+			let openingFailure: unknown;
 			try {
-				await fs.stat(`${databasePath}${suffix}`);
+				await openTrackedAuthority(
+					{ path: databasePath, identity, create: true, seed: invalidSeed },
+					ownership,
+					workerFactory,
+				);
 			} catch (error) {
-				statFailure = error;
+				openingFailure = error;
 			}
-			expect(statFailure).toEqual(expect.objectContaining({ code: "ENOENT" }));
-		}
-	});
+			expect(openingFailure).toBeInstanceOf(AuthorityRpcError);
+			if (!(openingFailure instanceof AuthorityRpcError))
+				throw new Error("SQLite worker opening did not preserve its RPC failure");
+			expect(openingFailure.cause).toEqual(
+				expect.objectContaining({
+					name: "SqliteAuthorityConstructionError",
+					constructionError: expect.objectContaining({ message: expect.stringMatching(/header metadata/i) }),
+					cleanupErrors: expect.arrayContaining([
+						expect.objectContaining({ message: "injected physical close boundary failure" }),
+					]),
+					errors: expect.arrayContaining([
+						expect.objectContaining({ message: expect.stringMatching(/header metadata/i) }),
+						expect.objectContaining({ message: "injected physical close boundary failure" }),
+					]),
+				}),
+			);
+			expect(closeAttempts).toEqual([
+				expect.objectContaining({ attempt: "initial", force: true }),
+				expect.objectContaining({ attempt: "retry", sameHandle: true, force: true }),
+			]);
+			expect(openCount).toBe(1);
+			expect(ownershipReleases).toBe(1);
+			for (const suffix of ["", "-wal", "-shm"]) {
+				let statFailure: unknown;
+				try {
+					await fs.stat(`${databasePath}${suffix}`);
+				} catch (error) {
+					statFailure = error;
+				}
+				expect(statFailure).toEqual(expect.objectContaining({ code: "ENOENT" }));
+			}
+		},
+	);
 });

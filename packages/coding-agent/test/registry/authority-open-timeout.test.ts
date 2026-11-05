@@ -11,16 +11,22 @@ import { jsonlLayout, listJsonlRotationArtifacts } from "../../src/registry/auth
 import { acquireAuthorityOwnership } from "../../src/registry/authority/ownership";
 import type { AuthorityOwnership } from "../../src/registry/authority/ownership";
 import type { AuthorityDriverOptions, AuthorityIdentity, MutationReceipt } from "../../src/registry/authority/types";
+import { pidfdThreadHost } from "./authority-capacity-host";
 
 // An open whose worker outlives the open deadline (a long replay or rotation of a large store) must not leave that
 // worker running with the store and its ownership: the client terminates it, confirms the exact thread exit, and
 // only then releases ownership. The open is an unknown outcome, and the store stays recoverable as after a crash.
 
-const libc = dlopen("libc.so.6", {
-	pidfd_open: { args: [FFIType.i32, FFIType.u32], returns: FFIType.i32 },
-	poll: { args: [FFIType.ptr, FFIType.u64, FFIType.i32], returns: FFIType.i32 },
-	close: { args: [FFIType.i32], returns: FFIType.i32 },
-});
+function openTestLibc() {
+	return dlopen("libc.so.6", {
+		pidfd_open: { args: [FFIType.i32, FFIType.u32], returns: FFIType.i32 },
+		poll: { args: [FFIType.ptr, FFIType.u64, FFIType.i32], returns: FFIType.i32 },
+		close: { args: [FFIType.i32], returns: FFIType.i32 },
+	});
+}
+// These cases independently pin the worker thread with PIDFD_THREAD. Hosts without it (glibc before 2.36 does not
+// export pidfd_open) skip the suite and never bind the symbol, which would otherwise fail the whole file at load.
+const libc = (pidfdThreadHost ? openTestLibc() : undefined) as ReturnType<typeof openTestLibc>;
 // PIDFD_THREAD shares O_EXCL's value; POLLIN|POLLHUP report the pinned thread's exit.
 const PIDFD_THREAD = 128;
 const THREAD_EXIT_EVENTS = 17;
@@ -194,7 +200,7 @@ function expectStoppedAndReleased(open: TimedOutOpen): void {
 	expect(open.releasesAfterExit).toEqual([true]);
 }
 
-describe("authority client open deadline", () => {
+describe.skipIf(!pidfdThreadHost)("authority client open deadline", () => {
 	it("terminates a worker blocked past the open deadline, confirms its exit, then releases ownership", async () => {
 		const fixture = await storeWithHistory();
 		const before = storeBytes(fixture.directory);
