@@ -402,7 +402,10 @@ async function openSessionAuthority(
 					`Legacy authority journal at ${canonical} lacks its required denial fence`,
 				);
 		}
-		if (beforeLock.migration || beforeLock.staging || beforeLock.temporary) {
+		// With a selected descriptor this evidence may belong to a live owner mid-write (a descriptor replacement's
+		// temporary, a migration in progress), so only the re-inspection under ownership below may call it stranded;
+		// a live owner then surfaces as held ownership instead of a spurious recovery demand.
+		if (!beforeLock.descriptor && (beforeLock.migration || beforeLock.staging || beforeLock.temporary)) {
 			throw new AuthorityRecoveryRequiredError(
 				`Authority migration or initialization evidence at ${canonical} requires explicit recovery; run: ${recoverFinish}`,
 				recoverFinish,

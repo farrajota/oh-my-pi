@@ -1987,6 +1987,29 @@ describe("authority backend configuration", () => {
 			expect(await owner.exited).toBe(0);
 		}
 	});
+	it("reports held ownership, not recovery, while a live owner's descriptor replacement is in flight", async () => {
+		const directory = await makeDirectory();
+		const session = await makeSession(directory);
+		await prepareActiveJsonlAuthority(session);
+		const owner = spawnAuthorityProcess("hold", session);
+		// writeAuthorityDescriptor writes this temporary and renames it over the descriptor under ownership.
+		const inFlight = `${authorityPaths(session).descriptor}.tmp-in-flight`;
+		try {
+			expect(await readAuthorityProcessMessage(owner.stdout)).toMatchObject({ acquired: true });
+			await fs.writeFile(inFlight, "{}", { mode: 0o600 });
+			const contender = spawnAuthorityProcess("try", session);
+			const contenderMessage = await readAuthorityProcessMessage(contender.stdout);
+			expect(contenderMessage.acquired).toBe(false);
+			expect(contenderMessage.error).toMatch(/ownership is already held|authority filesystem flock/);
+			expect(await contender.exited).toBe(0);
+		} finally {
+			await fs.rm(inFlight, { force: true });
+			if (!owner.stdin) throw new Error("Authority owner process has no release pipe");
+			owner.stdin.write("release\n");
+			owner.stdin.end();
+			expect(await owner.exited).toBe(0);
+		}
+	});
 	it("refuses xfs-capacity ownership on unsupported Linux mount types before parsing session data", async () => {
 		if (os.platform() !== "linux") return;
 		const procFile = "/proc/self/status";
