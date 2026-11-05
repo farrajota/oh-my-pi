@@ -221,7 +221,8 @@ import {
 	cfgSessionWarnCost,
 } from "./session/settings";
 import { cfgDisabledProviders, cfgEnabledModels } from "./config/model-settings";
-import { cfgTaskAgentIdleTtlMs } from "./task/settings";
+import { permissionProfileConfigErrors } from "./task/permission-profiles";
+import { cfgTaskAgentIdleTtlMs, cfgTaskPermissionMode } from "./task/settings";
 import { cfgSkillsIncludeSkills } from "./extensibility/settings";
 import { cfgWorkspaceAdditionalDirectories } from "./session/context-settings";
 
@@ -885,6 +886,16 @@ async function runInteractiveMode(
 			// `emitNotice` fired before the UI subscribed and was silently lost.
 			mode.showWarning(`WATCHDOG.yml: ${sanitizeDisplayWarnings(advisorConfigWarnings).join("; ")}`);
 		}
+		// Errors in permission profile files otherwise reach only the task tool description.
+		void permissionProfileConfigErrors(session.sessionManager.getCwd(), {
+			mode: cfgTaskPermissionMode.get(session.settings),
+			agentDir: session.settings.getAgentDir(),
+		})
+			.then(errors => {
+				if (errors.length > 0)
+					mode.showWarning(`Permission profiles: ${sanitizeDisplayWarnings(errors).join("; ")}`);
+			})
+			.catch((error: unknown) => logger.warn("Permission profile check failed", { error: String(error) }));
 
 		for (const notify of notifs) {
 			if (!notify) {

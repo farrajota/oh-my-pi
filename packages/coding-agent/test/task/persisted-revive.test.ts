@@ -2880,6 +2880,68 @@ describe("fail-closed revival", () => {
 		expect([...restored].sort()).toEqual(["narrow:project", "user-narrow:user"]);
 	});
 
+	it("revives despite a reserved-name conflict in the user-level file", async () => {
+		const cwd = makeTempDir("@pi-permission-reserved-revive-");
+		await Bun.write(
+			path.join(cwd, ".omp", "permissions.json"),
+			JSON.stringify({ profiles: { narrow: { tools: ["read"] } } }),
+		);
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
+			async options =>
+				({
+					session: createRevivedSession([], undefined, options).session,
+				}) as CreateAgentSessionResult,
+		);
+		const sessionFile = await createPersistedSession(cwd, true, undefined, undefined, {
+			permissionProfile: "narrow",
+		});
+		const ref = await createRef(sessionFile);
+		// Rejected and never applied, so every current profile identity is still known.
+		await Bun.write(
+			path.join(cwd, "sessions", "permissions.json"),
+			JSON.stringify({ profiles: { "browser-audit": { tools: ["browser"] } } }),
+		);
+
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected revival despite the reserved-name conflict");
+		await reviver(ref);
+	});
+
+	it("refuses revival when a higher-precedence file breaks a profile the snapshot uses", async () => {
+		const cwd = makeTempDir("@pi-permission-unresolved-revive-");
+		// The project file keeps defining both profiles correctly; only the local file breaks.
+		await Bun.write(
+			path.join(cwd, ".omp", "permissions.json"),
+			JSON.stringify({ profiles: { narrow: { tools: ["read"] }, other: { tools: ["read"] } } }),
+		);
+		const localFile = path.join(cwd, ".omp", "permissions.local.json");
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
+			async options =>
+				({
+					session: createRevivedSession([], undefined, options).session,
+				}) as CreateAgentSessionResult,
+		);
+		const narrowRef = await createRef(
+			await createPersistedSession(cwd, true, undefined, undefined, { permissionProfile: "narrow" }),
+		);
+		const otherRef = await createRef(
+			await createPersistedSession(cwd, true, undefined, undefined, { permissionProfile: "other" }),
+		);
+		const invalidNarrowOverride = JSON.stringify({ profiles: { narrow: { tools: ["read"], denyPath: ["x"] } } });
+
+		await Bun.write(localFile, invalidNarrowOverride);
+		expect(await createFactory(cwd)(narrowRef)).toBeUndefined();
+
+		// Unparseable: it may have overridden any name, so nothing can be verified.
+		await Bun.write(localFile, "{ not json");
+		expect(await createFactory(cwd)(otherRef)).toBeUndefined();
+
+		await Bun.write(localFile, invalidNarrowOverride);
+		const reviver = await createFactory(cwd)(otherRef);
+		if (!reviver) throw new Error("Expected revival of a profile the invalid entry does not touch");
+		await reviver(otherRef);
+	});
+
 	it("rejects a user-level profile that was edited or moved into the project file", async () => {
 		const cwd = makeTempDir("@pi-permission-user-drift-");
 		const userProfileFile = path.join(cwd, "sessions", "permissions.json");

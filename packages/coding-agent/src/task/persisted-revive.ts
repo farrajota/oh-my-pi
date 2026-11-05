@@ -54,6 +54,7 @@ import {
 	isScopeNoBroader,
 	loadPermissionProfiles,
 	type PermissionScopeSnapshot,
+	permissionProfileDrift,
 } from "./permission-profiles";
 
 /**
@@ -163,12 +164,10 @@ async function validatePersistedRevivalContract(
 	)
 		return undefined;
 	if (provenance.profiles.length) {
-		const currentProfiles = await loadPermissionProfiles(cwd, { agentDir });
-		if (currentProfiles.errors.length > 0) return undefined;
-		for (const identity of provenance.profiles) {
-			const current = currentProfiles.profileIdentities[identity.name];
-			if (!current || current.source !== identity.source || current.canonicalSha256 !== identity.canonicalSha256)
-				return undefined;
+		const drift = permissionProfileDrift(provenance.profiles, await loadPermissionProfiles(cwd, { agentDir }));
+		if (drift !== undefined) {
+			logger.warn("Persisted subagent not revived: permission profiles drifted", { agentId: ref.id, reason: drift });
+			return undefined;
 		}
 	}
 	if (durableState) {
@@ -294,12 +293,16 @@ export function createPersistedSubagentReviverFactory(
 		)
 			return undefined;
 		if (provenance.profiles.length) {
-			const currentProfiles = await loadPermissionProfiles(peek.cwd, { agentDir: ctx.settings.getAgentDir() });
-			if (currentProfiles.errors.length > 0) return undefined;
-			for (const identity of provenance.profiles) {
-				const current = currentProfiles.profileIdentities[identity.name];
-				if (!current || current.source !== identity.source || current.canonicalSha256 !== identity.canonicalSha256)
-					return undefined;
+			const drift = permissionProfileDrift(
+				provenance.profiles,
+				await loadPermissionProfiles(peek.cwd, { agentDir: ctx.settings.getAgentDir() }),
+			);
+			if (drift !== undefined) {
+				logger.warn("Persisted subagent not revived: permission profiles drifted", {
+					agentId: ref.id,
+					reason: drift,
+				});
+				return undefined;
 			}
 		}
 		if (durableState) {

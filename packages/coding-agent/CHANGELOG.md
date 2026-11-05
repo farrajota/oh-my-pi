@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Permission profiles in `permissions.json` files are now validated: a profile with an unknown field (such as a misspelled `denyPaths`, or an extra key like `notes`) or a wrongly typed value is reported and no longer usable, instead of loading with that field silently dropped. Remove or correct the field. An invalid profile that overrides a built-in or lower-precedence profile of the same name makes that name unavailable until it is fixed.
+
 ### Added
 
 - Added selectable durable authority backends: `OMP_JOURNALING_BACKEND=jsonl|sqlite` (JSONL when unset; any other value, including empty, padded or uppercase, fails before any authority write) chooses the backend for new session roots, each root keeps its backend in `<S>.authority.json` for its whole agent tree, and a different default prints one line naming the migration command. Both backends support Linux, macOS and Windows (qualified on Linux x86_64), keep one owner per root per host, sync every acknowledged write (`F_FULLFSYNC` on macOS), and never fall back to another format or retry an external callback to guess an outcome. Conversation transcripts are unchanged.
@@ -15,6 +19,8 @@
 
 ### Changed
 
+- Persisted subagents now still revive when a permission profile file has a reserved-name conflict or an invalid entry for a profile they do not use; a refused revival logs which profile drifted.
+- Errors in permission profile files are now shown as a startup warning unless `task.permissions.mode` is `off`.
 - Resuming a session saved before authority journaling now adopts it as JSONL with a one-line notice: a fresh store when no authority evidence exists, or an in-place upgrade of a clean legacy v1 journal (backup kept); ambiguous, partial, corrupt, quarantined, mid-migration or unresolved state refuses with the exact `omp session` command to run.
 - Resuming a transcript that was copied or moved without its authority bundle, or a child agent transcript (task subagent, seance, `/tan`), is now refused with the session to resume instead of starting an empty authority for it; new transcripts record the root that owns them in the header (`authorityRoot`), session moves keep it current, and shares and HTML exports omit it.
 - A process runs at most 8 root authority stores at once; opening a ninth root (for example an SDK host or ACP server with more than 8 concurrent sessions) is refused until another root closes.

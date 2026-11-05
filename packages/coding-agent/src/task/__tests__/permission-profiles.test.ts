@@ -16,6 +16,7 @@ import {
 	permissionScopeDrifted,
 	isScopeNoBroader,
 	loadPermissionProfiles,
+	permissionProfileConfigErrors,
 	preflightPermissionGuardrails,
 	type CompiledPermissionClause,
 	type DeepImmutable,
@@ -186,6 +187,99 @@ describe("permission profile loading", () => {
 		expect(loaded.profiles["read-only"]?.tools).toContain("read");
 		expect(loaded.profiles["read-only"]?.denyTools).toBeUndefined();
 		expect(loaded.profiles["focused-edit"]?.tools).toContain("edit");
+	});
+});
+
+describe("permission profile file validation", () => {
+	test("a profile with an unknown field or a wrongly typed value is reported and not applied", async () => {
+		const cwd = await tempCwd();
+		await writeJson(path.join(cwd, ".omp", "permissions.json"), {
+			profiles: {
+				"NO-NETWORK": { denyTools: ["browser"] },
+				// A misspelled denyPaths would otherwise load a silently broader profile.
+				Misspelled: { tools: ["read"], denyPath: ["secret/**"] },
+				"string-tools": { tools: "read" },
+				"mixed-tools": { tools: ["read", 5] },
+				"numeric-description": { description: 5, tools: ["read"] },
+				scalar: "read-only",
+				valid: { tools: ["read"], denyPaths: ["secret/**"] },
+			},
+		});
+
+		const loaded = await loadPermissionProfiles(cwd, { agentDir: await emptyAgentDir() });
+
+		// File order, normalized names, whichever kind of error each entry has.
+		expect(loaded.errors).toEqual([
+			'.omp/permissions.json: permission profile "no-network" is reserved and cannot be overridden',
+			'.omp/permissions.json: permission profile "misspelled" has unknown field "denyPath"',
+			'.omp/permissions.json: permission profile "string-tools" field "tools" must be an array of strings',
+			'.omp/permissions.json: permission profile "mixed-tools" field "tools" must be an array of strings',
+			'.omp/permissions.json: permission profile "numeric-description" field "description" must be a string',
+			'.omp/permissions.json: permission profile "scalar" must be an object',
+		]);
+		expect(loaded.profiles.misspelled).toBeUndefined();
+		expect(loaded.profiles["string-tools"]).toBeUndefined();
+		expect(loaded.profiles["mixed-tools"]).toBeUndefined();
+		expect(loaded.profiles.scalar).toBeUndefined();
+		expect(loaded.profiles.valid).toEqual({ tools: ["read"], denyPaths: ["secret/**"] });
+	});
+
+	test("an invalid override stops the name resolving instead of falling back to a broader definition", async () => {
+		const cwd = await tempCwd();
+		await writeJson(path.join(cwd, ".omp", "permissions.json"), {
+			profiles: { narrow: { tools: ["read", "write"] } },
+		});
+		await writeJson(path.join(cwd, ".omp", "permissions.local.json"), {
+			profiles: {
+				narrow: { tools: ["read"], denyPath: ["secret/**"] },
+				"read-only": { tool: ["read"] },
+				"browser-audit": { tool: ["read"] },
+			},
+		});
+
+		const loaded = await loadPermissionProfiles(cwd, { agentDir: await emptyAgentDir() });
+
+		expect(loaded.errors).toHaveLength(3);
+		expect(loaded.profiles.narrow).toBeUndefined();
+		expect(loaded.profiles["read-only"]).toBeUndefined();
+		// Reserved profiles always resolve to the built-in.
+		expect(loaded.profiles["browser-audit"]).toEqual(BUILTIN_PERMISSION_PROFILES["browser-audit"]);
+	});
+
+	test("a file whose root or profiles value is not an object is reported; other top-level keys are ignored", async () => {
+		const cwd = await tempCwd();
+		const agentDir = await emptyAgentDir();
+		await writeJson(path.join(agentDir, "permissions.json"), { defaultAction: "allow", bash: [] });
+		await writeJson(path.join(cwd, ".omp", "permissions.json"), { profiles: ["read-only"] });
+		await writeJson(path.join(cwd, ".omp", "permissions.local.json"), ["read-only"]);
+
+		const loaded = await loadPermissionProfiles(cwd, { agentDir });
+
+		expect(loaded.errors).toEqual([
+			'.omp/permissions.json: "profiles" must be an object',
+			".omp/permissions.local.json: must contain a JSON object",
+		]);
+	});
+});
+
+describe("permission profile startup errors", () => {
+	test("reports loader errors unless subagent permissions are off", async () => {
+		const cwd = await tempCwd();
+		const agentDir = await emptyAgentDir();
+		await writeJson(path.join(cwd, ".omp", "permissions.json"), { profiles: { bad: { denyPath: ["x"] } } });
+
+		expect(await permissionProfileConfigErrors(cwd, { mode: "off", agentDir })).toEqual([]);
+		expect(await permissionProfileConfigErrors(cwd, { mode: "enforce", agentDir })).toEqual([
+			'.omp/permissions.json: permission profile "bad" has unknown field "denyPath"',
+		]);
+	});
+
+	test("is empty when every profile file is valid", async () => {
+		const cwd = await tempCwd();
+		const agentDir = await emptyAgentDir();
+		await writeJson(path.join(agentDir, "permissions.json"), { profiles: { scout: { tools: ["read"] } } });
+
+		expect(await permissionProfileConfigErrors(cwd, { mode: "enforce", agentDir })).toEqual([]);
 	});
 });
 

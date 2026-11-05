@@ -734,6 +734,18 @@ export function classifyTaskPermissionRequest(
 /** Short alias retained for internal adapters that describe this as request shape. */
 export const classifyPermissionRequest = classifyTaskPermissionRequest;
 
+export interface LoadedPermissionProfiles {
+	profiles: Record<string, PermissionProfile>;
+	profileIdentities: Record<string, PermissionProfileIdentity>;
+	summaries: PermissionProfileSummary[];
+	errors: string[];
+	/**
+	 * A profile file existed but could not be read, parsed, or had a non-object root or `profiles`
+	 * value. It may have overridden any name, so no loaded definition can be trusted for revival.
+	 */
+	unreadableFile: boolean;
+}
+
 /**
  * Load built-in, user (`<agentDir>/permissions.json`), project (`.omp/permissions.json`) and local
  * (`.omp/permissions.local.json`) profiles; a later source replaces an earlier one by name.
@@ -741,12 +753,7 @@ export const classifyPermissionRequest = classifyTaskPermissionRequest;
 export async function loadPermissionProfiles(
 	cwd: string,
 	options: LoadPermissionProfilesOptions = {},
-): Promise<{
-	profiles: Record<string, PermissionProfile>;
-	profileIdentities: Record<string, PermissionProfileIdentity>;
-	summaries: PermissionProfileSummary[];
-	errors: string[];
-}> {
+): Promise<LoadedPermissionProfiles> {
 	const profiles: Record<string, PermissionProfile> = {};
 	const sources = new Map<string, ProfileSource>();
 	for (const [name, profile] of Object.entries(BUILTIN_PERMISSION_PROFILES)) {
@@ -755,6 +762,7 @@ export async function loadPermissionProfiles(
 		sources.set(canonicalName, "built-in");
 	}
 	const errors: string[] = [];
+	let unreadableFile = false;
 
 	for (const file of profileFiles(cwd, options)) {
 		let parsed: unknown;
@@ -763,13 +771,29 @@ export async function loadPermissionProfiles(
 		} catch (error) {
 			if (isMissingFileError(error)) continue;
 			errors.push(`${file.label}: ${error instanceof Error ? error.message : String(error)}`);
+			unreadableFile = true;
 			continue;
 		}
-		const fileProfiles = readProfileMap(parsed);
-		if (!fileProfiles) continue;
-		for (const [rawName, rawProfile] of Object.entries(fileProfiles)) {
-			const name = canonicalProfileName(rawName);
-			const profile = canonicalProfile(rawProfile);
+		const fileContent = readProfileMap(parsed);
+		if (fileContent.fileProblem !== undefined) {
+			errors.push(`${file.label}: ${fileContent.fileProblem}`);
+			unreadableFile = true;
+			continue;
+		}
+		for (const entry of fileContent.entries) {
+			const name = canonicalProfileName(entry.name);
+			if (entry.problem !== undefined) {
+				errors.push(`${file.label}: permission profile "${name}" ${entry.problem}`);
+				// Reserved profiles always keep the built-in. Any other name stops resolving, so neither
+				// a spawn nor a revival falls back to a broader lower-precedence definition.
+				if (!RESERVED_PERMISSION_PROFILE_NAMES.has(name)) {
+					delete profiles[name];
+					sources.delete(name);
+				}
+				continue;
+			}
+			if (entry.profile === undefined) continue;
+			const profile = canonicalProfile(entry.profile);
 			const existing = profiles[name];
 			if (existing !== undefined && RESERVED_PERMISSION_PROFILE_NAMES.has(name)) {
 				if (!profilesEqual(existing, profile)) {
@@ -807,7 +831,38 @@ export async function loadPermissionProfiles(
 			summarizeProfile(name, profiles[name] ?? {}, sources.get(name) ?? "project"),
 		),
 		errors,
+		unreadableFile,
 	};
+}
+
+/**
+ * Why persisted profile identities no longer match the current profile files, or undefined
+ * when every one still resolves to the same source and content.
+ */
+export function permissionProfileDrift(
+	persisted: readonly PermissionProfileIdentity[],
+	current: Pick<LoadedPermissionProfiles, "profileIdentities" | "unreadableFile">,
+): string | undefined {
+	if (persisted.length > 0 && current.unreadableFile)
+		return "a permission profile file could not be read, so no profile can be verified";
+	for (const identity of persisted) {
+		const now = current.profileIdentities[identity.name];
+		if (!now) return `permission profile "${identity.name}" no longer exists`;
+		if (now.source !== identity.source)
+			return `permission profile "${identity.name}" moved from ${identity.source} to ${now.source}`;
+		if (now.canonicalSha256 !== identity.canonicalSha256)
+			return `permission profile "${identity.name}" changed since the subagent was spawned`;
+	}
+	return undefined;
+}
+
+/** Permission profile file errors to show the user; empty in mode off, which is a no-op. */
+export async function permissionProfileConfigErrors(
+	cwd: string,
+	options: { mode: SubagentPermissionMode; agentDir?: string },
+): Promise<string[]> {
+	if (options.mode === "off") return [];
+	return (await loadPermissionProfiles(cwd, { agentDir: options.agentDir })).errors;
 }
 export function composeEffectivePermissions(input: {
 	mode: SubagentPermissionMode;
@@ -1279,17 +1334,50 @@ function isMissingFileError(error: unknown): boolean {
 	);
 }
 
-function readProfileMap(value: unknown): Record<string, PermissionProfile> | undefined {
-	if (!isRecord(value)) return undefined;
-	const rawProfiles = value.profiles;
-	if (!isRecord(rawProfiles)) return undefined;
-	const result: Record<string, PermissionProfile> = {};
-	for (const [name, rawProfile] of Object.entries(rawProfiles)) {
-		if (!isRecord(rawProfile)) continue;
-		const profile = normalizeProfile(rawProfile);
-		if (profile) result[name] = profile;
+const PROFILE_STRING_FIELDS = new Set(["description", "useWhen"]);
+const PROFILE_LIST_FIELDS = new Set(["tools", "denyTools", "allowPaths", "denyPaths"]);
+
+/** One `profiles` entry in file order: a usable profile (undefined when empty) or why it was rejected. */
+type ProfileFileEntry =
+	| { readonly name: string; readonly profile: PermissionProfile | undefined; readonly problem?: undefined }
+	| { readonly name: string; readonly problem: string };
+
+interface ProfileFileContent {
+	readonly entries: readonly ProfileFileEntry[];
+	/** The root or `profiles` value has the wrong shape, so no entry in the file was read. */
+	readonly fileProblem?: string;
+}
+
+/** Read only the top-level `profiles` object; other top-level keys are deliberately ignored. */
+function readProfileMap(value: unknown): ProfileFileContent {
+	if (!isRecord(value)) return { entries: [], fileProblem: "must contain a JSON object" };
+	if (value.profiles === undefined) return { entries: [] };
+	if (!isRecord(value.profiles)) return { entries: [], fileProblem: '"profiles" must be an object' };
+	const entries: ProfileFileEntry[] = [];
+	for (const [name, rawProfile] of Object.entries(value.profiles)) {
+		if (!isRecord(rawProfile)) {
+			entries.push({ name, problem: "must be an object" });
+			continue;
+		}
+		// An entry with a misspelled or mistyped field is rejected whole: dropping only that field
+		// could load a silently broader profile (for example a lost denyPaths).
+		const problem = profileFieldProblem(rawProfile);
+		entries.push(problem === undefined ? { name, profile: normalizeProfile(rawProfile) } : { name, problem });
 	}
-	return result;
+	return { entries };
+}
+
+function profileFieldProblem(value: Record<string, unknown>): string | undefined {
+	for (const [field, fieldValue] of Object.entries(value)) {
+		if (PROFILE_STRING_FIELDS.has(field)) {
+			if (typeof fieldValue !== "string") return `field "${field}" must be a string`;
+		} else if (PROFILE_LIST_FIELDS.has(field)) {
+			if (stringArray(fieldValue) === undefined) return `field "${field}" must be an array of strings`;
+		} else {
+			return `has unknown field "${field}"`;
+		}
+	}
+	return undefined;
 }
 
 function normalizeProfile(value: Record<string, unknown>): PermissionProfile | undefined {
