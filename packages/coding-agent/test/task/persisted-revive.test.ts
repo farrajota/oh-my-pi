@@ -391,7 +391,8 @@ async function createPersistedSession(
 	const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) throw new Error("Expected a persisted session file");
-	const loaded = await loadPermissionProfiles(cwd);
+	// Same agent dir as the reviver's fixture settings (see createRef), so user-level identities agree.
+	const loaded = await loadPermissionProfiles(cwd, { agentDir: path.dirname(sessionFile) });
 	const actorId = `persisted-${path.basename(sessionFile, ".jsonl")}`;
 	const requestedProfiles = contract?.permissionProfile ? [contract.permissionProfile] : [];
 	const composed = composeEffectivePermissions({
@@ -2007,7 +2008,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		setupRegistry?.(registry);
 		const authority = bindInternalAgentAuthoritySession(registry, root.session);
 		if (!authority) throw new Error("Test fixture requires parent authority");
-		const loadedProfiles = await loadPermissionProfiles(cwd);
+		const loadedProfiles = await loadPermissionProfiles(cwd, { agentDir: settings.getAgentDir() });
 		const composedPermissions = composeEffectivePermissions({
 			mode: "enforce",
 			toolsEnabled: true,
@@ -2834,5 +2835,80 @@ describe("fail-closed revival", () => {
 		const changedRef = await createRef(changedFile);
 		await fs.writeFile(profileFile, JSON.stringify({ profiles: { narrow: { tools: ["write"] } } }));
 		expect(await createFactory(cwd)(changedRef)).toBeUndefined();
+	});
+
+	it("revives unchanged user-level and project profiles while a user-level file is present", async () => {
+		const cwd = makeTempDir("@pi-permission-user-revive-");
+		// createRef roots the fixture settings' agent dir at the session directory.
+		await Bun.write(
+			path.join(cwd, "sessions", "permissions.json"),
+			JSON.stringify({ profiles: { "user-narrow": { tools: ["read"], allowPaths: ["src/**"] } } }),
+		);
+		await Bun.write(
+			path.join(cwd, ".omp", "permissions.json"),
+			JSON.stringify({ profiles: { narrow: { tools: ["read"] } } }),
+		);
+		const captured: CreateAgentSessionOptions[] = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (options) captured.push(options);
+			return {
+				session: createRevivedSession([], undefined, options).session,
+			} as CreateAgentSessionResult;
+		});
+		const userFile = await createPersistedSession(cwd, true, undefined, undefined, {
+			permissionProfile: "user-narrow",
+		});
+		const projectFile = await createPersistedSession(cwd, true, undefined, undefined, {
+			permissionProfile: "narrow",
+		});
+
+		for (const sessionFile of [userFile, projectFile]) {
+			const ref = await createRef(sessionFile);
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected exact permission revival");
+			await reviver(ref);
+		}
+
+		// Each revival may create more than one session; collect the distinct restored identities.
+		const restored = new Set(
+			captured.flatMap(options =>
+				(options.permissionScope?.provenance?.profiles ?? []).map(
+					identity => `${identity.name}:${identity.source}`,
+				),
+			),
+		);
+		expect([...restored].sort()).toEqual(["narrow:project", "user-narrow:user"]);
+	});
+
+	it("rejects a user-level profile that was edited or moved into the project file", async () => {
+		const cwd = makeTempDir("@pi-permission-user-drift-");
+		const userProfileFile = path.join(cwd, "sessions", "permissions.json");
+		const original = { tools: ["read"] };
+		await Bun.write(userProfileFile, JSON.stringify({ profiles: { "user-narrow": original } }));
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
+			async options =>
+				({
+					session: createRevivedSession([], undefined, options).session,
+				}) as CreateAgentSessionResult,
+		);
+		const editedFile = await createPersistedSession(cwd, true, undefined, undefined, {
+			permissionProfile: "user-narrow",
+		});
+		const movedFile = await createPersistedSession(cwd, true, undefined, undefined, {
+			permissionProfile: "user-narrow",
+		});
+		const editedRef = await createRef(editedFile);
+		const movedRef = await createRef(movedFile);
+
+		await Bun.write(userProfileFile, JSON.stringify({ profiles: { "user-narrow": { tools: ["write"] } } }));
+		expect(await createFactory(cwd)(editedRef)).toBeUndefined();
+
+		// Identical content now owned by the project file: the source half of the identity changed.
+		await Bun.write(userProfileFile, JSON.stringify({ profiles: {} }));
+		await Bun.write(
+			path.join(cwd, ".omp", "permissions.json"),
+			JSON.stringify({ profiles: { "user-narrow": original } }),
+		);
+		expect(await createFactory(cwd)(movedRef)).toBeUndefined();
 	});
 });

@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentToolPreparedExecution } from "@oh-my-pi/pi-agent-core";
+import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
+import { getAgentDir, normalizePathForComparison } from "@oh-my-pi/pi-utils";
 import type {
 	BoundedList,
 	EffectivePermissionSummary,
@@ -162,13 +164,13 @@ export interface PermissionLease {
 
 export interface PermissionProfileIdentity {
 	readonly name: string;
-	readonly source: "built-in" | "project" | "local" | "request" | "inherited";
+	readonly source: "built-in" | "user" | "project" | "local" | "request" | "inherited";
 	readonly canonicalSha256: string;
 }
 
 /** Provenance for a frozen permission scope, including exact selected descriptor identities. */
 export interface PermissionProvenance {
-	readonly source: "builtin" | "project" | "local" | "request" | "inherited";
+	readonly source: "builtin" | "user" | "project" | "local" | "request" | "inherited";
 	readonly profileNames: readonly string[];
 	readonly profiles: readonly PermissionProfileIdentity[];
 }
@@ -227,7 +229,7 @@ export interface PermissionProfileSummary {
 	useWhen: string;
 	toolsSummary: string;
 	pathsSummary: string;
-	source: "built-in" | "project" | "local";
+	source: "built-in" | "user" | "project" | "local";
 }
 
 const SUMMARY_PROFILE_LIMIT = 16;
@@ -606,10 +608,46 @@ export const BUILTIN_PERMISSION_PROFILES: Record<string, PermissionProfile> = {
 
 type ProfileSource = PermissionProfileSummary["source"];
 
-const PROFILE_FILES: Array<{ relativePath: string; source: ProfileSource }> = [
+/** Project files, resolved against the session cwd, in ascending precedence. */
+const PROJECT_PROFILE_FILES: Array<{ relativePath: string; source: ProfileSource }> = [
 	{ relativePath: ".omp/permissions.json", source: "project" },
 	{ relativePath: ".omp/permissions.local.json", source: "local" },
 ];
+
+/** User-level file name inside the agent dir, next to config.yml. */
+const USER_PROFILE_FILE_NAME = "permissions.json";
+
+export interface LoadPermissionProfilesOptions {
+	/** Agent dir holding the user-level permissions.json; defaults to {@link getAgentDir}. */
+	agentDir?: string;
+	/** Read `<agentDir>/permissions.json`. Defaults to true. */
+	includeUserProfiles?: boolean;
+}
+
+interface ProfileFile {
+	readonly filePath: string;
+	/** Error label: cwd-relative for project files, home-relative for the user file. */
+	readonly label: string;
+	readonly source: ProfileSource;
+}
+
+/** Profile files in ascending precedence: user, project, local. */
+function profileFiles(cwd: string, options: LoadPermissionProfilesOptions): ProfileFile[] {
+	const files: ProfileFile[] = [];
+	let userFileIdentity: string | undefined;
+	if (options.includeUserProfiles !== false) {
+		const filePath = path.resolve(options.agentDir ?? getAgentDir(), USER_PROFILE_FILE_NAME);
+		files.push({ filePath, label: shortenPath(filePath), source: "user" });
+		userFileIdentity = normalizePathForComparison(filePath);
+	}
+	for (const file of PROJECT_PROFILE_FILES) {
+		const filePath = path.resolve(cwd, file.relativePath);
+		// A project file that is the user file (agent dir at <cwd>/.omp, or a symlink) loads once, as user.
+		if (userFileIdentity !== undefined && normalizePathForComparison(filePath) === userFileIdentity) continue;
+		files.push({ filePath, label: file.relativePath, source: file.source });
+	}
+	return files;
+}
 
 const PATH_KEYS = new Set(["path", "paths", "file", "file_path", "relative_path", "cwd", "dir"]);
 const RESERVED_PERMISSION_PROFILE_NAMES = new Set(["browser-audit", "secrets-blind", "no-network"]);
@@ -696,7 +734,14 @@ export function classifyTaskPermissionRequest(
 /** Short alias retained for internal adapters that describe this as request shape. */
 export const classifyPermissionRequest = classifyTaskPermissionRequest;
 
-export async function loadPermissionProfiles(cwd: string): Promise<{
+/**
+ * Load built-in, user (`<agentDir>/permissions.json`), project (`.omp/permissions.json`) and local
+ * (`.omp/permissions.local.json`) profiles; a later source replaces an earlier one by name.
+ */
+export async function loadPermissionProfiles(
+	cwd: string,
+	options: LoadPermissionProfilesOptions = {},
+): Promise<{
 	profiles: Record<string, PermissionProfile>;
 	profileIdentities: Record<string, PermissionProfileIdentity>;
 	summaries: PermissionProfileSummary[];
@@ -711,14 +756,13 @@ export async function loadPermissionProfiles(cwd: string): Promise<{
 	}
 	const errors: string[] = [];
 
-	for (const file of PROFILE_FILES) {
-		const filePath = path.resolve(cwd, file.relativePath);
+	for (const file of profileFiles(cwd, options)) {
 		let parsed: unknown;
 		try {
-			parsed = JSON.parse(await readFile(filePath, "utf8"));
+			parsed = JSON.parse(await readFile(file.filePath, "utf8"));
 		} catch (error) {
 			if (isMissingFileError(error)) continue;
-			errors.push(`${file.relativePath}: ${error instanceof Error ? error.message : String(error)}`);
+			errors.push(`${file.label}: ${error instanceof Error ? error.message : String(error)}`);
 			continue;
 		}
 		const fileProfiles = readProfileMap(parsed);
@@ -729,7 +773,7 @@ export async function loadPermissionProfiles(cwd: string): Promise<{
 			const existing = profiles[name];
 			if (existing !== undefined && RESERVED_PERMISSION_PROFILE_NAMES.has(name)) {
 				if (!profilesEqual(existing, profile)) {
-					errors.push(`${file.relativePath}: permission profile "${name}" is reserved and cannot be overridden`);
+					errors.push(`${file.label}: permission profile "${name}" is reserved and cannot be overridden`);
 				}
 				continue;
 			}
@@ -739,7 +783,7 @@ export async function loadPermissionProfiles(cwd: string): Promise<{
 				name === "no-network" &&
 				!profilesEqual(existing, profile)
 			) {
-				errors.push(`${file.relativePath}: permission profile "${name}" is reserved and cannot be overridden`);
+				errors.push(`${file.label}: permission profile "${name}" is reserved and cannot be overridden`);
 				continue;
 			}
 			profiles[name] = profile;
@@ -1081,9 +1125,11 @@ function compilePermissionScope(input: {
 			? "local"
 			: profileIdentities.some(identity => identity.source === "project")
 				? "project"
-				: input.selectedProfiles?.length
-					? "request"
-					: "builtin";
+				: profileIdentities.some(identity => identity.source === "user")
+					? "user"
+					: input.selectedProfiles?.length
+						? "request"
+						: "builtin";
 	const provenance: PermissionProvenance = Object.freeze({
 		source,
 		profileNames: Object.freeze([...input.profiles]),

@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import * as os from "node:os";
 import path from "node:path";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { __resetDirsFromEnvForTests } from "@oh-my-pi/pi-utils";
 import {
 	appendPermissionDenialToSummary,
 	BUILTIN_PERMISSION_PROFILES,
@@ -50,9 +51,16 @@ afterEach(async () => {
 });
 
 async function tempCwd(): Promise<string> {
-	const cwd = await mkdtemp(path.join(tmpdir(), "omp-permission-profiles-"));
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "omp-permission-profiles-"));
 	tempRoots.push(cwd);
 	return cwd;
+}
+
+/** Agent dir with no user-level permissions.json, so the real ~/.omp/agent never leaks into a load. */
+async function emptyAgentDir(): Promise<string> {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "omp-permission-agent-"));
+	tempRoots.push(dir);
+	return dir;
 }
 
 async function writeJson(filePath: string, value: unknown): Promise<void> {
@@ -103,7 +111,7 @@ function evaluate(
 describe("permission profile loading", () => {
 	test("loads built-in profiles when no config files exist", async () => {
 		const cwd = await tempCwd();
-		const loaded = await loadPermissionProfiles(cwd);
+		const loaded = await loadPermissionProfiles(cwd, { agentDir: await emptyAgentDir() });
 
 		expect(loaded.errors).toEqual([]);
 		expect(Object.keys(loaded.profiles).sort()).toEqual(Object.keys(BUILTIN_PERMISSION_PROFILES).sort());
@@ -136,7 +144,7 @@ describe("permission profile loading", () => {
 			},
 		});
 
-		const loaded = await loadPermissionProfiles(cwd);
+		const loaded = await loadPermissionProfiles(cwd, { agentDir: await emptyAgentDir() });
 
 		expect(loaded.errors).toEqual([]);
 		expect(loaded.profiles["read-only"]?.description).toBe("Project read profile");
@@ -157,7 +165,7 @@ describe("permission profile loading", () => {
 				},
 			},
 		});
-		const loaded = await loadPermissionProfiles(cwd);
+		const loaded = await loadPermissionProfiles(cwd, { agentDir: await emptyAgentDir() });
 
 		expect(loaded.errors).toContain(
 			'.omp/permissions.json: permission profile "browser-audit" is reserved and cannot be overridden',
@@ -171,13 +179,163 @@ describe("permission profile loading", () => {
 		await mkdir(path.join(cwd, ".omp"), { recursive: true });
 		await writeFile(path.join(cwd, ".omp", "permissions.json"), "{ not json", "utf8");
 
-		const loaded = await loadPermissionProfiles(cwd);
+		const loaded = await loadPermissionProfiles(cwd, { agentDir: await emptyAgentDir() });
 
 		expect(loaded.errors).toHaveLength(1);
 		expect(loaded.errors[0]).toContain(".omp/permissions.json");
 		expect(loaded.profiles["read-only"]?.tools).toContain("read");
 		expect(loaded.profiles["read-only"]?.denyTools).toBeUndefined();
 		expect(loaded.profiles["focused-edit"]?.tools).toContain("edit");
+	});
+});
+
+describe("user-level permission profiles", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	test("profiles from <agentDir>/permissions.json load with source user", async () => {
+		const cwd = await tempCwd();
+		const agentDir = await emptyAgentDir();
+		await writeJson(path.join(agentDir, "permissions.json"), {
+			defaultAction: "allow",
+			profiles: { "repo-scout": { description: "User scout", tools: ["read", "search"] } },
+		});
+
+		const loaded = await loadPermissionProfiles(cwd, { agentDir });
+
+		expect(loaded.errors).toEqual([]);
+		expect(loaded.profiles["repo-scout"]).toEqual({ description: "User scout", tools: ["read", "search"] });
+		expect(loaded.summaries.find(summary => summary.name === "repo-scout")?.source).toBe("user");
+		expect(loaded.profileIdentities["repo-scout"]?.source).toBe("user");
+		expect(loaded.summaries.find(summary => summary.name === "read-only")?.source).toBe("built-in");
+	});
+
+	test("project overrides user and local overrides both for the same profile name", async () => {
+		const cwd = await tempCwd();
+		const agentDir = await emptyAgentDir();
+		await writeJson(path.join(agentDir, "permissions.json"), {
+			profiles: {
+				shared: { description: "User shared", tools: ["read"] },
+				layered: { description: "User layered", tools: ["read"] },
+				"user-only": { description: "User only", tools: ["find"] },
+			},
+		});
+		await writeJson(path.join(cwd, ".omp", "permissions.json"), {
+			profiles: {
+				shared: { description: "Project shared", tools: ["search"] },
+				layered: { description: "Project layered", tools: ["search"] },
+			},
+		});
+		await writeJson(path.join(cwd, ".omp", "permissions.local.json"), {
+			profiles: { layered: { description: "Local layered", tools: ["lsp"] } },
+		});
+
+		const loaded = await loadPermissionProfiles(cwd, { agentDir });
+
+		expect(loaded.errors).toEqual([]);
+		expect(loaded.profiles.shared?.description).toBe("Project shared");
+		expect(loaded.profileIdentities.shared?.source).toBe("project");
+		expect(loaded.profiles.layered?.description).toBe("Local layered");
+		expect(loaded.profileIdentities.layered?.source).toBe("local");
+		expect(loaded.profiles["user-only"]?.description).toBe("User only");
+		expect(loaded.profileIdentities["user-only"]?.source).toBe("user");
+	});
+
+	test("default agent dir follows PI_CODING_AGENT_DIR, not PI_CONFIG_DIR", async () => {
+		const cwd = await tempCwd();
+		const agentDir = await emptyAgentDir();
+		const unrelatedConfigRoot = await emptyAgentDir();
+		await writeJson(path.join(agentDir, "permissions.json"), {
+			profiles: { "from-agent-dir": { tools: ["read"] } },
+		});
+		// Decoys at both locations a config-root based lookup would read.
+		await writeJson(path.join(unrelatedConfigRoot, "permissions.json"), {
+			profiles: { "from-config-root": { tools: ["read"] } },
+		});
+		await writeJson(path.join(unrelatedConfigRoot, "agent", "permissions.json"), {
+			profiles: { "from-config-agent": { tools: ["read"] } },
+		});
+		const previous = {
+			PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+			PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
+		};
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		process.env.PI_CONFIG_DIR = unrelatedConfigRoot;
+		__resetDirsFromEnvForTests();
+		try {
+			const loaded = await loadPermissionProfiles(cwd);
+
+			expect(loaded.profileIdentities["from-agent-dir"]?.source).toBe("user");
+			expect(loaded.profiles["from-config-root"]).toBeUndefined();
+			expect(loaded.profiles["from-config-agent"]).toBeUndefined();
+		} finally {
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			__resetDirsFromEnvForTests();
+		}
+	});
+
+	test("a malformed user file reports a home-relative error and other sources still load", async () => {
+		const home = await tempCwd();
+		const cwd = await tempCwd();
+		const agentDir = path.join(home, ".omp", "agent");
+		await mkdir(agentDir, { recursive: true });
+		await writeFile(path.join(agentDir, "permissions.json"), "{ not json", "utf8");
+		await writeJson(path.join(cwd, ".omp", "permissions.json"), {
+			profiles: { "project-only": { tools: ["read"] } },
+		});
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+
+		const loaded = await loadPermissionProfiles(cwd, { agentDir });
+
+		expect(loaded.errors).toHaveLength(1);
+		expect(loaded.errors[0]).toStartWith("~/.omp/agent/permissions.json: ");
+		expect(loaded.profileIdentities["project-only"]?.source).toBe("project");
+		expect(loaded.profiles["read-only"]?.tools).toContain("read");
+	});
+
+	test("a user file cannot redefine a reserved profile", async () => {
+		const home = await tempCwd();
+		const cwd = await tempCwd();
+		const agentDir = path.join(home, ".omp", "agent");
+		await writeJson(path.join(agentDir, "permissions.json"), {
+			profiles: {
+				"browser-audit": { description: "User replacement", tools: ["browser"] },
+				"secrets-blind": BUILTIN_PERMISSION_PROFILES["secrets-blind"],
+			},
+		});
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+
+		const loaded = await loadPermissionProfiles(cwd, { agentDir });
+
+		expect(loaded.errors).toEqual([
+			'~/.omp/agent/permissions.json: permission profile "browser-audit" is reserved and cannot be overridden',
+		]);
+		expect(loaded.profiles["browser-audit"]).toEqual(BUILTIN_PERMISSION_PROFILES["browser-audit"]);
+		expect(loaded.profileIdentities["browser-audit"]?.source).toBe("built-in");
+		expect(loaded.profileIdentities["secrets-blind"]?.source).toBe("built-in");
+	});
+
+	test("a project file that resolves to the user file loads once, as user", async () => {
+		const cwd = await tempCwd();
+		const agentDir = await emptyAgentDir();
+		await writeJson(path.join(agentDir, "permissions.json"), {
+			profiles: {
+				"browser-audit": { tools: ["browser"] },
+				shared: { tools: ["read"] },
+			},
+		});
+		await mkdir(path.join(cwd, ".omp"), { recursive: true });
+		await symlink(path.join(agentDir, "permissions.json"), path.join(cwd, ".omp", "permissions.json"));
+
+		const loaded = await loadPermissionProfiles(cwd, { agentDir });
+
+		// A second load as "project" would repeat the reserved-name error and relabel the profile.
+		expect(loaded.errors).toHaveLength(1);
+		expect(loaded.profileIdentities.shared?.source).toBe("user");
 	});
 });
 
@@ -383,7 +541,7 @@ describe("deterministic permission profile smoke fixture", () => {
 			},
 		});
 
-		const loaded = await loadPermissionProfiles(cwd);
+		const loaded = await loadPermissionProfiles(cwd, { agentDir: await emptyAgentDir() });
 		const scope = enforceScope({ profiles: ["read-only", "no-blocked"], profilesMap: loaded.profiles });
 
 		expect(evaluate(scope, "read", { path: "allowed/ok.txt" }, cwd).action).toBe("allow");
@@ -486,7 +644,7 @@ describe("W1 reserved profile migration", () => {
 				"NO-NETWORK": { denyTools: ["browser"] },
 			},
 		});
-		const loaded = await loadPermissionProfiles(cwd);
+		const loaded = await loadPermissionProfiles(cwd, { agentDir: await emptyAgentDir() });
 		expect(loaded.errors).toEqual([
 			'.omp/permissions.json: permission profile "no-network" is reserved and cannot be overridden',
 		]);

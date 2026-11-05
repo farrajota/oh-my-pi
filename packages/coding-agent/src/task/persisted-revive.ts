@@ -123,6 +123,7 @@ function hasValidStartupToolNames(init: Pick<PersistedRevivalInit, "startupToolN
 async function validatePersistedRevivalContract(
 	init: PersistedRevivalInit,
 	cwd: string,
+	agentDir: string,
 	ref: { id: string; parentId?: string; lineage?: { rootId: string; generation: number } },
 	durableState: AuthorityStore | undefined,
 ): Promise<
@@ -162,7 +163,7 @@ async function validatePersistedRevivalContract(
 	)
 		return undefined;
 	if (provenance.profiles.length) {
-		const currentProfiles = await loadPermissionProfiles(cwd);
+		const currentProfiles = await loadPermissionProfiles(cwd, { agentDir });
 		if (currentProfiles.errors.length > 0) return undefined;
 		for (const identity of provenance.profiles) {
 			const current = currentProfiles.profileIdentities[identity.name];
@@ -293,7 +294,7 @@ export function createPersistedSubagentReviverFactory(
 		)
 			return undefined;
 		if (provenance.profiles.length) {
-			const currentProfiles = await loadPermissionProfiles(peek.cwd);
+			const currentProfiles = await loadPermissionProfiles(peek.cwd, { agentDir: ctx.settings.getAgentDir() });
 			if (currentProfiles.errors.length > 0) return undefined;
 			for (const identity of provenance.profiles) {
 				const current = currentProfiles.profileIdentities[identity.name];
@@ -366,6 +367,7 @@ export function createPersistedSubagentReviverFactory(
 				const currentContract = await validatePersistedRevivalContract(
 					currentPeek.init,
 					currentPeek.cwd,
+					ctx.settings.getAgentDir(),
 					ref,
 					durableState,
 				);

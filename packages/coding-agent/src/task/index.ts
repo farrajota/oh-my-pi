@@ -280,6 +280,12 @@ interface TaskDescriptionOptions {
 	permissionProfileErrors: string[];
 }
 
+/** Permission profiles and loader errors rendered into the tool description. */
+interface PermissionProfileListing {
+	readonly summaries: PermissionProfileSummary[];
+	readonly errors: string[];
+}
+
 /** Plan mode hides seance; a `spawns` list led by it defaults to the next permitted agent. */
 function defaultAgentFor(spawnPolicy: ResolvedSpawnPolicy, planMode: boolean): string {
 	if (!planMode || spawnPolicy.defaultAgent !== SEANCE_AGENT_NAME) return spawnPolicy.defaultAgent;
@@ -1058,8 +1064,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly #discoveredAgents: AgentDefinition[];
 	readonly #browserAuditAuthority: BrowserAuditTaskAuthority | undefined;
 	readonly #blockedAgent: string | undefined;
-	readonly #permissionProfiles: PermissionProfileSummary[];
-	readonly #permissionProfileErrors: string[];
+	readonly #permissionProfiles: PermissionProfileListing;
+	/** Listing without the user-level file, shown while task.permissions.mode is off. */
+	readonly #offModePermissionProfiles: PermissionProfileListing;
 	/**
 	 * One semaphore per TaskTool instance (i.e. per session): bounds concurrent
 	 * subagents across parallel `task` calls within the session. Resized in
@@ -1172,6 +1179,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationEnabled = !planMode && cfgTaskIsolationEnabled.get(this.session.settings);
 		const permissionMode = settingValue<SubagentPermissionMode>("task.permissions.mode", this.session.settings);
+		const profileListing = permissionMode === "off" ? this.#offModePermissionProfiles : this.#permissionProfiles;
 		return renderDescription({
 			agents,
 			sessionAgents,
@@ -1192,21 +1200,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			permissionMode,
 			permissionToolsEnabled: settingValue<boolean>("task.permissions.tools.enabled", this.session.settings),
 			permissionPathsEnabled: settingValue<boolean>("task.permissions.paths.enabled", this.session.settings),
-			permissionProfiles: this.#permissionProfiles,
-			permissionProfileErrors: this.#permissionProfileErrors,
+			permissionProfiles: profileListing.summaries,
+			permissionProfileErrors: profileListing.errors,
 		});
 	}
 	private constructor(
 		private readonly session: ToolSession,
 		discoveredAgents: AgentDefinition[],
-		permissionProfiles: PermissionProfileSummary[],
-		permissionProfileErrors: string[],
+		permissionProfiles: PermissionProfileListing,
+		offModePermissionProfiles: PermissionProfileListing,
 		browserAuditAuthority?: BrowserAuditTaskAuthority,
 	) {
 		this.#blockedAgent = $env.PI_BLOCKED_AGENT;
 		this.#discoveredAgents = discoveredAgents;
 		this.#permissionProfiles = permissionProfiles;
-		this.#permissionProfileErrors = permissionProfileErrors;
+		this.#offModePermissionProfiles = offModePermissionProfiles;
 		this.#browserAuditAuthority = browserAuditAuthority;
 	}
 
@@ -1538,7 +1546,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (preflightFailures.length > 0) {
 			throw new StructuredSubagentError("preflight", preflightFailures.join("\n"));
 		}
-		const loadedPermissionProfiles = await loadPermissionProfiles(this.session.cwd);
+		const loadedPermissionProfiles = await loadPermissionProfiles(this.session.cwd, {
+			agentDir: preparedSettings.getAgentDir(),
+			// Mode off is a no-op: the user-level file must not reach it.
+			includeUserProfiles: permissionMode !== "off",
+		});
 		const inheritedPermissions = this.session.getPermissionScope?.();
 		const liveCapabilities = await collectLivePermissionCapabilities(this.session, signal);
 		const activeToolNames = this.session.getActiveToolNames?.();
@@ -1809,11 +1821,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 */
 	static async create(session: ToolSession): Promise<TaskTool> {
 		const browserAuditAuthority = takeBrowserAuditTaskAuthority(session);
-		const [{ agents }, profileLoad] = await Promise.all([
+		const agentDir = session.settings.getAgentDir();
+		// The description reads task.permissions.mode live, so both listings are kept: mode off
+		// must show exactly what it showed before user-level profiles existed.
+		const [{ agents }, profileLoad, offModeProfileLoad] = await Promise.all([
 			discoverAgentsForCreate(session.cwd, session.effectiveExtensionRoots?.()),
-			loadPermissionProfiles(session.cwd),
+			loadPermissionProfiles(session.cwd, { agentDir }),
+			loadPermissionProfiles(session.cwd, { agentDir, includeUserProfiles: false }),
 		]);
-		return new TaskTool(session, agents, profileLoad.summaries, profileLoad.errors, browserAuditAuthority);
+		return new TaskTool(session, agents, profileLoad, offModeProfileLoad, browserAuditAuthority);
 	}
 
 	async execute(

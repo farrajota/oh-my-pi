@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
+import { mkdtempSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -50,17 +51,23 @@ function makeSession(
 	settingsOverrides: Parameters<typeof Settings.isolated>[0] = {},
 	sessionOverrides: Partial<ToolSession> = {},
 ): ToolSession {
-	const settings = Settings.isolated({
-		"async.enabled": false,
-		"task.batch": false,
-		"task.enableLsp": true,
-		"task.isolation.enabled": false,
-		"task.maxConcurrency": 4,
-		"task.permissions.mode": "off",
-		"task.permissions.paths.enabled": true,
-		"task.permissions.tools.enabled": true,
-		...settingsOverrides,
-	});
+	// Empty agent dir so a developer's real <agentDir>/permissions.json never reaches TaskTool.
+	const agentDir = mkdtempSync(path.join(os.tmpdir(), "task-index-agent-"));
+	temporaryRoots.push(agentDir);
+	const settings = Settings.isolated(
+		{
+			"async.enabled": false,
+			"task.batch": false,
+			"task.enableLsp": true,
+			"task.isolation.enabled": false,
+			"task.maxConcurrency": 4,
+			"task.permissions.mode": "off",
+			"task.permissions.paths.enabled": true,
+			"task.permissions.tools.enabled": true,
+			...settingsOverrides,
+		},
+		{ agentDir },
+	);
 	const agentRegistry = new AgentRegistry();
 	return {
 		cwd: process.cwd(),

@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../config/settings";
 import type { ToolSession } from "../../tools";
 import * as taskDiscovery from "../discovery";
 import { TaskTool } from "../index";
+import { cfgTaskPermissionMode } from "../settings";
 import { type AgentDefinition, getTaskSchema, type TaskToolSchemaInstance } from "../types";
 
 const DISABLED_PERMISSIONS_ERROR =
@@ -76,6 +80,45 @@ async function makeTaskTool(settings: Settings): Promise<TaskTool> {
 	vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
 	return TaskTool.create(makeSession(settings));
 }
+
+describe("task description permission profiles", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("shows user-level profiles only while subagent permissions are enabled", async () => {
+		const root = TempDir.createSync("@omp-task-user-profiles-");
+		try {
+			const cwd = root.join("project");
+			const agentDir = root.join("agent");
+			await fs.mkdir(cwd, { recursive: true });
+			await Bun.write(
+				path.join(agentDir, "permissions.json"),
+				JSON.stringify({
+					profiles: {
+						"user-only-scout": { description: "User scout", tools: ["read"] },
+						"browser-audit": { tools: ["browser"] },
+					},
+				}),
+			);
+			const settings = Settings.isolated({ "task.permissions.mode": "off" }, { cwd, agentDir });
+			vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+			const taskTool = await TaskTool.create({ ...makeSession(settings), cwd });
+
+			expect(taskTool.description).not.toContain("user-only-scout");
+			expect(taskTool.description).not.toContain("Profile config errors");
+
+			cfgTaskPermissionMode.override(settings, "enforce");
+
+			expect(taskTool.description).toContain("# user-only-scout");
+			expect(taskTool.description).toContain(
+				'permissions.json: permission profile "browser-audit" is reserved and cannot be overridden',
+			);
+		} finally {
+			root.removeSync();
+		}
+	});
+});
 
 describe("task permission schema", () => {
 	afterEach(() => {
