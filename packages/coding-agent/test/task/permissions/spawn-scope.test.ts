@@ -357,6 +357,16 @@ describe("executor starts the child under its scope", () => {
 		expect(created.restrictToolNames).toBe(true);
 	});
 
+	it("starts a child whose inherited scope does not decode with no tools", async () => {
+		const created = await executorSpawn({
+			settings: Settings.isolated({ "task.permissions.activeScope": "not a scope" }),
+			agent: makeAgent(["read", "write"]),
+		});
+
+		expect(created.toolNames).toEqual([]);
+		expect(created.restrictToolNames).toBe(true);
+	});
+
 	it("records a suggest scope without narrowing anything", async () => {
 		const created = await executorSpawn({
 			settings: Settings.isolated(),
