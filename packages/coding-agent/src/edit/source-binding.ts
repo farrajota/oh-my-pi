@@ -220,3 +220,25 @@ export function pinnedWritePath(binding: EditSourceBinding, file: string, label:
 	if (!samePin(source, current)) throw changedSince(label);
 	return source.physical;
 }
+
+/**
+ * Throw unless `target` (a path or internal URL as {@link captureEditSources} saw it) still lands on
+ * an unchanged pinned source. For a caller that hands `target` itself to a native call, which
+ * resolves it again: a swap in between those two steps is not caught.
+ */
+export function assertPinnedTarget(
+	binding: EditSourceBinding,
+	target: string,
+	cwd: string,
+	context: ResolveContext,
+): void {
+	const router = InternalUrlRouter.instance();
+	const normalized = router.normalize(target.trim());
+	if (!router.canHandle(normalized)) {
+		pinnedWritePath(binding, resolveToCwd(target, cwd), target);
+		return;
+	}
+	const located = router.locateSync(router.peelWriteSelector(normalized, "edit"), context);
+	if (located === undefined) throw changedSince(target);
+	pinnedWritePath(binding, located, target);
+}

@@ -7,8 +7,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -19,8 +19,10 @@ import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { PermissionScope } from "@oh-my-pi/pi-coding-agent/task/permissions/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { AstEditTool } from "@oh-my-pi/pi-coding-agent/tools/ast-edit";
 import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "../../helpers/agent-session-setup";
 import { enforceScope, scopedSettings } from "./scope-fixtures";
 
 const SECRET_SENTINEL = "SECRET_SENTINEL_7f3a";
@@ -414,5 +416,71 @@ describe("edit without a permission scope", () => {
 
 		expect(result.isError).toBe(false);
 		expect(read("notes.txt")).toBe("token = 2\nextra = 7\n");
+	});
+});
+
+describe("ast_edit preview and apply under a permission scope", () => {
+	const REWRITE = { ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }], paths: ["app.ts"] };
+
+	/** Preview `REWRITE` under `scope`, run `betweenPreviewAndApply`, then apply through `resolve`. */
+	async function previewThenApply(scope: PermissionScope, betweenPreviewAndApply: () => void): Promise<string> {
+		const pending: Array<(input: unknown) => Promise<AgentToolResult<unknown>>> = [];
+		const tool = new AstEditTool({
+			...toolSession(scopedSettings(scope)),
+			modelRegistry: new ModelRegistry(createInMemoryAuthStorage()),
+			getToolChoiceQueue: () =>
+				({
+					registerPendingInvoker: (
+						_id: string,
+						_tool: string,
+						invoke: (input: unknown) => Promise<AgentToolResult<unknown>>,
+					) => pending.push(invoke),
+					removePendingInvoker: () => {},
+				}) as never,
+		} as ToolSession);
+		await tool.execute("ast-edit-preview", REWRITE);
+		expect(pending).toHaveLength(1);
+		betweenPreviewAndApply();
+		try {
+			const result = await pending[0]!({ action: "apply", reason: "apply the preview" });
+			return result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		}
+	}
+
+	it("refuses to apply after the previewed file was swapped for a symlink into a denied path", async () => {
+		fs.writeFileSync(path.join(cwd, "app.ts"), "legacyWrap(a, b);\n");
+		const secret = path.join(cwd, "secret", "keys.ts");
+		fs.writeFileSync(secret, `legacyWrap(a, b);\n// ${SECRET_SENTINEL}\n`);
+
+		const output = await previewThenApply(DENY_SECRET, () => {
+			fs.unlinkSync(path.join(cwd, "app.ts"));
+			fs.symlinkSync(secret, path.join(cwd, "app.ts"));
+		});
+
+		expect(fs.readFileSync(secret, "utf8")).toBe(`legacyWrap(a, b);\n// ${SECRET_SENTINEL}\n`);
+		expect(output).toContain("changed after it was approved");
+	});
+
+	it("refuses a same-inode source change even when rewrite counts are unchanged (fork ast-edit case)", async () => {
+		const source = path.join(cwd, "app.ts");
+		fs.writeFileSync(source, "legacyWrap(a, b);\n");
+		const inode = fs.statSync(source).ino;
+
+		const output = await previewThenApply(DENY_SECRET, () => fs.writeFileSync(source, "legacyWrap(c, d);\n"));
+
+		expect(fs.statSync(source).ino).toBe(inode);
+		expect(read("app.ts")).toBe("legacyWrap(c, d);\n");
+		expect(output).toContain("changed after it was approved");
+	});
+
+	it("applies a preview whose file did not change", async () => {
+		fs.writeFileSync(path.join(cwd, "app.ts"), "legacyWrap(a, b);\n");
+
+		const output = await previewThenApply(DENY_SECRET, () => {});
+
+		expect(output).toContain("Applied 1 replacement in 1 file.");
+		expect(read("app.ts")).toBe("modernWrap(a, b);\n");
 	});
 });

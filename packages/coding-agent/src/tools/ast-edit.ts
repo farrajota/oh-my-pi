@@ -11,6 +11,12 @@ import type { ToolExample } from "@oh-my-pi/pi-ai";
 import { type AstReplaceChange, type AstReplaceFileChange, astEdit, type ShellFilesystem } from "@oh-my-pi/pi-natives";
 
 import { $envpos, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import {
+	assertEditSourcesUnchanged,
+	assertPinnedTarget,
+	captureEditSources,
+	type EditSourceBinding,
+} from "../edit/source-binding";
 import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
 import { InternalUrlRouter, sessionResolveContext } from "../internal-urls";
@@ -309,6 +315,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				isDirectory ? resolveSearchResultPath(resolvedSearchPath, changePath) : resolvedSearchPath;
 			let result = preview;
 			let applyTargets = multiTargets;
+			let pinned: EditSourceBinding | undefined;
 			if (permitted) {
 				const keep = (changePath: string) => permitted(changeFile(changePath));
 				const fileChanges = preview.fileChanges.filter(change => keep(change.path));
@@ -320,6 +327,13 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					filesTouched: fileChanges.length,
 				};
 				applyTargets = fileChanges.map(change => ({ basePath: changeFile(change.path) }));
+				// The guard approved this call; pin the files it will rewrite, so `resolve` applies to exactly
+				// these files as they are now, or not at all.
+				pinned = captureEditSources(
+					applyTargets.map(target => target.basePath),
+					this.session.cwd,
+					resolveContext,
+				);
 			}
 			const grammarNote = result.missingGrammars?.length ? missingGrammarsNote(result.missingGrammars) : undefined;
 
@@ -470,6 +484,12 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					apply: async (_reason: string) => {
 						// The apply outlives the preview call: its filesystem carries no signal.
 						const applyContext = sessionResolveContext(this.session);
+						if (pinned) {
+							assertEditSourcesUnchanged(pinned, this.session.cwd);
+							for (const target of applyTargets ?? []) {
+								assertPinnedTarget(pinned, target.basePath, this.session.cwd, applyContext);
+							}
+						}
 						const applyResult = await runAstEditOnce(applyTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
 							dryRun: false,
