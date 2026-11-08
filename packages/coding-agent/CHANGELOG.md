@@ -50,6 +50,7 @@
 
 ### Fixed
 
+- `--single-request` turns off auto-compaction (threshold, mid-turn, idle and speculative), context promotion, TTSR, the memory backend, task labels, image descriptions and speech, so no summary, recall or re-send request goes out beside the one guarded request
 - Under a permission scope with path rules or secrets-blind, an `ast_edit` preview of a single file applies through `resolve` instead of failing with "Path not found: Not a directory"
 - Under a permission scope, a path list is judged by every entry it reads: a `read` of `local://x;.env`, `src/a.ts;lib/b.ts` or `src/a.ts,.env` is refused when any entry is, the `local://` exemption covers only a single `local://` URL, and `always-ask-cached` grants and restricted folders key each entry too
 - Under such a scope, `read` also judges the file behind an archive member, SQLite table, JSON query, binary view or PDF image member, and a missing path no longer resolves by its unique suffix to a file the scope refuses; `grep` of an archive member is judged by its archive

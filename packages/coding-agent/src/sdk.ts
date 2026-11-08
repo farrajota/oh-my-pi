@@ -459,7 +459,19 @@ const SINGLE_REQUEST_SETTINGS_OVERRIDES: Readonly<Record<string, unknown>> = Obj
 	"autolearn.enabled": false,
 	"memories.enabled": false,
 	"recap.enabled": false,
+	// Every request below runs outside the guarded session stream (compaction
+	// summaries, promotion and TTSR re-sends, memory recall/retain, labels and
+	// image descriptions), so none of them may start under the guard.
+	"compaction.enabled": false,
 	"compaction.idleEnabled": false,
+	"compaction.midTurnEnabled": false,
+	"compaction.asyncEnabled": false,
+	"contextPromotion.enabled": false,
+	"ttsr.enabled": false,
+	"memory.backend": "off",
+	"task.generateLabels": false,
+	"images.describeForTextModels": false,
+	"speech.enabled": false,
 });
 
 /**

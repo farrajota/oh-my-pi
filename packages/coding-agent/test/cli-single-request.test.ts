@@ -17,7 +17,7 @@ const GUARD_REPORT =
 const UNCONFIGURED_GUARD_REPORT =
 	"single-request guard effective: adapter=none dispatch-budget=1 fetch-budget=1 selector-match=false destination-match=false";
 
-type FixtureResponse = "503" | "cooldown" | "transport" | "redirect" | "success";
+type FixtureResponse = "503" | "cooldown" | "transport" | "redirect" | "success" | "success-over-threshold";
 
 interface CapturedRequest {
 	method: string;
@@ -91,8 +91,12 @@ async function createResponsesFixture(reply: FixtureResponse): Promise<Responses
 				case "redirect":
 					response.writeHead(302, { location: "/v1/codex/redirect-target" }).end();
 					return;
-				case "success": {
+				case "success":
+				case "success-over-threshold": {
 					const text = "HELLO_WORLD";
+					// Billed input near the 128k window pushes the session past every
+					// compaction threshold, so an unguarded session would summarize next.
+					const inputTokens = reply === "success-over-threshold" ? 120_000 : 5;
 					const events = [
 						{
 							type: "response.output_item.added",
@@ -137,9 +141,9 @@ async function createResponsesFixture(reply: FixtureResponse): Promise<Responses
 							response: {
 								status: "completed",
 								usage: {
-									input_tokens: 5,
+									input_tokens: inputTokens,
 									output_tokens: 1,
-									total_tokens: 6,
+									total_tokens: inputTokens + 1,
 									input_tokens_details: { cached_tokens: 0 },
 								},
 							},
@@ -226,6 +230,10 @@ async function configureAgent(
 			"      - cliproxy-codex/gpt-6.1-sol-fallback",
 			"features:",
 			"  unexpectedStopDetection: smart",
+			"compaction:",
+			"  enabled: true",
+			"  midTurnEnabled: true",
+			"  asyncEnabled: true",
 			"advisor:",
 			"  enabled: true",
 			"autolearn:",
@@ -379,6 +387,21 @@ describe("--single-request CLI guard", () => {
 			expect(run.stdout.split(/\r?\n/).filter(line => line === "HELLO_WORLD")).toHaveLength(1);
 			expect(run.stderr).toContain(GUARD_REPORT);
 			expect(run.stderr).not.toContain(FIXTURE_API_KEY);
+			expect(fixture.requests).toEqual([{ method: "POST", path: REQUEST_PATH, model: PRIMARY_MODEL }]);
+		} finally {
+			await fixture.close();
+		}
+	}, 120_000);
+
+	it("sends no compaction request after a response that crosses the compaction threshold", async () => {
+		using tempDir = TempDir.createSync("@omp-single-request-compaction-");
+		const fixture = await createResponsesFixture("success-over-threshold");
+		try {
+			const { agentDir, home } = await configureAgent(tempDir, fixture);
+			const run = await runGuardedCli(tempDir, agentDir, home);
+			expect(run.exitCode, run.stderr).toBe(0);
+			expect(run.stdout.split(/\r?\n/).filter(line => line === "HELLO_WORLD")).toHaveLength(1);
+			expect(run.stderr).toContain(GUARD_REPORT);
 			expect(fixture.requests).toEqual([{ method: "POST", path: REQUEST_PATH, model: PRIMARY_MODEL }]);
 		} finally {
 			await fixture.close();
