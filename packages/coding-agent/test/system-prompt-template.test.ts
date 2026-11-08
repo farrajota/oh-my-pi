@@ -35,9 +35,12 @@ async function withDiscoveryHome<T>(fn: (paths: DiscoveryPaths) => Promise<T>): 
 	const previousHome = process.env.HOME;
 	const previousUserProfile = process.env.USERPROFILE;
 	const previousAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+	// An absolute PI_CONFIG_DIR is the config root itself and would bypass the temp home.
+	const previousConfigDirEnv = process.env.PI_CONFIG_DIR;
 	process.env.HOME = home;
 	process.env.USERPROFILE = home;
 	restoreEnvValue("PI_CODING_AGENT_DIR", undefined);
+	restoreEnvValue("PI_CONFIG_DIR", undefined);
 	__resetDirsFromEnvForTests();
 	try {
 		return await fn({
@@ -52,6 +55,7 @@ async function withDiscoveryHome<T>(fn: (paths: DiscoveryPaths) => Promise<T>): 
 		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
 		else process.env.USERPROFILE = previousUserProfile;
 		restoreEnvValue("PI_CODING_AGENT_DIR", previousAgentDirEnv);
+		restoreEnvValue("PI_CONFIG_DIR", previousConfigDirEnv);
 		__resetDirsFromEnvForTests();
 	}
 }

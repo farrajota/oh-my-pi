@@ -13,7 +13,9 @@ describe("plugin extension discovery", () => {
 	let projectDir: TempDir;
 	let tempHome = "";
 	const originalAgentDir = getAgentDir();
-	const xdgVars = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] as const;
+	// PI_CONFIG_DIR is cleared with the XDG vars: an absolute value is the config root itself,
+	// so the agent sandbox's per-launch value would bypass the temp home.
+	const isolatedEnvVars = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "PI_CONFIG_DIR"] as const;
 	const originalXdg = new Map<string, string | undefined>();
 
 	beforeEach(() => {
@@ -27,7 +29,7 @@ describe("plugin extension discovery", () => {
 		//    `$XDG_DATA_HOME/omp` over the home config root when that dir exists, so an
 		//    XDG-migrated environment would otherwise still resolve the real plugins dir.
 		tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-home-"));
-		for (const key of xdgVars) {
+		for (const key of isolatedEnvVars) {
 			originalXdg.set(key, process.env[key]);
 			delete process.env[key];
 		}
