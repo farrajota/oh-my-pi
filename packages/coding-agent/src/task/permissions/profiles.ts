@@ -389,3 +389,17 @@ export async function permissionProfileConfigErrors(
 	if (options.mode === "off") return [];
 	return (await loadPermissionProfiles(cwd, { agentDir: options.agentDir })).errors;
 }
+
+/**
+ * The one warning interactive startup shows for the profile files: their errors, then the tools
+ * profiles list but will not get, or `undefined` when there are none or the mode is `off`.
+ */
+export async function permissionProfileStartupWarning(
+	cwd: string,
+	options: { mode: SubagentPermissionMode; agentDir?: string },
+): Promise<string | undefined> {
+	if (options.mode === "off") return undefined;
+	const loaded = await loadPermissionProfiles(cwd, { agentDir: options.agentDir });
+	const problems = [...loaded.errors, ...loaded.warnings];
+	return problems.length > 0 ? `Permission profiles: ${problems.join("; ")}` : undefined;
+}

@@ -147,6 +147,8 @@ import { registerLocalInferenceApi } from "./tiny/local-inference-api";
 import { automaticThinkingLevel, concreteThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { LspStartupServerInfo } from "./tools";
 import { sanitizeDisplayWarnings } from "@oh-my-pi/pi-tui/render/render-utils";
+import { permissionProfileStartupWarning } from "./task/permissions/profiles";
+import { cfgTaskPermissionsMode } from "./task/permissions/settings";
 import { getChangelogPath, readLastChangelogVersion, resolveStartupChangelogForDisplay } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
 import { resolveFirstLaunchPythonEvalWarning } from "./eval/startup-warning";
@@ -768,6 +770,11 @@ async function runInteractiveMode(
 			// `emitNotice` fired before the UI subscribed and was silently lost.
 			mode.showWarning(`WATCHDOG.yml: ${sanitizeDisplayWarnings(advisorConfigWarnings).join("; ")}`);
 		}
+		const permissionProfileWarning = await permissionProfileStartupWarning(session.sessionManager.getCwd(), {
+			mode: cfgTaskPermissionsMode.get(session.settings),
+			agentDir: session.settings.getAgentDir(),
+		});
+		if (permissionProfileWarning) mode.showWarning(sanitizeDisplayWarnings([permissionProfileWarning]).join("; "));
 
 		for (const notify of notifs) {
 			if (!notify) {

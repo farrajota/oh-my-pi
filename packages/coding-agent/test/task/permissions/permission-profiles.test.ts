@@ -14,6 +14,7 @@ import {
 	BUILTIN_PERMISSION_PROFILES,
 	loadPermissionProfiles,
 	permissionProfileConfigErrors,
+	permissionProfileStartupWarning,
 } from "@oh-my-pi/pi-coding-agent/task/permissions/profiles";
 import type {
 	DeepImmutable,
@@ -288,6 +289,28 @@ describe("permission profile startup errors", () => {
 		expect(await permissionProfileConfigErrors(cwd, { mode: "enforce", agentDir })).toEqual([
 			'.omp/permissions.json: permission profile "bad" has unknown field "denyPath"',
 		]);
+	});
+
+	test("joins errors and load warnings into one startup warning unless permissions are off", async () => {
+		const cwd = await tempCwd();
+		const agentDir = await emptyAgentDir();
+		await writeJson(path.join(cwd, ".omp", "permissions.json"), {
+			profiles: { bad: { denyPath: ["x"] }, runner: { tools: ["read", "bash"], denyPaths: ["secret"] } },
+		});
+
+		expect(await permissionProfileStartupWarning(cwd, { mode: "off", agentDir })).toBeUndefined();
+		const warning = await permissionProfileStartupWarning(cwd, { mode: "suggest", agentDir });
+		expect(warning).toStartWith(
+			'Permission profiles: .omp/permissions.json: permission profile "bad" has unknown field "denyPath"; .omp/permissions.json: permission profile "runner" lists bash together with path rules',
+		);
+	});
+
+	test("gives no startup warning when every profile file is valid", async () => {
+		const cwd = await tempCwd();
+		const agentDir = await emptyAgentDir();
+		await writeJson(path.join(agentDir, "permissions.json"), { profiles: { scout: { tools: ["read"] } } });
+
+		expect(await permissionProfileStartupWarning(cwd, { mode: "enforce", agentDir })).toBeUndefined();
 	});
 
 	test("is empty when every profile file is valid", async () => {
