@@ -353,6 +353,7 @@ export const VALUELESS_FLAGS: ReadonlySet<string> = new Set([
 	"--from-claude",
 	"--from-codex",
 	"--no-session",
+	"--single-request",
 	"--no-tools",
 	"--no-lsp",
 	"--no-pty",
@@ -422,7 +423,8 @@ export function flagConsumesValue(flag: string, next: string | undefined): boole
  * session: the relaunch supplies its own session source, and replaying a
  * stale continue/fork/import selector would re-run its one-shot session
  * choice. `--goal` belongs here too: it seeds a fresh session only, and
- * `validateGoalLaunch` rejects it beside any resume/fork selector.
+ * `validateGoalLaunch` rejects it beside any resume/fork selector, and so does
+ * `--single-request`, which `validateSingleRequestLaunch` rejects beside them.
  */
 const ONE_SHOT_LAUNCH_FLAGS: Readonly<Record<string, true>> = {
 	"--resume": true,
@@ -434,6 +436,7 @@ const ONE_SHOT_LAUNCH_FLAGS: Readonly<Record<string, true>> = {
 	"--fork": true,
 	"--from-claude": true,
 	"--from-codex": true,
+	"--single-request": true,
 	"--goal": true,
 };
 

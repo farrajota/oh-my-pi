@@ -34,6 +34,7 @@ import {
 	validateGoalStartup,
 	validateRestoreLaunch,
 	validateRestorePrompt,
+	validateSingleRequestLaunch,
 	validateToolNames,
 } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -130,6 +131,7 @@ import {
 } from "./session/session-listing";
 import { ForkSourceNotFoundError, SessionManager, SessionMoveRefusedError } from "./session/session-manager";
 import { forkIfMovedAway } from "./session/session-transfer";
+import { formatSingleRequestGuardVerification, verifySingleRequestGuard } from "./session/single-request-guard";
 import { shouldShowStartupSplash } from "./startup-splash";
 import {
 	discoverSystemPromptOverride,
@@ -660,6 +662,7 @@ async function runInteractiveMode(
 	startupGoal?: string,
 	startupRestore?: () => Promise<RestoreOutcome>,
 	refreshScopedModelsAfterLogin?: () => Promise<void>,
+	singleRequest = false,
 ): Promise<void> {
 	const InteractiveModeConstructor = await loadInteractiveModeConstructor();
 	let mode: InteractiveMode;
@@ -692,7 +695,7 @@ async function runInteractiveMode(
 		// setting needs the shared setup splash renderer.
 		const storedSetupVersion = cfgSetupVersion.get(settings);
 		setupWizard =
-			forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash
+			!singleRequest && (forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash)
 				? await import("./modes/setup")
 				: undefined;
 		const setupOptions = {
@@ -1428,6 +1431,10 @@ export async function buildSessionOptions(
 		cwd: parsed.cwd ?? getProjectDir(),
 		autoApprove: parsed.autoApprove ?? false,
 	};
+	if (parsed.singleRequest) {
+		options.singleRequest = true;
+		options.cacheWarming = false;
+	}
 	const restoringSession = Boolean(parsed.continue || parsed.resume || isForeignSessionImport(parsed));
 	if (parsed.serviceTier !== undefined) {
 		options.openAIServiceTier = serviceTierSettingToTier(parsed.serviceTier) ?? null;
@@ -1455,7 +1462,7 @@ export async function buildSessionOptions(
 	const templatePath =
 		parsed.systemPromptTemplate ?? (discoveredOverride?.kind === "template" ? discoveredOverride.path : undefined);
 	const appendPromptSource = parsed.appendSystemPrompt ?? discoverAppendSystemPromptFile();
-	const titleSystemPromptSource = discoverTitleSystemPromptFile(cwd);
+	const titleSystemPromptSource = parsed.singleRequest ? undefined : discoverTitleSystemPromptFile(cwd);
 	const [resolvedSystemPrompt, resolvedAppendPrompt, titleSystemPrompt, resolvedSystemPromptTemplate] =
 		await Promise.all([
 			discoveredOverride?.kind === "text"
@@ -1634,13 +1641,15 @@ export async function buildSessionOptions(
 	if (parsed.noPrewalk && (parsed.prewalk || parsed.prewalkInto !== undefined)) {
 		throw new Error("--no-prewalk cannot be combined with --prewalk or --prewalk-into");
 	}
-	options.suppressAutoPrewalk = parsed.noPrewalk;
+	options.suppressAutoPrewalk = parsed.noPrewalk || parsed.singleRequest;
 	const explicitPrewalk = parsed.prewalk === true || parsed.prewalkInto !== undefined;
-	const prewalkEnabled = parsed.noPrewalk
+	const prewalkEnabled = parsed.singleRequest
 		? false
-		: explicitPrewalk
-			? true
-			: !restoringSession && cfgPrewalkEnabled.get(activeSettings);
+		: parsed.noPrewalk
+			? false
+			: explicitPrewalk
+				? true
+				: !restoringSession && cfgPrewalkEnabled.get(activeSettings);
 	if (prewalkEnabled) {
 		const target = parsed.prewalkInto ?? cfgPrewalkInto.get(activeSettings);
 		// `--model` mutates only the session default role. Resolve an explicit
@@ -1832,6 +1841,16 @@ export async function runRootCommand(
 		await logger.time("initTheme:initial", ensureTheme);
 
 		const parsedArgs = parsed;
+		if (parsedArgs.singleRequest) {
+			validateSingleRequestLaunch(parsedArgs);
+			parsedArgs.noSession = true;
+			parsedArgs.noTools = true;
+			parsedArgs.noExtensions = true;
+			parsedArgs.noSkills = true;
+			parsedArgs.noRules = true;
+			parsedArgs.noTitle = true;
+			parsedArgs.noLsp = true;
+		}
 		try {
 			await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
 		} catch (error: unknown) {
@@ -1883,8 +1902,9 @@ export async function runRootCommand(
 		// Kick off plugin-root preload in parallel with the remaining startup work.
 		// Awaited later (before extension/skill discovery in createAgentSession needs it).
 		const home = os.homedir();
-		const pluginPreloadPromise =
-			parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+		const pluginPreloadPromise = parsedArgs.singleRequest
+			? Promise.resolve()
+			: parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
 				? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
 				: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
 		// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
@@ -1893,7 +1913,7 @@ export async function runRootCommand(
 
 		// Trusted files load as exact module paths, never as package roots whose
 		// sibling hooks/tools/commands/MCP content could be discovered implicitly.
-		if (!parsedArgs.trustedExtensions?.length) {
+		if (!parsedArgs.singleRequest && !parsedArgs.trustedExtensions?.length) {
 			// Register CLI-provided extension package paths (`--extension`, `--hook`) so
 			// the `omp-plugins` discovery provider can surface their `skills/`, `hooks/`,
 			// `tools/`, `commands/`, `rules/`, `prompts/`, and `.mcp.json` sub-trees.
@@ -2097,13 +2117,9 @@ export async function runRootCommand(
 		});
 
 		await credentialScopedCacheHydration;
-		let scopedModels = await logger.time(
-			"resolveModelScope",
-			resolveScopedModels,
-			parsedArgs,
-			modelRegistry,
-			settingsInstance,
-		);
+		let scopedModels = parsedArgs.singleRequest
+			? []
+			: await logger.time("resolveModelScope", resolveScopedModels, parsedArgs, modelRegistry, settingsInstance);
 
 		// Resolve an explicit `--continue <id>` before extension flags are loaded.
 		// Reading the token immediately after `--continue` distinguishes the session
@@ -2343,7 +2359,7 @@ export async function runRootCommand(
 		// Pure file I/O: overlap it with session-option building, but land it before
 		// extensions load or the session can start project daemons.
 		const daemonPresencePromise =
-			deps === DEFAULT_RUN_ROOT_DEPENDENCIES
+			!parsedArgs.singleRequest && deps === DEFAULT_RUN_ROOT_DEPENDENCIES
 				? logger.time("registerDaemonProjectPresence", registerDaemonProjectPresence, cwd)
 				: undefined;
 		daemonPresencePromise?.catch(() => {});
@@ -2437,7 +2453,7 @@ export async function runRootCommand(
 			// discovery arms; running these concurrently contends for the event loop and stretches
 			// every parallel arm by ~30ms. Interactive startup defers it further, behind the first
 			// frame (see `startDeferredStartupWork`), for the same reason.
-			if (!isInteractive) modelRegistry.refreshInBackground();
+			if (!parsedArgs.singleRequest && !isInteractive) modelRegistry.refreshInBackground();
 			return result;
 		};
 
@@ -2590,7 +2606,7 @@ export async function runRootCommand(
 			// a hung configured python.interpreter.
 			let lastChangelogVersion: string | undefined;
 			let pythonEvalWarningPromise: Promise<string | undefined> | undefined;
-			if (isInteractive) {
+			if (isInteractive && !parsedArgs.singleRequest) {
 				lastChangelogVersion = await readLastChangelogVersion();
 				const pythonEvalProbeAbort = new AbortController();
 				const unregisterPythonEvalProbe = postmortem.register(
@@ -2608,7 +2624,9 @@ export async function runRootCommand(
 			}
 			// Resumed and imported sessions neither show nor advance the startup changelog.
 			const showsStartupChangelog =
-				isInteractive && !(parsedArgs.continue || parsedArgs.resume || isForeignSessionImport(parsedArgs));
+				isInteractive &&
+				!parsedArgs.singleRequest &&
+				!(parsedArgs.continue || parsedArgs.resume || isForeignSessionImport(parsedArgs));
 
 			const preloadProviderRegistrations =
 				isInteractive && autoResumed ? extensionsResult.runtime.pendingProviderRegistrations.slice() : [];
@@ -2649,8 +2667,15 @@ export async function runRootCommand(
 				lspServers,
 				mcpManager,
 				startBackgroundModelDiscovery,
+				singleRequestVerification,
 			} = createdSession;
-			if (!isInteractive) session.validateRetryFallbackChains();
+			if (parsedArgs.singleRequest) {
+				// The release harness greps this exact line; keep its format byte-stable.
+				process.stderr.write(
+					`${formatSingleRequestGuardVerification(verifySingleRequestGuard(singleRequestVerification, session.model))}\n`,
+				);
+			}
+			if (!parsedArgs.singleRequest && !isInteractive) session.validateRetryFallbackChains();
 
 			const sessionToolNames = session.getAllToolNames();
 			try {
@@ -2695,7 +2720,7 @@ export async function runRootCommand(
 			// snapshotted. Pick their models up now so the startup scope notice, the
 			// scoped /models list and the Ctrl+P cycle include them from the first frame
 			// instead of after the background catalog refresh (issue #6694).
-			if (configuredScope.length > 0) {
+			if (!parsedArgs.singleRequest && configuredScope.length > 0) {
 				const rebuilt = await logger.time(
 					"rebuildScopedModels",
 					rebuildScopedModels,
@@ -2717,6 +2742,7 @@ export async function runRootCommand(
 			// prompt: fallback-chain validation and the startup changelog only add header
 			// rows, and the background refresh already raced the first prompt when it ran earlier.
 			const startDeferredStartupWork = (interactive: InteractiveMode): void => {
+				if (parsedArgs.singleRequest) return;
 				if (showsStartupChangelog) {
 					void resolveStartupChangelogForDisplay({
 						mode: cfgStartupChangelogMode.get(settingsInstance),
@@ -2745,9 +2771,10 @@ export async function runRootCommand(
 				}
 			};
 			const refreshScopedModelsAfterLogin = async () => {
+				if (parsedArgs.singleRequest) return;
 				await rebuildScopedModels(session, parsedArgs, modelRegistry, settingsInstance);
 			};
-			watchScopedModelSettings(session, parsedArgs, modelRegistry, settingsInstance);
+			if (!parsedArgs.singleRequest) watchScopedModelSettings(session, parsedArgs, modelRegistry, settingsInstance);
 
 			if (modelFallbackMessage) {
 				notifs.push({ kind: "warn", message: modelFallbackMessage });
@@ -2833,7 +2860,9 @@ export async function runRootCommand(
 					input: rpcInput,
 				});
 			} else if (isInteractive) {
-				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
+				const versionCheckPromise = parsedArgs.singleRequest
+					? Promise.resolve(undefined)
+					: checkForNewVersion(VERSION).catch(() => undefined);
 
 				const modelScopeNotification = buildModelScopeNotification(
 					scopedModels,
@@ -2883,6 +2912,7 @@ export async function runRootCommand(
 						initialArgs.goal,
 						parsedArgs.restore ? () => restoreSession(session, { eventBus, subagentEventBus }) : undefined,
 						refreshScopedModelsAfterLogin,
+						parsedArgs.singleRequest === true,
 					);
 				} finally {
 					startupLease?.dispose();
