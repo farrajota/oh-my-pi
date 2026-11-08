@@ -3,6 +3,8 @@ import type { AnimationFrame, TranscriptPresentationTarget } from "../chrome/tra
 import { type Component, Container } from "../tui";
 import { Disclosure } from "../components/disclosure";
 import { Markdown } from "../components/markdown";
+import { Text } from "../components/text";
+import { formatUsageTimestamp } from "../overlays/usage-row";
 import { formatBytes } from "@oh-my-pi/pi-utils";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { TspSpan } from "@oh-my-pi/pi-wire";
@@ -68,7 +70,10 @@ export interface UserBubbleOptions {
 	liveSteered?: boolean;
 	/** SKILL.md path for a skill chip by name; `undefined` leaves the chip unlinked. */
 	skillPath?: (name: string) => string | undefined;
-	/** When the message was sent (ms); shown beside the native hover toolbar. */
+	/**
+	 * When the message was sent (ms); shown beside the native hover toolbar and,
+	 * in the terminal, as a dim row under a prompt that is not agent-attributed.
+	 */
 	timestamp?: number;
 }
 
@@ -178,6 +183,10 @@ export class UserMessageComponent extends Container implements ReactionTarget, T
 		});
 		markdown.setIgnoreTight(true);
 		this.addChild(markdown);
+		const sentAt = options.timestamp;
+		if (!this.#synthetic && sentAt !== undefined && Number.isFinite(sentAt) && sentAt > 0) {
+			this.addChild(new Text(theme.fg("dim", formatUsageTimestamp(sentAt)), 1, 0));
+		}
 	}
 
 	override releaseRenderCaches(): void {

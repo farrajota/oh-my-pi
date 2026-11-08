@@ -1711,6 +1711,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Unregisters this mode's transcript-image blob writer (a later mode's registration survives). */
 	#disposeImageBlobWriter: (() => void) | undefined;
 	#optimisticUserMessageComponents: Component[] = [];
+	/** Send time of the optimistic user row; rebuilds replay it so the shown issued time stays put. */
+	#optimisticUserMessageTimestamp: number | undefined;
 	#optimisticSkillMessageComponents: Component[] = [];
 	/** True while an optimistically-rendered `/skill:` row awaits its canonical
 	 *  `message_start`. Read by the event controller to reconcile the row. */
@@ -3907,6 +3909,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	clearOptimisticUserMessage(): void {
 		this.optimisticUserMessageSignature = undefined;
+		this.#optimisticUserMessageTimestamp = undefined;
 		this.#pendingSubmissionDispose?.();
 		this.#pendingSubmissionDispose = undefined;
 		this.#optimisticUserMessageComponents = [];
@@ -3917,6 +3920,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		options?: { imageLinks?: readonly (string | undefined)[] },
 	): void {
 		this.optimisticUserMessageSignature = undefined;
+		this.#optimisticUserMessageTimestamp = undefined;
 		this.#pendingSubmissionDispose?.();
 		this.#pendingSubmissionDispose = undefined;
 		for (const component of this.#optimisticUserMessageComponents) {
@@ -4035,6 +4039,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#resetGoalContinuationSuppression();
 			const imageCount = submission.images?.length ?? 0;
 			this.optimisticUserMessageSignature = `${submission.text}\u0000${imageCount}`;
+			const timestamp = Date.now();
+			this.#optimisticUserMessageTimestamp = timestamp;
 			this.#pendingSubmissionDispose = this.recordLocalSubmission(submission.text, imageCount);
 			this.#optimisticUserMessageComponents = this.#captureAddedChatComponents(() => {
 				this.addMessageToChat(
@@ -4042,7 +4048,7 @@ export class InteractiveMode implements InteractiveModeContext {
 						role: "user",
 						content: [{ type: "text", text: submission.text }, ...(submission.images ?? [])],
 						attribution: "user",
-						timestamp: Date.now(),
+						timestamp,
 					},
 					{ imageLinks: input.imageLinks },
 				);
@@ -4160,6 +4166,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		if (wasPendingSubmission && !this.session.isStreaming && !this.streamingComponent) {
 			this.optimisticUserMessageSignature = undefined;
+			this.#optimisticUserMessageTimestamp = undefined;
 			pendingSubmissionDispose?.();
 			this.#optimisticUserMessageComponents = [];
 			this.#pendingWorkingMessage = undefined;
@@ -5058,13 +5065,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.optimisticUserMessageSignature) return;
 		const submission = this.#pendingSubmittedInput;
 		if (!submission || submission.cancelled || submission.customType) return;
+		const timestamp = this.#optimisticUserMessageTimestamp ?? Date.now();
 		this.#optimisticUserMessageComponents = this.#captureAddedChatComponents(() => {
 			this.addMessageToChat(
 				{
 					role: "user",
 					content: [{ type: "text", text: submission.text }, ...(submission.images ?? [])],
 					attribution: "user",
-					timestamp: Date.now(),
+					timestamp,
 				},
 				{ imageLinks: submission.imageLinks },
 			);

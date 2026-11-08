@@ -11,7 +11,7 @@ import type { DescribeContext, NativeChild, NativeNode } from "../native/node";
 const MIN_DURATION_MS = 100;
 
 /** Local ISO date with a wall-clock time; only the hour cycle follows the terminal. */
-function formatUsageTimestamp(ms: number, hour12 = false): string {
+export function formatUsageTimestamp(ms: number, hour12 = false): string {
 	const d = new Date(ms);
 	const pad = (n: number): string => String(n).padStart(2, "0");
 	const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;

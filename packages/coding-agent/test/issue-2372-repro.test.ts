@@ -101,6 +101,20 @@ describe("issue #2372 pre-streaming chat rebuild preserves optimistic submission
 		expect(mode.chatContainer.children.length).toBeGreaterThan(0);
 	});
 
+	it("replays the submission's own timestamp, so the prompt's issued time does not move", () => {
+		let now = 1_700_000_000_000;
+		vi.spyOn(Date, "now").mockImplementation(() => now++);
+		const addMessageSpy = vi.spyOn(mode, "addMessageToChat");
+
+		mode.startPendingSubmission({ text: "stamped prompt" });
+		now += 5_000;
+		mode.rebuildChatFromMessages();
+
+		const [initial, replay] = addMessageSpy.mock.calls.map(call => call[0]);
+		if (initial?.role !== "user" || replay?.role !== "user") throw new Error("Expected two user renders");
+		expect(replay.timestamp).toBe(initial.timestamp);
+	});
+
 	it("does not duplicate the user message once message_start has cleared the optimistic signature", () => {
 		const addMessageSpy = vi.spyOn(mode, "addMessageToChat");
 
