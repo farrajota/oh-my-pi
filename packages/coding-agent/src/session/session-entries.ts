@@ -10,6 +10,7 @@ import type {
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { CompactionMethod } from "./compaction-methods";
+import type { PersistedPermissionSnapshot } from "../task/permissions/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 import type { RuntimeIdentity } from "./runtime-identity";
@@ -318,6 +319,12 @@ export interface SessionInitEntry extends SessionEntryBase {
 	isolated?: boolean;
 	/** Work-pool yield items of the last model call; revival restores them so the yield tool matches. Absent when none. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/** Permission profiles the spawn's request named, in request order. Present only on scoped spawns. */
+	requestedPermissionProfiles?: string[];
+	/** Inherited plus requested permission profiles, in composition order. Present only on scoped spawns. */
+	effectivePermissionProfiles?: string[];
+	/** The permission scope the subagent was spawned with and its canonical hash; fork-era files hold a v1 scope. */
+	permissionSnapshot?: PersistedPermissionSnapshot;
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */

@@ -138,6 +138,7 @@ import {
 	type PermissionPromptView,
 	permissionPromptView,
 	permissionRestrictsStartup,
+	permissionSessionInitFields,
 	permissionStartupToolNames,
 } from "./permissions/spawn";
 import type { PermissionScope } from "./permissions/types";
@@ -545,6 +546,8 @@ export interface ExecutorOptions {
 	 * child reads its parent's scope, if any, through its settings.
 	 */
 	permissionScope?: PermissionScope;
+	/** Profile names the spawn's permission request named, in request order; recorded with the scope. */
+	requestedPermissionProfiles?: string[];
 	/**
 	 * Limit the child to its explicit host tool names and the required yield
 	 * tool, suppressing discovered and always-included capabilities.
@@ -5281,6 +5284,10 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				// stamp the contract so cold revival leaves them transcript-only
 				// even when the workspace was retained for recovery.
 				isolated: worktree !== undefined || undefined,
+				// Revival restores and verifies the scope from these; an unscoped spawn records none.
+				...(options.permissionScope
+					? permissionSessionInitFields(options.permissionScope, options.requestedPermissionProfiles)
+					: undefined),
 			});
 
 			abortSignal.addEventListener(

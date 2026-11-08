@@ -133,6 +133,15 @@ export interface PermissionScopeSnapshot {
 	readonly canonicalSha256: string;
 }
 
+/**
+ * `session_init.permissionSnapshot` as a transcript holds it: a v2 {@link PermissionScopeSnapshot}, or a
+ * fork-era v1 scope. Untrusted until `readPermissionSnapshot` verifies it.
+ */
+export interface PersistedPermissionSnapshot {
+	readonly scope: unknown;
+	readonly canonicalSha256: string;
+}
+
 export type PermissionDenialCode = "tool-deny" | "tool-not-allowed" | "path-deny" | "path-not-allowed" | "guardrail";
 
 export interface PermissionDenialDetails {

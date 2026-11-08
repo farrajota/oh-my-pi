@@ -865,6 +865,7 @@ function buildExecutorOptions(
 		workPoolYieldItems: request.workPoolYieldItems,
 		// The child's own id makes it the scope's actor, which its agent:// and history:// rules key on.
 		permissionScope: policy.permissionScope ? { ...policy.permissionScope, actorId: id } : undefined,
+		requestedPermissionProfiles: policy.permissionScope ? request.permissions?.profiles : undefined,
 		contextFiles: session.contextFiles,
 		noContextFiles: session.noContextFiles,
 		skills,

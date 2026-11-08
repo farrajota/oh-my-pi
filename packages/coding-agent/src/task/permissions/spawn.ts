@@ -14,12 +14,14 @@ import { evaluateSubagentPermission } from "./evaluate";
 import { activePermissionScope } from "./guard";
 import { loadPermissionProfiles } from "./profiles";
 import { cfgTaskPermissionsMode, cfgTaskPermissionsPathsEnabled, cfgTaskPermissionsToolsEnabled } from "./settings";
+import { freezePermissionScope } from "./snapshot";
 import { resolveTaskToolProfile, type TaskToolProfileName } from "./tool-profiles";
 import { MESSAGING_GRANT, permissionToolKey, uniquePermissionTools } from "./tool-names";
 import type {
 	DeepImmutable,
 	PathConstraintGroup,
 	PermissionScope,
+	PermissionScopeSnapshot,
 	SubagentPermissionMode,
 	TaskPermissionRequest,
 } from "./types";
@@ -214,4 +216,27 @@ export function permissionsBlockSpeculativeLaunch(
 	if (spawn.permissions !== undefined || spawn.toolProfile !== undefined) return true;
 	const active = activePermissionScope(settings);
 	return active !== undefined && (!active.ok || active.scope.mode === "enforce");
+}
+
+/** The `session_init` fields that record the scope a child was spawned with. */
+export interface PermissionSessionInitFields {
+	readonly requestedPermissionProfiles: string[];
+	readonly effectivePermissionProfiles: string[];
+	readonly permissionSnapshot: PermissionScopeSnapshot;
+}
+
+/**
+ * Provenance of a scoped spawn for its `session_init`: the profiles its request named (in request
+ * order), the effective profiles (in composition order), and the frozen scope with its hash, which
+ * revival verifies.
+ */
+export function permissionSessionInitFields(
+	scope: PermissionScope,
+	requested: readonly string[] | undefined,
+): PermissionSessionInitFields {
+	return {
+		requestedPermissionProfiles: [...(requested ?? [])],
+		effectivePermissionProfiles: [...scope.profiles],
+		permissionSnapshot: freezePermissionScope(scope),
+	};
 }

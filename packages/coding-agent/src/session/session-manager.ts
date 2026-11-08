@@ -42,6 +42,7 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
+import type { PersistedPermissionSnapshot } from "../task/permissions/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import { createInterruptedToolResults, sessionExitFollowsLastMessage } from "./exit-diagnostics";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
@@ -3733,6 +3734,9 @@ export class SessionManager {
 		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 		isolated?: boolean;
 		workPoolYieldItems?: WorkPoolYieldItem[];
+		requestedPermissionProfiles?: string[];
+		effectivePermissionProfiles?: string[];
+		permissionSnapshot?: PersistedPermissionSnapshot;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -4804,6 +4808,9 @@ export interface PersistedSessionInit {
 	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	isolated?: boolean;
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	requestedPermissionProfiles?: string[];
+	effectivePermissionProfiles?: string[];
+	permissionSnapshot?: PersistedPermissionSnapshot;
 }
 
 /**
@@ -4836,6 +4843,14 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			isolated: entry.isolated,
 			...(entry.compactionThreshold !== undefined ? { compactionThreshold: entry.compactionThreshold } : undefined),
 			...(entry.workPoolYieldItems !== undefined ? { workPoolYieldItems: entry.workPoolYieldItems } : undefined),
+			// Revival verifies the scope against these; a re-appended contract must keep them.
+			...(entry.requestedPermissionProfiles !== undefined
+				? { requestedPermissionProfiles: entry.requestedPermissionProfiles }
+				: undefined),
+			...(entry.effectivePermissionProfiles !== undefined
+				? { effectivePermissionProfiles: entry.effectivePermissionProfiles }
+				: undefined),
+			...(entry.permissionSnapshot !== undefined ? { permissionSnapshot: entry.permissionSnapshot } : undefined),
 		};
 	}
 	return init;
