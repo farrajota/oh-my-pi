@@ -59,6 +59,9 @@ import { generateTaskName, sanitizeAgentId } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { ovnfsWorkspace } from "./ovnfs";
 import { permissionDelegationRefusal } from "./permissions/session-checks";
+import { composeSpawnScope } from "./permissions/spawn";
+import type { TaskToolProfileName } from "./permissions/tool-profiles";
+import type { PermissionScope, TaskPermissionRequest } from "./permissions/types";
 import { resolveSpawnPolicy } from "./spawn-policy";
 import { isBundledSeance, prepareSeance, type PreparedSeanceSession } from "./seance";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
@@ -197,6 +200,10 @@ export interface StructuredSubagentRequest {
 	customTools?: CustomTool[];
 	/** Workpool items accepted by the child yield tool during this turn. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/** Permission request of a task item; composed with the scope the spawning session runs under. */
+	permissions?: TaskPermissionRequest;
+	/** Named tool set of a task item; folded into the permission request as a tool allowlist. */
+	toolProfile?: TaskToolProfileName;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	/** See {@link ExecutorOptions.onToolResult}. */
@@ -237,6 +244,11 @@ export interface EffectiveSubagentPolicy {
 	enableIrc: boolean;
 	/** Caller `effort` hint to apply; dropped when the agent's level comes from the user's `^model:level` tag. */
 	effort?: TaskEffort;
+	/**
+	 * Permission scope the child runs under, with an empty `actorId` until its id is allocated.
+	 * Undefined for an unscoped child: no request, and no scope to inherit.
+	 */
+	permissionScope?: PermissionScope;
 }
 
 /** Settled child execution plus data needed by the frontends' own rendering. */
@@ -636,6 +648,14 @@ export async function resolveEffectiveSubagentPolicy(
 			"Subagent isolated execution requires task.isolation.enabled; it is currently false.",
 		);
 	}
+	const permissionScope = await composeSpawnScope({
+		settings: request.session.settings,
+		cwd: request.session.cwd,
+		parentId: request.session.getAgentId?.() ?? MAIN_AGENT_ID,
+		permissions: request.permissions,
+		toolProfile: request.toolProfile,
+	});
+	if (!permissionScope.ok) throw new StructuredSubagentError("preflight", permissionScope.error);
 	return {
 		discovery,
 		agentName,
@@ -668,6 +688,7 @@ export async function resolveEffectiveSubagentPolicy(
 				(request.session.enableIrc !== false &&
 					isIrcEnabled(request.session.settings, request.session.taskDepth ?? 0))),
 		effort: userTaggedEffort ? undefined : request.effort,
+		permissionScope: permissionScope.scope,
 	};
 }
 
@@ -842,6 +863,8 @@ function buildExecutorOptions(
 		enableMCP,
 		customTools: request.customTools,
 		workPoolYieldItems: request.workPoolYieldItems,
+		// The child's own id makes it the scope's actor, which its agent:// and history:// rules key on.
+		permissionScope: policy.permissionScope ? { ...policy.permissionScope, actorId: id } : undefined,
 		contextFiles: session.contextFiles,
 		noContextFiles: session.noContextFiles,
 		skills,

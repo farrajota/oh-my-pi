@@ -1173,11 +1173,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			...this.#resultParams(params),
 			...this.#effortParams(params),
 			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+			...this.#permissionParams(params),
 			blockedAgent: this.#blockedAgent,
 			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
 			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			maxRuntimeMs: cfgTaskMaxRuntimeMs.get(this.session.settings),
 		});
+	}
+
+	/** The spawn's permission request; shape validation refused both fields while the mode is `off`. */
+	#permissionParams(params: TaskParams): Pick<StructuredSubagentRequest, "permissions" | "toolProfile"> {
+		return {
+			...(params.permissions !== undefined ? { permissions: params.permissions } : {}),
+			...(params.toolProfile !== undefined ? { toolProfile: params.toolProfile } : {}),
+		};
 	}
 
 	/**
@@ -2044,6 +2053,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
 				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+				...this.#permissionParams(params),
 				blockedAgent: this.#blockedAgent,
 				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),

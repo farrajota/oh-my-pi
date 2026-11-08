@@ -132,6 +132,15 @@ import { TOOLS_SOURCE_ID } from "../job-widgets/types";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
 import { permissionResultFilter, permissionWithholdsExtensionCode } from "./permissions/session-checks";
+import { cfgTaskPermissionsActiveScope } from "./permissions/settings";
+import { encodePermissionScope } from "./permissions/snapshot";
+import {
+	type PermissionPromptView,
+	permissionPromptView,
+	permissionRestrictsStartup,
+	permissionStartupToolNames,
+} from "./permissions/spawn";
+import type { PermissionScope } from "./permissions/types";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
@@ -530,6 +539,12 @@ export interface ExecutorOptions {
 	customTools?: CustomTool[];
 	/** Workpool items accepted by the child yield tool during this turn. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/**
+	 * Permission scope the child runs under, written into its settings overlay as a runtime override
+	 * of `task.permissions.activeScope`. Plain data, so it crosses worker links as is. Without one the
+	 * child reads its parent's scope, if any, through its settings.
+	 */
+	permissionScope?: PermissionScope;
 	/**
 	 * Limit the child to its explicit host tool names and the required yield
 	 * tool, suppressing discovered and always-included capabilities.
@@ -4086,6 +4101,8 @@ interface SubagentPromptInputs {
 	ircRoster?: IrcPeerRosterData;
 	/** Set while a warm revive rebuilds the session. */
 	reviving: boolean;
+	/** Permissions section for a child under a restricting scope. */
+	permissions?: PermissionPromptView;
 }
 
 /**
@@ -4174,6 +4191,7 @@ function buildSubagentSessionOptions(
 				ircParkedCount: ircRoster?.parkedCount ?? 0,
 				ircOmittedCount: ircRoster?.omittedCount ?? 0,
 				ircSelfId: inputs.ircEnabled ? inputs.id : "",
+				permissions: inputs.permissions,
 			});
 			if (ircRoster) recordIrcRender(inputs, subagentPrompt, ircRoster);
 			// Per-spawn text (context, worktree, IRC roster) goes after the trailing
@@ -4545,6 +4563,9 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			...(advisorRolePattern
 				? { modelRoles: { ...settings.getModelRoles(), advisor: advisorRolePattern } }
 				: undefined),
+			...(options.permissionScope
+				? { [cfgTaskPermissionsActiveScope.id]: encodePermissionScope(options.permissionScope) }
+				: undefined),
 		},
 		options.parentServiceTier,
 	);
@@ -4556,7 +4577,10 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 	const { softRequestBudget, softRequestBudgetNotice } = softRequestBudgetFor(agent.name, settings);
 	const parentDepth = options.taskDepth ?? 0;
 	const childDepth = parentDepth + 1;
-	const restrictToolNames = options.restrictToolNames === true || preparedSession !== undefined;
+	// An enforce-restricted scope (its own or inherited) owns the child's tool list, like a restricted host.
+	const permissionRestricted = permissionRestrictsStartup(subagentSettings);
+	const restrictToolNames =
+		options.restrictToolNames === true || preparedSession !== undefined || permissionRestricted;
 	const withholdExtensionCode = permissionWithholdsExtensionCode(subagentSettings);
 	// The parent's tree lists what the child's scope may refuse; such a child scans its own, filtered.
 	const forwardWorkspaceTree = permissionResultFilter(subagentSettings, worktree ?? cwd, "read") === undefined;
@@ -4594,6 +4618,13 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 		(toolNames.includes("task") || toolNames.includes("bash"))
 	) {
 		toolNames = [...toolNames, "wait"];
+	}
+	if (permissionRestricted) {
+		toolNames = permissionStartupToolNames(
+			subagentSettings,
+			toolNames,
+			(options.customTools ?? []).map(tool => tool.name),
+		);
 	}
 	// Inbound steering works without messaging; outbound peer coordination requires write.
 	const ircEnabled =
@@ -5060,6 +5091,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					ircRoot: {},
 					ircRenders: new Map(),
 					reviving: false,
+					permissions: permissionPromptView(subagentSettings),
 				},
 			};
 
