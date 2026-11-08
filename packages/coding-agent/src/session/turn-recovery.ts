@@ -662,12 +662,19 @@ export class TurnRecovery {
 
 	/** Closes a failed retry saga when no compaction continuation took ownership. */
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
+		if (message.stopReason !== "error") return;
 		const repeated = this.#repeatedRetry;
-		if (repeated && message.stopReason === "error") {
+		if (compaction.continuationScheduled) {
+			// The continuation owns the saga, as for an ordinary retry: its success closes
+			// it, another failure comes back here. It is a recovery turn, not a probe.
+			if (repeated) this.#restoreProbeAttempts(repeated);
+			return;
+		}
+		if (repeated) {
 			await this.#finishRepeatedRetry(repeated, "not-recoverable", { terminalTurn: message });
 			return;
 		}
-		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
+		if (this.#retryAttempt === 0) return;
 		const attempt = this.#retryAttempt;
 		this.#retryAttempt = 0;
 		await this.#host.emitSessionEvent({

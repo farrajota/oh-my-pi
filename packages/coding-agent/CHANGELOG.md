@@ -50,6 +50,7 @@
 
 ### Fixed
 
+- A repeated-retry probe that fails with a context overflow no longer ends the retry as not recoverable while compaction continues the turn; the continuation closes it, and runs with the normal provider attempt budget
 - `/restart` in a `--single-request` session relaunches it under the guard again instead of as an unguarded session with tools, retries and fallback
 - `--single-request` turns off auto-compaction (threshold, mid-turn, idle and speculative), context promotion, TTSR, the memory backend, task labels, image descriptions and speech, so no summary, recall or re-send request goes out beside the one guarded request
 - Under a permission scope with path rules or secrets-blind, an `ast_edit` preview of a single file applies through `resolve` instead of failing with "Path not found: Not a directory"
