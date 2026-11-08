@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "omp://skill-cutover/member-evidence.schema.json",
+  "title": "Skill-set member identity and evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["target", "device", "inode", "uid", "gid", "aliases", "index", "member_id", "workspace", "sentinel", "sentinel_sha256", "expected_state_sha256"],
+  "properties": {
+    "target": {"type": "string", "minLength": 1},
+    "device": {"type": "integer", "minimum": 0},
+    "inode": {"type": "integer", "minimum": 1},
+    "uid": {"type": "integer", "minimum": 0},
+    "gid": {"type": "integer", "minimum": 0},
+    "aliases": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "index": {"type": "integer", "minimum": 0},
+    "member_id": {"type": "string", "pattern": "^member-[0-9a-f]{20}$"},
+    "workspace": {"type": "string", "minLength": 1},
+    "capability_evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sentinel": {"type": "object"},
+    "sentinel_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "expected_state_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
