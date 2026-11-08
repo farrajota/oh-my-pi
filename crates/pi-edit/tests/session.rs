@@ -464,6 +464,7 @@ async fn hashline_rem_streaming_preview_does_not_error_on_invalid_utf8() {
 		enforce_seen_lines: false,
 		max_columns:        512,
 		raw_input:          false,
+		source_snapshots:   None,
 	};
 	let mut session = Session::new(config, EditStore::new());
 	// Completed REM section followed by an incomplete trailing section.
@@ -754,4 +755,69 @@ async fn result_text_uses_compact_preview_and_header() {
 	assert!(outcome.files[0].diff.contains("+2|TWO"), "{}", outcome.files[0].diff);
 	assert_eq!(outcome.files[0].old_text.as_deref(), Some("one\ntwo\nthree\n"));
 	assert_eq!(outcome.files[0].new_text.as_deref(), Some("one\nTWO\nthree\n"));
+}
+
+/// A session pinned to `sources` (workspace-relative path, captured text;
+/// `None` for a target that did not exist).
+fn pinned_session(ws: &Workspace, sources: &[(&str, Option<&str>)]) -> pi_edit::Session {
+	let mut config = ws.config.clone();
+	config.source_snapshots = Some(std::sync::Arc::new(
+		sources
+			.iter()
+			.map(|(rel, text)| (ws.cwd().join(rel), text.map(|text| text.as_bytes().to_vec())))
+			.collect(),
+	));
+	pi_edit::Session::new(config, ws.store.clone())
+}
+
+#[tokio::test]
+async fn pinned_sources_stage_against_captured_bytes_not_the_disk() {
+	let ws = Workspace::new(EditMode::Sloppy);
+	ws.write("a.rs", "fn main() {\n    let x = 1;\n    let late = 0;\n}\n");
+	let mut session = pinned_session(&ws, &[("a.rs", Some(SOURCE))]);
+	session.set_args_json(&serde_json::json!({ "input": sloppy_payload("a.rs") }).to_string());
+	session.finish();
+
+	let writer = DiskWriter::default();
+	session
+		.apply(ApplyRequest::default(), &writer)
+		.await
+		.expect("apply");
+
+	let requests = writer.requests.lock();
+	assert_eq!(requests.len(), 1);
+	assert_eq!(
+		requests[0].content.as_deref(),
+		Some(SOURCE.replace("let x = 1;", "let x = 2;").as_str())
+	);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_target_swapped_for_another_file_is_refused_before_any_write() {
+	let ws = Workspace::new(EditMode::Sloppy);
+	ws.write("a.rs", SOURCE);
+	ws.write("allowed.rs", SOURCE);
+	let secret = ws.write("secret.rs", &format!("{SOURCE}// SECRET_SENTINEL\n"));
+	let alias = ws.cwd().join("alias.rs");
+	std::os::unix::fs::symlink(ws.cwd().join("allowed.rs"), &alias).unwrap();
+	let mut session = pinned_session(&ws, &[("a.rs", Some(SOURCE)), ("allowed.rs", Some(SOURCE))]);
+	std::fs::remove_file(&alias).unwrap();
+	std::os::unix::fs::symlink(&secret, &alias).unwrap();
+	let input = format!("{}{}", sloppy_payload("a.rs"), sloppy_payload("alias.rs"));
+	session.set_args_json(&serde_json::json!({ "input": input }).to_string());
+	session.finish();
+
+	let writer = DiskWriter::default();
+	let message = session
+		.apply(ApplyRequest::default(), &writer)
+		.await
+		.expect_err("swapped target")
+		.to_string();
+
+	assert!(message.contains("alias.rs: the file changed after it was approved"), "{message}");
+	assert!(!message.contains("SECRET_SENTINEL"), "{message}");
+	assert!(writer.requests.lock().is_empty());
+	assert_eq!(ws.read("a.rs").unwrap(), SOURCE);
+	assert_eq!(ws.read("secret.rs").unwrap(), format!("{SOURCE}// SECRET_SENTINEL\n"));
 }

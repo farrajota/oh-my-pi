@@ -302,12 +302,13 @@ pub fn canonical_key(absolute: &Path) -> PathBuf {
 	strip_windows_verbatim_path(resolved)
 }
 
-/// Where `path` (lexically absolute and normalized) physically lands: its
-/// deepest existing ancestor canonicalized (symlinks resolved, verbatim
+/// Where `path` (lexically absolute and normalized) physically lands.
+///
+/// Its deepest existing ancestor canonicalized (symlinks resolved, verbatim
 /// prefix stripped) with the missing tail re-appended. `None` when a missing
 /// tail component is a dangling symlink (or otherwise unresolvable entry),
 /// whose destination cannot be judged.
-fn physical_path(path: &Path) -> Option<PathBuf> {
+pub fn physical_path(path: &Path) -> Option<PathBuf> {
 	let mut existing = path;
 	let mut tail = Vec::new();
 	loop {

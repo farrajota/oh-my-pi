@@ -1957,6 +1957,11 @@ export interface EditPolicy {
   homeDir: string
   /** The payload is a verbatim custom-format string, not JSON. */
   rawInput: boolean
+  /**
+   * Sources captured at approval. When set, the session reads only these,
+   * never the disk, and refuses a target whose physical path has none.
+   */
+  sourceSnapshots?: Array<EditSourceSnapshot>
 }
 
 /** A batch of previews for one session generation. */
@@ -1966,6 +1971,17 @@ export interface EditPreviewBatch {
   /** False for the final untrimmed pass after `finish()`. */
   streaming: boolean
   files: Array<EditFilePreview>
+}
+
+/**
+ * Source bytes the host captured for one edit target when the call was
+ * approved.
+ */
+export interface EditSourceSnapshot {
+  /** Physical path: symlinks resolved, a missing tail appended as written. */
+  path: string
+  /** File bytes; absent when the target did not exist. */
+  bytes?: Uint8Array
 }
 
 /** Host answer for one internal URL (`resolveUrl`). */

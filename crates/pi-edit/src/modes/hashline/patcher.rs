@@ -1105,6 +1105,7 @@ mod lifecycle {
 					enforce_seen_lines: true,
 					max_columns:        MAX_COLUMNS,
 					raw_input:          true,
+					source_snapshots:   None,
 				},
 				self.store.clone(),
 			);

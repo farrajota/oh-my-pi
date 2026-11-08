@@ -47,6 +47,16 @@ import { DEFAULT_MAX_COLUMN } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { resolveEditMode } from "../utils/edit-mode";
 import { attemptEditAutoRepair, type EditAutoRepairOutcome } from "./auto-repair";
+import {
+	assertEditSourcesUnchanged,
+	bindEditSources,
+	boundEditSources,
+	captureEditSources,
+	type EditSourceBinding,
+	nativeSourceSnapshots,
+	pinnedWritePath,
+} from "./source-binding";
+import { permissionPinsEditSources } from "../task/permissions/session-checks";
 import { type AppliedEditSnapshot, createEditBlackboxRecorder } from "./blackbox";
 import hashlineCompactPrompt from "./hashline-compact.md" with { type: "text" };
 import { getLspBatchRequest } from "../lsp/batch";
@@ -448,6 +458,8 @@ export class EditTool implements AgentTool<TInput> {
 	 * plus move/rename destinations, mirroring {@link approval}.
 	 */
 	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
+		const pinned = boundEditSources(this, args);
+		if (pinned) return pinned.approvalKeys.length > 0 ? pinned.approvalKeys : undefined;
 		const { paths, fileOps } = this.#inspect(args);
 		const targets = [...paths];
 		for (const op of fileOps) if (op.kind === "move" && op.to !== undefined) targets.push(op.to);
@@ -457,6 +469,15 @@ export class EditTool implements AgentTool<TInput> {
 			if (key !== undefined) keys.push(key);
 		}
 		return keys.length > 0 ? keys : undefined;
+	};
+
+	/**
+	 * Under a permission scope that judges real paths, pin every target right before the full approval
+	 * gate, so the guard checks exactly what the edit will apply against ({@link captureEditSources}).
+	 */
+	readonly bindApprovalTargets = (args: unknown): void => {
+		if (!permissionPinsEditSources(this.session.settings)) return;
+		bindEditSources(this, args, this.#captureSources(args));
 	};
 
 	matcherDigest(args: unknown): string | undefined {
@@ -524,7 +545,12 @@ export class EditTool implements AgentTool<TInput> {
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
 		let open = this.#sessions.get(toolCallId);
 		const argsJson = JSON.stringify(params);
-		if (open && this.#streamedArgs.get(toolCallId) !== argsJson) {
+		// A call outside the approval wrapper was never pinned; pin it now, before anything is read.
+		const pinned = permissionPinsEditSources(this.session.settings)
+			? (boundEditSources(this, params) ?? this.#captureSources(params))
+			: undefined;
+		// The streamed session previewed from disk; a pinned apply reads only the pinned sources.
+		if (open && (pinned !== undefined || this.#streamedArgs.get(toolCallId) !== argsJson)) {
 			open.native.close();
 			this.#sessions.delete(toolCallId);
 			open = undefined;
@@ -538,7 +564,8 @@ export class EditTool implements AgentTool<TInput> {
 			// No deltas were streamed (non-streaming provider, inline recovery,
 			// Cursor batch frames), or a pre-execution hook revised the arguments:
 			// the parsed args are the whole effective payload.
-			open = this.#openSession(false, signal);
+			if (pinned) assertEditSourcesUnchanged(pinned, this.session.cwd);
+			open = this.#openSession(false, signal, undefined, pinned);
 			open.native.setArgsJson(argsJson);
 			open.native.finish();
 		}
@@ -548,7 +575,7 @@ export class EditTool implements AgentTool<TInput> {
 		try {
 			outcome = await editSession.apply(
 				{ lspBatchId: batch?.id, lspFlush: batch?.flush ?? false },
-				(_error, request) => this.#write(request, signal),
+				(_error, request) => this.#write(request, signal, pinned),
 			);
 			if (outcome.isError && batch?.flush) {
 				await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
@@ -592,12 +619,15 @@ export class EditTool implements AgentTool<TInput> {
 			const display = path.relative(this.session.cwd, snapshot.path) || snapshot.path;
 			let repaired: EditAutoRepairOutcome | undefined;
 			try {
-				repaired = await attemptEditAutoRepair({
-					session: this.session,
-					snapshot,
-					writethrough: createEditWritethrough(this.session),
-					signal,
-				});
+				// Auto-repair re-reads and rewrites the file outside the pinned sources.
+				repaired = pinned
+					? undefined
+					: await attemptEditAutoRepair({
+							session: this.session,
+							snapshot,
+							writethrough: createEditWritethrough(this.session),
+							signal,
+						});
 				if (repaired) getEditStore(this.session).invalidate(snapshot.path);
 			} catch (error) {
 				logger.warn("Edit auto-repair failed", {
@@ -635,26 +665,39 @@ export class EditTool implements AgentTool<TInput> {
 		return inspection;
 	}
 
+	/** Pin every file the payload names: section targets and move destinations. */
+	#captureSources(args: unknown): EditSourceBinding {
+		const { paths, entries, fileOps } = this.#inspect(args);
+		const targets = [...paths, ...entries.map(entry => entry.path)];
+		for (const op of fileOps) {
+			targets.push(op.path);
+			if (op.kind === "move" && op.to !== undefined) targets.push(op.to);
+		}
+		return captureEditSources(targets, this.session.cwd, sessionResolveContext(this.session));
+	}
+
 	/**
 	 * Open a native session whose internal-URL targets resolve through the router
-	 * with one {@link ResolveContext} built for the session's lifetime.
+	 * with one {@link ResolveContext} built for the session's lifetime. A pinned
+	 * session reads only the sources `pinned` holds.
 	 */
 	#openSession(
 		rawInput: boolean,
 		signal?: AbortSignal,
 		onPreview?: (error: Error | null, batch: EditPreviewBatch) => void,
+		pinned?: EditSourceBinding,
 	): OpenEditSession {
 		const resolveContext = sessionResolveContext(this.session, { signal });
 		const native = new EditSession(
 			getEditStore(this.session),
-			this.#policy(rawInput, resolveContext),
+			this.#policy(rawInput, resolveContext, pinned),
 			onPreview,
 			(_error, url) => this.#resolveUrl(url, resolveContext),
 		);
 		return { native, resolveContext };
 	}
 
-	#policy(rawInput: boolean, context: ResolveContext): EditPolicy {
+	#policy(rawInput: boolean, context: ResolveContext, pinned?: EditSourceBinding): EditPolicy {
 		const router = InternalUrlRouter.instance();
 		const specs = router.specs();
 		const urlAliasSchemes: string[] = [];
@@ -673,6 +716,7 @@ export class EditTool implements AgentTool<TInput> {
 			planWritableRoots: router.sandboxRoots(context),
 			homeDir: os.homedir(),
 			rawInput,
+			sourceSnapshots: pinned ? nativeSourceSnapshots(pinned) : undefined,
 		};
 	}
 
@@ -701,7 +745,22 @@ export class EditTool implements AgentTool<TInput> {
 		}
 	}
 
-	async #write(request: EditWriteRequest, signal?: AbortSignal): Promise<EditWriteResponse> {
+	async #write(
+		request: EditWriteRequest,
+		signal?: AbortSignal,
+		pinned?: EditSourceBinding,
+	): Promise<EditWriteResponse> {
+		if (pinned) {
+			// Write the pinned real paths, and only while they still hold what was pinned.
+			const { moveTo } = request;
+			request = {
+				...request,
+				path: pinnedWritePath(pinned, request.path, request.displayPath),
+				moveTo: moveTo
+					? pinnedWritePath(pinned, moveTo, path.relative(this.session.cwd, moveTo) || moveTo)
+					: moveTo,
+			};
+		}
 		if (request.op === "delete") {
 			await deleteFileWithFallback(request.path, Bun.file(request.path));
 			if (this.session.enableLsp ?? true) {

@@ -14,6 +14,12 @@
 //! [`FileCache::take_recovery_misses`]) and resolves as not recovered until
 //! the host searches the working tree and [`FileCache::provide_recovery`]s
 //! the answer: the engine itself never walks.
+//!
+//! A cache built [`FileCache::with_source_snapshots`] is closed-world: it
+//! reads only the bytes the host captured when the call was approved, keyed
+//! by each target's physical path, and never the disk. A target whose path
+//! now lands elsewhere (a swapped symlink, a recovered or re-resolved path)
+//! is refused instead of read.
 
 use std::{
 	collections::HashMap,
@@ -27,7 +33,7 @@ use crate::{
 	engine::{FileOp, Resolved},
 	error::{EditError, EditResult, Rejection},
 	notebook,
-	path_policy::{PathPolicy, RecoveryGlob, UrlResolution, canonical_key},
+	path_policy::{PathPolicy, RecoveryGlob, UrlResolution, canonical_key, physical_path},
 	text::{LineEnding, detect_line_ending, normalize_to_lf, restore_line_endings, strip_bom},
 };
 
@@ -73,6 +79,11 @@ pub fn persist_new(resolved: &Resolved, after_lf: &str) -> EditResult<String> {
 	}
 	Ok(after_lf.to_owned())
 }
+
+/// Source bytes the host captured for each edit target when the call was
+/// approved, keyed by physical path ([`physical_path`]); `None` marks a target
+/// that did not exist then.
+pub type SourceSnapshots = HashMap<PathBuf, Option<Vec<u8>>>;
 
 /// Filesystem view an engine reads through.
 pub trait FileSource {
@@ -144,7 +155,8 @@ fn stamp(absolute: &Path) -> Option<Stamp> {
 /// Default [`FileSource`] backed by `std::fs`.
 pub struct FileCache {
 	policy:          PathPolicy,
-	reads:           HashMap<PathBuf, (Stamp, Arc<FileRead>)>,
+	/// Cached reads; the stamp is `None` for reads from `snapshots`.
+	reads:           HashMap<PathBuf, (Option<Stamp>, Arc<FileRead>)>,
 	/// Authored path → resolution (so paired hunks share one recovery).
 	resolutions:     HashMap<(String, bool), Resolved>,
 	/// Host answers keyed by [`PathPolicy::url_target`].
@@ -156,6 +168,8 @@ pub struct FileCache {
 	recovered:       HashMap<String, Option<Resolved>>,
 	/// Authored paths that missed `recovered`, deduped in first-seen order.
 	recovery_misses: Vec<String>,
+	/// Closed-world sources; when set, the disk is never read.
+	snapshots:       Option<Arc<SourceSnapshots>>,
 }
 
 impl FileCache {
@@ -169,7 +183,39 @@ impl FileCache {
 			unresolved: Vec::new(),
 			recovered: HashMap::new(),
 			recovery_misses: Vec::new(),
+			snapshots: None,
 		}
+	}
+
+	/// Closed-world cache over `snapshots`: reads, existence checks and
+	/// resolution never touch the disk, and missing paths are never
+	/// recovered.
+	pub fn with_source_snapshots(policy: PathPolicy, snapshots: Arc<SourceSnapshots>) -> Self {
+		Self { snapshots: Some(snapshots), ..Self::new(policy) }
+	}
+
+	/// The physical path of `resolved` and the source captured there (`None`
+	/// when it did not exist at approval).
+	///
+	/// # Errors
+	/// When nothing was captured there: the path now lands somewhere the
+	/// approval did not cover.
+	fn snapshot_at<'a>(
+		snapshots: &'a SourceSnapshots,
+		resolved: &Resolved,
+	) -> EditResult<(PathBuf, Option<&'a [u8]>)> {
+		physical_path(&resolved.absolute)
+			.and_then(|physical| {
+				let source = snapshots.get(&physical)?.as_deref();
+				Some((physical, source))
+			})
+			.ok_or_else(|| {
+				EditError::apply(format!(
+					"{}: the file changed after it was approved, or is not one the approval covered; \
+					 the edit was refused.",
+					resolved.display
+				))
+			})
 	}
 
 	/// Record the host answer for `url`, dropping cached resolutions and
@@ -230,6 +276,9 @@ impl FileCache {
 	}
 
 	fn read_resolved(&mut self, resolved: &Resolved) -> EditResult<Option<Arc<FileRead>>> {
+		if let Some(snapshots) = self.snapshots.clone() {
+			return self.read_snapshot(&snapshots, resolved);
+		}
 		let Some(current) = stamp(&resolved.absolute) else {
 			return Ok(None);
 		};
@@ -239,7 +288,7 @@ impl FileCache {
 				resolved.display
 			)));
 		}
-		if let Some((cached_stamp, read)) = self.reads.get(&resolved.absolute)
+		if let Some((Some(cached_stamp), read)) = self.reads.get(&resolved.absolute)
 			&& *cached_stamp == current
 			&& read.resolved.display == resolved.display
 		{
@@ -250,6 +299,43 @@ impl FileCache {
 			Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
 			Err(source) => return Err(EditError::Io { path: resolved.absolute.clone(), source }),
 		};
+		let read = Arc::new(self.decode(resolved, bytes, canonical_key(&resolved.absolute))?);
+		self
+			.reads
+			.insert(resolved.absolute.clone(), (Some(current), Arc::clone(&read)));
+		Ok(Some(read))
+	}
+
+	fn read_snapshot(
+		&mut self,
+		snapshots: &SourceSnapshots,
+		resolved: &Resolved,
+	) -> EditResult<Option<Arc<FileRead>>> {
+		let (physical, Some(bytes)) = Self::snapshot_at(snapshots, resolved)? else {
+			return Ok(None);
+		};
+		if let Some((None, read)) = self.reads.get(&resolved.absolute)
+			&& read.resolved.display == resolved.display
+		{
+			return Ok(Some(Arc::clone(read)));
+		}
+		// A captured target existed, so its physical path is its realpath: the
+		// same store key `canonical_key` gives.
+		let read = Arc::new(self.decode(resolved, bytes.to_vec(), physical)?);
+		self
+			.reads
+			.insert(resolved.absolute.clone(), (None, Arc::clone(&read)));
+		Ok(Some(read))
+	}
+
+	/// Decode `bytes` read for `resolved` into its editable form, enforcing
+	/// the auto-generated guard.
+	fn decode(
+		&self,
+		resolved: &Resolved,
+		bytes: Vec<u8>,
+		canonical: PathBuf,
+	) -> EditResult<FileRead> {
 		if let Some(message) = self
 			.policy
 			.auto_generated_message(&resolved.display, &bytes[..bytes.len().min(1024)])
@@ -274,19 +360,7 @@ impl FileCache {
 		} else {
 			detect_line_ending(strip_bom(&raw).1)
 		};
-		let read = Arc::new(FileRead {
-			canonical: canonical_key(&resolved.absolute),
-			resolved: resolved.clone(),
-			raw,
-			bom,
-			ending,
-			text,
-			is_notebook,
-		});
-		self
-			.reads
-			.insert(resolved.absolute.clone(), (current, Arc::clone(&read)));
-		Ok(Some(read))
+		Ok(FileRead { canonical, resolved: resolved.clone(), raw, bom, ending, text, is_notebook })
 	}
 }
 
@@ -307,7 +381,12 @@ impl FileSource for FileCache {
 			self.unresolved.push(url.clone());
 		}
 		let mut resolved = resolved?;
-		if must_exist && !self.policy.is_internal_url(authored) && stamp(&resolved.absolute).is_none()
+		// Pinned sessions never substitute a path: the approval covered only
+		// the authored one.
+		if must_exist
+			&& self.snapshots.is_none()
+			&& !self.policy.is_internal_url(authored)
+			&& stamp(&resolved.absolute).is_none()
 		{
 			match self.recovered.get(authored) {
 				Some(Some(recovered)) => resolved = recovered.clone(),
@@ -329,7 +408,12 @@ impl FileSource for FileCache {
 	}
 
 	fn exists(&mut self, absolute: &Path) -> bool {
-		stamp(absolute).is_some()
+		match &self.snapshots {
+			Some(snapshots) => physical_path(absolute)
+				.and_then(|physical| snapshots.get(&physical))
+				.is_some_and(Option::is_some),
+			None => stamp(absolute).is_some(),
+		}
 	}
 
 	fn read(&mut self, authored: &str) -> EditResult<Arc<FileRead>> {
@@ -416,6 +500,75 @@ mod tests {
 		let resolved = files.resolve("src/a.ts", true).unwrap();
 		assert_eq!(resolved.display, "src/a.ts");
 		assert!(files.take_recovery_misses().is_empty());
+	}
+
+	fn snapshot_cache(root: &Path, snapshots: SourceSnapshots) -> FileCache {
+		FileCache::with_source_snapshots(cache(root).policy, Arc::new(snapshots))
+	}
+
+	#[test]
+	fn source_snapshots_are_read_instead_of_the_disk_and_survive_clear() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path().canonicalize().unwrap();
+		let source = root.join("source.rs");
+		std::fs::write(&source, "disk version\n").unwrap();
+		let raw = "\u{feff}snapshot\r\n";
+		let mut files =
+			snapshot_cache(&root, HashMap::from([(source.clone(), Some(raw.as_bytes().to_vec()))]));
+
+		let first = files.read("source.rs").unwrap();
+		assert_eq!(first.raw, raw);
+		assert_eq!(first.text, "snapshot\n");
+		assert_eq!(first.persist(&first.text).unwrap(), raw);
+		assert_eq!(first.canonical, source);
+
+		std::fs::write(&source, "changed on disk\n").unwrap();
+		files.clear();
+		assert_eq!(files.read("source.rs").unwrap().raw, raw);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_symlink_swapped_after_capture_is_refused_not_read() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path().canonicalize().unwrap();
+		let allowed = root.join("allowed.rs");
+		let secret = root.join("secret.rs");
+		std::fs::write(&allowed, "allowed\n").unwrap();
+		std::fs::write(&secret, "SECRET\n").unwrap();
+		let alias = root.join("alias.rs");
+		std::os::unix::fs::symlink(&allowed, &alias).unwrap();
+		let mut files =
+			snapshot_cache(&root, HashMap::from([(allowed.clone(), Some(b"allowed\n".to_vec()))]));
+		assert_eq!(files.read("alias.rs").unwrap().text, "allowed\n");
+
+		std::fs::remove_file(&alias).unwrap();
+		std::os::unix::fs::symlink(&secret, &alias).unwrap();
+		files.clear();
+		let error = files.read("alias.rs").unwrap_err().to_string();
+		assert!(error.contains("changed after it was approved"), "{error}");
+		assert!(!error.contains("SECRET"), "{error}");
+		assert!(!files.exists(&alias));
+	}
+
+	#[test]
+	fn absent_and_uncaptured_targets_never_reach_the_disk() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path().canonicalize().unwrap();
+		let fresh = root.join("fresh.rs");
+		let mut files = snapshot_cache(&root, HashMap::from([(fresh.clone(), None)]));
+		std::fs::write(&fresh, "created after capture\n").unwrap();
+		assert!(!files.exists(&fresh));
+		let resolved = files.resolve("fresh.rs", false).unwrap();
+		assert!(files.try_read(&resolved).unwrap().is_none());
+
+		let uncaptured = root.join("nested/unique.rs");
+		std::fs::create_dir_all(uncaptured.parent().unwrap()).unwrap();
+		std::fs::write(&uncaptured, "not captured\n").unwrap();
+		assert!(!files.exists(&uncaptured));
+		assert!(files.read("nested/unique.rs").is_err());
+		files.resolve("unique.rs", true).unwrap();
+		assert!(files.take_recovery_misses().is_empty(), "pinned sessions never recover a path");
 	}
 
 	#[test]

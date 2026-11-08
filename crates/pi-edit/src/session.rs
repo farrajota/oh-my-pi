@@ -4,7 +4,7 @@
 //! Threading and callbacks live in the napi layer; this type is single
 //! threaded and pure apart from file reads and the writer trait.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 
@@ -14,7 +14,7 @@ use crate::{
 		EditMode, FileOp, FileOpIntent, HeaderKind, ModeEngine, PreviewFile, Resolved, StagedFile,
 	},
 	error::{EditError, EditResult},
-	files::{FileCache, FileSource},
+	files::{FileCache, FileSource, SourceSnapshots},
 	modes::hashline::syntax::has_syntax_oracle,
 	notebook,
 	path_policy::{PathPolicy, UrlResolution, canonical_key},
@@ -37,6 +37,9 @@ pub struct SessionConfig {
 	pub max_columns:        usize,
 	/// The payload is not JSON (custom-format tool): the buffer is `input`.
 	pub raw_input:          bool,
+	/// Sources the host captured at approval; when set, the session reads
+	/// only these, never the disk ([`FileCache::with_source_snapshots`]).
+	pub source_snapshots:   Option<Arc<SourceSnapshots>>,
 }
 
 /// One streamed preview pass. Empty `files` means "nothing to show yet";
@@ -150,7 +153,12 @@ impl Session {
 			config.enforce_seen_lines,
 			config.max_columns,
 		);
-		let files = FileCache::new(config.policy.clone());
+		let files = match &config.source_snapshots {
+			Some(snapshots) => {
+				FileCache::with_source_snapshots(config.policy.clone(), Arc::clone(snapshots))
+			},
+			None => FileCache::new(config.policy.clone()),
+		};
 		Self {
 			args: ArgStream::new(config.raw_input),
 			config,
@@ -661,6 +669,7 @@ mod tests {
 			enforce_seen_lines: false,
 			max_columns:        0,
 			raw_input:          false,
+			source_snapshots:   None,
 		};
 		let mut session = Session::new(config, EditStore::new());
 		session.set_args_json(&serde_json::json!({ "input": input }).to_string());

@@ -36,7 +36,7 @@ use std::{
 use async_trait::async_trait;
 use napi::{
 	Status,
-	bindgen_prelude::{Promise, Result},
+	bindgen_prelude::{Promise, Result, Uint8Array},
 	threadsafe_function::{ThreadsafeFunction, UnknownReturnValue},
 };
 use napi_derive::napi;
@@ -70,6 +70,16 @@ fn reason(err: impl std::fmt::Display) -> napi::Error {
 // Policy and result objects
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Source bytes the host captured for one edit target when the call was
+/// approved.
+#[napi(object)]
+pub struct EditSourceSnapshot {
+	/// Physical path: symlinks resolved, a missing tail appended as written.
+	pub path:  String,
+	/// File bytes; absent when the target did not exist.
+	pub bytes: Option<Uint8Array>,
+}
+
 /// Session-wide policy; TypeScript builds it once per tool call.
 #[napi(object)]
 pub struct EditPolicy {
@@ -95,6 +105,9 @@ pub struct EditPolicy {
 	pub home_dir:             String,
 	/// The payload is a verbatim custom-format string, not JSON.
 	pub raw_input:            bool,
+	/// Sources captured at approval. When set, the session reads only these,
+	/// never the disk, and refuses a target whose physical path has none.
+	pub source_snapshots:     Option<Vec<EditSourceSnapshot>>,
 }
 
 impl EditPolicy {
@@ -119,6 +132,16 @@ impl EditPolicy {
 			enforce_seen_lines: self.enforce_seen_lines,
 			max_columns:        self.max_columns as usize,
 			raw_input:          self.raw_input,
+			source_snapshots:   self.source_snapshots.map(|snapshots| {
+				Arc::new(
+					snapshots
+						.into_iter()
+						.map(|snapshot| {
+							(PathBuf::from(snapshot.path), snapshot.bytes.map(|bytes| bytes.to_vec()))
+						})
+						.collect(),
+				)
+			}),
 		})
 	}
 }
@@ -1261,6 +1284,7 @@ mod tests {
 			enforce_seen_lines: false,
 			max_columns:        512,
 			raw_input:          false,
+			source_snapshots:   None,
 		};
 		let (wake, _rx) = flume::bounded::<()>(1);
 		let shared = Shared {

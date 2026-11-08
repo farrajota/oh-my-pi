@@ -121,6 +121,7 @@ impl Workspace {
 			enforce_seen_lines: false,
 			max_columns: 512,
 			raw_input: false,
+			source_snapshots: None,
 		};
 		Self { dir, store: EditStore::new(), config }
 	}

@@ -83,6 +83,20 @@ export function internalUrlFileRefusal(
 }
 
 /**
+ * Whether native edits under `settings` apply only against the sources pinned when the call was
+ * approved, refusing a target whose identity or content changed since: an enforce scope with path
+ * rules or secrets-blind, whose guard judges each target by its real path at approval. A scope that
+ * does not decode pins too (its guard refuses the edit anyway).
+ */
+export function permissionPinsEditSources(settings: Settings): boolean {
+	const active = activePermissionScope(settings);
+	if (active === undefined) return false;
+	if (!active.ok) return true;
+	const { scope } = active;
+	return scope.mode === "enforce" && (hasPathRules(scope) || scope.guardrails.secretsBlind);
+}
+
+/**
  * Whether a child running under `settings` must start without its parent's extension and custom-tool
  * code: its scope is enforce-restricted, or does not decode. Extension handlers run unconstrained by
  * the scope's tool rules, and custom tool modules execute as they load.

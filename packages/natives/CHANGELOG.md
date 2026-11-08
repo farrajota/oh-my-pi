@@ -4,6 +4,7 @@
 
 ### Added
 
+- `EditPolicy.sourceSnapshots`: an `EditSession` given the source bytes its host captured reads only those, never the disk, and refuses a target whose real path has none
 - macOS `ax()` lines show what an element can do: `(selected)`, `(settable)` on dates `setValue` can write, `(readonly)` on web text fields the page locks, `actions=` beyond its press, and names for unlabeled window buttons ([#15282](https://github.com/can1357/oh-my-pi/pull/15282) by [@will-bogusz](https://github.com/will-bogusz))
 
 ### Changed
