@@ -516,8 +516,9 @@ export interface StreamOptions {
 	maxHttpAttempts?: number;
 	/**
 	 * Total outbound requests for one stream call of an OpenAI-family provider
-	 * (chat completions, Responses, Azure Responses, Codex), including the
-	 * initial request. HTTP retries, stream reopens, transport fallbacks,
+	 * (chat completions, Responses, Azure Responses, Codex) or of Anthropic
+	 * Messages (including the OpenAI/Anthropic shim), including the initial
+	 * request. HTTP retries, stream reopens, transport fallbacks,
 	 * request-shape fallbacks and empty-completion replays all share it, and a
 	 * capped Responses stream does not poll for a dropped run's stored result.
 	 * `undefined` preserves each layer's own limit. Finite values are

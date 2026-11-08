@@ -7,6 +7,7 @@
 - `AssistantMessage.errorCode` carries the provider error's own code (for example CLIProxyAPI's `model_cooldown`) on OpenAI Completions, OpenAI Responses and Codex failures, and `isModelCooldownError()` recognizes a proxy-wide model cooldown; a Codex cooldown keeps the proxy's message beside the friendly rate-limit text
 - `providerMaxAttempts` caps the total outbound requests of one OpenAI Completions, OpenAI Responses, Azure Responses or Codex stream call across HTTP retries, stream reopens, transport and request-shape fallbacks, and empty-completion replays; `streamSimple` forwards it, and a capped Responses stream does not poll for a dropped run's stored result
 - Azure OpenAI Responses honors `maxHttpAttempts`
+- Anthropic Messages and the OpenAI/Anthropic shim (Kimi Code, Synthetic) honor `providerMaxAttempts` too: every request of one stream call, retries, shape fallbacks and empty-completion replays included, counts against it, and a spent budget surfaces the failure that asked for another request
 
 ### Fixed
 

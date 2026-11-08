@@ -100,6 +100,12 @@ import {
 	ANTHROPIC_USAGE_LIMIT_HEADER,
 	parseAnthropicSlowModeHeaders,
 } from "./anthropic-slow-mode";
+import {
+	canStartProviderAttempt,
+	createProviderAttemptBudget,
+	createProviderAttemptLimitError,
+	type ProviderAttemptBudget,
+} from "../utils/provider-attempt-budget";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { getHeadersFromError, getRetryAfterMsFromHeaders } from "../utils/retry-after";
 import { COMBINATOR_KEYS, NO_STRICT, toolWireSchema } from "../utils/schema";
@@ -1863,6 +1869,7 @@ const streamAnthropicOnce = (
 	context: Context,
 	options?: AnthropicOptions,
 	transport?: AnthropicStreamTransport,
+	attemptBudget: ProviderAttemptBudget = createProviderAttemptBudget(options?.providerMaxAttempts),
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
 
@@ -2473,6 +2480,8 @@ const streamAnthropicOnce = (
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
 			// Malformed envelopes/JSON: only before replay-unsafe text/tool events are visible on this stream.
 			let providerRetryAttempt = 0;
+			// The failure that sent this loop round again; surfaced as-is once the attempt budget is spent.
+			let lastStreamFailure: unknown;
 			const firstEventTimeoutAbortError = new AIError.StreamTimeoutError(
 				"Anthropic stream timed out while waiting for the first event",
 			);
@@ -2687,6 +2696,12 @@ const streamAnthropicOnce = (
 					maxRetries: 0,
 					...(requestHeaders ? { headers: requestHeaders } : {}),
 				};
+				// Every pass of this loop sends one request: retries, shape fallbacks and
+				// recoveries all come back here.
+				if (!canStartProviderAttempt(attemptBudget)) {
+					throw lastStreamFailure ?? createProviderAttemptLimitError(model.provider);
+				}
+				attemptBudget.attempts += 1;
 				const anthropicRequest: unknown =
 					isOAuthToken && client.beta
 						? client.beta.messages.create({ ...wireParams, stream: true }, requestOptions)
@@ -3278,6 +3293,7 @@ const streamAnthropicOnce = (
 					const localAbortReason = activeAbortTracker.getLocalAbortReason();
 					const preserveTransportStatus = transport && AIError.status(streamError) !== undefined;
 					const streamFailure = preserveTransportStatus ? streamError : (localAbortReason ?? streamError);
+					lastStreamFailure = streamFailure;
 					if (transport) throw streamFailure;
 					const threadRecovery = firstTokenTime === undefined ? threadTurn?.recover(streamFailure) : undefined;
 					if (threadRecovery) {
@@ -3827,12 +3843,20 @@ const streamAnthropicOnce = (
 
 /**
  * Public entry: retry benign empty completions before they reach the agent
- * loop. The inner attempt owns Anthropic provider-failure retries.
+ * loop. The inner attempt owns Anthropic provider-failure retries; every
+ * request of the call, replays included, counts against `providerMaxAttempts`.
  */
-export const streamAnthropic: StreamFunction<"anthropic-messages"> = (model, context, options) =>
-	withReplaySafeStreamRetry(withoutDisabledExperimentalBetas(model), context, options, streamAnthropicOnce, {
-		retryEmptyCompletion: true,
-	});
+export const streamAnthropic: StreamFunction<"anthropic-messages"> = (model, context, options) => {
+	const attemptBudget = createProviderAttemptBudget(options?.providerMaxAttempts);
+	return withReplaySafeStreamRetry(
+		withoutDisabledExperimentalBetas(model),
+		context,
+		options,
+		(attemptModel, attemptContext, attemptOptions) =>
+			streamAnthropicOnce(attemptModel, attemptContext, attemptOptions, undefined, attemptBudget),
+		{ retryEmptyCompletion: true, attemptBudget },
+	);
+};
 
 /** Whether Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to this model's provider. */
 function experimentalBetasDisabled(model: Model<"anthropic-messages">): boolean {
