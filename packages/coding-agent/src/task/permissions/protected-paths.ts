@@ -9,7 +9,7 @@
  * messages are internal URLs, never filesystem targets, so they are not protected paths.
  */
 import * as path from "node:path";
-import { getSessionsDir } from "@oh-my-pi/pi-utils";
+import { getMemoriesDir, getSessionsDir } from "@oh-my-pi/pi-utils";
 import { artifactsDirsFromRegistry } from "../../internal-urls/registry-helpers";
 import { approvalCacheKeyForPath } from "../../tools/approval-cache";
 
@@ -27,12 +27,21 @@ function isWithin(target: string, directory: string): boolean {
 
 /**
  * Why writing `targets` (absolute paths, as named and as resolved) is refused, or `undefined`. The
- * agent dir counts as named and by its real path. A profile file counts by name in any `.omp` folder,
+ * agent dir (with its sessions and memories dirs, wherever the layout keeps them) counts as named and
+ * by its real path. A profile file counts by name in any `.omp` folder,
  * and by the real path of each file the loader reads, so a symlinked `.omp` folder or a symlinked
  * user `permissions.json` is covered under the name it points to.
  */
 export function protectedPathRefusal(targets: readonly string[], agentDir: string, cwd: string): string | undefined {
-	const agentDirs = [...new Set([path.resolve(agentDir), approvalCacheKeyForPath(path.resolve(agentDir))])];
+	// An XDG layout keeps sessions and memories outside the agent dir; they are agent-dir state all the same.
+	const agentDirs = [
+		...new Set(
+			[agentDir, getSessionsDir(agentDir), getMemoriesDir(agentDir)].flatMap(directory => [
+				path.resolve(directory),
+				approvalCacheKeyForPath(path.resolve(directory)),
+			]),
+		),
+	];
 	const profileFiles = new Set(
 		[path.join(agentDir, USER_PROFILE_FILE), ...PROJECT_PROFILE_FILES.map(file => path.join(cwd, file))].map(file =>
 			approvalCacheKeyForPath(path.resolve(file)),

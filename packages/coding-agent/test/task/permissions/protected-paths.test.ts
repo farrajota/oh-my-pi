@@ -4,8 +4,9 @@
  * files, whatever its scope otherwise allows. It can still write its `local://` scratch space and
  * message other agents through `agent://`. Design 7, step 17.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -19,7 +20,14 @@ import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
 import { ManageSkillTool } from "@oh-my-pi/pi-coding-agent/tools/manage-skill";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
-import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import {
+	__resetDirsFromEnvForTests,
+	getAgentDir,
+	getMemoriesDir,
+	getSessionsDir,
+	setAgentDir,
+	TempDir,
+} from "@oh-my-pi/pi-utils";
 import { enforceScope, scopedSettings } from "./scope-fixtures";
 import { createScopedSession } from "./scoped-session";
 
@@ -243,5 +251,33 @@ describe("protected paths under an enforce-restricted scope", () => {
 		expect(
 			resolveIn(settings, writeTier("write"), { path: path.join(agentDir, "skills", "deploy", "SKILL.md") }),
 		).toMatchObject({ policy: "deny", source: "permission" });
+	});
+
+	it("refuses writes to the sessions and memories dirs when an XDG layout keeps them outside the agent dir", () => {
+		const env = { ...process.env };
+		vi.spyOn(os, "homedir").mockReturnValue(tempDir.join("home"));
+		for (const dir of ["home", "xdg-data/omp", "xdg-state/omp"]) fs.mkdirSync(tempDir.join(dir), { recursive: true });
+		process.env.XDG_DATA_HOME = tempDir.join("xdg-data");
+		process.env.XDG_STATE_HOME = tempDir.join("xdg-state");
+		delete process.env.PI_CODING_AGENT_DIR;
+		try {
+			__resetDirsFromEnvForTests();
+			const sessions = getSessionsDir();
+			const memories = getMemoriesDir();
+			expect(sessions.startsWith(getAgentDir())).toBe(false);
+			const settings = scopedSettings(writer);
+			for (const target of [
+				path.join(sessions, "--repo--", "parent.jsonl"),
+				path.join(memories, "--repo--", "learned.md"),
+			]) {
+				expect(resolveIn(settings, writeTier("write"), { path: target })).toMatchObject({
+					policy: "deny",
+					source: "permission",
+				});
+			}
+		} finally {
+			process.env = env;
+			vi.restoreAllMocks();
+		}
 	});
 });
