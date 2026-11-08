@@ -21,7 +21,7 @@ import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import { fuzzyFilter } from "@oh-my-pi/pi-tui/fuzzy";
 import { type CfgWriteDetails, type CfgWriteOutcome } from "@oh-my-pi/pi-tui/tools/cfg-render";
 import { CFG_SAVE_SEGMENT, CFG_URL_PREFIX, parseCfgUrl } from "@oh-my-pi/pi-tui/tools/cfg-url";
-import { type AnySetting, all } from "../config/registry";
+import { type AnySetting, userFacingSettings } from "../config/registry";
 import type { SettingProvenance, Settings } from "../config/settings";
 import cfgPromptDoc from "../prompts/internal-urls/cfg.md" with { type: "text" };
 import cfgEnvShadowedTemplate from "../prompts/tools/cfg-env-shadowed.md" with { type: "text" };
@@ -43,12 +43,12 @@ import type {
 let sortedSettings: AnySetting[] | undefined;
 
 /**
- * Every setting, ordered by id segment by segment so each namespace's members stay
+ * Every user-facing setting, ordered by id segment by segment so each namespace's members stay
  * contiguous. Computed on first use: the settings module is still initializing
  * when the router loads this handler.
  */
 function allSettings(): AnySetting[] {
-	sortedSettings ??= all().toSorted((a, b) => {
+	sortedSettings ??= userFacingSettings().toSorted((a, b) => {
 		const left = a.id.split(".");
 		const right = b.id.split(".");
 		for (let i = 0; i < Math.min(left.length, right.length); i++) {

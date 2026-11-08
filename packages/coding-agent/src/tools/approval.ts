@@ -28,6 +28,7 @@ import {
 	approvalGrantKey,
 } from "./approval-cache";
 import { cfgToolsApproval, cfgToolsApprovalMode, cfgToolsRestrictedFolders } from "./settings";
+import { permissionApprovalGuard } from "../task/permissions/guard";
 import {
 	approvalFolderListing,
 	type ApprovalFolderListing,
@@ -55,7 +56,7 @@ export interface ResolvedExecuteTimeApproval {
 	userPolicies: Record<string, unknown>;
 }
 
-type ApprovalSubject = Pick<
+export type ApprovalSubject = Pick<
 	AgentTool,
 	"name" | "approval" | "formatApprovalDetails" | "approvalCacheTargets" | "approvalRestrictionPaths"
 > & {
@@ -117,7 +118,7 @@ export interface ResolvedApproval {
 	tier: ToolTier;
 	reason?: string;
 	override: boolean;
-	source?: "tool" | "user" | "mode" | "restriction";
+	source?: "tool" | "user" | "mode" | "restriction" | "permission";
 	/**
 	 * User-policy key that produced `source: "user"` (defaults to the tool name), or the keyed
 	 * sub-tool (an `xd://` device) a tool-owned or mode decision is about.
@@ -321,7 +322,20 @@ function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {
 	return TIER_RANK[tier] <= TIER_RANK[APPROVAL_MODE_MAX_TIER[mode]];
 }
 
-/** `tools.restrictedFolders` as one call sees it. */
+/**
+ * A restriction that refuses a call outright, whatever the mode, a policy, or a grant says. It never
+ * asks: the subagent permission scope is one, authorized when the parent spawned the subagent.
+ */
+export interface ApprovalGuard {
+	/** Why the call is refused, or `undefined` to let it resolve normally. */
+	check(
+		tool: ApprovalSubject,
+		args: unknown,
+		call: { tier: ToolTier; policyKey?: string },
+	): { reason: string } | undefined;
+}
+
+/** `tools.restrictedFolders` and the approval guards as one call sees them. */
 export interface ApprovalRestrictions {
 	/** Folders where every action needs an explicit approval, whatever the mode, policy, or grant. */
 	restrictedFolders: readonly string[];
@@ -330,6 +344,7 @@ export interface ApprovalRestrictions {
 	 * argument, resolved against it), and relative configured folders resolve against it.
 	 */
 	cwd?: string;
+	guards?: readonly ApprovalGuard[];
 }
 
 /** The restrictions `settings` configure for calls running in `cwd`; `undefined` when none are. */
@@ -339,8 +354,9 @@ export function approvalRestrictions(
 ): ApprovalRestrictions | undefined {
 	if (!settings) return undefined;
 	const restrictedFolders = cfgToolsRestrictedFolders.get(settings);
-	if (restrictedFolders.length === 0) return undefined;
-	return cwd === undefined ? { restrictedFolders } : { restrictedFolders, cwd };
+	const guard = permissionApprovalGuard(settings, cwd ?? settings.getCwd());
+	if (restrictedFolders.length === 0 && !guard) return undefined;
+	return { restrictedFolders, ...(cwd !== undefined && { cwd }), ...(guard && { guards: [guard] }) };
 }
 
 /**
@@ -357,7 +373,9 @@ export function approvalRestrictions(
  *  3. Active mode tier comparison. In `always-ask-cached`, a call whose
  *     `approvalCacheTargets` are all granted in `grants` is allowed instead
  *     (see {@link resolveCachedModeApproval}).
- *  4. A call touching a folder in `restrictions` turns any non-deny result into
+ *  4. A guard in `restrictions` that refuses the call turns any non-deny result
+ *     into a deny sourced `permission`, with the guard's reason.
+ *  5. A call touching a folder in `restrictions` turns any non-deny result into
  *     a per-call prompt sourced `restriction` (see {@link restrictedFolderReason}).
  *
  * In yolo mode, override-based tool prompts are ignored; user `tools.approval`
@@ -374,6 +392,15 @@ export function resolveApproval(
 ): ResolvedApproval {
 	const resolved = resolvePolicy(tool, args, mode, userConfig, grants, context);
 	if (resolved.policy === "deny") return resolved;
+	if (restrictions?.guards?.length) {
+		// The keyed sub-tool (an `xd://` device) comes from the tool's own decision: a mode allow drops it.
+		const policyKey = getToolDecision(tool, args, context).policyKey;
+		const call = { tier: resolved.tier, ...(policyKey ? { policyKey } : {}) };
+		for (const guard of restrictions.guards) {
+			const refusal = guard.check(tool, args, call);
+			if (refusal) return { policy: "deny", ...call, override: false, source: "permission", reason: refusal.reason };
+		}
+	}
 	const reason = restrictedFolderReason(tool, args, restrictions);
 	if (reason === undefined) return resolved;
 	// A restricted folder outranks every mode, policy, and grant. `override` keeps nested `xd://`
@@ -612,10 +639,11 @@ export function sessionApprovalScope(
 }
 
 /**
- * Error for a resolved deny. Distinguishes tool-owned policy from user config.
+ * Error for a resolved deny. Distinguishes tool-owned policy and approval guards from user config.
  */
 export function denyError(resolved: ResolvedApproval, toolName: string): Error {
 	const { source, reason, policyKey } = resolved;
+	if (source === "permission") return new Error(reason ?? `Tool "${toolName}" is blocked by its permission scope.`);
 	if (source === "tool") {
 		return new Error(`Tool "${toolName}" is blocked by tool policy.${reason ? `\nReason: ${reason}` : ""}`);
 	}

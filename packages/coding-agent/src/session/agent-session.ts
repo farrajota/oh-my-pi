@@ -239,7 +239,7 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
-import { resolveApproval } from "../tools/approval";
+import { approvalRestrictions, resolveApproval } from "../tools/approval";
 import { type ApprovalGrantStore, getApprovalGrants } from "../tools/approval-cache";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { type AskToolInput, recoverAskQuestions } from "../tools/ask";
@@ -5760,12 +5760,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const metadata = ctx.toolCall.providerMetadata;
 		const computer = metadata?.type === "computer" ? metadata : undefined;
 		// Parity with the wrapper's pre-emit short-circuit: an already-denied
-		// call never reaches extensions. Deny is mode-independent (tool decision
-		// or user policy), so resolving under the most permissive mode is exact;
-		// the wrapper still enforces the mode-accurate gate before execution.
+		// call never reaches extensions. Deny is mode-independent (tool decision,
+		// user policy or permission scope), so resolving under the most permissive
+		// mode is exact; the wrapper still enforces the mode-accurate gate before execution.
 		const userPolicies: Record<string, unknown> = cfgToolsApproval.get(this.settings);
 		const approvalArgs = computer ? { actions: computer.actions } : ctx.args;
-		if (resolveApproval(ctx.tool, approvalArgs, "yolo", userPolicies).policy === "deny") {
+		const restrictions = approvalRestrictions(this.settings, this.sessionManager.getCwd());
+		if (resolveApproval(ctx.tool, approvalArgs, "yolo", userPolicies, undefined, restrictions).policy === "deny") {
 			return undefined;
 		}
 		const eventArgs = computer

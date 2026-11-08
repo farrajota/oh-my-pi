@@ -58,10 +58,17 @@ function toSettingDef(setting: AnySetting): CliSettingDef {
 	};
 }
 
+/** Settings a user may see and change, in panel order: runtime-only ones are never listed. */
+function userFacingDefs(): CliSettingDef[] {
+	return orderedSettings()
+		.filter(setting => !setting.runtimeOnly)
+		.map(toSettingDef);
+}
+
 /** Find setting definition by path */
 function findSettingDef(path: string): CliSettingDef | undefined {
 	const setting = lookup(path);
-	return setting ? toSettingDef(setting) : undefined;
+	return setting && !setting.runtimeOnly ? toSettingDef(setting) : undefined;
 }
 
 // =============================================================================
@@ -208,7 +215,7 @@ async function writeStdout(text: string): Promise<void> {
 }
 
 async function handleList(flags: { json?: boolean }): Promise<void> {
-	const defs = orderedSettings().map(toSettingDef);
+	const defs = userFacingDefs();
 
 	if (flags.json) {
 		// A redacted entry omits `value` and says so, rather than substituting a
@@ -274,7 +281,7 @@ async function handleList(flags: { json?: boolean }): Promise<void> {
 async function handleListLayer(scope: ConfigScope, flags: { json?: boolean }): Promise<void> {
 	const layer = scope === "project" ? settings.getProjectSettings() : settings.getGlobalSettings();
 	const entries: [CliSettingDef, unknown][] = [];
-	for (const def of orderedSettings().map(toSettingDef)) {
+	for (const def of userFacingDefs()) {
 		let value: unknown = layer;
 		for (const segment of def.setting.segments) value = isRecord(value) ? value[segment] : undefined;
 		if (value !== undefined) entries.push([def, value]);

@@ -117,6 +117,11 @@ interface DefinitionBase {
 	 * `set`/`override` — e.g. flooring request limits. May throw like `validate`.
 	 */
 	normalize?: (value: unknown) => unknown;
+	/**
+	 * Set only by the runtime (a host or a subagent spawn), never by the user: hidden from the
+	 * settings panel, `omp config` and `cfg://`, which therefore can neither show nor write it.
+	 */
+	runtimeOnly?: true;
 }
 
 export interface BooleanDefinition extends DefinitionBase {
@@ -508,6 +513,11 @@ export class Setting<T, Id extends string = string> extends Derived<T> {
 		return this.definition.ui as AnyUiMetadata | undefined;
 	}
 
+	/** Whether only the runtime sets this value, so user-facing surfaces never list it. */
+	get runtimeOnly(): boolean {
+		return this.definition.runtimeOnly === true;
+	}
+
 	/** Whether the value is a credential (explicit marker or legacy `ui.secret`). */
 	get isCredential(): boolean {
 		return this.definition.credential === true || this.ui?.secret === true;
@@ -834,6 +844,11 @@ export function lookup(id: string): AnySetting | undefined {
 /** Every registered setting, in declaration order. */
 export function all(): readonly AnySetting[] {
 	return ordered;
+}
+
+/** Every setting a user may see and change (not {@link Setting.runtimeOnly}), in declaration order. */
+export function userFacingSettings(): readonly AnySetting[] {
+	return ordered.filter(setting => !setting.runtimeOnly);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

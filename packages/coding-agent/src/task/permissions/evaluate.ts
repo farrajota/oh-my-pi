@@ -58,6 +58,13 @@ function collectPathStrings(value: unknown, output: Set<string>, depth: number, 
 	}
 }
 
+/** The strings a call names under a path argument key (`path`, `paths`, `file`, `cwd`, ...), deduplicated. */
+export function permissionPathArguments(toolInput: Record<string, unknown>): string[] {
+	const named = new Set<string>();
+	collectPathStrings(toolInput, named, 0);
+	return [...named];
+}
+
 function hasScheme(target: string, scheme: string): boolean {
 	return target.toLowerCase().startsWith(scheme);
 }
@@ -164,9 +171,7 @@ export function evaluateSubagentPermission(input: PermissionCallInput): Permissi
 	if (key === "yield") return ALLOW;
 	if (key === "report_tool_issue" && scope.restricted) return ALLOW;
 
-	const named = new Set<string>();
-	collectPathStrings(input.toolInput, named, 0);
-	const targets = [...new Set([...named, ...(input.targets ?? [])])];
+	const targets = [...new Set([...permissionPathArguments(input.toolInput), ...(input.targets ?? [])])];
 
 	if (scope.toolsEnabled) {
 		const toolDecision = evaluateToolName(scope, toolName, key, targets);
