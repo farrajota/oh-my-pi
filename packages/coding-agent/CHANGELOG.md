@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- An extension message sent with `triggerTurn` while a manual compaction's resume is withheld claims that resume once its turn starts, even when the turn then fails, instead of being followed by a second, synthetic resume turn
 - A manual or experimental-rollover compaction whose session entry fails to append no longer counts as committed, so it does not resume the turn it interrupted
 - A manual `/compact` no longer resumes the interrupted turn in a conversation that was reset or replaced while the compaction ran, including a resume an earlier compaction withheld for a parked command
 - The `bash` tool bounds its output (`tools.outputMaxColumns`, `tools.artifactHeadBytes`, `tools.artifactMaxBytes`) by the calling session's settings instead of the process-wide ones, on the direct, background-job and PTY paths, so a subagent or SDK session with its own limits gets them

@@ -1779,6 +1779,87 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(held.order).toEqual(["compaction ended"]);
 	});
 
+	it("claims an extension next-turn resume when its turn starts before failing", async () => {
+		cfgCompactionKeepRecentTokens.set(session.settings, 1);
+		cfgCompactionAutoContinue.override(session.settings, true);
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "previous answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		session.agent.state.isStreaming = true;
+		vi.spyOn(session, "abort").mockImplementation(async () => {
+			session.agent.state.isStreaming = false;
+		});
+		type Dispatched = { role: string; customType?: string; synthetic?: boolean };
+		const prompted: Dispatched[][] = [];
+		vi.spyOn(session.agent, "prompt").mockImplementation(async message => {
+			prompted.push((Array.isArray(message) ? message : [message]) as Dispatched[]);
+			if (prompted.length === 1) {
+				session.agent.state.isStreaming = true;
+				throw new Error("provider rejected after turn start");
+			}
+		});
+
+		let sentRejection: Promise<void> | undefined;
+		const sentStarted = Promise.withResolvers<void>();
+		(globalThis as ParkCommandGlobals).__ompParkAction = () => {
+			const sent = session.sendCustomMessage(
+				{ customType: "extension-directive", content: "carry on with the new plan", display: false },
+				{ deliverAs: "nextTurn", triggerTurn: true },
+			);
+			sentRejection = sent.then(
+				() => {
+					throw new Error("Expected extension prompt to fail after turn start");
+				},
+				error => {
+					expect(error).toBeInstanceOf(Error);
+					expect((error as Error).message).toBe("provider rejected after turn start");
+				},
+			);
+			sentStarted.resolve();
+		};
+		const compactGate = Promise.withResolvers<void>();
+		(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+			compactGate.promise;
+		const parkGate = Promise.withResolvers<void>();
+		(globalThis as ParkCommandGlobals).__ompParkGate = parkGate.promise;
+		const compacted = session.compact();
+		while (!getRuntimeSignals().includes("before_compact:enter")) {
+			await Promise.resolve();
+		}
+		const command = session.prompt("/park");
+		compactGate.resolve();
+		await compacted;
+		await sentStarted.promise;
+		if (!sentRejection) throw new Error("Extension turn was not submitted");
+		await sentRejection;
+		session.agent.state.isStreaming = false;
+		parkGate.resolve();
+		expect(await command).toBe(false);
+		await session.waitForIdle();
+
+		expect(prompted).toHaveLength(1);
+		expect(
+			prompted[0]?.some(message => message.role === "custom" && message.customType === "extension-directive"),
+		).toBe(true);
+		expect(prompted[0]?.some(message => message.synthetic === true)).toBe(false);
+	});
+
 	it("cancels an in-flight auto-compaction when manual compact startup aborts", async () => {
 		// Give the branch something to summarize so auto-compaction reaches the
 		// awaited session_before_compact hook, where the test parks it.

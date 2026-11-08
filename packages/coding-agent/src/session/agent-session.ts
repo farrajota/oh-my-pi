@@ -10279,7 +10279,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 *  are expected) must not assume dispatch happened just because this was awaited. */
 	async #promptAgentInitiatedMessage(
 		message: CustomMessage,
-		options?: { acceptTerminalEmptyStop?: boolean },
+		options?: {
+			acceptTerminalEmptyStop?: boolean;
+			/** Called once the message starts an agent turn, before that turn settles or fails. */
+			onTurnStarted?: () => void;
+		},
 	): Promise<boolean> {
 		const inFlightEpoch = this.#beginInFlight();
 		try {
@@ -10289,7 +10293,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#resetPromptMaintenanceState();
 			}
 			this.#recovery.setAcceptTerminalEmptyStop(acceptTerminalEmptyStop);
+			const wasStreaming = this.agent.state.isStreaming;
 			const run = this.agent.prompt(message);
+			// The agent marks its run streaming synchronously when the turn starts.
+			if (!wasStreaming && this.agent.state.isStreaming) options?.onTurnStarted?.();
 			// No dispatch-live wake here: an agent-initiated turn has no
 			// client promptTurn, so steers parked on a dispatching CLIENT
 			// prompt must keep parking through it — waking on this claim
@@ -10450,6 +10457,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			| undefined,
 		outcome: PromptDispatchOutcome,
 	): Promise<boolean> {
+		// A turn this message started claims the session even when it then fails.
+		const claimStartedTurn = (): void => {
+			outcome.sessionClaimed = true;
+		};
 		// Captured before the awaits below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
 		// A turn-triggering message waits out context replacement; plain appends do not.
@@ -10533,6 +10544,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				}
 				outcome.sessionClaimed = await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
 					acceptTerminalEmptyStop: options.acceptTerminalEmptyStop === true,
+					onTurnStarted: claimStartedTurn,
 				});
 				return outcome.sessionClaimed;
 			}
@@ -10582,6 +10594,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			outcome.sessionClaimed = await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
 				acceptTerminalEmptyStop: options.acceptTerminalEmptyStop === true,
+				onTurnStarted: claimStartedTurn,
 			});
 			return outcome.sessionClaimed;
 		}
@@ -10591,7 +10604,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
 				return false;
 			}
-			outcome.sessionClaimed = await this.#promptAgentInitiatedMessage(normalizedAppMessage);
+			outcome.sessionClaimed = await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
+				onTurnStarted: claimStartedTurn,
+			});
 			return outcome.sessionClaimed;
 		}
 
