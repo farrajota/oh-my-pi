@@ -60,7 +60,7 @@ import { assertEditableFile } from "./auto-generated-guard";
 
 import { isReadTruncationNotice } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import { hasColumnTruncationClause, isColumnTruncationNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
-import { recoverConflictUriPrefix } from "./conflict-detect";
+import { type ParsedConflictUri, parseConflictUri, recoverConflictUriPrefix } from "./conflict-detect";
 import { unwrapHashlineHeaderPath } from "./hashline-header-path";
 import { outputMeta } from "./output-meta";
 import { formatPathRelativeToCwd, probeLiteralPathExists, specialFileKind } from "./path-utils";
@@ -620,6 +620,27 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		if (typeof rawPath !== "string" || rawPath.length === 0) return undefined;
 		const key = approvalTargetKey(this.session.cwd, unwrapHashlineHeaderPath(rawPath));
 		return key === undefined ? undefined : [key];
+	};
+	/**
+	 * Files a write reaches through a URL that names none: `conflict://N` (or `<file>:conflict://N`)
+	 * splices into the file `read` registered block N from, and `conflict://*` into every registered
+	 * file. Restricted folders and a permission scope judge those files, not the URL.
+	 */
+	readonly approvalRestrictionPaths = (args: unknown): readonly string[] | undefined => {
+		const rawPath = (args as Partial<WriteParams> | null | undefined)?.path;
+		if (typeof rawPath !== "string") return undefined;
+		let conflict: ParsedConflictUri | null;
+		try {
+			conflict = parseConflictUri(recoverConflictUriPrefix(unwrapHashlineHeaderPath(rawPath)).path);
+		} catch {
+			// A malformed conflict URI fails in execute before it touches any file.
+			return undefined;
+		}
+		const history = this.session.conflictHistory;
+		if (!conflict || !history) return undefined;
+		const entries = conflict.id === "*" ? history.entries() : [history.get(conflict.id)];
+		const files = [...new Set(entries.flatMap(entry => (entry ? [entry.absolutePath] : [])))];
+		return files.length > 0 ? files : undefined;
 	};
 	readonly label = "Write";
 	get description(): string {

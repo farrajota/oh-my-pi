@@ -787,6 +787,43 @@ export async function splitMixedUrlPathList(
 	return parts;
 }
 
+/** Nesting a list entry may be re-split through: execution re-enters itself for each entry. */
+const DELIMITED_CANDIDATE_DEPTH = 4;
+
+/**
+ * Every entry a delimited path list may fan out to, for approval to key before execution splits it.
+ * Execution ({@link splitDelimitedPathEntry}, {@link splitMixedUrlPathList}) decides asynchronously
+ * from what exists, then re-splits each entry it reads; approval runs synchronously and must cover
+ * every file the call can open. So this takes the entries of each split mode, recursively, and keeps
+ * those that name a URL (`isUrl`) or an existing path: a missing entry reads nothing. The result is
+ * a superset of the entries execution reads; the unsplit entry itself is not included.
+ */
+export function delimitedPathCandidatesSync(entry: string, cwd: string, isUrl: (part: string) => boolean): string[] {
+	const found = new Set<string>();
+	const visit = (value: string, depth: number) => {
+		if (depth > DELIMITED_CANDIDATE_DEPTH || !hasTopLevelPathDelimiter(value)) return;
+		for (const mode of ["semicolon", "comma", "whitespace", "mixed"] as const) {
+			for (const rawPart of splitTopLevelDelimitedPath(value, mode)) {
+				const part = normalizePathLikeInput(rawPart);
+				if (part.length === 0 || part === value || found.has(part)) continue;
+				if (isUrl(part) || delimitedPathPartExistsSync(part, cwd)) found.add(part);
+				visit(part, depth + 1);
+			}
+		}
+	};
+	visit(normalizePathLikeInput(entry), 0);
+	return [...found];
+}
+
+function delimitedPathPartExistsSync(part: string, cwd: string): boolean {
+	try {
+		return fs.existsSync(resolveToCwd(splitPathAndSel(part).path, cwd)) || fs.existsSync(resolveToCwd(part, cwd));
+	} catch {
+		// resolveToCwd rejects URL schemes it does not route; such an entry names no host path.
+		return false;
+	}
+}
+
 /** Expand delimited entries in-place while preserving unsplit entries. */
 export async function expandDelimitedPathEntries(
 	entries: readonly string[],

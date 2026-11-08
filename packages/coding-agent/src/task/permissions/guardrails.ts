@@ -21,7 +21,7 @@ const EVAL_NETWORK_ACCESS =
 	/(?:\bfetch\s*\(|\bXMLHttpRequest\b|\bWebSocket\b|\bEventSource\b|\b(?:requests|httpx|urllib3?|aiohttp)\b|\b(?:node:)?https?\b|\b(?:browser|computer)\s*\.)/i;
 const PROC_ENVIRON = String.raw`\/proc\/(?:self|thread-self|\d+(?:\/task\/\d+)?)\/environ`;
 const SECRET_PATH = new RegExp(
-	String.raw`(?:^|[\\/])(?:\.env(?:\.[^\\/]*)?|\.ssh|\.kube)(?:[\\/]|$)|${PROC_ENVIRON}|(?:secret|credential)|private[^\\/]*key`,
+	String.raw`(?:^|[\\/;,])(?:\.env(?:\.[^\\/;,]*)?|\.ssh|\.kube)(?:[\\/;,]|$)|${PROC_ENVIRON}|(?:secret|credential)|private[^\\/]*key`,
 	"i",
 );
 const ENV_ACCESS = new RegExp(

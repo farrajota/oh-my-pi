@@ -75,12 +75,56 @@ function hasScheme(target: string, scheme: string): boolean {
 	return target.toLowerCase().startsWith(scheme);
 }
 
+const URL_SCHEME_PREFIX = /^[a-z][a-z0-9+.-]*:\//i;
+
+/** The top-level `;` entries of `target` (braces and backslash escapes protect a `;`), quotes stripped. */
+function semicolonEntries(target: string): string[] {
+	const entries: string[] = [];
+	let depth = 0;
+	let start = 0;
+	for (let i = 0; i < target.length; i++) {
+		const ch = target[i];
+		if (ch === "\\") i++;
+		else if (ch === "{") depth++;
+		else if (ch === "}" && depth > 0) depth--;
+		else if (ch === ";" && depth === 0) {
+			entries.push(target.slice(start, i));
+			start = i + 1;
+		}
+	}
+	entries.push(target.slice(start));
+	return entries.map(entry => entry.trim().replace(/^"(.*)"$/, "$1")).filter(entry => entry.length > 0);
+}
+
 /**
- * Targets the filesystem path rules never see: `local://` is the subagent's own scratch space, and a
- * `write` to `agent://` (a message) or `xd://` (a device, checked as its own tool when it runs) is a
- * transport rather than a file.
+ * What one path string stands for. Tools that take path lists (`read`, the search tools) open each
+ * entry of a `;` list, so a list is judged by its entries: `local://x;.env` is the scratch file `x`
+ * and `.env`, never one exempt URL. A plain string is judged whole too, because a literal file name
+ * may contain `;`. A URL-shaped string is a list or one URL of its first entry's scheme, so its
+ * entries cover it. Comma and whitespace lists split only when their entries exist; the approval
+ * targets a tool reports resolve those.
+ */
+function permissionListTargets(target: string): string[] {
+	if (!target.includes(";")) return [target];
+	const entries = semicolonEntries(target);
+	if (entries.length <= 1) return [target];
+	return URL_SCHEME_PREFIX.test(target.trim()) ? entries : [target, ...entries];
+}
+
+function expandListTargets(targets: Iterable<string>): string[] {
+	const expanded = new Set<string>();
+	for (const target of targets) for (const entry of permissionListTargets(target)) expanded.add(entry);
+	return [...expanded];
+}
+
+/**
+ * Targets the filesystem path rules never see: one `local://` URL is the subagent's own scratch
+ * space, and a `write` to `agent://` (a message) or `xd://` (a device, checked as its own tool when
+ * it runs) is a transport rather than a file. Lists are expanded before this check, so a list that
+ * starts with an exempt URL never exempts the entries after it.
  */
 function isPathRuleExempt(toolKey: string, target: string): boolean {
+	if (target.includes(";")) return false;
 	if (hasScheme(target, "local://")) return true;
 	return toolKey === "write" && (hasScheme(target, "agent://") || hasScheme(target, "xd://"));
 }
@@ -229,7 +273,7 @@ export function evaluateSubagentPermission(input: PermissionCallInput): Permissi
 	if (key === "yield") return ALLOW;
 	if (key === "report_tool_issue" && scope.restricted) return ALLOW;
 
-	const targets = [...new Set([...permissionPathArguments(input.toolInput), ...(input.targets ?? [])])];
+	const targets = expandListTargets([...permissionPathArguments(input.toolInput), ...(input.targets ?? [])]);
 
 	if (scope.toolsEnabled) {
 		const toolDecision = evaluateToolName(scope, toolName, key, targets);
@@ -256,7 +300,7 @@ export function evaluateSubagentPermission(input: PermissionCallInput): Permissi
 	const recordDenial = otherAgentRecordDenial(scope, toolName, targets);
 	if (recordDenial) return recordDenial;
 	if (scope.guardrails.secretsBlind) {
-		const secret = (input.targets ?? []).find(isSecretPath);
+		const secret = expandListTargets(input.targets ?? []).find(isSecretPath);
 		if (secret !== undefined) return secretsBlindDenial(toolName, [secret]);
 	}
 	return ALLOW;
@@ -274,13 +318,19 @@ export function evaluatePermissionPath(input: {
 }): PermissionDecision {
 	const { scope, toolName } = input;
 	if (scope?.mode !== "enforce") return ALLOW;
-	if (hasPathRules(scope) && !isPathRuleExempt(permissionToolKey(toolName), input.path)) {
-		const pathDecision = evaluatePathCandidates(scope, toolName, [toPathCandidate(input.path, input.cwd)], input.cwd);
+	const targets = permissionListTargets(input.path);
+	if (hasPathRules(scope)) {
+		const key = permissionToolKey(toolName);
+		const candidates = targets
+			.filter(target => !isPathRuleExempt(key, target))
+			.map(target => toPathCandidate(target, input.cwd));
+		const pathDecision = evaluatePathCandidates(scope, toolName, candidates, input.cwd);
 		if (pathDecision.action === "deny") return pathDecision;
 	}
-	const recordDenial = otherAgentRecordDenial(scope, toolName, [input.path]);
+	const recordDenial = otherAgentRecordDenial(scope, toolName, targets);
 	if (recordDenial) return recordDenial;
-	if (scope.guardrails.secretsBlind && isSecretPath(input.path)) return secretsBlindDenial(toolName, [input.path]);
+	const secret = scope.guardrails.secretsBlind ? targets.find(isSecretPath) : undefined;
+	if (secret !== undefined) return secretsBlindDenial(toolName, [secret]);
 	return ALLOW;
 }
 

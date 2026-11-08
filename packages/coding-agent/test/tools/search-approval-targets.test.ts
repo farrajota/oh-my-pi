@@ -20,6 +20,7 @@ import { GlobTool } from "@oh-my-pi/pi-coding-agent/tools/glob";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import * as ar from "@oh-my-pi/pi-utils/ar";
 
 /** Minimal tool session for directly exercising a search tool's approval-cache keys. */
 function createToolSession(cwd: string): ToolSession {
@@ -97,6 +98,15 @@ describe("search tool approval cache targets", () => {
 		expect(glob.approvalCacheTargets?.({ path: "src/notes.txt" })).toEqual([fileKey]);
 		// A line-range selector is peeled, so a ranged search shares the one file key.
 		expect(grep.approvalCacheTargets?.({ pattern: "hello", path: "src/notes.txt:1-2" })).toEqual([fileKey]);
+	});
+
+	it("reports a grep of an archive member as the archive's file key", async () => {
+		await ar.writeArchive(path.join(cwd, "bundle.tar"), "tar", [["notes.txt", "hello\n"]]);
+		const grep = new GrepTool(createToolSession(cwd));
+
+		expect(grep.approvalCacheTargets?.({ pattern: "hello", path: "bundle.tar:notes.txt" })).toEqual([
+			approvalTargetKey(cwd, "bundle.tar")!,
+		]);
 	});
 
 	it("reports every distinct root of a multi-root call, in order", () => {

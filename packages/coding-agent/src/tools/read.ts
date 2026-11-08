@@ -60,7 +60,7 @@ import {
 	spansCoverEveryLine,
 	warmBlockContext,
 } from "../utils/block-context";
-import { permissionResultFilter } from "../task/permissions/session-checks";
+import { permissionFileRefusal, permissionResultFilter } from "../task/permissions/session-checks";
 import { isCpuProfilePath, renderCpuProfile } from "../utils/cpuprofile";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { loadHeifImageInput, loadImageInput, loadSvgImageInput } from "../utils/image-loading";
@@ -84,6 +84,7 @@ import {
 	scanFileForConflicts,
 } from "./conflict-detect";
 import { executeReadUrl, fetchReadUrl, parseReadUrlTarget } from "./fetch";
+import { approvalGuardRefusal, approvalRestrictions } from "./approval";
 import { approvalDirectoryKey } from "./approval-cache";
 import { approvalTargetKey, approvalTargetNamesFile, isApprovalPublicUrl } from "./approval-targets";
 import {
@@ -98,6 +99,7 @@ import {
 	probeLiteralPathExists,
 	resolveReadPathAsync,
 	specialFileKind,
+	delimitedPathCandidatesSync,
 	splitDelimitedPathEntry,
 	splitMixedUrlPathList,
 	splitPathAndSelPreferringLiteral,
@@ -987,6 +989,20 @@ function acceptsLineSelector(path: string): boolean {
 	return scheme !== undefined && router.spec(scheme)?.selectors === "lines";
 }
 
+/** The entry a read of `rawPath` opens: a `file://` URL as its path, `<file>:conflict://N` as the conflict URL. */
+function normalizeReadPathEntry(rawPath: string): string {
+	return recoverConflictUriPrefix(rawPath.startsWith("file://") ? expandPath(rawPath) : rawPath).path;
+}
+
+/** Whether a read fetches `part` from the web; a malformed URL selector still names a URL. */
+function isReadUrlTarget(part: string): boolean {
+	try {
+		return parseReadUrlTarget(part) !== null;
+	} catch {
+		return true;
+	}
+}
+
 const LOCAL_READ_SPECULATION_INELIGIBLE: ToolSpeculationAssessment = {
 	eligible: false,
 	reason: "read target is not a speculation-safe local path",
@@ -1126,6 +1142,26 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
 		const rawPath = args && typeof args === "object" && "path" in args ? String(args.path ?? "") : "";
 		if (rawPath.length === 0) return undefined;
+		// A list (`a;b`, `a,b`, `local://x;.env`) reads each of its entries, so each needs its own key:
+		// the unsplit string alone would let a grant, a restricted folder or a permission scope judge a
+		// path the read never opens instead of the ones it does.
+		const whole = normalizeReadPathEntry(rawPath);
+		const router = InternalUrlRouter.instance();
+		const entries = [
+			whole,
+			...delimitedPathCandidatesSync(
+				whole,
+				this.session.cwd,
+				part => isReadUrlTarget(part) || router.canResolve(part),
+			).map(normalizeReadPathEntry),
+		];
+		const keys = new Set<string>();
+		for (const entry of entries) for (const key of this.#approvalEntryKeys(entry)) keys.add(key);
+		return keys.size > 0 ? [...keys] : undefined;
+	};
+
+	/** The cache key of one read entry, as {@link approvalCacheTargets} documents; empty for a public web read. */
+	#approvalEntryKeys(rawPath: string): string[] {
 		const withoutImageQuestion = splitImageQuestionTarget(rawPath).path;
 		const router = InternalUrlRouter.instance();
 		// Authorization must key what execution reads: an existing literal file like `notes:1` is
@@ -1137,16 +1173,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			// Nobody needs permission to read a public page, so those stay ungated. A private host —
 			// loopback, a private or link-local address, a single-label intranet name — is reachable
 			// only from inside this machine or network, so it is gated like a file.
-			if (isApprovalPublicUrl(selectorless)) return undefined;
+			if (isApprovalPublicUrl(selectorless)) return [];
 		}
 		const key = approvalTargetKey(this.session.cwd, selectorless);
-		if (key === undefined) return undefined;
+		if (key === undefined) return [];
 		// A directory read lists that folder itself, so it keys as the folder grant: approving it
 		// covers the folder's own entries, and a parent folder's grant never authorizes reading a
 		// subfolder's contents.
 		if (path.isAbsolute(key) && !approvalTargetNamesFile(key)) return [approvalDirectoryKey(key)];
 		return [key];
-	};
+	}
 	readonly label = "Read";
 	readonly loadMode = "essential";
 	/** Rendered per access so the hashline guidance follows a live `edit.mode` change. */
@@ -1356,6 +1392,15 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		for (const part of parts) {
 			try {
+				// Approval judged the call before it split; each entry answers to the scope again as it is
+				// read, because the split depends on what exists now (approval keyed every entry it could).
+				const refusal = approvalGuardRefusal(
+					this,
+					{ path: part },
+					{ tier: this.approval({ path: part }) },
+					approvalRestrictions(this.session.settings, this.session.cwd),
+				);
+				if (refusal !== undefined) throw new ToolError(refusal);
 				const result = await this.execute("read-delimited-part", { path: part }, signal, undefined, toolContext);
 				const nestedTargets = result.details?.displayReadTargets;
 				if (nestedTargets?.length) {
@@ -1389,6 +1434,18 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		flushText();
 
 		return toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks }).content(content).done();
+	}
+
+	/**
+	 * Refuse opening `absolutePath` when the session's permission scope would refuse it. Approval judged
+	 * the path the call named; member and selector syntax (`vault.tar:notes.txt`, `app.db:users`,
+	 * `bin:main`, `doc.pdf` image members) and suffix or plan recovery open a file under another name.
+	 * A routed read already had its backing file judged when its URL was located.
+	 */
+	#assertScopeAllowsFile(absolutePath: string, located: LocatedRead | undefined): void {
+		if (located) return;
+		const refusal = permissionFileRefusal(this.session.settings, this.session.cwd, this.name, absolutePath);
+		if (refusal !== undefined) throw new ToolError(refusal);
 	}
 
 	/**
@@ -1906,11 +1963,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		lexicalAbsolutePath?: string,
 		plainWindow?: boolean,
 	): Promise<AgentToolResult<ReadToolDetails>> {
-		let { path: readPath } = params;
-		if (readPath.startsWith("file://")) {
-			readPath = expandPath(readPath);
-		}
-		readPath = recoverConflictUriPrefix(readPath).path;
+		let readPath = normalizeReadPathEntry(params.path);
 		// A `;` list mixing URLs with local paths must split before URL detection
 		// claims the whole string as one fetch or one internal/MCP resource.
 		const mixedParts = await splitMixedUrlPathList(
@@ -2113,6 +2166,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				markRawSuffixResolution(archivePath.suffixResolution, isRawSelector(parseSel(literalSplit.sel)));
 			}
 			if (archivePath) {
+				this.#assertScopeAllowsFile(archivePath.absolutePath, located);
 				if (question !== undefined) throw new ToolError(IMAGE_QUESTION_SELECTOR_ERROR);
 				const archiveSubPath = located
 					? { path: archivePath.archiveSubPath, sel: located.sel }
@@ -2130,6 +2184,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 			const sqlitePath = await resolveSqliteReadPath(this.session, readPath, suffixCache, signal);
 			if (sqlitePath) {
+				this.#assertScopeAllowsFile(sqlitePath.absolutePath, located);
 				return readSqlite(sqlitePath, signal);
 			}
 			// local:// and artifact:// locate backing files without their URL query;
@@ -2145,6 +2200,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					? null
 					: await resolveJsonReadPath(this.session, jsonReadPath, suffixCache, signal);
 			if (jsonPath) {
+				this.#assertScopeAllowsFile(jsonPath.absolutePath, located);
 				if (jsonPath.suffixResolution) {
 					markRawSuffixResolution(jsonPath.suffixResolution, isRawSelector(parseSel(literalSplit.sel)));
 				}
@@ -2169,7 +2225,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const binaryParsed = parseSel(literalSplit.sel);
 				if (!isRawSelector(binaryParsed)) {
 					const binaryView = await resolveBinaryViewPath(this.session, literalSplit.path);
-					if (binaryView) return readBinary(this.session, binaryView, binaryParsed, signal);
+					if (binaryView) {
+						this.#assertScopeAllowsFile(binaryView.absolutePath, located);
+						return readBinary(this.session, binaryView, binaryParsed, signal);
+					}
 				}
 			}
 
@@ -2262,6 +2321,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				throw error;
 			}
 		}
+		this.#assertScopeAllowsFile(absolutePath, located);
 		if (specialKind) {
 			throw new ToolError(
 				`Cannot read '${localReadPath}': it is a ${specialKind}, not a regular file or directory.`,

@@ -57,6 +57,31 @@ export function permissionResultFilter(
 }
 
 /**
+ * Why the session's scope refuses `toolName` opening the host file `file`, or `undefined`. For a file
+ * a tool reached by resolving what the call named (an archive member's archive, a database behind a
+ * table selector): the approval guard judged the name, this judges the file, as named and by its real
+ * path. A scope that does not decode refuses.
+ */
+export function permissionFileRefusal(
+	settings: Settings,
+	cwd: string,
+	toolName: string,
+	file: string,
+): string | undefined {
+	const active = activePermissionScope(settings);
+	if (active === undefined) return undefined;
+	if (!active.ok) return unreadableScopeReason(active.error);
+	const { scope } = active;
+	if (scope.mode !== "enforce" || !(hasPathRules(scope) || scope.guardrails.secretsBlind)) return undefined;
+	const named = evaluatePermissionPath({ scope, toolName, path: file, cwd });
+	if (named.action === "deny") return named.reason;
+	const real = approvalCacheKeyForPath(file);
+	if (real === file) return undefined;
+	const resolved = evaluatePermissionPath({ scope, toolName, path: real, cwd: approvalCacheKeyForPath(cwd) });
+	return resolved.action === "deny" ? resolved.reason : undefined;
+}
+
+/**
  * Why the session's scope refuses `file`, the file the internal URL `url` resolved to, or `undefined`.
  * The approval guard sees only the URL; this applies the path rules and secrets-blind to the file
  * behind it (P7), as named and by its real path.

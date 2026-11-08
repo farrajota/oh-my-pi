@@ -1,4 +1,5 @@
 import type { GrepToolDetails } from "@oh-my-pi/pi-tui/tools/grep";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -25,7 +26,7 @@ import {
 	type TruncationResult,
 	truncateHead,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { permissionResultFilter } from "../task/permissions/session-checks";
+import { permissionFileRefusal, permissionResultFilter } from "../task/permissions/session-checks";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
@@ -274,6 +275,14 @@ function mergeRangesInto(map: Map<string, LineRange[]>, absKey: string, ranges: 
 	}
 }
 
+/** The archive an `archive:member` search entry reads, when that archive exists; the member form wins as in execution. */
+function archiveMemberArchive(entry: string, cwd: string): string | undefined {
+	const member = parseArchivePathCandidates(entry).find(
+		candidate => candidate.subPath !== "" && candidate.archivePath !== entry,
+	);
+	return member && existsSync(resolveReadPath(member.archivePath, cwd)) ? member.archivePath : undefined;
+}
+
 /**
  * Pre-resolve any `paths` entries that point at a member inside an archive
  * (e.g. `bundle.zip:src/foo.ts`, `release.tar.gz:notes.md`). Native grep
@@ -288,6 +297,7 @@ function mergeRangesInto(map: Map<string, LineRange[]>, absKey: string, ranges: 
  * cleanup hook the caller MUST invoke in a `finally`.
  */
 async function resolveArchiveSearchPaths(
+	refuseArchive: (archiveAbs: string) => string | undefined,
 	pathSpecs: readonly GrepPathSpec[],
 	cwd: string,
 ): Promise<{
@@ -313,6 +323,12 @@ async function resolveArchiveSearchPaths(
 		if (!member) continue;
 
 		const archiveAbs = resolveReadPath(member.archivePath, cwd);
+		// Members are not workspace entries, so the result filter keeps them: the archive answers here.
+		const refusal = refuseArchive(archiveAbs);
+		if (refusal !== undefined) {
+			unreadable.push(`${entry} (${refusal})`);
+			continue;
+		}
 		let archive = archiveCache.get(archiveAbs);
 		if (!archive) {
 			try {
@@ -564,7 +580,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
 		const a = args as { path?: string | string[]; paths?: string | string[] } | null | undefined;
 		const cwd = this.session.cwd;
-		const splitBase = (entry: string) => parseSearchPath(splitPathAndSel(entry).path).basePath;
+		// An archive member (`vault.tar:notes.txt`) searches the archive, so the archive is the root.
+		const splitBase = (entry: string) =>
+			archiveMemberArchive(entry, cwd) ?? parseSearchPath(splitPathAndSel(entry).path).basePath;
 		const roots = toPathList(a?.path ?? a?.paths);
 		const exclusionParts = (list: string) =>
 			approvalRootCandidates(list)
@@ -711,7 +729,11 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				displaySet: archiveDisplaySet,
 				unreadable: archiveUnreadable,
 				cleanup: cleanupArchiveScratch,
-			} = await resolveArchiveSearchPaths(pathSpecs, this.session.cwd);
+			} = await resolveArchiveSearchPaths(
+				archive => permissionFileRefusal(this.session.settings, this.session.cwd, this.name, archive),
+				pathSpecs,
+				this.session.cwd,
+			);
 			try {
 				const rangesByAbsPath = new Map<string, LineRange[]>();
 

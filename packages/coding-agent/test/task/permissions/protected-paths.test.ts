@@ -14,6 +14,9 @@ import {
 	type ResolvedApproval,
 	resolveApproval,
 } from "@oh-my-pi/pi-coding-agent/tools/approval";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { enforceScope, scopedSettings } from "./scope-fixtures";
 import { createScopedSession } from "./scoped-session";
@@ -135,6 +138,28 @@ describe("protected paths under an enforce-restricted scope", () => {
 		]) {
 			const decision = resolveIn(settings, writeTier("write"), { path: path.join(agentDir, "config.yml") });
 			expect(decision.policy).not.toBe("deny");
+		}
+	});
+
+	it("refuses resolving a conflict whose registered file is a protected path", async () => {
+		fs.writeFileSync(
+			tempDir.join(".omp", "permissions.json"),
+			'{\n<<<<<<< HEAD\n  "a": 1\n=======\n  "a": 2\n>>>>>>> branch\n}\n',
+		);
+		const settings = scopedSettings(writer);
+		const session: ToolSession = {
+			cwd: tempDir.path(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings,
+		};
+		// Reading the file is allowed and registers its conflict block as conflict://1.
+		await new ReadTool(session).execute("read", { path: ".omp/permissions.json" });
+		const write = new WriteTool(session);
+		for (const target of ["conflict://1", "conflict://*", "src/a.ts:conflict://1"]) {
+			const args = { path: target, content: "@theirs" };
+			expect(resolveIn(settings, write, args)).toMatchObject({ policy: "deny", source: "permission" });
 		}
 	});
 });

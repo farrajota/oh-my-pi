@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { getRemoteDir } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../sdk";
+import { permissionResultFilter } from "../task/permissions/session-checks";
 import { findUniqueWorkspaceSuffix } from "./path-utils";
 
 // Remote mount path prefix (sshfs mounts) - skip fuzzy matching to avoid hangs
@@ -30,7 +31,11 @@ export async function findSuffixMatchCached(
 ): Promise<{ absolutePath: string; displayPath: string } | null> {
 	const hit = cache.get(rawPath);
 	if (hit !== undefined) return hit;
-	const result = await findUniqueWorkspaceSuffix(rawPath, session.cwd, signal);
+	const found = await findUniqueWorkspaceSuffix(rawPath, session.cwd, signal);
+	// The scope judged the path the call named, not the file a suffix match finds elsewhere in the
+	// workspace; a match the scope refuses resolves to nothing, as if it did not exist.
+	const permitted = found && permissionResultFilter(session.settings, session.cwd, "read");
+	const result = found && permitted && !permitted(found.absolutePath) ? null : found;
 	cache.set(rawPath, result);
 	return result;
 }

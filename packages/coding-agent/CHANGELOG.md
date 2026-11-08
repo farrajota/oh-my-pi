@@ -51,6 +51,9 @@
 ### Fixed
 
 - Under a permission scope with path rules or secrets-blind, an `ast_edit` preview of a single file applies through `resolve` instead of failing with "Path not found: Not a directory"
+- Under a permission scope, a path list is judged by every entry it reads: a `read` of `local://x;.env`, `src/a.ts;lib/b.ts` or `src/a.ts,.env` is refused when any entry is, the `local://` exemption covers only a single `local://` URL, and `always-ask-cached` grants and restricted folders key each entry too
+- Under such a scope, `read` also judges the file behind an archive member, SQLite table, JSON query, binary view or PDF image member, and a missing path no longer resolves by its unique suffix to a file the scope refuses; `grep` of an archive member is judged by its archive
+- A `write` to `conflict://N` (or `conflict://*`) is judged by the files the conflicts were registered from, so it cannot rewrite a protected or restricted file
 - A rebuild before the model starts streaming (theme change, thinking-block toggle) redraws the just-sent prompt with its original send time instead of the rebuild's
 - Stats session syncs requested in the interactive process (the dashboard's live ingest, extensions using the stats runtime) run in a stats subprocess instead of blocking the TUI for seconds to minutes while stats.db is written
 - Eval cells no longer see credentials from the agent's environment: Python kernels drop secret-shaped variables (`*TOKEN*`, `*API_KEY*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`, access/private keys, cookies) even under the allowed `PI_`/`XDG_`/`LC_` prefixes, and JS eval workers, subprocess and Bun Worker fallback alike, start without them
