@@ -11,7 +11,7 @@ import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlRouter } from "../internal-urls/router";
 import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
 import astGrepDescription from "../prompts/tools/ast-grep.md" with { type: "text" };
-import { permissionResultFilter } from "../task/permissions/session-checks";
+import { permissionResultFilter, withoutRefusedDiagnostics } from "../task/permissions/session-checks";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
 
@@ -285,7 +285,11 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 						};
 			const grammarNote = result.missingGrammars?.length ? missingGrammarsNote(result.missingGrammars) : undefined;
 
-			const normalizedParseErrors = (result.parseErrors ?? []).map(error => {
+			const shownParseErrors =
+				withoutRefusedDiagnostics(result.parseErrors, permitted, reported =>
+					resolveSearchResultPath(resolvedSearchPath, reported),
+				) ?? [];
+			const normalizedParseErrors = shownParseErrors.map(error => {
 				const parseError = error.match(/^.+: (.+: parse error \(syntax tree contains error nodes\))$/);
 				return parseError?.[1] ?? error;
 			});

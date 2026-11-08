@@ -115,3 +115,23 @@ export function internalUrlListingFilter(
 		internalUrlFileRefusal(settings, cwd, `${base}/${relativePath}`, path.join(directory, relativePath)) ===
 		undefined;
 }
+
+/**
+ * Parse diagnostics (`<path>: parse error ...`, possibly after a `<prefix>: `) without those that
+ * name an entry `permitted` refuses, so a filtered search does not reveal the name of a refused file.
+ * `resolve` turns a reported path into what `permitted` checks.
+ */
+export function withoutRefusedDiagnostics(
+	errors: readonly string[] | undefined,
+	permitted: ((entry: string) => boolean) | undefined,
+	resolve: (reported: string) => string,
+): string[] | undefined {
+	if (!errors || !permitted) return errors?.slice();
+	return errors.filter(error => {
+		const end = error.indexOf(": parse error");
+		if (end <= 0) return true;
+		const head = error.slice(0, end);
+		const separator = head.lastIndexOf(": ");
+		return permitted(resolve(separator === -1 ? head : head.slice(separator + 2)));
+	});
+}

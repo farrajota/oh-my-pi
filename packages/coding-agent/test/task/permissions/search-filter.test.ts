@@ -164,3 +164,31 @@ describe("ast_edit under a permission scope", () => {
 		expect(fs.readFileSync(temp.join("restricted", "keys.ts"), "utf8")).toBe("export const token = 2;\n");
 	});
 });
+
+describe("parse diagnostics under a permission scope", () => {
+	beforeEach(() => {
+		fs.writeFileSync(temp.join("restricted", "broken.ts"), "export const = = ;\n");
+		fs.writeFileSync(temp.join("src", "torn.ts"), "export const = = ;\n");
+	});
+
+	it("ast_grep does not name a refused file in its parse errors", async () => {
+		const output = text(
+			await new AstGrepTool(session(scopedSettings(denyRestricted()))).execute("ast", {
+				pat: "export const $X = $Y",
+			}),
+		);
+		expect(output).toContain("torn.ts");
+		expect(output).not.toContain("broken.ts");
+	});
+
+	it("ast_edit does not name a refused file in its parse errors", async () => {
+		const output = text(
+			await new AstEditTool(session(scopedSettings(denyRestricted()))).execute("edit", {
+				ops: [{ pat: "export const token = $V", out: "export const token = 0" }],
+				paths: ["."],
+			}),
+		);
+		expect(output).toContain("torn.ts");
+		expect(output).not.toContain("broken.ts");
+	});
+});

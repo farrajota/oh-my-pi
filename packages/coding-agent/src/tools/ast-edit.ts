@@ -18,7 +18,7 @@ import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
 import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
 
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
-import { permissionResultFilter } from "../task/permissions/session-checks";
+import { permissionResultFilter, withoutRefusedDiagnostics } from "../task/permissions/session-checks";
 
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { missingGrammarsNote, rerunWithGrammars } from "../utils/grammars";
@@ -322,7 +322,13 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			}
 			const grammarNote = result.missingGrammars?.length ? missingGrammarsNote(result.missingGrammars) : undefined;
 
-			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(result.parseErrors);
+			const shownParseErrors = (errors: readonly string[] | undefined) =>
+				withoutRefusedDiagnostics(errors, permitted, reported =>
+					resolveSearchResultPath(resolvedSearchPath, reported),
+				);
+			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(
+				shownParseErrors(result.parseErrors),
+			);
 			const formatPath = (filePath: string): string =>
 				formatResultPath(filePath, isDirectory, resolvedSearchPath, this.session.cwd);
 
@@ -473,7 +479,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							filesystem: new InternalUrlFilesystem({ context: applyContext, tier }).shellFilesystem(),
 						});
 						const { errors: cappedApplyParseErrors, total: applyParseErrorsTotal } = capParseErrors(
-							applyResult.parseErrors,
+							shownParseErrors(applyResult.parseErrors),
 						);
 						const { record: recordAppliedFile, list: appliedFileList } = createFileRecorder();
 						const appliedFileReplacementCounts = new Map<string, number>();
