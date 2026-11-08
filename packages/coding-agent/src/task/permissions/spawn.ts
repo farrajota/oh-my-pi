@@ -201,3 +201,17 @@ export function permissionPromptView(settings: Settings): PermissionPromptView |
 		askAgent: grantsMessaging(scope) ? scope.parentId : undefined,
 	};
 }
+
+/**
+ * Whether a streamed task item must wait for dispatch instead of starting speculatively: it carries
+ * a permission request, or the calling session runs under an enforce scope (or one that does not
+ * decode). Dispatch composes the child's scope from the finished call.
+ */
+export function permissionsBlockSpeculativeLaunch(
+	settings: Settings,
+	spawn: { readonly permissions?: unknown; readonly toolProfile?: unknown },
+): boolean {
+	if (spawn.permissions !== undefined || spawn.toolProfile !== undefined) return true;
+	const active = activePermissionScope(settings);
+	return active !== undefined && (!active.ok || active.scope.mode === "enforce");
+}

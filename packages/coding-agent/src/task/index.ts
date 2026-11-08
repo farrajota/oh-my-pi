@@ -74,6 +74,7 @@ import {
 	cfgTaskPermissionsPathsEnabled,
 	cfgTaskPermissionsToolsEnabled,
 } from "./permissions/settings";
+import { permissionsBlockSpeculativeLaunch } from "./permissions/spawn";
 import type { SubagentPermissionMode } from "./permissions/types";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
@@ -1127,6 +1128,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	): Promise<SpawnRun | undefined> {
 		// File bytes must be captured at dispatch, not while arguments stream.
 		if (spawn.taskFile !== undefined) return undefined;
+		// A permission scope is composed and checked against the finished call, at dispatch.
+		if (permissionsBlockSpeculativeLaunch(this.session.settings, spawn)) return undefined;
 		if (spawn.tools?.length && this.session.getPlanModeState?.()?.enabled === true) return undefined;
 		let blocking: boolean;
 		try {
