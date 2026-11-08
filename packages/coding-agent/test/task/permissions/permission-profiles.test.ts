@@ -7,7 +7,6 @@ import {
 	classifyTaskPermissionRequest,
 	composeEffectivePermissions,
 	isScopeNoBroader,
-	preflightPermissionGuardrails,
 } from "@oh-my-pi/pi-coding-agent/task/permissions/compose";
 import { evaluateSubagentPermission } from "@oh-my-pi/pi-coding-agent/task/permissions/evaluate";
 import {
@@ -929,20 +928,6 @@ describe("W1 permission request truth table", () => {
 		if (result.ok) expect(result.value.tools).toEqual(["hub"]);
 	});
 
-	test("preflight rejects an unclassified route under a restricted enforce scope", () => {
-		const result = preflightPermissionGuardrails({
-			mode: "enforce",
-			toolsEnabled: true,
-			pathsEnabled: true,
-			actorId: "tester",
-			actorKind: "sub",
-			request: { allowPaths: ["src/**"] },
-			profiles: BUILTIN_PERMISSION_PROFILES,
-			capabilities: [{ name: "custom_route", source: "custom" }],
-		});
-		expect(result).toMatchObject({ ok: false });
-	});
-
 	test("an allowlist names eval and MCP routes; a route it omits is denied", () => {
 		const permitted = enforceScope({ request: { tools: ["summarize_eval", "mcp__docs__search"] } });
 		expect(evaluate(permitted, "summarize_eval", {}, "/tmp").action).toBe("allow");
@@ -973,10 +958,7 @@ describe("W1 reserved profile migration", () => {
 
 describe("W2 permission clauses and structural proofs", () => {
 	test("preserves ambient routes, narrows inherited authority, and distinguishes deny-only from allow-none", () => {
-		const capabilities = [
-			{ name: "summarize_eval", source: "eval" as const },
-			{ name: "mcp__docs__search", source: "mcp" as const },
-		];
+		const routes = ["summarize_eval", "mcp__docs__search"];
 		const base = {
 			mode: "enforce" as const,
 			toolsEnabled: true,
@@ -984,7 +966,6 @@ describe("W2 permission clauses and structural proofs", () => {
 			actorId: "child",
 			actorKind: "sub" as const,
 			profiles: BUILTIN_PERMISSION_PROFILES,
-			capabilities,
 		};
 		const inherited = composeEffectivePermissions({
 			...base,
@@ -993,28 +974,28 @@ describe("W2 permission clauses and structural proofs", () => {
 		});
 		if (!inherited.ok) throw new Error(inherited.error);
 		for (const request of [undefined, {}, { allowPaths: [] }] satisfies Array<TaskPermissionRequest | undefined>) {
-			const ambient = preflightPermissionGuardrails({ ...base, request });
-			const child = preflightPermissionGuardrails({ ...base, request, inherited: inherited.value });
+			const ambient = composeEffectivePermissions({ ...base, request });
+			const child = composeEffectivePermissions({ ...base, request, inherited: inherited.value });
 			if (!ambient.ok || !child.ok) throw new Error("Expected ambient and inherited composition");
-			for (const route of capabilities) expect(evaluate(ambient.value, route.name, {}, "/tmp").action).toBe("allow");
+			for (const route of routes) expect(evaluate(ambient.value, route, {}, "/tmp").action).toBe("allow");
 			expect(evaluate(child.value, "summarize_eval", {}, "/tmp").action).toBe("allow");
 			expect(evaluate(child.value, "mcp__docs__search", {}, "/tmp").action).toBe("deny");
 			expect(isScopeNoBroader(inherited.value, child.value)).toBe(true);
 		}
 		// P2: a path rule makes eval and MCP effects unprovable, so both routes are denied.
-		const pathOnly = preflightPermissionGuardrails({ ...base, request: { allowPaths: ["src/**"] } });
+		const pathOnly = composeEffectivePermissions({ ...base, request: { allowPaths: ["src/**"] } });
 		if (!pathOnly.ok) throw new Error(pathOnly.error);
-		for (const route of capabilities) {
-			expect(evaluate(pathOnly.value, route.name, { path: "src/file.ts" }, "/tmp").details?.code).toBe("guardrail");
+		for (const route of routes) {
+			expect(evaluate(pathOnly.value, route, { path: "src/file.ts" }, "/tmp").details?.code).toBe("guardrail");
 		}
 		expect(evaluate(pathOnly.value, "read", { path: "src/file.ts" }, "/tmp").action).toBe("allow");
 		expect(evaluate(pathOnly.value, "read", { path: "other/file.ts" }, "/tmp").action).toBe("deny");
 		for (const request of [{ denyTools: ["mcp__docs__search"] }, { profiles: ["no-network"] }]) {
-			expect(preflightPermissionGuardrails({ ...base, request }).ok).toBe(false);
+			expect(composeEffectivePermissions({ ...base, request }).ok).toBe(false);
 		}
-		const none = preflightPermissionGuardrails({ ...base, request: { tools: [] } });
+		const none = composeEffectivePermissions({ ...base, request: { tools: [] } });
 		if (!none.ok) throw new Error(none.error);
-		for (const route of capabilities) expect(evaluate(none.value, route.name, {}, "/tmp").action).toBe("deny");
+		for (const route of routes) expect(evaluate(none.value, route, {}, "/tmp").action).toBe("deny");
 	});
 
 	test("intersects crossed positive profiles instead of synthesizing their union", () => {

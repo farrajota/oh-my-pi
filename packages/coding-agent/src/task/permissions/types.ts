@@ -162,9 +162,3 @@ export type PermissionDecision =
 			readonly matched: string;
 			readonly details: PermissionDenialDetails;
 	  };
-
-/** A tool route the spawning session exposes, classified for the unclassified-route preflight. */
-export interface PermissionCapability {
-	readonly name: string;
-	readonly source: "builtin" | "eval" | "mcp" | "custom" | "opaque";
-}

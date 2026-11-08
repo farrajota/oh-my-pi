@@ -5,7 +5,6 @@ import { permissionToolKey, uniquePermissionTools } from "./tool-names";
 import type {
 	PathConstraintGroup,
 	PermissionActorKind,
-	PermissionCapability,
 	PermissionProfile,
 	PermissionProfileIdentity,
 	PermissionScope,
@@ -30,11 +29,6 @@ export interface PermissionComposeInput {
 	readonly profiles: Readonly<Record<string, PermissionProfile>>;
 	/** Loader identities; a profile without one is recorded with source `request`. */
 	readonly profileIdentities?: Readonly<Record<string, PermissionProfileIdentity>>;
-}
-
-export interface PermissionPreflightInput extends PermissionComposeInput {
-	/** Every tool route the spawning session exposes. */
-	readonly capabilities?: readonly PermissionCapability[];
 }
 
 /** Classify a request without changing it. */
@@ -271,27 +265,6 @@ function buildScope(input: {
 			profiles: Object.freeze(identities.map(identity => Object.freeze({ ...identity }))),
 		}),
 	} satisfies PermissionScope);
-}
-
-/**
- * {@link composeEffectivePermissions}, then refuse an enforce scope that would expose custom or opaque
- * tool routes without a concrete allowlist: nothing would say which of them the subagent may call.
- */
-export function preflightPermissionGuardrails(input: PermissionPreflightInput): PermissionComposeResult {
-	const composed = composeEffectivePermissions(input);
-	if (!composed.ok) return composed;
-	const scope = composed.value;
-	if (scope.mode !== "enforce" || !scope.restricted || scope.tools !== undefined) return composed;
-	const unclassified = (input.capabilities ?? []).some(
-		capability => capability.source === "custom" || capability.source === "opaque",
-	);
-	if (unclassified) {
-		return {
-			ok: false,
-			error: "Cannot enforce subagent permissions while custom or opaque tool routes are exposed without a concrete tool allowlist.",
-		};
-	}
-	return composed;
 }
 
 function isToolSubset(child: readonly string[] | undefined, parent: readonly string[] | undefined): boolean {
