@@ -2394,6 +2394,20 @@ export class SessionManager {
 			await this.#rewriteAtomically();
 		}
 	}
+	/**
+	 * Make `sessionFile` current. The previous session stays current while the target loads, so
+	 * an entry appended in that window persists to the previous file and reopens its writer and
+	 * claim. Close and release both here; callers adopt the target's state with no await after
+	 * this, so neither session's entries are written into the other's file.
+	 */
+	async #adoptSessionFile(sessionFile: string): Promise<void> {
+		await this.#drainAndCloseWriter();
+		this.#sessionClaim?.release?.();
+		this.#sessionClaim = undefined;
+		this.#sessionFile = sessionFile;
+		this.#rememberBreadcrumb(this.#cwd, sessionFile);
+	}
+
 	/** Switch to a different session file (resume / branch). */
 	async setSessionFile(sessionFile: string): Promise<void> {
 		await this.#setSessionFile(sessionFile);
@@ -2426,11 +2440,9 @@ export class SessionManager {
 			);
 		}
 
-		this.#sessionFile = resolvedSessionFile;
-		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
-
 		const { entries: fileEntries, titleSlot } = loaded;
 		if (fileEntries.length === 0) {
+			await this.#adoptSessionFile(resolvedSessionFile);
 			if (options?.throwIfMissing) {
 				throw new Error(
 					`Cannot resume session "${resolvedSessionFile}": the session file holds no entries. The file was not modified.`,
@@ -2460,7 +2472,10 @@ export class SessionManager {
 		// cannot enter. Keep the current cwd so the session stays where the
 		// user already is.
 		const headerCwd = header.cwd ? path.resolve(header.cwd) : undefined;
-		if (headerCwd && headerCwd !== path.resolve(this.#cwd) && (await directoryIsEnterable(headerCwd))) {
+		const adoptHeaderCwd =
+			headerCwd !== undefined && headerCwd !== path.resolve(this.#cwd) && (await directoryIsEnterable(headerCwd));
+		await this.#adoptSessionFile(resolvedSessionFile);
+		if (headerCwd && adoptHeaderCwd) {
 			this.#cwd = headerCwd;
 			this.#sessionDir = path.dirname(resolvedSessionFile);
 			this.#fallbackRuntimeOnly = false;

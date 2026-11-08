@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- Switching sessions while something is still writing to the old one (for example a vibe worker's lifecycle event) no longer writes the new session's entries into the old file or forks the switch onto a new sibling file
 - The `omp launch` daemon broker no longer shuts down under a client that has connected but not yet authenticated, and closes a connection that does not authenticate within 10 seconds
 - With an absolute `PI_CONFIG_DIR`, user config discovery reads that directory instead of a copy nested under home, and project plugin registries are found in the project's `.omp/`
 - A browser relay tab stays usable after a password manager's inline autofill menu opens in it; the call that opened the menu still fails once (reinstall the extension with `omp browser-relay install` and reload it) ([#16908](https://github.com/can1357/oh-my-pi/pull/16908) by [@will-bogusz](https://github.com/will-bogusz))
