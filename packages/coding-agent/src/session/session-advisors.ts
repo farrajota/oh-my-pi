@@ -625,6 +625,10 @@ export class SessionAdvisors {
 	#advisorBoundaryGuidanceLastTurn: number | undefined;
 	#advisorInterruptImmuneTurnStart: number | undefined;
 	#pendingAdvisorCardEvents = new Set<Promise<void>>();
+	/** First advisor-card persistence failure of the current conversation; reset with the conversation. */
+	#advisorCardEventFailure: { error: unknown } | undefined;
+	/** Bumped at each conversation boundary so a prior conversation's late card failure is ignored. */
+	#advisorCardEventGeneration = 0;
 	#advisorYieldQueueUnsubscribe: (() => void) | undefined;
 
 	constructor(host: SessionAdvisorsHost, options: SessionAdvisorsOptions) {
@@ -967,8 +971,15 @@ export class SessionAdvisors {
 
 	/** Tracks persistence of a visible advisor card emitted outside the primary loop. */
 	trackCardEvent(processing: Promise<void>): void {
+		const generation = this.#advisorCardEventGeneration;
 		this.#pendingAdvisorCardEvents.add(processing);
-		void processing.finally(() => this.#pendingAdvisorCardEvents.delete(processing)).catch(() => {});
+		void processing.then(
+			() => this.#pendingAdvisorCardEvents.delete(processing),
+			error => {
+				this.#pendingAdvisorCardEvents.delete(processing);
+				if (generation === this.#advisorCardEventGeneration) this.#advisorCardEventFailure ??= { error };
+			},
+		);
 	}
 
 	/** Waits for all advisor-card persistence handlers currently in flight. */
@@ -1071,6 +1082,10 @@ export class SessionAdvisors {
 	 * so none of them inject into the new conversation.
 	 */
 	#resetAdvisorSessionState(preserveCost: boolean): void {
+		// Card persistence still running for the prior conversation no longer gates the new one's catch-up.
+		this.#advisorCardEventGeneration++;
+		this.#pendingAdvisorCardEvents.clear();
+		this.#advisorCardEventFailure = undefined;
 		if (!preserveCost) {
 			this.#advisorCosts.clear();
 			this.#advisorSubscriptionSlugs.clear();
@@ -2719,7 +2734,9 @@ export class SessionAdvisors {
 		while (this.#pendingAdvisorCardEvents.size > 0) {
 			const remainingMs = deadline - Date.now();
 			if (remainingMs <= 0) return false;
-			const settled = Promise.allSettled(this.#pendingAdvisorCardEvents).then(() => true as const);
+			const settled = Promise.allSettled(this.#pendingAdvisorCardEvents).then(
+				results => !results.some(result => result.status === "rejected"),
+			);
 			const { promise: timedOut, resolve } = Promise.withResolvers<false>();
 			const timer = setTimeout(() => resolve(false), remainingMs);
 			try {
@@ -2728,7 +2745,8 @@ export class SessionAdvisors {
 				clearTimeout(timer);
 			}
 		}
-		return true;
+		// A card whose persistence handler rejected never reached the transcript.
+		return this.#advisorCardEventFailure === undefined;
 	}
 
 	/**
@@ -2764,6 +2782,11 @@ export class SessionAdvisors {
 				timeoutMs,
 				advisors: abandoned.map(advisor => ({ name: advisor.name, backlog: advisor.runtime.backlog })),
 				pendingAdvisorCards: this.#pendingAdvisorCardEvents.size,
+				cardEventFailure: this.#advisorCardEventFailure
+					? this.#advisorCardEventFailure.error instanceof Error
+						? this.#advisorCardEventFailure.error.message
+						: String(this.#advisorCardEventFailure.error)
+					: undefined,
 			});
 			return false;
 		}

@@ -401,6 +401,68 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(mock.calls).toHaveLength(1);
 	});
 
+	it("reports failed catch-up when a preserved advisor card hook rejects", async () => {
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		const extensionRunner: AdvisorTestExtensionRunner = {
+			hasHandlers: eventType => eventType === "message_end",
+			emitBeforeAgentStart: async () => undefined,
+			emit: async event => {
+				if (event.type !== "message_end" || !event.message || !isAdvisorCard(event.message)) return;
+				if (event.message.content === "new conversation card") return;
+				hookStarted.resolve();
+				await releaseHook.promise;
+			},
+		};
+		const { session, sessionManager } = await createCompletedAdvisorSession({ severity: "concern", extensionRunner });
+		const persisted = capturePersistedAdvice(sessionManager);
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		await session.prompt("answer with exactly one line");
+		await hookStarted.promise;
+		expect(persisted.at(-1)).toContain("Fixture verdict confirmed");
+		expect(await session.waitForAdvisorCatchup(0)).toBe(false);
+		const catchup = session.waitForAdvisorCatchup(1000);
+		releaseHook.reject(new Error("advisor card hook failed"));
+		expect(await catchup).toBe(false);
+		expect(persisted).toHaveLength(1);
+		expect(await session.newSession()).toBe(true);
+		const nextCard = { role: "custom" as const, ...advisorCard("new conversation card"), timestamp: Date.now() };
+		session.agent.emitExternalEvent({ type: "message_start", message: nextCard });
+		session.agent.emitExternalEvent({ type: "message_end", message: nextCard });
+		expect(await session.waitForAdvisorCatchup(1000)).toBe(true);
+		expect(persisted.at(-1)).toContain("new conversation card");
+	});
+
+	it("ignores a prior conversation's late card hook failure after a successful reset card", async () => {
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseOldHook = Promise.withResolvers<void>();
+		const extensionRunner: AdvisorTestExtensionRunner = {
+			hasHandlers: eventType => eventType === "message_end",
+			emitBeforeAgentStart: async () => undefined,
+			emit: async event => {
+				if (event.type !== "message_end" || !event.message || !isAdvisorCard(event.message)) return;
+				if (event.message.content === "new conversation card") return;
+				hookStarted.resolve();
+				await releaseOldHook.promise;
+			},
+		};
+		const { session, sessionManager } = await createCompletedAdvisorSession({ severity: "concern", extensionRunner });
+		const persisted = capturePersistedAdvice(sessionManager);
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		await session.prompt("answer with exactly one line");
+		await hookStarted.promise;
+		expect(persisted.at(-1)).toContain("Fixture verdict confirmed");
+		expect(await session.newSession()).toBe(true);
+		const nextCard = { role: "custom" as const, ...advisorCard("new conversation card"), timestamp: Date.now() };
+		session.agent.emitExternalEvent({ type: "message_start", message: nextCard });
+		session.agent.emitExternalEvent({ type: "message_end", message: nextCard });
+		expect(await session.waitForAdvisorCatchup(1000)).toBe(true);
+		releaseOldHook.reject(new Error("old card hook rejected late"));
+		await Promise.resolve();
+		expect(await session.waitForAdvisorCatchup(1000)).toBe(true);
+		expect(persisted.at(-1)).toContain("new conversation card");
+	});
+
 	it("waits for preserved advisor card start hooks before reporting catch-up", async () => {
 		const hookStarted = Promise.withResolvers<void>();
 		const releaseHook = Promise.withResolvers<void>();
