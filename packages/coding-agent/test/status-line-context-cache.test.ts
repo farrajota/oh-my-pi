@@ -624,7 +624,8 @@ describe("StatusLineComponent context breakdown", () => {
 		expect(comp.render(80)).toHaveLength(0); // box mode: main status lives in the editor border
 
 		comp.setComposerStyle({ statusAttachment: "none", bottomBar: "full", bottomBarGap: false });
-		const lines = comp.render(80);
+		// Wide enough for the checkout's branch and path: a bar that overflows wraps onto more rows.
+		const lines = comp.render(200);
 		expect(lines).toHaveLength(1);
 		// Plain bar: transparent background, no powerline caps or bg fill.
 		expect(lines[0]).not.toContain("\x1b[48;");
@@ -633,7 +634,7 @@ describe("StatusLineComponent context breakdown", () => {
 		// Styles without bottom chrome (rule/field/rail) request a spacer row so
 		// the bar doesn't sit flush against the last input row.
 		comp.setComposerStyle({ statusAttachment: "none", bottomBar: "full", bottomBarGap: true });
-		const gapped = comp.render(80);
+		const gapped = comp.render(200);
 		expect(gapped).toHaveLength(2);
 		expect(gapped[0]).toBe("");
 		expect(gapped[1]).toBe(lines[0]);
@@ -648,9 +649,9 @@ describe("StatusLineComponent context breakdown", () => {
 		comp.setComposerStyle({ statusAttachment: "none", bottomBar: "full", bottomBarGap: true });
 		let menuOpen = true;
 		comp.setAutocompleteActiveProbe(() => menuOpen);
-		expect(comp.render(80)).toHaveLength(0);
+		expect(comp.render(200)).toHaveLength(0);
 		menuOpen = false;
-		expect(comp.render(80)).toHaveLength(2); // spacer + bar return together
+		expect(comp.render(200)).toHaveLength(2); // spacer + bar return together
 	});
 
 	it("claude layout splits groups: left-only bottom bar, right group as top-rule chip", () => {

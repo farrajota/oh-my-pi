@@ -40,6 +40,7 @@ import {
 	sliceByColumn,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "../utils";
 import {
 	countGraphemes,
@@ -828,6 +829,8 @@ export class Editor implements Component, Focusable {
 	#promptGutterCache: { source: string; firstLine: string; continuation: string; width: number } | undefined;
 	#paddingXOverride: number | undefined;
 	#maxHeight?: number;
+	/** Status continuation rows drawn under the top chrome in the last render; they share the height limit. */
+	#topContinuationRows = 0;
 	#scrollOffset: number = 0;
 	/** When true, the right border shows a scrollbar track/thumb when content
 	 *  overflows {@link #maxHeight}. Enabled by {@link HookEditorComponent} and
@@ -1403,7 +1406,7 @@ export class Editor implements Component, Focusable {
 
 	#getVisibleContentHeight(contentLines: number): number {
 		if (this.#maxHeight === undefined) return contentLines;
-		return Math.max(1, this.#maxHeight - this.#effectiveStyle().verticalChrome);
+		return Math.max(1, this.#maxHeight - this.#effectiveStyle().verticalChrome - this.#topContinuationRows);
 	}
 	/** Apply the optional input decorator to a plain (ANSI-free) text segment.
 	 *  Decoration only adds zero-width SGR codes, so visible width is unchanged.
@@ -1569,6 +1572,26 @@ export class Editor implements Component, Focusable {
 		const box = this.#theme.symbols.boxRound;
 		const borderWidth = this.#getHorizontalChromeWidth(paddingX);
 
+		// Resolve the custom top-border content once per frame; the style decides
+		// how (and whether) to draw it. Provider evaluation stays editor-owned,
+		// coalescing per-event rebuilds to one per painted frame. It runs before
+		// layout because status continuation rows take from the height limit.
+		const topFillWidth = Math.max(0, width - borderWidth * 2);
+		let topBorder: EditorTopBorder | undefined;
+		if (style.statusAttachment !== "none") {
+			if (this.#topBorderProvider) {
+				topBorder = this.#topBorderProvider(topFillWidth);
+			} else {
+				topBorder = this.#topBorderContent;
+			}
+		}
+		// Providers fit continuation rows to the width they were given; rewrap
+		// (never clip) a stale one so it cannot break the side chrome.
+		const topContinuation = (topBorder?.continuation ?? []).flatMap(line =>
+			visibleWidth(line) > topFillWidth ? wrapTextWithAnsi(line, Math.max(1, topFillWidth)) : [line],
+		);
+		this.#topContinuationRows = topContinuation.length;
+
 		// Layout the text
 		const layoutLines = this.#layoutText(layoutWidth);
 		const visibleContentHeight = this.#getVisibleContentHeight(layoutLines.length);
@@ -1583,19 +1606,6 @@ export class Editor implements Component, Focusable {
 			scrollbarThumb = scrollbarThumbRange(visibleContentHeight, layoutLines.length, this.#scrollOffset);
 		}
 
-		// Resolve the custom top-border content once per frame; the style decides
-		// how (and whether) to draw it. Provider evaluation stays editor-owned,
-		// coalescing per-event rebuilds to one per painted frame.
-		const topFillWidth = Math.max(0, width - borderWidth * 2);
-		let topBorder: EditorTopBorder | undefined;
-		if (style.statusAttachment !== "none") {
-			if (this.#topBorderProvider) {
-				topBorder = this.#topBorderProvider(topFillWidth);
-			} else {
-				topBorder = this.#topBorderContent;
-			}
-		}
-
 		const chromeCtx: ComposerChromeContext = {
 			width,
 			paddingX,
@@ -1608,6 +1618,20 @@ export class Editor implements Component, Focusable {
 
 		const topRow = style.renderTop(chromeCtx);
 		if (topRow !== undefined) result.push(topRow);
+		for (const text of topContinuation) {
+			result.push(
+				...style.renderRow({
+					...chromeCtx,
+					text,
+					pad: padding(Math.max(0, topFillWidth - visibleWidth(text))),
+					gutter: "",
+					isLastRow: false,
+					cursorOverflow: 0,
+					imeSafeCursorTail: false,
+					scrollbarThumb: false,
+				}),
+			);
+		}
 
 		// Render each layout line
 		// Keep the hardware cursor at the text insertion point while autocomplete

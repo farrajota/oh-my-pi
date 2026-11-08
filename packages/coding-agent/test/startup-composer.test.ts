@@ -776,8 +776,9 @@ describe("Composer prepaint", () => {
 			);
 			lease.adopt();
 			vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+			// The default band shape draws the live bar through the wrapping band getter.
 			const realTopBorder = vi
-				.spyOn(mode.statusLine, "getTopBorder")
+				.spyOn(mode.statusLine, "getBandTopBorderRows")
 				.mockReturnValue({ content: "real status bar", width: 15, revision: 1 });
 			terminal.sendInput(" between");
 			expect(mode.editor.getExpandedText()).toBe("draft message between");

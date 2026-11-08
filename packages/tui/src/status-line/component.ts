@@ -20,6 +20,7 @@ import {
 	spinnerTickDelay,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "../index";
 import { adjustHsv, formatNumber, getProjectDir, hexToRgb, rgbToHex } from "@oh-my-pi/pi-utils";
 import type {
@@ -29,7 +30,7 @@ import type {
 	PromptCacheStatus,
 	StatusLineSession,
 } from "./host";
-import type { Editor } from "../components/editor";
+import type { Editor, EditorTopBorder } from "../components/editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../theme/session-color";
 import { sanitizeHookStatusText, sanitizeStatusText } from "../chrome/shared";
 import { getThemeEpoch, theme } from "../theme";
@@ -492,6 +493,8 @@ class StatusLineExternalInputs {
 interface CachedStatusLine {
 	content: string;
 	dimmedContent: string;
+	/** Rows under the first one in `wrap` mode, dimmed like it; empty in `drop` mode. */
+	continuation: readonly string[];
 	width: number;
 	availableWidth: number;
 	renderRevision: number;
@@ -646,6 +649,19 @@ function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean 
 type StatusLineLayout = "box" | "band" | "plain-full" | "plain-left" | "plain-right";
 
 /**
+ * What a render does with segments that do not fit its width. `drop` keeps one
+ * row: it shrinks the title and the path, then drops segments. `wrap` keeps every
+ * segment unshortened and moves the overflow, in configured order, onto
+ * continuation rows.
+ */
+type StatusLineOverflow = "drop" | "wrap";
+
+interface RenderedStatusLine {
+	content: string;
+	continuation: string[];
+}
+
+/**
  * Git views of immutable `VcsRepo` handles. `asGit()` mints a fresh napi
  * wrapper around the same backend handle on every call, which the per-frame
  * branch lookup would otherwise pay each render.
@@ -668,13 +684,22 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	#standaloneGap = false;
 	#autocompleteActiveProbe: (() => boolean) | undefined;
 	#renderRevision = 0;
-	/** Fully rendered bars for the current revision/clock tick, keyed by layout. */
-	#statusLineRenderCache: Record<StatusLineLayout, CachedStatusLine | undefined> = {
-		box: undefined,
-		band: undefined,
-		"plain-full": undefined,
-		"plain-left": undefined,
-		"plain-right": undefined,
+	/** Fully rendered bars for the current revision/clock tick, keyed by overflow mode and layout. */
+	#statusLineRenderCache: Record<StatusLineOverflow, Record<StatusLineLayout, CachedStatusLine | undefined>> = {
+		drop: {
+			box: undefined,
+			band: undefined,
+			"plain-full": undefined,
+			"plain-left": undefined,
+			"plain-right": undefined,
+		},
+		wrap: {
+			box: undefined,
+			band: undefined,
+			"plain-full": undefined,
+			"plain-left": undefined,
+			"plain-right": undefined,
+		},
 	};
 	#statusLineInputRevision = 0;
 	#statusLineClockTick = 0;
@@ -3019,7 +3044,12 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		return 0;
 	}
 
-	#buildStatusLine(width: number, layout: StatusLineLayout = "box", previewTitle?: string): CachedStatusLine {
+	#buildStatusLine(
+		width: number,
+		layout: StatusLineLayout,
+		previewTitle: string | undefined,
+		overflow: StatusLineOverflow,
+	): CachedStatusLine {
 		const effectiveSettings = this.#resolveSettings();
 		const externalInputs = this.#externalInputsProbe;
 		this.#readStatusLineExternalInputs(externalInputs);
@@ -3031,7 +3061,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			this.#invalidateStatusLineRenderCache();
 		}
 
-		const cached = this.#statusLineRenderCache[layout];
+		const cache = this.#statusLineRenderCache[overflow];
+		const cached = cache[layout];
 		if (
 			cached &&
 			cached.availableWidth === width &&
@@ -3045,10 +3076,11 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 
 		// The probe now belongs to the new cache entry; later probes need their own buffer.
 		this.#externalInputsProbe = new StatusLineExternalInputs();
-		const content = this.#renderStatusLine(width, layout, previewTitle, nowMs);
+		const { content, continuation } = this.#renderStatusLine(width, layout, previewTitle, nowMs, overflow);
 		const result = {
 			content,
 			dimmedContent: this.#dimWhileFocusProxied(content),
+			continuation: continuation.map(row => this.#dimWhileFocusProxied(row)),
 			width: visibleWidth(content),
 			availableWidth: width,
 			renderRevision: this.#renderRevision,
@@ -3056,7 +3088,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			previewTitle,
 			externalInputs,
 		};
-		this.#statusLineRenderCache[layout] = result;
+		cache[layout] = result;
 		return result;
 	}
 
@@ -3101,8 +3133,15 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	 *
 	 * `previewTitle` is a stand-in session title for composer previews; the
 	 * `session_name` segment renders it when the session is unnamed.
+	 * `overflow` picks how segments that do not fit are handled.
 	 */
-	#renderStatusLine(width: number, layout: StatusLineLayout, previewTitle: string | undefined, nowMs: number): string {
+	#renderStatusLine(
+		width: number,
+		layout: StatusLineLayout,
+		previewTitle: string | undefined,
+		nowMs: number,
+		overflow: StatusLineOverflow,
+	): RenderedStatusLine {
 		const effectiveSettings = this.#resolveSettings();
 		this.#syncPricingTimer();
 		const plain = layout !== "box" && layout !== "band";
@@ -3242,6 +3281,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			return embeddedContextWidth;
 		};
 		const totalWidth = () => leftWidth + rightWidth + minimumGapWidth();
+		const wrap = overflow === "wrap";
+		// Segments moved off the first row in wrap mode, each in configured order.
+		const overflowLeft: string[] = [];
+		const overflowRight: string[] = [];
 
 		if (topFillWidth > 0) {
 			// Truncate the session-name segment before dropping right segments —
@@ -3249,7 +3292,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			// wholesale left narrow bars (and the ≤76-col composer previews)
 			// without any title.
 			const nameSegIdx = rightSegIds.indexOf("session_name");
-			if (nameSegIdx >= 0 && totalWidth() > topFillWidth) {
+			if (!wrap && nameSegIdx >= 0 && totalWidth() > topFillWidth) {
 				// Badge/job parts were unshifted ahead of the tracked segment ids.
 				const nameIdx = nameSegIdx + (right.length - rightSegIds.length);
 				const currentNameVW = rightWidths[nameIdx];
@@ -3264,13 +3307,14 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			}
 			while (totalWidth() > topFillWidth && right.length > 0) {
 				const removedWidth = rightWidths[right.length - 1];
-				right.pop();
+				const removed = right.pop();
 				rightWidths.pop();
+				if (wrap && removed !== undefined) overflowRight.unshift(removed);
 				rightWidth = right.length > 0 ? rightWidth - removedWidth - rightSepWidth - 2 : 0;
 			}
 			// Shrink path before dropping left segments — path is the only elastic segment
 			const pathIdx = leftSegIds.indexOf("path");
-			if (pathIdx >= 0 && totalWidth() > topFillWidth) {
+			if (!wrap && pathIdx >= 0 && totalWidth() > topFillWidth) {
 				const overflow = totalWidth() - topFillWidth;
 				const currentPathVW = leftWidths[pathIdx];
 				const minPathVW = 8; // icon + ellipsis + a few chars
@@ -3319,16 +3363,18 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			};
 
 			while (totalWidth() > topFillWidth && left.length > 0) {
-				const dropIdx = leftOverflowDropIndex();
+				// Wrapping keeps configured order across rows, so it peels from the end.
+				const dropIdx = wrap ? left.length - 1 : leftOverflowDropIndex();
 				const removedWidth = leftWidths[dropIdx];
-				left.splice(dropIdx, 1);
+				const [removed] = left.splice(dropIdx, 1);
+				if (wrap && removed !== undefined) overflowLeft.unshift(removed);
 				leftWidths.splice(dropIdx, 1);
 				leftSegIds.splice(dropIdx, 1);
 				leftWidth = left.length > 0 ? leftWidth - removedWidth - leftSepWidth - 2 : 0;
 			}
 		}
 
-		const renderGroup = (parts: string[], direction: "left" | "right"): string => {
+		const renderGroup = (parts: string[], direction: "left" | "right", open = true): string => {
 			if (parts.length === 0) return "";
 			const sep = direction === "left" ? separatorDef.left : separatorDef.right;
 			const cap =
@@ -3340,7 +3386,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			const capPrefix = separatorDef.endCaps?.useBgAsFg ? bgAnsi.replace("\x1b[48;", "\x1b[38;") : bgAnsi + sepAnsi;
 			const capText = cap ? `${capPrefix}${this.#focusedAgentId ? "\x1b[22m" : ""}${cap}\x1b[0m` : "";
 			const openText =
-				direction === "left" && bandCap
+				direction === "left" && bandCap && open
 					? `${capPrefix}${this.#focusedAgentId ? "\x1b[22m" : ""}${bandCap}\x1b[0m`
 					: "";
 
@@ -3352,24 +3398,59 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			return openText + content + capText;
 		};
 
+		const continuation: string[] = [];
+		const overflowParts = [...overflowLeft, ...overflowRight];
+		if (overflowParts.length > 0) {
+			// Continuation rows read as further left groups (same fill, separators and
+			// closing cap) without the band's opening cap, packed greedily in order.
+			const rowWidth = (widths: number[]): number => groupWidth(widths, leftCapWidth, leftSepWidth);
+			let rowParts: string[] = [];
+			let rowWidths: number[] = [];
+			const flush = (): void => {
+				if (rowParts.length > 0) continuation.push(renderGroup(rowParts, "left", false));
+				rowParts = [];
+				rowWidths = [];
+			};
+			for (const part of overflowParts) {
+				const partWidth = visibleWidth(part);
+				if (rowParts.length > 0 && rowWidth([...rowWidths, partWidth]) > topFillWidth) flush();
+				if (rowWidth([partWidth]) <= topFillWidth) {
+					rowParts.push(part);
+					rowWidths.push(partWidth);
+					continue;
+				}
+				// A segment wider than a whole row wraps its text instead of being clipped;
+				// two cells keep a wide (CJK) character placeable.
+				const innerWidth = topFillWidth - rowWidth([0]);
+				if (innerWidth >= 2) {
+					for (const piece of wrapTextWithAnsi(part, innerWidth))
+						continuation.push(renderGroup([piece], "left", false));
+				} else {
+					continuation.push(...wrapTextWithAnsi(part, topFillWidth));
+				}
+			}
+			flush();
+		}
+
 		const leftGroup = renderGroup(left, "left");
 		const rightGroup = renderGroup(right, "right");
-		if (!leftGroup && !rightGroup) return "";
+		if (!leftGroup && !rightGroup) return { content: "", continuation };
 
 		if (topFillWidth === 0 || (plain && (left.length === 0 || right.length === 0))) {
-			return leftGroup + (leftGroup && rightGroup ? " " : "") + rightGroup;
+			return { content: leftGroup + (leftGroup && rightGroup ? " " : "") + rightGroup, continuation };
 		}
 
 		const gapWidth = Math.max(1, topFillWidth - leftWidth - rightWidth);
 		if (plain) {
 			// Standalone composers: no gauge line between the groups, just air.
-			return leftGroup + padding(gapWidth) + rightGroup;
+			return { content: leftGroup + padding(gapWidth) + rightGroup, continuation };
 		}
 		// Box layout: with one group absent (an unnamed session hides
 		// `session_name`, emptying the default preset's right group) the gauge
 		// runs to the border edge instead of disappearing, so embedded context
 		// labels don't fall back to a context chip until the session is titled.
-		return leftGroup + this.#buildContextGaugeFill(gapWidth, ctx, effectiveSettings, embedContext) + rightGroup;
+		const gauge = this.#buildContextGaugeFill(gapWidth, ctx, effectiveSettings, embedContext);
+		return { content: leftGroup + gauge + rightGroup, continuation };
 	}
 
 	/**
@@ -3584,13 +3665,13 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		this.setAutocompleteActiveProbe(() => editor.isAutocompleteActive());
 		switch (style.statusAttachment) {
 			case "top-border":
-				editor.setTopBorderProvider(availableWidth => this.getTopBorder(availableWidth));
+				editor.setTopBorderProvider(availableWidth => this.getTopBorderRows(availableWidth));
 				break;
 			case "top-band":
-				editor.setTopBorderProvider(availableWidth => this.getBandTopBorder(availableWidth));
+				editor.setTopBorderProvider(availableWidth => this.getBandTopBorderRows(availableWidth));
 				break;
 			case "top-rule-chip":
-				editor.setTopBorderProvider(availableWidth => this.getStandaloneTopBorder(availableWidth));
+				editor.setTopBorderProvider(availableWidth => this.getStandaloneTopBorderRows(availableWidth));
 				break;
 			case "none":
 				editor.setTopBorderProvider(undefined);
@@ -3600,8 +3681,40 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		this.setComposerStyle(style);
 	}
 
+	/**
+	 * The bar's rows in wrap mode: the first row, then the continuation rows. When
+	 * nothing fits beside the gauge, the first continuation row moves up.
+	 */
+	#statusLineRows(width: number, layout: StatusLineLayout): string[] {
+		const statusLine = this.#buildStatusLine(width, layout, undefined, "wrap");
+		return statusLine.dimmedContent
+			? [statusLine.dimmedContent, ...statusLine.continuation]
+			: [...statusLine.continuation];
+	}
+
+	#wrappedTopBorder(width: number, layout: StatusLineLayout): EditorTopBorder {
+		const [content = "", ...continuation] = this.#statusLineRows(width, layout);
+		return { content, width: visibleWidth(content), revision: this.#renderRevision, continuation };
+	}
+
+	/** Live box top border: the first row, with segments that do not fit as continuation rows. */
+	getTopBorderRows(width: number): EditorTopBorder {
+		return this.#wrappedTopBorder(width, "box");
+	}
+
+	/** Live band top row, with segments that do not fit as continuation rows. */
+	getBandTopBorderRows(width: number): EditorTopBorder {
+		return this.#wrappedTopBorder(width, "band");
+	}
+
+	/** Live claude top-rule chip (right group), with segments that do not fit as continuation rows. */
+	getStandaloneTopBorderRows(width: number): EditorTopBorder {
+		return this.#wrappedTopBorder(width, "plain-right");
+	}
+
+	/** Single-row box top border: segments that do not fit are shortened, then dropped. */
 	getTopBorder(width: number, previewTitle?: string): { content: string; width: number; revision: number } {
-		const statusLine = this.#buildStatusLine(width, "box", previewTitle);
+		const statusLine = this.#buildStatusLine(width, "box", previewTitle, "drop");
 		return {
 			content: statusLine.dimmedContent,
 			width: statusLine.width,
@@ -3611,7 +3724,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 
 	/** Flush-left soft-capped powerline band (the band composer's top row). */
 	getBandTopBorder(width: number, previewTitle?: string): { content: string; width: number; revision: number } {
-		const statusLine = this.#buildStatusLine(width, "band", previewTitle);
+		const statusLine = this.#buildStatusLine(width, "band", previewTitle, "drop");
 		return {
 			content: statusLine.dimmedContent,
 			width: statusLine.width,
@@ -3648,7 +3761,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 
 	/** Plain right-group content for the claude composer's top rule. */
 	getStandaloneTopBorder(width: number, previewTitle?: string): { content: string; width: number; revision: number } {
-		const statusLine = this.#buildStatusLine(width, "plain-right", previewTitle);
+		const statusLine = this.#buildStatusLine(width, "plain-right", previewTitle, "drop");
 		return {
 			content: statusLine.dimmedContent,
 			width: statusLine.width,
@@ -3663,7 +3776,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	 * the active one).
 	 */
 	renderBottomBar(width: number, groups: "left" | "full", previewTitle?: string): string {
-		return this.#buildStatusLine(width, groups === "left" ? "plain-left" : "plain-full", previewTitle).dimmedContent;
+		const layout = groups === "left" ? "plain-left" : "plain-full";
+		return this.#buildStatusLine(width, layout, previewTitle, "drop").dimmedContent;
 	}
 	/**
 	 * Status bar lines for a composer layout, rendered through the real
@@ -3678,13 +3792,12 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			style?.bottomBar ?? (this.#standalone === false ? "none" : this.#standalone === "left-only" ? "left" : "full");
 		const lines: string[] = [];
 		if (attachment === "top-border") {
-			const border = this.getTopBorder(width);
-			if (border.content) lines.push(border.content);
+			lines.push(...this.#statusLineRows(width, "box"));
 		} else if (attachment === "top-band") {
-			const band = this.getBandTopBorder(width);
-			if (band.content) lines.push(band.content);
+			lines.push(...this.#statusLineRows(width, "band"));
 		} else if (attachment === "top-rule-chip") {
 			// Render the chip on its rule exactly as the claude composer does.
+			const { continuation, ...topBorder } = this.getStandaloneTopBorderRows(width);
 			const rule = claudeComposerStyle.renderTop({
 				width,
 				paddingX: 0,
@@ -3692,13 +3805,13 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 				accentColor: str => theme.fg("accent", str),
 				surfaceColor: str => theme.bgFill("userMessageBg", theme.fgOnBg("userMessageText", "userMessageBg", str)),
 				box: theme.boxRound,
-				topBorder: this.getStandaloneTopBorder(width),
+				topBorder,
 			});
 			if (rule !== undefined) lines.push(rule);
+			if (continuation) lines.push(...continuation);
 		}
 		if (bottomBar !== "none") {
-			const main = this.renderBottomBar(width, bottomBar);
-			if (main) lines.push(main);
+			lines.push(...this.#statusLineRows(width, bottomBar === "left" ? "plain-left" : "plain-full"));
 		}
 		return lines;
 	}
@@ -4003,10 +4116,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	render(width: number): readonly string[] {
 		const lines: string[] = [];
 		if (this.#standalone && !this.#autocompleteActiveProbe?.()) {
-			const content = this.renderBottomBar(width, this.#standalone === "left-only" ? "left" : "full");
-			if (content) {
+			const rows = this.#statusLineRows(width, this.#standalone === "left-only" ? "plain-left" : "plain-full");
+			if (rows.length > 0) {
 				if (this.#standaloneGap) lines.push("");
-				lines.push(content);
+				lines.push(...rows);
 			}
 		}
 		const showHooks = this.#settings.showHookStatus ?? true;

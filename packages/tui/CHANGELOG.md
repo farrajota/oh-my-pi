@@ -9,10 +9,12 @@
 
 ### Changed
 
+- A status line wider than the terminal keeps every configured segment: the overflow moves, in configured order, onto continuation rows under the box border, the band, the top-rule chip or the standalone bar (a segment wider than a row wraps), instead of shrinking the path and title and dropping segments. Continuation rows count against the editor's height limit. `EditorTopBorder.continuation` carries the extra rows; `StatusLineComponent.getTopBorderRows()`, `getBandTopBorderRows()` and `getStandaloneTopBorderRows()` return them, while `getTopBorder()` and the other single-row getters keep dropping
 - Grep results for a single searched file no longer repeat `1 file` after the match count; the header already names the file ([#18422](https://github.com/can1357/oh-my-pi/pull/18422) by [@JustasMasiulis](https://github.com/JustasMasiulis)).
 
 ### Fixed
 
+- The `/settings` appearance preview draws a multi-row status line (such as the claude shape's rule and bottom bar) as separate framed rows instead of one broken row
 - When the status line overflows it drops the model, git and other left segments before the active mode ("Plan", "Goal", ...), and a box or band bar with only one segment group no longer runs one cell past its width
 - The agent transcript viewer strips terminal control sequences from the agent id, kind, parent and model in its header and cuts a long id before the status badge, and a multi-byte character split across two transcript polls no longer renders as replacement characters
 - Pinned sessions color their pin icon with the theme accent in the status line instead of the session title's color, matching the resume picker ([#18401](https://github.com/can1357/oh-my-pi/pull/18401) by [@SuperUserA](https://github.com/SuperUserA))

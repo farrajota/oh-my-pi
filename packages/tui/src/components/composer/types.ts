@@ -37,6 +37,11 @@ export interface EditorTopBorder {
 	width: number;
 	/** Optional logical revision that changes independently of available width. */
 	revision?: number;
+	/**
+	 * Status rows that did not fit the top chrome, each already fitted to the
+	 * available width; the editor draws them as content-width rows under it.
+	 */
+	continuation?: readonly string[];
 }
 
 /** Inputs shared by every chrome row. */
