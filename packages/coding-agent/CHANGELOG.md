@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- A manual `/compact` no longer resumes the interrupted turn in a conversation that was reset or replaced while the compaction ran, including a resume an earlier compaction withheld for a parked command
 - The `bash` tool bounds its output (`tools.outputMaxColumns`, `tools.artifactHeadBytes`, `tools.artifactMaxBytes`) by the calling session's settings instead of the process-wide ones, on the direct, background-job and PTY paths, so a subagent or SDK session with its own limits gets them
 - A browser tab's download is found and moved into its folder even when another tab of the same browser pointed Chromium's download folder elsewhere and Chromium did not report the saved path; owned tabs now share one staging folder per browser
 - Reading a docs subdirectory such as `omp://tools` lists the docs under it instead of failing with "Documentation file not found"; grep and the URL filesystem already treated it as a directory

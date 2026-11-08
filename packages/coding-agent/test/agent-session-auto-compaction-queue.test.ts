@@ -928,6 +928,53 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(promptSpy).not.toHaveBeenCalled();
 	});
 
+	it("does not resume the interrupted turn when the session resets while the compaction's abort tears down", async () => {
+		cfgCompactionKeepRecentTokens.set(session.settings, 1);
+		cfgCompactionAutoContinue.override(session.settings, true);
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "previous answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		session.agent.state.isStreaming = true;
+		const teardownEntered = Promise.withResolvers<void>();
+		const teardownGate = Promise.withResolvers<void>();
+		let abortCalls = 0;
+		vi.spyOn(session, "abort").mockImplementation(async () => {
+			abortCalls++;
+			session.agent.state.isStreaming = false;
+			if (abortCalls === 1) {
+				teardownEntered.resolve();
+				await teardownGate.promise;
+			}
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {});
+
+		const compacted = session.compact();
+		await teardownEntered.promise;
+		const reset = session.resetSessionContext();
+		teardownGate.resolve();
+		expect(await reset).toBeDefined();
+		await compacted.catch(() => undefined);
+		await session.waitForIdle();
+
+		expect(promptSpy).not.toHaveBeenCalled();
+	});
+
 	it("carries a withheld resume into a second manual compaction", async () => {
 		// The first compaction withholds its resume for a parked local command that
 		// is still running when a second /compact starts. That pass interrupts
@@ -995,6 +1042,58 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(getRuntimeSignals()).toContain("command:park");
 		expect(prompted).toHaveLength(1);
 		expect(prompted[0]?.some(message => message.role === "developer" && message.synthetic === true)).toBe(true);
+	});
+
+	it("does not rebind a withheld resume after a session reset", async () => {
+		cfgCompactionKeepRecentTokens.set(session.settings, 1);
+		cfgCompactionAutoContinue.override(session.settings, true);
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "previous answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		session.agent.state.isStreaming = true;
+		vi.spyOn(session, "abort").mockImplementation(async () => {
+			session.agent.state.isStreaming = false;
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {});
+
+		const compactGate = Promise.withResolvers<void>();
+		(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+			compactGate.promise;
+		const parkGate = Promise.withResolvers<void>();
+		(globalThis as ParkCommandGlobals).__ompParkGate = parkGate.promise;
+		const compacted = session.compact();
+		while (!getRuntimeSignals().includes("before_compact:enter")) {
+			await Promise.resolve();
+		}
+		const command = session.prompt("/park");
+		compactGate.resolve();
+		await compacted;
+		await session.waitForIdle();
+
+		expect(await session.resetSessionContext()).toBeDefined();
+		await session.compact().catch(() => undefined);
+		await session.waitForIdle();
+		parkGate.resolve();
+		expect(await command).toBe(false);
+		await session.waitForIdle();
+
+		expect(promptSpy).not.toHaveBeenCalled();
 	});
 
 	/**

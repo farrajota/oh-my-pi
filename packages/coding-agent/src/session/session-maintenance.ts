@@ -1236,10 +1236,12 @@ export class SessionMaintenance {
 		if (ownsCompactionController) {
 			this.#compactionAbortController = compactionAbortController;
 			this.#manualCompactionCleanup = manualCompactionCleanup?.promise;
-			// A resume still withheld from an earlier pass belongs to this pass now:
-			// the earlier pass's abort already bumped the generation it captured, so
-			// re-decide with this pass's generation instead of stranding the turn.
-			inheritedResume = this.#deferredResumeGeneration !== undefined;
+			// A resume still withheld from an earlier pass belongs to this pass while
+			// the prompt generation it was withheld at is still current: the earlier
+			// pass's abort already bumped to it, so re-decide with this pass's
+			// generation instead of stranding the turn. A reset or new session since
+			// then advanced the generation, and its turn is not this session's to resume.
+			inheritedResume = this.#deferredResumeGeneration === this.#host.promptGeneration();
 			this.#deferredResumeGeneration = undefined;
 		}
 		// A manual pass supersedes any background speculation; running both would
@@ -1257,12 +1259,16 @@ export class SessionMaintenance {
 				// its behalf would nudge the model on the previous transcript instead.
 				const interruptedActiveTurn = this.#host.agent.state.isStreaming;
 				this.#host.disconnectFromAgent();
-				await this.#host.abort({ goalReason: "internal", preserveCompaction: true });
+				// The abort bumps the generation synchronously; capture it before
+				// awaiting the teardown, so a reset or new session during the teardown
+				// leaves the resume stale instead of adopting the new session's generation.
+				const aborted = this.#host.abort({ goalReason: "internal", preserveCompaction: true });
+				interruptedTurnGeneration = this.#host.promptGeneration();
+				await aborted;
 				resumeInterruptedTurn =
 					(interruptedActiveTurn || inheritedResume) &&
 					options?.suppressContinuation !== true &&
 					cfgCompactionAutoContinue.get(this.#host.settings) !== false;
-				interruptedTurnGeneration = this.#host.promptGeneration();
 				manualCompactionStarted = true;
 				await this.#emitLifecycleEvent(
 					{ type: "manual_compaction_start", ...(compactMode ? { mode: compactMode.name } : {}) },
