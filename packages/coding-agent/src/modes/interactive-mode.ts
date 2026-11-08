@@ -395,6 +395,7 @@ import type {
 import type { TodoItem, TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import type { ConversationPosition } from "./utils/conversation-position";
 import { materializeImageChipLinks, UiHelpers } from "./utils/ui-helpers";
+import { workingMessageSuffixContext } from "./working-message-suffix";
 
 import {
 	askTimeoutMs,
@@ -8909,7 +8910,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					return accent ? `${accent.dim}${spinner}\x1b[39m` : theme.fg("muted", spinner);
 				},
 				messageColorFn,
-				DEFAULT_WORKING_MESSAGE,
+				this.#loaderWorkingMessage(DEFAULT_WORKING_MESSAGE),
 				// The brand spinner lives in the status line while working; this row
 				// leads with the interrupt affordance instead of a second spinner.
 				// The leading space nudges the row one column right of the flush-left
@@ -8951,7 +8952,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (message === undefined) {
 			this.#pendingWorkingMessage = undefined;
 			if (this.loadingAnimation) {
-				this.loadingAnimation.setMessage(DEFAULT_WORKING_MESSAGE);
+				this.loadingAnimation.setMessage(this.#loaderWorkingMessage(DEFAULT_WORKING_MESSAGE));
 				this.#workingMessage = DEFAULT_WORKING_MESSAGE;
 			}
 			return;
@@ -8959,12 +8960,27 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		if (this.loadingAnimation) {
 			const label = typeof message === "function" ? this.#oneRowWorkingLabel(message) : message;
-			this.loadingAnimation.setMessage(label);
+			this.loadingAnimation.setMessage(this.#loaderWorkingMessage(label));
 			this.#workingMessage = label;
 			return;
 		}
 
 		this.#pendingWorkingMessage = message;
+	}
+
+	/**
+	 * The loader's text for `label`: with extension working-row suffixes registered, a live label
+	 * that appends them on every tick. The native working row keeps the bare label, since it
+	 * already shows the elapsed time.
+	 */
+	#loaderWorkingMessage(label: string | (() => string)): string | (() => string) {
+		const runner = this.session.extensionRunner;
+		if (!runner?.hasWorkingMessageSuffixes()) return label;
+		return this.#oneRowWorkingLabel(() => {
+			const message = typeof label === "function" ? label() : label;
+			const context = workingMessageSuffixContext(this.viewSession, this.sessionManager.getCwd(), Date.now());
+			return message + runner.renderWorkingMessageSuffix(message, context);
+		});
 	}
 
 	/**

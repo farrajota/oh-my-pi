@@ -15,6 +15,7 @@
 
 ### Added
 
+- Added `pi.registerWorkingMessageSuffix(name, renderer)` so extensions can append live run metrics (elapsed time from the session's run start, billed run tokens) to the interactive working row
 - Added `task.generateLabels` (default on); turning it off stops subagent tasks without a description from sending the small-model label request
 - Added `promptSuggestions.enabled`, `promptSuggestions.model` and `promptSuggestions.fallbackModel` settings (Interaction > Input), exported from the package entry as `cfgPromptSuggestions*` handles for external prompt-suggestions extensions
 - Added opt-in `--single-request` CLI launches with an ephemeral zero-tool session, configured-model verification, and a fail-closed one-dispatch/one-fetch transport budget that also caps every provider retry, fallback and replay at one request

@@ -58,6 +58,7 @@ import type {
 	ToolDefinition,
 	ToolInfo,
 	TranscriptPresenter,
+	WorkingMessageSuffixRenderer,
 } from "./types";
 
 installLegacyPiSpecifierShim();
@@ -306,6 +307,16 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	registerAssistantThinkingRenderer(renderer: AssistantThinkingRenderer): void {
 		this.extension.assistantThinkingRenderers.push(renderer);
+	}
+
+	registerWorkingMessageSuffix(name: string, renderer: WorkingMessageSuffixRenderer): void {
+		if (typeof renderer !== "function") {
+			throw new TypeError(
+				`registerWorkingMessageSuffix expects a function, got ${typeof renderer} (extension ${this.extension.path})`,
+			);
+		}
+		this.extension.workingMessageSuffixes ??= new Map();
+		this.extension.workingMessageSuffixes.set(name, renderer);
 	}
 
 	registerAssistantTextRenderer(renderer: AssistantTextRenderer): void {

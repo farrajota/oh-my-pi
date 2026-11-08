@@ -117,7 +117,7 @@ Core methods:
 
 - `on(event, handler)`
 - `registerTool`, `registerCommand`, `registerShortcut`, `getShortcutConflict`, `registerFlag`
-- `registerMessageRenderer`, `registerAssistantThinkingRenderer`, `registerAssistantTextRenderer`, `registerTranscriptPresenter`, `registerLinkScheme`
+- `registerMessageRenderer`, `registerAssistantThinkingRenderer`, `registerAssistantTextRenderer`, `registerTranscriptPresenter`, `registerLinkScheme`, `registerWorkingMessageSuffix`
 - `registerComposerShape`
 - `setLabel`, `getFlag`
 - `sendMessage`, `sendUserMessage`, `appendEntry`, `exec`
@@ -1354,6 +1354,17 @@ pi.registerAssistantThinkingRenderer((context, theme) => {
 ```
 
 Used by interactive rendering to add display-only supplemental UI below each visible assistant thinking block. The renderer receives the already-visible thinking text, content/thinking indexes, theme, and a `requestRender()` callback for async renderers. All registered renderers that return a component are appended in registration order. Renderers must not mutate messages; the original thinking block remains the provider/session source of truth.
+
+## Working message suffix
+
+```ts
+pi.registerWorkingMessageSuffix("elapsed", (message, state) => {
+	if (state.elapsedMs === undefined) return undefined;
+	return ` ${Math.floor(state.elapsedMs / 1000)}s · +${state.runTokenDelta ?? 0} tokens`;
+});
+```
+
+Appends text to the interactive working row (`⎋ Working…`) while a run is in progress. The renderer runs on every repaint of the row with the row's current message and a context: `now`, `startedAt` and `elapsedMs` (from the viewed session's run start, so they survive a focus switch; unset while idle), `runTokenDelta` (tokens billed by the run's finished assistant requests: input, cache writes and output, as in the turn usage line; it grows when a request ends, not while it streams) and `cwd`. Suffixes are concatenated in extension load order, then registration order; return `undefined` or `""` to add nothing. Registering a name again replaces that renderer. A renderer that throws is reported once on the extension error channel and skipped from then on. The row stays one terminal line, so long suffixes are cut. The native (TSP) working row shows its own elapsed time and does not call the renderers; headless modes never call them.
 
 ## Assistant text renderer
 

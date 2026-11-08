@@ -2045,6 +2045,15 @@ export interface ExtensionAPI {
 	registerAssistantThinkingRenderer(renderer: AssistantThinkingRenderer): void;
 
 	/**
+	 * Append text to the interactive working row's message (for example elapsed time and run
+	 * tokens). Renderers run on every repaint of the row, in extension load order and then
+	 * registration order; return `undefined` or `""` to add nothing. A renderer that throws is
+	 * reported once through the extension error channel and then skipped. Registering the same
+	 * `name` again replaces the earlier renderer. Headless modes never call renderers.
+	 */
+	registerWorkingMessageSuffix(name: string, renderer: WorkingMessageSuffixRenderer): void;
+
+	/**
 	 * Register a display-only transform for assistant text blocks: it returns the markdown to draw.
 	 * Called with the full text so far each time a streaming update is drawn (replies skip the
 	 * smooth-streaming reveal while renderers are active) and once more when the text is final.
@@ -2458,6 +2467,29 @@ export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionAction
 }
 
 /** Loaded extension with all registered items. */
+/** What a working-row suffix renderer sees on each repaint. */
+export interface WorkingMessageSuffixContext {
+	/** Epoch ms of this repaint. */
+	now: number;
+	/** Epoch ms the viewed session's current run started; undefined while it is idle. */
+	startedAt?: number;
+	/** `now - startedAt`; undefined while the session is idle. */
+	elapsedMs?: number;
+	/**
+	 * Tokens billed for the run so far, counted like the turn usage line: input, cache writes and
+	 * output of every assistant message the run has finished. Cache reads stay out.
+	 */
+	runTokenDelta?: number;
+	/** Working directory of the session. */
+	cwd: string;
+}
+
+/** Returns text appended to the working message, or `undefined` to add nothing. */
+export type WorkingMessageSuffixRenderer = (
+	message: string,
+	context: WorkingMessageSuffixContext,
+) => string | undefined;
+
 export interface Extension {
 	path: string;
 	resolvedPath: string;
@@ -2478,6 +2510,8 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	/** Working-row suffix renderers from `registerWorkingMessageSuffix`, keyed by name. */
+	workingMessageSuffixes?: Map<string, WorkingMessageSuffixRenderer>;
 	/** Set once the extension calls `registerProvider`; providers feed startup model resolution. */
 	registersProviders?: boolean;
 }

@@ -114,6 +114,7 @@ import type {
 	UserBashEventResult,
 	UserPythonEvent,
 	UserPythonEventResult,
+	WorkingMessageSuffixContext,
 } from "./types";
 
 import {
@@ -564,6 +565,8 @@ export class ExtensionRunner {
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
 	/** Link schemes already reported as claimed by more than one extension. */
 	#warnedLinkSchemes = new Set<string>();
+	/** `resolvedPath\0name` of working-row suffix renderers that threw; they are skipped from then on. */
+	#failedWorkingMessageSuffixes = new Set<string>();
 	#toolRegistrationScope = new AsyncLocalStorage<ToolRegistrationScope>();
 	#toolRegistrationBarrier: Promise<void> | undefined;
 	#initialized = false;
@@ -1511,6 +1514,39 @@ export class ExtensionRunner {
 
 	getAssistantThinkingRenderers(): AssistantThinkingRenderer[] {
 		return this.extensions.flatMap(ext => ext.assistantThinkingRenderers);
+	}
+
+	/** Whether any active extension registered a working-row suffix renderer. */
+	hasWorkingMessageSuffixes(): boolean {
+		return this.extensions.some(ext => (ext.workingMessageSuffixes?.size ?? 0) > 0);
+	}
+
+	/**
+	 * Concatenate every active extension's working-row suffix for `message`. A renderer that throws
+	 * is reported once and skipped from then on, so a broken extension cannot break the row's repaint.
+	 */
+	renderWorkingMessageSuffix(message: string, context: WorkingMessageSuffixContext): string {
+		let result = "";
+		for (const ext of this.extensions) {
+			if (!ext.workingMessageSuffixes) continue;
+			for (const [name, renderer] of ext.workingMessageSuffixes) {
+				const key = `${ext.resolvedPath}\0${name}`;
+				if (this.#failedWorkingMessageSuffixes.has(key)) continue;
+				try {
+					const suffix = renderer(message, context);
+					if (suffix) result += suffix;
+				} catch (err) {
+					this.#failedWorkingMessageSuffixes.add(key);
+					this.emitError({
+						extensionPath: ext.path,
+						event: `working_message_suffix:${name}`,
+						error: err instanceof Error ? err.message : String(err),
+						stack: err instanceof Error ? err.stack : undefined,
+					});
+				}
+			}
+		}
+		return result;
 	}
 
 	/**
