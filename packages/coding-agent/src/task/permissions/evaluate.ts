@@ -85,32 +85,52 @@ function isPathRuleExempt(toolKey: string, target: string): boolean {
 	return toolKey === "write" && (hasScheme(target, "agent://") || hasScheme(target, "xd://"));
 }
 
+/** Schemes that expose another agent's work: its transcript and its output, with the noun a denial names. */
+const AGENT_RECORD_SCHEMES: readonly (readonly [scheme: string, noun: string])[] = [
+	["history://", "history"],
+	["agent://", "output"],
+];
+
 /**
- * `history://<id>` of an agent other than `actorId`. The index (`history://`) lists ids only, and
- * `history://current` is the caller's own branch.
+ * The noun for `target` when it reads the transcript or output of an agent outside `actorId`'s own
+ * subtree, else `undefined`. Nested agents have dot-qualified ids (`Parent.Child`), and a descendant
+ * runs under its ancestor's scope, so the agent itself and its descendants stay readable. An index
+ * (`history://`, `agent://`) names ids only, and `history://current` is the caller's own branch.
  */
-function otherAgentHistory(target: string, actorId: string): boolean {
-	if (!hasScheme(target, "history://")) return false;
-	const id = target.slice("history://".length).split(/[/:?#]/, 1)[0] ?? "";
-	return id.length > 0 && id.toLowerCase() !== "current" && id !== actorId;
+function outsideOwnSubtree(target: string, actorId: string): string | undefined {
+	for (const [scheme, noun] of AGENT_RECORD_SCHEMES) {
+		if (!hasScheme(target, scheme)) continue;
+		const id = target.slice(scheme.length).split(/[/:?#]/, 1)[0] ?? "";
+		if (id.length === 0 || id === actorId || id.startsWith(`${actorId}.`)) return undefined;
+		return scheme === "history://" && id.toLowerCase() === "current" ? undefined : noun;
+	}
+	return undefined;
 }
 
-/** P7: a secrets-blind subagent cannot read another agent's transcript, which may hold what it may not see. */
-function otherAgentHistoryDenial(
+/**
+ * P7: a secrets-blind subagent cannot read the transcript or output of an agent outside its own
+ * subtree, which may hold what it may not see. A `write` to `agent://` is a message, not a read.
+ */
+function otherAgentRecordDenial(
 	scope: PermissionScope,
 	toolName: string,
 	targets: readonly string[],
 ): PermissionDecision | undefined {
 	if (!scope.guardrails.secretsBlind) return undefined;
-	const history = targets.find(target => otherAgentHistory(target, scope.actorId));
-	if (history === undefined) return undefined;
-	return deny(
-		"guardrail",
-		`BLOCKED: secrets-blind guardrail denied another agent's history '${history}'.`,
-		"guardrail:secrets-blind-history",
-		toolName,
-		[history],
-	);
+	const key = permissionToolKey(toolName);
+	for (const target of targets) {
+		if (key === "write" && hasScheme(target, "agent://")) continue;
+		const noun = outsideOwnSubtree(target, scope.actorId);
+		if (noun === undefined) continue;
+		return deny(
+			"guardrail",
+			`BLOCKED: secrets-blind guardrail denied another agent's ${noun} '${target}'.`,
+			`guardrail:secrets-blind-${noun}`,
+			toolName,
+			[target],
+		);
+	}
+	return undefined;
 }
 
 function evaluateToolName(
@@ -233,8 +253,8 @@ export function evaluateSubagentPermission(input: PermissionCallInput): Permissi
 	}
 	const guardrailDecision = evaluatePermissionGuardrails({ scope, toolName, toolInput: input.toolInput });
 	if (guardrailDecision.action === "deny") return guardrailDecision;
-	const historyDenial = otherAgentHistoryDenial(scope, toolName, targets);
-	if (historyDenial) return historyDenial;
+	const recordDenial = otherAgentRecordDenial(scope, toolName, targets);
+	if (recordDenial) return recordDenial;
 	if (scope.guardrails.secretsBlind) {
 		const secret = (input.targets ?? []).find(isSecretPath);
 		if (secret !== undefined) return secretsBlindDenial(toolName, [secret]);
@@ -258,8 +278,8 @@ export function evaluatePermissionPath(input: {
 		const pathDecision = evaluatePathCandidates(scope, toolName, [toPathCandidate(input.path, input.cwd)], input.cwd);
 		if (pathDecision.action === "deny") return pathDecision;
 	}
-	const historyDenial = otherAgentHistoryDenial(scope, toolName, [input.path]);
-	if (historyDenial) return historyDenial;
+	const recordDenial = otherAgentRecordDenial(scope, toolName, [input.path]);
+	if (recordDenial) return recordDenial;
 	if (scope.guardrails.secretsBlind && isSecretPath(input.path)) return secretsBlindDenial(toolName, [input.path]);
 	return ALLOW;
 }

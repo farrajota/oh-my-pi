@@ -52,6 +52,44 @@ describe("history:// under secrets-blind", () => {
 	});
 });
 
+describe("agent:// outputs under secrets-blind", () => {
+	const blind = () => enforceScope({ guardrails: { noNetwork: false, secretsBlind: true } });
+
+	it("refuses another agent's output", async () => {
+		const [other, nested] = await runCalls(blind(), [
+			{ name: "read", arguments: { path: "agent://OtherAgent" } },
+			{ name: "read", arguments: { path: "agent://OtherAgent.Worker/reports/0" } },
+		]);
+		for (const result of [other, nested]) {
+			expect(result?.isError).toBe(true);
+			expect(result?.text).toContain("BLOCKED: secrets-blind guardrail denied another agent's output");
+		}
+	});
+
+	it("does not refuse the agent's own output or its descendants' outputs and transcripts", async () => {
+		const results = await runCalls(blind(), [
+			{ name: "read", arguments: { path: "agent://ScopedChild" } },
+			{ name: "read", arguments: { path: "agent://ScopedChild.Worker" } },
+			{ name: "read", arguments: { path: "history://ScopedChild.Worker" } },
+		]);
+		for (const result of results) expect(result.text).not.toContain("BLOCKED");
+	});
+
+	it("does not refuse a message to another agent", async () => {
+		const [message] = await runCalls(blind(), [
+			{ name: "write", arguments: { path: "agent://Main", content: "status update" } },
+		]);
+		expect(message?.text).not.toContain("BLOCKED");
+	});
+
+	it("leaves an allowlist's refusal of agent:// reads unchanged", async () => {
+		const [read] = await runCalls(enforceScope({ tools: ["read"], allowPathGroups: [["src"]] }), [
+			{ name: "read", arguments: { path: "agent://OtherAgent" } },
+		]);
+		expect(read?.text).toContain("BLOCKED: Subagent permission profile does not allow path 'agent://OtherAgent'.");
+	});
+});
+
 describe("local:// files", () => {
 	it("applies deny paths to the file a local:// URL names, and keeps the rest writable and readable", async () => {
 		const [denied, written, read] = await runCalls(
