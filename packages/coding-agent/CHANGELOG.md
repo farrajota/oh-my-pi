@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- Chromium flags passed to `launchHeadlessBrowser` through `args` are no longer dropped when they are also on the stealth ignore list of puppeteer defaults (for example `--disable-component-extensions-with-background-pages`)
 - Switching sessions while something is still writing to the old one (for example a vibe worker's lifecycle event) no longer writes the new session's entries into the old file or forks the switch onto a new sibling file
 - The `omp launch` daemon broker no longer shuts down under a client that has connected but not yet authenticated, and closes a connection that does not authenticate within 10 seconds
 - With an absolute `PI_CONFIG_DIR`, user config discovery reads that directory instead of a copy nested under home, and project plugin registries are found in the project's `.omp/`

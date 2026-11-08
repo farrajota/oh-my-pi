@@ -714,9 +714,12 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 			defaultViewport: opts.headless ? initialViewport : null,
 			executablePath,
 			args: launchArgs,
+			// puppeteer appends `args` to its defaults and then filters the merged list
+			// through `ignoreDefaultArgs`, so a requested flag that is also on the
+			// ignore list would be dropped. Requested args win.
 			ignoreDefaultArgs: [
 				...new Set([...stealthIgnoreDefaultArgs(executablePath), ...(opts.ignoreDefaultArgs ?? [])]),
-			],
+			].filter(arg => !launchArgs.includes(arg)),
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
 		try {

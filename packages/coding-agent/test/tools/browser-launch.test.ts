@@ -135,6 +135,20 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("process-local headless launch", () => {
 		30_000,
 	);
 
+	it("keeps a requested flag that is also a stealth-ignored puppeteer default", async () => {
+		// puppeteer appends `args` to its defaults and filters the merged list through
+		// `ignoreDefaultArgs`, so a requested flag on the stealth ignore list vanished.
+		const requested = "--disable-component-extensions-with-background-pages";
+		expect(stealthIgnoreDefaultArgs("/usr/bin/chromium")).toContain(requested);
+		const { browser, userDataDir } = await launchHeadlessBrowser({ headless: true, args: [requested] });
+		try {
+			expect(browser.process()?.spawnargs).toContain(requested);
+		} finally {
+			await closeLaunchedBrowser(browser);
+			if (userDataDir) await removeUserDataDir(userDataDir);
+		}
+	}, 30_000);
+
 	it("serves the tab-worker endpoint on a debugging port the caller picked", async () => {
 		const port = await findFreeCdpPort();
 		const { browser, wsEndpoint, userDataDir } = await launchHeadlessBrowser({
