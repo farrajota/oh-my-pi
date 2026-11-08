@@ -12,6 +12,7 @@ import { approvalCacheKeyForPath } from "../../tools/approval-cache";
 import { approvalTargetKey, approvalTreeSearchFolderKey } from "../../tools/approval-targets";
 import { evaluatePermissionPath, evaluateSubagentPermission, permissionPathArguments } from "./evaluate";
 import { hasPathRules } from "./path-rules";
+import { protectedPathRefusal } from "./protected-paths";
 import { cfgTaskPermissionsActiveScope } from "./settings";
 import { decodePermissionScope } from "./snapshot";
 import type { DeepImmutable, PermissionScope } from "./types";
@@ -62,7 +63,7 @@ export function permissionApprovalGuard(settings: Settings, cwd: string): Approv
 	if (active === undefined) return undefined;
 	if (!active.ok) return unreadableScopeGuard(active.error);
 	if (active.scope.mode !== "enforce") return undefined;
-	return scopeGuard(active.scope, cwd);
+	return scopeGuard(active.scope, cwd, settings.getAgentDir());
 }
 
 /** Why a call is refused when the session's scope does not decode. */
@@ -76,14 +77,18 @@ function unreadableScopeGuard(error: string): ApprovalGuard {
 	};
 }
 
-function scopeGuard(scope: DeepImmutable<PermissionScope>, cwd: string): ApprovalGuard {
+function scopeGuard(scope: DeepImmutable<PermissionScope>, cwd: string, agentDir: string): ApprovalGuard {
 	// Path rules and secrets-blind also see each target's real path; nothing else needs it.
 	const checksTargets = hasPathRules(scope) || scope.guardrails.secretsBlind;
 	return {
-		check(tool, args) {
+		check(tool, args, call) {
 			const toolInput = isRecord(args) ? args : {};
 			const decision = evaluateSubagentPermission({ scope, toolName: tool.name, toolInput, cwd });
 			if (decision.action === "deny") return { reason: decision.reason };
+			if (scope.restricted && call.tier !== "read") {
+				const reason = protectedPathRefusal(canonicalTargets(tool, args, toolInput, cwd), agentDir);
+				if (reason !== undefined) return { reason };
+			}
 			if (!checksTargets) return undefined;
 			// Canonical targets resolve symlinks, so relative rules resolve against the real cwd too.
 			const canonicalCwd = approvalCacheKeyForPath(cwd);
