@@ -347,6 +347,7 @@ import { buildNamedToolChoice } from "./utils/tool-choice";
 import { VibeSessionRegistry } from "./vibe/runtime";
 import { registerLocalInferenceApi } from "./tiny/local-inference-api";
 import { shutdownTinyTitleClient } from "./tiny/title-client";
+import { permissionResultFilter } from "./task/permissions/session-checks";
 import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
 import {
@@ -2143,9 +2144,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		totalLines: 0,
 		agentsMdFiles: [],
 	};
+	// A subagent permission scope leaves the entries it refuses out of the tree.
+	const workspaceEntryFilter = (): ((absolutePath: string) => boolean) | undefined =>
+		permissionResultFilter(settings, cwd, "read");
 	const scanWorkspaceTree = (): Promise<WorkspaceTree> => {
 		const scan = logger.time("buildWorkspaceTree", () =>
-			buildWorkspaceTree(cwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }),
+			buildWorkspaceTree(cwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS, keep: workspaceEntryFilter() }),
 		);
 		scan.catch(() => {});
 		return scan;
@@ -4546,6 +4550,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				secretsEnabled: obfuscator?.obfuscates() === true,
 				workspaceTree: workspaceTreePromise ?? emptyWorkspaceTree,
 				includeWorkspaceTree,
+				workspaceEntryFilter: workspaceEntryFilter(),
 				memoryBackend: memoryBackend?.id,
 				securityEnabled: cfgSecurityEnabled.get(settings),
 				settingsApproval: toolSession.settingsApproval === true,

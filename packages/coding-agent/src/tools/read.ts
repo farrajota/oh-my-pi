@@ -60,6 +60,7 @@ import {
 	spansCoverEveryLine,
 	warmBlockContext,
 } from "../utils/block-context";
+import { permissionResultFilter } from "../task/permissions/session-checks";
 import { isCpuProfilePath, renderCpuProfile } from "../utils/cpuprofile";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { loadHeifImageInput, loadImageInput, loadSvgImageInput } from "../utils/image-loading";
@@ -3304,6 +3305,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				// `lineCap` truncates the rendered tree itself; selectors slice the full
 				// rendering below instead so `:N-M` and `:-N` see the same listing.
 				lineCap: null,
+				keep: permissionResultFilter(this.session.settings, this.session.cwd, this.name),
 			});
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);

@@ -5,6 +5,7 @@ import { isEnoent } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import localDoc from "../prompts/internal-urls/local.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
+import { internalUrlListingFilter } from "../task/permissions/session-checks";
 import {
 	buildDirectoryResource,
 	containedRealPath,
@@ -186,8 +187,11 @@ function listCompletionFiles(localRoot: string): Promise<string[]> {
 	return listing;
 }
 
-async function buildListing(url: InternalUrl, localRoot: string): Promise<InternalResource> {
-	const files = await listFilesRecursively(localRoot);
+async function buildListing(url: InternalUrl, localRoot: string, context?: ResolveContext): Promise<InternalResource> {
+	const listed = await listFilesRecursively(localRoot);
+	// The caller's subagent permission scope leaves out the files it refuses.
+	const permitted = internalUrlListingFilter(context?.settings, context?.cwd, "local://", localRoot);
+	const files = permitted ? listed.filter(file => permitted(file)) : listed;
 	const listing = files.length === 0 ? "(empty)" : files.map(file => `- [${file}](local://${file})`).join("\n");
 	const content =
 		`# Local\n\n` +
@@ -534,10 +538,10 @@ export class LocalProtocolHandler implements ProtocolHandler {
 
 		const resolved = await resolveLocalTarget(url, opts);
 		if (resolved.kind === "listing") {
-			return buildListing(url, resolved.root);
+			return buildListing(url, resolved.root, context);
 		}
 		if (resolved.kind === "directory") {
-			return buildDirectoryResource(url.href, resolved.path, [LOCAL_WRITE_NOTE]);
+			return buildDirectoryResource(url.href, resolved.path, [LOCAL_WRITE_NOTE], context);
 		}
 
 		return buildFileResource(url, resolved);

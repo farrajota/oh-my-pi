@@ -125,13 +125,17 @@ function isBareMemoryUrl(url: InternalUrl): boolean {
 	return !rawPathname || rawPathname === "/";
 }
 
-async function tryResolveInRoot(url: InternalUrl, memoryRoot: string): Promise<InternalResource | undefined> {
+async function tryResolveInRoot(
+	url: InternalUrl,
+	memoryRoot: string,
+	context?: ResolveContext,
+): Promise<InternalResource | undefined> {
 	const realTargetPath = (await locateInRoot(url, memoryRoot, false))?.real;
 	if (realTargetPath === undefined) return undefined;
 
 	const stat = await fs.stat(realTargetPath);
 	if (stat.isDirectory()) {
-		return buildDirectoryResource(url.href, realTargetPath);
+		return buildDirectoryResource(url.href, realTargetPath, undefined, context);
 	}
 	if (!stat.isFile()) {
 		throw new Error(`memory:// URL must resolve to a file or directory: ${url.href}`);
@@ -457,7 +461,7 @@ export class MemoryProtocolHandler implements ProtocolHandler {
 				if (isEnoent(error)) continue;
 				throw error;
 			}
-			const result = await tryResolveInRoot(url, root);
+			const result = await tryResolveInRoot(url, root, context);
 			if (result) return result;
 		}
 

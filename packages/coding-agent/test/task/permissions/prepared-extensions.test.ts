@@ -14,6 +14,7 @@ import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { PermissionScope } from "@oh-my-pi/pi-coding-agent/task/permissions/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import type { WorkspaceTree } from "@oh-my-pi/pi-coding-agent/workspace-tree";
 import { createSessionDefaults } from "../../helpers/session-defaults";
 import { enforceScope, scopedSettings } from "./scope-fixtures";
 
@@ -67,7 +68,7 @@ const customToolPaths: ToolPathWithSource[] = [
 	{ path: "/parent/.omp/tools/x.ts", source: { provider: "config", providerName: "Config", level: "project" } },
 ];
 
-async function spawnUnder(settings: Settings) {
+async function spawnUnder(settings: Settings, extra: Partial<Parameters<typeof runSubprocess>[0]> = {}) {
 	const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(sessionResult(yieldingSession()));
 	const result = await runSubprocess({
 		cwd: "/tmp",
@@ -81,6 +82,7 @@ async function spawnUnder(settings: Settings) {
 		preloadedExtensionPaths: [extensionPath],
 		preloadedPreparedExtensions: preparedExtensions,
 		preloadedCustomToolPaths: customToolPaths,
+		...extra,
 	});
 	expect(result.exitCode).toBe(0);
 	return spy.mock.calls[0]?.[0];
@@ -113,5 +115,28 @@ describe("extension code for a child under a permission scope", () => {
 		expect(forwarded?.preloadedPreparedExtensions).toBe(preparedExtensions);
 		expect(forwarded?.preloadedExtensionPaths).toEqual([extensionPath]);
 		expect(forwarded?.preloadedCustomToolPaths).toBe(customToolPaths);
+	});
+});
+
+describe("the parent's workspace tree for a child under a permission scope", () => {
+	const tree: WorkspaceTree = {
+		rootPath: "/tmp",
+		rendered: "restricted/\n  keys.ts",
+		truncated: false,
+		totalLines: 2,
+		agentsMdFiles: [],
+	};
+
+	it("is not forwarded to a child whose scope filters paths, which scans its own filtered tree", async () => {
+		const scope = enforceScope({ tools: ["read"], denyPathGroups: [["restricted"]] });
+		const forwarded = await spawnUnder(scopedSettings(scope), { workspaceTree: tree });
+
+		expect(forwarded?.workspaceTree).toBeUndefined();
+	});
+
+	it("is forwarded to a child under a scope without path rules or secrets-blind", async () => {
+		const forwarded = await spawnUnder(scopedSettings(enforceScope({ tools: ["read"] })), { workspaceTree: tree });
+
+		expect(forwarded?.workspaceTree).toBe(tree);
 	});
 });

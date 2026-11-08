@@ -37,11 +37,20 @@ export interface BuildDirectoryTreeOptions {
 	rootLimit?: number | null;
 	/** Hard rendered line cap. `null` disables. Default: `null`. */
 	lineCap?: number | null;
+	/** Keeps an entry (absolute path); a dropped directory takes its contents with it. Default: all. */
+	keep?: (absolutePath: string) => boolean;
 }
 
 export interface BuildWorkspaceTreeOptions {
 	/** Abort the native workspace scan after this many milliseconds. */
 	timeoutMs?: number;
+	/** Keeps an entry (absolute path); a dropped directory takes its contents with it. Default: all. */
+	keep?: (absolutePath: string) => boolean;
+}
+
+/** The scanned entries `keep` admits; entries are root-relative with `/` separators. */
+function keptEntries(rootPath: string, entries: readonly GlobMatch[], keep?: (absolutePath: string) => boolean) {
+	return keep ? entries.filter(entry => keep(path.join(rootPath, entry.path))) : entries;
 }
 
 /**
@@ -69,7 +78,7 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 		reportDirectoryErrors: true,
 	});
 
-	return assembleTree(rootPath, result.entries, {
+	return assembleTree(rootPath, keptEntries(rootPath, result.entries, options.keep), {
 		perDirLimit,
 		rootLimit,
 		lineCap: options.lineCap === undefined ? null : options.lineCap,
@@ -105,7 +114,7 @@ export async function buildWorkspaceTree(cwd: string, options: BuildWorkspaceTre
 			collectAgentsMd: true,
 			timeoutMs: options.timeoutMs,
 		});
-		const tree = assembleTree(rootPath, result.entries, {
+		const tree = assembleTree(rootPath, keptEntries(rootPath, result.entries, options.keep), {
 			perDirLimit: WORKSPACE_DEFAULTS.perDirLimit,
 			rootLimit: WORKSPACE_DEFAULTS.perDirLimit,
 			lineCap: WORKSPACE_DEFAULTS.lineCap,
@@ -116,7 +125,11 @@ export async function buildWorkspaceTree(cwd: string, options: BuildWorkspaceTre
 			ageMode: "absolute",
 			compactMetadata: false,
 		});
-		return { ...tree, agentsMdFiles: result.agentsMdFiles };
+		const { keep } = options;
+		const agentsMdFiles = keep
+			? result.agentsMdFiles.filter(file => keep(path.resolve(rootPath, file)))
+			: result.agentsMdFiles;
+		return { ...tree, agentsMdFiles };
 	} catch {
 		return { ...emptyTree(rootPath), agentsMdFiles: [] };
 	}

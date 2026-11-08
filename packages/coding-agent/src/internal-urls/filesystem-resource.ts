@@ -2,7 +2,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { hasFsCode, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils";
 import { isMarkdownPath } from "@oh-my-pi/pi-tui/lang-from-path";
-import type { InternalResource } from "./types";
+import { internalUrlListingFilter } from "../task/permissions/session-checks";
+import type { InternalResource, ResolveContext } from "./types";
 
 /** Resource content type inferred from a file extension: markdown, JSON, or plain text. */
 export function contentTypeForPath(filePath: string): InternalResource["contentType"] {
@@ -136,9 +137,13 @@ export async function buildDirectoryResource(
 	url: string,
 	directoryPath: string,
 	notes?: string[],
+	context?: ResolveContext,
 ): Promise<InternalResource> {
 	const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-	const content = formatDirectoryListing(entries.map(e => ({ name: e.name, isDirectory: e.isDirectory() })));
+	// The caller's subagent permission scope leaves out the entries it refuses.
+	const permitted = internalUrlListingFilter(context?.settings, context?.cwd, url, directoryPath);
+	const shown = permitted ? entries.filter(entry => permitted(entry.name)) : entries;
+	const content = formatDirectoryListing(shown.map(e => ({ name: e.name, isDirectory: e.isDirectory() })));
 	return {
 		url,
 		content,

@@ -572,6 +572,8 @@ export interface BuildSystemPromptOptions {
 	secretsEnabled?: boolean;
 	/** Pre-loaded workspace tree (skips discovery if provided). May be a Promise to allow early kick-off. */
 	workspaceTree?: WorkspaceTree | Promise<WorkspaceTree>;
+	/** Keeps a workspace tree entry (absolute path); the session's permission scope supplies it. */
+	workspaceEntryFilter?: (absolutePath: string) => boolean;
 	/** Active `memory.backend` id; undefined when memory is off. */
 	memoryBackend?: string;
 	/** Whether the read-only security:// resource namespace is active. */
@@ -687,6 +689,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		taskIrcEnabled = false,
 		secretsEnabled = false,
 		workspaceTree: providedWorkspaceTree,
+		workspaceEntryFilter,
 		scoutAvailable = true,
 		delegationBias = "eager",
 		memoryBackend,
@@ -813,19 +816,24 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 				? await Promise.resolve(providedWorkspaceTree)
 				: includeWorkspaceTree
 					? await logger.time("buildWorkspaceTree", () =>
-							buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
+							buildWorkspaceTree(resolvedCwd, {
+								timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS,
+								keep: workspaceEntryFilter,
+							}),
 						)
 					: { rootPath: resolvedCwd, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] };
 		if (additionalRootsForTree.length === 0 || !includeWorkspaceTree) return primary;
 		const extraTrees = await Promise.all(
 			additionalRootsForTree.map(root =>
-				buildWorkspaceTree(root, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }).catch(() => ({
-					rootPath: root,
-					rendered: "",
-					truncated: false,
-					totalLines: 0,
-					agentsMdFiles: [],
-				})),
+				buildWorkspaceTree(root, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS, keep: workspaceEntryFilter }).catch(
+					() => ({
+						rootPath: root,
+						rendered: "",
+						truncated: false,
+						totalLines: 0,
+						agentsMdFiles: [],
+					}),
+				),
 			),
 		);
 		return { ...primary, agentsMdFiles: [...primary.agentsMdFiles, ...extraTrees.flatMap(t => t.agentsMdFiles)] };

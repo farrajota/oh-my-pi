@@ -131,7 +131,7 @@ import { TextTap } from "../job-widgets/text-tap";
 import { TOOLS_SOURCE_ID } from "../job-widgets/types";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
-import { permissionWithholdsExtensionCode } from "./permissions/session-checks";
+import { permissionResultFilter, permissionWithholdsExtensionCode } from "./permissions/session-checks";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
@@ -4558,6 +4558,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 	const childDepth = parentDepth + 1;
 	const restrictToolNames = options.restrictToolNames === true || preparedSession !== undefined;
 	const withholdExtensionCode = permissionWithholdsExtensionCode(subagentSettings);
+	// The parent's tree lists what the child's scope may refuse; such a child scans its own, filtered.
+	const forwardWorkspaceTree = permissionResultFilter(subagentSettings, worktree ?? cwd, "read") === undefined;
 	const atMaxDepth = maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
 
 	// Add tools if specified. Unstructured runs never get `yield`, even when
@@ -5005,7 +5007,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					excludeAgentsMd: true,
 					skills: options.skills,
 					promptTemplates: options.promptTemplates,
-					workspaceTree: options.workspaceTree,
+					workspaceTree: forwardWorkspaceTree ? options.workspaceTree : undefined,
 					rules: options.rules,
 					extensionRoots: options.extensionRoots,
 					preloadedExtensionPaths:

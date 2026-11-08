@@ -8,6 +8,7 @@ import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { getEditStore } from "../edit/store";
 
 import { sessionResolveContext } from "../internal-urls/context";
+import { InternalUrlRouter } from "../internal-urls/router";
 import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
 import astGrepDescription from "../prompts/tools/ast-grep.md" with { type: "text" };
 import { permissionResultFilter } from "../task/permissions/session-checks";
@@ -267,7 +268,9 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 							filesystem,
 						}),
 			);
-			const permitted = permissionResultFilter(this.session.settings, this.session.cwd, this.name);
+			const permitted = permissionResultFilter(this.session.settings, this.session.cwd, this.name, url =>
+				InternalUrlRouter.instance().locateSync(url, resolveContext),
+			);
 			const keptMatches = permitted
 				? found.matches.filter(match => permitted(resolveSearchResultPath(resolvedSearchPath, match.path)))
 				: found.matches;

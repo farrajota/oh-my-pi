@@ -11,6 +11,7 @@ import type { FindToolDetails } from "@oh-my-pi/pi-tui/tools/find";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { formatBytes, formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
 import { sessionResolveContext } from "../../internal-urls/context";
+import { InternalUrlRouter } from "../../internal-urls/router";
 import { InternalUrlFilesystem } from "../../internal-urls/url-filesystem";
 import { hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../../judgment";
 import findDescription from "../../prompts/tools/find.md" with { type: "text" };
@@ -88,10 +89,8 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		const rawScopeInput = params.path === undefined ? "" : normalizePathLikeInput(params.path);
 		// Host paths stay native; internal URLs (`local://`, `omp://`, …) are
 		// listed, scanned, and read in place through the URL filesystem.
-		const filesystem = new InternalUrlFilesystem({
-			context: sessionResolveContext(this.session, { signal, containSkillPaths: true }),
-			tier: resolveToolTier(this, params),
-		});
+		const resolveContext = sessionResolveContext(this.session, { signal, containSkillPaths: true });
+		const filesystem = new InternalUrlFilesystem({ context: resolveContext, tier: resolveToolTier(this, params) });
 		const root = await resolveSearchRoot(filesystem, rawScopeInput, cwd);
 		const scopePath =
 			root.path === path.resolve(cwd)
@@ -124,7 +123,9 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				judge,
 				spotlight: experiment ? { client: experiment.client, thinking: experiment.thinking } : undefined,
 				includeHidden: false,
-				permitted: permissionResultFilter(this.session.settings, cwd, this.name),
+				permitted: permissionResultFilter(this.session.settings, cwd, this.name, url =>
+					InternalUrlRouter.instance().locateSync(url, resolveContext),
+				),
 				signal,
 				deadline,
 				onProgress: message => {

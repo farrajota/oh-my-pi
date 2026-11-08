@@ -958,7 +958,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						limitReached: result.limitReached,
 					};
 				}
-				const permitted = permissionResultFilter(this.session.settings, this.session.cwd, this.name);
+				const permitted = permissionResultFilter(this.session.settings, this.session.cwd, this.name, url =>
+					router.locateSync(url, resolveContext),
+				);
 				if (permitted) {
 					// Archive members and fetched URLs are no workspace entries; the guard checked their roots.
 					const materialized = new Set([...materializedExternalPaths.values()].map(entry => path.resolve(entry)));

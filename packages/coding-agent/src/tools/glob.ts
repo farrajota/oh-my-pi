@@ -226,8 +226,9 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			}
 			const internalRouter = InternalUrlRouter.instance();
 			// Internal URLs resolve inside the native walk, bounded by the tier this call was approved at.
+			const resolveContext = sessionResolveContext(this.session, { signal, containSkillPaths: true });
 			const urlFilesystem = new InternalUrlFilesystem({
-				context: sessionResolveContext(this.session, { signal, containSkillPaths: true }),
+				context: resolveContext,
 				tier: resolveToolTier(this, params),
 			});
 			const normalizedPatterns = aliasResolvedPatterns.map(pattern => internalRouter.normalize(pattern));
@@ -309,7 +310,9 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			const missingPathsNote =
 				missingPaths.length > 0 ? `Skipped missing paths: ${missingPaths.join(", ")}` : undefined;
 			// Entries are reported cwd-relative (a trailing slash marks a folder) or as internal URLs.
-			const scopeFilter = permissionResultFilter(this.session.settings, this.session.cwd, this.name);
+			const scopeFilter = permissionResultFilter(this.session.settings, this.session.cwd, this.name, url =>
+				internalRouter.locateSync(url, resolveContext),
+			);
 			const permitted = (entry: string): boolean =>
 				scopeFilter === undefined ||
 				scopeFilter(internalRouter.canHandle(entry) ? entry : path.resolve(this.session.cwd, entry));

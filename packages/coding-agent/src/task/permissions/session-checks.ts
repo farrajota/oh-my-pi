@@ -10,6 +10,9 @@ import { evaluateInternalUrlFile, evaluatePermissionPath } from "./evaluate";
 import { activePermissionScope, permissionApprovalGuard, unreadableScopeReason } from "./guard";
 import { hasPathRules } from "./path-rules";
 
+/** An entry a search reports as an internal URL (`local://notes.md`) rather than a host path. */
+const URL_ENTRY = /^[a-z][a-z0-9+.-]*:\/\//i;
+
 /**
  * Why the session's scope refuses to spawn a subagent, or `undefined`. A spawn through eval
  * `agent()` or `workpool()` is delegation exactly like a `task` call, so it needs the same grant
@@ -23,13 +26,14 @@ export function permissionDelegationRefusal(settings: Settings, cwd: string): st
  * Which entries a recursive search (grep, glob, find, ast_grep) may report under the session's scope,
  * or `undefined` when the scope filters nothing. The approval guard sees only the search root; this
  * drops each found entry the deny paths, the allowlist or secrets-blind would refuse. An entry is
- * checked as found and, when it is a host path, by its real path too. A scope that does not decode
- * keeps nothing.
+ * checked as found and, when it is a host path, by its real path too; an internal URL entry is
+ * checked by the file `locateUrl` finds behind it. A scope that does not decode keeps nothing.
  */
 export function permissionResultFilter(
 	settings: Settings,
 	cwd: string,
 	toolName: string,
+	locateUrl?: (url: string) => string | undefined,
 ): ((entry: string) => boolean) | undefined {
 	const active = activePermissionScope(settings);
 	if (active === undefined) return undefined;
@@ -39,6 +43,11 @@ export function permissionResultFilter(
 	const canonicalCwd = approvalCacheKeyForPath(cwd);
 	return entry => {
 		if (evaluatePermissionPath({ scope, toolName, path: entry, cwd }).action === "deny") return false;
+		if (URL_ENTRY.test(entry)) {
+			// A found internal URL answers for the file behind it (P7), as a read of it would.
+			const file = locateUrl?.(entry);
+			return file === undefined || internalUrlFileRefusal(settings, cwd, entry, file) === undefined;
+		}
 		if (!path.isAbsolute(entry)) return true;
 		const real = approvalCacheKeyForPath(entry);
 		return (
@@ -82,4 +91,27 @@ export function permissionWithholdsExtensionCode(settings: Settings): boolean {
 	const active = activePermissionScope(settings);
 	if (active === undefined) return false;
 	return !active.ok || (active.scope.mode === "enforce" && active.scope.restricted);
+}
+
+/**
+ * Which entries a directory listing behind the internal URL `directoryUrl` may show, or `undefined`
+ * when the caller's scope filters nothing. An entry (`relativePath` below `directory`) is kept when
+ * {@link internalUrlFileRefusal} would let the URL that names it through.
+ */
+export function internalUrlListingFilter(
+	settings: Settings | undefined,
+	cwd: string | undefined,
+	directoryUrl: string,
+	directory: string,
+): ((relativePath: string) => boolean) | undefined {
+	if (!settings) return undefined;
+	const active = activePermissionScope(settings);
+	if (active === undefined) return undefined;
+	if (!active.ok) return () => false;
+	const { scope } = active;
+	if (scope.mode !== "enforce" || !(hasPathRules(scope) || scope.guardrails.secretsBlind)) return undefined;
+	const base = directoryUrl.replace(/\/+$/, "");
+	return relativePath =>
+		internalUrlFileRefusal(settings, cwd, `${base}/${relativePath}`, path.join(directory, relativePath)) ===
+		undefined;
 }

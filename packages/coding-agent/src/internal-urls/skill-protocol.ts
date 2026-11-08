@@ -241,12 +241,16 @@ async function locateSkillTarget(
 }
 
 /** The file or directory resource at a located target; a target removed since it was located rejects with ENOENT. */
-async function readSkillTarget(url: InternalUrl, target: LocatedSkillTarget): Promise<InternalResource> {
+async function readSkillTarget(
+	url: InternalUrl,
+	target: LocatedSkillTarget,
+	context?: ResolveContext,
+): Promise<InternalResource> {
 	const { path: targetPath, stats } = target;
 	if (!stats) throw new Error(`File not found: ${targetPath}`);
 
 	if (stats.isDirectory()) {
-		return buildDirectoryResource(url.href, targetPath);
+		return buildDirectoryResource(url.href, targetPath, undefined, context);
 	}
 	if (!stats.isFile()) {
 		throw new Error(`skill:// URL must resolve to a file or directory: ${url.href}`);
@@ -319,13 +323,13 @@ export class SkillProtocolHandler implements ProtocolHandler {
 		}
 
 		try {
-			return await readSkillTarget(url, target);
+			return await readSkillTarget(url, target, context);
 		} catch (error) {
 			if (!isEnoent(error)) throw error;
 			// The target was removed after it was located: an upgrade published the plugin's new
 			// version and deleted the old directory between the check and the read. Locate it again,
 			// which now finds the old skill gone and rediscovers it.
-			return readSkillTarget(url, await locateSkillTarget(url, context, false));
+			return readSkillTarget(url, await locateSkillTarget(url, context, false), context);
 		}
 	}
 

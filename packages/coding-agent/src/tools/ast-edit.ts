@@ -301,7 +301,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			);
 			// Under a subagent permission scope the guard saw only the roots: drop the files the scope
 			// refuses, and apply to exactly the previewed files that remain instead of walking again.
-			const permitted = permissionResultFilter(this.session.settings, this.session.cwd, this.name);
+			const permitted = permissionResultFilter(this.session.settings, this.session.cwd, this.name, url =>
+				InternalUrlRouter.instance().locateSync(url, resolveContext),
+			);
 			let result = preview;
 			let applyTargets = multiTargets;
 			if (permitted) {
