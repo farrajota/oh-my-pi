@@ -37,6 +37,7 @@ import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { cursorMcpPrefersReplaceEdit, normalizeCursorReplaceArgs } from "./cursor-bridge-tools";
 import type { MCPResourceReadResult } from "./mcp/types";
 import {
+	approvalGuardRefusal,
 	approvalRestrictions,
 	resolveApproval,
 	resolveApprovalFromContext,
@@ -372,6 +373,14 @@ function allowsDirectFileMutation(options: CursorExecBridgeOptions): boolean {
  */
 function refuseByWritePolicy(options: CursorExecBridgeOptions, toolName: string, pathArg: string): string | null {
 	const context = options.getToolContext?.();
+	const cwd = options.getCwd?.() ?? options.cwd;
+	// The frame names its file only in `pathArg`, so the guard and the restriction check key it here.
+	const target = approvalTargetKey(cwd, pathArg);
+	const subject = { name: toolName, approvalCacheTargets: () => (target === undefined ? undefined : [target]) };
+	const restrictions = approvalRestrictions(context?.settings, cwd);
+	// The subagent permission scope refuses outright, whatever the user's policy says.
+	const scopeRefusal = approvalGuardRefusal(subject, { path: pathArg }, { tier: "write" }, restrictions);
+	if (scopeRefusal !== undefined) return scopeRefusal;
 	const { approvalMode, userPolicies } = resolveApprovalFromContext(context);
 	const approval = resolveApproval(
 		{ name: toolName, approval: "write" },
@@ -381,14 +390,7 @@ function refuseByWritePolicy(options: CursorExecBridgeOptions, toolName: string,
 		getApprovalGrants(context?.settings?.getAgentDir(), context?.sessionManager?.getSessionId()),
 	);
 	if (approval.policy === "allow") {
-		// The frame names its file only in `pathArg`, so the restriction check keys it here.
-		const cwd = options.getCwd?.() ?? options.cwd;
-		const target = approvalTargetKey(cwd, pathArg);
-		const restriction = restrictedFolderReason(
-			{ name: toolName, approvalCacheTargets: () => (target === undefined ? undefined : [target]) },
-			undefined,
-			approvalRestrictions(context?.settings, cwd),
-		);
+		const restriction = restrictedFolderReason(subject, undefined, restrictions);
 		if (restriction === undefined) return null;
 	}
 	return approval.policy === "deny"
@@ -926,6 +928,17 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			}
 			const refusal = refuseByWritePolicy(this.options, "write", downloadPath);
 			if (refusal) throw new Error(refusal);
+		} else {
+			// A plain resource read answers to the permission scope as `read mcp://<uri>` would.
+			const context = this.options.getToolContext?.();
+			const cwd = this.options.getCwd?.() ?? this.options.cwd;
+			const refusal = approvalGuardRefusal(
+				{ name: "read" },
+				{ path: `mcp://${uri}` },
+				{ tier: "read" },
+				approvalRestrictions(context?.settings, cwd),
+			);
+			if (refusal !== undefined) throw new Error(refusal);
 		}
 		const mcp = this.options.mcpResources;
 		if (!mcp) return null;

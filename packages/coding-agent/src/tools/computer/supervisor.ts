@@ -9,6 +9,7 @@ import { workerHostEntry } from "@oh-my-pi/pi-utils/worker-host";
 import {
 	type ApprovalContextSource,
 	type ApprovalPolicy,
+	approvalRestrictions,
 	resolveApproval,
 	resolveApprovalFromContext,
 } from "../approval";
@@ -40,11 +41,20 @@ const RESTART_MESSAGE = "computer worker restarted; captures and ax refs were re
 
 /**
  * The user's `tools.approval["computer.control"]` policy. The approval mode never decides it: the default `yolo`
- * would hand the user's foreground to every headless run, so without an explicit entry the user is asked.
+ * would hand the user's foreground to every headless run, so without an explicit entry the user is asked. A
+ * subagent permission scope that refuses control denies it whatever that policy says. Control names no path, so
+ * no cwd is passed and restricted folders never match it.
  */
 function controlPolicy(context: ApprovalContextSource): ApprovalPolicy {
 	const { userPolicies } = resolveApprovalFromContext(context);
-	return resolveApproval({ name: "computer.control", approval: "exec" }, undefined, "always-ask", userPolicies).policy;
+	return resolveApproval(
+		{ name: "computer.control", approval: "exec" },
+		undefined,
+		"always-ask",
+		userPolicies,
+		undefined,
+		approvalRestrictions(context.settings, undefined),
+	).policy;
 }
 
 /** Runs desktop scripts and owns their persistent worker session. */

@@ -52,6 +52,8 @@ import type {
 } from "@oh-my-pi/pi-natives";
 
 import { cfgComputerEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import { encodePermissionScope } from "@oh-my-pi/pi-coding-agent/task/permissions/snapshot";
+import { enforceScope } from "../task/permissions/scope-fixtures";
 
 /** Method name of the last step in a facade call chain, or "" when the chain is malformed. */
 function terminalMethod(chain: unknown): string {
@@ -5126,5 +5128,56 @@ describe("window() waiting for a window to appear", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.output.trim().split("\n").at(-1)).toBe("151");
 		expect(native.listings).toBe(3);
+	});
+});
+
+describe("computer.control under a subagent permission scope", () => {
+	async function acquire(scope: Parameters<typeof enforceScope>[0]): Promise<{ value: unknown; active: boolean }> {
+		const native = new FakeNativeSession();
+		const session = policySession({
+			"tools.approval": { "computer.control": "allow" },
+			"task.permissions.activeScope": encodePermissionScope(enforceScope(scope)),
+		});
+		const supervisor = new ComputerSupervisor(
+			session,
+			() => liveWorker(native),
+			undefined,
+			undefined,
+			NO_ESCAPE_STOPS,
+		);
+		try {
+			const result = await supervisor.run(
+				'return await desktop.control.acquire({ reason: "Policy" })',
+				2_000,
+				snapshot(),
+				undefined,
+				{ hasUI: false, settings: session.settings } as AgentToolContext,
+			);
+			return { value: result.returnValue, active: native.controlActive };
+		} finally {
+			await supervisor.close();
+		}
+	}
+
+	it("denies control the scope denies, despite a user allow", async () => {
+		expect(await acquire({ denyTools: ["computer.control"] })).toEqual({
+			value: { active: false, reason: "denied" },
+			active: false,
+		});
+	});
+
+	it("denies control to an allowlist that does not name computer", async () => {
+		expect(await acquire({ tools: ["read"] })).toEqual({ value: { active: false, reason: "denied" }, active: false });
+	});
+
+	it("grants control to an allowlist that names computer", async () => {
+		expect(await acquire({ tools: ["computer"] })).toEqual({ value: { active: true }, active: true });
+	});
+
+	it("denies control under path rules even when the allowlist names computer", async () => {
+		expect(await acquire({ tools: ["computer"], denyPathGroups: [["secret"]] })).toEqual({
+			value: { active: false, reason: "denied" },
+			active: false,
+		});
 	});
 });

@@ -1,6 +1,12 @@
 import { evaluatePermissionGuardrails, isSecretPath, secretsBlindDenial } from "./guardrails";
 import { hasPathRules, type PathCandidate, pathMatchesPattern, toPathCandidate } from "./path-rules";
-import { isUnprovableEffectTool, MESSAGING_GRANT, normalizePermissionToolName, permissionToolKey } from "./tool-names";
+import {
+	isUnprovableEffectTool,
+	MESSAGING_GRANT,
+	normalizePermissionToolName,
+	permissionToolKey,
+	permissionToolOwner,
+} from "./tool-names";
 import type { PermissionDecision, PermissionDenialCode, PermissionScope } from "./types";
 
 const ALLOW: PermissionDecision = Object.freeze({ action: "allow", reason: "", matched: "" });
@@ -88,8 +94,12 @@ function evaluateToolName(
 	const denied = (name: string) => scope.denyTools.find(tool => permissionToolKey(tool) === name);
 	const listed = (name: string) =>
 		scope.tools === undefined || scope.tools.some(tool => permissionToolKey(tool) === name);
+	const owner = permissionToolOwner(key);
 	const messagingUse = key === "wait" || (key === "write" && targets.some(target => hasScheme(target, "agent://")));
-	const deniedTool = denied(key) ?? (messagingUse ? denied(MESSAGING_GRANT) : undefined);
+	const deniedTool =
+		denied(key) ??
+		(owner !== undefined ? denied(owner) : undefined) ??
+		(messagingUse ? denied(MESSAGING_GRANT) : undefined);
 	if (deniedTool !== undefined) {
 		return deny(
 			"tool-deny",
@@ -99,7 +109,7 @@ function evaluateToolName(
 			targets,
 		);
 	}
-	if (listed(key)) return ALLOW;
+	if (listed(key) || (owner !== undefined && listed(owner))) return ALLOW;
 	const messaging = listed(MESSAGING_GRANT);
 	if (key === "wait" && messaging) return ALLOW;
 	// Without a write grant, `write` still reaches internal transports: its own `local://` space, `xd://`

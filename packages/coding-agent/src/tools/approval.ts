@@ -347,6 +347,23 @@ export interface ApprovalRestrictions {
 	guards?: readonly ApprovalGuard[];
 }
 
+/**
+ * The reason the first guard in `restrictions` refuses the call, or `undefined`. For sites that act
+ * without resolving a full approval, such as a frame that mutates files without a registry tool.
+ */
+export function approvalGuardRefusal(
+	tool: ApprovalSubject,
+	args: unknown,
+	call: { tier: ToolTier; policyKey?: string },
+	restrictions: ApprovalRestrictions | undefined,
+): string | undefined {
+	for (const guard of restrictions?.guards ?? []) {
+		const refusal = guard.check(tool, args, call);
+		if (refusal) return refusal.reason;
+	}
+	return undefined;
+}
+
 /** The restrictions `settings` configure for calls running in `cwd`; `undefined` when none are. */
 export function approvalRestrictions(
 	settings: Settings | undefined,
@@ -396,10 +413,8 @@ export function resolveApproval(
 		// The keyed sub-tool (an `xd://` device) comes from the tool's own decision: a mode allow drops it.
 		const policyKey = getToolDecision(tool, args, context).policyKey;
 		const call = { tier: resolved.tier, ...(policyKey ? { policyKey } : {}) };
-		for (const guard of restrictions.guards) {
-			const refusal = guard.check(tool, args, call);
-			if (refusal) return { policy: "deny", ...call, override: false, source: "permission", reason: refusal.reason };
-		}
+		const reason = approvalGuardRefusal(tool, args, call, restrictions);
+		if (reason !== undefined) return { policy: "deny", ...call, override: false, source: "permission", reason };
 	}
 	const reason = restrictedFolderReason(tool, args, restrictions);
 	if (reason === undefined) return resolved;

@@ -34,6 +34,17 @@ export function uniquePermissionTools(values: readonly string[]): string[] {
 	return result;
 }
 
+/**
+ * Permissions a tool checks under a name of its own (`tools.approval["computer.control"]`). A profile
+ * grants or denies them through the owning tool's name, and can also deny them by their own name.
+ */
+const SUB_PERMISSION_OWNERS: ReadonlyMap<string, string> = new Map([["computer.control", "computer"]]);
+
+/** The tool that owns a sub-permission key (`computer` for `computer.control`), or `undefined`. */
+export function permissionToolOwner(key: string): string | undefined {
+	return SUB_PERMISSION_OWNERS.get(key);
+}
+
 /** Tools that ship with the agent; anything else is an extension, custom, MCP or eval route. */
 const NATIVE_TOOL_KEYS: ReadonlySet<string> = new Set([
 	...BUILTIN_TOOL_NAMES,
