@@ -12,6 +12,8 @@ import { $env, isRecord } from "@oh-my-pi/pi-utils";
 
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import type { TaskToolProfileParam } from "@oh-my-pi/pi-tui/tools/task";
+import { TASK_TOOL_PROFILE_NAMES, type TaskToolProfileName } from "./permissions/tool-profiles";
 
 const parseNumber = (value: string | undefined, defaultValue: number): number => {
 	if (value) {
@@ -46,6 +48,39 @@ export interface SubagentEventPayload {
 const outputSchemaInputSchema = type("object | boolean | string | null");
 // Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
 const effortRule = '"lo" | "med" | "hi"' as const;
+
+// The wire type in pi-tui and the profile table here must name the same tool profiles.
+type SameUnion<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+const toolProfileParamsMatch: SameUnion<TaskToolProfileParam, TaskToolProfileName> = true;
+void toolProfileParamsMatch;
+const toolProfileRule = TASK_TOOL_PROFILE_NAMES.map(name => JSON.stringify(name)).join(" | ");
+
+/** Which permission fields the task schema advertises; see `task.permissions.*`. */
+export interface TaskSchemaPermissionOptions {
+	/** `task.permissions.mode` is not `off`. */
+	enabled: boolean;
+	/** `task.permissions.tools.enabled`: tool clauses and `toolProfile`. */
+	toolsEnabled: boolean;
+	/** `task.permissions.paths.enabled`: path clauses. */
+	pathsEnabled: boolean;
+}
+
+const NO_PERMISSION_FIELDS: TaskSchemaPermissionOptions = { enabled: false, toolsEnabled: false, pathsEnabled: false };
+
+/** The `permissions` and `toolProfile` schema fields for `options`; none while the mode is off. */
+function permissionSchemaFields(options: TaskSchemaPermissionOptions): Record<string, unknown> {
+	if (!options.enabled) return {};
+	const permissions = type.raw({
+		"profiles?": "string[]",
+		...(options.toolsEnabled ? { "tools?": "string[]", "denyTools?": "string[]" } : {}),
+		...(options.pathsEnabled ? { "allowPaths?": "string[]", "denyPaths?": "string[]" } : {}),
+		"+": "delete",
+	});
+	return {
+		"permissions?": permissions,
+		...(options.toolsEnabled ? { "toolProfile?": toolProfileRule } : {}),
+	};
+}
 
 // Per-spawn fields the seance schema adds or widens. Typed against
 // SeanceTaskSchemaFields so a field added there fails to compile until it is
@@ -182,8 +217,10 @@ function createTaskSchema(options: {
 	structured: boolean;
 	file: boolean;
 	seanceFields: SeanceTaskSchemaFields;
+	permissions: TaskSchemaPermissionOptions;
 }): BaseType {
 	const agent = taskAgentSchemaRule(options.defaultAgent);
+	const permissionFields = permissionSchemaFields(options.permissions);
 	const taskFields = options.file ? { "task?": "string", "taskFile?": "string" } : { task: "string" };
 	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
 	const schemaFields = options.structured
@@ -204,6 +241,7 @@ function createTaskSchema(options: {
 				...schemaFields,
 				...toolsField,
 				...seanceFields,
+				...permissionFields,
 				"isolated?": "boolean",
 				"+": "delete",
 			});
@@ -224,6 +262,7 @@ function createTaskSchema(options: {
 			...schemaFields,
 			...toolsField,
 			...seanceFields,
+			...permissionFields,
 			"+": "delete",
 		});
 		return guardBatchAgent(
@@ -244,6 +283,7 @@ function createTaskSchema(options: {
 			...schemaFields,
 			...toolsField,
 			...seanceFields,
+			...permissionFields,
 			"isolated?": "boolean",
 			"+": "delete",
 		});
@@ -257,6 +297,7 @@ function createTaskSchema(options: {
 		...schemaFields,
 		...toolsField,
 		...seanceFields,
+		...permissionFields,
 		"+": "delete",
 	});
 }
@@ -275,18 +316,29 @@ export function getTaskSchema(options: {
 	defaultAgent?: string;
 	/** Advertise historical source/model fields for the bundled seance agent. */
 	seanceFields?: SeanceTaskSchemaFields;
+	/** Advertise `permissions` and `toolProfile` (`task.permissions.*`); default none. */
+	permissions?: TaskSchemaPermissionOptions;
 }): TaskToolSchemaInstance {
 	const defaultAgent = options.defaultAgent ?? "task";
+	const permissions = options.permissions ?? NO_PERMISSION_FIELDS;
 	const effortEnabled = options.effortEnabled ?? false;
 	const evalToolsEnabled = options.evalToolsEnabled ?? true;
 	const structured = options.structured ?? true;
 	const file = options.file ?? false;
 	const seanceFields = options.seanceFields ?? {};
-	if (defaultAgent === "task" && !effortEnabled && evalToolsEnabled && structured && !file && !options.seanceFields) {
+	if (
+		defaultAgent === "task" &&
+		!effortEnabled &&
+		evalToolsEnabled &&
+		structured &&
+		!file &&
+		!options.seanceFields &&
+		!permissions.enabled
+	) {
 		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${file ? "file" : "inline"}:${options.seanceFields ? "seance" : "plain"}:${defaultAgent}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${file ? "file" : "inline"}:${options.seanceFields ? "seance" : "plain"}:${permissionsKey(permissions)}:${defaultAgent}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
 	const schema = createTaskSchema({
@@ -297,9 +349,15 @@ export function getTaskSchema(options: {
 		file,
 		defaultAgent,
 		seanceFields,
+		permissions,
 	});
 	taskSchemaCache.set(key, schema);
 	return schema;
+}
+
+function permissionsKey(permissions: TaskSchemaPermissionOptions): string {
+	if (!permissions.enabled) return "noperm";
+	return `perm${permissions.toolsEnabled ? "+tools" : ""}${permissions.pathsEnabled ? "+paths" : ""}`;
 }
 
 /**

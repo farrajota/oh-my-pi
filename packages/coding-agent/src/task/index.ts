@@ -68,6 +68,13 @@ import {
 	taskFileRestrictionPaths,
 } from "./file-approval";
 import { getPerCallModelAdvertisement, type PerCallModelAdvertisement } from "./model-approval";
+import { loadPermissionProfiles, type LoadedPermissionProfiles } from "./permissions/profiles";
+import {
+	cfgTaskPermissionsMode,
+	cfgTaskPermissionsPathsEnabled,
+	cfgTaskPermissionsToolsEnabled,
+} from "./permissions/settings";
+import type { SubagentPermissionMode } from "./permissions/types";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
@@ -177,7 +184,14 @@ interface TaskDescriptionOptions {
 	planMode: boolean;
 	asyncGuidance: string;
 	parentSpawns: string;
+	permissionMode: SubagentPermissionMode;
+	permissionToolsEnabled: boolean;
+	permissionPathsEnabled: boolean;
+	permissionProfiles: PermissionProfileListing;
 }
+
+/** Profiles and loader problems the description lists while `task.permissions.mode` is not `off`. */
+type PermissionProfileListing = Pick<LoadedPermissionProfiles, "summaries" | "errors" | "warnings">;
 
 /** Plan mode hides seance; a `spawns` list led by it defaults to the next permitted agent. */
 function defaultAgentFor(spawnPolicy: ResolvedSpawnPolicy, planMode: boolean): string {
@@ -232,6 +246,14 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		seanceGuidance: seanceAgent && isBundledSeance(seanceAgent) ? seanceTaskGuidance : "",
 		ircEnabled: options.ircEnabled,
 		asyncGuidance: options.asyncGuidance,
+		permissionsEnabled: options.permissionMode !== "off",
+		permissionMode: options.permissionMode,
+		permissionEnforced: options.permissionMode === "enforce",
+		permissionToolsEnabled: options.permissionToolsEnabled,
+		permissionPathsEnabled: options.permissionPathsEnabled,
+		permissionProfiles: options.permissionProfiles.summaries,
+		permissionProfileErrors: options.permissionProfiles.errors,
+		permissionProfileWarnings: options.permissionProfiles.warnings,
 	});
 }
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
@@ -247,9 +269,21 @@ function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
  * cannot accept. `outputSchema` is a first-class per-spawn field; stale
  * `schema` remains an eval-only alias and is rejected.
  */
-function validateShapeParams(batchEnabled: boolean, params: TaskParams): string | undefined {
+function validateShapeParams(
+	batchEnabled: boolean,
+	permissionsEnabled: boolean,
+	params: TaskParams,
+): string | undefined {
 	if (Object.hasOwn(params, "schema")) {
 		return "The task tool uses `outputSchema`; rename the stale `schema` field.";
+	}
+	if (!permissionsEnabled) {
+		const items: readonly TaskItem[] = [params, ...(Array.isArray(params.tasks) ? params.tasks : [])];
+		for (const field of ["permissions", "toolProfile"] as const) {
+			if (items.some(item => item?.[field] !== undefined)) {
+				return `Subagent permissions are disabled. Enable task.permissions.mode in /settings before using \`${field}\`.`;
+			}
+		}
 	}
 	if (batchEnabled && params.tasks !== undefined && Object.hasOwn(params, "agent")) {
 		return "Top-level `agent` is not part of the batch shape. Set `tasks[].agent` instead.";
@@ -404,6 +438,8 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("isolated" in params) item.isolated = params.isolated;
 	if ("sourceSession" in params) item.sourceSession = params.sourceSession;
 	if ("model" in params) item.model = params.model;
+	if (params.permissions !== undefined) item.permissions = params.permissions;
+	if (params.toolProfile !== undefined) item.toolProfile = params.toolProfile;
 	return [item];
 }
 
@@ -494,6 +530,8 @@ function spawnParamsFor(params: TaskParams, item: ResolvedTaskItem, defaultAgent
 	if ("effort" in item) spawn.effort = item.effort;
 	if ("sourceSession" in item) spawn.sourceSession = item.sourceSession;
 	if ("model" in item) spawn.model = item.model;
+	if (item.permissions !== undefined) spawn.permissions = item.permissions;
+	if (item.toolProfile !== undefined) spawn.toolProfile = item.toolProfile;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -524,7 +562,7 @@ function planSpawns(
 ): SpawnPlan | string {
 	const params = repairTaskParams(rawParams as TaskParams);
 	const error =
-		validateShapeParams(batchEnabled, params) ??
+		validateShapeParams(batchEnabled, cfgTaskPermissionsMode.get(settings) !== "off", params) ??
 		validateSpawnParams(params, batchEnabled, fileEnabled, defaultAgent, settings) ??
 		validateSeanceParams({ params, batchEnabled, defaultAgent, seanceAdvertised });
 	if (error) return error;
@@ -837,6 +875,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	// call frame stacked above the result frame. Mirrors `taskToolRenderer`.
 	readonly mergeCallAndResult = true;
 	readonly #discoveredAgents: AgentDefinition[];
+	/**
+	 * Read once at creation, user file included, so the description follows a later mode change; the
+	 * description shows it only while `task.permissions.mode` is not `off`. Spawns reload the files.
+	 */
+	readonly #permissionProfiles: PermissionProfileListing;
 	readonly #blockedAgent: string | undefined;
 	/**
 	 * One semaphore per TaskTool instance (i.e. per session): bounds concurrent
@@ -903,6 +946,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			file: cfgTaskFile.get(this.session.settings),
 			defaultAgent: this.#defaultAgent(),
 			seanceFields: this.#seanceSchemaFields(),
+			permissions: {
+				enabled: cfgTaskPermissionsMode.get(this.session.settings) !== "off",
+				toolsEnabled: cfgTaskPermissionsToolsEnabled.get(this.session.settings),
+				pathsEnabled: cfgTaskPermissionsPathsEnabled.get(this.session.settings),
+			},
 		});
 	}
 
@@ -953,14 +1001,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			planMode,
 			asyncGuidance: this.delegationGuidance,
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
+			permissionMode: cfgTaskPermissionsMode.get(this.session.settings),
+			permissionToolsEnabled: cfgTaskPermissionsToolsEnabled.get(this.session.settings),
+			permissionPathsEnabled: cfgTaskPermissionsPathsEnabled.get(this.session.settings),
+			permissionProfiles: this.#permissionProfiles,
 		});
 	}
 	private constructor(
 		private readonly session: ToolSession,
 		discoveredAgents: AgentDefinition[],
+		permissionProfiles: PermissionProfileListing,
 	) {
 		this.#blockedAgent = $env.PI_BLOCKED_AGENT;
 		this.#discoveredAgents = discoveredAgents;
+		this.#permissionProfiles = permissionProfiles;
 	}
 
 	#isBatchEnabled(): boolean {
@@ -1130,8 +1184,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * Create a TaskTool instance with async agent discovery.
 	 */
 	static async create(session: ToolSession): Promise<TaskTool> {
-		const { agents } = await discoverAgentsForCreate(session.cwd, session.effectiveExtensionRoots?.());
-		return new TaskTool(session, agents);
+		const [{ agents }, permissionProfiles] = await Promise.all([
+			discoverAgentsForCreate(session.cwd, session.effectiveExtensionRoots?.()),
+			loadPermissionProfiles(session.cwd, { agentDir: session.settings.getAgentDir() }),
+		]);
+		return new TaskTool(session, agents, permissionProfiles);
 	}
 
 	async execute(

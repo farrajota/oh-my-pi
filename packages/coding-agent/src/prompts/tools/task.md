@@ -27,6 +27,25 @@ Shared edits need one integration owner; give each task its files. Set interface
 {{/if}}{{#if isolationEnabled}}{{#if applyIsolatedChanges}}`isolated`: worktree; successful changes apply to parent.
 {{else}}`isolated`: worktree; changes retained, not applied.
 {{/if}}{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
+{{#if permissionsEnabled}}
+
+# Permissions
+Mode `{{permissionMode}}`{{#if permissionEnforced}}: a spawn that sets `permissions` or `toolProfile` starts with only the tools its scope allows, and every call outside the scope is refused. A spawn without `permissions` or `toolProfile` is not restricted.{{else}}: advisory; the scope is recorded and shown to the child, nothing is restricted.{{/if}} Children of a scoped child inherit its scope and can only narrow it. Guardrails, not a sandbox: NEVER ask a child to work around them.
+{{#if permissionToolsEnabled}}`toolProfile`: `none`|`inspect`|`review`|`edit`|`plan`|`web-research`|`vision`; narrows the agent's tools, never widens them.
+{{/if}}`permissions`{{#if batchEnabled}} (per `tasks[]` item){{/if}}: `profiles` (names below){{#if permissionToolsEnabled}}, `tools` allowlist, `denyTools`{{/if}}{{#if permissionPathsEnabled}}, `allowPaths`, `denyPaths` (a plain `dir` covers its subtree; prefer exact paths){{/if}}.{{#if permissionEnforced}}{{#if permissionToolsEnabled}} Name at least one profile that grants tools, or `tools`; modifier profiles only restrict.{{/if}}{{/if}} Tool allowlists intersect; denies and path rules accumulate; a deny wins. With path rules, bash, eval, LSP, MCP and extension tools are unavailable.
+<permission-profiles>
+{{#list permissionProfiles join="\n"}}
+# {{name}}
+{{description}}
+Use when: {{useWhen}}
+Tools: {{toolsSummary}}
+Paths: {{pathsSummary}}
+Source: {{source}}
+{{/list}}
+</permission-profiles>
+{{#if permissionProfileErrors.length}}Profile config errors: {{#list permissionProfileErrors join="; "}}{{this}}{{/list}}
+{{/if}}{{#if permissionProfileWarnings.length}}Profile config warnings: {{#list permissionProfileWarnings join="; "}}{{this}}{{/list}}
+{{/if}}{{/if}}
 
 # Format
 {{#if batchEnabled}}`context`: shared (`# Goal`, `# Contract` interfaces); NEVER repeat per task.

@@ -4,6 +4,7 @@
 
 ### Added
 
+- `TaskItem` and `TaskParams` carry the subagent permission request fields `permissions` (`TaskPermissionsParam`) and `toolProfile` (`TaskToolProfileParam`)
 - Each user prompt in the terminal transcript shows the time it was sent (`YYYY-MM-DD HH:MM:SS`, dim) on a row under the bubble; agent-attributed input shows none. `formatUsageTimestamp` is exported from `overlays/usage-row`
 - With auto-compaction on, the `context_pct` segment and the embedded context gauge's label start with `[N%]/`, how far usage has come toward the auto-compaction threshold (capped at 100%), so approaching compaction is visible on bars without gauge markers
 - Status-line segments `omp_version` (the installed omp version) and `docker_container` (`DOCKER_CONTAINER_NAME`, else `HOSTNAME`, else the machine hostname) for custom status-line layouts

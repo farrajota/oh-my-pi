@@ -2261,6 +2261,22 @@ export interface TaskItem {
 	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
+	/** Subagent permission request (`task.permissions.mode` not `off`). */
+	permissions?: TaskPermissionsParam;
+	/** Named tool set narrowing the child's tools (`task.permissions.mode` not `off`). */
+	toolProfile?: TaskToolProfileParam;
+}
+
+/** Tool set names a task item may pick with `toolProfile`. */
+export type TaskToolProfileParam = "none" | "inspect" | "review" | "edit" | "plan" | "web-research" | "vision";
+
+/** The `permissions` field of a task item: profile names plus inline tool and path clauses. */
+export interface TaskPermissionsParam {
+	profiles?: string[];
+	tools?: string[];
+	denyTools?: string[];
+	allowPaths?: string[];
+	denyPaths?: string[];
 }
 
 /**
@@ -2298,6 +2314,10 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
+	/** See {@link TaskItem.permissions} (flat form). */
+	permissions?: TaskPermissionsParam;
+	/** See {@link TaskItem.toolProfile} (flat form). */
+	toolProfile?: TaskToolProfileParam;
 }
 
 /**
