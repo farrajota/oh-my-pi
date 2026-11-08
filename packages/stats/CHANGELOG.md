@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `getStatsByModel(cutoff, { exactWhenRollupsStale: true })` reads raw messages when the rollup backlog is too large for exact rollup reads, so a long-window model breakdown is complete while rollups rebuild
+
 ## [18.17.0] - 2026-11-06
 
 ### Fixed

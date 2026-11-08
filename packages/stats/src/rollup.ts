@@ -534,6 +534,17 @@ function messageSource(database: Database, cutoff: number | null, fine: boolean)
 	return { sql: parts.join(" UNION ALL "), params };
 }
 
+/**
+ * Message facts straight from `messages`, with no rollups: exact at any backlog, but a full scan
+ * of the window. Facts carry bucket 0, so it serves aggregates, not time series.
+ */
+function rawMessageSource(cutoff: number | null): Source {
+	return {
+		sql: `SELECT ${messageFacts("0", "")} FROM messages${cutoff === null ? "" : " WHERE timestamp >= ?"} GROUP BY ${MESSAGE_DIMENSIONS}`,
+		params: cutoff === null ? [] : [cutoff],
+	};
+}
+
 /** Tool facts covering `[cutoff, now]`; same union shape as {@link messageSource}. */
 function toolSource(database: Database, cutoff: number | null, fine: boolean): Source {
 	const groupRaw = "GROUP BY 1, t.tool_name, t.model, t.provider";
@@ -573,12 +584,24 @@ function toolSource(database: Database, cutoff: number | null, fine: boolean): S
 	return { sql: parts.join(" UNION ALL "), params };
 }
 
-/** Run `select … FROM (<facts>) f <tail>` over the message facts for a window. */
-function queryMessages<T>(window: Pick<RangeWindow, "cutoff"> & { bucketMs?: number }, select: string, tail = ""): T[] {
+/**
+ * Run `select … FROM (<facts>) f <tail>` over the message facts for a window. With
+ * `exactWhenRollupsStale`, a rollup backlog too large to patch exactly reads raw messages instead.
+ */
+function queryMessages<T>(
+	window: Pick<RangeWindow, "cutoff"> & { bucketMs?: number },
+	select: string,
+	tail = "",
+	exactWhenRollupsStale = false,
+): T[] {
 	const database = currentDb();
 	if (!database) return [];
 	const fine = window.bucketMs !== undefined && window.bucketMs < HOUR_MS;
-	const source = messageSource(database, normalizeCutoff(window.cutoff), fine);
+	const cutoff = normalizeCutoff(window.cutoff);
+	const source =
+		exactWhenRollupsStale && !fine && !dirtyIsSmall(database)
+			? rawMessageSource(cutoff)
+			: messageSource(database, cutoff, fine);
 	// `query` caches the compiled statement: the SQL varies only over a small set of shapes.
 	return database.query(`SELECT ${select} FROM (${source.sql}) f ${tail}`).all(...source.params) as T[];
 }
@@ -677,12 +700,20 @@ export function getOverallStats(cutoff: number | null = null): AggregatedStats {
 	return toAggregatedStats(queryMessages<AggregateRow>({ cutoff }, AGGREGATE_COLUMNS)[0]);
 }
 
-/** Aggregates per (model, provider), busiest first. */
-export function getStatsByModel(cutoff: number | null = null): ModelStats[] {
+/**
+ * Aggregates per (model, provider), busiest first. By default a large rollup backlog reads
+ * rollups as they are (fast, possibly incomplete); `exactWhenRollupsStale` reads raw messages
+ * then, so the result is complete at the cost of a scan.
+ */
+export function getStatsByModel(
+	cutoff: number | null = null,
+	options: { exactWhenRollupsStale?: boolean } = {},
+): ModelStats[] {
 	return queryMessages<AggregateRow & { model: string; provider: string }>(
 		{ cutoff },
 		`f.model AS model, f.provider AS provider, ${AGGREGATE_COLUMNS}`,
 		"GROUP BY f.model, f.provider ORDER BY requests DESC",
+		options.exactWhenRollupsStale,
 	).map(row => ({ model: row.model, provider: row.provider, ...toAggregatedStats(row) }));
 }
 
