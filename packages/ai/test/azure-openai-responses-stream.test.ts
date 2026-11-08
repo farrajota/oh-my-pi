@@ -384,6 +384,31 @@ describe("azure openai responses streaming", () => {
 		expect(result.errorMessage).toContain("server_error: backend exploded");
 	});
 
+	it("replays a statusless response.failed server error once before any output", async () => {
+		let attempts = 0;
+		const fetchMock: FetchImpl = async () => {
+			attempts++;
+			return createSseResponse([
+				{ type: "response.failed", response: { error: { code: "server_error", message: "backend exploded" } } },
+			]);
+		};
+
+		const result = await streamAzureOpenAIResponses(
+			azureModel,
+			{ messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }] },
+			{
+				apiKey: "test-key",
+				azureBaseUrl: azureModel.baseUrl,
+				azureApiVersion: "v1",
+				fetch: fetchMock,
+				providerRetryWait: async () => {},
+			},
+		).result();
+
+		expect(result.errorStatus).toBeUndefined();
+		expect(attempts).toBe(2);
+	});
+
 	it("surfaces response.failed incomplete reasons", async () => {
 		const fetchMock: FetchImpl = vi.fn(async () =>
 			createSseResponse([

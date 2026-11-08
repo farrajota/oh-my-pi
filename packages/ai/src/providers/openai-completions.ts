@@ -1921,13 +1921,15 @@ function resolveOpenAICompletionsCompat(model: Model<"openai-completions">): Mod
 
 /**
  * Retries benign empty completions and transient provider failures only before
- * assistant output commits the attempt.
+ * assistant output commits the attempt. HTTP failures are not replayed:
+ * `postOpenAIStream` already retried them within its attempt budget.
  */
 export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (model, context, options) => {
 	const resolvedModel = resolveOpenAICompletionsCompat(model);
 	return withReplaySafeStreamRetry(resolvedModel, context, options, streamOpenAICompletionsOnce, {
 		retryEmptyCompletion: true,
 		retryProviderErrors: options?.maxHttpAttempts === undefined,
+		retryProviderHttpErrors: false,
 		maxProviderErrorRetries: 1,
 	});
 };

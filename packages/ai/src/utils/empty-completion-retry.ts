@@ -69,6 +69,12 @@ export interface ReplaySafeStreamRetryPolicy {
 	retryEmptyCompletion?: boolean | (() => boolean);
 	/** Retry transient provider errors before output is committed. */
 	retryProviderErrors?: boolean;
+	/**
+	 * Also replay provider errors that carry an HTTP status (default true). Set false when the
+	 * attempt's transport already retried HTTP failures within its own budget and honored the
+	 * server's `x-should-retry` verdict, which the finalized message no longer carries.
+	 */
+	retryProviderHttpErrors?: boolean;
 	/** Maximum transient provider-error retries; empty completions keep their shared fixed budget. */
 	maxProviderErrorRetries?: number;
 }
@@ -155,6 +161,7 @@ export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
 				!committed &&
 				failedMessage?.stopReason === "error" &&
 				failedMessage.errorMessage !== undefined &&
+				(policy.retryProviderHttpErrors !== false || failedMessage.errorStatus === undefined) &&
 				providerErrorRetries < (policy.maxProviderErrorRetries ?? 0) &&
 				AIError.isProviderRetryableError(
 					new FinalizedProviderStreamError(failedMessage.errorMessage, failedMessage.errorStatus),

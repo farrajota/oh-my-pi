@@ -260,9 +260,11 @@ const streamAzureOpenAIResponsesOnce = (
 
 /**
  * Retries transient Azure stream failures only before assistant output commits
- * the attempt. The unsupported explicit prompt-cache config is rejected
- * synchronously here — callers of the direct entrypoint get the immediate
- * `ConfigurationError` rather than a stream whose `.result()` rejects later.
+ * the attempt. HTTP failures are not replayed: `postOpenAIStream` already
+ * retried them within its attempt budget. The unsupported explicit
+ * prompt-cache config is rejected synchronously here — callers of the direct
+ * entrypoint get the immediate `ConfigurationError` rather than a stream whose
+ * `.result()` rejects later.
  */
 export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"> = (model, context, options) => {
 	if (options?.promptCache?.mode === "explicit" && resolveCacheRetention(options.cacheRetention) !== "none") {
@@ -272,6 +274,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 	}
 	return withReplaySafeStreamRetry(model, context, options, streamAzureOpenAIResponsesOnce, {
 		retryProviderErrors: true,
+		retryProviderHttpErrors: false,
 		maxProviderErrorRetries: 1,
 	});
 };
