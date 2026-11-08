@@ -14,6 +14,7 @@
  * same append path over the host's byte-capped transcript reads.
  */
 import type * as fs from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { TspSpan, TspTone } from "@oh-my-pi/pi-wire";
 import type { Component, TUI } from "../tui";
@@ -40,6 +41,8 @@ import {
 import { sanitizeErrorLine } from "../chrome/error-block";
 import type { ScrollRangeAnchor } from "../components/scroll-view";
 import { formatContextUsage } from "../chrome/context-thresholds";
+import { sanitizeStatusText } from "../chrome/shared";
+import { truncateToWidth } from "../utils";
 import { node, span, text } from "../native/describe";
 import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "../native/node";
 import { actionHint, escCloseButton, hintsRow, overlayCard } from "../native/overlay";
@@ -111,6 +114,8 @@ interface LocalTranscriptState {
 	mtimeMs: number;
 	offset: number;
 	pending: string;
+	/** Holds a UTF-8 sequence split across two reads until its last byte arrives. */
+	decoder: StringDecoder;
 	sentinels: LocalTranscriptSentinel[];
 }
 
@@ -379,7 +384,9 @@ export class AgentTranscriptViewer implements Component {
 		// (no terminating newline). Carry those bytes as `pending` so the next
 		// poll's `#appendLocal` joins them with the completion bytes instead of
 		// parsing a headless line fragment and dropping the entry.
-		const text = data.toString("utf-8");
+		// A fresh decoder per full load, so bytes held from the previous file never leak in.
+		const decoder = new StringDecoder("utf8");
+		const text = decoder.write(data);
 		const lastNewline = text.lastIndexOf("\n");
 		const complete = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : "";
 		const pending = lastNewline >= 0 ? text.slice(lastNewline + 1) : text;
@@ -392,6 +399,7 @@ export class AgentTranscriptViewer implements Component {
 			mtimeMs: post.mtimeMs,
 			offset: data.byteLength,
 			pending,
+			decoder,
 			sentinels: sentinelsFromBuffer(data),
 		};
 		this.#model = undefined;
@@ -401,12 +409,9 @@ export class AgentTranscriptViewer implements Component {
 	#appendLocal(sessionFile: string, stat: fs.Stats, state: LocalTranscriptState, allowAsync: boolean): void {
 		let chunk: string;
 		try {
-			chunk = readFileRangeSync(
-				this.#deps.transcript.fs,
-				sessionFile,
-				state.offset,
-				stat.size - state.offset,
-			).toString("utf-8");
+			chunk = state.decoder.write(
+				readFileRangeSync(this.#deps.transcript.fs, sessionFile, state.offset, stat.size - state.offset),
+			);
 		} catch (err) {
 			logger.debug("transcript viewer: tail read failed", { err: String(err) });
 			this.#loadLocalFull(sessionFile, stat, allowAsync);
@@ -779,7 +784,7 @@ export class AgentTranscriptViewer implements Component {
 		const { contentWidth, chromeWidth } = context;
 		const ref = this.#deps.registry.get(this.#deps.agentId);
 
-		const headerLines = this.#headerLines(ref?.status, ref?.kind, ref?.parentId);
+		const headerLines = this.#headerLines(ref?.status, ref?.kind, ref?.parentId, chromeWidth);
 		const footerLines = this.#footerLines();
 		const noticeLine = this.#notice
 			? theme.fg("error", sanitizeErrorLine(this.#notice, chromeWidth))
@@ -813,12 +818,26 @@ export class AgentTranscriptViewer implements Component {
 		};
 	}
 
-	#headerLines(status: AgentStatus | undefined, kind: string | undefined, parentId: string | undefined): string[] {
-		const lines = [theme.fg("accent", `Agent Hub ${theme.sep.dot} ${this.#deps.agentId}`)];
+	#headerLines(
+		status: AgentStatus | undefined,
+		kind: string | undefined,
+		parentId: string | undefined,
+		width: number,
+	): string[] {
+		// Ids, kinds and models come from the registry and the transcript file; strip terminal
+		// control sequences before they reach the screen.
+		const agentId = sanitizeStatusText(this.#deps.agentId);
+		const lines = [theme.fg("accent", `Agent Hub ${theme.sep.dot} ${agentId}`)];
 		if (status && kind) {
-			const kindTag = theme.fg("dim", ` ${parentId ? `${kind} ${theme.sep.dot} of ${parentId}` : kind}`);
-			const modelLabel = this.#model ? theme.fg("muted", `${theme.sep.dot}${this.#model}`) : "";
-			lines.push(`${theme.bold(this.#deps.agentId)} ${statusBadge(status)}${kindTag}${modelLabel}`);
+			const safeKind = sanitizeStatusText(kind);
+			const kindTag = theme.fg(
+				"dim",
+				` ${parentId ? `${safeKind} ${theme.sep.dot} of ${sanitizeStatusText(parentId)}` : safeKind}`,
+			);
+			const modelLabel = this.#model ? theme.fg("muted", `${theme.sep.dot}${sanitizeStatusText(this.#model)}`) : "";
+			// A long id is cut first so the status badge stays visible.
+			const shownId = truncateToWidth(agentId, Math.max(1, width - status.length - 1));
+			lines.push(`${theme.bold(shownId)} ${statusBadge(status)}${kindTag}${modelLabel}`);
 		}
 		return lines;
 	}
