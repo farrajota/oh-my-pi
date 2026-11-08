@@ -16,7 +16,7 @@ import { cfgTaskPermissionsActiveScope } from "./settings";
 import { decodePermissionScope } from "./snapshot";
 import type { DeepImmutable, PermissionScope } from "./types";
 
-type ActiveScope =
+export type ActiveScope =
 	| { readonly ok: true; readonly scope: DeepImmutable<PermissionScope> }
 	| { readonly ok: false; readonly error: string };
 
@@ -41,6 +41,15 @@ function decodeActiveScope(text: string): ActiveScope {
 }
 
 /**
+ * The scope a spawn wrote into `settings` (decoded, or the decode error), or `undefined` when the
+ * session runs without one. Only a runtime override of `task.permissions.activeScope` counts.
+ */
+export function activePermissionScope(settings: Settings): ActiveScope | undefined {
+	if (settings.getProvenance(cfgTaskPermissionsActiveScope) !== "runtime") return undefined;
+	return decodeActiveScope(cfgTaskPermissionsActiveScope.get(settings) ?? "");
+}
+
+/**
  * The guard for the scope in `settings`, or `undefined` when the session runs without one.
  *
  * Only a runtime override of `task.permissions.activeScope` counts: a subagent spawn writes it into
@@ -49,8 +58,8 @@ function decodeActiveScope(text: string): ActiveScope {
  * is advisory). A value that does not decode to a verified scope denies every tool but `yield`.
  */
 export function permissionApprovalGuard(settings: Settings, cwd: string): ApprovalGuard | undefined {
-	if (settings.getProvenance(cfgTaskPermissionsActiveScope) !== "runtime") return undefined;
-	const active = decodeActiveScope(cfgTaskPermissionsActiveScope.get(settings) ?? "");
+	const active = activePermissionScope(settings);
+	if (active === undefined) return undefined;
 	if (!active.ok) return unreadableScopeGuard(active.error);
 	if (active.scope.mode !== "enforce") return undefined;
 	return scopeGuard(active.scope, cwd);

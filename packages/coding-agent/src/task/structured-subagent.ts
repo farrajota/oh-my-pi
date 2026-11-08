@@ -58,6 +58,7 @@ import {
 import { generateTaskName, sanitizeAgentId } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { ovnfsWorkspace } from "./ovnfs";
+import { permissionDelegationRefusal } from "./permissions/session-checks";
 import { resolveSpawnPolicy } from "./spawn-policy";
 import { isBundledSeance, prepareSeance, type PreparedSeanceSession } from "./seance";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
@@ -503,6 +504,8 @@ function discoverAgentsShared(cwd: string, extensionRoots?: EffectiveExtensionRo
 export async function resolveEffectiveSubagentPolicy(
 	request: StructuredSubagentRequest,
 ): Promise<EffectiveSubagentPolicy> {
+	const delegationRefusal = permissionDelegationRefusal(request.session.settings, request.session.cwd);
+	if (delegationRefusal !== undefined) throw new StructuredSubagentError("preflight", delegationRefusal);
 	// A per-call model is approved against the operator settings behind any overlay, so reload those too.
 	await request.session.settings.reloadFromDisk({
 		includeParents: request.perCallModel !== undefined || request.seanceModel !== undefined,
