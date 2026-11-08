@@ -44,6 +44,7 @@ import { renderTerminalOutput } from "./terminal-output";
 import { quotePosixArgv } from "../utils/shell-quote";
 
 const DEFAULT_IDLE_GRACE_MS = 3_000;
+const CLIENT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_LOG_BYTES = 25 * 1024 * 1024;
 const LOG_READ_BYTES = 2 * 1024 * 1024;
@@ -429,6 +430,7 @@ class DaemonBroker {
 	readonly #idleGraceMs: number;
 	readonly #restartBackoffBaseMs: number;
 	readonly #endpointCheckMs: number;
+	readonly #clientHandshakeTimeoutMs: number;
 	#endpointTimer: NodeJS.Timeout | undefined;
 	readonly #records = new Map<string, ManagedDaemon>();
 	/**
@@ -459,6 +461,7 @@ class DaemonBroker {
 		idleGraceMs: number,
 		restartBackoffBaseMs: number,
 		endpointCheckMs: number,
+		clientHandshakeTimeoutMs: number,
 	) {
 		this.#projectDir = projectDir;
 		this.#runtimeDir = runtimeDir;
@@ -467,6 +470,7 @@ class DaemonBroker {
 		this.#idleGraceMs = idleGraceMs;
 		this.#restartBackoffBaseMs = restartBackoffBaseMs;
 		this.#endpointCheckMs = endpointCheckMs;
+		this.#clientHandshakeTimeoutMs = clientHandshakeTimeoutMs;
 	}
 
 	async run(onListening?: () => void): Promise<void> {
@@ -509,22 +513,32 @@ class DaemonBroker {
 	}
 
 	#accept(socket: IpcConnection): void {
+		// Every open connection holds off idle shutdown, so one that never authenticates
+		// is closed after a bounded handshake window instead of pinning the broker.
 		this.#sockets.add(socket);
 		let authenticated = false;
+		const handshakeTimer = setTimeout(() => {
+			if (!authenticated) socket.destroy();
+		}, this.#clientHandshakeTimeoutMs);
 		// Oversized requests (> MAX_REQUEST_BYTES) close the connection natively.
 		socket.start(
 			line => {
 				void this.#handleLine(socket, line, () => {
 					if (authenticated) return;
 					authenticated = true;
+					clearTimeout(handshakeTimer);
 					this.#clients.add(socket);
 					clearTimeout(this.#idleTimer);
 					this.#idleTimer = undefined;
 				});
 			},
 			() => {
+				clearTimeout(handshakeTimer);
 				this.#sockets.delete(socket);
-				if (!authenticated) return;
+				if (!authenticated) {
+					this.#scheduleIdleShutdown();
+					return;
+				}
 				this.#clients.delete(socket);
 				this.#scheduleIdleShutdown();
 				for (const [owner, registration] of this.#ownerSockets) {
@@ -1539,7 +1553,7 @@ class DaemonBroker {
 	}
 
 	#scheduleIdleShutdown(): void {
-		if (this.#shuttingDown || this.#clients.size > 0) return;
+		if (this.#shuttingDown || this.#sockets.size > 0) return;
 		clearTimeout(this.#idleTimer);
 		this.#idleTimer = setTimeout(() => {
 			this.#idleTimer = undefined;
@@ -1547,12 +1561,13 @@ class DaemonBroker {
 				const livePersistent = [...this.#records.values()].some(
 					record => record.spec.persist && !terminalState(record.snapshot.state),
 				);
-				if (this.#clients.size > 0 || livePersistent) return;
+				if (this.#sockets.size > 0 || livePersistent) return;
 				if (await hasLiveDaemonProjectPresence(this.#runtimeDir)) {
 					this.#scheduleIdleShutdown();
 					return;
 				}
-				if (this.#clients.size === 0) await this.shutdown();
+				// A connection that opened and closed during the presence check re-armed the timer.
+				if (this.#sockets.size === 0 && this.#idleTimer === undefined) await this.shutdown();
 			})();
 		}, this.#idleGraceMs);
 	}
@@ -1591,6 +1606,8 @@ export interface DaemonBrokerStartOptions {
 	restartBackoffBaseMs?: number;
 	/** How often the broker checks that its socket file still exists. */
 	endpointCheckMs?: number;
+	/** How long a new connection may stay open without authenticating before it is closed. */
+	clientHandshakeTimeoutMs?: number;
 	/**
 	 * Called once the broker accepts connections. An embedding host connects its
 	 * clients after this; a client that connects earlier finds no endpoint and
@@ -1645,6 +1662,7 @@ export async function startDaemonBrokerFromEnvironment(options: DaemonBrokerStar
 		idleGraceMs,
 		restartBackoffBaseMs,
 		options.endpointCheckMs ?? ENDPOINT_CHECK_MS,
+		options.clientHandshakeTimeoutMs ?? CLIENT_HANDSHAKE_TIMEOUT_MS,
 	);
 	const cancelCleanup = postmortem.register("daemon-broker", () => broker.shutdown());
 	try {

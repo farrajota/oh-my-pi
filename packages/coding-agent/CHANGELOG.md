@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- The `omp launch` daemon broker no longer shuts down under a client that has connected but not yet authenticated, and closes a connection that does not authenticate within 10 seconds
 - With an absolute `PI_CONFIG_DIR`, user config discovery reads that directory instead of a copy nested under home, and project plugin registries are found in the project's `.omp/`
 - A browser relay tab stays usable after a password manager's inline autofill menu opens in it; the call that opened the menu still fails once (reinstall the extension with `omp browser-relay install` and reload it) ([#16908](https://github.com/can1357/oh-my-pi/pull/16908) by [@will-bogusz](https://github.com/will-bogusz))
 - A `%%bash` cell in Python eval no longer prints its exit status (a stray `0`) after the command's output; a failing cell reports `%%bash: exit status N` on stderr instead.

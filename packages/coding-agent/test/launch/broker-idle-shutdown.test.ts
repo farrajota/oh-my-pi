@@ -7,9 +7,11 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { IpcConnection } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
+import { type DaemonBrokerStartOptions, startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient } from "../../src/launch/client";
+import { daemonBrokerEndpoint } from "../../src/launch/paths";
 import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
 
 function restoreEnv(name: string, value: string | undefined): void {
@@ -17,14 +19,19 @@ function restoreEnv(name: string, value: string | undefined): void {
 	else process.env[name] = value;
 }
 
-function startBroker(projectDir: string, runtimeDir: string, idleGraceMs: number): Promise<void> {
+function startBroker(
+	projectDir: string,
+	runtimeDir: string,
+	idleGraceMs: number,
+	options?: DaemonBrokerStartOptions,
+): Promise<void> {
 	const previousProjectDir = process.env[DAEMON_PROJECT_DIR_ENV];
 	const previousRuntimeDir = process.env[DAEMON_RUNTIME_DIR_ENV];
 	const previousGrace = process.env[DAEMON_IDLE_GRACE_ENV];
 	process.env[DAEMON_PROJECT_DIR_ENV] = projectDir;
 	process.env[DAEMON_RUNTIME_DIR_ENV] = runtimeDir;
 	process.env[DAEMON_IDLE_GRACE_ENV] = String(idleGraceMs);
-	const broker = startDaemonBrokerFromEnvironment();
+	const broker = startDaemonBrokerFromEnvironment(options);
 	restoreEnv(DAEMON_PROJECT_DIR_ENV, previousProjectDir);
 	restoreEnv(DAEMON_RUNTIME_DIR_ENV, previousRuntimeDir);
 	restoreEnv(DAEMON_IDLE_GRACE_ENV, previousGrace);
@@ -71,6 +78,78 @@ describe("daemon broker idle shutdown", () => {
 			// out — the regression this guards.
 			await broker;
 		} finally {
+			process.title = previousTitle;
+		}
+	}, 30_000);
+
+	it("keeps a connected client alive past idle grace until it authenticates", async () => {
+		using tempDir = TempDir.createSync("@omp-launch-handshake-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+
+		const previousTitle = process.title;
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 100 });
+		const token = (await fs.readFile(path.join(runtimeDir, "broker.token"), "utf8")).trim();
+		const broker = startBroker(projectDir, runtimeDir, 100);
+		let pending: IpcConnection | undefined;
+		try {
+			await client.request({ op: "ping" });
+			pending = await IpcConnection.connect(daemonBrokerEndpoint(runtimeDir), {
+				framing: "lines",
+				timeoutMs: 1_000,
+			});
+			const firstLine = Promise.withResolvers<string | null>();
+			let closed = false;
+			pending.start(firstLine.resolve, () => {
+				closed = true;
+				firstLine.resolve(null);
+			});
+			// The last authenticated client leaves; only the not-yet-authenticated connection remains.
+			client.close();
+			// Real timers: the broker's own idle timer (100ms) must elapse while the connection is open.
+			await Bun.sleep(250);
+			expect(closed).toBe(false);
+
+			pending.send(JSON.stringify({ id: "pending-handshake", token, operation: { op: "ping" } }));
+			expect(JSON.parse((await firstLine.promise) ?? "null")).toMatchObject({ id: "pending-handshake", ok: true });
+		} finally {
+			pending?.destroy();
+			client.close();
+			try {
+				await broker;
+			} finally {
+				process.title = previousTitle;
+			}
+		}
+	}, 30_000);
+
+	it("closes a connection that never authenticates and then shuts down idle", async () => {
+		using tempDir = TempDir.createSync("@omp-launch-handshake-timeout-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+
+		const previousTitle = process.title;
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 100 });
+		const broker = startBroker(projectDir, runtimeDir, 100, { clientHandshakeTimeoutMs: 300 });
+		let silent: IpcConnection | undefined;
+		try {
+			await client.request({ op: "ping" });
+			silent = await IpcConnection.connect(daemonBrokerEndpoint(runtimeDir), { framing: "lines", timeoutMs: 1_000 });
+			const silentClosed = Promise.withResolvers<void>();
+			silent.start(
+				() => {},
+				() => silentClosed.resolve(),
+			);
+			client.close();
+			// The broker's run() resolving is the shutdown signal. A silent connection that pinned
+			// the broker forever would leave this await hanging until the test timeout.
+			await broker;
+			await silentClosed.promise;
+		} finally {
+			silent?.destroy();
+			client.close();
 			process.title = previousTitle;
 		}
 	}, 30_000);
