@@ -774,8 +774,9 @@ export interface ExtensionContext {
 	getContextUsage(): ContextUsage | undefined;
 	/**
 	 * Read-only snapshot of the background jobs this session owns: the running ones and the newest
-	 * settled ones (`recentLimit`, 0 to 15, default 5), which stay listed after their results were
-	 * delivered. `includeAgentJobs: false` leaves out jobs that run a subagent. Null outside a session.
+	 * settled ones (`recentLimit`, default 5). `history: true` lists settled jobs from a bounded
+	 * history (at most 15) that keeps them after their results were delivered and their rows evicted.
+	 * `includeAgentJobs: false` leaves out jobs that run a subagent. Null outside a session.
 	 */
 	getAsyncJobSnapshot(options?: AsyncJobSnapshotOptions): AsyncJobSnapshot | null;
 	/** Live progress, then the result or error, of a job this session owns; null when there is none. */

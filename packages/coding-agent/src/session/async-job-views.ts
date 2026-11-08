@@ -180,29 +180,40 @@ export function cancelOwnedAsyncJob(manager: AsyncJobManagerApi, agentId: string
 }
 
 /**
- * The extension job snapshot (`ctx.getAsyncJobSnapshot`): running jobs `agentId` owns and the
- * newest settled ones from the manager's terminal history, which outlives evicted rows, so a
- * dashboard keeps showing jobs whose results were already delivered.
+ * The extension job snapshot (`ctx.getAsyncJobSnapshot`). By default it lists what
+ * {@link asyncJobSnapshot} lists: running jobs `agentId` owns and its newest settled rows. With
+ * `history`, `recent` comes from the manager's terminal history instead, which outlives evicted
+ * rows, so a dashboard keeps showing jobs whose results were already delivered.
  */
-export function asyncJobHistorySnapshot(
+export function extensionAsyncJobSnapshot(
 	manager: AsyncJobManagerApi,
 	agentId: string | undefined,
 	options?: AsyncJobSnapshotOptions,
 ): AsyncJobSnapshot {
 	const ownerFilter = agentId ? { ownerId: agentId } : undefined;
 	const includeAgentJobs = options?.includeAgentJobs !== false;
-	const requested = options?.recentLimit ?? 5;
-	const recentLimit = Number.isNaN(requested)
-		? 0
-		: Math.min(TERMINAL_HISTORY_LIMIT, Math.max(0, Math.trunc(requested)));
+	const listed = (job: { agentId?: string }): boolean => includeAgentJobs || job.agentId === undefined;
 	const running = manager
 		.getRunningJobs(ownerFilter)
-		.filter(job => includeAgentJobs || job.agentId === undefined)
+		.filter(listed)
 		.map(job => jobSnapshotItem(job, manager.widgets));
-	const recent = manager
-		.getTerminalHistory(ownerFilter, { includeAgentJobs })
-		.slice(0, recentLimit)
-		.map(entry => ({ ...entry }));
+	const requested = options?.recentLimit ?? 5;
+	let recent: AsyncJobSnapshotItem[];
+	if (options?.history === true) {
+		const recentLimit = Number.isNaN(requested)
+			? 0
+			: Math.min(TERMINAL_HISTORY_LIMIT, Math.max(0, Math.trunc(requested)));
+		recent = manager
+			.getTerminalHistory(ownerFilter, { includeAgentJobs })
+			.slice(0, recentLimit)
+			.map(entry => ({ ...entry }));
+	} else {
+		recent = manager
+			.getRecentJobs(Number.POSITIVE_INFINITY, ownerFilter)
+			.filter(listed)
+			.slice(0, requested)
+			.map(job => jobSnapshotItem(job, manager.widgets));
+	}
 	return { running, recent, delivery: manager.getDeliveryState(ownerFilter) };
 }
 

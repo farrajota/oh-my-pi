@@ -119,7 +119,7 @@ describe("extension job controls in a session", () => {
 		return { id, release };
 	}
 
-	it("lists this session's jobs, filters subagent jobs, and keeps settled jobs as bounded history", async () => {
+	it("lists this session's jobs, filters subagent jobs, and on request lists settled jobs from bounded history", async () => {
 		const running = blockedJob("sleep 60");
 		const queued = blockedJob("queued", { queued: true });
 		const agentJob = blockedJob("child task", { agentId: "0-Child" });
@@ -129,7 +129,11 @@ describe("extension job controls in a session", () => {
 		}
 		await Bun.sleep(5);
 
-		const snapshot: AsyncJobSnapshot | null = ctx.getAsyncJobSnapshot({ recentLimit: 99, includeAgentJobs: false });
+		const snapshot: AsyncJobSnapshot | null = ctx.getAsyncJobSnapshot({
+			recentLimit: 99,
+			includeAgentJobs: false,
+			history: true,
+		});
 		const runningIds = snapshot?.running.map(job => job.id) ?? [];
 		expect(runningIds).toContain(running.id);
 		expect(runningIds).toContain(queued.id);
@@ -138,11 +142,27 @@ describe("extension job controls in a session", () => {
 		const queuedItem: AsyncJobSnapshotItem | undefined = snapshot?.running.find(job => job.id === queued.id);
 		expect(queuedItem?.queued).toBe(true);
 		expect(snapshot?.recent).toHaveLength(15);
-		expect(ctx.getAsyncJobSnapshot({ recentLimit: 3 })?.recent).toHaveLength(3);
+		expect(ctx.getAsyncJobSnapshot({ recentLimit: 3, history: true })?.recent).toHaveLength(3);
+		expect(ctx.getAsyncJobSnapshot({ recentLimit: 99, includeAgentJobs: false })?.recent).toHaveLength(17);
 		expect(ctx.getAsyncJobSnapshot()?.recent).toHaveLength(5);
 		expect(ctx.getAsyncJobSnapshot()?.running.map(job => job.id)).toContain(agentJob.id);
 
 		for (const job of [running, queued, agentJob, foreign]) job.release.resolve("done");
+		await manager.waitForAll();
+	});
+
+	it("lists by default exactly the jobs upstream's session snapshot lists", async () => {
+		const running = blockedJob("sleep 60");
+		for (let index = 0; index < 17; index++) {
+			manager.register("bash", `done ${index}`, async () => "ok", { ownerId: "Main" });
+		}
+		await Bun.sleep(5);
+
+		expect(ctx.getAsyncJobSnapshot({ recentLimit: 20 })).toEqual(session.getAsyncJobSnapshot({ recentLimit: 20 }));
+		expect(ctx.getAsyncJobSnapshot()).toEqual(session.getAsyncJobSnapshot());
+		expect(ctx.getAsyncJobSnapshot({ recentLimit: 20 })?.recent).toHaveLength(17);
+
+		running.release.resolve("done");
 		await manager.waitForAll();
 	});
 

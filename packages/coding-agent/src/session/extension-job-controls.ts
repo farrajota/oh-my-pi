@@ -3,7 +3,7 @@ import type { ExtensionAsyncJobControls } from "../extensibility/extensions/type
 import { terminateSubagent } from "../registry/agent-control";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { AgentRegistry } from "../registry/agent-registry";
-import { asyncJobHistorySnapshot, asyncJobOutput, cancelOwnedAsyncJobAndSettle } from "./async-job-views";
+import { asyncJobOutput, cancelOwnedAsyncJobAndSettle, extensionAsyncJobSnapshot } from "./async-job-views";
 
 /** What the controls read from the session they serve. */
 export interface ExtensionJobControlSession {
@@ -22,7 +22,7 @@ export function createExtensionAsyncJobControls(
 		getSnapshot: options => {
 			const session = getSession();
 			const manager = session?.asyncJobManager;
-			return session && manager ? asyncJobHistorySnapshot(manager, session.getAgentId(), options) : null;
+			return session && manager ? extensionAsyncJobSnapshot(manager, session.getAgentId(), options) : null;
 		},
 		getOutput: jobId => {
 			const session = getSession();

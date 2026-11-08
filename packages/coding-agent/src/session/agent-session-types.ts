@@ -92,10 +92,16 @@ export type AsyncJobSnapshotItem = Pick<
 
 /** Options of the extension job snapshot (`ctx.getAsyncJobSnapshot`). */
 export interface AsyncJobSnapshotOptions {
-	/** Settled jobs to list, newest first: 0 to 15, default 5. */
+	/** Settled jobs to list, newest first. Default 5; at most 15 with `history`. */
 	recentLimit?: number;
 	/** List jobs that run a subagent (task jobs). Default true. Delivery state is unaffected. */
 	includeAgentJobs?: boolean;
+	/**
+	 * List settled jobs from the bounded terminal history (15 per owner for subagent jobs and 15
+	 * for the others), which keeps a job listed after its row is evicted. History items carry no
+	 * `caption`. Default false: settled jobs whose rows are still kept, as the session lists them.
+	 */
+	history?: boolean;
 }
 
 /** Where {@link AsyncJobOutputSnapshot.text} comes from. */
