@@ -22,7 +22,7 @@ import { initTheme, setSymbolPreset, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { cfgCompactionThresholdPercent } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { getSessionAccentAnsi } from "@oh-my-pi/pi-tui/theme/session-color";
-import { adjustHsv } from "@oh-my-pi/pi-utils";
+import { adjustHsv, getProjectDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
 import { StatusLineTestComponents } from "./helpers/status-line";
 
 import {
@@ -33,7 +33,15 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/settings";
 
 const statusLines = new StatusLineTestComponents();
+// The default bar shows the project path and its git branch. Rendered from the checkout, its
+// width would depend on where the repository lives and which branch is checked out, and a bar
+// that overflows wraps onto more rows. A fresh non-git directory pins both: no branch, and a
+// path the segment caps at 40 columns.
+const originalProjectDir = getProjectDir();
+let projectDir: TempDir | undefined;
 beforeAll(async () => {
+	projectDir = TempDir.createSync("@omp-status-line-");
+	setProjectDir(projectDir.path());
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
 	await initTheme();
@@ -42,6 +50,8 @@ beforeAll(async () => {
 afterAll(() => {
 	statusLines.dispose();
 	resetSettingsForTest();
+	setProjectDir(originalProjectDir);
+	projectDir?.removeSync();
 });
 
 interface Fake {
@@ -624,8 +634,7 @@ describe("StatusLineComponent context breakdown", () => {
 		expect(comp.render(80)).toHaveLength(0); // box mode: main status lives in the editor border
 
 		comp.setComposerStyle({ statusAttachment: "none", bottomBar: "full", bottomBarGap: false });
-		// Wide enough for the checkout's branch and path: a bar that overflows wraps onto more rows.
-		const lines = comp.render(200);
+		const lines = comp.render(80);
 		expect(lines).toHaveLength(1);
 		// Plain bar: transparent background, no powerline caps or bg fill.
 		expect(lines[0]).not.toContain("\x1b[48;");
@@ -634,7 +643,7 @@ describe("StatusLineComponent context breakdown", () => {
 		// Styles without bottom chrome (rule/field/rail) request a spacer row so
 		// the bar doesn't sit flush against the last input row.
 		comp.setComposerStyle({ statusAttachment: "none", bottomBar: "full", bottomBarGap: true });
-		const gapped = comp.render(200);
+		const gapped = comp.render(80);
 		expect(gapped).toHaveLength(2);
 		expect(gapped[0]).toBe("");
 		expect(gapped[1]).toBe(lines[0]);
@@ -649,9 +658,9 @@ describe("StatusLineComponent context breakdown", () => {
 		comp.setComposerStyle({ statusAttachment: "none", bottomBar: "full", bottomBarGap: true });
 		let menuOpen = true;
 		comp.setAutocompleteActiveProbe(() => menuOpen);
-		expect(comp.render(200)).toHaveLength(0);
+		expect(comp.render(80)).toHaveLength(0);
 		menuOpen = false;
-		expect(comp.render(200)).toHaveLength(2); // spacer + bar return together
+		expect(comp.render(80)).toHaveLength(2); // spacer + bar return together
 	});
 
 	it("claude layout splits groups: left-only bottom bar, right group as top-rule chip", () => {

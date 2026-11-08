@@ -763,6 +763,11 @@ describe("Composer prepaint", () => {
 		const lease = new ComposerLease(composer);
 		const testSession = await createTestSession({ inMemory: true });
 		let mode: InteractiveMode | undefined;
+		// The live band shows the project path and git branch; from the checkout its width would
+		// depend on the checkout's location and branch, and an overflowing band wraps onto a second
+		// row. The session's non-git temp dir pins both (no branch, a path capped at 40 columns).
+		const originalProject = getProjectDir();
+		setProjectDir(testSession.tempDir);
 
 		try {
 			mode = new InteractiveMode(
@@ -776,9 +781,8 @@ describe("Composer prepaint", () => {
 			);
 			lease.adopt();
 			vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
-			// The default band shape draws the live bar through the wrapping band getter.
 			const realTopBorder = vi
-				.spyOn(mode.statusLine, "getBandTopBorderRows")
+				.spyOn(mode.statusLine, "getTopBorder")
 				.mockReturnValue({ content: "real status bar", width: 15, revision: 1 });
 			terminal.sendInput(" between");
 			expect(mode.editor.getExpandedText()).toBe("draft message between");
@@ -809,6 +813,8 @@ describe("Composer prepaint", () => {
 		} finally {
 			mode?.stop();
 			lease.dispose();
+			// setProjectDir chdir'd into tempDir; Windows cannot delete the process cwd.
+			setProjectDir(originalProject);
 			await testSession.cleanup();
 			vi.restoreAllMocks();
 		}
