@@ -15,6 +15,8 @@ import {
 	resolveApproval,
 } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
+import { ManageSkillTool } from "@oh-my-pi/pi-coding-agent/tools/manage-skill";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
@@ -161,5 +163,85 @@ describe("protected paths under an enforce-restricted scope", () => {
 			const args = { path: target, content: "@theirs" };
 			expect(resolveIn(settings, write, args)).toMatchObject({ policy: "deny", source: "permission" });
 		}
+	});
+
+	it("refuses learn and manage_skill writes into the agent dir, which name no path", () => {
+		// Path rules only, so no allowlist removes learn: the agent-dir write is what refuses it.
+		const pathScoped = enforceScope({ allowPathGroups: [["src"]] });
+		const skill = { action: "create", name: "deploy-notes", description: "when deploying", body: "steps" };
+		for (const [settings, args] of [
+			[scopedSettings(pathScoped, { "memory.backend": "hindsight" }), { memory: "lesson", skill }],
+			[scopedSettings(pathScoped, { "memory.backend": "local" }), { memory: "lesson" }],
+		] as const) {
+			const session = {
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*" as const,
+				settings,
+			};
+			expect(resolveIn(settings, new LearnTool(session), args)).toMatchObject({
+				policy: "deny",
+				source: "permission",
+			});
+		}
+		const settings = scopedSettings(pathScoped);
+		expect(
+			resolveIn(settings, new ManageSkillTool(), { action: "create", name: "deploy-notes", body: "steps" }),
+		).toMatchObject({
+			policy: "deny",
+			source: "permission",
+		});
+	});
+
+	it("still lets learn store a lesson in a remote memory backend", () => {
+		const settings = scopedSettings(enforceScope({ allowPathGroups: [["src"]] }), { "memory.backend": "hindsight" });
+		const session = {
+			cwd: tempDir.path(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*" as const,
+			settings,
+		};
+		expect(resolveIn(settings, new LearnTool(session), { memory: "lesson" }).policy).not.toBe("deny");
+	});
+
+	it("refuses a profile file reached through a symlinked .omp folder, by either name", () => {
+		const realFolder = tempDir.join("dotfiles-omp");
+		fs.mkdirSync(realFolder);
+		fs.rmSync(tempDir.join(".omp"), { recursive: true });
+		fs.symlinkSync(realFolder, tempDir.join(".omp"));
+		const settings = scopedSettings(writer);
+		for (const target of [
+			".omp/permissions.json",
+			"dotfiles-omp/permissions.json",
+			"dotfiles-omp/permissions.local.json",
+		]) {
+			expect(resolveIn(settings, writeTier("write"), { path: target })).toMatchObject({
+				policy: "deny",
+				source: "permission",
+			});
+		}
+	});
+
+	it("refuses the user profile file by its real path when it is a symlink out of the agent dir", () => {
+		const realFile = tempDir.join("dotfiles-permissions.json");
+		fs.writeFileSync(realFile, "{}\n");
+		fs.symlinkSync(realFile, path.join(agentDir, "permissions.json"));
+		const settings = scopedSettings(writer);
+		expect(resolveIn(settings, writeTier("write"), { path: realFile })).toMatchObject({
+			policy: "deny",
+			source: "permission",
+		});
+	});
+
+	it("refuses a write through a symlinked folder inside the agent dir that resolves outside it", () => {
+		const dotfilesSkills = tempDir.join("dotfiles-skills");
+		fs.mkdirSync(dotfilesSkills);
+		fs.symlinkSync(dotfilesSkills, path.join(agentDir, "skills"));
+		const settings = scopedSettings(writer);
+		expect(
+			resolveIn(settings, writeTier("write"), { path: path.join(agentDir, "skills", "deploy", "SKILL.md") }),
+		).toMatchObject({ policy: "deny", source: "permission" });
 	});
 });

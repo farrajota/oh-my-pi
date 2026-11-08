@@ -1,7 +1,7 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { prompt } from "@oh-my-pi/pi-utils";
-import { sanitizeSkillName, writeManagedSkill } from "../autolearn/managed-skills";
+import { getManagedSkillsDir, sanitizeSkillName, writeManagedSkill } from "../autolearn/managed-skills";
 import { isNameClaimedByAuthoredSkill } from "../extensibility/skills";
 import { isHindsightConfigured, loadHindsightConfig } from "../hindsight/config";
 import { localBackend } from "../memory-backend/local-backend";
@@ -11,6 +11,7 @@ import type { ToolSession } from ".";
 import { cfgAutolearnEnabled } from "../autolearn/settings";
 import { isGlobalMemoryScopeAvailable } from "../memory-backend/global-scope";
 import { cfgMemoryBackend } from "../memory-backend/settings";
+import { getMemoryRoot } from "../memories";
 
 const learnSkillSchema = type({
 	action: "'create' | 'update'",
@@ -54,6 +55,20 @@ export class LearnTool implements AgentTool<LearnSchema> {
 		return params.skill || params.scope === "global" || cfgMemoryBackend.get(this.session.settings) === "local"
 			? "write"
 			: "read";
+	};
+	/**
+	 * The agent-dir files this call writes, although it names no path: a skill payload mints a managed
+	 * skill that later sessions load, and the local backend appends the lesson to the project's memory
+	 * root. Restricted folders and a permission scope's protected paths judge them.
+	 */
+	readonly approvalRestrictionPaths = (args: unknown): readonly string[] | undefined => {
+		const params = args as Partial<LearnParams>;
+		const files: string[] = [];
+		if (params.skill) files.push(getManagedSkillsDir());
+		if (cfgMemoryBackend.get(this.session.settings) === "local") {
+			files.push(getMemoryRoot(this.session.settings.getAgentDir(), this.session.cwd));
+		}
+		return files.length > 0 ? files : undefined;
 	};
 	readonly label = "Learn";
 	get description(): string {

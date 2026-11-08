@@ -11,7 +11,7 @@ import type { ApprovalGuard, ApprovalSubject } from "../../tools/approval";
 import { approvalCacheKeyForPath } from "../../tools/approval-cache";
 import { approvalTargetKey, approvalTreeSearchFolderKey } from "../../tools/approval-targets";
 import { evaluatePermissionPath, evaluateSubagentPermission } from "./evaluate";
-import { hasPathRules, permissionPathArguments } from "./path-rules";
+import { expandListTargets, hasPathRules, permissionPathArguments, toPathCandidate } from "./path-rules";
 import { protectedPathRefusal } from "./protected-paths";
 import { cfgTaskPermissionsActiveScope } from "./settings";
 import { decodePermissionScope } from "./snapshot";
@@ -86,7 +86,9 @@ function scopeGuard(scope: DeepImmutable<PermissionScope>, cwd: string, agentDir
 			const decision = evaluateSubagentPermission({ scope, toolName: tool.name, toolInput, cwd, tier: call.tier });
 			if (decision.action === "deny") return { reason: decision.reason };
 			if (scope.restricted && call.tier !== "read") {
-				const reason = protectedPathRefusal(canonicalTargets(tool, args, toolInput, cwd), agentDir);
+				// Named targets too: a symlink's own path is protected even when it resolves elsewhere.
+				const targets = [...namedTargets(toolInput, cwd), ...canonicalTargets(tool, args, toolInput, cwd)];
+				const reason = protectedPathRefusal(targets, agentDir, cwd);
 				if (reason !== undefined) return { reason };
 			}
 			if (!checksTargets) return undefined;
@@ -137,6 +139,15 @@ function canonicalTargets(
 	}
 	return targets;
 }
+
+/** The host paths a call names in its path arguments (lists expanded), resolved without following symlinks. */
+function namedTargets(toolInput: Record<string, unknown>, cwd: string): string[] {
+	return expandListTargets(permissionPathArguments(toolInput))
+		.filter(target => !URL_TARGET.test(target))
+		.map(target => toPathCandidate(target, cwd).absolute);
+}
+
+const URL_TARGET = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 function withoutTrailingSeparator(target: string): string {
 	return path.parse(target).root === target ? target : target.replace(/[\\/]+$/, "");

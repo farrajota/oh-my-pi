@@ -47,6 +47,9 @@ export class ManageSkillTool implements AgentTool<typeof manageSkillSchema> {
 	readonly loadMode = "essential" as const;
 	readonly summary = "Create, update, or delete an isolated managed skill";
 
+	/** The managed skills folder in the agent dir, which this tool writes although it names no path. */
+	readonly approvalRestrictionPaths = (): readonly string[] => [getManagedSkillsDir()];
+
 	constructor(private readonly refreshSkills?: () => Promise<void>) {}
 
 	static createIf(session: ToolSession): ManageSkillTool | null {
