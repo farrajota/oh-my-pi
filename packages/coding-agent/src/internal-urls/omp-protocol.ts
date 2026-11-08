@@ -6,6 +6,7 @@
  * URL forms:
  * - omp:// - Lists all available documentation files
  * - omp://<file>.md - Reads a specific documentation file
+ * - omp://<dir> - Lists the documentation files under a docs subdirectory
  */
 import * as path from "node:path";
 import { resolveContainedPath, resolveContainedPathSync } from "../discovery/contained-path";
@@ -66,6 +67,14 @@ export class OmpProtocolHandler implements ProtocolHandler {
 			return this.#listDocs(url);
 		}
 
+		// A docs subdirectory (`omp://tools`) is a directory to grep and the URL
+		// filesystem, so reading it lists the docs under it instead of failing.
+		const dirPrefix = `${docPath.replace(/\/+$/, "")}/`;
+		const filenames = getDocFilenames();
+		if (!filenames.includes(docPath) && filenames.some(name => name.startsWith(dirPrefix))) {
+			return this.#listDocs(url, dirPrefix);
+		}
+
 		return this.#readDoc(docPath, filename, url);
 	}
 
@@ -114,8 +123,9 @@ export class OmpProtocolHandler implements ProtocolHandler {
 		return resolution.status === "ok" ? resolution.realPath : null;
 	}
 
-	async #listDocs(url: InternalUrl): Promise<InternalResource> {
-		const filenames = getDocFilenames();
+	/** Lists every doc, or only those under `dirPrefix` (which ends in `/`) as a directory resource. */
+	async #listDocs(url: InternalUrl, dirPrefix?: string): Promise<InternalResource> {
+		const filenames = getDocFilenames().filter(f => dirPrefix === undefined || f.startsWith(dirPrefix));
 		if (filenames.length === 0) {
 			throw new Error("No documentation files found");
 		}
@@ -128,6 +138,7 @@ export class OmpProtocolHandler implements ProtocolHandler {
 			content,
 			contentType: "text/markdown",
 			size: Buffer.byteLength(content, "utf-8"),
+			...(dirPrefix === undefined ? {} : { isDirectory: true }),
 		};
 	}
 

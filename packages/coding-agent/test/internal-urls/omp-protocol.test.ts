@@ -20,6 +20,18 @@ describe("OmpProtocolHandler", () => {
 		expect(prefixed.content).toContain("# read");
 	});
 
+	it("lists the docs under a docs subdirectory", async () => {
+		// grep and the URL filesystem already walk `omp://tools` as a directory; read must agree.
+		const router = InternalUrlRouter.instance();
+		for (const url of ["omp://tools", "omp://tools/", "omp://docs/tools"]) {
+			const resource = await router.resolve(url);
+			expect(resource.isDirectory).toBe(true);
+			expect(resource.content).toContain("(omp://tools/read.md)");
+			expect(resource.content).not.toContain("custom-tools.md");
+		}
+		await expect(router.resolve("omp://no-such-dir")).rejects.toThrow("Documentation file not found");
+	});
+
 	it("locates a doc to the file the active corpus was read from", async () => {
 		const router = InternalUrlRouter.instance();
 		// A source checkout reads docs from disk; a bundled or embedded corpus
