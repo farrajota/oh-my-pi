@@ -2059,12 +2059,25 @@ async function handleCodexStreamFailure(context: CodexStreamFailureContext, erro
 	output.stopReason = result.stopReason;
 	output.errorStatus = result.status;
 	output.errorId = result.id;
-	output.errorMessage = result.message;
+	output.errorCode = result.code;
+	output.errorMessage = withCodexCooldownDetail(error, result.message);
 	output.duration = performance.now() - context.startTime;
 	if (context.firstTokenTime) {
 		output.ttft = context.firstTokenTime - context.startTime;
 	}
 	return output;
+}
+
+/**
+ * A 429 becomes the friendly "ChatGPT rate limit exceeded." text, which hides
+ * a proxy's aggregate cooldown (CLIProxyAPI `model_cooldown`: every upstream
+ * credential is cooling down). Keep the proxy's own sentence beside it.
+ */
+function withCodexCooldownDetail(error: unknown, message: string): string {
+	if (!(error instanceof CodexApiError) || error.code !== "model_cooldown") return message;
+	const detail = error.info.message.trim();
+	if (!detail || message.includes(detail)) return message;
+	return `${message}\n\n${detail}`;
 }
 
 /**

@@ -912,9 +912,11 @@ describe("OpenAI reasoning effort fallback retry", () => {
 
 		expect(completions.stopReason).toBe("error");
 		expect(completions.errorStatus).toBe(503);
+		expect(completions.errorCode).toBe("model_cooldown");
 		expect(completionsCalls).toBe(1);
 		expect(responses.stopReason).toBe("error");
 		expect(responses.errorStatus).toBe(503);
+		expect(responses.errorCode).toBeUndefined();
 		expect(responsesCalls).toBe(1);
 	});
 });

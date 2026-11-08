@@ -573,3 +573,18 @@ export function isAccountScopedCapText(message: string): boolean {
 export function isConcurrencyCapExclusion(status: number | undefined, message: string | undefined): boolean {
 	return message !== undefined && parseRateLimitReason(message) === "CONCURRENT_LIMIT" && status !== 402;
 }
+
+// CLIProxyAPI's aggregate cooldown: every upstream credential it holds for the
+// model is resting, so the proxy answers 429 `model_cooldown` with a
+// Retry-After for the earliest reset. The text form covers paths that keep only
+// the formatted message (`... cooling down via provider codex (type=model_cooldown)`).
+const MODEL_COOLDOWN_TEXT_PATTERN = /\bmodel_cooldown\b|\ball credentials for model\b[^\n]{0,200}\bcooling down\b/i;
+
+/**
+ * Whether a failed turn is a proxy-wide model cooldown: a limit that clears on
+ * its own when the proxy's credentials reset, not a per-minute throttle.
+ */
+export function isModelCooldownError(message: { errorCode?: string; errorMessage?: string }): boolean {
+	if (message.errorCode === "model_cooldown") return true;
+	return message.errorMessage !== undefined && MODEL_COOLDOWN_TEXT_PATTERN.test(message.errorMessage);
+}

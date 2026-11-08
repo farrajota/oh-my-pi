@@ -92,6 +92,10 @@ export interface MockResponse {
 	fallbackCreditHandle?: AnthropicFallbackCreditHandle;
 	/** Error text paired with an explicit `"error"` stop reason. */
 	errorMessage?: string;
+	/** HTTP status of the failure, on a `throw` or explicit `"error"` response. */
+	errorStatus?: number;
+	/** Provider error code of the failure, on a `throw` or explicit `"error"` response. */
+	errorCode?: string;
 	/** Usage stats. Missing fields default to 0; missing `cost.total` is recomputed from components. */
 	usage?: Partial<Omit<Usage, "cost">> & { cost?: Partial<Usage["cost"]> };
 	/** Service tier the mock reports serving the turn, as a real provider's response echo would. */
@@ -364,7 +368,7 @@ async function runMock(
 				: response.throw instanceof Error
 					? response.throw.message
 					: String(response.throw);
-		emitTerminalError(stream, model, startedAt, perfStart, "error", message);
+		emitTerminalError(stream, model, startedAt, perfStart, "error", message, response);
 		return;
 	}
 
@@ -411,6 +415,8 @@ async function runMock(
 	partial.stopDetails = response.stopDetails;
 	partial.fallbackCreditHandle = response.fallbackCreditHandle;
 	partial.errorMessage = response.errorMessage;
+	if (response.errorStatus !== undefined) partial.errorStatus = response.errorStatus;
+	if (response.errorCode !== undefined) partial.errorCode = response.errorCode;
 	partial.usage = mergeUsage(response.usage);
 	partial.serviceTier = response.serviceTier;
 	partial.duration = performance.now() - perfStart;
@@ -486,6 +492,7 @@ function emitTerminalError(
 	perfStart: number,
 	reason: "aborted" | "error",
 	message: string,
+	failureFields?: Pick<MockResponse, "errorStatus" | "errorCode">,
 ): void {
 	const failure: AssistantMessage = {
 		role: "assistant",
@@ -496,6 +503,8 @@ function emitTerminalError(
 		usage: emptyUsage(),
 		stopReason: reason as StopReason,
 		errorMessage: message,
+		...(failureFields?.errorStatus !== undefined ? { errorStatus: failureFields.errorStatus } : {}),
+		...(failureFields?.errorCode !== undefined ? { errorCode: failureFields.errorCode } : {}),
 		timestamp: startedAt,
 		duration: performance.now() - perfStart,
 	};

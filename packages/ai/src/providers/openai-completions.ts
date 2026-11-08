@@ -1903,6 +1903,7 @@ const streamOpenAICompletionsOnce = (
 			output.stopReason = result.stopReason;
 			output.errorStatus = result.status;
 			output.errorId = result.id;
+			output.errorCode = result.code;
 			output.errorMessage = result.message;
 			// Some providers via OpenRouter include extra details here.
 			const rawMetadata = readOpenRouterRawMetadata(capturedErrorResponse);

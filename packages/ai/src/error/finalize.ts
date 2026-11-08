@@ -27,6 +27,8 @@ export interface FinalizeOptions {
 export interface FinalizeResult {
 	/** Structured flag id from {@link classify}. */
 	id: number;
+	/** The error's own `code` field, when it carries one; never parsed from the message. */
+	code: string | undefined;
 	/** HTTP status, from the error or the captured response. */
 	status: number | undefined;
 	/** `"aborted"` when the caller cancelled, otherwise `"error"`. */
@@ -78,8 +80,16 @@ export async function finalize(error: unknown, opts: FinalizeOptions = {}): Prom
 
 	return {
 		id,
+		code: errorCode(error),
 		status: currentStatus,
 		stopReason: aborted ? "aborted" : "error",
 		message,
 	};
+}
+
+function errorCode(error: unknown): string | undefined {
+	if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+	const code = error.code;
+	if (typeof code === "string") return code || undefined;
+	return typeof code === "number" && Number.isFinite(code) ? String(code) : undefined;
 }
