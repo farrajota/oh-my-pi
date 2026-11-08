@@ -102,10 +102,10 @@ describe("write as a transport", () => {
 	const readOnly = scope({ tools: ["read"], allowPathGroups: [["src/**"]] });
 	const messaging = scope({ tools: ["read", "hub"], allowPathGroups: [["src/**"]] });
 
-	test("write without a write grant reaches local:// and xd:// targets only", () => {
-		expect(check(readOnly, "write", { path: "local://notes/plan.md" }).action).toBe("allow");
+	test("write without a write grant reaches xd:// targets only", () => {
 		expect(check(readOnly, "write", { path: "xd://clipboard/text" }).action).toBe("allow");
-		for (const target of ["src/a.ts", "/repo/src/a.ts", "agent://Main"]) {
+		// local:// is the parent's scratch root, shared by the whole tree: writing it needs a write grant.
+		for (const target of ["local://notes/plan.md", "src/a.ts", "/repo/src/a.ts", "agent://Main"]) {
 			expect(check(readOnly, "write", { path: target })).toMatchObject({
 				action: "deny",
 				reason: "BLOCKED: Subagent permission profile does not allow tool 'write'.",
@@ -120,7 +120,7 @@ describe("write as a transport", () => {
 	});
 
 	test("a filesystem target among internal ones is still a filesystem write", () => {
-		expect(check(messaging, "write", { path: "local://a.md" }, ["/repo/src/a.ts"]).details?.code).toBe(
+		expect(check(messaging, "write", { path: "agent://Main" }, ["/repo/src/a.ts"]).details?.code).toBe(
 			"tool-not-allowed",
 		);
 		expect(check(messaging, "write", {}).details?.code).toBe("tool-not-allowed");

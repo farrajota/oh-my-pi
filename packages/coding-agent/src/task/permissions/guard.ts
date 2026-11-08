@@ -83,7 +83,7 @@ function scopeGuard(scope: DeepImmutable<PermissionScope>, cwd: string, agentDir
 	return {
 		check(tool, args, call) {
 			const toolInput = isRecord(args) ? args : {};
-			const decision = evaluateSubagentPermission({ scope, toolName: tool.name, toolInput, cwd });
+			const decision = evaluateSubagentPermission({ scope, toolName: tool.name, toolInput, cwd, tier: call.tier });
 			if (decision.action === "deny") return { reason: decision.reason };
 			if (scope.restricted && call.tier !== "read") {
 				const reason = protectedPathRefusal(canonicalTargets(tool, args, toolInput, cwd), agentDir);

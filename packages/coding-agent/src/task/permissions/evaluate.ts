@@ -15,6 +15,7 @@ import {
 	permissionToolKey,
 	permissionToolOwner,
 } from "./tool-names";
+import type { ToolTier } from "@oh-my-pi/pi-agent-core";
 import type { PermissionDecision, PermissionDenialCode, PermissionScope } from "./types";
 
 const ALLOW: PermissionDecision = Object.freeze({ action: "allow", reason: "", matched: "" });
@@ -30,6 +31,8 @@ export interface PermissionCallInput {
 	 * pass the same path rules as the targets named in `toolInput`, and the secrets-blind check.
 	 */
 	readonly targets?: readonly string[];
+	/** The call's resolved approval tier; a multi-action tool's mutating actions report `write` or `exec`. */
+	readonly tier?: ToolTier;
 }
 
 /** Whether path rules or guardrails apply, so a tool's effects must be provable from its targets. */
@@ -116,15 +119,23 @@ function otherAgentRecordDenial(
 	return undefined;
 }
 
+/** Tools granted by name for their read actions whose other actions edit files or launch processes. */
+const MUTATING_ACTION_TOOLS: ReadonlySet<string> = new Set(["lsp", "github", "debug", "ida"]);
+
+/** Tools whose grant lets a scope write files. */
+const FILE_WRITE_TOOLS: readonly string[] = ["write", "edit", "ast_edit"];
+
 function evaluateToolName(
 	scope: PermissionScope,
 	toolName: string,
 	key: string,
 	targets: readonly string[],
+	tier: ToolTier | undefined,
 ): PermissionDecision {
 	const denied = (name: string) => scope.denyTools.find(tool => permissionToolKey(tool) === name);
 	const listed = (name: string) =>
 		scope.tools === undefined || scope.tools.some(tool => permissionToolKey(tool) === name);
+	const grantsFileWrites = FILE_WRITE_TOOLS.some(name => listed(name) && denied(name) === undefined);
 	const owner = permissionToolOwner(key);
 	const messagingUse = key === "wait" || (key === "write" && targets.some(target => hasScheme(target, "agent://")));
 	const deniedTool =
@@ -140,17 +151,32 @@ function evaluateToolName(
 			targets,
 		);
 	}
-	if (listed(key) || (owner !== undefined && listed(owner))) return ALLOW;
+	if (listed(key) || (owner !== undefined && listed(owner))) {
+		// A name grant covers what the call does only for read actions; `lsp rename_file` moves files.
+		if (MUTATING_ACTION_TOOLS.has(key) && tier !== undefined && tier !== "read" && !grantsFileWrites) {
+			return deny(
+				"tool-not-allowed",
+				`BLOCKED: Subagent permission profile allows only the read actions of tool '${toolName}'; this action changes files and the profile grants no file writes.`,
+				"subagent:mutating-action",
+				toolName,
+				targets,
+			);
+		}
+		return ALLOW;
+	}
 	const messaging = listed(MESSAGING_GRANT);
 	if (key === "wait" && messaging) return ALLOW;
-	// Without a write grant, `write` still reaches internal transports: its own `local://` space, `xd://`
-	// devices, and `agent://` when messaging is granted. One filesystem target makes it a file write.
+	// Without the `write` tool, `write` still reaches internal transports: `xd://` devices, and
+	// `agent://` when messaging is granted. Its `local://` space is the parent's, shared by the whole
+	// tree (plans, task files), so writing it needs a file-write grant. One filesystem target makes
+	// it a file write.
 	if (
 		key === "write" &&
 		targets.length > 0 &&
-		targets.every(
-			target =>
-				hasScheme(target, "local://") || hasScheme(target, "xd://") || (messaging && hasScheme(target, "agent://")),
+		targets.every(target =>
+			hasScheme(target, "local://")
+				? grantsFileWrites
+				: hasScheme(target, "xd://") || (messaging && hasScheme(target, "agent://")),
 		)
 	) {
 		return ALLOW;
@@ -161,6 +187,26 @@ function evaluateToolName(
 		"subagent:tool-allowlist",
 		toolName,
 		targets,
+	);
+}
+
+/**
+ * The `proc://` target a `write` names, if any: writing one sends a service stdin or kills it, so the
+ * call executes rather than writes and answers to the `bash` grant and the unprovable-effect rule.
+ */
+function executionTarget(key: string, targets: readonly string[]): string | undefined {
+	return key === "write" ? targets.find(target => hasScheme(target, "proc://")) : undefined;
+}
+
+function evaluateExecutionGrant(scope: PermissionScope, toolName: string, target: string): PermissionDecision {
+	const bash = (tool: string) => permissionToolKey(tool) === "bash";
+	if (!scope.denyTools.some(bash) && (scope.tools === undefined || scope.tools.some(bash))) return ALLOW;
+	return deny(
+		"tool-not-allowed",
+		`BLOCKED: Subagent permission profile does not allow writing '${target}': driving a process needs the bash grant.`,
+		"subagent:execution",
+		toolName,
+		[target],
 	);
 }
 
@@ -214,11 +260,16 @@ export function evaluateSubagentPermission(input: PermissionCallInput): Permissi
 
 	const targets = expandListTargets([...permissionPathArguments(input.toolInput), ...(input.targets ?? [])]);
 
+	const execution = executionTarget(key, targets);
 	if (scope.toolsEnabled) {
-		const toolDecision = evaluateToolName(scope, toolName, key, targets);
+		const toolDecision = evaluateToolName(scope, toolName, key, targets, input.tier);
 		if (toolDecision.action === "deny") return toolDecision;
+		if (execution !== undefined) {
+			const executionDecision = evaluateExecutionGrant(scope, toolName, execution);
+			if (executionDecision.action === "deny") return executionDecision;
+		}
 	}
-	if (hasUnprovableEffects(scope) && isUnprovableEffectTool(key)) {
+	if (hasUnprovableEffects(scope) && (isUnprovableEffectTool(key) || execution !== undefined)) {
 		return deny(
 			"guardrail",
 			`BLOCKED: Subagent permission scope cannot verify the effects of tool '${toolName}' while path rules or guardrails apply.`,
