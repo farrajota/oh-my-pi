@@ -19,7 +19,7 @@ import { initializeExtensions } from "../modes/runtime-init";
 import type { AsyncJobManagerApi } from "../async";
 import type { PreparedExtension } from "../extensibility/extensions/types";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
@@ -27,6 +27,8 @@ import type { ArtifactManagerApi } from "../session/artifacts";
 import type { CostGateApi } from "../session/cost-gate";
 import { installRetryFallbackRole } from "../session/retry-fallback-chains";
 import type { AuthStorage } from "../session/auth-storage";
+import type { FileEntry } from "../session/session-entries";
+import { loadEntriesFromFile } from "../session/session-loader";
 import { revivePersistedPlaced } from "../thread/executor-routing";
 import { subagentWorkerPool } from "../thread/subagent-worker";
 import {
@@ -46,6 +48,20 @@ import {
 	subagentRetryFallbackRole,
 } from "./executor";
 import { isCompletionProbeEnabled } from "./completion-probe";
+import { activePermissionScope } from "./permissions/guard";
+import {
+	checkPermissionRevival,
+	type ParentBindingState,
+	type ParentScopeState,
+	permissionBindingIn,
+	permissionRevivalRefusal,
+	persistedParentScope,
+} from "./permissions/revival";
+import { permissionWithholdsExtensionCode } from "./permissions/session-checks";
+import { cfgTaskPermissionsActiveScope } from "./permissions/settings";
+import { encodePermissionScope } from "./permissions/snapshot";
+import { permissionRestrictsStartup, permissionStartupToolNames } from "./permissions/spawn";
+import type { PermissionScope } from "./permissions/types";
 import { discoverAgents, getAgent } from "./discovery";
 import {
 	assertPerCallModelApproved,
@@ -111,6 +127,10 @@ export interface PersistedReviveSpec {
 	readonly enableLsp: boolean;
 	readonly eventBus: EventBus | undefined;
 	readonly subagentEventBus: EventBus | undefined;
+	/** The verified permission scope to restore; undefined revives the agent without one. */
+	readonly permissionScope: PermissionScope | undefined;
+	/** Hash of the snapshot that was verified; the reopened transcript must still hold it. */
+	readonly permissionSnapshotHash: string | undefined;
 }
 
 /**
@@ -214,6 +234,8 @@ export function createPersistedSubagentReviverFactory(
 			parentId = registry.get(parentId)?.parentId;
 		}
 		return async expectedRef => {
+			// Checked per revive: profile files and the parent's scope may have changed since the factory ran.
+			const permissions = await checkPersistedPermissions(ctx, ref, sessionFile, registry);
 			// Live root state is read per revive, so a later `/new` or cwd move is followed.
 			const spec: PersistedReviveSpec = {
 				id: ref.id,
@@ -234,6 +256,8 @@ export function createPersistedSubagentReviverFactory(
 				enableLsp: ctx.enableLsp,
 				eventBus: ctx.eventBus,
 				subagentEventBus: ctx.subagentEventBus,
+				permissionScope: permissions.scope,
+				permissionSnapshotHash: permissions.persistedHash,
 			};
 			// Worker mode: a revival is placed like a fresh spawn (main thread or a worker).
 			const pool = subagentWorkerPool(ctx.settings);
@@ -242,6 +266,82 @@ export function createPersistedSubagentReviverFactory(
 				: revivePersistedSubagent(spec, expectedRef);
 		};
 	};
+}
+
+/** The parent's transcript entries, or why they cannot be read. */
+async function parentTranscript(
+	parentId: string | undefined,
+	registry: AgentRegistryApi,
+): Promise<{ readonly entries: FileEntry[] } | { readonly error: string }> {
+	const file = parentId ? registry.get(parentId)?.sessionFile : undefined;
+	if (!parentId || !file) {
+		return { error: `its parent "${parentId ?? "unknown"}" has no transcript to check the scope against` };
+	}
+	try {
+		return { entries: await loadEntriesFromFile(file, undefined, { throwIfMissing: true }) };
+	} catch (error) {
+		return {
+			error: `its parent's transcript could not be read (${error instanceof Error ? error.message : String(error)})`,
+		};
+	}
+}
+
+function liveScopeState(settings: Settings): ParentScopeState {
+	const active = activePermissionScope(settings);
+	if (active === undefined) return { ok: true, scope: undefined };
+	return active.ok ? { ok: true, scope: active.scope } : { ok: false, error: active.error };
+}
+
+/**
+ * Verify the permission scope a persisted subagent may revive under, or throw a refusal that says
+ * why and what to do. The parent's own transcript holds the scope hash it recorded at spawn; the
+ * parent's live settings (else its transcript) hold the scope it runs under now.
+ */
+async function checkPersistedPermissions(
+	ctx: PersistedSubagentReviveContext,
+	ref: AgentRef,
+	sessionFile: string,
+	registry: AgentRegistryApi,
+): Promise<{ scope: PermissionScope | undefined; persistedHash: string | undefined }> {
+	const current = await SessionManager.peekSessionInit(sessionFile);
+	// Without a contract there is nothing to verify; the revive itself refuses after reopening the file.
+	if (!current?.init) return { scope: undefined, persistedHash: undefined };
+	const parentId = ref.parentId;
+	const transcript = await parentTranscript(parentId, registry);
+	const parentBinding: ParentBindingState =
+		"entries" in transcript
+			? { readable: true, hash: permissionBindingIn(transcript.entries, ref.id) }
+			: { readable: false, reason: transcript.error };
+	const rootAgentId = ctx.session.getAgentId?.() ?? MAIN_AGENT_ID;
+	// Live sessions on main and worker mirrors both expose their settings; the handle type does not.
+	const liveParentSettings = parentId
+		? (registry.get(parentId)?.session as { settings?: Settings } | null | undefined)?.settings
+		: undefined;
+	const parentScope: ParentScopeState =
+		parentId === undefined || parentId === rootAgentId
+			? liveScopeState(ctx.settings)
+			: liveParentSettings
+				? liveScopeState(liveParentSettings)
+				: "entries" in transcript
+					? persistedParentScope(extractSessionInit(transcript.entries))
+					: { ok: true, scope: undefined };
+	const decision = await checkPermissionRevival({
+		agentId: ref.id,
+		parentId,
+		init: current.init,
+		parentBinding,
+		parentScope,
+		cwd: current.cwd,
+		agentDir: ctx.settings.getAgentDir(),
+	});
+	if (!decision.ok) {
+		logger.warn("Persisted subagent not revived: permission check failed", {
+			agentId: ref.id,
+			reason: decision.reason,
+		});
+		throw new Error(permissionRevivalRefusal(ref.id, decision));
+	}
+	return decision;
 }
 
 /**
@@ -271,6 +371,12 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		await reopened.close();
 		throw new Error(
 			`Cannot revive subagent "${ref.id}": session file "${sessionFile}" has no message history (truncated to header/session_init). The agent was not revived.`,
+		);
+	}
+	if (init.permissionSnapshot?.canonicalSha256 !== spec.permissionSnapshotHash) {
+		await reopened.close();
+		throw new Error(
+			`Cannot revive subagent "${ref.id}": its permission snapshot changed while the revival was being checked. The agent was not revived. Retry, or start a fresh subagent for the work; its transcript stays readable at history://${ref.id}.`,
 		);
 	}
 	const resolveParentSession = () =>
@@ -383,6 +489,10 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 				}
 			: undefined),
 		...compactionThresholdSettings(init.compactionThreshold),
+		// The verified scope the spawn ran under, as the spawn wrote it (a runtime override).
+		...(spec.permissionScope
+			? { [cfgTaskPermissionsActiveScope.id]: encodePermissionScope(spec.permissionScope) }
+			: undefined),
 	});
 	// Restore the `subagent:<id>` fallback chain the spawn installed; the
 	// transcript alone cannot rebuild it (multi-model agent patterns and
@@ -413,16 +523,23 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	// Older session files persisted the synthetic xd:// write transport in the
 	// enabled set. A read-only agent definition could never grant full write,
 	// so remove that transport name before replaying tools as explicit grants.
-	const revivedToolNames = restoredSeance
+	const persistedToolNames = restoredSeance
 		? restoredSeance.toolNames
 		: init.readOnly === true && init.tools.includes("write")
 			? init.tools.filter(name => name !== "write")
 			: init.tools;
+	// An enforce-restricted scope owns the tool list, as at spawn: cut to what it allows, no
+	// MCP, and no extension or custom-tool code (their handlers run outside the scope).
+	const permissionRestricted = permissionRestrictsStartup(subagentSettings);
+	const withholdExtensionCode = permissionWithholdsExtensionCode(subagentSettings);
+	const revivedToolNames = permissionRestricted
+		? permissionStartupToolNames(subagentSettings, persistedToolNames)
+		: persistedToolNames;
 	const artifactManager = spec.artifactManager;
 	if (artifactManager && !restoredSeance) reopened.adoptArtifactManager(artifactManager);
 	// A restricted persisted contract must not consult process-global MCP
 	// state: same-name MCP tools are untrusted capability sources.
-	const restrictToolNames = restoredSeance !== undefined || init.restrictToolNames === true;
+	const restrictToolNames = restoredSeance !== undefined || init.restrictToolNames === true || permissionRestricted;
 	// The spawn's result contract: a session persisted without `yield` returned its final message.
 	const structured = revivedToolNames.includes("yield");
 	const mcpManager = restrictToolNames ? undefined : MCPManager.instance();
@@ -480,7 +597,8 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			systemPrompt: () => [...init.systemPrompt],
 			// Inherit current owner policy, never extension authority from a transcript.
 			extensionRoots: () => spec.root.effectiveExtensionRoots,
-			preloadedPreparedExtensions: spec.preparedExtensions,
+			// An empty prepared list also keeps the agent from discovering extensions of its own.
+			preloadedPreparedExtensions: withholdExtensionCode ? [] : spec.preparedExtensions,
 			// Old files predate persisted spawns: deny re-spawning rather than let
 			// createAgentSession default to wildcard ("*").
 			spawns: init.spawns ?? "",

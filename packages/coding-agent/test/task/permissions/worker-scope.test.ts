@@ -28,6 +28,7 @@ import { RemoteAgentSession } from "@oh-my-pi/pi-coding-agent/thread/remote-agen
 import { SubagentWorkerPool, setSubagentWorkerPoolForTests } from "@oh-my-pi/pi-coding-agent/thread/subagent-worker";
 import { __resetDirsFromEnvForTests, removeWithRetries } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../../helpers/agent-session-setup";
+import { FakeModelServer } from "./fake-model-server";
 import { enforceScope } from "./scope-fixtures";
 
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
@@ -37,115 +38,6 @@ const SCRIPT_ID = Bun.randomUUIDv7("hex");
 const WRITE_TASK = `omp-test-scoped-write-${SCRIPT_ID}`;
 const AGENT_MARKER = `omp-test-scoped-agent-${SCRIPT_ID}`;
 const TARGET = path.join("secret", "key.txt");
-
-interface ChatMessage {
-	role: string;
-	content?: unknown;
-}
-
-function messageText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map(part => (typeof part === "object" && part !== null && "text" in part ? String(part.text) : ""))
-		.join("");
-}
-
-function isChatMessage(value: unknown): value is ChatMessage {
-	return typeof value === "object" && value !== null && typeof Reflect.get(value, "role") === "string";
-}
-
-type Reply = { text: string } | { tool: string; args: Record<string, unknown> };
-
-function chunks(reply: Reply): string {
-	const base = { id: "chatcmpl-fake", object: "chat.completion.chunk", created: 0, model: "fake-model" };
-	const delta =
-		"text" in reply
-			? { role: "assistant", content: reply.text }
-			: {
-					role: "assistant",
-					tool_calls: [
-						{
-							index: 0,
-							id: `call_${reply.tool}`,
-							type: "function",
-							function: { name: reply.tool, arguments: JSON.stringify(reply.args) },
-						},
-					],
-				};
-	const frames = [
-		{ ...base, choices: [{ index: 0, delta, finish_reason: null }] },
-		{ ...base, choices: [{ index: 0, delta: {}, finish_reason: "text" in reply ? "stop" : "tool_calls" }] },
-		{ ...base, choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } },
-	];
-	return `${frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join("")}data: [DONE]\n\n`;
-}
-
-/**
- * Scripted model: the scoped agent's turn (its system prompt carries {@link AGENT_MARKER}) whose task
- * is {@link WRITE_TASK} writes {@link TARGET}; a tool result is answered with `tool said: …`; anything
- * else gets `pong`. Every system prompt of the run is kept so a test can read the child's prompt.
- */
-class FakeModelServer {
-	readonly #server: Bun.Server<undefined>;
-	readonly systemPrompts: string[] = [];
-
-	constructor() {
-		this.#server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => this.#fetch(request) });
-	}
-
-	async writeModelsYml(agentDir: string): Promise<string> {
-		const file = path.join(agentDir, "models.yml");
-		await Bun.write(
-			file,
-			[
-				"providers:",
-				"  fake:",
-				`    baseUrl: http://127.0.0.1:${this.#server.port}/v1`,
-				"    auth: none",
-				"    api: openai-completions",
-				"    models:",
-				"      - id: fake-model",
-				"        name: Fake Model",
-				"        reasoning: false",
-				"        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }",
-				"",
-			].join("\n"),
-		);
-		return file;
-	}
-
-	stop(): void {
-		this.#server.stop(true);
-	}
-
-	async #fetch(request: Request): Promise<Response> {
-		const url = new URL(request.url);
-		if (url.pathname.endsWith("/models")) {
-			return Response.json({ object: "list", data: [{ id: "fake-model", object: "model", owned_by: "fake" }] });
-		}
-		if (!url.pathname.endsWith("/chat/completions")) return new Response("not found", { status: 404 });
-		const body: unknown = await request.json();
-		const rawMessages: unknown =
-			typeof body === "object" && body !== null ? Reflect.get(body, "messages") : undefined;
-		const messages = Array.isArray(rawMessages) ? rawMessages.filter(isChatMessage) : [];
-		const last = messages.at(-1);
-		const lastUser = messages.findLast(message => message.role === "user");
-		const systemText = messages
-			.filter(message => message.role === "system" || message.role === "developer")
-			.map(message => messageText(message.content))
-			.join("\n");
-		const runTurn = systemText.includes(AGENT_MARKER);
-		if (runTurn) this.systemPrompts.push(systemText);
-		let reply: Reply = { text: "pong" };
-		if (runTurn && last?.role === "tool") {
-			reply = { text: `tool said: ${messageText(last.content)}` };
-		} else if (runTurn && lastUser && messageText(lastUser.content).includes(WRITE_TASK)) {
-			reply = { tool: "write", args: { path: TARGET, content: "leak" } };
-		}
-		return new Response(chunks(reply), { headers: { "content-type": "text/event-stream" } });
-	}
-}
 
 const AGENT: AgentDefinition = {
 	name: "task",
@@ -204,7 +96,7 @@ beforeEach(async () => {
 	AgentRegistry.resetGlobalForTests();
 	AgentLifecycleManager.resetGlobalForTests();
 	IrcBus.resetGlobalForTests();
-	server = new FakeModelServer();
+	server = new FakeModelServer({ agentMarker: AGENT_MARKER, writeTask: WRITE_TASK, target: TARGET });
 	const modelsPath = await server.writeModelsYml(agentDir);
 	authStorage = createInMemoryAuthStorage();
 	modelRegistry = new ModelRegistry(authStorage, modelsPath);
