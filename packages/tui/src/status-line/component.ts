@@ -3228,7 +3228,11 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			? embeddedContextGaugeMinWidth(ctx.contextPercent, ctx.contextWindow)
 			: 0;
 		const minimumGapWidth = (): number => {
-			if (!embeddedContextWidth) return left.length > 0 && right.length > 0 ? 1 : 0;
+			const hasLeft = left.length > 0;
+			const hasRight = right.length > 0;
+			if (plain) return hasLeft && hasRight ? 1 : 0;
+			// Box and band layouts draw at least one gauge cell even beside a single group.
+			if (!embeddedContextWidth) return hasLeft || hasRight ? 1 : 0;
 			// If the labels cannot coexist with the last surviving segment, fall
 			// back to the original one-cell gauge instead of dropping the entire
 			// status line. At this width the labels cannot render either way.
@@ -3301,10 +3305,13 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 				}
 			}
 			const leftOverflowDropIndex = (): number => {
-				// Preserve the current working directory as long as possible. The
-				// previous right-to-left pop could collapse a normal-width bar to
-				// just the model segment, hiding the path before less-critical left
-				// segments such as model/mode/collab were removed.
+				// Preserve the current working directory as long as possible, then the
+				// active mode ("Plan", "Goal", ...): it changes what the agent may do,
+				// so it outlives model, git and the other left segments.
+				for (let i = leftSegIds.length - 1; i >= 0; i--) {
+					const id = leftSegIds[i];
+					if (id !== "path" && id !== "mode") return i;
+				}
 				for (let i = leftSegIds.length - 1; i >= 0; i--) {
 					if (leftSegIds[i] !== "path") return i;
 				}
