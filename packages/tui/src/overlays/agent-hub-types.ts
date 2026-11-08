@@ -1,5 +1,6 @@
 import type { AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 
 /** Identity of the ambient main session in the agent roster. */
 export const MAIN_AGENT_ID = "Main";
@@ -60,6 +61,10 @@ export interface AgentRecordLike {
 		patchPath?: string;
 		branchName?: string;
 		nestedPatchPaths?: string[];
+		requestedPermissionProfiles?: string[];
+		effectivePermissionProfiles?: string[];
+		/** Display summary of the permission scope the agent runs under. */
+		permissionSummary?: EffectivePermissionSummary;
 	};
 	lifecycle?: { responseAt?: number; acceptedAt?: number; terminalAt?: number };
 }

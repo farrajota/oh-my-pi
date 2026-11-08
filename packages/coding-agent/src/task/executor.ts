@@ -141,6 +141,7 @@ import {
 	permissionSessionInitFields,
 	permissionStartupToolNames,
 } from "./permissions/spawn";
+import { buildPermissionSummary } from "./permissions/summary";
 import type { PermissionScope } from "./permissions/types";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
@@ -5252,6 +5253,9 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					? enabledSubagentTools.filter(name => name !== "write")
 					: enabledSubagentTools;
 
+			const permissionFields = options.permissionScope
+				? permissionSessionInitFields(options.permissionScope, options.requestedPermissionProfiles)
+				: undefined;
 			session.sessionManager.appendSessionInit({
 				// Blocks as sent; the session appends a newer session_init whenever a model call's base changes.
 				systemPrompt: session.agent.state.systemPrompt,
@@ -5285,10 +5289,16 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				// even when the workspace was retained for recovery.
 				isolated: worktree !== undefined || undefined,
 				// Revival restores and verifies the scope from these; an unscoped spawn records none.
-				...(options.permissionScope
-					? permissionSessionInitFields(options.permissionScope, options.requestedPermissionProfiles)
-					: undefined),
+				...permissionFields,
 			});
+			// The Agent Hub shows the scope while the child is live; a later roster scan reads the transcript.
+			if (options.permissionScope && permissionFields) {
+				AgentRegistry.global().setHistory(id, {
+					requestedPermissionProfiles: permissionFields.requestedPermissionProfiles,
+					effectivePermissionProfiles: permissionFields.effectivePermissionProfiles,
+					permissionSummary: buildPermissionSummary(options.permissionScope),
+				});
+			}
 
 			abortSignal.addEventListener(
 				"abort",

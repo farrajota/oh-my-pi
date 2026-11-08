@@ -10,6 +10,7 @@
  */
 
 import { logger } from "@oh-my-pi/pi-utils";
+import type { EffectivePermissionSummary } from "@oh-my-pi/pi-wire";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import { AgentAwaits, type AgentAwaitsApi } from "./agent-awaits";
 import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
@@ -61,6 +62,12 @@ export interface AgentHistorySummary {
 	branchName?: string;
 	/** Captured nested-repo patches (`<id>.nested-<n>-<path>.patch`), one per nested repository the agent changed. */
 	nestedPatchPaths?: string[];
+	/** Permission profiles the agent's spawn requested, in request order. */
+	requestedPermissionProfiles?: string[];
+	/** Inherited plus requested permission profiles, in composition order. */
+	effectivePermissionProfiles?: string[];
+	/** Display summary of the permission scope the agent runs under (never an authority input). */
+	permissionSummary?: EffectivePermissionSummary;
 }
 
 export interface AgentRef {

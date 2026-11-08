@@ -8,6 +8,7 @@ import { assistantTurnProducedOutput } from "../session/messages";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, PREWALK_MODEL_CHANGE_ROLE } from "../session/session-entries";
 import { readSessionHeaderId, visitEntriesFromFileStream } from "../session/session-loader";
 import { loadBundledAgents } from "../task/agents";
+import { permissionHistoryOf } from "../task/permissions/summary";
 import { isReadOnlyAgent } from "../task/read-only-policy";
 import { persistedVibeChildIds } from "../vibe/lifecycle";
 import {
@@ -402,6 +403,7 @@ async function readPersistedAgentMetadata(
 						typeof record.modelRole === "string" ? record.modelRole : (history.modelRole ?? inferred.modelRole),
 					resolvedModel: typeof record.resolvedModel === "string" ? record.resolvedModel : history.resolvedModel,
 					readOnly: typeof record.readOnly === "boolean" ? record.readOnly : inferred.readOnly,
+					...permissionHistoryOf(record),
 				};
 				return false;
 			},

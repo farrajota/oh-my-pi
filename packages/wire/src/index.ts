@@ -235,6 +235,34 @@ export interface SessionState {
 	isAborting?: boolean;
 }
 
+/** Display list capped at a fixed size, in source order; `omittedCount` counts the items left out. */
+export interface BoundedList<T> {
+	readonly items: readonly T[];
+	readonly omittedCount: number;
+}
+
+/**
+ * Display-only summary of the permission scope a subagent runs under. Never an authority input: the
+ * scope itself stays in the subagent's settings and transcript.
+ */
+export interface EffectivePermissionSummary {
+	readonly mode: "off" | "suggest" | "enforce";
+	/** At most 16 profile names in composition order, each at most 128 UTF-8 bytes. */
+	readonly profiles: BoundedList<string>;
+	/** Tool allowlist (at most 32 names; `messaging` stands for the irc/hub grant); absent when the scope has none. */
+	readonly tools?: BoundedList<string>;
+	/** At most 32 denied tool names. */
+	readonly denyTools: BoundedList<string>;
+	/** Path groups a path must each match (any pattern within a group): at most 16 groups of 16 patterns. */
+	readonly allowPathSets: BoundedList<BoundedList<string>>;
+	/** At most 32 deny patterns, each at most 512 UTF-8 bytes. */
+	readonly denyPaths: BoundedList<string>;
+	readonly guardrails: {
+		readonly noNetwork: boolean;
+		readonly secretsBlind: boolean;
+	};
+}
+
 export interface AgentSnapshot {
 	id: string;
 	displayName: string;
@@ -245,6 +273,12 @@ export interface AgentSnapshot {
 	hasSessionFile: boolean;
 	createdAt: number;
 	lastActivity: number;
+	/** Permission profiles the agent's spawn requested, in request order. */
+	requestedPermissionProfiles?: string[];
+	/** Inherited plus requested permission profiles, in composition order. */
+	effectivePermissionProfiles?: string[];
+	/** Display summary of the permission scope the agent runs under. */
+	permissionSummary?: EffectivePermissionSummary;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

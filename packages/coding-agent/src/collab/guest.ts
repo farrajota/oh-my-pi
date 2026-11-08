@@ -26,6 +26,7 @@ import { getConfigRootDir, logger, toError } from "@oh-my-pi/pi-utils";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
+import { permissionHistoryOfSnapshot } from "../task/permissions/summary";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 import { mintSessionId, SessionManager } from "../session/session-manager";
@@ -844,6 +845,9 @@ export class CollabGuestLink {
 				ref.displayName = snap.displayName;
 			}
 			this.#agentHasTranscript.set(snap.id, snap.hasSessionFile);
+			// Host metadata is display-only and untrusted here: re-own it before the hub reads it.
+			const permissionHistory = permissionHistoryOfSnapshot(snap);
+			if (Object.keys(permissionHistory).length > 0) this.agentRegistry.setHistory(snap.id, permissionHistory);
 		}
 	}
 

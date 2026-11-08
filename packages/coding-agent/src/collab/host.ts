@@ -1159,6 +1159,9 @@ export class CollabHost {
 					hasSessionFile: !!ref.sessionFile,
 					createdAt: ref.createdAt,
 					lastActivity: ref.lastActivity,
+					requestedPermissionProfiles: ref.history?.requestedPermissionProfiles,
+					effectivePermissionProfiles: ref.history?.effectivePermissionProfiles,
+					permissionSummary: ref.history?.permissionSummary,
 				}))
 		);
 	}
