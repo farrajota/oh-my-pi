@@ -447,6 +447,7 @@ const SINGLE_REQUEST_SETTINGS_OVERRIDES: Readonly<Record<string, unknown>> = Obj
 	"retry.enabled": false,
 	"retry.maxRetries": 0,
 	"retry.waitForUsageReset": false,
+	"retry.repeated.enabled": false,
 	"retry.modelFallback": false,
 	"retry.usageAwareFallback": false,
 	"features.unexpectedStopDetection": "none",

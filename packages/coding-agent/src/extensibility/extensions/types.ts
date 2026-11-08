@@ -121,7 +121,9 @@ import type {
 	AutoCompactionEndEvent,
 	AutoCompactionStartEvent,
 	AutoRetryEndEvent,
+	AutoRetryRecoveredEvent,
 	AutoRetryStartEvent,
+	AutoRetryTimeoutEvent,
 	CacheWarmingDecisionEvent,
 	CacheWarmingDecisionEventResult,
 	ContextEvent,
@@ -1305,7 +1307,12 @@ export type {
 	AutoCompactionEndEvent,
 	AutoCompactionStartEvent,
 	AutoRetryEndEvent,
+	AutoRetryRecoveredEvent,
 	AutoRetryStartEvent,
+	AutoRetryTimeoutEvent,
+	RepeatedRetryEndReason,
+	RepeatedRetryOutcome,
+	RepeatedRetryProgress,
 	RetryFallbackAppliedEvent,
 	RetryFallbackSucceededEvent,
 	TodoReminderEvent,
@@ -1695,6 +1702,8 @@ export type ExtensionEvent =
 	| AutoCompactionEndEvent
 	| AutoRetryStartEvent
 	| AutoRetryEndEvent
+	| AutoRetryRecoveredEvent
+	| AutoRetryTimeoutEvent
 	| RetryFallbackAppliedEvent
 	| RetryFallbackSucceededEvent
 	| TtsrTriggeredEvent
@@ -1920,6 +1929,8 @@ export interface ExtensionAPI {
 	on(event: "auto_compaction_end", handler: ExtensionHandler<AutoCompactionEndEvent>): void;
 	on(event: "auto_retry_start", handler: ExtensionHandler<AutoRetryStartEvent>): void;
 	on(event: "auto_retry_end", handler: ExtensionHandler<AutoRetryEndEvent>): void;
+	on(event: "auto_retry_recovered", handler: ExtensionHandler<AutoRetryRecoveredEvent>): void;
+	on(event: "auto_retry_timeout", handler: ExtensionHandler<AutoRetryTimeoutEvent>): void;
 	on(event: "retry_fallback_applied", handler: ExtensionHandler<RetryFallbackAppliedEvent>): void;
 	on(event: "retry_fallback_succeeded", handler: ExtensionHandler<RetryFallbackSucceededEvent>): void;
 	on(event: "ttsr_triggered", handler: ExtensionHandler<TtsrTriggeredEvent>): void;

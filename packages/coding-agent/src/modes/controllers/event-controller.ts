@@ -2865,7 +2865,11 @@ export class EventController {
 			this.ctx.clearPinnedError();
 		}
 		const retryStartMs = Date.now();
-		const retryLabel = `Retrying (${event.attempt}/${event.maxAttempts})`;
+		const repeatedRound = event.repeated?.round;
+		const retryLabel =
+			repeatedRound === undefined
+				? `Retrying (${event.attempt}/${event.maxAttempts})`
+				: `Waiting for limit reset (round ${repeatedRound})`;
 		this.ctx.retryLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("warning", spinner),
@@ -2878,7 +2882,10 @@ export class EventController {
 		);
 		this.ctx.retryLoader.setWorkingRow(
 			() => ({
-				label: `Retrying · attempt ${event.attempt} of ${event.maxAttempts}`,
+				label:
+					repeatedRound === undefined
+						? `Retrying · attempt ${event.attempt} of ${event.maxAttempts}`
+						: `Waiting for limit reset · round ${repeatedRound}`,
 				startedAt: retryStartMs,
 				variant: { kind: "retry", attempt: event.attempt, max: event.maxAttempts, delayMs: event.delayMs },
 				interruptKey: this.ctx.maintenanceInterruptKey(),
@@ -2931,7 +2938,9 @@ export class EventController {
 			this.ctx.clearPinnedError();
 		}
 		this.#clearRetrySupersededAssistantComponents();
-		if (!event.success) {
+		// The user ended a repeated wait (Esc or a new message); that is not a failure to report.
+		const userEndedRepeatedWait = event.repeated?.reason === "cancelled" || event.repeated?.reason === "manual-input";
+		if (!event.success && !userEndedRepeatedWait) {
 			if (terminalFailurePinned) {
 				const terminalError = this.#restorePinnedErrorInline
 					? `Retry failed after ${event.attempt} attempts: ${event.finalError || pinnedError || "Unknown error"}`

@@ -2,7 +2,7 @@ import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
-import type { RetryErrorUpdate } from "../extensibility/shared-events";
+import type { RepeatedRetryOutcome, RepeatedRetryProgress, RetryErrorUpdate } from "../extensibility/shared-events";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import type { GoalModeState } from "../goals/state";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
@@ -69,6 +69,7 @@ export type AgentSessionEvent =
 			delayMs: number;
 			errorMessage: string;
 			errorId?: number;
+			repeated?: RepeatedRetryProgress;
 	  }
 	| {
 			type: "auto_retry_end";
@@ -76,6 +77,7 @@ export type AgentSessionEvent =
 			attempt: number;
 			finalError?: string;
 			retryErrors?: RetryErrorUpdate[];
+			repeated?: RepeatedRetryOutcome;
 	  }
 	| ({ type: "cache_warming_start" } & CacheWarmingRefreshStart)
 	| ({ type: "cache_warming_end" } & CacheWarmingRefreshEnd)

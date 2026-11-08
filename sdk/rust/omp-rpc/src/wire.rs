@@ -3648,6 +3648,66 @@ impl NotifyType {
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RepeatedRetryEndReason {
+	#[serde(rename = "success")]
+	Success,
+	#[serde(rename = "cancelled")]
+	Cancelled,
+	#[serde(rename = "manual-input")]
+	ManualInput,
+	#[serde(rename = "timeout")]
+	Timeout,
+	#[serde(rename = "not-recoverable")]
+	NotRecoverable,
+}
+
+impl RepeatedRetryEndReason {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Success => "success",
+			Self::Cancelled => "cancelled",
+			Self::ManualInput => "manual-input",
+			Self::Timeout => "timeout",
+			Self::NotRecoverable => "not-recoverable",
+		}
+	}
+}
+
+/// A repeated retry (`retry.repeated.*`) waiting out a long limit window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepeatedRetryProgress {
+	/// 1 for the first repeated wait, then one more per failed probe.
+	pub round: i64,
+	#[serde(rename = "startedAtMs")]
+	pub started_at_ms: i64,
+	#[serde(rename = "deadlineMs")]
+	pub deadline_ms: i64,
+	#[serde(rename = "timeoutMs")]
+	pub timeout_ms: i64,
+	/// The wait follows a provider-stated reset rather than `retry.repeated.timerMs`.
+	#[serde(rename = "resetAware")]
+	pub reset_aware: bool,
+}
+
+/// How a repeated retry ended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepeatedRetryOutcome {
+	pub round: i64,
+	#[serde(rename = "startedAtMs")]
+	pub started_at_ms: i64,
+	#[serde(rename = "deadlineMs")]
+	pub deadline_ms: i64,
+	#[serde(rename = "timeoutMs")]
+	pub timeout_ms: i64,
+	#[serde(rename = "resetAware")]
+	pub reset_aware: bool,
+	pub reason: RepeatedRetryEndReason,
+	#[serde(rename = "endedAtMs")]
+	pub ended_at_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentStartEvent {
 	/// Calls of an unpaired assistant tail a continued run executes before its first model request.
@@ -3814,6 +3874,9 @@ pub struct AutoRetryStartEvent {
 	pub error_message: String,
 	#[serde(rename = "errorId", default, skip_serializing_if = "Option::is_none")]
 	pub error_id: Option<i64>,
+	/// Present when this wait belongs to a repeated retry.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub repeated: Option<RepeatedRetryProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3825,6 +3888,9 @@ pub struct AutoRetryEndEvent {
 	/// Persisted retry errors whose presentation changed when the retry settled.
 	#[serde(rename = "retryErrors", default = "default_auto_retry_end_event_retry_errors")]
 	pub retry_errors: Vec<Map<String, Value>>,
+	/// Present when a repeated retry ended.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub repeated: Option<RepeatedRetryOutcome>,
 }
 
 /// A prompt-cache refresh was handed to the provider.

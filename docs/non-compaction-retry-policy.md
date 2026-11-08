@@ -113,6 +113,7 @@ Settings:
 - `retry.baseDelayMs` (default `500`)
 - `retry.maxDelayMs` (default `300000`, 5 minutes; `<= 0` disables the fail-fast cap)
 - `retry.waitForUsageReset` (default `false`; allows provider-timed usage resets to exceed the delay cap)
+- `retry.repeated.enabled` (default `false`), `retry.repeated.timerMs` (default `900000`), `retry.repeated.timeoutMs` (default `86400000`): repeated retry, below
 
 Attempt numbering:
 
@@ -135,6 +136,19 @@ Delay override inputs can come from parsed retry headers (`retry-after-ms`, `ret
 If the delay exceeds `retry.maxDelayMs` and no switch succeeds, retry normally fails immediately. `retry.waitForUsageReset: true` permits a longer usage-limit wait only when timing is authoritative (parsed provider reset timing or a complete usage-report future reset), not a guessed exhaustion backoff. Long waits remain abortable and are chunked to avoid timer overflow; they also hold unattended/subagent runs.
 
 Usage-limit waits run to a wall-clock deadline, so time the machine spends asleep counts toward the reset; ordinary backoff stays monotonic.
+
+### Repeated retry for long limit windows
+
+With `retry.repeated.enabled`, the two dead ends above (the budget is spent, or the wait exceeds `retry.maxDelayMs`) no longer end the turn when the error is a long limit window and no credential or model switch happened. Eligible errors: retriable usage-limit errors, session/weekly/daily/subscription limit or quota-reset wording, and a proxy model cooldown (`errorCode: "model_cooldown"` or CLIProxyAPI's "All credentials for model … are cooling down"). Plan entitlement (`usage_not_included`) and billing caps are never eligible.
+
+Each round waits, on the wall clock, until the provider-stated reset (retry hint or complete usage report) or else `retry.repeated.timerMs`, capped at `startedAt + retry.repeated.timeoutMs`. It then probes with one provider request (`Agent.providerMaxAttempts = 1`, restored afterwards). A probe failing with another eligible error starts the next round without consulting credentials or fallback chains again; any other outcome ends the repeated retry:
+
+- success: `auto_retry_end { success: true, repeated: { reason: "success", … } }`, then the extension event `auto_retry_recovered`;
+- the deadline: `reason: "timeout"` without a further probe, then `auto_retry_timeout`;
+- Esc or abort: `reason: "cancelled"`; a message the user sends: `reason: "manual-input"` (the TUI reports neither as a failure);
+- a different error: `reason: "not-recoverable"`.
+
+`auto_retry_start` carries `repeated: { round, startedAtMs, deadlineMs, timeoutMs, resetAware }`; `resetAware` is `false` when the round waits the timer. `--single-request` forces `retry.repeated.enabled: false`.
 
 ## Abort mechanics
 

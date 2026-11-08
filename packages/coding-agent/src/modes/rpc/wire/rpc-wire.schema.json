@@ -3678,6 +3678,82 @@
 			],
 			"type": "string"
 		},
+		"RepeatedRetryEndReason": {
+			"enum": [
+				"success",
+				"cancelled",
+				"manual-input",
+				"timeout",
+				"not-recoverable"
+			],
+			"type": "string"
+		},
+		"RepeatedRetryProgress": {
+			"type": "object",
+			"properties": {
+				"round": {
+					"type": "integer",
+					"description": "1 for the first repeated wait, then one more per failed probe."
+				},
+				"startedAtMs": {
+					"type": "integer"
+				},
+				"deadlineMs": {
+					"type": "integer"
+				},
+				"timeoutMs": {
+					"type": "integer"
+				},
+				"resetAware": {
+					"type": "boolean",
+					"description": "The wait follows a provider-stated reset rather than `retry.repeated.timerMs`."
+				}
+			},
+			"required": [
+				"round",
+				"startedAtMs",
+				"deadlineMs",
+				"timeoutMs",
+				"resetAware"
+			],
+			"description": "A repeated retry (`retry.repeated.*`) waiting out a long limit window."
+		},
+		"RepeatedRetryOutcome": {
+			"type": "object",
+			"properties": {
+				"round": {
+					"type": "integer"
+				},
+				"startedAtMs": {
+					"type": "integer"
+				},
+				"deadlineMs": {
+					"type": "integer"
+				},
+				"timeoutMs": {
+					"type": "integer"
+				},
+				"resetAware": {
+					"type": "boolean"
+				},
+				"reason": {
+					"$ref": "#/$defs/RepeatedRetryEndReason"
+				},
+				"endedAtMs": {
+					"type": "integer"
+				}
+			},
+			"required": [
+				"round",
+				"startedAtMs",
+				"deadlineMs",
+				"timeoutMs",
+				"resetAware",
+				"reason",
+				"endedAtMs"
+			],
+			"description": "How a repeated retry ended."
+		},
 		"AgentStartEvent": {
 			"type": "object",
 			"properties": {
@@ -4038,6 +4114,10 @@
 				},
 				"errorId": {
 					"type": "integer"
+				},
+				"repeated": {
+					"$ref": "#/$defs/RepeatedRetryProgress",
+					"description": "Present when this wait belongs to a repeated retry."
 				}
 			},
 			"required": [
@@ -4072,6 +4152,10 @@
 					},
 					"description": "Persisted retry errors whose presentation changed when the retry settled.",
 					"default": []
+				},
+				"repeated": {
+					"$ref": "#/$defs/RepeatedRetryOutcome",
+					"description": "Present when a repeated retry ended."
 				}
 			},
 			"required": [

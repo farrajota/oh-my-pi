@@ -163,6 +163,7 @@ import type {
 } from "../extensibility/extensions";
 import { emitSessionShutdownEvent, TOP_LEVEL_AGENT, UNAVAILABLE_ANNOTATIONS } from "../extensibility/extensions";
 import { extensionEventFromSessionEvent } from "../extensibility/extensions/lifecycle-mirror";
+import type { RepeatedRetryOutcome } from "../extensibility/shared-events";
 import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
@@ -5951,6 +5952,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			return;
 		}
 
+		if (event.type === "auto_retry_end" && event.repeated) {
+			await this.#emitRepeatedRetryEnd(event, event.repeated);
+			return;
+		}
 		if (!this.#extensionRunner.hasHandlers(event.type)) return;
 		if (event.type === "agent_end") {
 			// `agent_end` extension notification is emitted from the settled
@@ -5962,6 +5967,36 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (!mapped) return;
 		if (event.type === "turn_end") this.#turnIndex++;
 		await this.#extensionRunner.emit(mapped);
+	}
+
+	/** The generic end first, then the recovered/timeout event a repeated retry's end implies. */
+	async #emitRepeatedRetryEnd(
+		event: Extract<AgentSessionEvent, { type: "auto_retry_end" }>,
+		repeated: RepeatedRetryOutcome,
+	): Promise<void> {
+		const runner = this.#extensionRunner;
+		if (!runner) return;
+		if (runner.hasHandlers("auto_retry_end")) {
+			const mapped = extensionEventFromSessionEvent(event, this.#turnIndex);
+			if (mapped) await runner.emit(mapped);
+		}
+		const window = {
+			round: repeated.round,
+			startedAtMs: repeated.startedAtMs,
+			durationMs: repeated.endedAtMs - repeated.startedAtMs,
+			deadlineMs: repeated.deadlineMs,
+			timeoutMs: repeated.timeoutMs,
+		};
+		if (repeated.reason === "success" && runner.hasHandlers("auto_retry_recovered")) {
+			await runner.emit({ type: "auto_retry_recovered", ...window, recoveredAtMs: repeated.endedAtMs });
+		} else if (repeated.reason === "timeout" && runner.hasHandlers("auto_retry_timeout")) {
+			await runner.emit({
+				type: "auto_retry_timeout",
+				...window,
+				timedOutAtMs: repeated.endedAtMs,
+				finalError: event.finalError,
+			});
+		}
 	}
 
 	/**
@@ -8466,6 +8501,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// A user turn owns the next decision; drop a queued forced choice from
 		// a reminder continuation this prompt just preempted.
 		this.#toolChoiceQueue.removeByLabel("plan-mode-decision");
+		this.#recovery.cancelRepeatedRetry("manual-input");
 	}
 
 	async #prompt(text: string, options?: PromptOptions): Promise<boolean> {
@@ -9845,7 +9881,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// user-driven (folds into context via #resumeStrandedIrcAsides's post-interrupt
 		// branch) until the next deliberate steer/follow-up/prompt, matching the
 		// sendCustomMessage aside path (queueAside), which never touches this flag.
-		if (mode !== "aside") this.#advisors.autoResumeSuppressed = false;
+		if (mode !== "aside") {
+			this.#advisors.autoResumeSuppressed = false;
+			// A long limit wait must not hold a message the user just sent.
+			this.#recovery.cancelRepeatedRetry("manual-input");
+		}
 		// The pre-dispatch re-check in prompt() arrives with normalization and the
 		// vision description already done — reuse them instead of paying a second
 		// vision-model request for the same attachment.

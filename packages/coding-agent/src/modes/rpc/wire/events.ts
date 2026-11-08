@@ -14,6 +14,29 @@ export const eventDefs = {
 	CacheWarmingPhase: "'streaming' | 'idle'",
 	CacheWarmingOutcome: "'hit' | 'miss' | 'error' | 'aborted'",
 	NotifyType: "'info' | 'warning' | 'error'",
+	RepeatedRetryEndReason: "'success' | 'cancelled' | 'manual-input' | 'timeout' | 'not-recoverable'",
+	RepeatedRetryProgress: doc(
+		{
+			round: doc("number.integer", "1 for the first repeated wait, then one more per failed probe."),
+			startedAtMs: "number.integer",
+			deadlineMs: "number.integer",
+			timeoutMs: "number.integer",
+			resetAware: doc("boolean", "The wait follows a provider-stated reset rather than `retry.repeated.timerMs`."),
+		},
+		"A repeated retry (`retry.repeated.*`) waiting out a long limit window.",
+	),
+	RepeatedRetryOutcome: doc(
+		{
+			round: "number.integer",
+			startedAtMs: "number.integer",
+			deadlineMs: "number.integer",
+			timeoutMs: "number.integer",
+			resetAware: "boolean",
+			reason: "RepeatedRetryEndReason",
+			endedAtMs: "number.integer",
+		},
+		"How a repeated retry ended.",
+	),
 
 	AgentStartEvent: {
 		type: "'agent_start'",
@@ -113,6 +136,7 @@ export const eventDefs = {
 		delayMs: "number.integer",
 		errorMessage: "string",
 		"errorId?": "number.integer",
+		"repeated?": doc("RepeatedRetryProgress", "Present when this wait belongs to a repeated retry."),
 	},
 	AutoRetryEndEvent: {
 		type: "'auto_retry_end'",
@@ -123,6 +147,7 @@ export const eventDefs = {
 			doc(`${JSON_OBJECT}[]`, "Persisted retry errors whose presentation changed when the retry settled."),
 			[],
 		),
+		"repeated?": doc("RepeatedRetryOutcome", "Present when a repeated retry ended."),
 	},
 	CacheWarmingStartEvent: doc(
 		{ type: "'cache_warming_start'", phase: "CacheWarmingPhase", provider: "string", model: "string" },

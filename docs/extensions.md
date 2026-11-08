@@ -638,7 +638,9 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 ### Reliability/runtime signals
 
 - `auto_compaction_start` / `auto_compaction_end`
-- `auto_retry_start` / `auto_retry_end`
+- `auto_retry_start` / `auto_retry_end` (both carry `repeated` while `retry.repeated.*` waits out a long limit)
+- `auto_retry_recovered` — `{ round, startedAtMs, recoveredAtMs, durationMs, deadlineMs, timeoutMs }` after a repeated retry's probe succeeds
+- `auto_retry_timeout` — `{ round, startedAtMs, timedOutAtMs, durationMs, deadlineMs, timeoutMs, finalError? }` when a repeated retry reaches `retry.repeated.timeoutMs`
 - `retry_fallback_applied` — `{ from, to, role, reason? }` when auto-retry switches model/provider
 - `retry_fallback_succeeded` — `{ model, role }` when a request succeeds on that fallback
 - `ttsr_triggered`

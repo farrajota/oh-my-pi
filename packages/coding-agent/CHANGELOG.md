@@ -4,6 +4,7 @@
 
 ### Breaking Changes
 
+- Rust SDK: `AutoRetryStartEvent` and `AutoRetryEndEvent` struct literals need `repeated: None`
 - Rust SDK: `BashCommand` and `ReadyEvent` struct literals need `exclude_from_context: None` and `supports_bash_exclude_from_context: None` ([#18206](https://github.com/can1357/oh-my-pi/pull/18206) by [@andrebrait](https://github.com/andrebrait))
 
 ### Changed
@@ -15,6 +16,7 @@
 
 ### Added
 
+- `retry.repeated.enabled`, `retry.repeated.timerMs` and `retry.repeated.timeoutMs`: when retries run out on a session, weekly or daily limit or a proxy `model_cooldown`, the session keeps waiting (until the stated reset, else the timer) and probes with one request per round until the limit clears or the timeout passes; `auto_retry_start`/`auto_retry_end` carry `repeated`, extensions get `auto_retry_recovered` and `auto_retry_timeout`, and `--single-request` turns it off
 - Added the `@oh-my-pi/pi-coding-agent/stats-runtime` entry: `loadStatsRuntime()` gives extensions the agent's own stats aggregator, database and rollup modules
 - Added extension job controls: `ctx.getAsyncJobSnapshot({ recentLimit, includeAgentJobs })` keeps settled jobs listed from a bounded per-owner history after their rows are evicted and marks queued jobs, `ctx.getAsyncJobOutput(id)` reads a job's progress or result, `ctx.cancelAsyncJob(id)` cancels and waits for the job, and `ctx.terminateSubagent(id)` kills a descendant subagent through the agent lifecycle; `ctx.actor` aliases `ctx.agent`, and `createReadOnlyAgentTranscriptViewer` opens a read-only transcript viewer pinned to one agent generation
 - Added `pi.registerWorkingMessageSuffix(name, renderer)` so extensions can append live run metrics (elapsed time from the session's run start, billed run tokens) to the interactive working row

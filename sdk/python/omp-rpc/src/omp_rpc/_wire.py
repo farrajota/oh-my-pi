@@ -166,6 +166,11 @@ _NOTIFY_TYPE_VALUES: Final[frozenset[str]] = frozenset({"info", "warning", "erro
 _decode_notify_type = cast("Decoder[NotifyType]", literal(_NOTIFY_TYPE_VALUES))
 
 
+RepeatedRetryEndReason: TypeAlias = Literal["success", "cancelled", "manual-input", "timeout", "not-recoverable"]
+_REPEATED_RETRY_END_REASON_VALUES: Final[frozenset[str]] = frozenset({"success", "cancelled", "manual-input", "timeout", "not-recoverable"})
+_decode_repeated_retry_end_reason = cast("Decoder[RepeatedRetryEndReason]", literal(_REPEATED_RETRY_END_REASON_VALUES))
+
+
 PromptStatus: TypeAlias = Literal["completed", "aborted", "error"]
 _PROMPT_STATUS_VALUES: Final[frozenset[str]] = frozenset({"completed", "aborted", "error"})
 _decode_prompt_status = cast("Decoder[PromptStatus]", literal(_PROMPT_STATUS_VALUES))
@@ -982,6 +987,30 @@ class PromptAck:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class RepeatedRetryProgress:
+    """A repeated retry (`retry.repeated.*`) waiting out a long limit window."""
+    round: int
+    """1 for the first repeated wait, then one more per failed probe."""
+    started_at_ms: int
+    deadline_ms: int
+    timeout_ms: int
+    reset_aware: bool
+    """The wait follows a provider-stated reset rather than `retry.repeated.timerMs`."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class RepeatedRetryOutcome:
+    """How a repeated retry ended."""
+    round: int
+    started_at_ms: int
+    deadline_ms: int
+    timeout_ms: int
+    reset_aware: bool
+    reason: RepeatedRetryEndReason
+    ended_at_ms: int
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class AgentStartEvent:
     type: Literal["agent_start"] = "agent_start"
     resumed_tool_call_ids: tuple[str, ...] | None = None
@@ -1125,6 +1154,8 @@ class AutoRetryStartEvent:
     delay_ms: int
     error_message: str
     error_id: int | None = None
+    repeated: RepeatedRetryProgress | None = None
+    """Present when this wait belongs to a repeated retry."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1135,6 +1166,8 @@ class AutoRetryEndEvent:
     final_error: str | None = None
     retry_errors: tuple[JsonObject, ...] = ()
     """Persisted retry errors whose presentation changed when the retry settled."""
+    repeated: RepeatedRetryOutcome | None = None
+    """Present when a repeated retry ended."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2392,6 +2425,30 @@ def parse_prompt_ack(value: object, path: str = "PromptAck") -> PromptAck:
     )
 
 
+def parse_repeated_retry_progress(value: object, path: str = "RepeatedRetryProgress") -> RepeatedRetryProgress:
+    payload = expect_object(value, path)
+    return RepeatedRetryProgress(
+        round=required(payload, "round", decode_int, path),
+        started_at_ms=required(payload, "startedAtMs", decode_int, path),
+        deadline_ms=required(payload, "deadlineMs", decode_int, path),
+        timeout_ms=required(payload, "timeoutMs", decode_int, path),
+        reset_aware=required(payload, "resetAware", decode_bool, path),
+    )
+
+
+def parse_repeated_retry_outcome(value: object, path: str = "RepeatedRetryOutcome") -> RepeatedRetryOutcome:
+    payload = expect_object(value, path)
+    return RepeatedRetryOutcome(
+        round=required(payload, "round", decode_int, path),
+        started_at_ms=required(payload, "startedAtMs", decode_int, path),
+        deadline_ms=required(payload, "deadlineMs", decode_int, path),
+        timeout_ms=required(payload, "timeoutMs", decode_int, path),
+        reset_aware=required(payload, "resetAware", decode_bool, path),
+        reason=required(payload, "reason", _decode_repeated_retry_end_reason, path),
+        ended_at_ms=required(payload, "endedAtMs", decode_int, path),
+    )
+
+
 def parse_agent_start_event(value: object, path: str = "AgentStartEvent") -> AgentStartEvent:
     payload = expect_object(value, path)
     required(payload, "type", cast('Decoder[Literal["agent_start"]]', literal(frozenset({"agent_start"}))), path)
@@ -2551,6 +2608,7 @@ def parse_auto_retry_start_event(value: object, path: str = "AutoRetryStartEvent
         delay_ms=required(payload, "delayMs", decode_int, path),
         error_message=required(payload, "errorMessage", decode_str, path),
         error_id=optional(payload, "errorId", decode_int, path),
+        repeated=optional(payload, "repeated", parse_repeated_retry_progress, path),
     )
 
 
@@ -2562,6 +2620,7 @@ def parse_auto_retry_end_event(value: object, path: str = "AutoRetryEndEvent") -
         attempt=required(payload, "attempt", decode_int, path),
         final_error=optional(payload, "finalError", decode_str, path),
         retry_errors=defaulted(payload, "retryErrors", array(decode_json_object), path, ()),
+        repeated=optional(payload, "repeated", parse_repeated_retry_outcome, path),
     )
 
 
@@ -4125,6 +4184,9 @@ __all__ = [
     "ReadyEvent",
     "RedactedThinkingContent",
     "RemoveQueuedMessageResult",
+    "RepeatedRetryEndReason",
+    "RepeatedRetryOutcome",
+    "RepeatedRetryProgress",
     "RestoredQueuedMessage",
     "RetryFallbackAppliedEvent",
     "RetryFallbackSucceededEvent",
@@ -4305,6 +4367,8 @@ __all__ = [
     "parse_ready_event",
     "parse_redacted_thinking_content",
     "parse_remove_queued_message_result",
+    "parse_repeated_retry_outcome",
+    "parse_repeated_retry_progress",
     "parse_restored_queued_message",
     "parse_retry_fallback_applied_event",
     "parse_retry_fallback_succeeded_event",

@@ -805,6 +805,30 @@ export type CacheWarmingOutcome = "hit" | "miss" | "error" | "aborted";
 
 export type NotifyType = "info" | "warning" | "error";
 
+export type RepeatedRetryEndReason = "success" | "cancelled" | "manual-input" | "timeout" | "not-recoverable";
+
+/** A repeated retry (`retry.repeated.*`) waiting out a long limit window. */
+export interface RepeatedRetryProgress {
+	/** 1 for the first repeated wait, then one more per failed probe. */
+	round: number;
+	startedAtMs: number;
+	deadlineMs: number;
+	timeoutMs: number;
+	/** The wait follows a provider-stated reset rather than `retry.repeated.timerMs`. */
+	resetAware: boolean;
+}
+
+/** How a repeated retry ended. */
+export interface RepeatedRetryOutcome {
+	round: number;
+	startedAtMs: number;
+	deadlineMs: number;
+	timeoutMs: number;
+	resetAware: boolean;
+	reason: RepeatedRetryEndReason;
+	endedAtMs: number;
+}
+
 export interface AgentStartEvent {
 	type: "agent_start";
 	/** Calls of an unpaired assistant tail a continued run executes before its first model request. */
@@ -933,6 +957,8 @@ export interface AutoRetryStartEvent {
 	delayMs: number;
 	errorMessage: string;
 	errorId?: number;
+	/** Present when this wait belongs to a repeated retry. */
+	repeated?: RepeatedRetryProgress;
 }
 
 export interface AutoRetryEndEvent {
@@ -942,6 +968,8 @@ export interface AutoRetryEndEvent {
 	finalError?: string;
 	/** Persisted retry errors whose presentation changed when the retry settled. */
 	retryErrors?: Record<string, unknown>[];
+	/** Present when a repeated retry ended. */
+	repeated?: RepeatedRetryOutcome;
 }
 
 /** A prompt-cache refresh was handed to the provider. */

@@ -17,7 +17,12 @@ import type {
 	ToolChoice,
 	AnthropicFallbackCreditHandle,
 } from "@oh-my-pi/pi-ai";
-import { calculateRateLimitBackoffMs, isBillingCapUsageLimit, parseRateLimitReason } from "@oh-my-pi/pi-ai";
+import {
+	calculateRateLimitBackoffMs,
+	isBillingCapUsageLimit,
+	isModelCooldownError,
+	parseRateLimitReason,
+} from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { shouldDropTruncatedThinkingOnlyAssistant } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
@@ -30,7 +35,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
 
 import type { Settings } from "../config/settings";
-import type { RetryErrorUpdate } from "../extensibility/shared-events";
+import type { RepeatedRetryEndReason, RepeatedRetryProgress, RetryErrorUpdate } from "../extensibility/shared-events";
 import { isEvalStateContext } from "../eval/state";
 import emptyStopRetryTemplate from "../prompts/system/empty-stop-retry.md" with { type: "text" };
 import malformedFunctionCallRetryTemplate from "../prompts/system/malformed-function-call-retry.md" with { type: "text" };
@@ -92,6 +97,7 @@ import {
 	cfgRetry,
 	cfgRetryEnabled,
 	cfgRetryModelFallback,
+	cfgRetryRepeated,
 	cfgRetryUsageAwareFallback,
 	cfgRetryUsageReservePct,
 	cfgRetryUsageReservePolicy,
@@ -374,6 +380,29 @@ type RetryPolicyOptions = {
 	preserveFailedTurn?: boolean;
 };
 
+/** An active repeated retry; see {@link TurnRecovery.cancelRepeatedRetry}. */
+type RepeatedRetryState = RepeatedRetryProgress & {
+	lastError: string;
+	/** Set by a cancel that lands while the wait is sleeping; the wait's catch ends the retry with it. */
+	cancelReason?: "cancelled" | "manual-input";
+	/** The agent's attempt cap while a single-request probe is outstanding. */
+	probeRestore?: { providerMaxAttempts: number | undefined };
+};
+
+function repeatedRetryProgress(state: RepeatedRetryState): RepeatedRetryProgress {
+	return {
+		round: state.round,
+		startedAtMs: state.startedAtMs,
+		deadlineMs: state.deadlineMs,
+		timeoutMs: state.timeoutMs,
+		resetAware: state.resetAware,
+	};
+}
+
+// Long-window wording a repeated retry may wait out even when the provider
+// error is not flagged as a usage limit.
+const LONG_WINDOW_LIMIT_PATTERN = /\b(?:session|weekly|daily|subscription|usage)\s+limit\b|\bquota\b[^\n]*\breset/i;
+
 type UsageLimitOutcome = {
 	switchedCredential: boolean;
 	retryAfterMs: number;
@@ -409,6 +438,7 @@ export class TurnRecovery {
 	#usageReserveApproval: { model: string; sessionId: string } | undefined;
 	#pendingRetryErrors: PendingRetryError[] = [];
 	#usageLimitOutcomes = new WeakMap<AssistantMessage, Promise<UsageLimitOutcome>>();
+	#repeatedRetry: RepeatedRetryState | undefined;
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
 	#malformedFunctionCallRetryCount = 0;
@@ -616,6 +646,11 @@ export class TurnRecovery {
 				role: this.#activeRetryFallback.role,
 			});
 		}
+		const repeated = this.#repeatedRetry;
+		if (repeated) {
+			await this.#finishRepeatedRetry(repeated, "success", { supersedingMessage: message });
+			return;
+		}
 		if (this.#retryAttempt === 0) {
 			return;
 		}
@@ -627,6 +662,11 @@ export class TurnRecovery {
 
 	/** Closes a failed retry saga when no compaction continuation took ownership. */
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
+		const repeated = this.#repeatedRetry;
+		if (repeated && message.stopReason === "error") {
+			await this.#finishRepeatedRetry(repeated, "not-recoverable", { terminalTurn: message });
+			return;
+		}
 		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
 		this.#retryAttempt = 0;
@@ -2640,6 +2680,8 @@ export class TurnRecovery {
 	 * @returns true if retry was initiated, false if max retries exceeded or disabled
 	 */
 	async #handleRetryableError(message: AssistantMessage, options?: RetryPolicyOptions): Promise<boolean> {
+		const repeated = this.#repeatedRetry;
+		if (repeated) return this.#continueRepeatedRetry(repeated, message, options);
 		try {
 			return await this.#applyRetryPolicy(message, options);
 		} catch (error) {
@@ -3049,6 +3091,8 @@ export class TurnRecovery {
 
 		if (retryBudgetExhausted) {
 			if (!switchedModel && !switchedCredential) {
+				const repeated = await this.#beginRepeatedRetry(message, id, preserveFailedTurn, generation);
+				if (repeated !== undefined) return repeated;
 				const attempt = this.#retryAttempt - 1;
 				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
 				await this.#closeRetrySaga(
@@ -3104,6 +3148,8 @@ export class TurnRecovery {
 
 		// The fail-fast cap (`exceedsDelayCap`, defined above the chain consult).
 		if (exceedsDelayCap(delayMs) && !switchedCredential && !switchedModel) {
+			const repeated = await this.#beginRepeatedRetry(message, id, preserveFailedTurn, generation);
+			if (repeated !== undefined) return repeated;
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;
 			await this.#closeRetrySaga(
@@ -3313,9 +3359,228 @@ export class TurnRecovery {
 	 * Cancel in-progress retry.
 	 */
 	abortRetry(): void {
+		this.cancelRepeatedRetry("cancelled");
 		this.#retryAbortController?.abort();
 		// Note: _retryAttempt is reset in the catch block of _autoRetry
 		this.resolveRetry();
+	}
+
+	/**
+	 * Ends an active repeated retry: Esc or abort (`cancelled`), or a message the
+	 * user sent while it waited (`manual-input`). A sleeping wait ends from its
+	 * own catch; between rounds (probe scheduled or in flight) it ends here.
+	 */
+	cancelRepeatedRetry(reason: "cancelled" | "manual-input"): void {
+		const repeated = this.#repeatedRetry;
+		if (!repeated) return;
+		if (this.#retryAbortController) {
+			repeated.cancelReason ??= reason;
+			this.#retryAbortController.abort();
+			return;
+		}
+		void this.#finishRepeatedRetry(repeated, reason).catch(error =>
+			logger.error("Ending a cancelled repeated retry threw", {
+				error: error instanceof Error ? error.message : String(error),
+			}),
+		);
+	}
+
+	/**
+	 * Whether a failed turn is a long limit window worth waiting out:
+	 * session/weekly/daily or subscription limits, provider-stated quota
+	 * resets, and proxy model cooldowns. Plan entitlement (`usage_not_included`)
+	 * and billing caps never clear by waiting.
+	 */
+	#isRepeatedRetryEligible(message: AssistantMessage, id: number): boolean {
+		if (cfgRetryRepeated.get(this.#host.settings).enabled !== true) return false;
+		const errorMessage = message.errorMessage ?? "";
+		if (message.errorCode === "usage_not_included" || /\busage_not_included\b/i.test(errorMessage)) return false;
+		if (isBillingCapUsageLimit(message.errorStatus, errorMessage)) return false;
+		return (
+			(AIError.is(id, AIError.Flag.UsageLimit) && AIError.retriable(id)) ||
+			LONG_WINDOW_LIMIT_PATTERN.test(errorMessage) ||
+			isModelCooldownError(message)
+		);
+	}
+
+	/**
+	 * Enters a repeated retry at one of the policy's dead ends when the error
+	 * qualifies. `undefined` means it does not, and the dead end closes the saga;
+	 * otherwise the repeated retry owns the saga and this is its retry decision.
+	 */
+	async #beginRepeatedRetry(
+		message: AssistantMessage,
+		id: number,
+		preserveFailedTurn: boolean,
+		generation: number,
+	): Promise<boolean | undefined> {
+		if (!this.#isRepeatedRetryEligible(message, id)) return undefined;
+		const { timeoutMs } = cfgRetryRepeated.get(this.#host.settings);
+		const startedAtMs = Date.now();
+		const state: RepeatedRetryState = {
+			round: 0,
+			startedAtMs,
+			deadlineMs: startedAtMs + timeoutMs,
+			timeoutMs,
+			resetAware: false,
+			lastError: message.errorMessage || "Unknown error",
+		};
+		this.#repeatedRetry = state;
+		return this.#runRepeatedRound(state, message, id, preserveFailedTurn, generation);
+	}
+
+	/** A probe failed: wait another round, or end the repeated retry when the error changed kind. */
+	async #continueRepeatedRetry(
+		state: RepeatedRetryState,
+		message: AssistantMessage,
+		options: RetryPolicyOptions | undefined,
+	): Promise<boolean> {
+		this.#restoreProbeAttempts(state);
+		const id = this.#classifyRetryMessage(message);
+		if (!this.#isRepeatedRetryEligible(message, id)) {
+			await this.#finishRepeatedRetry(state, "not-recoverable", { terminalTurn: message });
+			return false;
+		}
+		this.#retryAttempt++;
+		const preserveFailedTurn =
+			options?.preserveFailedTurn === true ||
+			(AIError.retriable(id) && this.#unexecutedToolCallsReplaySafe(message));
+		return this.#runRepeatedRound(state, message, id, preserveFailedTurn, this.#host.promptGeneration());
+	}
+
+	/**
+	 * One repeated round: wait until the provider-stated reset (else
+	 * `retry.repeated.timerMs`), capped at the deadline, then probe with a
+	 * single provider request. Reaching the deadline ends the retry instead.
+	 */
+	async #runRepeatedRound(
+		state: RepeatedRetryState,
+		message: AssistantMessage,
+		id: number,
+		preserveFailedTurn: boolean,
+		generation: number,
+	): Promise<boolean> {
+		const errorMessage = message.errorMessage || "Unknown error";
+		const now = Date.now();
+		const statedResetMs = await this.#statedResetMs(message, errorMessage);
+		const delayMs = Math.min(
+			statedResetMs ?? cfgRetryRepeated.get(this.#host.settings).timerMs,
+			Math.max(0, state.deadlineMs - now),
+		);
+		state.round++;
+		state.resetAware = statedResetMs !== undefined;
+		state.lastError = errorMessage;
+		await this.#recordPendingRetryError(message, id, { switchedCredential: false, switchedModel: false, delayMs });
+		await this.#host.emitSessionEvent({
+			type: "auto_retry_start",
+			attempt: this.#retryAttempt,
+			maxAttempts: this.#retryAttempt,
+			delayMs,
+			errorMessage,
+			errorId: message.errorId,
+			repeated: repeatedRetryProgress(state),
+		});
+		if (this.#repeatedRetry !== state) return false;
+		if (!preserveFailedTurn) {
+			this.removeAssistantMessageFromActiveContext(message, "auto-retry");
+		}
+
+		const waitAbortController = new AbortController();
+		this.#retryAbortController?.abort();
+		this.#retryAbortController = waitAbortController;
+		try {
+			// Wall clock: a limit window keeps running while the machine sleeps.
+			await sleepUntil(now + delayMs, waitAbortController.signal);
+		} catch {
+			if (this.#retryAbortController === waitAbortController) this.#retryAbortController = undefined;
+			await this.#finishRepeatedRetry(state, state.cancelReason ?? "cancelled");
+			return false;
+		}
+		if (this.#retryAbortController === waitAbortController) this.#retryAbortController = undefined;
+		if (this.#repeatedRetry !== state) return false;
+		if (Date.now() >= state.deadlineMs) {
+			await this.#finishRepeatedRetry(state, "timeout", { finalError: state.lastError });
+			return false;
+		}
+		if (!preserveFailedTurn && this.#host.promptGeneration() === generation) {
+			this.#stripFailedAssistantTail();
+		}
+		this.#host.scheduleAgentContinue({
+			source: "repeated-retry",
+			delayMs: 1,
+			generation,
+			shouldContinue: () => {
+				if (this.#repeatedRetry !== state) return false;
+				// One request per round: provider-level retries would multiply every probe.
+				state.probeRestore ??= { providerMaxAttempts: this.#host.agent.providerMaxAttempts };
+				this.#host.agent.providerMaxAttempts = 1;
+				return true;
+			},
+			onError: error =>
+				void this.#finishRepeatedRetry(state, "not-recoverable", {
+					finalError: `Repeated retry continuation failed locally: ${error instanceof Error ? error.message : String(error)}. Original error: ${state.lastError}`,
+				}).catch(failure =>
+					logger.error("Ending a repeated retry after a failed local continuation threw", {
+						error: failure instanceof Error ? failure.message : String(failure),
+					}),
+				),
+		});
+		return true;
+	}
+
+	/**
+	 * The provider's own reset for this failure, in ms from now: the error's
+	 * retry hint or a complete usage report's reset, whichever is later.
+	 */
+	async #statedResetMs(message: AssistantMessage, errorMessage: string): Promise<number | undefined> {
+		const hintMs = this.#parseRetryAfterMsFromError(errorMessage) ?? 0;
+		const reportResetAtMs = (await this.#usageLimitOutcomes.get(message))?.reportResetAtMs;
+		const reportMs = reportResetAtMs === undefined ? 0 : reportResetAtMs - Date.now();
+		const resetMs = Math.max(hintMs, reportMs);
+		return resetMs > 0 ? resetMs : undefined;
+	}
+
+	#restoreProbeAttempts(state: RepeatedRetryState): void {
+		if (!state.probeRestore) return;
+		this.#host.agent.providerMaxAttempts = state.probeRestore.providerMaxAttempts;
+		state.probeRestore = undefined;
+	}
+
+	async #finishRepeatedRetry(
+		state: RepeatedRetryState,
+		reason: RepeatedRetryEndReason,
+		record: { supersedingMessage?: AssistantMessage; terminalTurn?: AssistantMessage; finalError?: string } = {},
+	): Promise<void> {
+		if (this.#repeatedRetry !== state) return;
+		this.#repeatedRetry = undefined;
+		this.#restoreProbeAttempts(state);
+		const attempt = this.#retryAttempt;
+		// Cleared before any await: a settle path racing this close must not open a second end.
+		this.#retryAttempt = 0;
+		const repeated = { ...repeatedRetryProgress(state), reason, endedAtMs: Date.now() };
+		if (reason === "success") {
+			await this.#closeRetrySaga(
+				{ success: true, attempt, repeated },
+				record.supersedingMessage
+					? { retryErrors: { status: "recovered", supersedingMessage: record.supersedingMessage } }
+					: {},
+			);
+			return;
+		}
+		if (reason === "cancelled" || reason === "manual-input") {
+			// Same end as a cancelled ordinary retry; the failed attempts stay as they are.
+			await this.#closeRetrySaga({ success: false, attempt, finalError: "Retry cancelled", repeated }, {});
+			return;
+		}
+		await this.#closeRetrySaga(
+			{
+				success: false,
+				attempt,
+				finalError: record.finalError ?? record.terminalTurn?.errorMessage ?? state.lastError,
+				repeated,
+			},
+			{ terminalTurn: record.terminalTurn, retryErrors: { status: "superseded" } },
+		);
 	}
 
 	async #promptAgentWithIdleRetry(

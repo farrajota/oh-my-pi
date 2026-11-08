@@ -3599,6 +3599,91 @@ func (v *NotifyType) UnmarshalJSON(data []byte) error {
 	return unknownValue("NotifyType", s)
 }
 
+type RepeatedRetryEndReason string
+
+const (
+	RepeatedRetryEndReasonSuccess        RepeatedRetryEndReason = "success"
+	RepeatedRetryEndReasonCancelled      RepeatedRetryEndReason = "cancelled"
+	RepeatedRetryEndReasonManualInput    RepeatedRetryEndReason = "manual-input"
+	RepeatedRetryEndReasonTimeout        RepeatedRetryEndReason = "timeout"
+	RepeatedRetryEndReasonNotRecoverable RepeatedRetryEndReason = "not-recoverable"
+)
+
+func (v *RepeatedRetryEndReason) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "RepeatedRetryEndReason")
+	if err != nil {
+		return err
+	}
+	switch value := RepeatedRetryEndReason(s); value {
+	case RepeatedRetryEndReasonSuccess, RepeatedRetryEndReasonCancelled, RepeatedRetryEndReasonManualInput, RepeatedRetryEndReasonTimeout, RepeatedRetryEndReasonNotRecoverable:
+		*v = value
+		return nil
+	}
+	return unknownValue("RepeatedRetryEndReason", s)
+}
+
+// A repeated retry (`retry.repeated.*`) waiting out a long limit window.
+type RepeatedRetryProgress struct {
+	// 1 for the first repeated wait, then one more per failed probe.
+	Round       int64 `json:"round"`
+	StartedAtMs int64 `json:"startedAtMs"`
+	DeadlineMs  int64 `json:"deadlineMs"`
+	TimeoutMs   int64 `json:"timeoutMs"`
+	// The wait follows a provider-stated reset rather than `retry.repeated.timerMs`.
+	ResetAware bool `json:"resetAware"`
+}
+
+func (v *RepeatedRetryProgress) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "RepeatedRetryProgress", v.decodeFrom)
+}
+
+func (v *RepeatedRetryProgress) decodeFrom(raw map[string]json.RawMessage) error {
+	var out RepeatedRetryProgress
+	d := fieldDecoder{raw: raw, owner: "RepeatedRetryProgress"}
+	d.required("round", &out.Round)
+	d.required("startedAtMs", &out.StartedAtMs)
+	d.required("deadlineMs", &out.DeadlineMs)
+	d.required("timeoutMs", &out.TimeoutMs)
+	d.required("resetAware", &out.ResetAware)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+// How a repeated retry ended.
+type RepeatedRetryOutcome struct {
+	Round       int64                  `json:"round"`
+	StartedAtMs int64                  `json:"startedAtMs"`
+	DeadlineMs  int64                  `json:"deadlineMs"`
+	TimeoutMs   int64                  `json:"timeoutMs"`
+	ResetAware  bool                   `json:"resetAware"`
+	Reason      RepeatedRetryEndReason `json:"reason"`
+	EndedAtMs   int64                  `json:"endedAtMs"`
+}
+
+func (v *RepeatedRetryOutcome) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "RepeatedRetryOutcome", v.decodeFrom)
+}
+
+func (v *RepeatedRetryOutcome) decodeFrom(raw map[string]json.RawMessage) error {
+	var out RepeatedRetryOutcome
+	d := fieldDecoder{raw: raw, owner: "RepeatedRetryOutcome"}
+	d.required("round", &out.Round)
+	d.required("startedAtMs", &out.StartedAtMs)
+	d.required("deadlineMs", &out.DeadlineMs)
+	d.required("timeoutMs", &out.TimeoutMs)
+	d.required("resetAware", &out.ResetAware)
+	d.required("reason", &out.Reason)
+	d.required("endedAtMs", &out.EndedAtMs)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type AgentStartEvent struct {
 	// Calls of an unpaired assistant tail a continued run executes before its first model request.
 	ResumedToolCallIds []string `json:"resumedToolCallIds,omitempty"`
@@ -4055,6 +4140,8 @@ type AutoRetryStartEvent struct {
 	DelayMs      int64  `json:"delayMs"`
 	ErrorMessage string `json:"errorMessage"`
 	ErrorID      *int64 `json:"errorId,omitempty"`
+	// Present when this wait belongs to a repeated retry.
+	Repeated *RepeatedRetryProgress `json:"repeated,omitempty"`
 }
 
 func (v *AutoRetryStartEvent) UnmarshalJSON(data []byte) error {
@@ -4070,6 +4157,7 @@ func (v *AutoRetryStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("delayMs", &out.DelayMs)
 	d.required("errorMessage", &out.ErrorMessage)
 	d.optional("errorId", &out.ErrorID)
+	d.optional("repeated", &out.Repeated)
 	if d.err != nil {
 		return d.err
 	}
@@ -4088,6 +4176,8 @@ type AutoRetryEndEvent struct {
 	FinalError *string `json:"finalError,omitempty"`
 	// Persisted retry errors whose presentation changed when the retry settled.
 	RetryErrors []map[string]json.RawMessage `json:"retryErrors"`
+	// Present when a repeated retry ended.
+	Repeated *RepeatedRetryOutcome `json:"repeated,omitempty"`
 }
 
 func (v *AutoRetryEndEvent) UnmarshalJSON(data []byte) error {
@@ -4102,6 +4192,7 @@ func (v *AutoRetryEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("attempt", &out.Attempt)
 	d.optional("finalError", &out.FinalError)
 	d.defaulted("retryErrors", &out.RetryErrors, `[]`)
+	d.optional("repeated", &out.Repeated)
 	if d.err != nil {
 		return d.err
 	}

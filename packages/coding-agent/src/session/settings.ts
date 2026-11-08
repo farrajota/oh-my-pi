@@ -768,6 +768,67 @@ export const cfgRetryWaitForUsageReset = register({
 	},
 });
 
+export const cfgRetryRepeatedEnabled = register({
+	id: "retry.repeated.enabled",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Repeated Retry",
+		get description() {
+			return `When retries run out (or the provider asks for a wait past retry.maxDelayMs) on a session, weekly or daily limit or a proxy model cooldown, keep waiting and probe with one request per round until it clears or retry.repeated.timeoutMs passes. Waits until a stated reset, else retry.repeated.timerMs. Abortable (${formatKeyHint("escape")}); also holds subagents.`;
+		},
+	},
+});
+
+export const cfgRetryRepeatedTimerMs = register({
+	id: "retry.repeated.timerMs",
+	type: "number",
+	default: 900_000,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Repeated Retry Interval",
+		description: "Wait between repeated-retry probes when the provider states no reset time, in ms.",
+		condition: "repeatedRetryEnabled",
+		options: [
+			{ value: "60000", label: "1 minute" },
+			{ value: "300000", label: "5 minutes" },
+			{ value: "900000", label: "15 minutes" },
+			{ value: "1800000", label: "30 minutes" },
+			{ value: "3600000", label: "1 hour" },
+		],
+	},
+});
+
+export const cfgRetryRepeatedTimeoutMs = register({
+	id: "retry.repeated.timeoutMs",
+	type: "number",
+	default: 86_400_000,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Repeated Retry Timeout",
+		description: "Longest a repeated retry keeps waiting before the turn fails, in ms.",
+		condition: "repeatedRetryEnabled",
+		options: [
+			{ value: "3600000", label: "1 hour" },
+			{ value: "21600000", label: "6 hours" },
+			{ value: "43200000", label: "12 hours" },
+			{ value: "86400000", label: "24 hours" },
+			{ value: "172800000", label: "48 hours" },
+		],
+	},
+});
+
+/** Repeated retry for long limit windows (`retry.repeated.*`). */
+export const cfgRetryRepeated = combine({
+	enabled: cfgRetryRepeatedEnabled,
+	timerMs: cfgRetryRepeatedTimerMs,
+	timeoutMs: cfgRetryRepeatedTimeoutMs,
+});
+
 export const cfgRetryModelFallback = register({
 	id: "retry.modelFallback",
 	type: "boolean",

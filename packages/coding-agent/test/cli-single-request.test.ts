@@ -17,7 +17,7 @@ const GUARD_REPORT =
 const UNCONFIGURED_GUARD_REPORT =
 	"single-request guard effective: adapter=none dispatch-budget=1 fetch-budget=1 selector-match=false destination-match=false";
 
-type FixtureResponse = "503" | "transport" | "redirect" | "success";
+type FixtureResponse = "503" | "cooldown" | "transport" | "redirect" | "success";
 
 interface CapturedRequest {
 	method: string;
@@ -72,6 +72,18 @@ async function createResponsesFixture(reply: FixtureResponse): Promise<Responses
 				case "503":
 					response.writeHead(503, { "content-type": "application/json" });
 					response.end(JSON.stringify({ error: { message: "fixture unavailable", type: "server_error" } }));
+					return;
+				case "cooldown":
+					// CLIProxyAPI's aggregate cooldown, which `retry.repeated.enabled` would otherwise wait out.
+					response.writeHead(429, { "content-type": "application/json", "retry-after": "1" });
+					response.end(
+						JSON.stringify({
+							error: {
+								code: "model_cooldown",
+								message: `All credentials for model ${PRIMARY_MODEL} are cooling down via provider codex`,
+							},
+						}),
+					);
 					return;
 				case "transport":
 					response.destroy();
@@ -300,6 +312,21 @@ describe("--single-request CLI guard", () => {
 	it("does not retry or fall back after an HTTP 503", async () => {
 		using tempDir = TempDir.createSync("@omp-single-request-503-");
 		const fixture = await createResponsesFixture("503");
+		try {
+			const { agentDir, home } = await configureAgent(tempDir, fixture);
+			const run = await runGuardedCli(tempDir, agentDir, home);
+			expect(run.exitCode).not.toBe(0);
+			expect(run.stderr).toContain(GUARD_REPORT);
+			expect(run.stderr).not.toContain(FIXTURE_API_KEY);
+			expect(fixture.requests).toEqual([{ method: "POST", path: REQUEST_PATH, model: PRIMARY_MODEL }]);
+		} finally {
+			await fixture.close();
+		}
+	}, 120_000);
+
+	it("does not wait out a model cooldown even with retry.repeated.enabled", async () => {
+		using tempDir = TempDir.createSync("@omp-single-request-cooldown-");
+		const fixture = await createResponsesFixture("cooldown");
 		try {
 			const { agentDir, home } = await configureAgent(tempDir, fixture);
 			const run = await runGuardedCli(tempDir, agentDir, home);

@@ -258,6 +258,30 @@ export interface AutoCompactionEndEvent {
 	skipped?: boolean;
 }
 
+/**
+ * A repeated retry (`retry.repeated.*`): after normal retries give up on a
+ * long limit window, the session keeps waiting and probing until the limit
+ * clears or the timeout passes.
+ */
+export interface RepeatedRetryProgress {
+	/** 1 for the first repeated wait, then one more per failed probe. */
+	round: number;
+	startedAtMs: number;
+	deadlineMs: number;
+	timeoutMs: number;
+	/** True when the wait follows a provider-stated reset, false when it is `retry.repeated.timerMs`. */
+	resetAware: boolean;
+}
+
+/** Why a repeated retry ended. */
+export type RepeatedRetryEndReason = "success" | "cancelled" | "manual-input" | "timeout" | "not-recoverable";
+
+/** A finished repeated retry, carried by its closing `auto_retry_end`. */
+export interface RepeatedRetryOutcome extends RepeatedRetryProgress {
+	reason: RepeatedRetryEndReason;
+	endedAtMs: number;
+}
+
 /** Fired when auto-retry starts */
 export interface AutoRetryStartEvent {
 	type: "auto_retry_start";
@@ -266,6 +290,8 @@ export interface AutoRetryStartEvent {
 	delayMs: number;
 	errorMessage: string;
 	errorId?: number;
+	/** Present when this wait belongs to a repeated retry. */
+	repeated?: RepeatedRetryProgress;
 }
 
 /** Persisted retry error whose transcript presentation changed when the retry saga settled. */
@@ -283,6 +309,31 @@ export interface AutoRetryEndEvent {
 	attempt: number;
 	finalError?: string;
 	retryErrors?: RetryErrorUpdate[];
+	/** Present when a repeated retry ended. */
+	repeated?: RepeatedRetryOutcome;
+}
+
+/** Fired after `auto_retry_end` when a repeated retry's probe succeeded. */
+export interface AutoRetryRecoveredEvent {
+	type: "auto_retry_recovered";
+	round: number;
+	startedAtMs: number;
+	recoveredAtMs: number;
+	durationMs: number;
+	deadlineMs: number;
+	timeoutMs: number;
+}
+
+/** Fired after `auto_retry_end` when a repeated retry reached `retry.repeated.timeoutMs`. */
+export interface AutoRetryTimeoutEvent {
+	type: "auto_retry_timeout";
+	round: number;
+	startedAtMs: number;
+	timedOutAtMs: number;
+	durationMs: number;
+	deadlineMs: number;
+	timeoutMs: number;
+	finalError?: string;
 }
 
 /** Fired when auto-retry switches to a configured fallback model/provider. */
