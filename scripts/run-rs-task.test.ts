@@ -85,7 +85,7 @@ async function runCheckRs(fixture: Fixture, cwd: string, env: Record<string, str
 	}
 	const proc = Bun.spawn([process.execPath, "scripts/run-rs-task.ts", "check:rs"], {
 		cwd,
-		env: { ...base, ...env, PATH: `${fixture.shimDir}${path.delimiter}${process.env.PATH ?? ""}` },
+		env: { ...base, PATH: `${fixture.shimDir}${path.delimiter}${process.env.PATH ?? ""}`, ...env },
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -150,6 +150,36 @@ describe.skipIf(process.platform === "win32")("run-rs-task.ts check:rs", () => {
 
 			expect(result.cargoRan).toBe(true);
 			expect(result.output).toContain("crates/newcrate/");
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	// Failure mode: a shell that did not inherit the toolchain's bin directory
+	// (the agent sandbox sets CARGO_HOME=/usr/local/cargo) ran `cargo` by bare
+	// name and died with ENOENT although the toolchain was installed.
+	test(
+		"a cargo installed in CARGO_HOME/bin but absent from PATH still runs the Rust gate",
+		async () => {
+			const fixture = await makeFixture();
+			const cargoHome = path.join(fixture.root, "cargo-home");
+			await writeExecutable(path.join(cargoHome, "bin", "rustup"), "#!/bin/sh\nexit 1\n");
+			await writeExecutable(path.join(cargoHome, "bin", "cargo"), '#!/bin/sh\necho "cargo-stub $*"\n');
+			// PATH holds git and nothing else, so no ambient rustup or cargo is reachable through it.
+			const gitBinary = Bun.which("git");
+			if (!gitBinary) throw new Error("git must be on PATH to build the fixture");
+			const gitOnlyDir = path.join(fixture.root, "git-only");
+			await fs.mkdir(gitOnlyDir);
+			await fs.symlink(gitBinary, path.join(gitOnlyDir, "git"));
+
+			const result = await runCheckRs(fixture, fixture.work, {
+				PATH: gitOnlyDir,
+				CARGO_HOME: cargoHome,
+				HOME: fixture.root,
+				OMP_FORCE_RUST_TASKS: "1",
+			});
+
+			expect(result.cargoRan).toBe(true);
+			expect(result.exitCode).toBe(0);
 		},
 		CASE_TIMEOUT_MS,
 	);

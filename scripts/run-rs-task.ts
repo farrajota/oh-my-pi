@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import * as os from "node:os";
 import * as path from "node:path";
 import { $ } from "bun";
 
@@ -222,16 +223,31 @@ function isOneOf<T extends string>(value: string, values: readonly T[]): value i
 }
 
 async function resolveCargoBinary(): Promise<string> {
+	// PATH wins; the rustup install locations are searched after it, for shells
+	// that did not inherit the toolchain's bin directory (e.g. a container with
+	// CARGO_HOME=/usr/local/cargo whose PATH was reset).
+	const installBinDirs = [
+		...(Bun.env.CARGO_HOME ? [path.join(Bun.env.CARGO_HOME, "bin")] : []),
+		path.join(os.homedir(), ".cargo", "bin"),
+		...(process.platform === "win32" ? [] : ["/usr/local/cargo/bin"]),
+	];
+	const searchPath = [process.env.PATH ?? process.env.Path ?? "", ...installBinDirs].join(path.delimiter);
+
 	// On macOS runners, Homebrew's `rustup-init` binary is on PATH before the
 	// rustup proxies in `$CARGO_HOME/bin`, and invoking it as `cargo` falls
 	// through to its installer mode ("unexpected argument 'nextest' found").
 	// Ask rustup directly for the cargo binary in the active toolchain.
-	const result = await $`rustup which cargo`.cwd(repoRoot).quiet().nothrow();
-	if (result.exitCode === 0) {
-		const resolved = result.stdout.toString().trim();
-		if (resolved !== "") return resolved;
+	const rustup = Bun.which("rustup", { PATH: searchPath });
+	if (rustup) {
+		const result = await $`${rustup} which cargo`.cwd(repoRoot).quiet().nothrow();
+		if (result.exitCode === 0) {
+			const resolved = result.stdout.toString().trim();
+			if (resolved !== "") return resolved;
+		}
 	}
-	return "cargo";
+	const cargo = Bun.which("cargo", { PATH: searchPath });
+	if (cargo) return cargo;
+	throw new Error(`cargo not found on PATH or in ${installBinDirs.join(", ")}. Install Rust with rustup.`);
 }
 
 async function runCommand(command: readonly string[]): Promise<number> {
