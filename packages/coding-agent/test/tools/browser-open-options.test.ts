@@ -109,7 +109,10 @@ describe("browser open options CDP helpers", () => {
 			send,
 			detach: async () => undefined,
 		};
-		const browser = { target: () => ({ createCDPSession: async () => session }) } as unknown as Browser;
+		const browser = {
+			wsEndpoint: () => `ws://127.0.0.1:9/devtools/browser/${crypto.randomUUID()}`,
+			target: () => ({ createCDPSession: async () => session }),
+		} as unknown as Browser;
 		const page = { frames: () => [{ _id: "frame" }], browserContext: () => ({}) } as unknown as Page;
 		const downloads = new DownloadManager(browser, page, "tab", { perTab });
 		const complete = async (
@@ -270,6 +273,63 @@ describe("browser open options CDP helpers", () => {
 		const error = await rejectionOf(complete(42, undefined));
 		expect(error).toBeInstanceOf(ToolError);
 		expect((error as ToolError).message).toStartWith("Download failed: https://example.com/");
+	});
+
+	it("finds a tab's download that Chromium saved after a sibling tab re-pointed the download folder", async () => {
+		// Chromium has one download folder per browser, set by whichever tab called setDownloadBehavior last,
+		// and it does not always report where a completed download landed.
+		let chromiumFolder: string | undefined;
+		const listeners: Array<Map<string, (event: unknown) => void>> = [];
+		const endpoint = `ws://127.0.0.1:9/devtools/browser/${crypto.randomUUID()}`;
+		const browser = {
+			wsEndpoint: () => endpoint,
+			target: () => ({
+				createCDPSession: async () => {
+					const sessionListeners = new Map<string, (event: unknown) => void>();
+					listeners.push(sessionListeners);
+					return {
+						on: (event: string, listener: (event: unknown) => void) => sessionListeners.set(event, listener),
+						off: () => undefined,
+						send: async (_method: string, params: { downloadPath: string }) => {
+							chromiumFolder = params.downloadPath;
+						},
+						detach: async () => undefined,
+					};
+				},
+			}),
+		} as unknown as Browser;
+		const pageFor = (frameId: string) =>
+			({ frames: () => [{ _id: frameId }], browserContext: () => ({}) }) as unknown as Page;
+		const directoryA = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-download-test-"));
+		const directoryB = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-download-test-"));
+		tempDirs.push(directoryA, directoryB);
+		const tabA = new DownloadManager(browser, pageFor("frame-a"), "tab-a", { perTab: true });
+		const tabB = new DownloadManager(browser, pageFor("frame-b"), "tab-b", { perTab: true });
+		try {
+			await tabA.enable(directoryA);
+			const waiting = tabA.wait();
+			await tabA.arming;
+			await tabB.enable(directoryB);
+
+			const guid = crypto.randomUUID();
+			await Bun.write(path.join(chromiumFolder!, guid), "bytes");
+			for (const session of listeners) {
+				session.get("Browser.downloadWillBegin")!({
+					guid,
+					url: "https://example.com/",
+					suggestedFilename: "report.txt",
+					frameId: "frame-a",
+				});
+				session.get("Browser.downloadProgress")!({ guid, state: "completed", receivedBytes: 5 });
+			}
+
+			expect((await waiting).path).toBe(path.join(directoryA, "report.txt"));
+			expect(await Bun.file(path.join(directoryA, "report.txt")).text()).toBe("bytes");
+		} finally {
+			await tabA.close();
+			await tabB.close();
+			if (chromiumFolder) tempDirs.push(chromiumFolder);
+		}
 	});
 
 	it("rejects a wait whose signal is already aborted without leaving the enable failure unhandled", async () => {

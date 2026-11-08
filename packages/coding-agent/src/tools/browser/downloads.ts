@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -25,7 +26,7 @@ interface DownloadProgress {
 	guid: string;
 	state: "inProgress" | "completed" | "canceled";
 	receivedBytes: number;
-	/** Saved location on completion, in whichever folder Chromium was pointed at last. */
+	/** Saved location on completion; Chromium does not report it on every platform. */
 	filePath?: string;
 }
 
@@ -48,6 +49,7 @@ export class DownloadManager {
 	readonly #browser: Browser;
 	readonly #page: Page;
 	readonly #defaultDirectory: string;
+	readonly #stagingDirectory: string;
 	readonly #perTab: boolean;
 	#directory?: string;
 	#arming?: Promise<void>;
@@ -68,21 +70,28 @@ export class DownloadManager {
 		this.#browser = browser;
 		this.#page = page;
 		this.#defaultDirectory = path.join(os.tmpdir(), `omp-downloads-${tabId}`);
+		// Every tab worker connects its own Browser to the same Chromium, so the endpoint names the Chromium instance.
+		const browserId = createHash("sha256").update(browser.wsEndpoint()).digest("hex").slice(0, 16);
+		this.#stagingDirectory = path.join(os.tmpdir(), `omp-downloads-browser-${browserId}`);
 		this.#perTab = options.perTab;
 	}
 
 	/**
-	 * Point the browser's one download folder at this tab's folder. Per tab, files are saved under their download GUID
-	 * so tabs never overwrite each other's, and each tab moves its own into its folder under the suggested name.
+	 * Point the browser's one download folder where this tab's downloads are saved. Chromium keeps a single folder per
+	 * browser, set by whichever tab asked last. Per tab, every tab of that browser asks for the same staging folder and
+	 * files are saved there under their download GUID, so a sibling tab cannot send this tab's download to a folder this
+	 * tab does not know; each tab moves its own into its folder under the suggested name.
 	 */
 	async enable(directory?: string): Promise<void> {
 		const resolved = path.resolve(directory ?? this.#defaultDirectory);
 		await fs.mkdir(resolved, { recursive: true });
+		const downloadPath = this.#perTab ? this.#stagingDirectory : resolved;
+		if (this.#perTab) await fs.mkdir(downloadPath, { recursive: true });
 		if (!this.#session) await this.#attach();
 		const context = this.#page.browserContext() as { id?: string };
 		await this.#session!.send("Browser.setDownloadBehavior", {
 			behavior: this.#perTab ? "allowAndName" : "allow",
-			downloadPath: resolved,
+			downloadPath,
 			eventsEnabled: true,
 			...(context.id ? { browserContextId: context.id } : {}),
 		});
@@ -174,7 +183,11 @@ export class DownloadManager {
 
 	async #complete(pending: PendingDownload, filePath: string | undefined): Promise<void> {
 		const directory = this.#directory ?? this.#defaultDirectory;
-		const source = filePath ?? path.join(directory, this.#perTab ? pending.guid : pending.suggestedFilename);
+		const source =
+			filePath ??
+			(this.#perTab
+				? path.join(this.#stagingDirectory, pending.guid)
+				: path.join(directory, pending.suggestedFilename));
 		for (let attempt = 0; attempt < 100; attempt++) {
 			try {
 				await fs.stat(source);
