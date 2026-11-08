@@ -55,7 +55,7 @@ const NATIVE_TOOL_KEYS: ReadonlySet<string> = new Set([
 /**
  * Native tools whose effects reach beyond the paths their arguments name: shells and interpreters,
  * debuggers that launch programs, LSP workspace edits, GitHub checkouts and pushes into the working
- * tree, and managed skill files.
+ * tree, managed skill files, and security scans that read (and may upload) the whole repository.
  */
 const UNPROVABLE_NATIVE_TOOLS: ReadonlySet<string> = new Set([
 	"bash",
@@ -65,6 +65,7 @@ const UNPROVABLE_NATIVE_TOOLS: ReadonlySet<string> = new Set([
 	"ida",
 	"github",
 	"manage_skill",
+	"security_scan",
 ]);
 
 /**

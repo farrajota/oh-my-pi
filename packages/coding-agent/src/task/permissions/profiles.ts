@@ -344,7 +344,7 @@ export async function loadPermissionProfiles(
 			const unprovable = unprovableToolsWithPathRules(profile);
 			if (unprovable.length > 0) {
 				warnings.push(
-					`${file.label}: permission profile "${name}" lists ${unprovable.join(", ")} together with path rules; a subagent whose scope has path rules does not get tools whose effects reach beyond their path arguments (bash, eval, LSP, MCP, extension and custom tools, github, debug, ida, manage_skill)`,
+					`${file.label}: permission profile "${name}" lists ${unprovable.join(", ")} together with path rules; a subagent whose scope has path rules does not get tools whose effects reach beyond their path arguments (bash, eval, LSP, MCP, extension and custom tools, github, debug, ida, manage_skill, security_scan)`,
 				);
 			}
 		}
