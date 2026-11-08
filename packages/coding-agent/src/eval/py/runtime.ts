@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $env, $whichAll, getPythonEnvDir } from "@oh-my-pi/pi-utils";
+import { isSecretEnvKey } from "../secret-env";
 
 const DEFAULT_ENV_ALLOWLIST = new Set([
 	"PATH",
@@ -140,6 +141,8 @@ export function filterEnv(env: Record<string, string | undefined>): Record<strin
 			filtered[destKey] = value;
 			continue;
 		}
+		// An allowed prefix (`PI_`, `XDG_`, `LC_`) does not make a token or key safe to hand to cells.
+		if (isSecretEnvKey(normalizedKey)) continue;
 		if (NORMALIZED_ALLOW_PREFIXES.some(prefix => normalizedKey.startsWith(prefix))) {
 			filtered[key] = value;
 		}

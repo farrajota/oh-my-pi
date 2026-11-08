@@ -20,6 +20,7 @@ import {
 	type SessionOwners,
 } from "../executor-base";
 import { shouldDetachKernel } from "../py/spawn-options";
+import { withoutSecretEnv } from "../secret-env";
 import { updateEvalState } from "../state";
 import type { EvalShadowCellSession } from "../speculation/cell-session";
 import { getActiveEvalShadowCell } from "../speculation/runtime-context";
@@ -136,6 +137,9 @@ const productionWorkerFactories: JsEvalWorkerFactories = {
 	spawnWorker: spawnBunWorker,
 };
 let workerFactories = productionWorkerFactories;
+
+/** The production spawn paths, for tests that replace only one of them through {@link setJsEvalWorkerFactoriesForTests}. */
+export const defaultJsEvalWorkerFactories: Readonly<JsEvalWorkerFactories> = productionWorkerFactories;
 
 /**
  * Test-only seam for exercising isolated-runtime startup transitions. Returns
@@ -991,9 +995,11 @@ function spawnJsWorker(): JsEvalWorkerHandle {
 function spawnBunWorker(): JsEvalWorkerHandle {
 	try {
 		const hostEntry = workerHostEntry();
+		// A Worker's `process.env` defaults to a copy of the host's; give it the subprocess's filtered one.
+		const env = jsEvalWorkerEnv();
 		const worker = hostEntry
-			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_js_eval"] })
-			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, { type: "module" });
+			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_js_eval"], env })
+			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, { type: "module", env });
 		return wrapBunWorker(worker);
 	} catch (error) {
 		throw new Error(
@@ -1003,10 +1009,15 @@ function spawnBunWorker(): JsEvalWorkerHandle {
 	}
 }
 
+/** The host environment for a JS eval worker, without credentials cells could read. */
+function jsEvalWorkerEnv(): Record<string, string> {
+	return withoutSecretEnv(workerEnvFromParent());
+}
+
 function spawnJsProcess(): JsEvalWorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
 		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
-		env: workerEnvFromParent(),
+		env: jsEvalWorkerEnv(),
 		exitLabel: "JS eval worker",
 		detached: shouldDetachKernel(process.platform),
 		reportCleanExit: true,

@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- Eval cells no longer see credentials from the agent's environment: Python kernels drop secret-shaped variables (`*TOKEN*`, `*API_KEY*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`, access/private keys, cookies) even under the allowed `PI_`/`XDG_`/`LC_` prefixes, and JS eval workers, subprocess and Bun Worker fallback alike, start without them
 - Advisor catch-up (`waitForAdvisorCatchup`, used before headless disposal) reports failure when an advisor card's persistence hook rejected instead of reporting success, and a new conversation no longer waits on, or inherits a failure from, the previous conversation's card hooks
 - An extension message sent with `triggerTurn` while a manual compaction's resume is withheld claims that resume once its turn starts, even when the turn then fails, instead of being followed by a second, synthetic resume turn
 - A manual or experimental-rollover compaction whose session entry fails to append no longer counts as committed, so it does not resume the turn it interrupted
