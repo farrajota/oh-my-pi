@@ -4,6 +4,7 @@
 
 ### Added
 
+- Status-line segments `omp_version` (the installed omp version) and `docker_container` (`DOCKER_CONTAINER_NAME`, else `HOSTNAME`, else the machine hostname) for custom status-line layouts
 - Grep headers syntax-highlight regex patterns, including incomplete patterns while a call streams, in terminal and native views ([#18392](https://github.com/can1357/oh-my-pi/pull/18392) by [@JustasMasiulis](https://github.com/JustasMasiulis)).
 
 ### Changed

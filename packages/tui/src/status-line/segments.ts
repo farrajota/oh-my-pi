@@ -4,6 +4,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { getTimeBasedPricingPeriod } from "@oh-my-pi/pi-catalog/models";
 import { sharedSpinnerFrame, TERMINAL } from "../index";
 import {
+	VERSION,
 	formatDuration,
 	formatNumber,
 	getActiveProfile,
@@ -996,6 +997,35 @@ const hostnameSegment: StatusLineSegment = {
 	},
 };
 
+const ompVersionSegment: StatusLineSegment = {
+	id: "omp_version",
+	render() {
+		return { content: theme.fg("muted", withIcon(theme.icon.omp, VERSION)), visible: true };
+	},
+	describe() {
+		return segView([span(VERSION, "muted")], "omp");
+	},
+};
+
+/**
+ * Container identity for sandboxed sessions: the name the launcher exports, else
+ * the container's `HOSTNAME` (Docker sets it to the container id), else the machine
+ * hostname. Read per render because the launcher may export the name after startup.
+ */
+function dockerContainerName(): string {
+	return sanitizeStatusText(process.env.DOCKER_CONTAINER_NAME || process.env.HOSTNAME || os.hostname());
+}
+
+const dockerContainerSegment: StatusLineSegment = {
+	id: "docker_container",
+	render() {
+		return { content: theme.fg("muted", withIcon(theme.icon.host, dockerContainerName())), visible: true };
+	},
+	describe() {
+		return segView([span(dockerContainerName(), "muted")], "host");
+	},
+};
+
 const cacheReadSegment: StatusLineSegment = singleStatSegment("cache_read", "cacheRead", "cache", "statusLineSpend");
 
 const cacheWriteSegment: StatusLineSegment = singleStatSegment(
@@ -1357,6 +1387,8 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	collab: collabSegment,
 	stream: streamSegment,
 	vim: vimSegment,
+	omp_version: ompVersionSegment,
+	docker_container: dockerContainerSegment,
 };
 
 export function renderSegment(id: StatusLineSegmentId, ctx: SegmentContext): RenderedSegment {

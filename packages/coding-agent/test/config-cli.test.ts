@@ -160,6 +160,20 @@ describe("config CLI schema coverage", () => {
 			expect.stringContaining('Unknown status line segment: "modle". Valid status line segments: pi, status, model'),
 		);
 	});
+	it("accepts the omp_version and docker_container status line segment ids", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await runConfigCommand({
+			action: "set",
+			key: "statusLine.leftSegments",
+			value: '["omp_version","model","docker_container"]',
+			flags: { json: true },
+		});
+		await runConfigCommand({ action: "get", key: "statusLine.leftSegments", flags: { json: true } });
+
+		const parsed = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as { value: unknown };
+		expect(parsed.value).toEqual(["omp_version", "model", "docker_container"]);
+	});
 	it("sets numeric idle compaction settings from CLI values", async () => {
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		await runConfigCommand({
