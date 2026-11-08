@@ -32,6 +32,7 @@ import {
 	type ShellFsResponse,
 } from "@oh-my-pi/pi-natives";
 import { isFsError } from "@oh-my-pi/pi-utils";
+import { internalUrlFileRefusal } from "../task/permissions/session-checks";
 import { TIER_RANK } from "../tools/approval";
 import { UrlContainmentError } from "./filesystem-resource";
 import { parseInternalUrl } from "./parse";
@@ -767,11 +768,19 @@ export class InternalUrlFilesystem {
 		return leaves;
 	}
 
-	#locate(route: Route, url: string, create: boolean): Promise<string | null> {
+	async #locate(route: Route, url: string, create: boolean): Promise<string | null> {
 		const locate = route.handler?.locate;
-		if (!locate) return Promise.resolve(null);
+		if (!locate) return null;
 		// Nodes keep one type: a bare `skill://<name>` / `memory://root` is always its directory.
-		return locate.call(route.handler, parseInternalUrl(url), this.#context, { directory: true, create });
+		const located = await locate.call(route.handler, parseInternalUrl(url), this.#context, {
+			directory: true,
+			create,
+		});
+		// The caller's subagent permission scope applies to the file behind the URL.
+		const refusal =
+			located === null ? undefined : internalUrlFileRefusal(this.#context.settings, this.#context.cwd, url, located);
+		if (refusal !== undefined) throw new UrlFsError("EACCES", refusal);
+		return located;
 	}
 
 	/** The session scratch root always exists, like a mount point. */

@@ -85,6 +85,34 @@ function isPathRuleExempt(toolKey: string, target: string): boolean {
 	return toolKey === "write" && (hasScheme(target, "agent://") || hasScheme(target, "xd://"));
 }
 
+/**
+ * `history://<id>` of an agent other than `actorId`. The index (`history://`) lists ids only, and
+ * `history://current` is the caller's own branch.
+ */
+function otherAgentHistory(target: string, actorId: string): boolean {
+	if (!hasScheme(target, "history://")) return false;
+	const id = target.slice("history://".length).split(/[/:?#]/, 1)[0] ?? "";
+	return id.length > 0 && id.toLowerCase() !== "current" && id !== actorId;
+}
+
+/** P7: a secrets-blind subagent cannot read another agent's transcript, which may hold what it may not see. */
+function otherAgentHistoryDenial(
+	scope: PermissionScope,
+	toolName: string,
+	targets: readonly string[],
+): PermissionDecision | undefined {
+	if (!scope.guardrails.secretsBlind) return undefined;
+	const history = targets.find(target => otherAgentHistory(target, scope.actorId));
+	if (history === undefined) return undefined;
+	return deny(
+		"guardrail",
+		`BLOCKED: secrets-blind guardrail denied another agent's history '${history}'.`,
+		"guardrail:secrets-blind-history",
+		toolName,
+		[history],
+	);
+}
+
 function evaluateToolName(
 	scope: PermissionScope,
 	toolName: string,
@@ -205,6 +233,8 @@ export function evaluateSubagentPermission(input: PermissionCallInput): Permissi
 	}
 	const guardrailDecision = evaluatePermissionGuardrails({ scope, toolName, toolInput: input.toolInput });
 	if (guardrailDecision.action === "deny") return guardrailDecision;
+	const historyDenial = otherAgentHistoryDenial(scope, toolName, targets);
+	if (historyDenial) return historyDenial;
 	if (scope.guardrails.secretsBlind) {
 		const secret = (input.targets ?? []).find(isSecretPath);
 		if (secret !== undefined) return secretsBlindDenial(toolName, [secret]);
@@ -228,6 +258,32 @@ export function evaluatePermissionPath(input: {
 		const pathDecision = evaluatePathCandidates(scope, toolName, [toPathCandidate(input.path, input.cwd)], input.cwd);
 		if (pathDecision.action === "deny") return pathDecision;
 	}
+	const historyDenial = otherAgentHistoryDenial(scope, toolName, [input.path]);
+	if (historyDenial) return historyDenial;
 	if (scope.guardrails.secretsBlind && isSecretPath(input.path)) return secretsBlindDenial(toolName, [input.path]);
+	return ALLOW;
+}
+
+/**
+ * Decide the file an internal URL resolves to (P7): `url` as the caller named it, `path` the file it
+ * located. Deny paths and secrets-blind apply to every scheme's files. The allowlist applies to every
+ * scheme but `local://`, the subagent's own scratch space, which stays writable under `allowPaths`.
+ */
+export function evaluateInternalUrlFile(input: {
+	readonly scope: PermissionScope | undefined;
+	readonly url: string;
+	readonly path: string;
+	readonly cwd: string;
+}): PermissionDecision {
+	const { scope } = input;
+	if (scope?.mode !== "enforce") return ALLOW;
+	const toolName = "internal-url";
+	if (hasPathRules(scope)) {
+		const candidate: PathCandidate = { ...toPathCandidate(input.path, input.cwd), display: input.url };
+		const rules = hasScheme(input.url, "local://") ? { ...scope, allowPathGroups: [] } : scope;
+		const pathDecision = evaluatePathCandidates(rules, toolName, [candidate], input.cwd);
+		if (pathDecision.action === "deny") return pathDecision;
+	}
+	if (scope.guardrails.secretsBlind && isSecretPath(input.path)) return secretsBlindDenial(toolName, [input.url]);
 	return ALLOW;
 }

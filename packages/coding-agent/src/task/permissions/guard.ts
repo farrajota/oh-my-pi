@@ -65,12 +65,14 @@ export function permissionApprovalGuard(settings: Settings, cwd: string): Approv
 	return scopeGuard(active.scope, cwd);
 }
 
+/** Why a call is refused when the session's scope does not decode. */
+export function unreadableScopeReason(error: string): string {
+	return `BLOCKED: Subagent permission scope is unreadable (${error}); only yield is allowed.`;
+}
+
 function unreadableScopeGuard(error: string): ApprovalGuard {
 	return {
-		check: tool =>
-			tool.name === "yield"
-				? undefined
-				: { reason: `BLOCKED: Subagent permission scope is unreadable (${error}); only yield is allowed.` },
+		check: tool => (tool.name === "yield" ? undefined : { reason: unreadableScopeReason(error) }),
 	};
 }
 

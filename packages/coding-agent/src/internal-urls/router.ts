@@ -16,6 +16,7 @@ import { splitInternalUrlSel } from "@oh-my-pi/pi-tui/tools/read";
 import { setInternalUrlSchemeHost, splitUrlScheme } from "@oh-my-pi/pi-tui/tools/url-scheme-host";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { ToolSession } from "../tools";
+import { internalUrlFileRefusal } from "../task/permissions/session-checks";
 import { TIER_RANK } from "../tools/approval";
 import { AgentProtocolHandler } from "./agent-protocol";
 import { ArtifactProtocolHandler } from "./artifact-protocol";
@@ -50,6 +51,15 @@ import type {
 } from "./types";
 import { VaultProtocolHandler } from "./vault-protocol";
 import { XdProtocolHandler } from "./xd-protocol";
+
+/**
+ * Refuse a file an internal URL resolved to when the caller's subagent permission scope does not
+ * permit it: the approval guard sees only the URL, not the file behind it.
+ */
+function assertPermittedFile(url: string, file: string, context: ResolveContext | undefined): void {
+	const refusal = internalUrlFileRefusal(context?.settings, context?.cwd, url, file);
+	if (refusal !== undefined) throw new ToolError(refusal);
+}
 
 setInternalUrlCompletionHost({
 	completionSchemes: () => InternalUrlRouter.instance().completionSchemes(),
@@ -300,7 +310,10 @@ export class InternalUrlRouter {
 		const spec = handler.spec;
 		if (spec.backing === "file" && handler.locate) {
 			const located = await handler.locate(url, context);
-			if (located !== null) return { kind: "file", url, spec, path: located, sel };
+			if (located !== null) {
+				assertPermittedFile(bare, located, context);
+				return { kind: "file", url, spec, path: located, sel };
+			}
 		}
 		return { kind: "resource", url, spec, sel };
 	}
@@ -309,7 +322,13 @@ export class InternalUrlRouter {
 	async locate(input: string, context?: ResolveContext, options?: LocateOptions): Promise<string | null> {
 		const registered = this.#registered(input);
 		if (!registered?.handler.locate) return null;
-		return registered.handler.locate(parseInternalUrl(this.split(registered.url).path), context, options);
+		const located = await registered.handler.locate(
+			parseInternalUrl(this.split(registered.url).path),
+			context,
+			options,
+		);
+		if (located !== null) assertPermittedFile(registered.url, located, context);
+		return located;
 	}
 
 	/**
@@ -489,6 +508,7 @@ export class InternalUrlRouter {
 	async resolve(input: string, context?: ResolveContext): Promise<InternalResource> {
 		const { parsed, handler } = this.#route(input, true);
 		const resource = await handler.resolve(parsed, context);
+		if (resource.sourcePath) assertPermittedFile(input, resource.sourcePath, context);
 		return { ...resource, immutable: resource.immutable ?? handler.spec.immutable };
 	}
 

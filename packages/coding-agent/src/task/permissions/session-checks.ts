@@ -1,13 +1,13 @@
 /**
  * Checks of the session's subagent permission scope for effects that do not pass through one
- * approval resolve: spawning a subagent outside the `task` tool, and the entries a recursive search
- * finds below the root the guard checked.
+ * approval resolve: spawning a subagent outside the `task` tool, the entries a recursive search
+ * finds below the root the guard checked, and the file an internal URL resolves to.
  */
 import * as path from "node:path";
 import type { Settings } from "../../config/settings";
 import { approvalCacheKeyForPath } from "../../tools/approval-cache";
-import { evaluatePermissionPath } from "./evaluate";
-import { activePermissionScope, permissionApprovalGuard } from "./guard";
+import { evaluateInternalUrlFile, evaluatePermissionPath } from "./evaluate";
+import { activePermissionScope, permissionApprovalGuard, unreadableScopeReason } from "./guard";
 import { hasPathRules } from "./path-rules";
 
 /**
@@ -45,4 +45,30 @@ export function permissionResultFilter(
 			real === entry || evaluatePermissionPath({ scope, toolName, path: real, cwd: canonicalCwd }).action === "allow"
 		);
 	};
+}
+
+/**
+ * Why the session's scope refuses `file`, the file the internal URL `url` resolved to, or `undefined`.
+ * The approval guard sees only the URL; this applies the path rules and secrets-blind to the file
+ * behind it (P7), as named and by its real path.
+ */
+export function internalUrlFileRefusal(
+	settings: Settings | undefined,
+	cwd: string | undefined,
+	url: string,
+	file: string,
+): string | undefined {
+	if (!settings) return undefined;
+	const active = activePermissionScope(settings);
+	if (active === undefined) return undefined;
+	if (!active.ok) return unreadableScopeReason(active.error);
+	const { scope } = active;
+	if (scope.mode !== "enforce" || !(hasPathRules(scope) || scope.guardrails.secretsBlind)) return undefined;
+	const base = cwd ?? settings.getCwd();
+	const named = evaluateInternalUrlFile({ scope, url, path: file, cwd: base });
+	if (named.action === "deny") return named.reason;
+	const real = approvalCacheKeyForPath(file);
+	if (real === file) return undefined;
+	const resolved = evaluateInternalUrlFile({ scope, url, path: real, cwd: approvalCacheKeyForPath(base) });
+	return resolved.action === "deny" ? resolved.reason : undefined;
 }
