@@ -18,6 +18,7 @@ import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
 import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
 
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
+import { permissionResultFilter } from "../task/permissions/session-checks";
 
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { missingGrammarsNote, rerunWithGrammars } from "../utils/grammars";
@@ -288,7 +289,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
 			// Dry run, so a re-run after installing missing grammars cannot double-apply.
-			const result = await rerunWithGrammars(() =>
+			const preview = await rerunWithGrammars(() =>
 				runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 					rewrites: normalizedRewrites,
 					dryRun: true,
@@ -298,6 +299,25 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					filesystem: urlFilesystem.shellFilesystem(),
 				}),
 			);
+			// Under a subagent permission scope the guard saw only the roots: drop the files the scope
+			// refuses, and apply to exactly the previewed files that remain instead of walking again.
+			const permitted = permissionResultFilter(this.session.settings, this.session.cwd, this.name);
+			let result = preview;
+			let applyTargets = multiTargets;
+			if (permitted) {
+				const keep = (changePath: string) => permitted(resolveSearchResultPath(resolvedSearchPath, changePath));
+				const fileChanges = preview.fileChanges.filter(change => keep(change.path));
+				result = {
+					...preview,
+					changes: preview.changes.filter(change => keep(change.path)),
+					fileChanges,
+					totalReplacements: fileChanges.reduce((total, change) => total + change.count, 0),
+					filesTouched: fileChanges.length,
+				};
+				applyTargets = fileChanges.map(change => ({
+					basePath: resolveSearchResultPath(resolvedSearchPath, change.path),
+				}));
+			}
 			const grammarNote = result.missingGrammars?.length ? missingGrammarsNote(result.missingGrammars) : undefined;
 
 			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(result.parseErrors);
@@ -443,7 +463,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					apply: async (_reason: string) => {
 						// The apply outlives the preview call: its filesystem carries no signal.
 						const applyContext = sessionResolveContext(this.session);
-						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+						const applyResult = await runAstEditOnce(applyTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
 							dryRun: false,
 							maxFiles,

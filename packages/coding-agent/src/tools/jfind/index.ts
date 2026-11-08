@@ -15,6 +15,7 @@ import { InternalUrlFilesystem } from "../../internal-urls/url-filesystem";
 import { hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../../judgment";
 import findDescription from "../../prompts/tools/find.md" with { type: "text" };
 import { SPOTLIGHT_ENTRY } from "../../spotlight/types";
+import { permissionResultFilter } from "../../task/permissions/session-checks";
 import type { ToolSession } from "..";
 import { resolveToolTier } from "../approval";
 import {
@@ -123,6 +124,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				judge,
 				spotlight: experiment ? { client: experiment.client, thinking: experiment.thinking } : undefined,
 				includeHidden: false,
+				permitted: permissionResultFilter(this.session.settings, cwd, this.name),
 				signal,
 				deadline,
 				onProgress: message => {

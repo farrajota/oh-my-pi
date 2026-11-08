@@ -10,6 +10,7 @@ import { getEditStore } from "../edit/store";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
 import astGrepDescription from "../prompts/tools/ast-grep.md" with { type: "text" };
+import { permissionResultFilter } from "../task/permissions/session-checks";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
 
@@ -244,7 +245,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 
 			const DEFAULT_AST_LIMIT = 50;
 			if (params.lang) await ensureGrammar({ lang: params.lang });
-			const result = await rerunWithGrammars(() =>
+			const found = await rerunWithGrammars(() =>
 				multiTargets
 					? runMultiTargetAstGrep(multiTargets, {
 							patterns,
@@ -266,6 +267,19 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 							filesystem,
 						}),
 			);
+			const permitted = permissionResultFilter(this.session.settings, this.session.cwd, this.name);
+			const keptMatches = permitted
+				? found.matches.filter(match => permitted(resolveSearchResultPath(resolvedSearchPath, match.path)))
+				: found.matches;
+			const result =
+				keptMatches.length === found.matches.length
+					? found
+					: {
+							...found,
+							matches: keptMatches,
+							totalMatches: keptMatches.length,
+							filesWithMatches: new Set(keptMatches.map(match => match.path)).size,
+						};
 			const grammarNote = result.missingGrammars?.length ? missingGrammarsNote(result.missingGrammars) : undefined;
 
 			const normalizedParseErrors = (result.parseErrors ?? []).map(error => {

@@ -107,6 +107,8 @@ export interface CascadeOptions {
 	/** Rank filenames with Spotlight; the judge ranks them when absent or when Spotlight fails. */
 	spotlight?: CascadeSpotlight;
 	includeHidden: boolean;
+	/** Keeps a listed file (absolute host path or internal URL); a dropped file is never read or judged. */
+	permitted?: (entry: string) => boolean;
 	signal?: AbortSignal;
 	/**
 	 * The call's wall-clock budget. Firing during verification ends the search
@@ -239,10 +241,12 @@ class Cascade {
 
 		onProgress?.("lexical scan");
 		const native = filesystem.shellFilesystem();
-		const [entries, index] = await Promise.all([
+		const [listed, index] = await Promise.all([
 			listFiles(root, { includeHidden, filesystem: native, signal }),
 			grepIndex(root.path, keywords, { includeHidden, filesystem: native, signal, timeoutMs: SCAN_TIMEOUT_MS }),
 		]);
+		const { permitted } = this.#options;
+		const entries = permitted ? listed.filter(entry => permitted(entry.path)) : listed;
 		this.stats.listed = entries.length;
 		const weights = idf(index);
 		const noCounts = Array.from({ length: keywords.length }, () => 0);

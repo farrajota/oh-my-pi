@@ -1,5 +1,6 @@
 import type { GlobToolDetails } from "@oh-my-pi/pi-tui/tools/glob";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import * as natives from "@oh-my-pi/pi-natives";
@@ -9,6 +10,7 @@ import { InternalUrlFilesystem, type UrlFileStat } from "../internal-urls/url-fi
 import { glob as ovnfsGlob } from "../ovnfs/search";
 import globDescription from "../prompts/tools/glob.md" with { type: "text" };
 import { truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { permissionResultFilter } from "../task/permissions/session-checks";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
 import type { ToolSession } from ".";
@@ -306,11 +308,17 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 
 			const missingPathsNote =
 				missingPaths.length > 0 ? `Skipped missing paths: ${missingPaths.join(", ")}` : undefined;
+			// Entries are reported cwd-relative (a trailing slash marks a folder) or as internal URLs.
+			const scopeFilter = permissionResultFilter(this.session.settings, this.session.cwd, this.name);
+			const permitted = (entry: string): boolean =>
+				scopeFilter === undefined ||
+				scopeFilter(internalRouter.canHandle(entry) ? entry : path.resolve(this.session.cwd, entry));
 
 			const buildResult = (
-				files: string[],
+				found: string[],
 				opts?: { notice?: string; forceTruncated?: boolean; timedOut?: boolean },
 			): AgentToolResult<GlobToolDetails> => {
+				const files = scopeFilter === undefined ? found : found.filter(permitted);
 				const notice = opts?.notice;
 				const forceTruncated = opts?.forceTruncated ?? false;
 				if (files.length === 0) {
@@ -548,7 +556,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 				(err: Error | null, match: natives.GlobMatch | null): void => {
 					if (err || combinedSignal.aborted || !match?.path) return;
 					const relativePath = formatTargetMatch(match);
-					if (streamed.has(relativePath)) return;
+					if (streamed.has(relativePath) || !permitted(relativePath)) return;
 					streamed.add(relativePath);
 					onUpdateMatches.push(relativePath);
 					onUpdateMtimes.push(match.mtime ?? 0);

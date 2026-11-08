@@ -25,6 +25,7 @@ import {
 	type TruncationResult,
 	truncateHead,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { permissionResultFilter } from "../task/permissions/session-checks";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
@@ -956,6 +957,23 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						filesSearched: result.filesSearched,
 						limitReached: result.limitReached,
 					};
+				}
+				const permitted = permissionResultFilter(this.session.settings, this.session.cwd, this.name);
+				if (permitted) {
+					// Archive members and fetched URLs are no workspace entries; the guard checked their roots.
+					const materialized = new Set([...materializedExternalPaths.values()].map(entry => path.resolve(entry)));
+					const kept = result.matches.filter(match => {
+						const absolute = resolveSearchResultPath(searchPath, match.path);
+						return archiveDisplayMap.has(absolute) || materialized.has(absolute) || permitted(absolute);
+					});
+					if (kept.length !== result.matches.length) {
+						result = {
+							...result,
+							matches: kept,
+							totalMatches: kept.length,
+							filesWithMatches: new Set(kept.map(match => match.path)).size,
+						};
+					}
 				}
 				if (archiveDisplayMap.size > 0) {
 					for (const match of result.matches) {
