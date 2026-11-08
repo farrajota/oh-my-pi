@@ -1,0 +1,45 @@
+import { describe, expect, test } from "bun:test";
+import {
+	applyTaskToolProfile,
+	resolveTaskToolProfile,
+	TASK_TOOL_PROFILE_NAMES,
+} from "@oh-my-pi/pi-coding-agent/task/permissions/tool-profiles";
+
+describe("task tool profiles", () => {
+	test("none resolves to an explicit empty tool list", () => {
+		expect(resolveTaskToolProfile("none")).toEqual([]);
+	});
+
+	test("inspect normalizes search/find aliases", () => {
+		expect(resolveTaskToolProfile("inspect")).toEqual(["read", "grep", "find"]);
+	});
+
+	test("edit keeps mutation tools but excludes broad execution and delegation tools", () => {
+		const tools = resolveTaskToolProfile("edit");
+
+		expect(tools).toEqual(["read", "grep", "find", "ast_grep", "edit", "write"]);
+		expect(tools).not.toEqual(expect.arrayContaining(["bash", "eval", "browser", "task"]));
+	});
+
+	test("an absent agent tool list receives the selected profile", () => {
+		expect(applyTaskToolProfile(undefined, "review")).toEqual(["read", "grep", "find", "ast_grep"]);
+	});
+
+	test("profile application preserves only the intersection with explicit agent tools", () => {
+		expect(applyTaskToolProfile(["read"], "plan")).toEqual(["read"]);
+		expect(applyTaskToolProfile(["write"], "plan")).toEqual([]);
+	});
+
+	test("omitting a profile preserves an explicitly declared browser tool", () => {
+		expect(applyTaskToolProfile(["browser"], undefined)).toEqual(["browser"]);
+	});
+
+	test("browser remains agent-declared rather than becoming a native Task profile", () => {
+		expect(TASK_TOOL_PROFILE_NAMES).not.toContain("browser");
+	});
+
+	test("the retired browser-audit profile is gone and vision names only live tools", () => {
+		expect(TASK_TOOL_PROFILE_NAMES).not.toContain("browser-audit");
+		expect(resolveTaskToolProfile("vision")).toEqual(["read", "grep", "find"]);
+	});
+});

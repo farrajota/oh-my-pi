@@ -1,0 +1,69 @@
+{
+	"defaultAction": "fixture-default",
+	"tools": [],
+	"paths": ["fixture/one", "fixture/two", "fixture/three"],
+	"bash": ["fixture-a", "fixture-b", "fixture-c"],
+	"profiles": {
+		"secrets-blind": {
+			"description": "Modifier-only profile that prevents access to local secrets, credentials, and private key material without granting tools.",
+			"useWhen": "Pair with a role profile or inline permissions.tools when tool enforcement is in enforce mode and the task should avoid environment files, credentials, SSH material, or Kubernetes config.",
+			"denyPaths": [
+				"**/.env",
+				"**/.env.*",
+				"**/*secret*",
+				"**/*credential*",
+				"**/*private*key*",
+				".ssh/**",
+				".kube/**"
+			]
+		},
+		"fixture-reader": {
+			"description": "Invented reader profile.",
+			"useWhen": "Invented reader use.",
+			"tools": ["read", "search", "find", "ast_grep", "lsp", "irc"],
+			"denyPaths": [
+				"**/fx-a/**",
+				"**/fx-b/**",
+				"**/fx-c/**",
+				"**/fx-d/**",
+				"**/*.fx-e",
+				"**/*.fx-f",
+				"**/fx-g*",
+				"**/fx-h*",
+				"fx-i/**",
+				"fx-j/**"
+			]
+		},
+		"fixture-editor": {
+			"description": "Invented editor profile.",
+			"useWhen": "Invented editor use.",
+			"tools": ["read", "search", "find", "ast_grep", "lsp", "edit", "irc"],
+			"denyPaths": [
+				"**/fx-a/**",
+				"**/fx-b/**",
+				"**/fx-c/**",
+				"**/fx-d/**",
+				"**/*.fx-e",
+				"**/*.fx-f",
+				"**/fx-g*",
+				"**/fx-h*",
+				"fx-i/**",
+				"fx-j/**"
+			]
+		},
+		"fixture-debug-runner": {
+			"description": "Invented debug runner profile.",
+			"useWhen": "Invented debug use.",
+			"tools": ["read", "search", "find", "ast_grep", "lsp", "bash", "irc"],
+			"denyPaths": ["**/fx-a/**", "**/fx-b/**", "**/fx-c/**", "**/*.fx-e", "**/fx-g*", "fx-i/**", "fx-j/**"]
+		},
+		"fixture-docs-researcher": {
+			"description": "Invented docs researcher profile.",
+			"useWhen": "Invented docs use.",
+			"tools": ["web_search", "read", "search", "find", "irc"],
+			"denyPaths": ["**/fx-a/**", "**/fx-b/**", "**/*.fx-e", "**/fx-g*", "fx-i/**", "fx-j/**"]
+		}
+	},
+	"actors": { "notes": "fixture" },
+	"limitations": "fixture"
+}

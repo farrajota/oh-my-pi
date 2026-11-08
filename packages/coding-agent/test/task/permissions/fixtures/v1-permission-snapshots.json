@@ -1,0 +1,1474 @@
+{
+  "generatedBy": "packages/coding-agent/src/task/permission-profiles.ts at 0d98ea6aa3c720c29fa0702cf813eadf466d8ebe",
+  "cwd": "/fixture/repo",
+  "userPermissionsFile": {
+    "defaultAction": "ask",
+    "profiles": {
+      "fixture-scout": {
+        "description": "Invented read-only scout for the v1 fixture.",
+        "useWhen": "Fixture only.",
+        "tools": [
+          "read",
+          "search",
+          "find",
+          "ast_grep",
+          "lsp",
+          "irc"
+        ],
+        "denyPaths": [
+          "**/fixture-vault/**",
+          "**/*.pem",
+          "generated/**"
+        ]
+      }
+    }
+  },
+  "profileIdentities": {
+    "read-only": {
+      "name": "read-only",
+      "source": "built-in",
+      "canonicalSha256": "f6010062550a264e5ea82e432ef28fc17422ac3f44ffe58c303ab703087bcf52"
+    },
+    "focused-edit": {
+      "name": "focused-edit",
+      "source": "built-in",
+      "canonicalSha256": "b3160c78064c0236c85890663fbe3ece5fcc28d8785a54d43872e23a74ba5cc5"
+    },
+    "test-runner": {
+      "name": "test-runner",
+      "source": "built-in",
+      "canonicalSha256": "434418b07f70a136400e7ec84dd5daa0fdf28c44770cda4a3c0adc2df79b8701"
+    },
+    "no-network": {
+      "name": "no-network",
+      "source": "built-in",
+      "canonicalSha256": "49f720e7b94a5d99723af1c3fe71b6fc8dd3c14a938117187f6d97c0b85c8a55"
+    },
+    "no-delegation": {
+      "name": "no-delegation",
+      "source": "built-in",
+      "canonicalSha256": "1d78768493d778e1ed1808ba9e2bb09126b9e08186d5000ec87b4c363ebd2663"
+    },
+    "secrets-blind": {
+      "name": "secrets-blind",
+      "source": "built-in",
+      "canonicalSha256": "1d41b551350f76ee9c17095858a6f9b0120b1360fc6d298b898845b2e1b26020"
+    },
+    "browser-audit": {
+      "name": "browser-audit",
+      "source": "built-in",
+      "canonicalSha256": "acd3ae54a6fdf2751874bf55f671ffa94fffbd25f9e21be1e5d49a98bd7281ee"
+    },
+    "fixture-scout": {
+      "name": "fixture-scout",
+      "source": "user",
+      "canonicalSha256": "713dd029716a30a0c9bffe600d7fadb82e17bee4e81595ace69617423a997981"
+    }
+  },
+  "snapshots": {
+    "parent": {
+      "snapshot": {
+        "scope": {
+          "mode": "enforce",
+          "toolsEnabled": true,
+          "pathsEnabled": true,
+          "actorId": "FixtureScout",
+          "actorKind": "sub",
+          "parentId": "Main",
+          "profiles": [
+            "fixture-scout",
+            "secrets-blind"
+          ],
+          "tools": [
+            "read",
+            "grep",
+            "find",
+            "ast_grep",
+            "lsp",
+            "hub"
+          ],
+          "denyTools": [],
+          "allowPaths": [],
+          "denyPaths": [
+            "**/fixture-vault/**",
+            "**/*.pem",
+            "generated/**",
+            "**/.env",
+            "**/.env.*",
+            "**/*secret*",
+            "**/*credential*",
+            "**/*private*key*",
+            ".ssh/**",
+            ".kube/**"
+          ],
+          "allowPathGroups": [],
+          "denyPathGroups": [
+            [
+              "**/fixture-vault/**",
+              "**/*.pem",
+              "generated/**"
+            ],
+            [
+              "**/.env",
+              "**/.env.*",
+              "**/*secret*",
+              "**/*credential*",
+              "**/*private*key*",
+              ".ssh/**",
+              ".kube/**"
+            ]
+          ],
+          "availableTools": [
+            "read",
+            "grep",
+            "find",
+            "ast_grep",
+            "lsp",
+            "edit",
+            "write",
+            "bash",
+            "task",
+            "web_search",
+            "mcp__fixture__lookup",
+            "fixture_eval_helper",
+            "yield",
+            "report_tool_issue"
+          ],
+          "allowedDescriptorIds": [
+            "builtin:builtin:read:1762560000000:0.4242",
+            "builtin:builtin:grep:1762560000000:0.4242",
+            "builtin:builtin:find:1762560000000:0.4242",
+            "builtin:builtin:ast_grep:1762560000000:0.4242",
+            "builtin:builtin:lsp:1762560000000:0.4242",
+            "hub"
+          ],
+          "clauses": [
+            {
+              "source": "profile",
+              "name": "fixture-scout",
+              "descriptorIds": [
+                "builtin:builtin:read:1762560000000:0.4242",
+                "builtin:builtin:grep:1762560000000:0.4242",
+                "builtin:builtin:find:1762560000000:0.4242",
+                "builtin:builtin:ast_grep:1762560000000:0.4242",
+                "builtin:builtin:lsp:1762560000000:0.4242",
+                "hub"
+              ],
+              "denyPathSets": [
+                [
+                  "**/fixture-vault/**",
+                  "**/*.pem",
+                  "generated/**"
+                ]
+              ]
+            },
+            {
+              "source": "profile",
+              "name": "secrets-blind",
+              "denyPathSets": [
+                [
+                  "**/.env",
+                  "**/.env.*",
+                  "**/*secret*",
+                  "**/*credential*",
+                  "**/*private*key*",
+                  ".ssh/**",
+                  ".kube/**"
+                ]
+              ]
+            },
+            {
+              "source": "inline",
+              "descriptorIds": [
+                "builtin:builtin:read:1762560000000:0.4242",
+                "builtin:builtin:grep:1762560000000:0.4242",
+                "builtin:builtin:find:1762560000000:0.4242",
+                "builtin:builtin:ast_grep:1762560000000:0.4242",
+                "builtin:builtin:lsp:1762560000000:0.4242",
+                "hub"
+              ],
+              "denyPathSets": [
+                [
+                  "**/fixture-vault/**",
+                  "**/*.pem",
+                  "generated/**"
+                ],
+                [
+                  "**/.env",
+                  "**/.env.*",
+                  "**/*secret*",
+                  "**/*credential*",
+                  "**/*private*key*",
+                  ".ssh/**",
+                  ".kube/**"
+                ]
+              ]
+            }
+          ],
+          "guardrails": {
+            "noNetwork": false,
+            "secretsBlind": true
+          },
+          "intrinsicTools": {
+            "yield": true,
+            "reportToolIssue": true
+          },
+          "restrictedState": "restricted",
+          "provenance": {
+            "source": "user",
+            "profileNames": [
+              "fixture-scout",
+              "secrets-blind"
+            ],
+            "profiles": [
+              {
+                "name": "fixture-scout",
+                "source": "user",
+                "canonicalSha256": "713dd029716a30a0c9bffe600d7fadb82e17bee4e81595ace69617423a997981"
+              },
+              {
+                "name": "secrets-blind",
+                "source": "built-in",
+                "canonicalSha256": "1d41b551350f76ee9c17095858a6f9b0120b1360fc6d298b898845b2e1b26020"
+              }
+            ]
+          }
+        },
+        "canonicalSha256": "5c48279fa40dad57c5029e0dc0eea2c4741f435583fb1bc16334eda8dcaa738c"
+      },
+      "decisions": [
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "src/app.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "src/fixture-vault/key.txt"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/fixture-vault/**"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "config/server.pem"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/fixture-vault/**"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "generated/out.ts"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/fixture-vault/**"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": ".env"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/.env"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "nested/dir/.env.local"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/.env"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "lib/credentials.json"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/.env"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "/fixture/repo/src/deep/file.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "/elsewhere/file.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "search",
+          "toolInput": {
+            "path": "src",
+            "pattern": "x"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "grep",
+          "toolInput": {
+            "path": "lib/secret-store.ts",
+            "pattern": "x"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/.env"
+        },
+        {
+          "toolName": "find",
+          "toolInput": {
+            "path": "docs"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "ast_grep",
+          "toolInput": {
+            "paths": [
+              "src/a.ts",
+              "src/b.ts"
+            ]
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "edit",
+          "toolInput": {
+            "path": "src/app.ts"
+          },
+          "action": "deny",
+          "code": "tool-not-allowed",
+          "matched": "subagent:tool-allowlist"
+        },
+        {
+          "toolName": "write",
+          "toolInput": {
+            "path": "src/new.ts",
+            "content": "x"
+          },
+          "action": "deny",
+          "code": "tool-not-allowed",
+          "matched": "subagent:tool-allowlist"
+        },
+        {
+          "toolName": "web_search",
+          "toolInput": {
+            "query": "x"
+          },
+          "action": "deny",
+          "code": "tool-not-allowed",
+          "matched": "subagent:tool-allowlist"
+        },
+        {
+          "toolName": "task",
+          "toolInput": {},
+          "action": "deny",
+          "code": "tool-not-allowed",
+          "matched": "subagent:tool-allowlist"
+        },
+        {
+          "toolName": "yield",
+          "toolInput": {},
+          "action": "allow"
+        },
+        {
+          "toolName": "report_tool_issue",
+          "toolInput": {},
+          "action": "allow"
+        }
+      ]
+    },
+    "child": {
+      "snapshot": {
+        "scope": {
+          "mode": "enforce",
+          "toolsEnabled": true,
+          "pathsEnabled": true,
+          "actorId": "FixtureScout.Reader",
+          "actorKind": "sub",
+          "parentId": "FixtureScout",
+          "profiles": [
+            "fixture-scout",
+            "secrets-blind"
+          ],
+          "tools": [
+            "read",
+            "grep"
+          ],
+          "denyTools": [],
+          "allowPaths": [
+            "src/**",
+            "/fixture/repo/src/**"
+          ],
+          "denyPaths": [
+            "**/fixture-vault/**",
+            "**/*.pem",
+            "generated/**",
+            "**/.env",
+            "**/.env.*",
+            "**/*secret*",
+            "**/*credential*",
+            "**/*private*key*",
+            ".ssh/**",
+            ".kube/**"
+          ],
+          "allowPathGroups": [
+            [
+              "src/**",
+              "/fixture/repo/src/**"
+            ]
+          ],
+          "denyPathGroups": [
+            [
+              "**/fixture-vault/**",
+              "**/*.pem",
+              "generated/**"
+            ],
+            [
+              "**/.env",
+              "**/.env.*",
+              "**/*secret*",
+              "**/*credential*",
+              "**/*private*key*",
+              ".ssh/**",
+              ".kube/**"
+            ]
+          ],
+          "availableTools": [
+            "read",
+            "grep",
+            "find",
+            "ast_grep",
+            "lsp",
+            "edit",
+            "write",
+            "bash",
+            "task",
+            "web_search",
+            "mcp__fixture__lookup",
+            "fixture_eval_helper",
+            "yield",
+            "report_tool_issue"
+          ],
+          "allowedDescriptorIds": [
+            "builtin:builtin:read:1762560000000:0.4242",
+            "builtin:builtin:grep:1762560000000:0.4242"
+          ],
+          "clauses": [
+            {
+              "source": "inline",
+              "descriptorIds": [
+                "builtin:builtin:read:1762560000000:0.4242",
+                "builtin:builtin:grep:1762560000000:0.4242"
+              ],
+              "allowPathSets": [
+                [
+                  "src/**",
+                  "/fixture/repo/src/**"
+                ]
+              ],
+              "denyPathSets": [
+                [
+                  "**/fixture-vault/**",
+                  "**/*.pem",
+                  "generated/**"
+                ],
+                [
+                  "**/.env",
+                  "**/.env.*",
+                  "**/*secret*",
+                  "**/*credential*",
+                  "**/*private*key*",
+                  ".ssh/**",
+                  ".kube/**"
+                ]
+              ]
+            },
+            {
+              "source": "inherited",
+              "descriptorIds": [
+                "builtin:builtin:read:1762560000000:0.4242",
+                "builtin:builtin:grep:1762560000000:0.4242",
+                "builtin:builtin:find:1762560000000:0.4242",
+                "builtin:builtin:ast_grep:1762560000000:0.4242",
+                "builtin:builtin:lsp:1762560000000:0.4242",
+                "hub"
+              ],
+              "allowPathSets": [],
+              "denyPathSets": [
+                [
+                  "**/fixture-vault/**",
+                  "**/*.pem",
+                  "generated/**"
+                ],
+                [
+                  "**/.env",
+                  "**/.env.*",
+                  "**/*secret*",
+                  "**/*credential*",
+                  "**/*private*key*",
+                  ".ssh/**",
+                  ".kube/**"
+                ]
+              ]
+            }
+          ],
+          "guardrails": {
+            "noNetwork": false,
+            "secretsBlind": true
+          },
+          "intrinsicTools": {
+            "yield": true,
+            "reportToolIssue": true
+          },
+          "restrictedState": "restricted",
+          "provenance": {
+            "source": "inherited",
+            "profileNames": [
+              "fixture-scout",
+              "secrets-blind"
+            ],
+            "profiles": [
+              {
+                "name": "fixture-scout",
+                "source": "user",
+                "canonicalSha256": "713dd029716a30a0c9bffe600d7fadb82e17bee4e81595ace69617423a997981"
+              },
+              {
+                "name": "secrets-blind",
+                "source": "built-in",
+                "canonicalSha256": "1d41b551350f76ee9c17095858a6f9b0120b1360fc6d298b898845b2e1b26020"
+              }
+            ]
+          }
+        },
+        "canonicalSha256": "82f5067f0d36b7e160b5624bb15b28435b7d2912dc2407bc5f47505cb9ff99be"
+      },
+      "decisions": [
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "src/app.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "src/fixture-vault/key.txt"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/fixture-vault/**"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "config/server.pem"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/fixture-vault/**"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "generated/out.ts"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/fixture-vault/**"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": ".env"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/.env"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "nested/dir/.env.local"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/.env"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "lib/credentials.json"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/.env"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "/fixture/repo/src/deep/file.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "/elsewhere/file.ts"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "search",
+          "toolInput": {
+            "path": "src",
+            "pattern": "x"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "grep",
+          "toolInput": {
+            "path": "lib/secret-store.ts",
+            "pattern": "x"
+          },
+          "action": "deny",
+          "code": "path-deny",
+          "matched": "subagent:path-deny:**/.env"
+        },
+        {
+          "toolName": "find",
+          "toolInput": {
+            "path": "docs"
+          },
+          "action": "deny",
+          "code": "tool-not-allowed",
+          "matched": "subagent:tool-allowlist"
+        },
+        {
+          "toolName": "ast_grep",
+          "toolInput": {
+            "paths": [
+              "src/a.ts",
+              "src/b.ts"
+            ]
+          },
+          "action": "deny",
+          "code": "tool-not-allowed",
+          "matched": "subagent:tool-allowlist"
+        },
+        {
+          "toolName": "edit",
+          "toolInput": {
+            "path": "src/app.ts"
+          },
+          "action": "deny",
+          "code": "tool-not-allowed",
+          "matched": "subagent:tool-allowlist"
+        },
+        {
+          "toolName": "write",
+          "toolInput": {
+            "path": "src/new.ts",
+            "content": "x"
+          },
+          "action": "deny",
+          "code": "tool-not-allowed",
+          "matched": "subagent:tool-allowlist"
+        },
+        {
+          "toolName": "web_search",
+          "toolInput": {
+            "query": "x"
+          },
+          "action": "deny",
+          "code": "tool-not-allowed",
+          "matched": "subagent:tool-allowlist"
+        },
+        {
+          "toolName": "task",
+          "toolInput": {},
+          "action": "deny",
+          "code": "tool-not-allowed",
+          "matched": "subagent:tool-allowlist"
+        },
+        {
+          "toolName": "yield",
+          "toolInput": {},
+          "action": "allow"
+        },
+        {
+          "toolName": "report_tool_issue",
+          "toolInput": {},
+          "action": "allow"
+        }
+      ]
+    },
+    "editor": {
+      "snapshot": {
+        "scope": {
+          "mode": "enforce",
+          "toolsEnabled": true,
+          "pathsEnabled": true,
+          "actorId": "FixtureEditor",
+          "actorKind": "sub",
+          "parentId": "Main",
+          "profiles": [
+            "focused-edit",
+            "no-network",
+            "no-delegation"
+          ],
+          "tools": [
+            "read",
+            "grep",
+            "find",
+            "lsp",
+            "edit",
+            "write",
+            "ast_grep",
+            "ast_edit",
+            "hub"
+          ],
+          "denyTools": [
+            "browser",
+            "web_search",
+            "task"
+          ],
+          "allowPaths": [
+            "src/**",
+            "docs/*.md"
+          ],
+          "denyPaths": [],
+          "allowPathGroups": [
+            [
+              "src/**",
+              "docs/*.md"
+            ]
+          ],
+          "denyPathGroups": [],
+          "availableTools": [
+            "read",
+            "grep",
+            "find",
+            "ast_grep",
+            "lsp",
+            "edit",
+            "write",
+            "bash",
+            "task",
+            "web_search",
+            "mcp__fixture__lookup",
+            "fixture_eval_helper",
+            "yield",
+            "report_tool_issue"
+          ],
+          "allowedDescriptorIds": [
+            "builtin:builtin:read:1762560000000:0.4242",
+            "builtin:builtin:grep:1762560000000:0.4242",
+            "builtin:builtin:find:1762560000000:0.4242",
+            "builtin:builtin:lsp:1762560000000:0.4242",
+            "builtin:builtin:edit:1762560000000:0.4242",
+            "builtin:builtin:write:1762560000000:0.4242",
+            "builtin:builtin:ast_grep:1762560000000:0.4242",
+            "ast_edit",
+            "hub"
+          ],
+          "clauses": [
+            {
+              "source": "profile",
+              "name": "focused-edit",
+              "descriptorIds": [
+                "builtin:builtin:read:1762560000000:0.4242",
+                "builtin:builtin:grep:1762560000000:0.4242",
+                "builtin:builtin:find:1762560000000:0.4242",
+                "builtin:builtin:lsp:1762560000000:0.4242",
+                "builtin:builtin:edit:1762560000000:0.4242",
+                "builtin:builtin:write:1762560000000:0.4242",
+                "builtin:builtin:ast_grep:1762560000000:0.4242",
+                "ast_edit",
+                "hub"
+              ]
+            },
+            {
+              "source": "profile",
+              "name": "no-network",
+              "descriptorIds": [
+                "browser",
+                "builtin:builtin:web_search:1762560000000:0.4242"
+              ]
+            },
+            {
+              "source": "profile",
+              "name": "no-delegation",
+              "descriptorIds": [
+                "builtin:builtin:task:1762560000000:0.4242"
+              ]
+            },
+            {
+              "source": "inline",
+              "descriptorIds": [
+                "builtin:builtin:read:1762560000000:0.4242",
+                "builtin:builtin:grep:1762560000000:0.4242",
+                "builtin:builtin:find:1762560000000:0.4242",
+                "builtin:builtin:lsp:1762560000000:0.4242",
+                "builtin:builtin:edit:1762560000000:0.4242",
+                "builtin:builtin:write:1762560000000:0.4242",
+                "builtin:builtin:ast_grep:1762560000000:0.4242",
+                "ast_edit",
+                "hub"
+              ],
+              "allowPathSets": [
+                [
+                  "src/**",
+                  "docs/*.md"
+                ]
+              ]
+            }
+          ],
+          "guardrails": {
+            "noNetwork": true,
+            "secretsBlind": false
+          },
+          "intrinsicTools": {
+            "yield": true,
+            "reportToolIssue": true
+          },
+          "restrictedState": "restricted",
+          "provenance": {
+            "source": "request",
+            "profileNames": [
+              "focused-edit",
+              "no-network",
+              "no-delegation"
+            ],
+            "profiles": [
+              {
+                "name": "focused-edit",
+                "source": "built-in",
+                "canonicalSha256": "b3160c78064c0236c85890663fbe3ece5fcc28d8785a54d43872e23a74ba5cc5"
+              },
+              {
+                "name": "no-network",
+                "source": "built-in",
+                "canonicalSha256": "49f720e7b94a5d99723af1c3fe71b6fc8dd3c14a938117187f6d97c0b85c8a55"
+              },
+              {
+                "name": "no-delegation",
+                "source": "built-in",
+                "canonicalSha256": "1d78768493d778e1ed1808ba9e2bb09126b9e08186d5000ec87b4c363ebd2663"
+              }
+            ]
+          }
+        },
+        "canonicalSha256": "3f4e2eef9f759812dc7d09aa98fa9ca64d2f0672952e8b7a216d755e7924ea4c"
+      },
+      "decisions": [
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "src/app.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "src/fixture-vault/key.txt"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "config/server.pem"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "generated/out.ts"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": ".env"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "nested/dir/.env.local"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "lib/credentials.json"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "/fixture/repo/src/deep/file.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "/elsewhere/file.ts"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "search",
+          "toolInput": {
+            "path": "src",
+            "pattern": "x"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "grep",
+          "toolInput": {
+            "path": "lib/secret-store.ts",
+            "pattern": "x"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "find",
+          "toolInput": {
+            "path": "docs"
+          },
+          "action": "deny",
+          "code": "path-not-allowed",
+          "matched": "subagent:path-allowlist"
+        },
+        {
+          "toolName": "ast_grep",
+          "toolInput": {
+            "paths": [
+              "src/a.ts",
+              "src/b.ts"
+            ]
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "edit",
+          "toolInput": {
+            "path": "src/app.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "write",
+          "toolInput": {
+            "path": "src/new.ts",
+            "content": "x"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "web_search",
+          "toolInput": {
+            "query": "x"
+          },
+          "action": "deny",
+          "code": "tool-deny",
+          "matched": "subagent:tool-deny:web_search"
+        },
+        {
+          "toolName": "task",
+          "toolInput": {},
+          "action": "deny",
+          "code": "tool-deny",
+          "matched": "subagent:tool-deny:task"
+        },
+        {
+          "toolName": "yield",
+          "toolInput": {},
+          "action": "allow"
+        },
+        {
+          "toolName": "report_tool_issue",
+          "toolInput": {},
+          "action": "allow"
+        }
+      ]
+    },
+    "suggest": {
+      "snapshot": {
+        "scope": {
+          "mode": "suggest",
+          "toolsEnabled": true,
+          "pathsEnabled": true,
+          "actorId": "FixtureAdvisory",
+          "actorKind": "sub",
+          "parentId": "Main",
+          "profiles": [
+            "read-only"
+          ],
+          "tools": [
+            "read",
+            "grep",
+            "find",
+            "lsp",
+            "hub"
+          ],
+          "denyTools": [],
+          "allowPaths": [],
+          "denyPaths": [
+            "generated/**"
+          ],
+          "allowPathGroups": [],
+          "denyPathGroups": [
+            [
+              "generated/**"
+            ]
+          ],
+          "availableTools": [
+            "read",
+            "grep",
+            "find",
+            "ast_grep",
+            "lsp",
+            "edit",
+            "write",
+            "bash",
+            "task",
+            "web_search",
+            "mcp__fixture__lookup",
+            "fixture_eval_helper",
+            "yield",
+            "report_tool_issue"
+          ],
+          "allowedDescriptorIds": [
+            "builtin:builtin:read:1762560000000:0.4242",
+            "builtin:builtin:grep:1762560000000:0.4242",
+            "builtin:builtin:find:1762560000000:0.4242",
+            "builtin:builtin:lsp:1762560000000:0.4242",
+            "hub"
+          ],
+          "clauses": [
+            {
+              "source": "profile",
+              "name": "read-only",
+              "descriptorIds": [
+                "builtin:builtin:read:1762560000000:0.4242",
+                "builtin:builtin:grep:1762560000000:0.4242",
+                "builtin:builtin:find:1762560000000:0.4242",
+                "builtin:builtin:lsp:1762560000000:0.4242",
+                "hub"
+              ]
+            },
+            {
+              "source": "inline",
+              "descriptorIds": [
+                "builtin:builtin:read:1762560000000:0.4242",
+                "builtin:builtin:grep:1762560000000:0.4242",
+                "builtin:builtin:find:1762560000000:0.4242",
+                "builtin:builtin:lsp:1762560000000:0.4242",
+                "hub"
+              ],
+              "denyPathSets": [
+                [
+                  "generated/**"
+                ]
+              ]
+            }
+          ],
+          "guardrails": {
+            "noNetwork": false,
+            "secretsBlind": false
+          },
+          "intrinsicTools": {
+            "yield": true,
+            "reportToolIssue": true
+          },
+          "restrictedState": "restricted",
+          "provenance": {
+            "source": "request",
+            "profileNames": [
+              "read-only"
+            ],
+            "profiles": [
+              {
+                "name": "read-only",
+                "source": "built-in",
+                "canonicalSha256": "f6010062550a264e5ea82e432ef28fc17422ac3f44ffe58c303ab703087bcf52"
+              }
+            ]
+          }
+        },
+        "canonicalSha256": "4acd9957bfa249a5b7c5ffab76f252c82c79d94431aeb0491c20304ad9038335"
+      },
+      "decisions": [
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "src/app.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "src/fixture-vault/key.txt"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "config/server.pem"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "generated/out.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": ".env"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "nested/dir/.env.local"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "lib/credentials.json"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "/fixture/repo/src/deep/file.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "/elsewhere/file.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "search",
+          "toolInput": {
+            "path": "src",
+            "pattern": "x"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "grep",
+          "toolInput": {
+            "path": "lib/secret-store.ts",
+            "pattern": "x"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "find",
+          "toolInput": {
+            "path": "docs"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "ast_grep",
+          "toolInput": {
+            "paths": [
+              "src/a.ts",
+              "src/b.ts"
+            ]
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "edit",
+          "toolInput": {
+            "path": "src/app.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "write",
+          "toolInput": {
+            "path": "src/new.ts",
+            "content": "x"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "web_search",
+          "toolInput": {
+            "query": "x"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "task",
+          "toolInput": {},
+          "action": "allow"
+        },
+        {
+          "toolName": "yield",
+          "toolInput": {},
+          "action": "allow"
+        },
+        {
+          "toolName": "report_tool_issue",
+          "toolInput": {},
+          "action": "allow"
+        }
+      ]
+    },
+    "off": {
+      "snapshot": {
+        "scope": {
+          "mode": "off",
+          "toolsEnabled": true,
+          "pathsEnabled": true,
+          "actorId": "FixtureOff",
+          "actorKind": "sub",
+          "parentId": "Main",
+          "profiles": [],
+          "denyTools": [],
+          "allowPaths": [],
+          "denyPaths": [],
+          "allowPathGroups": [],
+          "denyPathGroups": [],
+          "availableTools": [
+            "read",
+            "grep",
+            "find",
+            "ast_grep",
+            "lsp",
+            "edit",
+            "write",
+            "bash",
+            "task",
+            "web_search",
+            "mcp__fixture__lookup",
+            "fixture_eval_helper",
+            "yield",
+            "report_tool_issue"
+          ],
+          "allowedDescriptorIds": [],
+          "clauses": [],
+          "guardrails": {
+            "noNetwork": false,
+            "secretsBlind": false
+          },
+          "intrinsicTools": {
+            "yield": true,
+            "reportToolIssue": false
+          },
+          "restrictedState": "unrestricted-root-ambient",
+          "provenance": {
+            "source": "builtin",
+            "profileNames": [],
+            "profiles": []
+          }
+        },
+        "canonicalSha256": "cab9b6951d6316640d2a6a05554d9ce5b7d6b833eeaf6474239c61c56e6d73df"
+      },
+      "decisions": [
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "src/app.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "src/fixture-vault/key.txt"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "config/server.pem"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "generated/out.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": ".env"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "nested/dir/.env.local"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "lib/credentials.json"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "/fixture/repo/src/deep/file.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "read",
+          "toolInput": {
+            "path": "/elsewhere/file.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "search",
+          "toolInput": {
+            "path": "src",
+            "pattern": "x"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "grep",
+          "toolInput": {
+            "path": "lib/secret-store.ts",
+            "pattern": "x"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "find",
+          "toolInput": {
+            "path": "docs"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "ast_grep",
+          "toolInput": {
+            "paths": [
+              "src/a.ts",
+              "src/b.ts"
+            ]
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "edit",
+          "toolInput": {
+            "path": "src/app.ts"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "write",
+          "toolInput": {
+            "path": "src/new.ts",
+            "content": "x"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "web_search",
+          "toolInput": {
+            "query": "x"
+          },
+          "action": "allow"
+        },
+        {
+          "toolName": "task",
+          "toolInput": {},
+          "action": "allow"
+        },
+        {
+          "toolName": "yield",
+          "toolInput": {},
+          "action": "allow"
+        },
+        {
+          "toolName": "report_tool_issue",
+          "toolInput": {},
+          "action": "allow"
+        }
+      ]
+    }
+  }
+}
