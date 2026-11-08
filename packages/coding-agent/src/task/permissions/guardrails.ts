@@ -1,4 +1,8 @@
+import { extractUriScheme } from "../../internal-urls/parse";
+import { InternalUrlRouter } from "../../internal-urls/router";
 import { isMCPToolName } from "../../tools/builtin-names";
+import { isReadUrlTarget } from "../../tools/read-url-target";
+import { expandListTargets, permissionPathArguments } from "./path-rules";
 import { permissionToolKey } from "./tool-names";
 import type { PermissionDecision, PermissionGuardrails, PermissionScope } from "./types";
 
@@ -13,7 +17,6 @@ const MUTATION_INERT_INPUT_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = ne
 	["edit", new Set(["i", "input", "old_string", "new_string"])],
 	["write", new Set(["i", "content"])],
 ]);
-const EXTERNAL_READ_SCHEME = /^(?:https?|ftp|ssh|mcp|issue|pr):\/\//i;
 const BARE_NETWORK_TARGET = /^(?:localhost|(?:[a-z0-9-]+\.)+[a-z]{2,}|\d{1,3}(?:\.\d{1,3}){3}):\d+(?:\/|$)/i;
 const NETWORK_COMMAND =
 	/(?:\b(?:curl|wget|fetch|ssh|scp|sftp|telnet|ping|traceroute|nc|ncat|netcat|socat|dig|nslookup|host|gh)\b|\/dev\/(?:tcp|udp)\/|\b(?:git\s+(?:clone|fetch|pull|push|ls-remote)|(?:npm|pnpm|yarn|bun|pip|pip3|cargo)\s+(?:add|install|update)|go\s+get)\b|(?:https?|ftp|ssh):\/\/)/i;
@@ -30,6 +33,23 @@ const ENV_ACCESS = new RegExp(
 );
 const SECRETS_BLIND_REASON =
 	"BLOCKED: secrets-blind guardrail denied an environment, credential, or private-key source.";
+
+/**
+ * Whether a tool reaches the network to resolve `target`: a URL `read` fetches (decided by the read
+ * tool's own parser, so `www.` hosts and a collapsed `http:/` count), an internal URL whose scheme is
+ * backed by a remote resource (`ssh://`, `mr://`, `issue://`, `pr://`, `mcp://`), or a custom scheme
+ * only the MCP resource fallback resolves.
+ */
+function isNetworkTarget(target: string): boolean {
+	const trimmed = target.trim();
+	if (isReadUrlTarget(trimmed)) return true;
+	const router = InternalUrlRouter.instance();
+	const normalized = router.normalize(trimmed);
+	const scheme = extractUriScheme(normalized);
+	if (scheme === undefined) return false;
+	const spec = router.spec(scheme);
+	return spec ? spec.backing === "remote" : router.canResolve(normalized);
+}
 
 /** Guardrails implied by deny lists: browser or web_search denied, or a secret-like deny path. */
 export function derivePermissionGuardrails(
@@ -145,6 +165,8 @@ export function evaluatePermissionGuardrails(input: {
 	readonly scope: PermissionScope | undefined;
 	readonly toolName: string;
 	readonly toolInput: Record<string, unknown>;
+	/** Further targets the call touches (canonical approval targets), judged like its path arguments. */
+	readonly targets?: readonly string[];
 }): PermissionDecision {
 	const { scope, toolName, toolInput } = input;
 	if (scope?.mode !== "enforce") return { action: "allow", reason: "", matched: "" };
@@ -157,16 +179,17 @@ export function evaluatePermissionGuardrails(input: {
 				toolName,
 			);
 		}
-		if (key === "read") {
-			const target = typeof toolInput.path === "string" ? toolInput.path.trim() : "";
-			if (EXTERNAL_READ_SCHEME.test(target) || BARE_NETWORK_TARGET.test(target)) {
-				return guardrailDenial(
-					`BLOCKED: no-network guardrail denied network read target '${target}'.`,
-					"guardrail:no-network:read-url",
-					toolName,
-					[target],
-				);
-			}
+		const pathTargets = expandListTargets([...permissionPathArguments(toolInput), ...(input.targets ?? [])]);
+		const remote = pathTargets.find(
+			target => isNetworkTarget(target) || (key === "read" && BARE_NETWORK_TARGET.test(target.trim())),
+		);
+		if (remote !== undefined) {
+			return guardrailDenial(
+				`BLOCKED: no-network guardrail denied network target '${remote}'.`,
+				"guardrail:no-network:url",
+				toolName,
+				[remote],
+			);
 		}
 		if (key === "bash" && visitInput(toolInput, value => NETWORK_COMMAND.test(value))) {
 			return guardrailDenial(

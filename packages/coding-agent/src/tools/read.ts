@@ -84,6 +84,7 @@ import {
 	scanFileForConflicts,
 } from "./conflict-detect";
 import { executeReadUrl, fetchReadUrl, parseReadUrlTarget } from "./fetch";
+import { isReadUrlTarget } from "./read-url-target";
 import { approvalGuardRefusal, approvalRestrictions } from "./approval";
 import { approvalDirectoryKey } from "./approval-cache";
 import { approvalTargetKey, approvalTargetNamesFile, isApprovalPublicUrl } from "./approval-targets";
@@ -992,15 +993,6 @@ function acceptsLineSelector(path: string): boolean {
 /** The entry a read of `rawPath` opens: a `file://` URL as its path, `<file>:conflict://N` as the conflict URL. */
 function normalizeReadPathEntry(rawPath: string): string {
 	return recoverConflictUriPrefix(rawPath.startsWith("file://") ? expandPath(rawPath) : rawPath).path;
-}
-
-/** Whether a read fetches `part` from the web; a malformed URL selector still names a URL. */
-function isReadUrlTarget(part: string): boolean {
-	try {
-		return parseReadUrlTarget(part) !== null;
-	} catch {
-		return true;
-	}
 }
 
 const LOCAL_READ_SPECULATION_INELIGIBLE: ToolSpeculationAssessment = {

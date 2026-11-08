@@ -29,12 +29,12 @@ import { findCredential } from "../web/search/providers/utils";
 import { applyListLimit } from "@oh-my-pi/pi-tui/tools/list-limit";
 import { parseTailCount } from "./path-utils";
 import { type LineRange, parseLineRanges } from "@oh-my-pi/pi-tui/tools/line-ranges";
-import { isReadableUrlPath } from "@oh-my-pi/pi-tui/tools/read";
 import type { ParsedSelector } from "./read-selector";
 import { formatBytes } from "@oh-my-pi/pi-tui/render/render-utils";
 import { listTables, looksLikeSqlite, openSqliteReadConnection, renderTableList } from "./sqlite-reader";
 import { ToolAbortError } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { isReadUrlTarget } from "./read-url-target";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 
@@ -152,7 +152,7 @@ export function parseReadUrlTarget(readPath: string): ParsedReadUrlTarget | null
 	const repaired = repairCollapsedScheme(readPath);
 	const embedded = tryExtractEmbeddedUrlSelector(repaired);
 	const urlPath = embedded?.path ?? repaired;
-	if (!isReadableUrlPath(urlPath)) {
+	if (!isReadUrlTarget(urlPath)) {
 		return null;
 	}
 

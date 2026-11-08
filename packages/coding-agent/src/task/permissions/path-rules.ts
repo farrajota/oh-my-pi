@@ -100,3 +100,72 @@ function matchesGlob(value: string, glob: string): boolean {
 	if (glob.startsWith("**/") && matchesGlob(value, glob.slice(3))) return true;
 	return globToRegex(glob).test(value);
 }
+
+/** Argument keys whose string values name filesystem targets. */
+const PATH_KEYS: ReadonlySet<string> = new Set(["path", "paths", "file", "file_path", "relative_path", "cwd", "dir"]);
+
+function collectPathStrings(value: unknown, output: Set<string>, depth: number, key?: string): void {
+	if (depth > 4) return;
+	if (typeof value === "string") {
+		if (key !== undefined && PATH_KEYS.has(key)) output.add(value);
+		return;
+	}
+	if (Array.isArray(value)) {
+		for (const item of value) collectPathStrings(item, output, depth + 1, key);
+		return;
+	}
+	if (value === null || typeof value !== "object") return;
+	for (const [childKey, childValue] of Object.entries(value)) {
+		if (PATH_KEYS.has(childKey)) collectPathStrings(childValue, output, depth + 1, childKey);
+		else if (typeof childValue === "object" && childValue !== null) collectPathStrings(childValue, output, depth + 1);
+	}
+}
+
+/** The strings a call names under a path argument key (`path`, `paths`, `file`, `cwd`, ...), deduplicated. */
+export function permissionPathArguments(toolInput: Record<string, unknown>): string[] {
+	const named = new Set<string>();
+	collectPathStrings(toolInput, named, 0);
+	return [...named];
+}
+
+const URL_SCHEME_PREFIX = /^[a-z][a-z0-9+.-]*:\//i;
+
+/** The top-level `;` entries of `target` (braces and backslash escapes protect a `;`), quotes stripped. */
+function semicolonEntries(target: string): string[] {
+	const entries: string[] = [];
+	let depth = 0;
+	let start = 0;
+	for (let i = 0; i < target.length; i++) {
+		const ch = target[i];
+		if (ch === "\\") i++;
+		else if (ch === "{") depth++;
+		else if (ch === "}" && depth > 0) depth--;
+		else if (ch === ";" && depth === 0) {
+			entries.push(target.slice(start, i));
+			start = i + 1;
+		}
+	}
+	entries.push(target.slice(start));
+	return entries.map(entry => entry.trim().replace(/^"(.*)"$/, "$1")).filter(entry => entry.length > 0);
+}
+
+/**
+ * What one path string stands for. Tools that take path lists (`read`, the search tools) open each
+ * entry of a `;` list, so a list is judged by its entries: `local://x;.env` is the scratch file `x`
+ * and `.env`, never one exempt URL. A plain string is judged whole too, because a literal file name
+ * may contain `;`. A URL-shaped string is a list or one URL of its first entry's scheme, so its
+ * entries cover it. Comma and whitespace lists split only when their entries exist; the approval
+ * targets a tool reports resolve those.
+ */
+export function permissionListTargets(target: string): string[] {
+	if (!target.includes(";")) return [target];
+	const entries = semicolonEntries(target);
+	if (entries.length <= 1) return [target];
+	return URL_SCHEME_PREFIX.test(target.trim()) ? entries : [target, ...entries];
+}
+
+export function expandListTargets(targets: Iterable<string>): string[] {
+	const expanded = new Set<string>();
+	for (const target of targets) for (const entry of permissionListTargets(target)) expanded.add(entry);
+	return [...expanded];
+}
