@@ -10,7 +10,8 @@ import {
 	hasRecurringTariff,
 } from "@oh-my-pi/pi-catalog/models";
 import type { ModelCost } from "@oh-my-pi/pi-catalog/types";
-import { getConfigRootDir, getStatsDbPath, VERSION } from "@oh-my-pi/pi-utils";
+import * as path from "node:path";
+import { getConfigRootDir, getSessionsDir, getStatsDbPath, VERSION } from "@oh-my-pi/pi-utils";
 import { ChunkedInsert } from "./chunked-insert";
 import { classifyAgentType, type ParseSessionResult, type SessionParserState } from "./parser";
 import { ensureRollupSchema, getDailyActivityFromRollup } from "./rollup";
@@ -29,6 +30,7 @@ import type {
 	FrustrationCounts,
 	MessageStats,
 	MessageStatsInput,
+	ModelAgentTypeStats,
 	ToolCallStats,
 	ToolResultLink,
 	UserMessageLink,
@@ -1228,6 +1230,88 @@ export function getMessageCount(): number {
 	const stmt = db.query("SELECT COUNT(*) as count FROM messages");
 	const row = stmt.get() as { count: number };
 	return row.count;
+}
+
+/** Read a value from the stats `meta` table; undefined before `initDb` or when unset. */
+export function getMetaValue(key: string): string | undefined {
+	if (!db) return undefined;
+	const row = db.query("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | null;
+	return row?.value;
+}
+
+/** Write a value to the stats `meta` table, which every process sharing stats.db reads. */
+export function setMetaValue(key: string, value: string): void {
+	db?.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(key, value);
+}
+
+/**
+ * The main transcript of the session tree `sessionFile` belongs to. Subagent and advisor
+ * transcripts live under the main transcript's stem: `<sessions>/<project>/<root>/<nested>.jsonl`
+ * belongs to `<sessions>/<project>/<root>.jsonl`. Paths outside the sessions directory are their
+ * own root.
+ */
+function sessionTreeRoot(sessionFile: string): string {
+	const relative = path.relative(getSessionsDir(), sessionFile);
+	if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return sessionFile;
+	const parts = relative.split(path.sep);
+	if (parts.length < 3) return sessionFile;
+	return path.join(getSessionsDir(), parts[0], `${parts[1]}.jsonl`);
+}
+
+/**
+ * Token usage of one persisted session tree (the main transcript and every transcript under its
+ * artifact directory), grouped by model and agent type; agent types other than main, subagent
+ * and advisor count as main. `sessionFile` may be any transcript in the tree.
+ */
+export function getSessionStatsByModelAndAgentType(sessionFile: string): ModelAgentTypeStats[] {
+	if (!db || !sessionFile.endsWith(".jsonl")) return [];
+	const root = sessionTreeRoot(sessionFile);
+	const artifacts = `${root.slice(0, -".jsonl".length)}${path.sep}`;
+	// A range over the artifact directory prefix rides UNIQUE(session_file, entry_id); the upper
+	// bound is the prefix with its separator bumped by one code point.
+	const artifactsEnd = `${artifacts.slice(0, -1)}${String.fromCharCode(path.sep.charCodeAt(0) + 1)}`;
+	const rows = db
+		.query(`
+			SELECT
+				model,
+				provider,
+				CASE WHEN agent_type IN ('main', 'subagent', 'advisor') THEN agent_type ELSE 'main' END AS agent,
+				COUNT(*) AS requests,
+				SUM(input_tokens) AS input_tokens,
+				SUM(output_tokens) AS output_tokens,
+				SUM(cache_read_tokens) AS cache_read_tokens,
+				SUM(cache_write_tokens) AS cache_write_tokens,
+				SUM(total_tokens) AS total_tokens,
+				TOTAL(cost_total) AS cost
+			FROM messages
+			WHERE session_file = ? OR (session_file >= ? AND session_file < ?)
+			GROUP BY model, provider, agent
+			ORDER BY model, provider, agent
+		`)
+		.all(root, artifacts, artifactsEnd) as Array<{
+		model: string;
+		provider: string;
+		agent: AgentType;
+		requests: number;
+		input_tokens: number;
+		output_tokens: number;
+		cache_read_tokens: number;
+		cache_write_tokens: number;
+		total_tokens: number;
+		cost: number;
+	}>;
+	return rows.map(row => ({
+		model: row.model,
+		provider: row.provider,
+		agentType: row.agent,
+		totalRequests: row.requests,
+		totalInputTokens: row.input_tokens,
+		totalOutputTokens: row.output_tokens,
+		totalCacheReadTokens: row.cache_read_tokens,
+		totalCacheWriteTokens: row.cache_write_tokens,
+		totalTokens: row.total_tokens,
+		totalCost: row.cost,
+	}));
 }
 
 /**

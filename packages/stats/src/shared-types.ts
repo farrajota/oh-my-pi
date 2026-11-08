@@ -193,6 +193,14 @@ export interface AgentTypeStats {
 	totalCost: number;
 }
 
+/** Token usage of one (model, provider, agent type) in a session tree. */
+export interface ModelAgentTypeStats extends AgentTypeStats {
+	model: string;
+	provider: string;
+	/** Provider-reported total tokens of the requests. */
+	totalTokens: number;
+}
+
 /**
  * Frustration tallies over a set of user messages. Each message counts once,
  * classified by its cached judge verdict when one exists, else by the regex

@@ -11,14 +11,17 @@ import {
 	getFileOffsets,
 	getMessageById,
 	getMessageCount,
+	getMetaValue,
 	initDb,
 	markSessionBackfillsComplete,
 	type ParsedSession,
 	prepareSessionSync,
+	setMetaValue,
 } from "./db";
 import {
 	getSessionEntry,
 	listAllSessionFiles,
+	listSessionFiles,
 	matchesSessionFile,
 	type ParseSessionResult,
 	parseSessionFile,
@@ -60,6 +63,8 @@ import { computeUsageWindowStats, fetchUsageData, type UsageDataSnapshot } from 
 
 const STATS_SYNC_LOCK_RETRY_MS = 25;
 const STATS_SYNC_LOCK_WAIT_MS = 60 * 60 * 1000;
+/** `meta` key holding when the last full scan (any process) completed, epoch ms. */
+const FULL_SYNC_COMPLETED_AT_KEY = "stats_full_sync_completed_at";
 // Bound queued results by both file count and derived rows; never hold a SQLite transaction across I/O.
 const SYNC_BATCH_FILES = 512;
 const SYNC_BATCH_ROWS = 8192;
@@ -73,12 +78,22 @@ const SYNC_INLINE_READS = 8;
  * The native lock is owned by an operating-system primitive, so an interrupted
  * owner is released automatically and a live owner is never displaced.
  */
-export async function withStatsSyncLock<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
+export async function withStatsSyncLock<T>(
+	dbPath: string,
+	fn: () => Promise<T>,
+	options?: { waitMs?: number },
+): Promise<T> {
 	await fs.promises.mkdir(path.dirname(dbPath), { recursive: true });
+	const waitMs = options?.waitMs ?? STATS_SYNC_LOCK_WAIT_MS;
 	return await withFileLock(`${dbPath}.sync`, fn, {
 		retryDelayMs: STATS_SYNC_LOCK_RETRY_MS,
-		retries: Math.ceil(STATS_SYNC_LOCK_WAIT_MS / STATS_SYNC_LOCK_RETRY_MS),
+		retries: Math.max(1, Math.ceil(waitMs / STATS_SYNC_LOCK_RETRY_MS)),
 	});
+}
+
+/** `withFileLock`'s error when the lock stayed held for the whole wait. */
+function isLockTimeout(error: unknown): boolean {
+	return error instanceof Error && error.message.startsWith("Failed to acquire lock for ");
 }
 
 /**
@@ -111,6 +126,12 @@ export interface SyncOptions {
 	 * listing every session. Missing files are skipped.
 	 */
 	files?: readonly string[];
+	/** How long to wait for another process's sync lock; default one hour. */
+	lockWaitMs?: number;
+	/** When the lock stays held for `lockWaitMs`, return `{ processed: 0, files: 0 }` instead of throwing. */
+	skipIfBusy?: boolean;
+	/** Skip a full scan (no `files`) when any process completed one less than this many ms ago. */
+	freshnessMs?: number;
 }
 
 function defaultWorkerCount(): number {
@@ -247,16 +268,50 @@ export async function smokeTestSyncWorker({ timeoutMs = 5_000 }: { timeoutMs?: n
  * bar walks at a steady rate).
  */
 export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
-	return withStatsSyncLock(getStatsDbPath(), async () => {
-		let processed = 0;
-		let files = 0;
-		while (true) {
-			const result = await syncAllSessionsLocked(opts);
-			processed += result.processed;
-			files += result.files;
-			if (!result.reconcile) return { processed, files };
-		}
-	});
+	const fullScan = opts?.files === undefined;
+	try {
+		return await withStatsSyncLock(
+			getStatsDbPath(),
+			async () => {
+				if (fullScan && opts?.freshnessMs !== undefined) {
+					await initDb();
+					const completedAt = Number(getMetaValue(FULL_SYNC_COMPLETED_AT_KEY));
+					if (Number.isFinite(completedAt) && Date.now() - completedAt < opts.freshnessMs) {
+						return { processed: 0, files: 0 };
+					}
+				}
+				let processed = 0;
+				let files = 0;
+				while (true) {
+					const result = await syncAllSessionsLocked(opts);
+					processed += result.processed;
+					files += result.files;
+					if (!result.reconcile) break;
+				}
+				if (fullScan) setMetaValue(FULL_SYNC_COMPLETED_AT_KEY, String(Date.now()));
+				return { processed, files };
+			},
+			{ waitMs: opts?.lockWaitMs },
+		);
+	} catch (error) {
+		if (opts?.skipIfBusy && isLockTimeout(error)) return { processed: 0, files: 0 };
+		throw error;
+	}
+}
+
+/**
+ * Sync one persisted session tree: `sessionFile` (a main transcript) and every transcript under
+ * its artifact directory, the way a targeted sync does (global backfills stay for the next full
+ * scan). Anything but a `.jsonl` path syncs nothing.
+ */
+export async function syncSessionTree(
+	sessionFile: string,
+	opts?: Omit<SyncOptions, "files" | "freshnessMs">,
+): Promise<{ processed: number; files: number }> {
+	if (path.extname(sessionFile) !== ".jsonl") return { processed: 0, files: 0 };
+	const nested = await listSessionFiles(sessionFile.slice(0, -".jsonl".length));
+	const files = [...new Set([sessionFile, ...nested])].sort();
+	return await syncAllSessions({ ...opts, files });
 }
 
 /** Recency tiers for {@link orderForIngest}, newest first. */

@@ -4,6 +4,8 @@
 
 ### Added
 
+- `getSessionStatsByModelAndAgentType(sessionFile)` aggregates one session tree (the main transcript and its subagent and advisor transcripts) by model and agent type, and `syncSessionTree(sessionFile)` syncs just that tree
+- `syncAllSessions` takes `lockWaitMs`, `skipIfBusy` (return nothing instead of throwing when the sync lock stays held) and `freshnessMs` (skip a full scan another process completed recently)
 - `getStatsByModel(cutoff, { exactWhenRollupsStale: true })` reads raw messages when the rollup backlog is too large for exact rollup reads, so a long-window model breakdown is complete while rollups rebuild
 
 ## [18.17.0] - 2026-11-06
