@@ -45,6 +45,7 @@ import {
 	type RangeWindow,
 } from "./rollup";
 import { spotlightRowCount } from "./spotlight-ingest";
+import { getSessionSyncHost } from "./sync-host";
 import type { SyncWorkerRequest, SyncWorkerResponse } from "./sync-worker";
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
 // hidden argv mode, so the compiled binary and npm bundle only need one
@@ -268,6 +269,8 @@ export async function smokeTestSyncWorker({ timeoutMs = 5_000 }: { timeoutMs?: n
  * bar walks at a steady rate).
  */
 export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
+	const host = getSessionSyncHost();
+	if (host) return await host.syncAllSessions(opts);
 	const fullScan = opts?.files === undefined;
 	try {
 		return await withStatsSyncLock(

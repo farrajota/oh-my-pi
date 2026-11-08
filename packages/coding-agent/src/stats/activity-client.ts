@@ -42,7 +42,8 @@ function wrapSubprocess(spawned: SpawnedSubprocess<StatsActivityWorkerOutbound>)
 	);
 }
 
-function spawnStatsActivityWorker(): StatsActivityWorkerHandle {
+/** Spawn a one-shot stats subprocess, or a stub that fails every request when spawning is impossible. */
+export function spawnStatsActivityWorker(): StatsActivityWorkerHandle {
 	return spawnWorkerOrUnavailable(
 		() => wrapSubprocess(createStatsActivitySubprocess()),
 		createUnavailableWorker<StatsActivityWorkerInbound, StatsActivityWorkerOutbound>,

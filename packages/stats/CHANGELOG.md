@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A session sync's batch commit waits for another connection's write (a rollup refresh, another omp process) instead of failing with `database is locked`
+
 ### Added
 
+- `setSessionSyncHost(host)` (`@oh-my-pi/omp-stats/sync-host`) routes this process's `syncAllSessions` and `syncSessionTree` calls to another process
 - `getSessionStatsByModelAndAgentType(sessionFile)` aggregates one session tree (the main transcript and its subagent and advisor transcripts) by model and agent type, and `syncSessionTree(sessionFile)` syncs just that tree
 - `syncAllSessions` takes `lockWaitMs`, `skipIfBusy` (return nothing instead of throwing when the sync lock stays held) and `freshnessMs` (skip a full scan another process completed recently)
 - `getStatsByModel(cutoff, { exactWhenRollupsStale: true })` reads raw messages when the rollup backlog is too large for exact rollup reads, so a long-window model breakdown is complete while rollups rebuild
