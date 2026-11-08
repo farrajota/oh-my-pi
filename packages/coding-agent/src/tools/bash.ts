@@ -1107,6 +1107,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						signal: runSignal,
 						gitGuard: cfgBashGitGuard.get(this.session.settings),
 						ovnfs: ovnfsCommand(this.session.settings),
+						outputSettings: this.session.settings,
 						// Bound to the job's own signal: the job outlives the call that started it.
 						filesystem: this.#urlFilesystem(runSignal, options.approvalTier, onReply).shellFilesystem(),
 						artifactPath,
@@ -1877,6 +1878,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					env: backendPreflight?.env,
 					artifactPath,
 					artifactId,
+					outputSettings: this.session.settings,
 				})
 			: // executeBash runs its OWN direnv preflight internally — pass the RAW
 				// command here so the unset prefix is not applied twice.
@@ -1890,6 +1892,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					signal,
 					gitGuard: cfgBashGitGuard.get(this.session.settings),
 					ovnfs: ovnfsCommand(this.session.settings),
+					outputSettings: this.session.settings,
 					filesystem: this.#urlFilesystem(signal, approvalTier, text => {
 						replies.push(text);
 						emitFrame?.();

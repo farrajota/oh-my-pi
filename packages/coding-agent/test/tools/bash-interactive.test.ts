@@ -96,6 +96,19 @@ describe("runInteractiveBashPty", () => {
 		},
 	);
 
+	it.skipIf(ptyUnavailable)("caps output lines at the calling session's tools.outputMaxColumns", async () => {
+		const result = await runInteractiveBashPty(headlessUi(), {
+			command: "printf 'x%.0s' $(seq 1 600); echo",
+			cwd: tempDir.path(),
+			timeoutMs: 15_000,
+			outputSettings: Settings.isolated({ "tools.outputMaxColumns": 256 }),
+		});
+		expect(result.exitCode).toBe(0);
+		const wideLine = result.output.split("\n").find(line => line.startsWith("xxx"));
+		expect(wideLine).toBeDefined();
+		expect(wideLine!.length).toBeLessThanOrEqual(260);
+	});
+
 	it.skipIf(ptyUnavailable)("lets direnv values win over the terminal defaults and the dropped guards", async () => {
 		const output = await probe({
 			TERM: "direnv-term",

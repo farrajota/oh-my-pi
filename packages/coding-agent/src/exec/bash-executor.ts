@@ -75,6 +75,11 @@ export interface BashExecutorOptions {
 	 */
 	filesystem?: ShellFilesystem;
 	/**
+	 * Settings that bound the captured output (`tools.outputMaxColumns`, the artifact head and size caps). Pass the
+	 * calling session's settings; the process-wide settings apply when omitted.
+	 */
+	outputSettings?: Settings;
+	/**
 	 * Receives a copy of every byte crossing the command's pipes in the
 	 * embedded shell (`proc://<id>/streams`). The user-shell paths ignore it.
 	 */
@@ -660,6 +665,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	// Create output sink for truncation and artifact handling
 	const graphics = new TerminalGraphicsDecoder();
+	const outputSettings = options?.outputSettings ?? settings;
 	const onChunk = usePty ? undefined : options?.onChunk;
 	const onPreview = usePty ? undefined : options?.onPreview;
 	const sink: OutputSink = new OutputSink({
@@ -672,9 +678,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				: undefined,
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
-		headBytes: resolveOutputSinkHeadBytes(settings),
-		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
-		maxColumns: resolveOutputMaxColumns(settings),
+		headBytes: resolveOutputSinkHeadBytes(outputSettings),
+		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(outputSettings),
+		maxColumns: resolveOutputMaxColumns(outputSettings),
 		chunkThrottleMs: onChunk || onPreview ? (options?.chunkThrottleMs ?? 50) : 0,
 	});
 

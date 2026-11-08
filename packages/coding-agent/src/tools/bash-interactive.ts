@@ -26,6 +26,8 @@ export async function runInteractiveBashPty(
 		env?: Record<string, string>;
 		artifactPath?: string;
 		artifactId?: string;
+		/** Settings that bound the captured output; the process-wide settings apply when omitted. */
+		outputSettings?: Settings;
 	},
 ): Promise<BashInteractiveResult> {
 	const settings = await Settings.init();
@@ -40,12 +42,13 @@ export async function runInteractiveBashPty(
 	// monochrome marker. A key left out keeps the inherited launch value.
 	const { GIT_EDITOR: _gitEditor, GPG_TTY: _gpgTty, CI: _ci, NO_COLOR: _noColor, ...interactiveShellEnv } = shellEnv;
 	const graphics = new TerminalGraphicsDecoder();
+	const outputSettings = options.outputSettings ?? settings;
 	const sink = new OutputSink({
 		artifactPath: options.artifactPath,
 		artifactId: options.artifactId,
-		headBytes: resolveOutputSinkHeadBytes(settings),
-		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
-		maxColumns: resolveOutputMaxColumns(settings),
+		headBytes: resolveOutputSinkHeadBytes(outputSettings),
+		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(outputSettings),
+		maxColumns: resolveOutputMaxColumns(outputSettings),
 	});
 	try {
 		const result = await ui.custom<BashInteractiveResult>(
