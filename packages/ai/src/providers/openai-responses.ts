@@ -40,6 +40,13 @@ import {
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
+import {
+	assertProviderAttemptAvailable,
+	createProviderAttemptBudget,
+	type ProviderAttemptBudget,
+	remainingProviderAttempts,
+	wrapFetchWithProviderAttemptBudget,
+} from "../utils/provider-attempt-budget";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { getProxyForUrl } from "../utils/proxy";
 import { toolNamesByWire } from "../utils/tool-names";
@@ -741,6 +748,7 @@ const streamOpenAIResponsesOnce = (
 	context: Context,
 	options: OpenAIResponsesOptions | undefined,
 	attemptContext: ResponsesAttemptContext,
+	attemptBudget: ProviderAttemptBudget,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
 
@@ -974,6 +982,7 @@ const streamOpenAIResponsesOnce = (
 				);
 				activeRequestParams = requestParams;
 				lastSubmittedRequestWasFullReplay = requestParams.previous_response_id === undefined;
+				assertProviderAttemptAvailable(attemptBudget, model.provider);
 				let requestTimeout: NodeJS.Timeout | undefined;
 				if (!useWebSocket && requestTimeoutMs !== undefined) {
 					requestTimeout = setTimeout(
@@ -992,6 +1001,7 @@ const streamOpenAIResponsesOnce = (
 							throw new Error("OpenAI responses WebSocket requests do not support background: true");
 						}
 						const lease = webSocketLease!;
+						attemptBudget.attempts += 1;
 						return lease.session.events(requestParams, {
 							signal: requestSignal,
 							chain: isOpenAIResponsesWebSocketChainEnabled(options, model) && !lease.chainDisabled,
@@ -1010,12 +1020,17 @@ const streamOpenAIResponsesOnce = (
 						body: requestParams,
 						signal: requestSignal,
 						fetch: wrapFetchForCopilotFallback(
-							wrapFetchForRequestCompression(options?.fetch ?? fetch, model),
+							wrapFetchWithProviderAttemptBudget(
+								wrapFetchForRequestCompression(options?.fetch ?? fetch, model),
+								attemptBudget,
+								model.provider,
+							),
 							model.provider === "github-copilot",
 							resolveCopilotRequestIdentity(options?.headers),
 							copilotCacheKey,
 							copilotCacheSnapshot,
 						),
+						maxAttempts: remainingProviderAttempts(attemptBudget),
 						shouldRetryResponse: (response, bodyText) =>
 							!AIError.isRequestBodyReadTimeout(response.status, bodyText) ||
 							lastSubmittedRequestWasFullReplay !== true,
@@ -1295,8 +1310,10 @@ const streamOpenAIResponsesOnce = (
 					// to the normal retry handling when resume is ineligible or the
 					// poll gives up, leaving all existing behavior unchanged.
 					const resumeId = output.responseId;
+					// Polling sends requests of its own, so a capped stream never starts it.
 					if (
 						!useWebSocket &&
+						attemptBudget.maxAttempts === undefined &&
 						resumeId !== undefined &&
 						canResumeOpenAIResponsesResultAfterDrop({
 							responseId: resumeId,
@@ -1571,13 +1588,14 @@ const streamOpenAIResponsesOnce = (
  */
 export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (model, context, options) => {
 	const attemptContext: ResponsesAttemptContext = { mode: undefined };
+	const attemptBudget = createProviderAttemptBudget(options?.providerMaxAttempts);
 	return withReplaySafeStreamRetry(
 		model,
 		context,
 		options,
 		(attemptModel, attemptContextMessages, attemptOptions) =>
-			streamOpenAIResponsesOnce(attemptModel, attemptContextMessages, attemptOptions, attemptContext),
-		{ retryEmptyCompletion: () => attemptContext.mode === "sse" },
+			streamOpenAIResponsesOnce(attemptModel, attemptContextMessages, attemptOptions, attemptContext, attemptBudget),
+		{ retryEmptyCompletion: () => attemptContext.mode === "sse", attemptBudget },
 	);
 };
 

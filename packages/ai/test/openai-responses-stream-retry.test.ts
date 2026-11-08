@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { streamSimple } from "@oh-my-pi/pi-ai";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { postOpenAIStream } from "@oh-my-pi/pi-ai/utils/openai-http";
 import type {
@@ -121,6 +122,21 @@ function createCompletedToolResponse(responseId = "resp_retry"): Response {
 				id: responseId,
 				status: "completed",
 				usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } },
+			},
+		},
+	]);
+}
+
+function createCompletedEmptyResponse(responseId: string): Response {
+	return createSseResponse([
+		{ type: "response.created", response: { id: responseId, status: "in_progress" } },
+		{
+			type: "response.completed",
+			response: {
+				id: responseId,
+				status: "completed",
+				output: [],
+				usage: { input_tokens: 5, output_tokens: 0, total_tokens: 5, input_tokens_details: { cached_tokens: 0 } },
 			},
 		},
 	]);
@@ -344,6 +360,117 @@ describe("OpenAI Responses transient stream retry", () => {
 		).result();
 		expect(followup.stopReason).toBe("stop");
 		expect(sentRequests[2]?.previous_response_id).toBe("resp_retry");
+	});
+
+	it("shares providerMaxAttempts across a truncated stream replay and HTTP retries", async () => {
+		let outboundRequests = 0;
+		const fetchMock = vi.fn(async () => {
+			outboundRequests++;
+			if (outboundRequests === 1) return createTruncatedPendingToolResponse();
+			return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+				status: 429,
+				headers: { "content-type": "application/json", "retry-after": "0" },
+			});
+		}) as FetchImpl;
+		const result = await streamOpenAIResponses(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			providerMaxAttempts: 2,
+			providerRetryWait: async () => {},
+		}).result();
+
+		expect(outboundRequests).toBe(2);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(429);
+		expect(result.content).toEqual([]);
+		let singleAttemptRequests = 0;
+		const singleAttempt = await streamOpenAIResponses(model, context, {
+			apiKey: "test-key",
+			fetch: async () => {
+				singleAttemptRequests++;
+				return createTruncatedPendingToolResponse();
+			},
+			providerMaxAttempts: 1,
+			providerRetryWait: async () => {},
+		}).result();
+		expect(singleAttemptRequests).toBe(1);
+		expect(singleAttempt.stopReason).toBe("error");
+		expect(singleAttempt.content).toEqual([]);
+	});
+
+	for (const providerMaxAttempts of [1, 2]) {
+		it(`bounds empty-completion replays to ${providerMaxAttempts} outbound attempts`, async () => {
+			const fetchMock = vi.fn(async () =>
+				createCompletedEmptyResponse(`resp_empty_${providerMaxAttempts}`),
+			) as FetchImpl;
+			const result = await streamOpenAIResponses(model, context, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerMaxAttempts,
+				providerRetryWait: async () => {},
+			}).result();
+
+			expect(fetchMock).toHaveBeenCalledTimes(providerMaxAttempts);
+			expect(result.stopReason).toBe("error");
+			expect(result.content).toEqual([]);
+		});
+	}
+
+	it("allows a successful empty-completion replay within the shared budget", async () => {
+		let outboundRequests = 0;
+		const fetchMock = vi.fn(async () => {
+			outboundRequests++;
+			return outboundRequests === 1
+				? createCompletedEmptyResponse("resp_empty_before_success")
+				: createCompletedTextResponse("recovered", "resp_after_empty");
+		}) as FetchImpl;
+		const result = await streamOpenAIResponses(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			providerMaxAttempts: 2,
+			providerRetryWait: async () => {},
+		}).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(result.stopReason).toBe("stop");
+		expect(result.responseId).toBe("resp_after_empty");
+		expect(result.content).toMatchObject([{ type: "text", text: "recovered" }]);
+	});
+
+	it("preserves an explicitly accepted empty completion without replay", async () => {
+		const fetchMock = vi.fn(async () => createCompletedEmptyResponse("resp_accepted_empty")) as FetchImpl;
+		const result = await streamOpenAIResponses(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			providerMaxAttempts: 1,
+			acceptEmptyResponse: true,
+			providerRetryWait: async () => {},
+		}).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("stop");
+		expect(result.responseId).toBe("resp_accepted_empty");
+		expect(result.content).toEqual([]);
+	});
+
+	it("forwards providerMaxAttempts through streamSimple to the provider", async () => {
+		let outboundRequests = 0;
+		const fetchMock = vi.fn(async () => {
+			outboundRequests++;
+			return new Response(JSON.stringify({ error: { message: "upstream unavailable" } }), {
+				status: 503,
+				headers: { "content-type": "application/json", "retry-after-ms": "1" },
+			});
+		}) as FetchImpl;
+		const result = await streamSimple(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			providerMaxAttempts: 1,
+		}).result();
+
+		expect(outboundRequests).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(503);
 	});
 
 	it("falls back to full transcript when a fresh stream retry finds a stale chain baseline", async () => {

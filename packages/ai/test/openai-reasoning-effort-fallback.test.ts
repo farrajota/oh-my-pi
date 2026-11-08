@@ -156,6 +156,25 @@ function summaryReasoningErrorResponse(): Response {
 	);
 }
 
+function providerErrorResponse(code: string | number): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message: "The model is temporarily unavailable.",
+				type: "server_error",
+				code,
+			},
+		}),
+		{ status: 503, headers: { "content-type": "application/json" } },
+	);
+}
+function providerErrorWithoutCodeResponse(): Response {
+	return new Response(JSON.stringify({ error: { message: "The model is temporarily unavailable." } }), {
+		status: 503,
+		headers: { "content-type": "application/json" },
+	});
+}
+
 /**
  * Rejection aimed at a sibling tier-valued field: the current reasoning
  * effort is quoted, but the verdict is about text verbosity. Must not
@@ -859,5 +878,43 @@ describe("OpenAI reasoning effort fallback retry", () => {
 		expect(bodies[1]!.reasoning_effort).toBe("high");
 		// The kwargs twin must not keep the stale rejected value.
 		expect(bodies[1]!.chat_template_kwargs).toEqual({ preserve_thinking: true, reasoning_effort: "high" });
+	});
+
+	it("sends one request for a retryable provider error when providerMaxAttempts is one", async () => {
+		let completionsCalls = 0;
+		const completions = await streamOpenAICompletions(createCompletionsModel(), testContext, {
+			apiKey: "test-key",
+			fetch: Object.assign(
+				async (): Promise<Response> => {
+					completionsCalls += 1;
+					return providerErrorResponse("model_cooldown");
+				},
+				{
+					preconnect: fetch.preconnect,
+				},
+			),
+			providerMaxAttempts: 1,
+		}).result();
+		let responsesCalls = 0;
+		const responses = await streamOpenAIResponses(createResponsesModel(), testContext, {
+			apiKey: "test-key",
+			fetch: Object.assign(
+				async (): Promise<Response> => {
+					responsesCalls += 1;
+					return providerErrorWithoutCodeResponse();
+				},
+				{
+					preconnect: fetch.preconnect,
+				},
+			),
+			providerMaxAttempts: 1,
+		}).result();
+
+		expect(completions.stopReason).toBe("error");
+		expect(completions.errorStatus).toBe(503);
+		expect(completionsCalls).toBe(1);
+		expect(responses.stopReason).toBe("error");
+		expect(responses.errorStatus).toBe(503);
+		expect(responsesCalls).toBe(1);
 	});
 });

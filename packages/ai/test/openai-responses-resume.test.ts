@@ -452,6 +452,23 @@ describe("openai-responses socket-drop resume", () => {
 			else process.env.PI_MUSE_STORE_RESPONSES = previous;
 		}
 	});
+
+	it("does not poll for a stored result when providerMaxAttempts caps outbound requests", async () => {
+		const scenario = dropScenario("resp_capped", [
+			() => new Response(JSON.stringify(completedResult("resp_capped")), { status: 200 }),
+		]);
+		const result = await streamOpenAIResponses(bundledModel("muse-code"), context, {
+			fetch: scenario.fetchImpl,
+			apiKey: "test-key",
+			providerRetryWait: noWait,
+			storeResponses: true,
+			providerMaxAttempts: 1,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(scenario.posts).toHaveLength(1);
+		expect(scenario.gets).toEqual([]);
+	});
 });
 
 describe("pollOpenAIResponsesResultForCompletion", () => {

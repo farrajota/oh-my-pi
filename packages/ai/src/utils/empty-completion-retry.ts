@@ -16,6 +16,7 @@
 import * as AIError from "../error";
 import type { AssistantMessage, AssistantMessageEvent, Context } from "../types";
 import { AssistantMessageEventStream } from "./event-stream";
+import { canStartProviderAttempt, type ProviderAttemptBudget } from "./provider-attempt-budget";
 import { waitForRetry } from "./retry-wait";
 
 export const MAX_EMPTY_COMPLETION_RETRIES = 2;
@@ -77,6 +78,12 @@ export interface ReplaySafeStreamRetryPolicy {
 	retryProviderHttpErrors?: boolean;
 	/** Maximum transient provider-error retries; empty completions keep their shared fixed budget. */
 	maxProviderErrorRetries?: number;
+	/**
+	 * Outbound request budget the attempts share. A provider error is not replayed once it is
+	 * spent, so the original failure surfaces. An empty completion still replays, and the attempt
+	 * itself fails with the limit error: an empty answer is not a result to hand back.
+	 */
+	attemptBudget?: ProviderAttemptBudget;
 }
 
 class FinalizedProviderStreamError extends Error {
@@ -163,6 +170,7 @@ export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
 				failedMessage.errorMessage !== undefined &&
 				(policy.retryProviderHttpErrors !== false || failedMessage.errorStatus === undefined) &&
 				providerErrorRetries < (policy.maxProviderErrorRetries ?? 0) &&
+				(policy.attemptBudget === undefined || canStartProviderAttempt(policy.attemptBudget)) &&
 				AIError.isProviderRetryableError(
 					new FinalizedProviderStreamError(failedMessage.errorMessage, failedMessage.errorStatus),
 				);

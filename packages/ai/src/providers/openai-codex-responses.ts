@@ -72,6 +72,14 @@ import {
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
 import { getProxyForUrl } from "../utils/proxy";
+import {
+	assertProviderAttemptAvailable,
+	canStartProviderAttempt,
+	createProviderAttemptBudget,
+	type ProviderAttemptBudget,
+	remainingProviderAttempts,
+	wrapFetchWithProviderAttemptBudget,
+} from "../utils/provider-attempt-budget";
 import { wrapFetchForRequestCompression } from "../utils/request-compression";
 import { getHeadersFromError, getRetryAfterMsFromHeaders, type HeadersLike } from "../utils/retry-after";
 import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
@@ -252,6 +260,13 @@ function resolveCodexSseMaxAttempts(value: number | undefined): number {
 	if (value === undefined) return CODEX_MAX_RETRIES + 1;
 	if (!Number.isFinite(value)) return 1;
 	return Math.max(1, Math.trunc(value));
+}
+
+/** SSE pre-response attempts for one open: the `codexSseMaxAttempts` cap, lowered to what the stream budget has left. */
+function resolveCodexSseAttemptCap(codexSseMaxAttempts: number | undefined, budget: ProviderAttemptBudget): number {
+	const cap = resolveCodexSseMaxAttempts(codexSseMaxAttempts);
+	const remaining = remainingProviderAttempts(budget);
+	return remaining === undefined ? cap : Math.max(1, Math.min(cap, remaining));
 }
 const CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS = 10000;
 const CODEX_WEBSOCKET_PING_INTERVAL_MS = Number($env.PI_CODEX_WEBSOCKET_PING_INTERVAL_MS || 10_000);
@@ -727,6 +742,8 @@ interface CodexRequestContext {
 	requestMetadata?: CodexRequestMetadata;
 	transformedBody: RequestBody;
 	rawRequestDump: RawHttpRequestDump;
+	/** Outbound WebSocket and SSE requests of this stream call, across every reopen and fallback. */
+	attemptBudget: ProviderAttemptBudget;
 }
 
 interface CodexRequestSetup {
@@ -1340,6 +1357,7 @@ function createCodexRequestContext(
 		codexClientVersion,
 		transformedBody,
 		rawRequestDump,
+		attemptBudget: createProviderAttemptBudget(options?.providerMaxAttempts),
 	};
 }
 
@@ -1504,6 +1522,7 @@ async function openInitialCodexEventStream(
 						activated: activateFallback,
 						fatal: isFatal,
 					});
+				if (!canStartProviderAttempt(requestContext.attemptBudget)) throw error;
 				if (!activateFallback) {
 					websocketRetries += 1;
 					await scheduler.wait(CODEX_WEBSOCKET_RETRY_DELAY_MS * Math.max(1, websocketRetries), {
@@ -1520,6 +1539,7 @@ async function openInitialCodexEventStream(
 	try {
 		return await openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
 	} catch (error) {
+		if (!canStartProviderAttempt(requestContext.attemptBudget)) throw error;
 		if (!dropRejectedCodexAccessPrograms(transformedBody, model, requestContext.accountId, error)) throw error;
 		return openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
 	}
@@ -1697,6 +1717,8 @@ async function openCodexWebSocketTransport(
 	if (websocketState.connection?.hasActiveRequest()) {
 		throw new CodexWebSocketBusyError("websocket request already in progress");
 	}
+	assertProviderAttemptAvailable(requestContext.attemptBudget, model.provider);
+	requestContext.attemptBudget.attempts += 1;
 	// Accepted steering belongs to whichever request ends up owning the socket,
 	// so it is only consumed once this request takes it (see `onOwned` below).
 	const steered = websocketState.acceptedSteering;
@@ -1893,6 +1915,7 @@ async function openCodexSseTransport(
 	transport: CodexTransport;
 }> {
 	const open = async (wireBody: RequestBody) => {
+		assertProviderAttemptAvailable(requestContext.attemptBudget, model.provider);
 		// Keep the 400 dump honest: record the body actually sent on the wire.
 		requestContext.rawRequestDump.body = wireBody;
 		return requestSetup.wrapCodexSseStream(
@@ -1910,9 +1933,13 @@ async function openCodexSseTransport(
 				requestContext.requestMetadata,
 				requestSetup.requestSignal,
 				requestSetup.firstEventTimeoutMs,
-				options?.codexSseMaxAttempts,
+				resolveCodexSseAttemptCap(options?.codexSseMaxAttempts, requestContext.attemptBudget),
 				event => options?.onSseEvent?.(event, model),
-				wrapFetchForRequestCompression(options?.fetch ?? fetch, model),
+				wrapFetchWithProviderAttemptBudget(
+					wrapFetchForRequestCompression(options?.fetch ?? fetch, model),
+					requestContext.attemptBudget,
+					model.provider,
+				),
 			),
 		);
 	};
@@ -2672,12 +2699,18 @@ class CodexStreamProcessor {
 		resetCodexWebSocketAppendState(state);
 	}
 
+	/** Every recovery below sends a new request; once the stream's attempt budget is spent, the error surfaces. */
+	#canSendAnotherRequest(): boolean {
+		return canStartProviderAttempt(this.requestContext.attemptBudget);
+	}
+
 	async #recoverStreamError(error: unknown): Promise<boolean> {
 		if (
 			error instanceof CodexSteerCommitError &&
 			this.runtime.websocketState &&
 			this.output.content.length === 0 &&
-			!this.options?.signal?.aborted
+			!this.options?.signal?.aborted &&
+			this.#canSendAnotherRequest()
 		) {
 			// No successor is coming: send this request explicitly, steering
 			// input included as ordinary history.
@@ -2729,6 +2762,7 @@ class CodexStreamProcessor {
 		this.#dropTrailingDegenerateToolCall();
 		if (
 			this.runtime.whitespaceLoopRetries >= CODEX_WHITESPACE_LOOP_RETRY_LIMIT ||
+			!this.#canSendAnotherRequest() ||
 			!this.runtime.canSafelyReplayWebsocketOverSse ||
 			this.output.content.some(block => block.type !== "thinking") ||
 			this.options?.signal?.aborted
@@ -2795,7 +2829,12 @@ class CodexStreamProcessor {
 			return false;
 		}
 		const websocketState = this.requestContext.websocketState;
-		if (!websocketState || this.runtime.transport !== "websocket" || this.options?.signal?.aborted) {
+		if (
+			!websocketState ||
+			this.runtime.transport !== "websocket" ||
+			this.options?.signal?.aborted ||
+			!this.#canSendAnotherRequest()
+		) {
 			return false;
 		}
 
@@ -2856,6 +2895,7 @@ class CodexStreamProcessor {
 		if (
 			hasVisibleAssistantContent(this.output) ||
 			this.options?.signal?.aborted ||
+			!this.#canSendAnotherRequest() ||
 			!dropRejectedCodexAccessPrograms(
 				this.requestContext.transformedBody,
 				this.model,
@@ -2898,7 +2938,8 @@ class CodexStreamProcessor {
 			this.runtime.transport !== "websocket" ||
 			this.output.content.length > 0 ||
 			this.options?.signal?.aborted ||
-			this.runtime.providerRetryAttempt >= CODEX_MAX_RETRIES
+			this.runtime.providerRetryAttempt >= CODEX_MAX_RETRIES ||
+			!this.#canSendAnotherRequest()
 		) {
 			return false;
 		}
@@ -2925,7 +2966,8 @@ class CodexStreamProcessor {
 			!websocketState ||
 			this.output.content.length > 0 ||
 			this.options?.signal?.aborted ||
-			this.runtime.providerRetryAttempt >= CODEX_MAX_RETRIES
+			this.runtime.providerRetryAttempt >= CODEX_MAX_RETRIES ||
+			!this.#canSendAnotherRequest()
 		) {
 			return false;
 		}
@@ -2958,7 +3000,8 @@ class CodexStreamProcessor {
 			isCodexWebSocketRetryableStreamError(error) &&
 			this.runtime.canSafelyReplayWebsocketOverSse &&
 			!this.runtime.sawTerminalEvent &&
-			!this.options?.signal?.aborted;
+			!this.options?.signal?.aborted &&
+			this.#canSendAnotherRequest();
 		if (!canReplay) return false;
 
 		const state = websocketState;
@@ -3065,7 +3108,8 @@ class CodexStreamProcessor {
 			streamedContent ||
 			!this.runtime.canSafelyReplayWebsocketOverSse ||
 			this.runtime.providerRetryAttempt >= CODEX_MAX_RETRIES ||
-			this.options?.signal?.aborted
+			this.options?.signal?.aborted ||
+			!this.#canSendAnotherRequest()
 		) {
 			return false;
 		}
@@ -3131,6 +3175,7 @@ class CodexStreamProcessor {
 			// instead of surfacing a raw transport error to the caller. A socket busy
 			// with another request is not a failure and stays untouched.
 			if (!(error instanceof CodexWebSocketBusyError)) recordCodexWebSocketFailure(state, true);
+			if (!this.#canSendAnotherRequest()) throw error;
 			CODEX_DEBUG &&
 				logger.debug("[codex] codex websocket reopen failed, falling back to SSE", {
 					error: error.message,
@@ -3253,6 +3298,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 							url: "",
 							body: { model: model.id },
 						},
+						attemptBudget: createProviderAttemptBudget(options?.providerMaxAttempts),
 					},
 					startTime,
 				} satisfies CodexStreamFailureContext);
@@ -4056,7 +4102,7 @@ async function openCodexSseEventStream(
 	requestMetadata: CodexRequestMetadata | undefined,
 	signal: AbortSignal | undefined,
 	firstEventTimeoutMs: number | undefined,
-	codexSseMaxAttempts: number | undefined,
+	maxAttempts: number,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
@@ -4122,7 +4168,7 @@ async function openCodexSseEventStream(
 				clearPreResponseTimeout = watchdog.clear;
 				return { signal: watchdog.signal };
 			},
-			maxAttempts: resolveCodexSseMaxAttempts(codexSseMaxAttempts),
+			maxAttempts,
 			defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
 			maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
 			fetch: fetchAttempt,

@@ -21,6 +21,13 @@ import {
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
+import {
+	assertProviderAttemptAvailable,
+	createProviderAttemptBudget,
+	type ProviderAttemptBudget,
+	resolveHttpAttemptCap,
+	wrapFetchWithProviderAttemptBudget,
+} from "../utils/provider-attempt-budget";
 import { sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { mapToOpenAIResponsesToolChoice } from "../utils/tool-choice";
 import { isOpenAIResponsesProgressEvent } from "../utils/websocket";
@@ -80,6 +87,7 @@ type AzureOpenAIResponsesSamplingParams = ResponseCreateParamsStreaming & {
 const streamAzureOpenAIResponsesOnce = (
 	model: Model<"azure-openai-responses">,
 	context: Context,
+	attemptBudget: ProviderAttemptBudget,
 	options?: AzureOpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
@@ -161,6 +169,7 @@ const streamAzureOpenAIResponsesOnce = (
 					);
 				}
 				try {
+					assertProviderAttemptAvailable(attemptBudget, model.provider);
 					const headersWithTimeout = { ...headers };
 					if (requestTimeoutMs !== undefined) {
 						headersWithTimeout["X-Stainless-Timeout"] = Math.floor(requestTimeoutMs / 1000).toString();
@@ -170,7 +179,8 @@ const streamAzureOpenAIResponsesOnce = (
 						headers: headersWithTimeout,
 						body: params,
 						signal: requestSignal,
-						fetch: options?.fetch,
+						maxAttempts: resolveHttpAttemptCap(options?.maxHttpAttempts, attemptBudget),
+						fetch: wrapFetchWithProviderAttemptBudget(options?.fetch ?? fetch, attemptBudget, model.provider),
 						// Transient 408/429/5xx get Retry-After-aware transport retries;
 						// the first-event watchdog aborts `requestSignal`, so retries
 						// cannot extend the caller's deadline.
@@ -272,11 +282,20 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; Azure Responses does not emit explicit cache controls.`,
 		);
 	}
-	return withReplaySafeStreamRetry(model, context, options, streamAzureOpenAIResponsesOnce, {
-		retryProviderErrors: true,
-		retryProviderHttpErrors: false,
-		maxProviderErrorRetries: 1,
-	});
+	const attemptBudget = createProviderAttemptBudget(options?.providerMaxAttempts);
+	return withReplaySafeStreamRetry(
+		model,
+		context,
+		options,
+		(attemptModel, attemptContext, attemptOptions) =>
+			streamAzureOpenAIResponsesOnce(attemptModel, attemptContext, attemptBudget, attemptOptions),
+		{
+			retryProviderErrors: true,
+			retryProviderHttpErrors: false,
+			maxProviderErrorRetries: 1,
+			attemptBudget,
+		},
+	);
 };
 
 function resolveAzureConfig(

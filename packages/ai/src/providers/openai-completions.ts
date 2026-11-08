@@ -47,6 +47,13 @@ import {
 	iterateWithTerminalGrace,
 } from "../utils/idle-iterator";
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
+import {
+	assertProviderAttemptAvailable,
+	createProviderAttemptBudget,
+	type ProviderAttemptBudget,
+	resolveHttpAttemptCap,
+	wrapFetchWithProviderAttemptBudget,
+} from "../utils/provider-attempt-budget";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { wrapFetchForRequestCompression } from "../utils/request-compression";
 import {
@@ -842,6 +849,7 @@ function createOpenAICompletionsStreamError(chunk: unknown, provider: string): E
 const streamOpenAICompletionsOnce = (
 	model: Model<"openai-completions">,
 	context: Context,
+	attemptBudget: ProviderAttemptBudget,
 	options?: OpenAICompletionsOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
@@ -938,6 +946,7 @@ const streamOpenAICompletionsOnce = (
 				? `${trimmedBaseUrl}/chat/completions?${new URLSearchParams(query)}`
 				: `${trimmedBaseUrl}/chat/completions`;
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
+				assertProviderAttemptAvailable(attemptBudget, model.provider);
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
 				const builtParams = buildParams(model, context, options, effectiveToolStrictModeOverride);
 				appliedStrictTools = builtParams.strictToolsApplied;
@@ -986,9 +995,13 @@ const streamOpenAICompletionsOnce = (
 						headers: headersWithTimeout,
 						body: params,
 						signal: requestSignal,
-						maxAttempts: options?.maxHttpAttempts,
+						maxAttempts: resolveHttpAttemptCap(options?.maxHttpAttempts, attemptBudget),
 						fetch: wrapFetchForCopilotFallback(
-							wrapFetchForRequestCompression(options?.fetch ?? fetch, model),
+							wrapFetchWithProviderAttemptBudget(
+								wrapFetchForRequestCompression(options?.fetch ?? fetch, model),
+								attemptBudget,
+								model.provider,
+							),
 							model.provider === "github-copilot",
 							resolveCopilotRequestIdentity(options?.headers),
 							copilotCacheKey,
@@ -1926,12 +1939,21 @@ function resolveOpenAICompletionsCompat(model: Model<"openai-completions">): Mod
  */
 export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (model, context, options) => {
 	const resolvedModel = resolveOpenAICompletionsCompat(model);
-	return withReplaySafeStreamRetry(resolvedModel, context, options, streamOpenAICompletionsOnce, {
-		retryEmptyCompletion: true,
-		retryProviderErrors: options?.maxHttpAttempts === undefined,
-		retryProviderHttpErrors: false,
-		maxProviderErrorRetries: 1,
-	});
+	const attemptBudget = createProviderAttemptBudget(options?.providerMaxAttempts);
+	return withReplaySafeStreamRetry(
+		resolvedModel,
+		context,
+		options,
+		(attemptModel, attemptContext, attemptOptions) =>
+			streamOpenAICompletionsOnce(attemptModel, attemptContext, attemptBudget, attemptOptions),
+		{
+			retryEmptyCompletion: true,
+			retryProviderErrors: options?.maxHttpAttempts === undefined,
+			retryProviderHttpErrors: false,
+			maxProviderErrorRetries: 1,
+			attemptBudget,
+		},
+	);
 };
 
 function createRequestSetup(

@@ -508,10 +508,22 @@ export interface StreamOptions {
 	maxTokens?: number;
 	signal?: AbortSignal;
 	/**
-	 * OpenAI chat-completions HTTP attempt budget. When set, transient provider
-	 * errors are not replayed above the transport, so retries share this limit.
+	 * HTTP attempt budget for one OpenAI chat-completions or Azure Responses
+	 * request. When set, transient provider errors are not replayed above the
+	 * transport, so retries share this limit. If `providerMaxAttempts` is also
+	 * set, the lower finite cap applies.
 	 */
 	maxHttpAttempts?: number;
+	/**
+	 * Total outbound requests for one stream call of an OpenAI-family provider
+	 * (chat completions, Responses, Azure Responses, Codex), including the
+	 * initial request. HTTP retries, stream reopens, transport fallbacks,
+	 * request-shape fallbacks and empty-completion replays all share it, and a
+	 * capped Responses stream does not poll for a dropped run's stored result.
+	 * `undefined` preserves each layer's own limit. Finite values are
+	 * normalized to an integer of at least 1.
+	 */
+	providerMaxAttempts?: number;
 	apiKey?: string;
 	/** @internal Stored credential row serving this request, when known. */
 	credentialId?: number;

@@ -135,3 +135,27 @@ describe("provider replay above the OpenAI wire transport", () => {
 		expect(attempts).toBe(6);
 	});
 });
+
+describe("Azure Responses attempt caps", () => {
+	test.each([
+		["maxHttpAttempts", { maxHttpAttempts: 1 }, 1],
+		["providerMaxAttempts", { providerMaxAttempts: 1 }, 1],
+		["lower of both", { maxHttpAttempts: 4, providerMaxAttempts: 2 }, 2],
+	] as const)("limits a retryable 503 by the %s attempt cap", async (_label, caps, expected) => {
+		const { attempts, result } = await countProviderAttempts(
+			fetch =>
+				streamAzureOpenAIResponses(azureModel, context, {
+					apiKey: "test-key",
+					azureBaseUrl: azureModel.baseUrl,
+					azureApiVersion: "v1",
+					fetch,
+					providerRetryWait: async () => {},
+					...caps,
+				}).result(),
+			retryable503,
+		);
+
+		expect(result.errorStatus).toBe(503);
+		expect(attempts).toBe(expected);
+	});
+});

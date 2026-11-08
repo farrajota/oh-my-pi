@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- `providerMaxAttempts` caps the total outbound requests of one OpenAI Completions, OpenAI Responses, Azure Responses or Codex stream call across HTTP retries, stream reopens, transport and request-shape fallbacks, and empty-completion replays; `streamSimple` forwards it, and a capped Responses stream does not poll for a dropped run's stored result
+- Azure OpenAI Responses honors `maxHttpAttempts`
+
 ### Fixed
 
 - Azure OpenAI Responses and OpenAI Completions no longer replay an HTTP error the transport already retried, so a persistent 5xx costs at most the transport's 6 requests instead of 12, and a gateway's terminal `x-should-retry: false` is sent once

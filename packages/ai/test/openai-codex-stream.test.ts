@@ -3138,6 +3138,41 @@ describe("openai-codex streaming", () => {
 		}
 	});
 
+	it("shares providerMaxAttempts with Codex SSE transport retries", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const cases = [
+			{ providerMaxAttempts: 1, codexSseMaxAttempts: undefined, expected: 1 },
+			{ providerMaxAttempts: 2, codexSseMaxAttempts: undefined, expected: 2 },
+			{ providerMaxAttempts: 3, codexSseMaxAttempts: 2, expected: 2 },
+			{ providerMaxAttempts: 2, codexSseMaxAttempts: 4, expected: 2 },
+		];
+
+		for (const { providerMaxAttempts, codexSseMaxAttempts, expected } of cases) {
+			let requestCount = 0;
+			const fetchMock: FetchImpl = async () => {
+				requestCount += 1;
+				return new Response(JSON.stringify({ error: { message: "upstream unavailable" } }), {
+					status: 503,
+					headers: { "content-type": "application/json", "retry-after-ms": "1" },
+				});
+			};
+			const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+				apiKey: token,
+				fetch: fetchMock,
+				providerMaxAttempts,
+				codexSseMaxAttempts,
+			}).result();
+
+			expect(requestCount).toBe(expected);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorStatus).toBe(503);
+		}
+	});
+
 	it("names the host and cause when the Codex SSE transport rejects", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
@@ -7740,6 +7775,44 @@ describe("openai-codex streaming", () => {
 			.map(c => c.text)
 			.join("");
 		expect(text).toBe("Second");
+	});
+
+	it("does not fall back from a failed websocket when providerMaxAttempts is one", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		let connectionCount = 0;
+		class FailingWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				connectionCount += 1;
+				queueMicrotask(() => {
+					this.emit("error", new Event("error"));
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", new Event("close"));
+				});
+			}
+		}
+		global.WebSocket = FailingWebSocket as unknown as typeof WebSocket;
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback exceeded the one-attempt budget");
+		});
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		const result = await streamOpenAICodexResponses(
+			createCodexTestModel("https://chatgpt.com/backend-api"),
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				fetch: fetchMock as FetchImpl,
+				sessionId: "ws-single-attempt-session",
+				providerSessionState,
+				providerMaxAttempts: 1,
+			},
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(connectionCount).toBe(1);
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it("passes explicit service tier routing through websocket prewarm", async () => {
