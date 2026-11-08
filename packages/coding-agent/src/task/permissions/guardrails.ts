@@ -61,13 +61,16 @@ export function derivePermissionGuardrails(
 			const key = permissionToolKey(tool);
 			return key === "browser" || key === "web_search";
 		}),
-		secretsBlind: denyPatterns.some(
-			pattern =>
-				pattern.includes("secret") ||
-				pattern.includes("credential") ||
-				pattern.includes("private*key") ||
-				pattern.includes(".env"),
-		),
+		// Case-insensitive like SECRET_PATH: `**/Secrets/**` names the same kind of material as `**/secrets/**`.
+		secretsBlind: denyPatterns.some(pattern => {
+			const lower = pattern.toLowerCase();
+			return (
+				lower.includes("secret") ||
+				lower.includes("credential") ||
+				lower.includes("private*key") ||
+				lower.includes(".env")
+			);
+		}),
 	};
 }
 

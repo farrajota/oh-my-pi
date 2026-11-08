@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { composeEffectivePermissions } from "@oh-my-pi/pi-coding-agent/task/permissions/compose";
 import { evaluateSubagentPermission } from "@oh-my-pi/pi-coding-agent/task/permissions/evaluate";
 import { evaluatePermissionGuardrails } from "@oh-my-pi/pi-coding-agent/task/permissions/guardrails";
+import { BUILTIN_PERMISSION_PROFILES } from "@oh-my-pi/pi-coding-agent/task/permissions/profiles";
 import type { PermissionScope } from "@oh-my-pi/pi-coding-agent/task/permissions/types";
 
 function permissionScope(overrides: Partial<PermissionScope> = {}): PermissionScope {
@@ -28,6 +30,34 @@ function permissionScope(overrides: Partial<PermissionScope> = {}): PermissionSc
 }
 
 describe("permission guardrails", () => {
+	test("secrets-like deny paths turn on secrets-blind whatever their letter case", () => {
+		for (const denyPaths of [["**/Secrets/**"], ["**/*CREDENTIAL*"], ["**/.ENV"], ["**/Private*Key*"]]) {
+			const composed = composeEffectivePermissions({
+				mode: "enforce",
+				toolsEnabled: true,
+				pathsEnabled: true,
+				actorId: "Child",
+				actorKind: "sub",
+				request: { tools: ["read"], denyPaths },
+				profiles: BUILTIN_PERMISSION_PROFILES,
+			});
+			if (!composed.ok) throw new Error(composed.error);
+			expect({ denyPaths, secretsBlind: composed.value.guardrails.secretsBlind }).toEqual({
+				denyPaths,
+				secretsBlind: true,
+			});
+			// Secrets-blind then refuses what no deny path names, such as another agent's transcript.
+			expect(
+				evaluateSubagentPermission({
+					scope: composed.value,
+					toolName: "read",
+					toolInput: { path: "history://OtherAgent" },
+					cwd: "/repo",
+				}).action,
+			).toBe("deny");
+		}
+	});
+
 	test("no-network denies network read, shell, eval, and MCP calls", () => {
 		const scope = permissionScope({
 			tools: ["read", "bash", "eval", "mcp__docs__search", "web_search"],
