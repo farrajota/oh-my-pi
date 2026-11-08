@@ -5,6 +5,7 @@ import {
 	validateGoalLaunch,
 	validateRestoreLaunch,
 	validateRestorePrompt,
+	validateSingleRequestLaunch,
 	validateToolNames,
 } from "../src/cli/args";
 import { OPTIONAL_VALUE_FLAGS, restartArgv, STRING_VALUE_FLAGS } from "../src/cli/flag-tables";
@@ -290,6 +291,15 @@ describe("restartArgv (/restart relaunch argv)", () => {
 
 	it("omits --restore for a session that never materialized on disk", () => {
 		expect(restartArgv(["--no-session", "hello"], undefined)).toEqual(["--no-session"]);
+	});
+
+	it("relaunches a --single-request session under the guard again", () => {
+		// A guarded session is ephemeral, so the relaunch has no session to restore.
+		const relaunch = restartArgv(["--single-request", "--no-title", "say hi"], undefined);
+		expect(relaunch).toEqual(["--single-request", "--no-title"]);
+		const args = parseArgs(relaunch);
+		expect(args.singleRequest).toBe(true);
+		expect(() => validateSingleRequestLaunch(args)).not.toThrow();
 	});
 });
 describe("--restore", () => {
