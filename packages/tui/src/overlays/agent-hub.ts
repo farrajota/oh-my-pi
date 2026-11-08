@@ -15,7 +15,6 @@
  */
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type {
-	EffectivePermissionSummary,
 	TspPickerAction,
 	TspPickerColumn,
 	TspPickerItem,
@@ -82,6 +81,7 @@ import {
 	treeMetadataIndent,
 } from "./agent-hub-renderer";
 import { sanitizeDisplaySingleLine } from "./extensions/display-text";
+import { formatPermissionSummaryLines } from "./permission-summary";
 import { AgentTranscriptViewer, type AgentTranscriptSource } from "./agent-transcript-viewer";
 import type { AgentRoleDisplay } from "./agent-hub-renderer";
 import { fuzzyMatch } from "../fuzzy";
@@ -95,27 +95,6 @@ import { CLOSE_ACTION, picker, pickerQuery } from "../native/picker";
 import { Input } from "../components/input";
 
 /** A chrome-less search field: the hub draws its own prompt. */
-function boundedNames(list: { items: readonly string[]; omittedCount: number }, width: number): string {
-	const names = list.items.map(name => truncateToWidth(sanitizeDisplaySingleLine(name), width)).filter(Boolean);
-	const omitted = list.omittedCount > 0 ? ` (+${formatNumber(list.omittedCount)} omitted)` : "";
-	return `${names.join(", ")}${omitted}`;
-}
-
-/** The active permission scope of an agent, as inspector lines; none for an unscoped agent. */
-function permissionSummaryLines(summary: EffectivePermissionSummary | undefined): string[] {
-	if (!summary) return [];
-	const lines = [`Permissions: mode ${summary.mode}`];
-	if (summary.profiles.items.length > 0 || summary.profiles.omittedCount > 0) {
-		lines.push(`Profiles: ${boundedNames(summary.profiles, 40)}`);
-	}
-	const guardrails = [
-		...(summary.guardrails.noNetwork ? ["no network"] : []),
-		...(summary.guardrails.secretsBlind ? ["secrets blind"] : []),
-	];
-	if (guardrails.length > 0) lines.push(`Guardrails: ${guardrails.join(", ")}`);
-	return lines;
-}
-
 function filterInput(): Input {
 	const input = new Input();
 	input.prompt = "";
@@ -1440,7 +1419,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			facts.push({ k: "Current", v: value });
 		}
 		facts.push({ k: "Usage", v: metrics ? metricsText(metrics) : [span("usage —", "dim")] });
-		const permissionLines = permissionSummaryLines(ref.history?.permissionSummary);
+		const permissionLines = formatPermissionSummaryLines(ref.history?.permissionSummary);
 		if (permissionLines.length > 0) facts.push({ k: "Permissions", v: permissionLines.join(dot) });
 		facts.push({
 			k: "Lineage",
@@ -2145,7 +2124,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			add(theme.fg("dim", "usage —"));
 		}
 
-		const permissionLines = permissionSummaryLines(ref.history?.permissionSummary);
+		const permissionLines = formatPermissionSummaryLines(ref.history?.permissionSummary);
 		if (permissionLines.length > 0) {
 			section("Permissions", permissionLines.length);
 			for (const line of permissionLines) addWrapped(line, 3);
