@@ -39,6 +39,15 @@ class FakeClock {
 	now = NOW;
 	auto = true;
 	readonly #pending: { dueAt: number; resolve: () => void }[] = [];
+	readonly #onPending: (() => void)[] = [];
+
+	/** Resolves once some caller is sleeping in a pending (non-auto) wait. */
+	whenWaiting(): Promise<void> {
+		if (this.#pending.length > 0) return Promise.resolve();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#onPending.push(resolve);
+		return promise;
+	}
 
 	install(): void {
 		const perfBase = performance.now();
@@ -55,6 +64,7 @@ class FakeClock {
 			const { promise, resolve, reject } = Promise.withResolvers<undefined>();
 			const entry = { dueAt, resolve: () => resolve(undefined) };
 			this.#pending.push(entry);
+			for (const notify of this.#onPending.splice(0)) notify();
 			signal?.addEventListener(
 				"abort",
 				() => {
@@ -194,13 +204,35 @@ describe("AgentSession repeated retry (retry.repeated.*)", () => {
 		return starts.filter(event => event.repeated !== undefined);
 	}
 
-	async function waitForRepeatedStart(starts: RetryStart[], round = 1): Promise<RetryStart> {
-		for (let i = 0; i < 200; i++) {
-			const start = repeatedStarts(starts).find(event => event.repeated?.round === round);
-			if (start) return start;
-			await flush();
+	/**
+	 * Resolves once the round's `auto_retry_start` event fired and, with a manual clock, the session
+	 * sleeps in its wait. Both are awaited as signals: a bounded number of event-loop turns is not a
+	 * deadline, and under suite load the session's file I/O can outlast any fixed count.
+	 */
+	async function waitForRepeatedStart(
+		h: { session: AgentSession; starts: RetryStart[] },
+		round = 1,
+	): Promise<RetryStart> {
+		const start = await nextRepeatedStart(h, round);
+		if (!clock.auto) await clock.whenWaiting();
+		return start;
+	}
+
+	async function nextRepeatedStart(
+		h: { session: AgentSession; starts: RetryStart[] },
+		round: number,
+	): Promise<RetryStart> {
+		const seen = repeatedStarts(h.starts).find(event => event.repeated?.round === round);
+		if (seen) return seen;
+		const { promise, resolve } = Promise.withResolvers<RetryStart>();
+		const unsubscribe = h.session.subscribe(event => {
+			if (event.type === "auto_retry_start" && event.repeated?.round === round) resolve(event);
+		});
+		try {
+			return await promise;
+		} finally {
+			unsubscribe();
 		}
-		throw new Error(`No repeated retry round ${round}; starts: ${JSON.stringify(starts)}`);
 	}
 
 	it("keeps upstream exhaustion behavior when retry.repeated.enabled is off (the default)", async () => {
@@ -218,7 +250,7 @@ describe("AgentSession repeated retry (retry.repeated.*)", () => {
 		const h = await createHarness([failure(SESSION_LIMIT), success]);
 
 		const prompt = h.session.prompt("hit a session limit");
-		const start = await waitForRepeatedStart(h.starts);
+		const start = await waitForRepeatedStart(h);
 		expect(start.delayMs).toBe(TIMER_MS);
 		expect(start.repeated).toEqual({
 			round: 1,
@@ -355,7 +387,7 @@ describe("AgentSession repeated retry (retry.repeated.*)", () => {
 		const h = await createHarness([failure(SESSION_LIMIT), success]);
 
 		const prompt = h.session.prompt("cancel the wait");
-		await waitForRepeatedStart(h.starts);
+		await waitForRepeatedStart(h);
 		h.session.abortRetry();
 		await prompt;
 		await flush();
@@ -372,7 +404,7 @@ describe("AgentSession repeated retry (retry.repeated.*)", () => {
 		const h = await createHarness([failure(SESSION_LIMIT), { content: ["after input"], stopReason: "stop" }]);
 
 		const first = h.session.prompt("wait on the limit");
-		await waitForRepeatedStart(h.starts);
+		await waitForRepeatedStart(h);
 		const second = h.session.prompt("new direction", { streamingBehavior: "steer" });
 		// The wait is over; let the steered turn's own scheduling run.
 		clock.auto = true;
