@@ -59,6 +59,9 @@ export function toPathCandidate(value: string, cwd: string): PathCandidate {
  *
  * A pattern without `*` or `?` names a path: it covers that path and everything below it, the way
  * upstream's restricted folders do, so a directory entry `src` covers `src/**`.
+ *
+ * `src/**` does not match `src` itself (fork-era glob semantics, kept): under `allowPaths: ["src/**"]`
+ * a grep or find rooted at `src` is refused. Write `src` to cover the folder and its contents.
  */
 export function pathMatchesPattern(candidate: PathCandidate, pattern: string, cwd: string): boolean {
 	const normalizedPattern = pattern.replace(/\\/g, "/");

@@ -38,6 +38,9 @@ function compileOnlyReadonlyScopeFixture(scope: PermissionScope): void {
 }
 void compileOnlyReadonlyScopeFixture;
 
+const PATH_RULE_WARNING_TAIL =
+	"together with path rules; a subagent whose scope has path rules does not get tools whose effects reach beyond their path arguments (bash, eval, LSP, MCP, extension and custom tools, github, debug, ida, manage_skill)";
+
 const tempRoots: string[] = [];
 
 afterEach(async () => {
@@ -477,15 +480,17 @@ describe("user-level permission profiles", () => {
 			expect(evaluate(scope, "write", { path: "agent://Main" }, cwd).action).toBe("allow");
 			expect(evaluate(scope, "grep", { path: "src", pattern: "x" }, cwd).action).toBe("allow");
 		}
-		// P2: only the profile listing bash next to path rules warns.
+		// P2: every listed tool the path-rule exclusion removes is named; irc (messaging) and search are kept.
 		expect(loaded.warnings).toEqual([
-			'~/.omp/agent/permissions.json: permission profile "fixture-debug-runner" lists bash together with path rules; a subagent whose scope has path rules gets no bash, eval or MCP tools',
+			`~/.omp/agent/permissions.json: permission profile "fixture-reader" lists lsp ${PATH_RULE_WARNING_TAIL}`,
+			`~/.omp/agent/permissions.json: permission profile "fixture-editor" lists lsp ${PATH_RULE_WARNING_TAIL}`,
+			`~/.omp/agent/permissions.json: permission profile "fixture-debug-runner" lists lsp, bash ${PATH_RULE_WARNING_TAIL}`,
 		]);
 	});
 });
 
 describe("unprovable tools with path rules (P2)", () => {
-	test("loading a profile that lists bash, eval or an MCP tool with path rules warns once per profile", async () => {
+	test("loading a profile with path rules warns once, naming every listed tool the rule removes", async () => {
 		const cwd = await tempCwd();
 		await writeJson(path.join(cwd, ".omp", "permissions.json"), {
 			profiles: {
@@ -493,6 +498,12 @@ describe("unprovable tools with path rules (P2)", () => {
 				"eval-and-mcp-with-paths": { tools: ["read", "eval", "mcp__docs__search"], denyPaths: ["vault/**"] },
 				"shell-without-paths": { tools: ["read", "bash"] },
 				"lsp-with-paths": { tools: ["read", "lsp"], denyPaths: ["vault/**"] },
+				"native-effects-with-paths": {
+					tools: ["read", "github", "debug", "ida", "manage_skill", "edit"],
+					allowPaths: ["src"],
+				},
+				"extension-with-paths": { tools: ["grep", "custom_extension_tool", "vibe_spawn"], denyPaths: ["vault"] },
+				"messaging-with-paths": { tools: ["read", "search", "irc", "hub", "wait", "write"], denyPaths: ["vault"] },
 			},
 		});
 
@@ -500,11 +511,25 @@ describe("unprovable tools with path rules (P2)", () => {
 
 		expect(loaded.errors).toEqual([]);
 		expect(loaded.warnings).toEqual([
-			'.omp/permissions.json: permission profile "shell-with-paths" lists bash together with path rules; a subagent whose scope has path rules gets no bash, eval or MCP tools',
-			'.omp/permissions.json: permission profile "eval-and-mcp-with-paths" lists eval, mcp__docs__search together with path rules; a subagent whose scope has path rules gets no bash, eval or MCP tools',
+			`.omp/permissions.json: permission profile "shell-with-paths" lists bash ${PATH_RULE_WARNING_TAIL}`,
+			`.omp/permissions.json: permission profile "eval-and-mcp-with-paths" lists eval, mcp__docs__search ${PATH_RULE_WARNING_TAIL}`,
+			`.omp/permissions.json: permission profile "lsp-with-paths" lists lsp ${PATH_RULE_WARNING_TAIL}`,
+			`.omp/permissions.json: permission profile "native-effects-with-paths" lists github, debug, ida, manage_skill ${PATH_RULE_WARNING_TAIL}`,
+			`.omp/permissions.json: permission profile "extension-with-paths" lists custom_extension_tool, vibe_spawn ${PATH_RULE_WARNING_TAIL}`,
 		]);
 		// The profiles still load; the rule is applied when a scope is evaluated.
 		expect(loaded.profiles["shell-with-paths"]?.tools).toEqual(["read", "bash"]);
+	});
+
+	test("github, debug, ida, manage_skill, lsp and extension tools are denied under path rules while messaging stays", async () => {
+		const cwd = await tempCwd();
+		const tools = ["read", "lsp", "github", "debug", "ida", "manage_skill", "custom_extension_tool", "irc", "wait"];
+		const scope = enforceScope({ request: { tools, denyPaths: ["vault"] } });
+
+		for (const tool of ["lsp", "github", "debug", "ida", "manage_skill", "custom_extension_tool"]) {
+			expect(evaluate(scope, tool, {}, cwd).matched).toBe("guardrail:unprovable-effect");
+		}
+		for (const tool of ["read", "wait"]) expect(evaluate(scope, tool, {}, cwd).action).toBe("allow");
 	});
 
 	test("a scope with any path rule denies bash, eval and MCP even when listed", async () => {
@@ -597,6 +622,17 @@ describe("directory entries in path rules (P8)", () => {
 		// A sibling sharing the prefix is not below the directory.
 		expect(evaluate(scope, "read", { path: "src-other/a.ts" }, cwd).details?.code).toBe("path-not-allowed");
 		expect(evaluate(scope, "read", { path: "srcx" }, cwd).details?.code).toBe("path-not-allowed");
+	});
+
+	test("dir/** covers what is below dir but not dir itself; the plain entry covers both", async () => {
+		const cwd = await tempCwd();
+		const globbed = enforceScope({ request: { tools: ["grep"], allowPaths: ["src/**"] } });
+		const plain = enforceScope({ request: { tools: ["grep"], allowPaths: ["src"] } });
+
+		expect(evaluate(globbed, "grep", { path: "src/a.ts", pattern: "x" }, cwd).action).toBe("allow");
+		expect(evaluate(globbed, "grep", { path: "src", pattern: "x" }, cwd).details?.code).toBe("path-not-allowed");
+		expect(evaluate(plain, "grep", { path: "src", pattern: "x" }, cwd).action).toBe("allow");
+		expect(evaluate(plain, "grep", { path: "src/a.ts", pattern: "x" }, cwd).action).toBe("allow");
 	});
 
 	test("a glob entry keeps its own meaning and a directory deny entry covers its contents", async () => {

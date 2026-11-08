@@ -12,17 +12,25 @@ export type SubagentPermissionMode = "off" | "suggest" | "enforce";
 
 export const SUBAGENT_PERMISSION_MODES: readonly SubagentPermissionMode[] = ["off", "suggest", "enforce"];
 
-/** One named entry in a permissions.json `profiles` map. */
+/**
+ * One named entry in a permissions.json `profiles` map.
+ *
+ * Path entries: a glob (`*` any characters including `/`, `?` one character) matches as written, and
+ * `src/**` matches what is below `src` but not `src` itself. An entry without `*` or `?` names a path
+ * and covers it and everything below it, so `src` is the way to allow or deny a folder with its
+ * contents.
+ */
 export interface PermissionProfile {
 	description?: string;
 	useWhen?: string;
+	/** Tool allowlist. `irc`/`hub` grant messaging (`wait` and `write` to `agent://`); `search` is `grep`. */
 	tools?: string[];
 	denyTools?: string[];
 	allowPaths?: string[];
 	denyPaths?: string[];
 }
 
-/** The `permissions` field of a task item. */
+/** The `permissions` field of a task item; fields and path entries mean what they mean in a profile. */
 export interface TaskPermissionRequest {
 	profiles?: string[];
 	tools?: string[];

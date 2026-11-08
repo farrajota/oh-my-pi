@@ -1,35 +1,12 @@
-import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, isMCPToolName } from "../../tools/builtin-names";
 import { evaluatePermissionGuardrails, isSecretPath, secretsBlindDenial } from "./guardrails";
 import { hasPathRules, type PathCandidate, pathMatchesPattern, toPathCandidate } from "./path-rules";
-import { MESSAGING_GRANT, normalizePermissionToolName, permissionToolKey } from "./tool-names";
+import { isUnprovableEffectTool, MESSAGING_GRANT, normalizePermissionToolName, permissionToolKey } from "./tool-names";
 import type { PermissionDecision, PermissionDenialCode, PermissionScope } from "./types";
 
 const ALLOW: PermissionDecision = Object.freeze({ action: "allow", reason: "", matched: "" });
 
 /** Argument keys whose string values name filesystem targets. */
 const PATH_KEYS: ReadonlySet<string> = new Set(["path", "paths", "file", "file_path", "relative_path", "cwd", "dir"]);
-
-/** Tools that ship with the agent; anything else is an extension, custom, MCP or eval route. */
-const NATIVE_TOOL_KEYS: ReadonlySet<string> = new Set([
-	...BUILTIN_TOOL_NAMES,
-	...HIDDEN_TOOL_NAMES,
-	"report_tool_issue",
-]);
-
-/**
- * Native tools whose effects reach beyond the paths their arguments name: shells and interpreters,
- * debuggers that launch programs, LSP workspace edits, GitHub checkouts and pushes into the working
- * tree, and managed skill files.
- */
-const UNPROVABLE_NATIVE_TOOLS: ReadonlySet<string> = new Set([
-	"bash",
-	"eval",
-	"lsp",
-	"debug",
-	"ida",
-	"github",
-	"manage_skill",
-]);
 
 export interface PermissionCallInput {
 	readonly scope: PermissionScope | undefined;
@@ -47,12 +24,6 @@ export interface PermissionCallInput {
 /** Whether path rules or guardrails apply, so a tool's effects must be provable from its targets. */
 export function hasUnprovableEffects(scope: PermissionScope): boolean {
 	return hasPathRules(scope) || scope.guardrails.noNetwork || scope.guardrails.secretsBlind;
-}
-
-/** Whether a tool's effects cannot be checked against path rules (normalized name, any case). */
-export function isUnprovableEffectTool(toolName: string): boolean {
-	const key = permissionToolKey(toolName);
-	return UNPROVABLE_NATIVE_TOOLS.has(key) || isMCPToolName(key) || !NATIVE_TOOL_KEYS.has(key);
 }
 
 function deny(

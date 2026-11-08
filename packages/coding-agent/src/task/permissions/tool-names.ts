@@ -1,4 +1,4 @@
-import { normalizeToolNames } from "../../tools/builtin-names";
+import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, isMCPToolName, normalizeToolNames } from "../../tools/builtin-names";
 
 /**
  * Permission name of the messaging grant. Profile files spell it `irc` or `hub`; the fork-era hub
@@ -32,4 +32,36 @@ export function uniquePermissionTools(values: readonly string[]): string[] {
 		result.push(normalized);
 	}
 	return result;
+}
+
+/** Tools that ship with the agent; anything else is an extension, custom, MCP or eval route. */
+const NATIVE_TOOL_KEYS: ReadonlySet<string> = new Set([
+	...BUILTIN_TOOL_NAMES,
+	...HIDDEN_TOOL_NAMES,
+	"report_tool_issue",
+]);
+
+/**
+ * Native tools whose effects reach beyond the paths their arguments name: shells and interpreters,
+ * debuggers that launch programs, LSP workspace edits, GitHub checkouts and pushes into the working
+ * tree, and managed skill files.
+ */
+const UNPROVABLE_NATIVE_TOOLS: ReadonlySet<string> = new Set([
+	"bash",
+	"eval",
+	"lsp",
+	"debug",
+	"ida",
+	"github",
+	"manage_skill",
+]);
+
+/**
+ * Whether a tool's effects cannot be checked against path rules (normalized name, any case). A scope
+ * with path rules or guardrails denies these. The messaging grant is not a tool and never counts.
+ */
+export function isUnprovableEffectTool(toolName: string): boolean {
+	const key = permissionToolKey(toolName);
+	if (key === MESSAGING_GRANT) return false;
+	return UNPROVABLE_NATIVE_TOOLS.has(key) || isMCPToolName(key) || !NATIVE_TOOL_KEYS.has(key);
 }

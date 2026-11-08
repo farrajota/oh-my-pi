@@ -1,9 +1,8 @@
 import * as path from "node:path";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { getAgentDir, isEnoent, isRecord, normalizePathForComparison } from "@oh-my-pi/pi-utils";
-import { isMCPToolName } from "../../tools/builtin-names";
 import { canonicalPermissionValue, sha256Hex } from "./snapshot";
-import { permissionToolKey, uniquePermissionTools } from "./tool-names";
+import { isUnprovableEffectTool, uniquePermissionTools } from "./tool-names";
 import type {
 	PermissionProfile,
 	PermissionProfileIdentity,
@@ -223,13 +222,13 @@ function readProfile(value: Record<string, unknown>): PermissionProfile | undefi
 	return Object.keys(profile).length > 0 ? profile : undefined;
 }
 
-/** Tools a profile lists that a scope with path rules never gets: bash, eval and MCP tools. */
+/**
+ * Tools a profile lists that a scope with path rules never gets (see {@link isUnprovableEffectTool}).
+ * Named in a load warning, because the evaluator drops them without telling the user.
+ */
 function unprovableToolsWithPathRules(profile: PermissionProfile): string[] {
 	if ((profile.allowPaths?.length ?? 0) === 0 && (profile.denyPaths?.length ?? 0) === 0) return [];
-	return (profile.tools ?? []).filter(tool => {
-		const key = permissionToolKey(tool);
-		return key === "bash" || key === "eval" || isMCPToolName(key);
-	});
+	return (profile.tools ?? []).filter(isUnprovableEffectTool);
 }
 
 function summarizeProfile(
@@ -345,7 +344,7 @@ export async function loadPermissionProfiles(
 			const unprovable = unprovableToolsWithPathRules(profile);
 			if (unprovable.length > 0) {
 				warnings.push(
-					`${file.label}: permission profile "${name}" lists ${unprovable.join(", ")} together with path rules; a subagent whose scope has path rules gets no bash, eval or MCP tools`,
+					`${file.label}: permission profile "${name}" lists ${unprovable.join(", ")} together with path rules; a subagent whose scope has path rules does not get tools whose effects reach beyond their path arguments (bash, eval, LSP, MCP, extension and custom tools, github, debug, ida, manage_skill)`,
 				);
 			}
 		}
