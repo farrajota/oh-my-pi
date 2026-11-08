@@ -83,7 +83,7 @@ export function getChangelogPath(): string | undefined {
  */
 const USER_CONFIG_BASES = priorityList.map(({ dir, globalAgentDir }) => ({
 	base: () =>
-		dir === ".claude" ? resolveClaudePaths().configDir : path.join(os.homedir(), globalAgentDir?.() ?? dir),
+		dir === ".claude" ? resolveClaudePaths().configDir : path.resolve(os.homedir(), globalAgentDir?.() ?? dir),
 	name: dir,
 }));
 

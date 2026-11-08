@@ -188,6 +188,28 @@ test.each([undefined, ".pi"])(
 	},
 );
 
+test("an absolute PI_CONFIG_DIR named .omp keeps its parent out of native project discovery", async () => {
+	const operatorRoot = path.join(tempDir, "operator");
+	process.env.PI_CONFIG_DIR = path.join(operatorRoot, ".omp");
+	writeFile(path.join(operatorRoot, ".omp", "SYSTEM.md"), "operator system prompt\n");
+	writeFile(path.join(operatorRoot, ".omp", "RULES.md"), "operator rule\n");
+	writeFile(path.join(operatorRoot, ".omp", "AGENTS.md"), "operator agents\n");
+	const cwd = path.join(operatorRoot, "scratch", "work");
+	fs.mkdirSync(cwd, { recursive: true });
+	vi.spyOn(os, "homedir").mockReturnValue(home);
+	const ctx: LoadContext = { cwd, home, repoRoot: null };
+
+	const prompts = await loadNative<SystemPrompt>(systemPromptCapability.id, ctx);
+	const rules = await loadNative<Rule>(ruleCapability.id, ctx);
+	const contexts = await loadNative<ContextFile>(contextFileCapability.id, ctx);
+
+	expect({
+		prompts: prompts.map(prompt => prompt.path),
+		rules: rules.map(rule => rule.path),
+		contexts: contexts.map(context => context.path),
+	}).toEqual({ prompts: [], rules: [], contexts: [] });
+});
+
 test("an overridden discovery home does not make the process home a native project config root", async () => {
 	const cwd = path.join(home, "scratch", "work");
 	fs.mkdirSync(cwd, { recursive: true });

@@ -37,6 +37,13 @@ describe("PI_CONFIG_DIR", () => {
 		const expected = path.resolve(path.join(os.homedir(), ".config/omp", "agent", "commands"));
 		expect(result[0]).toEqual({ path: expected, source: ".omp", level: "user" });
 	});
+
+	test("getConfigDirs uses an absolute PI_CONFIG_DIR as-is for the user base", () => {
+		const absolute = path.join(os.tmpdir(), "omp-absolute-config-root");
+		process.env.PI_CONFIG_DIR = absolute;
+		const result = getConfigDirs("commands", { project: false });
+		expect(result[0]).toEqual({ path: path.join(absolute, "agent", "commands"), source: ".omp", level: "user" });
+	});
 });
 
 describe("CLAUDE_CONFIG_DIR", () => {

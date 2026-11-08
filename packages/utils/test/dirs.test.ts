@@ -4,14 +4,20 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as nativePath from "@oh-my-pi/pi-natives/path";
 import {
+	__resetDirsFromEnvForTests,
 	__resetProjectDirCacheForTests,
 	directoryIsMissing,
+	getAgentDir,
+	getConfigRootDir,
 	getLogPath,
+	getPluginsDir,
+	getProfileRootDir,
 	getProjectDir,
 	localDay,
 	relativePathWithinRoot,
 	setProjectDir,
 } from "@oh-my-pi/pi-utils/dirs";
+import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
 
 const originalProjectDir = fs.realpathSync(process.cwd()).replace(/^\/private(?=\/)/, "");
 
@@ -109,5 +115,55 @@ describe("dated log path", () => {
 		if (proc.exitCode === 2) return; // TZ not honored on this platform
 		if (proc.exitCode !== 0) console.error(proc.stderr.toString());
 		expect(proc.exitCode).toBe(0);
+	});
+});
+
+describe("absolute PI_CONFIG_DIR", () => {
+	const ENV_KEYS = [
+		"OMP_PROFILE",
+		"PI_PROFILE",
+		"PI_CONFIG_DIR",
+		"PI_CODING_AGENT_DIR",
+		"XDG_DATA_HOME",
+		"XDG_STATE_HOME",
+		"XDG_CACHE_HOME",
+	] as const;
+	let originalEnv: Partial<Record<(typeof ENV_KEYS)[number], string>> = {};
+	let configDir = "";
+
+	function useAbsoluteConfigDir(agentDirOverride?: string): void {
+		originalEnv = {};
+		for (const key of ENV_KEYS) {
+			originalEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		configDir = path.join(os.tmpdir(), "pi-utils-abs-config", Snowflake.next(), ".omp-amgr");
+		process.env.PI_CONFIG_DIR = configDir;
+		if (agentDirOverride) process.env.PI_CODING_AGENT_DIR = agentDirOverride;
+		__resetDirsFromEnvForTests();
+	}
+
+	afterEach(() => {
+		for (const key of ENV_KEYS) {
+			const value = originalEnv[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		__resetDirsFromEnvForTests();
+	});
+
+	it("uses the absolute path as the config root instead of nesting it under home", () => {
+		useAbsoluteConfigDir();
+		expect(getConfigRootDir()).toBe(configDir);
+		expect(getAgentDir()).toBe(path.join(configDir, "agent"));
+		expect(getProfileRootDir("work")).toBe(path.join(configDir, "profiles", "work"));
+		expect(getPluginsDir(path.join(os.tmpdir(), "some-other-home"))).toBe(path.join(configDir, "plugins"));
+	});
+
+	it("lets PI_CODING_AGENT_DIR override the agent dir under an absolute config root", () => {
+		const agentOverride = path.join(os.tmpdir(), "pi-utils-abs-config", Snowflake.next(), "custom-agent");
+		useAbsoluteConfigDir(agentOverride);
+		expect(getConfigRootDir()).toBe(configDir);
+		expect(getAgentDir()).toBe(agentOverride);
 	});
 });

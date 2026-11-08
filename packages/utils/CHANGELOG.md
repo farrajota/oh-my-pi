@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An absolute `PI_CONFIG_DIR` (for example `/home/node/.omp-amgr`) is used as the config root as-is instead of being nested under the home directory
+
 ## [18.18.0] - 2026-11-07
 
 ### Fixed

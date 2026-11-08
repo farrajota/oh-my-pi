@@ -1047,11 +1047,20 @@ export function getProjectDiscoveryCeilings(): ReadonlySet<string> {
 	return ceilings;
 }
 
+/**
+ * The config dir name projects use. An absolute PI_CONFIG_DIR only relocates the user
+ * config root, so projects keep the default name instead of joining the absolute path.
+ */
+function getProjectConfigDirName(): string {
+	const configDirName = getConfigDirName();
+	return path.isAbsolute(configDirName) ? CONFIG_DIR_NAME : configDirName;
+}
+
 /** The current user's config roots are never project anchors. */
 export function isUserConfigRoot(root: string): boolean {
-	const configDir = normalizePathForComparison(path.join(root, getConfigDirName()));
+	const configDir = normalizePathForComparison(path.join(root, getProjectConfigDirName()));
 	return (
-		configDir === normalizePathForComparison(path.join(os.homedir(), getConfigDirName())) ||
+		configDir === normalizePathForComparison(path.resolve(os.homedir(), getConfigDirName())) ||
 		configDir === normalizePathForComparison(path.dirname(getPluginsDir()))
 	);
 }
@@ -1112,7 +1121,7 @@ async function resolveProjectRegistryPath(cwd: string, ceilings: ReadonlySet<str
 	}
 
 	// Existing .omp/ directories still win, even above the git root, except foreign user roots.
-	const configDirName = getConfigDirName();
+	const configDirName = getProjectConfigDirName();
 	let aboveGitRoot = nearestGitRoot === null;
 	dir = path.resolve(cwd);
 	while (!ceilings.has(normalizePathForComparison(dir))) {
@@ -1134,7 +1143,7 @@ async function resolveProjectRegistryPath(cwd: string, ceilings: ReadonlySet<str
 		dir = parent;
 	}
 
-	return gitAnchor ? path.join(gitAnchor, getConfigDirName(), "plugins", "installed_plugins.json") : null;
+	return gitAnchor ? path.join(gitAnchor, getProjectConfigDirName(), "plugins", "installed_plugins.json") : null;
 }
 
 /**
@@ -1156,10 +1165,10 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 	if (
 		ceilings.has(normalizePathForComparison(cwd)) ||
 		isUserConfigRoot(cwd) ||
-		(await isForeignUserConfigRoot(cwd, getConfigDirName()))
+		(await isForeignUserConfigRoot(cwd, getProjectConfigDirName()))
 	)
 		return undefined;
-	return path.join(cwd, getConfigDirName(), "plugins", "installed_plugins.json");
+	return path.join(cwd, getProjectConfigDirName(), "plugins", "installed_plugins.json");
 }
 
 async function canonicalClaudeProjectPath(projectPath: string): Promise<string | null> {

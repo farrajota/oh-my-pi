@@ -235,6 +235,29 @@ describe("resolveActiveProjectRegistryPath", () => {
 		);
 	});
 
+	it("resolves project .omp/ registries by name when PI_CONFIG_DIR is an absolute path", async () => {
+		const originalConfigDir = process.env.PI_CONFIG_DIR;
+		process.env.PI_CONFIG_DIR = path.join(tmpDir, "operator", ".omp-amgr");
+		try {
+			const project = path.join(tmpDir, "project");
+			const cwd = path.join(project, "sub");
+			fs.mkdirSync(path.join(project, ".omp"), { recursive: true });
+			fs.mkdirSync(cwd, { recursive: true });
+			const fresh = path.join(tmpDir, "fresh");
+			fs.mkdirSync(fresh, { recursive: true });
+
+			expect(await resolveActiveProjectRegistryPath(cwd)).toBe(
+				path.join(project, ".omp", "plugins", "installed_plugins.json"),
+			);
+			expect(await resolveOrDefaultProjectRegistryPath(fresh)).toBe(
+				path.join(fresh, ".omp", "plugins", "installed_plugins.json"),
+			);
+		} finally {
+			if (originalConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
+			else process.env.PI_CONFIG_DIR = originalConfigDir;
+		}
+	});
+
 	it("returns null when neither .omp/ nor .git/ found anywhere in the tree", async () => {
 		// Start at the filesystem root — guaranteed to have no .omp/ or .git/ ancestors.
 		const result = await resolveActiveProjectRegistryPath(path.sep);
