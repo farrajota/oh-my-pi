@@ -43,7 +43,7 @@ import {
 import { canReuseCachedPr, createPrCacheContext, isSamePrCacheContext, type PrCacheContext } from "./git-utils";
 import { summarizeUsageResetCredits } from "../overlays/usage-display";
 import { getPreset } from "./presets";
-import { describeSegment, renderSegment, type SegmentContext } from "./segments";
+import { describeSegment, formatCompactionFillPrefix, renderSegment, type SegmentContext } from "./segments";
 import { promptCacheBrief } from "./prompt-cache";
 import type { TspMeterMark, TspProps } from "@oh-my-pi/pi-wire";
 import type { NativeNode, NativeUiEvent } from "../native/node";
@@ -625,10 +625,18 @@ function formatEmbeddedContextPercent(percent: number): string {
 	return `${percent > 0 && percent < 1 ? percent.toFixed(1) : Math.round(percent)}%`;
 }
 
+/**
+ * The embedded gauge's percent label: the compaction fill prefix (see
+ * {@link formatCompactionFillPrefix}) and the context percent.
+ */
+function embeddedContextPercentLabel(ctx: SegmentContext, percent: number): string {
+	return `${formatCompactionFillPrefix(ctx)}${formatEmbeddedContextPercent(percent)}`;
+}
+
 /** Gap width the embedded gauge needs for its labels; an unknown percent (`null`) shows the window label alone. */
-function embeddedContextGaugeMinWidth(percent: number | null, contextWindow: number): number {
-	const percentWidth = percent === null ? 0 : formatEmbeddedContextPercent(percent).length + 2;
-	return percentWidth + formatNumber(contextWindow).length + 2;
+function embeddedContextGaugeMinWidth(ctx: SegmentContext, percent: number | null): number {
+	const percentWidth = percent === null ? 0 : embeddedContextPercentLabel(ctx, percent).length + 2;
+	return percentWidth + formatNumber(ctx.contextWindow).length + 2;
 }
 
 function hasGitSegment(segments: readonly StatusLineSegmentId[]): boolean {
@@ -2756,6 +2764,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			contextTokens,
 			contextWindow,
 			autoCompactEnabled: this.#autoCompactEnabled,
+			compactionThresholdPercent:
+				this.#autoCompactEnabled && contextWindow > 0
+					? (this.#compactionBoundaries(contextWindow)?.thresholdPercent ?? null)
+					: null,
 			compactionSpeculation,
 			speculationBlinkOn: this.#speculationBlinkOn,
 			subagentCount: this.#subagentCount,
@@ -3263,9 +3275,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		// handling, so the gauge must reserve enough room for both labels. Without
 		// this budget a long path/session title can leave a one-cell gap: the
 		// context segment is gone, and the gauge silently omits its labels too.
-		const embeddedContextWidth = embedContext
-			? embeddedContextGaugeMinWidth(ctx.contextPercent, ctx.contextWindow)
-			: 0;
+		const embeddedContextWidth = embedContext ? embeddedContextGaugeMinWidth(ctx, ctx.contextPercent) : 0;
 		const minimumGapWidth = (): number => {
 			const hasLeft = left.length > 0;
 			const hasRight = right.length > 0;
@@ -3493,9 +3503,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		// past the window label — `──200K─120%` with the percent in error color.
 		const percentOverflow = pct !== null && pct > 100;
 		if (embedContext) {
-			const candidatePercent = pct === null ? "" : formatEmbeddedContextPercent(percentOverflow ? pct : clampedPct);
+			const candidatePercent =
+				pct === null ? "" : embeddedContextPercentLabel(ctx, percentOverflow ? pct : clampedPct);
 			const candidateWindow = formatNumber(ctx.contextWindow);
-			if (gapWidth >= embeddedContextGaugeMinWidth(pct, ctx.contextWindow)) {
+			if (gapWidth >= embeddedContextGaugeMinWidth(ctx, pct)) {
 				percentLabel = candidatePercent;
 				windowLabel = candidateWindow;
 				if (percentOverflow) {
@@ -3550,6 +3561,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 					break;
 				}
 			}
+			// With the compaction fill prefix the label can be too long for any
+			// marker-free slot on a narrow gauge; it then covers the markers, which
+			// it outranks, instead of disappearing.
+			if (percentStart < 0 && maxStart >= 1) percentStart = preferredStart;
 		}
 
 		const speculationGlyph = theme.symbol("context.speculation");

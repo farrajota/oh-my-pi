@@ -923,6 +923,8 @@ The `path` segment abbreviates the home directory to `~`. On Windows, shared pat
 
 The `omp_version` segment shows the installed omp version. The `docker_container` segment shows the container the session runs in: `DOCKER_CONTAINER_NAME` when set, otherwise `HOSTNAME`, otherwise the machine hostname. No preset includes them; add them to a custom layout.
 
+With auto-compaction on, the `context_pct` segment and the embedded gauge label start with `[N%]/`: usage as a share of the auto-compaction threshold, capped at 100% (for example `[50%]/30.0%/200K` when compaction fires at 60%).
+
 The `pi` segment tags the brand with the active named profile (`π-work`; see [Profiles](config-usage.md#profiles)). Set `statusLine.segmentOptions.pi.showProfile: false` to hide the tag.
 
 The `cost` segment shows recorded session costs. For an active provider/model with scheduled pricing, it appends `↑` during peak hours or `↓` off-peak, refreshing at boundaries even while idle. The arrow reflects the current tariff, not past spending; flat-price models and explicit cost overrides have no arrow. See [usage costs and time-based pricing](models.md#usage-costs-and-time-based-pricing) for the UTC schedule and estimation semantics.

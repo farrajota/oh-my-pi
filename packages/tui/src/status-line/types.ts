@@ -150,6 +150,8 @@ export interface SegmentContext {
 	contextTokens: number;
 	contextWindow: number;
 	autoCompactEnabled: boolean;
+	/** Context percent at which auto-compaction fires; null or absent when it cannot fire or is unknown. */
+	compactionThresholdPercent?: number | null;
 	/** Background speculative-compaction state (async compaction). */
 	compactionSpeculation: "idle" | "running" | "armed";
 	/** Blink phase for the running-speculation pulse; toggled by the component's timer. */

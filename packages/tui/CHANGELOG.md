@@ -4,6 +4,7 @@
 
 ### Added
 
+- With auto-compaction on, the `context_pct` segment and the embedded context gauge's label start with `[N%]/`, how far usage has come toward the auto-compaction threshold (capped at 100%), so approaching compaction is visible on bars without gauge markers
 - Status-line segments `omp_version` (the installed omp version) and `docker_container` (`DOCKER_CONTAINER_NAME`, else `HOSTNAME`, else the machine hostname) for custom status-line layouts
 - Grep headers syntax-highlight regex patterns, including incomplete patterns while a call streams, in terminal and native views ([#18392](https://github.com/can1357/oh-my-pi/pull/18392) by [@JustasMasiulis](https://github.com/JustasMasiulis)).
 

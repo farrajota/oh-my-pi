@@ -43,6 +43,23 @@ function withIcon(icon: string, text: string): string {
 	return icon ? `${icon} ${text}` : text;
 }
 
+/**
+ * `[N%]/`: how far context usage has come toward the auto-compaction threshold,
+ * capped at 100%. The gauge's threshold marker shows the same thing, but the
+ * embedded gauge hides its markers on narrow bars and the plain bars have none.
+ * Empty when auto-compaction is off, usage or the threshold is unknown, or usage
+ * is past the window (the overflow label already says more).
+ */
+export function formatCompactionFillPrefix(
+	ctx: Pick<SegmentContext, "autoCompactEnabled" | "contextPercent" | "compactionThresholdPercent">,
+): string {
+	const pct = ctx.contextPercent;
+	const threshold = ctx.compactionThresholdPercent;
+	if (!ctx.autoCompactEnabled || pct === null || pct > 100) return "";
+	if (threshold === null || threshold === undefined || threshold <= 0) return "";
+	return `[${Math.min(100, Math.max(0, Math.round((100 * pct) / threshold)))}%]/`;
+}
+
 /** Native segment description helper. */
 function segView(spans: readonly TspSpan[], icon?: string, tone?: TspTone): SegmentView {
 	return tone === undefined ? (icon === undefined ? { spans } : { spans, icon }) : { spans, icon, tone };
@@ -868,7 +885,9 @@ const contextPctSegment: StatusLineSegment = {
 		// A known window with unknown usage (startup prepaint) shows the window alone.
 		const text = theme.fg(
 			color,
-			pct === null && window > 0 ? formatNumber(window) : formatContextUsage(pct, window, ctx.contextTokens),
+			pct === null && window > 0
+				? formatNumber(window)
+				: `${formatCompactionFillPrefix(ctx)}${formatContextUsage(pct, window, ctx.contextTokens)}`,
 		);
 		const content = withIcon(theme.icon.context, `${text}${autoIcon}`);
 
@@ -881,7 +900,9 @@ const contextPctSegment: StatusLineSegment = {
 		const color = getContextUsageThemeColor(level);
 		const spans: TspSpan[] = [
 			span(
-				pct === null && window > 0 ? formatNumber(window) : formatContextUsage(pct, window, ctx.contextTokens),
+				pct === null && window > 0
+					? formatNumber(window)
+					: `${formatCompactionFillPrefix(ctx)}${formatContextUsage(pct, window, ctx.contextTokens)}`,
 				color,
 			),
 		];
