@@ -251,6 +251,12 @@ export interface AgentOptions {
 	maxRetryDelayMs?: number;
 
 	/**
+	 * Total outbound attempts per provider request for the OpenAI-family
+	 * transports, the first one included. `undefined` keeps the provider default.
+	 */
+	providerMaxAttempts?: number;
+
+	/**
 	 * Provides tool execution context, resolved per tool call.
 	 * Use for late-bound UI or session state access.
 	 */
@@ -474,6 +480,7 @@ export class Agent {
 	#serviceTierResolver?: (model: Model) => ServiceTier | undefined;
 	#hideThinkingSummary?: boolean;
 	#maxRetryDelayMs?: number;
+	#providerMaxAttempts?: number;
 	#getToolContext?: (toolCall?: ToolCallContext) => AgentToolContext | undefined;
 	#cursorExecHandlers?: CursorExecHandlers;
 	#getCursorTools?: () => AgentTool[];
@@ -595,6 +602,7 @@ export class Agent {
 		this.#serviceTierResolver = opts.serviceTierResolver;
 		this.#hideThinkingSummary = opts.hideThinkingSummary;
 		this.#maxRetryDelayMs = opts.maxRetryDelayMs;
+		this.#providerMaxAttempts = opts.providerMaxAttempts;
 		this.getApiKey = opts.getApiKey;
 		this.#onPayload = opts.onPayload;
 		this.#onResponse = opts.onResponse;
@@ -902,6 +910,15 @@ export class Agent {
 	 */
 	set maxRetryDelayMs(value: number | undefined) {
 		this.#maxRetryDelayMs = value;
+	}
+
+	/** Provider attempt cap for the next requests; `undefined` keeps the provider default. */
+	get providerMaxAttempts(): number | undefined {
+		return this.#providerMaxAttempts;
+	}
+
+	set providerMaxAttempts(value: number | undefined) {
+		this.#providerMaxAttempts = value;
 	}
 	get state(): AgentState {
 		return this.#state;
@@ -2021,6 +2038,7 @@ export class Agent {
 			providerSessionState: this.#providerSessionState,
 			thinkingBudgets: this.#thinkingBudgets,
 			maxRetryDelayMs: this.#maxRetryDelayMs,
+			providerMaxAttempts: this.#providerMaxAttempts,
 			kimiApiFormat: this.#kimiApiFormat,
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,
