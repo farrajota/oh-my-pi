@@ -76,6 +76,7 @@ export class CrossThreadSessionReadError extends Error {
 /** Receiver-side `ReadonlySessionManager` built from a {@link WireSessionView}; see the module doc. */
 export class ToolContextSessionView implements ReadonlySessionManager {
 	readonly #wire: WireSessionView;
+	readonly #allocatedArtifactIds = new Set<string>();
 
 	constructor(wire: WireSessionView) {
 		this.#wire = wire;
@@ -121,12 +122,21 @@ export class ToolContextSessionView implements ReadonlySessionManager {
 		return this.#wire.ensureOnDisk();
 	}
 
-	allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
-		return this.#wire.allocateArtifactPath(toolType);
+	async allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
+		const allocated = await this.#wire.allocateArtifactPath(toolType);
+		if (allocated.id !== undefined) this.#allocatedArtifactIds.add(allocated.id);
+		return allocated;
 	}
 
-	saveArtifact(content: string, toolType: string): Promise<string | undefined> {
-		return this.#wire.saveArtifact(content, toolType);
+	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
+		const id = await this.#wire.saveArtifact(content, toolType);
+		if (id !== undefined) this.#allocatedArtifactIds.add(id);
+		return id;
+	}
+
+	/** Whether this session allocated artifact `id`; see {@link SessionManager.allocatedArtifact}. */
+	allocatedArtifact(id: string): boolean {
+		return this.#allocatedArtifactIds.has(id);
 	}
 
 	getArtifactPath(id: string): Promise<string | null> {

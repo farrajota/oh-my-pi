@@ -9,6 +9,8 @@
  * messages are internal URLs, never filesystem targets, so they are not protected paths.
  */
 import * as path from "node:path";
+import { getSessionsDir } from "@oh-my-pi/pi-utils";
+import { artifactsDirsFromRegistry } from "../../internal-urls/registry-helpers";
 import { approvalCacheKeyForPath } from "../../tools/approval-cache";
 
 /** `permissions.json`, `permissions.local.json`, and any other `permissions*.json` in a `.omp` folder. */
@@ -48,6 +50,26 @@ export function protectedPathRefusal(targets: readonly string[], agentDir: strin
 		if (inAgentDir || profileFile) {
 			return `BLOCKED: Subagent permission scope denied a write to protected path '${target}': the agent directory and permission profile files are not writable under a restricted scope.`;
 		}
+	}
+	return undefined;
+}
+
+/**
+ * Secrets-blind: why reading `targets` (absolute paths) by host path is refused, or `undefined`. The
+ * sessions dir and every live session's artifacts dir hold each agent's transcript and raw tool output,
+ * which may carry what the child may not see; its own and its descendants' records stay readable
+ * through `history://`, `agent://` and `artifact://`, which apply the subtree rule. The `local://`
+ * scratch root inside an artifacts dir is not a record: it is shared scratch space under P7.
+ */
+export function agentRecordReadRefusal(targets: readonly string[], agentDir: string): string | undefined {
+	const variants = (directory: string) => [path.resolve(directory), approvalCacheKeyForPath(path.resolve(directory))];
+	const artifactDirs = artifactsDirsFromRegistry();
+	const recordDirs = [getSessionsDir(agentDir), ...artifactDirs].flatMap(variants);
+	const scratchDirs = artifactDirs.flatMap(directory => variants(path.join(directory, "local")));
+	for (const target of targets) {
+		if (!path.isAbsolute(target) || !recordDirs.some(directory => isWithin(target, directory))) continue;
+		if (scratchDirs.some(directory => isWithin(target, directory))) continue;
+		return `BLOCKED: secrets-blind guardrail denied reading agent records at '${target}': read your own transcript and output through history://, agent:// and artifact://.`;
 	}
 	return undefined;
 }

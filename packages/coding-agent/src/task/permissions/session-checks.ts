@@ -5,9 +5,12 @@
  */
 import * as path from "node:path";
 import type { Settings } from "../../config/settings";
+import type { ResolveContext } from "../../internal-urls/types";
+import { AgentRegistry } from "../../registry/agent-registry";
 import { approvalCacheKeyForPath } from "../../tools/approval-cache";
 import { evaluateInternalUrlFile, evaluatePermissionPath } from "./evaluate";
 import { activePermissionScope, permissionApprovalGuard, unreadableScopeReason } from "./guard";
+import { agentRecordReadRefusal } from "./protected-paths";
 import { hasPathRules } from "./path-rules";
 
 /** An entry a search reports as an internal URL (`local://notes.md`) rather than a host path. */
@@ -76,9 +79,37 @@ export function permissionFileRefusal(
 	const named = evaluatePermissionPath({ scope, toolName, path: file, cwd });
 	if (named.action === "deny") return named.reason;
 	const real = approvalCacheKeyForPath(file);
+	if (scope.guardrails.secretsBlind) {
+		const records = agentRecordReadRefusal([file, real], settings.getAgentDir());
+		if (records !== undefined) return records;
+	}
 	if (real === file) return undefined;
 	const resolved = evaluatePermissionPath({ scope, toolName, path: real, cwd: approvalCacheKeyForPath(cwd) });
 	return resolved.action === "deny" ? resolved.reason : undefined;
+}
+
+/**
+ * Why the scope in `context` refuses reading `artifact://<id>`, or `undefined`. Artifact ids are
+ * shared across the agent tree and resolve against every live session's artifacts, so under
+ * secrets-blind (P7, as for `agent://` and `history://`) a child reads only artifacts its own session
+ * allocated, or a session of its descendants (`<actorId>.<child>`) did.
+ */
+export function artifactRecordRefusal(context: ResolveContext | undefined, id: string): string | undefined {
+	const settings = context?.settings;
+	if (!settings) return undefined;
+	const active = activePermissionScope(settings);
+	if (active === undefined) return undefined;
+	if (!active.ok) return unreadableScopeReason(active.error);
+	const { scope } = active;
+	if (scope.mode !== "enforce" || !scope.guardrails.secretsBlind) return undefined;
+	if (context?.session?.sessionManager?.allocatedArtifact?.(id) === true) return undefined;
+	const registry = context?.agentRegistry ?? AgentRegistry.global();
+	const descendant = `${scope.actorId}.`;
+	for (const ref of registry.list()) {
+		if (ref.id.startsWith(descendant) && ref.session?.sessionManager.allocatedArtifact?.(id) === true)
+			return undefined;
+	}
+	return `BLOCKED: secrets-blind guardrail denied another agent's artifact 'artifact://${id}'.`;
 }
 
 /**

@@ -12,7 +12,7 @@ import { approvalCacheKeyForPath } from "../../tools/approval-cache";
 import { approvalTargetKey, approvalTreeSearchFolderKey } from "../../tools/approval-targets";
 import { evaluatePermissionPath, evaluateSubagentPermission } from "./evaluate";
 import { expandListTargets, hasPathRules, permissionPathArguments, toPathCandidate } from "./path-rules";
-import { protectedPathRefusal } from "./protected-paths";
+import { agentRecordReadRefusal, protectedPathRefusal } from "./protected-paths";
 import { cfgTaskPermissionsActiveScope } from "./settings";
 import { decodePermissionScope } from "./snapshot";
 import type { DeepImmutable, PermissionScope } from "./types";
@@ -89,6 +89,11 @@ function scopeGuard(scope: DeepImmutable<PermissionScope>, cwd: string, agentDir
 				// Named targets too: a symlink's own path is protected even when it resolves elsewhere.
 				const targets = [...namedTargets(toolInput, cwd), ...canonicalTargets(tool, args, toolInput, cwd)];
 				const reason = protectedPathRefusal(targets, agentDir, cwd);
+				if (reason !== undefined) return { reason };
+			}
+			if (scope.guardrails.secretsBlind) {
+				const targets = [...namedTargets(toolInput, cwd), ...canonicalTargets(tool, args, toolInput, cwd)];
+				const reason = agentRecordReadRefusal(targets, agentDir);
 				if (reason !== undefined) return { reason };
 			}
 			if (!checksTargets) return undefined;

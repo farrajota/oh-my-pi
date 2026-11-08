@@ -1043,6 +1043,8 @@ export class SessionManager {
 	#adoptedArtifactManager: ArtifactManagerApi | null = null;
 	#inMemoryArtifacts: Map<string, string> | null = null;
 	#inMemoryArtifactCounter = 0;
+	/** Ids this session allocated through {@link allocateArtifactPath} and {@link saveArtifact}. */
+	readonly #allocatedArtifactIds = new Set<string>();
 
 	#suppressBreadcrumb = false;
 	/**
@@ -3323,19 +3325,34 @@ export class SessionManager {
 
 	async allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
 		if (this.#released) return {};
-		return (await this.#artifactManagerForSession()?.allocatePath(toolType)) ?? {};
+		const allocated = await this.#artifactManagerForSession()?.allocatePath(toolType);
+		if (!allocated) return {};
+		this.#allocatedArtifactIds.add(allocated.id);
+		return allocated;
 	}
 
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
 		if (this.#released) return undefined;
 		const manager = this.#artifactManagerForSession();
-		if (manager) return manager.save(content, toolType);
+		if (manager) {
+			const id = await manager.save(content, toolType);
+			this.#allocatedArtifactIds.add(id);
+			return id;
+		}
 
 		// Non-persistent session: keep an in-memory copy so spill truncation works.
 		this.#inMemoryArtifacts ??= new Map();
 		const id = String(this.#inMemoryArtifactCounter++);
 		this.#inMemoryArtifacts.set(id, content);
 		return id;
+	}
+
+	/**
+	 * Whether this session allocated artifact `id` in the artifacts dir it writes. A subagent shares its
+	 * parent's dir and id space, so an id alone does not say whose output it is.
+	 */
+	allocatedArtifact(id: string): boolean {
+		return this.#allocatedArtifactIds.has(id);
 	}
 
 	async getArtifactPath(id: string): Promise<string | null> {

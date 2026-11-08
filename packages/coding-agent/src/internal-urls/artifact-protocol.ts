@@ -13,7 +13,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import artifactDoc from "../prompts/internal-urls/artifact.md" with { type: "text" };
+import { artifactRecordRefusal } from "../task/permissions/session-checks";
 import { artifactsDirsFromRegistry } from "./registry-helpers";
 import type {
 	InternalResource,
@@ -95,6 +97,12 @@ function callerInMemoryArtifact(id: string, context?: ResolveContext): string | 
 	if (context?.localProtocolOptions?.getArtifactsDir?.()) return null;
 	if (context?.session?.seanceSourceArtifactsDir) return null;
 	return context?.session?.sessionManager?.getArtifactContent?.(id) ?? null;
+}
+
+/** Refuse an artifact the caller's permission scope keeps from it (another agent's, under secrets-blind). */
+function assertArtifactPermitted(url: InternalUrl, context: ResolveContext | undefined): void {
+	const refusal = artifactRecordRefusal(context, parseArtifactId(url));
+	if (refusal !== undefined) throw new ToolError(refusal);
 }
 
 /** Resolve an `artifact://` URL to its backing file without reading artifact bytes. */
@@ -179,6 +187,7 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 	async locate(url: InternalUrl, context?: ResolveContext): Promise<string | null> {
 		// No backing file: the read tool falls through to `resolve` and applies selectors in memory.
 		if (callerInMemoryArtifact(parseArtifactId(url), context) !== null) return null;
+		assertArtifactPermitted(url, context);
 		try {
 			return (await resolveArtifactFile(url, context)).path;
 		} catch (error) {
@@ -202,6 +211,7 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 				size: Buffer.byteLength(inMemory, "utf8"),
 			};
 		}
+		assertArtifactPermitted(url, context);
 		const artifact = await resolveArtifactFile(url, context);
 
 		// Path consumers (search, the shell filesystem) use `locate`, which never
