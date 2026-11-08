@@ -15,6 +15,7 @@
 
 ### Added
 
+- Added `task.generateLabels` (default on); turning it off stops subagent tasks without a description from sending the small-model label request
 - Added `promptSuggestions.enabled`, `promptSuggestions.model` and `promptSuggestions.fallbackModel` settings (Interaction > Input), exported from the package entry as `cfgPromptSuggestions*` handles for external prompt-suggestions extensions
 - Added opt-in `--single-request` CLI launches with an ephemeral zero-tool session, configured-model verification, and a fail-closed one-dispatch/one-fetch transport budget that also caps every provider retry, fallback and replay at one request
 - RPC `bash` accepts `excludeFromContext: true` to keep a run out of model context like terminal `!!`; runtimes advertise support with `supportsBashExcludeFromContext` in the `ready` frame, and the Python SDK exposes that frame as `client.ready` ([#18206](https://github.com/can1357/oh-my-pi/pull/18206) by [@andrebrait](https://github.com/andrebrait))

@@ -523,6 +523,19 @@ export const cfgTaskCompletionProbe = register({
 	},
 });
 
+export const cfgTaskGenerateLabels = register({
+	id: "task.generateLabels",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Generate Task Labels",
+		description:
+			"Generate a short label for a subagent task with a small model when the caller gives no description. Off sends no label request, so every model request a task makes is one the caller asked for.",
+	},
+});
+
 export const cfgTaskAgentIdleTtlMs = register({
 	id: "task.agentIdleTtlMs",
 	type: "number",
