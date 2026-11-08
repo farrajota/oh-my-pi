@@ -1,3 +1,46 @@
+import {
+	AgentTranscriptViewer,
+	type AgentTranscriptViewerDeps,
+} from "@oh-my-pi/pi-tui/overlays/agent-transcript-viewer";
+import type { AgentRef } from "../../registry/agent-registry";
+import { agentTranscriptSource } from "../agent-hub-runtime";
+
+/** Inputs of {@link createReadOnlyAgentTranscriptViewer}: the viewer's deps minus everything that acts. */
+export type ReadOnlyAgentTranscriptViewerDeps = Omit<
+	AgentTranscriptViewerDeps,
+	"registry" | "remote" | "lifecycle" | "transcript"
+> & {
+	registry: { get(id: string): AgentRef | undefined };
+};
+
+/**
+ * A transcript viewer for one local agent that can only read: no messaging, revive or kill, and
+ * no collab remote. It stays on the agent generation registered when it opens; a later agent
+ * reusing the id is not shown.
+ */
+export function createReadOnlyAgentTranscriptViewer(deps: ReadOnlyAgentTranscriptViewerDeps): AgentTranscriptViewer {
+	const opened = deps.registry.get(deps.agentId);
+	const current = (): AgentRef | undefined => {
+		const ref = deps.registry.get(deps.agentId);
+		return ref && opened && ref.generation === opened.generation ? ref : undefined;
+	};
+	const pinned: AgentTranscriptViewerDeps["registry"] = {
+		get: id => (id === deps.agentId ? current() : undefined),
+		list: () => {
+			const ref = current();
+			return ref ? [ref] : [];
+		},
+		onChange: () => () => {},
+	};
+	return new AgentTranscriptViewer({
+		...deps,
+		registry: pinned,
+		transcript: agentTranscriptSource,
+		remote: undefined,
+		lifecycle: undefined,
+	});
+}
+
 // UI Components barrel export
 
 export {

@@ -8,7 +8,17 @@ import type { AsyncJob, AsyncJobManagerApi } from "../async";
 import type { JobWidgetRegistry } from "../job-widgets/types";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
-import type { AsyncJobInspection, AsyncJobSnapshot, AsyncJobSnapshotItem, AsyncJobTree } from "./agent-session-types";
+import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { TERMINAL_HISTORY_LIMIT } from "../async/job-manager";
+import type {
+	AsyncJobInspection,
+	AsyncJobOutputSnapshot,
+	AsyncJobSnapshot,
+	AsyncJobSnapshotItem,
+	AsyncJobSnapshotOptions,
+	AsyncJobTree,
+	BackgroundControlResult,
+} from "./agent-session-types";
 
 /** The public summary of `job` (see {@link AsyncJobSnapshotItem}); its caption shows only while widgets are on. */
 function jobSnapshotItem(job: AsyncJob, widgets: JobWidgetRegistry | undefined): AsyncJobSnapshotItem {
@@ -24,6 +34,7 @@ function jobSnapshotItem(job: AsyncJob, widgets: JobWidgetRegistry | undefined):
 		endTime: job.endTime,
 		agentId: job.agentId,
 		ownerId: job.ownerId,
+		...(job.status === "running" && job.queued === true ? { queued: true } : {}),
 	};
 }
 
@@ -166,4 +177,85 @@ export function ownedAsyncJob(
 export function cancelOwnedAsyncJob(manager: AsyncJobManagerApi, agentId: string | undefined, id: string): boolean {
 	const job = ownedAsyncJob(manager, agentId, id);
 	return job !== undefined && manager.cancel(id, { ownerId: job.ownerId });
+}
+
+/**
+ * The extension job snapshot (`ctx.getAsyncJobSnapshot`): running jobs `agentId` owns and the
+ * newest settled ones from the manager's terminal history, which outlives evicted rows, so a
+ * dashboard keeps showing jobs whose results were already delivered.
+ */
+export function asyncJobHistorySnapshot(
+	manager: AsyncJobManagerApi,
+	agentId: string | undefined,
+	options?: AsyncJobSnapshotOptions,
+): AsyncJobSnapshot {
+	const ownerFilter = agentId ? { ownerId: agentId } : undefined;
+	const includeAgentJobs = options?.includeAgentJobs !== false;
+	const requested = options?.recentLimit ?? 5;
+	const recentLimit = Number.isNaN(requested)
+		? 0
+		: Math.min(TERMINAL_HISTORY_LIMIT, Math.max(0, Math.trunc(requested)));
+	const running = manager
+		.getRunningJobs(ownerFilter)
+		.filter(job => includeAgentJobs || job.agentId === undefined)
+		.map(job => jobSnapshotItem(job, manager.widgets));
+	const recent = manager
+		.getTerminalHistory(ownerFilter, { includeAgentJobs })
+		.slice(0, recentLimit)
+		.map(entry => ({ ...entry }));
+	return { running, recent, delivery: manager.getDeliveryState(ownerFilter) };
+}
+
+/**
+ * Output of a job `agentId` owns: the latest progress while it runs, then its result (or its
+ * error when it failed, or was cancelled with one), as a bounded tail. Null for unknown,
+ * evicted and other owners' jobs.
+ */
+export function asyncJobOutput(
+	manager: AsyncJobManagerApi,
+	agentId: string | undefined,
+	id: string,
+): AsyncJobOutputSnapshot | null {
+	const job = ownedAsyncJob(manager, agentId, id);
+	if (!job) return null;
+	const sourced =
+		job.status === "running"
+			? { source: "progress" as const, text: job.progressText }
+			: job.status === "completed"
+				? { source: "result" as const, text: job.resultText }
+				: job.status === "failed" || job.errorText !== undefined
+					? { source: "error" as const, text: job.errorText }
+					: { source: "result" as const, text: job.resultText };
+	if (sourced.text === undefined) return { id, status: job.status, source: "none", text: "", truncated: false };
+	const bounded = truncateTail(sourced.text);
+	return {
+		id,
+		status: job.status,
+		source: sourced.source,
+		text: bounded.content,
+		truncated: bounded.truncated === true,
+	};
+}
+
+/**
+ * Cancel a running job `agentId` owns and wait for it to settle, so the caller's next snapshot
+ * already shows it cancelled.
+ */
+export async function cancelOwnedAsyncJobAndSettle(
+	manager: AsyncJobManagerApi,
+	agentId: string | undefined,
+	id: string,
+): Promise<BackgroundControlResult> {
+	const job = ownedAsyncJob(manager, agentId, id);
+	if (!job) return { id, status: "not_found", message: "Background job not found." };
+	if (job.status !== "running") {
+		return { id, status: "already_completed", message: "Background job is already complete." };
+	}
+	if (cancelOwnedAsyncJob(manager, agentId, id)) {
+		await job.promise;
+		return { id, status: "cancelled", message: "Background job cancelled." };
+	}
+	return ownedAsyncJob(manager, agentId, id)
+		? { id, status: "already_completed", message: "Background job completed before cancellation." }
+		: { id, status: "not_found", message: "Background job is no longer available." };
 }

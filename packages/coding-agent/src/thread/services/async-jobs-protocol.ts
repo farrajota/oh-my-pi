@@ -23,6 +23,7 @@ import {
 	type AsyncJobDeliveryState,
 	type AsyncJobDetails,
 	type AsyncJobFilter,
+	type AsyncJobHistoryEntry,
 	type AsyncJobReapResult,
 	type AsyncJobRunResult,
 	type AsyncJobType,
@@ -137,6 +138,10 @@ export type AsyncJobManagerProtocol = {
 	getRunningJobs: RpcMethod<[filter: AsyncJobFilter | undefined], AsyncJobWire[]>;
 	getRecentJobs: RpcMethod<[limit: number | undefined, filter: AsyncJobFilter | undefined], AsyncJobWire[]>;
 	getAllJobs: RpcMethod<[filter: AsyncJobFilter | undefined], AsyncJobWire[]>;
+	getTerminalHistory: RpcMethod<
+		[filter: AsyncJobFilter | undefined, options: { includeAgentJobs?: boolean } | undefined],
+		AsyncJobHistoryEntry[]
+	>;
 	backgroundJob: RpcMethod<[jobId: string], boolean>;
 	releaseForegroundJob: RpcMethod<[jobId: string], void>;
 	getDeliveryState: RpcMethod<[filter: AsyncJobFilter | undefined], AsyncJobDeliveryState>;

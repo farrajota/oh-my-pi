@@ -36,7 +36,7 @@ import { type Settings, withActiveSettings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
-import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
+import type { AsyncJobSnapshot, AsyncJobSnapshotOptions, SendUserMessageOptions } from "../../session/agent-session";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
@@ -115,7 +115,20 @@ import type {
 	UserPythonEvent,
 	UserPythonEventResult,
 	WorkingMessageSuffixContext,
+	ExtensionAsyncJobControls,
 } from "./types";
+
+/** Job controls of a runner with no session: nothing to list, read, cancel or terminate. */
+const NO_ASYNC_JOB_CONTROLS: ExtensionAsyncJobControls = {
+	getSnapshot: () => null,
+	getOutput: () => null,
+	cancel: async jobId => ({ id: jobId, status: "not_found", message: "Background jobs are unavailable here." }),
+	terminateSubagent: async agentId => ({
+		id: agentId,
+		status: "not_found",
+		message: "Subagent control is unavailable here.",
+	}),
+};
 
 import {
 	cfgExtensionAssistantTextRenderers,
@@ -548,7 +561,7 @@ export class ExtensionRunner {
 	#runEphemeralTurnFn?: ExtensionContextActions["runEphemeralTurn"];
 	#startLiveFn?: ExtensionContextActions["startLive"];
 	#ephemeralTurnBlocker = new AsyncLocalStorage<string | undefined>();
-	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
+	#asyncJobControls: ExtensionAsyncJobControls = NO_ASYNC_JOB_CONTROLS;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
 	#navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -782,7 +795,7 @@ export class ExtensionRunner {
 		getMemory?: () => MemoryRuntimeContext | undefined,
 		private readonly settings?: Settings,
 		private readonly localProtocolOptions?: LocalProtocolOptions,
-		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
+		getAsyncJobSnapshot?: (options?: AsyncJobSnapshotOptions) => AsyncJobSnapshot | null,
 		/** Identity of the agent this runner's session runs; defaults to the top-level agent. */
 		private readonly agent: ExtensionAgentIdentity = TOP_LEVEL_AGENT,
 		/** Builds `ctx.annotations`; supplied by the host that wires the bundled `/annotate` command. */
@@ -791,7 +804,7 @@ export class ExtensionRunner {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
 		this.#createAnnotations = createAnnotations;
-		this.#getAsyncJobSnapshotFn = getAsyncJobSnapshot ?? (() => null);
+		if (getAsyncJobSnapshot) this.#asyncJobControls = { ...NO_ASYNC_JOB_CONTROLS, getSnapshot: getAsyncJobSnapshot };
 		this.runtime.getShortcutConflict = (shortcut, extensionPath) => this.getShortcutConflict(shortcut, extensionPath);
 	}
 
@@ -1516,6 +1529,11 @@ export class ExtensionRunner {
 		return this.extensions.flatMap(ext => ext.assistantThinkingRenderers);
 	}
 
+	/** Bind the background-job controls of the session this runner serves (`ctx.getAsyncJobSnapshot` and friends). */
+	setAsyncJobControls(controls: ExtensionAsyncJobControls): void {
+		this.#asyncJobControls = controls;
+	}
+
 	/** Whether any active extension registered a working-row suffix renderer. */
 	hasWorkingMessageSuffixes(): boolean {
 		return this.extensions.some(ext => (ext.workingMessageSuffixes?.size ?? 0) > 0);
@@ -1767,13 +1785,17 @@ export class ExtensionRunner {
 			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
-			getAsyncJobSnapshot: () => this.#getAsyncJobSnapshotFn(),
+			getAsyncJobSnapshot: options => this.#asyncJobControls.getSnapshot(options),
+			getAsyncJobOutput: jobId => this.#asyncJobControls.getOutput(jobId),
+			cancelAsyncJob: jobId => this.#asyncJobControls.cancel(jobId),
+			terminateSubagent: agentId => this.#asyncJobControls.terminateSubagent(agentId),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
 			modelRegistry: this.modelRegistry,
 			isProjectTrusted: () => true,
 			agent,
+			actor: agent,
 			get model() {
 				return getModel();
 			},

@@ -15,6 +15,7 @@
 
 ### Added
 
+- Added extension job controls: `ctx.getAsyncJobSnapshot({ recentLimit, includeAgentJobs })` keeps settled jobs listed from a bounded per-owner history after their rows are evicted and marks queued jobs, `ctx.getAsyncJobOutput(id)` reads a job's progress or result, `ctx.cancelAsyncJob(id)` cancels and waits for the job, and `ctx.terminateSubagent(id)` kills a descendant subagent through the agent lifecycle; `ctx.actor` aliases `ctx.agent`, and `createReadOnlyAgentTranscriptViewer` opens a read-only transcript viewer pinned to one agent generation
 - Added `pi.registerWorkingMessageSuffix(name, renderer)` so extensions can append live run metrics (elapsed time from the session's run start, billed run tokens) to the interactive working row
 - Added `task.generateLabels` (default on); turning it off stops subagent tasks without a description from sending the small-model label request
 - Added `promptSuggestions.enabled`, `promptSuggestions.model` and `promptSuggestions.fallbackModel` settings (Interaction > Input), exported from the package entry as `cfgPromptSuggestions*` handles for external prompt-suggestions extensions

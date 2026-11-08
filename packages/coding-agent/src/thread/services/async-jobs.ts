@@ -230,6 +230,7 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 		getRunningJobs: (manager, filter) => toJobWires(manager.getRunningJobs(filter)),
 		getRecentJobs: (manager, limit, filter) => toJobWires(manager.getRecentJobs(limit, filter)),
 		getAllJobs: (manager, filter) => toJobWires(manager.getAllJobs(filter)),
+		getTerminalHistory: (manager, filter, options) => manager.getTerminalHistory(filter, options),
 		backgroundJob: (manager, jobId) => manager.backgroundJob(jobId),
 		releaseForegroundJob: (manager, jobId) => manager.releaseForegroundJob(jobId),
 		getDeliveryState: (manager, filter) => manager.getDeliveryState(filter),

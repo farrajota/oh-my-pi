@@ -136,6 +136,19 @@ describe("runtime thread services: async jobs", () => {
 		expect(await probe("deliveries")).toEqual([{ jobId: id, text: "all done", status: "completed", isRow: true }]);
 	});
 
+	it("reads the main manager's terminal history from a worker", async () => {
+		const manager = newManager();
+		const probe = await startWorker();
+		const id = await jobId(probe, manager, "Worker");
+		await probe("finish", id, "all done");
+		await manager.getJob(id)?.promise;
+
+		expect(await probe("history", manager, "Worker")).toEqual([
+			expect.objectContaining({ id, status: "completed", ownerId: "Worker" }),
+		]);
+		expect(await probe("history", manager, "Other")).toEqual([]);
+	});
+
 	it("returns and consumes a job settled during a worker-homed eval wait", async () => {
 		const manager = newManager();
 		const probe = await startWorker();

@@ -26,6 +26,7 @@ import type {
 	AsyncJobDeliveryState,
 	AsyncJobDetails,
 	AsyncJobFilter,
+	AsyncJobHistoryEntry,
 	AsyncJobManagerApi,
 	AsyncJobProcess,
 	AsyncJobReapResult,
@@ -302,6 +303,10 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 
 	getAllJobs(filter?: AsyncJobFilter): AsyncJob[] {
 		return this.#rows(this.#remote.callSync("getAllJobs", filter));
+	}
+
+	getTerminalHistory(filter?: AsyncJobFilter, options?: { includeAgentJobs?: boolean }): AsyncJobHistoryEntry[] {
+		return this.#remote.callSync("getTerminalHistory", filter, options);
 	}
 
 	backgroundJob(jobId: string): boolean {

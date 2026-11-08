@@ -96,7 +96,13 @@ import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
-import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
+import type {
+	AsyncJobOutputSnapshot,
+	AsyncJobSnapshot,
+	AsyncJobSnapshotOptions,
+	BackgroundControlResult,
+	SendUserMessageOptions,
+} from "../../session/agent-session";
 import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessagePayload } from "../../session/messages";
@@ -764,8 +770,21 @@ export interface ExtensionContext {
 	mode: ExtensionMode;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
-	/** Get a read-only snapshot of async jobs owned by this session. */
-	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
+	/**
+	 * Read-only snapshot of the background jobs this session owns: the running ones and the newest
+	 * settled ones (`recentLimit`, 0 to 15, default 5), which stay listed after their results were
+	 * delivered. `includeAgentJobs: false` leaves out jobs that run a subagent. Null outside a session.
+	 */
+	getAsyncJobSnapshot(options?: AsyncJobSnapshotOptions): AsyncJobSnapshot | null;
+	/** Live progress, then the result or error, of a job this session owns; null when there is none. */
+	getAsyncJobOutput(jobId: string): AsyncJobOutputSnapshot | null;
+	/** Cancel a running job this session owns; resolves once the job settled. */
+	cancelAsyncJob(jobId: string): Promise<BackgroundControlResult>;
+	/**
+	 * Kill a subagent below this session's agent, as the agent hub does: it ends as an `aborted`
+	 * tombstone. Agents outside this session's tree read as `not_found`.
+	 */
+	terminateSubagent(agentId: string): Promise<BackgroundControlResult>;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
 	/** Whether UI is available (false in print/RPC mode) */
@@ -824,6 +843,8 @@ export interface ExtensionContext {
 	sessionModes?: ExtensionSessionModes;
 	/** Identity of the agent this session runs: the top-level session or a subagent. */
 	agent: ExtensionAgentIdentity;
+	/** @deprecated Same object as {@link agent}; kept for extensions written against the name `actor`. */
+	actor: ExtensionAgentIdentity;
 	/**
 	 * Whether the current project/workspace is trusted. OMP performs no
 	 * project-trust gating — project-level settings and extensions load
@@ -2443,6 +2464,14 @@ export interface ExtensionContextActions {
 	getSystemPrompt: () => string[];
 	runEphemeralTurn?: (options: EphemeralTurnOptions) => Promise<EphemeralTurnResult>;
 	startLive?: (options: ExtensionLiveStartOptions) => Promise<ExtensionLiveSession>;
+}
+
+/** Background-job controls a session gives its extension contexts (see {@link ExtensionContext.getAsyncJobSnapshot}). */
+export interface ExtensionAsyncJobControls {
+	getSnapshot(options?: AsyncJobSnapshotOptions): AsyncJobSnapshot | null;
+	getOutput(jobId: string): AsyncJobOutputSnapshot | null;
+	cancel(jobId: string): Promise<BackgroundControlResult>;
+	terminateSubagent(agentId: string): Promise<BackgroundControlResult>;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

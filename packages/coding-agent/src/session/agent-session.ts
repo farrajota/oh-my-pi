@@ -306,6 +306,7 @@ import {
 	requestJobTreeCaptions,
 	runningJobWidgets,
 } from "./async-job-views";
+import { createExtensionAsyncJobControls } from "./extension-job-controls";
 import type {
 	AgentSessionConfig,
 	AgentSessionDisposeOptions,
@@ -9448,6 +9449,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			return this.#extensionRunner.createCommandContext();
 		}
 
+		const jobControls = createExtensionAsyncJobControls(() => this);
 		return {
 			ui: noOpUIContext,
 			mode: "print",
@@ -9459,6 +9461,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// Used only when the session has no extension runner. `createAgentSession` always builds
 			// one (carrying the real identity), so only hand-constructed sessions land here.
 			agent: TOP_LEVEL_AGENT,
+			actor: TOP_LEVEL_AGENT,
 
 			model: this.model ?? undefined,
 			models: createExtensionModelQuery(this.#modelRegistry, this.settings, () => this.model ?? undefined),
@@ -9478,7 +9481,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			getPendingPlanReview: () => undefined,
 			openPlanReview: async () => false,
 			getContextUsage: () => this.getContextUsage(),
-			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),
+			getAsyncJobSnapshot: options => jobControls.getSnapshot(options),
+			getAsyncJobOutput: jobId => jobControls.getOutput(jobId),
+			cancelAsyncJob: jobId => jobControls.cancel(jobId),
+			terminateSubagent: agentId => jobControls.terminateSubagent(agentId),
 			waitForIdle: () => this.waitForIdle(),
 			newSession: async options => {
 				const success = await this.newSession({ parentSession: options?.parentSession });

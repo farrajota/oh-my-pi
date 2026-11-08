@@ -369,7 +369,13 @@ Handlers and tool `execute` receive `ctx` with:
 - `models` (read-only model query — see below)
 - `localProtocolOptions` (optional calling-session `local://` root mapping for external tool bridges)
 - `getContextUsage()`
-- `getAsyncJobSnapshot()` returns the current session's read-only async-job snapshot, or `null` when no session owns the context
+- `getAsyncJobSnapshot(options?)` returns the background jobs the current session owns, or `null` when no session owns the context: `running` jobs (each with `queued: true` while it waits for a slot) and the newest settled ones in `recent`. `recent` comes from a bounded history (15 per owner for subagent jobs and 15 for the others) that keeps a job listed after its row is evicted. `options.recentLimit` (0 to 15, default 5) caps `recent`; `options.includeAgentJobs: false` leaves out jobs that run a subagent
+- `getAsyncJobOutput(jobId)`: the live progress text of a job this session owns, then its result (or error) once settled, as a bounded tail (`{ id, status, source: "progress" | "result" | "error" | "none", text, truncated }`); `null` for unknown, evicted or other sessions' jobs
+- `cancelAsyncJob(jobId)`: cancels a running job this session owns and resolves once it settled, with `{ id, status: "cancelled" | "already_completed" | "not_found", message }`
+- `terminateSubagent(agentId)`: kills a subagent below this session's agent the way the agent hub does (its run is aborted and it stays as an `aborted` tombstone); agents outside the session's tree, and the session's own agent, read as `not_found`. Rejects when the tombstone cannot be saved or the abort fails
+- `agent` (and its deprecated alias `actor`): identity of the agent this session runs
+
+`createReadOnlyAgentTranscriptViewer(deps)` (package root) builds the Agent Hub transcript viewer for one local agent as a component for `ctx.ui.custom`: it can scroll and expand but not message, revive or kill, and it stays on the agent generation registered when it opened.
 - `compact(instructionsOrOptions?)`: accepts summary focus text or `CompactOptions`, including one-off `mode: "soft" | "remote" | "snapcompact"`, `onComplete`, `onError`, and `suppressContinuation`
 - `isIdle()`, `hasPendingMessages()`, `abort()`
 - `shutdown()`

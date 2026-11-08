@@ -113,6 +113,11 @@ const probe: RuntimeProbe = async (op, ...args) => {
 		case "finish":
 			body(args[0]).finish.resolve(String(args[1]));
 			return true;
+		case "history":
+			return manager(args[0]).getTerminalHistory(
+				{ ownerId: String(args[1]) },
+				{ includeAgentJobs: args[2] !== false },
+			);
 		case "append":
 			body(args[0]).tap?.append(String(args[1]));
 			return true;

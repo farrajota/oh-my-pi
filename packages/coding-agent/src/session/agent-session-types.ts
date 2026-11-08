@@ -86,7 +86,41 @@ export type AsyncJobSnapshotItem = Pick<
 	command?: string;
 	/** One line on what the command does and when it ends, while widgets are on (`JobWidgetRegistry.caption`). */
 	caption?: string;
+	/** True while a running job waits behind a caller-managed gate (e.g. a task batch slot). */
+	queued?: boolean;
 };
+
+/** Options of the extension job snapshot (`ctx.getAsyncJobSnapshot`). */
+export interface AsyncJobSnapshotOptions {
+	/** Settled jobs to list, newest first: 0 to 15, default 5. */
+	recentLimit?: number;
+	/** List jobs that run a subagent (task jobs). Default true. Delivery state is unaffected. */
+	includeAgentJobs?: boolean;
+}
+
+/** Where {@link AsyncJobOutputSnapshot.text} comes from. */
+export type AsyncJobOutputSource = "progress" | "result" | "error" | "none";
+
+/** Output of one async job (`ctx.getAsyncJobOutput`). */
+export interface AsyncJobOutputSnapshot {
+	readonly id: string;
+	readonly status: AsyncJob["status"];
+	/** `progress` while running, `result` or `error` once settled, `none` when there is no text. */
+	readonly source: AsyncJobOutputSource;
+	/** The text's tail, bounded like tool output. */
+	readonly text: string;
+	readonly truncated: boolean;
+}
+
+export type BackgroundControlStatus = "cancelled" | "not_found" | "already_completed";
+
+/** Outcome of a job cancel or subagent termination requested by an extension. */
+export interface BackgroundControlResult {
+	readonly id: string;
+	readonly status: BackgroundControlStatus;
+	/** One line for the user. */
+	readonly message: string;
+}
 
 /** One async job as a job inspector (the jobs sheet) shows it beyond its snapshot row. */
 export interface AsyncJobInspection {

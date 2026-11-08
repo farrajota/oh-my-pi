@@ -42,6 +42,8 @@ const RETAINED_ARTIFACTS_CLEANUP_GRACE_MS = 60_000;
  */
 const RETAINED_ARTIFACTS_CLEANUP_MAX_WAIT_MS = DEFAULT_RETENTION_MS;
 const DEFAULT_MAX_RUNNING_JOBS = 15;
+/** Settled jobs kept in an owner's terminal history, for subagent jobs and for the others each. */
+export const TERMINAL_HISTORY_LIMIT = 15;
 /** Abort reason used only when the owning session shuts down the entire manager. */
 export const ASYNC_JOB_MANAGER_SHUTDOWN_REASON = Symbol("AsyncJobManager shutdown");
 
@@ -297,6 +299,30 @@ export interface AsyncJobRegisterOptions {
 }
 
 /**
+ * Metadata of a settled background job, kept by {@link AsyncJobManagerApi.getTerminalHistory}
+ * after the job's row is evicted. It holds no result or error text.
+ */
+export interface AsyncJobHistoryEntry {
+	readonly id: string;
+	readonly type: AsyncJobType;
+	readonly status: Exclude<AsyncJob["status"], "running">;
+	readonly label: string;
+	readonly intent?: string;
+	readonly startTime: number;
+	readonly endTime?: number;
+	readonly ownerId?: string;
+	readonly agentId?: string;
+	/** Full command line of a job that ran a process. */
+	readonly command?: string;
+}
+
+interface TerminalHistoryRecord {
+	/** Insertion order, breaking ties between jobs that settled in the same millisecond. */
+	sequence: number;
+	entry: AsyncJobHistoryEntry;
+}
+
+/**
  * Filter applied to job query/cancel/delivery APIs. Matches jobs registered by
  * exactly `ownerId` (registry id from `AgentRegistry`, e.g. "Main",
  * "AuthLoader"); `ownerId: undefined` matches only unowned jobs. Omit the
@@ -349,6 +375,12 @@ export interface AsyncJobManagerApi {
 	getRecentJobs(limit?: number, filter?: AsyncJobFilter): AsyncJob[];
 	/** Every background job row. */
 	getAllJobs(filter?: AsyncJobFilter): AsyncJob[];
+	/**
+	 * Settled background jobs `filter` matches, newest first, including jobs whose rows were already
+	 * evicted: the newest {@link TERMINAL_HISTORY_LIMIT} per owner for subagent jobs and as many for
+	 * the others. `includeAgentJobs: false` leaves out jobs that run a subagent.
+	 */
+	getTerminalHistory(filter?: AsyncJobFilter, options?: { includeAgentJobs?: boolean }): AsyncJobHistoryEntry[];
 	/** Promote a foreground-backed job to a background job; false for unknown ids. */
 	backgroundJob(jobId: string): boolean;
 	/** Drop a foreground-backed job whose result the foreground call already returned. */
@@ -418,6 +450,14 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	/** Live widgets of this root's jobs; set by the root session when widgets are available. */
 	widgets: JobWidgetRegistry | undefined;
 	readonly #settleListeners = new Set<() => void>();
+	/** Per owner: settled jobs that run a subagent and the others, newest first, each capped. */
+	readonly #terminalHistory = new Map<
+		string | undefined,
+		{ agent: TerminalHistoryRecord[]; other: TerminalHistoryRecord[] }
+	>();
+	/** Jobs already in the history, and jobs whose owner's history was cleared while they ran. */
+	readonly #historyClosedJobs = new WeakSet<AsyncJob>();
+	#nextHistorySequence = 0;
 
 	/**
 	 * Calls `listener` whenever a job settles (completed, failed or cancelled), so
@@ -568,6 +608,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 					this.#enqueueDelivery(id, errorText);
 				}
 			}
+			this.#recordTerminalHistory(job);
 			if (this.#releasedForegroundJobs.has(id)) this.#discardForegroundJob(id);
 			else this.#scheduleEviction(id);
 			for (const listener of this.#settleListeners) {
@@ -616,6 +657,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		};
 		this.#jobs.set(id, job);
 		this.#recordAgentReply(job);
+		this.#recordTerminalHistory(job);
 		this.#enqueueDelivery(id, result.text);
 		this.#scheduleEviction(id);
 		return id;
@@ -667,6 +709,49 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		return this.#visibleJobs(filter);
 	}
 
+	getTerminalHistory(filter?: AsyncJobFilter, options?: { includeAgentJobs?: boolean }): AsyncJobHistoryEntry[] {
+		const histories = filter
+			? [this.#terminalHistory.get(filter.ownerId)].filter(history => history !== undefined)
+			: [...this.#terminalHistory.values()];
+		const includeAgentJobs = options?.includeAgentJobs !== false;
+		return histories
+			.flatMap(history => (includeAgentJobs ? [...history.agent, ...history.other] : history.other))
+			.sort(
+				(a, b) =>
+					(b.entry.endTime ?? b.entry.startTime) - (a.entry.endTime ?? a.entry.startTime) ||
+					b.sequence - a.sequence,
+			)
+			.map(record => record.entry);
+	}
+
+	/** Add a settled, visible job to its owner's terminal history once; drops the oldest past the cap. */
+	#recordTerminalHistory(job: AsyncJob): void {
+		if (job.status === "running" || job.foreground || this.#historyClosedJobs.has(job)) return;
+		this.#historyClosedJobs.add(job);
+		let history = this.#terminalHistory.get(job.ownerId);
+		if (!history) {
+			history = { agent: [], other: [] };
+			this.#terminalHistory.set(job.ownerId, history);
+		}
+		const bucket = job.agentId !== undefined ? history.agent : history.other;
+		bucket.unshift({
+			sequence: this.#nextHistorySequence++,
+			entry: {
+				id: job.id,
+				type: job.type,
+				status: job.status,
+				label: job.label,
+				intent: job.intent,
+				startTime: job.startTime,
+				endTime: job.endTime,
+				ownerId: job.ownerId,
+				agentId: job.agentId,
+				command: job.process?.command,
+			},
+		});
+		if (bucket.length > TERMINAL_HISTORY_LIMIT) bucket.length = TERMINAL_HISTORY_LIMIT;
+	}
+
 	/**
 	 * Promote a foreground-backed job to a real background job: it becomes
 	 * visible to listings and its completion is delivered (re-enqueued when it
@@ -678,6 +763,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		if (!job.foreground) return true;
 		job.foreground = undefined;
 		this.#suppressedDeliveries.delete(jobId);
+		this.#recordTerminalHistory(job);
 		if (job.status === "completed" || job.status === "failed") {
 			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
 		}
@@ -820,6 +906,11 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	 * suppression marker — that marker is cleared when the id is reused.
 	 */
 	evictCompletedJobs(filter?: AsyncJobFilter): number {
+		// The owner is starting over (new or switched session, dispose): its history goes too, and
+		// jobs still settling must not refill it.
+		if (filter) this.#terminalHistory.delete(filter.ownerId);
+		else this.#terminalHistory.clear();
+		for (const job of this.#filterJobs(this.#jobs.values(), filter)) this.#historyClosedJobs.add(job);
 		let evicted = 0;
 		for (const job of this.#filterJobs(this.#jobs.values(), filter)) {
 			if (job.status !== "completed" && job.status !== "failed") continue;
@@ -990,6 +1081,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		this.#watchedJobs.clear();
 		this.#consumedJobResults.clear();
 		this.#releasedForegroundJobs.clear();
+		this.#terminalHistory.clear();
 		this.#deliverySinks.clear();
 		this.widgets?.dispose();
 		this.widgets = undefined;

@@ -172,6 +172,7 @@ import autolearnCaptureRefused from "./prompts/system/autolearn-capture-refused.
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
+import { createExtensionAsyncJobControls } from "./session/extension-job-controls";
 import {
 	type AgentKind,
 	type AgentRef,
@@ -3879,6 +3880,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// A dialog waits for the user, not the agent: the session lets the display sleep while one is open.
 		const trackUserWait: UserWaitTracker = dialog => (hasSession ? session.waitForUser(dialog) : dialog());
 		extensionRunner.setUserWaitTracker(trackUserWait);
+		extensionRunner.setAsyncJobControls(createExtensionAsyncJobControls(() => (hasSession ? session : undefined)));
 
 		credentialDisabledTarget = extensionRunner;
 		for (const event of startupCredentialDisabledEvents.splice(0)) {
