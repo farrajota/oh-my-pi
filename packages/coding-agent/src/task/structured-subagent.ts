@@ -59,6 +59,7 @@ import { generateTaskName, sanitizeAgentId } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { ovnfsWorkspace } from "./ovnfs";
 import { permissionDelegationRefusal } from "./permissions/session-checks";
+import { recordPermissionBinding } from "./permissions/revival";
 import { composeSpawnScope } from "./permissions/spawn";
 import type { TaskToolProfileName } from "./permissions/tool-profiles";
 import type { PermissionScope, TaskPermissionRequest } from "./permissions/types";
@@ -1073,6 +1074,10 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 		});
 		if (policy.preparedSession === undefined) await refreshSkillsForAutoload(request.session, policy.agent);
 		const baseOptions = buildExecutorOptions(request, policy, lease, id);
+		// The parent's own transcript holds the scope revival must match; the child cannot write it.
+		if (baseOptions.permissionScope) {
+			recordPermissionBinding(request.session.sessionManager, id, baseOptions.permissionScope);
+		}
 		baseOptions.onCleanupDeferred = completion => {
 			deferredCleanup = completion;
 		};
