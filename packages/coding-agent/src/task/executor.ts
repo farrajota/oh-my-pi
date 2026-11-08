@@ -131,6 +131,7 @@ import { TextTap } from "../job-widgets/text-tap";
 import { TOOLS_SOURCE_ID } from "../job-widgets/types";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
+import { permissionWithholdsExtensionCode } from "./permissions/session-checks";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
@@ -4556,6 +4557,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 	const parentDepth = options.taskDepth ?? 0;
 	const childDepth = parentDepth + 1;
 	const restrictToolNames = options.restrictToolNames === true || preparedSession !== undefined;
+	const withholdExtensionCode = permissionWithholdsExtensionCode(subagentSettings);
 	const atMaxDepth = maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
 
 	// Add tools if specified. Unstructured runs never get `yield`, even when
@@ -5006,9 +5008,12 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					workspaceTree: options.workspaceTree,
 					rules: options.rules,
 					extensionRoots: options.extensionRoots,
-					preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
-					preloadedPreparedExtensions: options.preloadedPreparedExtensions,
-					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
+					preloadedExtensionPaths:
+						restrictToolNames || withholdExtensionCode ? [] : options.preloadedExtensionPaths,
+					// An empty prepared list also keeps the child from discovering extensions of its own.
+					preloadedPreparedExtensions: withholdExtensionCode ? [] : options.preloadedPreparedExtensions,
+					preloadedCustomToolPaths:
+						restrictToolNames || withholdExtensionCode ? [] : options.preloadedCustomToolPaths,
 					hasUI: false,
 					prewalk,
 					spawns: spawnsEnv,

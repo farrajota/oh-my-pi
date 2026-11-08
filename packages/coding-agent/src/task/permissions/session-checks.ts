@@ -72,3 +72,14 @@ export function internalUrlFileRefusal(
 	const resolved = evaluateInternalUrlFile({ scope, url, path: real, cwd: approvalCacheKeyForPath(base) });
 	return resolved.action === "deny" ? resolved.reason : undefined;
 }
+
+/**
+ * Whether a child running under `settings` must start without its parent's extension and custom-tool
+ * code: its scope is enforce-restricted, or does not decode. Extension handlers run unconstrained by
+ * the scope's tool rules, and custom tool modules execute as they load.
+ */
+export function permissionWithholdsExtensionCode(settings: Settings): boolean {
+	const active = activePermissionScope(settings);
+	if (active === undefined) return false;
+	return !active.ok || (active.scope.mode === "enforce" && active.scope.restricted);
+}
