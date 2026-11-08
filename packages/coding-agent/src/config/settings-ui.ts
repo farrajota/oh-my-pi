@@ -15,7 +15,13 @@ import {
 } from "../session/settings";
 import { cfgAutolearnEnabled } from "../autolearn/settings";
 import { cfgMemoryBackend } from "../memory-backend/settings";
-import { cfgComposerPredictions, cfgTuiVimMode } from "../modes/settings";
+import {
+	cfgComposerPredictions,
+	cfgPromptSuggestionsEnabled,
+	cfgPromptSuggestionsFallbackModel,
+	cfgPromptSuggestionsModel,
+	cfgTuiVimMode,
+} from "../modes/settings";
 import { cfgAdvisorEnabled } from "../advisor/settings";
 import { cfgContextFilesExtra } from "../session/context-settings";
 import { cfgTaskPerCallModelAllow } from "../task/settings";
@@ -41,6 +47,12 @@ const CONDITIONS: Record<string, () => boolean> = {
 	repeatedRetryEnabled: whenSettings(s => cfgRetryRepeatedEnabled.get(s) === true),
 	planModeEnabled: whenSettings(s => cfgPlanEnabled.get(s)),
 	planAutosaveEnabled: whenSettings(s => cfgPlanEnabled.get(s) && cfgPlanAutosave.get(s)),
+	// Only an external prompt-suggestions extension reads these; a user of it has configured them.
+	promptSuggestionsConfigured: whenSettings(s =>
+		[cfgPromptSuggestionsEnabled, cfgPromptSuggestionsModel, cfgPromptSuggestionsFallbackModel].some(
+			setting => setting.provenance(s) !== "default",
+		),
+	),
 	// These editors write the global layer; hide them so a project-supplied list is never promoted to global.
 	contextFilesExtraNotProject: whenSettings(s => cfgContextFilesExtra.provenance(s) !== "project"),
 	restrictedFoldersNotProject: whenSettings(s => cfgToolsRestrictedFolders.provenance(s) !== "project"),

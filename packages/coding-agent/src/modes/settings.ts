@@ -1090,8 +1090,9 @@ export const cfgBareSlashCommands = register({
 	},
 });
 
-// Core owns these so they show in /settings and load from config.yml before any extension runs; an external
-// prompt-suggestions extension reads the handles through the package entry point.
+// Core owns these so they load from config.yml before any extension runs; an external prompt-suggestions
+// extension reads the handles through the package entry point. Nothing in core reads them, so /settings shows
+// the rows only once one of them is configured.
 export const cfgPromptSuggestionsEnabled = register({
 	id: "promptSuggestions.enabled",
 	type: "boolean",
@@ -1100,6 +1101,7 @@ export const cfgPromptSuggestionsEnabled = register({
 		tab: "interaction",
 		group: "Input",
 		label: "Prompt Suggestions",
+		condition: "promptSuggestionsConfigured",
 		description: "Show context-aware next-prompt ghost suggestions after agent responses",
 	},
 });
@@ -1112,6 +1114,7 @@ export const cfgPromptSuggestionsModel = register({
 		tab: "interaction",
 		group: "Input",
 		label: "Prompt Suggestions Model",
+		condition: "promptSuggestionsConfigured",
 		description:
 			"Model or role used to generate next-prompt suggestions (smol/default/slow, pi/<role>, or provider/model)",
 	},
@@ -1125,6 +1128,7 @@ export const cfgPromptSuggestionsFallbackModel = register({
 		tab: "interaction",
 		group: "Input",
 		label: "Prompt Suggestions Fallback Model",
+		condition: "promptSuggestionsConfigured",
 		description: "Model or role used for next-prompt suggestions when the primary model times out",
 	},
 });

@@ -74,6 +74,23 @@ describe("prompt suggestion settings", () => {
 		expect(savedConfig.promptSuggestions?.fallbackModel).toBeUndefined();
 	});
 
+	it("keeps the rows out of /settings until promptSuggestions is configured", async () => {
+		// Only an external extension reads these settings; for everyone else the rows would do nothing.
+		const agentDir = tempDir.join("agent");
+		await Settings.init({ cwd: tempDir.path(), agentDir });
+		const rows = () => createSettingsHost().entries.filter(entry => entry.path.startsWith("promptSuggestions."));
+		expect(rows().map(entry => entry.path)).toEqual([
+			"promptSuggestions.enabled",
+			"promptSuggestions.model",
+			"promptSuggestions.fallbackModel",
+		]);
+		expect(rows().map(entry => entry.condition?.() ?? true)).toEqual([false, false, false]);
+
+		cfgPromptSuggestionsModel.set(Settings.instance, "slow");
+
+		expect(rows().map(entry => entry.condition?.() ?? true)).toEqual([true, true, true]);
+	});
+
 	it("enables suggestions on the smol role when config.yml omits them", () => {
 		const settings = Settings.isolated();
 
