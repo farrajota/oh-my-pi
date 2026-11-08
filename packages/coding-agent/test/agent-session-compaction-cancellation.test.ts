@@ -302,6 +302,30 @@ describe.each([false, true])("AgentSession compaction cancellation source (exper
 		expect(prompted).toHaveLength(1);
 		expect(prompted[0]?.some(message => message.role === "developer" && message.synthetic === true)).toBe(true);
 	});
+
+	it("does not resume the interrupted turn when the compaction entry fails to append", async () => {
+		session = await createSession("park");
+		cfgCompactionAutoContinue.override(session.settings, true);
+		session.agent.state.isStreaming = true;
+		vi.spyOn(session, "abort").mockImplementation(async () => {
+			session.agent.state.isStreaming = false;
+		});
+		vi.spyOn(session.sessionManager, "appendCompaction").mockImplementation(() => {
+			throw new Error("append failed before commit");
+		});
+		type Dispatched = { role: string; synthetic?: boolean };
+		const prompted: Dispatched[][] = [];
+		vi.spyOn(session.agent, "prompt").mockImplementation(async message => {
+			prompted.push((Array.isArray(message) ? message : [message]) as Dispatched[]);
+		});
+
+		await expect(session.compact()).rejects.toThrow("append failed before commit");
+		expect(session.sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
+		await session.waitForIdle();
+
+		expect(prompted).toHaveLength(0);
+		expect(session.isCompacting).toBe(false);
+	});
 	if (experimental) {
 		for (const mutation of ["branch", "disable"] as const) {
 			it(`rejects a rollover when ${mutation} changes during an awaited hook`, async () => {

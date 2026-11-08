@@ -1591,7 +1591,6 @@ export class SessionMaintenance {
 				});
 			}
 
-			markCommitted();
 			await this.#commitCompactionEntry({
 				summary,
 				shortSummary,
@@ -1604,6 +1603,7 @@ export class SessionMaintenance {
 				codexCompaction,
 				providerReplayThroughEntryId,
 				advisorResetReason: "compact",
+				onCommitted: markCommitted,
 			});
 
 			const compactionResult: CompactionResult = {
@@ -1790,17 +1790,13 @@ export class SessionMaintenance {
 						details: { kind: "experimental-context-rollover", version: 1 },
 						preserveData: prepared.preserveData,
 					};
-		// Report before `#commitCompactionEntry`, as the direct path does: it appends
-		// the entry and then awaits post-append bookkeeping and the `session_compact`
-		// hook, and a rejection there must still count as committed for the
-		// interrupted-turn resume.
-		onCommitted();
 		await this.#commitCompactionEntry({
 			...result,
 			fromExtension,
 			method: undefined,
 			codexCompaction: undefined,
 			advisorResetReason: "experimental-context-rollover",
+			onCommitted,
 		});
 		this.#experimentalNotesReminderBoundaryId = undefined;
 		return {
@@ -2619,6 +2615,12 @@ export class SessionMaintenance {
 		providerReplayThroughEntryId?: string;
 		advisorResetReason: string;
 		detachExtensionEmit?: boolean;
+		/**
+		 * Reports the commit once the entry is appended, before post-append
+		 * bookkeeping and the `session_compact` hook: a rejection there still
+		 * counts as committed for the interrupted-turn resume, a failed append does not.
+		 */
+		onCommitted?: () => void;
 	}): Promise<CompactionEntry | undefined> {
 		const entryId = this.#host.sessionManager.appendCompaction(
 			args.summary,
@@ -2637,6 +2639,7 @@ export class SessionMaintenance {
 						: this.#projectCompactedContextTokens(args),
 			},
 		);
+		args.onCommitted?.();
 		this.#host.persistEvalStateContext();
 		// A committed compaction starts a new cycle; native compaction gets a fresh try.
 		this.#failedNativeSpeculation = undefined;

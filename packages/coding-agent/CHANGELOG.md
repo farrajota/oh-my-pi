@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- A manual or experimental-rollover compaction whose session entry fails to append no longer counts as committed, so it does not resume the turn it interrupted
 - A manual `/compact` no longer resumes the interrupted turn in a conversation that was reset or replaced while the compaction ran, including a resume an earlier compaction withheld for a parked command
 - The `bash` tool bounds its output (`tools.outputMaxColumns`, `tools.artifactHeadBytes`, `tools.artifactMaxBytes`) by the calling session's settings instead of the process-wide ones, on the direct, background-job and PTY paths, so a subagent or SDK session with its own limits gets them
 - A browser tab's download is found and moved into its folder even when another tab of the same browser pointed Chromium's download folder elsewhere and Chromium did not report the saved path; owned tabs now share one staging folder per browser
