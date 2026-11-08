@@ -163,6 +163,32 @@ describe("ast_edit under a permission scope", () => {
 		expect(fs.readFileSync(temp.join("src", "app.ts"), "utf8")).toStartWith("export const token = 0");
 		expect(fs.readFileSync(temp.join("restricted", "keys.ts"), "utf8")).toBe("export const token = 2;\n");
 	});
+
+	it("applies a preview of a single file", async () => {
+		const pending: Array<(input: unknown) => Promise<AgentToolResult<unknown>>> = [];
+		const tool = new AstEditTool({
+			...session(scopedSettings(denyRestricted())),
+			getToolChoiceQueue: () =>
+				({
+					registerPendingInvoker: (
+						_id: string,
+						_tool: string,
+						invoke: (input: unknown) => Promise<AgentToolResult<unknown>>,
+					) => pending.push(invoke),
+					removePendingInvoker: () => {},
+				}) as never,
+		} as ToolSession);
+
+		await tool.execute("edit", {
+			ops: [{ pat: "export const token = $V", out: "export const token = 0" }],
+			paths: ["src/app.ts"],
+		});
+		expect(pending).toHaveLength(1);
+		const applied = text(await pending[0]!({ action: "apply", reason: "apply the rewrite" }));
+
+		expect(applied).toContain("Applied 1 replacement in 1 file.");
+		expect(fs.readFileSync(temp.join("src", "app.ts"), "utf8")).toStartWith("export const token = 0");
+	});
 });
 
 describe("parse diagnostics under a permission scope", () => {

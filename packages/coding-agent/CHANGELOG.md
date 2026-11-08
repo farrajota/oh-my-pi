@@ -48,6 +48,7 @@
 
 ### Fixed
 
+- Under a permission scope with path rules or secrets-blind, an `ast_edit` preview of a single file applies through `resolve` instead of failing with "Path not found: Not a directory"
 - A rebuild before the model starts streaming (theme change, thinking-block toggle) redraws the just-sent prompt with its original send time instead of the rebuild's
 - Stats session syncs requested in the interactive process (the dashboard's live ingest, extensions using the stats runtime) run in a stats subprocess instead of blocking the TUI for seconds to minutes while stats.db is written
 - Eval cells no longer see credentials from the agent's environment: Python kernels drop secret-shaped variables (`*TOKEN*`, `*API_KEY*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`, access/private keys, cookies) even under the allowed `PI_`/`XDG_`/`LC_` prefixes, and JS eval workers, subprocess and Bun Worker fallback alike, start without them

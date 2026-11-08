@@ -304,10 +304,13 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			const permitted = permissionResultFilter(this.session.settings, this.session.cwd, this.name, url =>
 				InternalUrlRouter.instance().locateSync(url, resolveContext),
 			);
+			// A change path is relative to the search folder; a single-file search names its own file.
+			const changeFile = (changePath: string): string =>
+				isDirectory ? resolveSearchResultPath(resolvedSearchPath, changePath) : resolvedSearchPath;
 			let result = preview;
 			let applyTargets = multiTargets;
 			if (permitted) {
-				const keep = (changePath: string) => permitted(resolveSearchResultPath(resolvedSearchPath, changePath));
+				const keep = (changePath: string) => permitted(changeFile(changePath));
 				const fileChanges = preview.fileChanges.filter(change => keep(change.path));
 				result = {
 					...preview,
@@ -316,16 +319,12 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					totalReplacements: fileChanges.reduce((total, change) => total + change.count, 0),
 					filesTouched: fileChanges.length,
 				};
-				applyTargets = fileChanges.map(change => ({
-					basePath: resolveSearchResultPath(resolvedSearchPath, change.path),
-				}));
+				applyTargets = fileChanges.map(change => ({ basePath: changeFile(change.path) }));
 			}
 			const grammarNote = result.missingGrammars?.length ? missingGrammarsNote(result.missingGrammars) : undefined;
 
 			const shownParseErrors = (errors: readonly string[] | undefined) =>
-				withoutRefusedDiagnostics(errors, permitted, reported =>
-					resolveSearchResultPath(resolvedSearchPath, reported),
-				);
+				withoutRefusedDiagnostics(errors, permitted, changeFile);
 			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(
 				shownParseErrors(result.parseErrors),
 			);
