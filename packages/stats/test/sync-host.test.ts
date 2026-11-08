@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { type SyncOptions, syncAllSessions, syncSessionTree } from "@oh-my-pi/omp-stats/aggregator";
@@ -14,13 +14,28 @@ let restoreHost: (() => void) | undefined;
 afterEach(() => {
 	restoreHost?.();
 	restoreHost = undefined;
+	vi.restoreAllMocks();
 });
 
-function recordingHost(calls: (SyncOptions | undefined)[], onCall?: () => void): SessionSyncHost {
+/** Run `request` and resolve once StatsLive reports the resulting sync finished (idle, newly synced). */
+async function syncOnce(live: StatsLive, request: () => void): Promise<void> {
+	const finished = Promise.withResolvers<void>();
+	const before = live.status().sync.lastSyncedAt;
+	const unsubscribe = live.subscribe(status => {
+		if (status.sync.phase === "idle" && status.sync.lastSyncedAt !== before) finished.resolve();
+	});
+	try {
+		request();
+		await finished.promise;
+	} finally {
+		unsubscribe();
+	}
+}
+
+function recordingHost(calls: (SyncOptions | undefined)[]): SessionSyncHost {
 	return {
 		async syncAllSessions(opts) {
 			calls.push(opts);
-			onCall?.();
 			return { processed: 7, files: 3 };
 		},
 	};
@@ -101,26 +116,16 @@ describe("session sync host", () => {
 	});
 
 	it("routes the dashboard's live full and targeted syncs through the registered host", async () => {
+		// StatsLive drops a status identical to the last one it sent, and a targeted run changes only
+		// `lastSyncedAt`. A clock that moves on every read makes each run's end a distinct event.
+		let now = 1_700_000_000_000;
+		vi.spyOn(Date, "now").mockImplementation(() => (now += 10_000));
 		const calls: (SyncOptions | undefined)[] = [];
-		let notify: (() => void) | undefined;
-		restoreHost = setSessionSyncHost(recordingHost(calls, () => notify?.()));
+		restoreHost = setSessionSyncHost(recordingHost(calls));
 		const live = new StatsLive();
 		try {
-			const full = Promise.withResolvers<void>();
-			notify = full.resolve;
-			live.requestSync();
-			await full.promise;
-
-			const targeted = Promise.withResolvers<void>();
-			notify = targeted.resolve;
-			live.requestSync(["/sessions/changed.jsonl"]);
-			await targeted.promise;
-
-			// Let the targeted run settle before teardown closes the database.
-			const settled = Promise.withResolvers<void>();
-			const unsubscribe = live.subscribe(() => settled.resolve());
-			await settled.promise;
-			unsubscribe();
+			await syncOnce(live, () => live.requestSync());
+			await syncOnce(live, () => live.requestSync(["/sessions/changed.jsonl"]));
 		} finally {
 			live.stop();
 		}
