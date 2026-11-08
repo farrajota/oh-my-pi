@@ -122,6 +122,35 @@ describe("interactive stats sync host", () => {
 		expect(storedMessageCount()).toBe(4);
 	});
 
+	it("reuses one stats worker subprocess for every sync of a long-lived host", async () => {
+		const first = writeSession("reuse-a", 2);
+		restoreHost = installStatsSyncHost();
+		const spawn = vi.spyOn(Bun, "spawn");
+
+		expect(await syncAllSessions()).toEqual({ processed: 2, files: 1 });
+		const second = writeSession("reuse-b", 3);
+		expect(await syncAllSessions({ files: [second] })).toEqual({ processed: 3, files: 1 });
+		expect(await syncSessionTree(first, { workers: 1 })).toEqual({ processed: 0, files: 0 });
+
+		expect(statsWorkerSpawns(spawn)).toBe(1);
+		expect(storedMessageCount()).toBe(5);
+	}, 30_000);
+
+	it("replaces a stats worker that died between syncs", async () => {
+		writeSession("respawn-a", 1);
+		restoreHost = installStatsSyncHost();
+		const spawn = vi.spyOn(Bun, "spawn");
+		expect(await syncAllSessions()).toEqual({ processed: 1, files: 1 });
+
+		const [worker] = spawn.mock.results.map(result => result.value as Bun.Subprocess);
+		worker.kill("SIGKILL");
+		await worker.exited;
+		const second = writeSession("respawn-b", 2);
+
+		expect(await syncAllSessions({ files: [second] })).toEqual({ processed: 2, files: 1 });
+		expect(statsWorkerSpawns(spawn)).toBe(2);
+	}, 30_000);
+
 	it("surfaces a failed subprocess sync as a rejection", async () => {
 		writeSession("locked", 1);
 		restoreHost = installStatsSyncHost();

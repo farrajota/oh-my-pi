@@ -3,9 +3,10 @@
  * `activity-client.ts` / `sync-client.ts` (re-entered through the agent CLI's
  * hidden `__omp_worker_stats_activity` selector). Owns the stats DB handle for
  * the `/usage` heatmap load and for session syncs so the synchronous SQLite
- * work never runs on the TUI thread; the parent SIGKILLs the child once `done`
- * or `synced` arrives. Worker selectors dispatch before the CLI registers its
- * session sync host, so syncs here run inline in this process.
+ * work never runs on the TUI thread. A heatmap load is one-shot (the parent
+ * SIGKILLs the child once `done` arrives); the TUI's sync host keeps one child
+ * and sends it every `sync` request. No session sync host is registered in
+ * this process, so syncs here run inline.
  */
 import { type SyncProgress, syncAllSessions } from "@oh-my-pi/omp-stats/aggregator";
 import { getDailyActivity } from "@oh-my-pi/omp-stats/db";

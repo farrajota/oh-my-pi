@@ -133,6 +133,7 @@ import { ForkSourceNotFoundError, SessionManager, SessionMoveRefusedError } from
 import { forkIfMovedAway } from "./session/session-transfer";
 import { formatSingleRequestGuardVerification, verifySingleRequestGuard } from "./session/single-request-guard";
 import { shouldShowStartupSplash } from "./startup-splash";
+import { installStatsSyncHost } from "./stats/sync-host";
 import {
 	discoverSystemPromptOverride,
 	discoverTitleSystemPromptFile,
@@ -666,6 +667,11 @@ async function runInteractiveMode(
 	refreshScopedModelsAfterLogin?: () => Promise<void>,
 	singleRequest = false,
 ): Promise<void> {
+	// Stats session syncs write stats.db synchronously, for seconds to minutes on a cold ingest.
+	// In the TUI they run in one stats subprocess so the dashboard's live ingest and extensions
+	// using the stats runtime never block the UI thread. The host lives as long as the process;
+	// its idle subprocess never holds the process open and exits with it.
+	installStatsSyncHost();
 	const InteractiveModeConstructor = await loadInteractiveModeConstructor();
 	let mode: InteractiveMode;
 	try {

@@ -1,12 +1,12 @@
 /**
- * Wire types between the interactive process and the one-shot stats
- * subprocess. `bun:sqlite` is synchronous, so the daily-activity aggregate
- * (a scan over every `messages` row in the heatmap window) and session syncs
+ * Wire types between the interactive process and the stats subprocess.
+ * `bun:sqlite` is synchronous, so the daily-activity aggregate (a scan over
+ * every `messages` row in the heatmap window) and session syncs
  * run in a child process — on a multi-GB stats database each query stalls the
  * event loop for seconds, and a cold ingest of the sessions tree for minutes,
  * which froze the TUI when it ran inline. See `activity-client.ts` (the
  * `/usage` heatmap) and `sync-client.ts` (session syncs requested anywhere in
- * the interactive process) for the spawn/kill glue.
+ * the TUI process, over one long-lived child) for the client glue.
  */
 import type { SyncOptions, SyncProgress } from "@oh-my-pi/omp-stats/aggregator";
 import type { DailyActivityPoint } from "@oh-my-pi/omp-stats/shared-types";
