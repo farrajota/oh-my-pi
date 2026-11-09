@@ -401,6 +401,37 @@ it("always-ask: an ACP grant satisfies the inner wrapper's explicit prompt polic
 	expect(bashTool.executeCalls).toBe(1);
 });
 
+it("an allow_once ACP grant covers only the call it was given for, never the caller's shared context", async () => {
+	// The grant must stay on a per-call copy of the context. If it leaked onto the
+	// caller's object, any later call reusing that context with the same arguments,
+	// through the ACP gate or straight into the inner tool, would skip approval.
+	const bashTool = makeFakeTool("bash");
+	const wrapped = new ExtensionToolWrapper(bashTool, noUiRunner()) as unknown as AgentTool;
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const approvalSettings: Record<string, unknown> = {
+		"tools.approvalMode": "always-ask",
+		"tools.approval": { bash: "prompt" },
+	};
+	session = await createSession([wrapped], bridge, approvalSettings);
+	await session.setActiveToolsByName(["bash"]);
+	const gatedBash = session.agent.state.tools.find(t => t.name === "bash");
+	if (!gatedBash) throw new Error("Missing bash tool");
+	const ctx = { settings: Settings.isolated(approvalSettings) } as AgentToolContext;
+	const args = { command: "echo granted-once" };
+
+	await gatedBash.execute("call-1", args, undefined, undefined as never, ctx as never);
+	expect(Object.hasOwn(ctx, "acpApprovedArgs")).toBe(false);
+
+	await gatedBash.execute("call-2", args, undefined, undefined as never, ctx as never);
+	expect(permissionSpy).toHaveBeenCalledTimes(2);
+
+	await expect(wrapped.execute("call-3", args, undefined, undefined as never, ctx as never)).rejects.toThrow(
+		/requires approval but no interactive UI/,
+	);
+	expect(bashTool.executeCalls).toBe(2);
+});
+
 it("ACP bash uses pattern decisions and scopes persistent grants to noncritical commands", async () => {
 	const settingsOverrides = {
 		"tools.approvalMode": "always-ask",
