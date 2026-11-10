@@ -412,7 +412,7 @@ describe("pickElectronTarget", () => {
 			},
 		});
 		const controller = new AbortController();
-		const childScript = `await fetch(${JSON.stringify(marker.url.href)}); Bun.serve({ port: 0, fetch: () => new Response("ok") });`;
+		const childScript = `await fetch(${JSON.stringify(marker.url.href)}); Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("ok") });`;
 		const openError = acquireBrowser(
 			{
 				kind: "spawned",
@@ -532,8 +532,9 @@ describe("pickElectronTarget", () => {
 			const ownedName = `owned-${crypto.randomUUID()}`;
 			try {
 				await waitForCdp(`http://127.0.0.1:${port}`, 15_000);
+				const borrowedExecutable = process.platform === "linux" ? await fs.realpath(`/proc/${child.pid}/exe`) : exe;
 				const existing = await acquireBrowser(
-					{ kind: "spawned", path: exe, args: [...flags, `--user-data-dir=${borrowedProfile}`] },
+					{ kind: "spawned", path: borrowedExecutable, args: [...flags, `--user-data-dir=${borrowedProfile}`] },
 					{ cwd: session.cwd },
 				);
 				if (!("browser" in existing)) throw new Error("Expected Chromium browser");
@@ -543,7 +544,7 @@ describe("pickElectronTarget", () => {
 					action: "open",
 					name: borrowedName,
 					url: "data:text/html,<title>Borrowed</title>",
-					app: { path: exe, args: [...flags, "--user-data-dir", borrowedProfile] },
+					app: { path: borrowedExecutable, args: [...flags, "--user-data-dir", borrowedProfile] },
 				});
 				await invoke({
 					action: "open",
@@ -1386,8 +1387,12 @@ describe("probeCdpStatus", () => {
 	// loopback addresses, so a bare fetch()/node:http probe misreports a healthy
 	// CDP daemon as dead. The raw-TCP probe must ignore HTTP_PROXY entirely.
 	test("returns the loopback status even when HTTP_PROXY 502s the request", async () => {
-		const cdp = Bun.serve({ port: 0, fetch: () => new Response("{}", { status: 200 }) });
-		const proxy = Bun.serve({ port: 0, fetch: () => new Response("Bad Gateway", { status: 502 }) });
+		const cdp = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("{}", { status: 200 }) });
+		const proxy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => new Response("Bad Gateway", { status: 502 }),
+		});
 		const saved = { HTTP_PROXY: process.env.HTTP_PROXY, http_proxy: process.env.http_proxy };
 		process.env.HTTP_PROXY = `http://127.0.0.1:${proxy.port}`;
 		process.env.http_proxy = `http://127.0.0.1:${proxy.port}`;
@@ -1409,7 +1414,7 @@ describe("probeCdpStatus", () => {
 	});
 
 	test("surfaces a non-2xx status from a live endpoint", async () => {
-		const server = Bun.serve({ port: 0, fetch: () => new Response("nope", { status: 503 }) });
+		const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("nope", { status: 503 }) });
 		try {
 			const status = await probeCdpStatus(`http://127.0.0.1:${server.port}/json/version`, { timeoutMs: 1500 });
 			expect(status).toBe(503);
@@ -1425,7 +1430,7 @@ describe("probeCdpStatus", () => {
 	});
 
 	test("returns null when the request is already aborted", async () => {
-		const server = Bun.serve({ port: 0, fetch: () => new Response("{}", { status: 200 }) });
+		const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("{}", { status: 200 }) });
 		try {
 			const status = await probeCdpStatus(`http://127.0.0.1:${server.port}/json/version`, {
 				timeoutMs: 1500,

@@ -966,9 +966,30 @@ mod tests {
 		let wt = repo.parent().expect("parent").join("bare-wt");
 		assert!(!wt.join("tracked.txt").exists(), "--no-checkout handled by git");
 
-		// Branch already checked out: git's own fatal error and status.
+		// Compare the unsupported invocation with the installed git binary under
+		// the same repository state, arguments, and GIT_CONFIG-free environment.
+		let mut expected = tempfile::tempfile().expect("git transcript");
+		let mut git = std::process::Command::new("git");
+		git.args(["worktree", "add", "../again", "main"])
+			.current_dir(&repo)
+			.env_clear()
+			.envs(
+				std::env::vars_os()
+					.filter(|(name, _)| !name.to_string_lossy().starts_with("GIT_CONFIG")),
+			)
+			.stdout(std::process::Stdio::from(expected.try_clone().expect("clone git transcript")))
+			.stderr(std::process::Stdio::from(expected.try_clone().expect("clone git transcript")));
+		let expected_status = git.status().expect("run installed git");
+		use std::io::{Read as _, Seek as _};
+		expected.rewind().expect("rewind git transcript");
+		let mut expected_output = String::new();
+		expected
+			.read_to_string(&mut expected_output)
+			.expect("read git transcript");
+
 		let (code, output) = run(&repo, "git worktree add ../again main").await;
-		assert_eq!(code, Some(128));
-		assert!(output.contains("fatal: 'main' is already used by worktree"), "{output}");
+		assert_eq!(expected_status.code(), Some(128), "{expected_output}");
+		assert_eq!(expected_output, output);
+		assert_eq!(code, expected_status.code());
 	}
 }

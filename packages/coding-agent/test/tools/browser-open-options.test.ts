@@ -427,6 +427,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 	it("overrides navigator and request user agents", async () => {
 		const seen = Promise.withResolvers<string>();
 		const server = Bun.serve({
+			hostname: "127.0.0.1",
 			port: 0,
 			fetch(request) {
 				seen.resolve(request.headers.get("user-agent") ?? "");
@@ -455,6 +456,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 	it("accepts an untrusted certificate for the tab's lifetime, across a worker recycle, and checks it again once the tab closes", async () => {
 		const serveUntrusted = () =>
 			Bun.serve({
+				hostname: "127.0.0.1",
 				port: 0,
 				tls: { cert: CLAUDE_TRACE_DEBUG_CERT, key: CLAUDE_TRACE_DEBUG_KEY },
 				fetch: () => new Response("<title>untrusted</title>", { headers: { "content-type": "text/html" } }),
@@ -526,8 +528,9 @@ await Promise.withResolvers().promise;`;
 	}, 30_000);
 
 	it("closes the tab its open created when the navigation fails outright, but keeps a reused one", async () => {
-		const refused = Bun.serve({ port: 0, fetch: () => new Response("") });
-		const url = refused.url.href;
+		const refused = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
+		const url = new URL(refused.url);
+		url.hostname = "127.0.0.1";
 		refused.stop(true);
 		const invoke = browserHost();
 		const tabNames = async () =>
@@ -535,14 +538,14 @@ await Promise.withResolvers().promise;`;
 		const name = `refused-${crypto.randomUUID()}`;
 		const keptNote = `browser.tab(${JSON.stringify(name)})`;
 
-		const fresh = await rejectionOf(invoke({ action: "open", name, url }));
+		const fresh = await rejectionOf(invoke({ action: "open", name, url: url.href }));
 		expect(fresh).toMatchObject({ message: expect.stringContaining("net::ERR_CONNECTION_REFUSED") });
 		expect(fresh).not.toMatchObject({ message: expect.stringContaining(keptNote) });
 		expect(getTab(name)).toBeUndefined();
 		expect(await tabNames()).not.toContain(name);
 
 		await invoke({ action: "open", name, url: "data:text/html,<title>kept</title>" });
-		expect(await rejectionOf(invoke({ action: "open", name, url }))).toMatchObject({
+		expect(await rejectionOf(invoke({ action: "open", name, url: url.href }))).toMatchObject({
 			message: expect.stringContaining(keptNote),
 		});
 		expect(getTab(name)?.state).toBe("alive");
@@ -553,6 +556,7 @@ await Promise.withResolvers().promise;`;
 		const requested = Promise.withResolvers<void>();
 		const answer = Promise.withResolvers<void>();
 		const server = Bun.serve({
+			hostname: "127.0.0.1",
 			port: 0,
 			async fetch() {
 				requested.resolve();
@@ -588,6 +592,7 @@ await Promise.withResolvers().promise;`;
 		const gateReached = Promise.withResolvers<void>();
 		const gateOpened = Promise.withResolvers<void>();
 		const server = Bun.serve({
+			hostname: "127.0.0.1",
 			port: 0,
 			async fetch(request) {
 				const url = new URL(request.url);
@@ -658,6 +663,7 @@ await Promise.withResolvers().promise;`;
 	it("saves a download started inside the tab's iframe into the tab's downloads directory", async () => {
 		const payload = new TextEncoder().encode("download payload\n");
 		const server = Bun.serve({
+			hostname: "127.0.0.1",
 			port: 0,
 			fetch(request) {
 				const { pathname } = new URL(request.url);
@@ -701,6 +707,7 @@ await Promise.withResolvers().promise;`;
 	it("waits for a completed download and records its bytes", async () => {
 		const payload = new TextEncoder().encode("download payload\n");
 		const server = Bun.serve({
+			hostname: "127.0.0.1",
 			port: 0,
 			fetch(request) {
 				if (new URL(request.url).pathname === "/file") {
@@ -749,6 +756,7 @@ await Promise.withResolvers().promise;`;
 	it("tracks a download started right after waitForDownload on a tab opened without a downloads directory", async () => {
 		const payload = new TextEncoder().encode("download payload\n");
 		const server = Bun.serve({
+			hostname: "127.0.0.1",
 			port: 0,
 			fetch(request) {
 				if (new URL(request.url).pathname === "/file") {

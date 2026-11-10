@@ -17,6 +17,7 @@ export {
 	type SyncProgress,
 	smokeTestSyncWorker,
 	syncAllSessions,
+	syncSessionTree,
 } from "./aggregator";
 export { closeDb } from "./db";
 export { refreshRollups } from "./rollup";

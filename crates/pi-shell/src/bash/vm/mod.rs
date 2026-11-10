@@ -1296,9 +1296,20 @@ pub fn zsh_startup_values(
 	// `signals`: `EXIT`, the signal names by number, `ZERR`, `DEBUG`.
 	let mut signals = vec![BString::from("EXIT")];
 	for n in 1..=31u8 {
-		match crate::bash::signal::Signal::from_number(n, platform) {
-			Some(s) => signals.push(BString::from(s.to_string())),
-			None => signals.push(BString::from(format!("SIG{n}"))),
+		if platform == crate::bash::ids::Platform::Linux {
+			match n {
+				6 => signals.push(BString::from("IOT")),
+				29 => signals.push(BString::from("POLL")),
+				_ => match crate::bash::signal::Signal::from_number(n, platform) {
+					Some(s) => signals.push(BString::from(s.to_string())),
+					None => signals.push(BString::from(format!("SIG{n}"))),
+				},
+			}
+		} else {
+			match crate::bash::signal::Signal::from_number(n, platform) {
+				Some(s) => signals.push(BString::from(s.to_string())),
+				None => signals.push(BString::from(format!("SIG{n}"))),
+			}
 		}
 	}
 	signals.push(BString::from("ZERR"));

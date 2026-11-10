@@ -13,11 +13,11 @@ mod pty_support;
 
 use std::{io, time::Duration};
 
-use pty_support::{Pty, Spawn, TIMEOUT, differential, have_real_zsh};
+use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
-/// How long output must stay quiet before the screen is read.
+/// How long startup output must stay quiet before sourcing the rc file.
 const QUIET: Duration = Duration::from_millis(300);
 
 /// The history file every case starts with (oldest first).
@@ -35,54 +35,60 @@ fn spawn(real: bool, rc: &str) -> Spawn {
 	// `^Xq` replaces the line with `cat ~/log` and runs it (see `same_log`).
 	let rc = format!(
 		"HISTSIZE=100\nfc -R ~/hist\nq() {{ BUFFER='cat ~/log'; zle .accept-line }}\nzle -N \
-		 q\nbindkey -M emacs '^Xq' q\nbindkey -M viins '^Xq' q\nbindkey -M vicmd '^Xq' q\n{rc}"
+		 q\nbindkey -M emacs '^Xq' q\nbindkey -M viins '^Xq' q\nbindkey -M vicmd '^Xq' q\n{rc}\n. \
+		 ~/{ZLE_SYNC_SCRIPT}\nprint -r -- RC''DONE\n"
 	);
 	s.args(["-f", "-i"])
 		.env("PS1", "%~ %# ")
 		.env("RPS1", "[%?]")
 		.rc_file("hist", HIST)
 		.rc_file(".zshrc", rc)
+		.zle_sync()
 		.cwd("/tmp")
 		.size(24, 80)
 }
 
-/// Type `text` key by key.
+/// Type `text` key by key and wait for the line editor to finish handling it.
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 	pty.type_keys(text, KEY)?;
-	pty.settle(QUIET, TIMEOUT)
+	pty.zle_sync(TIMEOUT)
 }
 
 /// The final screens of `drive` against both shells after sourcing the rc
 /// file (`None` for zsh when it is not installed).
 fn screens(
 	rc: &str,
-	drive: impl Fn(&mut Pty) -> io::Result<()>,
+	mut drive: impl FnMut(&mut Pty) -> io::Result<()>,
 ) -> io::Result<(String, Option<String>)> {
-	let run = |pty: &mut Pty| -> io::Result<()> {
+	let make_spawn = |real| spawn(real, rc);
+	let mut run = |pty: &mut Pty| -> io::Result<()> {
 		pty.settle(QUIET, TIMEOUT)?;
-		keys(pty, ". ~/.zshrc\r")?;
+		pty.type_keys(". ~/.zshrc\r", KEY)?;
+		pty.read_until("RCDONE", TIMEOUT)?;
+		pty.zle_sync(TIMEOUT)?;
 		// A clean screen for the case itself.
 		keys(pty, "\x0c")?;
 		drive(pty)
 	};
 	if !have_real_zsh() {
-		let mut ours = spawn(false, rc).spawn()?;
+		let mut ours = make_spawn(false).spawn()?;
 		run(&mut ours)?;
 		return Ok((ours.screen().contents(), None));
 	}
-	let (ours, real) = differential(spawn(false, rc), spawn(true, rc), run)?;
+	let (ours, real) = differential(make_spawn(false), make_spawn(true), run)?;
 	Ok((ours, Some(real)))
 }
 
 /// Assert both screens (with the cursor position) are the same.
-fn same(rc: &str, typed: &str) {
+fn same(rc: &str, typed: &str) -> (String, Option<String>) {
 	let (ours, real) = match screens(rc, |pty| keys(pty, typed)) {
 		Ok(s) => s,
 		Err(e) => panic!("pty session failed: {e}"),
 	};
-	if let Some(real) = real {
-		assert_eq!(ours, real, "obash screen:\n{ours}\n--- zsh screen:\n{real}");
+	if let Some(real) = &real {
+		assert_eq!(&ours, real, "obash screen:\n{ours}\n--- zsh screen:\n{real}");
 	}
+	(ours, real)
 }
 
 /// [`same`], then `~/log` shown in place of the line: what the widgets
@@ -161,10 +167,10 @@ fn history_beginning_search_with_histfindnodups() {
 #[test]
 fn history_beginning_search_end_functions() {
 	let rc = format!(
-		"{SHOW}fpath=(/usr/share/zsh/5.9/functions)\nautoload -Uz history-search-end\nzle -N \
-		 history-beginning-search-backward-end history-search-end\nzle -N \
-		 history-beginning-search-forward-end history-search-end\nbindkey '^T' \
-		 history-beginning-search-backward-end\nbindkey '^Y' history-beginning-search-forward-end\n"
+		"{SHOW}autoload -Uz history-search-end\nzle -N history-beginning-search-backward-end \
+		 history-search-end\nzle -N history-beginning-search-forward-end \
+		 history-search-end\nbindkey '^T' history-beginning-search-backward-end\nbindkey '^Y' \
+		 history-beginning-search-forward-end\n"
 	);
 	same_log(&rc, "echo t\x14\x18p\x14\x18p\x19\x18p");
 }
@@ -345,7 +351,11 @@ fn insert_last_word_from_the_line_itself() {
 #[test]
 fn infer_next_history_and_accept_and_infer() {
 	let rc = format!("{SHOW}bindkey '^T' accept-and-infer-next-history\n");
-	same(&rc, "ls -l /tmp\x18\x0e\x18p\x15ls -l /tmp\x14");
+	let (ours, real) = same(&rc, "ls -l /tmp\x18\x0e\x18p\x15ls -l /tmp\x14");
+	assert!(ours.contains("/tmp % echo three"), "obash did not infer echo three:\n{ours}");
+	if let Some(real) = real {
+		assert!(real.contains("/tmp % echo three"), "zsh did not infer echo three:\n{real}");
+	}
 }
 
 #[test]

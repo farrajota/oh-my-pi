@@ -69,7 +69,7 @@ true satisfies _MissingKnownApis extends never ? true : ["KNOWN_APIS is missing 
 const BUNDLE_POLICIES = ["always", "fallback", "empty", "never"] as const satisfies readonly SeedBundlePolicy[];
 const DEFAULT_BUNDLE: SeedBundlePolicy = "always";
 const SEED_PROPS = ["api", "base-url", "bundle", "precedence"] as const;
-const MODEL_PROPS = ["name", "api", "base-url"] as const;
+const MODEL_PROPS = ["name", "description", "api", "base-url"] as const;
 const COST_PROPS = ["input", "output", "cache-read", "cache-write"] as const;
 const LIMIT_PROPS = ["context", "max-tokens"] as const;
 const DISCOVERY_PROPS = ["label", "oauth-provider", "allow-unauthenticated"] as const;
@@ -167,6 +167,7 @@ function parseModel(node: KdlNodeView, provider: string, defaults: SeedDefaults)
 	validateProps(node, MODEL_PROPS);
 	const id = requiredName(node);
 	const name = requiredProp(node, "name");
+	const description = propString(node, "description");
 	const api = propApi(node) ?? defaults.api;
 	const baseUrl = propString(node, "base-url") ?? defaults.baseUrl;
 	if (api === undefined || baseUrl === undefined) {
@@ -251,6 +252,7 @@ function parseModel(node: KdlNodeView, provider: string, defaults: SeedDefaults)
 	return {
 		id,
 		name,
+		...(description !== undefined && { description }),
 		api,
 		provider,
 		baseUrl,

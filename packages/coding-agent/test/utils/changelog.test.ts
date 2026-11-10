@@ -266,6 +266,31 @@ describe("formatStartupChangelogSummary", () => {
 });
 
 describe("parseChangelog", () => {
+	test("orders shuffled releases numerically and preserves their complete bodies", async () => {
+		await withTempAgentDir(async tempDir => {
+			const changelogPath = path.join(tempDir, "CHANGELOG.md");
+			const bodies = [
+				"## [2.10.0] - 2026-01-01\n\n### Changed\n\n- Ten minor.",
+				"## [10.0.0] - 2026-01-02\n\n### Added\n\n- New major.",
+				"## [2.9.12] - 2026-01-03\n\n### Fixed\n\n- Twelve patch.",
+				"## [2.9.3] - 2026-01-04\n\n### Fixed\n\n- Three patch.",
+				"## [2.9.4] - 2026-01-05\n\n### Fixed\n\n- Four patch.",
+			];
+			await Bun.write(changelogPath, bodies.join("\n"));
+
+			const entries = await parseChangelog(changelogPath);
+
+			expect(entries.map(({ major, minor, patch }) => [major, minor, patch])).toEqual([
+				[10, 0, 0],
+				[2, 10, 0],
+				[2, 9, 12],
+				[2, 9, 4],
+				[2, 9, 3],
+			]);
+			expect(entries.map(entry => entry.content)).toEqual([bodies[1], bodies[0], bodies[2], bodies[4], bodies[3]]);
+		});
+	});
+
 	test("reads current source release data and filters versions newer than the previous release", async () => {
 		const entries = await parseChangelog(undefined);
 		const latest = entries[0];

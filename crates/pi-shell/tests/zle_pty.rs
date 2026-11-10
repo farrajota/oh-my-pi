@@ -190,7 +190,11 @@ fn eof_on_an_empty_line_exits() {
 		Ok(p) => p,
 		Err(e) => panic!("spawn failed: {e}"),
 	};
-	let r = keys(&mut pty, "\x04").and_then(|()| pty.wait(TIMEOUT));
+	let r = pty
+		.read_until("> ", TIMEOUT)
+		.and_then(|_| pty.wait_raw(TIMEOUT))
+		.and_then(|()| keys(&mut pty, "\x04"))
+		.and_then(|()| pty.wait(TIMEOUT));
 	match r {
 		Ok(status) => assert_eq!(status.code(), Some(0)),
 		Err(e) => panic!("shell did not exit on ^D: {e}"),

@@ -6,7 +6,7 @@ import { getComposerStyle } from "../src/components/composer/registry";
 import { CustomEditor } from "../src/prompt/custom-editor";
 import type { StatusLineComponent } from "../src/status-line/component";
 import type { StatusLineSettings } from "../src/status-line/types";
-import { initTheme } from "../src/theme";
+import { initTheme, theme } from "../src/theme";
 import { visibleWidth } from "../src/utils";
 import { createStatusLineFixture } from "./helpers/status-line";
 import { defaultEditorTheme } from "./test-themes";
@@ -40,7 +40,18 @@ function plainRows(rows: readonly string[]): string[] {
 
 /** Asserts each text occurs exactly once across the rows, in the given order. */
 function expectEachOnceInOrder(rows: readonly string[], texts: readonly string[]): void {
-	const joined = plainRows(rows).join("\n");
+	const vertical = defaultEditorTheme.symbols.boxRound.vertical;
+	const cap = theme.sep.powerlineLeft;
+	// Continuation rows add layout chrome even when they split one segment's text.
+	const joined = plainRows(rows)
+		.map(row => {
+			let body = row.trim();
+			if (body.startsWith(vertical) && body.endsWith(vertical))
+				body = body.slice(vertical.length, -vertical.length).trim();
+			if (cap && body.endsWith(cap)) body = body.slice(0, -cap.length).trimEnd();
+			return body;
+		})
+		.join("");
 	let previous = -1;
 	for (const text of texts) {
 		expect(joined.split(text).length - 1).toBe(1);
@@ -128,6 +139,7 @@ describe("status line wraps overflowing segments onto continuation rows", () => 
 			expect(row.endsWith(defaultEditorTheme.symbols.boxRound.vertical)).toBe(true);
 		}
 		expectEachOnceInOrder(rows, SEGMENT_TEXTS);
+		expectEachOnceInOrder(rows, [getProjectDir()]);
 	});
 
 	it("wraps the band and rule-chip layouts within the terminal width", () => {
@@ -140,6 +152,7 @@ describe("status line wraps overflowing segments onto continuation rows", () => 
 			band,
 			SEGMENT_TEXTS.filter(text => text !== SESSION_TITLE),
 		);
+		expectEachOnceInOrder(band, [getProjectDir()]);
 
 		// The rule chip carries only the right group; the left group lives on the bottom bar.
 		component?.dispose();
@@ -157,6 +170,7 @@ describe("status line wraps overflowing segments onto continuation rows", () => 
 		expect(rows.length).toBeGreaterThan(1);
 		expectRowsWithin(rows, width);
 		expectEachOnceInOrder(rows, SEGMENT_TEXTS);
+		expectEachOnceInOrder(rows, [getProjectDir()]);
 		expect(status.getPreviewLines(width)).toEqual([...rows]);
 	});
 
@@ -201,5 +215,6 @@ describe("status line wraps overflowing segments onto continuation rows", () => 
 		const rows = editor.render(width);
 		expect(rows.length).toBeLessThanOrEqual(maxHeight);
 		expectEachOnceInOrder(rows, SEGMENT_TEXTS);
+		expectEachOnceInOrder(rows, [getProjectDir()]);
 	});
 });

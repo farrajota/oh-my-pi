@@ -126,6 +126,12 @@ Building `all` into one dest would clobber gnu addons with musl ones (shared bas
 
 The driver also supports `--source <dir>` to install prebuilt outputs arranged as `natives-<target>/<canonical>.node`, without invoking Bazel. This mode cannot take extra Bazel arguments. Installation stamps a temporary copy before atomic rename; pre-stamp artifacts can remain unstamped when accepted by that path. For a host-loadable target, the driver runs a child-process load probe with a 60-second timeout and checks the reported version when stamped.
 
+### Shell parity test environments
+
+Completion snapshot collation is fixture-specific: the PTY helper prefers loadable `C.UTF-8`/`C.utf8` before `en_US.UTF-8` to preserve option ordering, while comptest fixtures select their own `ZSH_TEST_LANG` (or `C`). Do not substitute one locale for another merely because both support UTF-8. The PTY helper probes locales with private locale handles, without changing the process or thread locale, and spawned children inherit `LOCPATH` when it is explicitly set. `LOCPATH` controls locale lookup, not where `localedef` writes generated data: when a test needs a generated locale, use a task-local output/prefix with the matching locale-generation tool rather than assuming host privileges or installing system-wide.
+
+The zsh TCP parity test compares the complete output and resolves environment-dependent reverse names independently through the OS. Configured NSS may consult DNS, so this test is not inherently network-free.
+
 ### Typedef regeneration (napi CLI, dev-only)
 
 `native/index.js`/`index.d.ts` are **committed**, so Bazel artifact builds never need the napi CLI. To regenerate after a Rust API change explicitly (the default Cargo-backed host build also performs this step):

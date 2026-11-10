@@ -628,6 +628,7 @@ export interface CompiledProviderDiscovery {
 export interface CompiledSeedModel {
 	id: string;
 	name: string;
+	description?: string;
 	api: Api;
 	provider: string;
 	baseUrl: string;

@@ -70,7 +70,12 @@ async function withCli(
 			retry: { enabled: true, maxRetries: 1, baseDelayMs: 1, maxDelayMs: 1000, modelFallback: false },
 			providers: {
 				openaiResponsesWebsockets: options.websockets === "default" ? undefined : (options.websockets ?? true),
-				streamFirstEventTimeoutSeconds: options.first ?? 1,
+				// This budget also bounds the WebSocket connect, so a 1 s default let a slow
+				// handshake on a loaded machine fall back to SSE before the socket fixture ran.
+				// Cases that test the first-event timeout itself pass `first` explicitly. The
+				// outage case fails after about twice this budget, which must stay well under
+				// promptTimeout.
+				streamFirstEventTimeoutSeconds: options.first ?? 5,
 				streamIdleTimeoutSeconds: options.idle ?? 1,
 				cacheWarming: "off",
 			},

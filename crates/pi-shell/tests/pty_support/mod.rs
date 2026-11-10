@@ -3,8 +3,9 @@
 //!
 //! [`Spawn`] describes the process: program, `argv[0]`, arguments, a
 //! hermetic environment (`PATH` of the runner, `HOME` and `ZDOTDIR` a fresh
-//! temporary directory, `TERM=xterm-256color`, `LANG=en_US.UTF-8`), startup
-//! files written into that home ([`Spawn::rc_file`]) and the window size.
+//! temporary directory, `TERM=xterm-256color`, and a loadable UTF-8
+//! `LANG`), startup files written into that home ([`Spawn::rc_file`]) and the
+//! window size.
 //! [`Spawn::spawn`] starts it as the leader of a new session whose
 //! controlling terminal is the pty (fds 0–2 on its terminal side).
 //!
@@ -63,6 +64,74 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The real zsh for differential runs.
 pub const REAL_ZSH: &str = "/bin/zsh";
+/// The directories of zsh's shell-code completion functions, in installed
+/// lookup order. Supports both flat and source-tree layouts.
+#[must_use]
+pub fn compsys_fpath() -> Option<Vec<PathBuf>> {
+	for root in ["/usr/share/zsh/5.9/functions", "/usr/share/zsh/functions"] {
+		let root = Path::new(root);
+		if root.join("_main_complete").is_file() && root.join("compinit").is_file() {
+			return Some(vec![root.to_owned()]);
+		}
+		if root.join("Completion/Base/_main_complete").is_file() {
+			let mut dirs = Vec::new();
+			for top in sorted_dirs(root) {
+				dirs.extend(sorted_dirs(&top));
+				dirs.push(top);
+			}
+			return Some(dirs);
+		}
+	}
+	None
+}
+
+fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {
+	let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
+		.into_iter()
+		.flatten()
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| p.is_dir())
+		.collect();
+	dirs.sort();
+	dirs
+}
+
+/// `fpath=( ... )` words for [`compsys_fpath`] (the paths need no quoting).
+#[must_use]
+pub fn fpath_words(dirs: &[PathBuf]) -> String {
+	let words: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+	words.join(" ")
+}
+
+/// A loadable UTF-8 locale, preferring C collation for stable PTY snapshots.
+///
+/// Does not change the process or thread locale.
+#[must_use]
+pub fn utf8_locale() -> &'static str {
+	["C.UTF-8", "C.utf8", "en_US.UTF-8"]
+		.into_iter()
+		.find(|name| {
+			let name = CString::new(*name).expect("locale name has no NUL");
+			// SAFETY: newlocale copies the NUL-terminated name and returns an
+			// independent handle; nl_langinfo_l only reads that handle.
+			let locale =
+				unsafe { libc::newlocale(libc::LC_CTYPE_MASK, name.as_ptr(), std::ptr::null_mut()) };
+			if locale.is_null() {
+				return false;
+			}
+			// SAFETY: locale is valid until freelocale below.
+			let codeset = unsafe { libc::nl_langinfo_l(libc::CODESET, locale) };
+			let is_utf8 = !codeset.is_null()
+				&& unsafe { std::ffi::CStr::from_ptr(codeset) }
+					.to_bytes()
+					.eq_ignore_ascii_case(b"UTF-8");
+			// SAFETY: locale was returned by newlocale and is no longer used.
+			unsafe { libc::freelocale(locale) };
+			is_utf8
+		})
+		.expect("a loadable UTF-8 locale is required by PTY tests")
+}
 
 /// The script [`Spawn::zle_sync`] writes into the home directory; a
 /// zsh-like shell (obash as `zsh`, the real zsh) sources it
@@ -119,10 +188,21 @@ impl Spawn {
 			(OsString::from("HOME"), home.path().as_os_str().to_owned()),
 			(OsString::from("ZDOTDIR"), home.path().as_os_str().to_owned()),
 			(OsString::from("TERM"), OsString::from("xterm-256color")),
-			(OsString::from("LANG"), OsString::from("en_US.UTF-8")),
+			(OsString::from("LANG"), OsString::from(utf8_locale())),
 		];
+		if let Some(dirs) = compsys_fpath() {
+			let fpath = dirs
+				.iter()
+				.map(|dir| dir.display().to_string())
+				.collect::<Vec<_>>()
+				.join(":");
+			env.push((OsString::from("FPATH"), OsString::from(fpath)));
+		}
 		if let Some(path) = std::env::var_os("PATH") {
 			env.push((OsString::from("PATH"), path));
+		}
+		if let Some(path) = std::env::var_os("LOCPATH") {
+			env.push((OsString::from("LOCPATH"), path));
 		}
 		Self {
 			program: program.into(),

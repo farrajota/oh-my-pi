@@ -236,7 +236,7 @@ function parseChangelogContent(content: string): ChangelogEntry[] {
 		});
 	}
 
-	return entries;
+	return entries.sort((a, b) => compareChangelogEntries(b, a));
 }
 
 async function parseStartupChangelog(

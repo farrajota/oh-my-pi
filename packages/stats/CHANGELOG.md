@@ -5,6 +5,7 @@
 ### Fixed
 
 - A session sync's batch commit waits for another connection's write (a rollup refresh, another omp process) instead of failing with `database is locked`
+- Export `syncSessionTree` from the public stats entrypoint.
 
 ### Added
 

@@ -673,15 +673,21 @@ async function navigateOpenedTab(
 	startedAt: number,
 	created?: WorkerTabSession,
 ): Promise<string | undefined> {
-	const remainingMs = opts.timeoutMs - (performance.now() - startedAt);
-	const gotoMs = Math.max(1, Math.round(remainingMs - Math.min(OPEN_NAVIGATION_REPORT_MS, remainingMs / 2)));
 	try {
+		if (opts.signal?.aborted) throw new ToolAbortError("Browser tab open aborted");
+		const remainingMs = opts.timeoutMs - (performance.now() - startedAt);
+		if (remainingMs <= 0) {
+			throw new ToolError(
+				`Browser tab open used up its ${opts.timeoutMs}ms budget before navigation; call was not run again.`,
+			);
+		}
+		const gotoMs = Math.max(1, Math.round(remainingMs - Math.min(OPEN_NAVIGATION_REPORT_MS, remainingMs / 2)));
 		await runInTabWithSnapshot(
 			name,
 			{
 				code: `await tab.goto(${JSON.stringify(url)}, { waitUntil: ${JSON.stringify(opts.waitUntil ?? "load")} });`,
-				// tab.goto bounds itself to the cell budget less CELL_BUDGET_SLACK_MS.
-				timeoutMs: gotoMs + CELL_BUDGET_SLACK_MS,
+				// Reporting slack cannot extend the open's shared budget.
+				timeoutMs: Math.min(remainingMs, gotoMs + CELL_BUDGET_SLACK_MS),
 				signal: opts.signal,
 			},
 			{ cwd: getProjectDir() },
@@ -950,7 +956,14 @@ async function runInTabWithSnapshot(
 		if (current && current !== recovered) {
 			throw new ToolError(`Tab ${JSON.stringify(name)} was closed while its worker was being reattached.`);
 		}
-		opts = { ...opts, timeoutMs: Math.max(1, opts.timeoutMs - Math.round(performance.now() - waitStartedAt)) };
+		const remainingMs = opts.timeoutMs - Math.round(performance.now() - waitStartedAt);
+		if (remainingMs <= 0) {
+			if (opts.signal?.aborted) throw new ToolAbortError();
+			throw new ToolError(
+				`Browser worker recovery used up this call's ${opts.timeoutMs}ms budget; call was not run again.`,
+			);
+		}
+		opts = { ...opts, timeoutMs: remainingMs };
 	}
 	const tab = tabs.get(name);
 	if (!tab || tab.state === "dead") {

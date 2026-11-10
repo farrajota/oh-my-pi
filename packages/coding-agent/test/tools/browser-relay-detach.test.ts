@@ -473,7 +473,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 			const terminate = tab.worker.terminate.bind(tab.worker);
 			const held = spyOn(tab.worker, "terminate").mockImplementation(async () => {
 				await terminate();
-				now.mockReturnValue(30_000);
+				now.mockReturnValue(20_000);
 			});
 			try {
 				const result = await invoke({ action: "open", url: `${pageUrl}&never`, timeout: 20 }).catch(

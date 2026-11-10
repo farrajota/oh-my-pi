@@ -9,6 +9,7 @@
 
 ### Changed
 
+- Changelog parsing orders releases by numeric major, minor, and patch versions so recent views select the newest entries.
 - Agent `bash` commands run with `LANG`/`LC_ALL=C.UTF-8` on every platform instead of the inherited locale, so sort order, number formats and tool messages no longer vary by machine; a locale in the command's `env` or `.envrc` still wins, and `!` commands keep yours
 - omp's built-in shell (`omp bash`/`omp zsh` and the bash tool) parses scripts about a third faster, sources large function libraries about 20% faster, and re-runs a repeated `eval` or `source` without recompiling it.
 - The `computer` tool's `el.perform()` takes any spelling of an action `ax()` lists (`perform("open")`), and `computer.backgroundFallback: refuse` refuses every spelling of a raise, open, context menu or popup press ([#15282](https://github.com/can1357/oh-my-pi/pull/15282) by [@will-bogusz](https://github.com/will-bogusz))
@@ -49,6 +50,12 @@
 - RPC `bash` accepts `excludeFromContext: true` to keep a run out of model context like terminal `!!`; runtimes advertise support with `supportsBashExcludeFromContext` in the `ready` frame, and the Python SDK exposes that frame as `client.ready` ([#18206](https://github.com/can1357/oh-my-pi/pull/18206) by [@andrebrait](https://github.com/andrebrait))
 
 ### Fixed
+
+- The zsh shortcut-command PTY test seeds an empty `.zshrc` in its synthetic home so first-run setup cannot intercept interactive input
+- Browser attach/open-options tests use the observed executable for borrowed-browser identity and explicitly bind synthetic Bun fixture listeners to `127.0.0.1`
+- Rust task launcher Cargo resolution prefers explicit `CARGO_HOME/bin`, `~/.cargo/bin` and repository `.cargo/bin` before PATH, resolves active-toolchain Cargo through Rustup, and falls back to direct Cargo when Rustup resolution fails or is empty
+- Browser open keeps a recovered tab on its original page when the shared timeout expires before navigation; internal reporting slack no longer extends that budget
+- Browser relay detach regression simulates elapsed time that exhausts the open budget without exhausting recovery, while retaining the original caller timeout and tab-preservation assertions
 
 - A repeated-retry probe that fails with a context overflow no longer ends the retry as not recoverable while compaction continues the turn; the continuation closes it, and runs with the normal provider attempt budget
 - `/restart` in a `--single-request` session relaunches it under the guard again instead of as an unguarded session with tools, retries and fallback

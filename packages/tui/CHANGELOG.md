@@ -14,6 +14,7 @@
 
 ### Changed
 
+- Status-line wrap checks reconstruct text across continuation-row framing and verify the full project path, so a path split across rows is not mistaken for dropped text.
 - A status line wider than the terminal keeps every configured segment: the overflow moves, in configured order, onto continuation rows under the box border, the band, the top-rule chip or the standalone bar (a segment wider than a row wraps), instead of shrinking the path and title and dropping segments. Continuation rows count against the editor's height limit. `EditorTopBorder.continuation` carries the extra rows; `StatusLineComponent.getTopBorderRows()`, `getBandTopBorderRows()` and `getStandaloneTopBorderRows()` return them, while `getTopBorder()` and the other single-row getters keep dropping
 - Grep results for a single searched file no longer repeat `1 file` after the match count; the header already names the file ([#18422](https://github.com/can1357/oh-my-pi/pull/18422) by [@JustasMasiulis](https://github.com/JustasMasiulis)).
 

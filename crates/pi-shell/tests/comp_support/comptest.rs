@@ -21,8 +21,8 @@ use std::{
 	time::Duration,
 };
 
-use super::{compsys_fpath, fpath_words, shell};
-use crate::pty_support::Pty;
+use super::shell;
+use crate::pty_support::{Pty, compsys_fpath, fpath_words};
 
 /// Bound of the first prompt (obash's startup).
 const STARTUP: Duration = Duration::from_secs(60);

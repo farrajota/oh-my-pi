@@ -22,6 +22,13 @@ const SIGCOUNT: i64 = 31;
 
 /// zsh `sigs[n]` for `1 <= n <= SIGCOUNT` (as `$signals`).
 fn sig_name(n: i64, platform: Platform) -> String {
+	if platform == Platform::Linux {
+		match n {
+			6 => return String::from("IOT"),
+			29 => return String::from("POLL"),
+			_ => {},
+		}
+	}
 	u8::try_from(n)
 		.ok()
 		.and_then(|n| Signal::from_number(n, platform))

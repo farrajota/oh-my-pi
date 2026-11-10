@@ -181,6 +181,8 @@ Concurrency guard:
    - other shells get `-lc`.
 - `startArgv()` passes each argument directly to `portable_pty::CommandBuilder`.
 - PTY commands inherit the process environment after stripping Git repository-location overrides; explicit PTY `env` values can add them back.
+
+- The `zsh_comp_pty` completion snapshot tests set `LC_ALL` per spawned shell: cases use the test helper's loadable UTF-8 locale by default, while `compadd_matchers` and `options_of_print_with_descriptions` explicitly use `en_US.UTF-8`. This is fixture-local and does not change the process or thread locale.
 - Default size is `120x40`; dimensions are clamped (`cols 20..400`, `rows 5..200`) on start and resize.
 - `write(data: string)` sends the string's UTF-8 bytes to PTY stdin.
 - `resize()` sends a control message and clamps dimensions again.

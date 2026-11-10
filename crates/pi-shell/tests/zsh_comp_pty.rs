@@ -21,8 +21,8 @@ mod pty_support;
 
 use std::{fmt::Write as _, fs, io, path::PathBuf, time::Duration};
 
-use comp_support::{bless, compsys_fpath, fpath_words, oracle, quiet, sgr_transcript, shell};
-use pty_support::Pty;
+use comp_support::{bless, oracle, quiet, sgr_transcript, shell};
+use pty_support::{Pty, compsys_fpath, fpath_words, utf8_locale};
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
@@ -69,7 +69,14 @@ fn step(pty: &mut Pty, keys: &str) -> io::Result<()> {
 }
 
 /// Run the case on the shell under test; the record of its steps.
-fn record(fpath: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) -> io::Result<String> {
+fn record(
+	fpath: &str,
+	setup: Setup,
+	rc: &str,
+	steps: &[&str],
+	what: Record,
+	locale: &str,
+) -> io::Result<String> {
 	let mut rcfile = format!("fpath=( {fpath} )\n{FIXTURE}");
 	if setup == Setup::Compsys {
 		rcfile.push_str("autoload -U compinit; compinit -u -D\n");
@@ -79,7 +86,7 @@ fn record(fpath: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) -> 
 	let mut pty = shell()
 		.args(["-f", "-i"])
 		.env("PS1", "%# ")
-		.env("LC_ALL", "en_US.UTF-8")
+		.env("LC_ALL", locale)
 		.rc_file(".zshrc", rcfile)
 		.size(24, 80)
 		.spawn()?;
@@ -107,11 +114,23 @@ fn record(fpath: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) -> 
 
 /// Record the case and compare it with (or, blessing, write) its snapshot.
 fn check(name: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) {
+	check_with_locale(name, setup, rc, steps, what, utf8_locale());
+}
+
+/// Check a snapshot with an explicitly selected UTF-8 locale.
+fn check_with_locale(
+	name: &str,
+	setup: Setup,
+	rc: &str,
+	steps: &[&str],
+	what: Record,
+	locale: &str,
+) {
 	let Some(fpath) = compsys_fpath() else {
 		eprintln!("skipped: zsh 5.9 completion functions are not installed");
 		return;
 	};
-	let got = match record(&fpath_words(&fpath), setup, rc, steps, what) {
+	let got = match record(&fpath_words(&fpath), setup, rc, steps, what, locale) {
 		Ok(text) => text,
 		Err(e) => panic!("pty session failed: {e}"),
 	};
@@ -159,7 +178,14 @@ fn cd_completes_directories() {
 
 #[test]
 fn options_of_print_with_descriptions() {
-	check("options_of_print_with_descriptions", Setup::Compsys, "", &["print -\t"], Record::Screen);
+	check_with_locale(
+		"options_of_print_with_descriptions",
+		Setup::Compsys,
+		"",
+		&["print -\t"],
+		Record::Screen,
+		"en_US.UTF-8",
+	);
 }
 
 /// macOS `ls`: too many options for the screen, so zsh asks first.
@@ -431,12 +457,13 @@ fn compadd_matchers() {
 	let rc = "_m() {\n\x20 compadd -M 'm:{a-z}={A-Z}' Foobar FooBaz Quux\n\x20 compadd -M 'r:|.=* \
 	          r:|=*' comp.sources.unix comp.graphics.misc\n}\nzle -C m complete-word _m\nbindkey \
 	          '^T' m";
-	check(
+	check_with_locale(
 		"compadd_matchers",
 		Setup::Bare,
 		rc,
 		&[": foob\x14", "\x14", "\x15: c.s.u\x14", "\x15: .g\x14"],
 		Record::Screen,
+		"en_US.UTF-8",
 	);
 }
 
