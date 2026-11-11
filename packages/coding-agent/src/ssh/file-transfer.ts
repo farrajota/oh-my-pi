@@ -7,7 +7,7 @@
  * and final newlines are preserved.
  */
 import { type ShellFsDirEntry, ShellFsFileType } from "@oh-my-pi/pi-natives";
-import { ConcatSink, ptree } from "@oh-my-pi/pi-utils";
+import { ConcatSink, logger, ptree } from "@oh-my-pi/pi-utils";
 import { buildRemoteCommand, ensureConnection, ensureHostInfo, type SSHConnectionTarget } from "./connection-manager";
 import { quotePosixArgument } from "../utils/shell-quote";
 import { wrapInPosixShell } from "./utils";
@@ -244,19 +244,38 @@ export async function listRemoteDir(
 		`cd ${quotePosixArgument(remotePath)} && ` +
 		`LC_ALL=C find . ! -name . -prune -exec ${shell} -c ${quotePosixArgument(classify)} ${shell} {} +`;
 	const args = await buildRemoteCommand(target, wrapInPosixShell(shell, command));
-	using child = ptree.spawn(["ssh", ...args], {
-		signal: ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
-	});
+	const signal = ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+	using child = ptree.spawn(["ssh", ...args], { signal });
+	// ptree cuts off only the readers it owns on abort. This raw bounded read must stop itself:
+	// a descendant that escaped the process-tree kill can hold stdout open long after cancellation.
+	// cancel() rejects only for a stream that already errored; read() reports that error below.
+	const stdout = child.proc.stdout.getReader();
+	const stopReading = () => {
+		stdout
+			.cancel()
+			.catch(error => logger.debug("ssh://: directory listing stdout cancel failed", { error: String(error) }));
+	};
+	if (signal?.aborted) stopReading();
+	else signal?.addEventListener("abort", stopReading, { once: true });
 	const buffer = new ConcatSink();
 	let size = 0;
-	for await (const chunk of child.proc.stdout) {
-		size += chunk.length;
-		if (size > DIRECTORY_MAX_BYTES) {
-			throw new Error("ssh://: directory listing exceeds the 1 MiB limit; use a narrower directory scope");
+	try {
+		for (;;) {
+			const { done, value } = await stdout.read();
+			if (done) break;
+			size += value.length;
+			if (size > DIRECTORY_MAX_BYTES) {
+				throw new Error("ssh://: directory listing exceeds the 1 MiB limit; use a narrower directory scope");
+			}
+			buffer.append(value);
 		}
-		buffer.append(chunk);
+	} finally {
+		signal?.removeEventListener("abort", stopReading);
+		stopReading();
 	}
 	await child.exitedCleanly;
+	// An abort after a clean root exit leaves exitedCleanly resolved; the bytes read so far are partial.
+	if (child.exitReason?.aborted) throw child.exitReason;
 	const fields = new TextDecoder("utf-8", { fatal: true }).decode(buffer.flush()).split("\0");
 	if (fields.pop() !== "" || fields.length % 2 !== 0) {
 		throw new Error("ssh://: malformed directory listing (expected NUL-delimited type/name pairs)");

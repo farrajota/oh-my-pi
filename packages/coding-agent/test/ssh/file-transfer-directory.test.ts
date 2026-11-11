@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { ShellFsFileType } from "@oh-my-pi/pi-natives";
 import * as connectionManager from "../../src/ssh/connection-manager";
 import { listRemoteDir } from "../../src/ssh/file-transfer";
+import { quotePosixArgument } from "../../src/utils/shell-quote";
 import { fakeSshTransport } from "../helpers/fake-ssh-transport";
 
 const target = { name: "directory-fixture", host: "fixture" };
@@ -71,4 +72,62 @@ describe.skipIf(process.platform === "win32")("SSH structured directory transpor
 		onSpawn = () => controller.abort(new Error("directory transfer cancelled"));
 		await expect(listRemoteDir(target, fixture, { signal: controller.signal })).rejects.toThrow(/cancel|abort/i);
 	});
+
+	// A descendant reparented away from the ssh process escapes the process-tree kill and keeps
+	// the output pipe open; the shell's own vfork, which defers SIGTERM, can produce one by chance.
+	it("settles a cancelled directory transfer while an escaped descendant still holds the output pipe", async () => {
+		const controller = new AbortController();
+		const ready = path.join(fixture, "ready");
+		const holderPid = path.join(fixture, "holder.pid");
+		vi.spyOn(connectionManager, "buildRemoteCommand").mockResolvedValue([
+			"--fixture",
+			`(sleep 60 & echo $! > ${quotePosixArgument(holderPid)}); ` +
+				`printf 'file\\000partial\\000'; : > ${quotePosixArgument(ready)}; exec sleep 60`,
+		]);
+		try {
+			const listing = listRemoteDir(target, fixture, { signal: controller.signal });
+			while (!(await Bun.file(ready).exists())) await Bun.sleep(5);
+			controller.abort(new Error("directory transfer cancelled"));
+			await expect(listing).rejects.toThrow(/cancel|abort/i);
+		} finally {
+			await killHolder(holderPid);
+		}
+	});
+
+	it("rejects a transfer cancelled after a clean remote exit instead of returning the partial listing", async () => {
+		const controller = new AbortController();
+		const rootPid = path.join(fixture, "root.pid");
+		const holderPid = path.join(fixture, "holder.pid");
+		vi.spyOn(connectionManager, "buildRemoteCommand").mockResolvedValue([
+			"--fixture",
+			`(sleep 60 & echo $! > ${quotePosixArgument(holderPid)}); ` +
+				`printf 'file\\000partial\\000'; echo $$ > ${quotePosixArgument(rootPid)}`,
+		]);
+		try {
+			const listing = listRemoteDir(target, fixture, { signal: controller.signal });
+			while (!(await Bun.file(rootPid).exists())) await Bun.sleep(5);
+			const pid = Number.parseInt(await Bun.file(rootPid).text(), 10);
+			while (isRunning(pid)) await Bun.sleep(5);
+			controller.abort(new Error("directory transfer cancelled"));
+			await expect(listing).rejects.toThrow(/cancel|abort/i);
+		} finally {
+			await killHolder(holderPid);
+		}
+	});
 });
+
+function isRunning(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		throw error;
+	}
+}
+
+async function killHolder(pidFile: string): Promise<void> {
+	if (!(await Bun.file(pidFile).exists())) return;
+	const pid = Number.parseInt(await Bun.file(pidFile).text(), 10);
+	if (isRunning(pid)) process.kill(pid, "SIGKILL");
+}
