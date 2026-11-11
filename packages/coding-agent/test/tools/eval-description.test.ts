@@ -13,7 +13,9 @@ import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 import { cfgEvalPy } from "@oh-my-pi/pi-coding-agent/eval/settings";
+import { encodePermissionScope } from "@oh-my-pi/pi-coding-agent/task/permissions/snapshot";
 import { cfgTaskMaxRecursionDepth } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { enforceScope } from "../task/permissions/scope-fixtures";
 
 function makeSession(opts: {
 	spawns?: string | null;
@@ -412,5 +414,34 @@ describe("eval tool description await markers", () => {
 				expect(JSON.parse(result.output.trim())).toEqual(Object.fromEntries(documented));
 			});
 		}
+	});
+});
+
+describe("eval tool description and the bash grant", () => {
+	const LANGUAGES = [
+		{ py: true, js: true },
+		{ py: true, js: false },
+		{ py: false, js: true },
+	];
+
+	it("omits sh() when the session may not run bash", () => {
+		for (const languages of LANGUAGES) {
+			expect(getEvalToolDescription({ ...languages, shellAvailable: false })).not.toContain("sh(");
+		}
+		const scoped = makeSession({
+			settings: { "task.permissions.activeScope": encodePermissionScope(enforceScope({ tools: ["eval", "read"] })) },
+		});
+		expect(new EvalTool(scoped).description).not.toContain("sh(");
+	});
+
+	it("documents sh() when the session may run bash or runs without a scope", () => {
+		for (const languages of LANGUAGES) expect(getEvalToolDescription(languages)).toContain("sh(command");
+		const withBash = makeSession({
+			settings: {
+				"task.permissions.activeScope": encodePermissionScope(enforceScope({ tools: ["eval", "bash", "read"] })),
+			},
+		});
+		expect(new EvalTool(withBash).description).toContain("sh(command");
+		expect(new EvalTool(makeSession({})).description).toContain("sh(command");
 	});
 });

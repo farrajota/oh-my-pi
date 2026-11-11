@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- In `enforce` mode a subagent whose permission scope does not grant `bash` no longer gets `eval`, which runs shell commands; eval's `sh()`, `agent()`, `workpool()`, `completion()` and `judge()` helpers need the `bash` or `task` grant of the tool they stand in for, and the startup warning names profiles that grant eval without bash
+
 ## [18.18.7] - 2026-11-10
 
 ### Added

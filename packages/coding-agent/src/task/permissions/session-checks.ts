@@ -1,7 +1,8 @@
 /**
  * Checks of the session's subagent permission scope for effects that do not pass through one
- * approval resolve: spawning a subagent outside the `task` tool, the entries a recursive search
- * finds below the root the guard checked, and the file an internal URL resolves to.
+ * approval resolve: an effect another tool's grant covers (an eval bridge, spawning a subagent
+ * outside the `task` tool), the entries a recursive search finds below the root the guard checked,
+ * and the file an internal URL resolves to.
  */
 import * as path from "node:path";
 import type { Settings } from "../../config/settings";
@@ -17,12 +18,25 @@ import { hasPathRules } from "./path-rules";
 const URL_ENTRY = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 /**
+ * Why the session's scope refuses an effect that `toolName`'s grant covers, or `undefined`. The
+ * effect is checked as an `exec` call of that tool with `toolInput`, by the guard a direct call meets.
+ */
+export function permissionToolGrantRefusal(
+	settings: Settings,
+	cwd: string,
+	toolName: string,
+	toolInput: unknown = {},
+): string | undefined {
+	return permissionApprovalGuard(settings, cwd)?.check({ name: toolName }, toolInput, { tier: "exec" })?.reason;
+}
+
+/**
  * Why the session's scope refuses to spawn a subagent, or `undefined`. A spawn through eval
  * `agent()` or `workpool()` is delegation exactly like a `task` call, so it needs the same grant
  * (`no-delegation` denies it; an allowlist must name `task`).
  */
 export function permissionDelegationRefusal(settings: Settings, cwd: string): string | undefined {
-	return permissionApprovalGuard(settings, cwd)?.check({ name: "task" }, {}, { tier: "exec" })?.reason;
+	return permissionToolGrantRefusal(settings, cwd, "task");
 }
 
 /**

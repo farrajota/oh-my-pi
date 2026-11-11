@@ -12,8 +12,9 @@ import { committedTodoPhases } from "../../tools/todo";
 import { isReplyWrite, toolResultReplies } from "@oh-my-pi/pi-tui/chat/reply-write";
 import { parseMCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { permissionToolGrantRefusal } from "../../task/permissions/session-checks";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
-import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
+import { EVAL_PRELUDE_BRIDGE_NAME, findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
 import { EVAL_AGENT_BRIDGE_NAME, type EvalAgentHandleResult, runEvalAgent } from "../agent-bridge";
 import { EVAL_BUDGET_BRIDGE_NAME, type EvalBudgetResult, runEvalBudget } from "../budget-bridge";
 import { withBridgeTimeoutPause } from "../bridge-timeout";
@@ -222,67 +223,127 @@ function waitForSpeculativeClaim<T>(claim: Promise<T>, signal?: AbortSignal): Pr
 	return promise;
 }
 
+async function callEvalPrelude(args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
+	const request = parsePreludeRequest(args);
+	const toolCallId = `prelude-${request.name}-${crypto.randomUUID()}`;
+	try {
+		// Browser/computer operations own their deadlines. Charging their host
+		// wait to Eval as well can kill its kernel during a first-use browser
+		// install or an explicitly longer navigation. Caller abort still flows
+		// through; only the runtime-work watchdog is paused.
+		const result = await withBridgeTimeoutPause(options.emitStatus, () =>
+			invokeEvalPrelude(request.name, request.parameters, {
+				session: options.session,
+				toolCallId,
+				signal: options.signal,
+				context: options.session.getToolContext?.(),
+			}),
+		);
+		return bridgeValueFromToolResult(
+			request.name,
+			request.parameters,
+			result,
+			options.emitStatus,
+			summarizePreludeResult(options.session),
+		);
+	} catch (error) {
+		options.emitStatus?.({
+			op: request.name,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		throw error;
+	}
+}
+
+/** Every reserved bridge name; {@link callSessionTool} dispatches these before any registry tool. */
+type EvalBridgeName =
+	| typeof EVAL_PRELUDE_BRIDGE_NAME
+	| typeof EVAL_COMPLETION_BRIDGE_NAME
+	| typeof EVAL_JUDGMENT_BRIDGE_NAME
+	| typeof EVAL_JUDGMENT_BATCH_BRIDGE_NAME
+	| typeof EVAL_AGENT_BRIDGE_NAME
+	| typeof EVAL_BUDGET_BRIDGE_NAME
+	| typeof EVAL_SHELL_BRIDGE_NAME
+	| typeof EVAL_WAIT_BRIDGE_NAME
+	| typeof EVAL_STATUS_BRIDGE_NAME
+	| typeof EVAL_CANCEL_BRIDGE_NAME
+	| typeof EVAL_WORKPOOL_BRIDGE_NAME;
+
+/**
+ * What a bridge needs from the session's subagent permission scope before its handler runs:
+ * - `tool`: the grant of the registry tool it stands in for, checked by the guard a direct call of
+ *   that tool meets. `forwardArgs` passes the bridge's arguments as that tool's input, for a bridge
+ *   whose arguments have the tool's shape.
+ * - `handler`: the handler resolves its own approval, guard included.
+ * - `none`: bookkeeping on the cell's own handles or budget, with no effect of its own.
+ */
+type BridgePermission =
+	| { readonly kind: "tool"; readonly name: string; readonly forwardArgs?: boolean }
+	| { readonly kind: "handler" }
+	| { readonly kind: "none" };
+
+interface BridgeEntry {
+	readonly permission: BridgePermission;
+	readonly run: (args: unknown, options: ToolBridgeOptions) => Promise<ToolValue> | ToolValue;
+}
+
+/**
+ * Spawning a subagent and running a model outside the agent's turn are both delegation, which the
+ * `task` grant covers (`no-delegation` denies it).
+ */
+const DELEGATION: BridgePermission = { kind: "tool", name: "task" };
+
+let evalBridges: Readonly<Record<EvalBridgeName, BridgeEntry>> | undefined;
+
+/**
+ * The bridge table, built on first call. agent-bridge and workpool-bridge reach this module through
+ * their own imports, so a table built at load time would read their name constants before they
+ * initialize when one of them loads first.
+ */
+function getEvalBridges(): Readonly<Record<EvalBridgeName, BridgeEntry>> {
+	// `satisfies Record<EvalBridgeName, …>` makes a bridge name without an entry a compile error, so a
+	// new bridge cannot skip declaring its grant; no runtime test can see a missing key.
+	evalBridges ??= {
+		[EVAL_PRELUDE_BRIDGE_NAME]: { permission: { kind: "handler" }, run: callEvalPrelude },
+		[EVAL_SHELL_BRIDGE_NAME]: { permission: { kind: "tool", name: "bash", forwardArgs: true }, run: runEvalShell },
+		[EVAL_AGENT_BRIDGE_NAME]: { permission: DELEGATION, run: runEvalAgent },
+		[EVAL_WORKPOOL_BRIDGE_NAME]: { permission: DELEGATION, run: runEvalWorkpool },
+		[EVAL_COMPLETION_BRIDGE_NAME]: { permission: DELEGATION, run: runEvalCompletion },
+		[EVAL_JUDGMENT_BRIDGE_NAME]: { permission: DELEGATION, run: runEvalJudgment },
+		[EVAL_JUDGMENT_BATCH_BRIDGE_NAME]: { permission: DELEGATION, run: runEvalJudgmentBatch },
+		[EVAL_BUDGET_BRIDGE_NAME]: { permission: { kind: "none" }, run: runEvalBudget },
+		[EVAL_WAIT_BRIDGE_NAME]: { permission: { kind: "none" }, run: runEvalWait },
+		[EVAL_STATUS_BRIDGE_NAME]: { permission: { kind: "none" }, run: runEvalStatus },
+		[EVAL_CANCEL_BRIDGE_NAME]: { permission: { kind: "none" }, run: runEvalCancel },
+	} as const satisfies Record<EvalBridgeName, BridgeEntry>;
+	return evalBridges;
+}
+
+function isEvalBridgeName(name: string): name is EvalBridgeName {
+	return Object.hasOwn(getEvalBridges(), name);
+}
+
+/** Why the session's scope refuses a bridge call, or `undefined`; no scope, `off` and `suggest` refuse nothing. */
+function bridgePermissionRefusal(
+	permission: BridgePermission,
+	args: unknown,
+	session: ToolSession,
+): string | undefined {
+	if (permission.kind !== "tool") return undefined;
+	return permissionToolGrantRefusal(
+		session.settings,
+		session.cwd,
+		permission.name,
+		permission.forwardArgs ? args : {},
+	);
+}
+
 export async function callSessionTool(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
-	if (name === "__prelude__") {
-		const request = parsePreludeRequest(args);
-		const toolCallId = `prelude-${request.name}-${crypto.randomUUID()}`;
-		try {
-			// Browser/computer operations own their deadlines. Charging their host
-			// wait to Eval as well can kill its kernel during a first-use browser
-			// install or an explicitly longer navigation. Caller abort still flows
-			// through; only the runtime-work watchdog is paused.
-			const result = await withBridgeTimeoutPause(options.emitStatus, () =>
-				invokeEvalPrelude(request.name, request.parameters, {
-					session: options.session,
-					toolCallId,
-					signal: options.signal,
-					context: options.session.getToolContext?.(),
-				}),
-			);
-			return bridgeValueFromToolResult(
-				request.name,
-				request.parameters,
-				result,
-				options.emitStatus,
-				summarizePreludeResult(options.session),
-			);
-		} catch (error) {
-			options.emitStatus?.({
-				op: request.name,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			throw error;
-		}
-	}
-	if (name === EVAL_COMPLETION_BRIDGE_NAME) {
-		return await runEvalCompletion(args, options);
-	}
-	if (name === EVAL_JUDGMENT_BRIDGE_NAME) {
-		return await runEvalJudgment(args, options);
-	}
-	if (name === EVAL_JUDGMENT_BATCH_BRIDGE_NAME) {
-		return await runEvalJudgmentBatch(args, options);
-	}
-	if (name === EVAL_AGENT_BRIDGE_NAME) {
-		return await runEvalAgent(args, options);
-	}
-	if (name === EVAL_BUDGET_BRIDGE_NAME) {
-		return await runEvalBudget(args, options);
-	}
-	if (name === EVAL_SHELL_BRIDGE_NAME) {
-		return await runEvalShell(args, options);
-	}
-	if (name === EVAL_WAIT_BRIDGE_NAME) {
-		return await runEvalWait(args, options);
-	}
-	if (name === EVAL_STATUS_BRIDGE_NAME) {
-		return runEvalStatus(args, options);
-	}
-	if (name === EVAL_CANCEL_BRIDGE_NAME) {
-		return runEvalCancel(args, options);
-	}
-	if (name === EVAL_WORKPOOL_BRIDGE_NAME) {
-		return await runEvalWorkpool(args, options);
+	if (isEvalBridgeName(name)) {
+		const bridge = getEvalBridges()[name];
+		const refusal = bridgePermissionRefusal(bridge.permission, args, options.session);
+		if (refusal !== undefined) throw new ToolError(refusal);
+		return await bridge.run(args, options);
 	}
 	const tool = getTool(options.session, name);
 	// Wire aliases share every guard, status and bookkeeping path with the canonical tool.

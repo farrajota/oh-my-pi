@@ -45,6 +45,7 @@ import {
 	type OutputSummary,
 	TailBuffer,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { permissionToolGrantRefusal } from "../task/permissions/session-checks";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { resolveSpawnPolicy } from "../task/spawn-policy";
 import { canSpawnAtDepth } from "../task/types";
@@ -208,6 +209,8 @@ export interface EvalToolDescriptionOptions {
 	toolNames?: readonly string[];
 	/** Configured global ceiling for nonzero cell deadlines. */
 	maxTimeout?: number;
+	/** Advertise `sh()`; false when the session's permission scope refuses `bash`. Default: true. */
+	shellAvailable?: boolean;
 }
 
 function evalTemplateContext(options: EvalToolDescriptionOptions) {
@@ -229,6 +232,7 @@ function evalTemplateContext(options: EvalToolDescriptionOptions) {
 		timeoutMax: TOOL_TIMEOUTS.eval.max,
 		configuredMaxTimeout: options.maxTimeout !== undefined && options.maxTimeout > 0 ? options.maxTimeout : undefined,
 		timeoutCeiling: clampTimeout("eval", TOOL_TIMEOUTS.eval.max, options.maxTimeout),
+		shellAvailable: options.shellAvailable ?? true,
 	};
 }
 
@@ -410,6 +414,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				: undefined,
 			toolNames: session.getAdvertisedEvalToolNames?.(),
 			maxTimeout: cfgToolsMaxTimeout.get(session.settings),
+			// `sh()` is refused under a scope without the bash grant (see the eval tool bridge).
+			shellAvailable: permissionToolGrantRefusal(session.settings, session.cwd, "bash") === undefined,
 		};
 	}
 

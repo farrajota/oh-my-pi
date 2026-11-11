@@ -9,6 +9,9 @@ import {
 	resolveApprovalFromContext,
 } from "../tools/approval";
 
+/** Synthetic bridge name the runtimes call a prelude through. */
+export const EVAL_PRELUDE_BRIDGE_NAME = "__prelude__";
+
 /** Host context supplied when an eval prelude calls back out of its language VM. */
 export interface EvalPreludeContext {
 	/** Live owning session; authorization is always resolved against its current preludes. */

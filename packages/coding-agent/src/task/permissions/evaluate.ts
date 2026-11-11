@@ -210,6 +210,22 @@ function evaluateExecutionGrant(scope: PermissionScope, toolName: string, target
 	);
 }
 
+/**
+ * Eval cells run shell commands without the `bash` tool (`sh()`, `Bun.$`, `Bun.spawn`, Python
+ * `subprocess`), so eval is granted only where a bare `bash` call would be. Asking the evaluator
+ * about `bash` keeps one definition of that grant across allowlists, deny lists and tool profiles.
+ */
+function evaluateEvalShellGrant(scope: PermissionScope, toolName: string, cwd: string): PermissionDecision {
+	if (evaluateSubagentPermission({ scope, toolName: "bash", toolInput: {}, cwd }).action === "allow") return ALLOW;
+	return deny(
+		"tool-not-allowed",
+		`BLOCKED: tool '${toolName}' runs arbitrary code including shell commands; it requires the 'bash' grant.`,
+		"subagent:eval-requires-bash",
+		toolName,
+		[],
+	);
+}
+
 function evaluatePathCandidates(
 	scope: PermissionScope,
 	toolName: string,
@@ -248,8 +264,8 @@ function evaluatePathCandidates(
  * Decide one tool call under a subagent scope. Only `enforce` denies; `off` and `suggest` allow.
  *
  * Order: intrinsic tools (`yield` always, `report_tool_issue` in a restricted scope), tool deny, tool
- * allowlist (with the messaging grant and write transports), unprovable effects, path deny, path
- * allowlist, then the guardrails.
+ * allowlist (with the messaging grant and write transports), unprovable effects, eval's bash grant,
+ * path deny, path allowlist, then the guardrails.
  */
 export function evaluateSubagentPermission(input: PermissionCallInput): PermissionDecision {
 	const { scope, toolName } = input;
@@ -277,6 +293,10 @@ export function evaluateSubagentPermission(input: PermissionCallInput): Permissi
 			toolName,
 			[],
 		);
+	}
+	if (key === "eval") {
+		const evalDecision = evaluateEvalShellGrant(scope, toolName, input.cwd);
+		if (evalDecision.action === "deny") return evalDecision;
 	}
 	if (hasPathRules(scope)) {
 		const candidates = targets

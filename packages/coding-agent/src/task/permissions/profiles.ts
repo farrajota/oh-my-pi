@@ -2,7 +2,7 @@ import * as path from "node:path";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { getAgentDir, isEnoent, isRecord, normalizePathForComparison } from "@oh-my-pi/pi-utils";
 import { canonicalPermissionValue, sha256Hex } from "./snapshot";
-import { isUnprovableEffectTool, uniquePermissionTools } from "./tool-names";
+import { isUnprovableEffectTool, permissionToolKey, uniquePermissionTools } from "./tool-names";
 import type {
 	PermissionProfile,
 	PermissionProfileIdentity,
@@ -231,6 +231,17 @@ function unprovableToolsWithPathRules(profile: PermissionProfile): string[] {
 	return (profile.tools ?? []).filter(isUnprovableEffectTool);
 }
 
+/**
+ * Whether a profile, as a scope of its own, grants eval but not bash. Enforce mode drops eval from
+ * such a scope (eval runs shell commands), and says so only when a call is denied.
+ */
+function grantsEvalWithoutBash(profile: PermissionProfile): boolean {
+	const grants = (name: string) =>
+		(profile.tools === undefined || profile.tools.some(tool => permissionToolKey(tool) === name)) &&
+		!(profile.denyTools ?? []).some(tool => permissionToolKey(tool) === name);
+	return grants("eval") && !grants("bash");
+}
+
 function summarizeProfile(
 	name: string,
 	profile: PermissionProfile,
@@ -345,6 +356,12 @@ export async function loadPermissionProfiles(
 			if (unprovable.length > 0) {
 				warnings.push(
 					`${file.label}: permission profile "${name}" lists ${unprovable.join(", ")} together with path rules; a subagent whose scope has path rules does not get tools whose effects reach beyond their path arguments (bash, eval, LSP, MCP, extension and custom tools, github, debug, ida, manage_skill, security_scan)`,
+				);
+			}
+			// A profile the path-rule warning already names eval for is not warned twice.
+			if (!unprovable.some(tool => permissionToolKey(tool) === "eval") && grantsEvalWithoutBash(profile)) {
+				warnings.push(
+					`${file.label}: permission profile "${name}" grants eval but not bash; eval runs arbitrary code including shell commands, so enforce mode drops eval from a scope without the bash grant`,
 				);
 			}
 		}
