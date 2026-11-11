@@ -3853,18 +3853,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}).content;
 			return `${headTail}\nFull output: artifact://${rawArtifactId}`;
 		}
+		let savedId: string | undefined;
 		try {
 			const { path: artifactPath, id: artifactId } = await this.sessionManager.allocateArtifactPath("async");
 			if (artifactPath && artifactId) {
 				await writeArtifact(artifactPath, result);
-				return `${preview}\nFull output: artifact://${artifactId}`;
+				savedId = artifactId;
+			} else {
+				// No artifacts dir (--no-session, SDK in-memory sessions and their subagents):
+				// keep an in-memory copy, which artifact:// resolves for this session.
+				savedId = await this.sessionManager.saveArtifact(result, "async");
 			}
 		} catch (error) {
 			logger.warn("Failed to persist async follow-up artifact", {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
-		return preview;
+		if (savedId) return `${preview}\nFull output: artifact://${savedId}`;
+		return `${preview}\n[Full async output could not be saved; only this preview is available. Rerun the job to see the rest.]`;
 	}
 
 	// =========================================================================

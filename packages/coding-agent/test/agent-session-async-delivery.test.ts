@@ -580,6 +580,69 @@ describe("AgentSession owner-routed async delivery", () => {
 		}
 	});
 
+	async function deliverOversizedBashResult(sessionManager: SessionManager, owner: string, output: string) {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: owner,
+			asyncJobManager: manager,
+		});
+		manager.register("bash", "big output", async () => output, { id: `${owner}-job`, ownerId: owner });
+		await session.settleAsyncWork();
+		return agent.state.messages
+			.filter(
+				(message): message is CustomMessage => message.role === "custom" && message.customType === "async-result",
+			)
+			.map(message =>
+				typeof message.content === "string"
+					? message.content
+					: message.content.map(block => (block.type === "text" ? block.text : "")).join("\n"),
+			)
+			.join("\n");
+	}
+
+	// ~43 KB: past the inline limit, so the follow-up carries only a preview.
+	const oversizedOutput = `${Array.from({ length: 2500 }, (_, index) => `line ${index} payload`).join("\n")}\nUNIQUE-TAIL-MARKER`;
+
+	it("keeps an oversized follow-up's full output reachable in a session without an artifacts dir", async () => {
+		const store = SessionManager.inMemory();
+		const followUp = await deliverOversizedBashResult(store, "InMemoryOwner", oversizedOutput);
+
+		expect(followUp).not.toContain("UNIQUE-TAIL-MARKER");
+		const artifactId = followUp.match(/Full output: artifact:\/\/(\d+)/)?.[1];
+		if (!artifactId) throw new Error("Expected the follow-up to link its full output");
+		expect(store.getArtifactContent(artifactId)).toBe(oversizedOutput);
+		expect(followUp).not.toContain("could not be saved");
+	});
+
+	it("tells the model once that an oversized follow-up's full output is lost when saving fails", async () => {
+		const store = SessionManager.inMemory();
+		vi.spyOn(store, "allocateArtifactPath").mockRejectedValue(new Error("EROFS: read-only file system"));
+		vi.spyOn(store, "saveArtifact").mockRejectedValue(new Error("EROFS: read-only file system"));
+		const followUp = await deliverOversizedBashResult(store, "FailingSaveOwner", oversizedOutput);
+
+		expect(followUp).toContain("line 0 payload");
+		expect(followUp).not.toContain("UNIQUE-TAIL-MARKER");
+		expect(followUp.match(/could not be saved/g)).toHaveLength(1);
+		expect(followUp).toContain("Rerun the job");
+		expect(followUp).not.toContain("artifact://");
+	});
+
 	it("retains every capture warning on its own live and rebuilt async batch row", async () => {
 		const entries = ["open", "write", undefined].map((artifactError, index): AsyncResultEntry => {
 			const meta: OutputMeta | undefined =

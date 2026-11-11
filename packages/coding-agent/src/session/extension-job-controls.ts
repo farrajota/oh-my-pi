@@ -8,6 +8,8 @@ import { asyncJobOutput, cancelOwnedAsyncJobAndSettle, extensionAsyncJobSnapshot
 /** What the controls read from the session they serve. */
 export interface ExtensionJobControlSession {
 	readonly asyncJobManager: AsyncJobManagerApi | undefined;
+	/** Transcript of the session, undefined when it has none; scopes subagent termination to its tree. */
+	readonly sessionFile: string | undefined;
 	getAgentId(): string | undefined;
 }
 
@@ -38,14 +40,16 @@ export function createExtensionAsyncJobControls(
 			return cancelOwnedAsyncJobAndSettle(manager, session.getAgentId(), jobId);
 		},
 		terminateSubagent: async agentId => {
-			const ownerId = getSession()?.getAgentId();
-			if (!ownerId) {
+			const session = getSession();
+			const ownerId = session?.getAgentId();
+			if (!session || !ownerId) {
 				return { id: agentId, status: "not_found", message: "Subagent control is unavailable in this session." };
 			}
 			return terminateSubagent({
 				registry: AgentRegistry.global(),
 				lifecycle: AgentLifecycleManager.global(),
 				ownerId,
+				ownerSessionFile: session.sessionFile,
 				targetId: agentId,
 			});
 		},

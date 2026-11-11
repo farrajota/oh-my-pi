@@ -223,6 +223,15 @@ describe("extension job controls in a session", () => {
 		await manager.waitForAll();
 	});
 
+	/** Where the task tool writes this session's subagent transcripts: its artifacts dir. */
+	function sessionArtifactsDir(): string {
+		const sessionFile = session.sessionFile;
+		if (!sessionFile) throw new Error("expected a persistent session");
+		const dir = sessionFile.slice(0, -".jsonl".length);
+		fs.mkdirSync(dir, { recursive: true });
+		return dir;
+	}
+
 	function registerSubagent(id: string, parentId: string, status: "running" | "aborted" = "running") {
 		return AgentRegistry.global().register({
 			id,
@@ -230,7 +239,7 @@ describe("extension job controls in a session", () => {
 			kind: "sub",
 			parentId,
 			status,
-			sessionFile: path.join(tempDir, `${id}.jsonl`),
+			sessionFile: path.join(sessionArtifactsDir(), `${id}.jsonl`),
 			session:
 				status === "running"
 					? ({
@@ -267,6 +276,40 @@ describe("extension job controls in a session", () => {
 		expect(await ctx.terminateSubagent("0-Nobody")).toMatchObject({ status: "not_found" });
 		expect(calls).toEqual([]);
 		expect(AgentRegistry.global().get("0-Stranger")?.status).toBe("running");
+	});
+
+	it("does not terminate an earlier session's descendant with the same owner id", async () => {
+		// The registry is process-global and every session's main agent is "Main": after /new or
+		// /resume, a parked subagent of the earlier session still has parentId "Main".
+		const priorTranscript = path.join(tempDir, "earlier-session", "0-Reviewer.jsonl");
+		const currentTranscript = path.join(sessionArtifactsDir(), "0-Sibling.jsonl");
+		for (const file of [priorTranscript, currentTranscript]) {
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, "");
+		}
+		const registry = AgentRegistry.global();
+		for (const [id, sessionFile] of [
+			["0-Reviewer", priorTranscript],
+			["0-Sibling", currentTranscript],
+		]) {
+			registry.register({
+				id,
+				displayName: id,
+				kind: "sub",
+				parentId: "Main",
+				status: "parked",
+				session: null,
+				sessionFile,
+			});
+		}
+
+		expect(await ctx.terminateSubagent("0-Reviewer")).toMatchObject({ id: "0-Reviewer", status: "not_found" });
+		expect(registry.get("0-Reviewer")?.status).toBe("parked");
+		expect(fs.existsSync(`${priorTranscript}.tombstone`)).toBe(false);
+
+		expect(await ctx.terminateSubagent("0-Sibling")).toMatchObject({ id: "0-Sibling", status: "cancelled" });
+		expect(registry.get("0-Sibling")?.status).toBe("aborted");
+		expect(fs.existsSync(`${currentTranscript}.tombstone`)).toBe(true);
 	});
 
 	it("reports an already aborted subagent as completed", async () => {

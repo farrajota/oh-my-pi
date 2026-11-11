@@ -6,6 +6,10 @@
 
 - `AgentStats` takes a `tokens` total, which `formatAgentStatRun` shows as `N tok` after the request count when above zero
 
+### Fixed
+
+- `/settings` fits short terminals: the frame no longer grows past the terminal height (which pushed the title, tabs and list off screen and misplaced mouse clicks), and a status-line preview taller than its space keeps at least 3 list rows and scrolls with the mouse wheel
+
 ## [18.18.7] - 2026-11-10
 
 ### Changed

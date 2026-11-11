@@ -3,6 +3,7 @@ import type { Effort } from "@oh-my-pi/pi-ai";
 import {
 	type Component,
 	Container,
+	clampScrollOffset,
 	extractPrintableText,
 	FuzzyCorpus,
 	getKeybindings,
@@ -20,6 +21,7 @@ import {
 	type Tab,
 	TabBar,
 	truncateToWidth,
+	viewportRange,
 	visibleWidth,
 } from "../index";
 import type { ShapeTarget } from "@oh-my-pi/snapcompact";
@@ -649,6 +651,11 @@ export class SettingsSelectorComponent implements Component {
 	#tabRowCount = 0;
 	#contentRowStart = 0;
 	#contentRowCount = 0;
+	#previewRowStart = 0;
+	#previewRowCount = 0;
+	#previewTotalRows = 0;
+	/** First appearance-preview row shown when the preview is taller than its viewport. */
+	#previewScrollOffset = 0;
 	#sidebarWidth: number;
 	readonly #context: SettingsRuntimeContext;
 	readonly #callbacks: SettingsCallbacks;
@@ -695,6 +702,7 @@ export class SettingsSelectorComponent implements Component {
 
 	#switchToTab(tabId: SettingTab | "plugins"): void {
 		this.#currentTabId = tabId;
+		this.#previewScrollOffset = 0;
 		this.#setContent(() => {
 			if (tabId === "plugins") {
 				this.#showPluginsTab();
@@ -739,22 +747,40 @@ export class SettingsSelectorComponent implements Component {
 	 * Fullscreen frame: title border, tab row, divider, optional search banner,
 	 * the active content sized to fill the terminal, the appearance preview,
 	 * then a footer hint pinned above the bottom border.
+	 *
+	 * The frame never exceeds the terminal height: the overlay is
+	 * bottom-anchored and the compositor keeps only the last rows, so any
+	 * overflow would push the title, tabs and list off screen and shift every
+	 * mouse row by the overflow.
 	 */
 	render(width: number): readonly string[] {
-		const height = Math.max(14, process.stdout.rows || 40);
+		const height = Math.max(1, process.stdout.rows || 40);
 		const innerWidth = Math.max(1, width - 4);
 
 		const tabLines = this.#tabBar.render(innerWidth);
 		const searching = this.#searchList !== null;
 		const showPreview = !searching && this.#currentTabId === "appearance";
 		// The preview is one row per composer chrome row (a wrapped status line has several).
-		const previewLines = showPreview
+		const allPreviewLines = showPreview
 			? ["", theme.fg("muted", "Preview:"), ...this.#getStatusPreviewString().split("\n")]
 			: [];
 
 		// Fixed chrome: top border, tabs, divider, [search row], divider, hint, bottom border.
 		const fixedRows = 1 + tabLines.length + 1 + (searching ? 1 : 0) + 1 + 1 + 1;
-		const contentRows = Math.max(7, height - fixedRows - previewLines.length);
+		const remainingRows = Math.max(0, height - fixedRows);
+		// The preview never takes the list's last 3 rows (it keeps one row itself once two are
+		// free); any preview rows past its share scroll with the wheel.
+		const listFloor = remainingRows > 1 ? Math.min(3, remainingRows - 1) : remainingRows;
+		const previewViewportRows = Math.min(allPreviewLines.length, remainingRows - listFloor);
+		const contentRows = remainingRows - previewViewportRows;
+		this.#previewTotalRows = allPreviewLines.length;
+		this.#previewScrollOffset = clampScrollOffset(
+			this.#previewScrollOffset,
+			allPreviewLines.length,
+			previewViewportRows,
+		);
+		const previewRange = viewportRange(allPreviewLines.length, previewViewportRows, this.#previewScrollOffset);
+		const previewLines = allPreviewLines.slice(previewRange.start, previewRange.end);
 
 		const list = this.#searchList ?? this.#currentList;
 		let contentLines: readonly string[];
@@ -784,13 +810,19 @@ export class SettingsSelectorComponent implements Component {
 		for (let i = 0; i < contentRows; i++) {
 			out.push(row(contentLines[i] ?? "", width));
 		}
+		this.#previewRowStart = out.length;
+		this.#previewRowCount = previewLines.length;
 		for (const line of previewLines) {
 			out.push(row(line, width));
 		}
 		out.push(divider(width));
 		out.push(row(theme.fg("dim", this.#footerHintText()), width));
-		out.push(bottomBorder(width));
-		return out;
+		const frameBottom = bottomBorder(width);
+		out.push(frameBottom);
+		// Only chrome taller than the terminal (e.g. wrapped tabs) still overflows here.
+		// Keep the top rows so the recorded hit-test geometry stays valid, and close the frame.
+		if (out.length <= height) return out;
+		return [...out.slice(0, height - 1), frameBottom];
 	}
 
 	/**
@@ -1260,10 +1292,18 @@ export class SettingsSelectorComponent implements Component {
 		const tabLine = event.row - this.#tabRowStart;
 		const overTabs = tabLine >= 0 && tabLine < this.#tabRowCount;
 		const overContent = contentLine >= 0 && contentLine < this.#contentRowCount;
+		const previewLine = event.row - this.#previewRowStart;
+		const overPreview = previewLine >= 0 && previewLine < this.#previewRowCount;
 
 		if (event.wheel !== null) {
 			if (overContent) {
 				list?.handleWheelAt(event.wheel, contentLine, innerCol);
+			} else if (overPreview) {
+				this.#previewScrollOffset = clampScrollOffset(
+					this.#previewScrollOffset + event.wheel,
+					this.#previewTotalRows,
+					this.#previewRowCount,
+				);
 			}
 			return true;
 		}

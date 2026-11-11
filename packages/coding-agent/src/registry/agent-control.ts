@@ -6,13 +6,30 @@ import type { BackgroundControlResult } from "../session/agent-session-types";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
 import type { AgentLifecycleApi } from "./agent-lifecycle";
 import type { AgentRef, AgentRegistryApi } from "./agent-registry";
+import { sessionFileBelongsToRoot } from "./persisted-agents";
 
 export interface TerminateSubagentOptions {
 	registry: AgentRegistryApi;
 	lifecycle: AgentLifecycleApi;
 	/** Registry id of the agent asking; only its descendants can be terminated. */
 	ownerId: string;
+	/**
+	 * Transcript of the owner's session, undefined when it has none. A target with a transcript
+	 * outside this session's artifacts tree belongs to another session.
+	 */
+	ownerSessionFile: string | undefined;
 	targetId: string;
+}
+
+/**
+ * The registry is process-global and every session's main agent is "Main", so lineage alone also
+ * reaches an earlier session's parked subagents. A target with a transcript must also live in the
+ * owner's artifacts tree (the agent hub roster's predicate); one without a transcript (a session
+ * without a session file spawns those) is judged by lineage only.
+ */
+function inOwnerSession(ref: AgentRef, ownerSessionFile: string | undefined): boolean {
+	if (!ref.sessionFile) return true;
+	return ownerSessionFile !== undefined && sessionFileBelongsToRoot(ref.sessionFile, ownerSessionFile);
 }
 
 function isDescendant(registry: AgentRegistryApi, ref: AgentRef, ownerId: string): boolean {
@@ -32,14 +49,22 @@ function isDescendant(registry: AgentRegistryApi, ref: AgentRef, ownerId: string
  * persisted or the abort fails.
  */
 export async function terminateSubagent(options: TerminateSubagentOptions): Promise<BackgroundControlResult> {
-	const { registry, lifecycle, ownerId, targetId } = options;
+	const { registry, lifecycle, ownerId, ownerSessionFile, targetId } = options;
 	const notFound: BackgroundControlResult = {
 		id: targetId,
 		status: "not_found",
 		message: `Subagent not found: ${targetId}`,
 	};
 	const ref = registry.get(targetId);
-	if (!ref || ref.kind !== "sub" || ref.id === ownerId || !isDescendant(registry, ref, ownerId)) return notFound;
+	if (
+		!ref ||
+		ref.kind !== "sub" ||
+		ref.id === ownerId ||
+		!isDescendant(registry, ref, ownerId) ||
+		!inOwnerSession(ref, ownerSessionFile)
+	) {
+		return notFound;
+	}
 	if (ref.status === "aborted") {
 		return { id: targetId, status: "already_completed", message: `Subagent ${targetId} is already stopped.` };
 	}
