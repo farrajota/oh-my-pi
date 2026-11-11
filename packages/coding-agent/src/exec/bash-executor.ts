@@ -58,6 +58,14 @@ export interface BashExecutorOptions {
 	sessionKey?: string;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
+	/**
+	 * Names the command must not see. The embedded shell starts from the full
+	 * host environment and `env` can only add or override, so every matching
+	 * name in the host, session, or command env is unset at the start of the
+	 * command (it stays unset in a persistent shell). The user-shell PTY path
+	 * cannot honor it and throws.
+	 */
+	hideEnv?: (name: string) => boolean;
 	/** Run through the configured user shell instead of the embedded shell parsing directly. */
 	useUserShell?: boolean;
 	/** Run supported user shells (zsh/fish) on a headless PTY; requires `useUserShell`. */
@@ -98,8 +106,9 @@ export interface BashExecutorOptions {
 	onStart?: (pids: () => readonly number[]) => void;
 	/**
 	 * Invoked before the run when the session's persistent shell is busy with
-	 * another command, so this one runs in a one-shot shell instead: it sees
-	 * none of the session's shell state, and the state it sets is discarded.
+	 * another command, so this one runs in a fork of it instead: it sees the
+	 * session's shell state as of before that command, and the state it sets
+	 * is discarded.
 	 */
 	onSessionShellBusy?: () => void;
 	/**
@@ -161,6 +170,20 @@ export interface BashResult extends OutputSummary {
  *  command line, so a hostile `.envrc` can't smuggle shell syntax through
  *  `unset`. `.envrc` never produces non-identifier names in practice. */
 const SAFE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** `unset -v` for each POSIX-named variable of `envs` that `hide` matches, or `""` when none does. */
+function hiddenEnvUnsetPrefix(
+	hide: (name: string) => boolean,
+	envs: readonly Record<string, string | undefined>[],
+): string {
+	const names = new Set<string>();
+	for (const env of envs) {
+		for (const name of Object.keys(env)) {
+			if (SAFE_ENV_NAME.test(name) && hide(name)) names.add(name);
+		}
+	}
+	return names.size > 0 ? `unset -v ${[...names].join(" ")}; ` : "";
+}
 
 /** A `scheme://` working directory: it exists only in the embedded shell's injected filesystem. */
 const URL_CWD_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
@@ -636,6 +659,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	if (virtualCwd && (usePty || !options?.filesystem)) {
 		throw new Error(`Working directory ${commandCwd} needs the embedded shell with an injected filesystem`);
 	}
+	if (usePty && options?.hideEnv) {
+		throw new Error("hideEnv needs the embedded shell; the user-shell PTY path cannot unset inherited variables");
+	}
 	// Fold the repo's direnv/devenv env into the command + env so devenv tools
 	// land on PATH; the caller's explicit `env` still wins. Thread the caller's
 	// signal + timeout so an aborted / short-timeout call can't hang on a cold
@@ -747,6 +773,10 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		snapshotPath: snapshotPath ?? undefined,
 		minimizer,
 	};
+	// Ahead of any shell `prefix` wrapper, so a profiler/strace prefix still wraps the command itself.
+	const runCommand = options?.hideEnv
+		? `${hiddenEnvUnsetPrefix(options.hideEnv, [Bun.env, sessionEnv, commandEnv])}${finalCommand}`
+		: finalCommand;
 	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, sessionEnv, options?.sessionKey, minimizer);
 	const persistentSessionBroken = brokenShellSessions.has(sessionKey);
 	if (persistentSessionBroken) {
@@ -756,15 +786,17 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	// A persistent Shell runs one command at a time (the native session is a
 	// mutex-guarded queue and `abort()` kills every in-flight run on it). When
 	// parallel bash calls overlap on the same key, the first one owns the
-	// persistent session; the rest degrade to isolated one-shot shells — the
-	// same path quarantined sessions take.
+	// persistent session; the rest run in one-shot forks of it, which start
+	// from the session's state before the owner's command. A quarantined
+	// session gets a fresh one-shot shell.
 	const sessionBusy = shellSessionsInUse.has(sessionKey);
 	let shellSession = persistentSessionBroken || sessionBusy ? undefined : shellSessions.get(sessionKey);
 	if (!shellSession && !persistentSessionBroken && !sessionBusy) {
 		shellSession = new Shell(shellOptions);
 		shellSessions.set(sessionKey, shellSession);
 	}
-	const executionShell = shellSession ?? new Shell(shellOptions);
+	const busyShell = sessionBusy ? shellSessions.get(sessionKey) : undefined;
+	const executionShell = shellSession ?? busyShell?.fork() ?? new Shell(shellOptions);
 	const ownsPersistentSession = shellSession !== undefined;
 	if (ownsPersistentSession) {
 		shellSessionsInUse.add(sessionKey);
@@ -814,7 +846,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	}
 
 	let resetSession = false;
-	const runTrace = options?.onTrace ? new RunTrace(finalCommand) : undefined;
+	const runTrace = options?.onTrace ? new RunTrace(runCommand) : undefined;
 	const tracePoll = runTrace && options?.onTrace ? pollRunTrace(runTrace, options.onTrace) : undefined;
 	// The last snapshot once the run settled (any outcome); `stop()` is idempotent past the first call.
 	let finalTrace: ShellTrace | undefined;
@@ -828,7 +860,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	try {
 		const runPromise = executionShell.run(
 			{
-				command: finalCommand,
+				command: runCommand,
 				cwd: commandCwd,
 				env: commandEnv,
 				timeoutMs: nativeTimeoutMs,

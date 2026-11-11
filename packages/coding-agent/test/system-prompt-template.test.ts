@@ -204,7 +204,7 @@ describe("system prompt Handlebars templates", () => {
 			const result = await buildSystemPrompt(options(cwd));
 			const text = result.systemPrompt.join("\n\n");
 			expect(text).toContain("fallback literal prompt");
-			expect(text).not.toContain("§ Tool Policy");
+			expect(text).not.toContain("⁂ Tool Policy");
 		});
 	});
 
@@ -215,7 +215,7 @@ describe("system prompt Handlebars templates", () => {
 			const result = await buildSystemPrompt(options(cwd));
 			const text = result.systemPrompt.join("\n\n");
 			expect(text).not.toContain("TASK_BRANCH=");
-			expect(text).toContain("§ Tool Policy");
+			expect(text).toContain("⁂ Tool Policy");
 		});
 	});
 
@@ -227,7 +227,7 @@ describe("system prompt Handlebars templates", () => {
 			const result = await buildSystemPrompt(options(cwd));
 			const text = result.systemPrompt.join("\n\n");
 			expect(text).toContain("fallback literal prompt");
-			expect(text).not.toContain("§ Tool Policy");
+			expect(text).not.toContain("⁂ Tool Policy");
 		});
 	});
 

@@ -103,7 +103,9 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser screenshots of background tabs", (
 
 		expect(await repaintAndCapture(name, "#00ff00")).toEqual([0, 255, 0]);
 		expect(await visibility(userPage)).toBe("visible");
-		expect(await visibility(agentPage)).toBe("hidden");
+		// omp emulates focus on a tab it drives (upstream 338a5b19e2), so the agent tab reads visible while held;
+		// browser-background-input covers it reading hidden again once released.
+		expect(await visibility(agentPage)).toBe("visible");
 	}, 45_000);
 
 	it("captures the adopted tab after the user switched away from it", async () => {

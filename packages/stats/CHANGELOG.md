@@ -13,6 +13,17 @@
 - `getSessionStatsByModelAndAgentType(sessionFile)` aggregates one session tree (the main transcript and its subagent and advisor transcripts) by model and agent type, and `syncSessionTree(sessionFile)` syncs just that tree
 - `syncAllSessions` takes `lockWaitMs`, `skipIfBusy` (return nothing instead of throwing when the sync lock stays held) and `freshnessMs` (skip a full scan another process completed recently)
 - `getStatsByModel(cutoff, { exactWhenRollupsStale: true })` reads raw messages when the rollup backlog is too large for exact rollup reads, so a long-window model breakdown is complete while rollups rebuild
+## [18.18.4] - 2026-11-09
+
+### Fixed
+
+- Fixed `omp stats` re-parsing every unchanged session after a filesystem's device number changes, such as across ZFS remounts ([#14736](https://github.com/can1357/oh-my-pi/issues/14736)) ([#18536](https://github.com/can1357/oh-my-pi/pull/18536) by [@Alex-Wengg](https://github.com/Alex-Wengg)).
+
+## [18.18.2] - 2026-11-08
+
+### Fixed
+
+- Fixed the trace dashboard returning HTTP 431 for sessions with many subagents.
 
 ## [18.17.0] - 2026-11-06
 
