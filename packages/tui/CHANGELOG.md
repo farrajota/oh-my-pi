@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `AgentStats` takes a `tokens` total, which `formatAgentStatRun` shows as `N tok` after the request count when above zero
+
 ## [18.18.7] - 2026-11-10
 
 ### Changed

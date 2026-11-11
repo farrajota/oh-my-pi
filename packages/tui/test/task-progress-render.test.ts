@@ -9,6 +9,7 @@ import { getSubprocessToolRenderer } from "@oh-my-pi/pi-tui/tools/subprocess";
 import type { AgentProgress, SingleResult, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { FEED_MODEL_BADGE_WIDTH } from "@oh-my-pi/pi-tui/render/render-utils";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
+import { formatAgentStatRun } from "@oh-my-pi/pi-tui/tools/agent-tree";
 
 function runningProgress(overrides: Partial<AgentProgress> = {}): AgentProgress {
 	return {
@@ -435,6 +436,73 @@ describe("task progress rendering", () => {
 			expect(row).toContain(`${glyph} custom/model:high LegacyWorker`);
 			expect(row).not.toContain(theme.thinking.high.split(" ")[0]);
 		}
+	});
+
+	it("shows the token total and whole-second elapsed time on running rows", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const progress = runningProgress({
+			id: "MetricsWorker",
+			description: "Probe metrics",
+			toolCount: 7,
+			requests: 5,
+			tokens: 4_500,
+			contextTokens: 30_000,
+			contextWindow: 200_000,
+			cost: 0.37,
+			durationMs: 12_345,
+		});
+		const row = Bun.stripANSI(
+			findRow(
+				taskToolRenderer.renderResult(
+					{ content: [], details: detailsFor(progress) },
+					{ expanded: false, isPartial: true },
+					theme,
+				),
+				"MetricsWorker",
+			),
+		);
+		expect(row).toContain(
+			`MetricsWorker: Probe metrics · 7 ${theme.icon.extensionTool} · 5 req · 4.5K tok · 15.0%/200K · $0.37 · 12.0s`,
+		);
+	});
+
+	it("omits the token and elapsed cells on running rows before either has a value", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const progress = runningProgress({ id: "FreshWorker", requests: 1, tokens: 0, durationMs: 400 });
+		const row = Bun.stripANSI(
+			findRow(
+				taskToolRenderer.renderResult(
+					{ content: [], details: detailsFor(progress) },
+					{ expanded: false, isPartial: true },
+					theme,
+				),
+				"FreshWorker",
+			),
+		);
+		expect(row).toContain("1 req");
+		expect(row).not.toContain("tok");
+		expect(row).not.toContain("ms");
+	});
+
+	it("leaves the token cell out of a stat run without a token count", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		expect(Bun.stripANSI(formatAgentStatRun({ requests: 2 }, theme))).toBe(" · 2 req");
+	});
+
+	it("shows the token total beside the settled duration on finished rows", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [finishedResult({ id: "SettledWorker", requests: 5, tokens: 12_300, durationMs: 65_000 })],
+			totalDurationMs: 65_000,
+		};
+		const row = Bun.stripANSI(
+			findRow(
+				taskToolRenderer.renderResult({ content: [], details }, { expanded: false, isPartial: false }, theme),
+				"SettledWorker",
+			),
+		);
+		expect(row).toContain("5 req · 12K tok · 1m5s");
 	});
 
 	it("renders running task rows with a static running glyph", async () => {

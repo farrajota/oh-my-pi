@@ -17,12 +17,14 @@ import { visibleWidth } from "../utils";
 export interface AgentStats {
 	toolCount?: number;
 	requests?: number;
+	/** Lifetime input + output + cacheWrite tokens; distinct from the current context fill. */
+	tokens?: number;
 	contextTokens?: number;
 	contextWindow?: number;
 	cost?: number;
 }
 
-/** Format the shared tool-count, request, context, and cost stat run. */
+/** Format the shared tool-count, request, token, context, and cost stat run. */
 export function formatAgentStatRun(stats: AgentStats, theme: Theme): string {
 	let line = "";
 	if (stats.toolCount) {
@@ -30,6 +32,9 @@ export function formatAgentStatRun(stats: AgentStats, theme: Theme): string {
 	}
 	if (stats.requests) {
 		line += `${theme.sep.dot}${theme.fg("dim", `${formatNumber(stats.requests)} req`)}`;
+	}
+	if (stats.tokens && stats.tokens > 0) {
+		line += `${theme.sep.dot}${theme.fg("dim", `${formatNumber(stats.tokens)} tok`)}`;
 	}
 	if (stats.contextTokens && stats.contextTokens > 0) {
 		const context =

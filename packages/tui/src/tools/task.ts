@@ -758,6 +758,8 @@ function renderAgentProgress(
 					: undefined,
 			stats: progress.status === "running" || progress.status === "completed" ? progress : undefined,
 			completionPercent: progress.completionPercent,
+			// Whole seconds: the row is rebuilt per progress snapshot, so tenths would only add churn.
+			durationMs: progress.status === "running" ? Math.floor(progress.durationMs / 1000) * 1000 : undefined,
 		},
 		theme,
 	);
@@ -1117,6 +1119,7 @@ function renderAgentResult(
 	statusLine += formatAgentStatRun(
 		{
 			requests: result.requests,
+			tokens: result.tokens,
 			contextTokens: result.contextTokens,
 			contextWindow: result.contextWindow,
 			cost: result.usage?.cost.total ?? 0,

@@ -259,6 +259,47 @@ describe("subagent HUD lines", () => {
 		expect(out).toContain("SchemaMigrator: Migrating the users table");
 	});
 
+	it("shows the stat run and whole-second elapsed time on running rows", () => {
+		const now = 1_000_000;
+		const session = makeSession({
+			id: "MetricsWorker",
+			description: "Probe metrics",
+			progress: makeProgress({
+				id: "MetricsWorker",
+				toolCount: 7,
+				requests: 5,
+				tokens: 4_500,
+				contextTokens: 30_000,
+				contextWindow: 200_000,
+				cost: 0.37,
+				durationMs: 60_000,
+			}),
+			progressAt: now - 5_400,
+		});
+		const out = Bun.stripANSI(renderSubagentHudLines([session], 160, false, false, undefined, now).join("\n"));
+		expect(out).toContain(
+			`MetricsWorker: Probe metrics · 7 ${theme.icon.extensionTool} · 5 req · 4.5K tok · 15.0%/200K · $0.37 · 1m5s`,
+		);
+	});
+
+	it("keeps the id and description whole at narrow widths and cuts the stat run first", () => {
+		const now = 1_000_000;
+		const columns = 44;
+		const session = makeSession({
+			id: "MetricsWorker",
+			description: "Probe metrics",
+			progress: makeProgress({ id: "MetricsWorker", requests: 5, tokens: 4_500, cost: 0.37, durationMs: 65_000 }),
+			progressAt: now,
+		});
+		const rows = Bun.stripANSI(renderSubagentHudLines([session], columns, false, false, undefined, now).join("\n"))
+			.split("\n")
+			.filter(line => line.includes("MetricsWorker"));
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toContain("MetricsWorker: Probe metrics");
+		expect(rows[0]).not.toContain("1m5s");
+		expect(Bun.stringWidth(rows[0]!)).toBeLessThanOrEqual(columns);
+	});
+
 	it("counts running agents and previews the raw assignment, not the rendered prompt", () => {
 		const assignment = "Run the 512-rule corpus against the native build and report every mismatch";
 		const out = render([
@@ -1180,6 +1221,30 @@ describe("InteractiveMode subagent observer UI sync", () => {
 		vi.advanceTimersByTime(1_000);
 		expect(mode.subagentContainer.children[0]).toBe(hud);
 		expect(hudText()).toContain("bash: sleep 40 · 21.1s");
+	});
+
+	it("advances a quiet call's row elapsed time without the live preview", async () => {
+		await mode.init({ suppressWelcomeIntro: true });
+		vi.spyOn(mode.ui, "requestRender").mockImplementation(() => {});
+		vi.useFakeTimers();
+		setSystemTime(1_000_000);
+		const payload = makeProgressPayload("Sleeper", 0, "Run sleep", true);
+		payload.progress = {
+			...payload.progress,
+			currentTool: "bash",
+			currentToolArgs: "sleep 40",
+			currentToolStartMs: 1_000_000 - 20_000,
+			durationMs: 20_000,
+		};
+		eventBus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, payload);
+		await Promise.resolve();
+		vi.advanceTimersByTime(100); // observer UI coalesce window
+		const hudText = () => Bun.stripANSI(mode.subagentContainer.render(120).join("\n"));
+		expect(hudText()).toContain("Sleeper: Run sleep · 20.0s");
+		expect(hudText()).not.toContain("bash: sleep 40");
+
+		vi.advanceTimersByTime(1_000);
+		expect(hudText()).toContain("Sleeper: Run sleep · 21.0s");
 	});
 
 	it("repaints an identical new call after the elapsed timer painted the previous call", async () => {

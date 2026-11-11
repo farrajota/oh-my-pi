@@ -212,6 +212,7 @@ describe("task renderer: nested live rendering", () => {
 		const text = await render(
 			makeRunningProgress({
 				toolCount: 19,
+				tokens: 1_000,
 				contextTokens: 58_000,
 				contextWindow: 272_000,
 				cost: 2.1,
@@ -221,7 +222,8 @@ describe("task renderer: nested live rendering", () => {
 
 		// Context now matches the status line gauge: 58000/272000 → 21.3%/272K.
 		// Cost is separated by the theme dot separator, not a literal ".".
-		const expectedStats = `${formatNumber(19)} ${theme.icon.extensionTool}${theme.sep.dot}21.3%/272K${theme.sep.dot}$2.10`;
+		// The lifetime token total sits between the tool count and the context gauge.
+		const expectedStats = `${formatNumber(19)} ${theme.icon.extensionTool}${theme.sep.dot}1K tok${theme.sep.dot}21.3%/272K${theme.sep.dot}$2.10`;
 		expect(text).toContain(expectedStats);
 		expect(text).not.toContain("tools");
 		expect(text).not.toContain("ctx");

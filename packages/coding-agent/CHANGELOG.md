@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Running task rows show the subagent's elapsed time, and task rows show its lifetime token total (`12K tok`) in the stat run; pinned Subagents HUD rows end with the same stats and elapsed time, cut before the agent name or description when the row runs out of width, and a quiet tool call keeps its HUD elapsed time advancing without the live preview
+
 ### Changed
 
 - In `enforce` mode a subagent whose permission scope does not grant `bash` no longer gets `eval`, which runs shell commands; eval's `sh()`, `agent()`, `workpool()`, `completion()` and `judge()` helpers need the `bash` or `task` grant of the tool they stand in for, and the startup warning names profiles that grant eval without bash

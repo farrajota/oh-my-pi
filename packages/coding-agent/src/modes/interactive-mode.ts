@@ -180,6 +180,7 @@ import type { SpaceHoldHandler } from "@oh-my-pi/pi-tui/space-hold";
 import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
 import { labelEchoesHandle } from "../task/label";
+import { formatAgentStatRun } from "@oh-my-pi/pi-tui/tools/agent-tree";
 import { agentTypeBadge, formatTaskId } from "@oh-my-pi/pi-tui/tools/task";
 import type { ModelRoleLookup } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import {
@@ -1135,7 +1136,7 @@ export class SubagentHudComponent implements Component {
 
 const SUBAGENT_OBSERVER_UI_COALESCE_MS = 100;
 
-/** Repaint cadence for live-preview elapsed markers while a subagent tool call runs. */
+/** Repaint cadence for HUD elapsed times and live-preview markers while a subagent tool call runs. */
 const SUBAGENT_PREVIEW_TICK_MS = 1000;
 
 /** Item rows a collapsed jump list shows before the expander. */
@@ -1182,10 +1183,12 @@ const SUBAGENT_PREVIEW_ELAPSED_MIN_MS = 5000;
 const SUBAGENT_PREVIEW_MIN_DETAIL_WIDTH = 8;
 
 /**
- * Delay until the live preview next needs a repaint with no progress event to
- * trigger it: when the first listed in-flight call crosses the elapsed-marker
- * threshold, then once a second while any marker is showing. Undefined when no
- * listed agent is mid-call, so an idle or thinking agent never arms a timer.
+ * Delay until the HUD next needs a repaint with no progress event to trigger
+ * it: when the first listed in-flight call crosses the elapsed-marker
+ * threshold, then once a second while any marker is showing, which also keeps
+ * row elapsed times from going stale during a quiet call. Undefined when no
+ * listed agent is mid-call, so an idle or thinking agent never arms a timer;
+ * a streaming agent advances its row through its own progress events.
  */
 export function nextSubagentPreviewTickMs(sessions: readonly ObservableSession[], now: number): number | undefined {
 	let delay: number | undefined;
@@ -1207,7 +1210,7 @@ export function nextSubagentPreviewTickMs(sessions: readonly ObservableSession[]
  * args — never an earlier call's intent. Undefined when the agent has not
  * called a tool yet. The row never overflows `width`.
  */
-function renderSubagentToolPreview(session: ObservableSession, width: number): string | undefined {
+function renderSubagentToolPreview(session: ObservableSession, width: number, now: number): string | undefined {
 	const progress = session.progress;
 	if (progress?.status !== "running") return undefined;
 	const currentTool = progress.currentTool;
@@ -1224,7 +1227,7 @@ function renderSubagentToolPreview(session: ObservableSession, width: number): s
 		: args
 			? shortenToolArgumentPaths(replaceTabs(args), argsKey)
 			: undefined;
-	const elapsed = currentTool && progress.currentToolStartMs ? Date.now() - progress.currentToolStartMs : 0;
+	const elapsed = currentTool && progress.currentToolStartMs ? now - progress.currentToolStartMs : 0;
 	const elapsedLabel =
 		elapsed > SUBAGENT_PREVIEW_ELAPSED_MIN_MS
 			? `${theme.sep.dot}${theme.fg("warning", formatDuration(elapsed))}`
@@ -1256,6 +1259,8 @@ function renderSubagentToolPreview(session: ObservableSession, width: number): s
  * With `livePreview` (`display.subagentLivePreview`), a row that has called a
  * tool carries a second physical row showing that call; both rows share one
  * returned line (joined by a newline) so line N still maps to agent N - 2.
+ * A row with a progress snapshot ends with the task rows' stat run and its
+ * whole-second elapsed time, cut first when the row runs out of width.
  * Returns an empty array when nothing is running so the container can clear.
  */
 export function renderSubagentHudLines(
@@ -1264,6 +1269,7 @@ export function renderSubagentHudLines(
 	expanded = false,
 	livePreview = false,
 	hubKey?: string,
+	now = Date.now(),
 ): string[] {
 	const running = sessions.filter(isHudSubagent);
 	if (running.length === 0) return [];
@@ -1329,8 +1335,17 @@ export function renderSubagentHudLines(
 						if (budget > 0) line += ` ${theme.fg("muted", truncateToWidth(formatted, budget))}`;
 					}
 				}
+				const progress = session.progress;
+				if (progress) {
+					// `durationMs` was current at `progressAt`, so age it to now as the agent hub does.
+					const elapsed = progress.durationMs + Math.max(0, now - (session.progressAt ?? now));
+					line += formatAgentStatRun(progress, theme);
+					if (elapsed >= 1000) {
+						line += `${theme.sep.dot}${theme.fg("dim", formatDuration(Math.floor(elapsed / 1000) * 1000))}`;
+					}
+				}
 				const head = truncateToWidth(line, rowWidth, "");
-				const preview = livePreview ? renderSubagentToolPreview(session, rowWidth) : undefined;
+				const preview = livePreview ? renderSubagentToolPreview(session, rowWidth, now) : undefined;
 				itemLineCounts.set(session, preview ? 2 : 1);
 				return preview ? [head, preview] : head;
 			},
@@ -5654,10 +5669,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * Anchored HUD of in-flight subagents, mirroring the Todos block above the
 	 * editor. Driven entirely by observer-registry change events, so rows appear
 	 * on spawn and the whole block clears itself once the last subagent leaves
-	 * the "active" state. With the live preview on, a tool call running without
-	 * progress events (a long quiet bash) still needs its elapsed marker to
-	 * appear and advance, so a repaint is armed for when the marker first shows
-	 * and then once a second while a listed agent stays mid-call.
+	 * the "active" state. A tool call running without progress events (a long
+	 * quiet bash) still needs its row elapsed time, and with the live preview on
+	 * its elapsed marker, to advance, so a repaint is armed for when the marker
+	 * first shows and then once a second while a listed agent stays mid-call.
 	 */
 	#renderSubagentList(): boolean {
 		this.#cancelSubagentPreviewTick();
@@ -5697,10 +5712,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		const lines = renderSubagentHudLines(sessions, this.ui.terminal.columns, expanded, livePreview, hubKey);
 		if (lines.length === 0) return undefined;
 		const layout = layoutPinnedHud(running.length, expanded);
-		const tickMs =
-			livePreview && !agentPauseGate.paused
-				? nextSubagentPreviewTickMs(running.slice(0, layout.itemRows), Date.now())
-				: undefined;
+		const tickMs = agentPauseGate.paused
+			? undefined
+			: nextSubagentPreviewTickMs(running.slice(0, layout.itemRows), Date.now());
 		return { lines, order: running.map(session => session.id), toggleRow: layout.toggleRow, tickMs };
 	}
 
