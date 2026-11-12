@@ -24,6 +24,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import * as structuredSubagentModule from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { loadBundledAgents } from "@oh-my-pi/pi-coding-agent/task/agents";
 import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
@@ -473,7 +474,10 @@ describe("task.batch validation", () => {
 		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: true, field: "sourceSession" },
 		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: true, field: "sourceSession" },
 		{ form: "batch", seance: "advertised", batch: true, structured: false, isolation: false, field: "model" },
+		{ form: "batch", seance: "advertised", batch: true, structured: false, isolation: false, field: "sourceSession" },
 		{ form: "flat", seance: "hidden", batch: false, structured: false, isolation: false, field: "model" },
+		{ form: "flat", seance: "hidden", batch: false, structured: false, isolation: false, field: "sourceSession" },
+		{ form: "flat", seance: "advertised", batch: false, structured: false, isolation: false, field: "sourceSession" },
 	])(
 		"refuses $field on an ordinary agent in the $form form with seance $seance (structured: $structured, isolation: $isolation)",
 		async ({ seance, batch, structured, isolation, field }) => {
@@ -531,6 +535,99 @@ describe("task.batch validation", () => {
 			expect(run).not.toHaveBeenCalled();
 		},
 	);
+
+	// Some models fill every optional schema field, sending `sourceSession: ""` and
+	// `model: ""` on ordinary delegations. A blank value names no session and no
+	// selector, so it must route like an omitted field rather than be refused, and
+	// it must not reach the spawn as a source session.
+	it.each([
+		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: false, sourceSession: "" },
+		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: false, sourceSession: "" },
+		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: true, sourceSession: "" },
+		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: true, sourceSession: "  " },
+		{ form: "batch", seance: "advertised", batch: true, structured: false, isolation: false, sourceSession: "" },
+		{ form: "batch", seance: "advertised", batch: true, structured: false, isolation: false, sourceSession: " \t" },
+		{ form: "flat", seance: "hidden", batch: false, structured: false, isolation: false, sourceSession: "" },
+		{ form: "flat", seance: "advertised", batch: false, structured: false, isolation: false, sourceSession: "  " },
+	])(
+		"accepts a blank sourceSession and model on an ordinary agent in the $form form with seance $seance (structured: $structured, isolation: $isolation, sourceSession: $sourceSession)",
+		async ({ seance, batch, structured: structuredSetting, isolation, sourceSession }) => {
+			const bundledSeance = loadBundledAgents().find(agent => agent.name === "seance")!;
+			mockDiscovery(seance === "advertised" ? [taskAgent, bundledSeance] : taskAgent);
+			const run = vi
+				.spyOn(executorModule, "runSubprocess")
+				.mockImplementation(async options => makeResult(options.id ?? "?"));
+			const requests = vi.spyOn(structuredSubagentModule, "runStructuredSubagent");
+			const tool = await TaskTool.create(
+				createSession({
+					settings: {
+						"async.enabled": false,
+						"task.batch": batch,
+						"task.structured": structuredSetting,
+						"task.isolation.enabled": isolation,
+					},
+				}),
+			);
+			const item = { name: "Alpha", agent: "task", task: "Do A.", solutionSpace: "c", sourceSession, model: "" };
+			const mock = createMockModel({
+				responses: [
+					{
+						content: [
+							{
+								type: "toolCall",
+								id: "tc-blank-seance-fields",
+								name: "task",
+								arguments: batch ? { context: "# Goal\nX", tasks: [item] } : item,
+							},
+						],
+					},
+					{ content: ["done"] },
+				],
+			});
+			const agent = new Agent({
+				initialState: {
+					model: mock.model,
+					systemPrompt: ["Test"],
+					tools: [tool as unknown as AgentTool],
+					messages: [],
+				},
+				streamFn: mock.stream,
+			});
+			await agent.prompt("go");
+
+			const toolResult = agent.state.messages.find(message => message.role === "toolResult");
+			const text = toolResult?.role === "toolResult" ? getFirstText(toolResult) : "";
+			expect(text).not.toContain("is only accepted for the");
+			expect(toolResult?.role === "toolResult" && toolResult.isError).toBe(false);
+			expect(run).toHaveBeenCalledTimes(1);
+			expect(requests).toHaveBeenCalledTimes(1);
+			const request = requests.mock.calls[0]![0];
+			expect(request.sourceSession).toBeUndefined();
+			expect(request.perCallModel).toBeUndefined();
+			expect(request.seanceModel).toBeUndefined();
+		},
+	);
+
+	it.each([
+		{ form: "batch", batch: true, sourceSession: "" },
+		{ form: "flat", batch: false, sourceSession: "  " },
+	])("still refuses a blank sourceSession on the seance agent in the $form form", async ({ batch, sourceSession }) => {
+		const bundledSeance = loadBundledAgents().find(agent => agent.name === "seance")!;
+		mockDiscovery([taskAgent, bundledSeance]);
+		const run = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		const tool = await TaskTool.create(createSession({ settings: { "async.enabled": false, "task.batch": batch } }));
+		const item = { name: "Medium", agent: "seance", task: "What was decided?", solutionSpace: "c", sourceSession };
+		const result = await tool.execute(
+			"tc-blank-seance-source",
+			batch ? { context: "# Goal\nX", tasks: [item] } : item,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(getFirstText(result)).toContain("requires a non-empty `sourceSession`.");
+		expect(run).not.toHaveBeenCalled();
+	});
 });
 
 describe("task.batch spawning", () => {

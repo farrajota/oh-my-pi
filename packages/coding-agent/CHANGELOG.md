@@ -15,6 +15,7 @@
 - A large background bash or eval result delivered to a session without a session file (`--no-session`, SDK in-memory sessions and their subagents) now links its full output as `artifact://`, and when the full output cannot be saved the agent is told that only the preview is available and that rerunning the job shows the rest
 - An extension's `ctx.terminateSubagent` no longer stops a subagent left over from an earlier session in the same process (after `/new` or `/resume`); such agents read as `not_found`, as documented
 - Cancelling or timing out an `ssh://` directory listing now settles even when a remote-side process that escaped the kill still holds the output pipe, and a cancel that lands after the remote command finished rejects instead of returning the partial listing
+- A `task` call that sends an empty or whitespace `sourceSession` for an agent other than `seance` (as models that fill every optional field do) now runs as if the field were omitted instead of being refused; a non-empty one is still refused
 
 ## [18.18.7] - 2026-11-10
 
