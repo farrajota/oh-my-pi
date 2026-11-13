@@ -555,50 +555,27 @@ function isEmptyModelPlaceholder(model: unknown): boolean {
 }
 
 /**
- * A blank `sourceSession` on a spawn whose agent is not `seance` names no
- * session: models that fill every optional field send `""`, which must route
- * like an omitted field instead of tripping the seance-only refusal. A seance
- * spawn keeps it so seance validation still reports the missing source.
+ * Drop empty `model` placeholders from the call and its batch items so they
+ * route like an omitted model. Copy-on-write: the submitted arguments are
+ * never mutated, and the same reference is returned when nothing changed.
  */
-function isBlankSourceSessionPlaceholder(
-	spawn: { agent?: unknown; sourceSession?: unknown },
-	defaultAgent: string,
-): boolean {
-	if (typeof spawn.sourceSession !== "string" || spawn.sourceSession.trim() !== "") return false;
-	const agent = (typeof spawn.agent === "string" ? spawn.agent.trim() : "") || defaultAgent;
-	return agent !== SEANCE_AGENT_NAME;
-}
-
-/**
- * Drop empty `model` placeholders and non-seance blank `sourceSession`
- * placeholders from the call and its batch items so they route like omitted
- * fields. Copy-on-write: the submitted arguments are never mutated, and the
- * same reference is returned when nothing changed.
- */
-function normalizeTaskPlaceholders(params: TaskParams, defaultAgent: string): TaskParams {
+function normalizeTaskModelPlaceholders(params: TaskParams): TaskParams {
 	const originalTasks = params.tasks;
 	let normalizedTasks: TaskItem[] | undefined;
 	if (Array.isArray(originalTasks)) {
 		for (let i = 0; i < originalTasks.length; i++) {
 			const item = originalTasks[i];
-			if (!isRecord(item)) continue;
-			const emptyModel = isEmptyModelPlaceholder(item.model);
-			const blankSource = isBlankSourceSessionPlaceholder(item, defaultAgent);
-			if (!emptyModel && !blankSource) continue;
+			if (!isRecord(item) || !isEmptyModelPlaceholder(item.model)) continue;
 			normalizedTasks ??= originalTasks.slice();
 			const copy = { ...item };
-			if (emptyModel) delete copy.model;
-			if (blankSource) delete copy.sourceSession;
+			delete copy.model;
 			normalizedTasks[i] = copy;
 		}
 	}
 	const emptyRootModel = isEmptyModelPlaceholder(params.model);
-	// A batch call's root `sourceSession` belongs to no spawn; it stays for the placement refusal.
-	const blankRootSource = !Array.isArray(originalTasks) && isBlankSourceSessionPlaceholder(params, defaultAgent);
-	if (!emptyRootModel && !blankRootSource && !normalizedTasks) return params;
+	if (!emptyRootModel && !normalizedTasks) return params;
 	const copy = { ...params };
 	if (emptyRootModel) delete copy.model;
-	if (blankRootSource) delete copy.sourceSession;
 	if (normalizedTasks) copy.tasks = normalizedTasks;
 	return copy;
 }
@@ -616,7 +593,7 @@ function planSpawns(
 	seanceAdvertised: boolean,
 	settings: Settings,
 ): SpawnPlan | string {
-	const params = normalizeTaskPlaceholders(repairTaskParams(rawParams as TaskParams), defaultAgent);
+	const params = normalizeTaskModelPlaceholders(repairTaskParams(rawParams as TaskParams));
 	const error =
 		validateShapeParams(batchEnabled, cfgTaskPermissionsMode.get(settings) !== "off", params) ??
 		validateSpawnParams(params, batchEnabled, fileEnabled, defaultAgent, settings) ??
