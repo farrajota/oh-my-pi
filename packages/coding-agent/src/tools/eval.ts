@@ -62,6 +62,7 @@ import { hasWaitTool } from "./wait";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
+import { docTopicsReadable } from "./xdev";
 
 import {
 	cfgEvalAutoBackgroundEnabled,
@@ -78,7 +79,7 @@ import { cfgToolsMaxTimeout, cfgToolsSpeculativeExecutionEnabled } from "./setti
 export type EvalLanguageToken = "py" | "js";
 const EVAL_LANGUAGE_ORDER: readonly EvalLanguageToken[] = ["py", "js"];
 const EVAL_LANGUAGE_RUNTIME: Record<EvalLanguageToken, string> = {
-	py: '"py": Python with IPython-style magics (not IPython)',
+	py: '"py": Python',
 	js: '"js": Bun',
 };
 const EVAL_LANGUAGE_NAME: Record<EvalLanguageToken, string> = {
@@ -115,7 +116,7 @@ function enabledEvalLanguages(backends: EvalBackendsAllowance): EvalLanguageToke
 }
 
 const evalCellCommonFields = {
-	code: type("string").describe("Code or standalone % command; top-level await works."),
+	code: type("string").describe("Code or standalone % command."),
 	"title?": type("string").describe("Short transcript label."),
 	"timeout?": evalTimeoutSchema(),
 	"reset?": type("boolean").describe("Wipe only this kernel."),
@@ -207,8 +208,6 @@ export interface EvalToolDescriptionOptions {
 	perCallModelAdvertisement?: PerCallModelAdvertisement;
 	/** Canonical and wire names currently accepted by the session tool bridge. */
 	toolNames?: readonly string[];
-	/** Configured global ceiling for nonzero cell deadlines. */
-	maxTimeout?: number;
 	/** Advertise `sh()`; false when the session's permission scope refuses `bash`. Default: true. */
 	shellAvailable?: boolean;
 }
@@ -228,10 +227,6 @@ function evalTemplateContext(options: EvalToolDescriptionOptions) {
 		autoProvision: options.autoProvision ?? true,
 		perCallModel: options.perCallModel ?? false,
 		perCallModelAdvertisement: options.perCallModelAdvertisement,
-		timeoutMin: TOOL_TIMEOUTS.eval.min,
-		timeoutMax: TOOL_TIMEOUTS.eval.max,
-		configuredMaxTimeout: options.maxTimeout !== undefined && options.maxTimeout > 0 ? options.maxTimeout : undefined,
-		timeoutCeiling: clampTimeout("eval", TOOL_TIMEOUTS.eval.max, options.maxTimeout),
 		shellAvailable: options.shellAvailable ?? true,
 	};
 }
@@ -397,6 +392,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			session.taskDepth ?? 0,
 		);
 		const perCallModel = perCallModelEnabled(session.settings, "eval");
+		const perCallModelAdvertisement =
+			session.advertisedPerCallModel?.() ??
+			(perCallModel
+				? getPerCallModelAdvertisement(session.settings, session.getActiveModel?.(), session.modelRegistry)
+				: undefined);
 		return {
 			py: backends.python,
 			js: backends.js,
@@ -406,14 +406,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			eagerDelegation: sessionDelegationBias(session) === "eager",
 			waitTool: hasWaitTool(session),
 			preludes: this.#advertisedPreludes(session),
-			inlineTopics: session.isToolActive?.("read") === false,
+			inlineTopics: !docTopicsReadable(session),
 			autoProvision: cfgEvalAutoProvision.get(session.settings),
 			perCallModel,
-			perCallModelAdvertisement: perCallModel
-				? getPerCallModelAdvertisement(session.settings, session.getActiveModel?.(), session.modelRegistry)
-				: undefined,
+			perCallModelAdvertisement,
 			toolNames: session.getAdvertisedEvalToolNames?.(),
-			maxTimeout: cfgToolsMaxTimeout.get(session.settings),
 			// `sh()` is refused under a scope without the bash grant (see the eval tool bridge).
 			shellAvailable: permissionToolGrantRefusal(session.settings, session.cwd, "bash") === undefined,
 		};

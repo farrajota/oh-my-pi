@@ -154,7 +154,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 			entry => parseSearchPath(entry).basePath,
 		);
 	readonly label = "AST Grep";
-	readonly summary = "Search code with AST patterns (structural grep)";
+	readonly summary = "Search code with AST patterns (SHOULD be preferred for structural search)";
 	get description(): string {
 		const eagerDelegation = sessionDelegationBias(this.session) === "eager";
 		const scoutAvailable = isScoutSpawnable(

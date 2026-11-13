@@ -329,7 +329,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 				"tools.maxTimeout": 0,
 			}),
 		};
-		await invoke({ action: "open", app: { relay: true, target: "case=" }, timeout: 20 });
+		await invoke({ action: "open", app: "relay", target: "case=", timeout: 20 });
 		await invoke({ action: "run", code: "await page.evaluate(() => { window.mark = 'kept'; });", timeout: 10 });
 		return extension;
 	}
@@ -410,7 +410,8 @@ describe("relay tabs Chrome detaches omp from", () => {
 				const opened = invoke(
 					{
 						action: "open",
-						app: { relay: true, target: "case=" },
+						app: "relay",
+						target: "case=",
 						url: String(login.url),
 						timeout: 20,
 					},
@@ -497,7 +498,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 			await openRelayTab();
 			for (let attempt = 0; attempt < 4; attempt++) {
 				await releaseTab(name, { keepPage: true });
-				await invoke({ action: "open", app: { relay: true, target: "case=" }, timeout: 20 });
+				await invoke({ action: "open", app: "relay", target: "case=", timeout: 20 });
 				expect((await invoke(readMark)).value).toBe("kept");
 			}
 		},
@@ -688,7 +689,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 			ext.refuseAttach = false;
 			await page?.evaluate("location.hash = 'moved'");
 			ext.urlChanged(`${pageUrl}#moved`);
-			await invoke({ action: "open", app: { relay: true, target: "case=" }, timeout: 20 });
+			await invoke({ action: "open", app: "relay", target: "case=", timeout: 20 });
 			expect((await invoke(readMark)).value).toBe("kept");
 		},
 		60_000,
@@ -758,4 +759,41 @@ describe("relay tabs Chrome detaches omp from", () => {
 		},
 		60_000,
 	);
+
+	it("keeps the tab when a re-adoption outlasts the cancel grace that stops running code", async () => {
+		const ext = await openRelayTab();
+		const tab = getTab(name);
+		if (tab?.backend !== "worker") throw new Error("expected a worker tab");
+		// A slow worker start (a loaded host) holds the re-adoption past the 750 ms grace a cancel gives running
+		// code to stop. Nothing runs during a re-adoption, so the grace must not kill the tab it is re-adopting.
+		const terminate = tab.worker.terminate.bind(tab.worker);
+		const readopting = Promise.withResolvers<void>();
+		const resume = Promise.withResolvers<void>();
+		const held = spyOn(tab.worker, "terminate").mockImplementation(async () => {
+			await terminate();
+			readopting.resolve();
+			await resume.promise;
+		});
+		try {
+			const ac = new AbortController();
+			const evaluating = ext.hanging();
+			const stalled = runInTab(name, {
+				code: HANG.code,
+				timeoutMs: 30_000,
+				session: tool,
+				signal: ac.signal,
+			}).catch((error: unknown) => error);
+			await evaluating;
+			await ext.chromeDetach("target_closed");
+			await readopting.promise;
+			ac.abort();
+			await Bun.sleep(1_500);
+			resume.resolve();
+			expect(await stalled).toBeInstanceOf(ToolAbortError);
+			expect((await invoke(readMark)).value).toBe("kept");
+		} finally {
+			resume.resolve();
+			held.mockRestore();
+		}
+	}, 60_000);
 });

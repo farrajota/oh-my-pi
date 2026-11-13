@@ -338,12 +338,6 @@ export function getConfigDirName(): string {
 	return process.env.PI_CONFIG_DIR || CONFIG_DIR_NAME;
 }
 
-/** Get the config agent directory name (e.g. ".omp/agent" or PI_CONFIG_DIR + "/agent"); same home-relative rule as {@link getConfigDirName}. */
-export function getConfigAgentDirName(): string {
-	const profile = getActiveProfile();
-	return profile ? path.join(getConfigDirName(), "profiles", profile, "agent") : `${getConfigDirName()}/agent`;
-}
-
 // =============================================================================
 // DirResolver — cached, XDG-aware path resolution
 // =============================================================================
@@ -674,6 +668,15 @@ export function getUpdateStateDir(): string {
 }
 
 /**
+ * Return a per-user directory (`<tmpdir>/<prefix>-<uid>`) under the OS temp dir
+ * so `bun test` state never collides across accounts sharing `/tmp`.
+ */
+export function getTestTempDir(prefix: string): string {
+	const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
+	return path.join(os.tmpdir(), `${prefix}-${uid}`);
+}
+
+/**
  * Get the logs directory (~/.omp/logs). `bun test` processes get
  * `<tmpdir>/omp-test-logs-<uid>` instead, so suites never write into the
  * developer's real logs; the uid suffix (as for the test session-owners dir)
@@ -681,8 +684,7 @@ export function getUpdateStateDir(): string {
  */
 export function getLogsDir(): string {
 	if (isBunTestRuntime()) {
-		const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
-		return path.join(os.tmpdir(), `omp-test-logs-${uid}`);
+		return getTestTempDir("omp-test-logs");
 	}
 	return dirs.rootSubdir("logs", "state");
 }
@@ -813,6 +815,15 @@ export function getPythonGatewayDir(): string {
 /** Get the puppeteer sandbox directory (~/.omp/puppeteer). */
 export function getPuppeteerDir(): string {
 	return dirs.rootSubdir("puppeteer", "cache");
+}
+
+/**
+ * Get where the WebKit browser engine's host executable is installed: `ABHost` (`ABHost.exe` on Windows)
+ * in the ABKit engine directory `~/.o2/lib/abkit`. The location is shared with Tern, so it is outside omp's
+ * own directories.
+ */
+export function getWebKitHostPath(platform: NodeJS.Platform = process.platform): string {
+	return path.join(os.homedir(), ".o2", "lib", "abkit", platform === "win32" ? "ABHost.exe" : "ABHost");
 }
 
 /** Get the browser relay extension install directory (~/.omp/browser-relay). */

@@ -80,12 +80,27 @@ async function runCheckRs(fixture: Fixture, cwd: string, env: Record<string, str
 	const base: Record<string, string | undefined> = { ...process.env };
 	// The ambient environment must not decide the case: an omp shell exports
 	// CI=true, a GitHub runner exports GITHUB_ACTIONS, and a git hook exports GIT_DIR.
-	for (const key of ["CI", "GITHUB_ACTIONS", "OMP_FORCE_RUST_TASKS", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]) {
+	// The script prefers CARGO_HOME/bin and ~/.cargo/bin over PATH, so an ambient
+	// CARGO_HOME or a real home with a toolchain would bypass the cargo stub.
+	for (const key of [
+		"CI",
+		"GITHUB_ACTIONS",
+		"OMP_FORCE_RUST_TASKS",
+		"GIT_DIR",
+		"GIT_WORK_TREE",
+		"GIT_INDEX_FILE",
+		"CARGO_HOME",
+	]) {
 		delete base[key];
 	}
 	const proc = Bun.spawn([process.execPath, "scripts/run-rs-task.ts", "check:rs"], {
 		cwd,
-		env: { ...base, PATH: `${fixture.shimDir}${path.delimiter}${process.env.PATH ?? ""}`, ...env },
+		env: {
+			...base,
+			HOME: fixture.root,
+			PATH: `${fixture.shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+			...env,
+		},
 		stdout: "pipe",
 		stderr: "pipe",
 	});
