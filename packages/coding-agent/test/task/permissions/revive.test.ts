@@ -165,6 +165,8 @@ interface ChildOptions {
 	/** Persist these effective profiles instead of the scope's own. */
 	readonly effective?: string[];
 	readonly tools?: string[];
+	/** Persist an output schema, which is what gives a spawn its `yield` tool. */
+	readonly outputSchema?: unknown;
 }
 
 async function persistChild(options: ChildOptions = {}): Promise<string> {
@@ -177,6 +179,7 @@ async function persistChild(options: ChildOptions = {}): Promise<string> {
 		systemPrompt: ["persisted prompt"],
 		task: "persisted task",
 		tools: options.tools ?? ["read", "write", "yield"],
+		...(options.outputSchema !== undefined ? { outputSchema: options.outputSchema } : {}),
 		...(fields && !options.omitProvenance
 			? {
 					requestedPermissionProfiles: fields.requestedPermissionProfiles,
@@ -294,7 +297,7 @@ describe("cold revival restores the recorded permission scope", () => {
 		const parent = new Parent("Main");
 		const scope = await composeChild({ tools: ["read"] });
 		parent.bind(CHILD, scope);
-		const ref = childRef(await persistChild({ scope, tools: ["read", "write", "bash", "yield"] }));
+		const ref = childRef(await persistChild({ scope, tools: ["read", "write", "bash", "yield"], outputSchema: {} }));
 		const captured = captureSessions();
 
 		await revive(ref);

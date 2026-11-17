@@ -13,6 +13,17 @@
 - `getSessionStatsByModelAndAgentType(sessionFile)` aggregates one session tree (the main transcript and its subagent and advisor transcripts) by model and agent type, and `syncSessionTree(sessionFile)` syncs just that tree
 - `syncAllSessions` takes `lockWaitMs`, `skipIfBusy` (return nothing instead of throwing when the sync lock stays held) and `freshnessMs` (skip a full scan another process completed recently)
 - `getStatsByModel(cutoff, { exactWhenRollupsStale: true })` reads raw messages when the rollup backlog is too large for exact rollup reads, so a long-window model breakdown is complete while rollups rebuild
+- The stats Gain tab counts the context snapcompact compactions free, beside imaged tool results, so sessions that compact with snapcompact no longer show zero savings; the first sync after upgrading re-reads transcripts written since 2026-08-20 once to fill in that history ([#19120](https://github.com/can1357/oh-my-pi/pull/19120) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.20.1] - 2026-11-14
+
+### Fixed
+
+- Fixed Traces tab timing so background jobs show their actual completion times, including accurate idle periods and turn durations.
+- Fixed per-model message counts on the Frustration page to include all answered messages.
+- Improved dashboard responsiveness by keeping other pages and Live status available while Spotlight rebuilds.
+- Fixed daily usage charts to group activity by the user's local calendar day instead of UTC.
+
 ## [18.20.0] - 2026-11-12
 
 ### Fixed

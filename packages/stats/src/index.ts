@@ -33,7 +33,11 @@ export type {
 	SpotlightDashboardStats,
 	SpotlightSessionContext,
 } from "./shared-types";
-export { getSpotlightDashboardStats, getSpotlightSessionContext } from "./spotlight-aggregator";
+export {
+	getSpotlightDashboardStats,
+	getSpotlightSessionContext,
+	smokeTestSpotlightWorker,
+} from "./spotlight-aggregator";
 export type {
 	AggregatedStats,
 	DashboardStats,

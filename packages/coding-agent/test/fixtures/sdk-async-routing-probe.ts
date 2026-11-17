@@ -60,6 +60,9 @@ const model = createMockModel({
 									agent: "task",
 									task: "Return initial child result.",
 									solutionSpace: "Report only.",
+									// An output schema is what gives the child its `yield` tool, and with it the
+									// wake-turn re-`yield` that carries the correction to the parent.
+									outputSchema: { type: "string" },
 								},
 							],
 						},
@@ -77,7 +80,7 @@ registry.getAvailable = () => [model];
 const settings = Settings.isolated({
 	"async.enabled": true,
 	"task.batch": true,
-	// The correction reaches the parent through a wake-turn re-`yield`.
+	// Advertises `outputSchema` on the task tool; the child's schema gives it `yield`.
 	"task.structured": true,
 	"task.maxConcurrency": 1,
 	"task.agentIdleTtlMs": 0,

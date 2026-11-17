@@ -90,6 +90,8 @@ export interface MockResponse {
 	stopDetails?: StopDetails | null;
 	/** In-memory fallback credit handle attached when a refusal response carries a fallback credit token. */
 	fallbackCreditHandle?: AnthropicFallbackCreditHandle;
+	/** On a refusal: how many of other models' reasoning blocks the refused request replayed as text. */
+	demotedReasoningBlocks?: number;
 	/** Error text paired with an explicit `"error"` stop reason. */
 	errorMessage?: string;
 	/** HTTP status of the failure, on a `throw` or explicit `"error"` response. */
@@ -414,6 +416,7 @@ async function runMock(
 	partial.stopReason = reason;
 	partial.stopDetails = response.stopDetails;
 	partial.fallbackCreditHandle = response.fallbackCreditHandle;
+	partial.demotedReasoningBlocks = response.demotedReasoningBlocks;
 	partial.errorMessage = response.errorMessage;
 	if (response.errorStatus !== undefined) partial.errorStatus = response.errorStatus;
 	if (response.errorCode !== undefined) partial.errorCode = response.errorCode;

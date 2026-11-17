@@ -99,6 +99,9 @@ describe("runSubprocess task label generation", () => {
 			settings,
 			"LabelTest",
 			expect.any(AbortSignal),
+			// No parent model pattern or provider: the run has no parent session.
+			undefined,
+			undefined,
 		);
 	});
 

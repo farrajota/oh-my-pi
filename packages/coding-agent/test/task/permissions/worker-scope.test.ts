@@ -138,7 +138,6 @@ function runOptions(id: string, extra: Partial<ExecutorOptions> = {}): ExecutorO
 		id,
 		description: `scoped ${id}`,
 		modelOverride: MODEL,
-		structured: false,
 		settings,
 		authStorage,
 		modelRegistry,

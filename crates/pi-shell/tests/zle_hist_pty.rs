@@ -17,7 +17,7 @@ use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
-/// How long startup output must stay quiet before sourcing the rc file.
+/// Incremental searches can remain in a recursive key read.
 const QUIET: Duration = Duration::from_millis(300);
 
 /// The history file every case starts with (oldest first).
@@ -62,7 +62,9 @@ fn screens(
 ) -> io::Result<(String, Option<String>)> {
 	let make_spawn = |real| spawn(real, rc);
 	let mut run = |pty: &mut Pty| -> io::Result<()> {
-		pty.settle(QUIET, TIMEOUT)?;
+		// Do not send input until the line editor, rather than the kernel's
+		// canonical/echoing line discipline, owns the terminal.
+		pty.wait_raw(TIMEOUT)?;
 		pty.type_keys(". ~/.zshrc\r", KEY)?;
 		pty.read_until("RCDONE", TIMEOUT)?;
 		pty.zle_sync(TIMEOUT)?;
@@ -81,7 +83,18 @@ fn screens(
 
 /// Assert both screens (with the cursor position) are the same.
 fn same(rc: &str, typed: &str) -> (String, Option<String>) {
-	let (ours, real) = match screens(rc, |pty| keys(pty, typed)) {
+	same_with(rc, typed, false)
+}
+
+fn same_with(rc: &str, typed: &str, returns_to_main: bool) -> (String, Option<String>) {
+	let (ours, real) = match screens(rc, |pty| {
+		if returns_to_main {
+			keys(pty, typed)
+		} else {
+			pty.type_keys(typed, KEY)?;
+			pty.settle(QUIET, TIMEOUT)
+		}
+	}) {
 		Ok(s) => s,
 		Err(e) => panic!("pty session failed: {e}"),
 	};
@@ -94,7 +107,7 @@ fn same(rc: &str, typed: &str) -> (String, Option<String>) {
 /// [`same`], then `~/log` shown in place of the line: what the widgets
 /// logged on the way.
 fn same_log(rc: &str, typed: &str) {
-	same(rc, &format!("{typed}\x18q"));
+	same_with(rc, &format!("{typed}\x18q"), true);
 }
 
 /// A widget logging `BUFFER`, `CURSOR` and `HISTNO` to `~/log`, bound to

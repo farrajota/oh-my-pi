@@ -117,6 +117,7 @@ import {
 	getOpenAIStrictToolsScope,
 	getOpenRouterResponsesSessionId,
 	isCompiledGrammarTooLargeStrictError,
+	isOpenAIResponsesRefusedEncryptedReasoningError,
 	isOpenAIResponsesStalePreviousResponseError,
 	isStrictToolsDisabledForScope,
 	readOpenRouterRawMetadata,
@@ -124,6 +125,7 @@ import {
 	type OpenAIStrictToolsScope,
 	type OpenAIStrictToolsState,
 	processResponsesStream,
+	replaysEncryptedReasoning,
 	resolveOpenAICompatPolicy,
 	resolveOpenAIOutputTokenParam,
 	resolveOpenAIRequestSetup,
@@ -692,6 +694,8 @@ type ResponsesTransport = "websocket" | "sse";
 
 interface ResponsesAttemptContext {
 	mode: ResponsesTransport | undefined;
+	/** Set once the server refused replayed encrypted reasoning; later attempts build without it. */
+	dropEncryptedReasoning: boolean;
 }
 
 function isPreSendTransportFallback(error: unknown, signal: AbortSignal): boolean {
@@ -899,6 +903,7 @@ const streamOpenAIResponsesOnce = (
 					strictToolsScope,
 					disableStrictTools,
 					chainState?.canAppend ? chainState.lastParams?.input : undefined,
+					attemptContext.dropEncryptedReasoning,
 				);
 				const { params, trailingScaffoldingItems } = builtParams;
 				wireToolNames = builtParams.toolNamesByWire;
@@ -1079,6 +1084,35 @@ const streamOpenAIResponsesOnce = (
 			let strictRetryAvailable = true;
 			let activeStrictToolsApplied = builtParams.strictToolsApplied;
 			let forceDisableStrictTools = false;
+			let encryptedReasoningRetryAvailable = true;
+			// The server refused a replayed encrypted reasoning blob (key rotation,
+			// another credential): resending fails the same way, so rebuild the full
+			// transcript once without any earlier blob. Text, tool calls and results stay.
+			const prepareEncryptedReasoningRetry = async (error: unknown): Promise<boolean> => {
+				if (
+					!encryptedReasoningRetryAvailable ||
+					requestSignal.aborted ||
+					!isOpenAIResponsesRefusedEncryptedReasoningError(error) ||
+					!replaysEncryptedReasoning(activeParams.input)
+				) {
+					return false;
+				}
+				encryptedReasoningRetryAvailable = false;
+				attemptContext.dropEncryptedReasoning = true;
+				if (chainState) resetOpenAIResponsesChainState(chainState);
+				const retry = await prepareRequest(forceDisableStrictTools);
+				chained = retry.chained;
+				activeRawRequestDump.body = chained.params;
+				activeParams = retry.builtParams.params;
+				activeTrailingScaffoldingItems = retry.builtParams.trailingScaffoldingItems;
+				activeStrictToolsApplied = retry.builtParams.strictToolsApplied;
+				logger.debug("OpenAI responses replayed encrypted reasoning refused; retrying without it", {
+					provider: model.provider,
+					model: model.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return true;
+			};
 			const openResponsesStreamWithFallbacks = async (): Promise<AsyncIterable<ResponseStreamEvent>> => {
 				let openaiStream: AsyncIterable<ResponseStreamEvent>;
 				try {
@@ -1130,6 +1164,7 @@ const streamOpenAIResponsesOnce = (
 								};
 								continue;
 							}
+							if (await prepareEncryptedReasoningRetry(error)) continue;
 							const compiledGrammarTooLarge =
 								model.compat.retryWithoutStrictOnGrammarError &&
 								isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse);
@@ -1185,6 +1220,8 @@ const streamOpenAIResponsesOnce = (
 								providerSessionState,
 								strictToolsScope,
 								forceDisableStrictTools,
+								undefined,
+								attemptContext.dropEncryptedReasoning,
 							);
 							const currentParams = currentBuilt.params;
 							// Only ZDR forces `store: false` (the org never persists responses). A
@@ -1421,25 +1458,29 @@ const streamOpenAIResponsesOnce = (
 							}
 						}
 					}
+					const replaySafe =
+						!useWebSocket && !sawReplayUnsafeOutput && !requestSignal.aborted && !abortTracker.wasCallerAbort();
+					// An in-stream refusal of replayed encrypted reasoning, before any output.
+					const encryptedReasoningRetry = replaySafe && (await prepareEncryptedReasoningRetry(streamFailure));
 					const canRetry =
-						!useWebSocket &&
-						!sawReplayUnsafeOutput &&
-						!requestSignal.aborted &&
-						!abortTracker.wasCallerAbort() &&
-						transientStreamRetryAttempt < OPENAI_RESPONSES_MAX_TRANSIENT_STREAM_RETRIES &&
-						isRetryableOpenAIResponsesStreamFailure(streamFailure);
+						encryptedReasoningRetry ||
+						(replaySafe &&
+							transientStreamRetryAttempt < OPENAI_RESPONSES_MAX_TRANSIENT_STREAM_RETRIES &&
+							isRetryableOpenAIResponsesStreamFailure(streamFailure));
 					if (!canRetry) {
 						forwardAttemptEvents();
 						throw streamFailure;
 					}
 
-					transientStreamRetryAttempt++;
-					logger.debug("OpenAI responses stream ended before replay-unsafe output; retrying", {
-						provider: model.provider,
-						model: model.id,
-						attempt: transientStreamRetryAttempt,
-						error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
-					});
+					if (!encryptedReasoningRetry) {
+						transientStreamRetryAttempt++;
+						logger.debug("OpenAI responses stream ended before replay-unsafe output; retrying", {
+							provider: model.provider,
+							model: model.id,
+							attempt: transientStreamRetryAttempt,
+							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+						});
+					}
 					const retryOutput = createInitialResponsesAssistantMessage(model.api, model.provider, model.id);
 					output.content.length = 0;
 					output.responseId = undefined;
@@ -1457,17 +1498,22 @@ const streamOpenAIResponsesOnce = (
 					firstTokenTime = undefined;
 					nativeOutputItems.length = 0;
 
-					await waitForRetry(
-						options?.providerRetryWait,
-						OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_DELAY_MS,
-						options?.signal,
-					);
+					if (!encryptedReasoningRetry) {
+						await waitForRetry(
+							options?.providerRetryWait,
+							OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_DELAY_MS,
+							options?.signal,
+						);
+					}
 					if (abortTracker.wasCallerAbort()) throw new AIError.AbortError();
 					openaiStream = await openResponsesStreamWithFallbacks();
 				}
 			}
 
-			output.providerPayload = createOpenAIResponsesHistoryPayload(model.provider, nativeOutputItems);
+			const historyPayload = createOpenAIResponsesHistoryPayload(model.provider, nativeOutputItems);
+			// Persisted with the turn so later requests, even after a restart, omit the refused blobs.
+			if (attemptContext.dropEncryptedReasoning) historyPayload.encryptedReasoningFloor = true;
+			output.providerPayload = historyPayload;
 			const replayableResponseItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
 				cloneJsonTree(nativeOutputItems),
 				{
@@ -1588,7 +1634,7 @@ const streamOpenAIResponsesOnce = (
  * Responses request metadata remains stable.
  */
 export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (model, context, options) => {
-	const attemptContext: ResponsesAttemptContext = { mode: undefined };
+	const attemptContext: ResponsesAttemptContext = { mode: undefined, dropEncryptedReasoning: false };
 	const attemptBudget = createProviderAttemptBudget(options?.providerMaxAttempts);
 	return withReplaySafeStreamRetry(
 		model,
@@ -1796,6 +1842,7 @@ export function buildParams(
 	strictToolsScope?: OpenAIStrictToolsScope,
 	disableStrictToolsOverride = false,
 	statefulCacheBaseline?: ResponseInput,
+	dropEncryptedReasoning = false,
 ): {
 	params: OpenAIResponsesSamplingParams;
 	trailingScaffoldingItems: number;
@@ -1840,6 +1887,7 @@ export function buildParams(
 			canReconstructReasoningReplay,
 		repairOrphanOutputs: true,
 		toolNaming,
+		dropEncryptedReasoning,
 	});
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);

@@ -40,6 +40,9 @@ const OPTION_TIERS = {
 	statefulResponses: "client",
 	acceptEmptyResponse: "client",
 	loopGuard: "client",
+	// A session that learned to leave other models' reasoning out of Claude
+	// requests must keep doing so through the gateway.
+	omitDemotedReasoning: "client",
 
 	// Attribution.
 	headers: "gateway",
@@ -75,6 +78,7 @@ const OPTION_TIERS = {
 	cwd: "server",
 	providerOptions: "server",
 	providerSessionState: "server",
+	thinkingCapabilityDbPath: "server",
 	providerRetryWait: "server",
 	parentSessionId: "server",
 	minimizeEffort: "server",

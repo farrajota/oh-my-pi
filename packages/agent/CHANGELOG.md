@@ -5,6 +5,12 @@
 ### Added
 
 - `Agent.providerMaxAttempts` (constructor option and property) caps the outbound attempts of each provider request; `undefined` keeps the provider default
+## [18.20.1] - 2026-11-14
+
+### Fixed
+
+- Corrected context cost estimates for requests that omit reasoning history, so billing estimates now include thinking text only when it is sent or reconstructed for a tool call.
+
 ## [18.20.0] - 2026-11-12
 
 ### Changed

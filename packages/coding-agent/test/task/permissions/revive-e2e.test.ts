@@ -147,7 +147,6 @@ function runOptions(id: string, extra: Partial<ExecutorOptions> = {}): ExecutorO
 		id,
 		description: `scoped ${id}`,
 		modelOverride: MODEL,
-		structured: false,
 		settings,
 		authStorage,
 		modelRegistry,
@@ -230,7 +229,6 @@ describe("a scoped subagent revived after it parked", () => {
 				id: "WarmScoped",
 				agent: AGENT,
 				message: WRITE_TASK,
-				structured: false,
 			});
 
 			expect(result.output).toContain(BLOCKED);
@@ -257,7 +255,6 @@ describe("a scoped subagent revived after it parked", () => {
 				id: "ColdScoped",
 				agent: AGENT,
 				message: WRITE_TASK,
-				structured: false,
 			});
 
 			const revived = AgentRegistry.global().get("ColdScoped")?.session;
@@ -285,7 +282,6 @@ describe("a scoped subagent revived after it parked", () => {
 				id: "ColdOpen",
 				agent: AGENT,
 				message: WRITE_TASK,
-				structured: false,
 			});
 
 			expect(result.output).not.toContain("BLOCKED");
