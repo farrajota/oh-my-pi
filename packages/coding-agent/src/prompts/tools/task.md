@@ -51,7 +51,7 @@ Run one agent synchronously.
   - Examples: `one fix: rename, names given`; `one fix: slice end in paginate`; `single-flight cache load; races easy to miss`;
     `several retry API shapes; error classes to choose`; `deadlock cause open, no repro`
 {{#if evalToolsEnabled}}
-- `tools`: eval-defined, run in your kernel.
+- `tools`: names of functions you defined with @tool (Python) or tool(fn, {…}) (JS) in an eval cell; they run in your kernel. Never built-in tools.{{#if permissionsEnabled}}{{#if permissionToolsEnabled}} To limit built-in tools, use `permissions.tools` or `toolProfile`.{{/if}}{{/if}}
 {{/if}}
 {{#if effortEnabled}}
 - `effort`: `"lo"`|`"med"`|`"hi"` by how open-ended the problem is.

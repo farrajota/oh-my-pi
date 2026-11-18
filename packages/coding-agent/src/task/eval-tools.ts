@@ -13,6 +13,8 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
 
 import { cfgEvalToolsEnabled } from "../eval/settings";
+import { BUILTIN_TOOL_NAMES, normalizeToolName } from "../tools/builtin-names";
+import { cfgTaskPermissionsMode, cfgTaskPermissionsToolsEnabled } from "./permissions/settings";
 
 interface EvalToolQueryResult {
 	tools: EvalToolDescriptor[];
@@ -78,6 +80,29 @@ export function evalToolsEnabled(session: ToolSession): boolean {
 	return cfgEvalToolsEnabled.get(session.settings) !== false;
 }
 
+const BUILTIN_TOOL_NAME_SET: ReadonlySet<string> = new Set(BUILTIN_TOOL_NAMES);
+
+function isBuiltinToolName(name: string): boolean {
+	return BUILTIN_TOOL_NAME_SET.has(normalizeToolName(name));
+}
+
+/**
+ * Models read a task item's `tools` (eval-defined functions) as the built-in allowlist that
+ * `permissions.tools` actually is. Name the field that does what they meant, but never drop the
+ * names: a model that sent only `tools: ["read"]` expects a restricted child, and silently
+ * ignoring the field would spawn an unrestricted one.
+ */
+function builtinToolNamesError(session: ToolSession, names: readonly string[]): ToolError {
+	const permissionToolFieldsOffered =
+		cfgTaskPermissionsMode.get(session.settings) !== "off" && cfgTaskPermissionsToolsEnabled.get(session.settings);
+	const remedy = permissionToolFieldsOffered
+		? "To limit the child's built-in tools, use `permissions.tools` or `toolProfile` instead."
+		: "The child's built-in tools come from its agent definition; leave them out of `tools`.";
+	return new ToolError(
+		`\`tools\` names built-in tool(s): ${names.join(", ")}. \`tools\` only hands the child functions you defined with @tool (Python) or tool(fn, {…}) (JS) in an eval cell. ${remedy}`,
+	);
+}
+
 /** Resolve named kernel-defined tools for a child session. */
 export async function describeEvalTools(
 	session: ToolSession,
@@ -87,11 +112,15 @@ export async function describeEvalTools(
 	const requested = [...new Set(names.filter(name => name.length > 0))];
 	if (requested.length === 0) return [];
 	if (!evalToolsEnabled(session)) {
+		const builtins = requested.filter(isBuiltinToolName);
+		if (builtins.length > 0) throw builtinToolNamesError(session, builtins);
 		throw new ToolError("Eval-defined tools are disabled; set eval.tools.enabled=true to expose them to subagents.");
 	}
 	const tools = await queryAllEvalTools(session, requested, signal);
 	const found = new Set(tools.map(tool => tool.name));
 	const missing = requested.filter(name => !found.has(name));
+	const missingBuiltins = missing.filter(isBuiltinToolName);
+	if (missingBuiltins.length > 0) throw builtinToolNamesError(session, missingBuiltins);
 	if (missing.length > 0) {
 		const available = (await listEvalTools(session, signal))
 			.map(tool => tool.name)
