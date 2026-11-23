@@ -1,21 +1,12 @@
 import type { SyncOptions } from "@oh-my-pi/omp-stats/aggregator";
 import type { SessionSyncResult } from "@oh-my-pi/omp-stats/sync-host";
-import { wrapRefCountedSubprocess } from "../subprocess/model-worker-host";
-import {
-	createWorkerSubprocess,
-	logWorkerMessage,
-	type RefCountedWorkerHandle,
-	resolveWorkerSpawnCmd,
-	type SpawnedSubprocess,
-	workerEnvFromParent,
-} from "../subprocess/worker-client";
+import { workerHostEntry } from "@oh-my-pi/pi-utils/worker-host";
+import { logWorkerMessage } from "../subprocess/worker-client";
 import {
 	STATS_ACTIVITY_WORKER_ARG,
 	type StatsActivityWorkerInbound,
 	type StatsActivityWorkerOutbound,
 } from "./activity-protocol";
-
-type StatsSyncWorkerHandle = RefCountedWorkerHandle<StatsActivityWorkerInbound, StatsActivityWorkerOutbound>;
 
 interface PendingSync {
 	onProgress: SyncOptions["onProgress"];
@@ -23,26 +14,26 @@ interface PendingSync {
 	reject(error: unknown): void;
 }
 
-interface LiveWorker {
-	handle: StatsSyncWorkerHandle;
-	proc: SpawnedSubprocess<StatsActivityWorkerOutbound>["proc"];
-	unsubscribe: (() => void)[];
+function spawnStatsSyncWorker(): Worker {
+	const hostEntry = workerHostEntry();
+	return hostEntry
+		? new Worker(hostEntry, { type: "module", argv: [STATS_ACTIVITY_WORKER_ARG] })
+		: new Worker(new URL("./activity-worker.ts", import.meta.url).href, { type: "module" });
 }
 
 /**
- * Runs `syncAllSessions` requests in one long-lived stats subprocess (the activity worker),
- * spawned on the first sync and reused for every later one, so a TUI whose dashboard asks
- * for a targeted sync every few hundred milliseconds does not pay a process start each time.
+ * Runs `syncAllSessions` requests in one long-lived stats activity worker thread, spawned on
+ * the first sync and reused for every later one, so a TUI whose dashboard asks for a targeted
+ * sync every few hundred milliseconds does not pay a worker start each time.
  *
  * Progress streams back to each request's `onProgress`; a throwing callback rejects that
- * request, as it would inline (the child finishes the batch it is writing). The worker is
- * referenced only while a sync is in flight, so an idle one never holds the process open, and
- * it exits on its own when the parent goes away. A worker that dies or faults fails its
- * in-flight syncs and is replaced by the next sync. There is no inline fallback: syncing here
- * would put the SQLite ingest back on the caller's event loop.
+ * request, as it would inline (the worker finishes the batch it is writing). The worker is
+ * referenced only while a sync is in flight, so an idle one never holds the process open. A
+ * worker that faults or exits fails its in-flight syncs and is replaced by the next sync. There
+ * is no inline fallback: syncing here would put the SQLite ingest back on the caller's thread.
  */
 export class StatsSyncClient {
-	#worker: LiveWorker | undefined;
+	#worker: Worker | undefined;
 	readonly #pending = new Map<string, PendingSync>();
 	#nextId = 0;
 
@@ -52,50 +43,38 @@ export class StatsSyncClient {
 		const id = `sync-${++this.#nextId}`;
 		const { promise, resolve, reject } = Promise.withResolvers<SessionSyncResult>();
 		this.#pending.set(id, { onProgress, resolve, reject });
-		if (this.#pending.size === 1) worker.handle.ref();
+		if (this.#pending.size === 1) worker.ref();
 		try {
-			worker.handle.send({ type: "sync", id, options });
+			worker.postMessage({ type: "sync", id, options } satisfies StatsActivityWorkerInbound);
 			return await promise;
 		} finally {
 			this.#pending.delete(id);
-			if (this.#pending.size === 0) this.#worker?.handle.unref();
+			if (this.#pending.size === 0) this.#worker?.unref();
 		}
 	}
 
-	/** Fail in-flight syncs and kill the worker. */
-	async dispose(): Promise<void> {
+	/** Fail in-flight syncs and terminate the worker. */
+	dispose(): void {
 		const worker = this.#worker;
 		this.#detach(new Error("stats sync host disposed"));
-		await worker?.handle.terminate();
+		worker?.terminate();
 	}
 
-	#ensureWorker(): LiveWorker {
-		const current = this.#worker;
-		// An exited worker drops requests silently, and its exit error can arrive after the
-		// exit itself, so check the process rather than waiting for that error.
-		if (current && current.proc.exitCode === null && current.proc.signalCode === null) return current;
-		if (current) {
-			this.#detach(new Error("stats sync subprocess exited"));
-			void current.handle.terminate();
-		}
-		const spawned = createWorkerSubprocess<StatsActivityWorkerOutbound>({
-			spawnCommand: resolveWorkerSpawnCmd(STATS_ACTIVITY_WORKER_ARG),
-			env: workerEnvFromParent(),
-			exitLabel: "stats sync subprocess",
-		});
-		const handle = wrapRefCountedSubprocess<StatsActivityWorkerInbound, StatsActivityWorkerOutbound>(
-			spawned,
-			"stats-sync",
+	#ensureWorker(): Worker {
+		if (this.#worker) return this.#worker;
+		const worker = spawnStatsSyncWorker();
+		worker.addEventListener("message", (event: MessageEvent<StatsActivityWorkerOutbound>) =>
+			this.#handleMessage(event.data),
 		);
-		const worker: LiveWorker = { handle, proc: spawned.proc, unsubscribe: [] };
-		worker.unsubscribe = [
-			handle.onMessage(message => this.#handleMessage(message)),
-			handle.onError(error => {
-				if (this.#worker !== worker) return;
-				this.#detach(error);
-				void handle.terminate();
-			}),
-		];
+		worker.addEventListener("error", (event: ErrorEvent) => {
+			if (this.#worker !== worker) return;
+			this.#detach(event.error instanceof Error ? event.error : new Error(event.message));
+			worker.terminate();
+		});
+		worker.addEventListener("close", () => {
+			if (this.#worker === worker) this.#detach(new Error("stats sync worker exited unexpectedly"));
+		});
+		worker.unref();
 		this.#worker = worker;
 		return worker;
 	}
@@ -126,9 +105,7 @@ export class StatsSyncClient {
 
 	/** Forget the current worker and fail every sync it was running. */
 	#detach(error: Error): void {
-		const worker = this.#worker;
 		this.#worker = undefined;
-		if (worker) for (const unsubscribe of worker.unsubscribe) unsubscribe();
 		for (const pending of this.#pending.values()) pending.reject(error);
 	}
 }

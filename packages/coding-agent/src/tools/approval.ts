@@ -13,7 +13,6 @@ import approvalFolderTemplate from "../prompts/tools/approval-folder.md" with { 
 import type { AgentTool, AgentToolContext, ToolApprovalDecision, ToolTier } from "@oh-my-pi/pi-agent-core";
 import * as path from "node:path";
 import type { Settings } from "../config/settings";
-import { normalizeToLF } from "../edit/normalize";
 import type {
 	ExtensionApprovalAnswer,
 	ExtensionApprovalGrant,
@@ -120,8 +119,8 @@ export interface ResolvedApproval {
 	override: boolean;
 	source?: "tool" | "user" | "mode" | "restriction" | "permission";
 	/**
-	 * User-policy key that produced `source: "user"` (defaults to the tool name), or the keyed
-	 * sub-tool (an `xd://` device) a tool-owned or mode decision is about.
+	 * `tools.approval` key whose user policy decided the call: the tool's name, or its legacy name
+	 * when a renamed tool inherits that policy. Kept when a restricted folder turns it into a prompt.
 	 */
 	policyKey?: string;
 }
@@ -201,7 +200,6 @@ function resolveCachedModeApproval(
 		tier: decision.tier,
 		override: false,
 		source: "mode" as const,
-		...(decision.policyKey ? { policyKey: decision.policyKey } : {}),
 	};
 	const targets = approvalCacheTargets(tool, args);
 	if (targets.length === 0) {
@@ -282,14 +280,11 @@ function normalizeDecision(value: unknown): Omit<ResolvedApproval, "policy"> & {
 		const tier = isToolTier(record.tier) ? record.tier : "exec";
 		const reason = typeof record.reason === "string" && record.reason.length > 0 ? record.reason : undefined;
 		const policy = normalizePolicy(record.policy);
-		const policyKey =
-			typeof record.policyKey === "string" && record.policyKey.length > 0 ? record.policyKey : undefined;
 		return {
 			tier,
 			override: record.override === true,
 			...(policy ? { policy } : {}),
 			...(reason ? { reason } : {}),
-			...(policyKey ? { policyKey } : {}),
 		};
 	}
 
@@ -311,7 +306,7 @@ function getToolDecision(
  * Evaluate a tool's own approval declaration against `args` and return the
  * resulting capability tier, defaulting to `exec` when the tool omits an
  * approval. Unlike reading `tool.approval` directly, this runs function-valued
- * approvals — the write tool's `xd://` gate uses it to take a mounted device's
+ * approvals — the tool-command dispatch uses it to take a mounted tool's
  * argument-dependent tier instead of falling back to `exec`.
  */
 export function resolveToolTier(tool: ApprovalSubject, args: unknown, context?: AgentToolContext): ToolTier {
@@ -328,11 +323,7 @@ function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {
  */
 export interface ApprovalGuard {
 	/** Why the call is refused, or `undefined` to let it resolve normally. */
-	check(
-		tool: ApprovalSubject,
-		args: unknown,
-		call: { tier: ToolTier; policyKey?: string },
-	): { reason: string } | undefined;
+	check(tool: ApprovalSubject, args: unknown, call: { tier: ToolTier }): { reason: string } | undefined;
 }
 
 /** `tools.restrictedFolders` and the approval guards as one call sees them. */
@@ -354,7 +345,7 @@ export interface ApprovalRestrictions {
 export function approvalGuardRefusal(
 	tool: ApprovalSubject,
 	args: unknown,
-	call: { tier: ToolTier; policyKey?: string },
+	call: { tier: ToolTier },
 	restrictions: ApprovalRestrictions | undefined,
 ): string | undefined {
 	for (const guard of restrictions?.guards ?? []) {
@@ -381,11 +372,6 @@ export function approvalRestrictions(
  *
  * Resolution order:
  *  1. Tool `approval(args)` decision, defaulting to tier "exec" when omitted.
- *     A decision may carry a `policyKey` — `tools.approval.<policyKey>` is then
- *     the user override consulted instead of `tools.approval.<tool.name>`, with
- *     the invoking tool's own policy as the fallback when the user set none for
- *     the keyed sub-tool (e.g. an `xd://` device dispatch without a device
- *     policy still honors `tools.approval.write`).
  *  2. User per-tool override, if set and valid.
  *  3. Active mode tier comparison. In `always-ask-cached`, a call whose
  *     `approvalCacheTargets` are all granted in `grants` is allowed instead
@@ -410,15 +396,13 @@ export function resolveApproval(
 	const resolved = resolvePolicy(tool, args, mode, userConfig, grants, context);
 	if (resolved.policy === "deny") return resolved;
 	if (restrictions?.guards?.length) {
-		// The keyed sub-tool (an `xd://` device) comes from the tool's own decision: a mode allow drops it.
-		const policyKey = getToolDecision(tool, args, context).policyKey;
-		const call = { tier: resolved.tier, ...(policyKey ? { policyKey } : {}) };
+		const call = { tier: resolved.tier };
 		const reason = approvalGuardRefusal(tool, args, call, restrictions);
 		if (reason !== undefined) return { policy: "deny", ...call, override: false, source: "permission", reason };
 	}
 	const reason = restrictedFolderReason(tool, args, restrictions);
 	if (reason === undefined) return resolved;
-	// A restricted folder outranks every mode, policy, and grant. `override` keeps nested `xd://`
+	// A restricted folder outranks every mode, policy, and grant. `override` keeps nested tool-command
 	// dispatches asking, and a source other than `mode` makes the prompt neither session-grantable
 	// nor rememberable, so every call asks again.
 	return {
@@ -440,21 +424,14 @@ function resolvePolicy(
 	context?: AgentToolContext,
 ): ResolvedApproval {
 	const decision = getToolDecision(tool, args, context);
-	const policyKey = decision.policyKey ?? tool.name;
-	const userPolicy = Object.hasOwn(userConfig, policyKey) ? normalizePolicy(userConfig[policyKey]) : undefined;
-	const fallbackPolicy =
-		policyKey !== tool.name && userPolicy === undefined && Object.hasOwn(userConfig, tool.name)
-			? normalizePolicy(userConfig[tool.name])
-			: undefined;
-	const effectiveUserPolicy = userPolicy ?? fallbackPolicy;
-	const userPolicyKey = userPolicy !== undefined ? policyKey : tool.name;
+	const userPolicy = Object.hasOwn(userConfig, tool.name) ? normalizePolicy(userConfig[tool.name]) : undefined;
 
 	// Legacy-name fallback for renamed tools (e.g. MCP mints that gained digits).
 	// Fail-closed: only `deny`/`prompt` carry over from the old key, so a
 	// forgotten restrictive policy keeps protecting the renamed tool, while a
 	// stale `allow` cannot mask a `deny` another user sets under the new name.
 	const legacyPolicy =
-		effectiveUserPolicy === undefined &&
+		userPolicy === undefined &&
 		typeof tool.legacyName === "string" &&
 		tool.legacyName !== tool.name &&
 		Object.hasOwn(userConfig, tool.legacyName)
@@ -462,8 +439,8 @@ function resolvePolicy(
 			: undefined;
 	const inheritedPolicy = legacyPolicy === "deny" || legacyPolicy === "prompt" ? legacyPolicy : undefined;
 	const inheritedPolicyKey = inheritedPolicy !== undefined ? tool.legacyName : undefined;
-	const combinedUserPolicy = effectiveUserPolicy ?? inheritedPolicy;
-	const combinedUserPolicyKey = effectiveUserPolicy !== undefined ? userPolicyKey : inheritedPolicyKey;
+	const combinedUserPolicy = userPolicy ?? inheritedPolicy;
+	const combinedUserPolicyKey = userPolicy !== undefined ? tool.name : inheritedPolicyKey;
 
 	if (decision.policy === "deny") {
 		return {
@@ -471,7 +448,6 @@ function resolvePolicy(
 			tier: decision.tier,
 			override: decision.override,
 			source: "tool",
-			...(decision.policyKey ? { policyKey: decision.policyKey } : {}),
 			...(decision.reason ? { reason: decision.reason } : {}),
 		};
 	}
@@ -492,7 +468,6 @@ function resolvePolicy(
 				tier: decision.tier,
 				override: false,
 				source: "tool",
-				...(decision.policyKey ? { policyKey: decision.policyKey } : {}),
 				...(decision.reason ? { reason: decision.reason } : {}),
 			};
 		}
@@ -511,7 +486,6 @@ function resolvePolicy(
 			tier: decision.tier,
 			override: true,
 			source: "tool",
-			...(decision.policyKey ? { policyKey: decision.policyKey } : {}),
 			...(decision.reason ? { reason: decision.reason } : {}),
 		};
 	}
@@ -522,7 +496,6 @@ function resolvePolicy(
 			tier: decision.tier,
 			override: false,
 			source: "tool",
-			...(decision.policyKey ? { policyKey: decision.policyKey } : {}),
 			...(decision.reason ? { reason: decision.reason } : {}),
 		};
 	}
@@ -550,7 +523,6 @@ function resolvePolicy(
 		tier: decision.tier,
 		override: false,
 		source: "mode",
-		...(decision.policyKey ? { policyKey: decision.policyKey } : {}),
 		...(decision.reason ? { reason: decision.reason } : {}),
 	};
 }
@@ -639,7 +611,7 @@ export function restrictedFolderReason(
 
 /**
  * What an "approve for this session" answer may cover for a `resolved` prompt: the subject the
- * prompt names (the tool, or its `xd://` device) and a grant key that also pins the tier, so
+ * prompt names (the tool) and a grant key that also pins the tier, so
  * approving a write never covers an exec call of the same tool. Undefined when the prompt must
  * stay per-call: only a prompt the approval mode raised is grantable, never a critical override
  * or an explicit `prompt` policy (the user's or the tool's own).
@@ -649,8 +621,7 @@ export function sessionApprovalScope(
 	toolName: string,
 ): { subject: string; key: string } | undefined {
 	if (resolved.policy !== "prompt" || resolved.source !== "mode") return undefined;
-	const subject = resolved.policyKey ?? toolName;
-	return { subject, key: `${subject}\0${resolved.tier}` };
+	return { subject: toolName, key: `${toolName}\0${resolved.tier}` };
 }
 
 /**
@@ -702,7 +673,8 @@ function formatPayloadValue(value: unknown, indent: number): string {
 	if (value === null) return "null";
 	if (typeof value === "boolean" || typeof value === "number") return String(value);
 	if (typeof value === "string") {
-		const normalized = replaceTabs(normalizeToLF(value));
+		// Display only: every line break, a lone CR included, becomes a row.
+		const normalized = replaceTabs(value.replace(/\r\n?/g, "\n"));
 		if (normalized.includes("\n")) {
 			const padding = " ".repeat(indent);
 			// Keep delimiters and commas outside the body, including in arrays.
@@ -743,7 +715,7 @@ function formatPayloadValue(value: unknown, indent: number): string {
 }
 
 /**
- * Layout a decoded device or MCP argument payload:
+ * Layout a decoded tool-command or MCP argument payload:
  * - standard JSON layout with 2-space indentation
  * - multiline strings (manifests, scripts, policy documents) expanded into quoted blocks
  * - tabs sanitized to spaces

@@ -10,7 +10,9 @@
  */
 import * as path from "node:path";
 import { getMemoriesDir, getSessionsDir } from "@oh-my-pi/pi-utils";
+import { resolveLocalRoot } from "../../internal-urls/local-root";
 import { artifactsDirsFromRegistry } from "../../internal-urls/registry-helpers";
+import { AgentRegistry } from "../../registry/agent-registry";
 import { approvalCacheKeyForPath } from "../../tools/approval-cache";
 
 /** `permissions.json`, `permissions.local.json`, and any other `permissions*.json` in a `.omp` folder. */
@@ -63,22 +65,63 @@ export function protectedPathRefusal(targets: readonly string[], agentDir: strin
 	return undefined;
 }
 
+/** A spill file name (`<N>.log`), matched case-insensitively since a root may sit on such a filesystem. */
+const SPILL_FILE_NAME = /^(\d+)\.log$/i;
+
+/** `directory` as written and by its real path. */
+function directoryVariants(directory: string): string[] {
+	return [path.resolve(directory), approvalCacheKeyForPath(path.resolve(directory))];
+}
+
+/**
+ * The `local://` roots of every live session, as written and by real path: `<artifactsDir>/local`, or
+ * the temp root of a session without a session file.
+ */
+function liveLocalRoots(): string[] {
+	const roots = artifactsDirsFromRegistry().map(directory => path.join(directory, "local"));
+	for (const ref of AgentRegistry.global().list()) {
+		const manager = ref.session?.sessionManager;
+		if (!manager) continue;
+		roots.push(
+			resolveLocalRoot({
+				getArtifactsDir: () => manager.getArtifactsDir(),
+				getSessionId: () => manager.getSessionId(),
+			}),
+		);
+	}
+	return [...new Set(roots.flatMap(directoryVariants))];
+}
+
+/**
+ * The spill id of `target` (an absolute path) when it is a spill file at the top of a live session's
+ * `local://` root, else `undefined`. The agent tree shares one root, so a spill there may be any
+ * agent's raw tool output.
+ */
+export function liveSpillIdOf(target: string): string | undefined {
+	const id = SPILL_FILE_NAME.exec(path.basename(target))?.[1];
+	if (id === undefined) return undefined;
+	return liveLocalRoots().includes(path.dirname(target)) ? id : undefined;
+}
+
 /**
  * Secrets-blind: why reading `targets` (absolute paths) by host path is refused, or `undefined`. The
- * sessions dir and every live session's artifacts dir hold each agent's transcript and raw tool output,
- * which may carry what the child may not see; its own and its descendants' records stay readable
- * through `history://`, `agent://` and `artifact://`, which apply the subtree rule. The `local://`
- * scratch root inside an artifacts dir is not a record: it is shared scratch space under P7.
+ * sessions dir and every live session's artifacts dir hold each agent's transcript, and the spills
+ * (`<N>.log`) at the top of every live `local://` root hold raw tool output; either may carry what the
+ * child may not see. Its own and its descendants' records stay readable through `history://`,
+ * `agent://` and `local://<N>.log`, which apply the subtree rule. The rest of the `local://` scratch
+ * root is not a record: it is shared scratch space under P7.
  */
 export function agentRecordReadRefusal(targets: readonly string[], agentDir: string): string | undefined {
-	const variants = (directory: string) => [path.resolve(directory), approvalCacheKeyForPath(path.resolve(directory))];
 	const artifactDirs = artifactsDirsFromRegistry();
-	const recordDirs = [getSessionsDir(agentDir), ...artifactDirs].flatMap(variants);
-	const scratchDirs = artifactDirs.flatMap(directory => variants(path.join(directory, "local")));
+	const recordDirs = [getSessionsDir(agentDir), ...artifactDirs].flatMap(directoryVariants);
+	const scratchDirs = artifactDirs.flatMap(directory => directoryVariants(path.join(directory, "local")));
 	for (const target of targets) {
-		if (!path.isAbsolute(target) || !recordDirs.some(directory => isWithin(target, directory))) continue;
-		if (scratchDirs.some(directory => isWithin(target, directory))) continue;
-		return `BLOCKED: secrets-blind guardrail denied reading agent records at '${target}': read your own transcript and output through history://, agent:// and artifact://.`;
+		if (!path.isAbsolute(target)) continue;
+		if (liveSpillIdOf(target) === undefined) {
+			if (!recordDirs.some(directory => isWithin(target, directory))) continue;
+			if (scratchDirs.some(directory => isWithin(target, directory))) continue;
+		}
+		return `BLOCKED: secrets-blind guardrail denied reading agent records at '${target}': read your own transcript and output through history://, agent:// and local://.`;
 	}
 	return undefined;
 }

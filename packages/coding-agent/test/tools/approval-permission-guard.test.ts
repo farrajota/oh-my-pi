@@ -30,12 +30,12 @@ function tool(approval: ToolApprovalDecision, targets?: string[]): AgentTool {
 }
 
 /** A guard that denies every call and records what it was asked about. */
-function denyingGuard(): ApprovalGuard & { calls: Array<{ tool: string; tier: string; policyKey?: string }> } {
-	const calls: Array<{ tool: string; tier: string; policyKey?: string }> = [];
+function denyingGuard(): ApprovalGuard & { calls: Array<{ tool: string; tier: string }> } {
+	const calls: Array<{ tool: string; tier: string }> = [];
 	return {
 		calls,
 		check(subject, _args, call) {
-			calls.push({ tool: subject.name, tier: call.tier, ...(call.policyKey ? { policyKey: call.policyKey } : {}) });
+			calls.push({ tool: subject.name, tier: call.tier });
 			return { reason: REASON };
 		},
 	};
@@ -128,10 +128,10 @@ describe("approval guard", () => {
 		).toEqual({ policy: "prompt", tier: "exec", override: false, source: "mode" });
 	});
 
-	it("tells the guard the resolved tier and the keyed sub-tool of an xd:// dispatch", () => {
+	it("tells the guard the resolved tier of the call", () => {
 		const guard = denyingGuard();
-		resolveApproval(tool({ tier: "write", policyKey: "xd_device" }), {}, "write", {}, undefined, restrictedBy(guard));
-		expect(guard.calls).toEqual([{ tool: "probe", tier: "write", policyKey: "xd_device" }]);
+		resolveApproval(tool({ tier: "write" }), {}, "write", {}, undefined, restrictedBy(guard));
+		expect(guard.calls).toEqual([{ tool: "probe", tier: "write" }]);
 	});
 
 	it("reports the guard's reason as the error and is never session-grantable", () => {

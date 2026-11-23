@@ -867,6 +867,13 @@ describe("permission profile composition and evaluation", () => {
 		expect(evaluate(scope, "yield", {}, cwd).action).toBe("allow");
 		expect(evaluate(scope, "report_tool_issue", {}, cwd).action).toBe("allow");
 	});
+
+	test("report_issue, upstream's new name for report_tool_issue, is always allowed under a restrictive allowlist", async () => {
+		const cwd = await tempCwd();
+		const scope = enforceScope({ request: { tools: ["read"], denyTools: ["report_issue"] } });
+
+		expect(evaluate(scope, "report_issue", {}, cwd).action).toBe("allow");
+	});
 });
 
 describe("deterministic permission profile smoke fixture", () => {

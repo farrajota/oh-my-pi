@@ -8,7 +8,12 @@ import {
 	validateSingleRequestLaunch,
 	validateToolNames,
 } from "../src/cli/args";
-import { OPTIONAL_VALUE_FLAGS, restartArgv, STRING_VALUE_FLAGS } from "../src/cli/flag-tables";
+import {
+	EXTENSION_SHADOWABLE_STRING_FLAGS,
+	OPTIONAL_VALUE_FLAGS,
+	restartArgv,
+	STRING_VALUE_FLAGS,
+} from "../src/cli/flag-tables";
 import { CliUsageError } from "../src/cli/usage-error";
 
 /**
@@ -35,6 +40,7 @@ import { CliUsageError } from "../src/cli/usage-error";
  */
 describe("STRING_VALUE_FLAGS table is honored by args.ts parseArgs", () => {
 	for (const flag of STRING_VALUE_FLAGS) {
+		if (EXTENSION_SHADOWABLE_STRING_FLAGS.has(flag)) continue;
 		it(`${flag} consumes the next token unconditionally`, () => {
 			try {
 				const result = parseArgs([flag, "--profile", "work"]);
@@ -48,6 +54,25 @@ describe("STRING_VALUE_FLAGS table is honored by args.ts parseArgs", () => {
 				// token instead of activating the profile.
 				expect(error).toBeInstanceOf(CliUsageError);
 			}
+		});
+	}
+});
+
+describe("EXTENSION_SHADOWABLE_STRING_FLAGS table is honored by args.ts parseArgs", () => {
+	for (const flag of EXTENSION_SHADOWABLE_STRING_FLAGS) {
+		it(`${flag} consumes value-like and inline = tokens but releases tokens that start with -`, () => {
+			const released = parseArgs([flag, "--profile", "work"]);
+			expect(
+				released.profile,
+				`parseArgs should release --profile back to its own handler when it follows bare ${flag}`,
+			).toBe("work");
+
+			const consumed = parseArgs([flag, "work"]);
+			expect(consumed.messages).toEqual([]);
+
+			const inline = parseArgs([`${flag}=--profile`, "work"]);
+			expect(inline.profile).toBeUndefined();
+			expect(inline.messages).toEqual(["work"]);
 		});
 	}
 });
@@ -300,6 +325,24 @@ describe("restartArgv (/restart relaunch argv)", () => {
 		const args = parseArgs(relaunch);
 		expect(args.singleRequest).toBe(true);
 		expect(() => validateSingleRequestLaunch(args)).not.toThrow();
+	});
+
+	it("treats --plan before another flag as boolean while keeping a value-like --plan model", () => {
+		const booleanPlan = restartArgv(["--plan", "--continue", "fix the bug"], "sid");
+		expect(booleanPlan).toEqual(["--plan", "--restore", "sid"]);
+		const startupParsed = parseArgs(booleanPlan);
+		expect(startupParsed.restore).toBe(true);
+		expect(startupParsed.resume).toBe("sid");
+		expect(startupParsed.plan).toBeUndefined();
+		expect(startupParsed.messages).toEqual([]);
+		expect(() => validateRestoreLaunch(startupParsed, true)).not.toThrow();
+
+		expect(restartArgv(["--plan", "opus", "--continue", "fix the bug"], "sid")).toEqual([
+			"--plan",
+			"opus",
+			"--restore",
+			"sid",
+		]);
 	});
 });
 describe("--restore", () => {

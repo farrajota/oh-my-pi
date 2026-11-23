@@ -5,13 +5,14 @@
  * and the file an internal URL resolves to.
  */
 import * as path from "node:path";
+import { spillUrl } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import type { ResolveContext } from "../../internal-urls/types";
 import { AgentRegistry } from "../../registry/agent-registry";
 import { approvalCacheKeyForPath } from "../../tools/approval-cache";
 import { evaluateInternalUrlFile, evaluatePermissionPath } from "./evaluate";
 import { activePermissionScope, permissionApprovalGuard, unreadableScopeReason } from "./guard";
-import { agentRecordReadRefusal } from "./protected-paths";
+import { agentRecordReadRefusal, liveSpillIdOf } from "./protected-paths";
 import { hasPathRules } from "./path-rules";
 
 /** An entry a search reports as an internal URL (`local://notes.md`) rather than a host path. */
@@ -58,14 +59,24 @@ export function permissionResultFilter(
 	const { scope } = active;
 	if (scope.mode !== "enforce" || !(hasPathRules(scope) || scope.guardrails.secretsBlind)) return undefined;
 	const canonicalCwd = approvalCacheKeyForPath(cwd);
+	// A search of the shared `local://` root finds every agent's spills; secrets-blind keeps the subtree's.
+	const spillPermitted = (file: string): boolean => {
+		if (!scope.guardrails.secretsBlind) return true;
+		const id = liveSpillIdOf(file);
+		return id === undefined || spillAllocatedByRegisteredSubtree(scope.actorId, id);
+	};
 	return entry => {
 		if (evaluatePermissionPath({ scope, toolName, path: entry, cwd }).action === "deny") return false;
 		if (URL_ENTRY.test(entry)) {
 			// A found internal URL answers for the file behind it (P7), as a read of it would.
 			const file = locateUrl?.(entry);
-			return file === undefined || internalUrlFileRefusal(settings, cwd, entry, file) === undefined;
+			return (
+				file === undefined ||
+				(internalUrlFileRefusal(settings, cwd, entry, file) === undefined && spillPermitted(file))
+			);
 		}
 		if (!path.isAbsolute(entry)) return true;
+		if (!spillPermitted(entry)) return false;
 		const real = approvalCacheKeyForPath(entry);
 		return (
 			real === entry || evaluatePermissionPath({ scope, toolName, path: real, cwd: canonicalCwd }).action === "allow"
@@ -103,10 +114,10 @@ export function permissionFileRefusal(
 }
 
 /**
- * Why the scope in `context` refuses reading `artifact://<id>`, or `undefined`. Artifact ids are
- * shared across the agent tree and resolve against every live session's artifacts, so under
- * secrets-blind (P7, as for `agent://` and `history://`) a child reads only artifacts its own session
- * allocated, or a session of its descendants (`<actorId>.<child>`) did.
+ * Why the scope in `context` refuses reading spill `id` (`local://<id>.log`), or `undefined`. The agent
+ * tree shares one `local://` root and one spill id space, so a parent's raw tool output sits beside
+ * the child's own; under secrets-blind (P7, as for `agent://` and `history://`) a child reads only
+ * spills its own session allocated, or a session of its descendants (`<actorId>.<child>`) did.
  */
 export function artifactRecordRefusal(context: ResolveContext | undefined, id: string): string | undefined {
 	const settings = context?.settings;
@@ -123,7 +134,23 @@ export function artifactRecordRefusal(context: ResolveContext | undefined, id: s
 		if (ref.id.startsWith(descendant) && ref.session?.sessionManager.allocatedArtifact?.(id) === true)
 			return undefined;
 	}
-	return `BLOCKED: secrets-blind guardrail denied another agent's artifact 'artifact://${id}'.`;
+	return `BLOCKED: secrets-blind guardrail denied another agent's artifact '${spillUrl(id)}'.`;
+}
+
+/**
+ * Whether a registered session of agent `actorId` or of one of its descendants (`<actorId>.<child>`)
+ * allocated spill `id`. For checks with no caller session at hand, such as search results: a caller
+ * whose session is not registered does not find its own spills there either.
+ */
+function spillAllocatedByRegisteredSubtree(actorId: string, id: string): boolean {
+	const descendant = `${actorId}.`;
+	return AgentRegistry.global()
+		.list()
+		.some(
+			ref =>
+				(ref.id === actorId || ref.id.startsWith(descendant)) &&
+				ref.session?.sessionManager.allocatedArtifact?.(id) === true,
+		);
 }
 
 /**

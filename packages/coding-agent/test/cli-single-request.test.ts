@@ -9,8 +9,11 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 const cliEntry = path.join(repoRoot, "packages/coding-agent/src/cli.ts");
 const FIXTURE_API_KEY = "single-request-fixture-only";
-const PRIMARY_MODEL = "gpt-6.1-sol";
-const PRIMARY_SELECTOR = `cliproxy-codex/${PRIMARY_MODEL}:medium`;
+const PRIMARY_MODEL = "gpt-6.2-sol";
+const PRIMARY_SELECTOR = `cliproxy-codex/${PRIMARY_MODEL}:high`;
+// The guard's previous approved entry; it must now be refused like any other selector.
+const RETIRED_MODEL = "gpt-6.1-sol";
+const RETIRED_SELECTOR = `cliproxy-codex/${RETIRED_MODEL}:medium`;
 const REQUEST_PATH = "/v1/codex/responses";
 const GUARD_REPORT =
 	"single-request guard effective: adapter=openai-codex-responses dispatch-budget=1 fetch-budget=1 selector-match=true destination-match=false";
@@ -179,6 +182,7 @@ async function createResponsesFixture(reply: FixtureResponse): Promise<Responses
 async function configureAgent(
 	tempDir: TempDir,
 	fixture: ResponsesFixture,
+	primary: { model: string; selector: string } = { model: PRIMARY_MODEL, selector: PRIMARY_SELECTOR },
 ): Promise<{ agentDir: string; home: string }> {
 	const agentDir = tempDir.join("agent");
 	const home = tempDir.join("home");
@@ -194,14 +198,14 @@ async function configureAgent(
 			"    api: openai-codex-responses",
 			"    auth: apiKey",
 			"    models:",
-			`      - id: "${PRIMARY_MODEL}"`,
+			`      - id: "${primary.model}"`,
 			"        name: Guard fixture primary",
 			"        reasoning: true",
 			"        input: [text]",
 			"        contextWindow: 128000",
 			"        maxTokens: 8192",
 			"        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }",
-			"      - id: gpt-6.1-sol-fallback",
+			"      - id: gpt-6.2-sol-fallback",
 			"        name: Guard fixture fallback",
 			"        reasoning: true",
 			"        input: [text]",
@@ -215,8 +219,8 @@ async function configureAgent(
 		path.join(agentDir, "config.yml"),
 		[
 			"modelRoles:",
-			`  default: "${PRIMARY_SELECTOR}"`,
-			`  advisor: "${PRIMARY_SELECTOR}"`,
+			`  default: "${primary.selector}"`,
+			`  advisor: "${primary.selector}"`,
 			"retry:",
 			"  enabled: true",
 			"  maxRetries: 3",
@@ -227,7 +231,7 @@ async function configureAgent(
 			"  usageAwareFallback: true",
 			"  fallbackChains:",
 			"    default:",
-			"      - cliproxy-codex/gpt-6.1-sol-fallback",
+			"      - cliproxy-codex/gpt-6.2-sol-fallback",
 			"features:",
 			"  unexpectedStopDetection: smart",
 			"compaction:",
@@ -418,6 +422,24 @@ describe("--single-request CLI guard", () => {
 			expect(run.stderr).toContain(
 				"Single-request guard cannot use Codex WebSockets when enabled by the environment.",
 			);
+			expect(run.stderr).not.toContain(FIXTURE_API_KEY);
+			expect(fixture.requests).toEqual([]);
+		} finally {
+			await fixture.close();
+		}
+	}, 120_000);
+
+	it("refuses the retired gpt-6.1-sol:medium selector before any request", async () => {
+		using tempDir = TempDir.createSync("@omp-single-request-retired-");
+		const fixture = await createResponsesFixture("success");
+		try {
+			const { agentDir, home } = await configureAgent(tempDir, fixture, {
+				model: RETIRED_MODEL,
+				selector: RETIRED_SELECTOR,
+			});
+			const run = await runGuardedCli(tempDir, agentDir, home);
+			expect(run.exitCode).not.toBe(0);
+			expect(run.stderr).toContain("Single-request guard requires the configured approved model selector.");
 			expect(run.stderr).not.toContain(FIXTURE_API_KEY);
 			expect(fixture.requests).toEqual([]);
 		} finally {

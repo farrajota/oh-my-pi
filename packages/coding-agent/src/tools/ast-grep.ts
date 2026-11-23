@@ -28,6 +28,7 @@ import {
 	parseSearchPath,
 	relativeSearchResultPath,
 	resolveSearchResultPath,
+	resolveTargetResultPath,
 	resolveToolSearchScope,
 	searchPathTier,
 } from "./path-utils";
@@ -78,7 +79,7 @@ function retainAstFindMatch(matches: AstFindMatch[], capacity: number, candidate
 }
 
 async function runMultiTargetAstGrep(
-	targets: Array<{ basePath: string; glob?: string }>,
+	targets: Array<{ basePath: string; glob?: string; isDirectory: boolean }>,
 	options: {
 		patterns: string[];
 		commonBasePath: string;
@@ -124,7 +125,7 @@ async function runMultiTargetAstGrep(
 		if (targetResult.parseErrors) parseErrors.push(...targetResult.parseErrors);
 		for (const language of targetResult.missingGrammars ?? []) missingGrammars.add(language);
 		for (const match of targetResult.matches) {
-			const absolute = resolveSearchResultPath(target.basePath, match.path);
+			const absolute = resolveTargetResultPath(target, match.path);
 			const rebased = relativeSearchResultPath(options.commonBasePath, absolute);
 			retainAstFindMatch(retainedMatches, retainedCapacity, { ...match, path: rebased });
 		}

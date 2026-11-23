@@ -9,8 +9,8 @@ import { getOpenAICodexWebSocketEnvValue } from "@oh-my-pi/pi-ai/providers/opena
 import { $env } from "@oh-my-pi/pi-utils/env";
 
 const APPROVED_PROVIDER = "cliproxy-codex";
-const APPROVED_MODEL_ID = "gpt-6.1-sol";
-const APPROVED_THINKING_LEVEL = "medium";
+const APPROVED_MODEL_ID = "gpt-6.2-sol";
+const APPROVED_THINKING_LEVEL = "high";
 const APPROVED_SELECTOR = `${APPROVED_PROVIDER}/${APPROVED_MODEL_ID}:${APPROVED_THINKING_LEVEL}`;
 const APPROVED_ORIGIN = "https://cliproxyapi.zay.home";
 const APPROVED_BASE_PATH = "/v1";

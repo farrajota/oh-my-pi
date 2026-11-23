@@ -61,14 +61,13 @@ function hasScheme(target: string, scheme: string): boolean {
 
 /**
  * Targets the filesystem path rules never see: one `local://` URL is the subagent's own scratch
- * space, and a `write` to `agent://` (a message) or `xd://` (a device, checked as its own tool when
- * it runs) is a transport rather than a file. Lists are expanded before this check, so a list that
- * starts with an exempt URL never exempts the entries after it.
+ * space, and a `write` to `agent://` is a message rather than a file. Lists are expanded before this
+ * check, so a list that starts with an exempt URL never exempts the entries after it.
  */
 function isPathRuleExempt(toolKey: string, target: string): boolean {
 	if (target.includes(";")) return false;
 	if (hasScheme(target, "local://")) return true;
-	return toolKey === "write" && (hasScheme(target, "agent://") || hasScheme(target, "xd://"));
+	return toolKey === "write" && hasScheme(target, "agent://");
 }
 
 /** Schemes that expose another agent's work: its transcript and its output, with the noun a denial names. */
@@ -166,17 +165,14 @@ function evaluateToolName(
 	}
 	const messaging = listed(MESSAGING_GRANT);
 	if (key === "wait" && messaging) return ALLOW;
-	// Without the `write` tool, `write` still reaches internal transports: `xd://` devices, and
-	// `agent://` when messaging is granted. Its `local://` space is the parent's, shared by the whole
-	// tree (plans, task files), so writing it needs a file-write grant. One filesystem target makes
-	// it a file write.
+	// Without the `write` tool, `write` still reaches `agent://` when messaging is granted. Its
+	// `local://` space is the parent's, shared by the whole tree (plans, task files), so writing it
+	// needs a file-write grant. One filesystem target makes it a file write.
 	if (
 		key === "write" &&
 		targets.length > 0 &&
 		targets.every(target =>
-			hasScheme(target, "local://")
-				? grantsFileWrites
-				: hasScheme(target, "xd://") || (messaging && hasScheme(target, "agent://")),
+			hasScheme(target, "local://") ? grantsFileWrites : messaging && hasScheme(target, "agent://"),
 		)
 	) {
 		return ALLOW;
@@ -272,7 +268,8 @@ export function evaluateSubagentPermission(input: PermissionCallInput): Permissi
 	if (scope?.mode !== "enforce") return ALLOW;
 	const key = permissionToolKey(toolName);
 	if (key === "yield") return ALLOW;
-	if (key === "report_tool_issue" && scope.restricted) return ALLOW;
+	// `report_issue` is upstream's new name; the old one stays for persisted v1 scopes.
+	if ((key === "report_issue" || key === "report_tool_issue") && scope.restricted) return ALLOW;
 
 	const targets = expandListTargets([...permissionPathArguments(input.toolInput), ...(input.targets ?? [])]);
 

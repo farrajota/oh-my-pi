@@ -3,14 +3,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
-// Only the interactive TUI moves stats syncs into a subprocess (to keep them off its UI
-// thread). A one-shot command such as `omp stats --summary` syncs in-process, as upstream
-// does, instead of spawning a stats worker for every sync it requests.
+// Only the interactive TUI moves stats syncs into a stats activity worker thread (to keep them
+// off its UI thread). A one-shot command such as `omp stats --summary` syncs on its own thread,
+// as upstream does, instead of starting a stats worker for every sync it requests.
 
 const cliEntry = path.resolve(import.meta.dir, "../src/cli.ts");
 const STATS_WORKER_SELECTOR = "__omp_worker_stats_activity";
 
-// Records every command line the CLI process spawns, so the test can count stats workers.
+// Records every command line the CLI process spawns and every worker thread it starts (entry
+// plus argv selector), so the test can count stats workers either way.
 const SPAWN_RECORDER = `
 import * as fs from "node:fs";
 const log = process.env.OMP_TEST_SPAWN_LOG;
@@ -21,6 +22,13 @@ Bun.spawn = ((...args: unknown[]) => {
 	if (log) fs.appendFileSync(log, JSON.stringify(cmd) + "\\n");
 	return (spawn as (...a: unknown[]) => unknown)(...args);
 }) as typeof Bun.spawn;
+const OriginalWorker = globalThis.Worker;
+globalThis.Worker = class extends OriginalWorker {
+	constructor(url: string | URL, options?: WorkerOptions) {
+		if (log) fs.appendFileSync(log, JSON.stringify([String(url), ...((options as { argv?: unknown[] } | undefined)?.argv ?? [])]) + "\\n");
+		super(url, options);
+	}
+} as typeof Worker;
 `;
 
 function writeSession(sessionsDir: string, name: string, entries: number): void {

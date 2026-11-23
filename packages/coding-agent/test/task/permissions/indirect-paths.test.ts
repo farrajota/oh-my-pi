@@ -1,7 +1,8 @@
 /**
  * Indirect routes to a tool's effect answer to the subagent permission scope as the direct call
- * would: eval prelude host calls, JS tool-bridge calls, eval `agent()` and `workpool()` spawns,
- * and `xd://` device dispatches.
+ * would: eval prelude host calls, JS tool-bridge calls, and eval `agent()` and `workpool()` spawns.
+ * Tools run as bash tool commands (which replaced `xd://` devices) are covered in
+ * `tool-command-scope.test.ts`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -121,43 +122,5 @@ describe("delegation from eval", () => {
 				{ session: bareSession(scopedSettings(enforceScope({ tools: ["eval", "read"] }))) },
 			),
 		).rejects.toThrow("BLOCKED: Subagent permission profile does not allow tool 'task'.");
-	});
-});
-
-describe("xd:// device dispatch", () => {
-	it("checks a device dispatch against the device tool's name", async () => {
-		const scoped = await createScopedSession({
-			tempDir,
-			scope: enforceScope({ tools: ["read", "write"] }),
-			toolNames: ["read", "write", "bash"],
-			settings: { "tools.xdev": true },
-			calls: [{ name: "write", arguments: { path: "xd://bash", content: JSON.stringify({ command: "echo hi" }) } }],
-		});
-		try {
-			await scoped.session.sendUserMessage("run it");
-			const [result] = scoped.toolResults();
-			expect(result?.isError).toBe(true);
-			expect(result?.text).toContain("BLOCKED: Subagent permission profile does not allow tool 'bash'.");
-		} finally {
-			await scoped.dispose();
-		}
-	});
-
-	it("checks a device dispatch against a device the scope denies by name", async () => {
-		const scoped = await createScopedSession({
-			tempDir,
-			scope: enforceScope({ denyTools: ["bash"] }),
-			toolNames: ["read", "write", "bash"],
-			settings: { "tools.xdev": true },
-			calls: [{ name: "write", arguments: { path: "xd://bash", content: JSON.stringify({ command: "echo hi" }) } }],
-		});
-		try {
-			await scoped.session.sendUserMessage("run it");
-			const [result] = scoped.toolResults();
-			expect(result?.isError).toBe(true);
-			expect(result?.text).toContain("BLOCKED: Subagent permission profile denied tool 'bash'.");
-		} finally {
-			await scoped.dispose();
-		}
 	});
 });

@@ -102,6 +102,8 @@ describe("runSubprocess task label generation", () => {
 			// No parent model pattern or provider: the run has no parent session.
 			undefined,
 			undefined,
+			// No usage reporter: the run journals no task label usage.
+			undefined,
 		);
 	});
 

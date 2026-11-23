@@ -3,11 +3,11 @@ import type { StatsSyncClient } from "./sync-client";
 
 /**
  * Route every stats session sync requested in this process (the dashboard's live ingest,
- * extensions using the stats runtime) through one stats subprocess that lives as long as the
+ * extensions using the stats runtime) through one stats worker thread that lives as long as the
  * host, so the TUI thread never runs the synchronous SQLite ingest. Only the interactive TUI
- * installs it; one-shot commands sync inline. The subprocess glue loads on first sync, so
+ * installs it; one-shot commands sync inline. The worker glue loads on first sync, so
  * installing the host pulls in only the registry module. Returns the restore function, which
- * also kills the subprocess.
+ * also terminates the worker.
  */
 export function installStatsSyncHost(): () => void {
 	let client: StatsSyncClient | undefined;
@@ -22,7 +22,6 @@ export function installStatsSyncHost(): () => void {
 	});
 	return () => {
 		restore();
-		// dispose() kills the child synchronously and never rejects.
-		void client?.dispose();
+		client?.dispose();
 	};
 }

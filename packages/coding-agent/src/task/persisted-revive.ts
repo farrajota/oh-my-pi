@@ -45,6 +45,7 @@ import {
 	followMCPTools,
 	replayRevivedAgentStart,
 	softRequestBudgetFor,
+	subagentLspWritethroughSettings,
 	subagentRetryFallbackRole,
 	usesYield,
 } from "./executor";
@@ -452,6 +453,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	// in files written before that. Absent = unadvised (the
 	// createSubagentSettings default).
 	const subagentSettings = createSubagentSettings(spec.settings, {
+		...subagentLspWritethroughSettings(spec.settings),
 		...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 		...(init.advisor
 			? {
@@ -496,18 +498,13 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		: sessionLocalModel
 			? [sessionLocalModel, ...(spawnModelPattern === undefined ? [] : [spawnModelPattern].flat())]
 			: spawnModelPattern;
-	// Older session files persisted the synthetic xd:// write transport in the
-	// enabled set. A read-only agent definition could never grant full write,
-	// so remove that transport name before replaying tools as explicit grants.
-	const persistedToolNames =
-		init.readOnly === true && init.tools.includes("write") ? init.tools.filter(name => name !== "write") : init.tools;
 	// An enforce-restricted scope owns the tool list, as at spawn: cut to what it allows, no
 	// MCP, and no extension or custom-tool code (their handlers run outside the scope).
 	const permissionRestricted = permissionRestrictsStartup(subagentSettings);
 	const withholdExtensionCode = permissionWithholdsExtensionCode(subagentSettings);
 	const revivedToolNames = permissionRestricted
-		? permissionStartupToolNames(subagentSettings, persistedToolNames)
-		: persistedToolNames;
+		? permissionStartupToolNames(subagentSettings, init.tools)
+		: init.tools;
 	const artifactManager = spec.artifactManager;
 	if (artifactManager) reopened.adoptArtifactManager(artifactManager);
 	// A restricted persisted contract must not consult process-global MCP
@@ -531,7 +528,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			modelRegistry: spec.modelRegistry,
 			...(perCallModel ? { model: perCallModel, thinkingLevel: init.perCallThinkingLevel ?? undefined } : {}),
 			...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
-			modelPatternAuthFallback: init.perCallModel ? undefined : init.resolvedModel,
+			modelPatternParentFallback: init.perCallModel ? undefined : init.resolvedModel,
 			settings: subagentSettings,
 			sessionManager: reopened,
 			agentId: ref.id,
@@ -558,7 +555,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			expectedAgentRef: expectedRef,
 			taskDepth,
 			toolNames: revivedToolNames,
-			// `revivedToolNames` is the enabled set, devices included: keep those devices,
+			// The persisted enabled set includes tool commands: keep them as commands,
 			// or they come back as top-level tools and change the replayed tool list.
 			mountedToolNames: init.mountedTools,
 			outputSchema: init.outputSchema,
@@ -615,7 +612,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	// Clamp the active set to the persisted list: createAgentSession's
 	// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
 	// the original run didn't carry. Unknown/missing names are ignored.
-	await session.setActiveToolsByName([...revivedToolNames, ...session.getMountedXdevToolNames()]);
+	await session.setActiveToolsByName([...revivedToolNames, ...session.getMountedToolCommandNames()]);
 	// The yield tool's schema carries the last batch's items; the replayed prefix must match it.
 	if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
 	// Wire the extension runtime exactly as the live executor does. Without

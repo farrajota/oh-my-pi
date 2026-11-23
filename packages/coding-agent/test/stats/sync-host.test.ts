@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,10 +13,11 @@ const XDG_KEYS = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] as const;
 
 let tempDir: TempDir | undefined;
 let restoreHost: (() => void) | undefined;
+let restoreWorker: (() => void) | undefined;
 const originalAgentDir = getAgentDir();
 const originalEnv: Record<string, string | undefined> = {};
 
-// The stats worker subprocess resolves stats.db from the environment, so the
+// The stats worker thread resolves stats.db from the environment it copies at spawn, so the
 // isolated profile must live in env vars it inherits, not only in setAgentDir.
 beforeEach(() => {
 	tempDir = TempDir.createSync("@omp-stats-sync-host-");
@@ -30,7 +31,8 @@ beforeEach(() => {
 afterEach(() => {
 	restoreHost?.();
 	restoreHost = undefined;
-	vi.restoreAllMocks();
+	restoreWorker?.();
+	restoreWorker = undefined;
 	closeDb();
 	for (const [key, value] of Object.entries(originalEnv)) {
 		if (value === undefined) delete process.env[key];
@@ -87,71 +89,82 @@ function storedMessageCount(): number {
 	}
 }
 
-function statsWorkerSpawns(spawn: { mock: { calls: unknown[][] } }): number {
-	return spawn.mock.calls.filter(([options]) => {
-		const cmd = (options as { cmd?: string[] }).cmd ?? [];
-		return cmd.includes(STATS_WORKER_SELECTOR);
-	}).length;
+/** Records every stats activity worker thread this process constructs from now on. */
+function recordStatsWorkers(): Worker[] {
+	const Original = globalThis.Worker;
+	const spawned: Worker[] = [];
+	globalThis.Worker = class extends Original {
+		constructor(url: string | URL, options?: WorkerOptions) {
+			super(url, options);
+			const argv = (options as { argv?: unknown[] } | undefined)?.argv ?? [];
+			if (argv.includes(STATS_WORKER_SELECTOR) || String(url).endsWith("/activity-worker.ts")) spawned.push(this);
+		}
+	} as typeof Worker;
+	restoreWorker = () => {
+		globalThis.Worker = Original;
+	};
+	return spawned;
 }
 
 describe("interactive stats sync host", () => {
-	it("runs a full session sync in the stats worker subprocess and forwards its progress", async () => {
+	it("runs a full session sync in the stats worker thread and forwards its progress", async () => {
 		writeSession("first", 3);
 		writeSession("second", 2);
 		restoreHost = installStatsSyncHost();
-		const spawn = vi.spyOn(Bun, "spawn");
+		const spawned = recordStatsWorkers();
 		const progress: SyncProgress[] = [];
 
 		const result = await syncAllSessions({ onProgress: event => progress.push(event) });
 
-		expect(statsWorkerSpawns(spawn)).toBe(1);
+		expect(spawned).toHaveLength(1);
 		expect(result).toEqual({ processed: 5, files: 2 });
 		expect(progress.at(-1)).toMatchObject({ current: 2, total: 2, processed: 5 });
 		expect(storedMessageCount()).toBe(5);
 	}, 30_000);
 
-	it("runs a session-tree sync in the stats worker subprocess", async () => {
+	it("runs a session-tree sync in the stats worker thread", async () => {
 		const sessionFile = writeSession("tree", 4);
 		restoreHost = installStatsSyncHost();
-		const spawn = vi.spyOn(Bun, "spawn");
+		const spawned = recordStatsWorkers();
 
 		const result = await syncSessionTree(sessionFile, { workers: 1 });
 
-		expect(statsWorkerSpawns(spawn)).toBe(1);
+		expect(spawned).toHaveLength(1);
 		expect(result).toEqual({ processed: 4, files: 1 });
 		expect(storedMessageCount()).toBe(4);
 	});
 
-	it("reuses one stats worker subprocess for every sync of a long-lived host", async () => {
+	it("reuses one stats worker thread for every sync of a long-lived host", async () => {
 		const first = writeSession("reuse-a", 2);
 		restoreHost = installStatsSyncHost();
-		const spawn = vi.spyOn(Bun, "spawn");
+		const spawned = recordStatsWorkers();
 
 		expect(await syncAllSessions()).toEqual({ processed: 2, files: 1 });
 		const second = writeSession("reuse-b", 3);
 		expect(await syncAllSessions({ files: [second] })).toEqual({ processed: 3, files: 1 });
 		expect(await syncSessionTree(first, { workers: 1 })).toEqual({ processed: 0, files: 0 });
 
-		expect(statsWorkerSpawns(spawn)).toBe(1);
+		expect(spawned).toHaveLength(1);
 		expect(storedMessageCount()).toBe(5);
 	}, 30_000);
 
 	it("replaces a stats worker that died between syncs", async () => {
 		writeSession("respawn-a", 1);
 		restoreHost = installStatsSyncHost();
-		const spawn = vi.spyOn(Bun, "spawn");
+		const spawned = recordStatsWorkers();
 		expect(await syncAllSessions()).toEqual({ processed: 1, files: 1 });
 
-		const [worker] = spawn.mock.results.map(result => result.value as Bun.Subprocess);
-		worker.kill("SIGKILL");
-		await worker.exited;
+		const [worker] = spawned;
+		const closed = new Promise<void>(resolve => worker.addEventListener("close", () => resolve(), { once: true }));
+		worker.terminate();
+		await closed;
 		const second = writeSession("respawn-b", 2);
 
 		expect(await syncAllSessions({ files: [second] })).toEqual({ processed: 2, files: 1 });
-		expect(statsWorkerSpawns(spawn)).toBe(2);
+		expect(spawned).toHaveLength(2);
 	}, 30_000);
 
-	it("surfaces a failed subprocess sync as a rejection", async () => {
+	it("surfaces a failed worker sync as a rejection", async () => {
 		writeSession("locked", 1);
 		restoreHost = installStatsSyncHost();
 

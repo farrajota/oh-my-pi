@@ -96,7 +96,7 @@ describe("local:// writes", () => {
 		});
 	});
 
-	it("allows it with a write grant, and keeps agent:// messaging and xd:// dispatch without one", () => {
+	it("allows it with a write grant, and keeps agent:// messaging without one", () => {
 		for (const tools of [
 			["read", "write"],
 			["read", "edit"],

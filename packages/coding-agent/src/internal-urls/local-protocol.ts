@@ -1,11 +1,11 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import localDoc from "../prompts/internal-urls/local.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
-import { internalUrlListingFilter } from "../task/permissions/session-checks";
+import { artifactRecordRefusal, internalUrlListingFilter } from "../task/permissions/session-checks";
 import {
 	buildDirectoryResource,
 	containedRealPath,
@@ -25,26 +25,9 @@ import type {
 	UrlCompletion,
 } from "./types";
 import { formatByteSize } from "../utils/video";
+import { type LocalProtocolOptions, resolveLocalRoot } from "./local-root";
 
-export interface LocalProtocolOptions {
-	getArtifactsDir?: () => string | null;
-	getSessionId?: () => string | null;
-}
-
-const WINDOWS_LOCAL_ROOT_MAX_CHARS = 180;
-
-function safeSessionId(options: LocalProtocolOptions): string {
-	const raw = options.getSessionId?.() ?? "session";
-	const safe = raw.replace(/[^a-zA-Z0-9_.-]/g, "_");
-	return safe && safe !== "." && safe !== ".." ? safe : "session";
-}
-
-function shortLocalRoot(options: LocalProtocolOptions): string {
-	// Derive the short root from the stable session id, never the artifact path,
-	// so `SessionManager.moveTo()` and the resume-after-move flow keep finding
-	// the same `local://` directory the session wrote pre-move.
-	return path.join(os.tmpdir(), "omp-local", safeSessionId(options));
-}
+export * from "./local-root";
 
 const LOCAL_TEXT_SNIFF_BYTES = 8 * 1024;
 const LOCAL_TEXT_RESOURCE_MAX_BYTES = 1024 * 1024;
@@ -187,11 +170,47 @@ function listCompletionFiles(localRoot: string): Promise<string[]> {
 	return listing;
 }
 
+/** A spill file name (`<N>.log`), matched case-insensitively since the root may sit on such a filesystem. */
+const SPILL_FILE_NAME_RE = /^(\d+)\.log$/i;
+
+/**
+ * Why the caller's permission scope refuses `filePath` as another agent's spill, or `undefined`. The
+ * agent tree shares one `local://` root and one spill id space, so a parent's raw tool output
+ * (`local://<N>.log`) sits beside the child's own; under secrets-blind a child reads only spills its
+ * own subtree allocated (P7). `roots` are the root as written and by real path: a located file is a
+ * real path, a path to create is lexical.
+ */
+function spillRefusal(
+	filePath: string,
+	roots: readonly string[],
+	context: ResolveContext | undefined,
+): string | undefined {
+	if (!roots.includes(path.dirname(filePath))) return undefined;
+	const id = SPILL_FILE_NAME_RE.exec(path.basename(filePath))?.[1];
+	return id === undefined ? undefined : artifactRecordRefusal(context, id);
+}
+
+/** The session's `local://` root as written and, once it exists, by real path. */
+async function localRootVariants(opts: LocalProtocolOptions): Promise<string[]> {
+	const root = path.resolve(resolveLocalRoot(opts));
+	try {
+		const real = await fs.realpath(root);
+		return real === root ? [root] : [root, real];
+	} catch (error) {
+		if (isEnoent(error)) return [root];
+		throw error;
+	}
+}
+
 async function buildListing(url: InternalUrl, localRoot: string, context?: ResolveContext): Promise<InternalResource> {
 	const listed = await listFilesRecursively(localRoot);
 	// The caller's subagent permission scope leaves out the files it refuses.
 	const permitted = internalUrlListingFilter(context?.settings, context?.cwd, "local://", localRoot);
-	const files = permitted ? listed.filter(file => permitted(file)) : listed;
+	const files = listed.filter(
+		file =>
+			(!permitted || permitted(file)) &&
+			spillRefusal(path.join(localRoot, file), [localRoot], context) === undefined,
+	);
 	const listing = files.length === 0 ? "(empty)" : files.map(file => `- [${file}](local://${file})`).join("\n");
 	const content =
 		`# Local\n\n` +
@@ -238,20 +257,6 @@ function extractRelativePath(url: InternalUrl): string {
 	}
 	validateRelativePath(decoded, "local");
 	return decoded;
-}
-
-/** Resolve the session-scoped local:// root, shortening long Windows artifact paths before writes hit MAX_PATH. */
-export function resolveLocalRoot(options: LocalProtocolOptions, platform: NodeJS.Platform = process.platform): string {
-	const artifactsDir = options.getArtifactsDir?.();
-	if (artifactsDir) {
-		const candidate = path.resolve(artifactsDir, "local");
-		if (platform === "win32" && candidate.length >= WINDOWS_LOCAL_ROOT_MAX_CHARS) {
-			return shortLocalRoot(options);
-		}
-		return candidate;
-	}
-
-	return path.join(os.tmpdir(), "omp-local", safeSessionId(options));
 }
 
 export interface LocalFileEntry {
@@ -375,7 +380,7 @@ const LOCAL_WRITE_NOTE = "Use write path local://<file> to persist large interme
 type ResolvedLocalTarget =
 	| { kind: "listing"; root: string }
 	| { kind: "directory"; path: string }
-	| { kind: "file"; path: string; size: number };
+	| { kind: "file"; path: string; size: number; root: string };
 
 /**
  * Resolve a local:// URL to its on-disk target with realpath + containment
@@ -417,7 +422,7 @@ async function resolveLocalTarget(url: InternalUrl, opts: LocalProtocolOptions):
 	if (!stat.isFile()) {
 		throw new Error(`local:// URL must resolve to a file or directory: ${url.href}`);
 	}
-	return { kind: "file", path: realTargetPath, size: stat.size };
+	return { kind: "file", path: realTargetPath, size: stat.size, root: resolvedRoot };
 }
 
 /**
@@ -470,6 +475,7 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		backing: "file",
 		selectors: "lines",
 		immutable: false,
+		unspilledPages: true,
 		pathAuthority: true,
 		linkable: true,
 		imageQuestion: true,
@@ -544,6 +550,8 @@ export class LocalProtocolHandler implements ProtocolHandler {
 			return buildDirectoryResource(url.href, resolved.path, [LOCAL_WRITE_NOTE], context);
 		}
 
+		const refusal = spillRefusal(resolved.path, [resolved.root], context);
+		if (refusal !== undefined) throw new ToolError(refusal);
 		return buildFileResource(url, resolved);
 	}
 
@@ -552,7 +560,12 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		if (!opts) {
 			throw new Error("No session - local:// unavailable");
 		}
-		return locateLocalTarget(url, opts, options?.create === true);
+		const located = await locateLocalTarget(url, opts, options?.create === true);
+		if (located === null || !SPILL_FILE_NAME_RE.test(path.basename(located))) return located;
+		// Paths to create too: a write over another agent's spill replaces the output its transcript links.
+		const refusal = spillRefusal(located, await localRootVariants(opts), context);
+		if (refusal !== undefined) throw new ToolError(refusal);
+		return located;
 	}
 
 	locateSync(url: InternalUrl, context?: ResolveContext): string | undefined {

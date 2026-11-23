@@ -26,7 +26,14 @@ import {
 } from "@oh-my-pi/pi-natives";
 import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { type FileSnapshot, readSnapshot } from "../commit/selective/journal";
-import { extractUriScheme, InternalUrlRouter, type ResolveContext, sessionResolveContext } from "../internal-urls";
+import {
+	extractUriScheme,
+	InternalUrlRouter,
+	type ResolveContext,
+	sessionResolveContext,
+	sessionWriteContext,
+} from "../internal-urls";
+import { isRemoteTextWritable, remoteMirrorUrl, writeRemoteMirror } from "./remote-mirror";
 import { createLspWritethrough, flushLspWritethroughBatch, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { type FileDiagnosticsResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import { notifyWorkspaceWatchedFiles } from "../lsp/client";
@@ -61,6 +68,8 @@ import {
 import { permissionPinsEditSources } from "../task/permissions/session-checks";
 import { type AppliedEditSnapshot, createEditBlackboxRecorder } from "./blackbox";
 import hashlineCompactPrompt from "./hashline-compact.md" with { type: "text" };
+import { MAGIC_EDIT_GRAMMAR, magicEditPaths, runMagicEdit } from "./magic";
+import magicEditDescription from "../prompts/tools/magic-edit.md" with { type: "text" };
 import { getLspBatchRequest } from "../lsp/batch";
 import { type EditToolDetails, type EditToolPerFileResult, type Operation } from "@oh-my-pi/pi-tui/tools/edit";
 import {
@@ -68,6 +77,8 @@ import {
 	applyPatchSchema,
 	type HashlineParams,
 	hashlineEditParamsSchema,
+	type MagicEditParams,
+	magicEditSchema,
 	type PatchParams,
 	patchEditSchema,
 	type ReplaceBatchParams,
@@ -108,9 +119,17 @@ type TInput =
 	| typeof patchEditSchema
 	| typeof hashlineEditParamsSchema
 	| typeof applyPatchSchema
-	| typeof sloppyEditSchema;
+	| typeof sloppyEditSchema
+	| typeof magicEditSchema;
 
-type EditParams = ReplaceParams | ReplaceBatchParams | PatchParams | HashlineParams | ApplyPatchParams | SloppyParams;
+type EditParams =
+	| ReplaceParams
+	| ReplaceBatchParams
+	| PatchParams
+	| HashlineParams
+	| ApplyPatchParams
+	| SloppyParams
+	| MagicEditParams;
 
 const PATCH_EXAMPLES = [
 	{
@@ -394,15 +413,26 @@ export class EditTool implements AgentTool<TInput> {
 	get mode(): EditMode {
 		if (this.#editMode) return this.#editMode;
 		const mode = resolveEditMode(this.session);
-		// `edit.mode: none` unregisters this tool on the next built-in reconcile; until then keep a valid schema.
-		return mode === "none" ? "replace" : mode;
+		// `magic` applies its model-written batch through `replace` (see `#magic`). `edit.mode: none`
+		// unregisters this tool on the next built-in reconcile; until then keep a valid schema.
+		return mode === "none" || mode === "magic" ? "replace" : mode;
+	}
+
+	/**
+	 * `edit.mode: magic`: calls carry described changes, which {@link runMagicEdit} turns
+	 * into one `replace` batch per file before anything reaches the native engine.
+	 */
+	get #magic(): boolean {
+		return this.#editMode === undefined && resolveEditMode(this.session) === "magic";
 	}
 
 	get description(): string {
+		if (this.#magic) return prompt.render(magicEditDescription);
 		return resolveEditToolDescription(this.mode, this.session.getActiveModel?.());
 	}
 
 	get parameters(): TInput {
+		if (this.#magic) return magicEditSchema;
 		switch (this.mode) {
 			case "replace":
 				return replaceEditSchema;
@@ -424,6 +454,7 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	get customFormat(): { syntax: "lark"; definition: string } | undefined {
+		if (this.#magic) return MAGIC_EDIT_GRAMMAR;
 		const definition = editGrammar(this.mode);
 		return definition === null ? undefined : { syntax: "lark", definition };
 	}
@@ -546,6 +577,25 @@ export class EditTool implements AgentTool<TInput> {
 		_onUpdate?: AgentToolUpdateCallback<EditToolDetails, TInput>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
+		if (this.#magic && "input" in params) {
+			return runMagicEdit({
+				session: this.session,
+				input: params.input,
+				signal,
+				apply: (path, edits, rawSnapshot) =>
+					this.#execute(toolCallId, { path, edits }, signal, context, rawSnapshot),
+			});
+		}
+		return this.#execute(toolCallId, params, signal, context);
+	}
+
+	async #execute(
+		toolCallId: string,
+		params: EditParams,
+		signal?: AbortSignal,
+		context?: AgentToolContext,
+		rawSnapshot?: string,
+	): Promise<AgentToolResult<EditToolDetails, TInput>> {
 		let open = this.#sessions.get(toolCallId);
 		const argsJson = JSON.stringify(params);
 		// A call outside the approval wrapper was never pinned; pin it now, before anything is read.
@@ -578,7 +628,14 @@ export class EditTool implements AgentTool<TInput> {
 		try {
 			outcome = await editSession.apply(
 				{ lspBatchId: batch?.id, lspFlush: batch?.flush ?? false },
-				(_error, request) => this.#write(request, signal, pinned),
+				async (_error, request) => {
+					if (rawSnapshot !== undefined && (await Bun.file(request.path).text()) !== rawSnapshot) {
+						throw new ToolError("The file changed after the numbered snapshot was read; re-read and retry.", {
+							path: request.path,
+						});
+					}
+					return this.#write(request, signal, pinned);
+				},
 			);
 			if (outcome.isError && batch?.flush) {
 				await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
@@ -655,6 +712,11 @@ export class EditTool implements AgentTool<TInput> {
 	 * so repeat lookups for one object pay once.
 	 */
 	#inspect(args: unknown): EditInspection {
+		if (this.#magic) {
+			// The payload names its files itself; the native inspectors do not know its syntax.
+			const input = (args as { input?: unknown } | null | undefined)?.input;
+			return { paths: typeof input === "string" ? magicEditPaths(input) : [], entries: [], fileOps: [] };
+		}
 		const tagged = typeof args === "object" && args !== null ? (args as InspectedArgs) : undefined;
 		const cached = tagged?.[kInspection];
 		if (cached?.mode === this.mode) return cached.inspection;
@@ -737,6 +799,13 @@ export class EditTool implements AgentTool<TInput> {
 			const scheme = extractUriScheme(target);
 			const spec = scheme === undefined ? undefined : router.spec(scheme);
 			if (!spec) return { error: `Unknown internal URL: ${url}`, planWritable: false };
+			if (isRemoteTextWritable(spec)) {
+				// Patched through a local mirror of the live remote text; `#write` sends it back.
+				const resource = await router.resolve(target, context);
+				if (resource.isDirectory) return { error: `${url} is a directory`, planWritable: false };
+				if (typeof resource.content !== "string") return { error: `${url} is binary`, planWritable: false };
+				return { path: await writeRemoteMirror(target, resource.content), planWritable: false };
+			}
 			if (!router.fileWritable(target)) {
 				const reason = spec.write?.via === "handler" ? "is written through `write`, not edited" : "is read-only";
 				return { error: `${url} ${reason}`, planWritable: false };
@@ -748,13 +817,28 @@ export class EditTool implements AgentTool<TInput> {
 		}
 	}
 
+	/** Send a patched remote mirror back through its scheme's handler; the mirror tracks what was written. */
+	async #writeRemote(url: string, request: EditWriteRequest, signal?: AbortSignal): Promise<EditWriteResponse> {
+		if (request.op !== "update" || request.content === undefined) {
+			throw new ToolError(`${url} can only be patched in place; use \`bash\` to delete or move it`, {
+				path: request.path,
+			});
+		}
+		await InternalUrlRouter.instance().write(url, request.content, sessionWriteContext(this.session, { signal }));
+		await Bun.write(request.path, request.content);
+		return { written: request.content };
+	}
+
 	async #write(
 		request: EditWriteRequest,
 		signal?: AbortSignal,
 		pinned?: EditSourceBinding,
 	): Promise<EditWriteResponse> {
+		// Mirrors are keyed by the path the edit saw, before any pinned rewrite.
+		const remote = remoteMirrorUrl(request.path);
 		if (pinned) {
-			// Write the pinned real paths, and only while they still hold what was pinned.
+			// Write the pinned real paths, and only while they still hold what was pinned. A mirror
+			// that approval never pinned throws here, so a scoped edit fails closed.
 			const { moveTo } = request;
 			request = {
 				...request,
@@ -764,6 +848,7 @@ export class EditTool implements AgentTool<TInput> {
 					: moveTo,
 			};
 		}
+		if (remote !== undefined) return this.#writeRemote(remote, request, signal);
 		const journaled = this.session.recordFileChange !== undefined;
 		const before = journaled ? await readSnapshot(request.path) : undefined;
 		const journal = (file: string, after: string | null, snapshot: FileSnapshot | undefined = before) => {
@@ -773,7 +858,6 @@ export class EditTool implements AgentTool<TInput> {
 				tool: "edit",
 				before: snapshot.text,
 				after,
-				beforeMtimeMs: snapshot.mtimeMs,
 			});
 		};
 		if (request.op === "delete") {
@@ -879,7 +963,9 @@ export class EditTool implements AgentTool<TInput> {
 		if (preWriteBytes !== undefined) {
 			// Fail when a content-changing write left disk at the pre-image. Compare
 			// post vs pre first (native memcmp, usually a length mismatch) so the
-			// requested content is only encoded when disk really is unchanged.
+			// expected final content is only encoded when disk really is unchanged.
+			// A formatter may restore the pre-image even though the request changed it.
+			const expectedContent = diagnostics.formatted ? diagnostics.finalContent : request.content;
 			let postWriteBytes: Uint8Array | undefined;
 			try {
 				postWriteBytes = await Bun.file(request.path).bytes();
@@ -889,8 +975,8 @@ export class EditTool implements AgentTool<TInput> {
 			if (
 				postWriteBytes !== undefined &&
 				bytesEqual(postWriteBytes, preWriteBytes) &&
-				(Buffer.byteLength(request.content, "utf8") !== preWriteBytes.byteLength ||
-					!bytesEqual(Buffer.from(request.content, "utf8"), preWriteBytes))
+				(Buffer.byteLength(expectedContent, "utf8") !== preWriteBytes.byteLength ||
+					!bytesEqual(Buffer.from(expectedContent, "utf8"), preWriteBytes))
 			) {
 				throw new ToolError(
 					`edit appeared successful but file content did not change on disk: ${request.displayPath}`,

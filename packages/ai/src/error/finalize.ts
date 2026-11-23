@@ -28,7 +28,7 @@ export interface FinalizeResult {
 	/** Structured flag id from {@link classify}. */
 	id: number;
 	/** The error's own `code` field, when it carries one; never parsed from the message. */
-	code: string | undefined;
+	code?: string;
 	/** HTTP status, from the error or the captured response. */
 	status: number | undefined;
 	/** `"aborted"` when the caller cancelled, otherwise `"error"`. */

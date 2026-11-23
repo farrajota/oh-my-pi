@@ -19,10 +19,10 @@ import type { ToolSession } from "../tools";
 import { internalUrlFileRefusal } from "../task/permissions/session-checks";
 import { TIER_RANK } from "../tools/approval";
 import { AgentProtocolHandler } from "./agent-protocol";
-import { ArtifactProtocolHandler } from "./artifact-protocol";
 import { AttachmentProtocolHandler } from "./attachment-protocol";
 import { CfgProtocolHandler } from "./cfg-protocol";
 import { ConflictProtocolHandler } from "./conflict-protocol";
+import { HelpProtocolHandler } from "./help-protocol";
 import { HistoryProtocolHandler } from "./history-protocol";
 import { IssueProtocolHandler, PrProtocolHandler } from "./issue-pr-protocol";
 import { LocalProtocolHandler } from "./local-protocol";
@@ -50,7 +50,6 @@ import type {
 	WriteContext,
 } from "./types";
 import { VaultProtocolHandler } from "./vault-protocol";
-import { XdProtocolHandler } from "./xd-protocol";
 
 /**
  * Refuse a file an internal URL resolved to when the caller's subagent permission scope does not
@@ -124,7 +123,6 @@ export class InternalUrlRouter {
 		this.register(new OutProtocolHandler());
 		this.register(new AgentProtocolHandler());
 		this.register(new HistoryProtocolHandler());
-		this.register(new ArtifactProtocolHandler());
 		this.register(new LocalProtocolHandler());
 		this.register(new ProcProtocolHandler());
 		this.register(new CfgProtocolHandler());
@@ -137,7 +135,7 @@ export class InternalUrlRouter {
 		this.register(new MrProtocolHandler());
 		this.register(resourceFallback);
 		this.register(new OmpProtocolHandler());
-		this.register(new XdProtocolHandler());
+		this.register(new HelpProtocolHandler());
 		this.register(new AttachmentProtocolHandler());
 		this.register(new ConflictProtocolHandler());
 		this.#builtinSchemes = new Set(this.#handlers.keys());
@@ -282,9 +280,9 @@ export class InternalUrlRouter {
 	 * A mutating tool's URL target ({@link normalize}d) with a whole-file display selector
 	 * (`:raw`/`:conflicts`) peeled, so it names the file `read` does. Any other selector — a line
 	 * range, `raw:1-20`, a malformed `:-10` — throws ToolError: the tool addresses a whole file, and
-	 * dropping the selector would mutate a file the caller never named. Device URLs (xd://) refuse
-	 * every selector: write approval judges the unpeeled URL, so peeling `xd://ast_edit:raw` would
-	 * dispatch a device the gate never judged. Non-URLs pass through.
+	 * dropping the selector would mutate a file the caller never named. Device-backed schemes
+	 * (proc://, out://) refuse every selector: write approval judges the unpeeled URL, so
+	 * peeling one would act on a handle the gate never judged. Non-URLs pass through.
 	 */
 	peelWriteSelector(input: string, tool: string): string {
 		const { path, sel } = this.split(input);
@@ -339,8 +337,8 @@ export class InternalUrlRouter {
 
 	/**
 	 * locate or throw ToolError. A locatable, immutable, non-remote scheme resolves from session-local
-	 * stores, so its resolve error diagnoses the miss (`Cannot find artifact://9: Artifact 9 not found.
-	 * Available: …`); otherwise `Cannot ${action} ${scheme}:// URL: no local file backs ${input}`
+	 * stores, so its resolve error diagnoses the miss (`Cannot find agent://x: Not found: x`);
+	 * otherwise `Cannot ${action} ${scheme}:// URL: no local file backs ${input}`
 	 * (+ a `read` hint for remote/virtual schemes).
 	 */
 	async requireLocal(
@@ -462,7 +460,7 @@ export class InternalUrlRouter {
 		return lines;
 	}
 
-	/** Rendered promptReference entries, registration order: the body of `xd://read/urls`. */
+	/** Rendered promptReference entries, registration order: the body of `help://read/urls`. */
 	reference(): string[] {
 		const lines: string[] = [];
 		for (const handler of this.#handlers.values()) {
@@ -521,7 +519,7 @@ export class InternalUrlRouter {
 	}
 
 	/** Resolve an internal URL through its registered protocol handler. */
-	async resolve(input: string, context?: ResolveContext): Promise<InternalResource> {
+	async resolve(input: string, context?: ResolveContext): Promise<InternalResource<string | Buffer>> {
 		const { parsed, handler } = this.#route(input, true);
 		const resource = await handler.resolve(parsed, context);
 		if (resource.sourcePath) assertPermittedFile(input, resource.sourcePath, context);
